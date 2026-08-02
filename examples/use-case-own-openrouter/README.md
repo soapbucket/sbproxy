@@ -11,6 +11,7 @@ The full walkthrough is [docs/use-case-own-openrouter.md](../../docs/use-case-ow
 ## Run
 
 ```bash
+export SB_ADMIN_PASSWORD=pick-something-real
 export OPENAI_API_KEY=sk-...
 export ANTHROPIC_API_KEY=sk-ant-...
 sbproxy sb.yml
@@ -23,7 +24,7 @@ docker compose up
 
 ```bash
 # Mint a team key; the plaintext token is returned exactly once.
-TOKEN=$(curl -s -u admin:admin -X POST http://127.0.0.1:9090/admin/keys \
+TOKEN=$(curl -s -u "admin:$SB_ADMIN_PASSWORD" -X POST http://127.0.0.1:9090/admin/keys \
   -d '{"name":"team-payments"}' | jq -r .token)
 
 # Same endpoint, two vendors: the model field picks the provider.

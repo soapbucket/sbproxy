@@ -398,7 +398,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (verdict) (rate(sbproxy_policy_audit_events_total{policy_type=\"semantic_constraint\"}[5m]))",
+          "expr": "sum by (verdict) (rate(sbproxy_policy_audit_events_total{policy_id=\"semantic_constraint\"}[5m]))",
           "legendFormat": "{{verdict}}",
           "datasource": {
             "type": "prometheus",

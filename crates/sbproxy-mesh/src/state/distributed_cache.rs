@@ -5,14 +5,18 @@
 //! or removed.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
+use crate::state::register::{VersionedLwwMergeOutcome, VersionedLwwRegister};
+use crate::transport::frame::{MAX_ROUTED_SNAPSHOT_BYTES, MAX_ROUTED_SNAPSHOT_PREFIX_BYTES};
 use crate::transport::TransportClientPool;
+
+const MAX_LOCAL_SNAPSHOT_ENTRIES: usize = 4_096;
 
 /// Default sweeper period (seconds) used by
 /// [`DistributedCache::start_sweeper`] when the caller does not pin a
@@ -81,6 +85,33 @@ impl ConsistentHashRing {
         }
         seen.len()
     }
+
+    /// Return the preference list for `key`: the first `n` distinct real
+    /// nodes reached by walking the ring clockwise from the key's hash.
+    ///
+    /// The first element is the same node [`Self::get_node`] returns, so a
+    /// preference list of length 1 degenerates to single-owner routing.
+    /// When the ring holds fewer than `n` distinct nodes the list is the
+    /// entire membership; callers that need a fixed replication factor must
+    /// treat a short list as a degraded (but still usable) placement.
+    pub fn get_nodes(&self, key: &str, n: usize) -> Vec<String> {
+        if self.ring.is_empty() || n == 0 {
+            return Vec::new();
+        }
+        let h = hash_key(key);
+        let start = self.ring.partition_point(|(ring_hash, _)| *ring_hash < h);
+        let mut out: Vec<String> = Vec::with_capacity(n);
+        for offset in 0..self.ring.len() {
+            let (_, id) = &self.ring[(start + offset) % self.ring.len()];
+            if !out.iter().any(|existing| existing == id) {
+                out.push(id.clone());
+                if out.len() == n {
+                    break;
+                }
+            }
+        }
+        out
+    }
 }
 
 // --- Entry ---
@@ -108,6 +139,29 @@ pub struct DistributedCache<V: Clone + Send + Sync + 'static> {
     ring: Mutex<ConsistentHashRing>,
     local_node_id: String,
 }
+
+/// Deterministically ordered, bounded view of one local cache-key prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalCacheSnapshot<V> {
+    /// Lexicographically ordered key/value pairs.
+    pub entries: Vec<(String, V)>,
+    /// Whether additional matching keys were excluded by the bound.
+    pub truncated: bool,
+}
+
+/// A local cache snapshot request violated a fixed input or output bound.
+///
+/// Display text is fixed and non-secret on purpose. The transport server
+/// echoes a snapshot rejection back to the peer, so this string must never
+/// carry the requested prefix, a stored key, or a stored value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("invalid local cache snapshot request")]
+pub struct LocalCacheSnapshotError;
+
+/// A versioned application value could not be decoded or encoded safely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("invalid versioned mesh state")]
+pub struct VersionedCacheMergeError;
 
 impl<V: Clone + Send + Sync + 'static> DistributedCache<V> {
     /// Create a new distributed cache for the given local node.
@@ -297,6 +351,42 @@ impl<V: Clone + Send + Sync + 'static> DistributedCache<V> {
         n
     }
 
+    /// Capture the lexicographically first bounded page for one local prefix.
+    ///
+    /// The method scans the local shard while retaining at most
+    /// `maximum + 1` matching values, so output memory remains bounded even
+    /// when another cache namespace is large. Expired entries are removed
+    /// before the snapshot is assembled.
+    pub fn snapshot_prefix_local(
+        &self,
+        prefix: &str,
+        maximum: usize,
+    ) -> Result<LocalCacheSnapshot<V>, LocalCacheSnapshotError> {
+        if !(1..=MAX_LOCAL_SNAPSHOT_ENTRIES).contains(&maximum) {
+            return Err(LocalCacheSnapshotError);
+        }
+        let now = Instant::now();
+        let mut cache = self.local_cache.lock().unwrap();
+        cache.retain(|_, entry| entry.expires_at.is_none_or(|deadline| deadline > now));
+
+        let retained = maximum.saturating_add(1);
+        let mut selected = BTreeMap::new();
+        for (key, entry) in cache.iter().filter(|(key, _)| key.starts_with(prefix)) {
+            selected.insert(key.clone(), entry.value.clone());
+            if selected.len() > retained {
+                selected.pop_last();
+            }
+        }
+        let truncated = selected.len() > maximum;
+        if truncated {
+            selected.pop_last();
+        }
+        Ok(LocalCacheSnapshot {
+            entries: selected.into_iter().collect(),
+            truncated,
+        })
+    }
+
     /// Number of entries currently in the local shard (including expired
     /// entries that have not yet been swept). Test / diagnostics only.
     #[cfg(test)]
@@ -322,6 +412,30 @@ impl<V: Clone + Send + Sync + 'static> DistributedCache<V> {
         ring.get_node(key).map(|s| s.to_string())
     }
 
+    /// Return the preference list for `key` (see
+    /// [`ConsistentHashRing::get_nodes`]). Shares the same ring the gossip
+    /// loop mutates on join/eviction, so the list always reflects current
+    /// membership as this node sees it.
+    pub fn preference_nodes(&self, key: &str, n: usize) -> Vec<String> {
+        let ring = self.ring.lock().unwrap();
+        ring.get_nodes(key, n)
+    }
+
+    /// Distinct node IDs currently in the ring, sorted. The replicated
+    /// substrate uses this as its membership view so data placement and
+    /// maintenance always agree with routing.
+    pub fn member_nodes(&self) -> Vec<String> {
+        let ring = self.ring.lock().unwrap();
+        let mut seen: Vec<String> = Vec::new();
+        for (_, id) in &ring.ring {
+            if !seen.iter().any(|existing| existing == id) {
+                seen.push(id.clone());
+            }
+        }
+        seen.sort();
+        seen
+    }
+
     /// Local node identifier this cache was constructed with.
     pub fn local_node_id(&self) -> &str {
         &self.local_node_id
@@ -339,6 +453,120 @@ impl<V: Clone + Send + Sync + 'static> DistributedCache<V> {
 // generic routed API would require.
 
 impl DistributedCache<Bytes> {
+    /// Atomically merge a versioned LWW value into the owning local shard.
+    ///
+    /// Existing expiry is retained when a candidate loses. A winning
+    /// candidate receives the supplied TTL, while conflict metadata is
+    /// persisted without extending the winning value's lifetime.
+    pub fn merge_versioned_local_with_ttl(
+        &self,
+        key: &str,
+        candidate: Bytes,
+        ttl_secs: u64,
+    ) -> Result<VersionedLwwMergeOutcome, VersionedCacheMergeError> {
+        let candidate = serde_json::from_slice::<VersionedLwwRegister>(&candidate)
+            .map_err(|_| VersionedCacheMergeError)?;
+        let now = Instant::now();
+        let candidate_expiry = (ttl_secs > 0).then(|| now + Duration::from_secs(ttl_secs));
+        let mut cache = self.local_cache.lock().unwrap();
+        if cache
+            .get(key)
+            .is_some_and(|entry| entry.expires_at.is_some_and(|deadline| deadline <= now))
+        {
+            cache.remove(key);
+        }
+
+        let Some(current_entry) = cache.get_mut(key) else {
+            let encoded = serde_json::to_vec(&candidate).map_err(|_| VersionedCacheMergeError)?;
+            cache.insert(
+                key.to_string(),
+                Entry {
+                    value: Bytes::from(encoded),
+                    expires_at: candidate_expiry,
+                },
+            );
+            return Ok(VersionedLwwMergeOutcome::Replaced);
+        };
+
+        let mut current = serde_json::from_slice::<VersionedLwwRegister>(&current_entry.value)
+            .map_err(|_| VersionedCacheMergeError)?;
+        let outcome = current.merge(&candidate);
+        let encoded = serde_json::to_vec(&current).map_err(|_| VersionedCacheMergeError)?;
+        current_entry.value = Bytes::from(encoded);
+        if matches!(
+            outcome,
+            VersionedLwwMergeOutcome::Replaced | VersionedLwwMergeOutcome::ConflictReplaced
+        ) {
+            current_entry.expires_at = candidate_expiry;
+        }
+        Ok(outcome)
+    }
+
+    /// Capture one lexicographic page of a local prefix under both an entry
+    /// bound and an aggregate byte bound.
+    ///
+    /// Unlike [`Self::snapshot_prefix_local`] this helper never clones a
+    /// value during candidate selection: it retains at most `maximum + 1`
+    /// borrowed candidates in a lexicographic map, then checks
+    /// `key.len() + value.len()` with checked arithmetic before cloning each
+    /// output entry. The page is marked truncated when the next entry would
+    /// cross either bound, so a first oversized entry yields an empty
+    /// truncated page rather than an unbounded copy.
+    ///
+    /// `maximum` must be in `1..=4096`, and `prefix` must be non-empty and at
+    /// most [`MAX_ROUTED_SNAPSHOT_PREFIX_BYTES`] bytes. Anything else is
+    /// [`LocalCacheSnapshotError`], whose Display text is fixed and carries
+    /// nothing from the request.
+    ///
+    /// Expired local entries are removed before candidates are selected, so
+    /// a page never advertises an entry the owner would refuse to serve.
+    pub fn snapshot_prefix_local_bounded(
+        &self,
+        prefix: &str,
+        maximum: usize,
+        maximum_bytes: usize,
+    ) -> Result<LocalCacheSnapshot<Bytes>, LocalCacheSnapshotError> {
+        if !(1..=MAX_LOCAL_SNAPSHOT_ENTRIES).contains(&maximum) {
+            return Err(LocalCacheSnapshotError);
+        }
+        if prefix.is_empty() || prefix.len() > MAX_ROUTED_SNAPSHOT_PREFIX_BYTES {
+            return Err(LocalCacheSnapshotError);
+        }
+        let now = Instant::now();
+        let mut cache = self.local_cache.lock().unwrap();
+        cache.retain(|_, entry| entry.expires_at.is_none_or(|deadline| deadline > now));
+
+        let retained = maximum.saturating_add(1);
+        let mut selected: BTreeMap<&str, &Bytes> = BTreeMap::new();
+        for (key, entry) in cache.iter().filter(|(key, _)| key.starts_with(prefix)) {
+            selected.insert(key.as_str(), &entry.value);
+            if selected.len() > retained {
+                selected.pop_last();
+            }
+        }
+
+        let mut truncated = selected.len() > maximum;
+        let mut entries: Vec<(String, Bytes)> = Vec::new();
+        let mut total: usize = 0;
+        for (key, value) in selected.into_iter().take(maximum) {
+            let Some(cost) = key.len().checked_add(value.len()) else {
+                truncated = true;
+                break;
+            };
+            let Some(next_total) = total.checked_add(cost) else {
+                truncated = true;
+                break;
+            };
+            if next_total > maximum_bytes {
+                truncated = true;
+                break;
+            }
+            total = next_total;
+            entries.push((key.to_string(), value.clone()));
+        }
+        Ok(LocalCacheSnapshot { entries, truncated })
+    }
+
     /// Fetch `key` via the consistent hash ring.
     ///
     /// If the local node owns the key, serves from the local shard. Otherwise
@@ -446,6 +674,167 @@ impl DistributedCache<Bytes> {
         client.put_with_ttl(key.to_string(), value, ttl_secs).await
     }
 
+    /// Store `key` -> `value` on the owner of a *different* `routing_key`.
+    ///
+    /// The owner is resolved from `routing_key`, but the entry is stored
+    /// under `key`. That lets a family of related records share one owner
+    /// without changing the key a later purge or direct fetch uses. The
+    /// semantic cache uses it so every membership record beneath one LSH
+    /// bucket lands on the bucket owner and a single bounded snapshot can
+    /// read them all.
+    ///
+    /// TTL handling matches [`Self::put_routed_with_ttl`]: `ttl_secs = 0`
+    /// means no expiry, and the owning node applies the lifetime to its own
+    /// shard. Transport failures are returned to the caller as `Err`.
+    pub async fn put_routed_by(
+        &self,
+        routing_key: &str,
+        key: &str,
+        value: Bytes,
+        ttl_secs: u64,
+        pool: &TransportClientPool,
+        peer_addr_for_node: impl Fn(&str) -> Option<String>,
+    ) -> anyhow::Result<()> {
+        let owner = match self.responsible_node(routing_key) {
+            Some(id) => id,
+            None => {
+                self.put_local_with_ttl(key, value, ttl_secs);
+                return Ok(());
+            }
+        };
+        if owner == self.local_node_id {
+            self.put_local_with_ttl(key, value, ttl_secs);
+            return Ok(());
+        }
+        let addr = peer_addr_for_node(&owner).ok_or_else(|| {
+            anyhow::anyhow!(
+                "put_routed_by: no transport address configured for owner node '{owner}'"
+            )
+        })?;
+        let client = pool.try_client_for_node(&owner, &addr).ok_or_else(|| {
+            anyhow::anyhow!("put_routed_by: owner node '{owner}' is not an authenticated node ID")
+        })?;
+        client.put_with_ttl(key.to_string(), value, ttl_secs).await
+    }
+
+    /// Read one bounded lexicographic page of `prefix` from the owner of
+    /// `routing_key`.
+    ///
+    /// Validates `maximum` through the same `1..=4096` bound the local helper
+    /// uses and rejects an empty prefix or a prefix above
+    /// [`MAX_ROUTED_SNAPSHOT_PREFIX_BYTES`] bytes before touching the ring.
+    /// A local or empty-ring owner answers from
+    /// [`Self::snapshot_prefix_local_bounded`] with the fixed
+    /// [`MAX_ROUTED_SNAPSHOT_BYTES`] aggregate cap. A remote owner answers
+    /// through [`crate::transport::PeerClient::snapshot_prefix`], and the
+    /// reply is revalidated against both bounds before it is mapped back.
+    ///
+    /// Unlike [`Self::get_routed`], this method returns transport errors
+    /// rather than collapsing them into an empty page. A caller that wants
+    /// fail-open behavior decides that for itself; the semantic cache adapter
+    /// turns the error into an observable miss and records it.
+    pub async fn snapshot_prefix_routed(
+        &self,
+        routing_key: &str,
+        prefix: &str,
+        maximum: usize,
+        pool: &TransportClientPool,
+        peer_addr_for_node: impl Fn(&str) -> Option<String>,
+    ) -> anyhow::Result<LocalCacheSnapshot<Bytes>> {
+        if !(1..=MAX_LOCAL_SNAPSHOT_ENTRIES).contains(&maximum)
+            || prefix.is_empty()
+            || prefix.len() > MAX_ROUTED_SNAPSHOT_PREFIX_BYTES
+        {
+            return Err(anyhow::Error::from(LocalCacheSnapshotError));
+        }
+        let owner = match self.responsible_node(routing_key) {
+            Some(owner) => owner,
+            None => {
+                return self
+                    .snapshot_prefix_local_bounded(prefix, maximum, MAX_ROUTED_SNAPSHOT_BYTES)
+                    .map_err(anyhow::Error::from);
+            }
+        };
+        if owner == self.local_node_id {
+            return self
+                .snapshot_prefix_local_bounded(prefix, maximum, MAX_ROUTED_SNAPSHOT_BYTES)
+                .map_err(anyhow::Error::from);
+        }
+        let addr = peer_addr_for_node(&owner).ok_or_else(|| {
+            anyhow::anyhow!(
+                "snapshot_prefix_routed: no transport address configured for owner node '{owner}'"
+            )
+        })?;
+        let client = pool.try_client_for_node(&owner, &addr).ok_or_else(|| {
+            anyhow::anyhow!(
+                "snapshot_prefix_routed: owner node '{owner}' is not an authenticated node ID"
+            )
+        })?;
+        let requested = u32::try_from(maximum).map_err(|_| LocalCacheSnapshotError)?;
+        let snapshot = client
+            .snapshot_prefix(prefix.to_string(), requested)
+            .await?;
+
+        // Revalidate the peer's reply. A trusted-but-buggy owner must not be
+        // able to hand back more entries or more bytes than were asked for.
+        if snapshot.entries.len() > maximum {
+            anyhow::bail!("snapshot_prefix_routed: owner returned more entries than requested");
+        }
+        let mut total: usize = 0;
+        for (key, value) in &snapshot.entries {
+            let cost = key.len().checked_add(value.len()).ok_or_else(|| {
+                anyhow::anyhow!("snapshot_prefix_routed: owner page size overflowed")
+            })?;
+            total = total.checked_add(cost).ok_or_else(|| {
+                anyhow::anyhow!("snapshot_prefix_routed: owner page size overflowed")
+            })?;
+        }
+        if total > MAX_ROUTED_SNAPSHOT_BYTES {
+            anyhow::bail!("snapshot_prefix_routed: owner returned more bytes than the fixed cap");
+        }
+        Ok(LocalCacheSnapshot {
+            entries: snapshot.entries,
+            truncated: snapshot.truncated,
+        })
+    }
+
+    /// Atomically merge a versioned value through the consistent-hash owner.
+    pub async fn merge_versioned_routed_with_ttl(
+        &self,
+        key: &str,
+        value: Bytes,
+        ttl_secs: u64,
+        pool: &TransportClientPool,
+        peer_addr_for_node: impl Fn(&str) -> Option<String>,
+    ) -> anyhow::Result<VersionedLwwMergeOutcome> {
+        let owner = match self.responsible_node(key) {
+            Some(owner) => owner,
+            None => {
+                return self
+                    .merge_versioned_local_with_ttl(key, value, ttl_secs)
+                    .map_err(anyhow::Error::from);
+            }
+        };
+        if owner == self.local_node_id {
+            return self
+                .merge_versioned_local_with_ttl(key, value, ttl_secs)
+                .map_err(anyhow::Error::from);
+        }
+        let address = peer_addr_for_node(&owner).ok_or_else(|| {
+            anyhow::anyhow!(
+                "merge_versioned_routed: no transport address configured for owner node '{owner}'"
+            )
+        })?;
+        let client = pool.try_client_for_node(&owner, &address).ok_or_else(|| {
+            anyhow::anyhow!(
+                "merge_versioned_routed: owner node '{owner}' is not an authenticated node ID"
+            )
+        })?;
+        client
+            .merge_versioned(key.to_string(), value, ttl_secs)
+            .await
+    }
+
     /// Delete `key` via the consistent hash ring.
     ///
     /// Routing mirrors [`Self::put_routed`]. Transport failures propagate as
@@ -485,6 +874,26 @@ impl DistributedCache<Bytes> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::register::{VersionedLwwMergeOutcome, VersionedLwwRegister};
+
+    fn versioned_bytes(
+        value: &str,
+        node_id: &str,
+        timestamp_ms: u64,
+        logical_version: u64,
+        parent_logical_version: Option<u64>,
+    ) -> Bytes {
+        Bytes::from(
+            serde_json::to_vec(&VersionedLwwRegister::live(
+                value.to_string(),
+                node_id,
+                timestamp_ms,
+                logical_version,
+                parent_logical_version,
+            ))
+            .unwrap(),
+        )
+    }
 
     // --- ConsistentHashRing tests ---
 
@@ -522,6 +931,52 @@ mod tests {
         }
         // With 50 keys and 3 nodes + 100 vnodes, all nodes should own at least one key
         assert!(!owners.is_empty());
+    }
+
+    #[test]
+    fn preference_list_starts_at_owner_and_holds_distinct_nodes() {
+        let mut ring = ConsistentHashRing::new(64);
+        ring.add_node("node-a");
+        ring.add_node("node-b");
+        ring.add_node("node-c");
+        for i in 0..50 {
+            let key = format!("key-{i}");
+            let prefs = ring.get_nodes(&key, 2);
+            assert_eq!(prefs.len(), 2);
+            assert_eq!(prefs[0], ring.get_node(&key).unwrap());
+            assert_ne!(prefs[0], prefs[1]);
+        }
+    }
+
+    #[test]
+    fn preference_list_short_ring_returns_full_membership() {
+        let mut ring = ConsistentHashRing::new(16);
+        ring.add_node("node-a");
+        ring.add_node("node-b");
+        let prefs = ring.get_nodes("some-key", 3);
+        assert_eq!(prefs.len(), 2);
+        assert_ne!(prefs[0], prefs[1]);
+    }
+
+    #[test]
+    fn preference_list_empty_ring_or_zero_n_is_empty() {
+        let ring = ConsistentHashRing::new(16);
+        assert!(ring.get_nodes("k", 2).is_empty());
+        let mut ring = ConsistentHashRing::new(16);
+        ring.add_node("node-a");
+        assert!(ring.get_nodes("k", 0).is_empty());
+    }
+
+    #[test]
+    fn preference_list_is_stable_for_a_key() {
+        let mut ring = ConsistentHashRing::new(64);
+        ring.add_node("node-a");
+        ring.add_node("node-b");
+        ring.add_node("node-c");
+        let first = ring.get_nodes("stable-key", 3);
+        let second = ring.get_nodes("stable-key", 3);
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 3);
     }
 
     #[test]
@@ -788,6 +1243,36 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn versioned_merge_routes_to_the_consistent_hash_owner() {
+        let cache_b: Arc<DistributedCache<Bytes>> = Arc::new(DistributedCache::new("node-B", 128));
+        let server_b = TransportServer::start(0, cache_b.clone()).await.unwrap();
+        let cache_a: DistributedCache<Bytes> = DistributedCache::new("node-A", 128);
+        cache_a.add_node("node-B");
+        let key = find_key_owned_by(&cache_a, "node-B");
+        let address = format!("127.0.0.1:{}", server_b.local_port());
+        let lookup = |node_id: &str| (node_id == "node-B").then(|| address.clone());
+        let pool = TransportClientPool::new();
+
+        let outcome = cache_a
+            .merge_versioned_routed_with_ttl(
+                &key,
+                versioned_bytes("remote", "node-A", 100, 1, None),
+                60,
+                &pool,
+                lookup,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, VersionedLwwMergeOutcome::Replaced);
+        assert!(cache_a.get_local(&key).is_none());
+        let stored: VersionedLwwRegister =
+            serde_json::from_slice(&cache_b.get_local(&key).unwrap()).unwrap();
+        assert_eq!(stored.value(), Some("remote"));
+        server_b.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn get_routed_fails_open_when_peer_unreachable() {
         let cache_a: DistributedCache<Bytes> = DistributedCache::new("node-A", 128);
         cache_a.add_node("node-B");
@@ -986,5 +1471,393 @@ mod tests {
             .await
             .expect_err("put_routed should fail without a peer mapping");
         assert!(err.to_string().contains("no transport address"));
+    }
+
+    #[test]
+    fn versioned_local_merge_is_atomic_and_rejects_stale_replacement() {
+        let cache: DistributedCache<Bytes> = DistributedCache::new("node-a", 1);
+        let inserted = cache
+            .merge_versioned_local_with_ttl(
+                "state:one",
+                versioned_bytes("v2", "node-a", 100, 2, Some(1)),
+                60,
+            )
+            .unwrap();
+        let rejected = cache
+            .merge_versioned_local_with_ttl(
+                "state:one",
+                versioned_bytes("stale", "node-z", 9_000, 1, None),
+                60,
+            )
+            .unwrap();
+
+        assert_eq!(inserted, VersionedLwwMergeOutcome::Replaced);
+        assert_eq!(rejected, VersionedLwwMergeOutcome::StaleRejected);
+        let stored: VersionedLwwRegister =
+            serde_json::from_slice(&cache.get_local("state:one").unwrap()).unwrap();
+        assert_eq!(stored.value(), Some("v2"));
+        assert_eq!(stored.logical_version(), 2);
+    }
+
+    #[test]
+    fn versioned_local_merge_marks_competing_children_on_the_winner() {
+        let cache: DistributedCache<Bytes> = DistributedCache::new("node-a", 1);
+        cache
+            .merge_versioned_local_with_ttl(
+                "state:one",
+                versioned_bytes("left", "node-a", 700, 8, Some(7)),
+                60,
+            )
+            .unwrap();
+        let outcome = cache
+            .merge_versioned_local_with_ttl(
+                "state:one",
+                versioned_bytes("right", "node-z", 700, 8, Some(7)),
+                60,
+            )
+            .unwrap();
+
+        assert_eq!(outcome, VersionedLwwMergeOutcome::ConflictReplaced);
+        let stored: VersionedLwwRegister =
+            serde_json::from_slice(&cache.get_local("state:one").unwrap()).unwrap();
+        assert_eq!(stored.value(), Some("right"));
+        assert!(stored.conflict_detected());
+    }
+
+    #[test]
+    fn local_prefix_snapshot_is_sorted_bounded_and_namespace_scoped() {
+        let cache: DistributedCache<Bytes> = DistributedCache::new("node-a", 1);
+        cache.put_local("state:z", Bytes::from_static(b"z"));
+        cache.put_local("state:a", Bytes::from_static(b"a"));
+        cache.put_local("other:a", Bytes::from_static(b"other"));
+        cache.put_local("state:m", Bytes::from_static(b"m"));
+
+        let snapshot = cache.snapshot_prefix_local("state:", 2).unwrap();
+
+        assert_eq!(
+            snapshot.entries,
+            vec![
+                ("state:a".to_string(), Bytes::from_static(b"a")),
+                ("state:m".to_string(), Bytes::from_static(b"m")),
+            ]
+        );
+        assert!(snapshot.truncated);
+        assert!(cache.snapshot_prefix_local("state:", 0).is_err());
+    }
+
+    // --- Bounded routed prefix snapshot ---
+
+    #[test]
+    fn snapshot_prefix_zero_limit_is_rejected() {
+        let cache: DistributedCache<Bytes> = DistributedCache::new("node-a", 1);
+        assert_eq!(
+            cache.snapshot_prefix_local_bounded("state:", 0, MAX_ROUTED_SNAPSHOT_BYTES),
+            Err(LocalCacheSnapshotError)
+        );
+    }
+
+    #[test]
+    fn snapshot_prefix_above_4096_is_rejected() {
+        let cache: DistributedCache<Bytes> = DistributedCache::new("node-a", 1);
+        assert_eq!(
+            cache.snapshot_prefix_local_bounded("state:", 4_097, MAX_ROUTED_SNAPSHOT_BYTES),
+            Err(LocalCacheSnapshotError)
+        );
+        assert!(cache
+            .snapshot_prefix_local_bounded("state:", 4_096, MAX_ROUTED_SNAPSHOT_BYTES)
+            .is_ok());
+    }
+
+    #[test]
+    fn snapshot_prefix_empty_prefix_is_rejected() {
+        // An empty prefix would page the whole shard. The routed snapshot is
+        // always scoped to one generated key family, so refuse it outright
+        // rather than relying on the byte cap to contain the damage.
+        let cache: DistributedCache<Bytes> = DistributedCache::new("node-a", 1);
+        assert_eq!(
+            cache.snapshot_prefix_local_bounded("", 8, MAX_ROUTED_SNAPSHOT_BYTES),
+            Err(LocalCacheSnapshotError)
+        );
+    }
+
+    #[test]
+    fn snapshot_prefix_above_1024_bytes_is_rejected() {
+        let cache: DistributedCache<Bytes> = DistributedCache::new("node-a", 1);
+        let too_long = "p".repeat(MAX_ROUTED_SNAPSHOT_PREFIX_BYTES + 1);
+        assert_eq!(
+            cache.snapshot_prefix_local_bounded(&too_long, 8, MAX_ROUTED_SNAPSHOT_BYTES),
+            Err(LocalCacheSnapshotError)
+        );
+        let at_bound = "p".repeat(MAX_ROUTED_SNAPSHOT_PREFIX_BYTES);
+        assert!(cache
+            .snapshot_prefix_local_bounded(&at_bound, 8, MAX_ROUTED_SNAPSHOT_BYTES)
+            .is_ok());
+    }
+
+    #[test]
+    fn snapshot_local_stops_before_cloning_more_than_one_mib() {
+        // Three entries just under 512 KiB each: the page stops after two,
+        // because the third would cross the fixed 1 MiB aggregate cap.
+        //
+        // The values are 512 KiB minus a small margin on purpose. The cap
+        // counts the key alongside the value, since both cross the wire, so
+        // two flat 512 KiB entries would already exceed 1 MiB by their key
+        // bytes and only one would fit.
+        let cache: DistributedCache<Bytes> = DistributedCache::new("node-a", 1);
+        let nearly_half_mib = Bytes::from(vec![0u8; 512 * 1024 - 64]);
+        for index in 0..3 {
+            cache.put_local(&format!("state:{index}"), nearly_half_mib.clone());
+        }
+        let snapshot = cache
+            .snapshot_prefix_local_bounded("state:", 16, MAX_ROUTED_SNAPSHOT_BYTES)
+            .expect("bounded snapshot");
+        assert_eq!(snapshot.entries.len(), 2);
+        assert!(snapshot.truncated);
+        assert!(
+            snapshot
+                .entries
+                .iter()
+                .fold(0usize, |total, (key, value)| total
+                    + key.len()
+                    + value.len())
+                <= MAX_ROUTED_SNAPSHOT_BYTES
+        );
+
+        // A single first entry above the cap yields an empty truncated page
+        // rather than one oversized clone.
+        let cache: DistributedCache<Bytes> = DistributedCache::new("node-a", 1);
+        cache.put_local(
+            "state:big",
+            Bytes::from(vec![0u8; MAX_ROUTED_SNAPSHOT_BYTES + 1]),
+        );
+        let snapshot = cache
+            .snapshot_prefix_local_bounded("state:", 16, MAX_ROUTED_SNAPSHOT_BYTES)
+            .expect("bounded snapshot");
+        assert!(snapshot.entries.is_empty());
+        assert!(snapshot.truncated);
+    }
+
+    #[test]
+    fn snapshot_prefix_local_bounded_is_sorted_and_skips_expired_entries() {
+        let cache: DistributedCache<Bytes> = DistributedCache::new("node-a", 1);
+        cache.put_local("state:c", Bytes::from_static(b"c"));
+        cache.put_local("state:a", Bytes::from_static(b"a"));
+        cache.put_local("other:a", Bytes::from_static(b"other"));
+        cache.put_local_with_ttl("state:b", Bytes::from_static(b"b"), 0);
+
+        let snapshot = cache
+            .snapshot_prefix_local_bounded("state:", 16, MAX_ROUTED_SNAPSHOT_BYTES)
+            .expect("bounded snapshot");
+        assert_eq!(
+            snapshot
+                .entries
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["state:a", "state:b", "state:c"]
+        );
+        assert!(!snapshot.truncated);
+    }
+
+    /// Two caches on one two-node ring plus a live transport server for the
+    /// remote half. Returns the local cache, the remote cache, the remote
+    /// server, the shared pool, and a node-aware address lookup.
+    async fn two_node_snapshot_fixture() -> (
+        DistributedCache<Bytes>,
+        Arc<DistributedCache<Bytes>>,
+        TransportServer,
+        TransportClientPool,
+        std::collections::HashMap<String, String>,
+    ) {
+        let cache_b: Arc<DistributedCache<Bytes>> = Arc::new(DistributedCache::new("node-B", 128));
+        cache_b.add_node("node-A");
+        let server_b = TransportServer::start(0, cache_b.clone())
+            .await
+            .expect("server B bind");
+        let cache_a: DistributedCache<Bytes> = DistributedCache::new("node-A", 128);
+        cache_a.add_node("node-B");
+        let mut addresses = std::collections::HashMap::new();
+        addresses.insert(
+            "node-B".to_string(),
+            format!("127.0.0.1:{}", server_b.local_port()),
+        );
+        (
+            cache_a,
+            cache_b,
+            server_b,
+            TransportClientPool::new(),
+            addresses,
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn put_routed_by_stores_the_actual_key_on_the_routing_key_owner() {
+        let (cache_a, cache_b, server_b, pool, addresses) = two_node_snapshot_fixture().await;
+        let lookup = |node_id: &str| addresses.get(node_id).cloned();
+        let routing_key = find_key_owned_by(&cache_a, "node-B");
+        // The stored key is deliberately one this node owns, so a naive
+        // implementation that routed by `key` would keep it local.
+        let stored_key = find_key_owned_by(&cache_a, "node-A");
+
+        cache_a
+            .put_routed_by(
+                &routing_key,
+                &stored_key,
+                Bytes::from_static(b"member"),
+                0,
+                &pool,
+                &lookup,
+            )
+            .await
+            .expect("put_routed_by ok");
+
+        assert_eq!(cache_a.get_local(&stored_key), None);
+        assert_eq!(
+            cache_b.get_local(&stored_key),
+            Some(Bytes::from_static(b"member"))
+        );
+        server_b.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn put_routed_by_preserves_ttl() {
+        let (cache_a, cache_b, server_b, pool, addresses) = two_node_snapshot_fixture().await;
+        let lookup = |node_id: &str| addresses.get(node_id).cloned();
+        let routing_key = find_key_owned_by(&cache_a, "node-B");
+
+        cache_a
+            .put_routed_by(
+                &routing_key,
+                "member:ttl",
+                Bytes::from_static(b"1"),
+                1,
+                &pool,
+                &lookup,
+            )
+            .await
+            .expect("put_routed_by ok");
+        assert_eq!(
+            cache_b.get_local("member:ttl"),
+            Some(Bytes::from_static(b"1"))
+        );
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        assert_eq!(cache_b.get_local("member:ttl"), None);
+        server_b.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_prefix_routed_reads_the_remote_owner() {
+        let (cache_a, cache_b, server_b, pool, addresses) = two_node_snapshot_fixture().await;
+        let lookup = |node_id: &str| addresses.get(node_id).cloned();
+        let routing_key = find_key_owned_by(&cache_a, "node-B");
+
+        cache_b.put_local("member:b", Bytes::from_static(b"two"));
+        cache_b.put_local("member:a", Bytes::from_static(b"one"));
+        cache_b.put_local("other:a", Bytes::from_static(b"skip"));
+        cache_a.put_local("member:local-only", Bytes::from_static(b"local"));
+
+        let snapshot = cache_a
+            .snapshot_prefix_routed(&routing_key, "member:", 16, &pool, &lookup)
+            .await
+            .expect("routed snapshot");
+        assert_eq!(
+            snapshot.entries,
+            vec![
+                ("member:a".to_string(), Bytes::from_static(b"one")),
+                ("member:b".to_string(), Bytes::from_static(b"two")),
+            ]
+        );
+        assert!(!snapshot.truncated);
+        server_b.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_prefix_routed_reads_locally_when_this_node_owns_the_routing_key() {
+        let (cache_a, cache_b, server_b, pool, addresses) = two_node_snapshot_fixture().await;
+        let lookup = |node_id: &str| addresses.get(node_id).cloned();
+        let routing_key = find_key_owned_by(&cache_a, "node-A");
+
+        cache_a.put_local("member:a", Bytes::from_static(b"local"));
+        cache_b.put_local("member:z", Bytes::from_static(b"remote"));
+
+        let snapshot = cache_a
+            .snapshot_prefix_routed(&routing_key, "member:", 16, &pool, &lookup)
+            .await
+            .expect("routed snapshot");
+        assert_eq!(
+            snapshot.entries,
+            vec![("member:a".to_string(), Bytes::from_static(b"local"))]
+        );
+        assert!(
+            pool.is_empty(),
+            "a local routing owner must not open a peer connection"
+        );
+        server_b.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_prefix_routed_returns_an_error_for_a_missing_owner_address() {
+        let cache_a: DistributedCache<Bytes> = DistributedCache::new("node-A", 128);
+        cache_a.add_node("node-B");
+        let pool = TransportClientPool::new();
+        let lookup = |_: &str| -> Option<String> { None };
+        let routing_key = find_key_owned_by(&cache_a, "node-B");
+
+        let err = cache_a
+            .snapshot_prefix_routed(&routing_key, "member:", 16, &pool, &lookup)
+            .await
+            .expect_err("missing owner address must not read a partial page");
+        assert!(err.to_string().contains("no transport address"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_prefix_routed_returns_an_error_for_a_transport_failure() {
+        // Unlike `get_routed`, a snapshot must not collapse a transport
+        // failure into an empty page: the caller cannot distinguish that
+        // from "the owner holds nothing".
+        let cache_a: DistributedCache<Bytes> = DistributedCache::new("node-A", 128);
+        cache_a.add_node("node-B");
+        let pool = TransportClientPool::new();
+        let lookup = |node_id: &str| (node_id == "node-B").then(|| "127.0.0.1:1".to_string());
+        let routing_key = find_key_owned_by(&cache_a, "node-B");
+
+        let err = cache_a
+            .snapshot_prefix_routed(&routing_key, "member:", 16, &pool, &lookup)
+            .await
+            .expect_err("transport failure must surface");
+        let message = err.to_string();
+        assert!(message.contains("connect") || message.contains("127.0.0.1:1"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_prefix_routed_rejects_invalid_bounds_before_routing() {
+        let cache_a: DistributedCache<Bytes> = DistributedCache::new("node-A", 128);
+        cache_a.add_node("node-B");
+        let pool = TransportClientPool::new();
+        let lookup = |_: &str| -> Option<String> { Some("127.0.0.1:1".to_string()) };
+        let routing_key = find_key_owned_by(&cache_a, "node-B");
+
+        let too_long = "p".repeat(MAX_ROUTED_SNAPSHOT_PREFIX_BYTES + 1);
+        let cases: [(&str, usize); 4] = [
+            ("member:", 0),
+            ("member:", 4_097),
+            ("", 16),
+            (too_long.as_str(), 16),
+        ];
+        for (prefix, maximum) in cases {
+            let err = cache_a
+                .snapshot_prefix_routed(&routing_key, prefix, maximum, &pool, &lookup)
+                .await
+                .expect_err("invalid bounds must be refused");
+            assert_eq!(
+                err.to_string(),
+                LocalCacheSnapshotError.to_string(),
+                "rejection must use the fixed non-secret string"
+            );
+        }
+        assert!(
+            pool.is_empty(),
+            "an invalid request must not reach the transport"
+        );
     }
 }

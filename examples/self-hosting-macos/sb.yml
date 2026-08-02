@@ -42,8 +42,8 @@ origins:
               - model: "hf:Qwen/Qwen3-8B-GGUF:Q4_K_M"
                 gguf_file: Qwen3-8B-Q4_K_M.gguf
                 name: qwen3-8b
-                # llama-server applies the GGUF's embedded chat template.
-                extra_args: ["--jinja"]
+                # Pin the engine: --jinja is not on the cross-engine allowlist.
+                engine: llama_cpp
                 # Idle time before the engine unloads to free memory.
                 keep_alive: 30m
 

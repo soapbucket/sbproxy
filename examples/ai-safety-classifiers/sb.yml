@@ -1,0 +1,79 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Enforce toxicity, jailbreak, and content-safety verdicts with one local
+# sentence-embedding model.
+#
+# Download the model and tokenizer:
+#
+#   mkdir -p /var/lib/sbproxy/models/minilm
+#   curl -fSL -o /var/lib/sbproxy/models/minilm/model.onnx \
+#     https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/5641a7880f40ebf4035d05e60c5f9b7a9c272c84/onnx/model.onnx
+#   curl -fSL -o /var/lib/sbproxy/models/minilm/tokenizer.json \
+#     https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/5641a7880f40ebf4035d05e60c5f9b7a9c272c84/tokenizer.json
+#
+# Then:
+#
+#   export OPENAI_API_KEY=sk-...
+#   sbproxy examples/ai-safety-classifiers/sb.yml
+#
+# The three entries share the loaded embedder and use the shipped, calibrated
+# centroid artifact. Optional class examples extend those defaults.
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      routing: round_robin
+
+      providers:
+        - name: openai
+          provider_type: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini
+
+      guardrails:
+        input:
+          - type: jailbreak
+            mode: classifier
+            classifier:
+              backend:
+                kind: embedding
+                model_path: /var/lib/sbproxy/models/minilm/model.onnx
+                tokenizer_path: /var/lib/sbproxy/models/minilm/tokenizer.json
+                max_model_bytes: 209715200
+              scope: last_user_message
+              max_chars: 2000
+
+          - type: content_safety
+            mode: classifier
+            blocked_categories:
+              - violence
+              - self_harm
+              - sexual
+              - hate_speech
+              - illegal
+            classifier:
+              backend:
+                kind: embedding
+                model_path: /var/lib/sbproxy/models/minilm/model.onnx
+                tokenizer_path: /var/lib/sbproxy/models/minilm/tokenizer.json
+                max_model_bytes: 209715200
+              scope: last_user_message
+              max_chars: 2000
+
+        output:
+          - type: toxicity
+            mode: classifier
+            stream_policy: close
+            classifier:
+              backend:
+                kind: embedding
+                model_path: /var/lib/sbproxy/models/minilm/model.onnx
+                tokenizer_path: /var/lib/sbproxy/models/minilm/tokenizer.json
+                max_model_bytes: 209715200
+              scope: full_text
+              max_chars: 2000

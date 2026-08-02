@@ -18,9 +18,9 @@ use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
 use crate::crypto::Cipher;
 use crate::metrics::{
-    DISSEM_KIND_PING, MESH_DISSEMINATION_UPDATES_SENT, MESH_PROBE_DIRECT_SUCCESS,
-    MESH_PROBE_DIRECT_TIMEOUT, MESH_PROBE_INDIRECT_SUCCESS, MESH_SUSPECT_TRANSITIONS,
-    PEER_STATE_ALIVE, PEER_STATE_DEAD, PEER_STATE_SUSPECT,
+    DISSEM_KIND_PING, MESH_DISSEMINATION_UPDATES_SENT, MESH_GOSSIP_LATENCY, MESH_GOSSIP_RETRY,
+    MESH_PROBE_DIRECT_SUCCESS, MESH_PROBE_DIRECT_TIMEOUT, MESH_PROBE_INDIRECT_SUCCESS,
+    MESH_SUSPECT_TRANSITIONS, PEER_STATE_ALIVE, PEER_STATE_DEAD, PEER_STATE_SUSPECT,
 };
 use crate::peer_eviction::PeerEvictor;
 
@@ -84,6 +84,7 @@ pub(super) async fn run_probe(
         from: cfg.node_id.clone(),
         updates: ping_updates,
     };
+    let probe_started = Instant::now();
     send_msg(socket, cipher, &ping, parsed_addr).await;
 
     let direct_ok = tokio::time::timeout(ping_timeout, ack_rx).await.is_ok();
@@ -97,6 +98,9 @@ pub(super) async fn run_probe(
     };
 
     if direct_ok {
+        MESH_GOSSIP_LATENCY
+            .with_label_values(&[label])
+            .observe(probe_started.elapsed().as_secs_f64());
         MESH_PROBE_DIRECT_SUCCESS.with_label_values(&[label]).inc();
         transition_to_alive(peers, &target_id, &target_addr, Some(disseminator));
         evictor.record_success(key_of(&target_id, &target_addr));
@@ -114,7 +118,10 @@ pub(super) async fn run_probe(
         return;
     }
 
-    // Fan out PING-REQ.
+    // Fan out PING-REQ. The direct probe timed out and the indirect
+    // fallback is actually firing, so this counts as one gossip retry
+    // attempt against the target (once per attempt, not per witness).
+    MESH_GOSSIP_RETRY.with_label_values(&[label]).inc();
     let indirect_seq = seq_gen.fetch_add(1, Ordering::Relaxed);
     let (ind_tx, ind_rx) = oneshot::channel::<bool>();
     pending

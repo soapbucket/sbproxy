@@ -1,8 +1,15 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
-import { api, ApiError, type AuditRow, type WorkspaceStatus } from "../api";
+import { computed, onMounted, ref, watch } from "vue";
+import {
+  api,
+  ApiError,
+  type AuditEvent,
+  type AuditRow,
+  type WorkspaceStatus,
+} from "../api";
 import { useAsync } from "../composables/useAsync";
-import { formatTime, toDate } from "../lib/format";
+import { toast } from "../composables/useToasts";
+import { formatTime, shortId, toDate } from "../lib/format";
 import PageHeader from "../components/PageHeader.vue";
 import StatusBadge from "../components/StatusBadge.vue";
 import ErrorState from "../components/ErrorState.vue";
@@ -10,11 +17,43 @@ import EmptyState from "../components/EmptyState.vue";
 
 const req = useAsync(() => api.auditRecent(100));
 const budgetReq = useAsync(() => api.budgetSnapshot());
+
+// WOR-2094: the unified security + change audit sample.
+const channelFilter = ref<"" | "security" | "key" | "config" | "admin" | "policy">("");
+const keyFilter = ref("");
+const eventsReq = useAsync(() =>
+  api.auditEvents({
+    limit: 200,
+    channel: channelFilter.value || undefined,
+    keyId: keyFilter.value || undefined,
+  }),
+);
+const events = computed<AuditEvent[]>(() =>
+  Array.isArray(eventsReq.data.value) ? eventsReq.data.value : [],
+);
+watch([channelFilter, keyFilter], () => eventsReq.run());
+
 function refresh() {
   req.run();
   budgetReq.run();
+  eventsReq.run();
 }
 onMounted(refresh);
+
+function channelTone(channel: string): "ok" | "warn" | "err" | "info" | "neutral" {
+  switch (channel) {
+    case "security":
+      return "err";
+    case "key":
+      return "warn";
+    case "config":
+      return "info";
+    case "admin":
+      return "info";
+    default:
+      return "neutral";
+  }
+}
 
 const rows = computed<AuditRow[]>(() => (Array.isArray(req.data.value) ? req.data.value : []));
 
@@ -27,21 +66,16 @@ const budgetConfigured = computed(
 );
 
 const busy = ref("");
-const banner = ref<{ tone: "ok" | "err"; text: string } | null>(null);
 async function resume(ws: string) {
   if (busy.value) return;
   busy.value = ws;
-  banner.value = null;
   try {
     await api.resumeWorkspace(ws);
-    banner.value = { tone: "ok", text: `Resumed "${ws}".` };
+    toast.success(`Resumed "${ws}"`);
     budgetReq.run();
     req.run();
   } catch (e) {
-    banner.value = {
-      tone: "err",
-      text: e instanceof ApiError ? e.hint : e instanceof Error ? e.message : "Failed.",
-    };
+    toast.error(e, "Resume workspace");
   } finally {
     busy.value = "";
   }
@@ -74,14 +108,13 @@ function actionTone(action?: string): "ok" | "warn" | "err" | "neutral" {
 <template>
   <PageHeader
     title="Audit"
-    subtitle="Rate-limit budget actions (suspend, throttle, resume) with the reason each fired."
+    subtitle="Security and change events, plus rate-limit budget actions, from the bounded runtime audit sample."
   >
     <template #actions>
       <button class="sb-btn sb-btn--sm" @click="refresh">Refresh</button>
     </template>
   </PageHeader>
 
-  <p v-if="banner" class="banner" :class="`banner--${banner.tone}`">{{ banner.text }}</p>
 
   <!-- Workspace budgets + manual resume (WOR-1764) -->
   <section class="section" v-if="budgetConfigured">
@@ -116,13 +149,69 @@ function actionTone(action?: string): "ok" | "warn" | "err" | "neutral" {
     </div>
   </section>
 
+  <!-- WOR-2094: security + change audit timeline -->
+  <section class="section">
+    <h2>Security and change events</h2>
+    <div class="filter-row">
+      <select v-model="channelFilter" class="sb-select" aria-label="Filter by channel">
+        <option value="">all channels</option>
+        <option value="security">security</option>
+        <option value="key">key</option>
+        <option value="config">config</option>
+        <option value="admin">admin</option>
+        <option value="policy">policy</option>
+      </select>
+      <input
+        v-model="keyFilter"
+        class="sb-input"
+        placeholder="Filter by key ID"
+        aria-label="Filter by key ID"
+      />
+    </div>
+    <ErrorState
+      v-if="eventsReq.error.value"
+      :error="eventsReq.error.value"
+      @retry="eventsReq.run"
+    />
+    <EmptyState
+      v-else-if="!events.length"
+      message="No audit events in the current sample. This is a bounded runtime view; the durable trail is whatever your collector ships the audit tracing targets to."
+    />
+    <div v-else class="table-wrap">
+      <table class="sb-table">
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Channel</th>
+            <th>Kind</th>
+            <th>Actor</th>
+            <th>Key</th>
+            <th>Detail</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="(e, i) in events" :key="i">
+            <td class="sb-mono">{{ formatTime(toDate(e.timestamp)) }}</td>
+            <td><StatusBadge :label="e.channel" :tone="channelTone(e.channel)" /></td>
+            <td class="sb-mono">{{ e.kind }}</td>
+            <td class="sb-mono">{{ e.actor ?? "-" }}</td>
+            <td class="sb-mono" :title="e.api_key_id">
+              {{ e.api_key_id ? shortId(e.api_key_id) : "-" }}
+            </td>
+            <td>{{ e.detail ?? "-" }}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
   <!-- Budget audit trail -->
   <section class="section">
     <h2>Budget audit trail</h2>
     <ErrorState v-if="req.error.value" :error="req.error.value" @retry="req.run" />
     <EmptyState
       v-else-if="!rows.length"
-      message="No budget audit events recorded. Rate-limit budget actions appear here; broader admin-action audit (logins, config edits) is written to the tracing log under the admin::audit target."
+      message="No budget audit events recorded. Rate-limit budget actions appear here; security and change events are in the section above."
     />
     <div v-else class="table-wrap">
       <table class="sb-table">
@@ -143,9 +232,9 @@ function actionTone(action?: string): "ok" | "warn" | "err" | "neutral" {
     </div>
   </section>
   <p class="sb-faint note">
-    This trail covers rate-limit budget decisions. Login, config, and key
-    changes are audited to the structured log (admin::audit), not this
-    in-memory ring.
+    Both audit views are bounded runtime samples that clear on restart.
+    The durable trail is whatever your log pipeline or OTel collector
+    ships the audit tracing targets to.
   </p>
 </template>
 
@@ -159,22 +248,14 @@ function actionTone(action?: string): "ok" | "warn" | "err" | "neutral" {
 .section h2 {
   margin-bottom: var(--sb-space-4);
 }
-.banner {
-  padding: var(--sb-space-3) var(--sb-space-4);
-  border-radius: var(--sb-radius-sm);
-  margin-bottom: var(--sb-space-4);
-  font-size: 0.9rem;
-}
-.banner--ok {
-  background: var(--sb-accent-tint);
-  color: var(--sb-accent);
-}
-.banner--err {
-  background: #fdecea;
-  color: #c0392b;
-}
 .note {
   margin-top: var(--sb-space-4);
   font-size: 0.82rem;
+}
+.filter-row {
+  display: flex;
+  gap: var(--sb-space-3);
+  margin-bottom: var(--sb-space-4);
+  flex-wrap: wrap;
 }
 </style>

@@ -20,9 +20,56 @@
 
 pub mod burn_rate;
 pub mod channels;
+pub mod engine;
 pub mod error_rate;
 pub mod rate_limit;
 pub mod rules;
+pub mod runtime;
 pub mod slo;
 
 pub use channels::{Alert, AlertChannelConfig, AlertDispatcher};
+pub use engine::{
+    error_burn, histogram_quantile_delta_ms, minute_sample_delta, provider_attempt_delta,
+    rate_limit_delta, sample_registry, AlertEngine, CertExpiryReading, CircuitBreakerReading,
+    CircuitBreakerState, EngineConfig, HistogramBucket, HistogramCounters, MetricReadings,
+    ProviderCounters, RateLimitCounters, RegistrySnapshot, RequestCounters, RuleEvaluation,
+    RuleEvaluationState,
+};
+pub use runtime::{AlertRuntime, AlertRuntimeSnapshot};
+
+use std::sync::OnceLock;
+
+/// The alert channels resolved at boot, installed by the binary once secret
+/// references in `url` / `routing_key` have been resolved.
+///
+/// The binary owns secret resolution (it depends on the vault backends);
+/// `sbproxy-core`, which spawns the evaluation loop, does not. So the binary
+/// resolves and installs the finished channel set here, mirroring
+/// [`crate::telemetry::install_resolved_otlp_headers`], and core reads it back
+/// with [`configured_channels`] at boot. Empty (never installed) means no
+/// dispatcher is built and the loop never spawns.
+static RESOLVED_CHANNELS: OnceLock<Vec<AlertChannelConfig>> = OnceLock::new();
+
+/// Install the boot-resolved alert channels. Call once from the binary after
+/// resolving secret references; a second call is ignored.
+pub fn install_channels(channels: Vec<AlertChannelConfig>) {
+    let _ = RESOLVED_CHANNELS.set(channels);
+}
+
+/// The boot-resolved alert channels, empty when none were installed (as in
+/// `validate` / tests, or a config with no `proxy.alerting.channels`).
+pub fn configured_channels() -> Vec<AlertChannelConfig> {
+    RESOLVED_CHANNELS.get().cloned().unwrap_or_default()
+}
+
+/// Whether a `proxy.alerting` block was installed at boot. Unlike
+/// [`has_configured_channels`], this remains true for an explicitly configured
+/// block with zero channels so the admin API can explain the active rule state.
+pub fn has_alerting_config() -> bool {
+    RESOLVED_CHANNELS.get().is_some()
+}
+
+/// Whether at least one alert channel was installed at boot.
+pub fn has_configured_channels() -> bool {
+    RESOLVED_CHANNELS.get().is_some_and(|c| !c.is_empty())
+}

@@ -79,6 +79,7 @@ pub fn capture_dimensions(
     // headers without a second config lookup.
     let (props, prop_drops) = capture_properties(headers, properties_cfg);
     ctx.properties = props;
+    ctx.rollup_properties = properties_cfg.promoted_properties(&ctx.properties);
     ctx.properties_echo = properties_cfg.echo;
     sbproxy_observe::metrics::record_capture_drop(
         workspace_id,
@@ -220,16 +221,17 @@ pub fn dispatch_terminal_event(
     );
     ev.event_type = event_type;
     ev.latency_ms = latency_ms;
+    ev.tenant_id = Some(ctx.tenant_id.to_string());
     ev.session_id = ctx.session_id;
     ev.parent_session_id = ctx.parent_session_id;
     ev.user_id = ctx.user_id.clone();
     ev.user_id_source = ctx.user_id_source;
-    // WOR-1498: the credential (API key) that injected the policy, so
-    // the request-event ledger join keys on it like the metrics do.
-    ev.api_key_id = match ctx.principal.api_key_id() {
-        "" => None,
-        id => Some(id.to_string()),
-    };
+    // WOR-2093: the canonical accountability id, shared with the access
+    // log, the admin ring, the inbound-key metric, and spans, so every
+    // surface reports the same key for the same request.
+    ev.api_key_id = ctx.accountable_key_id().map(str::to_string);
+    ev.key_provider = ctx.native_key_provider.clone();
+    ev.key_mode = Some(ctx.inbound_key_mode.as_str().to_string());
     ev.properties = ctx.properties.clone();
     ev.provider = ctx.ai_provider.clone();
     ev.model = ctx.ai_model.clone();
@@ -240,6 +242,7 @@ pub fn dispatch_terminal_event(
     ev.prompt_fingerprint = ctx.ai_prompt_fingerprint.clone();
     ev.tokens_in = ctx.ai_tokens_in.and_then(|v| u32::try_from(v).ok());
     ev.tokens_out = ctx.ai_tokens_out.and_then(|v| u32::try_from(v).ok());
+    ev.tokens_cached = ctx.ai_tokens_cached.and_then(|v| u32::try_from(v).ok());
     ev.cost_usd_micros = ctx.ai_cost_usd_micros;
     // WOR-1874: guardrail intervention columns, mirrored onto the
     // event envelope so log-only consumers can filter on them.
@@ -293,6 +296,8 @@ mod dispatch_tests {
         ctx.ai_tokens_in = Some(100);
         ctx.ai_tokens_out = Some(25);
         ctx.ai_cost_usd_micros = Some(375);
+        ctx.native_key_provider = Some("openai".to_string());
+        ctx.inbound_key_mode = crate::context::InboundKeyMode::Native;
 
         CAPTURED.lock().expect("test sink lock").clear();
         dispatch_terminal_event(&ctx, DEFAULT_WORKSPACE_ID, Some(42), None);
@@ -310,6 +315,11 @@ mod dispatch_tests {
         assert_eq!(ev.tokens_in, Some(100));
         assert_eq!(ev.tokens_out, Some(25));
         assert_eq!(ev.cost_usd_micros, Some(375));
+        assert_eq!(ev.key_provider.as_deref(), Some("openai"));
+        assert_eq!(ev.key_mode.as_deref(), Some("native"));
+        assert!(!serde_json::to_string(ev)
+            .expect("request event serializes")
+            .contains("sk-caller-owned-canary"));
         assert!(matches!(ev.event_type, EventType::RequestCompleted));
     }
 
@@ -458,6 +468,41 @@ mod tests {
         assert_eq!(ctx.properties.len(), 2);
         assert_eq!(ctx.properties.get("environment").unwrap(), "prod");
         assert_eq!(ctx.properties.get("customer-tier").unwrap(), "enterprise");
+    }
+
+    #[test]
+    fn promoted_rollup_properties_are_bounded_and_already_redacted() {
+        let mut ctx = RequestContext::new();
+        let headers = headers_from(&[
+            ("X-Sb-Property-Feature", "assistant"),
+            ("X-Sb-Property-Customer-Email", "alice@example.com"),
+            ("X-Sb-Property-Unpromoted", "request-only"),
+        ]);
+        let cfg = PropertiesConfig {
+            rollup_keys: vec!["feature".to_string(), "customer-email".to_string()],
+            redact: sbproxy_observe::RedactConfig {
+                keys: vec!["customer-email".to_string()],
+                value_regex: vec![],
+            },
+            ..PropertiesConfig::default()
+        };
+
+        capture_dimensions(
+            &mut ctx,
+            &headers,
+            &cfg,
+            &SessionsConfig::default(),
+            &UserConfig::default(),
+            None,
+            None,
+            DEFAULT_WORKSPACE_ID,
+        );
+
+        assert_eq!(ctx.properties.len(), 3);
+        assert_eq!(ctx.rollup_properties.len(), 2);
+        assert_eq!(ctx.rollup_properties["feature"], "assistant");
+        assert_eq!(ctx.rollup_properties["customer-email"], "[redacted]");
+        assert!(!ctx.rollup_properties.contains_key("unpromoted"));
     }
 
     #[test]

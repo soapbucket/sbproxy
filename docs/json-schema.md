@@ -1,24 +1,25 @@
 # JSON Schema for `sb.yml`
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-01*
 
-SBproxy publishes a JSON Schema describing every field its
-configuration accepts. Editors that understand the schema
-(VS Code with the YAML extension, IntelliJ / JetBrains family,
-Helix) validate the file as you type and surface a typo or a
-wrong-typed value before you ever start the binary.
+SBproxy publishes a generated JSON Schema for the typed `sb.yml` envelope.
+Editors that understand the schema (VS Code with the YAML extension, the
+IntelliJ / JetBrains family, Helix) can autocomplete known envelope fields,
+check their types, and offer closed-enum values.
 
 ## Where it lives
 
 The schema is committed at
 [`schemas/sb-config.schema.json`](../schemas/sb-config.schema.json).
 
-It is **generated from the Rust types** that the runtime parses,
-not hand-rolled, so it cannot drift from the binary. The
+It is generated from the Rust types that parse the configuration envelope. The
 [`crates/sbproxy-config/src/types.rs`](../crates/sbproxy-config/src/types.rs)
 file is the source of truth; every `pub struct` and `pub enum`
 reachable from `ConfigFile` derives `schemars::JsonSchema`, and
 [`generate-schema.rs`](../crates/sbproxy-config/src/bin/generate-schema.rs)
 emits the JSON via `schemars::schema_for!(ConfigFile)`.
+
+The schema and runtime stay aligned for those typed fields. Runtime module
+constructors own a second layer that the generated schema cannot describe.
 
 ## Editor opt-in
 
@@ -39,20 +40,94 @@ examples self-validate against the schema operators consume.
 
 The directive is a YAML comment, so a runtime that does not
 understand it ignores the line. The schema does not change the
-config format; it just teaches the editor what to flag.
+config format; it teaches the editor what to flag.
 
 ## What you get
 
-* **Field-name autocomplete**. Tab-complete on `proxy.` shows
-  every top-level field the runtime accepts.
+* **Field-name autocomplete**. Tab-complete on `proxy.` shows its typed
+  envelope fields.
 * **Type validation**. Typing a string where the field expects
   an integer underlines red.
 * **Enum hints**. Closed enums (`admin.operators[].role:
   read_only | admin`) drop down the allowed values.
-* **Inline docs**. The doc comment on every `pub struct` field
-  in `types.rs` lands in the schema's `description`, so an
-  editor that surfaces tooltips shows the same description the
-  rustdoc surfaces.
+* **Inline docs**. Rust field comments land in the schema's `description`.
+
+## Calling it
+
+The runnable configuration is
+[`examples/json-schema/`](../examples/json-schema/). The interesting part is
+line 1, the `# yaml-language-server: $schema=` directive; the rest is a
+minimal single-origin proxy.
+
+Editor autocomplete cannot be shown here, but the schema that drives it can be
+checked outside an editor, which is also how you would wire it into CI. Point
+any JSON Schema validator at it:
+
+```bash
+python3 -c '
+import json, yaml, jsonschema
+schema = json.load(open("schemas/sb-config.schema.json"))
+doc = yaml.safe_load(open("examples/json-schema/sb.yml"))
+for e in jsonschema.Draft7Validator(schema).iter_errors(doc):
+    print("/".join(map(str, e.path)), e.message)
+'
+```
+
+That prints nothing for the shipped config. Change `http_bind_port: 8080` to
+`http_bind_port: "hello"`, the exact case the section above says underlines
+red, and it prints:
+
+```
+proxy/http_bind_port 'hello' is not of type 'integer'
+```
+
+The path is the same one your editor highlights, because it is the same
+schema.
+
+The binary is the second opinion, and it does not read the schema at all. It
+compiles the config through the real Rust types:
+
+```bash
+sbproxy validate examples/json-schema/sb.yml
+# ok: examples/json-schema/sb.yml is a valid sbproxy config
+```
+
+The same broken file fails with a message carrying the line and column:
+
+```
+validate: config '/tmp/bad.yml' did not compile:
+failed to parse config YAML: proxy.http_bind_port: invalid type: string "hello", expected u16 at line 23 column 19
+```
+
+Both agree because the schema is generated from those same Rust types, which
+is the property that keeps the editor from drifting from the binary. They are
+not interchangeable, though: the schema catches shape errors as you type, and
+`sbproxy validate` catches everything the schema deliberately leaves opaque,
+including the module payloads described next. Use the schema in your editor
+and `sbproxy validate` in CI.
+
+## Opaque module payloads
+
+Four module boundaries are deliberately opaque in the generated schema:
+
+* `origins.<host>.action`
+* `origins.<host>.authentication` (also accepted at runtime as `auth`)
+* each item under `origins.<host>.policies`
+* each item under `origins.<host>.transforms`
+
+These values are stored as generic JSON and passed to the constructor selected
+by their `type` field. The schema can confirm the surrounding origin shape,
+but it cannot autocomplete a module's fields or reject a typo inside one of
+these payloads.
+
+Run the runtime-authoritative check before deployment:
+
+```bash
+sbproxy validate /etc/sbproxy/sb.yml
+```
+
+`validate` compiles the typed envelope and constructs the selected action,
+authentication, policies, and transforms without starting listeners.
 
 ## Regenerating the schema
 
@@ -72,11 +147,19 @@ order across runs), so the diff is byte-for-byte.
 
 ## Caveats
 
+* **Open objects**. Most typed envelope structs do not set
+  `additionalProperties: false`. An editor therefore accepts an extra key in
+  those objects even when the runtime later ignores it for compatibility or
+  rejects it during compilation.
+* **Serde aliases**. Runtime aliases such as `auth`, `session_config`,
+  `l2_cache`, and several legacy field names are accepted by serde but do not
+  appear as separate properties in the generated schema. An editor may flag a
+  valid alias, and autocomplete favors the canonical spelling.
 * **Free-form extension fields**. The `extensions:` map under
-  `proxy:` and `origins[]:` accepts arbitrary user-defined keys
+  `proxy:` and `origins.<host>:` accepts arbitrary user-defined keys
   (the runtime forwards them to extension consumers without
   parsing). The schema models these as
-  `Map<String, Object>`; an editor will not warn on unknown
+  an open map; an editor will not warn on unknown
   keys inside an `extensions:` block. This is intentional.
 * **Schema dialect**. The output is JSON Schema draft-07. Every
   editor in our compatibility list supports draft-07; the

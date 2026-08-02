@@ -31,11 +31,15 @@ use sbproxy_modules::AiCrawlDecision;
 use sbproxy_modules::RateLimitInfo;
 use sbproxy_plugin::{PolicyDecision, PolicyEnforcer};
 
-use crate::context::RequestContext;
+use crate::context::{PaymentResponse, RequestContext};
 
 /// Newtype wrapper that adapts [`AiCrawlControlPolicy`] to the
 /// [`PolicyEnforcer`] trait surface.
 pub struct AiCrawlEnforcer(pub Arc<AiCrawlControlPolicy>);
+
+fn verified_cap_pricing_exemption(principal: &sbproxy_plugin::Principal) -> bool {
+    principal.source == sbproxy_plugin::PrincipalSource::Cap && !principal.sub.trim().is_empty()
+}
 
 impl PolicyEnforcer for AiCrawlEnforcer {
     fn policy_type(&self) -> &'static str {
@@ -92,8 +96,48 @@ impl PolicyEnforcer for AiCrawlEnforcer {
             }
         }
 
+        // WOR-2143: when durable settlement is active for this pinned
+        // pipeline generation, the legacy path must never see the payment
+        // credential. The old ledger's verify consumes the nonce, so a
+        // settlement retry it happened to read would burn a quote the
+        // settlement store still needs to resume an interrupted payment.
+        // The gate at the `check_policies` call site owns redemption; here
+        // the credential header is stripped from a cloned view and the
+        // policy is stashed for the gate. One wasted legacy quote issuance
+        // per 402 is the accepted cost. Cloudflare interop mode keeps the
+        // legacy ledger contract and is exempt.
+        #[cfg(feature = "payments")]
+        let stripped_headers: Option<http::HeaderMap> = {
+            let settlement_active = ctx
+                .pipeline
+                .payments
+                .as_ref()
+                .is_some_and(|runtime| runtime.gate().is_some())
+                && !policy.cloudflare_compat();
+            if settlement_active {
+                ctx.crawl_settlement_policy = Some(Arc::clone(&policy));
+                let mut cloned = req.headers().clone();
+                // `remove` drops one value per call; loop so a repeated
+                // credential header cannot leave a copy behind.
+                while cloned.remove(policy.header_name()).is_some() {}
+                Some(cloned)
+            } else {
+                None
+            }
+        };
+        #[cfg(not(feature = "payments"))]
+        let stripped_headers: Option<http::HeaderMap> = None;
+        let effective_headers = stripped_headers.as_ref().unwrap_or_else(|| req.headers());
+
         let hostname = ctx.hostname.to_string();
-        let decision = policy.check(method, &hostname, path, req.headers(), agent_id_param);
+        let decision = policy.check_with_pricing_exemption(
+            method,
+            &hostname,
+            path,
+            effective_headers,
+            agent_id_param,
+            verified_cap_pricing_exemption(&ctx.principal),
+        );
         match decision {
             AiCrawlDecision::Allow => Box::pin(async move { Ok(PolicyDecision::Allow) }),
             AiCrawlDecision::AllowCharged { charged_header } => {
@@ -109,7 +153,11 @@ impl PolicyEnforcer for AiCrawlEnforcer {
                 // `crawler-price` header through the same challenge slot
                 // the single-rail path uses; the 402 response handler
                 // stamps the literal header name `crawler-price`.
-                ctx.crawl_challenge = Some(("crawler-price".to_string(), price_header, body));
+                ctx.crawl_challenge = Some(PaymentResponse::json_with_header(
+                    "crawler-price",
+                    price_header,
+                    body,
+                ));
                 ctx.deny_policy_type = Some("ai_crawl_payment");
                 Box::pin(async move {
                     Ok(PolicyDecision::Deny {
@@ -119,7 +167,11 @@ impl PolicyEnforcer for AiCrawlEnforcer {
                 })
             }
             AiCrawlDecision::Charge { body, challenge } => {
-                ctx.crawl_challenge = Some((policy.header_name().to_string(), challenge, body));
+                ctx.crawl_challenge = Some(PaymentResponse::json_with_header(
+                    policy.header_name(),
+                    challenge,
+                    body,
+                ));
                 ctx.deny_policy_type = Some("ai_crawl_payment");
                 Box::pin(async move {
                     Ok(PolicyDecision::Deny {
@@ -129,8 +181,7 @@ impl PolicyEnforcer for AiCrawlEnforcer {
                 })
             }
             AiCrawlDecision::MultiRail { body, content_type } => {
-                ctx.crawl_challenge =
-                    Some(("Content-Type".to_string(), content_type.to_string(), body));
+                ctx.crawl_challenge = Some(PaymentResponse::typed(content_type.to_string(), body));
                 ctx.deny_policy_type = Some("ai_crawl_multi_rail");
                 Box::pin(async move {
                     Ok(PolicyDecision::Deny {
@@ -140,11 +191,7 @@ impl PolicyEnforcer for AiCrawlEnforcer {
                 })
             }
             AiCrawlDecision::NoAcceptableRail { body } => {
-                ctx.crawl_challenge = Some((
-                    "Content-Type".to_string(),
-                    "application/json".to_string(),
-                    body,
-                ));
+                ctx.crawl_challenge = Some(PaymentResponse::json(body));
                 ctx.deny_policy_type = Some("ai_crawl_no_acceptable_rail");
                 Box::pin(async move {
                     Ok(PolicyDecision::Deny {
@@ -158,11 +205,7 @@ impl PolicyEnforcer for AiCrawlEnforcer {
                 // Signal the operator declared as disallowed (`=no`).
                 // Block with 403 and carry the JSON explanation through
                 // the same challenge slot the other deny shapes use.
-                ctx.crawl_challenge = Some((
-                    "Content-Type".to_string(),
-                    "application/json".to_string(),
-                    body,
-                ));
+                ctx.crawl_challenge = Some(PaymentResponse::json(body));
                 ctx.deny_policy_type = Some("ai_crawl_signal_blocked");
                 Box::pin(async move {
                     Ok(PolicyDecision::Deny {
@@ -187,7 +230,7 @@ impl PolicyEnforcer for AiCrawlEnforcer {
                 body,
                 retry_after_seconds,
             } => {
-                ctx.crawl_challenge = Some((policy.header_name().to_string(), String::new(), body));
+                ctx.crawl_challenge = Some(PaymentResponse::json(body));
                 ctx.rate_limit_info = Some(RateLimitInfo {
                     allowed: false,
                     limit: 0,
@@ -195,6 +238,7 @@ impl PolicyEnforcer for AiCrawlEnforcer {
                     reset_secs: retry_after_seconds as u64,
                     headers_enabled: false,
                     include_retry_after: true,
+                    include_ratelimit_policy: false,
                 });
                 ctx.deny_policy_type = Some("ai_crawl_ledger_unavailable");
                 Box::pin(async move {
@@ -205,5 +249,25 @@ impl PolicyEnforcer for AiCrawlEnforcer {
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cap_pricing_exempt_requires_nonempty_verified_cap_principal() {
+        let mut principal =
+            sbproxy_plugin::Principal::anonymous_for(sbproxy_plugin::TenantId::from("tenant"));
+        principal.source = sbproxy_plugin::PrincipalSource::Cap;
+
+        assert!(!verified_cap_pricing_exemption(&principal));
+
+        principal.sub = "agent_acme_001".to_string();
+        assert!(verified_cap_pricing_exemption(&principal));
+
+        principal.source = sbproxy_plugin::PrincipalSource::Bearer;
+        assert!(!verified_cap_pricing_exemption(&principal));
     }
 }

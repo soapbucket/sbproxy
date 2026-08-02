@@ -47,6 +47,7 @@ impl JailbreakGuardrail {
 
         // Check for "DAN" as a standalone word (common jailbreak persona).
         if self.detect_common && contains_dan_reference(&lower) {
+            record_keyword_verdict(true);
             return Some(GuardrailBlock {
                 name: "jailbreak".to_string(),
                 reason: "Jailbreak detected: DAN reference".to_string(),
@@ -56,6 +57,7 @@ impl JailbreakGuardrail {
         if self.detect_common {
             for pattern in COMMON_JAILBREAK_PATTERNS {
                 if lower.contains(pattern) {
+                    record_keyword_verdict(true);
                     return Some(GuardrailBlock {
                         name: "jailbreak".to_string(),
                         reason: format!("Jailbreak detected: matched pattern \"{pattern}\""),
@@ -67,6 +69,7 @@ impl JailbreakGuardrail {
         for pattern in &self.custom_patterns {
             let pattern_lower = pattern.to_lowercase();
             if lower.contains(&pattern_lower) {
+                record_keyword_verdict(true);
                 return Some(GuardrailBlock {
                     name: "jailbreak".to_string(),
                     reason: format!("Jailbreak detected: matched custom pattern \"{pattern}\""),
@@ -74,6 +77,7 @@ impl JailbreakGuardrail {
             }
         }
 
+        record_keyword_verdict(false);
         None
     }
 
@@ -97,6 +101,15 @@ impl JailbreakGuardrail {
             .unwrap_or(0);
         common.max(custom)
     }
+}
+
+fn record_keyword_verdict(blocked: bool) {
+    crate::ai_metrics::record_safety_guardrail_verdict(
+        "jailbreak",
+        if blocked { "jailbreak" } else { "none" },
+        "keyword",
+        if blocked { "block" } else { "allow" },
+    );
 }
 
 /// True when the DAN standalone-word rule fires ONLY because of

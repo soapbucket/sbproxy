@@ -1,5 +1,5 @@
 # AI Crawl Control + Pay Per Crawl
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-01*
 
 ![GPTBot receiving a 402 challenge, then the article after presenting a Crawler-Payment token](assets/ai-crawl-control.gif)
 
@@ -7,24 +7,34 @@ Each token redeems exactly once ([config](../examples/ai-crawl-control/)).
 
 The `ai_crawl_control` policy implements the "Pay Per Crawl" pattern: AI crawlers that arrive without a valid `Crawler-Payment` token receive `402 Payment Required` along with a JSON challenge body. A crawler that wants the content reads the challenge, posts a payment to your billing system, and retries with the issued token in the `Crawler-Payment` header. Each token redeems exactly once.
 
-The OSS implementation ships an in-memory ledger seeded from config and an HTTPS-only HTTP ledger client for production. The enterprise build extends the same `Ledger` trait with managed adapters so the proxy can authorise tokens against Stripe, x402, MPP, and Lightning rails.
+The implementation ships an in-memory ledger seeded from config and an HTTPS-only HTTP ledger client for production.
 
-## OSS scope: challenge body only
+## Challenge body
 
 The OSS proxy emits two challenge shapes:
 
 1. **Single-rail (default).** A 402 with the `Crawler-Payment` header and a flat JSON body describing the price. This is the path legacy crawlers see.
 2. **Multi-rail (opt-in).** When the agent sends `Accept-Payment:` or one of the multi-rail `Accept` MIME types (`application/sbproxy-multi-rail+json`, `application/x402+json`, `application/mpp+json`), the OSS proxy emits a 402 with `Content-Type: application/sbproxy-multi-rail+json` and a body that lists one entry per rail the operator declared (x402, MPP, Lightning), each with its own quote-token JWS.
 
-The multi-rail body is the wire-format contract. The OSS build can negotiate it, advertise rails, mint per-rail quote tokens, and respond 406 when the agent's preference set has no overlap with the operator's offered rails.
+This policy decides which requests are payable and what they cost. It does
+not settle payments. Settlement is a separate block, `proxy.payments`,
+which owns the rails, the durable intent store, and the rule that a paid
+request reaches the origin only after a committed record says the payment
+settled. See [`payment-settlement.md`](payment-settlement.md) for that
+configuration and [`402-challenge.md`](402-challenge.md) for the exact
+bytes of every challenge, credential, error, and receipt.
 
-What the OSS build cannot do is settle a payment on x402, MPP, Stripe, or Lightning. Settlement code lives in the enterprise build behind the `stripe`, `x402`, `mpp`, `lightning-cln`, `lightning-lnd`, and `lightning-phoenixd` cargo features. With an OSS-only build, the rails advertised in the multi-rail body are honoured by the in-memory or HTTP ledger; the enterprise BillingRail registrations are what actually authorise a real-money settlement.
-
-### Stripe rail: partially implemented
-
-The Stripe rail is experimental and not advertised as a supported rail yet. On the `stripe_fiat` rail the build emits a placeholder payment intent (`pi_pending_<quote_id>`), not a real Stripe `pi_*`, so no charge is created; the issued token is honoured only by the local in-memory or HTTP ledger. Real Stripe capture is an enterprise concern behind the `stripe` cargo feature and is still being finished. Treat Stripe support as a work in progress until this note is removed, and do not rely on it for production billing.
-
-This is the same framing the rail-Lightning example uses: see `examples/rail-lightning/README.md`. For the wire-shape contract on its own, see [`402-challenge.md`](402-challenge.md).
+With `proxy.payments` configured, the settlement gate takes over this
+policy's 402s: challenges are compiled from the matched tier's price into
+signed payment requirements, persisted as durable intents before the 402
+is written, and rendered in the selected rail's wire shape, with the
+signed quote token in this policy's configured `header`. The in-memory
+`valid_tokens` ledger and the HTTP ledger below then no longer redeem
+those requests, and the legacy `rails:` and `quote_token:` blocks on this
+policy should be dropped in favor of the rails under `proxy.payments`.
+The request-path sequence, the per-rail challenge shapes, and the failure
+posture live in
+[payment-settlement.md](payment-settlement.md#the-request-path-end-to-end).
 
 ## Request flow
 
@@ -32,9 +42,9 @@ This is the same framing the rail-Lightning example uses: see `examples/rail-lig
 crawler GET /article
         User-Agent: GPTBot/1.0
 proxy   <- 402 Payment Required
-        Crawler-Payment: realm="ai-crawl" currency="USD" price="0.001"
+        Crawler-Payment: Crawler-Payment realm="ai-crawl" currency="USD" price="0.001000"
         Content-Type: application/json
-        body: {"error":"payment_required","price":"0.001","currency":"USD","target":"blog.example.com/article","header":"crawler-payment"}
+        body: {"error":"payment_required","price":"0.001000","amount_micros":1000,"currency":"USD","target":"blog.example.com/article","header":"crawler-payment"}
 
 crawler GET /article (after paying out-of-band)
         User-Agent: GPTBot/1.0
@@ -81,6 +91,89 @@ policies:
 | `ledger` | block | unset | HTTP ledger client config. See "HTTP ledger" below. Mutually exclusive with `valid_tokens`. |
 
 Only `GET` and `HEAD` requests are subject to charging today. `POST`, `PUT`, `PATCH`, and `DELETE` pass through without charge.
+
+## Calling it
+
+The runnable configuration is
+[`examples/ai-crawl-control/`](../examples/ai-crawl-control/), which is the
+block above in front of a proxy origin, seeded with three single-use tokens
+(`token-aaa-001`, `token-aaa-002`, `token-aaa-003`). Start it:
+
+```bash
+make run CONFIG=examples/ai-crawl-control/sb.yml
+```
+
+Arrive as a known crawler with no token:
+
+```bash
+curl -sS -i -H 'Host: blog.local' \
+  -H 'User-Agent: GPTBot/1.0' \
+  http://127.0.0.1:8080/article
+```
+
+```http
+HTTP/1.1 402 Payment Required
+content-type: application/json
+crawler-payment: Crawler-Payment realm="ai-crawl" currency="USD" price="0.001000"
+content-length: 142
+
+{"error":"payment_required","price":"0.001000","amount_micros":1000,"currency":"USD","target":"blog.local/article","header":"crawler-payment"}
+```
+
+Two details in there are easy to get wrong. `price` is a **string**, not a
+JSON number, and it is rendered at six decimal places, so `0.001` in the
+config reads back as `"0.001000"`. `amount_micros` carries the same figure as
+an integer count of millionths, which is the field to compute against, since
+it avoids parsing a decimal string into a float. `target` is the host and path
+being charged for, so a crawler can tell which resource the quote covers.
+
+The response header name is whatever `header:` is set to, here
+`crawler-payment`. Its value repeats the canonical `Crawler-Payment` scheme
+name followed by the realm, currency, and price.
+
+Now pay. Retry with a seeded token in that same header:
+
+```bash
+curl -sS -i -H 'Host: blog.local' \
+  -H 'User-Agent: GPTBot/1.0' \
+  -H 'crawler-payment: token-aaa-001' \
+  http://127.0.0.1:8080/article
+```
+
+The paywall opens and the upstream's real response comes back:
+
+```http
+HTTP/1.1 200 OK
+Content-Type: text/html; charset=utf-8
+link: </licenses.xml>; rel="license"
+Transfer-Encoding: chunked
+```
+
+Send that exact request a second time and it is refused, because the ledger is
+single-use and the token left the set when it was redeemed:
+
+```http
+HTTP/1.1 402 Payment Required
+crawler-payment: Crawler-Payment realm="ai-crawl" currency="USD" price="0.001000"
+
+{"error":"payment_required","price":"0.001000","amount_micros":1000,"currency":"USD","target":"blog.local/article","header":"crawler-payment"}
+```
+
+That replay refusal is the property worth checking in your own run. A token
+that keeps working is a ledger that is not spending, and with the in-memory
+ledger it also means a proxy restart has reseeded `valid_tokens` from the
+config.
+
+Finally, the same URL with no crawler User-Agent is not charged at all:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -H 'Host: blog.local' http://127.0.0.1:8080/article
+# 200
+```
+
+The challenge fires on the User-Agent substring match, so ordinary browser
+and client traffic reaches the origin untouched.
 
 ## Tiered pricing
 
@@ -146,6 +239,7 @@ policies:
     currency: USD
     ledger:
       url: "https://ledger.internal"   # required; plain http:// is rejected
+      trust_roots: []                  # optional PEM CA bundles for private PKI
       key_id: "sb-ledger-2026-q2"
       secret_ref:
         env: SBPROXY_LEDGER_HMAC_KEY   # env var holding the hex-encoded HMAC key
@@ -164,7 +258,9 @@ policies:
 
 The HMAC key resolves through `secret_ref`, which takes either `env: <VAR>` (an environment variable holding the hex-encoded key) or `secret: <name>` (a logical secret resolved through the secrets layer). For dev configs and tests only, an inline `key_hex:` is honoured when `secret_ref` is absent; it should not appear in a production `sb.yml`. The agent identity fields on the redeem payload come from the request-time agent-class resolver, not from ledger config.
 
-The client refuses to construct against a non-HTTPS `url` at config-load time. Plain HTTP is a hard error because the request envelope carries an HMAC over the body, and TLS is the only thing keeping the body itself confidential.
+For a ledger signed by a private CA, each `trust_roots` entry may contain one or more PEM `CERTIFICATE` blocks. These certificates are added to the system trust store rather than replacing it, so public HTTPS endpoints continue to validate normally. Malformed or empty PEM bundles fail at config load.
+
+The client refuses to construct against a non-HTTPS `url` at config-load time. Plain HTTP is a hard error because the request envelope carries an HMAC over the body, and TLS is the only thing keeping the body itself confidential. A `ledger:` block also fails config load when the binary was built without the `http-ledger` feature; it never falls back silently to `valid_tokens`.
 
 ### Request envelope
 
@@ -329,6 +425,8 @@ What ships now: exemplars on `sbproxy_ledger_redeem_duration_seconds_bucket` car
 ## See also
 
 - [configuration.md](configuration.md#ai_crawl_control) - schema reference.
+- [payment-settlement.md](payment-settlement.md) - `proxy.payments`: rails, durable state, timeouts, reconciliation, and the exact unsupported boundaries.
+- [402-challenge.md](402-challenge.md) - the exact challenge, credential, error, and receipt bytes.
 - [ai-gateway.md](ai-gateway.md) - how this policy interacts with `ai_proxy` upstreams.
 - [observability.md](observability.md) - metrics, logs, traces, dashboards.
 - `examples/ai-crawl-control/` - runnable example.

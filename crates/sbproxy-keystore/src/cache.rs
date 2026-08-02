@@ -11,10 +11,21 @@
 //! cached for a shorter window so a flood of unknown keys cannot stampede the
 //! store. A store error is never cached.
 //!
-//! Fail-closed: when the store cannot be reached, [`TtlCache::resolve_key`]
-//! returns `Err`. The caller maps that to a denial when [`TtlCacheConfig::fail_closed`]
-//! is set (the default); only an operator who explicitly opted into
-//! `failure_mode_allow` treats an unreachable store as allow.
+//! Store errors are never swallowed: when the store cannot be reached,
+//! [`TtlCache::resolve_key`] and [`TtlCache::resolve_credential`] return
+//! `Err`. What that means for the request is not this cache's decision.
+//! The caller owns it, reading `proxy.key_management.failure_posture`
+//! through `KeyManagementConfig::failure_posture()`, and denies (503) or
+//! falls through to the origin's configured auth accordingly.
+//!
+//! This module used to carry its own `fail_closed: bool` alongside that
+//! posture, populated as `!failure_mode_allow`. It was one operator knob
+//! spelled twice with opposite polarity, and only the other spelling was
+//! ever consulted: nothing outside a test read it, and neither resolve
+//! path branched on it. It is gone rather than migrated (WOR-2121). This
+//! crate deliberately does not depend on `sbproxy-config`, so importing
+//! the shared `FailureMode` here would drag the whole config schema into
+//! a lean crate to hold a value it does not act on.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -40,9 +51,6 @@ pub struct TtlCacheConfig {
     /// Soft cap on entries per map; over it, expired entries are purged and then
     /// the least-recently-used entry is evicted.
     pub max_entries: usize,
-    /// When the store is unreachable, deny (the default). Set false only via an
-    /// explicit `failure_mode_allow`.
-    pub fail_closed: bool,
 }
 
 impl Default for TtlCacheConfig {
@@ -51,7 +59,6 @@ impl Default for TtlCacheConfig {
             ttl: Duration::from_secs(60),
             negative_ttl: Duration::from_secs(5),
             max_entries: 10_000,
-            fail_closed: true,
         }
     }
 }
@@ -82,7 +89,7 @@ struct Entry<V> {
     stamp: u64,
 }
 
-/// A fail-closed TTL cache wrapping a [`KeyStore`].
+/// A TTL cache wrapping a [`KeyStore`] that never swallows a store error.
 pub struct TtlCache {
     store: Arc<dyn KeyStore>,
     tier: Option<Arc<dyn CacheTier>>,
@@ -117,18 +124,14 @@ impl TtlCache {
         &self.store
     }
 
-    /// Whether the cache is configured to fail closed (deny) on store errors.
-    pub fn fail_closed(&self) -> bool {
-        self.cfg.fail_closed
-    }
-
     fn next_stamp(&self) -> u64 {
         self.stamp.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Resolve a key record by its public `key_id`, going L1 -> L2 -> store.
     /// `Ok(None)` means the key is genuinely absent; `Err` means the store
-    /// could not be reached (the caller fails closed).
+    /// could not be reached. The caller decides what an unreachable store
+    /// means for the request, from its configured failure posture.
     pub async fn resolve_key(&self, key_id: &str) -> Result<Option<KeyRecord>> {
         let now = Instant::now();
         // L1.
@@ -166,7 +169,33 @@ impl TtlCache {
         let loaded = self.store.get_credential(id).await?;
         self.insert_credential(id, loaded.clone(), now);
         if let (Some(tier), Some(rec)) = (&self.tier, loaded.as_ref()) {
-            tier.put_credential(rec, self.cfg.ttl).await;
+            // Never publish a raw secret to the second tier. Every tier is a
+            // shared surface: the mesh tier replicates into a node-wide
+            // distributed cache that every peer can hold a copy of, and the
+            // Redis tier writes to an external server outside this process
+            // entirely. Serialising a `CredentialMaterial::Plaintext` record
+            // would put the secret in both, in the clear, which is not
+            // something the keystore ever agreed to.
+            //
+            // Skipping the publish needs no fallback: this tier is best-effort
+            // by contract and a miss falls through to the store, which is the
+            // system of record. The only cost is one store read per resolve for
+            // config-seeded plaintext credentials, which are the discouraged
+            // path anyway.
+            //
+            // L1 above is deliberately still populated. It is process-local
+            // heap, and an attacker who can read it can already read whatever
+            // key would have sealed it, so sealing it would buy nothing. See
+            // the guardrail about not encrypting memory-only caches.
+            if rec.material.is_plaintext() {
+                tracing::debug!(
+                    credential_id = %rec.id,
+                    "not publishing a plaintext credential to the second cache tier; \
+                     resolves will read through to the keystore"
+                );
+            } else {
+                tier.put_credential(rec, self.cfg.ttl).await;
+            }
         }
         Ok(loaded)
     }
@@ -434,13 +463,129 @@ mod tests {
         assert_eq!(store.loads(), 2);
     }
 
+    /// A store error always surfaces to the caller, on both resolve paths.
+    ///
+    /// This is the cache's whole contract around an unreachable store, and
+    /// it holds no matter what the operator's failure posture is: the
+    /// cache never decides admission, it only refuses to invent an answer.
+    /// A silent `Ok(None)` here would be indistinguishable from "that key
+    /// does not exist", which is a 401 rather than a 503 and would make an
+    /// outage look like a bad credential.
     #[tokio::test]
-    async fn fail_closed_propagates_store_error() {
+    async fn store_error_propagates_to_the_caller_that_owns_the_decision() {
         let cache = TtlCache::new(Arc::new(BrokenStore), TtlCacheConfig::default());
-        assert!(cache.fail_closed());
         assert!(
             cache.resolve_key("k1").await.is_err(),
-            "store error surfaces so the caller can deny"
+            "store error surfaces so the caller can apply its failure posture"
+        );
+        assert!(
+            cache.resolve_credential("c1").await.is_err(),
+            "the credential path surfaces the same error for the same reason"
+        );
+    }
+
+    /// A tier that records every credential published to it, so a test can
+    /// assert on what would have left the process.
+    #[derive(Default)]
+    struct RecordingTier {
+        published: Mutex<Vec<CredentialRecord>>,
+    }
+
+    impl RecordingTier {
+        fn published_ids(&self) -> Vec<String> {
+            self.published
+                .lock()
+                .iter()
+                .map(|record| record.id.clone())
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl CacheTier for RecordingTier {
+        async fn get_key(&self, _: &str) -> Option<KeyRecord> {
+            None
+        }
+        async fn put_key(&self, _: &KeyRecord, _: Duration) {}
+        async fn get_credential(&self, _: &str) -> Option<CredentialRecord> {
+            None
+        }
+        async fn put_credential(&self, record: &CredentialRecord, _: Duration) {
+            self.published.lock().push(record.clone());
+        }
+        async fn invalidate(&self, _: &str) {}
+        async fn invalidate_all(&self) {}
+    }
+
+    fn credential(id: &str, material: serde_json::Value) -> CredentialRecord {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "name": id,
+            "material": material,
+            "created_at": "2023-11-14T22:13:20Z",
+            "updated_at": "2023-11-14T22:13:20Z"
+        }))
+        .expect("credential fixture")
+    }
+
+    /// A plaintext secret must never reach the second tier.
+    ///
+    /// The tier is a shared surface: the mesh tier replicates into a node-wide
+    /// distributed cache and the Redis tier writes to an external server. A
+    /// `CredentialMaterial::Plaintext` record serialised into either puts the
+    /// raw secret somewhere the keystore never agreed to put it.
+    #[tokio::test]
+    async fn plaintext_credentials_are_never_published_to_the_second_tier() {
+        let store = MemoryKeyStore::new();
+        store
+            .put_credential(credential(
+                "sealed",
+                serde_json::json!({"kind": "vault_ref", "reference": "vault://x"}),
+            ))
+            .await
+            .expect("put vault_ref credential");
+        store
+            .put_credential(credential(
+                "raw",
+                serde_json::json!({"kind": "plaintext", "value": "sk-super-secret"}),
+            ))
+            .await
+            .expect("put plaintext credential");
+
+        let tier = Arc::new(RecordingTier::default());
+        let cache = TtlCache::new(Arc::new(store), TtlCacheConfig::default())
+            .with_tier(tier.clone() as Arc<dyn CacheTier>);
+
+        // Both resolve correctly. Skipping the publish must not change what the
+        // caller gets back, only where the record is allowed to travel.
+        let sealed = cache
+            .resolve_credential("sealed")
+            .await
+            .expect("resolve sealed")
+            .expect("sealed present");
+        assert!(!sealed.material.is_plaintext());
+        let raw = cache
+            .resolve_credential("raw")
+            .await
+            .expect("resolve raw")
+            .expect("raw present");
+        assert!(
+            raw.material.is_plaintext(),
+            "the caller still receives usable plaintext material"
+        );
+
+        assert_eq!(
+            tier.published_ids(),
+            vec!["sealed".to_string()],
+            "only the non-plaintext credential may be published to the tier"
+        );
+
+        // And nothing resembling the secret was serialised into the tier.
+        let published = tier.published.lock();
+        let encoded = serde_json::to_string(&*published).expect("encode published records");
+        assert!(
+            !encoded.contains("sk-super-secret"),
+            "the raw secret must not appear anywhere in what reached the tier: {encoded}"
         );
     }
 }

@@ -3,6 +3,7 @@ import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
 import {
   api,
   ApiError,
+  setCsrfToken,
   type ClusterDeploymentBundleDraft,
   type DeploymentReplacementRequest,
   type ModelDeployment,
@@ -22,6 +23,7 @@ function stubFetch(rawBody: string, status = 200) {
 }
 
 afterEach(() => {
+  setCsrfToken(null);
   vi.unstubAllGlobals();
 });
 
@@ -202,5 +204,126 @@ describe("model lifecycle request contracts", () => {
         }),
       ],
     ]);
+  });
+});
+
+describe("request observability contracts", () => {
+  it("encodes bounded request-ring filters and omits client-only filters", async () => {
+    const fetchMock = stubFetch("[]");
+
+    await api.requests({
+      method: "POST",
+      status: "503",
+      path: "/v1/chat?stream=true",
+      origin: "public-api",
+      guardrailAction: "block",
+      guardrailCategory: "pii",
+      cacheStatus: "semantic_hit",
+      retried: true,
+      propertyKey: "customer.tier",
+      propertyValue: "gold & beta",
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/requests?method=POST&status=503&path=%2Fv1%2Fchat%3Fstream%3Dtrue&guardrail_action=block&guardrail_category=pii&cache_status=semantic_hit&retried=true&property_key=customer.tier&property_value=gold+%26+beta",
+      expect.objectContaining({ method: "GET" }),
+    );
+  });
+
+  it("keeps HTTP-class filtering client-side", async () => {
+    const fetchMock = stubFetch("[]");
+
+    await api.requests({ status: "5xx" });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/requests",
+      expect.objectContaining({ method: "GET" }),
+    );
+  });
+});
+
+describe("promoted property spend contracts", () => {
+  it("decodes available keys and encodes property grouping", async () => {
+    const fetchMock = stubFetch(
+      JSON.stringify({
+        from: 1,
+        to: 2,
+        group_by: "property:customer.tier",
+        bucket_secs: 3600,
+        buckets: [],
+        totals: {
+          requests: 0,
+          tokens_in: 0,
+          tokens_out: 0,
+          cost_usd_micros: 0,
+          ok: 0,
+          blocked: 0,
+          error: 0,
+        },
+        property_keys: ["customer.tier", "feature"],
+      }),
+    );
+
+    const result = await api.spendWindow("24h", "property:customer.tier");
+
+    expect(result.property_keys).toEqual(["customer.tier", "feature"]);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/usage/spend?window=24h&group_by=property%3Acustomer.tier",
+      expect.objectContaining({ method: "GET" }),
+    );
+  });
+});
+
+describe("alert operations contracts", () => {
+  it("decodes the secret-free runtime snapshot", async () => {
+    stubFetch(
+      JSON.stringify({
+        enabled: true,
+        authority: "file",
+        read_only: true,
+        rules: [
+          {
+            rule: "error_rate_spike",
+            description: "Provider error rate",
+            thresholds: [0.1, 0.2],
+            minimum_samples: 10,
+            state: "inactive",
+            sample_count: 4,
+          },
+        ],
+        channels: [
+          {
+            index: 0,
+            type: "slack",
+            target: "https://hooks.slack.com",
+            health: { status: "untested" },
+          },
+        ],
+        history: [],
+      }),
+    );
+
+    await expect(api.alerts()).resolves.toMatchObject({
+      authority: "file",
+      read_only: true,
+      rules: [{ minimum_samples: 10, state: "inactive" }],
+      channels: [{ target: "https://hooks.slack.com" }],
+    });
+  });
+
+  it("sends the browser CSRF token on targeted channel tests", async () => {
+    const fetchMock = stubFetch('{"status":"accepted"}', 202);
+    setCsrfToken("csrf-alert-test");
+
+    await api.testAlertChannel(3);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/alerts/test",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({ "X-CSRF-Token": "csrf-alert-test" }),
+        body: JSON.stringify({ channel_index: 3 }),
+      }),
+    );
   });
 });

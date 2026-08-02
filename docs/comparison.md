@@ -1,6 +1,6 @@
 # How SBproxy compares
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-27*
 
 SBproxy is an AI gateway that governs traffic in both directions. Most AI gateways only handle the calls your apps make out to models; SBproxy also governs the AI agents and crawlers coming in to your APIs and content, and because it is a real reverse proxy it handles the rest of your API traffic on the same runtime. This page is honest about where SBproxy fits and where you should pick something else.
 
@@ -52,14 +52,19 @@ self-hosted binary, with no vendor control plane.
 - **One policy over everything.** A single sandboxed CEL expression reads the
   principal, model, guardrail verdicts, and budget state and returns a closed
   action set (allow, deny, redact, route, downgrade). See [ai-policy-cel.md](ai-policy-cel.md).
-- **Clustered without an external Redis.** Run a fleet and the key plane, budgets,
-  and rate counters stay coherent: mint on one replica, use on any, revoke on one
-  and the others deny on their next request. A gossip mesh with CRDT counters and
-  a consistent-hash distributed cache does the coordination, all open source in
-  this repository, so the fleet needs no external Redis in the path and no vendor
-  control plane. A durable shared store still sits behind it, Redis or a secrets
-  manager. See the clustering section of [key-management.md](key-management.md)
-  and [examples/ai-dynamic-keys-cluster/](../examples/ai-dynamic-keys-cluster/).
+- **Clustered without an external Redis.** Run a fleet and the key plane stays
+  coherent: mint on one replica, use on any, revoke on one and the others deny
+  on their next request. A gossip mesh with a consistent-hash distributed
+  cache does the coordination, all open source in this repository, backed by
+  a durable shared store, Redis or a secrets manager. Budgets and rate limits
+  ride the same open-source mesh by default: each node disseminates its own
+  settled usage and merges every peer's in, so a governed key's limits are
+  cluster-aware within a bounded staleness window, no external database
+  required. That default tier is approximate, not exact; point a key's
+  governance at Redis for the strict tier when a limit has to be exact under
+  concurrent traffic, and the fleet needs no vendor control plane either way.
+  See the clustering section of [key-management.md](key-management.md) and
+  [examples/ai-dynamic-keys-cluster/](../examples/ai-dynamic-keys-cluster/).
 - **Cost and latency stay on-box.** The semantic cache vectorizes prompts on a
   local embedder, so a near-duplicate prompt replays with no per-call cost and
   the prompt never leaves your network. See [local-inference.md](local-inference.md).
@@ -72,7 +77,10 @@ SBproxy fits when you need a production reverse proxy *and* an AI gateway in the
 - **You care about overhead.** Sub-millisecond p99 on the proxy path. Idle RSS in single-digit megabytes. LiteLLM wants 4 CPU and 8 GB plus Python, PostgreSQL, and Redis. Managed gateways add a public network hop.
 - **You want scripting that ships in the binary.** CEL for routing (compiled once, evaluates in microseconds), Lua for transforms, JavaScript via QuickJS, and sandboxed WebAssembly for plugins. No C modules to compile, no separate plugin daemon.
 - **You need MCP federation.** SBproxy proxies and federates Model Context Protocol traffic alongside HTTP and AI. No other general-purpose proxy ships this.
-- **You want to self-host without a database.** Single binary. No PostgreSQL. Redis is optional, only needed for distributed rate limiting and shared cache.
+- **You want to self-host without a database.** Single binary. No PostgreSQL.
+  Redis is optional. Configure it for Redis-backed features such as exact
+  distributed rate limiting, shared cache, or canonical `summary_buffer`
+  context-compression state.
 
 ## When to pick something else
 
@@ -85,11 +93,11 @@ SBproxy fits when you need a production reverse proxy *and* an AI gateway in the
 ### vs LiteLLM
 
 LiteLLM is the most popular open-source AI gateway. It supports 100+ LLM providers.
-SBproxy reaches 200+ models through 66 native providers behind one OpenAI-compatible API, including a native Anthropic translator. You bring your own key per provider and the model name passes straight through, so any model a provider serves works without per-model config. Point any provider at a custom `base_url` for self-hosted or proprietary endpoints.
+SBproxy reaches 200+ models through 72 native providers behind one OpenAI-compatible API, including a native Anthropic translator. You bring your own key per provider and the model name passes straight through, so any model a provider serves works without per-model config. Point any provider at a custom `base_url` for self-hosted or proprietary endpoints.
 
 | | SBproxy | LiteLLM |
 |---|---------|---------|
-| LLM providers | 200+ models (66 native providers, bring your own keys) | 100+ native |
+| LLM providers | 200+ models (72 native providers, bring your own keys) | 100+ native |
 | General HTTP proxy | Yes | No |
 | Implementation | Compiled native binary | Python |
 | Min resources | 1 CPU, 256 MB | 4 CPU, 8 GB |
@@ -102,11 +110,11 @@ SBproxy reaches 200+ models through 66 native providers behind one OpenAI-compat
 | Virtual keys hashed at rest + runtime revoke | Yes (HMAC + pepper, admin API) | Varies |
 | Upstream creds encrypted at rest | Yes (AEAD envelope or vault ref) | Varies |
 | Verifiable, signed usage ledger | Yes | No |
-| OSS clustering substrate (gossip + CRDTs) | Yes | No |
+| OSS clustering substrate (gossip mesh, no Postgres) | Yes | No |
 | Scripting | CEL + Lua + WASM + JS | No |
-| Rate limiting | Built-in, distributed | Built-in |
+| Rate limiting | Built-in (node-local; cluster-wide needs a shared backend) | Built-in |
 | Response caching | Built-in (memory, file, memcached, redis) | 7 backends |
-| Guardrails | 9 built-in types (PII, injection, ...) | External integrations |
+| Guardrails | 10 built-in types (PII, injection, ...) | External integrations |
 | P99 proxy overhead | < 1 ms | 240-1200 ms |
 
 Choose LiteLLM if you only need an AI gateway and want the broadest provider coverage out

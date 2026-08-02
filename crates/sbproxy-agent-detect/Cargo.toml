@@ -24,10 +24,8 @@ anyhow = { workspace = true }
 arc-swap = { workspace = true }
 # Slice 3 (WOR-586): pull in `sbproxy-tls` so the detection layer can
 # build `TlsSignals` directly from the existing `TlsFingerprint`
-# captured at handshake time. Both crates live in the OSS workspace
-# (sbproxy-tls is foundational), so the dep does not break the
-# enterprise/OSS layering check enforced by
-# `scripts/check-crate-graph.sh`.
+# captured at handshake time. This keeps TLS types in the foundational
+# `sbproxy-tls` crate and the detection crate layered on top of it.
 sbproxy-tls = { path = "../sbproxy-tls" }
 # Slice 4 (WOR-587) uses SHA-256 for the request header-order hash.
 sha2 = { workspace = true }

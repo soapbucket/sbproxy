@@ -20,6 +20,16 @@ pub struct ProviderConfig {
     pub deployment: Option<String>,
     /// API key used to authenticate with the upstream provider.
     pub api_key: Option<String>,
+    /// Canonical native-provider label whose caller-owned credential this
+    /// exact provider destination may receive.
+    ///
+    /// This is an explicit destination trust decision. It defaults to
+    /// disabled and must match `provider_type` (or `name` when no type is
+    /// configured). For example, `openai` permits an OpenAI-shaped native key
+    /// to replace `api_key` only for this provider entry and its effective
+    /// `base_url`.
+    #[serde(default)]
+    pub accept_native_credentials_for: Option<String>,
     /// Override the upstream base URL (defaults to the provider's well-known URL).
     #[serde(default)]
     pub base_url: Option<String>,
@@ -100,6 +110,59 @@ fn default_true() -> bool {
 }
 
 impl ProviderConfig {
+    /// Provider protocol/catalog key used to select wire format.
+    pub fn effective_provider_type(&self) -> &str {
+        self.provider_type.as_deref().unwrap_or(&self.name)
+    }
+
+    /// Whether this exact destination explicitly accepts the canonical
+    /// caller-owned native credential.
+    pub fn accepts_native_credential_for(&self, native_provider: &str) -> bool {
+        self.accept_native_credentials_for
+            .as_deref()
+            .is_some_and(|bound| {
+                bound == bound.trim().to_ascii_lowercase()
+                    && bound.eq_ignore_ascii_case(native_provider.trim())
+                    && bound.eq_ignore_ascii_case(self.effective_provider_type().trim())
+                    && !self.is_managed_model()
+                    && self.serve.is_none()
+            })
+    }
+
+    /// Validate the explicit native-credential destination binding.
+    pub fn validate_native_credential_binding(&self) -> Result<(), String> {
+        let Some(bound) = self.accept_native_credentials_for.as_deref() else {
+            return Ok(());
+        };
+        let canonical = bound.trim().to_ascii_lowercase();
+        if canonical.is_empty() {
+            return Err("accept_native_credentials_for must not be empty".to_string());
+        }
+        if bound != canonical {
+            return Err(
+                "accept_native_credentials_for must be a trimmed lowercase provider label"
+                    .to_string(),
+            );
+        }
+        if self.is_managed_model() || self.serve.is_some() {
+            return Err(
+                "managed or locally served providers cannot accept native cloud credentials"
+                    .to_string(),
+            );
+        }
+        if !self
+            .effective_provider_type()
+            .trim()
+            .eq_ignore_ascii_case(&canonical)
+        {
+            return Err(format!(
+                "accept_native_credentials_for {bound:?} must match provider_type {:?}",
+                self.effective_provider_type()
+            ));
+        }
+        Ok(())
+    }
+
     /// Whether this provider routes to an SBproxy-managed deployment.
     pub fn is_managed_model(&self) -> bool {
         self.provider_type.as_deref() == Some("managed_model")
@@ -242,6 +305,7 @@ mod tests {
             provider_type: None,
             deployment: None,
             api_key: None,
+            accept_native_credentials_for: None,
             base_url: None,
             models: Vec::new(),
             default_model: None,
@@ -344,6 +408,60 @@ mod tests {
         assert!(p.api_key.is_none());
         assert!(p.base_url.is_none());
         assert!(p.models.is_empty());
+    }
+
+    #[test]
+    fn native_credential_destination_requires_explicit_canonical_binding() {
+        let unbound: ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "primary",
+            "provider_type": "openai",
+            "base_url": "https://gateway.example/v1"
+        }))
+        .unwrap();
+        assert!(!unbound.accepts_native_credential_for("openai"));
+
+        let bound: ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "primary",
+            "provider_type": "openai",
+            "base_url": "https://gateway.example/v1",
+            "accept_native_credentials_for": "openai"
+        }))
+        .unwrap();
+        assert!(bound.accepts_native_credential_for(" OPENAI "));
+        assert!(!bound.accepts_native_credential_for("anthropic"));
+        assert!(bound.validate_native_credential_binding().is_ok());
+    }
+
+    #[test]
+    fn native_credential_destination_rejects_ambiguous_or_local_bindings() {
+        for json in [
+            serde_json::json!({
+                "name": "primary",
+                "provider_type": "openai",
+                "accept_native_credentials_for": " OpenAI "
+            }),
+            serde_json::json!({
+                "name": "primary",
+                "provider_type": "anthropic",
+                "accept_native_credentials_for": "openai"
+            }),
+            serde_json::json!({
+                "name": "managed",
+                "provider_type": "managed_model",
+                "deployment": "local",
+                "accept_native_credentials_for": "managed_model"
+            }),
+        ] {
+            let provider: ProviderConfig = serde_json::from_value(json).unwrap();
+            assert!(provider.validate_native_credential_binding().is_err());
+        }
+    }
+
+    #[test]
+    fn native_credential_binding_is_present_in_provider_schema() {
+        let schema = schemars::schema_for!(ProviderConfig);
+        let json = serde_json::to_string(&schema).unwrap();
+        assert!(json.contains("\"accept_native_credentials_for\""));
     }
 
     // --- auth_header tests ---

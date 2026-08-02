@@ -34,6 +34,17 @@ pub struct ConfigAuditEntry {
     /// SIEM / ClickHouse can partition by this field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<String>,
+    /// Operator that performed the change, when it came through an
+    /// authenticated admin surface (WOR-2094). Absent for file-watcher
+    /// and mesh-broadcast changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    /// Config revision before the change, when known (WOR-2094).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prior_revision: Option<String>,
+    /// Config revision after the change, when known (WOR-2094).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_revision: Option<String>,
 }
 
 impl ConfigAuditEntry {
@@ -58,6 +69,24 @@ impl ConfigAuditEntry {
             }
             Err(_) => "serialize_error",
         };
+        // WOR-2094: normalized copy for the admin console's runtime
+        // sample; the collector remains the durable consumer.
+        crate::audit_ring::push_audit_event(crate::audit_ring::AuditRingEvent::new(
+            "config",
+            self.source.clone(),
+            self.actor.clone(),
+            self.tenant_id.clone(),
+            None,
+            None,
+            Some(format!(
+                "revision {} -> {}; +{} -{} ~{} origins",
+                self.prior_revision.as_deref().unwrap_or("?"),
+                self.next_revision.as_deref().unwrap_or("?"),
+                self.origins_added.len(),
+                self.origins_removed.len(),
+                self.origins_modified.len(),
+            )),
+        ));
         crate::metrics::record_audit_emit_duration(
             "config",
             outcome,
@@ -118,6 +147,17 @@ pub struct SecurityAuditEntry {
     /// by this field for per-tenant deny dashboards.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<String>,
+    /// Recognized native provider label. Never contains credential material.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_provider: Option<String>,
+    /// Inbound credential mode (`none`, `minted`, or `native`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_mode: Option<String>,
+    /// Public id of the key this event is attributed to, when one
+    /// resolved. The canonical accountability id, never the secret:
+    /// a denial names the key that was denied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_id: Option<String>,
 }
 
 impl SecurityAuditEntry {
@@ -141,6 +181,9 @@ impl SecurityAuditEntry {
             method,
             status_code: 400,
             tenant_id: None,
+            key_provider: None,
+            key_mode: None,
+            api_key_id: None,
         }
     }
 
@@ -171,6 +214,9 @@ impl SecurityAuditEntry {
             method,
             status_code,
             tenant_id: None,
+            key_provider: None,
+            key_mode: None,
+            api_key_id: None,
         }
     }
 
@@ -198,6 +244,9 @@ impl SecurityAuditEntry {
             method,
             status_code,
             tenant_id: None,
+            key_provider: None,
+            key_mode: None,
+            api_key_id: None,
         }
     }
 
@@ -205,6 +254,26 @@ impl SecurityAuditEntry {
     /// `self` so call sites can chain `SecurityAuditEntry::policy_violation(...).with_tenant_id(ctx.tenant_id.to_string())`.
     pub fn with_tenant_id(mut self, tenant_id: impl Into<String>) -> Self {
         self.tenant_id = Some(tenant_id.into());
+        self
+    }
+
+    /// Stamp the request's credential classification without retaining the
+    /// credential itself.
+    pub fn with_key_context(
+        mut self,
+        key_provider: Option<impl Into<String>>,
+        key_mode: impl Into<String>,
+    ) -> Self {
+        self.key_provider = key_provider.map(Into::into);
+        self.key_mode = Some(key_mode.into());
+        self
+    }
+
+    /// Name the key this event is attributed to (WOR-2093). Takes the
+    /// canonical public id; a denial that resolved a key names it so
+    /// the SIEM can pivot from the event to the credential.
+    pub fn with_api_key_id(mut self, api_key_id: Option<impl Into<String>>) -> Self {
+        self.api_key_id = api_key_id.map(Into::into);
         self
     }
 
@@ -227,6 +296,17 @@ impl SecurityAuditEntry {
             }
             Err(_) => "serialize_error",
         };
+        // WOR-2094: normalized copy for the admin console's runtime
+        // sample; the collector remains the durable consumer.
+        crate::audit_ring::push_audit_event(crate::audit_ring::AuditRingEvent::new(
+            "security",
+            self.event_type.clone(),
+            None,
+            self.tenant_id.clone(),
+            self.api_key_id.clone(),
+            self.request_id.clone(),
+            Some(self.reason.clone()),
+        ));
         crate::metrics::record_audit_emit_duration(
             "security",
             outcome,
@@ -250,6 +330,9 @@ impl ConfigAuditEntry {
             origins_removed,
             origins_modified,
             tenant_id: None,
+            actor: None,
+            prior_revision: None,
+            next_revision: None,
         }
     }
 
@@ -258,6 +341,23 @@ impl ConfigAuditEntry {
     /// `ConfigAuditEntry::new(...).with_tenant_id("acme")`.
     pub fn with_tenant_id(mut self, tenant_id: impl Into<String>) -> Self {
         self.tenant_id = Some(tenant_id.into());
+        self
+    }
+
+    /// Attach the operator that performed the change (WOR-2094).
+    pub fn with_actor(mut self, actor: impl Into<String>) -> Self {
+        self.actor = Some(actor.into());
+        self
+    }
+
+    /// Attach the revision pair the change moved between (WOR-2094).
+    pub fn with_revisions(
+        mut self,
+        prior: Option<impl Into<String>>,
+        next: Option<impl Into<String>>,
+    ) -> Self {
+        self.prior_revision = prior.map(Into::into);
+        self.next_revision = next.map(Into::into);
         self
     }
 }
@@ -336,6 +436,10 @@ impl KeyAuditEntry {
     }
 
     /// Serialize and emit on the `key_audit` tracing target at INFO level.
+    ///
+    /// Also pushes a normalized copy onto the in-memory audit ring so
+    /// the admin console can show the mutation without collector
+    /// wiring (WOR-2094).
     pub fn emit(&self) {
         let started = std::time::Instant::now();
         let outcome = match serde_json::to_string(self) {
@@ -345,6 +449,20 @@ impl KeyAuditEntry {
             }
             Err(_) => "serialize_error",
         };
+        crate::audit_ring::push_audit_event(crate::audit_ring::AuditRingEvent::new(
+            "key",
+            self.op.clone(),
+            self.actor.clone(),
+            self.tenant_id.clone(),
+            Some(self.id.clone()),
+            None,
+            Some(match (&self.before, &self.after) {
+                (Some(before), Some(after)) => {
+                    format!("{}: {before} -> {after}", self.resource)
+                }
+                _ => self.resource.clone(),
+            }),
+        ));
         crate::metrics::record_audit_emit_duration("key", outcome, started.elapsed().as_secs_f64());
     }
 }
@@ -361,7 +479,80 @@ mod tests {
             origins_removed: vec![],
             origins_modified: vec!["legacy.example.com".to_string()],
             tenant_id: None,
+            actor: None,
+            prior_revision: None,
+            next_revision: None,
         }
+    }
+
+    #[test]
+    fn key_audit_emit_lands_on_the_ring_with_actor_tenant_and_diff() {
+        KeyAuditEntry::new("rotate", "key", "sbp_audit_ring_key")
+            .with_actor("operator-jo")
+            .with_tenant_id("tenant-r")
+            .with_diff(
+                Some(serde_json::json!({ "status": "active" })),
+                Some(serde_json::json!({ "status": "active" })),
+            )
+            .emit();
+        let events = crate::audit_ring::recent_audit_events(10, Some("key"), Some("rotate"), None);
+        let event = events
+            .iter()
+            .find(|e| e.api_key_id.as_deref() == Some("sbp_audit_ring_key"))
+            .expect("key mutation reaches the audit ring");
+        assert_eq!(event.actor.as_deref(), Some("operator-jo"));
+        assert_eq!(event.tenant_id.as_deref(), Some("tenant-r"));
+        assert!(
+            event
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("status")),
+            "the diff summary names what changed: {event:?}"
+        );
+    }
+
+    #[test]
+    fn security_audit_emit_names_the_denied_key_on_the_ring() {
+        SecurityAuditEntry::auth_failure(
+            "auth_denied",
+            "virtual_key",
+            403,
+            Some("api.ring-test".to_string()),
+            None,
+            Some("req-ring-security".to_string()),
+            Some("POST".to_string()),
+        )
+        .with_tenant_id("tenant-s")
+        .with_key_context(Some("anthropic"), "native")
+        .with_api_key_id(Some("native:tenant-s:api:anthropic"))
+        .emit();
+        let events = crate::audit_ring::recent_audit_events(
+            10,
+            Some("security"),
+            Some("auth_denied"),
+            Some("native:tenant-s:api:anthropic"),
+        );
+        assert_eq!(events.len(), 1, "denial names the key: {events:?}");
+        assert_eq!(events[0].request_id.as_deref(), Some("req-ring-security"));
+        assert_eq!(events[0].detail.as_deref(), Some("virtual_key"));
+    }
+
+    #[test]
+    fn config_audit_emit_lands_on_the_ring_with_revision_pair() {
+        ConfigAuditEntry::new("api", vec!["added.example".into()], vec![], vec![])
+            .with_actor("operator-cfg")
+            .with_revisions(Some("r-prior-cfg-test"), Some("r-next-cfg-test"))
+            .emit();
+        let events = crate::audit_ring::recent_audit_events(10, Some("config"), Some("api"), None);
+        let event = events
+            .iter()
+            .find(|e| e.actor.as_deref() == Some("operator-cfg"))
+            .expect("config change reaches the audit ring");
+        let detail = event.detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains("r-prior-cfg-test") && detail.contains("r-next-cfg-test"),
+            "the revision pair is on the event: {detail}"
+        );
     }
 
     #[test]
@@ -440,6 +631,25 @@ mod tests {
     }
 
     #[test]
+    fn security_audit_records_native_key_context_without_secret_material() {
+        let entry = SecurityAuditEntry::auth_failure(
+            "auth_denied",
+            "native_provider_key",
+            403,
+            Some("api.example.com".to_string()),
+            None,
+            Some("req-native".to_string()),
+            Some("POST".to_string()),
+        )
+        .with_key_context(Some("openai"), "native");
+        let json = serde_json::to_string(&entry).unwrap();
+
+        assert!(json.contains("\"key_provider\":\"openai\""));
+        assert!(json.contains("\"key_mode\":\"native\""));
+        assert!(!json.contains("sk-caller-owned-canary"));
+    }
+
+    #[test]
     fn security_audit_emit_does_not_panic() {
         let entry = SecurityAuditEntry::framing_violation("control_chars", None, None, None, None);
         entry.emit();
@@ -454,6 +664,9 @@ mod tests {
             origins_removed: vec!["c.com".to_string()],
             origins_modified: vec!["d.com".to_string(), "e.com".to_string()],
             tenant_id: None,
+            actor: None,
+            prior_revision: None,
+            next_revision: None,
         };
 
         let json = serde_json::to_string(&entry).unwrap();

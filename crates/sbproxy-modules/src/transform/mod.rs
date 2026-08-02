@@ -14,7 +14,6 @@ mod citation_block;
 mod control;
 mod json;
 mod json_envelope;
-pub mod llms_pricing;
 pub mod llms_txt;
 mod markup;
 mod text;
@@ -282,7 +281,7 @@ pub const PLUGIN_TRANSFORM_TIMEOUT: std::time::Duration = std::time::Duration::f
 ///    `block_in_place` call moves this thread off the runtime's
 ///    pollable-worker pool while the future runs, so other tasks
 ///    on the runtime keep making progress. This pattern is the same
-///    one the proxy already uses for its enterprise reload hook
+///    one the proxy already uses for its pipeline lifecycle hook
 ///    (see `crates/sbproxy-core/src/server.rs::reload`).
 /// 2. **Outside a tokio runtime** (the test case from `#[test]`): a
 ///    fresh current-thread runtime is built per call to drive the
@@ -298,6 +297,23 @@ fn dispatch_plugin(
     body: &mut BytesMut,
     content_type: Option<&str>,
 ) -> anyhow::Result<()> {
+    dispatch_plugin_within(handler, body, content_type, PLUGIN_TRANSFORM_TIMEOUT)
+}
+
+/// [`dispatch_plugin`] with the wall-clock cap supplied by the caller.
+///
+/// Production always goes through [`dispatch_plugin`], which passes
+/// [`PLUGIN_TRANSFORM_TIMEOUT`]. The cap is a parameter only so the timeout
+/// test can put the deadline a few hundred milliseconds out instead of waiting
+/// out the full production cap. That keeps the test on the real clock, so it
+/// still proves the timer actually fires, and avoids a global override that
+/// other tests in the same process could observe.
+fn dispatch_plugin_within(
+    handler: &dyn TransformHandler,
+    body: &mut BytesMut,
+    content_type: Option<&str>,
+    timeout: std::time::Duration,
+) -> anyhow::Result<()> {
     let plugin_name = handler.transform_type();
     if sbproxy_plugin::get_plugin(sbproxy_plugin::PluginKind::Transform, plugin_name).is_none() {
         anyhow::bail!(
@@ -309,11 +325,7 @@ fn dispatch_plugin(
     let ctx = TransformContext::empty();
     use futures::FutureExt;
     let future = std::panic::AssertUnwindSafe(async {
-        tokio::time::timeout(
-            PLUGIN_TRANSFORM_TIMEOUT,
-            handler.apply(body, content_type, &ctx),
-        )
-        .await
+        tokio::time::timeout(timeout, handler.apply(body, content_type, &ctx)).await
     })
     .catch_unwind();
 
@@ -347,7 +359,7 @@ fn dispatch_plugin(
         // tokio::time::timeout fired before the plugin finished.
         Ok(Err(_elapsed)) => Err(anyhow::Error::new(TransformError::Plugin {
             plugin: plugin_name_static,
-            detail: format!("timed out after {}ms", PLUGIN_TRANSFORM_TIMEOUT.as_millis()),
+            detail: format!("timed out after {}ms", timeout.as_millis()),
         })),
         // The plugin (or the surrounding future) panicked.
         Err(_panic) => Err(anyhow::Error::new(TransformError::Plugin {
@@ -1369,16 +1381,19 @@ mod tests {
         }
     }
 
-    /// A plugin whose future never completes should be cut off after
-    /// `PLUGIN_TRANSFORM_TIMEOUT` and surface a
+    /// A plugin whose future never completes should be cut off at the
+    /// dispatcher's wall-clock cap and surface a
     /// `TransformError::Plugin { detail: "timed out after Nms" }`.
-    /// We don't wait the full default timeout in the test; the
-    /// dispatcher uses the constant but the test exercises the
-    /// surface via a future that is "slow enough" to elapse the cap.
-    /// To keep the test fast, we temporarily install a thin shim
-    /// that calls into the runtime with a sub-second cap.
+    ///
+    /// Driven through `dispatch_plugin_within` with a short cap rather than
+    /// through the production `PLUGIN_TRANSFORM_TIMEOUT` of 5s, which this test
+    /// used to wait out in full. The cap is the contract under test, and it is
+    /// still a real deadline on the real clock; only the deadline moves closer.
     #[test]
     fn plugin_apply_times_out_slow_future() {
+        // Short enough to keep the test fast, long enough that a loaded runner
+        // cannot mistake scheduling delay for the plugin finishing.
+        const TEST_CAP: std::time::Duration = std::time::Duration::from_millis(250);
         struct SlowHandler;
         impl TransformHandler for SlowHandler {
             fn transform_type(&self) -> &'static str {
@@ -1393,12 +1408,9 @@ mod tests {
                 Box<dyn std::future::Future<Output = sbproxy_plugin::PluginResult<()>> + Send + 'a>,
             > {
                 Box::pin(async {
-                    // Sleep well beyond the dispatcher's wall-clock
-                    // cap so the timeout branch is exercised.
-                    tokio::time::sleep(
-                        PLUGIN_TRANSFORM_TIMEOUT + std::time::Duration::from_secs(1),
-                    )
-                    .await;
+                    // Sleep well beyond the cap the test installs so the
+                    // timeout branch is the one that fires.
+                    tokio::time::sleep(TEST_CAP * 10).await;
                     Ok(())
                 })
             }
@@ -1412,20 +1424,21 @@ mod tests {
             }
         }
 
-        let t = Transform::Plugin(Box::new(SlowHandler));
+        let handler = SlowHandler;
         let mut body = BytesMut::from(&b"x"[..]);
-        // The dispatcher caps at PLUGIN_TRANSFORM_TIMEOUT (5s in
-        // production). Tests are gated on the full duration; this
-        // is acceptable because the cap is the contract under
-        // test. A future change can introduce a configurable
-        // override + test-only shorter cap.
         let started = std::time::Instant::now();
-        let err = t.apply(&mut body, None).unwrap_err();
+        let err = dispatch_plugin_within(&handler, &mut body, None, TEST_CAP).unwrap_err();
         let elapsed = started.elapsed();
-        // Allow generous slack for slow CI runners while still
-        // confirming the cap fires.
+        // Two-sided: the cap must have fired (the handler would otherwise have
+        // slept ten times as long and returned Ok), and it must not have taken
+        // wildly longer than the cap. The upper bound keeps generous slack for
+        // a loaded runner.
         assert!(
-            elapsed < PLUGIN_TRANSFORM_TIMEOUT + std::time::Duration::from_secs(2),
+            elapsed >= TEST_CAP,
+            "the cap must be a real deadline, not an instant failure (elapsed: {elapsed:?})",
+        );
+        assert!(
+            elapsed < TEST_CAP * 8,
             "dispatcher must cap slow plugin futures (elapsed: {elapsed:?})",
         );
         let typed = err

@@ -16,6 +16,8 @@ service InferenceService {
   rpc Classify (ClassifyRequest) returns (ClassifyResponse);
   // Produce embedding vectors for one or more texts.
   rpc Embed (EmbedRequest) returns (EmbedResponse);
+  // Extractively prune text with a token-classification model.
+  rpc Compress (CompressRequest) returns (CompressResponse);
   // Describe a loaded model (used for capability negotiation at startup).
   rpc ModelInfo (ModelInfoRequest) returns (ModelInfoResponse);
   // Report sidecar version + the set of model ids it can serve.
@@ -59,6 +61,31 @@ message EmbedResponse {
 
 message Embedding {
   repeated float values = 1;
+}
+
+message CompressRequest {
+  // Logical token-classification model id. Empty selects the default.
+  string model = 1;
+  // Text to prune. Callers retain any surrounding structured markup.
+  string text = 2;
+  // Exactly one target is required. Servers reject an unset target.
+  oneof target {
+    // Fraction of source tokens to retain, greater than 0 and at most 1.
+    double retain_ratio = 3;
+    // Absolute number of source tokens to retain, greater than 0.
+    uint32 target_tokens = 4;
+  }
+}
+
+message CompressResponse {
+  // Extractive result assembled from spans of the request text.
+  string text = 1;
+  // Source token count according to the compression model tokenizer.
+  uint32 original_tokens = 2;
+  // Result token count according to the compression model tokenizer.
+  uint32 compressed_tokens = 3;
+  // Inference latency in microseconds, for the proxy's metrics.
+  uint64 latency_us = 4;
 }
 
 message ModelInfoRequest {

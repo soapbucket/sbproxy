@@ -1,8 +1,8 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-07-13*
+*Last modified: 2026-08-01*
 
-The complete configuration reference for SBproxy. Every option, every field, every action type is documented here with real-world examples you can copy-paste and run.
+The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
 For AI-specific features in depth, see [ai-gateway.md](ai-gateway.md). For CEL, Lua, JavaScript, and WASM scripting, see [scripting.md](scripting.md). For the event system, see [events.md](events.md).
 
@@ -47,7 +47,9 @@ For AI-specific features in depth, see [ai-gateway.md](ai-gateway.md). For CEL, 
 37. [Environment variables](#environment-variables)
 38. [ACME / auto TLS](#acme--auto-tls)
 39. [Redis integration](#redis-integration)
-40. [Validation](#validation)
+40. [Config source (GitOps)](#config-source-gitops)
+41. [Config authority](#config-authority-fleet-configuration-distribution)
+42. [Validation](#validation)
 
 ---
 
@@ -76,13 +78,45 @@ sbproxy validate /etc/sbproxy/production.yml
 sbproxy --config /etc/sbproxy/production.yml --check
 ```
 
-The config has two main sections: `proxy` (server-level settings) and `origins` (per-hostname routing and behavior). Optional shared-state blocks (`l2_cache_settings`, `messenger_settings`) live nested under `proxy`.
+The config has two main sections: `proxy` (server-level settings) and `origins`
+(per-hostname routing and behavior). Optional shared-state blocks
+(`l2_cache_settings`, `messenger_settings`) and process-owned
+`compression_state` live nested under `proxy`.
+
+Unknown keys are rejected. A misspelled key anywhere inside `proxy` or an
+origin (`force_ssl` typed as `forced_ssl`, `mtls` as `mtsl`, a stray field in
+a `credentials` policy) fails `serve`, `validate`, and hot reload with an
+error naming the key and the accepted alternatives, instead of being silently
+dropped while the setting takes its default. Two escape hatches stay open:
+out-of-tree blocks belong under `proxy.extensions:` (or an origin's
+`extensions:`), which accept arbitrary keys, and unknown keys at the very top
+level of the file only log a warning so flat schema-v1 configs from the
+archived Go line keep loading.
+
+The smallest runnable file is synced from
+[`examples/basic-proxy/sb.yml`](../examples/basic-proxy/sb.yml). CI compiles
+that canonical example and rejects this block if the two drift.
+
+<!-- sbproxy-config: examples/basic-proxy/sb.yml -->
+```yaml
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "myapp.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+```
 
 ---
 
 ## JSON Schema (editor autocomplete + validation)
 
-SBproxy ships a JSON Schema at `schemas/sb-config.schema.json`. Editor tooling that understands the `yaml-language-server` directive (VS Code with the YAML extension, IntelliJ / JetBrains, Helix) reads this schema and validates `sb.yml` field names + types in real time. A typo in a key surfaces as an editor error rather than as a runtime parse failure.
+SBproxy ships a generated JSON Schema at `schemas/sb-config.schema.json`.
+Editor tooling that understands the `yaml-language-server` directive (VS Code
+with the YAML extension, IntelliJ / JetBrains, Helix) uses it for autocomplete,
+typed fields, and closed-enum hints.
 
 Opt in by adding a comment header at the top of your `sb.yml`:
 
@@ -97,7 +131,20 @@ origins:
 
 Every `examples/*/sb.yml` in this repo carries the header pointing at the local `schemas/` path so the examples are self-validating against the same schema operators consume.
 
-The schema is **generated** from the Rust types in `crates/sbproxy-config/src/types.rs` so it cannot drift from the runtime. Regenerate locally with:
+The schema describes the typed configuration envelope generated from
+`crates/sbproxy-config/src/types.rs`. Module payloads stay opaque at this
+layer: `action`, `authentication`, each `policies[]` entry, and each
+`transforms[]` entry are parsed by their runtime constructors after the
+envelope loads. Envelope objects are closed (`additionalProperties: false`),
+matching the runtime's unknown-key rejection, but serde aliases such as
+`auth` and `session_config` do not appear as separate schema properties, so
+an editor may flag an alias the proxy accepts. Module payloads and aliases
+are the boundaries an editor cannot check.
+
+Run `sbproxy validate <path>` for the authoritative check. It loads the same
+configuration and constructs the same runtime modules as `serve`.
+
+Regenerate the schema locally with:
 
 ```bash
 cargo run -p sbproxy-config --bin generate-schema > schemas/sb-config.schema.json
@@ -109,9 +156,13 @@ The CI gate `scripts/check-config-schema.sh` runs the generator and `diff`s agai
 
 ## Top-level structure
 
-Complete YAML skeleton with every top-level key:
+**Map, not a config.** Every `{ ... }` and `[ ... ]` below is a placeholder for a real block documented in its own section, not literal YAML. This shows which keys nest where; it does not validate or run. For a complete file, see [`examples/basic-proxy/sb.yml`](../examples/basic-proxy/sb.yml) for the smallest real one, or any [`examples/<name>/sb.yml`](../examples/) for a feature-specific full config.
 
+<!-- sbproxy-config-excerpt -->
 ```yaml
+# Optional external source descriptor
+source: { ... }
+
 # Server settings (ports, TLS, ACME, admin, secrets, shared state)
 proxy:
   http_bind_port: 8080
@@ -126,6 +177,13 @@ proxy:
   secrets: { ... }
   cluster: { ... }
   model_host: { ... }
+  config_authority: { ... }
+  observability: { ... }
+  scripting: { ... }
+  key_management: { ... }
+  cache_reserve: { ... }
+  tenants: [ ... ]
+  credentials: [ ... ]
 
   # L2 cache (Redis) for distributed rate limiting and caching
   l2_cache_settings:
@@ -150,6 +208,14 @@ agent_classes:
     bot_auth_keyid_enabled: true
     cache_size: 10000
 
+# Optional process-wide blocks
+access_log: { ... }
+rate_limits: { ... }
+audit: { ... }
+session_ledger: { ... }
+flags: [ ... ]
+update: { ... }
+
 # Per-hostname origin configurations
 origins:
   "api.example.com":
@@ -166,11 +232,25 @@ origins:
     cors: { ... }
     compression: { ... }
     hsts: { ... }
-    connection_pool: { ... }
     extensions: { ... }
 ```
 
 `l2_cache_settings` and `messenger_settings` are nested under `proxy:` (the deserializer also accepts `l2_cache` as a canonical alias).
+
+### Top-level fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `source` | object | unset | Optional local or Git configuration source descriptor. |
+| `proxy` | object | defaults | Server-wide listener, security, state, and operations settings. |
+| `origins` | map | `{}` | Hostname-keyed request pipelines. |
+| `access_log` | object | unset | Structured JSON access-log configuration. |
+| `agent_classes` | object | unset | Agent catalog selection and resolver tuning. |
+| `rate_limits` | object | unset | Workspace-wide budget and auto-suspend state. Separate from per-origin policies. |
+| `audit` | object | unset | Compatibility audit configuration. `audit.sink` is config-only; OSS audit rows remain in memory and tracing. |
+| `session_ledger` | object | unset | MCP tool-call session-ledger emission. |
+| `flags` | list | `[]` | Process-wide feature flags exposed to CEL. |
+| `update` | object | stable channel, automatic checks off | Binary and managed-engine update policy. |
 
 ### Agent classes
 
@@ -236,23 +316,37 @@ proxy:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `http_bind_port` | int | 8080 | HTTP listen port |
+| `http2_cleartext` | bool | false | Enable h2c on the plain HTTP listener for plaintext HTTP/2 and gRPC clients. |
 | `https_bind_port` | int | unset | Optional HTTPS listen port. Requires `tls_cert_file` + `tls_key_file` or an `acme` block. |
 | `tls_cert_file` | string | | Path to PEM-encoded TLS certificate. Ignored when `acme` is configured. |
 | `tls_key_file` | string | | Path to PEM-encoded TLS private key. |
 | `acme` | object | | ACME (auto-TLS) block. Overrides manual cert/key when set. See [ACME / auto TLS](#acme--auto-tls). |
-| `http3` | object | | HTTP/3 (QUIC) listener config. Currently inert; see [HTTP/3 fields](#http3-fields). |
+| `http3` | object | | Reserved HTTP/3 (QUIC) listener config. Enabling it is rejected; see [HTTP/3 fields](#http3-fields). |
 | `metrics` | object | | Metrics tuning, including label cardinality limits. |
+| `observability` | object | | Log sinks, redaction, custom fields, OTLP export, and usage rollups. Parent log level, format, and sampling fields are config-only; the process uses CLI/environment logging selection. |
 | `alerting` | object | | Alert notification channels. |
-| `admin` | object | | Embedded read-only admin / stats API server. |
+| `admin` | object | | Embedded authenticated admin API and UI. |
 | `secrets` | object | | Secrets management backend. See [Secrets](#secrets). |
 | `cluster` | object | unset | Canonical local or distributed cluster identity, membership, mTLS, enrollment, snapshot, and signed deployment-authority settings. |
 | `model_host` | object | unset | Canonical managed-model authority, cache, engines, deployments, placement, and rollout policy. |
+| `config_authority` | object | unset | Subscribe to or publish signed configuration bundles. |
+| `key_management` | object | unset | Mutable key store, policy cache, encryption, claim mapping, and declarative seed. |
 | `l2_cache_settings` | object | | Optional shared-state backend. Alias: `l2_cache`. |
+| `cache_reserve` | object | unset | Optional cold-tier response cache backed by memory, filesystem, or Redis. |
+| `compression_state` | object | unset | Process-owned Local AI summary-state path. See [compression_state](#compression_state). |
+| `response_cache_store` | object | unset | Picks the backing store for the shared response cache and optionally encrypts entries at rest. See [Choosing the backing store](#choosing-the-backing-store). When unset, the store is Redis if `l2_cache_settings` is configured and an in-process map otherwise. |
 | `messenger_settings` | object | | Optional shared message bus for inter-component eventing. |
 | `trusted_proxies` | array of CIDR strings | `[]` | Source ranges whose inbound `X-Forwarded-For` / `X-Real-IP` / `Forwarded` headers are honoured. Connections from outside the list have those headers stripped on ingress so they cannot spoof identity. IPv6 CIDRs work. See [Trusted proxies and forwarding headers](#trusted-proxies-and-forwarding-headers). |
 | `correlation_id` | object | enabled, `X-Request-Id`, echo on | Correlation-ID propagation policy. See [Correlation ID](#correlation-id). |
 | `mtls` | object | unset | mTLS client-certificate verification on the HTTPS listener. See [mTLS client authentication](#mtls-client-authentication). |
+| `ai_providers_file` | string | unset | Override the embedded AI provider catalog at startup. |
+| `device_parser_file` | string | unset | Config-only. The current pure-Rust device parser does not load this override. |
+| `synthetic_probe` | object | unset | Optional in-process transaction probe reported through readiness. |
+| `scripting` | object | defaults | Scripting runtime limits, including the live Lua sandbox controls. |
 | `http_client_timeouts` | object | (see below) | Tunable timeouts for the proxy's outbound HTTP helpers (forward-auth, callbacks, mirrors, SWR refreshes, bot-auth directory). See [HTTP client timeouts](#http-client-timeouts). |
+| `web_bot_auth` | object | unset | Process-wide Ed25519 identity for outbound Web Bot Auth signing and public-key discovery. |
+| `tenants` | list | `[]` | Declared tenants referenced by `origins.*.tenant_id`. |
+| `credentials` | list | `[]` | Proxy-scope credentials inherited by tenant and origin scopes. |
 | `extensions` | object | | Opaque map for enterprise / third-party top-level config blocks. OSS never parses these. |
 
 ### HTTP client timeouts
@@ -282,13 +376,13 @@ proxy:
 
 ### HTTP/3 fields
 
-HTTP/3 is temporarily disabled until native QUIC support lands in Pingora. The `http3` block still parses, but no QUIC listener starts and setting `enabled: true` only logs a warning. The fields below are documented for forward compatibility; they have no runtime effect today.
+HTTP/3 is not served by this build. The `http3` shape is retained for forward compatibility: omitting the block or setting `enabled: false` compiles, while `enabled: true` fails config compilation with an actionable error referencing WOR-1969. The remaining fields are reserved and have no runtime effect while the block is disabled.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | bool | false | Enable the HTTP/3 (QUIC) listener. Currently inert; no listener starts. |
-| `max_streams` | int | 100 | Maximum concurrent QUIC streams per connection. Currently inert. |
-| `idle_timeout_secs` | int | 30 | Idle timeout for QUIC connections. Currently inert. |
+| `enabled` | bool | false | Reserved activation flag. Must remain false in this build. |
+| `max_streams` | int | 100 | Reserved maximum concurrent QUIC streams per connection. |
+| `idle_timeout_secs` | int | 30 | Reserved idle timeout for QUIC connections. |
 
 ### Admin fields
 
@@ -297,20 +391,31 @@ HTTP/3 is temporarily disabled until native QUIC support lands in Pingora. The `
 | `enabled` | bool | false | Enable the admin server |
 | `port` | int | 9090 | Listen port |
 | `username` | string | "admin" | Top-level admin HTTP Basic username |
-| `password` | string | "changeme" | Top-level admin HTTP Basic password |
+| `password` | string | "changeme" | Top-level admin HTTP Basic password. The default is rejected when the surface is reachable off loopback (see below) |
 | `max_log_entries` | int | 1000 | Recent-request log buffer size |
-| `bind` | string | "127.0.0.1" | Bind address; set to `0.0.0.0` or an interface for remote admin |
-| `allow_ips` | list | empty | IP / CIDR allowlist; empty keeps the loopback-only default |
+| `rate_limit_per_minute` | int | 240 | Admin API requests allowed per client IP per minute; the global cap across all clients is ten times this value. Valid range 1 to 100000; 0 is rejected because the limiter cannot be turned off |
+| `bind` | string | "127.0.0.1" | Bind address; set to `0.0.0.0` or an interface for remote admin. Must be an IP address literal; a value that does not parse is a validation error, not a silent fall back to loopback |
+| `allow_ips` | list | empty | IP / CIDR allowlist; empty keeps the loopback-only default (an empty list denies every non-loopback peer, it does not permit all) |
 | `cors_origins` | list | empty | Allowed CORS origins for a separately hosted UI |
 | `operators` | list | empty | Login identities with roles: `{username, password, role}` where `role` is `admin` or `read_only` |
 | `tls` | object | unset | `{cert, key}` PEM paths; serve HTTPS instead of plaintext |
 | `prompt_persistence_path` | string | unset | redb file persisting prompt-version edits across restarts |
+| `prompt_persistence_encryption` | object | unset | Seals the records in `prompt_persistence_path` at rest with AES-256-GCM. See [Encrypting persisted prompts at rest](#encrypting-persisted-prompts-at-rest). Unset stores them as plaintext JSON. |
 
 When enabled, the admin server binds `bind:<port>` (loopback by
 default), authenticates every request (HTTP Basic or a browser session),
-enforces the operator's role on mutations, and applies a rate limit of
-60 requests per minute per client IP, with a global cap of 600 requests
-per minute across all clients. Full auth, RBAC, remote-access, and endpoint reference is in
+enforces the operator's role on mutations, and applies a per-client-IP
+rate limit of `rate_limit_per_minute` requests per minute (default 240),
+with a global cap across all clients of ten times that value.
+
+The default credentials (`admin` / `changeme`) are fine on the loopback
+default and refused once the admin surface is reachable from another
+host, which means either `bind` is not a loopback address or `allow_ips`
+contains an entry outside loopback. `sbproxy validate` fails with the
+condition that tripped named; set a real password, or keep the admin
+server on loopback. Changes under `proxy.admin` need a restart rather
+than a reload, because the admin server reads its config once at
+startup. Full auth, RBAC, remote-access, and endpoint reference is in
 [admin.md](admin.md). Endpoints (abbreviated):
 
 | Path | Description |
@@ -507,6 +612,19 @@ for the engine, cache, admission, placement, and rollout contracts.
 | `max_cardinality_per_label` | int | 1000 | Default cap on unique label values per metric. New values are collapsed to `__other__`. |
 | `cardinality.hostname_cap` | int | 200 | Optional override for the `hostname` label budget. Useful for high-tenant-count deployments and deterministic overflow tests. |
 
+### Durable usage rollups
+
+`proxy.observability.usage_rollups` stores hourly and daily request, token,
+cost, and outcome aggregates in an embedded database. It is enabled by default
+and backs the windowed Spend API and UI.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `true` | Record durable rollups. If the path cannot be opened, the proxy logs a warning and continues with rollups unavailable. |
+| `path` | path | `/var/lib/sbproxy/usage-rollups.redb` | Embedded rollup database. |
+| `retention_hourly_days` | int | `90` | Days of hourly buckets retained before compaction. |
+| `retention_daily_days` | int | `395` | Days of daily buckets retained. |
+
 ### access_log
 
 Top-level block (sibling of `proxy:` and `origins:`) that turns on structured-JSON access logging. Off by default. When enabled, every completed request emits one JSON line at info level via the `access_log` tracing target after status, method, and sampling filters apply. Secrets are redacted before the line is written. See [Access log](access-log.md) for the full record shape.
@@ -538,17 +656,39 @@ proxy:
         url: https://hooks.example.com/sbproxy
         headers:
           X-Auth: ${ALERT_TOKEN}
+      - type: slack
+        url: ${SLACK_INCOMING_WEBHOOK}
+      - type: pagerduty
+        routing_key: ${PAGERDUTY_ROUTING_KEY}
       - type: log
 ```
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `channels` | list | `[]` | Notification channels. |
-| `channels[].type` | string | required | Channel type. Supported: `webhook`, `log`. |
-| `channels[].url` | string | | Webhook URL. Required when `type` is `webhook`. |
+| `channels[].type` | string | required | Channel type. Supported: `webhook`, `slack`, `pagerduty`, `log`. |
+| `channels[].url` | string | | Required for `webhook` and `slack`. Slack expects an incoming-webhook URL. |
 | `channels[].headers` | map | `{}` | Extra HTTP headers added to webhook deliveries. |
+| `channels[].routing_key` | secret reference | | Required for `pagerduty`; sent to Events API v2 and never exposed by the admin API. |
 
-An alert channel accepts exactly these three keys. A `secret:` key on a channel is rejected at config load as an unknown key; alert-webhook payload signing is not configurable yet. To sign webhook deliveries, use the `secret` field on per-origin `on_request` / `on_response` callbacks instead. See [Webhook envelope and signing](#webhook-envelope-and-signing).
+Webhook and Slack deliveries pass through the same SSRF guard as the rest of
+the proxy's outbound calls, so a channel pointed at a private or loopback
+address is rejected at delivery time and the admin Alerts page reports the
+channel as `failing` with "target rejected by SSRF policy". Point a local
+receiver at a routable address when testing.
+
+An alert channel accepts exactly `type`, `url`, `headers`, and `routing_key`.
+A `secret:` key on a channel is rejected at config load as an unknown key;
+alert-webhook payload signing is not configurable yet. To sign webhook
+deliveries, use the `secret` field on per-origin `on_request` / `on_response`
+callbacks instead. See [Webhook envelope and signing](#webhook-envelope-and-signing).
+
+The block in `sb.yml` is the configuration authority. The admin Alerts page
+and `GET /api/alerts` expose read-only rule state, sanitized channel targets,
+process-lifetime delivery health, and up to 200 recent events. The built-in
+provider error-rate rule requires at least 10 attempts in an evaluation window;
+smaller samples remain inactive. `POST /api/alerts/test` can test one channel
+without changing configuration.
 
 Alert webhook deliveries also include the standard `X-Sbproxy-*` identity headers (`Event`, `Instance`, `Rule`, `Severity`, `Timestamp`) and a `User-Agent: sbproxy/<version>`. The body is wrapped in an envelope:
 
@@ -562,7 +702,11 @@ Alert webhook deliveries also include the standard `X-Sbproxy-*` identity header
 
 ### l2_cache_settings
 
-The `l2_cache_settings` block points the proxy at a shared key-value backend used for cluster-wide rate limit counters and (optionally) response cache entries. When unset, every replica keeps its own in-memory state. The deserializer also accepts `l2_cache:` as an alias.
+The `l2_cache_settings` block points the proxy at a shared key-value backend used for cluster-wide rate limit counters and (optionally) response cache entries. When it is set, rate limits are enforced exactly across replicas.
+
+When it is unset, what happens depends on whether the node is on a mesh. A standalone replica keeps its own in-memory state. A node with `proxy.cluster` configured converges its per-minute rate limit counters over gossip instead, which is approximate rather than exact; see the `rate_limit` policy for the overshoot bound. Response cache entries are per-replica either way.
+
+The deserializer also accepts `l2_cache:` as an alias.
 
 The `driver` field selects the backend; `params` is a flat string map whose keys depend on the driver. Only the `redis` driver is implemented in the Rust proxy today.
 
@@ -571,16 +715,84 @@ proxy:
   l2_cache_settings:
     driver: redis
     params:
-      dsn: redis://redis.internal:6379/0
+      dsn: rediss://cache-user:${REDIS_PASSWORD_URLENCODED}@redis.internal:6380/7
+      ca_file: /etc/sbproxy/redis/ca.pem
+      cert_file: /etc/sbproxy/redis/client.pem
+      key_file: /etc/sbproxy/redis/client-key.pem
 ```
 
 `params` keys for the `redis` driver:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `dsn` | string | | Connection string. Accepts `redis://[user[:pass]@]host:port[/db]`, `rediss://...`, or a bare `host:port`. The database index in the path is parsed but ignored by the single-connection RESP client. |
+| `dsn` | string | required | Redis connection. Accepts a legacy hostname or `host:port`, a `redis://` URL, or a verified `rediss://` URL. URL paths select a non-negative logical database. |
+| `ca_file` | string | unset | PEM trust anchor for a private Redis CA. Valid only with `rediss://`. When omitted, verified TLS uses system trust roots. |
+| `cert_file` | string | unset | PEM client certificate chain for Redis mTLS. Must appear with `key_file` and requires `rediss://`. |
+| `key_file` | string | unset | PEM private key matching `cert_file`. Must appear with `cert_file` and requires `rediss://`. |
 
-Pool size and acquire timeout are not exposed via `params` and use built-in defaults (pool size 8, acquire timeout 5 seconds).
+Legacy `redis.internal` and `redis.internal:6379` values remain compatible and
+normalize to plaintext `redis://` connections. Bracketed IPv6 addresses are
+accepted. Unbracketed ambiguous IPv6 addresses are rejected.
+
+Use `redis://` only for an intentionally plaintext connection. `rediss://`
+performs certificate verification and never retries as plaintext. Redis ACL
+username and password authentication, password-only authentication, and
+database paths are preserved during connection setup. Percent-encode reserved
+characters in credentials, such as `%40` for `@` and `%2F` for `/`; environment
+interpolation does not URL-encode a value for you.
+
+Configuration loading validates the URL, supported scheme, database syntax,
+TLS field combinations, PEM material, and client certificate/key match. It
+does not contact Redis. The first L2 operation opens the connection and performs
+TLS, `AUTH`, and `SELECT`, so an unreachable service or a server-side trust,
+authentication, or database rejection appears at runtime. Query parameters,
+URL fragments such as `#insecure`, negative databases, and a username without
+a password are rejected instead of being weakened.
+
+Pool size, pool acquisition timeout, connection timeout, and command timeout
+are not exposed through `params`. The built-in pool size is 8 and each timeout
+defaults to 5 seconds.
+
+AI context compression with `summary_buffer` reuses this same validated DSN,
+private CA, client certificate, and client key. The compression block does not
+accept a separate Redis connection.
+
+Do not roll a secure deployment back to a release that predates these fields.
+Older releases are safe only for unauthenticated plaintext database-zero
+deployments because they did not preserve TLS, authentication, or database
+selection.
+
+### compression_state
+
+`proxy.compression_state` configures the process-owned redb file used when an
+AI `summary_buffer` pipeline selects `backend: local`. A `summary_buffer` with
+no action-level `state` block defaults to Local with a 24-hour TTL.
+
+```yaml
+proxy:
+  compression_state:
+    local_path: /var/lib/sbproxy/compression-state.redb
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `local_path` | string | platform selection | Absolute redb database path. It must be nonempty, at most 4096 bytes, and contain no control characters. |
+
+Configuration validation checks only the path string and performs no
+filesystem I/O. At runtime, an explicit path wins. Without one, SBproxy tries
+a writable `/var/lib/sbproxy/compression-state.redb`, then
+`$XDG_STATE_HOME/sbproxy/compression-state.redb`, then
+`$HOME/Library/Application Support/sbproxy/compression-state.redb` on macOS or
+`$HOME/.local/state/sbproxy/compression-state.redb` on other Unix systems.
+Only absolute environment paths participate. Windows requires an explicit
+path. A required path that cannot be opened fails startup and names the path.
+
+The file is a one-process durability boundary, not shared fleet state. It
+contains generated summaries in plaintext, so protect the directory, file,
+snapshots, and backups as prompt data. Deleted and expired pages are reusable,
+but redb may keep the file at its high-water allocation instead of shrinking it
+immediately. Use explicit Redis or mesh state for traffic that can move between
+processes.
 
 ### messenger_settings
 
@@ -604,7 +816,7 @@ Supported drivers and their `params` keys:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `dsn` | string | `redis://127.0.0.1:6379` | Redis connection string. Same parsing rules as the L2 cache `dsn`. |
+| `dsn` | string | `redis://127.0.0.1:6379` | Redis messenger connection string. The secure L2 fields and connection behavior described above do not apply to `messenger_settings`. |
 
 `sqs` (all required):
 
@@ -694,6 +906,7 @@ origins:
 |-------|------|---------|-------------|
 | `action` | object | required | What to do with the request (proxy, redirect, static, etc.). |
 | `tenant_id` | string | `__default__` | Tenant this origin resolves to. Must match a `proxy.tenants[].id`; absent uses the synthetic `__default__` tenant. Stamped on the request context for auth / policy / vault resolution. See [Tenants](#tenants). |
+| `credentials` | list | `[]` | Origin-scope credentials. These override or extend credentials inherited from tenant and proxy scopes. |
 | `authentication` | object | | Auth provider. Alias: `auth`. |
 | `policies` | list | | Policy enforcers (rate limit, IP filter, WAF, etc.). |
 | `transforms` | list | | Body transforms applied in order. |
@@ -703,6 +916,10 @@ origins:
 | `hsts` | object | | HSTS header injection. |
 | `compression` | object | | Response compression. |
 | `session` | object | | Session cookie settings. Alias: `session_config`. |
+| `properties` | object | | Custom request-property capture, redaction, response echo, and bounded durable-rollup promotion. |
+| `sessions` | object | | Observability session-ID capture and auto-generation. This is separate from the `session` cookie block. |
+| `user` | object | | Observability user-ID capture. |
+| `observability` | object | | Per-origin `log.redact.pii` override, composed with tenant or proxy scope. |
 | `force_ssl` | bool | false | Redirect plain HTTP requests to HTTPS. |
 | `allowed_methods` | list | empty (allow all) | Whitelist of HTTP methods. |
 | `forward_rules` | list | | Path / header / IP rules that route to inline child origins. |
@@ -714,14 +931,28 @@ origins:
 | `mirror` | object | | Shadow traffic configuration. See [Request mirror](#request-mirror). |
 | `bot_detection` | object | | Bot detection config. |
 | `threat_protection` | object | | IP reputation / blocklist config. |
-| `rate_limit_headers` | object | | `X-RateLimit-*` and `Retry-After` header configuration. |
-| `error_pages` | list | | Custom error pages keyed by status code or class. |
+| `rate_limit_headers` | object | | Config-only. Configure headers on the live rate-limit policy. |
+| `error_pages` | list | | Custom error pages matching one status code or an explicit list of status codes. |
 | `problem_details` | object | | RFC 9457 `application/problem+json` default renderer. Composes with `error_pages`. |
-| `traffic_capture` | object | | Traffic capture / mirroring. |
+| `proxy_status` | object | | RFC 9209 `Proxy-Status` response-header configuration. |
+| `traffic_capture` | object | | Config-only. Use `mirror` for live request mirroring. |
 | `message_signatures` | object | | RFC 9421 HTTP message signatures. |
+| `olp` | object | | RSL Open License Protocol token issuer and public-key endpoints. |
+| `web_bot_auth_publish` | object | | Publish a Web Bot Auth key directory and Signature Agent Card on this origin. |
 | `idempotency` | object | | RFC 8594 idempotency middleware. See [Idempotency](#idempotency). |
-| `connection_pool` | object | | Per-origin connection pool tuning. |
+| `connection_pool` | object | | Config-only. Pingora's built-in upstream pool settings apply. |
 | `extensions` | object | | Opaque map for enterprise / third-party origin-level blocks. |
+| `expose_openapi` | bool | false | Publish this origin's generated OpenAPI document at its well-known paths. |
+| `stream_safety` | list | `[]` | Per-origin streaming-safety rule identifiers. |
+| `default_content_shape` | string | `html` | Default projection shape when the request has no concrete `Accept` preference. |
+| `content_signal` | string | unset | `Content-Signal` value: `ai-train`, `search`, or `ai-input`. |
+| `token_bytes_ratio` | number | `0.25` | Markdown token-estimation ratio override. |
+| `agent_skills` | list | `[]` | Agent Skills advertisements served from well-known paths. |
+| `agents_md` | string | unset | Body served at `/AGENTS.md`. |
+| `ai_txt` | string | unset | Body served at `/ai.txt`. |
+| `agents_json` | object | unset | Manifest served at `/.well-known/agents.json`. |
+| `outbound_credential` | object | unset | Outbound credential exchange, client-credentials, or vault-secret resolver. |
+| `outbound_web_bot_auth` | bool | false | Sign upstream requests with `proxy.web_bot_auth`. |
 
 ### Origin architecture
 
@@ -740,11 +971,63 @@ origins:
     response_cache: { ... }      # Optional
     variables: { ... }           # Optional
     session: { ... }             # Optional
+    properties: { ... }          # Optional request properties
+    sessions: { ... }            # Optional observability session IDs
+    user: { ... }                # Optional user identity capture
     cors: { ... }                # Optional
     compression: { ... }         # Optional
     hsts: { ... }                # Optional
-    connection_pool: { ... }     # Optional
 ```
+
+### Request-envelope capture
+
+The `properties`, `sessions`, and `user` blocks capture bounded observability
+dimensions at request entry. Their defaults apply even when the blocks are
+omitted. The plural `sessions` block controls `X-Sb-Session-Id`; the singular
+`session` block above controls encrypted session cookies and is unrelated.
+
+```yaml
+origins:
+  "api.example.com":
+    action: {type: ai_proxy, providers: [{type: openai, api_key: "${OPENAI_API_KEY}"}]}
+    properties:
+      capture: true
+      echo: false
+      rollup_keys: [Feature, customer-tier]
+      redact:
+        keys: [customer-email]
+        value_regex: ['\b\d{3}-\d{2}-\d{4}\b']
+    sessions:
+      capture: true
+      auto_generate: anonymous
+      ttl_seconds: 86400
+    user:
+      capture: true
+      max_length: 256
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `properties.capture` | bool | `true` | Capture bounded `X-Sb-Property-*` headers. |
+| `properties.echo` | bool | `false` | Echo captured values as response headers. |
+| `properties.redact.keys` | list | `[]` | Lowercased property keys whose values become `[redacted]`. |
+| `properties.redact.value_regex` | list | `[]` | Regexes that replace a matching value with `[redacted]`. |
+| `properties.rollup_keys` | list | `[]` | Explicit property keys promoted into durable usage-rollup dimensions. At most five. |
+| `sessions.capture` | bool | `true` | Capture caller-supplied session and parent-session ULIDs. |
+| `sessions.auto_generate` | enum | `anonymous` | `never`, `anonymous`, or `always`. |
+| `sessions.ttl_seconds` | int | `86400` | Reserved compatibility hint. No OSS consumer expires the request ring from this value. |
+| `sessions.budget` | object | unset | Optional per-workspace cap for automatically generated session IDs. Caller-supplied IDs are not gated. |
+| `user.capture` | bool | `true` | Capture the resolved user identifier. |
+| `user.max_length` | int | `256` | Maximum captured user-ID length. |
+
+`properties.rollup_keys` is intentionally explicit and bounded. Compilation
+lowercases every key, applies the same property-key syntax as request capture,
+rejects duplicates after normalization, and rejects more than five entries.
+Redaction runs before promotion, so a configured sensitive key contributes the
+literal `[redacted]` value rather than its original value. Each promoted key
+adds a durable grouping dimension and can increase rollup cardinality. These
+properties are not exported as arbitrary Prometheus labels. Query a promoted
+dimension through `GET /api/usage/spend?...&group_by=property:<key>`.
 
 ---
 
@@ -923,6 +1206,9 @@ origins:
 |-------|------|---------|-------------|
 | `targets` | list | required | Backend targets. |
 | `algorithm` | string \| object | `round_robin` | Routing algorithm (see below). |
+| `strategy` | string | unset | Registered routing strategy name. The compiled strategy runs before `algorithm`; unknown names fail config compilation. See [Routing strategies](routing-strategies.md). |
+| `strategy_config` | object | `{}` | Strategy-specific settings. Must be an object. |
+| `lb_method` | string | unset | Compatibility marker for plugin routing. `plugin` requires `strategy`; `algorithm` remains the fallback. |
 | `sticky` | object | | Sticky-session config: `cookie_name` (default `sb_sticky`), `ttl` seconds. |
 | `deployment_mode` | object | `{mode: normal}` | Deployment mode. See below. |
 | `outlier_detection` | object | unset | Passive ejection policy. See [Outlier detection](#outlier-detection). |
@@ -939,6 +1225,12 @@ Algorithms:
 | `header_hash` | Hash a named request header. Configured as `algorithm: { header_hash: { header: X-User } }`. |
 | `cookie_hash` | Hash a named cookie. Configured as `algorithm: { cookie_hash: { cookie: sid } }`. |
 
+When `strategy` is set, deployment, backup, priority, health, circuit-breaker, and outlier filters run first. The registered strategy receives only eligible targets. Returning no selection falls through to `algorithm`.
+
+The production registry includes `first-healthy`, `lora`, `lora-aware`, `gpu-aware`, and `bandit`. `lora-aware` reads the adapter from `X-LoRA-Adapter` or `?adapter=` and matches it against `targets[].metadata.loaded_adapters`. `gpu-aware` selects the lowest valid numeric `targets[].metadata.gpu_utilization` in `[0.0, 1.0]`; it does not poll GPUs. `bandit` records real success and latency outcomes, with successful reward `1 / (1 + latency_seconds)` and failure reward `0`; it does not fabricate cost data. Empty request hints and hints over 256 bytes are ignored.
+
+Bandit learning survives a compatible hot reload in the same process when the origin, strategy name, and ordered target URLs remain unchanged. A process restart resets it. State is bounded to 256 retained namespaces and 256 target arms per namespace. See [Routing strategies](routing-strategies.md) for configuration and fallback details.
+
 Target fields:
 
 | Field | Type | Default | Description |
@@ -949,6 +1241,7 @@ Target fields:
 | `group` | string | | Deployment group label (`blue`, `green`, `canary`). |
 | `priority` | int | 5 | Routing priority (1 = highest, 10 = lowest). Read from `X-Priority` header when not set here. |
 | `zone` | string | | Availability zone or region label for locality-aware routing. |
+| `metadata` | object | `{}` | Strategy-specific JSON signals such as `loaded_adapters` or `gpu_utilization`. Limited to 64 entries per target and 64 bytes per key. |
 | `health_check` | object | | Active health-check probe config. See [Active health checks](#active-health-checks). |
 | `host_override` | string | unset | Override the upstream `Host` for this target. Default is the target URL's hostname. |
 | `disable_*_header` | bool | false | Same per-header opt-outs as on `proxy` actions; see [Forwarding headers](#trusted-proxies-and-forwarding-headers). |
@@ -1030,7 +1323,7 @@ origins:
 
 ### ai_proxy
 
-Route requests across LLM providers with automatic failover, cost tracking, and content-based routing. Supports 66 native providers behind one OpenAI-compatible API; the model name passes straight through, so any model a provider serves is reachable. For full details, see [ai-gateway.md](ai-gateway.md) and [providers.md](providers.md).
+Route requests across LLM providers with automatic failover, cost tracking, and content-based routing. Supports 72 native providers behind one OpenAI-compatible API; the model name passes straight through, so any model a provider serves is reachable. For full details, see [ai-gateway.md](ai-gateway.md) and [providers.md](providers.md).
 
 ```yaml
 origins:
@@ -1064,11 +1357,20 @@ origins:
 | `per_surface_rate_limits` | map | | Per-surface rate limit overrides keyed by AI surface label (`chat_completions`, `assistants`, `image_generation`, ...). |
 | `max_concurrent` | map | | Maximum concurrent in-flight requests per provider. |
 | `resilience` | object | | Per-provider circuit breaker, outlier detection, and active health probes. Also hosts the LLM-aware knobs (`retry_policy`, `llm_aware`, `content_policy_fallback`); see [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md). |
+| `compression` | object | unset | Ordered AI context-compression policy. See [AI context compression](#ai-context-compression) and [ai-context-compression.md](ai-context-compression.md). |
+| `reasoning` | string or object | `off` | Route policy for concise reasoning. Use `concise`, `off`, or `{budget: N}` with `N` greater than zero. |
 | `shadow` | object | | Side-by-side eval: mirror each request to a second provider and log metrics. |
 | `ai_policy` | object | | One sandboxed CEL expression over the AI decision pipeline (`expression`, `on_error`). See [ai-policy-cel.md](ai-policy-cel.md). |
 | `usage_sinks` | list | `[]` | Destinations for completed-call usage records. The `ledger` sink (`path`, optional `signing_seed_hex`) writes a hash-chained, signable record. See [ai-usage-ledger.md](ai-usage-ledger.md). |
 
 Routing strategies: `round_robin`, `weighted`, `fallback_chain`, `random`, `lowest_latency`, `least_connections`, `cost_optimized`, `token_rate`, `least_token_usage`, `prefix_affinity`, `peak_ewma`, `sticky`, `race`, `cascade`, `cost_quality`, `outcome_aware`. See [ai-gateway.md](ai-gateway.md#routing-strategies) for each; `outcome_aware` has its own page in [ai-outcome-aware-routing.md](ai-outcome-aware-routing.md).
+
+Peak EWMA accepts the object form:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `routing.strategy` | string | `round_robin` | Set to `peak_ewma` for power-of-two choices over decayed latency and in-flight cost. |
+| `routing.half_life` | duration | `10s` | Maximum idle decay interval before a provider re-enters at pool-neutral cost. Accepts integer seconds or a human-readable duration such as `10s`. |
 
 `default_model` is a per-provider field, not an action-level field. Set it on each `providers[]` entry.
 
@@ -1080,6 +1382,7 @@ Routing strategies: `round_robin`, `weighted`, `fallback_chain`, `random`, `lowe
 | `provider_type` | string | inferred from `name` | Provider type (`openai`, `anthropic`, `google`, etc.). |
 | `deployment` | string | required for `managed_model` | Canonical `proxy.model_host.deployments` ID. Valid only when `provider_type: managed_model`. |
 | `api_key` | string | | API key used to authenticate with the upstream. |
+| `accept_native_credentials_for` | string | unset | Explicitly allow this provider entry and its effective `base_url` to receive caller-owned native credentials for the named canonical provider, such as `openai`. Must match `provider_type` (or `name` when no type is set). Rejected for managed and locally served providers. |
 | `base_url` | string | provider default | Override the upstream base URL. Validated at config load: non-`http(s)` schemes and private/loopback targets are rejected as SSRF risks unless `allow_private_base_url` is set. |
 | `allow_private_base_url` | bool | `false` | Allow `base_url` to point at a loopback/private address (a local model server). The scheme check still applies. |
 | `models` | list | `[]` | Models served by this provider; empty defers to the provider catalog. |
@@ -1098,6 +1401,256 @@ A `managed_model` provider must set a non-empty `deployment` and must not set
 `api_key`, `base_url`, or the legacy `serve` block. Conversely, `deployment` is
 rejected for every other provider type. Managed traffic resolves through the
 deployment runtime rather than an operator-supplied upstream URL.
+
+#### AI reasoning policy
+
+`reasoning` controls reasoning effort for each provider attempt after
+`model_map` resolves the upstream model. It is disabled by default:
+
+```yaml
+action:
+  type: ai_proxy
+  providers:
+    - name: openai
+      api_key: ${OPENAI_API_KEY}
+      models: [gpt-5-mini]
+  reasoning: concise
+```
+
+Use an explicit positive budget when the provider supports one:
+
+```yaml
+reasoning:
+  budget: 2048
+```
+
+`concise` asks a supported model for its lowest native reasoning effort.
+For Anthropic and Gemini, `budget` is a native thinking-token budget when the
+mapped model accepts it. Anthropic keeps a separate visible-output allowance in
+`max_tokens`. OpenAI uses low reasoning effort and treats `budget` as a cap on
+`max_completion_tokens`, or `max_output_tokens` for a direct Responses-shaped
+call. An unsupported provider-model pair or native range receives one fixed
+concise instruction instead. Chat Completions and Messages receive a system
+message; Responses receives `instructions`. A budget fallback also caps the
+request shape's completion or output field. Requests declaring `tools` or
+legacy `functions`, and code-shaped prompts, including requests that name
+common source-file paths, bypass the policy. The safety facts are captured
+before context compression. Only Chat Completions, Anthropic Messages, and
+OpenAI Responses requests are eligible. A non-`off` policy on one of those
+surfaces bypasses semantic-cache reads and writes so an older cached response
+cannot skip the current reasoning or output budget.
+
+See [Reasoning policy](ai-gateway.md#reasoning-policy) for the exact provider
+mapping, fallback behavior, and metric outcomes.
+
+#### AI context compression
+
+The `compression` block on an `ai_proxy` action runs an ordered list of
+prompt-compression levers before provider dispatch. It is separate from the
+origin-level [response compression](#compression) middleware.
+
+This example first maintains a session summary, then deterministically fits the
+result to the resolved target model's context window:
+
+```yaml
+proxy:
+  compression_state:
+    local_path: /var/lib/sbproxy/compression-state.redb
+
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          models: [gpt-4o]
+        - name: anthropic
+          api_key: ${ANTHROPIC_API_KEY}
+          models: [claude-haiku-4-5]
+      compression:
+        allow_admin_content_inspection: false
+        levers:
+          - type: summary_buffer
+            min_tokens: 12000
+            retain_recent_messages: 8
+            target_summary_tokens: 2048
+            summarizer:
+              provider: anthropic
+              model: claude-haiku-4-5
+              timeout: 5s
+          - type: window_fit
+            completion_reserve_tokens: 1024
+            input_budget_tokens: 16384
+        profiles:
+          compact:
+            levers:
+              - type: window_fit
+                input_budget_tokens: 4096
+```
+
+For stateless marked retrieval text, select sentences first, prune source
+tokens through the classifier sidecar, then apply the final input bound:
+
+```yaml
+compression:
+  levers:
+    - type: query_select
+      max_sentences: 12
+    - type: token_prune
+      min_tokens: 512
+      endpoint: http://127.0.0.1:9440
+      model: llmlingua-2
+      timeout_ms: 250
+      max_chunks: 32
+      target:
+        mode: retain_ratio
+        retain_percent: 60
+    - type: window_fit
+      input_budget_tokens: 8192
+```
+
+Levers execute in declaration order. Each lever sees the message list accepted
+from the preceding lever, and a candidate replacement is used only when it
+strictly reduces the resolved target model's token estimate.
+
+Policy fields:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `state` | object | Local/24h for `summary_buffer`; unset otherwise | State used by `summary_buffer`. Omission is stateless when no summary lever is present. |
+| `state.backend` | enum | `local` when state is synthesized | `local` for one process-owned redb file, `redis` for cross-process serialized state, or `mesh` for replicated eventual-LWW state. Explicit choices never fall back. |
+| `state.ttl` | duration | `24h` when state is synthesized | Positive record lifetime. Accepts integer seconds or strings such as `60s`, `5m`, `2h30m`, and `1d`. Newly committed summaries refresh the lifetime; exact-summary reuse does not write or refresh it. |
+| `allow_admin_content_inspection` | bool | `false` | Permit the Admin-only, audit-first content endpoint for records from this handler. Metadata remains available to authenticated readers. This flag alone never grants access. |
+| `levers` | list | `[]` | Compression levers in execution order. An explicitly empty list disables compression for this handler. |
+| `profiles` | map | `{}` | Route-local named compression pipelines. Each entry has its own `levers` and optional `state`. Names use lowercase ASCII letters, digits, `_`, or `-`, begin with a letter or digit, contain from 1 to 64 bytes, and cannot be `on` or `off`. |
+| `profiles.<name>.state` | object | Local/24h for a summary profile | State for this named profile. Each profile defaults independently and does not inherit route state. |
+| `profiles.<name>.levers` | list | `[]` | Ordered levers for this named profile. |
+
+`summary_buffer` fields:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `type` | string | required | Must be `summary_buffer`. |
+| `min_tokens` | int | required | Positive input-token threshold below which the lever skips the request. |
+| `retain_recent_messages` | int | required | Positive number of the most recent messages to retain byte-for-byte. |
+| `target_summary_tokens` | int | required | Positive maximum output-token request sent to the summarizer. Must be smaller than `min_tokens`. |
+| `summarizer.provider` | string | required | Exact `providers[].name` from the same AI handler. The provider must be enabled. |
+| `summarizer.model` | string | required | Non-empty model sent to the selected provider. It must be declared by that provider, mapped by `model_map`, selected as its `default_model`, or allowed by an empty provider model list, and it must pass the handler's model allow and block lists. |
+| `summarizer.timeout` | duration | required | Positive hard deadline for the internal summarization request. Accepts the same seconds or humanized duration syntax as `state.ttl`. |
+
+`query_select` fields:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `type` | string | required | Must be `query_select`. |
+| `max_sentences` | int | exclusive | Keep at most this many positive-scoring sentences in each marked retrieval block. From 1 through 4,096. |
+| `target_tokens` | int | exclusive | Keep positive-scoring sentence bodies within this target-model estimate in each marked block. From 1 through 1,000,000. |
+
+Configure exactly one of `max_sentences` and `target_tokens`. The lever accepts
+only marked `format="text"` chunks. It preserves source order within each
+retained chunk, then places the strongest retained chunks at the block edges.
+A block may contain at most 4,096 source sentences in either mode. A larger
+block skips the whole lever as `marked_context_too_large` before ranking. A
+missing query, no positive lexical overlap, malformed markers, or structured
+chunk also causes a safe skip.
+
+`token_prune` fields:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `type` | string | required | Must be `token_prune`. |
+| `min_tokens` | int | required | Positive target-model estimate across all marked bodies before any sidecar call. |
+| `endpoint` | string | required | Classifier gRPC URI or `unix://` with an absolute socket path. |
+| `model` | string | required | Non-empty token-classification model ID loaded by the sidecar. The sidecar accepts at most 256 UTF-8 bytes. |
+| `timeout_ms` | int | `250` | Per-chunk RPC timeout, from 1 through 60,000. |
+| `max_chunks` | int | `64` | Maximum marked chunks sent during one request, from 1 through 256. |
+| `target.mode` | enum | required | `retain_ratio` or `target_tokens`. |
+| `target.retain_percent` | int | ratio mode | Per-chunk percentage limit, from 1 through 99, enforced with both the pruning tokenizer and the request's target-model estimator. |
+| `target.target_tokens` | int | token mode | Aggregate target-model budget across returned marked bodies, from 1 through 1,000,000. It must be at least the marked chunk count for that request to be eligible. |
+
+The route connects lazily and shares its client. Only marked
+`format="text"` bodies are sent. In ratio mode, SBproxy rechecks each returned
+chunk against the same percentage using the request model. In target-token
+mode, it allocates the budget across chunks and rechecks the combined output
+with that model. A token target smaller than the marked chunk count skips
+without a sidecar call. Sidecar transport errors and invalid output fail open
+at this lever; later entries still run.
+
+`window_fit` fields:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `type` | string | required | Must be `window_fit`. |
+| `completion_reserve_tokens` | int | `1024` | Non-negative completion capacity excluded from the input-message budget. |
+| `input_budget_tokens` | int | unset | Positive explicit input-message budget. The effective budget is the smaller of this value and a known model window minus the completion reserve. Unknown models can still use the explicit value. |
+
+With `input_budget_tokens`, `window_fit` uses the target-model counter for the
+complete JSON message shape. It preserves the contiguous leading `system` and
+`developer` prefix, the complete newest protocol unit, and a contiguous newest
+suffix. OpenAI and Anthropic tool calls stay grouped with their results. If the
+protected material cannot fit, the lever skips and leaves the request
+unchanged. Omitting the field preserves the legacy compatibility behavior.
+
+Requests select `on`, `off`, or a declared profile in this order:
+`X-Compression` header, governed-key `compression_profile`, CEL
+`compression:<selector>`, then route default. A malformed or undeclared header
+returns `400`; SBproxy strips a valid header before upstream dispatch.
+Malformed or undeclared operator-managed key and CEL selectors safely disable
+compression and record `invalid_operator`. See
+[AI context compression](ai-context-compression.md#profiles-and-request-selection)
+for cache behavior, metrics, logs, and examples.
+
+Configuration loading rejects unknown fields within `compression`, `state`,
+each profile, each lever, and `summarizer`. It also rejects a zero TTL,
+timeout, or explicit input budget, zero
+`summary_buffer` numeric fields, a summary target greater than or equal to its
+minimum threshold, an empty summarizer model, an unknown summarizer provider,
+a disabled summarizer provider, and a summarizer model not available through
+that provider or denied by the handler policy. It also rejects a
+`query_select` block with both or neither bound, out-of-range query or pruning
+targets, an empty token-prune model or endpoint, a relative Unix socket path,
+and out-of-range sidecar timeout or fanout. A stateful backend that is not
+available also fails pipeline construction instead of silently falling back:
+
+- `backend: local` opens one process-owned database selected through
+  `proxy.compression_state`; a required open failure is fatal. Configuration
+  validation never creates or probes the file.
+- `backend: redis` requires `proxy.l2_cache_settings.driver: redis`. For this
+  feature, `params.dsn` must be a `redis://` or `rediss://` URL with a host.
+- `backend: mesh` requires `proxy.cluster.replication` on every node and binds
+  to that live replicated substrate.
+- `token_prune`, `query_select`, `rag_select`, `compact_serialization`,
+  `position_reorder`, and `window_fit` are stateless. `token_prune` still
+  requires its configured sidecar at request time. A policy containing only
+  these levers creates no Local database and needs no Redis or mesh dependency.
+
+Request workers retain no memory-only conversational state between requests.
+The stateful lever stores its canonical running-summary record in the selected
+Local, Redis, or mesh backend under an opaque ID; raw session identifiers and
+raw turns are not stored in that record. Local survives restart at the same
+file path but does not share records with another process. There is no
+OmniRoute import path, migration format, or runtime dependency. Enabling this
+feature starts and maintains native SBproxy state only.
+
+For compatibility, the older boolean remains accepted:
+
+```yaml
+resilience:
+  llm_aware:
+    context_compress: true
+    completion_reserve_tokens: 2048
+```
+
+When `compression` is absent, `context_compress: true` maps to one
+`window_fit` lever with the configured reserve, or `1024` when the reserve is
+omitted. Any explicit `compression` block is authoritative, including
+`compression: {levers: []}`, so it disables that legacy mapping. The legacy
+form does not enable session summaries or admin content inspection.
+
+See [AI context compression](ai-context-compression.md) for request
+eligibility, session identity, concurrency, failure behavior, and operational
+guidance.
 
 #### Credentials
 
@@ -1138,9 +1691,10 @@ origins:
 | `provider` | string | | Provider this key routes to. Matches an entry in the action's `providers:` list. |
 | `key` | string | | Client-facing key material. Accepts `${ENV}` and secret reference URIs. |
 | `models.allow` / `models.deny` | list | | Per-key model gate, enforced with a 403 before any upstream call. Stacks on the origin-level allow-list; most restrictive wins. |
-| `attrs` | object | | Attribution metadata (`project`, `tags`, `budget`, ...) surfaced as attribution labels (including `api_key_id`) on the `sbproxy_ai_*_attributed_total` metrics. The `budget` here is attribution, not an enforced ceiling; enforced spend caps live in the action-level `budget:` block. |
+| `attrs` | object | | Attribution metadata (`project`, `tags`, ...) surfaced as attribution labels (including `api_key_id`) on the `sbproxy_ai_*_attributed_total` metrics. `attrs.team` is compatibility-only and is not copied into the principal; use `tags` or `metadata` instead. `attrs.budget.max_tokens` and `.max_cost_usd` add total per-key ceilings; `.reset` is also compatibility-only and does not install a reset schedule. Explicit compatibility-only keys emit a warning. |
 | `policies` | list | | Sub-policies that fire when this credential matches. `{type: rate_limit, rpm: <n>}` lowers to an enforced per-key requests-per-minute cap; there is no per-key tokens-per-minute knob. `{type: require_pii_redaction, rules: [...]}` gates dispatch on active PII redaction. |
 | `route_to_model` | string | | Pin the upstream `model` field; the client-supplied value is ignored. |
+| `compression_profile` | string | | Select `on`, `off`, or a named profile declared by this AI route. |
 | `inject_tools` | list | | Replace the request's `tools` array with these provider-native entries. |
 
 See [`examples/ai-virtual-keys/sb.yml`](https://github.com/soapbucket/sbproxy/blob/main/examples/ai-virtual-keys/sb.yml) for a runnable two-team setup and [migration-credentials.md](migration-credentials.md) for the field-by-field migration from the legacy shape.
@@ -1203,9 +1757,86 @@ per_surface_rate_limits:
 |-------|------|---------|-------------|
 | `input` | list | `[]` | Guardrails evaluated against the incoming request body. |
 | `output` | list | `[]` | Guardrails evaluated against the model output. |
+| `external` | list | `[]` | External HTTP guardrail adapters and failure policy. See [External AI guardrails](guardrails.md). |
 | `mesh` | object | unset | Runs input detectors as a cascade and fuses verdicts under a quorum rule (`block_threshold`, `redact_on_flag`, `cache`, `cache_capacity`, `latency_budget_ms`). See [ai-guardrail-mesh.md](ai-guardrail-mesh.md). |
 
-Each `input` / `output` entry is an object with a `type` field and type-specific config. Built-in types: `pii`, `secrets`, `injection` (alias `prompt_injection`), `toxicity`, `jailbreak`, `content_safety`, `schema`, `regex`, `regex_guard`, `context_poisoning`, `agent_alignment`. See [ai-gateway.md](ai-gateway.md#guardrails) for per-guardrail fields.
+Each `input` / `output` entry is an object with a `type` field and type-specific config. Built-in types: `pii`, `secrets`, `injection` (deprecated compatibility alias `prompt_injection`), `toxicity`, `jailbreak`, `content_safety`, `schema`, `regex`, `regex_guard`, `context_poisoning`, `agent_alignment`, `classifier`. The two injection names preserve their existing blocking fields but use the same canonical heuristic matcher as `prompt_injection_v2`. See [ai-gateway.md](ai-gateway.md#guardrails) for per-guardrail fields.
+
+##### Safety guardrail modes
+
+`toxicity`, `jailbreak`, and `content_safety` default to `mode: keyword`.
+That mode preserves the existing case-insensitive substring matchers and
+requires no model. It catches only configured or built-in literal terms; it
+does not provide semantic or ML detection.
+
+Set `mode: classifier` to make one of those guardrails enforce the local
+embedding classifier. This is an explicit, fail-closed configuration choice:
+the proxy rejects an unavailable backend, an incompatible model generation,
+an unknown class label, or keyword-only fields that would otherwise be
+ignored. It never substitutes the keyword backend after classifier mode was
+requested.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `mode` | `keyword` or `classifier` | `keyword` | Selects the literal matcher or local classifier. |
+| `classifier` | object | required in classifier mode | Uses the same `backend`, threshold, optional class-example, `scope`, and `max_chars` fields as the classifier input guardrail below. Rejected in keyword mode. |
+| `blocked_categories` | list | type-specific | In classifier mode, valid only for `content_safety`, must be nonempty, and may contain `violence`, `self_harm`, `sexual`, `hate_speech`, or `illegal`. |
+| `stream_policy` | `chunk`, `close`, or `off` | mode-specific | Output classifier mode defaults to `close`, accepts `close` or `off`, and rejects `chunk`. Keyword mode retains the normal streaming default. |
+
+Classifier mode ships these closed class maps:
+
+- `toxicity`: `toxic`, `safe`
+- `jailbreak`: `jailbreak`, `safe`
+- `content_safety`: `violence`, `self_harm`, `sexual`, `hate_speech`,
+  `illegal`, `safe`
+
+The `classes` map may be omitted. SBproxy then uses the versioned,
+precomputed centroids bundled with the binary. Entries supplied under
+`classes` add deployment-specific examples to the matching shipped class;
+they do not replace the default centroid. Unknown class names are rejected.
+The defaults require the pinned
+`sentence-transformers/all-MiniLM-L6-v2` model revision and tokenizer.
+A digest mismatch is a hard configuration error because vectors from another
+model generation are not comparable. When both threshold fields are omitted,
+the calibrated artifact thresholds apply. Explicit `min_score` or
+`min_margin` values opt into operator tuning.
+
+Input classifier mode defaults to `scope: last_user_message`; `full_text` is
+also available. Output classifier mode always evaluates the complete response:
+omit `scope` or set it to `full_text`. An explicit `last_user_message` output
+scope is rejected.
+
+See [Safety guardrail modes](ai-gateway.md#safety-guardrail-modes) and the
+[ai-safety-classifiers](../examples/ai-safety-classifiers/) example.
+
+##### Classifier input guardrail
+
+`type: classifier` is input-only. It maps prompt text onto operator-defined
+classes using a local embedding model and exposes the winning class through
+the guardrail label set. It is rejected under `output:` rather than accepted
+as a no-op.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `backend` | object | required | Tagged backend config. The shipped backend requires `kind: embedding`. |
+| `backend.model_path` | string | required | Nonblank path to the ONNX sentence-embedding model. |
+| `backend.tokenizer_path` | string | required | Nonblank path to the matching Hugging Face `tokenizer.json`. |
+| `backend.min_score` | float | `0.30` | Minimum cosine similarity for the winning class; finite and between `0` and `1`. |
+| `backend.min_margin` | float | `0.05` | Minimum winning-score gap over the runner-up; finite and between `0` and `2`. |
+| `backend.max_model_bytes` | int | loader default | Optional ONNX file-size limit in bytes. |
+| `classes` | map of string to list | required | Nonblank class labels and representative prompts. At least one class and one nonblank example per class are required; each example must fit `max_chars`. |
+| `scope` | enum | `last_user_message` | `last_user_message` or `full_text`. |
+| `max_chars` | int | `2000` | Character cap applied to request subjects and centroid examples before tokenization. Must be above zero. |
+
+The root JSON schema keeps each origin's `action` as raw JSON because actions
+are module-registry values, so editor completion cannot enumerate this nested
+table. The guardrail pipeline compiler parses and validates the classifier
+shape while compiling the AI action, before a candidate configuration can
+serve traffic. Unknown classifier or backend fields are rejected so a typo
+cannot silently change routing behavior. Classifier labels are nonblocking and
+do not count toward a mesh security quorum. For a complete routing
+configuration, see [ai-classifier-routing](../examples/ai-classifier-routing/)
+and the [embedding classifier guide](ai-gateway.md#embedding-classifier).
 
 See the [AI Gateway Guide](ai-gateway.md) for CEL selectors, Lua hooks, guardrails, context window validation, per-request attribution, and streaming behavior.
 
@@ -1238,15 +1869,20 @@ The block also accepts the LLM-aware keys: `retry_policy` (per-failure-class ret
 
 #### Shadow (`shadow`)
 
-Mirrors each request to a second provider concurrently. The primary's response is what the client sees; the shadow body is drained and metrics are logged at `target: sbproxy_ai_shadow` (status, latency, prompt/completion tokens, finish_reason). Useful for prompt regression checks before swapping a primary model.
+Mirrors a sampled set of non-streaming chat evaluation requests to a second provider after request policy, guardrails, model rewrites, and context compression. V1 includes Chat Completions plus normalized Messages and Responses requests. Mutating and non-chat surfaces, including Assistants, Threads, Batches, Fine Tuning, Files, images, audio, embeddings, moderation, and reranking, are never copied. The primary's response is what the client sees. Shadow work uses fire-and-forget admission bounded by 16 in-flight tasks and a 64 MiB reservation budget per live AI client, so shadow failure, timeout, or saturation cannot delay or reject the primary. Streaming requests are intentionally skipped.
+
+The shadow body is drained while at most 1 MiB is retained for comparison metadata, which is logged at `target: sbproxy_ai_shadow` (status, latency, prompt/completion tokens, finish reason). Each configured usage sink receives a distinct shadow row tagged `shadow`; its request ID is freshly generated by the server and ends in `:shadow`. Shadow cost is estimated in that row but does not debit primary budgets. Set `enabled: false` on a shadow-only provider to keep it out of primary routing; the explicit shadow selection still uses it. Credential provider allow/block rules apply to the shadow target independently. A request carrying `x-sbproxy-disallow-prompt-training: true` is copied only when the shadow provider declares `no_prompt_training: true`. A hosting process that attaches a purpose-scoped egress authorizer to `AiClient` suppresses v1 shadow dispatch because the direct shadow transport cannot yet consume authorized DNS pins and redirect checks.
 
 ```yaml
 shadow:
   provider: anthropic         # must also appear in `providers`
-  model: claude-haiku-4-5   # optional override; defaults to client's model
+  model: claude-haiku-4-5     # optional override; defaults to client's model
   sample_rate: 0.1            # mirror 10% of traffic; 1.0 mirrors all
-  timeout_ms: 30000
+  timeout_ms: 30000           # upstream HTTP timeout
+  task_timeout_ms: 30000      # hard wall-clock supervisor timeout
 ```
+
+`sbproxy_ai_shadow_dropped_total{reason=...}` uses the closed reasons `streaming`, `provider_not_found`, `provider_not_allowed`, `prompt_training_disallowed`, `egress_denied`, and `saturated`. Sampling out is expected behavior and does not increment the counter.
 
 #### Race strategy (`routing.strategy: race`)
 
@@ -1280,9 +1916,27 @@ origins:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `url` | string | required | Backend GraphQL endpoint URL (`http://` or `https://`). |
-| `max_depth` | int | 0 | Maximum query nesting depth. `0` means unlimited. |
-| `allow_introspection` | bool | true | When false, introspection queries are rejected. |
-| `validate_queries` | bool | false | When true, validate incoming GraphQL queries. |
+| `max_depth` | int | 0 | Maximum field nesting depth, including named-fragment expansion. The exact limit is accepted; `0` means unlimited. |
+| `allow_introspection` | bool | true | When false, operations selecting `__schema` or `__type` are rejected, including aliased or nested selections. |
+| `validate_queries` | bool | false | When true, parse GraphQL document syntax before proxying. This does not perform schema-aware validation. |
+
+With all three fields at their defaults, the action remains a transparent
+proxy and does not parse the request. Setting `validate_queries: true`,
+setting `max_depth` above zero, or setting `allow_introspection: false`
+enables fail-closed parsing. Validated requests support a percent-encoded
+`query` parameter on `GET`, plus an `application/json` object or batched
+array on `POST`. Every entry in a batch must contain a string `query`
+field and the complete batch is rejected when any entry fails. Validated
+`GET` requests are query-parameter-only: a non-empty inbound body, or a
+body added by a request modifier, is rejected with `400`.
+
+Validation failures return `400` before an HTTP request is sent upstream.
+Inbound bodies on validated requests are limited to 64 KiB so an accepted
+POST body can be replayed unchanged after the pre-upstream check; larger
+bodies return `413`. Multipart uploads and persisted-query-only envelopes
+are not validated transports and therefore return `400` when any validation
+control is enabled. They continue to pass through unchanged under the default
+transparent configuration.
 
 ### storage
 
@@ -1329,6 +1983,63 @@ origins:
 |-------|------|---------|-------------|
 | `url` | string | required | Upstream agent URL. |
 | `agent_card` | object | | Cached A2A agent card (free-form JSON). |
+
+### mcp
+
+Expose one MCP gateway that federates tools and resources from upstream MCP
+servers. Only `mode: gateway` is implemented, and `federated_servers` must
+contain at least one entry.
+
+```yaml
+origins:
+  "mcp.example.com":
+    action:
+      type: mcp
+      mode: gateway
+      server_info:
+        name: enterprise-tools
+        version: "1.0.0"
+      federated_servers:
+        - origin: https://tools.internal/mcp
+          prefix: tools
+          namespace: always
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `mode` | string | `gateway` | MCP operating mode. Other values fail configuration. |
+| `server_info` | object | generated defaults | Name and version returned by MCP `initialize`. |
+| `federated_servers` | list | required, non-empty | Upstream MCP or OpenAPI-backed servers. Each entry requires `origin`; optional fields include `prefix`, `namespace`, `transport`, `timeout`, `rbac`, and OpenAPI `spec` or `spec_path`. |
+| `rbac_policies` | map | `{}` | Named tool-access policies referenced by `federated_servers[].rbac`. |
+| `egress` | object | allow all | Default egress policy for OpenAPI-backed REST tools. A server-level `egress` block overrides it. |
+| `guardrails` | list | `[]` | Tool allowlist and lethal-trifecta checks applied before `tools/call`. |
+| `progressive_discovery` | bool | false | Advertise `search` and `execute` meta-tools instead of the full catalog. |
+| `oauth` | object | unset | RFC 9728 protected-resource discovery metadata. |
+| `refresh_interval` | duration | `60s` | Upstream tool and resource catalog refresh cadence. |
+| `upstream_connect_timeout` | duration | `5s` | TCP connection deadline for upstream exchanges. |
+| `upstream_timeout` | duration | `30s` | Whole-request deadline for upstream exchanges. |
+| `max_upstream_response_bytes` | int | 8 MiB | Maximum response body buffered from one upstream exchange. |
+| `tool_versioning` | object | unset | Optional lockfile, version-bump checks, judges, and rollout controls. |
+| `sessions` | object | unset | Optional `Mcp-Session-Id` lifecycle management. |
+| `token_compaction` | object | unset | Optional compaction for verbose tool-result text blocks. |
+| `dual_llm_quarantine` | object | unset | Optional LLM review gate for suspicious tool output. |
+| `tool_pricing` | map | `{}` | USD price per advertised tool name for cost attribution. |
+| `usage_sinks` | list | `[]` | JSONL, webhook, ledger, Langfuse, or Datadog tool-usage destinations. |
+
+See [mcp.md](mcp.md) for federation, RBAC, OpenAPI-backed tools, sessions,
+versioning, and cost attribution.
+
+### noop
+
+Return `200 OK` with an empty body. The action accepts no fields beyond
+`type` and is useful for health fixtures and policy-only origins.
+
+```yaml
+origins:
+  "noop.example.com":
+    action:
+      type: noop
+```
 
 ---
 
@@ -1561,6 +2272,78 @@ origins:
 | `trust_headers` | list | | Headers from the auth response to inject into the upstream request |
 | `success_status` | int \| list | 200 | Status code(s) that mean "authenticated". A list is accepted, but only the first element is used. |
 
+### bot_auth
+
+Verify RFC 9421 HTTP Message Signatures from known agents. Configure an inline
+`agents` directory, a hosted `directory`, or both.
+
+```yaml
+authentication:
+  type: bot_auth
+  clock_skew_seconds: 30
+  agents:
+    - name: openai-gptbot
+      key_id: openai-2026-01
+      algorithm: ed25519
+      public_key: ${OPENAI_BOT_PUBKEY}
+      required_components: ["@method", "@target-uri", "@authority"]
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `agents` | list | `[]` | Inline agent keys. Each `key_id` must be unique. |
+| `directory` | object | unset | HTTPS hosted-directory lookup and refresh settings. |
+| `clock_skew_seconds` | int | 30 | Tolerance for signature `created` and `expires` values. |
+| `nonce_policy` | string | `strict` | Replay behavior when a nonce store is installed: `strict` or `permissive`. |
+
+See [web-bot-auth.md](web-bot-auth.md) for directory validation, required
+signature components, and replay behavior.
+
+### cap
+
+Validate Crawler Authorization Protocol tokens from `CAP-Token` or the
+`Authorization: CAP` scheme. Configure a JWKS URL or an inline JWKS document;
+`jwks_url` wins when both are present.
+
+```yaml
+authentication:
+  type: cap
+  jwks_url: https://issuer.example.com/.well-known/cap/keys.json
+  audience: api.example.com
+  require_agent_binding: true
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `jwks_url` | string | unset | Remote JWKS endpoint. One of `jwks_url` or `jwks_static` is required. |
+| `jwks_static` | object | unset | Inline JWKS for offline or pre-issued-token deployments. |
+| `jwks_refresh_secs` | int | 3600 | Remote JWKS cache interval, clamped to at least 30 seconds. |
+| `audience` | string | request `Host` | Explicit token audience. |
+| `require_agent_binding` | bool | false | Require the token subject to match a resolved agent identity. |
+
+### oidc
+
+Run an OpenID Connect authorization-code and PKCE login flow, then authenticate
+later requests from a sealed session cookie.
+
+```yaml
+authentication:
+  type: oidc
+  authorization_endpoint: https://idp.example.com/authorize
+  token_endpoint: https://idp.example.com/oauth/token
+  jwks_uri: https://idp.example.com/.well-known/jwks.json
+  issuer: https://idp.example.com
+  client_id: sbproxy
+  client_secret: ${OIDC_CLIENT_SECRET}
+  cookie_secret: ${OIDC_COOKIE_SECRET}
+```
+
+The seven fields shown above are required. `cookie_secret` must contain at
+least 32 bytes after secret resolution. Optional fields include `scope`,
+`redirect_path`, session and transaction TTLs, userinfo, and RP-initiated
+logout settings. See [auth-oidc.md](auth-oidc.md) for the full field table and
+browser flow.
+
 ### noop
 
 The no-op auth provider accepts every request without checking credentials. Set this explicitly to mark an origin as unauthenticated, so the intent is obvious in the config.
@@ -1675,7 +2458,7 @@ The access log records the matched principal's source under the `principal_kind`
 
 Policies are evaluated before the action runs. They enforce rate limits, security rules, and access controls. The `policies` field is a sibling of `action` and is an array of policy objects.
 
-SBproxy ships twenty-seven policy types: `rate_limiting`, `rate_limit_budget`, `ip_filter`, `expression`, `waf`, `ddos`, `csrf`, `security_headers`, `request_limit`, `sri`, `assertion`, `request_validator`, `content_digest`, `concurrent_limit`, `ai_crawl_control`, `object_authz`, `exposed_credentials`, `page_shield`, `dlp`, `openapi_validation`, `prompt_injection_v2`, `http_framing`, `agent_class`, `a2a`, `semantic_constraint`, `peer_pricing_preflight`, and `agent_budget`. This page documents the most common ones; the rest have their own pages.
+SBproxy ships twenty-six policy types: `rate_limiting`, `rate_limit_budget`, `ip_filter`, `expression`, `waf`, `ddos`, `csrf`, `security_headers`, `request_limit`, `sri`, `assertion`, `request_validator`, `content_digest`, `concurrent_limit`, `ai_crawl_control`, `object_authz`, `exposed_credentials`, `page_shield`, `dlp`, `openapi_validation`, `prompt_injection_v2`, `http_framing`, `agent_class`, `a2a`, `semantic_constraint`, and `agent_budget`. This page documents the most common ones; the rest have their own pages.
 
 ### rate_limiting
 
@@ -1708,7 +2491,9 @@ Clients exceeding the limit receive `429 Too Many Requests` with a `Retry-After`
 | `headers` | object | | `X-RateLimit-*` and `Retry-After` header configuration |
 | `whitelist` | list | | IPs/CIDRs exempt from rate limiting |
 
-Distributed rate limiting: a single-instance deployment tracks counters in memory. For multi-instance deployments, configure an L2 Redis cache so counters are shared across all proxy replicas:
+Distributed rate limiting: a single-instance deployment tracks counters in memory. Multi-instance deployments have two options, and they enforce differently.
+
+**An L2 Redis cache is exact.** Every replica increments one shared counter, so the cluster admits exactly the configured limit. This is the option to pick when the limit is a hard promise.
 
 ```yaml
 proxy:
@@ -1717,6 +2502,18 @@ proxy:
     params:
       dsn: redis://redis.internal:6379/0
 ```
+
+**A gossip mesh with no Redis is approximate.** When `proxy.cluster` is configured and no L2 store is, each node admits against its own count plus a view of its peers refreshed every 3 seconds. That view is up to one refresh stale, so the cluster over-admits by at most:
+
+```
+overshoot = (nodes - 1) x rate_per_second x 3
+```
+
+For 600 requests per minute across three nodes that is 60 extra requests, so the cluster admits about 660 rather than 600. Five nodes admit about 720. Before this converged, the same configuration admitted 1800 and 3000: each node enforced the full limit by itself.
+
+Watch `sbproxy_rate_limit_cluster_peer_denials_total` to confirm it is working. The counter rises when a node denied a request that its own count alone would have admitted, which means peer counts are arriving. Flat at zero while several nodes serve the same limited key means they are not, and each node is enforcing its own limit while believing it is enforcing a shared one.
+
+**`requests_per_second` does not converge on a mesh.** A one second window closes before a peer's count can arrive, so per-second limits are enforced per node and the proxy warns at boot. Use `requests_per_minute`, which converges, or configure an L2 store for an exact per-second limit.
 
 ### ip_filter
 
@@ -1789,7 +2586,7 @@ policies:
 | `error_body` | string | structured JSON | Optional rejection body. Default is `{"error":"...","detail":"<location>"}` with no echoed payload. |
 | `error_content_type` | string | `application/json` | Content-Type for the rejection body. |
 
-The proxy buffers the request body locally until validation completes, then either releases it as one chunk to the upstream or aborts with the configured rejection. Remote `$ref` resolution in schemas is disabled at the workspace level so a malicious schema cannot become an SSRF primitive. The rejection body never echoes the offending payload back to the caller, only the JSON path where validation failed.
+The proxy buffers the request body locally until validation completes, then either releases it as one chunk to the upstream or aborts with the configured rejection. The validation buffer is capped at 8 MiB; a body past the cap is rejected with `413` before validation runs. Remote `$ref` resolution in schemas is disabled at the workspace level so a malicious schema cannot become an SSRF primitive. The rejection body never echoes the offending payload back to the caller, only the JSON path where validation failed.
 
 See [example 81](../examples/request-validator/sb.yml).
 
@@ -1842,7 +2639,7 @@ Cap in-flight requests per key. Distinct from `rate_limiting`, which throttles R
 policies:
   - type: concurrent_limit
     max: 50
-    key: api_key      # or 'ip', or 'origin' (default)
+    key_by: api_key   # or ip, route, header:<name>, or global (default)
     status: 503
     error_body: '{"error":"too many concurrent requests"}'
 ```
@@ -1850,11 +2647,12 @@ policies:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `max` | int | required | Maximum concurrent requests per key. Must be `> 0`. |
-| `key` | string | `origin` | Bucket strategy: `origin` (one global counter for the route), `ip` (per client IP), or `api_key` (per `X-Api-Key` or `Bearer` token). |
+| `key_by` | string | `global` | Bucket strategy: `global`, `ip`, `api_key`, `route`, or `header:<name>`. Route keys use the request path without its query. |
+| `key` | string | unset | Legacy schema-v1 spelling retained for compatibility. Supports `origin`, `ip`, and `api_key`; use `key_by` in new configuration. |
 | `status` | int | 503 | HTTP status when the limit is exceeded. |
 | `error_body` | string | unset | Optional response body for rejections. |
 
-Each accepted request takes a permit; the permit is released when the request finishes (success, error, or client disconnect). Counters use a sharded `DashMap` so contention across keys is bounded.
+Each accepted request takes a permit; the permit is released when the request finishes (success, error, panic, or client disconnect). Idle keys are removed from the sharded map, so one-off client keys do not accumulate after their requests drain.
 
 See [example 82](../examples/concurrent-limit/sb.yml).
 
@@ -1967,14 +2765,19 @@ The scan covers the request URI (path + query) and request headers; auth-class h
 
 ### prompt_injection_v2
 
-Successor to the v1 `prompt_injection` heuristic. The v2 policy splits detection from enforcement: a swappable detector returns a score in `[0.0, 1.0]` plus a categorical label, and the policy maps the score onto an action. The OSS build registers a heuristic detector by default (`detector: heuristic-v1`) so the policy works out of the box. Future builds register additional detectors (e.g. an ONNX classifier) without touching the policy core.
+Successor to the legacy `injection` / `prompt_injection` guardrail names. The v2 policy splits detection from enforcement: a swappable detector returns a score in `[0.0, 1.0]` plus a categorical label, and the policy maps the score onto an action. When `detector` is omitted, a complete verified local model pair selects `inprocess`; when both artifacts are absent, SBproxy logs the resolved paths once and selects `heuristic-v1`. Partial or invalid artifacts fail startup rather than silently downgrading.
 
 ```yaml
 policies:
   - type: prompt_injection_v2
     action: tag                         # tag (default) | block | log
-    detector: heuristic-v1              # default; lookup is link-time
+    # detector omitted: verified local auto-selection
     threshold: 0.5                      # fires when score >= threshold
+    detector_config:
+      model_path: /var/lib/sbproxy/models/injection/model.onnx
+      tokenizer_path: /var/lib/sbproxy/models/injection/tokenizer.json
+      model_sha256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      tokenizer_sha256: abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789
     score_header: x-prompt-injection-score
     label_header: x-prompt-injection-label
     block_body: 'prompt injection detected'
@@ -1983,15 +2786,29 @@ policies:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `detector` | string | `heuristic-v1` | Detector name. Resolved against the inventory registry; unknown names fail at compile time. |
+| `detector` | string | auto | Explicit `heuristic-v1`, `inprocess`, `sidecar`, or a registered custom name. Omission selects a verified local pair when present, otherwise the heuristic. Explicit choices always win. |
+| `detector_config.model_path` | path | classifier cache | Local ONNX path. In auto mode, configured paths take precedence over `<user-cache-dir>/sbproxy/models/prompt-injection-v2/model.onnx`. |
+| `detector_config.tokenizer_path` | path | classifier cache | Matching tokenizer path. Both paths must be configured together; partial presence is an error. |
+| `detector_config.model_sha256` | string | trusted registry pin | Required with `tokenizer_sha256` unless `detector_config.model` names a registry entry with a complete trusted pair. |
+| `detector_config.tokenizer_sha256` | string | trusted registry pin | Required with `model_sha256`; 64 hexadecimal characters. |
+| `detector_config.model_signature_path` | path | none | Optional detached Ed25519 signature over the model SHA-256 digest. Configure with tokenizer signature and public key. |
+| `detector_config.tokenizer_signature_path` | path | none | Optional detached Ed25519 signature over the tokenizer digest. |
+| `detector_config.signature_public_key` | string | none | Ed25519 key as 64 hex characters or a `PUBLIC KEY` PEM block. All three signature fields are required together. |
+| `detector_config.max_model_bytes` | integer | `209715200` | Model size budget checked before parsing. |
+| `detector_config.max_tokenizer_bytes` | integer | `209715200` | Tokenizer size budget checked before parsing. |
 | `threshold` | float | `0.5` | Score threshold in `[0.0, 1.0]`; the policy fires when `score >= threshold`. |
 | `action` | string | `tag` | `tag` stamps the score / label headers on the upstream. `block` returns `403` with `block_body`. `log` writes a structured warn under `sbproxy::prompt_injection_v2`. |
 | `score_header` | string | `x-prompt-injection-score` | Header carrying the numeric score (formatted as `"%.3f"`) on `action: tag`. |
 | `label_header` | string | `x-prompt-injection-label` | Header carrying `clean` / `suspicious` / `injection` on `action: tag`. |
 | `block_body` | string | `prompt injection detected` | Response body returned on `action: block`. |
 | `block_content_type` | string | `text/plain` | Content-Type for the block body. |
+| `enable_body_aware` | boolean | `false` | Scan the request body as well as the URI + headers. `ai_proxy` prompts and A2A message parts are scored as independent segments (worst-of-N, per-segment caching); on plain origins the buffered body is scanned at the body phase. Off means the body streams through unbuffered and unscanned. The body buffer is capped at 8 MiB; a larger body is rejected with `413` before the scan. Combining with `action: tag` on a non-`ai_proxy` origin fails config compile, because a body hit cannot stamp the tag headers. |
+| `a2a.root_action` | string | inherit | `log` or `block`, applied to an agent-to-agent hit at delegation depth 0. Omitted follows `action`, with `tag` resolving to `log`. |
+| `a2a.block_above_delegation_depth` | integer or null | `0` | Delegation depth above which an agent-to-agent hit blocks regardless of `a2a.root_action`. Depth 0 is the chain root, so the default blocks any delegated hop. `null` disables the escalation. |
 
-The OSS scaffold scans the request URI + non-auth headers (`Authorization`, `Cookie`, `Set-Cookie` are excluded so tokens carried by design don't self-flag) at request-filter time. Tag mode stamps the score / label headers via the existing trust-headers channel before `upstream_request_filter` builds the upstream request; block mode rejects with `403` immediately. Body-aware detection (the prompt typically lives in the JSON body) is on the roadmap and lands with the ONNX classifier follow-up. See [prompt-injection-v2.md](prompt-injection-v2.md) for the trait shape, the eval harness, and how to register a custom detector.
+The generic policy scans the request URI + non-auth headers (`Authorization`, `Cookie`, `Set-Cookie` are excluded so tokens carried by design don't self-flag) at request-filter time. Tag mode stamps the score / label headers via the existing trust-headers channel before `upstream_request_filter` builds the upstream request; block mode rejects with `403` immediately. Set `enable_body_aware: true` after measuring false positives to scan buffered request bodies as well; on a plain origin pair it with `block` or `log`, since a body hit arrives after the upstream request is assembled and cannot tag (`tag` + body-aware is refused at config compile there). A body-borne block honours `block_content_type`. See [prompt-injection-v2.md](prompt-injection-v2.md) for the phase table, auto-selection failure boundaries, the eval harness, and custom detector registration.
+
+The `a2a.*` keys apply only when an `a2a` policy is configured on the same origin and the request is detected as A2A 1.0. There is no `tag` in the agent-boundary vocabulary: the scan runs at the request-body phase, after the upstream request header has been built, so there is no header left to stamp. See [prompt-injection-v2.md](prompt-injection-v2.md#the-agent-boundary).
 
 ### waf
 
@@ -2537,7 +3354,7 @@ origins:
 | `headers.add` | map | Append headers |
 | `headers.remove` | list | Remove headers (alias: `delete`) |
 | `status.code` | int | Override the response status code |
-| `status.text` | string | Optional reason phrase (informational only; not sent in HTTP/2) |
+| `status.text` | string | Compatibility-only reason phrase; accepted with a warning and ignored |
 | `body.replace` | string | Replace the response body with this string |
 | `body.replace_json` | object | Replace the response body with this JSON value |
 
@@ -2592,7 +3409,206 @@ origins:
 | `cacheable_status` | list | `[200]` | Status codes eligible for caching. Alias: `status_codes`. |
 | `max_size` | int | 10000 | Upper bound on the in-memory cache size in entries. Ignored when an L2 Redis backend is attached. |
 
-When `proxy.l2_cache_settings` is configured with `driver: redis`, response cache entries are stored in the shared backend; the in-memory `max_size` becomes irrelevant.
+### Choosing the backing store
+
+There is one response-cache store per process. Every origin with `response_cache.enabled` shares it, which is safe because the cache key already carries the workspace, hostname, method, path, canonical query, and the Vary fingerprint, so two origins cannot read each other's entries. The store is built only when at least one origin enables the cache.
+
+`proxy.response_cache_store` picks which store that is. It is a top-level `proxy` block, not a per-origin field.
+
+```yaml
+proxy:
+  response_cache_store:
+    backend:
+      type: file
+      path: /var/cache/sbproxy/responses
+      max_size_mb: 512
+```
+
+| `type` | Survives a proxy restart | Shared across replicas | Stale-while-revalidate | Prefix purge |
+|--------|--------------------------|------------------------|------------------------|--------------|
+| `memory` | no | no | yes | yes |
+| `file` | yes | yes, when replicas share the directory | yes | no |
+| `memcached` | yes, until memcached itself restarts | yes | no | no |
+| `redis` | yes | yes | no | yes |
+
+Backend fields:
+
+| Backend | Field | Type | Default | Description |
+|---------|-------|------|---------|-------------|
+| `memory` | | | | No fields. Sized by the largest per-origin `response_cache.max_size`. |
+| `file` | `path` | string | required | Directory holding one file per entry, named by a hash of the cache key. Created at startup; a directory that cannot be created stops startup. |
+| `file` | `max_size_mb` | int | 0 | Ceiling on total directory size. `0` means no ceiling. A write that would cross the ceiling is refused rather than evicting an older entry, and every write walks the directory to measure it, so the check costs more as the entry count grows. Leave it at `0` unless the disk budget is real. |
+| `memcached` | `host` | string | `127.0.0.1` | Server hostname or IP. |
+| `memcached` | `port` | int | `11211` | Server port. |
+| `redis` | | | | No fields. Reuses the connection from `proxy.l2_cache_settings`. Selecting `redis` without that block stops startup. |
+
+Omit the block and the store is chosen the way it always was: Redis if `l2_cache_settings` is set with `driver: redis`, an in-process map otherwise. Existing configs therefore keep the backend they have today. The per-origin `max_size` sizes the `memory` store only; the other three ignore it.
+
+Check these before picking one, because none of them are configurable away.
+
+- `file` and `memcached` hash cache keys, so neither can scan by prefix. `invalidate_on_mutation` (on by default) does nothing on them and entries fall out by TTL instead.
+- Neither `memcached` nor `redis` can hand back an entry that is past its TTL, so `stale_while_revalidate` never fires on them. Memcached expires items server-side, and the Redis entry carries its own expiry.
+- `memcached` opens a TCP connection per operation, and its server default caps a value at 1 MiB. Larger responses are refused by the server; the write is logged and the request proceeds.
+- `memcached` and `redis` are not dialled at startup. A config compiles and the proxy boots with the server down; the first cache read is where you find out.
+
+Cache keys sent to memcached are hashed to fit the protocol's 250-byte limit, and a TTL longer than 30 days is clamped to 30 days because memcached reads anything larger as an absolute timestamp.
+
+### Encrypting cached responses at rest
+
+A response cache holds whatever the upstream returned, and once that is on disk or in a shared memcached it outlives the request that produced it. The optional `encryption` block seals response headers and bodies with AES-256-GCM before they reach the backing store.
+
+```yaml
+proxy:
+  response_cache_store:
+    backend:
+      type: file
+      path: /var/cache/sbproxy/responses
+    encryption:
+      enabled: true
+      key: "secret://primary/response-cache"
+      previous_keys:
+        - "secret://primary/response-cache-2026-06"
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | false | Master switch. |
+| `key` | string | unset | Secret reference for the active key. Seals new entries and opens entries sealed under it. Required when `enabled` is true. |
+| `previous_keys` | list of strings | `[]` | Retired keys, used only to open entries sealed before a rotation. |
+
+`key` and each entry in `previous_keys` take the same references as every other secret in the config: a provider URI such as `secret://backend/name` or `vault://...` resolved against a backend declared under [`proxy.secrets.backends`](#secret-reference-uri-schemes), a `file:/path` reference, or a whole-value `${ENV_VAR}`. The resolved material must be at least 16 bytes.
+
+Use 32 random bytes, not a passphrase. The proxy logs a short fingerprint of the key it loaded so operators can tell two keys apart, and that fingerprint gives an attacker something to guess against offline. Against 256 bits of entropy the guessing goes nowhere. Against a phrase somebody thought up, it finishes.
+
+```bash
+head -c 32 /dev/urandom | base64 > /etc/sbproxy/response-cache.key
+chmod 600 /etc/sbproxy/response-cache.key
+```
+
+Status, cache time, and TTL are stored readable, because the file and memcached backends need them to decide expiry without opening the entry. All three are authenticated, so they can be read but not altered: rewriting a cached `200` as a `500`, or stretching an entry's TTL, fails the integrity check.
+
+Every backend accepts the block, including `memory`, where it protects nothing meaningful: the plaintext lives in the same process either way. It is allowed there so a config can move between backends without anyone editing the encryption block.
+
+There is no plaintext fallback anywhere in this path:
+
+- A key that is missing, unresolvable, or shorter than 16 bytes stops startup with an error naming the field. A typo costs a failed boot, never a directory of plaintext you believed was sealed.
+- A secret reference is never used as key material verbatim. When no secret backend is configured to resolve it, startup fails and points at `proxy.secrets.backends`.
+- A write that cannot be sealed fails. It never falls back to storing the response in the clear.
+- A stored entry that no configured key can open is evicted and reported as a miss, so a cache that used to run unencrypted heals as entries are rewritten.
+- A stored entry that claims a configured key and then fails authentication is evicted, logged, and treated as a cache error; the request goes to the upstream.
+
+`sbproxy validate` checks the shape of the block but resolves no secrets and touches no filesystem, matching how it treats secrets everywhere else. A bad key reference surfaces the first time the config is served.
+
+#### Nonces
+
+Every entry draws its own random salt and derives a single-use key from the master material, so each 96-bit nonce is used under a key that seals exactly one message. That keeps the cache clear of the nonce-reuse ceiling a single long-lived key would reach in days at gateway write rates.
+
+#### Key rotation
+
+Move the current reference into `previous_keys` and name the new one as `key`. New writes seal under the new key; existing entries keep opening under the old one until they are rewritten or expire. Drop a reference out of `previous_keys` and its entries are evicted on the next read, at the cost of one cache miss each.
+
+Every entry carries a short identifier for the key that sealed it, so a read picks the right key directly rather than trying each one in turn.
+
+#### Per-origin keys
+
+One store serves every origin. By default one key seals every origin's entries too, which means the only thing separating two tenants in the cache is the cache key. `origins.<host>.response_cache.encryption` gives an origin its own key instead.
+
+```yaml
+proxy:
+  response_cache_store:
+    backend:
+      type: redis
+    encryption:
+      enabled: true
+      key: "secret://primary/response-cache"
+      per_origin_keys: inherit
+
+origins:
+  tenant-a.example.com:
+    response_cache:
+      enabled: true
+      encryption:
+        key: "secret://primary/cache-tenant-a"
+        previous_keys:
+          - "secret://primary/cache-tenant-a-2026-06"
+  tenant-b.example.com:
+    response_cache:
+      enabled: true
+      # No key, so this origin uses the store-wide one.
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `proxy.response_cache_store.encryption.per_origin_keys` | `inherit` \| `required` | `inherit` | What happens to an origin that caches and declares no key. `inherit` uses the store-wide key. `required` stops startup, naming every origin that is missing one. |
+| `origins.<host>.response_cache.encryption.key` | string | unset | Secret reference for this origin's active key. Same reference syntax as the store-wide `key`. |
+| `origins.<host>.response_cache.encryption.previous_keys` | list of strings | `[]` | This origin's retired keys. Rotating one origin does not touch any other. |
+
+The origin is authenticated into every entry regardless of which key sealed it. An entry sealed for one origin therefore fails to open when read as another, even when both inherit the store-wide key. That makes cross-tenant isolation a property of the record rather than of the routing table: a mis-scoped lookup fails the integrity check instead of returning another tenant's response body.
+
+What per-origin keys add on top is key separation. Under `inherit`, one leaked key opens every tenant's entries. Under `required`, it opens one tenant's.
+
+- Declaring a per-origin key while `proxy.response_cache_store.encryption` is off stops startup. An operator who wrote a key expected sealing to happen; ignoring it would store that tenant in the clear.
+- Every per-origin reference is resolved at boot. An unresolvable one stops startup with an error naming the origin, matching the store-wide rule.
+- Purge is unaffected. It matches on the cache key and never opens a value, so `POST /admin/cache/purge` with a prefix still clears entries sealed under keys the admin path does not hold.
+- Entries written by a build that predates per-origin keys keep opening, and reseal with the origin bound the next time they are written. Downgrading to such a build evicts the newer entries as unreadable and refetches them, which costs a cache miss each and no correctness.
+
+The runnable version of all of this is [`examples/response-cache-encrypted/`](../examples/response-cache-encrypted/).
+
+### What is encrypted at rest, and what is not
+
+Encryption is worth configuring where data outlives the request. This table says which surfaces those are, so the answer is not inferred from whichever block happens to have an `encryption` key.
+
+| Surface | What it holds | Persists or replicates | Encrypted at rest |
+| --- | --- | --- | --- |
+| Response cache | Upstream headers and bodies | Yes, with the `file`, `redis`, and `memcached` backends | Yes, via `proxy.response_cache_store.encryption` |
+| Prompt persistence | Runtime prompt-overlay records | Yes, a redb file on disk | Yes, via `admin.prompt_persistence_encryption` |
+| Upstream credentials | Provider secrets | Yes, in the keystore | Yes, as an AEAD envelope or a vault reference. See [key-management.md](key-management.md) |
+| Prompt cache | Normalised prompts and responses | No, in-process only | Not applicable |
+| Judge cache | Guardrail verdicts | No, in-process only | Not applicable |
+| Mesh distributed cache | Key-plane records, compression sessions | No, excluded from persisted cluster state | Not applicable. Peer traffic is sealed on the wire, see below |
+
+Memory-only caches are deliberately not encrypted. An attacker who can read the process heap can read the derived key out of the same heap, so sealing there buys close to nothing while adding another key to manage. Encrypt what persists or replicates.
+
+The prompt cache and the judge cache are memory-only because their in-tree implementations are, not because nothing could change that: both are structured so a backend can be swapped in. Startup therefore refuses a pipeline in which one of those caches reports a backend that survives a restart or is shared across replicas while storing entries unsealed. The response cache is checked too, but only warns: running it unencrypted on a `file` or `redis` backend is a documented configuration an operator chose, and the fix is the same `encryption` block either way.
+
+A credential whose material is stored as plaintext (`kind: plaintext`, only reachable for config-seeded credentials) is never published to a shared cache tier at all, neither the mesh tier nor Redis. Those resolves read through to the keystore instead. Prefer a vault reference or an envelope so the credential can be cached.
+
+#### What the mesh wire cipher does and does not cover
+
+`mesh.encryption.shared_key` seals traffic **between peers**. It protects cache and state RPCs in flight from anything watching the network between nodes.
+
+It is not at-rest encryption, and it is a different mechanism from the blocks above:
+
+- It covers bytes on the wire, not bytes in a backing store. A value the mesh replicates is sealed while it travels and plain in each node's memory once it arrives.
+- It does not extend to the response cache's backing store. A `redis` or `file` backend still needs `proxy.response_cache_store.encryption`; the wire cipher does nothing for a Redis server an attacker can read directly.
+- The mesh distributed cache is excluded from persisted cluster state, so its values do not reach Redis or disk through that path.
+
+The wire key is derived from `shared_key` by `key_derivation`, which is `sha256` by default and can be set to `hkdf` to put the mesh on the same derivation every other key in this workspace uses. Every node opens under both derivations, so a cluster is flipped one node at a time rather than all at once. See [mesh-replication.md](mesh-replication.md).
+
+### Encrypting persisted prompts at rest
+
+`admin.prompt_persistence_path` writes the runtime prompt overlay to a redb file so runtime prompt edits survive a restart. Prompt templates can carry business logic and, in some deployments, embedded context worth protecting. The optional `prompt_persistence_encryption` block seals each stored record with AES-256-GCM.
+
+```yaml
+admin:
+  prompt_persistence_path: /var/lib/sbproxy/prompts.redb
+  prompt_persistence_encryption:
+    enabled: true
+    key: "secret://primary/prompt-persistence"
+    previous_keys:
+      - "secret://primary/prompt-persistence-2026-06"
+```
+
+The same reference syntax as every other config secret: a provider URI against a backend declared under `proxy.secrets.backends`, a `file:/path` reference, or a whole-value `${ENV_VAR}`.
+
+Behaviour worth knowing before enabling it:
+
+- **No plaintext fallback.** `enabled: true` with no `key`, an unresolvable reference, or material shorter than 16 bytes aborts startup. This is stricter than the rest of prompt persistence, where an unreadable file only degrades to in-memory-only edits. Losing a file loses saved prompts; silently writing records in the clear after asking for encryption is worse.
+- **Turning it on does not orphan an existing file.** Records already written as plaintext keep hydrating, and each one seals the next time it is written.
+- **Records are bound to their slot.** The store key is authenticated, so a sealed record copied into another host's or another prompt's slot fails to open rather than being served as that prompt.
+- **Its key is separate from the response cache's.** Both derive through their own HKDF purpose, so pointing them at one operator secret still yields two unrelated keys, and neither can open the other's records.
+
+Rotation works as it does for the response cache: move the current reference into `previous_keys`, name the new one as `key`, and records reseal as they are rewritten. Each record carries a short identifier for the key that sealed it, so a read selects the right key directly. Drop a reference out of `previous_keys` and any record still sealed under it stops opening, which is what retiring a key means.
 
 ---
 
@@ -2784,24 +3800,10 @@ origins:
 
 ### Secret references
 
-Secrets are resolved through the top-level `proxy.secrets` block (see [Secrets](#secrets)). Once resolved, secrets are available in templates as `{{ secrets.name }}`.
-
-```yaml
-proxy:
-  secrets:
-    backend: hashicorp
-    hashicorp:
-      addr: https://vault.example.com:8200
-    map:
-      database_url: secret/data/prod/db_url
-      stripe_key: secret/data/prod/stripe_key
-
-origins:
-  "api.example.com":
-    action:
-      type: proxy
-      url: "{{ secrets.database_url }}"
-```
+Declare named backends under `proxy.secrets.backends` and place a provider URI
+directly in a secret-bearing field. The legacy `backend`, `hashicorp`, `map`,
+`rotation`, and `fallback` fields remain parseable but are config-only. See
+[Secrets](#secrets) and [the secrets guide](secrets.md).
 
 ### Template scopes
 
@@ -2893,22 +3895,10 @@ origins:
 
 ## Connection pool
 
-Per-origin connection pool tuning. When unset, falls back to proxy-wide defaults.
-
-```yaml
-origins:
-  "api.example.com":
-    connection_pool:
-      max_connections: 128
-      idle_timeout_secs: 90
-      max_lifetime_secs: 300
-```
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `max_connections` | int | 128 | Maximum concurrent connections to the upstream |
-| `idle_timeout_secs` | int | 90 | Maximum idle time before a connection is closed |
-| `max_lifetime_secs` | int | 300 | Maximum total lifetime of a connection |
+`origins.*.connection_pool` is retained for config compatibility but is not
+applied by the OSS runtime. Pingora's built-in upstream connection-pool
+behavior remains in effect regardless of the three parsed values. Do not use
+this block to enforce a connection cap, idle timeout, or maximum lifetime.
 
 ---
 
@@ -2965,7 +3955,7 @@ origins:
 | `json.max_keys` | int | unlimited | Maximum number of keys in any single object. |
 | `json.max_string_length` | int | unlimited | Maximum length of any single string value. |
 | `json.max_array_size` | int | unlimited | Maximum length of any single array. |
-| `json.max_total_size` | int | unlimited | Maximum total body size in bytes, checked before parsing. |
+| `json.max_total_size` | int | `8388608` | Maximum total body size in bytes, enforced while the body streams in and before parsing. A body past the cap is rejected with `413`, so proxy memory for the scan is bounded by the cap. Unset takes the proxy's 8 MiB buffering hard cap; the same bound applies to the body-validation buffer used by `request_validator`, `openapi_validation`, `content_digest`, and body-aware `prompt_injection_v2`. |
 
 ---
 
@@ -3331,7 +4321,7 @@ See [example 75](../examples/request-mirror/sb.yml).
 
 ## Upstream retries
 
-When an upstream connection fails (TCP refused, DNS failure, TLS handshake error, or connect timeout), or when an upstream response returns a configured status code, the proxy can retry the request automatically.
+When an upstream connection fails (TCP refused, DNS failure, TLS handshake error, or connect timeout), when an established upstream connection hits a read or write deadline, or when an upstream response returns a configured status code, the proxy can retry the request automatically.
 
 ```yaml
 origins:
@@ -3351,15 +4341,30 @@ origins:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `max_attempts` | int | `1` | Total request attempts including the original. `1` disables retries. |
-| `retry_on` | array | `[connect_error, timeout]` | Retry conditions. Recognized values include `connect_error`, `timeout`, and numeric upstream status codes such as `502` or `503`. Status codes may be written as YAML numbers or strings. |
+| `max_attempts` | int | `1` | Total request attempts including the original. `0` or `1` disables retries. Values above `16` are rejected at config load: the proxy loop never runs more tries than that. |
+| `retry_on` | array | `[connect_error, timeout]` | Retry conditions. Recognized values are `connect_error` (any failure establishing the upstream connection), `timeout` (a connect-phase deadline, or a read/write deadline on the established connection), and numeric upstream status codes in `100..=599` such as `502` or `503`. Status codes may be written as YAML numbers or strings. Any other entry, and an explicitly empty list, is rejected at config load instead of silently never matching. |
 | `backoff_ms` | int | `100` | Base backoff before the next attempt. Doubles on each retry, capped at 5000ms. |
 
-`retry` is accepted on both `proxy` and `load_balancer` actions. For `load_balancer`, a failed target is reported to the outlier detector and circuit breaker so the next retry attempt selects a different healthy peer rather than retrying the same dead target.
+`retry` is accepted on both `proxy` and `load_balancer` actions. Connect-error, timeout, and status-code retries share one attempt counter, so a mixed failure sequence is capped at `max_attempts` total attempts. When every attempt is exhausted, the last upstream response (or transport error) is what the client sees, untouched.
 
-Status-code retries are decided after upstream response headers arrive and before any downstream response headers are written. The proxy only replays methods that are safe or idempotent by HTTP semantics: `GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT`, and `DELETE`. A request with a body is replayed only after the downstream body has fully arrived and Pingora's retry buffer still contains the full body. Non-idempotent methods such as `POST` and `PATCH`, still-streaming bodies, and bodies larger than the retry buffer pass through unchanged. When a configured status retry is skipped, the response carries `x-sbproxy-retry-skip-reason` with one of `non_idempotent_method`, `streaming_body`, `body_too_large`, `body_unavailable`, or `max_attempts_exhausted`.
+Timeout retries cover two phases. A connect-phase deadline (TCP connect or TLS handshake) retries when `retry_on` lists either `connect_error` or `timeout`: a connect timeout is both a connect error and a timeout, so either token enables it. A read or write deadline hit after the connection was established retries only under the `timeout` token, and only while the response has not started: once any response byte has been written toward the client, nothing can be recalled, so the timeout surfaces as an error instead. Because an established-connection timeout means the request already reached the upstream, these retries also apply the same replay rules as status-code retries below: safe or idempotent methods only, with a request body the retry buffer can replay in full. Connect-phase retries carry no such method gate, because the request was never sent.
 
-See [example 76](../examples/upstream-retries/sb.yml).
+Status-code retries are decided after upstream response headers arrive and before any downstream response headers are written. The proxy only replays methods that are safe or idempotent by HTTP semantics: `GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT`, and `DELETE`. A request with a body is replayed only after the downstream body has fully arrived and Pingora's retry buffer still contains the full body; the buffer is Pingora machinery, not something the proxy re-implements, and a body it cannot replay is never retried. Non-idempotent methods such as `POST` and `PATCH`, still-streaming bodies, and bodies larger than the retry buffer pass through unchanged. When a configured status retry is skipped, the response carries `x-sbproxy-retry-skip-reason` with one of `non_idempotent_method`, `streaming_body`, `body_too_large`, `body_unavailable`, or `max_attempts_exhausted`.
+
+Choosing which statuses to retry is the operator's risk call, and the method gate above does not remove it: a `PUT` is idempotent in HTTP semantics but a billing webhook behind it may not be. A `503` usually means the upstream refused the request before doing any work, which makes it the safest status to retry. `502` and `504` are ambiguous: the upstream (or an intermediary in front of it) may have processed the request before the response was lost. List a status only when replaying a processed request is acceptable for that origin.
+
+For `load_balancer` actions, whether a retry lands on a different target depends on the algorithm:
+
+- `round_robin` advances its counter on every selection, so a retry naturally moves to the next target even with no health machinery configured.
+- `weighted_random` draws independently on each attempt; the retry may pick the failed target again by chance.
+- `least_connections` re-ranks by current connection counts; the failed target can win again.
+- `ip_hash`, `uri_hash`, `header_hash`, and `cookie_hash` are deterministic over the eligible target list, so a retry re-selects the same target until something shrinks that list.
+
+Independently of the algorithm, a failed attempt is reported to the outlier detector and the per-target circuit breaker when those are configured on the action. Once a target crosses the detector's ejection threshold (or its breaker opens), it drops out of the eligible list and every algorithm, including the hash-based ones, re-maps to a surviving target. Without outlier detection or circuit breakers configured, hash-based algorithms retry the same dead target; pair status retries with those features (or active health checks) if that matters for your topology.
+
+Each status-triggered retry increments `sbproxy_upstream_status_retries_total{origin, status}` at decision time. Skipped matches do not count; they surface through `x-sbproxy-retry-skip-reason` instead. Each retry of a timed-out attempt increments `sbproxy_upstream_timeout_retries_total{origin, phase}`, where `phase` is `connect` for connection-establishment deadlines and `upstream` for read/write deadlines on the established connection; timeouts that are not retried do not count.
+
+See [example 76](../examples/upstream-retries/sb.yml) for the combined connect + status story, and [retry-on-status](../examples/retry-on-status/sb.yml) for status-code retries across a two-target load balancer.
 
 ---
 
@@ -3424,7 +4429,7 @@ The breaker is **complementary to** [outlier detection](#outlier-detection):
 | Circuit breaker | `N` failures in a row, immediate isolation |
 | Outlier detection | Failure *rate* over a sliding window |
 
-Either signal independently ejects a target from `select_target`. Configure both for robust resilience: outlier detection catches "this target is bad in aggregate," the breaker catches "this target is hard down right now." When every target is tripped, the LB falls back to the unfiltered list rather than 502'ing the client.
+Either signal independently ejects a target from `select_target`. Configure both: outlier detection catches "this target is bad in aggregate," and the breaker catches "this target is hard down right now." When every target is tripped, the LB falls back to the unfiltered list rather than 502'ing the client.
 
 See [example 84](../examples/circuit-breaker/sb.yml).
 
@@ -3623,35 +4628,36 @@ Alert webhook channels (`proxy.alerting.channels[]`) do not accept a `secret` fi
 
 ## Secrets
 
-The top-level `proxy.secrets` block configures how `secret:` references are resolved at config-load time and how rotation is handled.
+The live surface is the named-backend list under
+`proxy.secrets.backends`. Provider URI references select a backend by name and
+fail startup if they cannot be resolved:
 
 ```yaml
 proxy:
   secrets:
-    backend: hashicorp
-    hashicorp:
-      addr: https://vault.example.com:8200
-      token: ${VAULT_TOKEN}
-      mount: secret
-    map:
-      openai_key: secret/data/prod/openai_key
-      db_password: secret/data/prod/db_password
-    rotation:
-      grace_period_secs: 300
-      re_resolve_interval_secs: 60
-    fallback: cache
+    backends:
+      - type: hashicorp
+        name: primary
+        addr: https://vault.example.com
+        mount: secret
+        auth:
+          type: token
+          token: ${VAULT_TOKEN}
+
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: vault://primary/apps/openai?key=api_key
 ```
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `backend` | string | `env` | Backend used to resolve secrets. Supported: `env`, `local`, `hashicorp`. |
-| `hashicorp.addr` | string | | Vault server address (required when `backend = hashicorp`) |
-| `hashicorp.token` | string | from `VAULT_TOKEN` env var | Vault token |
-| `hashicorp.mount` | string | `secret` | KV secrets engine mount path |
-| `map` | map | | Logical-name to vault-path mapping |
-| `rotation.grace_period_secs` | int | 300 | Seconds the previous secret value remains valid after rotation |
-| `rotation.re_resolve_interval_secs` | int | 60 | How often to re-fetch secrets from the backend |
-| `fallback` | string | `cache` | Strategy when the backend is unavailable. Supported: `cache`, `reject`, `env`. |
+The legacy `proxy.secrets.backend`, `hashicorp`, `map`, `rotation`, and
+`fallback` keys are config-only compatibility fields. They do not select a
+backend, schedule re-resolution, provide a dual-value grace window, or change
+failure behavior. Use [the named-backend guide](secrets.md) for every supported
+backend and URI shape.
 
 The `extensions` map at both the proxy and the origin level holds opaque blocks consumed by enterprise / third-party crates. OSS does not parse them.
 
@@ -3670,13 +4676,14 @@ In addition to `${ENV}`, `file:`, and `secret:`, secret-bearing fields accept pr
 | `vault://` | HashiCorp Vault KV | `vault://primary/secret/data/openai-prod?key=api_key` |
 | `awssm://` | AWS Secrets Manager | `awssm://primary/openai-keys?version=3&key=api_key` |
 | `gcpsm://` | GCP Secret Manager | `gcpsm://primary/openai-api-key?version=latest` |
+| `azurekv://` | Azure Key Vault | `azurekv://primary/openai-api-key?version=6a2b45c8f9e14e0d` |
 | `k8ssecret://` | Kubernetes Secret | `k8ssecret://primary/sbproxy-secrets/openai-key` |
 | `secretfile://` | Local YAML or JSON secret file | `secretfile://local/openai-prod?key=api_key` |
 | `secret://` | Local static secret map | `secret://local/openai-prod` |
 
 * `<backend-name>` is the operator-chosen backend instance name declared under `proxy.secrets.backends:`.
 * `<provider-path>` is the backend-specific path. The parser carries it verbatim; each backend validates its own shape at resolve time.
-* `version=<n>` pins a secret version where the backend supports versioning, such as HashiCorp KV v2, AWS Secrets Manager, or GCP Secret Manager. It is ignored by versionless backends.
+* `version=<n>` pins a secret version where the backend supports versioning, such as HashiCorp KV v2, AWS Secrets Manager, GCP Secret Manager, or Azure Key Vault. It is ignored by versionless backends.
 * `key=<json-field>` extracts a sub-field from a JSON secret payload. When omitted the entire payload is returned.
 * Additional query parameters carry through to the backend as opaque hints; the parser does not interpret them.
 
@@ -3689,6 +4696,7 @@ authentication:
     - vault://primary/secret/data/openai-prod?key=api_key
     - awssm://primary/prod/openai-keys?version=3&key=api_key
     - gcpsm://primary/openai-api-key?version=latest
+    - azurekv://primary/openai-api-key?version=6a2b45c8f9e14e0d
     - k8ssecret://primary/sbproxy-secrets/openai-key
     - secretfile://local/openai-prod?key=api_key
     - secret://local/openai-prod
@@ -3740,7 +4748,7 @@ origins:
           api_key: vault://beta-vault/secret/data/openai-prod?key=api_key
 ```
 
-The `vault://acme-vault/...` reference resolves against the `acme-vault` backend at `vault.acme.example`; the `beta-vault` reference resolves against the other instance. Backend types are `local`, `file`, `hashicorp`, `aws`, `gcp`, and `k8s`; see [secrets.md](secrets.md) for each backend's fields and auth methods. An unresolved reference in a secret-bearing field fails startup rather than reaching the wire verbatim.
+The `vault://acme-vault/...` reference resolves against the `acme-vault` backend at `vault.acme.example`; the `beta-vault` reference resolves against the other instance. Backend types are `local`, `file`, `hashicorp`, `aws`, `gcp`, `azure`, and `k8s`; see [secrets.md](secrets.md) for each backend's fields and auth methods. An unresolved reference in a secret-bearing field fails startup rather than reaching the wire verbatim.
 
 ---
 
@@ -3838,7 +4846,11 @@ proxy:
 
 ## Redis integration
 
-Redis has two roles in SBproxy: distributed caching (L2 cache) and real-time messaging (config sync, cache invalidation). Both blocks are nested under `proxy:`.
+Redis has two roles in SBproxy: distributed caching and shared state through the
+general L2 store, plus real-time messaging for config sync and cache
+invalidation. Both blocks are nested under `proxy`, but they use separate
+connection implementations. The verified TLS, authentication, database, and
+client-certificate contract in this section applies to `l2_cache_settings`.
 
 ### L2 cache (distributed rate limiting and caching)
 
@@ -3847,10 +4859,20 @@ proxy:
   l2_cache_settings:
     driver: redis
     params:
-      dsn: redis://redis.internal:6379/0
+      dsn: rediss://cache-user:${REDIS_PASSWORD_URLENCODED}@redis.internal:6380/7
+      ca_file: /etc/sbproxy/redis/ca.pem
+      cert_file: /etc/sbproxy/redis/client.pem
+      key_file: /etc/sbproxy/redis/client-key.pem
 ```
 
-When configured, rate limit counters are shared across all proxy instances. Response cache entries can also be stored in Redis for shared caching. The deserializer also accepts `l2_cache:` as a canonical alias.
+When configured, rate limit counters are shared across all proxy instances.
+Response cache entries can also be stored in Redis for shared caching. The
+deserializer accepts `l2_cache:` as an alias. See
+[`l2_cache_settings`](#l2_cache_settings) for legacy address compatibility,
+verified TLS, credential encoding, database selection, startup validation, and
+lazy connection behavior. The runnable
+[`redis-l2-secure`](../examples/redis-l2-secure/) example exercises private-CA
+verification, client mTLS, password authentication, and database 7.
 
 ### Messenger (real-time config updates)
 
@@ -3866,7 +4888,7 @@ When configured, config changes pushed via the API propagate to all proxy instan
 
 The Redis driver expects `params.dsn`. SQS uses `queue_url`, `region`, `api_key`. GCP Pub/Sub uses `project`, `topic`, `subscription`, `access_token`. The `memory` driver takes no params and is single-replica only.
 
-### Full Redis setup
+### L2 plus messenger setup
 
 ```yaml
 proxy:
@@ -3875,7 +4897,10 @@ proxy:
   l2_cache_settings:
     driver: redis
     params:
-      dsn: redis://redis.internal:6379/0
+      dsn: rediss://cache-user:${REDIS_PASSWORD_URLENCODED}@redis.internal:6380/7
+      ca_file: /etc/sbproxy/redis/ca.pem
+      cert_file: /etc/sbproxy/redis/client.pem
+      key_file: /etc/sbproxy/redis/client-key.pem
   messenger_settings:
     driver: redis
     params:
@@ -3893,6 +4918,516 @@ origins:
       enabled: true
       ttl_secs: 300
 ```
+
+The messenger DSN above is intentionally shown separately. Do not add the L2
+TLS file fields under `messenger_settings` or assume that the messenger inherits
+the L2 connection.
+
+---
+
+## Config source (GitOps)
+
+The top-level `source:` block says where the configuration document comes from. Without it, the file you hand the binary *is* the configuration, which is the historical behaviour and still the default. With it, that file is a pointer and the document it names is what compiles, boots, and serves traffic.
+
+Earlier releases parsed this block, published it in the JSON Schema, and then ignored it: a proxy configured with `source: {kind: git}` started clean and quietly served whatever was in the local file. That is fixed. The block is honoured at boot, on every reload, on a refresh timer, and by `sbproxy validate` and `sbproxy plan`. A `source:` block that cannot be resolved now stops the proxy starting instead of being skipped.
+
+```yaml
+source:
+  kind: git
+  repo: https://github.com/acme/sbproxy-config.git
+  revision: main                  # branch, tag, or a full commit sha
+  path: production/sb.yml
+  credential: env:SB_GIT_TOKEN    # private repositories only
+  verify_signature: false
+  timeout_secs: 60
+  refresh_interval_secs: 60
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `kind` | enum | required | `local` (the file is the config, same as omitting the block), `git`, or `git_overlay`. |
+| `repo` | string | required for `git` | Any URL `git clone` accepts. `https` and `ssh` both work. |
+| `revision` | string | default branch | A branch, a tag, or a full 40- or 64-character commit sha. A full sha is a pin, see below. |
+| `path` | string | required for `git` | Path to the config file inside the repository. Relative, and `..` components are refused: this names a file in the repository, not a file on the proxy host. |
+| `credential` | secret ref | | `env:NAME`, `${NAME}`, `file:/path`, or `secret://backend/name`. An inline literal is refused. |
+| `verify_signature` | bool | `false` | Require a verifiable signature on the resolved tag or commit. |
+| `timeout_secs` | int | `60` | Hard timeout for one fetch, 1 to 3600. The `git` child process is killed when it expires. |
+| `refresh_interval_secs` | int | `60` | How often to re-resolve while running. `0` resolves at boot and on ordinary reloads only. |
+
+### What a git source proves, and what it does not
+
+Transport trust: HTTPS plus whatever the git host authenticated the fetch as. There is no signature over the document and no provenance beyond "the remote served this". That is the same guarantee every GitOps tool offers and it is a reasonable place to stand, but it is **not** the guarantee a [signed config bundle](#config-authority-fleet-configuration-distribution) carries. If someone can write to the repository, or to the branch, they can change what your proxies run.
+
+Two settings close most of that gap, and both are yours to choose:
+
+- **Pin `revision` to a full commit sha.** After fetching, SBproxy resolves `HEAD` and refuses the document when it is not the commit you named. A branch moving underneath a pinned node cannot be followed silently, and a pinned node never reloads on someone else's push.
+- **Set `verify_signature: true`.** The resolved tag is checked first, then the commit, and a missing or unverifiable signature refuses the document. The signing key has to be in the git trust store on the proxy host.
+
+### `git` is a runtime dependency
+
+Resolution shells out to the `git` binary, so every host that resolves a git source needs `git` installed, container images included. A missing binary is a named failure that says so rather than a confusing clone error, and `sbproxy doctor` reports it in the `tooling` block:
+
+```text
+tooling
+  git         /usr/bin/git (git version 2.43.0)
+```
+
+One implementation note, because it changes what your git server has to allow: `git clone --depth 1` cannot fetch an arbitrary commit sha unless the server sets `uploadpack.allowReachableSHA1InWant`. Pinning to a sha therefore fetches the single commit when the server allows it and falls back to a full fetch when it does not. Pinning works either way; on a server without that setting it costs a full clone.
+
+### Refresh
+
+The resolved commit is the change detector. Each cycle re-resolves the source and compares: an unchanged commit means no recompile and no reload, exactly the way an unchanged `ETag` ends an authority poll. A moved commit compiles and applies through the same three-phase reload transaction a SIGHUP takes, so a document that does not compile leaves the previous configuration serving.
+
+The interval carries jitter, so a fleet that restarts together does not hit your git host in lockstep. The apply step never waits for the reload lock: another reload in flight skips the cycle and the next interval retries, rather than queueing up cycles for a commit that has since been superseded.
+
+| Situation | Behaviour |
+|---|---|
+| Remote unreachable, or `git` missing | Keep serving the document already applied. Error log, `unreachable` counter. |
+| Fetch exceeded `timeout_secs` | Child process killed. Keep serving. `timeout`. |
+| `revision` pins a sha and `HEAD` is a different commit | Refuse the document. `revision_mismatch`. |
+| `verify_signature` set and no verifiable signature | Refuse the document. `verify_failed`. |
+| Resolved document does not compile or cannot be constructed | Refuse the document. `compile_failed`. |
+| Another reload in flight | Skip the cycle. `reload_busy`. |
+| Resolved commit unchanged | Nothing at all. `not_modified`. |
+
+**Observability.** `sbproxy_config_source_fetch_total{kind,result}` counts one label per cycle, and `sbproxy_config_source_revision_info{sha}` carries the commit currently serving as a label with a constant value of `1`, so you can join "which config" onto every other series from that node.
+
+**Drift.** `GET /admin/drift` answers "has the local file changed since we read it?", so on a git-sourced node both sides of that comparison are the pointer file and drift stays `false` while the repository moves. Whether the *source* moved is what `sbproxy_config_source_revision_info` answers.
+
+### Node identity in a shared repository
+
+One repository pointed at by a whole fleet cannot carry `proxy.cluster` as written. Nearly every field in that block is a per-node fact, and changing any of them rejects the entire reload, so either every node claims the same `node_id` or the repository omits the block and every clustered node hard-fails.
+
+**The supported pattern is `${VAR}` interpolation.** The shared document names the per-node values and each host exports them:
+
+```yaml
+# in the repository, shared by the whole fleet
+proxy:
+  cluster:
+    cluster_id: prod-eu
+    node_id: ${SB_NODE_ID}
+    advertise_addr: ${SB_ADVERTISE_ADDR}:7946
+    roles: [gateway, worker]
+```
+
+Environment is the natural carrier in containers and Kubernetes, which is where a shared repository is most likely, and it needs no second document to keep in sync.
+
+Anywhere else in the config, an unresolved `${VAR}` is a warning and stays as literal text. **Under `proxy.cluster` in a resolved source document it is a hard failure**, because a host that forgot to export its node id would otherwise join the cluster under the literal string `${SB_NODE_ID}` and collide with every other host that forgot the same thing:
+
+```text
+the resolved config source leaves node-local reference(s) unresolved:
+proxy.cluster.node_id: ${SB_NODE_ID}. These identify this node, so the literal
+placeholder text cannot be used as a value: export the environment variable(s)
+on this host, or move the value into a node-local overlay
+```
+
+If a repository document changes the cluster fingerprint on a running node, the reload refusal now names the fields rather than saying only that something changed:
+
+```text
+process-owned cluster configuration changed and cannot be applied to a running
+process (changed field(s): proxy.cluster.node_id, proxy.cluster.seeds); restart
+sbproxy to adopt it.
+```
+
+`kind: git_overlay` is the alternative when the difference between nodes is structural rather than a handful of scalars. It resolves a base source and then merges ordered overlays on top of it, each of which is itself a source:
+
+```yaml
+source:
+  kind: git_overlay
+  base:
+    kind: git
+    repo: https://github.com/acme/sbproxy-config.git
+    revision: main
+    path: fleet/sb.yml
+  overlays:
+    - kind: git
+      repo: https://github.com/acme/sbproxy-config.git
+      revision: main
+      path: sites/eu-west/sb.yml
+```
+
+Overlays merge map by map with the overlay winning, sequences replace wholesale, and the chain is capped at eight levels deep. Every resolved commit contributes to the change detector, so a move in any input triggers one reload of the merged document.
+
+### Three deployment shapes
+
+**1. Standalone GitOps.** A `source:` block and no `proxy.config_authority`. The repository is the whole configuration and the proxy follows it on a timer. No signing infrastructure, no control plane, nothing to run.
+
+```yaml
+source:
+  kind: git
+  repo: https://github.com/acme/sbproxy-config.git
+  revision: main
+  path: production/sb.yml
+```
+
+**2. A git base with a signed authority overlay.** The local file declares a git source and also subscribes to an authority. Resolution order is fixed: the source resolves first and produces the base document, then the authority's signed overlay merges on top, then it compiles. **The authority wins over git**, key by key, because the [deny list](#what-the-subscriber-owns-outright) is what protects the box and the authority is the layer it is enforced against. Git content is operator-owned and therefore unrestricted, which is right: it is equivalent to editing the file by hand.
+
+```yaml
+source:
+  kind: git
+  repo: https://github.com/acme/sbproxy-config.git
+  revision: main
+  path: production/sb.yml
+proxy:
+  config_authority:
+    upstream:
+      url: https://control.example.com:9443
+      mode: overlay
+      subscriber_id: edge-01
+      credential: env:SB_CONFIG_AUTHORITY_TOKEN
+      verifying_keys_file: /etc/sbproxy/authority-keys.json
+      cache_path: /var/lib/sbproxy/config-bundle.json
+```
+
+You keep your own baseline in your repository and central policy still lands on it. Neither layer is locally owned, so a local edit is doomed either way. The merge records where every leaf in the result came from, and that provenance now has three values rather than two: `local`, `git`, and `authority`. A leaf from the git base carries the repository, the reference, and the resolved commit, which is what makes "why is this value here" answerable. An admin surface that serves the provenance map is not part of this version.
+
+When the repository moves, the refresh cycle re-applies the authority overlay it already holds on top of the new base, rather than reloading the repository's document alone. Otherwise there would be a window, one poll interval wide, where the node serves neither layer's answer.
+
+**3. A git-backed authority.** The authority's own published document declares a git source. It resolves that document, then validates, signs, stores, and distributes the *resolved* content. Customers keep configuration in their own repository, and the authority signs and fans it out.
+
+Signing the pointer instead would hand every subscriber a URL to fetch for itself, which is transport trust rather than the signed guarantee that endpoint promises. And because the resolved document is screened like any other payload, a repository whose configuration declares its own `source:` block is refused: `source` is on the deny list, since the authority overlays a base document and does not get to choose where that base comes from.
+
+### Validating a git-sourced config
+
+`sbproxy validate` and `sbproxy plan` resolve the source, so they check the document that would actually boot. Both accept `--no-fetch` to skip resolution, for a machine with no network or no credential for the repository, and both say so on stderr rather than passing silently:
+
+```bash
+sbproxy validate /etc/sbproxy/sb.yml
+sbproxy validate /etc/sbproxy/sb.yml --no-fetch
+# note: '/etc/sbproxy/sb.yml' declares a `source:` block and --no-fetch was
+# passed, so only the pointer file was checked. The document this proxy would
+# actually serve was not looked at.
+```
+
+### Not in this version
+
+No write-back: nothing here commits to a repository. Be aware that on a git-sourced node the admin config editor still writes the local pointer file, which the next refresh then resolves past, so the repository is the only place a configuration change sticks. Making that editor read-only is not part of this version. No `db` source kind, no submodule or LFS support, and no in-process git implementation; the `git` binary stays the transport.
+
+---
+
+## Config authority (fleet configuration distribution)
+
+Configuration in a file is configuration you have to copy to every box. `proxy.config_authority` replaces the copying: one node signs a configuration and the rest verify it and apply it, through the same reload transaction a SIGHUP takes.
+
+A node takes one of the two roles, never both:
+
+| Block | Role |
+|---|---|
+| `proxy.config_authority.publish` | **authority**: validates, signs, stores, and serves configuration |
+| `proxy.config_authority.upstream` | **subscriber**: polls, verifies, merges, applies |
+
+Setting both is a config error. A node in both roles would republish a document it does not fully own, and the provenance an auditor reads downstream would name that node rather than the authority the values actually came from.
+
+Runnable configs for both halves are in [`examples/config-authority/`](../examples/config-authority/).
+
+### What the subscriber owns outright
+
+No authority can set these paths, in either merge mode:
+
+`proxy.listeners`, `proxy.tls`, `proxy.admin`, `proxy.secrets`, `proxy.cluster`, `proxy.model_host`, `proxy.config_authority`, `source`
+
+Presence of one of them anywhere in a payload rejects the whole payload, at publish time on the authority and again at merge time on the subscriber. Not the changed keys, the whole thing: a partial apply of a configuration is a configuration nobody wrote.
+
+The reason is recovery. If a fleet-wide push could rewrite `proxy.admin`, the first bad push would take away the port you would use to undo it. If it could rewrite `proxy.config_authority`, it could point every node at a different authority, permanently. And `proxy.tls` and `proxy.secrets` are per-node material that a central document has no business knowing.
+
+### Authority: `proxy.config_authority.publish`
+
+```yaml
+proxy:
+  admin:
+    enabled: true
+    bind: 127.0.0.1
+    port: 9090
+    password: ${ADMIN_PASSWORD}
+
+  config_authority:
+    publish:
+      authority_id: control-plane-eu
+      key_id: authority-2026-07
+      signing_key_file: /etc/sbproxy/authority-signing.key
+      store_dir: /var/lib/sbproxy/config-authority
+      bind: 0.0.0.0:9443
+      tls:
+        cert_file: /etc/sbproxy/authority.pem
+        key_file: /etc/sbproxy/authority-key.pem
+      rate_limit_per_subscriber_per_minute: 30
+      rate_limit_total_per_minute: 1200
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `authority_id` | string | required | Stamped into every bundle. Subscribers read it as `authority_id`. Letters, digits, and `. - _ :`. |
+| `key_id` | string | required | Selects which entry of a subscriber's `verifying_keys_file` verifies the signature. Same character set. |
+| `signing_key_file` | path | required | One standard-base64 32-byte Ed25519 seed. Owner-only on unix. |
+| `store_dir` | path | required | Holds the durable revision counter, the current and previous signed bundles, and the subscriber registry. |
+| `bind` | `host:port` | required | The bundle listener's own address. An IP and a fixed port; a hostname and port `0` are both refused. |
+| `tls.cert_file` | path | | PEM certificate chain, leaf first. Required when `bind` is not loopback. |
+| `tls.key_file` | path | | PEM private key (PKCS#8 or RSA). Required when `bind` is not loopback. |
+| `rate_limit_per_subscriber_per_minute` | int | `30` | Requests one subscriber may make per minute before a `429`. 1 to 1000000; cannot be turned off. |
+| `rate_limit_total_per_minute` | int | `1200` | Requests served per minute across the whole fleet before a `429`. Must be at least the per-subscriber cap. |
+
+Two rules refuse a publishing node at startup, both checked by `sbproxy validate`:
+
+- **The shipped default admin password is refused, whatever `bind` says.** On an ordinary node, loopback plus the defaults is the first-run path and guards nothing the local user does not already have. On a publishing node the admin API validates, signs, and publishes the configuration every subscriber then applies, so the blast radius is the fleet rather than the box.
+- **A signing key that cannot be loaded is refused.** Missing, oversized, group-readable, or not a 32-byte seed. An authority that cannot sign cannot serve, and finding that out at the first publish attempt means finding it out during a change window.
+
+The bundle listener is separate from the admin listener, and its TLS posture is stricter. `proxy.admin` leaves TLS optional on a remote bind; this listener refuses to start on a non-loopback bind with no `tls` block, and refuses to start when configured TLS material cannot be read. It never falls back to plaintext. Subscribers present a long-lived fleet credential on it and the response body is the whole configuration.
+
+The listener serves exactly one path. `/admin/*`, `/metrics`, and the admin UI are all `404` there, so a subscriber's credential can never reach an operator surface.
+
+### The revision store on disk
+
+```text
+<store_dir>/
+  authority-state.json      revision counters + subscriber registry
+  revisions/current.json    the signed bundle subscribers fetch
+  revisions/previous.json   the one before it
+```
+
+Every file is written to a temporary name in the same directory, flushed, then renamed over the target, so a crash mid-write leaves the old file or the new one and never a truncated one.
+
+`authority-state.json` carries two counters. `current_revision` is what `revisions/current.json` holds; `high_water_revision` is the highest number ever handed out. The reservation is persisted *before* the bundle is signed, so a crash between the two burns a number rather than reissuing it: a subscriber that has applied revision 8 refuses a later bundle that also calls itself 8 with different content, and it refuses one that calls itself 7 at all. Gaps in the sequence are free; a reused number is not. `high_water_revision` above `current_revision` in the status document is exactly that: a reservation that never published.
+
+The bundle file is written before the state file names it, so the other crash window leaves a bundle nothing points at. That one is repaired at startup rather than refused: the reservation already covered the number, so nothing else can claim it, and the file on disk is the one that was signed. A bundle claiming a number above `high_water_revision`, or a state file naming a bundle that is not there, is refused, because both mean the two files came from different places.
+
+An invalid payload consumes nothing at all, because every validation step runs before the reservation.
+
+The store directory is pinned to its `authority_id`. Pointing a second authority at a directory the first wrote is refused rather than adopted, since the revision counter and the subscriber registry belong to whoever created them.
+
+### Publish validation matches boot
+
+`POST /admin/config-authority/publish` runs the same three steps `sbproxy validate` runs, in the same order: `compile_config`, then the per-origin module constructors, then the model-host desired-state checks.
+
+`compile_config` alone leaves `action`, `policies`, `transforms`, and `authentication` as opaque JSON. A typo inside a policy entry therefore compiles clean, signs clean, and then fails on every subscriber at once, which is a fleet-wide outage caused by a validation gap. Running the constructors is what catches it.
+
+The payload is validated as a configuration in its own right, because that is all the authority can see: under `mode: overlay` the document that actually boots is the payload merged over each subscriber's local file, and the authority does not have those files. So an `${VAR}` the authority cannot resolve is warned about rather than refused, since it may well resolve on the subscriber; if it does not, the subscriber refuses the bundle rather than applying the literal text.
+
+A publish payload is bounded by the admin server's request-body limit (512 KiB) as well as the signed-bundle limit (4 MiB), so the practical ceiling is the smaller of the two.
+
+### Admin routes
+
+All five sit on the admin listener behind operator auth and RBAC.
+
+| Route | Method | Purpose |
+|---|---|---|
+| `/admin/config-authority/publish` | `POST` | Body is the YAML payload; `?mode=overlay\|replace` selects how subscribers apply it (default `overlay`). |
+| `/admin/config-authority/rollback` | `POST` | Republish the previous stored revision's payload. No body, no query. |
+| `/admin/config-authority/status` | `GET` | Current revision, digest, ETag, key ID, the verifying-key file to distribute, and per-subscriber last-seen revision. |
+| `/admin/config-authority/subscribers` | `GET` / `POST` | List subscribers, or register one with `{"subscriber_id":"edge-01"}`. |
+| `/admin/config-authority/subscribers/revoke` | `POST` | `{"credential_id":"..."}` for one credential, `{"subscriber_id":"..."}` for every credential that node holds. |
+
+Operating these from `curl` is possible but nobody should have to.
+`sbproxy config authority {init|publish|status|rollback|subscriber}` is the
+same surface with local validation, an exit-code contract, and
+`--format json`; `sbproxy config pull --dry-run` previews what a
+subscriber would apply next without applying it. See
+[manual.md](manual.md#config-authority---operate-a-config-authority).
+
+`rollback` republishes the previous payload under a *new* revision number
+rather than re-serving the old one. A subscriber's anti-replay cursor
+refuses any revision that is not greater than the one it applied, so
+re-serving the old number would reach only the nodes that had not yet
+taken the revision being undone. The payload is revalidated on the way
+through, since a payload that published cleanly before a binary upgrade
+need not still construct after one. With nothing to go back to, the route
+answers `400` with code `no_previous_revision` and
+`"revision_consumed": false`.
+
+Registration returns the clear credential exactly once. The authority stores only a SHA-256 fingerprint of it, so the registry file is not a credential store: someone who reads it cannot authenticate with it. Credentials look like `sbca1.<credential-id>.<secret>` and are long-lived and reusable, unlike the single-use `sbce1` cluster enrollment tokens.
+
+A subscriber may hold several credentials at once, which is how one is rotated without a window where the node cannot fetch: register the new one, deploy it, then revoke the old.
+
+A rejected publish says which step caught it and confirms nothing was spent:
+
+```json
+{
+  "error": "config authority publish rejected: the payload compiles, but a module failed to construct, so every subscriber would refuse it at boot: ...",
+  "code": "construct_failed",
+  "revision_consumed": false
+}
+```
+
+Codes are `invalid_payload`, `denied_path`, `compile_failed`, `construct_failed`, `model_runtime_invalid` (the payload is at fault, `400`), and `signing_failed`, `store_failed`, `internal` (the authority is at fault, `500`, safe to retry).
+
+### The wire contract
+
+Documented so a non-SBproxy server can serve subscribers. One endpoint, one method.
+
+**Request.**
+
+```http
+GET /config-authority/v1/bundle HTTP/1.1
+Host: control.example.com:9443
+Authorization: Bearer sbca1.0lJ8kQ2vTn5mAqRt.9pQx7Yb2ZmKd3Lw8Rn6Tf1Vc4Hs0Jg5Ee2Aa8Bb1Cc
+X-Sbproxy-Subscriber-Id: edge-01
+If-None-Match: "7-sha256:2c26b46b68ffc68ff99b453c1d3041341340d0d0d0d0d0d0d0d0d0d0d0d0d0d0"
+```
+
+`Authorization` is the credential and the identity. `X-Sbproxy-Subscriber-Id` is a claim about it: SBproxy refuses a fetch whose header disagrees with the credential's registered subscriber (`403`), because the last-seen revision the endpoint records is the fleet's rollout evidence and attributing it to the wrong node makes that evidence worse than none. Sending no header at all is fine.
+
+**Response.**
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+ETag: "8-sha256:fcde2b2edba56bf408601fb721fe9b5c338d10ee429ea04fae5511b68fbf8fb9"
+Cache-Control: no-store
+Content-Length: 612
+
+{"schema_version":1,"bundle":{"authority_id":"control-plane-eu","revision":8,"mode":"overlay","content_digest":"sha256:fcde2b2edba56bf408601fb721fe9b5c338d10ee429ea04fae5511b68fbf8fb9","config_yaml":"origins:\n  \"edge.example.com\":\n    action:\n      type: proxy\n      url: https://test.sbproxy.dev\n","issued_at_unix_ms":1753401600000,"expires_at_unix_ms":null},"key_id":"authority-2026-07","algorithm":"ed25519","signature":"3p8Q0m...=="}
+```
+
+**The ETag format is exact:** `"<revision>-<content_digest>"`, with the double quotes, where `content_digest` is the `sha256:<64 lowercase hex>` of the exact `config_yaml` bytes. Both halves matter. The revision is what the authority compares; the digest is what makes a same-revision content change visible instead of a silent `304`. A subscriber sends back verbatim what it last received.
+
+`If-None-Match` accepts a comma-separated list, `*`, and the weak `W/` prefix, so an ordinary HTTP client library works against this endpoint.
+
+**Statuses.**
+
+| Status | Meaning |
+|---|---|
+| `200` | A bundle, with its `ETag`. |
+| `304` | `If-None-Match` matched the current bundle. No body, no `Content-Length`. |
+| `401` | No bearer credential, or one that does not authenticate. |
+| `403` | A valid credential that has been revoked, or a subscriber-ID header that disagrees with it. |
+| `404` | Nothing published yet, or any path other than the bundle path. |
+| `405` | Any method other than `GET`. |
+| `429` | Past the per-subscriber or the fleet-wide rate limit. |
+
+A subscriber treats every non-`200`, non-`304` answer as "authority unreachable": it keeps serving the configuration it already applied and retries at the next interval. A revoked credential therefore does not take a node down, it stops it receiving updates.
+
+**The envelope.** `signature` is base64 Ed25519 over `sbproxy.config-bundle.v1`, a single `0x00` byte, then the RFC 8785 (JCS) canonical JSON of the `bundle` object. Canonical JSON means the signature survives any re-serialization that preserves the parsed values, and the domain-separation prefix means a bundle signature can never be replayed as a cluster-state or model-dispatch signature even when one key signs all three. `content_digest` is checked independently of the signature, so a corrupt payload is caught even when the signing key is compromised.
+
+**Key distribution.** Subscribers read trusted keys from a JSON file mapping key ID to material. `GET /admin/config-authority/status` returns exactly this document under `verifying_keys_file`:
+
+```json
+{
+  "authority-2026-07": {
+    "algorithm": "ed25519",
+    "key": "3p8Q0mB1yV4kX7wR2tL6nS9cF5jH0dA8gZ2eK4uY1oM="
+  },
+  "authority-2026-08": {
+    "algorithm": "ed25519",
+    "key": "9kL2xP7bT4mV1nQ8wR5tY6sF3jH0dA8gZ2eK4uY1oM="
+  }
+}
+```
+
+Rotation is additive: publish under the new `key_id` while subscribers still trust the old one, then drop the old entry a window later. No restart at all, on any node. A subscriber re-reads `verifying_keys_file` on every poll that returns a bundle, so adding an entry starts verifying and removing one stops verifying without the process being touched. That matters most for the removal: a key revoked because it leaked has to stop working when you edit the file, not when you finish restarting the fleet. A read that fails, which is what a file being rewritten looks like for an instant, keeps the key set already loaded rather than trusting nothing, so an ordinary rotation is not a window where every bundle is refused. `hmac_sha256` is also accepted, for a single-operator lab, and refuses to verify unless the subscriber sets `allow_shared_secret_keys: true`; a shared secret is symmetric, so every subscriber holding it can forge a bundle for every other one.
+
+### Subscriber: `proxy.config_authority.upstream`
+
+```yaml
+proxy:
+  config_authority:
+    upstream:
+      url: https://control.example.com:9443
+      mode: overlay
+      subscriber_id: edge-01
+      credential: env:SB_CONFIG_AUTHORITY_TOKEN
+      verifying_keys_file: /etc/sbproxy/authority-keys.json
+      poll_interval: 30s
+      cache_path: /var/lib/sbproxy/config-bundle.json
+      max_staleness: 24h
+      require_bundle_on_boot: false
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `url` | string | required | Absolute base URL of the authority. Must be `https` unless `allow_insecure_http`. No query or fragment; the subscriber appends its own path. |
+| `mode` | enum | required | `overlay` merges the bundle over the local document; `replace` makes the bundle the whole document. Required rather than defaulted: the answer decides whether the local file still describes what the node serves. |
+| `subscriber_id` | string | required | Sent on every fetch as `x-sbproxy-subscriber-id`. Must match the id the credential was registered under. |
+| `credential` | secret ref | | Bearer credential, as `env:NAME`, `${NAME}`, `file:/path`, or `secret://backend/name`. An inline literal is refused: a token in a config file is a token in every copy of that file. |
+| `verifying_keys_file` | path | required | JSON file naming every key this subscriber trusts. |
+| `poll_interval` | duration | `30s` | 5s to 24h. The real interval carries jitter, so a fleet restarting together does not synchronize onto the authority. |
+| `cache_path` | path | required | Where the verified bundle is cached so the node can boot on the last known configuration. The anti-replay cursor is stored beside it as `<cache_path>.cursor`. |
+| `max_staleness` | duration | `24h` | How old a cached bundle may be and still be used at boot. At least `poll_interval`, at most 30 days. |
+| `require_bundle_on_boot` | bool | `false` under `overlay`, `true` under `replace` | Refuse to start without a usable bundle. An explicit `false` under `replace` is a config error rather than a silently overridden value, because under replace the local document is not a servable configuration. |
+| `allow_insecure_http` | bool | `false` | Permit a plaintext `http://` authority URL. Development only: signatures still hold, but the credential and the whole configuration are exposed on the path. |
+| `allow_shared_secret_keys` | bool | `false` | Acknowledge that `hmac_sha256` entries may verify bundles. Development only. |
+
+One cycle: conditional `GET`, verify the envelope, merge over the local document, refuse an unresolved `${VAR}`, then apply through the non-blocking reload entry point. A `304` ends the cycle before any compile.
+
+**Boot does no network I/O.** Startup that depends on a remote fetch is startup that hangs when the remote is slow. A node reads its cache and its key file and nothing else, so an empty cache means booting on the local document under `overlay` (with a loud warning) or refusing to start under `replace`. The first poll a few seconds later brings the authority's document in. Seeding `cache_path` with a signed bundle is how a `replace` subscriber comes up the first time.
+
+**Failure behaviour.** Every arm leaves the previously applied configuration serving:
+
+| Situation | Behaviour |
+|---|---|
+| Authority unreachable, or any answer other than `200` / `304` | Keep serving the cached bundle. Error log, age gauge climbs. |
+| Signature, schema, digest, expiry, declared-mode, or replay refusal | Reject the candidate. |
+| Merged document does not compile or cannot be constructed | Reject the candidate. |
+| Merged document carries an unresolved `${VAR}` | Reject the candidate, rather than applying the literal text fleet-wide. |
+| Bundle names a subscriber-owned path | Reject the whole bundle. |
+| Another reload in flight | Skip the cycle and retry at the next interval, rather than queueing behind it. |
+
+A running node past `max_staleness` keeps serving and logs at error level every cycle. The window is a boot-time gate, not a kill switch: a control-plane outage should not take down a data plane that does not depend on it.
+
+**Observability.** `sbproxy_config_bundle_fetch_total{result}` counts one label per cycle (`ok`, `not_modified`, `unreachable`, `verify_failed`, `compile_failed`, `denied_path`, `reload_busy`), `sbproxy_config_bundle_revision` gauges the applied revision, and `sbproxy_config_bundle_age_seconds` gauges the age of the bundle currently serving, measured from local receipt rather than from the authority's `issued_at` so two disagreeing clocks cannot produce an absurd age at exactly the moment someone is trying to work out whether distribution is stuck.
+
+Changing `proxy.config_authority` requires a restart. The block sits on the deny list, so it is also the one thing an authority can never rewrite.
+
+### What is running here, and who owns it
+
+Once configuration can arrive from a repository or an authority, "show me the config" stops having one answer. Three routes give the three different answers, and the difference matters most on the node you are trying to debug.
+
+| Route | Answers |
+|---|---|
+| `GET /admin/config` | This node's own file, verbatim. On a git-sourced node this may be nothing but the `source:` block that selected the repository. |
+| `GET /admin/config/effective` | The document actually running, after the base and any authority overlay are merged, plus which layer set each setting. |
+| `GET /admin/config/schema` | The JSON Schema for the config file, generated from the running binary's own types. |
+
+`GET /admin/drift` keeps its existing meaning, which is narrower than it sounds: it compares the **local file** against the content hash captured at the last load. On a git-sourced or authority-managed node it therefore reports drift in the local file only, and a node whose repository moved is not "drifted" by this measure. Use the effective route to see the merged result and `sbproxy_config_bundle_revision` or `sbproxy_config_source_revision_info` to see whether the remote layer is current.
+
+The effective response carries a provenance map from dotted setting path to the layer that set it:
+
+```json
+{
+  "yaml": "proxy:\n  http_bind_port: 8080\n...",
+  "provenance": {
+    "proxy.http_bind_port": "local",
+    "origins.api.action.url": "authority"
+  },
+  "layers": {
+    "base": {"kind": "git", "repo": "https://git.example.com/fleet.git", "reference": "main", "commit": "3f2a..."},
+    "authority": {"authority_id": "control-plane", "revision": 12, "mode": "overlay"}
+  },
+  "locally_owned": false,
+  "locally_owned_leaves": 4,
+  "total_leaves": 61
+}
+```
+
+A git leaf carries the resolved commit rather than the configured reference, because during an incident those are the two things most likely to differ.
+
+### The editor is only live where the node owns its config
+
+`PUT /admin/config` writes the local file. On a node that pulls configuration from anywhere else, some or all of that file is dead text: the next poll re-merges and the edit vanishes with no error. So the write is refused up front, with `409` and the paths at fault:
+
+```json
+{
+  "error": "this node does not own the edited path: origins.api.action.url",
+  "code": "config_not_locally_owned",
+  "conflicts": [{"path": "origins.api.action.url", "owner": "authority"}],
+  "layers": {"base": {"kind": "local"}, "authority": {"authority_id": "control-plane", "revision": 12, "mode": "overlay"}},
+  "remedy": "authority control-plane owns these paths at revision 12; publish the change through the authority with `sbproxy authority publish`"
+}
+```
+
+The rule is per-setting rather than per-node, and it is derived from the merge rather than from a list:
+
+| Node shape | Writes |
+|---|---|
+| Local file only | Unchanged. Everything is editable. |
+| Authority in `overlay` mode | Settings the authority does not set are editable. Settings it does set are refused. Adding a setting the authority has never mentioned is allowed. |
+| Authority in `replace` mode | Refused, except the subscriber-owned paths above. Those are grafted back from the local file on every merge, so an operator can still change their own admin listener, TLS material, and secrets on a centrally managed node. |
+| `source:` resolving to git | Refused. The repository is the configuration; the error names the repo, the reference, and the resolved commit. |
+| Git base with an authority overlay | Refused, for both reasons. |
+
+An authority that is configured but has not yet been reached counts as not locally owned. The next poll can claim any path, so treating the file as authoritative in that window would be a promise the node cannot keep.
+
+The refusal is enforced on the server, not in the browser. The admin console greys the editor out and says why, but the same write from `curl` gets the same `409`, and refusals are recorded in the audit log alongside the writes that land.
+
+Two notes on `mode: replace`. The response is a re-serialization, so comments and key order in the local file are not preserved in the effective document (they were already lost in any config with a `features:` block, which is migrated through a full YAML round-trip). And a setting the authority's document simply omits is reported with owner `suppressed` rather than a layer name: under replace it is discarded rather than overwritten, which is the same outcome for whoever was trying to set it.
 
 ---
 
@@ -3971,7 +5506,6 @@ origins:
     cors: { ... }
     compression: { ... }
     hsts: { ... }
-    connection_pool: { ... }
     mirror: { ... }                # shadow traffic; sibling of action
     on_request: [ ... ]            # webhook callbacks
     on_response: [ ... ]
@@ -3995,13 +5529,19 @@ action:
 
 ## Environment variable templating in header modifiers
 
-Request and response header modifiers may reference environment variables using the `{{env.NAME}}` template form. To prevent multi-tenant exfiltration of process secrets, env expansion is gated by an explicit allowlist on `TemplateContext::allowed_env_vars`. This change is tracked under OPENSOURCE.md H4.
+Request and response header modifiers may reference environment variables with
+`{{env.NAME}}`. Resolution has two stages:
 
-- The default allowlist is empty. With the default, every `{{env.X}}` template resolves to the empty string and a `tracing::warn!` is logged. This includes well-known secret names like `AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN`, and any custom `_TOKEN` / `_KEY` env vars set on the proxy process.
-- Operators opt in per-installation by adding env var names to `TemplateContext::allowed_env_vars` when populating the per-request template context. Names are matched literally; case matters.
-- Allowlisted env vars that are unset at the OS level resolve to the literal `{{env.X}}` string so misconfiguration shows up as obviously broken header values rather than silently empty ones.
+1. While compiling the origin, the stock binary replaces the template when
+   `NAME` is set in the process environment.
+2. If `NAME` is unset, the literal template reaches the request-time header
+   modifier. Its `TemplateContext` has an empty environment allowlist in the
+   stock runtime, so the unresolved `{{env.NAME}}` becomes an empty string and
+   emits a warning.
 
-Example header modifier and the matching allowlist a deployment would use:
+There is no configuration field or command-line option for populating that
+runtime allowlist. A missing environment variable can therefore produce an
+empty request or response header.
 
 ```yaml
 request_modifiers:
@@ -4011,11 +5551,7 @@ request_modifiers:
         X-Region:   "{{env.SBPROXY_REGION}}"
 ```
 
-```rust,no_run
-// Inside the proxy runtime that builds TemplateContext per request.
-let mut tmpl = sbproxy_middleware::modifiers::TemplateContext::new();
-tmpl.allowed_env_vars.push("SBPROXY_BUILD_ID".to_string());
-tmpl.allowed_env_vars.push("SBPROXY_REGION".to_string());
-```
-
-A header value of `{{env.AWS_SECRET_ACCESS_KEY}}` will not resolve unless `AWS_SECRET_ACCESS_KEY` is added to that allowlist. There is no global "allow all env vars" switch.
+Only trusted operators should be able to edit configuration that uses this
+form because a value resolved during compilation can be sent to an upstream.
+Use the secret reference backends for credentials instead of copying secrets
+into headers.

@@ -9,14 +9,25 @@ import StatusBadge from "../components/StatusBadge.vue";
 import ErrorState from "../components/ErrorState.vue";
 import EmptyState from "../components/EmptyState.vue";
 
-const health = useAsync(() => api.health());
-const stats = useAsync(() => api.stats());
-const modelHost = useAsync(() => api.modelHostStatus());
+// This page's subtitle promises live health, so it polls. 10s on health
+// (the thing an operator is actually watching) and 30s on the heavier
+// aggregate panels.
+const health = useAsync(() => api.health(), { pollMs: 10_000, refreshLabel: "Health" });
+const stats = useAsync(() => api.stats(), { pollMs: 30_000, refreshLabel: "Stats" });
+const modelHost = useAsync(() => api.modelHostStatus(), {
+  pollMs: 30_000,
+  refreshLabel: "Model host status",
+});
+const clusterVram = useAsync(() => api.clusterVram(), {
+  pollMs: 30_000,
+  refreshLabel: "Cluster VRAM",
+});
 
 function refresh() {
   health.run();
   stats.run();
   modelHost.run();
+  clusterVram.run();
 }
 onMounted(refresh);
 
@@ -155,14 +166,54 @@ function optionalNumber(v: unknown): number | undefined {
         </thead>
         <tbody>
           <tr v-for="(m, i) in residentModels" :key="i">
-            <td class="sb-mono">{{ m.name ?? m.id ?? "unknown" }}</td>
+            <td class="sb-mono">{{ m.name ?? m.id ?? m.deployment ?? "unknown" }}</td>
             <td><StatusBadge :label="String(m.state ?? m.status ?? 'unknown')" /></td>
             <td class="sb-muted">{{ m.engine ?? "n/a" }}</td>
-            <td>{{ formatBytes(m.vram_bytes ?? optionalNumber(m.vram)) }}</td>
+            <td>
+              {{
+                formatBytes(
+                  m.vram_bytes ??
+                    optionalNumber(m.vram) ??
+                    optionalNumber((m.memory as Record<string, unknown> | undefined)?.total_bytes),
+                )
+              }}
+            </td>
           </tr>
         </tbody>
       </table>
     </template>
+  </section>
+
+  <!-- Cluster VRAM -->
+  <section class="section">
+    <h2>Cluster VRAM</h2>
+    <ErrorState
+      v-if="clusterVram.error.value"
+      :error="clusterVram.error.value"
+      @retry="clusterVram.run"
+    />
+    <EmptyState
+      v-else-if="!clusterVram.loading.value && !clusterVram.data.value?.cluster.node_count"
+      message="No cluster VRAM data yet. This node may not be in distributed mode, or no worker has reported a device snapshot."
+    />
+    <div class="grid" v-else>
+      <StatCard
+        label="Total VRAM"
+        :value="formatBytes(clusterVram.data.value?.cluster.total_bytes)"
+      />
+      <StatCard
+        label="Used VRAM"
+        :value="formatBytes(clusterVram.data.value?.cluster.used_bytes)"
+      />
+      <StatCard
+        label="Free VRAM"
+        :value="formatBytes(clusterVram.data.value?.cluster.free_bytes)"
+      />
+      <StatCard
+        label="Nodes reporting"
+        :value="clusterVram.data.value?.cluster.node_count ?? 0"
+      />
+    </div>
   </section>
 </template>
 

@@ -1,49 +1,116 @@
 # yaml-language-server: $schema=../../schemas/sb-config.schema.json
-# 31 - rail-mpp-stripe-test
+# rail-mpp-stripe-test - Payment HTTP Authentication settling on Stripe.
 #
-# Stripe MPP (Merchant Payment Protocol, preview `2026-03-04`) paywall
-# in front of a markdown feed origin. The example uses Stripe in test
-# mode; the operator brings their own `STRIPE_SECRET_KEY=sk_test_...`
-# (see README for setup). When the env var is absent, the smoke
-# runner skips this example and the proxy still emits the 402
-# challenge body shape with a placeholder `pi_pending_*`
-# `payment_intent` id.
+# Two surfaces, one rail:
 #
-# Bundle layout:
-#   sb.yml                 - this file
-#   docker-compose.yml     - sbproxy + mock-origin (+ optional wiremock)
-#   mock-origin/           - nginx serving a markdown feed entry
-#   wiremock-stripe/       - offline Stripe stand-in (opt-in)
-#   Makefile               - up / down / logs / test wrappers
-#   smoke.json             - examples-smoke.sh probe schema
+#   protocols.payment_auth - the wire protocol. `WWW-Authenticate: Payment`
+#                            on the 402, `Authorization: Payment` on the
+#                            retry, `Payment-Receipt` on the paid 2xx.
+#   rails.stripe           - what actually settles it. Payment Auth is a
+#                            credential transport, not a network that
+#                            moves funds, so there is no `mpp` rail to
+#                            configure.
 #
-# Run (with a real Stripe test key):
+# `usage_reporters.stripe_meter` is here to make the split visible: meter
+# events record consumption and can never settle a payment or open a
+# route.
+#
+# Validate it without holding any of its secrets:
+#   sbproxy validate -f examples/rail-mpp-stripe-test/sb.yml
+#
+# Serve it (a Stripe test-mode key is enough; nothing here charges a real
+# card):
+#   export SBPROXY_PAYMENT_BINDING_KEY="$(openssl rand -hex 32)"
+#   export SBPROXY_PAYMENT_RECOVERY_KEY="$(openssl rand -hex 32)"
 #   export STRIPE_SECRET_KEY=sk_test_...
-#   export STRIPE_WEBHOOK_SECRET=whsec_...
 #   docker compose up -d --wait
 #
-# Run (offline, wiremock):
-#   docker compose --profile wiremock up -d --wait
-#   # There is no override knob yet to point the proxy at wiremock;
-#   # the container is wired but unused today. See README.
+# Probe the challenge:
+#   curl -is -H 'Host: feed.test.sbproxy.dev' \
+#        -H 'User-Agent: ClaudeBot/1.0' \
+#        -H 'Accept-Payment: stripe;intent=charge' \
+#        http://127.0.0.1:8080/feed/articles/2026
 
 proxy:
   http_bind_port: 8080
 
+  payments:
+    state_path: /var/lib/sbproxy/payments.sqlite3
+    challenge_binding_key: secret://env/SBPROXY_PAYMENT_BINDING_KEY
+    authorization_timeout_ms: 2000
+    max_body_bytes: 1048576
+
+    # Required whenever the Stripe rail is enabled. A create that crashed
+    # between the dispatch stamp and the recorded response is recovered by
+    # replaying byte-identical request bytes under the same idempotency
+    # key. Those bytes carry a single-use payment token in the Payment
+    # Auth form, so they are only ever stored encrypted.
+    recovery_encryption:
+      key_id: payments-2026-08
+      key: secret://env/SBPROXY_PAYMENT_RECOVERY_KEY
+      # Hard expiry, 1 through 23 hours. The ceiling sits one hour below
+      # Stripe's documented idempotency-key retention so a same-key
+      # recovery cannot race the provider forgetting the request.
+      max_age_hours: 23
+
+    worker:
+      reconcile_interval_ms: 1000
+      max_reconcile_batch: 32
+      shutdown_timeout_ms: 5000
+
+    protocols:
+      payment_auth:
+        # Declared rather than assumed. A config written against another
+        # draft fails at load instead of emitting bytes no client parses.
+        draft: draft-ryan-httpauth-payment-01
+        # The protection space. It is the first slot of the challenge
+        # binding, so changing it invalidates outstanding challenges. A
+        # quote or backslash here is rejected.
+        realm: feed.test.sbproxy.dev
+        # The only registered method and intent in this release.
+        method: stripe
+        intent: charge
+
+    rails:
+      stripe:
+        # Named, never inlined.
+        api_key: secret://env/STRIPE_SECRET_KEY
+        # The only version accepted. A silent follow of the account's
+        # dashboard default would authorize requests against a
+        # PaymentIntent contract nobody reviewed.
+        api_version: 2026-06-24.dahlia
+        # The only account context accepted. No Stripe-Account header is
+        # sent, so a payer cannot choose who gets paid.
+        account_context: platform
+        # Copied into the method details of a Payment Auth request.
+        business_network_id: profile_test_example
+        # Checked against the built-in ISO-4217 table, so a mis-declared
+        # currency cannot charge a hundred times the quoted price.
+        quote_currency: USD
+        currency_decimals: 2
+        payment_method_types: [card]
+        # Also offer the direct PaymentIntent mode, for clients that speak
+        # Stripe already. Only manual capture is accepted: preparing a
+        # challenge must not take money for a resource not yet delivered.
+        direct_payment_intent:
+          enabled: true
+          capture_method: manual
+
+    usage_reporters:
+      # Accounting, not settlement. A reporter cannot build a receipt and
+      # cannot move an intent to Succeeded.
+      stripe_meter:
+        event_name: sbproxy_feed_fetches
+        customer_field: stripe_customer_id
+
 origins:
   "feed.test.sbproxy.dev":
-    # Markdown feed origin. The proxy charges per fetch via the MPP
-    # rail; cooperative crawlers see the price up front and confirm
-    # the PaymentIntent before the request flows through.
     action:
       type: proxy
       url: http://mock-origin:80
 
     policies:
       - type: ai_crawl_control
-        # Default fallback price. Tier-matched routes override this in
-        # the multi-rail challenge body. MPP charges in the same micro
-        # currency units as x402 so prices are directly comparable.
         price: 0.005
         currency: USD
         header: crawler-payment
@@ -57,10 +124,12 @@ origins:
           - PerplexityBot
           - Google-Extended
 
-        # Single tier: $0.005 USD on the markdown feed. The shape
-        # selector ensures only Markdown-shaped requests match (see
-        # docs/ai-crawl-control.md for how Accept negotiation
-        # interacts with tier resolution).
+        free_paths:
+          - /robots.txt
+          - /health
+
+        # One priced route at $0.005. The currency has to match the
+        # rail's quote_currency; the proxy converts nothing.
         tiers:
           - route_pattern: /feed/*
             price:
@@ -68,22 +137,3 @@ origins:
               currency: USD
             content_shape: markdown
             paywall_position: top_of_page
-
-        # Wave 3 multi-rail block. MPP-only here; combine with x402
-        # in `examples/multi-rail-accept-payment/`. The MPP rail
-        # config is intentionally small in Wave 3: the `version` pin
-        # is the only operator-tunable knob. The Stripe `pi_*`
-        # identifier is generated by the proxy at 402-emission time
-        # as a placeholder (`pi_pending_<quote_id>`); the worker
-        # (G3.3) replaces it with the real PI on the redeem path.
-        rails:
-          mpp:
-            version: "1"
-
-        quote_token:
-          key_id: mpp-stripe-test-2026
-          # Demo seed only. Production deployments source from an env
-          # var via `secret_ref:`.
-          seed_hex: "2222222222222222222222222222222222222222222222222222222222222222"
-          issuer: "https://feed.test.sbproxy.dev"
-          default_ttl_seconds: 300

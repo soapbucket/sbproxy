@@ -42,6 +42,12 @@ pub struct RealtimeDispatchCtx {
     pub upstream_port: u16,
     /// Whether the upstream uses TLS.
     pub upstream_tls: bool,
+    /// Budget-authoritative model query value to apply after request modifiers.
+    ///
+    /// This carries only a public model identifier. Provider credentials stay
+    /// local to the final outbound request seam and must never enter this
+    /// `Debug` context.
+    pub model_override: Option<String>,
     /// Wall-clock instant when the session started. Diffed against
     /// the `logging` callback time to produce the session-duration
     /// histogram observation and the AudioSeconds billing approximation.
@@ -49,6 +55,41 @@ pub struct RealtimeDispatchCtx {
     /// Stable surface label (`"realtime"`) for downstream metric and
     /// log attribution.
     pub surface_label: &'static str,
+}
+
+/// Exact client response to emit when realtime quota admission fails after
+/// Pingora has entered the upstream pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RealtimeQuotaFailure {
+    /// HTTP status preserved from the fair-share admission contract.
+    pub status: u16,
+    /// Stable client-facing error message.
+    pub message: &'static str,
+}
+
+impl RealtimeQuotaFailure {
+    /// Map a pool failure to its client response, or `None` when the pool's
+    /// failure posture admits the attempt without a reservation.
+    ///
+    /// This used to be a third, independently written copy of the same
+    /// status mapping the AI dispatch path carries, and the copies had
+    /// already drifted. It now delegates to
+    /// [`sbproxy_ai::quota_pool::pool_error_disposition`], which reads the
+    /// posture through `QuotaPoolConfig::failure_posture` (WOR-2121). The
+    /// realtime path keeps its own type only because Pingora needs the
+    /// exact response stashed on the context before the upstream pipeline
+    /// takes over.
+    pub fn from_pool_error(
+        config: Option<&sbproxy_ai::QuotaPoolConfig>,
+        error: &sbproxy_ai::PoolError,
+    ) -> Option<Self> {
+        match sbproxy_ai::quota_pool::pool_error_disposition(config, error) {
+            sbproxy_ai::quota_pool::PoolErrorDisposition::Admit => None,
+            sbproxy_ai::quota_pool::PoolErrorDisposition::Reject { status, message } => {
+                Some(Self { status, message })
+            }
+        }
+    }
 }
 
 /// Parameters captured at `request_filter` time and consumed by
@@ -89,6 +130,172 @@ pub struct RequestMetrics {
     pub stripped_bytes: u64,
 }
 
+/// Stable, secret-free classification of the inbound key path.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum InboundKeyMode {
+    /// No governed or recognized native key was admitted.
+    #[default]
+    None,
+    /// An SBproxy-minted key resolved through the governed key plane.
+    Minted,
+    /// A caller-owned native provider key resolved through the default policy.
+    Native,
+}
+
+impl InboundKeyMode {
+    /// Closed vocabulary used by metrics and audit records.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minted => "minted",
+            Self::Native => "native",
+        }
+    }
+}
+
+/// Bounded cache outcome carried to the admin request ring.
+///
+/// The declaration order is the precedence order used when multiple cache
+/// layers participate in one request. A later, weaker observation cannot
+/// overwrite a stronger hit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AdminCacheStatus {
+    /// No response or semantic cache lookup ran.
+    #[default]
+    Disabled,
+    /// At least one enabled cache lookup ran without serving the response.
+    Miss,
+    /// The response cache or reserve served the response.
+    Hit,
+    /// A semantic cache served the response.
+    SemanticHit,
+}
+
+impl AdminCacheStatus {
+    /// Stable admin API value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Miss => "miss",
+            Self::Hit => "hit",
+            Self::SemanticHit => "semantic_hit",
+        }
+    }
+
+    const fn precedence(self) -> u8 {
+        match self {
+            Self::Disabled => 0,
+            Self::Miss => 1,
+            Self::Hit => 2,
+            Self::SemanticHit => 3,
+        }
+    }
+
+    /// Merge an observation into this status using cache precedence.
+    pub fn record(&mut self, status: Self) {
+        if status.precedence() > self.precedence() {
+            *self = status;
+        }
+    }
+}
+
+/// Stable location of a load-balancer action inside the request's pinned
+/// pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LoadBalancerActionKey {
+    pub(crate) origin_index: usize,
+    pub(crate) forward_rule_index: Option<usize>,
+}
+
+impl LoadBalancerActionKey {
+    pub(crate) const fn new(origin_index: usize, forward_rule_index: Option<usize>) -> Self {
+        Self {
+            origin_index,
+            forward_rule_index,
+        }
+    }
+}
+
+/// One selected load-balancer target and the action that owns its mutable
+/// connection, breaker, outlier, and strategy state.
+///
+/// The pinned pipeline plus this key keeps retry and terminal cleanup attached
+/// to the action that created the attempt, even when that action came from a
+/// forward rule.
+#[derive(Debug)]
+pub(crate) struct LoadBalancerAttemptToken {
+    pub(crate) action: LoadBalancerActionKey,
+    pub(crate) target_index: usize,
+    pub(crate) started_at: Instant,
+    /// Status received from the selected upstream before any proxy response
+    /// fallback or modifier can rewrite the downstream status.
+    pub(crate) observed_upstream_status: Option<u16>,
+}
+
+/// A payment-shaped response the policy rendered locally.
+///
+/// Replaces the `(header_name, value, body)` tuple this slot used to hold.
+/// That tuple could carry exactly one header, which forced two workarounds:
+/// a `Content-Type` sentinel in the name position to mean "stamp this as the
+/// content type instead", and no way at all to emit the repeated
+/// `WWW-Authenticate` field Payment HTTP Authentication requires, which is
+/// one field per offered challenge rather than one field listing several.
+///
+/// Every field is already final. The request phase writes what is here and
+/// composes nothing, so the policy that decided the outcome is the only thing
+/// that decides how it looks on the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaymentResponse {
+    /// The exact `Content-Type` to stamp.
+    pub content_type: String,
+    /// Additional headers, in order.
+    ///
+    /// A name may repeat. `WWW-Authenticate` does, and the writer appends
+    /// rather than replaces, so two offered challenges produce two fields.
+    pub headers: Vec<(String, String)>,
+    /// The exact body bytes.
+    pub body: String,
+}
+
+impl PaymentResponse {
+    /// A JSON response carrying no extra headers.
+    #[must_use]
+    pub fn json(body: String) -> Self {
+        Self {
+            content_type: "application/json".to_string(),
+            headers: Vec::new(),
+            body,
+        }
+    }
+
+    /// A JSON response carrying one challenge header.
+    #[must_use]
+    pub fn json_with_header(name: &str, value: String, body: String) -> Self {
+        Self {
+            content_type: "application/json".to_string(),
+            headers: vec![(name.to_string(), value)],
+            body,
+        }
+    }
+
+    /// A response whose content type the policy chose.
+    #[must_use]
+    pub fn typed(content_type: String, body: String) -> Self {
+        Self {
+            content_type,
+            headers: Vec::new(),
+            body,
+        }
+    }
+
+    /// Adds one header, keeping any already present under that name.
+    #[must_use]
+    pub fn with_header(mut self, name: &str, value: String) -> Self {
+        self.headers.push((name.to_string(), value));
+        self
+    }
+}
+
 /// Per-request state threaded through all Pingora phases as CTX.
 pub struct RequestContext {
     // --- Identity ---
@@ -123,6 +330,14 @@ pub struct RequestContext {
     // --- Auth state ---
     /// Authentication result, populated by the auth phase.
     pub auth_result: Option<AuthDecision>,
+    /// Conservative trust tier derived once after identity enrichment and
+    /// authentication. Downstream policies and scripting read this field
+    /// instead of independently combining signature, agent, and deny signals.
+    pub trust_tier: sbproxy_modules::auth::TrustTier,
+    /// Whether the request's final trust-tier metric observation has been
+    /// emitted. Body-bound Web Bot Auth remains provisional until the body
+    /// digest is checked, so the metric writer must be exactly-once.
+    pub(crate) trust_tier_metric_recorded: bool,
 
     // --- Flags ---
     /// Whether the force-SSL redirect check has already been performed.
@@ -138,8 +353,9 @@ pub struct RequestContext {
     pub short_circuit_content_type: Option<String>,
 
     // --- Load balancer state ---
-    /// Index of the selected load balancer target (for connection tracking).
-    pub lb_target_idx: Option<usize>,
+    /// Currently active target attempt, tied to the exact main or forward-rule
+    /// load-balancer action that owns its mutable runtime state.
+    pub(crate) lb_attempt: Option<LoadBalancerAttemptToken>,
 
     // --- Upstream retry state ---
     /// Number of retry attempts already made for this request.
@@ -154,12 +370,38 @@ pub struct RequestContext {
     /// the final upstream response so operators can see why the proxy
     /// did not replay a matching failure status.
     pub status_retry_skip_reason: Option<&'static str>,
+    /// Whether the current upstream attempt carried an outbound DPoP proof.
+    pub outbound_dpop_active: bool,
+    /// One-shot guard for the RFC 9449 protected-resource nonce retry.
+    pub dpop_nonce_retry_used: bool,
+    /// Canonical final resource target used by the active DPoP attempt.
+    pub outbound_dpop_htu: Option<String>,
+
+    // --- Bounded admin gateway status ---
+    /// Strongest response-cache or semantic-cache outcome observed.
+    pub admin_cache_status: AdminCacheStatus,
+    /// Number of AI provider calls actually attempted.
+    pub admin_ai_attempts: u32,
+    /// First provider that handed off to another provider.
+    pub admin_failover_from: Option<String>,
+    /// Latest provider selected after a handoff.
+    pub admin_failover_to: Option<String>,
+    /// Most recently attempted AI provider, used to detect handoffs.
+    pub admin_last_ai_provider: Option<String>,
+    /// Closed generic load-balancer or AI router strategy name.
+    pub admin_load_balancer_strategy: Option<String>,
+    /// Selected generic host:port or latest attempted AI provider.
+    pub admin_load_balancer_target: Option<String>,
 
     // --- Concurrent limit guards ---
     /// Permits issued by `ConcurrentLimitPolicy` for this request. The
     /// guards release their slots when dropped, which happens when the
     /// context is dropped at the end of the request lifecycle.
     pub concurrent_limit_guards: Vec<ConcurrentLimitGuard>,
+    /// Configured concurrent-limit rejection body. The enforcer stores
+    /// this separately from the decision message so the response phase
+    /// can emit it verbatim.
+    pub concurrent_limit_denial_body: Option<String>,
     /// Permits issued by `AgentBudgetPolicy`. Same lifecycle
     /// as `concurrent_limit_guards`: each guard tracks an in-flight
     /// agent-keyed slot and releases it when the request finishes.
@@ -174,6 +416,11 @@ pub struct RequestContext {
     /// Buffered request body, populated only when `validate_request_body`
     /// is true.
     pub request_body_buf: Option<BytesMut>,
+    /// True while origin-level threat protection is buffering the
+    /// request body. The body filter clears this after it can classify
+    /// a non-JSON payload or after the complete JSON body passes its
+    /// configured limits.
+    pub threat_scan_pending: bool,
     /// WOR-819: set in `upstream_request_filter` when the request matched
     /// a `transcode` route on a `grpc` action. While true, the body
     /// filters re-fetch the transcoder from the pipeline and rewrite the
@@ -257,6 +504,10 @@ pub struct RequestContext {
     /// so operators can spot pool pressure or oversize bodies. None
     /// when the middleware engaged normally (hit / miss / conflict).
     pub idempotency_skip_reason: Option<&'static str>,
+    /// Cached response selected only after a validated GraphQL request has
+    /// produced its final authoritative body. `fail_to_proxy` replays it with
+    /// the normal idempotency headers after the upstream request phase aborts.
+    pub idempotency_deferred_hit: Option<sbproxy_middleware::idempotency::CachedResponse>,
 
     // --- Request body size limit (streaming) ---
     /// Streaming-time max body size cap from `RequestLimitPolicy`.
@@ -276,6 +527,30 @@ pub struct RequestContext {
     /// actually saw, not what the upstream sent: transforms,
     /// fallback bodies, and cached responses are included.
     pub response_body_bytes: u64,
+
+    // --- Attested metering (WOR-2145) ---
+    /// Values of the response headers `proxy.attestation.origin_headers`
+    /// names, captured in `response_filter` because the upstream response
+    /// header is out of scope by the time the receipt is cut.
+    ///
+    /// Only the configured header names are copied, so a deployment with
+    /// no origin-header rules allocates nothing. Absent and empty are kept
+    /// apart: a name with no entry here is a header the origin never sent,
+    /// which is a different statement from one it sent empty, and the
+    /// receipt's evidence encodes that difference. Filled by
+    /// `crate::meter_runtime::capture_origin_headers` and read once by
+    /// `crate::meter_runtime::record_response`.
+    pub meter_origin_headers: Vec<(String, String)>,
+
+    /// Set when the meter refused this response under
+    /// `failure_mode: closed`, so the body filter drops every chunk
+    /// instead of delivering work the proxy cannot bill for.
+    ///
+    /// Refusing has to suppress the body, not just rewrite the status.
+    /// A 503 with the upstream's body still attached would hand the
+    /// buyer exactly the value the seller just declared itself unable to
+    /// record, which is the one outcome `closed` exists to prevent.
+    pub meter_refused: bool,
 
     // --- Request mirror state ---
     /// Captured-at-`request_filter` parameters for a request whose
@@ -404,6 +679,18 @@ pub struct RequestContext {
     /// so that the body filter phase can swap it in before sending upstream.
     pub replacement_request_body: Option<bytes::Bytes>,
 
+    // --- GraphQL validation state ---
+    /// Whether the resolved GraphQL action requires validation of the final
+    /// outbound request after request modifiers have run.
+    pub graphql_validation_pending: bool,
+    /// Original request bytes captured into Pingora's replay buffer. The final
+    /// validator uses these unless a body modifier supplies replacement bytes.
+    pub graphql_request_body: Option<bytes::Bytes>,
+    /// Exact POST body that passed GraphQL validation after all request
+    /// modifiers ran. Every request-body filter path must emit these bytes,
+    /// rather than whichever inbound chunk it inspected or hashed.
+    pub graphql_validated_request_body: Option<bytes::Bytes>,
+
     // --- Response modifier state ---
     /// If a response modifier specifies a status code override, it is stored here
     /// so that response_filter can apply it.
@@ -445,11 +732,12 @@ pub struct RequestContext {
     pub transform_error_attribution: Option<String>,
 
     // --- AI Crawl Control challenge ---
-    /// Set by an `ai_crawl_control` policy when a request must be
-    /// charged. Tuple is `(header_name, challenge_value, json_body)`.
-    /// The 402 response handler reads this to stamp the configured
-    /// header and write the JSON body.
-    pub crawl_challenge: Option<(String, String, String)>,
+    /// The locally rendered response an `ai_crawl_control` policy
+    /// produced, when a request was charged, refused, or blocked.
+    ///
+    /// The request phase writes this verbatim rather than reassembling
+    /// it, so every payment-shaped response has exactly one author.
+    pub crawl_challenge: Option<PaymentResponse>,
     /// Set by an `ai_crawl_control` policy in Cloudflare Pay Per Crawl
     /// interop mode when a request settled through the ledger. Carries
     /// the `crawler-charged` header value (`<currency> <amount>`, e.g.
@@ -457,10 +745,30 @@ pub struct RequestContext {
     /// response so the crawler learns exactly what it paid. `None` when
     /// the request was not a paid Cloudflare-compat crawl.
     pub crawl_charged: Option<String>,
+    /// The `ai_crawl_control` policy that owns this request's crawl
+    /// decision, stashed by the enforcer wrapper when durable settlement
+    /// is active for the pinned pipeline generation (WOR-2143).
+    ///
+    /// The settlement gate at the `check_policies` call site reads
+    /// pricing, tier matching, and the challenge header name through it.
+    /// It stays `None` whenever `proxy.payments` is absent or the policy
+    /// runs in Cloudflare interop mode, so the legacy path keeps its
+    /// exact shape.
+    #[cfg(feature = "payments")]
+    pub crawl_settlement_policy:
+        Option<std::sync::Arc<sbproxy_modules::policy::AiCrawlControlPolicy>>,
 
     // --- Distributed tracing ---
     /// W3C Trace Context for this request (parsed from `traceparent` or generated fresh).
     pub trace_ctx: Option<sbproxy_observe::TraceContext>,
+    /// `true` when `trace_ctx` came from actually parsing an inbound
+    /// `traceparent`/B3 header, `false` when it is a locally
+    /// synthesized root (`TraceContext::new_random`). Read at the
+    /// AI-dispatch span-creation site to decide whether to parent the
+    /// exported span on the caller's trace; carried explicitly here
+    /// rather than via any ambient/thread-local OTel state so nothing
+    /// can leak or bleed across requests on a reused worker thread.
+    pub trace_parent_is_remote: bool,
 
     // --- Response cache state ---
     /// Computed cache key for this request. Populated in `request_filter` when
@@ -525,6 +833,9 @@ pub struct RequestContext {
     /// Caller-supplied custom properties from `X-Sb-Property-*`
     /// headers. Cardinality-capped, allowlist-checked, redaction-applied.
     pub properties: BTreeMap<String, String>,
+    /// Redacted subset of [`Self::properties`] explicitly promoted by
+    /// the origin's bounded `properties.rollup_keys` configuration.
+    pub rollup_properties: BTreeMap<String, String>,
     /// Session identifier (caller-supplied or auto-generated for
     /// anonymous traffic per `SessionsConfig::auto_generate`).
     pub session_id: Option<Ulid>,
@@ -661,6 +972,10 @@ pub struct RequestContext {
     /// when the AI handler dispatched the request. `None` for
     /// non-AI traffic.
     pub ai_provider: Option<String>,
+    /// Prompt-free compression savings waiting for a terminal provider
+    /// success. The logging phase consumes this exactly once so retries,
+    /// failures, and cache hits never claim avoided tokens or cost.
+    pub pending_compression_value: Option<sbproxy_ai::PendingCompressionValue>,
     /// WOR-800: name of the stored prompt this request resolved (when it
     /// referenced one via `"prompt": "name@version"`). Recorded on the
     /// run metadata / billing event so a run can be traced to the prompt
@@ -717,6 +1032,10 @@ pub struct RequestContext {
     pub ai_prompt_fingerprint: Option<String>,
     /// Completion / output tokens reported by the provider response.
     pub ai_tokens_out: Option<u64>,
+    /// Tokens served from the upstream provider's prompt cache
+    /// (Anthropic `cache_read_input_tokens`, OpenAI `cached_tokens`).
+    /// `None` when the provider reported no cache activity.
+    pub ai_tokens_cached: Option<u64>,
     /// Rate-limiter bucket for the authenticated virtual key, set only
     /// when the key carries a tokens-per-minute cap (WOR-1833). The
     /// request-completion path uses it to charge the response's token
@@ -810,22 +1129,55 @@ pub struct RequestContext {
     /// Every downstream key predicate reads this retained snapshot rather
     /// than resolving mutable key state again.
     pub effective_key_policy: Option<sbproxy_ai::effective_key_policy::EffectiveKeyPolicy>,
+    /// Authenticated key record retained for later proxy phases.
+    ///
+    /// Usually set by the pre-auth sweep for a minted token. The AI gateway
+    /// also sets it when its legacy bearer or OIDC mapping resolves a record
+    /// later, preserving credential bindings needed by the upstream phase.
+    /// Downstream code reads this instead of re-reading `authorization`, which
+    /// an earlier phase may already have consumed.
+    pub resolved_inbound_key: Option<Box<sbproxy_keystore::record::KeyRecord>>,
+    /// Secret-free policy synthesized for an admitted caller-owned provider
+    /// credential.
+    ///
+    /// Kept separate from `resolved_inbound_key`: provider-shape attribution
+    /// is not authentication and must never short-circuit the origin's
+    /// configured auth provider.
+    pub native_key_policy_record: Option<Box<sbproxy_keystore::record::KeyRecord>>,
+    /// Lowercase name of the header the minted key arrived in.
+    ///
+    /// Stripped from the upstream request so the proxy's own key never reaches
+    /// an origin.
+    pub inbound_key_header: Option<String>,
+    /// Provider a native (non-minted) inbound credential was attributed to,
+    /// from the `key_management.inbound.provider_hints` rules.
+    ///
+    /// Attribution only: set when no minted key resolved, and never a reason
+    /// to refuse. Read by metrics, audit, and policy so native-key traffic
+    /// stops being invisible.
+    pub native_key_provider: Option<String>,
+    /// Secret-free inbound key classification for metrics and audit.
+    pub inbound_key_mode: InboundKeyMode,
+    /// Governed key-policy revision applied to this request, in the
+    /// `r{rev}:{digest}` / `c:{rev}:{digest}` vocabulary the
+    /// `sbproxy.policy_version` span attribute uses. `None` when no
+    /// key policy resolved.
+    pub ai_policy_version: Option<String>,
+    /// Bounded, ordered `policy_type:verdict` pairs recorded as each
+    /// enforcer decides (WOR-2094). Explains why the gateway acted.
+    pub policy_decisions: Vec<String>,
+    /// Machine-readable reason from the policy, guardrail, or auth
+    /// layer that denied this request, when one did (WOR-2094).
+    pub deny_reason: Option<String>,
     /// Accepted ingress governance reservation owned by this request.
     ///
-    /// The ingress gateway settles or releases this lease. Peer workers never
-    /// receive the store handle and therefore cannot charge the caller again.
-    pub governance_lease: Option<crate::governance_runtime::GovernanceCharge>,
-    /// Parseable usage accumulated from provider attempts that were discarded
-    /// before a fallback produced the response returned to the caller.
-    pub governance_retry_input_tokens: u64,
-    /// Parseable output usage accumulated from discarded fallback attempts.
-    pub governance_retry_output_tokens: u64,
-    /// Whether at least one discarded response carried an explicit usage
-    /// block, including an explicit zero-token usage report.
-    pub governance_retry_usage_observed: bool,
-    /// At least one dispatched fallback response lacked parseable usage, so
-    /// final settlement must use the conservative admitted ceiling.
-    pub governance_retry_usage_missing: bool,
+    /// Successful response accounting settles it with actual usage. Paths
+    /// that finish without billable provider usage release it explicitly.
+    /// Dropping the request context with an active lease schedules a
+    /// best-effort release, or settlement after usage is armed, so early
+    /// returns and cancelled streams do not hold capacity until backend
+    /// expiry or silently lose billable usage.
+    pub governance_lease: Option<crate::governance_runtime::GovernanceLease>,
     /// Pre-flight rate-limit reservation. Stamped by
     /// `handle_ai_proxy` after the prompt has been parsed and the
     /// tiktoken estimator has run; reconciled on the response side
@@ -849,6 +1201,16 @@ pub struct RequestContext {
     /// `logging` hook can observe session duration + emit the
     /// session-end `AiBillingEvent`.
     pub ai_realtime_dispatch: Option<RealtimeDispatchCtx>,
+    /// Fair-share reservation held across realtime peer validation and final
+    /// outbound request preparation. Dropping it before commit releases the
+    /// reservation without consuming quota.
+    pub ai_realtime_quota_attempt: Option<sbproxy_ai::quota_pool::QuotaPoolAttemptGuard>,
+    /// Pinned pool policy used to preserve fail-open vs fail-closed behavior
+    /// if final settlement reports a backend failure.
+    pub ai_realtime_quota_config: Option<sbproxy_ai::QuotaPoolConfig>,
+    /// Exact quota response to emit from `fail_to_proxy` when settlement at
+    /// the outbound-send seam rejects the realtime request.
+    pub ai_realtime_quota_failure: Option<RealtimeQuotaFailure>,
 
     /// WOR-1044: reversible PII redaction map for this request.
     /// Each entry is `(rule_name, placeholder, original)` recorded by
@@ -954,6 +1316,38 @@ pub struct RequestContext {
     /// verbatim instead of falling through to the generic
     /// `send_error` template.
     pub a2a_denial_body: Option<String>,
+    /// WOR-2139: the A2A `contextId` this hop carried, already capped to
+    /// the span-attribute identifier limit.
+    ///
+    /// This is the run correlation key. A2A task ids nest under a
+    /// context id, so it is the identifier that lets a fan-out of agent
+    /// hops reconstruct as one tree rather than a pile of unrelated
+    /// traces. It is read from `params.contextId` in the A2A 1.0
+    /// JSON-RPC body, which means `request_body_filter` is the first
+    /// phase that can see it, and that phase runs *after*
+    /// `upstream_request_filter` has already assembled the upstream
+    /// request. A run id therefore cannot be stamped onto an outbound
+    /// header on this hop; run correlation rides the W3C trace context
+    /// the upstream request filter already injects. The same phase
+    /// boundary is why the A2A injection vocabulary has no `tag` action
+    /// and why the push-notification check had to move to the body
+    /// phase.
+    ///
+    /// Deliberately not a field on `A2AContext`. That struct is built in
+    /// the request filter from headers, one phase earlier, and it
+    /// derives `Serialize` / `Deserialize` with no `serde(default)`, so
+    /// widening it would break deserialization of any already-serialized
+    /// envelope. Keeping the two apart also preserves a trust asymmetry
+    /// worth naming: `A2AContext::task_id` comes from the
+    /// `x-a2a-task-id` header and is honoured only behind the
+    /// trusted-peer gate, while this value comes from the request body
+    /// and is honoured from any caller. Read
+    /// `A2AContext::identity_verified` before treating either as an
+    /// authoritative name for a run.
+    ///
+    /// `None` for non-A2A traffic, for the two `v0` drafts, and for A2A
+    /// 1.0 hops on origins that never buffer the request body.
+    pub a2a_context_id: Option<String>,
 
     // --- WOR-114: per-request feature flags ---
     /// Parsed `x-sb-flags` header + `?_sb.<key>` query params.
@@ -1026,6 +1420,88 @@ pub enum HeadlessSignal {
 }
 
 impl RequestContext {
+    /// Record a cache outcome without allowing a weaker later observation to
+    /// hide a hit from another cache layer.
+    pub fn record_admin_cache_status(&mut self, status: AdminCacheStatus) {
+        self.admin_cache_status.record(status);
+    }
+
+    /// Record one actual AI provider attempt and derive bounded handoff state.
+    pub fn record_admin_ai_attempt(&mut self, provider: &str) {
+        if let Some(previous) = self.admin_last_ai_provider.as_deref() {
+            if previous != provider {
+                if self.admin_failover_from.is_none() {
+                    self.admin_failover_from = Some(previous.to_string());
+                }
+                self.admin_failover_to = Some(provider.to_string());
+            }
+        }
+        self.admin_load_balancer_target = Some(provider.to_string());
+        self.admin_last_ai_provider = Some(provider.to_string());
+        self.admin_ai_attempts = self.admin_ai_attempts.saturating_add(1);
+    }
+
+    /// Additional upstream attempts after the first, across generic and AI
+    /// retry mechanisms.
+    pub fn admin_retry_count(&self) -> u32 {
+        self.retry_count
+            .max(self.admin_ai_attempts.saturating_sub(1))
+    }
+
+    /// Whether a target or provider handoff occurred.
+    pub fn admin_failover_engaged(&self) -> bool {
+        self.fallback_triggered || self.admin_failover_to.is_some()
+    }
+
+    /// Canonical, secret-free key identity for accountability surfaces.
+    ///
+    /// One derivation shared by the access log, the admin request ring,
+    /// the inbound-key metric, audit events, and spans, so a single request
+    /// never reports different key ids on different surfaces. Precedence:
+    /// the governed effective policy's key id (set once per AI request),
+    /// then the resolved minted record, then the synthesized native policy
+    /// record, then the authenticated principal's public key id. Every
+    /// source is a public identifier; none carries the raw secret.
+    pub fn accountable_key_id(&self) -> Option<&str> {
+        if let Some(policy) = self.effective_key_policy.as_ref() {
+            if !policy.key_id.is_empty() {
+                return Some(policy.key_id.as_str());
+            }
+        }
+        if let Some(record) = self.resolved_inbound_key.as_deref() {
+            if !record.key_id.is_empty() {
+                return Some(record.key_id.as_str());
+            }
+        }
+        if let Some(record) = self.native_key_policy_record.as_deref() {
+            if !record.key_id.is_empty() {
+                return Some(record.key_id.as_str());
+            }
+        }
+        let principal_id = self.principal.api_key_id();
+        (!principal_id.is_empty()).then_some(principal_id)
+    }
+
+    /// Record one policy decision as a `policy_type:verdict` pair for
+    /// the admin ring's explainability column (WOR-2094).
+    ///
+    /// Bounded so a pathological chain cannot grow a per-request
+    /// allocation: past the cap the final slot is replaced with a
+    /// truncation marker rather than growing further.
+    pub fn record_policy_decision(&mut self, policy_type: &str, verdict: &str) {
+        const MAX_POLICY_DECISIONS: usize = 16;
+        match self.policy_decisions.len().cmp(&MAX_POLICY_DECISIONS) {
+            std::cmp::Ordering::Less => {
+                self.policy_decisions
+                    .push(format!("{policy_type}:{verdict}"));
+            }
+            std::cmp::Ordering::Equal => {
+                self.policy_decisions.push("...:truncated".to_string());
+            }
+            std::cmp::Ordering::Greater => {}
+        }
+    }
+
     /// Create a new, empty request context.
     pub fn new() -> Self {
         Self {
@@ -1035,14 +1511,26 @@ impl RequestContext {
             tenant_id: CompactString::const_new("__default__"),
             origin_idx: None,
             pipeline: crate::reload::current_pipeline_full(),
-            lb_target_idx: None,
+            lb_attempt: None,
             retry_count: 0,
             retry_backoff_ms: None,
             status_retry_skip_reason: None,
+            outbound_dpop_active: false,
+            dpop_nonce_retry_used: false,
+            outbound_dpop_htu: None,
+            admin_cache_status: AdminCacheStatus::Disabled,
+            admin_ai_attempts: 0,
+            admin_failover_from: None,
+            admin_failover_to: None,
+            admin_last_ai_provider: None,
+            admin_load_balancer_strategy: None,
+            admin_load_balancer_target: None,
             concurrent_limit_guards: Vec::new(),
+            concurrent_limit_denial_body: None,
             agent_budget_guards: Vec::new(),
             validate_request_body: false,
             request_body_buf: None,
+            threat_scan_pending: false,
             transcode_active: false,
             transcode_grpc_method: None,
             transcode_response_buf: None,
@@ -1062,12 +1550,17 @@ impl RequestContext {
             idempotency_response_headers: None,
             idempotency_permit: None,
             idempotency_skip_reason: None,
+            idempotency_deferred_hit: None,
             body_size_limit: None,
             body_bytes_seen: 0,
             request_body_bytes: 0,
             response_body_bytes: 0,
+            meter_origin_headers: Vec::new(),
+            meter_refused: false,
             mirror_pending: None,
             auth_result: None,
+            trust_tier: sbproxy_modules::auth::TrustTier::Anonymous,
+            trust_tier_metric_recorded: false,
             force_ssl_checked: false,
             short_circuit_status: None,
             short_circuit_body: None,
@@ -1094,6 +1587,9 @@ impl RequestContext {
             fallback_body: None,
             csrf_cookie: None,
             replacement_request_body: None,
+            graphql_validation_pending: false,
+            graphql_request_body: None,
+            graphql_validated_request_body: None,
             response_status_override: None,
             response_body_replacement: None,
             trust_headers: None,
@@ -1102,7 +1598,10 @@ impl RequestContext {
             transform_error_attribution: None,
             crawl_challenge: None,
             crawl_charged: None,
+            #[cfg(feature = "payments")]
+            crawl_settlement_policy: None,
             trace_ctx: None,
+            trace_parent_is_remote: false,
             cache_key: None,
             cache_body_buf: None,
             cache_status: None,
@@ -1115,6 +1614,7 @@ impl RequestContext {
             classifier_intent: None,
             classifier_extensions: HashMap::new(),
             properties: BTreeMap::new(),
+            rollup_properties: BTreeMap::new(),
             session_id: None,
             parent_session_id: None,
             user_id: None,
@@ -1144,6 +1644,7 @@ impl RequestContext {
             canonical_url: None,
             metrics: RequestMetrics::default(),
             ai_provider: None,
+            pending_compression_value: None,
             ai_prompt_name: None,
             ai_prompt_version: None,
             principal: sbproxy_plugin::Principal::anonymous(),
@@ -1155,6 +1656,7 @@ impl RequestContext {
             ai_prompt_tokens_est: None,
             ai_prompt_fingerprint: None,
             ai_tokens_out: None,
+            ai_tokens_cached: None,
             ai_key_tpm_bucket: None,
             ai_lane_priority: None,
             managed_model_permit: None,
@@ -1174,14 +1676,21 @@ impl RequestContext {
             ai_inbound_format: None,
             ai_native_bypass: false,
             effective_key_policy: None,
+            resolved_inbound_key: None,
+            native_key_policy_record: None,
+            inbound_key_header: None,
+            native_key_provider: None,
+            inbound_key_mode: InboundKeyMode::None,
+            ai_policy_version: None,
+            policy_decisions: Vec::new(),
+            deny_reason: None,
             governance_lease: None,
-            governance_retry_input_tokens: 0,
-            governance_retry_output_tokens: 0,
-            governance_retry_usage_observed: false,
-            governance_retry_usage_missing: false,
             ai_admission: None,
             ai_realtime_session: None,
             ai_realtime_dispatch: None,
+            ai_realtime_quota_attempt: None,
+            ai_realtime_quota_config: None,
+            ai_realtime_quota_failure: None,
             ai_reversible_redactions: Vec::new(),
             content_shape_pricing: None,
             content_shape_transform: None,
@@ -1194,6 +1703,7 @@ impl RequestContext {
             headless_signal: None,
             a2a: None,
             a2a_denial_body: None,
+            a2a_context_id: None,
             flags: crate::sb_flags::RequestFlags::default(),
             policy_response_headers: Vec::new(),
             deny_policy_type: None,
@@ -1235,12 +1745,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn accountable_key_id_precedence_is_policy_then_record_then_principal() {
+        // WOR-2093: one derivation for every surface. The precedence
+        // mirrors specificity: the governed effective policy knows the
+        // canonical id, records are next, the principal is the fallback.
+        let mut ctx = RequestContext::new();
+        assert!(ctx.accountable_key_id().is_none(), "no key -> no id");
+
+        ctx.principal.attrs.key_id = Some("principal-id".to_string());
+        assert_eq!(ctx.accountable_key_id(), Some("principal-id"));
+
+        let now = chrono::Utc::now();
+        ctx.native_key_policy_record = Some(Box::new(sbproxy_keystore::record::KeyRecord::new(
+            "native:t:api:openai",
+            "hash",
+            now,
+        )));
+        assert_eq!(ctx.accountable_key_id(), Some("native:t:api:openai"));
+
+        ctx.resolved_inbound_key = Some(Box::new(sbproxy_keystore::record::KeyRecord::new(
+            "sbp_minted_id",
+            "hash",
+            now,
+        )));
+        assert_eq!(
+            ctx.accountable_key_id(),
+            Some("sbp_minted_id"),
+            "a minted record beats native attribution"
+        );
+    }
+
+    #[test]
+    fn policy_decisions_are_bounded_with_a_truncation_marker() {
+        let mut ctx = RequestContext::new();
+        for i in 0..40 {
+            ctx.record_policy_decision(&format!("policy_{i}"), "allow");
+        }
+        assert_eq!(ctx.policy_decisions.len(), 17, "16 entries + marker");
+        assert_eq!(ctx.policy_decisions.last().unwrap(), "...:truncated");
+        assert_eq!(ctx.policy_decisions[0], "policy_0:allow");
+    }
+
+    #[test]
     fn new_context_has_sensible_defaults() {
         let ctx = RequestContext::new();
         assert!(ctx.request_id.is_empty());
         assert!(ctx.client_ip.is_none());
         assert!(ctx.hostname.is_empty());
         assert!(ctx.origin_idx.is_none());
+        assert!(ctx.lb_attempt.is_none());
         assert!(ctx.auth_result.is_none());
         assert!(!ctx.force_ssl_checked);
         assert!(ctx.short_circuit_status.is_none());
@@ -1251,10 +1804,18 @@ mod tests {
         assert!(ctx.response_body_buf.is_none());
         assert!(ctx.governance_lease.is_none());
         assert!(ctx.effective_key_policy.is_none());
+        assert!(ctx.ai_realtime_quota_attempt.is_none());
+        assert!(ctx.ai_realtime_quota_config.is_none());
+        assert!(ctx.ai_realtime_quota_failure.is_none());
         assert!(!ctx.buffering_body);
         assert!(ctx.upstream_content_type.is_none());
         assert!(ctx.forward_rule_idx.is_none());
         assert!(!ctx.fallback_triggered);
+        assert_eq!(
+            ctx.trust_tier,
+            sbproxy_modules::auth::TrustTier::Anonymous,
+            "missing evidence must default to the least-privileged tier"
+        );
     }
 
     #[test]
@@ -1265,6 +1826,51 @@ mod tests {
         assert_eq!(a.client_ip, b.client_ip);
         assert_eq!(a.hostname, b.hostname);
         assert_eq!(a.origin_idx, b.origin_idx);
+    }
+
+    #[test]
+    fn gateway_cache_status_uses_deterministic_precedence() {
+        let mut ctx = RequestContext::new();
+        assert_eq!(ctx.admin_cache_status, AdminCacheStatus::Disabled);
+        assert_eq!(ctx.admin_cache_status.as_str(), "disabled");
+
+        ctx.record_admin_cache_status(AdminCacheStatus::Miss);
+        ctx.record_admin_cache_status(AdminCacheStatus::Hit);
+        ctx.record_admin_cache_status(AdminCacheStatus::Miss);
+        assert_eq!(ctx.admin_cache_status, AdminCacheStatus::Hit);
+
+        ctx.record_admin_cache_status(AdminCacheStatus::SemanticHit);
+        ctx.record_admin_cache_status(AdminCacheStatus::Hit);
+        assert_eq!(ctx.admin_cache_status, AdminCacheStatus::SemanticHit);
+        assert_eq!(ctx.admin_cache_status.as_str(), "semantic_hit");
+    }
+
+    #[test]
+    fn gateway_attempts_capture_retry_and_failover_chain() {
+        let mut ctx = RequestContext::new();
+        ctx.record_admin_ai_attempt("openai");
+        assert_eq!(ctx.admin_retry_count(), 0);
+        assert!(!ctx.admin_failover_engaged());
+
+        ctx.record_admin_ai_attempt("anthropic");
+        ctx.record_admin_ai_attempt("bedrock");
+        assert_eq!(ctx.admin_ai_attempts, 3);
+        assert_eq!(ctx.admin_retry_count(), 2);
+        assert!(ctx.admin_failover_engaged());
+        assert_eq!(ctx.admin_failover_from.as_deref(), Some("openai"));
+        assert_eq!(ctx.admin_failover_to.as_deref(), Some("bedrock"));
+        assert_eq!(ctx.admin_load_balancer_target.as_deref(), Some("bedrock"));
+
+        ctx.retry_count = 4;
+        assert_eq!(ctx.admin_retry_count(), 4);
+    }
+
+    #[test]
+    fn generic_fallback_engages_gateway_failover_without_ai_attempts() {
+        let mut ctx = RequestContext::new();
+        ctx.fallback_triggered = true;
+        assert!(ctx.admin_failover_engaged());
+        assert_eq!(ctx.admin_retry_count(), 0);
     }
 
     #[test]
@@ -1387,5 +1993,114 @@ mod tests {
             .expect("extension set");
         assert_eq!(ext["hits"], 0);
         assert!(ctx.classifier_extension("enterprise.language").is_none());
+    }
+
+    fn quota_pool_config(
+        failure_mode: sbproxy_ai::QuotaPoolFailureMode,
+    ) -> sbproxy_ai::QuotaPoolConfig {
+        sbproxy_ai::QuotaPoolConfig {
+            name: "shared".to_string(),
+            window: std::time::Duration::from_secs(60),
+            total_limit: 10,
+            weights: HashMap::from([("member".to_string(), 1)]),
+            policy: sbproxy_ai::QuotaPoolPolicy::Burst,
+            dimension: sbproxy_ai::QuotaPoolDimension::Request,
+            consistency: sbproxy_ai::QuotaPoolConsistency::Local,
+            failure_mode,
+            failure_posture: None,
+        }
+    }
+
+    #[test]
+    fn realtime_quota_denial_preserves_the_429_response() {
+        let failure = RealtimeQuotaFailure::from_pool_error(
+            Some(&quota_pool_config(sbproxy_ai::QuotaPoolFailureMode::Closed)),
+            &sbproxy_ai::PoolError::Denied(sbproxy_ai::PoolDeny::PoolExhausted {
+                total_load: 10,
+                total_limit: 10,
+            }),
+        )
+        .expect("denial must reject");
+
+        assert_eq!(failure.status, 429);
+        assert_eq!(failure.message, "fair-share quota pool exhausted");
+    }
+
+    #[test]
+    fn realtime_quota_backend_failure_preserves_closed_and_open_modes() {
+        let closed = RealtimeQuotaFailure::from_pool_error(
+            Some(&quota_pool_config(sbproxy_ai::QuotaPoolFailureMode::Closed)),
+            &sbproxy_ai::PoolError::BackendUnavailable,
+        )
+        .expect("closed mode must reject");
+        assert_eq!(closed.status, 503);
+        assert_eq!(closed.message, "fair-share quota backend unavailable");
+
+        let allow_unreserved = RealtimeQuotaFailure::from_pool_error(
+            Some(&quota_pool_config(
+                sbproxy_ai::QuotaPoolFailureMode::AllowUnreserved,
+            )),
+            &sbproxy_ai::PoolError::BackendUnavailable,
+        );
+        assert!(
+            allow_unreserved.is_none(),
+            "allow_unreserved must bypass only backend unavailability"
+        );
+    }
+
+    /// An explicit `failure_posture` wins over the legacy `failure_mode`
+    /// on the realtime path too, and the realtime path agrees with the AI
+    /// dispatch path because both now call one helper.
+    #[test]
+    fn realtime_quota_honours_an_explicit_failure_posture() {
+        use sbproxy_config::types::FailureMode;
+
+        // Legacy says reject, explicit posture says admit.
+        let mut config = quota_pool_config(sbproxy_ai::QuotaPoolFailureMode::Closed);
+        config.failure_posture = Some(FailureMode::Degraded);
+        assert!(
+            RealtimeQuotaFailure::from_pool_error(
+                Some(&config),
+                &sbproxy_ai::PoolError::BackendUnavailable
+            )
+            .is_none(),
+            "the explicit posture wins over the legacy field"
+        );
+
+        // Legacy says admit, explicit posture says reject.
+        let mut config = quota_pool_config(sbproxy_ai::QuotaPoolFailureMode::AllowUnreserved);
+        config.failure_posture = Some(FailureMode::Closed);
+        let failure = RealtimeQuotaFailure::from_pool_error(
+            Some(&config),
+            &sbproxy_ai::PoolError::BackendUnavailable,
+        )
+        .expect("an explicit closed posture must reject");
+        assert_eq!(failure.status, 503);
+
+        // A plain `open` admits exactly like `degraded` here. They differ
+        // only in the fail-open counter, which the admission path owns.
+        let mut config = quota_pool_config(sbproxy_ai::QuotaPoolFailureMode::Closed);
+        config.failure_posture = Some(FailureMode::Open);
+        assert!(RealtimeQuotaFailure::from_pool_error(
+            Some(&config),
+            &sbproxy_ai::PoolError::BackendUnavailable
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn realtime_quota_invalid_state_never_fails_open() {
+        for failure_mode in [
+            sbproxy_ai::QuotaPoolFailureMode::Closed,
+            sbproxy_ai::QuotaPoolFailureMode::AllowUnreserved,
+        ] {
+            let failure = RealtimeQuotaFailure::from_pool_error(
+                Some(&quota_pool_config(failure_mode)),
+                &sbproxy_ai::PoolError::InvalidState,
+            )
+            .expect("invalid state must reject");
+            assert_eq!(failure.status, 503);
+            assert_eq!(failure.message, "fair-share quota state unavailable");
+        }
     }
 }

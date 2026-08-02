@@ -39,13 +39,11 @@
 //! as `Suspicious`: the operator wants to see the deny, not the
 //! contradicting valid signature.
 //!
-//! ## Out of scope here
+//! ## Runtime integration
 //!
-//! Wiring `TrustTier` into `sbproxy_core::server::RequestContext` and
-//! exposing it on the CEL / Lua / JS / WASM scripting surfaces lives
-//! in follow-up tickets. This module ships the type and the function;
-//! the integration touches a wide enough call-site surface that it
-//! deserves its own review.
+//! `sbproxy-core` derives this value after identity enrichment and
+//! authentication, stores it on the request context, and exposes its
+//! stable string form to CEL as `request.trust_tier`.
 
 use serde::{Deserialize, Serialize};
 

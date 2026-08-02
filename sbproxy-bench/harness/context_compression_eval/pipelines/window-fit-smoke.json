@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "profile": "window-fit-smoke-v1",
+  "levers": [
+    {
+      "type": "window_fit",
+      "completion_reserve_tokens": 8000,
+      "input_budget_tokens": 192
+    }
+  ]
+}

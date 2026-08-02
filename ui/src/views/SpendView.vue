@@ -10,6 +10,7 @@ import {
   type MetricFamily,
 } from "../lib/metrics";
 import { formatNumber, formatUsd } from "../lib/format";
+import { spendGroupOptions } from "../lib/spend-grouping";
 import PageHeader from "../components/PageHeader.vue";
 import StatCard from "../components/StatCard.vue";
 import MiniBars from "../components/MiniBars.vue";
@@ -32,7 +33,6 @@ const costFamily = computed(() =>
   findFamily(
     families.value,
     "sbproxy_ai_cost_dollars_attributed_total",
-    "sbproxy_ai_cost_dollars_total",
   ),
 );
 // Tokens by direction (input|output, plus cache/reasoning variants).
@@ -40,14 +40,12 @@ const tokensFamily = computed(() =>
   findFamily(
     families.value,
     "sbproxy_ai_tokens_attributed_total",
-    "sbproxy_ai_tokens_total",
   ),
 );
 const aiRequestsFamily = computed(() =>
   findFamily(
     families.value,
     "sbproxy_ai_requests_attributed_total",
-    "sbproxy_ai_requests_total",
   ),
 );
 
@@ -70,6 +68,12 @@ function labeled(rows: { key: string; value: number }[]) {
 const spendByModel = computed(() => groupByLabel(costFamily.value, "model"));
 const spendByProvider = computed(() =>
   groupByLabel(costFamily.value, "provider"),
+);
+// Per-origin spend rides the origin label on the attributed cost
+// counter. Absent on scrapes from older binaries, so the section
+// hides rather than showing one "(none)" row.
+const spendByOrigin = computed(() =>
+  labeled(groupByLabel(costFamily.value, "origin")),
 );
 const spendByKey = computed(() =>
   labeled(groupByLabel(costFamily.value, "api_key_id")),
@@ -111,18 +115,11 @@ const hasSpend = computed(() => totalSpend.value > 0);
 const hasTeams = computed(() => spendByTeam.value.length > 0);
 const hasProjects = computed(() => spendByProject.value.length > 0);
 const hasKeys = computed(() => spendByKey.value.length > 0);
+const hasOrigins = computed(() => spendByOrigin.value.length > 1);
 
 // --- Spend history from the durable rollups (WOR-1875) ---
 // Served by /api/usage/spend?window=&group_by=; survives restarts.
 const HISTORY_WINDOWS = ["1h", "24h", "7d", "30d"] as const;
-const HISTORY_GROUPS = [
-  { value: "total", label: "Total" },
-  { value: "model", label: "Model" },
-  { value: "provider", label: "Provider" },
-  { value: "team", label: "Team" },
-  { value: "project", label: "Project" },
-  { value: "api_key", label: "API key" },
-] as const;
 const historyWindow = ref<(typeof HISTORY_WINDOWS)[number]>("24h");
 const historyGroup = ref<string>("model");
 const history = useAsync(() =>
@@ -130,11 +127,27 @@ const history = useAsync(() =>
 );
 onMounted(history.run);
 watch([historyWindow, historyGroup], () => history.run());
+const historyGroupOptions = computed(() => {
+  const keys = history.data.value?.property_keys ?? [];
+  const propertyQueryUnavailable =
+    history.error.value?.status === 400 && historyGroup.value.startsWith("property:");
+  return spendGroupOptions(
+    propertyQueryUnavailable
+      ? keys.filter((key) => `property:${key}` !== historyGroup.value)
+      : keys,
+    historyGroup.value,
+  );
+});
+const selectedGroupOption = computed(() =>
+  historyGroupOptions.value.find((option) => option.value === historyGroup.value),
+);
 
-// Rollups disabled (503) reads as a hint, not a failure.
+// Rollups disabled (503) reads as a hint, not a failure. The detail
+// lives in the response body, not the error message.
 const historyDisabled = computed(() => {
   const e = history.error.value;
-  return e ? String(e).includes("not enabled") : false;
+  if (!e) return false;
+  return `${e.message} ${e.body}`.includes("not enabled");
 });
 
 function bucketLabel(tsSecs: number, bucketSecs: number): string {
@@ -218,12 +231,17 @@ const hasHistory = computed(() => historyRows.value.length > 0);
           </button>
         </div>
         <select v-model="historyGroup" aria-label="Group by">
-          <option v-for="g in HISTORY_GROUPS" :key="g.value" :value="g.value">
+          <option v-for="g in historyGroupOptions" :key="g.value" :value="g.value">
             {{ g.label }}
           </option>
         </select>
       </div>
     </div>
+
+    <p v-if="selectedGroupOption?.unavailable" class="hint property-unavailable">
+      This promoted property has no rollup data in the selected window. The selection
+      is preserved so the query remains explicit.
+    </p>
 
     <p v-if="historyDisabled" class="hint">
       Usage rollups are not enabled, so windowed history is unavailable.
@@ -257,7 +275,7 @@ const hasHistory = computed(() => historyRows.value.length > 0);
       <table class="detail">
         <thead>
           <tr>
-            <th>{{ HISTORY_GROUPS.find((g) => g.value === historyGroup)?.label ?? "Group" }}</th>
+            <th>{{ selectedGroupOption?.label ?? "Group" }}</th>
             <th>Cost</th>
             <th>Tokens in</th>
             <th>Tokens out</th>
@@ -322,6 +340,18 @@ const hasHistory = computed(() => historyRows.value.length > 0);
     <section class="panel">
       <h2>Spend by provider</h2>
       <MiniBars :items="spendByProvider" :format="formatUsd" />
+    </section>
+
+    <section class="panel" v-if="hasOrigins">
+      <h2>Spend by origin</h2>
+      <!-- Origin is the one spend dimension the request log can filter on,
+           so it is the one that gets a link. Linking the others would land
+           the operator on an unfiltered log, which is worse than no link. -->
+      <MiniBars
+        :items="spendByOrigin"
+        :format="formatUsd"
+        :link-for="(origin: string) => `/logs?origin=${encodeURIComponent(origin)}`"
+      />
     </section>
 
     <section class="panel" v-if="hasKeys">
@@ -396,7 +426,7 @@ const hasHistory = computed(() => historyRows.value.length > 0);
 .segmented {
   display: inline-flex;
   border: 1px solid var(--sb-border);
-  border-radius: 6px;
+  border-radius: 0;
   overflow: hidden;
 }
 .segmented button {
@@ -413,7 +443,7 @@ const hasHistory = computed(() => historyRows.value.length > 0);
   border-left: 1px solid var(--sb-border);
 }
 .segmented button.active {
-  background: var(--sb-bg-subtle, rgba(127, 127, 127, 0.12));
+  background: var(--sb-accent-tint);
   color: var(--sb-text);
 }
 .pickers select {
@@ -421,7 +451,7 @@ const hasHistory = computed(() => historyRows.value.length > 0);
   font-size: 12px;
   padding: 4px 8px;
   border: 1px solid var(--sb-border);
-  border-radius: 6px;
+  border-radius: 0;
   background: transparent;
   color: var(--sb-text);
 }

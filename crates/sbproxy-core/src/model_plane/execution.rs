@@ -113,7 +113,9 @@ impl WorkerModelExecution {
         let running = permit.ensure_ready(priority).await?;
         Ok(PreparedWorkerExecution {
             base_url: format!("http://127.0.0.1:{}", running.port),
-            engine_model: deployment.to_string(),
+            // Engine-aware: mistral.rs has no served-model-name flag and
+            // accepts `default` for the loaded model (WOR-1861).
+            engine_model: running.kind.request_model_id(deployment).to_string(),
             permit,
         })
     }

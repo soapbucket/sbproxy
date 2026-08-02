@@ -8,8 +8,16 @@
 #
 # Two guardrails inspect the model output before it reaches the client:
 #   - toxicity: keyword-based screen of the response text.
-#   - schema: the response must contain a top-level JSON object with
-#     a "summary" string and a "tags" array.
+#   - schema: the assistant message content (choices[].message.content,
+#     not the response envelope) must be a JSON object with a "summary"
+#     string and a "tags" array. The full JSON Schema is enforced, so a
+#     reply carrying both keys with the wrong types is rejected too.
+#     The schema compiles at config load; an invalid schema fails
+#     startup.
+#
+# Keyword mode is the zero-dependency default. It is literal substring
+# matching, not ML classification; see examples/ai-safety-classifiers for
+# the explicit local-classifier mode.
 #
 # Each guardrail returns a block result on a hit, which the gateway
 # converts into a 4xx response and increments

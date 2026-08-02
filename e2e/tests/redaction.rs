@@ -196,7 +196,6 @@ fn redaction_fixture_floor_no_secret_leaks_through_legacy_redactor() {
 /// generic marker).
 #[test]
 fn redaction_per_sink_fan_out() {
-    let _guard = enable_fake_sinks();
     let upstream = MockUpstream::start(json!({"ok": true})).expect("start mock upstream");
     let yaml = format!(
         r#"
@@ -225,7 +224,8 @@ origins:
 "#,
         upstream.base_url()
     );
-    let harness = ProxyHarness::start_with_yaml(&yaml).expect("start proxy");
+    let harness =
+        ProxyHarness::start_with_yaml_and_env(&yaml, FAKE_SINKS_ENV).expect("start proxy");
 
     for fx in fixtures() {
         // Reset the sink capture buffer before each fixture so cross-
@@ -284,7 +284,6 @@ origins:
 /// Catches over-eager redactors that match too broadly.
 #[test]
 fn redaction_does_not_eat_non_secrets() {
-    let _guard = enable_fake_sinks();
     let upstream = MockUpstream::start(json!({"ok": true})).expect("start mock upstream");
     let yaml = format!(
         r#"
@@ -298,7 +297,8 @@ origins:
 "#,
         upstream.base_url()
     );
-    let harness = ProxyHarness::start_with_yaml(&yaml).expect("start proxy");
+    let harness =
+        ProxyHarness::start_with_yaml_and_env(&yaml, FAKE_SINKS_ENV).expect("start proxy");
 
     let _ = reset_sink_buffers(&harness);
     let _ = harness
@@ -327,8 +327,13 @@ origins:
 // returned strings are the raw concatenated lines of the named sink
 // since the last reset. The endpoints are gated behind the
 // `SBPROXY_TEST_FAKE_SINKS=1` env var so production binaries never
-// expose them; [`enable_fake_sinks`] sets the var for the lifetime of
-// a single test, propagating it to the spawned proxy child.
+// expose them; [`FAKE_SINKS_ENV`] passes the var on the spawned proxy
+// child's environment, leaving this test runner's own environment
+// untouched (WOR-646).
+
+/// Child-process environment that turns the fake-sink admin routes on
+/// in the spawned proxy.
+const FAKE_SINKS_ENV: &[(&str, &str)] = &[("SBPROXY_TEST_FAKE_SINKS", "1")];
 
 fn reset_sink_buffers(h: &ProxyHarness) -> anyhow::Result<()> {
     // POST /api/_test/sinks/reset against the proxy port. The
@@ -356,22 +361,4 @@ fn read_sink_buffer(h: &ProxyHarness, sink: &str) -> anyhow::Result<String> {
         .header("host", "localhost")
         .send()?;
     Ok(resp.text()?)
-}
-
-/// Set `SBPROXY_TEST_FAKE_SINKS=1` for the duration of a single test
-/// so the harness-spawned proxy inherits it. Returns a guard that
-/// removes the var on drop. The two ignored-then-revived tests are
-/// gated on this; without the env var the proxy short-circuits the
-/// admin routes through to origin resolution.
-fn enable_fake_sinks() -> FakeSinksGuard {
-    std::env::set_var("SBPROXY_TEST_FAKE_SINKS", "1");
-    FakeSinksGuard
-}
-
-struct FakeSinksGuard;
-
-impl Drop for FakeSinksGuard {
-    fn drop(&mut self) {
-        std::env::remove_var("SBPROXY_TEST_FAKE_SINKS");
-    }
 }

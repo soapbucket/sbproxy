@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# run-tests.sh - Build sbproxy, then exercise all OSS features via curl
+# run-tests.sh - Exercise the HTTP compatibility catalog against a Rust binary
 #
 # Usage:
-#   ./test/run-tests.sh              # Run all tests
-#   ./test/run-tests.sh 01 03 07     # Run specific test cases
+#   ./run-tests.sh              # Run the maintained smoke set
+#   ./run-tests.sh --all        # Audit all 93 historical cases
+#   ./run-tests.sh 01 03 07     # Run specific test cases
 #
 # Each test case lives in its own numbered directory with:
 #   sb.yml    - proxy configuration for that test
@@ -20,8 +21,8 @@ set -euo pipefail
 # Config
 # ---------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SBPROXY_SRC="$(cd "$SCRIPT_DIR/.." && pwd)"
-SBPROXY_BIN="$SCRIPT_DIR/sbproxy"
+WORKSPACE="$(cd "$SCRIPT_DIR/../.." && pwd)"
+SBPROXY_BIN="${SBPROXY_BIN:-$WORKSPACE/target/release/sbproxy}"
 CASES_DIR="$SCRIPT_DIR/cases"
 SERVERS_DIR="$SCRIPT_DIR/servers"
 PROXY_PORT=18080
@@ -47,6 +48,8 @@ NC='\033[0m'
 # PIDs
 PROXY_PID=""
 CALLBACK_PID=""
+RUNTIME_CONFIGS=()
+PREPARED_CONFIG=""
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -55,6 +58,85 @@ log_header() { echo -e "\n${BOLD}${CYAN}=== $1 ===${NC}"; }
 log_pass()   { echo -e "  ${GREEN}PASS${NC} $1"; PASS=$((PASS + 1)); }
 log_fail()   { echo -e "  ${RED}FAIL${NC} $1"; FAIL=$((FAIL + 1)); FAILURES+=("$1"); }
 log_skip()   { echo -e "  ${YELLOW}SKIP${NC} $1"; SKIP=$((SKIP + 1)); }
+
+stop_pid() {
+    local pid="$1" attempt
+    if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+        return
+    fi
+    kill "$pid" 2>/dev/null || true
+    for attempt in {1..20}; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
+}
+
+reject_occupied_port() {
+    local port="$1" label="$2" owners
+    if ! command -v lsof >/dev/null 2>&1; then
+        echo -e "  ${RED}ERROR${NC}: lsof is required to start the $label safely"
+        return 1
+    fi
+    owners="$(lsof -nP -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)"
+    if [[ -n "$owners" ]]; then
+        echo -e "  ${RED}ERROR${NC}: $label port $port is already occupied by PID(s): $(echo "$owners" | tr '\n' ' ')"
+        return 1
+    fi
+}
+
+wait_for_owned_http() {
+    local pid="$1" port="$2" url="$3" label="$4" retries=30
+    while [[ $retries -gt 0 ]]; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            echo -e "  ${RED}ERROR${NC}: $label exited before owning port $port"
+            wait "$pid" 2>/dev/null || true
+            return 1
+        fi
+        if lsof -nP -a -p "$pid" -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null |
+           grep -qx "$pid"; then
+            if curl -s -o /dev/null --max-time 1 "$url" 2>/dev/null; then
+                return 0
+            fi
+        fi
+        retries=$((retries - 1))
+        sleep 0.1
+    done
+    echo -e "  ${RED}ERROR${NC}: $label failed to become ready on port $port"
+    return 1
+}
+
+prepare_case_config() {
+    local source="$1" case_dir="$2" output
+    output="$(mktemp "$case_dir/.sbproxy-runtime.XXXXXX")"
+    if ! awk '
+        {
+            print
+            if (!injected && $0 ~ /^proxy:[[:space:]]*$/) {
+                print "  extensions:"
+                print "    upstream:"
+                print "      allow_private_cidrs:"
+                print "        - 127.0.0.0/8"
+                print "        - ::1/128"
+                injected = 1
+            }
+        }
+        END {
+            if (!injected) {
+                exit 1
+            }
+        }
+    ' "$source" > "$output"; then
+        rm -f "$output"
+        echo "unable to prepare loopback-safe test config from $source" >&2
+        return 1
+    fi
+    RUNTIME_CONFIGS+=("$output")
+    PREPARED_CONFIG="$output"
+}
 
 # assert_status <description> <expected_status> <curl_args...>
 assert_status() {
@@ -180,9 +262,18 @@ start_proxy() {
     case_name=$(basename "$case_dir")
     local logfile="$LOG_DIR/$case_name.log"
 
-    # Kill any stale proxy on our port
-    lsof -ti:"$PROXY_PORT" 2>/dev/null | xargs kill -9 2>/dev/null || true
-    sleep 0.2
+    local owners
+    owners="$(lsof -ti:"$PROXY_PORT" 2>/dev/null || true)"
+    if [[ -n "$owners" ]]; then
+        echo -e "  ${RED}ERROR${NC}: port $PROXY_PORT is already occupied by PID(s): $(echo "$owners" | tr '\n' ' ')"
+        return 1
+    fi
+
+    # The archived suite predates the Rust runtime's SSRF deny-by-default
+    # guard. Every local backend is intentional, so opt the temporary
+    # per-case config into loopback without weakening the checked-in sample.
+    prepare_case_config "$config" "$case_dir" || return
+    config="$PREPARED_CONFIG"
 
     "$SBPROXY_BIN" serve -f "$config" --log-level warn > "$logfile" 2>&1 &
     PROXY_PID=$!
@@ -193,7 +284,7 @@ start_proxy() {
         retries=$((retries - 1))
         if [[ $retries -le 0 ]]; then
             echo -e "  ${RED}ERROR${NC}: sbproxy failed to start for $case_name (see $logfile)"
-            kill "$PROXY_PID" 2>/dev/null || true
+            stop_pid "$PROXY_PID"
             PROXY_PID=""
             return 1
         fi
@@ -210,15 +301,9 @@ start_proxy() {
 # Stop sbproxy
 stop_proxy() {
     if [[ -n "${PROXY_PID}" ]]; then
-        kill "$PROXY_PID" 2>/dev/null || true
-        wait "$PROXY_PID" 2>/dev/null || true
+        stop_pid "$PROXY_PID"
         PROXY_PID=""
     fi
-    # Kill anything on the proxy and telemetry ports (NOT mock server ports)
-    lsof -ti:"$PROXY_PORT" 2>/dev/null | xargs kill -9 2>/dev/null || true
-    lsof -ti:8888 2>/dev/null | xargs kill -9 2>/dev/null || true
-    lsof -ti:8443 2>/dev/null | xargs kill -9 2>/dev/null || true
-    sleep 0.2
 }
 
 # Start callback server (Node.js)
@@ -230,27 +315,22 @@ start_callback_server() {
         echo -e "  ${YELLOW}WARN${NC}: node not found, callback tests will be skipped"
         return 1
     fi
+    reject_occupied_port "$CALLBACK_PORT" "callback server" || return 1
     node "$SERVERS_DIR/test-server.js" "$CALLBACK_PORT" > "$LOG_DIR/callback-server.log" 2>&1 &
     CALLBACK_PID=$!
-    local retries=30
-    while ! curl -s -o /dev/null --max-time 1 "$CALLBACK_URL/health" 2>/dev/null; do
-        retries=$((retries - 1))
-        if [[ $retries -le 0 ]]; then
-            echo -e "  ${RED}ERROR${NC}: callback server failed to start"
-            kill "$CALLBACK_PID" 2>/dev/null || true
-            CALLBACK_PID=""
-            return 1
-        fi
-        sleep 0.1
-    done
+    if ! wait_for_owned_http \
+        "$CALLBACK_PID" "$CALLBACK_PORT" "$CALLBACK_URL/health" "callback server"; then
+        stop_pid "$CALLBACK_PID"
+        CALLBACK_PID=""
+        return 1
+    fi
     return 0
 }
 
 # Stop callback server
 stop_callback_server() {
     if [[ -n "${CALLBACK_PID}" ]]; then
-        kill "$CALLBACK_PID" 2>/dev/null || true
-        wait "$CALLBACK_PID" 2>/dev/null || true
+        stop_pid "$CALLBACK_PID"
         CALLBACK_PID=""
     fi
 }
@@ -294,20 +374,17 @@ start_mock_ai_server() {
         echo -e "  ${YELLOW}WARN${NC}: node not found, AI tests will be skipped"
         return 1
     fi
+    reject_occupied_port "$MOCK_AI_PORT" "primary mock AI server" || return 1
     # Primary mock AI server
     MOCK_AI_ID=primary MOCK_AI_PORT=$MOCK_AI_PORT node "$SERVERS_DIR/mock-ai.js" "$MOCK_AI_PORT" > "$LOG_DIR/mock-ai.log" 2>&1 &
     MOCK_AI_PID=$!
-    local retries=30
-    while ! curl -s -o /dev/null --max-time 1 "$MOCK_AI_URL/health" 2>/dev/null; do
-        retries=$((retries - 1))
-        if [[ $retries -le 0 ]]; then
-            echo -e "  ${RED}ERROR${NC}: mock AI server failed to start"
-            kill "$MOCK_AI_PID" 2>/dev/null || true
-            MOCK_AI_PID=""
-            return 1
-        fi
-        sleep 0.1
-    done
+    if ! wait_for_owned_http \
+        "$MOCK_AI_PID" "$MOCK_AI_PORT" "$MOCK_AI_URL/health" \
+        "primary mock AI server"; then
+        stop_pid "$MOCK_AI_PID"
+        MOCK_AI_PID=""
+        return 1
+    fi
     return 0
 }
 
@@ -317,29 +394,29 @@ start_mock_ai_server_2() {
     if [[ -n "${MOCK_AI_PID2}" ]] && kill -0 "$MOCK_AI_PID2" 2>/dev/null; then
         return 0
     fi
+    reject_occupied_port "$MOCK_AI_PORT2" "secondary mock AI server" || return 1
     MOCK_AI_ID=secondary node "$SERVERS_DIR/mock-ai.js" "$MOCK_AI_PORT2" > "$LOG_DIR/mock-ai-2.log" 2>&1 &
     MOCK_AI_PID2=$!
-    local retries=30
-    while ! curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$MOCK_AI_PORT2/health" 2>/dev/null; do
-        retries=$((retries - 1))
-        if [[ $retries -le 0 ]]; then return 1; fi
-        sleep 0.1
-    done
+    if ! wait_for_owned_http \
+        "$MOCK_AI_PID2" "$MOCK_AI_PORT2" \
+        "http://127.0.0.1:$MOCK_AI_PORT2/health" \
+        "secondary mock AI server"; then
+        stop_pid "$MOCK_AI_PID2"
+        MOCK_AI_PID2=""
+        return 1
+    fi
     return 0
 }
 
 stop_mock_ai_servers() {
     if [[ -n "${MOCK_AI_PID}" ]]; then
-        kill "$MOCK_AI_PID" 2>/dev/null || true
-        wait "$MOCK_AI_PID" 2>/dev/null || true
+        stop_pid "$MOCK_AI_PID"
         MOCK_AI_PID=""
     fi
     if [[ -n "${MOCK_AI_PID2}" ]]; then
-        kill "$MOCK_AI_PID2" 2>/dev/null || true
-        wait "$MOCK_AI_PID2" 2>/dev/null || true
+        stop_pid "$MOCK_AI_PID2"
         MOCK_AI_PID2=""
     fi
-    lsof -ti:$MOCK_AI_PORT -ti:$MOCK_AI_PORT2 -ti:$MOCK_AI_PORT_FAIL 2>/dev/null | xargs kill -9 2>/dev/null || true
 }
 
 # Cleanup on exit
@@ -347,27 +424,26 @@ cleanup() {
     stop_proxy
     stop_callback_server
     stop_mock_ai_servers
+    local index
+    for ((index=${#RUNTIME_CONFIGS[@]} - 1; index >= 0; index--)); do
+        rm -f -- "${RUNTIME_CONFIGS[$index]}"
+    done
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ---------------------------------------------------------------------------
-# Build
+# Rust binary
 # ---------------------------------------------------------------------------
-log_header "Building sbproxy"
+log_header "Using Rust sbproxy binary"
 
-if [[ ! -d "$SBPROXY_SRC" ]]; then
-    echo -e "${RED}ERROR${NC}: sbproxy source not found at $SBPROXY_SRC"
+if [[ ! -x "$SBPROXY_BIN" ]]; then
+    echo -e "${RED}ERROR${NC}: Rust sbproxy binary not found or not executable at $SBPROXY_BIN"
+    echo "Build it first with: cargo build --release -p sbproxy" >&2
     exit 1
 fi
-
-cd "$SBPROXY_SRC"
-if go build -o "$SBPROXY_BIN" ./cmd/sbproxy/; then
-    echo -e "  ${GREEN}OK${NC} Built sbproxy -> $SBPROXY_BIN"
-else
-    echo -e "  ${RED}ERROR${NC} Build failed"
-    exit 1
-fi
-cd "$SCRIPT_DIR"
+echo -e "  ${GREEN}OK${NC} Using sbproxy -> $SBPROXY_BIN"
 
 # ---------------------------------------------------------------------------
 # Generate certs
@@ -385,7 +461,18 @@ mkdir -p "$LOG_DIR"
 # ---------------------------------------------------------------------------
 # Determine which tests to run
 # ---------------------------------------------------------------------------
-if [[ $# -gt 0 ]]; then
+SMOKE_CASES=(01 30 37 48 71 83 84 85 86 87 88 89 90 91 92 93)
+
+if [[ "${1:-}" == "--all" ]]; then
+    if [[ $# -ne 1 ]]; then
+        echo -e "${RED}ERROR${NC}: --all cannot be combined with case numbers" >&2
+        exit 2
+    fi
+    TEST_CASES=()
+    while IFS= read -r dir; do
+        TEST_CASES+=("$dir")
+    done < <(find "$CASES_DIR" -maxdepth 1 -type d -name '[0-9]*' | sort)
+elif [[ $# -gt 0 ]]; then
     TEST_CASES=()
     for num in "$@"; do
         dir=$(find "$CASES_DIR" -maxdepth 1 -type d -name "${num}-*" | head -1)
@@ -397,9 +484,14 @@ if [[ $# -gt 0 ]]; then
     done
 else
     TEST_CASES=()
-    while IFS= read -r dir; do
+    for num in "${SMOKE_CASES[@]}"; do
+        dir=$(find "$CASES_DIR" -maxdepth 1 -type d -name "${num}-*" | head -1)
+        if [[ -z "$dir" ]]; then
+            echo -e "${RED}ERROR${NC}: maintained smoke case '$num' is missing" >&2
+            exit 1
+        fi
         TEST_CASES+=("$dir")
-    done < <(find "$CASES_DIR" -maxdepth 1 -type d -name '[0-9]*' | sort)
+    done
 fi
 
 # ===========================================================================
@@ -2104,16 +2196,16 @@ run_72_blue_green() {
     log_header "72 - Blue-Green Deployment"
     start_proxy "$CASES_DIR/72-blue-green" || return
 
-    # With "first" algorithm, all traffic goes to the first healthy target (blue)
+    # Blue-green deployment mode sends all traffic to the active blue group.
     assert_status "Blue-green - request succeeds" 200 \
         -H "Host: bluegreen.test" "$PROXY_URL/"
 
     # Verify traffic goes to the blue (first) target
-    assert_body_contains "Blue-green - routed to blue upstream" "env=blue" \
+    assert_body_contains "Blue-green - routed to blue upstream" "blue.internal" \
         -H "Host: bluegreen.test" "$PROXY_URL/"
 
     # Multiple requests should all go to blue
-    assert_body_contains "Blue-green - consistent blue routing" "env=blue" \
+    assert_body_contains "Blue-green - consistent blue routing" "blue.internal" \
         -H "Host: bluegreen.test" "$PROXY_URL/"
 
     stop_proxy
@@ -2229,21 +2321,21 @@ run_78_header_routing() {
     assert_status "Header route - API route succeeds" 200 \
         -H "Host: headerroute.test" -H "X-Route: api" "$PROXY_URL/"
 
-    assert_body_contains "Header route - API query param" "route=api" \
+    assert_body_contains "Header route - API upstream" "api.internal" \
         -H "Host: headerroute.test" -H "X-Route: api" "$PROXY_URL/"
 
     # Route to web backend with X-Route: web
     assert_status "Header route - web route succeeds" 200 \
         -H "Host: headerroute.test" -H "X-Route: web" "$PROXY_URL/"
 
-    assert_body_contains "Header route - web query param" "route=web" \
+    assert_body_contains "Header route - web upstream" "web.internal" \
         -H "Host: headerroute.test" -H "X-Route: web" "$PROXY_URL/"
 
     # No header falls through to default backend
     assert_status "Header route - default route succeeds" 200 \
         -H "Host: headerroute.test" "$PROXY_URL/"
 
-    assert_body_contains "Header route - default query param" "route=default" \
+    assert_body_contains "Header route - default upstream" "default.internal" \
         -H "Host: headerroute.test" "$PROXY_URL/"
 
     stop_proxy
@@ -2253,25 +2345,25 @@ run_79_priority_routing() {
     log_header "79 - Priority-Based Routing"
     start_proxy "$CASES_DIR/79-priority-routing" || return
 
-    # High priority requests
+    # Priority 1 admits only the high-priority target.
     assert_status "Priority - high priority succeeds" 200 \
-        -H "Host: priority.test" -H "X-Priority: high" "$PROXY_URL/"
+        -H "Host: priority.test" -H "X-Priority: 1" "$PROXY_URL/"
 
-    assert_body_contains "Priority - high route query param" "priority=high" \
-        -H "Host: priority.test" -H "X-Priority: high" "$PROXY_URL/"
+    assert_body_contains "Priority - high upstream" "high-priority.internal" \
+        -H "Host: priority.test" -H "X-Priority: 1" "$PROXY_URL/"
 
-    # Low priority requests
+    # Priority 8 admits high and low; header hashing selects the low target.
     assert_status "Priority - low priority succeeds" 200 \
-        -H "Host: priority.test" -H "X-Priority: low" "$PROXY_URL/"
+        -H "Host: priority.test" -H "X-Priority: 8" "$PROXY_URL/"
 
-    assert_body_contains "Priority - low route query param" "priority=low" \
-        -H "Host: priority.test" -H "X-Priority: low" "$PROXY_URL/"
+    assert_body_contains "Priority - low upstream" "low-priority.internal" \
+        -H "Host: priority.test" -H "X-Priority: 8" "$PROXY_URL/"
 
     # No priority header falls through to normal
     assert_status "Priority - normal (default) succeeds" 200 \
         -H "Host: priority.test" "$PROXY_URL/"
 
-    assert_body_contains "Priority - normal route query param" "priority=normal" \
+    assert_body_contains "Priority - normal upstream" "normal-priority.internal" \
         -H "Host: priority.test" "$PROXY_URL/"
 
     stop_proxy
@@ -2384,6 +2476,21 @@ run_83_ssrf_protection() {
         -X POST -H "Host: ssrf.test" -H "Content-Type: application/json" \
         -d '{"key":"value"}' "$PROXY_URL/"
 
+    # Regression: Pingora's retry buffer is 64 KiB. Threat protection must
+    # release its own validated buffer rather than relying on that replay path.
+    local large_json
+    large_json=$(python3 -c "
+import json
+print(json.dumps({f'k{i}': 'x' * 800 for i in range(90)}))
+" 2>/dev/null || echo "")
+    if [[ -n "$large_json" ]]; then
+        assert_status "SSRF - validated POST over 64 KiB reaches upstream" 200 \
+            -X POST -H "Host: ssrf.test" -H "Content-Type: application/json" \
+            --data-binary "$large_json" "$PROXY_URL/"
+    else
+        log_skip "SSRF - validated POST over 64 KiB (python3 not available)"
+    fi
+
     # Request with excessively long URL path is blocked
     local long_path
     long_path=$(python3 -c "print('a' * 3000)" 2>/dev/null || echo "")
@@ -2422,13 +2529,13 @@ run_84_metrics_origin() {
     assert_status "Metrics origin - proxy request" 200 \
         -H "Host: metrics.test" "$PROXY_URL/echo"
 
-    # Check the telemetry /metrics endpoint for origin request counter
+    # Metrics are served on the data-plane listener.
     sleep 0.5
     assert_body_contains "Metrics origin - sbproxy_origin_requests_total present" \
-        "sbproxy_origin_requests_total" "http://localhost:18089/metrics"
+        "sbproxy_origin_requests_total" \
+        -H "Host: metrics.test" "$PROXY_URL/metrics"
 
     stop_proxy
-    lsof -ti:18089 2>/dev/null | xargs kill -9 2>/dev/null || true
 }
 
 run_85_metrics_cardinality() {
@@ -2441,13 +2548,12 @@ run_85_metrics_cardinality() {
     assert_status "Metrics cardinality - request 2" 200 \
         -H "Host: cardinality.test" "$PROXY_URL/echo?q=2"
 
-    # Verify the telemetry /metrics endpoint responds
+    # Verify the data-plane /metrics endpoint responds.
     sleep 0.5
     assert_status "Metrics cardinality - /metrics endpoint serves" 200 \
-        "http://localhost:18089/metrics"
+        -H "Host: cardinality.test" "$PROXY_URL/metrics"
 
     stop_proxy
-    lsof -ti:18089 2>/dev/null | xargs kill -9 2>/dev/null || true
 }
 
 run_86_security_headers_array() {
@@ -2502,17 +2608,19 @@ run_87_secret_references() {
 }
 
 run_88_config_version() {
-    log_header "88 - Config Version"
-    start_proxy "$CASES_DIR/88-config-version" || return
+    log_header "88 - Removed Config Version"
+    local config="$CASES_DIR/88-config-version/sb.yml"
+    local logfile="$LOG_DIR/88-config-version.log"
 
-    # Proxy should start and serve requests with config_version: 2
-    assert_status "Config version 2 - proxy serves" 200 \
-        -H "Host: cfgver.test" "$PROXY_URL/echo"
-
-    assert_body_contains "Config version 2 - echo body" "cfgver.test" \
-        -H "Host: cfgver.test" "$PROXY_URL/echo"
-
-    stop_proxy
+    # Origin-level config_version was removed. Preserve this invalid fixture
+    # so the CLI's strict-key validation cannot regress silently.
+    if "$SBPROXY_BIN" validate "$config" >"$logfile" 2>&1; then
+        log_fail "Removed config_version - validation unexpectedly succeeds"
+    elif grep -q "origins.cfgver.test.config_version" "$logfile"; then
+        log_pass "Removed config_version - validation rejects the origin key"
+    else
+        log_fail "Removed config_version - unexpected diagnostic (see $logfile)"
+    fi
 }
 
 run_89_access_logging() {
@@ -2572,7 +2680,7 @@ run_91_consistent_hashing() {
     start_proxy "$CASES_DIR/91-consistent-hashing" || return
 
     # Same hash key should route to the same backend consistently
-    local body1 body2 body3
+    local body1 body2 body3 path1 path2 path3
     body1=$(curl -s --compressed -H "Accept-Encoding: identity" --max-time 10 \
         -H "Host: conhash.test" -H "X-Hash-Key: user-abc-123" "$PROXY_URL/" 2>/dev/null || echo "")
     body2=$(curl -s --compressed -H "Accept-Encoding: identity" --max-time 10 \
@@ -2580,10 +2688,17 @@ run_91_consistent_hashing() {
     body3=$(curl -s --compressed -H "Accept-Encoding: identity" --max-time 10 \
         -H "Host: conhash.test" -H "X-Hash-Key: user-abc-123" "$PROXY_URL/" 2>/dev/null || echo "")
 
-    if [[ "$body1" == "$body2" ]] && [[ "$body2" == "$body3" ]]; then
-        log_pass "Consistent hashing - same key routes to same backend"
+    if command -v jq >/dev/null 2>&1; then
+        path1=$(printf '%s' "$body1" | jq -r '.path // empty' 2>/dev/null)
+        path2=$(printf '%s' "$body2" | jq -r '.path // empty' 2>/dev/null)
+        path3=$(printf '%s' "$body3" | jq -r '.path // empty' 2>/dev/null)
+        if [[ -n "$path1" ]] && [[ "$path1" == "$path2" ]] && [[ "$path2" == "$path3" ]]; then
+            log_pass "Consistent hashing - same key routes to same backend"
+        else
+            log_fail "Consistent hashing - same key routes to same backend (paths differ)"
+        fi
     else
-        log_fail "Consistent hashing - same key routes to same backend (responses differ)"
+        log_skip "Consistent hashing - same key routes to same backend (jq not installed)"
     fi
 
     # Different hash key may route to a different backend
@@ -2680,12 +2795,18 @@ for case_dir in "${TEST_CASES[@]}"; do
 
     # Start callback server if needed
     if needs_callback_server "$case_num" 2>/dev/null; then
-        start_callback_server || true
+        if ! start_callback_server; then
+            log_fail "$case_name - callback server unavailable"
+            continue
+        fi
     fi
 
     # Start mock AI server if needed
     if needs_mock_ai_server "$case_num" 2>/dev/null; then
-        start_mock_ai_server || true
+        if ! start_mock_ai_server; then
+            log_fail "$case_name - mock AI server unavailable"
+            continue
+        fi
     fi
 
     func_name="run_${case_num}_$(echo "${case_name#*-}" | tr '-' '_')"
@@ -2709,8 +2830,8 @@ echo -e "  Total:   $((PASS + FAIL + SKIP))"
 if [[ ${#FAILURES[@]} -gt 0 ]]; then
     echo ""
     echo -e "${RED}${BOLD}Failures:${NC}"
-    for f in "${FAILURES[@]}"; do
-        echo -e "  ${RED}-${NC} $f"
+    for ((failure_index=0; failure_index<${#FAILURES[@]}; failure_index++)); do
+        echo -e "  ${RED}-${NC} ${FAILURES[$failure_index]}"
     done
 fi
 

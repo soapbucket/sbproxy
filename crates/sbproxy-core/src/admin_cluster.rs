@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Soap Bucket LLC
 
-//! Cluster status, metrics, and one-time enrollment admin adapters.
+//! Cluster status, metrics, artifact-usage, and one-time enrollment
+//! admin adapters.
 
 use sbproxy_mesh::enrollment::{EnrollmentError, EnrollmentRequest};
+use sbproxy_mesh::metrics::{
+    ENROLLMENT_OUTCOME_ERROR, ENROLLMENT_OUTCOME_OK, ENROLLMENT_REASON_OK, MESH_ENROLLMENT,
+};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -15,7 +19,16 @@ pub const ENROLL_PATH: &str = "/admin/cluster/enroll";
 pub const STATUS_PATH: &str = "/admin/cluster/status";
 /// Authenticated signed cluster deployment read and publication endpoint.
 pub const DEPLOYMENTS_PATH: &str = "/admin/cluster/deployments";
+/// Authenticated cluster-wide VRAM aggregation endpoint.
+pub const VRAM_PATH: &str = "/admin/cluster/vram";
 const METRICS_PATH: &str = "/admin/cluster/metrics";
+const ARTIFACTS_PATH: &str = "/admin/cluster/artifacts";
+/// Authenticated replicated-state listing and replicated delete (WOR-1947).
+const STATE_PATH: &str = "/admin/cluster/state";
+/// Authenticated bounded replicated-state purge (WOR-1947).
+const STATE_PURGE_PATH: &str = "/admin/cluster/state/purge";
+/// Authenticated single-record read and write on the replicated substrate.
+const STATE_KEY_PATH: &str = "/admin/cluster/state/key";
 
 #[derive(Debug, Clone, Serialize)]
 struct ClusterStatusResponse {
@@ -115,6 +128,37 @@ struct ClusterNodeAlert {
     model_endpoint: Option<String>,
 }
 
+/// Fleet-wide VRAM totals: the sum of every node's device totals below.
+#[derive(Debug, Clone, Default, Serialize)]
+struct ClusterVramSummary {
+    total_bytes: u64,
+    used_bytes: u64,
+    free_bytes: u64,
+    device_count: usize,
+    node_count: usize,
+}
+
+/// One node's VRAM contribution, reusing the same per-node
+/// `VramStatus`/`DeviceVram` shape `GET /admin/model-host/status` reports
+/// locally (`sbproxy_model_host::runtime`), so a client already parsing
+/// that shape needs no second type. Here `budget_bytes` is this node's
+/// summed device total (not the single-largest-device residency budget
+/// the local route means by the same field).
+#[derive(Debug, Clone, Serialize)]
+struct ClusterVramNode {
+    node_id: String,
+    vram: sbproxy_model_host::VramStatus,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ClusterVramResponse {
+    schema_version: u32,
+    generated_at_unix_ms: u64,
+    directory_collected_at_unix_ms: Option<u64>,
+    cluster: ClusterVramSummary,
+    nodes: Vec<ClusterVramNode>,
+}
+
 /// Whether a path uses its enrollment token instead of admin credentials.
 pub fn is_public_enrollment_path(path: &str) -> bool {
     path.split('?').next() == Some(ENROLL_PATH)
@@ -126,14 +170,258 @@ pub fn dispatch(
     path: &str,
     body: Option<&str>,
 ) -> Option<(u16, &'static str, String)> {
+    let query = path.split_once('?').map(|(_, query)| query);
     let path = path.split('?').next().unwrap_or(path);
     match path {
         STATUS_PATH => Some(dispatch_status(method)),
         DEPLOYMENTS_PATH => Some(dispatch_deployments(method, body)),
+        VRAM_PATH => Some(dispatch_vram(method)),
         METRICS_PATH => Some(dispatch_metrics(method)),
+        ARTIFACTS_PATH => Some(dispatch_artifacts(method)),
         ENROLL_PATH => Some(dispatch_enrollment(method, body)),
+        STATE_PATH => Some(dispatch_state(method, query)),
+        STATE_PURGE_PATH => Some(dispatch_state_purge(method, body)),
+        STATE_KEY_PATH => Some(dispatch_state_key(method, query, body)),
         _ => None,
     }
+}
+
+/// Single-record read and write through the replicated quorum paths.
+fn dispatch_state_key(
+    method: &str,
+    query: Option<&str>,
+    body: Option<&str>,
+) -> (u16, &'static str, String) {
+    let store = match replicated_store() {
+        Ok(store) => store,
+        Err(response) => return response,
+    };
+    let Some(key) = query_param(query, "key").filter(|key| !key.is_empty()) else {
+        return json(
+            400,
+            serde_json::json!({"error": "missing key query parameter", "code": "bad_request"}),
+        );
+    };
+    if method.eq_ignore_ascii_case("GET") {
+        return match crate::cluster::block_on_cluster(store.get(&key)) {
+            Ok(outcome) => {
+                let value_base64 = outcome.value.as_ref().map(|value| {
+                    use base64::Engine as _;
+                    base64::engine::general_purpose::STANDARD.encode(value)
+                });
+                let value_utf8 = outcome
+                    .value
+                    .as_ref()
+                    .and_then(|value| std::str::from_utf8(value).ok().map(str::to_string));
+                json(
+                    if outcome.value.is_some() { 200 } else { 404 },
+                    serde_json::json!({
+                        "schema_version": 1,
+                        "key": key,
+                        "found": outcome.value.is_some(),
+                        "value_base64": value_base64,
+                        "value_utf8": value_utf8,
+                        "replicas_answered": outcome.responses,
+                        "repaired": outcome.repaired,
+                    }),
+                )
+            }
+            Err(error) => json(
+                502,
+                serde_json::json!({
+                    "error": format!("replicated read failed: {error}"),
+                    "code": "replication_read_failed",
+                }),
+            ),
+        };
+    }
+    if method.eq_ignore_ascii_case("PUT") {
+        let Some(value) = body else {
+            return json(
+                400,
+                serde_json::json!({"error": "request body is the record value", "code": "bad_request"}),
+            );
+        };
+        let ttl_secs = query_param(query, "ttl_secs")
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or(0);
+        return match crate::cluster::block_on_cluster(store.put(&key, value.as_bytes(), ttl_secs)) {
+            Ok(receipt) => json(
+                200,
+                serde_json::json!({
+                    "schema_version": 1,
+                    "key": key,
+                    "acked_replicas": receipt.acked,
+                    "logical_version": receipt.register.logical_version(),
+                }),
+            ),
+            Err(error) => json(
+                502,
+                serde_json::json!({
+                    "error": format!("replicated write failed: {error}"),
+                    "code": "replication_write_failed",
+                }),
+            ),
+        };
+    }
+    json(405, serde_json::json!({"error": "method not allowed"}))
+}
+
+// --- WOR-1947 replicated-state admin ---
+
+/// Resolve the replicated store, or the standard "not enabled" error.
+fn replicated_store(
+) -> Result<Arc<sbproxy_mesh::state::replicated::ReplicatedStore>, (u16, &'static str, String)> {
+    crate::cluster::current_cluster_handle()
+        .and_then(|handle| handle.mesh_node())
+        .and_then(|node| node.replicated_store())
+        .ok_or_else(|| {
+            json(
+                404,
+                serde_json::json!({
+                    "error": "replicated state substrate not enabled",
+                    "code": "replication_disabled",
+                }),
+            )
+        })
+}
+
+/// Minimal percent-decoder for admin query parameters. Replicated keys
+/// and opaque page tokens can carry characters that URL syntax reserves.
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                let hex = bytes.get(i + 1..i + 3).and_then(|pair| {
+                    std::str::from_utf8(pair)
+                        .ok()
+                        .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                });
+                match hex {
+                    Some(byte) => {
+                        out.push(byte);
+                        i += 3;
+                    }
+                    None => {
+                        out.push(b'%');
+                        i += 1;
+                    }
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn query_param(query: Option<&str>, name: &str) -> Option<String> {
+    query?
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(key, _)| *key == name)
+        .map(|(_, value)| percent_decode(value))
+}
+
+fn dispatch_state(method: &str, query: Option<&str>) -> (u16, &'static str, String) {
+    let store = match replicated_store() {
+        Ok(store) => store,
+        Err(response) => return response,
+    };
+    if method.eq_ignore_ascii_case("GET") {
+        let prefix = query_param(query, "prefix").unwrap_or_default();
+        let page_token = query_param(query, "page_token");
+        let limit = query_param(query, "limit")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(200);
+        let page = crate::cluster::block_on_cluster(store.fleet_state_page(
+            &prefix,
+            page_token.as_deref(),
+            limit,
+        ));
+        return json(
+            200,
+            serde_json::json!({
+                "schema_version": 1,
+                "entries": page.entries,
+                "next_page_token": page.next_page_token,
+                "unreachable": page.unreachable,
+            }),
+        );
+    }
+    if method.eq_ignore_ascii_case("DELETE") {
+        let Some(key) = query_param(query, "key").filter(|key| !key.is_empty()) else {
+            return json(
+                400,
+                serde_json::json!({"error": "missing key query parameter", "code": "bad_request"}),
+            );
+        };
+        return match crate::cluster::block_on_cluster(store.delete(&key)) {
+            Ok(receipt) => json(
+                200,
+                serde_json::json!({
+                    "schema_version": 1,
+                    "deleted": key,
+                    "acked_replicas": receipt.acked,
+                }),
+            ),
+            Err(error) => json(
+                502,
+                serde_json::json!({
+                    "error": format!("replicated delete failed: {error}"),
+                    "code": "replication_write_failed",
+                }),
+            ),
+        };
+    }
+    json(405, serde_json::json!({"error": "method not allowed"}))
+}
+
+fn dispatch_state_purge(method: &str, body: Option<&str>) -> (u16, &'static str, String) {
+    if !method.eq_ignore_ascii_case("POST") {
+        return json(405, serde_json::json!({"error": "method not allowed"}));
+    }
+    let store = match replicated_store() {
+        Ok(store) => store,
+        Err(response) => return response,
+    };
+    #[derive(serde::Deserialize)]
+    struct PurgeRequest {
+        prefix: String,
+        #[serde(default = "default_purge_max")]
+        max: usize,
+    }
+    fn default_purge_max() -> usize {
+        1_000
+    }
+    let request = match body.map(serde_json::from_str::<PurgeRequest>) {
+        Some(Ok(request)) => request,
+        _ => {
+            return json(
+                400,
+                serde_json::json!({"error": "body must be {\"prefix\": string, \"max\": number}", "code": "bad_request"}),
+            )
+        }
+    };
+    let outcome = crate::cluster::block_on_cluster(store.fleet_purge(&request.prefix, request.max));
+    json(
+        200,
+        serde_json::json!({
+            "schema_version": 1,
+            "deleted": outcome.deleted,
+            "failed": outcome.failed,
+            "truncated": outcome.truncated,
+        }),
+    )
 }
 
 fn dispatch_deployments(method: &str, body: Option<&str>) -> (u16, &'static str, String) {
@@ -318,6 +606,107 @@ fn dispatch_status_with_placement(
             tracing::error!(%error, "serialize cluster status response");
             json(500, serde_json::json!({"error": "cluster status failed"}))
         }
+    }
+}
+
+/// `GET /admin/cluster/vram`: fleet-wide VRAM aggregation. Unlike
+/// `dispatch_status`, this does not require a configured cluster owner;
+/// with no model directory available yet it answers an honest empty
+/// aggregate (zero nodes), the same "no data yet, not an error" pattern
+/// `files_response` uses for the local artifact cache.
+fn dispatch_vram(method: &str) -> (u16, &'static str, String) {
+    if !method.eq_ignore_ascii_case("GET") {
+        return json(405, serde_json::json!({"error": "method not allowed"}));
+    }
+    let view = crate::cluster::current_model_directory().map(|directory| directory.load());
+    cluster_vram_response(view.as_deref(), unix_time_ms())
+}
+
+fn cluster_vram_response(
+    view: Option<&sbproxy_ai::model_directory::ModelDirectoryView>,
+    now: u64,
+) -> (u16, &'static str, String) {
+    let response = build_cluster_vram_response(view, now);
+    match serde_json::to_string(&response) {
+        Ok(body) => (200, "application/json", body),
+        Err(error) => {
+            tracing::error!(%error, "serialize cluster vram response");
+            json(500, serde_json::json!({"error": "cluster vram failed"}))
+        }
+    }
+}
+
+/// Aggregate every node's device totals from the same `ModelDirectoryView`
+/// `cluster_status_response` / `status_node_from_directory` read below,
+/// off each node's retained `NodeModelSnapshot.devices`. Gated on
+/// `model_eligible`, not merely on `snapshot.is_some()`:
+/// `retain_last_snapshot` (`model_directory.rs`) keeps showing a stale,
+/// expired, unreachable, or malformed node's last-known snapshot (so
+/// other admin surfaces can still describe what it was last serving) but
+/// always clears `model_eligible` when it does that. Aggregating off
+/// `snapshot.is_some()` alone would keep counting a dead worker's
+/// last-known VRAM into the fleet total forever. A node that has never
+/// reported, or has since dropped out of eligibility, contributes
+/// nothing rather than a guessed or stale value.
+fn build_cluster_vram_response(
+    view: Option<&sbproxy_ai::model_directory::ModelDirectoryView>,
+    now: u64,
+) -> ClusterVramResponse {
+    let directory_collected_at_unix_ms = view
+        .filter(|view| view.collected_at_unix_ms > 0)
+        .map(|view| view.collected_at_unix_ms);
+    let nodes: Vec<ClusterVramNode> = view
+        .map(|view| view.nodes.as_slice())
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|node| {
+            if !node.model_eligible {
+                return None;
+            }
+            let snapshot = node.snapshot.as_ref()?;
+            let devices: Vec<sbproxy_model_host::DeviceVram> = snapshot
+                .devices
+                .iter()
+                .map(|device| sbproxy_model_host::DeviceVram {
+                    index: device.index,
+                    name: device.name.clone(),
+                    total_bytes: device.total_memory_bytes,
+                    free_bytes: device.available_memory_bytes,
+                    compute_utilization: device
+                        .compute_utilization_millis
+                        .map(|millis| f64::from(millis) / 1000.0),
+                    memory_occupancy: device
+                        .memory_occupancy_millis
+                        .map(|millis| f64::from(millis) / 1000.0),
+                })
+                .collect();
+            let total_bytes: u64 = devices.iter().map(|device| device.total_bytes).sum();
+            let free_bytes: u64 = devices.iter().map(|device| device.free_bytes).sum();
+            let used_bytes = total_bytes.saturating_sub(free_bytes);
+            Some(ClusterVramNode {
+                node_id: node.node_id.clone(),
+                vram: sbproxy_model_host::VramStatus {
+                    budget_bytes: total_bytes,
+                    used_bytes,
+                    free_bytes,
+                    devices,
+                },
+            })
+        })
+        .collect();
+    let cluster = ClusterVramSummary {
+        total_bytes: nodes.iter().map(|node| node.vram.budget_bytes).sum(),
+        used_bytes: nodes.iter().map(|node| node.vram.used_bytes).sum(),
+        free_bytes: nodes.iter().map(|node| node.vram.free_bytes).sum(),
+        device_count: nodes.iter().map(|node| node.vram.devices.len()).sum(),
+        node_count: nodes.len(),
+    };
+    ClusterVramResponse {
+        schema_version: 1,
+        generated_at_unix_ms: now,
+        directory_collected_at_unix_ms,
+        cluster,
+        nodes,
     }
 }
 
@@ -643,6 +1032,161 @@ fn dispatch_metrics(method: &str) -> (u16, &'static str, String) {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ClusterArtifactsResponse {
+    schema_version: u32,
+    nodes: Vec<ClusterArtifactsNode>,
+    models: Vec<ClusterArtifactsModel>,
+    partial: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ClusterArtifactsNode {
+    node_id: String,
+    total_bytes: u64,
+    artifact_count: usize,
+    snapshot_age_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ClusterArtifactsModel {
+    logical_model: String,
+    total_bytes: u64,
+    node_count: usize,
+}
+
+// WOR-1910: fleet artifact disk usage aggregated from the node snapshots
+// already collected in the cluster model directory. Without a configured
+// cluster the local verified cache is the whole fleet, reported as one
+// "local" node.
+fn dispatch_artifacts(method: &str) -> (u16, &'static str, String) {
+    if !method.eq_ignore_ascii_case("GET") {
+        return json(405, serde_json::json!({"error": "method not allowed"}));
+    }
+    match crate::cluster::current_model_directory() {
+        // The process-wide directory exists even without a configured
+        // cluster; an empty membership means this node is the fleet, so
+        // report the local cache rather than an empty aggregate.
+        Some(directory) => {
+            let view = directory.load();
+            if view.nodes.is_empty() {
+                local_artifacts_response()
+            } else {
+                artifacts_response_from_directory(&view, unix_time_ms())
+            }
+        }
+        None => local_artifacts_response(),
+    }
+}
+
+fn artifacts_response_from_directory(
+    view: &sbproxy_ai::model_directory::ModelDirectoryView,
+    now: u64,
+) -> (u16, &'static str, String) {
+    let mut partial = false;
+    let mut nodes = Vec::with_capacity(view.nodes.len());
+    let mut models: BTreeMap<String, (u64, BTreeSet<String>)> = BTreeMap::new();
+    for node in &view.nodes {
+        let Some(snapshot) = node.snapshot.as_ref() else {
+            // A member without an accepted snapshot has unknown cache
+            // truth, so the aggregate is explicitly partial.
+            partial = true;
+            continue;
+        };
+        let mut total_bytes: u64 = 0;
+        let mut artifact_count = 0usize;
+        for artifact in &snapshot.artifacts {
+            // Snapshots include synthesized zero-byte "missing" rows for
+            // runtime digests absent from the inventory; only bytes on
+            // disk count toward usage.
+            if artifact.completed_bytes == 0 {
+                continue;
+            }
+            total_bytes = total_bytes.saturating_add(artifact.completed_bytes);
+            artifact_count += 1;
+            let entry = models.entry(artifact.model.clone()).or_default();
+            entry.0 = entry.0.saturating_add(artifact.completed_bytes);
+            entry.1.insert(node.node_id.clone());
+        }
+        nodes.push(ClusterArtifactsNode {
+            node_id: node.node_id.clone(),
+            total_bytes,
+            artifact_count,
+            snapshot_age_ms: now.saturating_sub(snapshot.published_at_unix_ms),
+        });
+    }
+    nodes.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+    render_artifacts_response(nodes, models, partial)
+}
+
+fn local_artifacts_response() -> (u16, &'static str, String) {
+    let runtime = crate::server::model_host::model_runtime_manager();
+    let mut total_bytes: u64 = 0;
+    let mut artifact_count = 0usize;
+    let mut models: BTreeMap<String, (u64, BTreeSet<String>)> = BTreeMap::new();
+    match runtime.cached_artifacts() {
+        // No model host is configured, so no artifact cache is open and
+        // the single-node inventory is honestly empty.
+        None => {}
+        Some(Ok(artifacts)) => {
+            for artifact in artifacts {
+                total_bytes = total_bytes.saturating_add(artifact.total_size_bytes);
+                artifact_count += 1;
+                let entry = models.entry(artifact.logical_model).or_default();
+                entry.0 = entry.0.saturating_add(artifact.total_size_bytes);
+                entry.1.insert("local".to_string());
+            }
+        }
+        Some(Err(error)) => {
+            tracing::error!(%error, "list local artifact inventory for cluster aggregate");
+            return json(
+                502,
+                serde_json::json!({"error": "artifact inventory unavailable; inspect server logs"}),
+            );
+        }
+    }
+    let nodes = vec![ClusterArtifactsNode {
+        node_id: "local".to_string(),
+        total_bytes,
+        artifact_count,
+        snapshot_age_ms: 0,
+    }];
+    render_artifacts_response(nodes, models, false)
+}
+
+fn render_artifacts_response(
+    nodes: Vec<ClusterArtifactsNode>,
+    models: BTreeMap<String, (u64, BTreeSet<String>)>,
+    partial: bool,
+) -> (u16, &'static str, String) {
+    let models = models
+        .into_iter()
+        .map(
+            |(logical_model, (total_bytes, model_nodes))| ClusterArtifactsModel {
+                logical_model,
+                total_bytes,
+                node_count: model_nodes.len(),
+            },
+        )
+        .collect();
+    let response = ClusterArtifactsResponse {
+        schema_version: 1,
+        nodes,
+        models,
+        partial,
+    };
+    match serde_json::to_string(&response) {
+        Ok(body) => (200, "application/json", body),
+        Err(error) => {
+            tracing::error!(%error, "serialize cluster artifacts response");
+            json(
+                500,
+                serde_json::json!({"error": "cluster artifacts failed"}),
+            )
+        }
+    }
+}
+
 fn dispatch_enrollment(method: &str, body: Option<&str>) -> (u16, &'static str, String) {
     dispatch_enrollment_with(method, body, crate::cluster::current_enrollment_authority())
 }
@@ -656,6 +1200,9 @@ fn dispatch_enrollment_with(
         return json(405, serde_json::json!({"error": "method not allowed"}));
     }
     let Some(body) = body.filter(|body| !body.is_empty() && body.len() <= 64 * 1024) else {
+        MESH_ENROLLMENT
+            .with_label_values(&[ENROLLMENT_OUTCOME_ERROR, "invalid_request"])
+            .inc();
         return json(
             400,
             serde_json::json!({"error": "invalid enrollment request", "code": "invalid_request"}),
@@ -664,34 +1211,66 @@ fn dispatch_enrollment_with(
     let request: EnrollmentRequest = match serde_json::from_str(body) {
         Ok(request) => request,
         Err(_) => {
+            MESH_ENROLLMENT
+                .with_label_values(&[ENROLLMENT_OUTCOME_ERROR, "invalid_request"])
+                .inc();
             return json(
                 400,
                 serde_json::json!({"error": "invalid enrollment request", "code": "invalid_request"}),
-            )
+            );
         }
     };
     let Some(authority) = authority else {
+        MESH_ENROLLMENT
+            .with_label_values(&[ENROLLMENT_OUTCOME_ERROR, "authority_unavailable"])
+            .inc();
         return json(
             503,
             serde_json::json!({"error": "this node is not an enrollment authority", "code": "authority_unavailable"}),
         );
     };
     match authority.enroll(request) {
-        Ok(response) => match serde_json::to_string(&response) {
-            Ok(body) => (200, "application/json", body),
-            Err(error) => {
-                tracing::error!(%error, "serialize cluster enrollment response");
-                json(
-                    500,
-                    serde_json::json!({"error": "cluster enrollment failed", "code": "internal"}),
-                )
+        Ok(response) => {
+            // The authority accepted the request and consumed the token,
+            // so the attempt counts as ok even if response serialization
+            // fails below.
+            MESH_ENROLLMENT
+                .with_label_values(&[ENROLLMENT_OUTCOME_OK, ENROLLMENT_REASON_OK])
+                .inc();
+            match serde_json::to_string(&response) {
+                Ok(body) => (200, "application/json", body),
+                Err(error) => {
+                    tracing::error!(%error, "serialize cluster enrollment response");
+                    json(
+                        500,
+                        serde_json::json!({"error": "cluster enrollment failed", "code": "internal"}),
+                    )
+                }
             }
-        },
+        }
         Err(error) => enrollment_error_response(error),
     }
 }
 
+/// Bounded `reason` label for `mesh_enrollment_total`, mapped explicitly
+/// from the [`EnrollmentError`] variant.
+fn enrollment_error_reason(error: &EnrollmentError) -> &'static str {
+    match error {
+        EnrollmentError::InvalidRequest(_) => "invalid_request",
+        EnrollmentError::AlreadyExists(_) => "already_exists",
+        EnrollmentError::AuthorityMissing(_) => "authority_missing",
+        EnrollmentError::Corrupt(_) => "corrupt",
+        EnrollmentError::TokenRejected(_) => "token_rejected",
+        EnrollmentError::Io(_) => "io",
+        EnrollmentError::Json(_) => "json",
+        EnrollmentError::Crypto(_) => "crypto",
+    }
+}
+
 fn enrollment_error_response(error: EnrollmentError) -> (u16, &'static str, String) {
+    MESH_ENROLLMENT
+        .with_label_values(&[ENROLLMENT_OUTCOME_ERROR, enrollment_error_reason(&error)])
+        .inc();
     match error {
         EnrollmentError::TokenRejected(_) => json(
             401,
@@ -741,6 +1320,158 @@ mod tests {
         let (status, content_type, _) = dispatch("GET", METRICS_PATH, None).expect("matched");
         assert!(status == 200 || status == 404, "status {status}");
         assert_eq!(content_type, "application/json");
+    }
+
+    #[test]
+    fn artifacts_contract_is_method_aware() {
+        assert_eq!(
+            dispatch("POST", ARTIFACTS_PATH, None).expect("matched").0,
+            405
+        );
+    }
+
+    #[test]
+    fn artifacts_contract_reports_the_single_node_equivalent_without_a_cluster() {
+        // Without a configured cluster the local verified cache is the
+        // whole fleet: one "local" node, zero snapshot age, not partial.
+        let (status, content_type, body) = local_artifacts_response();
+        assert_eq!(status, 200);
+        assert_eq!(content_type, "application/json");
+        let body: serde_json::Value = serde_json::from_str(&body).expect("artifacts JSON");
+        assert_eq!(body["schema_version"], 1);
+        assert_eq!(body["partial"], false);
+        assert_eq!(body["nodes"].as_array().expect("nodes array").len(), 1);
+        assert_eq!(body["nodes"][0]["node_id"], "local");
+        assert_eq!(body["nodes"][0]["snapshot_age_ms"], 0);
+        assert!(body["nodes"][0]["total_bytes"].is_u64());
+        assert!(body["nodes"][0]["artifact_count"].is_u64());
+        assert!(body["models"].is_array());
+    }
+
+    #[test]
+    fn artifacts_contract_aggregates_node_snapshots_and_marks_missing_ones_partial() {
+        use sbproxy_ai::model_directory::{
+            DirectoryMember, DirectoryMemberState, DirectorySnapshotEnvelope,
+            DirectorySnapshotRead, ModelDirectory,
+        };
+        use sbproxy_model_host::node_snapshot::{
+            ModelPlaneHealth, NodeArtifactSnapshot, NodeArtifactState, NodeHealthSnapshot,
+            NodeHealthState, NodeIdentitySnapshot, NodeModelSnapshot, NodeRole,
+            NODE_MODEL_SNAPSHOT_SCHEMA_VERSION,
+        };
+
+        let snapshot = NodeModelSnapshot {
+            schema_version: NODE_MODEL_SNAPSHOT_SCHEMA_VERSION,
+            node: NodeIdentitySnapshot {
+                node_id: "worker-a".to_string(),
+                roles: BTreeSet::from([NodeRole::Worker]),
+                labels: BTreeMap::new(),
+                model_endpoint: Some("https://worker-a.internal:9443".to_string()),
+            },
+            health: NodeHealthSnapshot {
+                state: NodeHealthState::Unhealthy,
+                reason_codes: vec!["engine_unhealthy".to_string()],
+                model_plane: ModelPlaneHealth::Unavailable,
+            },
+            engines: Vec::new(),
+            devices: Vec::new(),
+            artifacts: vec![
+                NodeArtifactSnapshot {
+                    artifact_digest: "a".repeat(64),
+                    model: "qwen2.5-0.5b-instruct".to_string(),
+                    variant: "q4_k_m".to_string(),
+                    state: NodeArtifactState::Ready,
+                    completed_bytes: 1_000,
+                    total_bytes: Some(1_000),
+                    last_accessed_unix_ms: Some(900),
+                    reason_code: None,
+                },
+                NodeArtifactSnapshot {
+                    artifact_digest: "b".repeat(64),
+                    model: "qwen3-8b".to_string(),
+                    variant: "q8_0".to_string(),
+                    state: NodeArtifactState::Partial,
+                    completed_bytes: 250,
+                    total_bytes: None,
+                    last_accessed_unix_ms: None,
+                    reason_code: None,
+                },
+                // Synthesized zero-byte rows carry no disk usage and
+                // must not count as cached artifacts.
+                NodeArtifactSnapshot {
+                    artifact_digest: "c".repeat(64),
+                    model: "qwen3-8b".to_string(),
+                    variant: "q8_0".to_string(),
+                    state: NodeArtifactState::Missing,
+                    completed_bytes: 0,
+                    total_bytes: None,
+                    last_accessed_unix_ms: None,
+                    reason_code: None,
+                },
+            ],
+            replicas: Vec::new(),
+            placement_weight: 0,
+            active_deployment_digest: Some("d".repeat(64)),
+            generation: 4,
+            published_at_unix_ms: 1_000,
+            expires_at_unix_ms: 31_000,
+        };
+        let directory = ModelDirectory::new();
+        let view = directory
+            .refresh(
+                1_100,
+                vec![
+                    DirectoryMember {
+                        node_id: "worker-a".to_string(),
+                        address: Some("10.0.0.12:7946".to_string()),
+                        state: DirectoryMemberState::Alive,
+                        last_ack_age_ms: 25,
+                        incarnation: 2,
+                    },
+                    DirectoryMember {
+                        node_id: "worker-b".to_string(),
+                        address: Some("10.0.0.13:7946".to_string()),
+                        state: DirectoryMemberState::Alive,
+                        last_ack_age_ms: 25,
+                        incarnation: 1,
+                    },
+                ],
+                BTreeMap::from([(
+                    "worker-a".to_string(),
+                    DirectorySnapshotRead::Present(DirectorySnapshotEnvelope {
+                        publisher_node_id: "worker-a".to_string(),
+                        schema_version: NODE_MODEL_SNAPSHOT_SCHEMA_VERSION,
+                        generation: 4,
+                        published_at_unix_ms: 1_000,
+                        expires_at_unix_ms: 31_000,
+                        authenticated_identity: None,
+                        payload: serde_json::to_value(snapshot).expect("snapshot JSON"),
+                    }),
+                )]),
+            )
+            .expect("directory view");
+
+        let (status, _, body) = artifacts_response_from_directory(&view, 1_200);
+
+        assert_eq!(status, 200);
+        let body: serde_json::Value = serde_json::from_str(&body).expect("artifacts JSON");
+        assert_eq!(body["schema_version"], 1);
+        // worker-b has no accepted snapshot, so its cache truth is
+        // unknown and the aggregate says so.
+        assert_eq!(body["partial"], true);
+        assert_eq!(body["nodes"].as_array().expect("nodes array").len(), 1);
+        assert_eq!(body["nodes"][0]["node_id"], "worker-a");
+        assert_eq!(body["nodes"][0]["total_bytes"], 1_250);
+        assert_eq!(body["nodes"][0]["artifact_count"], 2);
+        assert_eq!(body["nodes"][0]["snapshot_age_ms"], 200);
+        let models = body["models"].as_array().expect("models array");
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0]["logical_model"], "qwen2.5-0.5b-instruct");
+        assert_eq!(models[0]["total_bytes"], 1_000);
+        assert_eq!(models[0]["node_count"], 1);
+        assert_eq!(models[1]["logical_model"], "qwen3-8b");
+        assert_eq!(models[1]["total_bytes"], 250);
+        assert_eq!(models[1]["node_count"], 1);
     }
 
     #[test]
@@ -836,6 +1567,261 @@ mod tests {
             dispatch_status_with("POST", handle, settings, None, 1_200).0,
             405
         );
+    }
+
+    #[test]
+    fn vram_route_is_method_aware() {
+        assert_eq!(dispatch_vram("POST").0, 405);
+    }
+
+    #[test]
+    fn vram_response_with_no_directory_is_an_honest_empty_aggregate() {
+        let response = build_cluster_vram_response(None, 1_200);
+        assert_eq!(response.nodes.len(), 0);
+        assert_eq!(response.cluster.node_count, 0);
+        assert_eq!(response.cluster.total_bytes, 0);
+        assert_eq!(response.directory_collected_at_unix_ms, None);
+    }
+
+    #[test]
+    fn vram_response_aggregates_device_totals_and_skips_nodes_without_a_snapshot() {
+        use sbproxy_ai::model_directory::{
+            DirectoryMember, DirectoryMemberState, DirectorySnapshotEnvelope,
+            DirectorySnapshotRead, ModelDirectory,
+        };
+        use sbproxy_model_host::node_snapshot::{
+            ModelPlaneHealth, NodeDeviceSnapshot, NodeHealthSnapshot, NodeHealthState,
+            NodeIdentitySnapshot, NodeModelSnapshot, NodeRole, NODE_MODEL_SNAPSHOT_SCHEMA_VERSION,
+        };
+        use sbproxy_model_host::{AcceleratorKind, GpuVendor};
+
+        // worker-a reports two devices; worker-b is a live cluster member
+        // but has never published an accepted snapshot, so it must
+        // contribute nothing to the aggregate rather than a guessed value.
+        let snapshot = NodeModelSnapshot {
+            schema_version: NODE_MODEL_SNAPSHOT_SCHEMA_VERSION,
+            node: NodeIdentitySnapshot {
+                node_id: "worker-a".to_string(),
+                roles: BTreeSet::from([NodeRole::Worker]),
+                labels: BTreeMap::new(),
+                model_endpoint: Some("https://worker-a.internal:9443".to_string()),
+            },
+            health: NodeHealthSnapshot {
+                state: NodeHealthState::Ready,
+                reason_codes: Vec::new(),
+                model_plane: ModelPlaneHealth::Ready,
+            },
+            engines: Vec::new(),
+            devices: vec![
+                NodeDeviceSnapshot {
+                    index: 0,
+                    vendor: GpuVendor::Nvidia,
+                    accelerator: Some(AcceleratorKind::Cuda),
+                    name: "H100".to_string(),
+                    total_memory_bytes: 80_000_000_000,
+                    available_memory_bytes: 20_000_000_000,
+                    compute_capability: None,
+                    supports_fp8: true,
+                    compute_utilization_millis: Some(250),
+                    memory_occupancy_millis: Some(750),
+                },
+                NodeDeviceSnapshot {
+                    index: 1,
+                    vendor: GpuVendor::Nvidia,
+                    accelerator: Some(AcceleratorKind::Cuda),
+                    name: "H100".to_string(),
+                    total_memory_bytes: 80_000_000_000,
+                    available_memory_bytes: 80_000_000_000,
+                    compute_capability: None,
+                    supports_fp8: true,
+                    compute_utilization_millis: None,
+                    memory_occupancy_millis: None,
+                },
+            ],
+            artifacts: Vec::new(),
+            replicas: Vec::new(),
+            placement_weight: 1,
+            active_deployment_digest: None,
+            generation: 1,
+            published_at_unix_ms: 1_000,
+            expires_at_unix_ms: 31_000,
+        };
+        let directory = ModelDirectory::new();
+        let view = directory
+            .refresh(
+                1_100,
+                vec![
+                    DirectoryMember {
+                        node_id: "worker-a".to_string(),
+                        address: Some("10.0.0.12:7946".to_string()),
+                        state: DirectoryMemberState::Alive,
+                        last_ack_age_ms: 25,
+                        incarnation: 1,
+                    },
+                    DirectoryMember {
+                        node_id: "worker-b".to_string(),
+                        address: Some("10.0.0.13:7946".to_string()),
+                        state: DirectoryMemberState::Alive,
+                        last_ack_age_ms: 25,
+                        incarnation: 1,
+                    },
+                ],
+                BTreeMap::from([(
+                    "worker-a".to_string(),
+                    DirectorySnapshotRead::Present(DirectorySnapshotEnvelope {
+                        publisher_node_id: "worker-a".to_string(),
+                        schema_version: NODE_MODEL_SNAPSHOT_SCHEMA_VERSION,
+                        generation: 1,
+                        published_at_unix_ms: 1_000,
+                        expires_at_unix_ms: 31_000,
+                        authenticated_identity: None,
+                        payload: serde_json::to_value(snapshot).expect("snapshot JSON"),
+                    }),
+                )]),
+            )
+            .expect("directory view");
+
+        let response = build_cluster_vram_response(Some(&view), 1_200);
+
+        assert_eq!(response.schema_version, 1);
+        assert_eq!(response.directory_collected_at_unix_ms, Some(1_100));
+        assert_eq!(response.nodes.len(), 1);
+        assert_eq!(response.nodes[0].node_id, "worker-a");
+        assert_eq!(response.nodes[0].vram.devices.len(), 2);
+        assert_eq!(response.nodes[0].vram.budget_bytes, 160_000_000_000);
+        assert_eq!(response.nodes[0].vram.free_bytes, 100_000_000_000);
+        assert_eq!(response.nodes[0].vram.used_bytes, 60_000_000_000);
+        assert_eq!(response.cluster.node_count, 1);
+        assert_eq!(response.cluster.device_count, 2);
+        assert_eq!(response.cluster.total_bytes, 160_000_000_000);
+        assert_eq!(response.cluster.free_bytes, 100_000_000_000);
+        assert_eq!(response.cluster.used_bytes, 60_000_000_000);
+        let first_device = &response.nodes[0].vram.devices[0];
+        assert_eq!(first_device.compute_utilization, Some(0.25));
+        assert_eq!(first_device.memory_occupancy, Some(0.75));
+        let second_device = &response.nodes[0].vram.devices[1];
+        assert_eq!(second_device.compute_utilization, None);
+        assert_eq!(second_device.memory_occupancy, None);
+    }
+
+    #[test]
+    fn vram_response_excludes_a_node_whose_retained_snapshot_has_gone_stale() {
+        use sbproxy_ai::model_directory::{
+            DirectoryMember, DirectoryMemberState, DirectorySnapshotEnvelope,
+            DirectorySnapshotRead, ModelDirectory,
+        };
+        use sbproxy_model_host::node_snapshot::{
+            ModelPlaneHealth, NodeDeviceSnapshot, NodeHealthSnapshot, NodeHealthState,
+            NodeIdentitySnapshot, NodeModelSnapshot, NodeRole, NODE_MODEL_SNAPSHOT_SCHEMA_VERSION,
+        };
+        use sbproxy_model_host::{AcceleratorKind, GpuVendor};
+
+        let snapshot = NodeModelSnapshot {
+            schema_version: NODE_MODEL_SNAPSHOT_SCHEMA_VERSION,
+            node: NodeIdentitySnapshot {
+                node_id: "worker-c".to_string(),
+                roles: BTreeSet::from([NodeRole::Worker]),
+                labels: BTreeMap::new(),
+                model_endpoint: Some("https://worker-c.internal:9443".to_string()),
+            },
+            health: NodeHealthSnapshot {
+                state: NodeHealthState::Ready,
+                reason_codes: Vec::new(),
+                model_plane: ModelPlaneHealth::Ready,
+            },
+            engines: Vec::new(),
+            devices: vec![NodeDeviceSnapshot {
+                index: 0,
+                vendor: GpuVendor::Nvidia,
+                accelerator: Some(AcceleratorKind::Cuda),
+                name: "H100".to_string(),
+                total_memory_bytes: 80_000_000_000,
+                available_memory_bytes: 20_000_000_000,
+                compute_capability: None,
+                supports_fp8: true,
+                compute_utilization_millis: None,
+                memory_occupancy_millis: None,
+            }],
+            artifacts: Vec::new(),
+            replicas: Vec::new(),
+            placement_weight: 1,
+            active_deployment_digest: None,
+            generation: 1,
+            published_at_unix_ms: 1_000,
+            expires_at_unix_ms: 31_000,
+        };
+        let member = DirectoryMember {
+            node_id: "worker-c".to_string(),
+            address: Some("10.0.0.14:7946".to_string()),
+            state: DirectoryMemberState::Alive,
+            last_ack_age_ms: 25,
+            incarnation: 1,
+        };
+        let directory = ModelDirectory::new();
+
+        // First refresh: worker-c reports a real snapshot and is eligible,
+        // exactly like the healthy case above. This populates the
+        // directory's `last_snapshot` retention for worker-c.
+        let first_view = directory
+            .refresh(
+                1_100,
+                vec![member.clone()],
+                BTreeMap::from([(
+                    "worker-c".to_string(),
+                    DirectorySnapshotRead::Present(DirectorySnapshotEnvelope {
+                        publisher_node_id: "worker-c".to_string(),
+                        schema_version: NODE_MODEL_SNAPSHOT_SCHEMA_VERSION,
+                        generation: 1,
+                        published_at_unix_ms: 1_000,
+                        expires_at_unix_ms: 31_000,
+                        authenticated_identity: None,
+                        payload: serde_json::to_value(snapshot).expect("snapshot JSON"),
+                    }),
+                )]),
+            )
+            .expect("first directory view");
+        let first_response = build_cluster_vram_response(Some(&first_view), 1_200);
+        assert_eq!(
+            first_response.nodes.len(),
+            1,
+            "sanity: worker-c starts eligible"
+        );
+
+        // Second refresh: worker-c's snapshot has since expired. The
+        // directory keeps worker-c's *last-known* snapshot (so other admin
+        // surfaces can still describe it) but marks it ineligible --
+        // `snapshot.is_some()` alone stays true here, which is exactly the
+        // trap this test guards against.
+        let second_view = directory
+            .refresh(
+                2_100,
+                vec![member],
+                BTreeMap::from([(
+                    "worker-c".to_string(),
+                    DirectorySnapshotRead::Expired {
+                        generation: 1,
+                        expires_at_unix_ms: 31_000,
+                    },
+                )]),
+            )
+            .expect("second directory view");
+        assert!(
+            second_view.nodes[0].snapshot.is_some(),
+            "sanity: the stale snapshot is still retained, not cleared"
+        );
+        assert!(
+            !second_view.nodes[0].model_eligible,
+            "sanity: retain_last_snapshot marks the node ineligible"
+        );
+
+        let response = build_cluster_vram_response(Some(&second_view), 2_200);
+        assert_eq!(
+            response.nodes.len(),
+            0,
+            "a stale-marked node must not contribute its retained VRAM to the fleet total"
+        );
+        assert_eq!(response.cluster.total_bytes, 0);
+        assert_eq!(response.cluster.node_count, 0);
     }
 
     #[test]

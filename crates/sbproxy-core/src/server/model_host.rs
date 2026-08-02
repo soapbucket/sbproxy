@@ -30,8 +30,8 @@ use bytes::Bytes;
 use sbproxy_ai::local_host::pick_local_model_name;
 use sbproxy_ai::AiHandlerConfig;
 use sbproxy_model_host::{
-    ArtifactManager, ArtifactTransport, Catalog, ConfigDirMetadataProvider, GpuProbe,
-    ModelHostConfig,
+    ArtifactCacheMetadata, ArtifactError, ArtifactManager, ArtifactTransport, Catalog,
+    ConfigDirMetadataProvider, GpuProbe, ModelHostConfig,
 };
 
 /// Permanent process-wide managed-model runtime adapter.
@@ -55,6 +55,79 @@ pub struct ProductionModelRuntime {
 const MODEL_PLANE_UNAVAILABLE: u8 = 0;
 const MODEL_PLANE_DEGRADED: u8 = 1;
 const MODEL_PLANE_READY: u8 = 2;
+
+/// An exact prompt token count for a managed deployment, with the served
+/// context window it was checked against (WOR-1671).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptTokenFit {
+    /// Prompt tokens counted against the model's own tokenizer.
+    pub tokens: usize,
+    /// The served context window (the engine's `--max-model-len`).
+    pub context_limit: u64,
+}
+
+impl PromptTokenFit {
+    /// Whether the prompt fits the served context window. A prompt that
+    /// exactly fills the window leaves no room to generate, so it does not
+    /// fit.
+    pub fn fits(&self) -> bool {
+        (self.tokens as u64) < self.context_limit
+    }
+}
+
+/// Process-wide cache of parsed tokenizers, shared by every managed
+/// deployment so a model's `tokenizer.json` is parsed once, not per request.
+fn tokenizer_cache() -> &'static sbproxy_model_host::TokenizerCache {
+    static CACHE: std::sync::OnceLock<sbproxy_model_host::TokenizerCache> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(sbproxy_model_host::TokenizerCache::new)
+}
+
+/// Build the text to count for a chat request. When a `tokenizer_config.json`
+/// with a string `chat_template` is available, render the messages through
+/// it (with a generation prompt) so the count matches what the engine
+/// tokenizes; on any missing template or render failure, fall back to
+/// concatenating each message's role and content, which is a small, safe
+/// undercount rather than a hard failure.
+fn render_prompt_for_count(
+    tokenizer_config_path: Option<&std::path::Path>,
+    messages: &[serde_json::Value],
+) -> String {
+    let chat_messages: Vec<sbproxy_model_host::ChatMessage> = messages
+        .iter()
+        .map(|message| {
+            sbproxy_model_host::ChatMessage::new(
+                message.get("role").and_then(|v| v.as_str()).unwrap_or(""),
+                message
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            )
+        })
+        .collect();
+    if let Some(template) = tokenizer_config_path
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|config| {
+            config
+                .get("chat_template")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+    {
+        if let Ok(rendered) =
+            sbproxy_model_host::render_chat_template(&template, &chat_messages, true)
+        {
+            return rendered;
+        }
+    }
+    chat_messages
+        .iter()
+        .map(|message| format!("{}: {}", message.role, message.content))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 /// Successful durable admin deployment revision and its runtime effect.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,6 +258,10 @@ pub struct ManagedModelPermit {
     manager: Arc<sbproxy_model_host::ModelRuntimeManager>,
     deployment: String,
     admission: sbproxy_model_host::DeploymentAdmissionPermit,
+    /// Resolved engine version captured from the running engine when this
+    /// permit's route reached readiness (WOR-1906). `None` until then, or
+    /// when the engine never reported a version.
+    engine_version: Option<String>,
 }
 
 impl std::fmt::Debug for ManagedModelPermit {
@@ -206,12 +283,21 @@ impl ManagedModelPermit {
             manager,
             deployment,
             admission,
+            engine_version: None,
         }
     }
 
     /// Canonical deployment held by this request.
     pub fn deployment(&self) -> &str {
         &self.deployment
+    }
+
+    /// Resolved version of the running engine that serves this permit's
+    /// deployment, when readiness captured one (WOR-1906). A cheap clone
+    /// so end-of-request usage records can stamp the served engine
+    /// version without touching the runtime manager again.
+    pub fn engine_version(&self) -> Option<String> {
+        self.engine_version.clone()
     }
 
     pub(crate) async fn ensure_ready(
@@ -365,8 +451,9 @@ impl sbproxy_model_host::ModelHostObserver for MetricsObserver {
     ) {
         let engine = match engine {
             Some(sbproxy_model_host::EngineKind::Vllm) => "vllm",
+            Some(sbproxy_model_host::EngineKind::SGLang) => "sglang",
             Some(sbproxy_model_host::EngineKind::LlamaCpp) => "llama_cpp",
-            Some(sbproxy_model_host::EngineKind::Embedded) => "embedded",
+            Some(sbproxy_model_host::EngineKind::MistralRs) => "mistralrs",
             None => "unknown",
         };
         sbproxy_observe::metrics::set_model_host_deployment_state(
@@ -386,6 +473,21 @@ impl sbproxy_model_host::ModelHostObserver for MetricsObserver {
             priority.as_str(),
             reason.as_str(),
         );
+    }
+    fn set_load_queue_depth(&self, model: &str, depth: i64) {
+        sbproxy_observe::metrics::set_model_host_load_queue_depth(model, depth);
+    }
+}
+
+/// Records artifact acquisition failures into the `sbproxy_model_host_*`
+/// metrics. Job-progress events are not consumed here; the durable job
+/// store (`ArtifactManager::jobs`) remains the source of truth for those.
+struct ArtifactMetricsObserver;
+
+impl sbproxy_model_host::ArtifactObserver for ArtifactMetricsObserver {
+    fn on_job(&self, _job: &sbproxy_model_host::OperationJob) {}
+    fn on_artifact_error(&self, kind: &'static str) {
+        sbproxy_observe::metrics::record_model_host_artifact_error(kind);
     }
 }
 
@@ -840,6 +942,120 @@ impl ProductionModelRuntime {
         self.active_manager().statuses().await
     }
 
+    /// Root directory of the verified artifact cache, when a model runtime
+    /// foundation has been committed. `None` until a model host is
+    /// configured, because no artifact cache is open before that.
+    pub fn artifact_cache_root(&self) -> Option<PathBuf> {
+        self.foundation
+            .read()
+            .expect("model runtime foundation lock")
+            .as_ref()
+            .map(|foundation| foundation.cache_root.clone())
+    }
+
+    /// List durable ready artifact metadata from the verified cache in
+    /// deterministic digest order, when a production preparer is active.
+    /// Read-only inventory for the admin files surface (WOR-1910); it
+    /// never touches artifact bytes.
+    pub fn cached_artifacts(&self) -> Option<Result<Vec<ArtifactCacheMetadata>, ArtifactError>> {
+        let preparer = self
+            .snapshot_preparer
+            .read()
+            .expect("model runtime snapshot-preparer lock")
+            .clone();
+        preparer.map(|preparer| preparer.cached_artifacts())
+    }
+
+    /// The durable operation job store backing this node's artifact cache,
+    /// when a production preparer is active. `None` until a model host is
+    /// configured, because no job store is open before that.
+    pub fn job_store(&self) -> Option<sbproxy_model_host::FileJobStore> {
+        let preparer = self
+            .snapshot_preparer
+            .read()
+            .expect("model runtime snapshot-preparer lock")
+            .clone();
+        preparer.map(|preparer| preparer.jobs().clone())
+    }
+
+    /// Count a managed deployment's prompt tokens against the model's own
+    /// tokenizer and check them against the served context window
+    /// (WOR-1671). Returns `None` when the deployment is not running or
+    /// shipped no tokenizer, so the caller keeps its length-based estimate.
+    /// When a `chat_template` is available it is rendered before counting,
+    /// matching what the engine tokenizes; otherwise the message content is
+    /// counted directly (a small, safe undercount).
+    pub fn prompt_token_fit(
+        &self,
+        deployment: &str,
+        messages: &[serde_json::Value],
+    ) -> Option<PromptTokenFit> {
+        let context = self
+            .active_manager()
+            .deployment_serving_context(deployment)?;
+        let tokenizer_path = context.tokenizer_path.as_deref()?;
+        let text = render_prompt_for_count(context.tokenizer_config_path.as_deref(), messages);
+        let tokens = tokenizer_cache().count(tokenizer_path, &text)?;
+        Some(PromptTokenFit {
+            tokens,
+            context_limit: context.context_limit,
+        })
+    }
+
+    /// Assemble the live cache-protection sets for exact artifact removal
+    /// and budget-driven collection (WOR-1910). Mirrors the protection
+    /// `sbproxy models remove` builds: every runtime status digest counts
+    /// as resident, every catalog-resolvable configured deployment counts
+    /// as configured, and a legacy `pinned: true` serve entry pins its
+    /// resolved digest. Read-only: it snapshots committed desired state
+    /// and never touches the artifact cache.
+    pub async fn artifact_cache_protection(
+        &self,
+    ) -> Result<sbproxy_model_host::CacheProtection, String> {
+        let mut protection = sbproxy_model_host::CacheProtection::default();
+        for status in self.statuses().await {
+            if let Some(digest) = status.artifact_digest {
+                protection.resident.insert(digest);
+            }
+        }
+        let desired = self.current_desired();
+        let catalog = self.active_catalog();
+        if desired.deployments.is_empty() {
+            return Ok(protection);
+        }
+        let worker = sbproxy_model_host::WorkerProfile::from_descriptors(&make_probe().probe())
+            .map_err(|error| format!("resolve artifact protection worker: {error}"))?;
+        for compiled in desired.deployments.values() {
+            // Raw `hf:` references have no catalog v2 digest to resolve;
+            // their runtime digest, when one exists, is already protected
+            // as resident above.
+            if compiled.desired.model.starts_with("hf:") {
+                continue;
+            }
+            let artifact = catalog
+                .resolve_artifact(
+                    &sbproxy_model_host::ResolveArtifactRequest {
+                        model: compiled.desired.model.clone(),
+                        variant: compiled.desired.variant.clone(),
+                        engine: compiled.desired.engine,
+                        replicas: compiled.desired.replicas,
+                        heterogeneous_variants: compiled.desired.heterogeneous_variants,
+                    },
+                    &worker,
+                )
+                .map_err(|error| format!("resolve configured artifact protection: {error}"))?;
+            if compiled
+                .legacy_entry
+                .as_ref()
+                .is_some_and(|entry| entry.pinned)
+            {
+                protection.pinned.insert(artifact.artifact_digest.clone());
+            }
+            protection.configured.insert(artifact.artifact_digest);
+        }
+        Ok(protection)
+    }
+
     /// Build one bounded, path-free cluster snapshot from current runtime truth.
     pub async fn node_model_snapshot(
         &self,
@@ -1090,6 +1306,7 @@ impl ProductionModelRuntime {
             manager,
             deployment: deployment.to_string(),
             admission,
+            engine_version: None,
         })
     }
 
@@ -1608,9 +1825,10 @@ fn managed_deployment_from_model(
     let engine = match deployment.engine {
         sbproxy_model_host::EngineChoice::Auto => sbproxy_config::ManagedEngineChoice::Auto,
         sbproxy_model_host::EngineChoice::Vllm => sbproxy_config::ManagedEngineChoice::Vllm,
+        sbproxy_model_host::EngineChoice::SGLang => sbproxy_config::ManagedEngineChoice::SGLang,
         sbproxy_model_host::EngineChoice::LlamaCpp => sbproxy_config::ManagedEngineChoice::LlamaCpp,
-        sbproxy_model_host::EngineChoice::Embedded => {
-            anyhow::bail!("signed cluster deployments do not support the embedded engine")
+        sbproxy_model_host::EngineChoice::MistralRs => {
+            sbproxy_config::ManagedEngineChoice::MistralRs
         }
     };
     Ok(sbproxy_config::ManagedDeploymentConfig {
@@ -1618,6 +1836,7 @@ fn managed_deployment_from_model(
         variant: deployment.variant,
         heterogeneous_variants: deployment.heterogeneous_variants,
         replicas: deployment.replicas,
+        tensor_parallel: deployment.tensor_parallel,
         required_labels: deployment.required_labels,
         spread_by: deployment.spread_by,
         pull: match deployment.pull {
@@ -1650,6 +1869,19 @@ fn managed_deployment_from_model(
                 sbproxy_config::ManagedRolloutPolicy::Recreate
             }
         },
+        extra_args: deployment.extra_args,
+        chunked_prefill: deployment.chunked_prefill.map(|prefill| {
+            sbproxy_config::ManagedChunkedPrefill {
+                max_batched_tokens: prefill.max_batched_tokens,
+                target_ttft_ms: prefill.target_ttft_ms,
+            }
+        }),
+        tool_call_parser: deployment.tool_call_parser,
+        swap_space_gib: deployment.swap_space_gib,
+        cpu_offload_gib: deployment.cpu_offload_gib,
+        engine_version: deployment.engine_version,
+        engine_image: deployment.engine_image,
+        engine_sha256: deployment.engine_sha256,
     })
 }
 
@@ -1663,18 +1895,10 @@ pub fn validate_model_runtime(
         candidate.desired.control.authority,
         pipeline.config.server.cluster.is_some(),
     )?;
-    if pipeline.config.server.cluster.is_none() {
-        if let Some((deployment, _)) = candidate
-            .desired
-            .deployments
-            .iter()
-            .find(|(_, deployment)| deployment.desired.replicas != 1)
-        {
-            anyhow::bail!(
-                "single-node runtime requires deployment {deployment:?} to use replicas: 1"
-            );
-        }
-    }
+    // A single node may run several replicas of a deployment. The device
+    // budget (replicas times the tensor-parallel degree against the node's
+    // devices) needs the live probe, so it is enforced at reconcile with a
+    // legible over-subscription error rather than statically here.
     Ok(())
 }
 
@@ -1702,7 +1926,8 @@ fn build_production_manager(
     let transport = artifact_transport().map_err(anyhow::Error::msg)?;
     let artifacts = Arc::new(
         ArtifactManager::new(cache_root.clone(), transport)
-            .map_err(|error| anyhow::anyhow!("open model artifact cache: {error}"))?,
+            .map_err(|error| anyhow::anyhow!("open model artifact cache: {error}"))?
+            .with_observer(Arc::new(ArtifactMetricsObserver)),
     );
     let metadata = Arc::new(ConfigDirMetadataProvider {
         cache_root,
@@ -1962,6 +2187,8 @@ pub struct ManagedDistributedRequest<'a> {
     pub requested_adapter: Option<&'a str>,
     /// Maximum engine-facing request body size.
     pub max_body_bytes: usize,
+    /// Reserved quota unit committed only when a managed transport sends.
+    pub quota_attempt: sbproxy_ai::quota_pool::QuotaPoolAttemptGuard,
 }
 
 /// Selected distributed response and its public route identity.
@@ -1994,6 +2221,9 @@ pub enum ManagedDistributedError {
     /// Every safe current replica attempt failed.
     #[error(transparent)]
     Dispatch(#[from] crate::model_plane::ManagedDispatchFailure),
+    /// Quota settlement failed at the managed transport boundary.
+    #[error(transparent)]
+    Quota(#[from] sbproxy_ai::quota_pool::PoolError),
 }
 
 impl ManagedDistributedError {
@@ -2003,6 +2233,7 @@ impl ManagedDistributedError {
             Self::Resolution(_) => None,
             Self::ColdStartFallback { trace } => Some(trace),
             Self::Dispatch(failure) => Some(&failure.trace),
+            Self::Quota(_) => None,
         }
     }
 
@@ -2018,7 +2249,7 @@ impl ManagedDistributedError {
             {
                 Some("no_eligible_replica")
             }
-            Self::Resolution(_) | Self::Dispatch(_) => None,
+            Self::Resolution(_) | Self::Dispatch(_) | Self::Quota(_) => None,
         }
     }
 }
@@ -2064,6 +2295,7 @@ struct ProductionManagedReplicaExecutor {
     content_type: Option<String>,
     priority: sbproxy_model_host::PriorityClass,
     max_body_bytes: usize,
+    quota: crate::model_plane::ModelPlaneQuotaAttempt,
 }
 
 #[async_trait]
@@ -2106,11 +2338,22 @@ impl ProductionManagedReplicaExecutor {
             &execution.engine_model,
             self.max_body_bytes,
         )?;
-        let target = format!("{}{}", execution.base_url, self.path);
+        let target = reqwest::Url::parse(&format!("{}{}", execution.base_url, self.path)).map_err(
+            |error| crate::model_plane::ModelPlaneError::InvalidConfiguration(error.to_string()),
+        )?;
+        let content_type = self
+            .content_type
+            .as_deref()
+            .map(reqwest::header::HeaderValue::from_str)
+            .transpose()
+            .map_err(|error| {
+                crate::model_plane::ModelPlaneError::InvalidConfiguration(error.to_string())
+            })?;
         let mut request = managed_loopback_client().post(target).body(body);
-        if let Some(content_type) = self.content_type.as_deref() {
+        if let Some(content_type) = content_type {
             request = request.header(reqwest::header::CONTENT_TYPE, content_type);
         }
+        self.quota.commit().await?;
         let response = request
             .send()
             .await
@@ -2181,8 +2424,9 @@ impl ProductionManagedReplicaExecutor {
                 },
             ),
         };
-        let response = crate::model_plane::ModelPlaneClient::new(security)
-            .dispatch(endpoint, &signed, self.body.clone())
+        let client = crate::model_plane::ModelPlaneClient::new(security);
+        let response = client
+            .dispatch_with_quota(endpoint, &signed, self.body.clone(), &self.quota)
             .await?;
         Ok(crate::model_plane::ManagedAttemptResponse::without_permit(
             response.into(),
@@ -2287,6 +2531,7 @@ pub async fn current_managed_model_availability(
     };
 
     let local_deployments = runtime.current_desired();
+    let local_statuses = runtime.statuses().await;
     for deployment_id in local_deployments.deployments.keys() {
         let Some(deployment_availability) = availability.get_mut(deployment_id) else {
             continue;
@@ -2294,23 +2539,27 @@ pub async fn current_managed_model_availability(
         if deployment_availability.ready_replicas > 0 || deployment_availability.cold_replicas > 0 {
             continue;
         }
-        let Some(status) = runtime.status(deployment_id).await else {
-            continue;
-        };
-        match status.state {
-            sbproxy_model_host::DeploymentRuntimeState::Ready => {
-                deployment_availability.ready_replicas = 1;
+        // Count every replica of this deployment, not just the primary, so a
+        // multi-replica deployment reports how many engines are actually ready.
+        let mut ready_replicas = 0u32;
+        let mut cold_replicas = 0u32;
+        for status in local_statuses
+            .iter()
+            .filter(|status| &status.deployment == deployment_id)
+        {
+            match status.state {
+                sbproxy_model_host::DeploymentRuntimeState::Ready => ready_replicas += 1,
+                sbproxy_model_host::DeploymentRuntimeState::Assigned
+                | sbproxy_model_host::DeploymentRuntimeState::Cached
+                | sbproxy_model_host::DeploymentRuntimeState::Preparing => cold_replicas += 1,
+                sbproxy_model_host::DeploymentRuntimeState::Configured
+                | sbproxy_model_host::DeploymentRuntimeState::Draining
+                | sbproxy_model_host::DeploymentRuntimeState::Stopped
+                | sbproxy_model_host::DeploymentRuntimeState::Failed => {}
             }
-            sbproxy_model_host::DeploymentRuntimeState::Assigned
-            | sbproxy_model_host::DeploymentRuntimeState::Cached
-            | sbproxy_model_host::DeploymentRuntimeState::Preparing => {
-                deployment_availability.cold_replicas = 1;
-            }
-            sbproxy_model_host::DeploymentRuntimeState::Configured
-            | sbproxy_model_host::DeploymentRuntimeState::Draining
-            | sbproxy_model_host::DeploymentRuntimeState::Stopped
-            | sbproxy_model_host::DeploymentRuntimeState::Failed => {}
         }
+        deployment_availability.ready_replicas = ready_replicas;
+        deployment_availability.cold_replicas = cold_replicas;
     }
     availability
 }
@@ -2518,17 +2767,21 @@ pub async fn distributed_managed_upstream(
         content_type: request.content_type.map(str::to_string),
         priority: request.priority,
         max_body_bytes: request.max_body_bytes,
+        quota: crate::model_plane::ModelPlaneQuotaAttempt::new(request.quota_attempt),
     };
     let deployment = deployment_id;
-    match crate::model_plane::dispatch_managed_candidates(
+    let dispatch = crate::model_plane::dispatch_managed_candidates(
         selection,
         &executor,
         request.tenant_id,
         request.governed_key_id,
         request.policy_revision,
     )
-    .await
-    {
+    .await;
+    if let Some(error) = executor.quota.error().await {
+        return Err(ManagedDistributedError::Quota(error));
+    }
+    match dispatch {
         Ok(outcome) => {
             record_managed_route_trace(request.provider.name.as_str(), &deployment, &outcome.trace);
             Ok(Some(ManagedDistributedUpstream {
@@ -2639,20 +2892,28 @@ pub async fn managed_upstream(
             )
         })?;
     let deployment = route.deployment.clone();
-    let engine_model = deployment.clone();
     let admission = manager
         .admit(&deployment, priority)
         .await
         .map_err(|error| format!("{}: {}", error.reason.as_str(), error.detail))?;
-    let permit = ManagedModelPermit {
+    let mut permit = ManagedModelPermit {
         manager,
-        deployment,
+        deployment: deployment.clone(),
         admission,
+        engine_version: None,
     };
     let running = permit
         .ensure_ready(priority)
         .await
         .map_err(|error| format!("{}: {error}", error.reason_code()))?;
+    // Engine-aware outbound model id: mistral.rs has no served-model-name
+    // flag and accepts `default` for the loaded model (WOR-1861).
+    let engine_model = running.kind.request_model_id(&deployment).to_string();
+    // Capture the served engine version on the permit, which lives on the
+    // request context through the complete response, so the end-of-request
+    // usage record can answer "what served this" from the ledger alone
+    // (WOR-1906).
+    permit.engine_version = running.engine_version.clone();
     Ok(Some(ManagedLocalUpstream {
         base_url: format!("http://127.0.0.1:{}/v1", running.port),
         public_model,
@@ -2673,9 +2934,256 @@ pub(crate) fn lane_class_for(priority: Option<sbproxy_ai::identity::KeyPriority>
     }
 }
 
+/// Build a `ProductionModelRuntime` with a real, empty production preparer:
+/// a durable artifact cache and job store open over `cache_root`, no
+/// configured deployments. Lets tests outside this module (e.g.
+/// `admin_model_host`) exercise the job-store-backed admin surfaces without
+/// standing up a full pipeline or touching the network.
+#[cfg(test)]
+pub(crate) fn test_runtime_with_job_store(cache_root: &Path) -> ProductionModelRuntime {
+    let catalog = Arc::new(Catalog::builtin());
+    let artifacts = Arc::new(
+        ArtifactManager::new(
+            cache_root.to_path_buf(),
+            Arc::new(sbproxy_model_host::UnavailableArtifactTransport),
+        )
+        .expect("open fixture artifact cache"),
+    );
+    let metadata = Arc::new(ConfigDirMetadataProvider {
+        cache_root: cache_root.to_path_buf(),
+        revision: "main".to_string(),
+        catalog: Arc::clone(&catalog),
+    });
+    let preparer = Arc::new(sbproxy_model_host::ProductionDeploymentPreparer::new(
+        Arc::clone(&catalog),
+        artifacts,
+        make_probe(),
+        metadata,
+        sbproxy_model_host::NetworkPolicy::Allowed,
+    ));
+    let manager = Arc::new(
+        sbproxy_model_host::ModelRuntimeManager::new(
+            catalog.catalog_revision.clone(),
+            preparer.clone(),
+        )
+        .expect("fixture manager"),
+    );
+    ProductionModelRuntime {
+        active: ArcSwap::from(manager),
+        active_catalog: ArcSwap::from(catalog),
+        foundation: RwLock::new(None),
+        snapshot_preparer: RwLock::new(Some(preparer)),
+        cluster_state: RwLock::new(None),
+        model_plane_health: AtomicU8::new(MODEL_PLANE_UNAVAILABLE),
+        epoch: AtomicU64::new(0),
+        commit_lock: tokio::sync::Mutex::new(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct RecordingManagedQuotaStore {
+        settled: tokio::sync::Mutex<Vec<String>>,
+        released: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl sbproxy_ai::quota_pool::QuotaPoolStore for RecordingManagedQuotaStore {
+        async fn reserve(
+            &self,
+            pool: &str,
+            member: &str,
+            units: u64,
+            reservation_id: &str,
+        ) -> Result<sbproxy_ai::quota_pool::QuotaReservation, sbproxy_ai::quota_pool::PoolError>
+        {
+            Ok(sbproxy_ai::quota_pool::QuotaReservation {
+                pool: pool.to_string(),
+                member: member.to_string(),
+                units,
+                reservation_id: reservation_id.to_string(),
+            })
+        }
+
+        async fn reconcile(
+            &self,
+            reservation: sbproxy_ai::quota_pool::QuotaReservation,
+            _actual: sbproxy_ai::quota_pool::PoolUsage,
+        ) -> Result<(), sbproxy_ai::quota_pool::PoolError> {
+            self.settled.lock().await.push(reservation.reservation_id);
+            Ok(())
+        }
+
+        async fn release(
+            &self,
+            reservation: sbproxy_ai::quota_pool::QuotaReservation,
+        ) -> Result<(), sbproxy_ai::quota_pool::PoolError> {
+            self.released.lock().await.push(reservation.reservation_id);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn distributed_managed_preflight_exit_releases_uncommitted_quota() {
+        let pool_config: sbproxy_ai::quota_pool::QuotaPoolConfig =
+            serde_json::from_value(serde_json::json!({
+                "name": "managed-preflight",
+                "total_limit": 10,
+                "weights": {"virtual-key-a": 1},
+                "policy": "burst"
+            }))
+            .expect("quota fixture");
+        let recording = Arc::new(RecordingManagedQuotaStore::default());
+        let store: Arc<dyn sbproxy_ai::quota_pool::QuotaPoolStore> = recording.clone();
+        let admission = sbproxy_ai::quota_pool::QuotaPoolAdmission::new(
+            Some(pool_config),
+            Ok(Some(store)),
+            Ok("virtual-key-a".to_string()),
+        );
+        let quota_attempt = admission
+            .reserve_attempt("managed-preflight-attempt")
+            .await
+            .expect("quota reservation");
+        let provider: sbproxy_ai::provider::ProviderConfig =
+            serde_json::from_value(serde_json::json!({
+                "name": "managed-preflight-no-route",
+                "provider_type": "managed_model",
+                "deployment": "managed-preflight-no-deployment",
+                "api_key": null
+            }))
+            .expect("managed provider fixture");
+
+        let _ = distributed_managed_upstream(ManagedDistributedRequest {
+            origin: "managed-preflight-no-origin",
+            provider: &provider,
+            requested_model: Some("managed-preflight-no-model"),
+            request_id: "managed-preflight-request",
+            tenant_id: "tenant-a",
+            governed_key_id: "virtual-key-a",
+            policy_revision: "revision-a",
+            path: "/v1/chat/completions",
+            body: Bytes::from_static(br#"{"model":"managed-preflight-no-model"}"#),
+            content_type: Some("application/json"),
+            priority: sbproxy_model_host::PriorityClass::Standard,
+            prefix_key: b"managed-preflight",
+            preferred_region: None,
+            requested_adapter: None,
+            max_body_bytes: 1024,
+            quota_attempt,
+        })
+        .await;
+
+        for _ in 0..16 {
+            if !recording.released.lock().await.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            recording.released.lock().await.as_slice(),
+            ["managed-preflight-attempt"]
+        );
+        assert!(recording.settled.lock().await.is_empty());
+        tokio::task::yield_now().await;
+    }
+
+    #[test]
+    fn prompt_token_fit_reserves_room_to_generate() {
+        // A prompt that exactly fills the window leaves no room to generate,
+        // so it does not fit; anything shorter does.
+        assert!(PromptTokenFit {
+            tokens: 99,
+            context_limit: 100,
+        }
+        .fits());
+        assert!(!PromptTokenFit {
+            tokens: 100,
+            context_limit: 100,
+        }
+        .fits());
+        assert!(!PromptTokenFit {
+            tokens: 101,
+            context_limit: 100,
+        }
+        .fits());
+    }
+
+    #[test]
+    fn production_runtime_exposes_its_job_store() {
+        // Once a production preparer is active, `job_store` exposes the
+        // same durable `FileJobStore` the artifact cache writes
+        // pull/verify operations into, so admin lifecycle routes can
+        // enqueue and poll jobs through it too.
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = test_runtime_with_job_store(directory.path());
+
+        let job_store = runtime
+            .job_store()
+            .expect("job store is open once a production preparer is active");
+        let job = job_store
+            .create(
+                sbproxy_model_host::OperationKind::Load,
+                "fixture-deployment".to_string(),
+            )
+            .expect("create fixture job");
+
+        assert_eq!(
+            job_store
+                .get(&job.id)
+                .expect("read back fixture job")
+                .expect("fixture job is present"),
+            job
+        );
+    }
+
+    #[test]
+    fn empty_runtime_has_no_job_store() {
+        // Mirrors `cached_artifacts`/`artifact_cache_root`: before any
+        // model host is configured there is no open artifact cache, so
+        // there is no durable job store to hand back either.
+        let runtime = ProductionModelRuntime::empty().expect("empty runtime");
+        assert!(runtime.job_store().is_none());
+    }
+
+    #[test]
+    fn render_prompt_for_count_uses_the_template_then_falls_back() {
+        let messages = vec![
+            serde_json::json!({"role": "system", "content": "be terse"}),
+            serde_json::json!({"role": "user", "content": "hi"}),
+        ];
+
+        // With a tokenizer_config.json carrying a chat_template, the render
+        // path runs and its markers appear in the counted text.
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("tokenizer_config.json");
+        std::fs::write(
+            &config,
+            serde_json::to_vec(&serde_json::json!({
+                "chat_template":
+                    "{% for m in messages %}<|{{ m.role }}|>{{ m.content }}{% endfor %}<|assistant|>"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let rendered = render_prompt_for_count(Some(config.as_path()), &messages);
+        assert_eq!(rendered, "<|system|>be terse<|user|>hi<|assistant|>");
+
+        // No template path: fall back to concatenated role/content, never a
+        // panic or empty string.
+        let fallback = render_prompt_for_count(None, &messages);
+        assert_eq!(fallback, "system: be terse\nuser: hi");
+
+        // A malformed template also falls back rather than failing.
+        let bad = dir.path().join("bad.json");
+        std::fs::write(&bad, br#"{"chat_template":"{% for %}"}"#).unwrap();
+        assert_eq!(
+            render_prompt_for_count(Some(bad.as_path()), &messages),
+            "system: be terse\nuser: hi"
+        );
+    }
 
     #[derive(Clone)]
     struct SharedLogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
@@ -2895,6 +3403,7 @@ cluster:
                 accelerator: sbproxy_model_host::AcceleratorKind::Cpu,
                 started_at_ms: 1,
                 artifact_digest: "a".repeat(64),
+                engine_version: None,
                 memory: sbproxy_model_host::MemoryEstimate::from_total(0, 1),
                 process: Arc::new(ClusterFixtureProcess),
             })

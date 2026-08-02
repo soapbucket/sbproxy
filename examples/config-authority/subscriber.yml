@@ -1,0 +1,51 @@
+# Config-authority subscriber: pull signed configuration from the
+# authority in `sb.yml`, verify it, merge it over this file, and apply the
+# result through the ordinary reload transaction.
+#
+# One node is either a subscriber or an authority, never both. A node in
+# both roles would republish a document it does not fully own, and the
+# provenance an auditor reads downstream would name it rather than the
+# authority the values came from.
+proxy:
+  http_bind_port: 8080
+
+  config_authority:
+    upstream:
+      # The authority's bundle listener, not its admin port.
+      url: https://control.example.com:9443
+      # `overlay` merges the authority's document over this file, leaving
+      # anything it does not mention alone. `replace` makes the authority's
+      # document the whole configuration and implies
+      # `require_bundle_on_boot: true`, because under replace this file is
+      # not a servable configuration on its own.
+      mode: overlay
+      # Sent on every fetch as `x-sbproxy-subscriber-id`, and it has to
+      # match the id the credential was registered under.
+      subscriber_id: edge-01
+      # The credential the authority minted, by reference. An inline token
+      # is refused: a token in a config file is a token in every copy of
+      # that file.
+      credential: env:SB_CONFIG_AUTHORITY_TOKEN
+      # The authority's public key, as published by
+      # `GET /admin/config-authority/status`.
+      verifying_keys_file: /etc/sbproxy/authority-keys.json
+      poll_interval: 30s
+      # Where the verified bundle is cached so this node boots on the last
+      # known configuration when the authority is unreachable. The
+      # anti-replay cursor is stored beside it.
+      cache_path: /var/lib/sbproxy/config-bundle.json
+      # How old a cached bundle may be and still be used at boot. A
+      # running node past this window keeps serving and logs every cycle:
+      # the window is a boot-time gate, not a kill switch.
+      max_staleness: 24h
+
+# Whatever this node owns outright. An overlay keeps all of it, and the
+# deny list means the authority could not touch `proxy.listeners`,
+# `proxy.tls`, `proxy.admin`, `proxy.secrets`, `proxy.cluster`,
+# `proxy.model_host`, `proxy.config_authority`, or `source` even if it
+# tried.
+origins:
+  "edge.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev

@@ -1,0 +1,77 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Route prompts by an in-process embedding classifier.
+#
+# The classifier embeds operator-provided examples once when the origin's
+# guardrail pipeline is first used, builds one centroid per class, and labels
+# each request with the nearest class.
+# Classifier results are non-enforcing routing labels, so the AI policy can
+# send documentation work to the smaller model without weakening security
+# guardrail block thresholds.
+#
+# Download the model and tokenizer first:
+#
+#   mkdir -p /var/lib/sbproxy/models/minilm
+#   curl -fSL -o /var/lib/sbproxy/models/minilm/model.onnx \
+#     https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx
+#   curl -fSL -o /var/lib/sbproxy/models/minilm/tokenizer.json \
+#     https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json
+#
+# Setup and run:
+#
+#   export OPENAI_API_KEY=sk-...
+#   sbproxy examples/ai-classifier-routing/sb.yml
+#
+# A documentation prompt is rewritten to gpt-4o-mini. Coding and
+# unclassified prompts keep the requested model:
+#
+#   curl -s http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' -H 'Content-Type: application/json' \
+#     -d '{"model":"gpt-4.1","messages":[{"role":"user","content":
+#       "Write an upgrade guide for this release."}]}' | jq -r .model
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      routing: round_robin
+
+      providers:
+        - name: openai
+          provider_type: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4.1
+          models:
+            - gpt-4.1
+            - gpt-4o-mini
+
+      guardrails:
+        input:
+          - type: classifier
+            backend:
+              kind: embedding
+              model_path: /var/lib/sbproxy/models/minilm/model.onnx
+              tokenizer_path: /var/lib/sbproxy/models/minilm/tokenizer.json
+              min_score: 0.30
+              min_margin: 0.05
+              max_model_bytes: 209715200
+            classes:
+              documentation:
+                - "write the readme for this project"
+                - "explain how to install and configure the service"
+                - "prepare an upgrade guide for the next release"
+              coding:
+                - "implement the parser and add unit tests"
+                - "fix the race condition in the request handler"
+                - "refactor this module without changing behavior"
+            scope: last_user_message
+            max_chars: 2000
+
+      ai_policy:
+        expression: |
+          "documentation" in ai.guardrails.labels
+            ? ["route_to:gpt-4o-mini", "set_sink_tag:documentation"]
+            : ["allow"]
+        on_error: allow

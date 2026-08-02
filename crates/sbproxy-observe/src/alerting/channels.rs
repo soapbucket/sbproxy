@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
 
+use super::runtime::AlertRuntime;
+
 // --- Data types ---
 
 /// Configuration for a single alert notification channel.
@@ -77,11 +79,31 @@ pub struct AlertDispatcher {
     channels: Vec<AlertChannelConfig>,
     client: reqwest::Client,
     tasks: tokio_util::task::TaskTracker,
+    runtime: Option<AlertRuntime>,
+    #[cfg(test)]
+    allow_private_test_urls: bool,
+}
+
+/// Rejection from a targeted channel dispatch request.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AlertDispatchError {
+    /// No channel exists at the requested configuration index.
+    #[error("unknown alert channel index {0}")]
+    UnknownChannel(usize),
 }
 
 impl AlertDispatcher {
     /// Create a dispatcher with the given channel configurations.
     pub fn new(channels: Vec<AlertChannelConfig>) -> Self {
+        Self::build(channels, None)
+    }
+
+    /// Create a dispatcher that publishes delivery health into `runtime`.
+    pub fn with_runtime(channels: Vec<AlertChannelConfig>, runtime: AlertRuntime) -> Self {
+        Self::build(channels, Some(runtime))
+    }
+
+    fn build(channels: Vec<AlertChannelConfig>, runtime: Option<AlertRuntime>) -> Self {
         let client = reqwest::Client::builder()
             .user_agent("sbproxy-alerting/0.1")
             .build()
@@ -91,7 +113,17 @@ impl AlertDispatcher {
             channels,
             client,
             tasks: tokio_util::task::TaskTracker::new(),
+            runtime,
+            #[cfg(test)]
+            allow_private_test_urls: false,
         }
+    }
+
+    #[cfg(test)]
+    fn with_runtime_for_test(channels: Vec<AlertChannelConfig>, runtime: AlertRuntime) -> Self {
+        let mut dispatcher = Self::build(channels, Some(runtime));
+        dispatcher.allow_private_test_urls = true;
+        dispatcher
     }
 
     /// Wait for every in-flight webhook delivery to finish, then close the
@@ -109,136 +141,181 @@ impl AlertDispatcher {
     /// For `"webhook"` channels a Tokio task is spawned for non-blocking
     /// HTTP delivery.
     pub fn fire(&self, alert: Alert) {
-        for channel in &self.channels {
-            match channel.channel_type.as_str() {
-                "log" => {
-                    tracing::warn!(
-                        target: "alerting",
-                        rule = %alert.rule,
-                        severity = %alert.severity,
-                        message = %alert.message,
-                        timestamp = %alert.timestamp,
-                        "alert fired"
-                    );
-                }
-                "webhook" => {
-                    if let Some(url) = &channel.url {
-                        let client = self.client.clone();
-                        let url = url.clone();
-                        let headers = channel.headers.clone();
-                        let secret = channel.secret.clone();
-                        let alert = alert.clone();
+        for (index, channel) in self.channels.iter().cloned().enumerate() {
+            self.dispatch_channel(index, channel, alert.clone());
+        }
+    }
 
-                        self.tasks.spawn(async move {
-                            // WOR-604: SSRF guard before egress. Alert payloads
-                            // carry operational context, so never POST them to
-                            // a loopback / link-local / private target or a
-                            // non-http(s) scheme. `validate_url` may resolve
-                            // DNS, so run it on the blocking pool rather than
-                            // stalling an async worker. Re-validating per
-                            // dispatch (rather than once at construction) also
-                            // means a transient DNS failure never permanently
-                            // disables a legitimate webhook.
-                            let to_check = url.clone();
-                            match tokio::task::spawn_blocking(move || {
-                                webhook_url_allowed(&to_check)
-                            })
-                            .await
-                            {
-                                Ok(Ok(())) => {
-                                    deliver_alert(client, url, headers, secret, alert).await;
-                                }
-                                Ok(Err(reason)) => {
-                                    tracing::error!(
-                                        target: "alerting",
-                                        url = %url,
-                                        reason = %reason,
-                                        "webhook url failed SSRF validation - skipping delivery"
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        target: "alerting",
-                                        error = %e,
-                                        "SSRF validation task failed - skipping delivery"
-                                    );
-                                }
-                            }
-                        });
-                    } else {
-                        tracing::error!(
-                            target: "alerting",
-                            "webhook channel has no url configured"
-                        );
-                    }
-                }
-                // WOR-1876: Slack incoming webhook. Same SSRF-guarded
-                // delivery loop as `webhook`, Blocks-formatted payload.
-                "slack" => {
-                    if let Some(url) = &channel.url {
-                        let client = self.client.clone();
-                        let url = url.clone();
-                        let body = slack_payload(&alert);
-                        self.tasks.spawn(async move {
-                            let to_check = url.clone();
-                            match tokio::task::spawn_blocking(move || {
-                                webhook_url_allowed(&to_check)
-                            })
-                            .await
-                            {
-                                Ok(Ok(())) => {
-                                    deliver_json(client, url, body, "alert_slack").await;
-                                }
-                                _ => {
-                                    crate::metrics::record_telemetry_dropped(
-                                        "alert_slack",
-                                        "ssrf_rejected",
-                                    );
-                                    tracing::error!(
-                                        target: "alerting",
-                                        url = %url,
-                                        "slack webhook url failed SSRF validation - skipping"
-                                    );
-                                }
-                            }
-                        });
-                    } else {
-                        tracing::error!(
-                            target: "alerting",
-                            "slack channel has no url configured"
-                        );
-                    }
-                }
-                // WOR-1876: PagerDuty Events API v2. Trigger / resolve
-                // keyed on the rule identity so recovery auto-resolves.
-                "pagerduty" => {
-                    if let Some(routing_key) = &channel.routing_key {
-                        let client = self.client.clone();
-                        let body = pagerduty_payload(&alert, routing_key);
-                        self.tasks.spawn(async move {
-                            deliver_json(
-                                client,
-                                "https://events.pagerduty.com/v2/enqueue".to_string(),
-                                body,
-                                "alert_pagerduty",
-                            )
-                            .await;
-                        });
-                    } else {
-                        tracing::error!(
-                            target: "alerting",
-                            "pagerduty channel has no routing_key configured"
-                        );
-                    }
-                }
-                unknown => {
-                    tracing::warn!(
-                        target: "alerting",
-                        channel_type = %unknown,
-                        "unknown alert channel type - ignoring"
-                    );
-                }
+    /// Fire an alert to exactly one configured channel.
+    pub fn fire_channel(
+        &self,
+        channel_index: usize,
+        alert: Alert,
+    ) -> Result<(), AlertDispatchError> {
+        let channel = self
+            .channels
+            .get(channel_index)
+            .cloned()
+            .ok_or(AlertDispatchError::UnknownChannel(channel_index))?;
+        self.dispatch_channel(channel_index, channel, alert);
+        Ok(())
+    }
+
+    fn dispatch_channel(&self, channel_index: usize, channel: AlertChannelConfig, alert: Alert) {
+        match channel.channel_type.as_str() {
+            "log" => {
+                tracing::warn!(
+                    target: "alerting",
+                    rule = %alert.rule,
+                    severity = %alert.severity,
+                    message = %alert.message,
+                    timestamp = %alert.timestamp,
+                    "alert fired"
+                );
+                record_delivery_result(self.runtime.as_ref(), channel_index, &Ok(()));
             }
+            "webhook" => {
+                let Some(url) = channel.url else {
+                    tracing::error!(target: "alerting", "webhook channel has no url configured");
+                    record_delivery_result(
+                        self.runtime.as_ref(),
+                        channel_index,
+                        &Err("channel URL is not configured".to_string()),
+                    );
+                    return;
+                };
+                let client = self.client.clone();
+                let headers = channel.headers;
+                let secret = channel.secret;
+                let runtime = self.runtime.clone();
+                #[cfg(test)]
+                let allow_private_test_urls = self.allow_private_test_urls;
+                #[cfg(not(test))]
+                let allow_private_test_urls = false;
+                self.tasks.spawn(async move {
+                    let result = match validate_delivery_target(&url, allow_private_test_urls).await
+                    {
+                        Ok(()) => deliver_alert(client, url, headers, secret, alert).await,
+                        Err(error) => Err(error),
+                    };
+                    record_delivery_result(runtime.as_ref(), channel_index, &result);
+                });
+            }
+            "slack" => {
+                let Some(url) = channel.url else {
+                    tracing::error!(target: "alerting", "slack channel has no url configured");
+                    record_delivery_result(
+                        self.runtime.as_ref(),
+                        channel_index,
+                        &Err("channel URL is not configured".to_string()),
+                    );
+                    return;
+                };
+                let client = self.client.clone();
+                let body = slack_payload(&alert);
+                let runtime = self.runtime.clone();
+                #[cfg(test)]
+                let allow_private_test_urls = self.allow_private_test_urls;
+                #[cfg(not(test))]
+                let allow_private_test_urls = false;
+                self.tasks.spawn(async move {
+                    let result = match validate_delivery_target(&url, allow_private_test_urls).await
+                    {
+                        Ok(()) => deliver_json(client, url, body, "alert_slack").await,
+                        Err(error) => {
+                            crate::metrics::record_telemetry_dropped(
+                                "alert_slack",
+                                "ssrf_rejected",
+                            );
+                            Err(error)
+                        }
+                    };
+                    record_delivery_result(runtime.as_ref(), channel_index, &result);
+                });
+            }
+            "pagerduty" => {
+                let Some(routing_key) = channel.routing_key else {
+                    tracing::error!(
+                        target: "alerting",
+                        "pagerduty channel has no routing_key configured"
+                    );
+                    record_delivery_result(
+                        self.runtime.as_ref(),
+                        channel_index,
+                        &Err("routing key is not configured".to_string()),
+                    );
+                    return;
+                };
+                let client = self.client.clone();
+                let body = pagerduty_payload(&alert, &routing_key);
+                let runtime = self.runtime.clone();
+                self.tasks.spawn(async move {
+                    let result = deliver_json(
+                        client,
+                        "https://events.pagerduty.com/v2/enqueue".to_string(),
+                        body,
+                        "alert_pagerduty",
+                    )
+                    .await;
+                    record_delivery_result(runtime.as_ref(), channel_index, &result);
+                });
+            }
+            unknown => {
+                tracing::warn!(
+                    target: "alerting",
+                    channel_type = %unknown,
+                    "unknown alert channel type - ignoring"
+                );
+                record_delivery_result(
+                    self.runtime.as_ref(),
+                    channel_index,
+                    &Err("unsupported channel type".to_string()),
+                );
+            }
+        }
+    }
+}
+
+fn record_delivery_result(
+    runtime: Option<&AlertRuntime>,
+    channel_index: usize,
+    result: &Result<(), String>,
+) {
+    let Some(runtime) = runtime else {
+        return;
+    };
+    match result {
+        Ok(()) => {
+            runtime.record_delivery_success(channel_index);
+        }
+        Err(error) => {
+            runtime.record_delivery_failure(channel_index, error);
+        }
+    }
+}
+
+async fn validate_delivery_target(url: &str, allow_private_test_urls: bool) -> Result<(), String> {
+    if allow_private_test_urls {
+        return Ok(());
+    }
+    let to_check = url.to_string();
+    match tokio::task::spawn_blocking(move || webhook_url_allowed(&to_check)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(reason)) => {
+            tracing::error!(
+                target: "alerting",
+                reason = %reason,
+                "webhook url failed SSRF validation - skipping delivery"
+            );
+            Err("target rejected by SSRF policy".to_string())
+        }
+        Err(error) => {
+            tracing::error!(
+                target: "alerting",
+                error = %error,
+                "SSRF validation task failed - skipping delivery"
+            );
+            Err("target validation failed".to_string())
         }
     }
 }
@@ -344,7 +421,7 @@ async fn deliver_json(
     url: String,
     body: serde_json::Value,
     kind: &'static str,
-) {
+) -> Result<(), String> {
     let req = client
         .post(&url)
         .timeout(Duration::from_secs(5))
@@ -354,16 +431,19 @@ async fn deliver_json(
     match req.send().await {
         Ok(resp) if resp.status().is_success() => {
             tracing::debug!(target: "alerting", url = %url, kind = %kind, "alert delivered");
+            Ok(())
         }
         Ok(resp) => {
             crate::metrics::record_telemetry_dropped(kind, "http_error");
+            let status = resp.status();
             tracing::warn!(
                 target: "alerting",
                 url = %url,
                 kind = %kind,
-                status = %resp.status(),
+                status = %status,
                 "alert delivery non-success"
             );
+            Err(format!("HTTP {}", status.as_u16()))
         }
         Err(e) => {
             crate::metrics::record_telemetry_dropped(kind, "delivery_failed");
@@ -374,6 +454,7 @@ async fn deliver_json(
                 error = %e,
                 "alert delivery failed"
             );
+            Err(request_error_summary(&e))
         }
     }
 }
@@ -415,7 +496,7 @@ async fn deliver_alert(
     headers: Vec<(String, String)>,
     secret: Option<String>,
     alert: Alert,
-) {
+) -> Result<(), String> {
     // Wrap the alert in an envelope shape that matches the rest of the
     // proxy's webhook surface so receivers can use the same parser.
     let envelope = serde_json::json!({
@@ -430,7 +511,7 @@ async fn deliver_alert(
         Ok(b) => b,
         Err(e) => {
             tracing::error!(error = %e, "alerting: failed to serialize alert");
-            return;
+            return Err("payload serialization failed".to_string());
         }
     };
 
@@ -458,13 +539,27 @@ async fn deliver_alert(
     match req.send().await {
         Ok(resp) if resp.status().is_success() => {
             tracing::debug!(url = %url, "alerting: webhook delivered");
+            Ok(())
         }
         Ok(resp) => {
-            tracing::warn!(url = %url, status = %resp.status(), "alerting: webhook non-success");
+            let status = resp.status();
+            tracing::warn!(url = %url, status = %status, "alerting: webhook non-success");
+            Err(format!("HTTP {}", status.as_u16()))
         }
         Err(e) => {
             tracing::warn!(url = %url, error = %e, "alerting: webhook delivery failed");
+            Err(request_error_summary(&e))
         }
+    }
+}
+
+fn request_error_summary(error: &reqwest::Error) -> String {
+    if error.is_timeout() {
+        "request timed out".to_string()
+    } else if error.is_connect() {
+        "connection failed".to_string()
+    } else {
+        "request failed".to_string()
     }
 }
 
@@ -504,6 +599,37 @@ fn instance_id() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alerting::burn_rate::MinuteSample;
+    use crate::alerting::runtime::{AlertRuntime, DeliveryStatus};
+    use crate::alerting::{
+        AlertEngine, CertExpiryReading, CircuitBreakerReading, CircuitBreakerState, EngineConfig,
+        MetricReadings,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn local_http_server(status: u16) -> (String, tokio::sync::oneshot::Receiver<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = vec![0; 8 * 1024];
+            let read = socket.read(&mut bytes).await.unwrap();
+            let request = String::from_utf8_lossy(&bytes[..read]).into_owned();
+            let _ = request_tx.send(request);
+            let reason = if status < 400 { "OK" } else { "Error" };
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        (format!("http://{address}"), request_rx)
+    }
 
     fn make_alert(severity: &str) -> Alert {
         let mut labels = HashMap::new();
@@ -655,6 +781,70 @@ mod tests {
         assert!(dispatcher.tasks.is_empty());
     }
 
+    #[tokio::test]
+    async fn targeted_delivery_invokes_only_the_selected_channel_and_marks_it_healthy() {
+        let (base_url, request_rx) = local_http_server(204).await;
+        let channels = vec![
+            AlertChannelConfig {
+                channel_type: "webhook".to_string(),
+                url: Some(format!("{base_url}/first")),
+                headers: vec![],
+                secret: None,
+                routing_key: None,
+            },
+            AlertChannelConfig {
+                channel_type: "webhook".to_string(),
+                url: Some(format!("{base_url}/second")),
+                headers: vec![],
+                secret: None,
+                routing_key: None,
+            },
+        ];
+        let runtime = AlertRuntime::new(&EngineConfig::default(), &channels);
+        let dispatcher = AlertDispatcher::with_runtime_for_test(channels, runtime.clone());
+
+        dispatcher.fire_channel(1, make_alert("warning")).unwrap();
+        dispatcher.drain().await;
+
+        let request = request_rx.await.unwrap();
+        assert!(
+            request.starts_with("POST /second "),
+            "request was {request:?}"
+        );
+        let snapshot = runtime.snapshot();
+        assert_eq!(snapshot.channels[0].health.status, DeliveryStatus::Untested);
+        assert_eq!(snapshot.channels[1].health.status, DeliveryStatus::Healthy);
+    }
+
+    #[tokio::test]
+    async fn targeted_delivery_reports_http_failure_and_rejects_unknown_index() {
+        let (base_url, request_rx) = local_http_server(503).await;
+        let channels = vec![AlertChannelConfig {
+            channel_type: "webhook".to_string(),
+            url: Some(format!("{base_url}/failing")),
+            headers: vec![],
+            secret: None,
+            routing_key: None,
+        }];
+        let runtime = AlertRuntime::new(&EngineConfig::default(), &channels);
+        let dispatcher = AlertDispatcher::with_runtime_for_test(channels, runtime.clone());
+
+        assert_eq!(
+            dispatcher.fire_channel(9, make_alert("warning")),
+            Err(AlertDispatchError::UnknownChannel(9))
+        );
+        dispatcher.fire_channel(0, make_alert("warning")).unwrap();
+        dispatcher.drain().await;
+        let _ = request_rx.await.unwrap();
+
+        let snapshot = runtime.snapshot();
+        assert_eq!(snapshot.channels[0].health.status, DeliveryStatus::Failing);
+        assert_eq!(
+            snapshot.channels[0].health.error.as_deref(),
+            Some("HTTP 503")
+        );
+    }
+
     #[test]
     fn slack_payload_formats_firing_and_recovered() {
         // WOR-1876: readable headline, message section, labels +
@@ -700,6 +890,172 @@ mod tests {
         assert_eq!(resolve["event_action"], "resolve");
         assert_eq!(resolve["dedup_key"].as_str().unwrap(), dedup);
         assert!(resolve.get("payload").is_none());
+    }
+
+    #[test]
+    fn every_engine_rule_resolves_the_pagerduty_incident_it_opened() {
+        let mut pairs = Vec::new();
+
+        let mut budget = AlertEngine::new(EngineConfig::default());
+        let fired = budget
+            .evaluate(&MetricReadings {
+                budget_utilization: Some(0.99),
+                ..MetricReadings::default()
+            })
+            .remove(0);
+        let resolved = budget
+            .evaluate(&MetricReadings {
+                budget_utilization: Some(0.10),
+                ..MetricReadings::default()
+            })
+            .remove(0);
+        pairs.push((fired, resolved));
+
+        let mut error_rate = AlertEngine::new(EngineConfig::default());
+        let fired = error_rate
+            .evaluate(&MetricReadings {
+                provider_error_rate: Some(0.50),
+                provider_attempts: 100,
+                ..MetricReadings::default()
+            })
+            .remove(0);
+        let resolved = error_rate
+            .evaluate(&MetricReadings {
+                provider_error_rate: Some(0.01),
+                provider_attempts: 100,
+                ..MetricReadings::default()
+            })
+            .remove(0);
+        pairs.push((fired, resolved));
+
+        let mut slo = AlertEngine::new(EngineConfig {
+            slo_p99_threshold_ms: 100.0,
+            ..EngineConfig::default()
+        });
+        let fired = slo
+            .evaluate(&MetricReadings {
+                p99_latency_ms: Some(250.0),
+                ..MetricReadings::default()
+            })
+            .remove(0);
+        let resolved = slo
+            .evaluate(&MetricReadings {
+                p99_latency_ms: Some(50.0),
+                ..MetricReadings::default()
+            })
+            .remove(0);
+        pairs.push((fired, resolved));
+
+        let mut rate_limit = AlertEngine::new(EngineConfig::default());
+        let fired = rate_limit
+            .evaluate(&MetricReadings {
+                rate_limit_rejections: Some(9),
+                rate_limit_decisions: 10,
+                ..MetricReadings::default()
+            })
+            .remove(0);
+        let resolved = rate_limit
+            .evaluate(&MetricReadings {
+                rate_limit_rejections: Some(1),
+                rate_limit_decisions: 10,
+                ..MetricReadings::default()
+            })
+            .remove(0);
+        pairs.push((fired, resolved));
+
+        let mut cert = AlertEngine::new(EngineConfig::default());
+        let fired = cert
+            .evaluate(&MetricReadings {
+                cert_expiry: Some(CertExpiryReading {
+                    hostname: "near.example".to_string(),
+                    days_remaining: 6,
+                }),
+                ..MetricReadings::default()
+            })
+            .remove(0);
+        let resolved = cert
+            .evaluate(&MetricReadings {
+                cert_expiry: Some(CertExpiryReading {
+                    hostname: "near.example".to_string(),
+                    days_remaining: 90,
+                }),
+                ..MetricReadings::default()
+            })
+            .remove(0);
+        pairs.push((fired, resolved));
+
+        let mut breaker = AlertEngine::new(EngineConfig::default());
+        let fired = breaker
+            .evaluate(&MetricReadings {
+                circuit_breakers: Some(vec![CircuitBreakerReading {
+                    origin: "https://upstream.example#0".to_string(),
+                    state: CircuitBreakerState::Open,
+                }]),
+                ..MetricReadings::default()
+            })
+            .remove(0);
+        let resolved = breaker
+            .evaluate(&MetricReadings {
+                circuit_breakers: Some(vec![CircuitBreakerReading {
+                    origin: "https://upstream.example#0".to_string(),
+                    state: CircuitBreakerState::Closed,
+                }]),
+                ..MetricReadings::default()
+            })
+            .remove(0);
+        pairs.push((fired, resolved));
+
+        let clean = MinuteSample {
+            requests: 100,
+            errors: 0,
+            p99_ms: 20.0,
+        };
+        let burning = MinuteSample {
+            requests: 100,
+            errors: 10,
+            p99_ms: 20.0,
+        };
+        let mut burn = AlertEngine::new(EngineConfig::default());
+        for _ in 0..30 {
+            burn.evaluate(&MetricReadings {
+                minute_sample: Some(clean),
+                ..MetricReadings::default()
+            });
+        }
+        let mut fired = None;
+        for _ in 0..30 {
+            fired = burn
+                .evaluate(&MetricReadings {
+                    minute_sample: Some(burning),
+                    ..MetricReadings::default()
+                })
+                .into_iter()
+                .find(|alert| alert.rule == "burn_rate")
+                .or(fired);
+        }
+        let mut resolved = None;
+        for _ in 0..30 {
+            resolved = burn
+                .evaluate(&MetricReadings {
+                    minute_sample: Some(clean),
+                    ..MetricReadings::default()
+                })
+                .into_iter()
+                .find(|alert| alert.rule == "burn_rate" && alert.resolved)
+                .or(resolved);
+        }
+        pairs.push((fired.unwrap(), resolved.unwrap()));
+
+        assert_eq!(pairs.len(), 7);
+        for (triggered, resolved) in pairs {
+            assert!(!triggered.resolved);
+            assert!(resolved.resolved);
+            let trigger = pagerduty_payload(&triggered, "rk");
+            let resolve = pagerduty_payload(&resolved, "rk");
+            assert_eq!(trigger["event_action"], "trigger");
+            assert_eq!(resolve["event_action"], "resolve");
+            assert_eq!(trigger["dedup_key"], resolve["dedup_key"]);
+        }
     }
 
     #[test]

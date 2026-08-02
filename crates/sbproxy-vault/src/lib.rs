@@ -5,6 +5,7 @@
 #![warn(missing_docs)]
 
 pub mod aws;
+pub mod azure;
 pub mod convergent;
 pub mod file;
 pub mod gcp;
@@ -17,9 +18,14 @@ pub mod resolver;
 pub mod rotation;
 pub mod scope;
 pub mod secret_string;
+#[cfg(test)]
+mod test_env;
 pub mod vault_ref;
 
 pub use aws::{AwsAuth, AwsSecretsManagerBackend, AwsSecretsManagerConfig, DEFAULT_AWS_CACHE_TTL};
+pub use azure::{
+    AzureKeyVaultAuth, AzureKeyVaultBackend, AzureKeyVaultConfig, DEFAULT_AZURE_CACHE_TTL,
+};
 pub use convergent::ConvergentFingerprinter;
 pub use file::{FileFormat, FileVaultBackend, FileVaultConfig};
 pub use gcp::{

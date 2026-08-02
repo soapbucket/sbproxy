@@ -66,8 +66,20 @@ pub mod agent_classifier_types;
 pub mod judge_rpc;
 pub mod known_models;
 
+mod default_centroids;
 mod embedder;
+mod token_classifier;
+pub use default_centroids::{
+    default_centroid_artifact, default_safety_centroids, DefaultCentroid, DefaultCentroidArtifact,
+    DefaultCentroidTaxonomyArtifact, DEFAULT_CENTROID_DIMENSION, DEFAULT_CENTROID_MODEL_ID,
+    DEFAULT_CENTROID_MODEL_REVISION, DEFAULT_CENTROID_MODEL_SHA256,
+    DEFAULT_CENTROID_TOKENIZER_SHA256,
+};
 pub use embedder::{EmbeddingOutput, OnnxEmbedder};
+pub use token_classifier::{
+    OnnxTokenClassifier, TokenCompressionLimitError, TokenCompressionLimits,
+    TokenCompressionOutput, TokenCompressionTarget,
+};
 
 pub use agent_class::{
     AgentClass, AgentClassCatalog, AgentId, AgentIdSource, AgentPurpose, DEFAULT_CATALOG_YAML,
@@ -94,11 +106,10 @@ use tract_onnx::prelude::*;
 /// Default upper bound on the size of either an ONNX model file or a
 /// tokenizer file (200 MB).
 ///
-/// The classifiers used by sbproxy detectors are small (DeBERTa-base is
-/// roughly 350 MB unquantised, ~70 MB after the int8 ONNX export, and
-/// the matching tokenizer is well under 5 MB). 200 MB is a generous
-/// ceiling that still rejects the kind of runaway download that could
-/// exhaust the cache disk before tract or tokenizers sees the file.
+/// 200 MB admits the small, reviewed classifiers SBproxy is intended to run
+/// while rejecting heavyweight or runaway artifacts before tract or
+/// tokenizers sees the file. A model advertised as a compact export must still
+/// be measured; filenames and model-card estimates are not trusted.
 ///
 /// Operators running a larger custom model can lift this via
 /// [`LoadOptions::with_max_model_bytes`] /
@@ -178,6 +189,61 @@ pub struct SignatureConfig {
     /// 32-byte Ed25519 verifying key. The detector config layer parses
     /// the operator's PEM or hex string into this fixed-size form.
     verifying_key: [u8; PUBLIC_KEY_LENGTH],
+}
+
+/// Required supply-chain pins, plus optional detached signatures, for
+/// classifier artifacts staged on local disk.
+///
+/// Unlike the download path, a local path has no trusted URL from which to
+/// infer integrity metadata. Both SHA-256 pins are therefore mandatory.
+#[derive(Debug, Clone)]
+pub struct LocalArtifactVerification {
+    model_sha256: String,
+    tokenizer_sha256: String,
+    signatures: Option<LocalSignatureConfig>,
+}
+
+#[derive(Debug, Clone)]
+struct LocalSignatureConfig {
+    model_signature_path: PathBuf,
+    tokenizer_signature_path: PathBuf,
+    verifying_key: [u8; PUBLIC_KEY_LENGTH],
+}
+
+impl LocalArtifactVerification {
+    /// Create a mandatory SHA-256 pin pair for a local model and tokenizer.
+    pub fn new(
+        model_sha256: impl Into<String>,
+        tokenizer_sha256: impl Into<String>,
+    ) -> Result<Self> {
+        let model_sha256 = model_sha256.into();
+        let tokenizer_sha256 = tokenizer_sha256.into();
+        validate_sha256_pin(&model_sha256, "model")?;
+        validate_sha256_pin(&tokenizer_sha256, "tokenizer")?;
+        Ok(Self {
+            model_sha256,
+            tokenizer_sha256,
+            signatures: None,
+        })
+    }
+
+    /// Require detached Ed25519 signatures for both local artifacts.
+    ///
+    /// Each signature signs the 32-byte SHA-256 digest of its artifact and
+    /// may be stored as 64 raw bytes, base64, or lowercase/uppercase hex.
+    pub fn with_signatures(
+        mut self,
+        model_signature_path: impl Into<PathBuf>,
+        tokenizer_signature_path: impl Into<PathBuf>,
+        verifying_key: [u8; PUBLIC_KEY_LENGTH],
+    ) -> Self {
+        self.signatures = Some(LocalSignatureConfig {
+            model_signature_path: model_signature_path.into(),
+            tokenizer_signature_path: tokenizer_signature_path.into(),
+            verifying_key,
+        });
+        self
+    }
 }
 
 impl LoadOptions {
@@ -317,6 +383,49 @@ impl OnnxClassifier {
         labels: Option<Vec<String>>,
     ) -> Result<Self> {
         Self::load_with_options(model_path, tokenizer_path, labels, &LoadOptions::default())
+    }
+
+    /// Verify and load a classifier pair staged on local disk.
+    ///
+    /// Validation is deliberately ordered before either parser sees bytes:
+    /// regular readable files, size budgets, both SHA-256 pins, both optional
+    /// detached signatures, then tokenizer and ONNX parsing.
+    pub fn load_verified_local_with_options(
+        model_path: &Path,
+        tokenizer_path: &Path,
+        labels: Option<Vec<String>>,
+        verification: &LocalArtifactVerification,
+        options: &LoadOptions,
+    ) -> Result<Self> {
+        check_local_artifact(model_path, "model")?;
+        check_local_artifact(tokenizer_path, "tokenizer")?;
+        check_size_budget(model_path, "model", options.effective_model_limit())?;
+        check_size_budget(
+            tokenizer_path,
+            "tokenizer",
+            options.effective_tokenizer_limit(),
+        )?;
+        validate_sha256(model_path, &verification.model_sha256)
+            .context("model sha256 verification failed")?;
+        validate_sha256(tokenizer_path, &verification.tokenizer_sha256)
+            .context("tokenizer sha256 verification failed")?;
+
+        if let Some(signatures) = verification.signatures.as_ref() {
+            verify_local_artifact_signature(
+                model_path,
+                &signatures.model_signature_path,
+                &signatures.verifying_key,
+                "model",
+            )?;
+            verify_local_artifact_signature(
+                tokenizer_path,
+                &signatures.tokenizer_signature_path,
+                &signatures.verifying_key,
+                "tokenizer",
+            )?;
+        }
+
+        Self::load_with_options(model_path, tokenizer_path, labels, options)
     }
 
     /// Load a classifier from local files with explicit
@@ -691,6 +800,29 @@ pub(crate) fn check_size_budget(path: &Path, kind: &str, max_bytes: u64) -> Resu
     Ok(())
 }
 
+fn check_local_artifact(path: &Path, kind: &str) -> Result<()> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("stat local {kind} artifact {}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(anyhow!(
+            "local {kind} artifact {} is not a regular file",
+            path.display()
+        ));
+    }
+    fs::File::open(path)
+        .with_context(|| format!("open local {kind} artifact {}", path.display()))?;
+    Ok(())
+}
+
+fn validate_sha256_pin(pin: &str, kind: &str) -> Result<()> {
+    if pin.len() != 64 || !pin.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(anyhow!(
+            "{kind}_sha256 must be exactly 64 hexadecimal characters"
+        ));
+    }
+    Ok(())
+}
+
 /// Fetch the detached signature at `signature_url`, then verify it
 /// against `SHA-256(artifact_bytes)` with the supplied verifying key.
 ///
@@ -707,7 +839,51 @@ fn verify_artifact_signature(
     kind: &str,
 ) -> Result<()> {
     let sig_bytes = fetch_signature_bytes(signature_url, cache_dir, kind)?;
+    verify_artifact_signature_bytes(artifact_path, &sig_bytes, verifying_key, kind)
+}
 
+fn verify_local_artifact_signature(
+    artifact_path: &Path,
+    signature_path: &Path,
+    verifying_key: &[u8; PUBLIC_KEY_LENGTH],
+    kind: &str,
+) -> Result<()> {
+    let signature_kind = format!("{kind} signature");
+    check_local_artifact(signature_path, &signature_kind)?;
+    check_size_budget(signature_path, &signature_kind, 4096)?;
+    let mut raw = Vec::new();
+    fs::File::open(signature_path)
+        .with_context(|| {
+            format!(
+                "opening local {kind} signature {}",
+                signature_path.display()
+            )
+        })?
+        .take(4097)
+        .read_to_end(&mut raw)
+        .with_context(|| {
+            format!(
+                "reading local {kind} signature {}",
+                signature_path.display()
+            )
+        })?;
+    if raw.len() > 4096 {
+        return Err(anyhow!(
+            "local {kind} signature {} exceeds the 4096 byte limit",
+            signature_path.display()
+        ));
+    }
+    let sig_bytes = decode_signature_bytes(&raw)?;
+    verify_artifact_signature_bytes(artifact_path, &sig_bytes, verifying_key, kind)
+        .with_context(|| format!("local {kind} signature verification failed"))
+}
+
+fn verify_artifact_signature_bytes(
+    artifact_path: &Path,
+    sig_bytes: &[u8],
+    verifying_key: &[u8; PUBLIC_KEY_LENGTH],
+    kind: &str,
+) -> Result<()> {
     let mut hasher = Sha256::new();
     let mut f = fs::File::open(artifact_path)
         .with_context(|| format!("opening {kind} for signature verification"))?;
@@ -725,7 +901,7 @@ fn verify_artifact_signature(
 
     let key = VerifyingKey::from_bytes(verifying_key)
         .map_err(|e| anyhow!("invalid Ed25519 verifying key: {e}"))?;
-    let sig_arr: [u8; SIGNATURE_LENGTH] = sig_bytes.as_slice().try_into().map_err(|_| {
+    let sig_arr: [u8; SIGNATURE_LENGTH] = sig_bytes.try_into().map_err(|_| {
         anyhow!(
             "{kind} signature is {} bytes; Ed25519 signatures are {} bytes",
             sig_bytes.len(),
@@ -810,11 +986,17 @@ fn decode_signature_bytes(raw: &[u8]) -> Result<Vec<u8>> {
 fn validate_sha256(path: &Path, expected_hex: &str) -> Result<()> {
     let mut f =
         fs::File::open(path).with_context(|| format!("opening {path:?} for sha256 check"))?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf)
-        .with_context(|| format!("reading {path:?} for sha256 check"))?;
     let mut hasher = Sha256::new();
-    hasher.update(&buf);
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let read = f
+            .read(&mut chunk)
+            .with_context(|| format!("reading {path:?} for sha256 check"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&chunk[..read]);
+    }
     let actual = hex::encode(hasher.finalize());
     if actual.eq_ignore_ascii_case(expected_hex) {
         Ok(())
@@ -973,6 +1155,85 @@ mod tests {
         assert_eq!(opts.effective_model_limit(), MAX_MODEL_BYTES_DEFAULT);
         assert_eq!(opts.effective_tokenizer_limit(), MAX_MODEL_BYTES_DEFAULT);
         assert_eq!(MAX_MODEL_BYTES_DEFAULT, 200 * 1024 * 1024);
+    }
+
+    #[test]
+    fn local_artifact_verification_requires_two_well_formed_pins() {
+        assert!(LocalArtifactVerification::new("not-a-digest", "00".repeat(32)).is_err());
+        assert!(LocalArtifactVerification::new("00".repeat(32), "still-not-a-digest").is_err());
+        LocalArtifactVerification::new("00".repeat(32), "11".repeat(32)).unwrap();
+    }
+
+    #[test]
+    fn verified_local_load_rejects_tampering_before_parsing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let model = tmp.path().join("model.onnx");
+        let tokenizer = tmp.path().join("tokenizer.json");
+        fs::write(&model, b"tampered model").unwrap();
+        fs::write(&tokenizer, b"tampered tokenizer").unwrap();
+        let verification =
+            LocalArtifactVerification::new("00".repeat(32), "11".repeat(32)).unwrap();
+
+        let error = match OnnxClassifier::load_verified_local_with_options(
+            &model,
+            &tokenizer,
+            None,
+            &verification,
+            &LoadOptions::default(),
+        ) {
+            Ok(_) => panic!("tampered local model must not reach the parser"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("model sha256 verification failed"));
+    }
+
+    #[test]
+    fn verified_local_load_rejects_a_bad_detached_signature_before_parsing() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let model = tmp.path().join("model.onnx");
+        let tokenizer = tmp.path().join("tokenizer.json");
+        let model_bytes = b"model bytes";
+        let tokenizer_bytes = b"tokenizer bytes";
+        fs::write(&model, model_bytes).unwrap();
+        fs::write(&tokenizer, tokenizer_bytes).unwrap();
+
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let model_digest = Sha256::digest(model_bytes);
+        let model_signature = signing.sign(model_digest.as_slice());
+        let tokenizer_digest = Sha256::digest(tokenizer_bytes);
+        let tokenizer_signature = signing.sign(tokenizer_digest.as_slice());
+        let model_signature_path = tmp.path().join("model.sig");
+        let tokenizer_signature_path = tmp.path().join("tokenizer.sig");
+        fs::write(&model_signature_path, model_signature.to_bytes()).unwrap();
+        fs::write(&tokenizer_signature_path, tokenizer_signature.to_bytes()).unwrap();
+
+        let wrong_key = SigningKey::from_bytes(&[99u8; 32])
+            .verifying_key()
+            .to_bytes();
+        let verification = LocalArtifactVerification::new(
+            hex::encode(model_digest),
+            hex::encode(tokenizer_digest),
+        )
+        .unwrap()
+        .with_signatures(&model_signature_path, &tokenizer_signature_path, wrong_key);
+
+        let error = match OnnxClassifier::load_verified_local_with_options(
+            &model,
+            &tokenizer,
+            None,
+            &verification,
+            &LoadOptions::default(),
+        ) {
+            Ok(_) => panic!("bad local signature must not reach the parser"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("local model signature verification failed"));
     }
 
     #[test]

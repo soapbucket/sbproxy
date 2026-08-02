@@ -1,6 +1,6 @@
 # SBproxy Supply Chain
 
-*Last modified: 2026-07-13*
+*Last modified: 2026-07-28*
 
 The long-form companion to `SECURITY.md`, intended for security teams, procurement reviewers, and anyone whose job is to answer the question "can we trust this binary?"
 
@@ -219,7 +219,7 @@ The Rust gateway depends on a vetted set of crates. The Cargo.lock file is commi
 - Serialization: `serde`, `serde_yaml`, `serde_json`
 - Tracing and metrics: `tracing`, `prometheus`
 - Scripting bridges: `mlua`, `rquickjs` (sandboxed)
-- ML/embedding (enterprise classifier sidecar): handled in a separate process with its own dependency surface
+- ML/embedding sidecars: handled in a separate process with their own dependency surface
 
 There are **no Python or Node runtime dependencies** in the gateway hot path. The Lua and JavaScript scripting modules execute user-provided code in sandboxes; they do not pull external module ecosystems at runtime.
 
@@ -243,12 +243,12 @@ There are **no Python or Node runtime dependencies** in the gateway hot path. Th
 
 The release workflow itself is part of the supply chain. The following invariants are enforced:
 
-- **All third-party GitHub Actions are pinned by commit SHA, not by tag.** Action authors can re-tag silently; SHAs cannot be changed retroactively. Renovate keeps the SHAs current with full diffs.
-- **Job-level minimum permissions.** The release job has only `id-token: write` (for keyless cosign), `contents: write` (for release publish), and `packages: write` (for GHCR push). No `permissions: write-all`, ever.
+- **Third-party GitHub Actions use explicit reviewed versions.** The workflow currently uses major-version tags such as `actions/checkout@v5`; updates are visible in review.
+- **Job-level minimum permissions.** The binary release job has `contents: write`, `id-token: write`, and `attestations: write`. The separate image job also has `packages: write`. Other jobs inherit `contents: read` unless they declare a narrower publish need. No job uses `permissions: write-all`.
 - **Hosted runners only.** SLSA Level 3 requires this. Self-hosted runners are not used for release jobs.
-- **No secrets in environment variables that scripts can echo.** Where unavoidable, secrets are scoped to a single step.
+- **Publish secrets are scoped to the steps that need them.** Release and registry credentials are not set as workflow-wide environment variables.
 - **No interactive prompts in CI.** Every command is non-interactive; every flag is explicit.
-- **Branch protection on `main` and `archive/go`.** Force-push and deletion are disabled. `main` requires PR review and a passing CI run before merge.
+- **Branch protection on `main`.** Force-push and deletion are disabled. Changes require PR review and a passing CI run before merge.
 - **Tag protection on `v*` tags.** Only specific roles can create release tags.
 - **Provenance includes the workflow file SHA.** A change to `release.yml` is visible in the next release's attestation.
 
@@ -292,7 +292,7 @@ The supply-chain story exists because incidents happen. Here is how we respond.
 2. **Yank the affected version from package indices** (Homebrew, Docker `:latest`, Cargo if applicable). Existing pulls of the affected artifact remain available because deletion makes forensics harder; the advisory directs users to the safe replacement.
 3. **Cut a fixed release** with a higher patch number. We do not re-tag a known-compromised version.
 4. **Publish a post-mortem** within 7 days of the advisory, naming the root cause and the changes to the pipeline. This includes an updated entry in `SUPPLY-CHAIN.md` itself if the threat model gained a new scenario.
-5. **Notify enterprise customers directly** via the support contact on file.
+5. **Notify affected customers directly** via the support contact on file.
 
 We do **not** silently rebuild and re-push under the same version. Every signing event is in the Rekor transparency log; pretending it didn't happen is impossible and dishonest.
 
@@ -315,7 +315,6 @@ This is a category of risk we cannot fully mitigate but can constrain:
 
 - The Rekor transparency log has multiple monitors, including the open-source Sigstore community and several auditing services. A backdated or forged log entry would be detected.
 - GitHub OIDC tokens are short-lived and bound to the workflow run. A long-running compromise of the GitHub OIDC issuer would invalidate the entire ecosystem, not just SBproxy; it is a public infrastructure incident.
-- For customers who require independence from the Sigstore ecosystem, the enterprise tier offers an additional **GPG-signed release option** with maintainer-held keys. This is opt-in because the operational complexity is real (key management, revocation, rotation) and most customers do not need it. Talk to us.
 
 ---
 

@@ -43,6 +43,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       pkg-config libclang-dev \
       build-essential cmake perl \
+      protobuf-compiler \
  && rm -rf /var/lib/apt/lists/*
 # Pin cargo-chef so a registry republish cannot perturb the build.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \

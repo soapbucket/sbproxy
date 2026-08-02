@@ -72,6 +72,22 @@ impl CacheStore for RedisCacheStore {
         self.store.put_with_ttl(&full, &encoded, ttl)
     }
 
+    fn compare_and_swap(
+        &self,
+        key: &str,
+        expected: &CachedResponse,
+        replacement: &CachedResponse,
+    ) -> Result<bool> {
+        let full = self.full_key(key);
+        let expected =
+            serde_json::to_vec(expected).context("serialize expected cached response for redis")?;
+        let ttl = replacement.ttl_secs.saturating_add(1);
+        let replacement = serde_json::to_vec(replacement)
+            .context("serialize replacement cached response for redis")?;
+        self.store
+            .compare_and_swap_with_ttl(&full, &expected, &replacement, ttl)
+    }
+
     fn delete(&self, key: &str) -> Result<()> {
         self.store.delete(&self.full_key(key))
     }
@@ -105,5 +121,46 @@ impl CacheStore for RedisCacheStore {
 
     fn backend_name(&self) -> &'static str {
         "redis"
+    }
+
+    fn durability(&self) -> crate::at_rest::CacheDurability {
+        // Entries live on a shared server that other replicas read.
+        crate::at_rest::CacheDurability::Replicated
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sbproxy_platform::storage::MemoryKVStore;
+
+    fn entry(generation: u64, body: &[u8]) -> CachedResponse {
+        CachedResponse {
+            generation,
+            status: 200,
+            headers: Vec::new(),
+            body: body.to_vec(),
+            cached_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            ttl_secs: 300,
+        }
+    }
+
+    #[test]
+    fn conditional_replace_rejects_a_newer_shared_entry() {
+        let store = RedisCacheStore::new(Arc::new(MemoryKVStore::new(0)));
+        let stale = entry(1, b"stale");
+        store.put("key", &stale).unwrap();
+        store.put("key", &entry(2, b"foreground")).unwrap();
+
+        assert!(!store
+            .compare_and_swap("key", &stale, &entry(3, b"background"))
+            .unwrap());
+        assert_eq!(
+            store.get("key").unwrap().expect("foreground entry").body,
+            b"foreground"
+        );
     }
 }

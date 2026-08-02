@@ -10,7 +10,10 @@ ACTUAL="$(mktemp -t sbproxy-model-host-capabilities.XXXXXX)"
 trap 'rm -f "$ACTUAL"' EXIT
 
 cd "$ROOT_DIR"
-cargo run -q -p sbproxy-model-host --bin generate-model-host-capabilities > "$ACTUAL"
+# shellcheck source=scripts/lib/workspace-bin.sh
+. "$ROOT_DIR/scripts/lib/workspace-bin.sh"
+run_workspace_bin generate-model-host-capabilities \
+  -p sbproxy-model-host --bin generate-model-host-capabilities > "$ACTUAL"
 
 if [ ! -f "$EXPECTED" ]; then
   echo "model-host capability matrix is missing: $EXPECTED" >&2

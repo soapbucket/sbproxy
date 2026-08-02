@@ -1,46 +1,59 @@
 //! HTTP client for forwarding requests to AI providers.
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use sbproxy_security::egress::{EgressAuthorizer, EgressDenied, EgressPurpose, HostResolver};
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 use crate::ai_metrics;
+use crate::compression::{SummarizationOutput, SummarizerError};
 use crate::handler::AiHandlerConfig;
 use crate::provider::ProviderConfig;
 use crate::providers::{get_provider_info, ProviderFormat};
-use crate::routing::Router;
+use crate::routing::{provider_allowed_by_policy, Router};
 use crate::translators;
+use crate::usage_sink::{LlmUsageEvent, UsageSink};
 
 /// Default upper bound on shadow requests in flight per `AiClient`.
-/// Sized so a 1024-deep queue holding ~32 KB of request state per
-/// task fits comfortably in well under 64 MB of resident memory,
-/// while still absorbing burst traffic to a slow shadow provider.
-pub const DEFAULT_SHADOW_MAX_INFLIGHT: usize = 1024;
+pub const DEFAULT_SHADOW_MAX_INFLIGHT: usize = 16;
+/// Process-wide shadow memory reservation budget per `AiClient`.
+///
+/// Admission reserves twice the serialized request size plus twice the
+/// response metadata cap for each task. This covers the request clone and
+/// transient response translation without allowing task count and per-task
+/// buffers to multiply into an unbounded resident-memory claim.
+pub const DEFAULT_SHADOW_MEMORY_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
 /// Minimum interval between rate-limited shadow-overflow WARN log
 /// lines. Bursts above this rate are coalesced into a single line.
 const SHADOW_OVERFLOW_WARN_INTERVAL: Duration = Duration::from_secs(60);
+/// Maximum response bytes retained for shadow usage metadata parsing.
+/// The response is still drained so the connection can be reused.
+const MAX_SHADOW_RESPONSE_METADATA_BYTES: usize = 1024 * 1024;
 const PROVIDER_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
 const PROVIDER_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
 const PROVIDER_RETRY_JITTER_PCT: u64 = 25;
 
 /// Supervisor for shadow / side-by-side eval tasks.
 ///
-/// Owns a bounded in-flight queue (`Semaphore`) so a slow or hung
-/// shadow provider can never accumulate unbounded background tasks.
-/// Each spawned task wraps `run_shadow_request` in
-/// `tokio::time::timeout`; when the timeout elapses the future is
-/// dropped (which aborts the in-flight reqwest connection) and the
-/// `sbproxy_ai_shadow_timeout_total` counter ticks. When `try_acquire`
-/// fails the supervisor logs at WARN at most once per minute and ticks
-/// `sbproxy_ai_shadow_dropped_total`.
+/// Owns bounded task and memory semaphores so a slow or hung shadow provider
+/// can never accumulate unbounded background work or retained response
+/// buffers. Each spawned task wraps `run_shadow_request` in
+/// `tokio::time::timeout`; when the timeout elapses the future is dropped
+/// (which aborts the in-flight reqwest connection) and the
+/// `sbproxy_ai_shadow_timeout_total` counter ticks. When either admission
+/// resource is exhausted the supervisor logs at WARN at most once per minute
+/// and ticks `sbproxy_ai_shadow_dropped_total`.
 pub struct ShadowSupervisor {
     semaphore: Arc<Semaphore>,
+    memory: Arc<Semaphore>,
     max_inflight: usize,
+    max_memory_bytes: usize,
     /// Unix-epoch nanoseconds of the last overflow WARN log. `0`
     /// means "never logged"; `AtomicI64` because `Instant` is not
     /// portable to atomics and a wall-clock skew of a few seconds is
@@ -51,10 +64,16 @@ pub struct ShadowSupervisor {
 impl ShadowSupervisor {
     /// Build a supervisor with the given in-flight bound.
     pub fn new(max_inflight: usize) -> Self {
+        Self::with_memory_budget(max_inflight, DEFAULT_SHADOW_MEMORY_BUDGET_BYTES)
+    }
+
+    fn with_memory_budget(max_inflight: usize, max_memory_bytes: usize) -> Self {
         let bound = max_inflight.max(1);
         Self {
             semaphore: Arc::new(Semaphore::new(bound)),
+            memory: Arc::new(Semaphore::new(max_memory_bytes)),
             max_inflight: bound,
+            max_memory_bytes,
             last_warn_unix_nanos: AtomicI64::new(0),
         }
     }
@@ -72,17 +91,58 @@ impl ShadowSupervisor {
     /// Try to admit one shadow task. Returns the owned permit on
     /// success; on overflow, ticks `sbproxy_ai_shadow_dropped_total`,
     /// emits a rate-limited WARN, and returns `None`.
-    fn try_admit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        match self.semaphore.clone().try_acquire_owned() {
-            Ok(permit) => Some(permit),
-            Err(_) => {
-                ai_metrics::record_shadow_dropped();
-                self.maybe_warn_overflow();
-                None
-            }
-        }
+    #[cfg(test)]
+    fn try_admit(&self) -> Option<ShadowPermit> {
+        self.try_admit_request(0)
     }
 
+    fn try_admit_request(&self, request_bytes: usize) -> Option<ShadowPermit> {
+        let slot = match self.semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => return self.reject_admission(),
+        };
+        let memory_bytes = shadow_memory_reservation(request_bytes);
+        if memory_bytes > self.max_memory_bytes {
+            return self.reject_admission();
+        }
+        let memory_permits = match u32::try_from(memory_bytes) {
+            Ok(permits) => permits,
+            Err(_) => return self.reject_admission(),
+        };
+        let memory = match self.memory.clone().try_acquire_many_owned(memory_permits) {
+            Ok(permit) => permit,
+            Err(_) => return self.reject_admission(),
+        };
+        Some(ShadowPermit {
+            _slot: slot,
+            _memory: memory,
+        })
+    }
+
+    fn reject_admission<T>(&self) -> Option<T> {
+        ai_metrics::record_shadow_dropped(ai_metrics::ShadowDropReason::Saturated);
+        self.maybe_warn_overflow();
+        None
+    }
+
+    #[cfg(test)]
+    fn available_memory_bytes(&self) -> usize {
+        self.memory.available_permits()
+    }
+}
+
+struct ShadowPermit {
+    _slot: tokio::sync::OwnedSemaphorePermit,
+    _memory: tokio::sync::OwnedSemaphorePermit,
+}
+
+fn shadow_memory_reservation(request_bytes: usize) -> usize {
+    request_bytes
+        .saturating_mul(2)
+        .saturating_add(MAX_SHADOW_RESPONSE_METADATA_BYTES.saturating_mul(2))
+}
+
+impl ShadowSupervisor {
     /// Emit at most one overflow WARN per
     /// `SHADOW_OVERFLOW_WARN_INTERVAL`. Concurrent overflows are
     /// coalesced via a CAS on `last_warn_unix_nanos`.
@@ -103,7 +163,8 @@ impl ShadowSupervisor {
                 warn!(
                     target: "sbproxy_ai_shadow",
                     max_inflight = self.max_inflight,
-                    "shadow supervisor queue full; dropping shadow request (rate-limited)"
+                    max_memory_bytes = self.max_memory_bytes,
+                    "shadow supervisor capacity exhausted; dropping shadow request (rate-limited)"
                 );
                 return;
             }
@@ -133,10 +194,132 @@ impl Drop for ShadowInflightGuard {
     }
 }
 
+/// Result of trying to enqueue one configured shadow request.
+///
+/// This vocabulary is deliberately closed so callers can make
+/// deterministic assertions without parsing logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShadowDispatchOutcome {
+    /// The handler has no shadow block.
+    NotConfigured,
+    /// The request surface is outside the v1 chat-evaluation allowlist.
+    UnsupportedSurface,
+    /// Streaming shadowing is intentionally unsupported.
+    StreamingSkipped,
+    /// The configured probabilistic sampler did not select this request.
+    SampledOut,
+    /// The named shadow provider was absent from the handler provider list.
+    ProviderNotFound,
+    /// Credential-scoped provider policy disallowed the shadow provider.
+    ProviderNotAllowed,
+    /// Prompt-training opt-out disallowed the configured shadow provider.
+    PromptTrainingDisallowed,
+    /// Purpose-scoped egress is active and shadow transport cannot honor it.
+    EgressDenied,
+    /// The bounded shadow supervisor had no free slot.
+    Saturated,
+    /// The shadow task was admitted and spawned.
+    Spawned,
+}
+
+/// Request-scoped usage attribution copied into a completed shadow event.
+///
+/// The event and sinks are owned by the background task, keeping
+/// shadow accounting separate from the primary budget and governance
+/// path. Recording is implemented alongside the usage-sink wiring.
+#[derive(Debug, Clone)]
+pub struct ShadowUsageRecord {
+    event: LlmUsageEvent,
+    sinks: Vec<Arc<dyn UsageSink>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ShadowAttribution {
+    Shadow,
+}
+
+impl ShadowAttribution {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Shadow => "shadow",
+        }
+    }
+}
+
+impl ShadowUsageRecord {
+    /// Build shadow accounting from the request's governed identity.
+    pub fn new(mut event: LlmUsageEvent, sinks: Vec<Arc<dyn UsageSink>>) -> Self {
+        event.provider.clear();
+        event.model.clear();
+        event.prompt_tokens = 0;
+        event.completion_tokens = 0;
+        event.total_tokens = 0;
+        event.cost_usd = 0.0;
+        event.latency_ms = 0;
+        event.status = 0;
+        // Never derive the ledger dedup key from a caller-controlled
+        // correlation header. A different primary request could otherwise
+        // deliberately choose that derived value and suppress this event.
+        event.request_id = Some(format!("{:032x}:shadow", rand::random::<u128>()));
+        event.tag = Some(ShadowAttribution::Shadow.as_str().to_string());
+        event.engine_version = None;
+        Self { event, sinks }
+    }
+
+    fn record(mut self, provider: String, model: String, result: ShadowCallResult) {
+        let usage = crate::budget::AiUsage::Tokens {
+            input: result.prompt_tokens,
+            output: result.completion_tokens,
+            cached_input: 0,
+            cache_creation: 0,
+        };
+        self.event.provider = provider;
+        self.event.model = model;
+        self.event.prompt_tokens = result.prompt_tokens;
+        self.event.completion_tokens = result.completion_tokens;
+        self.event.total_tokens = result
+            .prompt_tokens
+            .saturating_add(result.completion_tokens);
+        self.event.cost_usd = crate::budget::estimate_cost_for_usage(&self.event.model, &usage);
+        self.event.latency_ms = result.latency_ms;
+        self.event.status = result.status;
+        for sink in &self.sinks {
+            sink.record(&self.event);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ShadowCallResult {
+    status: u16,
+    latency_ms: u64,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+}
+
+struct PreparedShadowRequest {
+    permit: ShadowPermit,
+    http: reqwest::Client,
+    provider: ProviderConfig,
+    path: String,
+    body: serde_json::Value,
+    http_timeout: Duration,
+    task_timeout: Duration,
+    task_timeout_ms: u64,
+    usage_provider: String,
+    usage_model: String,
+    reasoning_outcome: &'static str,
+    usage: Option<ShadowUsageRecord>,
+    quota_attempt: Option<crate::quota_pool::QuotaPoolAttemptGuard>,
+}
+
 /// HTTP client that forwards AI requests to upstream providers.
 pub struct AiClient {
     http: reqwest::Client,
     shadow_supervisor: Arc<ShadowSupervisor>,
+    /// Optional purpose-scoped egress authorizer. `None` preserves
+    /// legacy ungated provider calls (omitted `proxy.egress` config).
+    egress: Option<EgressAuthorizer>,
 }
 
 impl AiClient {
@@ -150,7 +333,16 @@ impl AiClient {
                 .build()
                 .expect("AI HTTP client builder failed; cannot enforce the request timeout"),
             shadow_supervisor: Arc::new(ShadowSupervisor::default()),
+            egress: None,
         }
+    }
+
+    /// Attach a purpose-scoped egress authorizer. When set, every
+    /// provider URL is authorized for [`EgressPurpose::AiProvider`]
+    /// before any I/O (fail closed).
+    pub fn with_egress(mut self, authorizer: EgressAuthorizer) -> Self {
+        self.egress = Some(authorizer);
+        self
     }
 
     /// Create a new AI client with a custom shadow supervisor. Used
@@ -163,12 +355,492 @@ impl AiClient {
                 .build()
                 .expect("AI HTTP client builder failed; cannot enforce the request timeout"),
             shadow_supervisor: supervisor,
+            egress: None,
         }
+    }
+
+    /// Authorize `url` for AI provider egress when an authorizer is
+    /// configured. Returns the closed [`EgressDenied`] vocabulary.
+    pub fn authorize_provider_url(
+        &self,
+        url: &str,
+        resolver: &dyn HostResolver,
+    ) -> Result<(), EgressDenied> {
+        let Some(auth) = &self.egress else {
+            return Ok(());
+        };
+        auth.authorize(EgressPurpose::AiProvider, url, resolver)
+            .map(|_| ())
+    }
+
+    fn gate_provider_url(&self, url: &str) -> Result<()> {
+        self.authorize_provider_url(url, &PublicPinResolver)
+            .map_err(|e| anyhow::anyhow!("egress denied: {e:?}"))
     }
 
     /// Borrow the shadow supervisor (test + diagnostic accessor).
     pub fn shadow_supervisor(&self) -> &Arc<ShadowSupervisor> {
         &self.shadow_supervisor
+    }
+
+    /// Best-effort, non-blocking admission for one non-streaming
+    /// shadow copy. All policy and capacity failures suppress only the
+    /// shadow copy; they never reject or await the primary request.
+    // Keep policy and accounting inputs explicit at this one dispatch boundary.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_spawn_shadow(
+        &self,
+        config: &AiHandlerConfig,
+        path: &str,
+        body: &serde_json::Value,
+        is_stream: bool,
+        allowed_providers: &[String],
+        blocked_providers: &[String],
+        disallow_prompt_training: bool,
+        usage: Option<ShadowUsageRecord>,
+    ) -> ShadowDispatchOutcome {
+        match self.prepare_shadow(
+            config,
+            path,
+            body,
+            is_stream,
+            allowed_providers,
+            blocked_providers,
+            disallow_prompt_training,
+            usage,
+            None,
+        ) {
+            Ok(prepared) => Self::spawn_prepared_shadow(prepared),
+            Err(outcome) => outcome,
+        }
+    }
+
+    /// Apply every ordinary shadow gate, reserve one quota unit, then spawn.
+    ///
+    /// Sampled-out, unsupported, policy-blocked, egress-blocked, and saturated
+    /// copies return without touching the quota pool. A closed quota error is
+    /// returned before a background provider call starts. The reservation
+    /// settles inside the task immediately before transport send.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn try_spawn_shadow_with_quota(
+        &self,
+        config: &AiHandlerConfig,
+        path: &str,
+        body: &serde_json::Value,
+        is_stream: bool,
+        allowed_providers: &[String],
+        blocked_providers: &[String],
+        disallow_prompt_training: bool,
+        usage: Option<ShadowUsageRecord>,
+        quota: &crate::quota_pool::QuotaPoolAdmission,
+        quota_reservation_prefix: &str,
+    ) -> std::result::Result<ShadowDispatchOutcome, crate::quota_pool::PoolError> {
+        let mut prepared = match self.prepare_shadow(
+            config,
+            path,
+            body,
+            is_stream,
+            allowed_providers,
+            blocked_providers,
+            disallow_prompt_training,
+            usage,
+            None,
+        ) {
+            Ok(prepared) => prepared,
+            Err(outcome) => return Ok(outcome),
+        };
+        prepared.quota_attempt = Some(
+            quota
+                .reserve_attempt(&format!("{quota_reservation_prefix}:shadow"))
+                .await?,
+        );
+        Ok(Self::spawn_prepared_shadow(prepared))
+    }
+
+    /// Queue quota admission and shadow transport without delaying the caller.
+    ///
+    /// All synchronous shadow gates and bounded supervisor admission complete
+    /// before this returns. The detached task reserves quota, then launches the
+    /// provider call, which settles immediately before send. A closed quota
+    /// failure suppresses the optional copy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_spawn_shadow_with_quota_detached(
+        &self,
+        config: &AiHandlerConfig,
+        path: &str,
+        body: &serde_json::Value,
+        is_stream: bool,
+        allowed_providers: &[String],
+        blocked_providers: &[String],
+        disallow_prompt_training: bool,
+        usage: Option<ShadowUsageRecord>,
+        quota: crate::quota_pool::QuotaPoolAdmission,
+        quota_reservation_prefix: &str,
+    ) -> ShadowDispatchOutcome {
+        self.try_spawn_shadow_with_quota_detached_impl(
+            config,
+            path,
+            body,
+            is_stream,
+            allowed_providers,
+            blocked_providers,
+            disallow_prompt_training,
+            usage,
+            quota,
+            quota_reservation_prefix,
+            None,
+        )
+    }
+
+    /// Queue a governed shadow while preserving safety facts captured before
+    /// lossy request transformations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_spawn_shadow_with_quota_detached_with_reasoning_eligibility(
+        &self,
+        config: &AiHandlerConfig,
+        path: &str,
+        body: &serde_json::Value,
+        is_stream: bool,
+        allowed_providers: &[String],
+        blocked_providers: &[String],
+        disallow_prompt_training: bool,
+        usage: Option<ShadowUsageRecord>,
+        quota: crate::quota_pool::QuotaPoolAdmission,
+        quota_reservation_prefix: &str,
+        reasoning_eligibility: crate::reasoning::ReasoningEligibility,
+    ) -> ShadowDispatchOutcome {
+        self.try_spawn_shadow_with_quota_detached_impl(
+            config,
+            path,
+            body,
+            is_stream,
+            allowed_providers,
+            blocked_providers,
+            disallow_prompt_training,
+            usage,
+            quota,
+            quota_reservation_prefix,
+            Some(reasoning_eligibility),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_spawn_shadow_with_quota_detached_impl(
+        &self,
+        config: &AiHandlerConfig,
+        path: &str,
+        body: &serde_json::Value,
+        is_stream: bool,
+        allowed_providers: &[String],
+        blocked_providers: &[String],
+        disallow_prompt_training: bool,
+        usage: Option<ShadowUsageRecord>,
+        quota: crate::quota_pool::QuotaPoolAdmission,
+        quota_reservation_prefix: &str,
+        reasoning_eligibility: Option<crate::reasoning::ReasoningEligibility>,
+    ) -> ShadowDispatchOutcome {
+        let mut prepared = match self.prepare_shadow(
+            config,
+            path,
+            body,
+            is_stream,
+            allowed_providers,
+            blocked_providers,
+            disallow_prompt_training,
+            usage,
+            reasoning_eligibility,
+        ) {
+            Ok(prepared) => prepared,
+            Err(outcome) => return outcome,
+        };
+        let reservation_id = format!("{quota_reservation_prefix}:shadow");
+        tokio::spawn(async move {
+            match quota.reserve_attempt(&reservation_id).await {
+                Ok(attempt) => {
+                    prepared.quota_attempt = Some(attempt);
+                    Self::spawn_prepared_shadow(prepared);
+                }
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "quota admission suppressed optional shadow request"
+                    );
+                }
+            }
+        });
+        ShadowDispatchOutcome::Spawned
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_shadow(
+        &self,
+        config: &AiHandlerConfig,
+        path: &str,
+        body: &serde_json::Value,
+        is_stream: bool,
+        allowed_providers: &[String],
+        blocked_providers: &[String],
+        disallow_prompt_training: bool,
+        usage: Option<ShadowUsageRecord>,
+        reasoning_eligibility: Option<crate::reasoning::ReasoningEligibility>,
+    ) -> std::result::Result<PreparedShadowRequest, ShadowDispatchOutcome> {
+        let Some(shadow_cfg) = config.shadow.as_ref() else {
+            return Err(ShadowDispatchOutcome::NotConfigured);
+        };
+        if !crate::handler::classify_surface("POST", path).supports_shadow_eval() {
+            return Err(ShadowDispatchOutcome::UnsupportedSurface);
+        }
+        if is_stream {
+            ai_metrics::record_shadow_dropped(ai_metrics::ShadowDropReason::Streaming);
+            return Err(ShadowDispatchOutcome::StreamingSkipped);
+        }
+
+        let sampled = if shadow_cfg.sample_rate >= 1.0 {
+            true
+        } else if shadow_cfg.sample_rate <= 0.0 {
+            false
+        } else {
+            rand::random::<f32>() < shadow_cfg.sample_rate
+        };
+        if !sampled {
+            return Err(ShadowDispatchOutcome::SampledOut);
+        }
+
+        let Some(shadow_provider) = config
+            .providers
+            .iter()
+            .find(|provider| provider.name == shadow_cfg.provider)
+        else {
+            ai_metrics::record_shadow_dropped(ai_metrics::ShadowDropReason::ProviderNotFound);
+            warn!(
+                provider = %shadow_cfg.provider,
+                "shadow target not found in providers list"
+            );
+            return Err(ShadowDispatchOutcome::ProviderNotFound);
+        };
+        let shadow_provider = shadow_provider.clone();
+
+        if !provider_allowed_by_policy(
+            shadow_provider.name.as_str(),
+            allowed_providers,
+            blocked_providers,
+        ) {
+            ai_metrics::record_shadow_dropped(ai_metrics::ShadowDropReason::ProviderNotAllowed);
+            debug!(
+                provider = %shadow_provider.name,
+                "credential provider policy suppressed shadow request"
+            );
+            return Err(ShadowDispatchOutcome::ProviderNotAllowed);
+        }
+
+        if disallow_prompt_training && !shadow_provider.no_prompt_training {
+            ai_metrics::record_shadow_dropped(
+                ai_metrics::ShadowDropReason::PromptTrainingDisallowed,
+            );
+            debug!(
+                provider = %shadow_provider.name,
+                "prompt-training opt-out suppressed shadow request"
+            );
+            return Err(ShadowDispatchOutcome::PromptTrainingDisallowed);
+        }
+
+        // The shadow transport uses reqwest directly and cannot yet consume
+        // the egress authorizer's DNS pins or re-authorize redirect targets.
+        // Fail closed whenever purpose-scoped egress is active instead of
+        // pretending that an initial URL check secures the whole call.
+        if self.egress.is_some() {
+            ai_metrics::record_shadow_dropped(ai_metrics::ShadowDropReason::EgressDenied);
+            warn!(
+                provider = %shadow_provider.name,
+                "egress-authorized shadow transport is unavailable; suppressing shadow request"
+            );
+            return Err(ShadowDispatchOutcome::EgressDenied);
+        }
+
+        let mut body_owned = if let Some(model) = shadow_cfg.model.as_ref() {
+            let mut body = body.clone();
+            if let Some(object) = body.as_object_mut() {
+                object.insert(
+                    "model".to_string(),
+                    serde_json::Value::String(model.clone()),
+                );
+            }
+            body
+        } else {
+            body.clone()
+        };
+        if let Some(model) = body_owned
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+        {
+            if let Some(object) = body_owned.as_object_mut() {
+                object.insert(
+                    "model".to_string(),
+                    serde_json::Value::String(shadow_provider.map_model(&model)),
+                );
+            }
+        }
+        let reasoning_model = body_owned
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let reasoning = match reasoning_eligibility {
+            Some(eligibility) => crate::reasoning::apply_reasoning_policy_with_eligibility(
+                config.reasoning,
+                &shadow_provider,
+                &reasoning_model,
+                &mut body_owned,
+                eligibility,
+            ),
+            None => crate::reasoning::apply_reasoning_policy(
+                config.reasoning,
+                &shadow_provider,
+                &reasoning_model,
+                &mut body_owned,
+            ),
+        };
+        let request_bytes = serialized_json_len(&body_owned);
+        let Some(permit) = self.shadow_supervisor.try_admit_request(request_bytes) else {
+            return Err(ShadowDispatchOutcome::Saturated);
+        };
+        let http_timeout_ms = shadow_cfg.timeout_ms;
+        let task_timeout_ms = shadow_cfg.task_timeout_ms;
+        let http_timeout = Duration::from_millis(http_timeout_ms);
+        let task_timeout = Duration::from_millis(task_timeout_ms);
+        let usage_provider = shadow_provider.name.as_str().to_string();
+        let usage_model = body_owned
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        Ok(PreparedShadowRequest {
+            permit,
+            http: self.http.clone(),
+            provider: shadow_provider,
+            path: path.to_string(),
+            body: body_owned,
+            http_timeout,
+            task_timeout,
+            task_timeout_ms,
+            usage_provider,
+            usage_model,
+            reasoning_outcome: reasoning.outcome_label(),
+            usage,
+            quota_attempt: None,
+        })
+    }
+
+    fn spawn_prepared_shadow(prepared: PreparedShadowRequest) -> ShadowDispatchOutcome {
+        let PreparedShadowRequest {
+            permit,
+            http,
+            provider,
+            path,
+            body,
+            http_timeout,
+            task_timeout,
+            task_timeout_ms,
+            usage_provider,
+            usage_model,
+            reasoning_outcome,
+            usage,
+            quota_attempt,
+        } = prepared;
+        tokio::spawn(async move {
+            let _permit = permit;
+            let _gauge = ShadowInflightGuard::enter();
+            ai_metrics::record_reasoning_policy_attempt(&provider.name, reasoning_outcome);
+            match tokio::time::timeout(
+                task_timeout,
+                run_shadow_request(http, provider, path, body, http_timeout, quota_attempt),
+            )
+            .await
+            {
+                Ok(result) => {
+                    if let Some(usage) = usage {
+                        usage.record(usage_provider, usage_model, result);
+                    }
+                }
+                Err(_) => {
+                    ai_metrics::record_shadow_timeout();
+                    if let Some(usage) = usage {
+                        usage.record(
+                            usage_provider,
+                            usage_model,
+                            ShadowCallResult {
+                                status: 504,
+                                latency_ms: task_timeout_ms,
+                                prompt_tokens: 0,
+                                completion_tokens: 0,
+                            },
+                        );
+                    }
+                    warn!(
+                        target: "sbproxy_ai_shadow",
+                        timeout_ms = task_timeout_ms,
+                        "shadow request exceeded supervisor timeout; dropping"
+                    );
+                }
+            }
+        });
+        ShadowDispatchOutcome::Spawned
+    }
+
+    /// Execute one bounded chat-completion call against exactly one provider.
+    ///
+    /// This is the below-pipeline boundary for internal context summaries. It
+    /// deliberately has no router, handler configuration, semantic cache,
+    /// shadow configuration, or compression callback, so an internal request
+    /// cannot recursively enter ordinary AI dispatch. Credential governance
+    /// and budget admission remain the responsibility of the request-scoped
+    /// runtime adapter before this method is called.
+    pub async fn summarize_internal(
+        &self,
+        provider: &ProviderConfig,
+        model: &str,
+        messages: &[serde_json::Value],
+        target_summary_tokens: u64,
+        timeout: Duration,
+    ) -> Result<SummarizationOutput, SummarizerError> {
+        let mapped_model = provider.map_model(model);
+        let body = serde_json::json!({
+            "model": mapped_model,
+            "messages": messages,
+            "max_tokens": target_summary_tokens,
+            "stream": false,
+        });
+        let response_limit = target_summary_tokens
+            .saturating_mul(32)
+            .clamp(64 * 1024, 1024 * 1024) as usize;
+        let operation = async {
+            let mut response = self
+                .forward_request(provider, "/v1/chat/completions", &body)
+                .await
+                .map_err(|_| SummarizerError::Provider)?;
+            if !response.status().is_success() {
+                return Err(SummarizerError::Provider);
+            }
+
+            let mut raw = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|_| SummarizerError::Provider)?
+            {
+                if raw.len().saturating_add(chunk.len()) > response_limit {
+                    return Err(SummarizerError::InvalidOutput);
+                }
+                raw.extend_from_slice(&chunk);
+            }
+            let translated = translators::translate_response_bytes(provider_format(provider), &raw);
+            parse_internal_summary(model, messages, &translated)
+        };
+
+        tokio::time::timeout(timeout, operation)
+            .await
+            .map_err(|_| SummarizerError::Timeout)?
     }
 
     /// Forward a chat completions request to the selected provider.
@@ -189,85 +861,11 @@ impl AiClient {
         path: &str,
         body: &serde_json::Value,
     ) -> Result<reqwest::Response> {
-        // Shadow / side-by-side eval: fire a copy of the request at
-        // the configured shadow provider concurrently with the
-        // primary. The shadow response is logged + drained; the
-        // primary response is what the client sees.
-        if let Some(shadow_cfg) = config.shadow.as_ref() {
-            let sampled = if shadow_cfg.sample_rate >= 1.0 {
-                true
-            } else if shadow_cfg.sample_rate <= 0.0 {
-                false
-            } else {
-                rand::random::<f32>() < shadow_cfg.sample_rate
-            };
-            if sampled {
-                if let Some(shadow_provider) = config
-                    .providers
-                    .iter()
-                    .find(|p| p.name == shadow_cfg.provider)
-                    .cloned()
-                {
-                    let http = self.http.clone();
-                    let path_owned = path.to_string();
-                    let body_owned = if let Some(model) = shadow_cfg.model.as_ref() {
-                        let mut b = body.clone();
-                        if let Some(obj) = b.as_object_mut() {
-                            obj.insert(
-                                "model".to_string(),
-                                serde_json::Value::String(model.clone()),
-                            );
-                        }
-                        b
-                    } else {
-                        body.clone()
-                    };
-                    let http_timeout_ms = shadow_cfg.timeout_ms;
-                    let task_timeout_ms = shadow_cfg.task_timeout_ms;
-                    let http_timeout = Duration::from_millis(http_timeout_ms);
-                    let task_timeout = Duration::from_millis(task_timeout_ms);
-                    // Bounded supervisor: try_admit returns None when
-                    // the in-flight queue is full. On admit, we hold
-                    // the OwnedSemaphorePermit + an inflight gauge
-                    // guard inside the spawned task so both clean up
-                    // automatically whether the future completes,
-                    // times out, or is cancelled.
-                    if let Some(permit) = self.shadow_supervisor.try_admit() {
-                        tokio::spawn(async move {
-                            let _permit = permit;
-                            let _gauge = ShadowInflightGuard::enter();
-                            match tokio::time::timeout(
-                                task_timeout,
-                                run_shadow_request(
-                                    http,
-                                    shadow_provider,
-                                    path_owned,
-                                    body_owned,
-                                    http_timeout,
-                                ),
-                            )
-                            .await
-                            {
-                                Ok(()) => {}
-                                Err(_) => {
-                                    ai_metrics::record_shadow_timeout();
-                                    warn!(
-                                        target: "sbproxy_ai_shadow",
-                                        timeout_ms = task_timeout_ms,
-                                        "shadow request exceeded supervisor timeout; dropping"
-                                    );
-                                }
-                            }
-                        });
-                    }
-                } else {
-                    warn!(
-                        provider = %shadow_cfg.provider,
-                        "shadow target not found in providers list"
-                    );
-                }
-            }
-        }
+        let is_stream = body
+            .get("stream")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let _ = self.try_spawn_shadow(config, path, body, is_stream, &[], &[], false, None);
 
         // Race strategy: fan out to every eligible provider in
         // parallel, return the first 2xx, cancel the losers. The
@@ -301,7 +899,10 @@ impl AiClient {
 
             let per_provider_attempts = provider_retry_attempts(provider);
             for provider_attempt in 0..per_provider_attempts {
-                match self.forward_request(provider, path, body).await {
+                let (attempt_body, reasoning_outcome) =
+                    prepare_provider_attempt_body(config, provider, body);
+                ai_metrics::record_reasoning_policy_attempt(&provider.name, reasoning_outcome);
+                match self.forward_request(provider, path, &attempt_body).await {
                     Ok(resp) if resp.status().is_server_error() => {
                         let status = resp.status();
                         last_err = Some(anyhow::anyhow!(
@@ -352,6 +953,31 @@ impl AiClient {
         path: &str,
         body: &serde_json::Value,
     ) -> Result<reqwest::Response> {
+        self.forward_request_impl(provider, path, body, None).await
+    }
+
+    /// Forward a request after committing its already-reserved quota attempt.
+    ///
+    /// URL, egress, headers, translation, and the request builder are all
+    /// prepared before quota settles immediately ahead of transport send.
+    pub async fn forward_request_with_quota(
+        &self,
+        provider: &ProviderConfig,
+        path: &str,
+        body: &serde_json::Value,
+        quota_attempt: crate::quota_pool::QuotaPoolAttemptGuard,
+    ) -> Result<reqwest::Response> {
+        self.forward_request_impl(provider, path, body, Some(quota_attempt))
+            .await
+    }
+
+    async fn forward_request_impl(
+        &self,
+        provider: &ProviderConfig,
+        path: &str,
+        body: &serde_json::Value,
+        quota_attempt: Option<crate::quota_pool::QuotaPoolAttemptGuard>,
+    ) -> Result<reqwest::Response> {
         let format = provider_format(provider);
         let (translated_body, translated_path) = translators::translate_request(format, path, body);
         // Passthrough formats return `None`; send the original borrowed
@@ -360,9 +986,11 @@ impl AiClient {
 
         let base_url_owned = provider.effective_base_url();
         let base_url = base_url_owned.trim_end_matches('/');
-        let url = build_url(base_url, &translated_path);
+        let url_string = build_url(base_url, &translated_path);
+        self.gate_provider_url(&url_string)?;
+        let url = reqwest::Url::parse(&url_string)?;
 
-        let (auth_header, auth_value) = provider.auth_header();
+        let (auth_header, auth_value) = provider_auth_header(provider)?;
 
         debug!(
             url = %url,
@@ -374,7 +1002,7 @@ impl AiClient {
 
         let mut req = self
             .http
-            .post(&url)
+            .post(url)
             .header("content-type", "application/json")
             .header(auth_header, &auth_value);
 
@@ -384,7 +1012,9 @@ impl AiClient {
             req = req.header("anthropic-version", "2023-06-01");
         }
 
-        let resp = req.json(send_body).send().await?;
+        let req = req.json(send_body);
+        commit_quota_attempt(quota_attempt).await?;
+        let resp = req.send().await?;
 
         Ok(resp)
     }
@@ -395,11 +1025,33 @@ impl AiClient {
         provider: &ProviderConfig,
         path: &str,
     ) -> Result<reqwest::Response> {
+        self.forward_get_request_impl(provider, path, None).await
+    }
+
+    /// Forward a GET request after committing its reserved quota attempt.
+    pub async fn forward_get_request_with_quota(
+        &self,
+        provider: &ProviderConfig,
+        path: &str,
+        quota_attempt: crate::quota_pool::QuotaPoolAttemptGuard,
+    ) -> Result<reqwest::Response> {
+        self.forward_get_request_impl(provider, path, Some(quota_attempt))
+            .await
+    }
+
+    async fn forward_get_request_impl(
+        &self,
+        provider: &ProviderConfig,
+        path: &str,
+        quota_attempt: Option<crate::quota_pool::QuotaPoolAttemptGuard>,
+    ) -> Result<reqwest::Response> {
         let base_url_owned = provider.effective_base_url();
         let base_url = base_url_owned.trim_end_matches('/');
-        let url = build_url(base_url, path);
+        let url_string = build_url(base_url, path);
+        self.gate_provider_url(&url_string)?;
+        let url = reqwest::Url::parse(&url_string)?;
 
-        let (auth_header, auth_value) = provider.auth_header();
+        let (auth_header, auth_value) = provider_auth_header(provider)?;
 
         debug!(
             url = %url,
@@ -407,12 +1059,9 @@ impl AiClient {
             "forwarding AI GET request to provider"
         );
 
-        let resp = self
-            .http
-            .get(&url)
-            .header(auth_header, &auth_value)
-            .send()
-            .await?;
+        let req = self.http.get(url).header(auth_header, auth_value);
+        commit_quota_attempt(quota_attempt).await?;
+        let resp = req.send().await?;
 
         Ok(resp)
     }
@@ -438,6 +1087,31 @@ impl AiClient {
         path: &str,
         body: Option<&serde_json::Value>,
     ) -> Result<reqwest::Response> {
+        self.forward_with_method_impl(provider, method, path, body, None)
+            .await
+    }
+
+    /// Forward with an arbitrary method after committing reserved quota.
+    pub async fn forward_with_method_and_quota(
+        &self,
+        provider: &ProviderConfig,
+        method: &str,
+        path: &str,
+        body: Option<&serde_json::Value>,
+        quota_attempt: crate::quota_pool::QuotaPoolAttemptGuard,
+    ) -> Result<reqwest::Response> {
+        self.forward_with_method_impl(provider, method, path, body, Some(quota_attempt))
+            .await
+    }
+
+    async fn forward_with_method_impl(
+        &self,
+        provider: &ProviderConfig,
+        method: &str,
+        path: &str,
+        body: Option<&serde_json::Value>,
+        quota_attempt: Option<crate::quota_pool::QuotaPoolAttemptGuard>,
+    ) -> Result<reqwest::Response> {
         let format = provider_format(provider);
 
         // Translate body and path when the body is present and the
@@ -452,9 +1126,11 @@ impl AiClient {
 
         let base_url_owned = provider.effective_base_url();
         let base_url = base_url_owned.trim_end_matches('/');
-        let url = build_url(base_url, &translated_path);
+        let url_string = build_url(base_url, &translated_path);
+        self.gate_provider_url(&url_string)?;
+        let url = reqwest::Url::parse(&url_string)?;
 
-        let (auth_header, auth_value) = provider.auth_header();
+        let (auth_header, auth_value) = provider_auth_header(provider)?;
 
         debug!(
             url = %url,
@@ -468,7 +1144,7 @@ impl AiClient {
 
         let mut req = self
             .http
-            .request(reqwest_method, &url)
+            .request(reqwest_method, url)
             .header(auth_header, &auth_value);
 
         if matches!(format, ProviderFormat::Anthropic) {
@@ -479,9 +1155,52 @@ impl AiClient {
             req = req.header("content-type", "application/json").json(sb);
         }
 
+        commit_quota_attempt(quota_attempt).await?;
         let resp = req.send().await?;
         Ok(resp)
     }
+}
+
+fn parse_internal_summary(
+    model: &str,
+    input_messages: &[serde_json::Value],
+    body: &[u8],
+) -> Result<SummarizationOutput, SummarizerError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(body).map_err(|_| SummarizerError::InvalidOutput)?;
+    let summary = value
+        .get("choices")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|summary| !summary.trim().is_empty())
+        .ok_or(SummarizerError::InvalidOutput)?
+        .to_string();
+
+    let usage = value.get("usage");
+    let input_tokens = usage
+        .and_then(|usage| usage.get("prompt_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_else(|| {
+            crate::token_estimate::estimate_json_message_tokens(model, input_messages)
+        });
+    let output_tokens = usage
+        .and_then(|usage| usage.get("completion_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_else(|| {
+            crate::token_estimate::estimate_json_message_tokens(
+                model,
+                &[serde_json::json!({"role": "assistant", "content": summary})],
+            )
+        });
+
+    Ok(SummarizationOutput {
+        summary,
+        input_tokens,
+        output_tokens,
+    })
 }
 
 impl AiClient {
@@ -501,12 +1220,39 @@ impl AiClient {
         native_path: &str,
         body: bytes::Bytes,
     ) -> Result<reqwest::Response> {
+        self.forward_native_bypass_impl(provider, method, native_path, body, None)
+            .await
+    }
+
+    /// Forward a native-format body after committing reserved quota.
+    pub async fn forward_native_bypass_with_quota(
+        &self,
+        provider: &ProviderConfig,
+        method: &str,
+        native_path: &str,
+        body: bytes::Bytes,
+        quota_attempt: crate::quota_pool::QuotaPoolAttemptGuard,
+    ) -> Result<reqwest::Response> {
+        self.forward_native_bypass_impl(provider, method, native_path, body, Some(quota_attempt))
+            .await
+    }
+
+    async fn forward_native_bypass_impl(
+        &self,
+        provider: &ProviderConfig,
+        method: &str,
+        native_path: &str,
+        body: bytes::Bytes,
+        quota_attempt: Option<crate::quota_pool::QuotaPoolAttemptGuard>,
+    ) -> Result<reqwest::Response> {
         let format = provider_format(provider);
 
         let base_url_owned = provider.effective_base_url();
         let base_url = base_url_owned.trim_end_matches('/');
-        let url = build_url(base_url, native_path);
-        let (auth_header, auth_value) = provider.auth_header();
+        let url_string = build_url(base_url, native_path);
+        self.gate_provider_url(&url_string)?;
+        let url = reqwest::Url::parse(&url_string)?;
+        let (auth_header, auth_value) = provider_auth_header(provider)?;
         let reqwest_method = parse_http_method(method)?;
 
         debug!(
@@ -520,14 +1266,16 @@ impl AiClient {
 
         let mut req = self
             .http
-            .request(reqwest_method, &url)
+            .request(reqwest_method, url)
             .header(auth_header, &auth_value)
             .header("content-type", "application/json");
         if matches!(format, ProviderFormat::Anthropic) {
             req = req.header("anthropic-version", "2023-06-01");
         }
 
-        let resp = req.body(body).send().await?;
+        let req = req.body(body);
+        commit_quota_attempt(quota_attempt).await?;
+        let resp = req.send().await?;
         Ok(resp)
     }
 
@@ -549,10 +1297,47 @@ impl AiClient {
         body: bytes::Bytes,
         content_type: &str,
     ) -> Result<reqwest::Response> {
+        self.forward_bytes_impl(provider, method, path, body, content_type, None)
+            .await
+    }
+
+    /// Forward an opaque body after committing reserved quota.
+    pub async fn forward_bytes_with_quota(
+        &self,
+        provider: &ProviderConfig,
+        method: &str,
+        path: &str,
+        body: bytes::Bytes,
+        content_type: &str,
+        quota_attempt: crate::quota_pool::QuotaPoolAttemptGuard,
+    ) -> Result<reqwest::Response> {
+        self.forward_bytes_impl(
+            provider,
+            method,
+            path,
+            body,
+            content_type,
+            Some(quota_attempt),
+        )
+        .await
+    }
+
+    async fn forward_bytes_impl(
+        &self,
+        provider: &ProviderConfig,
+        method: &str,
+        path: &str,
+        body: bytes::Bytes,
+        content_type: &str,
+        quota_attempt: Option<crate::quota_pool::QuotaPoolAttemptGuard>,
+    ) -> Result<reqwest::Response> {
         let base_url_owned = provider.effective_base_url();
         let base_url = base_url_owned.trim_end_matches('/');
-        let url = build_url(base_url, path);
-        let (auth_header, auth_value) = provider.auth_header();
+        let url_string = build_url(base_url, path);
+        self.gate_provider_url(&url_string)?;
+        let url = reqwest::Url::parse(&url_string)?;
+        let (auth_header, auth_value) = provider_auth_header(provider)?;
+        let content_type_header = reqwest::header::HeaderValue::from_str(content_type)?;
         let reqwest_method = parse_http_method(method)?;
 
         debug!(
@@ -564,16 +1349,35 @@ impl AiClient {
             "forwarding AI raw-body request to provider"
         );
 
-        let resp = self
+        let req = self
             .http
-            .request(reqwest_method, &url)
-            .header(auth_header, &auth_value)
-            .header("content-type", content_type)
-            .body(body)
-            .send()
-            .await?;
+            .request(reqwest_method, url)
+            .header(auth_header, auth_value)
+            .header("content-type", content_type_header)
+            .body(body);
+        commit_quota_attempt(quota_attempt).await?;
+        let resp = req.send().await?;
         Ok(resp)
     }
+}
+
+async fn commit_quota_attempt(
+    quota_attempt: Option<crate::quota_pool::QuotaPoolAttemptGuard>,
+) -> Result<()> {
+    if let Some(attempt) = quota_attempt {
+        attempt.commit().await.map_err(anyhow::Error::new)?;
+    }
+    Ok(())
+}
+
+fn provider_auth_header(
+    provider: &ProviderConfig,
+) -> Result<(reqwest::header::HeaderName, reqwest::header::HeaderValue)> {
+    let (name, value) = provider.auth_header();
+    let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())?;
+    let mut value = reqwest::header::HeaderValue::from_str(&value)?;
+    value.set_sensitive(true);
+    Ok((name, value))
 }
 
 /// Parse an HTTP method string into a `reqwest::Method`. Accepts the
@@ -591,6 +1395,21 @@ fn parse_http_method(method: &str) -> Result<reqwest::Method> {
         "OPTIONS" => Ok(reqwest::Method::OPTIONS),
         other => reqwest::Method::from_bytes(other.as_bytes())
             .map_err(|e| anyhow::anyhow!("unsupported HTTP method '{other}': {e}")),
+    }
+}
+
+/// Resolver that pins a fixed public address so unit tests and the
+/// pre-flight gate never touch the network. Production GS wiring may
+/// inject a real DNS resolver; until then host/scheme/port checks still
+/// run fail-closed when an authorizer is attached.
+struct PublicPinResolver;
+
+impl HostResolver for PublicPinResolver {
+    fn resolve(&self, _host: &str, port: u16) -> Result<Vec<SocketAddr>, ()> {
+        Ok(vec![SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+            port,
+        )])
     }
 }
 
@@ -616,6 +1435,29 @@ fn provider_retry_backoff_with_jitter(retry_number: usize, jitter_seed: u64) -> 
     Duration::from_millis(base_ms.saturating_add(jitter))
 }
 
+fn prepare_provider_attempt_body(
+    config: &AiHandlerConfig,
+    provider: &ProviderConfig,
+    body: &serde_json::Value,
+) -> (serde_json::Value, &'static str) {
+    let mut attempt_body = body.clone();
+    let logical_model = attempt_body
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let provider_model = provider.map_model(logical_model);
+    if !logical_model.is_empty() {
+        attempt_body["model"] = serde_json::Value::String(provider_model.clone());
+    }
+    let transform = crate::reasoning::apply_reasoning_policy(
+        config.reasoning,
+        provider,
+        &provider_model,
+        &mut attempt_body,
+    );
+    (attempt_body, transform.outcome_label())
+}
+
 impl AiClient {
     async fn forward_race(
         &self,
@@ -634,7 +1476,9 @@ impl AiClient {
             // No race needed; single provider just forwards.
             let idx = candidates[0];
             let p = &config.providers[idx];
-            return match self.forward_request(p, path, body).await {
+            let (attempt_body, reasoning_outcome) = prepare_provider_attempt_body(config, p, body);
+            ai_metrics::record_reasoning_policy_attempt(&p.name, reasoning_outcome);
+            return match self.forward_request(p, path, &attempt_body).await {
                 Ok(r) if r.status().is_server_error() => {
                     router.record_provider_failure(idx, p.name.as_str());
                     Err(anyhow::anyhow!(
@@ -658,9 +1502,21 @@ impl AiClient {
         for idx in &candidates {
             let provider = config.providers[*idx].clone();
             let path_owned = path.to_string();
-            let body_owned = body.clone();
+            let (body_owned, reasoning_outcome) =
+                prepare_provider_attempt_body(config, &provider, body);
             let http = self.http.clone();
             let i = *idx;
+            // Pre-authorize before spawning so an unlisted host is
+            // denied without opening a connection.
+            {
+                let format = provider_format(&provider);
+                let (_translated_body, translated_path) =
+                    translators::translate_request(format, &path_owned, &body_owned);
+                let base_url_owned = provider.effective_base_url();
+                let base_url = base_url_owned.trim_end_matches('/');
+                let url = build_url(base_url, &translated_path);
+                self.gate_provider_url(&url)?;
+            }
             tasks.push(async move {
                 let format = provider_format(&provider);
                 let (translated_body, translated_path) =
@@ -677,6 +1533,7 @@ impl AiClient {
                 if matches!(format, ProviderFormat::Anthropic) {
                     req = req.header("anthropic-version", "2023-06-01");
                 }
+                ai_metrics::record_reasoning_policy_attempt(&provider.name, reasoning_outcome);
                 let resp = req.json(send_body).send().await;
                 (i, provider, resp)
             });
@@ -746,18 +1603,9 @@ pub struct CascadeOutcome {
     /// cascade returned the last tier's response after exhausting
     /// tiers without acceptance (cost cap, or no tier met the bar).
     pub accepted: bool,
-    /// Sum of every parseable input-token count reported by an
-    /// upstream response in this cascade, including rejected,
-    /// failed, refused, low-confidence, and returned responses.
-    pub aggregate_input_tokens: u64,
-    /// Sum of every parseable output-token count reported by an
-    /// upstream response in this cascade, including rejected,
-    /// failed, refused, low-confidence, and returned responses.
-    pub aggregate_output_tokens: u64,
-    /// `true` when at least one upstream response was received but
-    /// did not expose any parseable input or output token count.
-    /// Skipped tiers and transport failures do not set this flag.
-    pub billable_usage_missing: bool,
+    /// Providers that received a request, in attempt order. Skipped or
+    /// ineligible tiers are omitted.
+    pub attempted_providers: Vec<String>,
 }
 
 impl AiClient {
@@ -830,15 +1678,113 @@ impl AiClient {
         tags: &crate::attribution::AttributionTags,
         surface: &str,
     ) -> Result<CascadeOutcome> {
+        self.forward_cascade_with_policy_impl(
+            config,
+            cascade,
+            allowed_providers,
+            blocked_providers,
+            path,
+            body,
+            tags,
+            surface,
+            None,
+            "",
+            None,
+        )
+        .await
+    }
+
+    /// Dispatch a confidence cascade with per-tier quota admission.
+    ///
+    /// Each tier reserves and commits immediately before its upstream call.
+    /// The caller supplies a globally unique request prefix; the tier index is
+    /// appended so retries never reuse one reservation.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn forward_cascade_with_policy_and_quota(
+        &self,
+        config: &AiHandlerConfig,
+        cascade: &crate::routing::CascadeConfig,
+        allowed_providers: &[String],
+        blocked_providers: &[String],
+        path: &str,
+        body: &serde_json::Value,
+        tags: &crate::attribution::AttributionTags,
+        surface: &str,
+        quota: &crate::quota_pool::QuotaPoolAdmission,
+        quota_reservation_prefix: &str,
+    ) -> Result<CascadeOutcome> {
+        self.forward_cascade_with_policy_impl(
+            config,
+            cascade,
+            allowed_providers,
+            blocked_providers,
+            path,
+            body,
+            tags,
+            surface,
+            Some(quota),
+            quota_reservation_prefix,
+            None,
+        )
+        .await
+    }
+
+    /// Dispatch a quota-governed confidence cascade while preserving
+    /// eligibility captured before lossy request transformations.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn forward_cascade_with_policy_and_quota_with_reasoning_eligibility(
+        &self,
+        config: &AiHandlerConfig,
+        cascade: &crate::routing::CascadeConfig,
+        allowed_providers: &[String],
+        blocked_providers: &[String],
+        path: &str,
+        body: &serde_json::Value,
+        tags: &crate::attribution::AttributionTags,
+        surface: &str,
+        quota: &crate::quota_pool::QuotaPoolAdmission,
+        quota_reservation_prefix: &str,
+        reasoning_eligibility: crate::reasoning::ReasoningEligibility,
+    ) -> Result<CascadeOutcome> {
+        self.forward_cascade_with_policy_impl(
+            config,
+            cascade,
+            allowed_providers,
+            blocked_providers,
+            path,
+            body,
+            tags,
+            surface,
+            Some(quota),
+            quota_reservation_prefix,
+            Some(reasoning_eligibility),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn forward_cascade_with_policy_impl(
+        &self,
+        config: &AiHandlerConfig,
+        cascade: &crate::routing::CascadeConfig,
+        allowed_providers: &[String],
+        blocked_providers: &[String],
+        path: &str,
+        body: &serde_json::Value,
+        tags: &crate::attribution::AttributionTags,
+        surface: &str,
+        quota: Option<&crate::quota_pool::QuotaPoolAdmission>,
+        quota_reservation_prefix: &str,
+        reasoning_eligibility: Option<crate::reasoning::ReasoningEligibility>,
+    ) -> Result<CascadeOutcome> {
         if cascade.tiers.is_empty() {
             return Err(anyhow::anyhow!("cascade has no tiers"));
         }
 
         let mut last_outcome: Option<CascadeOutcome> = None;
         let mut total_cost_micros: u64 = 0;
-        let mut aggregate_input_tokens: u64 = 0;
-        let mut aggregate_output_tokens: u64 = 0;
-        let mut billable_usage_missing = false;
+        let mut attempted_providers: Vec<String> = Vec::new();
+        let router = config.router();
 
         for (tier_idx, tier) in cascade.tiers.iter().enumerate() {
             // Cost cap gate. Both the cascade-level and per-tier
@@ -863,17 +1809,23 @@ impl AiClient {
                 continue;
             }
 
-            // Find the provider config for this tier.
-            let provider = match config.providers.iter().find(|p| {
-                p.name == tier.provider_id
-                    && cascade_provider_is_eligible(p, allowed_providers, blocked_providers)
+            // Find the provider config for this tier, then apply the same
+            // strict live resilience gate as ordinary dispatch. A cascade
+            // must never revive an unhealthy, ejected, or breaker-blocked
+            // provider merely because it appears in the configured tiers.
+            let provider = match config.providers.iter().enumerate().find(|(idx, provider)| {
+                provider.name == tier.provider_id
+                    && cascade_provider_is_eligible(provider, allowed_providers, blocked_providers)
+                    && !router
+                        .eligible_candidate_indices(&config.providers, &[*idx])
+                        .is_empty()
             }) {
-                Some(p) => p,
+                Some((_, provider)) => provider,
                 None => {
                     warn!(
                         tier = tier_idx,
                         provider_id = %tier.provider_id,
-                        "cascade: tier provider not found or disabled; skipping"
+                        "cascade: tier provider not found or ineligible; skipping"
                     );
                     ai_metrics::record_cascade_tier_outcome(tier_idx, "retry");
                     continue;
@@ -885,12 +1837,33 @@ impl AiClient {
             // remap because the tier-specified model is the
             // authoritative choice.
             let mut tier_body = body.clone();
+            let provider_model = provider.map_model(&tier.model);
             if let Some(obj) = tier_body.as_object_mut() {
                 obj.insert(
                     "model".to_string(),
-                    serde_json::Value::String(tier.model.clone()),
+                    serde_json::Value::String(provider_model.clone()),
                 );
             }
+            let policy = if matches!(surface, "chat_completions" | "messages" | "responses") {
+                config.reasoning
+            } else {
+                crate::reasoning::ReasoningPolicy::Off
+            };
+            let reasoning = match reasoning_eligibility {
+                Some(eligibility) => crate::reasoning::apply_reasoning_policy_with_eligibility(
+                    policy,
+                    provider,
+                    &provider_model,
+                    &mut tier_body,
+                    eligibility,
+                ),
+                None => crate::reasoning::apply_reasoning_policy(
+                    policy,
+                    provider,
+                    &provider_model,
+                    &mut tier_body,
+                ),
+            };
 
             debug!(
                 tier = tier_idx,
@@ -900,8 +1873,35 @@ impl AiClient {
                 "cascade: dispatching tier"
             );
 
-            let resp = match self.forward_request(provider, path, &tier_body).await {
+            attempted_providers.push(provider.name.to_string());
+            let resp = if let Some(quota) = quota {
+                let reservation_id = format!("{quota_reservation_prefix}:tier:{tier_idx}");
+                let attempt = quota
+                    .reserve_attempt(&reservation_id)
+                    .await
+                    .map_err(anyhow::Error::new)?;
+                ai_metrics::record_reasoning_policy_attempt(
+                    &provider.name,
+                    reasoning.outcome_label(),
+                );
+                self.forward_request_with_quota(provider, path, &tier_body, attempt)
+                    .await
+            } else {
+                ai_metrics::record_reasoning_policy_attempt(
+                    &provider.name,
+                    reasoning.outcome_label(),
+                );
+                self.forward_request(provider, path, &tier_body).await
+            };
+            let resp = match resp {
                 Ok(r) => r,
+                Err(error)
+                    if error
+                        .downcast_ref::<crate::quota_pool::PoolError>()
+                        .is_some() =>
+                {
+                    return Err(error);
+                }
                 Err(e) => {
                     warn!(
                         tier = tier_idx,
@@ -945,10 +1945,6 @@ impl AiClient {
                         "cascade: body read failed; trying next tier"
                     );
                     ai_metrics::record_cascade_tier_outcome(tier_idx, "retry");
-                    billable_usage_missing = true;
-                    if let Some(outcome) = last_outcome.as_mut() {
-                        outcome.billable_usage_missing = true;
-                    }
                     continue;
                 }
             };
@@ -959,16 +1955,9 @@ impl AiClient {
             // confidence_score lookup runs uniformly. The translated
             // bytes are also what we hand back to the caller; the
             // gateway speaks OpenAI Chat to clients by default.
-            let translated_vec = translators::translate_response_bytes(format, &raw_bytes);
+            let translated_vec =
+                translators::translate_success_response_bytes(format, status.as_u16(), &raw_bytes);
             let translated = bytes::Bytes::from(translated_vec);
-
-            match extract_usage_tokens(&translated) {
-                Some((input_tokens, output_tokens)) => {
-                    aggregate_input_tokens = aggregate_input_tokens.saturating_add(input_tokens);
-                    aggregate_output_tokens = aggregate_output_tokens.saturating_add(output_tokens);
-                }
-                None => billable_usage_missing = true,
-            }
 
             // 5xx responses are treated as failure regardless of
             // body shape. The cascade falls through to the next
@@ -998,9 +1987,7 @@ impl AiClient {
                     format,
                     tier_index: tier_idx,
                     accepted: false,
-                    aggregate_input_tokens,
-                    aggregate_output_tokens,
-                    billable_usage_missing,
+                    attempted_providers: attempted_providers.clone(),
                 });
                 continue;
             }
@@ -1035,9 +2022,7 @@ impl AiClient {
                     format,
                     tier_index: tier_idx,
                     accepted: false,
-                    aggregate_input_tokens,
-                    aggregate_output_tokens,
-                    billable_usage_missing,
+                    attempted_providers: attempted_providers.clone(),
                 });
                 continue;
             }
@@ -1067,9 +2052,7 @@ impl AiClient {
                     format,
                     tier_index: tier_idx,
                     accepted: false,
-                    aggregate_input_tokens,
-                    aggregate_output_tokens,
-                    billable_usage_missing,
+                    attempted_providers: attempted_providers.clone(),
                 });
                 continue;
             }
@@ -1085,9 +2068,7 @@ impl AiClient {
                 format,
                 tier_index: tier_idx,
                 accepted: true,
-                aggregate_input_tokens,
-                aggregate_output_tokens,
-                billable_usage_missing,
+                attempted_providers,
             });
         }
 
@@ -1108,28 +2089,23 @@ fn estimate_cost_micros(model: &str) -> u64 {
     (cost_dollars * 1_000_000.0).round() as u64
 }
 
-/// Extract provider-neutral `(input_tokens, output_tokens)` from a
-/// translated response body. OpenAI-shaped field names are preferred;
-/// the input/output aliases preserve accounting if a translator passes
-/// through a provider-native usage block. At least one numeric count is
-/// required, while an explicitly reported zero remains parseable.
-fn extract_usage_tokens(body: &[u8]) -> Option<(u64, u64)> {
-    let value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
-    let usage = value.get("usage")?;
-    let input_tokens = usage
-        .get("prompt_tokens")
-        .or_else(|| usage.get("input_tokens"))
-        .and_then(serde_json::Value::as_u64);
-    let output_tokens = usage
-        .get("completion_tokens")
-        .or_else(|| usage.get("output_tokens"))
-        .and_then(serde_json::Value::as_u64);
-
-    if input_tokens.is_none() && output_tokens.is_none() {
-        return None;
-    }
-
-    Some((input_tokens.unwrap_or(0), output_tokens.unwrap_or(0)))
+/// Extract OpenAI-shaped `(prompt_tokens, completion_tokens)` from a
+/// translated response body, returning `(0, 0)` when no usage block
+/// is present. The cascade always translates upstream bodies back to
+/// OpenAI Chat before this runs, so the `usage` shape is uniform.
+fn extract_usage_tokens(body: &[u8]) -> (u64, u64) {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("usage").cloned())
+        .map(|u| {
+            let p = u.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+            let c = u
+                .get("completion_tokens")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0);
+            (p, c)
+        })
+        .unwrap_or((0, 0))
 }
 
 /// WOR-1093: a cascade tier that returned a body but lost (5xx,
@@ -1144,9 +2120,7 @@ fn record_cascade_loser_waste(
     tags: &crate::attribution::AttributionTags,
     body: &[u8],
 ) {
-    let Some((prompt, completion)) = extract_usage_tokens(body) else {
-        return;
-    };
+    let (prompt, completion) = extract_usage_tokens(body);
     let tokens = prompt.saturating_add(completion);
     if tokens == 0 {
         return;
@@ -1211,31 +2185,52 @@ async fn run_shadow_request(
     path: String,
     body: serde_json::Value,
     timeout: std::time::Duration,
-) {
+    quota_attempt: Option<crate::quota_pool::QuotaPoolAttemptGuard>,
+) -> ShadowCallResult {
     let format = provider_format(&provider);
     let (translated_body, translated_path) = translators::translate_request(format, &path, &body);
     let send_body = translated_body.as_ref().unwrap_or(&body);
     let base_url_owned = provider.effective_base_url();
     let base_url = base_url_owned.trim_end_matches('/');
-    let url = build_url(base_url, &translated_path);
-    let (auth_header, auth_value) = provider.auth_header();
     let started = std::time::Instant::now();
+    let url_string = build_url(base_url, &translated_path);
+    let url = match reqwest::Url::parse(&url_string) {
+        Ok(url) => url,
+        Err(error) => {
+            warn!(provider = %provider.name, %error, "shadow request URL is invalid");
+            return failed_shadow_call(started);
+        }
+    };
+    let (auth_header, auth_value) = match provider_auth_header(&provider) {
+        Ok(header) => header,
+        Err(error) => {
+            warn!(provider = %provider.name, %error, "shadow request auth header is invalid");
+            return failed_shadow_call(started);
+        }
+    };
     let mut req = http
-        .post(&url)
-        .header("content-type", "application/json")
-        .header(auth_header, &auth_value)
+        .post(url)
+        .header(auth_header, auth_value)
         .header("x-sbproxy-shadow", "1")
         .json(send_body)
         .timeout(timeout);
     if matches!(format, ProviderFormat::Anthropic) {
         req = req.header("anthropic-version", "2023-06-01");
     }
-    let resp = match req.send().await {
+    if let Err(error) = commit_quota_attempt(quota_attempt).await {
+        warn!(
+            provider = %provider.name,
+            %error,
+            "quota admission suppressed optional shadow request"
+        );
+        return failed_shadow_call(started);
+    }
+    let mut resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
             warn!(provider = %provider.name, error = %e, "shadow request transport error");
             ai_metrics::record_provider_error(&provider.name, "transport");
-            return;
+            return failed_shadow_call(started);
         }
     };
     let status = resp.status();
@@ -1249,17 +2244,34 @@ async fn run_shadow_request(
         };
         ai_metrics::record_provider_error(&provider.name, kind);
     }
-    let raw_bytes = match resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => {
-            warn!(provider = %provider.name, error = %e, "shadow body drain failed");
-            ai_metrics::record_provider_error(&provider.name, "transport");
-            return;
+    let mut raw_bytes = Vec::new();
+    let mut total_response_bytes = 0_u64;
+    let mut metadata_truncated = false;
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                total_response_bytes =
+                    total_response_bytes.saturating_add(chunk.len().try_into().unwrap_or(u64::MAX));
+                metadata_truncated |=
+                    append_shadow_response_metadata(&mut raw_bytes, chunk.as_ref());
+            }
+            Ok(None) => break,
+            Err(e) => {
+                warn!(provider = %provider.name, error = %e, "shadow body drain failed");
+                ai_metrics::record_provider_error(&provider.name, "transport");
+                return ShadowCallResult {
+                    status: status.as_u16(),
+                    latency_ms: started.elapsed().as_millis() as u64,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                };
+            }
         }
-    };
+    }
     // Translate non-OpenAI shadow responses into OpenAI shape so the
     // metadata parsing below works uniformly across providers.
-    let bytes_vec = translators::translate_response_bytes(format, &raw_bytes);
+    let bytes_vec =
+        translators::translate_success_response_bytes(format, status.as_u16(), &raw_bytes);
     let bytes: &[u8] = &bytes_vec;
     let elapsed = started.elapsed();
     let (prompt_tokens, completion_tokens, finish_reason) = parse_shadow_metadata(bytes);
@@ -1268,12 +2280,59 @@ async fn run_shadow_request(
         provider = %provider.name,
         status = %status,
         latency_ms = elapsed.as_millis() as u64,
-        bytes = bytes.len(),
+        bytes = total_response_bytes,
+        metadata_truncated,
         prompt_tokens = ?prompt_tokens,
         completion_tokens = ?completion_tokens,
         finish_reason = ?finish_reason,
         "shadow response"
     );
+    ShadowCallResult {
+        status: status.as_u16(),
+        latency_ms: elapsed.as_millis() as u64,
+        prompt_tokens: prompt_tokens.unwrap_or(0),
+        completion_tokens: completion_tokens.unwrap_or(0),
+    }
+}
+
+fn failed_shadow_call(started: std::time::Instant) -> ShadowCallResult {
+    ShadowCallResult {
+        status: 0,
+        latency_ms: started.elapsed().as_millis() as u64,
+        prompt_tokens: 0,
+        completion_tokens: 0,
+    }
+}
+
+fn append_shadow_response_metadata(buffer: &mut Vec<u8>, chunk: &[u8]) -> bool {
+    let available = MAX_SHADOW_RESPONSE_METADATA_BYTES.saturating_sub(buffer.len());
+    let retained = available.min(chunk.len());
+    buffer.extend_from_slice(&chunk[..retained]);
+    retained < chunk.len()
+}
+
+#[derive(Default)]
+struct CountingWriter {
+    bytes: usize,
+}
+
+impl std::io::Write for CountingWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self.bytes.saturating_add(buffer.len());
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_json_len(value: &serde_json::Value) -> usize {
+    let mut writer = CountingWriter::default();
+    match serde_json::to_writer(&mut writer, value) {
+        Ok(()) => writer.bytes,
+        Err(_) => usize::MAX,
+    }
 }
 
 /// Best-effort extraction of token counts and finish_reason from an
@@ -1320,7 +2379,11 @@ impl Default for AiClient {
 /// pass-through path) for unknown / custom provider names so existing
 /// configurations keep working unchanged.
 pub fn provider_format(provider: &ProviderConfig) -> ProviderFormat {
-    get_provider_info(&provider.name)
+    let provider_key = provider
+        .provider_type
+        .as_deref()
+        .unwrap_or(provider.name.as_str());
+    get_provider_info(provider_key)
         .map(|info| info.format)
         .unwrap_or(ProviderFormat::OpenAi)
 }
@@ -1366,6 +2429,305 @@ pub(crate) fn build_url(base_url: &str, path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static SHADOW_METRIC_TEST_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    #[derive(Default)]
+    struct RecordingQuotaStore {
+        reservation_ids: std::sync::Mutex<Vec<String>>,
+        settled_ids: std::sync::Mutex<Vec<String>>,
+        released_ids: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::quota_pool::QuotaPoolStore for RecordingQuotaStore {
+        async fn reserve(
+            &self,
+            pool: &str,
+            member: &str,
+            units: u64,
+            reservation_id: &str,
+        ) -> std::result::Result<crate::quota_pool::QuotaReservation, crate::quota_pool::PoolError>
+        {
+            self.reservation_ids
+                .lock()
+                .expect("recording quota lock")
+                .push(reservation_id.to_string());
+            Ok(crate::quota_pool::QuotaReservation {
+                pool: pool.to_string(),
+                member: member.to_string(),
+                units,
+                reservation_id: reservation_id.to_string(),
+            })
+        }
+
+        async fn reconcile(
+            &self,
+            reservation: crate::quota_pool::QuotaReservation,
+            _actual: crate::quota_pool::PoolUsage,
+        ) -> std::result::Result<(), crate::quota_pool::PoolError> {
+            self.settled_ids
+                .lock()
+                .expect("recording quota lock")
+                .push(reservation.reservation_id);
+            Ok(())
+        }
+
+        async fn release(
+            &self,
+            reservation: crate::quota_pool::QuotaReservation,
+        ) -> std::result::Result<(), crate::quota_pool::PoolError> {
+            self.released_ids
+                .lock()
+                .expect("recording quota lock")
+                .push(reservation.reservation_id);
+            Ok(())
+        }
+    }
+
+    fn request_quota_config() -> crate::quota_pool::QuotaPoolConfig {
+        serde_json::from_value(serde_json::json!({
+            "name": "shared-upstream",
+            "total_limit": 10,
+            "weights": {"virtual-key-a": 1},
+            "policy": "burst"
+        }))
+        .expect("quota fixture")
+    }
+
+    async fn wait_for_quota_release(store: &RecordingQuotaStore) {
+        for _ in 0..16 {
+            if !store
+                .released_ids
+                .lock()
+                .expect("recording quota lock")
+                .is_empty()
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn quota_aware_forward_releases_when_local_url_construction_fails() {
+        let provider: ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "broken",
+            "api_key": "test-key",
+            "base_url": "not a URL"
+        }))
+        .expect("provider fixture");
+        let store = Arc::new(RecordingQuotaStore::default());
+        let quota_store: Arc<dyn crate::quota_pool::QuotaPoolStore> = store.clone();
+        let admission = crate::quota_pool::QuotaPoolAdmission::new(
+            Some(request_quota_config()),
+            Ok(Some(quota_store)),
+            Ok("virtual-key-a".to_string()),
+        );
+        let attempt = admission
+            .reserve_attempt("request-local-url")
+            .await
+            .expect("quota reservation");
+
+        AiClient::new()
+            .forward_request_with_quota(
+                &provider,
+                "/v1/chat/completions",
+                &serde_json::json!({"model": "test"}),
+                attempt,
+            )
+            .await
+            .expect_err("malformed URL must fail locally");
+
+        wait_for_quota_release(&store).await;
+        assert_eq!(
+            *store.released_ids.lock().expect("recording quota lock"),
+            vec!["request-local-url".to_string()]
+        );
+        assert!(store
+            .settled_ids
+            .lock()
+            .expect("recording quota lock")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn quota_aware_method_releases_when_local_method_validation_fails() {
+        let provider: ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "openai",
+            "api_key": "test-key"
+        }))
+        .expect("provider fixture");
+        let store = Arc::new(RecordingQuotaStore::default());
+        let quota_store: Arc<dyn crate::quota_pool::QuotaPoolStore> = store.clone();
+        let admission = crate::quota_pool::QuotaPoolAdmission::new(
+            Some(request_quota_config()),
+            Ok(Some(quota_store)),
+            Ok("virtual-key-a".to_string()),
+        );
+        let attempt = admission
+            .reserve_attempt("request-local-method")
+            .await
+            .expect("quota reservation");
+
+        AiClient::new()
+            .forward_with_method_and_quota(
+                &provider,
+                "method with spaces",
+                "/v1/files",
+                None,
+                attempt,
+            )
+            .await
+            .expect_err("invalid method must fail locally");
+
+        wait_for_quota_release(&store).await;
+        assert_eq!(
+            *store.released_ids.lock().expect("recording quota lock"),
+            vec!["request-local-method".to_string()]
+        );
+        assert!(store
+            .settled_ids
+            .lock()
+            .expect("recording quota lock")
+            .is_empty());
+    }
+
+    #[derive(Debug, Default)]
+    struct CapturingUsageSink {
+        events: std::sync::Mutex<Vec<LlmUsageEvent>>,
+    }
+
+    impl UsageSink for CapturingUsageSink {
+        fn record(&self, event: &LlmUsageEvent) {
+            self.events
+                .lock()
+                .expect("capturing usage sink lock")
+                .push(event.clone());
+        }
+
+        fn name(&self) -> &str {
+            "capturing"
+        }
+    }
+
+    async fn serve_one_json_response(
+        response_body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<Vec<u8>>) {
+        serve_one_json_response_with_status(response_body, 200).await
+    }
+
+    async fn serve_one_json_response_with_status(
+        response_body: &'static str,
+        status: u16,
+    ) -> (String, tokio::task::JoinHandle<Vec<u8>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test provider");
+        let address = listener.local_addr().expect("test provider address");
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept test request");
+            let mut request = Vec::new();
+            let expected_len = loop {
+                let mut chunk = [0_u8; 4096];
+                let read = stream.read(&mut chunk).await.expect("read test request");
+                assert!(read > 0, "request ended before headers");
+                request.extend_from_slice(&chunk[..read]);
+                let Some(headers_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..headers_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().expect("content length"))
+                    })
+                    .unwrap_or(0);
+                break headers_end + 4 + content_length;
+            };
+            while request.len() < expected_len {
+                let mut chunk = [0_u8; 4096];
+                let read = stream.read(&mut chunk).await.expect("read request body");
+                assert!(read > 0, "request body ended early");
+                request.extend_from_slice(&chunk[..read]);
+            }
+
+            let response = format!(
+                "HTTP/1.1 {status} Fixture\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write test response");
+            request
+        });
+        (format!("http://{address}/v1"), task)
+    }
+
+    async fn serve_one_hanging_response() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind hanging test provider");
+        let address = listener.local_addr().expect("hanging provider address");
+        let task = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.expect("accept shadow request");
+            std::future::pending::<()>().await;
+        });
+        (format!("http://{address}/v1"), task)
+    }
+
+    #[tokio::test]
+    async fn internal_summarizer_targets_one_provider_and_mapped_model() {
+        let (base_url, captured) = serve_one_json_response(
+            r#"{"choices":[{"message":{"role":"assistant","content":"bounded facts"}}],"usage":{"prompt_tokens":31,"completion_tokens":4}}"#,
+        )
+        .await;
+        let provider: ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "dedicated-summary-provider",
+            "api_key": "test-secret",
+            "base_url": base_url,
+            "allow_private_base_url": true,
+            "models": ["summary-model"],
+            "model_map": {"summary-model": "upstream-summary-model"}
+        }))
+        .expect("provider fixture");
+        let messages = vec![serde_json::json!({"role": "user", "content": "history"})];
+
+        let output = AiClient::new()
+            .summarize_internal(
+                &provider,
+                "summary-model",
+                &messages,
+                64,
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("internal summary succeeds");
+
+        assert_eq!(output.summary, "bounded facts");
+        assert_eq!(output.input_tokens, 31);
+        assert_eq!(output.output_tokens, 4);
+
+        let request = captured.await.expect("test provider task");
+        let request_text = String::from_utf8(request).expect("HTTP request is UTF-8");
+        assert!(request_text.starts_with("POST /v1/chat/completions HTTP/1.1"));
+        assert!(!request_text
+            .to_ascii_lowercase()
+            .contains("x-sbproxy-shadow"));
+        let body = request_text.split_once("\r\n\r\n").expect("HTTP body").1;
+        let body: serde_json::Value = serde_json::from_str(body).expect("JSON request body");
+        assert_eq!(body["model"], "upstream-summary-model");
+        assert_eq!(body["messages"], serde_json::Value::Array(messages));
+        assert_eq!(body["max_tokens"], 64);
+        assert_eq!(body["stream"], false);
+    }
 
     #[test]
     fn build_url_with_v1_overlap() {
@@ -1465,14 +2827,167 @@ mod tests {
         assert!(!cascade_provider_is_eligible(&provider, &allowed, &blocked));
     }
 
-    #[test]
-    fn cascade_usage_extraction_distinguishes_zero_usage_from_missing_usage() {
-        assert_eq!(
-            extract_usage_tokens(br#"{"usage":{"prompt_tokens":0,"completion_tokens":0}}"#),
-            Some((0, 0))
+    fn two_tier_cascade_config(first_url: &str, second_url: &str) -> AiHandlerConfig {
+        AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {
+                    "name": "first",
+                    "api_key": "test-key",
+                    "base_url": first_url,
+                    "allow_private_base_url": true
+                },
+                {
+                    "name": "second",
+                    "api_key": "test-key",
+                    "base_url": second_url,
+                    "allow_private_base_url": true
+                }
+            ],
+            "routing": {
+                "strategy": "cascade",
+                "tiers": [
+                    {
+                        "provider_id": "first",
+                        "model": "test-model",
+                        "quality_threshold": 0.5
+                    },
+                    {
+                        "provider_id": "second",
+                        "model": "test-model",
+                        "quality_threshold": 0.5
+                    }
+                ]
+            }
+        }))
+        .expect("cascade fixture")
+    }
+
+    fn one_tier_anthropic_cascade_config(url: &str) -> AiHandlerConfig {
+        AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "anthropic",
+                "provider_type": "anthropic",
+                "api_key": "test-key",
+                "base_url": url,
+                "allow_private_base_url": true
+            }],
+            "routing": {
+                "strategy": "cascade",
+                "tiers": [{
+                    "provider_id": "anthropic",
+                    "model": "claude-3-5-sonnet",
+                    "quality_threshold": 0.5
+                }]
+            }
+        }))
+        .expect("Anthropic cascade fixture")
+    }
+
+    #[tokio::test]
+    async fn cascade_preserves_final_anthropic_error_envelope() {
+        let error = r#"{"type":"error","error":{"type":"overloaded_error","message":"try later"}}"#;
+        let (url, request) = serve_one_json_response_with_status(error, 503).await;
+        let config = one_tier_anthropic_cascade_config(&url);
+        let cascade = config.router().cascade_config().cloned().expect("cascade");
+
+        let outcome = AiClient::new()
+            .forward_cascade_with_policy(
+                &config,
+                &cascade,
+                &[],
+                &[],
+                "/v1/chat/completions",
+                &serde_json::json!({
+                    "model": "claude-3-5-sonnet",
+                    "messages": [{"role": "user", "content": "ping"}]
+                }),
+                &crate::attribution::AttributionTags::default(),
+                "messages",
+            )
+            .await
+            .expect("final cascade error is returned");
+
+        assert_eq!(outcome.status, 503);
+        assert_eq!(outcome.body.as_ref(), error.as_bytes());
+        request.await.expect("Anthropic request captured");
+    }
+
+    #[tokio::test]
+    async fn cascade_consumes_one_unique_quota_reservation_per_dispatched_tier() {
+        let low =
+            r#"{"confidence_score":0.1,"choices":[{"message":{"content":"try another tier"}}]}"#;
+        let accepted = r#"{"confidence_score":1.0,"choices":[{"message":{"content":"accepted"}}]}"#;
+        let (first_url, first_request) = serve_one_json_response(low).await;
+        let (second_url, second_request) = serve_one_json_response(accepted).await;
+        let config = two_tier_cascade_config(&first_url, &second_url);
+        let cascade = config.router().cascade_config().cloned().expect("cascade");
+        let store = Arc::new(RecordingQuotaStore::default());
+        let quota_store: Arc<dyn crate::quota_pool::QuotaPoolStore> = store.clone();
+        let admission = crate::quota_pool::QuotaPoolAdmission::new(
+            Some(request_quota_config()),
+            Ok(Some(quota_store)),
+            Ok("virtual-key-a".to_string()),
         );
-        assert_eq!(extract_usage_tokens(br#"{"usage":{}}"#), None);
-        assert_eq!(extract_usage_tokens(b"not-json"), None);
+
+        let outcome = AiClient::new()
+            .forward_cascade_with_policy_and_quota(
+                &config,
+                &cascade,
+                &[],
+                &[],
+                "/v1/chat/completions",
+                &serde_json::json!({"model": "test-model"}),
+                &crate::attribution::AttributionTags::default(),
+                "chat_completions",
+                &admission,
+                "request-1:quota-pool:cascade",
+            )
+            .await
+            .expect("second cascade tier succeeds");
+
+        assert_eq!(outcome.provider_name, "second");
+        assert_eq!(
+            *store.reservation_ids.lock().expect("recording quota lock"),
+            vec![
+                "request-1:quota-pool:cascade:tier:0".to_string(),
+                "request-1:quota-pool:cascade:tier:1".to_string(),
+            ]
+        );
+        first_request.await.expect("first request captured");
+        second_request.await.expect("second request captured");
+    }
+
+    #[tokio::test]
+    async fn cascade_skips_a_resilience_ineligible_tier() {
+        let accepted = r#"{"confidence_score":1.0,"choices":[{"message":{"content":"accepted"}}]}"#;
+        let (first_url, first_request) = serve_one_json_response(accepted).await;
+        let (second_url, second_request) = serve_one_json_response(accepted).await;
+        let config = two_tier_cascade_config(&first_url, &second_url);
+        config.router().set_provider_health(0, false);
+        let cascade = config.router().cascade_config().cloned().expect("cascade");
+
+        let outcome = AiClient::new()
+            .forward_cascade_with_policy(
+                &config,
+                &cascade,
+                &[],
+                &[],
+                "/v1/chat/completions",
+                &serde_json::json!({"model": "test-model"}),
+                &crate::attribution::AttributionTags::default(),
+                "chat_completions",
+            )
+            .await
+            .expect("healthy fallback tier succeeds");
+
+        assert_eq!(outcome.provider_name, "second");
+        assert_eq!(outcome.attempted_providers, vec!["second"]);
+        assert!(
+            !first_request.is_finished(),
+            "resilience-ineligible tier must receive no upstream request"
+        );
+        first_request.abort();
+        second_request.await.expect("healthy request captured");
     }
 
     // --- Shadow supervisor tests ---
@@ -1484,6 +2999,681 @@ mod tests {
     // are covered without needing a live HTTP server.
 
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    fn shadow_handler_config(sample_rate: f32) -> AiHandlerConfig {
+        AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {
+                    "name": "primary",
+                    "api_key": "primary-test-key",
+                    "base_url": "http://127.0.0.1:9/v1",
+                    "allow_private_base_url": true
+                },
+                {
+                    "name": "shadow",
+                    "api_key": "shadow-test-key",
+                    "base_url": "http://127.0.0.1:9/v1",
+                    "allow_private_base_url": true
+                }
+            ],
+            "shadow": {
+                "provider": "shadow",
+                "model": "shadow-model",
+                "sample_rate": sample_rate,
+                "timeout_ms": 50,
+                "task_timeout_ms": 50
+            }
+        }))
+        .expect("valid shadow handler fixture")
+    }
+
+    #[tokio::test]
+    async fn quota_aware_shadow_does_not_charge_a_sampled_out_copy() {
+        let store = Arc::new(RecordingQuotaStore::default());
+        let quota_store: Arc<dyn crate::quota_pool::QuotaPoolStore> = store.clone();
+        let admission = crate::quota_pool::QuotaPoolAdmission::new(
+            Some(request_quota_config()),
+            Ok(Some(quota_store)),
+            Ok("virtual-key-a".to_string()),
+        );
+
+        let outcome = AiClient::new()
+            .try_spawn_shadow_with_quota(
+                &shadow_handler_config(0.0),
+                "/v1/chat/completions",
+                &serde_json::json!({"model": "primary-model"}),
+                false,
+                &[],
+                &[],
+                false,
+                None,
+                &admission,
+                "request-1:quota-pool",
+            )
+            .await
+            .expect("sampling out is not a quota failure");
+
+        assert_eq!(outcome, ShadowDispatchOutcome::SampledOut);
+        assert!(
+            store
+                .reservation_ids
+                .lock()
+                .expect("recording quota lock")
+                .is_empty(),
+            "a shadow suppressed before dispatch must not consume quota"
+        );
+    }
+
+    #[tokio::test]
+    async fn quota_aware_shadow_charges_immediately_before_spawn() {
+        let (base_url, captured) =
+            serve_one_json_response(r#"{"choices":[{"message":{"content":"ok"}}]}"#).await;
+        let config = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "primary", "api_key": "primary-test-key"},
+                {
+                    "name": "shadow",
+                    "api_key": "shadow-test-key",
+                    "base_url": base_url,
+                    "allow_private_base_url": true
+                }
+            ],
+            "shadow": {
+                "provider": "shadow",
+                "sample_rate": 1.0,
+                "timeout_ms": 500,
+                "task_timeout_ms": 500
+            }
+        }))
+        .expect("valid shadow fixture");
+        let store = Arc::new(RecordingQuotaStore::default());
+        let quota_store: Arc<dyn crate::quota_pool::QuotaPoolStore> = store.clone();
+        let admission = crate::quota_pool::QuotaPoolAdmission::new(
+            Some(request_quota_config()),
+            Ok(Some(quota_store)),
+            Ok("virtual-key-a".to_string()),
+        );
+
+        let outcome = AiClient::new()
+            .try_spawn_shadow_with_quota(
+                &config,
+                "/v1/chat/completions",
+                &serde_json::json!({"model": "primary-model"}),
+                false,
+                &[],
+                &[],
+                false,
+                None,
+                &admission,
+                "request-1:quota-pool",
+            )
+            .await
+            .expect("quota admits shadow");
+
+        assert_eq!(outcome, ShadowDispatchOutcome::Spawned);
+        captured.await.expect("shadow request reached provider");
+        assert_eq!(
+            *store.reservation_ids.lock().expect("recording quota lock"),
+            vec!["request-1:quota-pool:shadow".to_string()]
+        );
+        assert_eq!(
+            *store.settled_ids.lock().expect("recording quota lock"),
+            vec!["request-1:quota-pool:shadow".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn quota_aware_shadow_releases_when_local_header_construction_fails() {
+        let config = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "primary", "api_key": "primary-test-key"},
+                {
+                    "name": "shadow",
+                    "api_key": "invalid\nheader",
+                    "base_url": "http://127.0.0.1:9/v1",
+                    "allow_private_base_url": true
+                }
+            ],
+            "shadow": {
+                "provider": "shadow",
+                "sample_rate": 1.0,
+                "timeout_ms": 500,
+                "task_timeout_ms": 500
+            }
+        }))
+        .expect("valid shadow fixture");
+        let store = Arc::new(RecordingQuotaStore::default());
+        let quota_store: Arc<dyn crate::quota_pool::QuotaPoolStore> = store.clone();
+        let admission = crate::quota_pool::QuotaPoolAdmission::new(
+            Some(request_quota_config()),
+            Ok(Some(quota_store)),
+            Ok("virtual-key-a".to_string()),
+        );
+
+        let outcome = AiClient::new()
+            .try_spawn_shadow_with_quota(
+                &config,
+                "/v1/chat/completions",
+                &serde_json::json!({"model": "primary-model"}),
+                false,
+                &[],
+                &[],
+                false,
+                None,
+                &admission,
+                "request-local-shadow",
+            )
+            .await
+            .expect("reservation succeeds before local shadow construction");
+
+        assert_eq!(outcome, ShadowDispatchOutcome::Spawned);
+        wait_for_quota_release(&store).await;
+        assert_eq!(
+            *store.released_ids.lock().expect("recording quota lock"),
+            vec!["request-local-shadow:shadow".to_string()]
+        );
+        assert!(store
+            .settled_ids
+            .lock()
+            .expect("recording quota lock")
+            .is_empty());
+    }
+
+    fn shadow_usage_event(request_id: &str) -> LlmUsageEvent {
+        LlmUsageEvent {
+            provider: "primary".to_string(),
+            model: "primary-model".to_string(),
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 2,
+            cost_usd: 1.0,
+            latency_ms: 1,
+            status: 200,
+            key_id: None,
+            tenant_id: None,
+            project: None,
+            user: None,
+            team: None,
+            tags: Vec::new(),
+            metadata: std::collections::BTreeMap::new(),
+            request_id: Some(request_id.to_string()),
+            session_id: None,
+            tag: None,
+            priority: None,
+            engine_version: None,
+            agent_id: None,
+            a2a_context_id: None,
+            a2a_identity_verified: None,
+            workflow_id: None,
+        }
+    }
+
+    #[test]
+    fn shadow_usage_id_is_server_generated_and_cannot_collide_with_primary_id() {
+        let usage = ShadowUsageRecord::new(shadow_usage_event("caller-id"), Vec::new());
+        let request_id = usage.event.request_id.expect("shadow request id");
+
+        assert_ne!(request_id, "caller-id:shadow");
+        assert!(request_id.ends_with(":shadow"));
+        assert_eq!(request_id.len(), 39);
+        assert!(request_id[..32]
+            .chars()
+            .all(|character| character.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn shadow_response_metadata_buffer_is_bounded() {
+        let mut buffer = vec![b'a'; MAX_SHADOW_RESPONSE_METADATA_BYTES - 2];
+
+        let truncated = append_shadow_response_metadata(&mut buffer, b"bcdef");
+
+        assert!(truncated);
+        assert_eq!(buffer.len(), MAX_SHADOW_RESPONSE_METADATA_BYTES);
+        assert!(buffer.ends_with(b"bc"));
+    }
+
+    #[tokio::test]
+    async fn shadow_dispatch_applies_the_shadow_providers_model_map() {
+        let (base_url, captured) =
+            serve_one_json_response(r#"{"usage":{"prompt_tokens":1,"completion_tokens":1}}"#).await;
+        let config = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {
+                    "name": "primary",
+                    "api_key": "primary-test-key"
+                },
+                {
+                    "name": "shadow",
+                    "api_key": "shadow-test-key",
+                    "base_url": base_url,
+                    "allow_private_base_url": true,
+                    "model_map": {"shadow-model": "upstream-shadow-model"}
+                }
+            ],
+            "shadow": {
+                "provider": "shadow",
+                "model": "shadow-model",
+                "sample_rate": 1.0,
+                "timeout_ms": 500,
+                "task_timeout_ms": 500
+            }
+        }))
+        .expect("valid mapped shadow fixture");
+        let client = AiClient::with_shadow_supervisor(Arc::new(ShadowSupervisor::new(1)));
+
+        let outcome = client.try_spawn_shadow(
+            &config,
+            "/v1/chat/completions",
+            &serde_json::json!({"model": "primary-model"}),
+            false,
+            &[],
+            &[],
+            false,
+            None,
+        );
+
+        assert_eq!(outcome, ShadowDispatchOutcome::Spawned);
+        let request = captured.await.expect("test provider task");
+        let request_text = String::from_utf8(request).expect("HTTP request is UTF-8");
+        let body = request_text.split_once("\r\n\r\n").expect("HTTP body").1;
+        let body: serde_json::Value = serde_json::from_str(body).expect("JSON request body");
+        assert_eq!(body["model"], "upstream-shadow-model");
+    }
+
+    #[test]
+    fn shadow_preserves_pre_compression_code_bypass() {
+        let config = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "primary", "api_key": "primary-test-key"},
+                {
+                    "name": "shadow",
+                    "provider_type": "openai",
+                    "api_key": "shadow-test-key",
+                    "base_url": "http://127.0.0.1:9/v1",
+                    "allow_private_base_url": true
+                }
+            ],
+            "reasoning": "concise",
+            "shadow": {
+                "provider": "shadow",
+                "model": "gpt-5-mini",
+                "sample_rate": 1.0,
+                "timeout_ms": 50,
+                "task_timeout_ms": 50
+            }
+        }))
+        .expect("valid reasoning shadow fixture");
+        let original = serde_json::json!({
+            "model": "gpt-5-mini",
+            "messages": [{
+                "role": "user",
+                "content": "Implement fn parse(input: &str) -> Result<Value, Error>."
+            }]
+        });
+        let eligibility = crate::reasoning::reasoning_eligibility(&original);
+        let compressed = serde_json::json!({
+            "model": "gpt-5-mini",
+            "messages": [{"role": "user", "content": "Implement the parser."}]
+        });
+        let client = AiClient::with_shadow_supervisor(Arc::new(ShadowSupervisor::new(1)));
+
+        let prepared = client
+            .prepare_shadow(
+                &config,
+                "/v1/chat/completions",
+                &compressed,
+                false,
+                &[],
+                &[],
+                false,
+                None,
+                Some(eligibility),
+            )
+            .expect("shadow is admitted");
+
+        assert_eq!(prepared.reasoning_outcome, "code_bypass");
+        assert!(prepared.body.get("reasoning_effort").is_none());
+        assert_eq!(prepared.body["messages"], compressed["messages"]);
+    }
+
+    #[tokio::test]
+    async fn shadow_dispatch_boundary_rejects_non_chat_paths() {
+        let client = AiClient::with_shadow_supervisor(Arc::new(ShadowSupervisor::new(1)));
+
+        let outcome = client.try_spawn_shadow(
+            &shadow_handler_config(1.0),
+            "/v1/assistants",
+            &serde_json::json!({"model": "primary-model"}),
+            false,
+            &[],
+            &[],
+            false,
+            None,
+        );
+
+        assert_eq!(outcome, ShadowDispatchOutcome::UnsupportedSurface);
+        assert_eq!(client.shadow_supervisor().available(), 1);
+    }
+
+    #[tokio::test]
+    async fn shadow_dispatch_skips_streaming_without_admission() {
+        let _metric_guard = SHADOW_METRIC_TEST_LOCK.lock().await;
+        let client = AiClient::with_shadow_supervisor(Arc::new(ShadowSupervisor::new(1)));
+        let outcome = client.try_spawn_shadow(
+            &shadow_handler_config(1.0),
+            "/v1/chat/completions",
+            &serde_json::json!({"model": "primary-model", "stream": true}),
+            true,
+            &[],
+            &[],
+            false,
+            None,
+        );
+
+        assert_eq!(outcome, ShadowDispatchOutcome::StreamingSkipped);
+        assert_eq!(client.shadow_supervisor().available(), 1);
+    }
+
+    #[tokio::test]
+    async fn shadow_dispatch_sampling_out_is_not_a_failed_admission() {
+        let _metric_guard = SHADOW_METRIC_TEST_LOCK.lock().await;
+        let client = AiClient::with_shadow_supervisor(Arc::new(ShadowSupervisor::new(1)));
+        let outcome = client.try_spawn_shadow(
+            &shadow_handler_config(0.0),
+            "/v1/chat/completions",
+            &serde_json::json!({"model": "primary-model"}),
+            false,
+            &[],
+            &[],
+            false,
+            None,
+        );
+
+        assert_eq!(outcome, ShadowDispatchOutcome::SampledOut);
+        assert_eq!(client.shadow_supervisor().available(), 1);
+    }
+
+    #[tokio::test]
+    async fn shadow_dispatch_honors_credential_provider_policy() {
+        let _metric_guard = SHADOW_METRIC_TEST_LOCK.lock().await;
+        let client = AiClient::with_shadow_supervisor(Arc::new(ShadowSupervisor::new(1)));
+        let outcome = client.try_spawn_shadow(
+            &shadow_handler_config(1.0),
+            "/v1/chat/completions",
+            &serde_json::json!({"model": "primary-model"}),
+            false,
+            &["primary".to_string()],
+            &[],
+            false,
+            None,
+        );
+
+        assert_eq!(outcome, ShadowDispatchOutcome::ProviderNotAllowed);
+        assert_eq!(client.shadow_supervisor().available(), 1);
+    }
+
+    #[tokio::test]
+    async fn shadow_dispatch_honors_prompt_training_opt_out() {
+        let _metric_guard = SHADOW_METRIC_TEST_LOCK.lock().await;
+        let client = AiClient::with_shadow_supervisor(Arc::new(ShadowSupervisor::new(1)));
+        let dropped_before = ai_metrics::shadow_dropped_value(
+            ai_metrics::ShadowDropReason::PromptTrainingDisallowed,
+        );
+        let outcome = client.try_spawn_shadow(
+            &shadow_handler_config(1.0),
+            "/v1/chat/completions",
+            &serde_json::json!({"model": "primary-model"}),
+            false,
+            &[],
+            &[],
+            true,
+            None,
+        );
+
+        assert_eq!(outcome, ShadowDispatchOutcome::PromptTrainingDisallowed);
+        assert!(
+            ai_metrics::shadow_dropped_value(
+                ai_metrics::ShadowDropReason::PromptTrainingDisallowed
+            ) - dropped_before
+                >= 1.0
+        );
+        assert_eq!(client.shadow_supervisor().available(), 1);
+    }
+
+    #[tokio::test]
+    async fn prompt_training_opt_out_allows_a_compliant_shadow_provider() {
+        let mut config = shadow_handler_config(1.0);
+        config
+            .providers
+            .iter_mut()
+            .find(|provider| provider.name == "shadow")
+            .expect("shadow provider")
+            .no_prompt_training = true;
+        let client = AiClient::with_shadow_supervisor(Arc::new(ShadowSupervisor::new(1)));
+
+        let outcome = client.try_spawn_shadow(
+            &config,
+            "/v1/chat/completions",
+            &serde_json::json!({"model": "primary-model"}),
+            false,
+            &[],
+            &[],
+            true,
+            None,
+        );
+
+        assert_eq!(outcome, ShadowDispatchOutcome::Spawned);
+    }
+
+    #[tokio::test]
+    async fn shadow_dispatch_records_each_closed_drop_reason_exactly_once() {
+        let _metric_guard = SHADOW_METRIC_TEST_LOCK.lock().await;
+        let reasons = [
+            ai_metrics::ShadowDropReason::Streaming,
+            ai_metrics::ShadowDropReason::ProviderNotFound,
+            ai_metrics::ShadowDropReason::ProviderNotAllowed,
+            ai_metrics::ShadowDropReason::PromptTrainingDisallowed,
+            ai_metrics::ShadowDropReason::EgressDenied,
+            ai_metrics::ShadowDropReason::Saturated,
+        ];
+        let snapshot = || reasons.map(ai_metrics::shadow_dropped_value);
+
+        let before_sampling = snapshot();
+        assert_eq!(
+            AiClient::new().try_spawn_shadow(
+                &shadow_handler_config(0.0),
+                "/v1/chat/completions",
+                &serde_json::json!({"model": "primary-model"}),
+                false,
+                &[],
+                &[],
+                false,
+                None,
+            ),
+            ShadowDispatchOutcome::SampledOut
+        );
+        assert_eq!(snapshot(), before_sampling, "sampling is not a drop");
+
+        let assert_one_increment = |before: [f64; 6], reason: ai_metrics::ShadowDropReason| {
+            let after = snapshot();
+            for (index, candidate) in reasons.iter().enumerate() {
+                let expected = if *candidate == reason { 1.0 } else { 0.0 };
+                assert_eq!(
+                    after[index] - before[index],
+                    expected,
+                    "unexpected increment for {} while exercising {}",
+                    candidate.as_str(),
+                    reason.as_str()
+                );
+            }
+        };
+
+        let client = AiClient::new();
+        let before = snapshot();
+        assert_eq!(
+            client.try_spawn_shadow(
+                &shadow_handler_config(1.0),
+                "/v1/chat/completions",
+                &serde_json::json!({"model": "primary-model", "stream": true}),
+                true,
+                &[],
+                &[],
+                false,
+                None,
+            ),
+            ShadowDispatchOutcome::StreamingSkipped
+        );
+        assert_one_increment(before, ai_metrics::ShadowDropReason::Streaming);
+
+        let mut missing = shadow_handler_config(1.0);
+        missing.shadow.as_mut().expect("shadow config").provider = "missing".to_string();
+        let before = snapshot();
+        assert_eq!(
+            client.try_spawn_shadow(
+                &missing,
+                "/v1/chat/completions",
+                &serde_json::json!({"model": "primary-model"}),
+                false,
+                &[],
+                &[],
+                false,
+                None,
+            ),
+            ShadowDispatchOutcome::ProviderNotFound
+        );
+        assert_one_increment(before, ai_metrics::ShadowDropReason::ProviderNotFound);
+
+        let before = snapshot();
+        assert_eq!(
+            client.try_spawn_shadow(
+                &shadow_handler_config(1.0),
+                "/v1/chat/completions",
+                &serde_json::json!({"model": "primary-model"}),
+                false,
+                &["primary".to_string()],
+                &[],
+                false,
+                None,
+            ),
+            ShadowDispatchOutcome::ProviderNotAllowed
+        );
+        assert_one_increment(before, ai_metrics::ShadowDropReason::ProviderNotAllowed);
+
+        let before = snapshot();
+        assert_eq!(
+            client.try_spawn_shadow(
+                &shadow_handler_config(1.0),
+                "/v1/chat/completions",
+                &serde_json::json!({"model": "primary-model"}),
+                false,
+                &[],
+                &[],
+                true,
+                None,
+            ),
+            ShadowDispatchOutcome::PromptTrainingDisallowed
+        );
+        assert_one_increment(
+            before,
+            ai_metrics::ShadowDropReason::PromptTrainingDisallowed,
+        );
+
+        let egress_client = AiClient::new().with_egress(enforce_ai_provider(&["api.openai.com"]));
+        let before = snapshot();
+        assert_eq!(
+            egress_client.try_spawn_shadow(
+                &shadow_handler_config(1.0),
+                "/v1/chat/completions",
+                &serde_json::json!({"model": "primary-model"}),
+                false,
+                &[],
+                &[],
+                false,
+                None,
+            ),
+            ShadowDispatchOutcome::EgressDenied
+        );
+        assert_one_increment(before, ai_metrics::ShadowDropReason::EgressDenied);
+
+        let supervisor = Arc::new(ShadowSupervisor::new(1));
+        let saturated_client = AiClient::with_shadow_supervisor(supervisor.clone());
+        let held = supervisor.try_admit().expect("reserve the only slot");
+        let before = snapshot();
+        assert_eq!(
+            saturated_client.try_spawn_shadow(
+                &shadow_handler_config(1.0),
+                "/v1/chat/completions",
+                &serde_json::json!({"model": "primary-model"}),
+                false,
+                &[],
+                &[],
+                false,
+                None,
+            ),
+            ShadowDispatchOutcome::Saturated
+        );
+        assert_one_increment(before, ai_metrics::ShadowDropReason::Saturated);
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn shadow_dispatch_drops_when_bounded_admission_is_saturated() {
+        let _metric_guard = SHADOW_METRIC_TEST_LOCK.lock().await;
+        let supervisor = Arc::new(ShadowSupervisor::new(1));
+        let client = AiClient::with_shadow_supervisor(supervisor.clone());
+        let held = supervisor.try_admit().expect("reserve the only slot");
+        let dropped_before =
+            ai_metrics::shadow_dropped_value(ai_metrics::ShadowDropReason::Saturated);
+
+        let outcome = client.try_spawn_shadow(
+            &shadow_handler_config(1.0),
+            "/v1/chat/completions",
+            &serde_json::json!({"model": "primary-model"}),
+            false,
+            &[],
+            &[],
+            false,
+            None,
+        );
+
+        assert_eq!(outcome, ShadowDispatchOutcome::Saturated);
+        assert!(
+            ai_metrics::shadow_dropped_value(ai_metrics::ShadowDropReason::Saturated)
+                - dropped_before
+                >= 1.0
+        );
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn shadow_admission_reserves_a_process_wide_memory_budget() {
+        let _metric_guard = SHADOW_METRIC_TEST_LOCK.lock().await;
+        let one_task_bytes = MAX_SHADOW_RESPONSE_METADATA_BYTES * 2 + 16;
+        let supervisor = ShadowSupervisor::with_memory_budget(8, one_task_bytes);
+        let first = supervisor
+            .try_admit_request(8)
+            .expect("first request fits the byte budget");
+        assert_eq!(supervisor.available_memory_bytes(), 0);
+        let dropped_before =
+            ai_metrics::shadow_dropped_value(ai_metrics::ShadowDropReason::Saturated);
+
+        assert!(
+            supervisor.try_admit_request(8).is_none(),
+            "a free task slot must not bypass the byte budget"
+        );
+        assert_eq!(
+            ai_metrics::shadow_dropped_value(ai_metrics::ShadowDropReason::Saturated)
+                - dropped_before,
+            1.0
+        );
+
+        drop(first);
+        assert_eq!(supervisor.available_memory_bytes(), one_task_bytes);
+        assert!(
+            supervisor.try_admit_request(8).is_some(),
+            "dropping the task must return both admission resources"
+        );
+    }
 
     #[tokio::test]
     async fn shadow_supervisor_succeeds_within_timeout() {
@@ -1516,6 +3706,7 @@ mod tests {
 
     #[tokio::test]
     async fn shadow_supervisor_records_timeout_when_future_hangs() {
+        let _metric_guard = SHADOW_METRIC_TEST_LOCK.lock().await;
         let supervisor = ShadowSupervisor::new(4);
         let timeout_before = ai_metrics::shadow_timeout_value();
 
@@ -1546,8 +3737,10 @@ mod tests {
 
     #[tokio::test]
     async fn shadow_supervisor_drops_request_when_queue_full() {
+        let _metric_guard = SHADOW_METRIC_TEST_LOCK.lock().await;
         let supervisor = ShadowSupervisor::new(2);
-        let dropped_before = ai_metrics::shadow_dropped_value();
+        let dropped_before =
+            ai_metrics::shadow_dropped_value(ai_metrics::ShadowDropReason::Saturated);
 
         // Fill every slot. Hold the permits across the test so the
         // semaphore stays at zero.
@@ -1559,7 +3752,9 @@ mod tests {
         let denied = supervisor.try_admit();
         assert!(denied.is_none(), "queue must reject when full");
         assert!(
-            ai_metrics::shadow_dropped_value() - dropped_before >= 1.0,
+            ai_metrics::shadow_dropped_value(ai_metrics::ShadowDropReason::Saturated)
+                - dropped_before
+                >= 1.0,
             "shadow_dropped_total should have ticked"
         );
 
@@ -1569,5 +3764,124 @@ mod tests {
         drop(p2);
         drop(p3);
         assert_eq!(supervisor.available(), 2);
+    }
+
+    #[tokio::test]
+    async fn production_shadow_timeout_emits_a_failed_usage_event() {
+        let _metric_guard = SHADOW_METRIC_TEST_LOCK.lock().await;
+        let (base_url, hanging_provider) = serve_one_hanging_response().await;
+        let config = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "primary", "api_key": "primary-test-key"},
+                {
+                    "name": "shadow",
+                    "api_key": "shadow-test-key",
+                    "base_url": base_url,
+                    "allow_private_base_url": true
+                }
+            ],
+            "shadow": {
+                "provider": "shadow",
+                "model": "gpt-4o",
+                "sample_rate": 1.0,
+                "timeout_ms": 5000,
+                "task_timeout_ms": 25
+            }
+        }))
+        .expect("valid timeout fixture");
+        let sink = Arc::new(CapturingUsageSink::default());
+        let usage = ShadowUsageRecord::new(
+            shadow_usage_event("caller-controlled"),
+            vec![sink.clone() as Arc<dyn UsageSink>],
+        );
+        let timeout_before = ai_metrics::shadow_timeout_value();
+
+        assert_eq!(
+            AiClient::new().try_spawn_shadow(
+                &config,
+                "/v1/chat/completions",
+                &serde_json::json!({"model": "gpt-4o"}),
+                false,
+                &[],
+                &[],
+                false,
+                Some(usage),
+            ),
+            ShadowDispatchOutcome::Spawned
+        );
+
+        let event = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(event) = sink
+                    .events
+                    .lock()
+                    .expect("capturing usage sink lock")
+                    .first()
+                    .cloned()
+                {
+                    break event;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("shadow timeout usage event");
+        hanging_provider.abort();
+
+        assert_eq!(ai_metrics::shadow_timeout_value() - timeout_before, 1.0);
+        assert_eq!(event.provider, "shadow");
+        assert_eq!(event.model, "gpt-4o");
+        assert_eq!(event.status, 504);
+        assert_eq!(event.total_tokens, 0);
+        assert_eq!(event.tag.as_deref(), Some("shadow"));
+        assert_ne!(
+            event.request_id.as_deref(),
+            Some("caller-controlled:shadow")
+        );
+    }
+
+    fn enforce_ai_provider(hosts: &[&str]) -> EgressAuthorizer {
+        use sbproxy_security::egress::{EgressConfig, PurposeAllowlist};
+        use std::collections::HashMap;
+        let mut allow = PurposeAllowlist::default();
+        for h in hosts {
+            allow.hosts.insert((*h).to_string());
+        }
+        allow.schemes.insert("https".to_string());
+        allow.schemes.insert("http".to_string());
+        allow.ports.insert(443);
+        allow.ports.insert(80);
+        let mut purposes = HashMap::new();
+        purposes.insert(EgressPurpose::AiProvider, allow);
+        EgressAuthorizer::new(EgressConfig { purposes })
+    }
+
+    #[test]
+    fn provider_egress_denies_unlisted_host_with_closed_vocabulary() {
+        let client = AiClient::new().with_egress(enforce_ai_provider(&["api.openai.com"]));
+        let err = client
+            .authorize_provider_url("https://evil.example/v1/chat", &PublicPinResolver)
+            .expect_err("unlisted host must be denied");
+        assert_eq!(err, EgressDenied::UnlistedHost);
+        assert!(!format!("{err:?}").contains("evil.example"));
+    }
+
+    #[test]
+    fn omitted_egress_preserves_legacy_provider_compatibility() {
+        let client = AiClient::new();
+        client
+            .authorize_provider_url("https://evil.example/v1/chat", &PublicPinResolver)
+            .expect("omitted egress must not deny");
+    }
+
+    #[test]
+    fn enforce_egress_fails_closed_for_unlisted_purpose_host() {
+        let client = AiClient::new().with_egress(enforce_ai_provider(&["api.openai.com"]));
+        assert_eq!(
+            client
+                .authorize_provider_url("https://api.anthropic.com/v1", &PublicPinResolver)
+                .unwrap_err(),
+            EgressDenied::UnlistedHost
+        );
     }
 }

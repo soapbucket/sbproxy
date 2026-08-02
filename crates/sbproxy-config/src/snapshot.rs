@@ -15,9 +15,9 @@ use smallvec::SmallVec;
 use crate::types::{
     AccessLogConfig, AgentClassesConfig, AgentSkillEntry, AgentsJsonConfig, CompressionConfig,
     CorsConfig, ErrorPageEntry, HstsConfig, IdempotencyConfig, MessageSignaturesConfig,
-    MirrorConfig, OlpConfig, ProblemDetailsConfig, ProxyServerConfig, ProxyStatusConfig,
-    RequestModifierConfig, ResponseCacheConfig, ResponseModifierConfig, SessionConfig,
-    WebBotAuthPublishConfig,
+    MirrorConfig, OlpConfig, OriginAttestationConfig, ProblemDetailsConfig, ProxyServerConfig,
+    ProxyStatusConfig, RequestModifierConfig, ResponseCacheConfig, ResponseModifierConfig,
+    SessionConfig, WebBotAuthPublishConfig,
 };
 
 /// Fully compiled, immutable origin ready for request processing.
@@ -196,6 +196,12 @@ pub struct CompiledOrigin {
     /// When `true` and `proxy.web_bot_auth` is set, the proxy signs the
     /// upstream request with its Ed25519 key (RFC 9421, `tag=web-bot-auth`).
     pub outbound_web_bot_auth: bool,
+    /// Per-origin consumption attestation overrides (WOR-2127). `None`
+    /// leaves the origin on `proxy.attestation`'s role with no
+    /// agreement named. The resolved posture the request path actually
+    /// runs under is computed once per pipeline generation, not per
+    /// request; see `sbproxy_core::attestation`.
+    pub attestation: Option<OriginAttestationConfig>,
     /// WOR-1043 PR3: origin-scope observability overrides. Today the
     /// only nested surface is `log.redact.pii`, composed against the
     /// tenant-scope (or proxy-scope) PII pass at config-load. `None`
@@ -234,21 +240,26 @@ pub struct CompiledConfig {
     /// Parsed top-level `agent_classes:` block. `None` means the
     /// operator did not author the block; the binary startup code
     /// constructs a resolver from defaults in that case. `Some(_)`
-    /// carries the typed catalog source / hosted-feed URL / resolver
-    /// tuning so the binary can build the correct `AgentClassResolver`
-    /// at startup.
+    /// carries the catalog selection and resolver tuning. Hosted-feed
+    /// fields remain compatibility-only; the OSS runtime falls back to
+    /// the built-in catalog instead of fetching them.
     pub agent_classes: Option<AgentClassesConfig>,
     /// WOR-1130: parsed top-level `rate_limits:` workspace budget +
     /// auto-suspend escalation. `None` means no workspace ceiling is
     /// configured. The binary installs a process-wide budget registry
     /// from this at startup.
     pub rate_limits: Option<crate::types::RateLimitsConfig>,
-    /// WOR-1130: audit sink selection (`memory` / `tracing`).
+    /// WOR-1130: compatibility-only audit sink selection. The runtime
+    /// always retains rows in memory and mirrors them to tracing.
     pub audit: Option<crate::types::AuditConfig>,
     /// WOR-1186: session-ledger emission config. `None` (or
     /// `enabled: false`) leaves the ledger off. The binary registers a
     /// ledger sink from this at startup.
     pub session_ledger: Option<crate::types::SessionLedgerConfig>,
+    /// Process-wide flags compiled from the top-level `flags:` block.
+    /// The binary atomically replaces the live CEL store from this
+    /// complete snapshot at boot and after every successful reload.
+    pub flags: Vec<crate::types::FeatureFlagConfig>,
 }
 
 impl CompiledConfig {
@@ -263,7 +274,7 @@ mod tests {
     use super::*;
 
     // Default-constructed snapshots must have no mesh node attached; the
-    // enterprise startup hook is responsible for populating the field when
+    // pipeline lifecycle extension is responsible for populating the field when
     // the `mesh:` extension is configured.
     #[test]
     fn compiled_config_default_has_no_mesh() {

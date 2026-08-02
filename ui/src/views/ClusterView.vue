@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { onMounted, ref } from "vue";
+import { usePoll } from "../composables/usePoll";
 import {
   api,
   ApiError,
@@ -70,6 +71,9 @@ function refresh() {
 }
 
 onMounted(refresh);
+// Node health and membership are exactly what an operator watches this page
+// for; a frozen roster hides the node that just went unreachable.
+usePoll(refresh, 15_000);
 </script>
 
 <template>

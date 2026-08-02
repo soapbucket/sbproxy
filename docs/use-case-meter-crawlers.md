@@ -1,10 +1,10 @@
 # AI crawlers are reading your site for free
 
-*Last modified: 2026-07-06*
+*Last modified: 2026-07-28*
 
 ![An unsigned crawler gets 401, a signed crawler gets a 402 price challenge, a payment token redeems once for a 200, and the replay is charged again](assets/use-case-meter-crawlers.gif)
 
-GPTBot, ClaudeBot, and PerplexityBot are in your access logs right now, pulling pages your team paid to produce. The usual response is a robots.txt entry or an outright block, which forfeits the one useful thing about this traffic: AI vendors will pay for licensed content when there is a machine-readable way to charge them. SBproxy's pitch is "Call any model. Serve your own. Govern both.", and this guide is the govern half pointed at inbound traffic. The same Apache-2.0 binary that routes chat completions to 66 providers, or serves weights on your own GPUs, stands in front of your site, checks each crawler's cryptographic identity, quotes a price per fetch, and answers with HTTP 402 until a payment token arrives.
+GPTBot, ClaudeBot, and PerplexityBot are in your access logs right now, pulling pages your team paid to produce. The usual response is a robots.txt entry or an outright block, which forfeits the one useful thing about this traffic: AI vendors will pay for licensed content when there is a machine-readable way to charge them. SBproxy's pitch is "Call any model. Serve your own. Govern both.", and this guide is the govern half pointed at inbound traffic. The same Apache-2.0 binary that routes chat completions to 72 providers, or serves weights on your own GPUs, stands in front of your site, checks each crawler's cryptographic identity, quotes a price per fetch, and answers with HTTP 402 until a payment token arrives.
 
 ## What you will build
 
@@ -12,7 +12,7 @@ One origin with two independent gates in front of it. The first gate is identity
 
 By the end you will have watched four requests on the wire: an unsigned crawler challenged with `401`, a signed crawler without payment challenged with `402`, the same crawler served with `200` after presenting a token, and the replayed token refused with a fresh `402`.
 
-One boundary to be clear about before you start, because vendors in this space tend to blur it: the open-source build advertises and meters, and the enterprise build settles. Every wire format in this guide is Apache 2.0 code, including the 402 challenge bodies, the multi-rail negotiation and quote-token JWS described in [402-challenge.md](402-challenge.md), and the two ledgers that redeem tokens (in-memory for a single process, JSON-over-HTTPS for a fleet). Moving real money, whether capturing a Stripe payment intent, verifying an x402 redemption against a facilitator, or settling a Lightning invoice, requires the enterprise build's settlement backends. Your `sb.yml` does not change between the two: enterprise registers its rails under the same names the OSS schema already parses. In this walkthrough, "paying" means redeeming a token you seeded in the config; a production deployment issues tokens from its billing system through the HTTPS ledger client instead.
+This walkthrough uses the Apache-2.0 code in this repository. It covers 402 challenge bodies, multi-rail negotiation, quote-token JWS, and the two token ledgers: in-memory for one process and JSON over HTTPS for a fleet. Here, "paying" means redeeming a token seeded in the configuration. A production deployment issues tokens from its billing system through the HTTPS ledger client. Settlement adapters belong in the same OSS project as they become available.
 
 ## Prerequisites
 
@@ -25,7 +25,8 @@ One boundary to be clear about before you start, because vendors in this space t
 ## Install
 
 ```bash
-# Linux / macOS, single static binary:
+# Prebuilt release executable for Linux amd64/arm64 (glibc) or Apple Silicon macOS.
+# No Rust, Python, JVM, or Node toolchain/runtime is required.
 curl -fsSL https://download.sbproxy.dev | sh
 
 # macOS via Homebrew:
@@ -177,5 +178,4 @@ Note that the replayed request reused the same signature headers and still passe
 - [402-challenge.md](402-challenge.md) is the wire contract: single-rail and multi-rail challenge bodies, quote tokens, the 406 fallback, and Cloudflare Pay Per Crawl interop via `cloudflare_compat: true`.
 - [rsl.md](rsl.md) and [content-for-agents.md](content-for-agents.md) advertise your terms so cooperative crawlers can discover them without a 402 round-trip: `/licenses.xml`, `robots.txt`, `llms.txt`, TDMRep, and Markdown or JSON projections of your pages.
 - [l402.md](l402.md) documents the Lightning-flavored macaroon credential surface if your buyers already speak L402.
-- [outbound-peer-pricing.md](outbound-peer-pricing.md) is this story's mirror image: your own agents reading someone else's priced manifest and staying inside a budget.
 - [listings.md](listings.md) publishes a versioned, priced view of an origin once you have something worth selling.

@@ -1,5 +1,5 @@
-//! AI request support helpers: guardrail-pipeline memoization,
-//! budget gating, usage extraction, upstream-error mapping, HTTP
+//! AI request support helpers: budget gating, usage extraction,
+//! upstream-error mapping, HTTP
 //! message-signature verification, AI billing, and idempotency.
 //!
 //! Extracted from `server.rs`. Behavior-preserving move:
@@ -8,47 +8,17 @@
 
 use super::*;
 
-/// Process-wide memoization of compiled guardrail pipelines, keyed by
-/// the address of the configured `GuardrailsConfig`. The address is
-/// stable for the lifetime of an `AiHandlerConfig` (held in the
-/// reload-managed `Arc<Pipeline>`), so a hit returns the
-/// already-compiled `GuardrailPipeline` rather than re-running regex
-/// compilation on every request. Hot reload swaps in a new pipeline
-/// (and therefore a new config address), so stale entries fall out of
-/// use; the map is small (one entry per ai handler config) and never
-/// grows hot.
-pub(super) static GUARDRAIL_PIPELINE_CACHE: std::sync::LazyLock<
-    std::sync::Mutex<
-        std::collections::HashMap<usize, std::sync::Arc<sbproxy_ai::guardrails::GuardrailPipeline>>,
-    >,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+/// Internal cache metadata. New AI idempotency entries store final client-wire
+/// bytes and carry this marker so replay never runs a second format adapter.
+/// The header is stripped before the cached response is sent to a client.
+pub(super) const AI_IDEMPOTENCY_BODY_FORMAT_HEADER: &str = "x-sbproxy-idempotency-body-format";
+pub(super) const AI_IDEMPOTENCY_WIRE_BODY_FORMAT: &str = "wire-v1";
 
-/// Look up (or compile-and-cache) the guardrail pipeline for the given
-/// configuration. Returns `None` and emits a `tracing::warn!` when
-/// `compile_pipeline` fails so the AI proxy can fall through to its
-/// no-guardrails behaviour (matching the previous best-effort policy).
-pub(super) fn cached_guardrails_pipeline(
-    guardrails_config: &sbproxy_ai::guardrails::GuardrailsConfig,
-) -> Option<std::sync::Arc<sbproxy_ai::guardrails::GuardrailPipeline>> {
-    let key = guardrails_config as *const _ as usize;
-    if let Ok(map) = GUARDRAIL_PIPELINE_CACHE.lock() {
-        if let Some(p) = map.get(&key) {
-            return Some(p.clone());
-        }
-    }
-    match sbproxy_ai::guardrails::compile_pipeline(guardrails_config) {
-        Ok(pipeline) => {
-            let arc = std::sync::Arc::new(pipeline);
-            if let Ok(mut map) = GUARDRAIL_PIPELINE_CACHE.lock() {
-                map.insert(key, arc.clone());
-            }
-            Some(arc)
-        }
-        Err(e) => {
-            warn!(error = %e, "AI proxy: failed to compile guardrails, skipping");
-            None
-        }
-    }
+pub(super) fn ai_idempotency_body_is_wire(headers: &[(String, String)]) -> bool {
+    headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case(AI_IDEMPOTENCY_BODY_FORMAT_HEADER)
+            && value == AI_IDEMPOTENCY_WIRE_BODY_FORMAT
+    })
 }
 
 /// Best-effort extraction of a single prompt string from a parsed AI request
@@ -294,23 +264,42 @@ const AI_TRACE_CONTENT_MAX_MESSAGES: usize = sbproxy_observe::capture::MAX_PROPE
 #[derive(Clone, Copy)]
 pub(super) struct AiTraceContentArgs<'a> {
     enabled: bool,
+    /// WOR-2096: whether the console content-capture gate passed
+    /// (origin flag AND key-policy consent). Independent of the span
+    /// gate above.
+    capture: bool,
     pii_redactor: Option<&'a sbproxy_security::pii::PiiRedactor>,
 }
 
 impl<'a> AiTraceContentArgs<'a> {
     pub(super) fn from_config(config: &'a AiHandlerConfig) -> Self {
+        // The redactor borrow is cheap; carrying it unconditionally
+        // lets the WOR-2096 capture path reuse it when the span gate is
+        // off. Both consumers still check their own gate before use.
         Self {
             enabled: config.trace_content,
-            pii_redactor: if config.trace_content {
-                config.pii_redactor()
-            } else {
-                None
-            },
+            capture: false,
+            pii_redactor: config.pii_redactor(),
         }
+    }
+
+    /// Set the WOR-2096 console-capture gate, computed by the caller
+    /// from the origin flag and the resolved key policy.
+    pub(super) fn with_capture(mut self, capture: bool) -> Self {
+        self.capture = capture;
+        self
     }
 
     pub(super) fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    pub(super) fn capture_enabled(&self) -> bool {
+        self.capture
+    }
+
+    pub(super) fn redactor(&self) -> Option<&'a sbproxy_security::pii::PiiRedactor> {
+        self.pii_redactor
     }
 }
 
@@ -486,6 +475,39 @@ pub(super) fn record_ai_input_trace(
             }
         }
     });
+}
+
+/// Redacted role-aware messages for the WOR-2096 content-capture store.
+///
+/// Same redaction stack and caps as `trace_content` span events, but
+/// gated independently: capture can be on while span content is off,
+/// and vice versa. Empty when everything redacts away.
+pub(super) fn captured_content_messages(
+    aggregate: &str,
+    messages: &[AiTraceMessage],
+    pii_redactor: Option<&sbproxy_security::pii::PiiRedactor>,
+) -> Vec<crate::content_capture::CapturedMessage> {
+    if messages.is_empty() {
+        let redacted = redact_ai_trace_content(aggregate, pii_redactor);
+        if redacted.trim().is_empty() {
+            return Vec::new();
+        }
+        return vec![crate::content_capture::CapturedMessage {
+            role: "user".to_string(),
+            content: redacted,
+        }];
+    }
+    messages
+        .iter()
+        .take(AI_TRACE_CONTENT_MAX_MESSAGES)
+        .filter_map(|message| {
+            let redacted = redact_ai_trace_content(&message.content, pii_redactor);
+            (!redacted.trim().is_empty()).then(|| crate::content_capture::CapturedMessage {
+                role: message.role.clone(),
+                content: redacted,
+            })
+        })
+        .collect()
 }
 
 pub(super) fn record_ai_output_trace(
@@ -826,7 +848,7 @@ mod ai_trace_content_tests {
 /// Outcome of a pre-dispatch budget check. Tells the caller whether
 /// the request should proceed, fail with a 402, or have its model
 /// rewritten before forwarding upstream.
-pub(super) enum BudgetGate {
+pub(crate) enum BudgetGate {
     /// No limit was exceeded. Continue with the original model.
     Allow,
     /// At least one limit fired and the configured action is `block`.
@@ -838,9 +860,15 @@ pub(super) enum BudgetGate {
 }
 
 /// Build the list of scope keys to check / record against for a given
-/// AI request. We compute one key per limit so a workspace cap can
-/// coexist with a per-api-key cap on the same origin.
-pub(super) fn budget_scope_keys(
+/// AI request that no caller agent is attributable to.
+///
+/// This is the entry point for spend the proxy incurs on its own behalf
+/// (the context-compression summarizer, for example): there is no A2A
+/// caller to bill, so an `agent`-scoped limit debits the unattributed
+/// bucket. Request paths that can see `ctx.a2a` should call
+/// [`budget_scope_keys_for_agent`] instead so a per-agent cap is
+/// actually enforced rather than pooled.
+pub(crate) fn budget_scope_keys(
     cfg: &sbproxy_ai::BudgetConfig,
     workspace_id: &str,
     api_key: Option<&str>,
@@ -848,6 +876,37 @@ pub(super) fn budget_scope_keys(
     model: Option<&str>,
     origin: Option<&str>,
     tag: Option<&str>,
+) -> Vec<(usize, String)> {
+    budget_scope_keys_for_agent(
+        cfg,
+        workspace_id,
+        api_key,
+        user,
+        model,
+        origin,
+        tag,
+        sbproxy_ai::budget::AgentIdentity::default(),
+    )
+}
+
+/// Build the list of scope keys to check / record against for a given
+/// AI request. We compute one key per limit so a workspace cap can
+/// coexist with a per-api-key cap on the same origin.
+///
+/// `agent` is the calling agent's identity (WOR-2140). Only a verified
+/// id earns its own bucket; see [`sbproxy_ai::budget::AgentIdentity`].
+// One argument per scope dimension plus the agent identity; the count is
+// inherent to the scope inputs, hence the deliberate allow.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn budget_scope_keys_for_agent(
+    cfg: &sbproxy_ai::BudgetConfig,
+    workspace_id: &str,
+    api_key: Option<&str>,
+    user: Option<&str>,
+    model: Option<&str>,
+    origin: Option<&str>,
+    tag: Option<&str>,
+    agent: sbproxy_ai::budget::AgentIdentity<'_>,
 ) -> Vec<(usize, String)> {
     budget_scope_keys_at(
         cfg,
@@ -857,14 +916,42 @@ pub(super) fn budget_scope_keys(
         model,
         origin,
         tag,
+        agent,
         budget_now_unix_secs(),
     )
 }
 
-/// [`budget_scope_keys`] with an explicit clock so the rolling-window
-/// bucketing is deterministic under test. `now_unix_secs` is the UTC Unix
-/// time used to pick each limit's window bucket.
-// Mirrors the 7-arg public entry point plus an injected clock; the argument
+/// Build the request's budget scope keys, fetch any cluster-shared usage,
+/// and apply the existing budget gate.
+///
+/// Callers retain ownership of model rewrites, response handling, and
+/// soft-landing behavior. Keeping those concerns outside this helper lets the
+/// regular HTTP and realtime admission paths share hard-limit semantics
+/// without changing their dispatch-specific behavior.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn scoped_budget_preflight(
+    cfg: &sbproxy_ai::BudgetConfig,
+    providers: &[sbproxy_ai::ProviderConfig],
+    workspace_id: &str,
+    api_key: Option<&str>,
+    user: Option<&str>,
+    model: Option<&str>,
+    origin: Option<&str>,
+    tag: Option<&str>,
+    agent: sbproxy_ai::budget::AgentIdentity<'_>,
+) -> (Vec<(usize, String)>, BudgetGate) {
+    let keys =
+        budget_scope_keys_for_agent(cfg, workspace_id, api_key, user, model, origin, tag, agent);
+    let shared_spend = super::budget_share::read_shared_for_keys(&keys).await;
+    let gate = budget_preflight(cfg, &keys, providers, &shared_spend);
+    (keys, gate)
+}
+
+/// [`budget_scope_keys_for_agent`] with an explicit clock so the
+/// rolling-window bucketing is deterministic under test.
+/// `now_unix_secs` is the UTC Unix time used to pick each limit's window
+/// bucket.
+// Mirrors the public entry point plus an injected clock; the argument
 // count is inherent to the scope inputs, hence the deliberate allow.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn budget_scope_keys_at(
@@ -875,6 +962,7 @@ pub(super) fn budget_scope_keys_at(
     model: Option<&str>,
     origin: Option<&str>,
     tag: Option<&str>,
+    agent: sbproxy_ai::budget::AgentIdentity<'_>,
     now_unix_secs: u64,
 ) -> Vec<(usize, String)> {
     let mut out = Vec::with_capacity(cfg.limits.len());
@@ -887,6 +975,7 @@ pub(super) fn budget_scope_keys_at(
             model,
             origin,
             tag,
+            agent,
         ) {
             // WOR-1527: bucket the key by this limit's rolling window so a
             // `daily`/`monthly` cap resets per period. Both the check and
@@ -938,7 +1027,7 @@ pub(super) fn limit_utilization(
 /// across the configured providers' `models` lists is selected from
 /// the embedded price catalog; if no candidates are available the
 /// request blocks instead of silently passing through.
-pub(super) fn budget_preflight(
+pub(crate) fn budget_preflight(
     cfg: &sbproxy_ai::BudgetConfig,
     keys: &[(usize, String)],
     providers: &[sbproxy_ai::ProviderConfig],
@@ -1048,6 +1137,273 @@ pub(super) fn budget_preflight(
     BudgetGate::Allow
 }
 
+pub(super) fn realtime_model_from_uri(uri: &http::Uri) -> Option<String> {
+    url::form_urlencoded::parse(uri.query()?.as_bytes())
+        .find_map(|(name, value)| (name == "model").then(|| value.into_owned()))
+}
+
+pub(super) fn replace_realtime_model_query(
+    uri: &http::Uri,
+    model: &str,
+) -> Result<http::Uri, http::uri::InvalidUri> {
+    let mut parameters: Vec<(String, String)> =
+        url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes())
+            .filter(|(name, _)| name != "model")
+            .map(|(name, value)| (name.into_owned(), value.into_owned()))
+            .collect();
+    parameters.push(("model".to_string(), model.to_string()));
+
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(parameters)
+        .finish();
+    format!("{}?{}", uri.path(), query).parse()
+}
+
+#[cfg(test)]
+mod budget_preflight_tests {
+    use super::{budget_preflight, scoped_budget_preflight, BudgetGate};
+    use sbproxy_ai::budget::{
+        AgentIdentity, BudgetConfig, BudgetLimit, BudgetScope, OnExceedAction,
+    };
+    use sbproxy_ai::UsageRecord;
+    use std::collections::HashMap;
+
+    fn workspace_budget(action: OnExceedAction, downgrade_to: Option<&str>) -> BudgetConfig {
+        BudgetConfig {
+            limits: vec![BudgetLimit {
+                scope: BudgetScope::Workspace,
+                max_tokens: Some(100),
+                max_cost_usd: None,
+                period: Some("total".to_string()),
+                downgrade_to: downgrade_to.map(str::to_string),
+            }],
+            on_exceed: action,
+            soft_landing: None,
+        }
+    }
+
+    fn exceeded_shared_usage(key: &str) -> HashMap<String, UsageRecord> {
+        HashMap::from([(
+            key.to_string(),
+            UsageRecord {
+                tokens: 100,
+                cost_usd: 0.0,
+                request_count: 1,
+            },
+        )])
+    }
+
+    #[test]
+    fn budget_preflight_log_allows_an_exceeded_scope() {
+        let key = "workspace:budget-preflight-log";
+        let gate = budget_preflight(
+            &workspace_budget(OnExceedAction::Log, None),
+            &[(0, key.to_string())],
+            &[],
+            &exceeded_shared_usage(key),
+        );
+
+        assert!(matches!(gate, BudgetGate::Allow));
+    }
+
+    #[test]
+    fn budget_preflight_block_returns_the_existing_402_json() {
+        let key = "workspace:budget-preflight-block";
+        let gate = budget_preflight(
+            &workspace_budget(OnExceedAction::Block, None),
+            &[(0, key.to_string())],
+            &[],
+            &exceeded_shared_usage(key),
+        );
+
+        let BudgetGate::Block { status, body } = gate else {
+            panic!("expected budget block");
+        };
+        assert_eq!(status, 402);
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("budget JSON");
+        assert_eq!(body["error"]["type"], "budget_exceeded");
+        assert_eq!(body["error"]["scope"], "workspace");
+        assert_eq!(body["error"]["message"], "token limit exceeded: 100 >= 100");
+    }
+
+    #[test]
+    fn budget_preflight_downgrade_returns_the_configured_model() {
+        let key = "workspace:budget-preflight-downgrade";
+        let gate = budget_preflight(
+            &workspace_budget(OnExceedAction::Downgrade, Some("gpt-4o-mini")),
+            &[(0, key.to_string())],
+            &[],
+            &exceeded_shared_usage(key),
+        );
+
+        assert!(matches!(
+            gate,
+            BudgetGate::Downgrade { model } if model == "gpt-4o-mini"
+        ));
+    }
+
+    #[tokio::test]
+    async fn budget_preflight_scoped_helper_builds_keys_and_preserves_the_gate() {
+        let cfg = BudgetConfig {
+            limits: vec![BudgetLimit {
+                scope: BudgetScope::Workspace,
+                max_tokens: Some(0),
+                max_cost_usd: None,
+                period: Some("total".to_string()),
+                downgrade_to: None,
+            }],
+            on_exceed: OnExceedAction::Block,
+            soft_landing: None,
+        };
+
+        let (keys, gate) = scoped_budget_preflight(
+            &cfg,
+            &[],
+            "budget-preflight-scoped",
+            None,
+            None,
+            None,
+            Some("budget-preflight-scoped"),
+            None,
+            AgentIdentity::default(),
+        )
+        .await;
+
+        assert_eq!(
+            keys,
+            vec![(0, "workspace:budget-preflight-scoped".to_string())]
+        );
+        assert!(matches!(gate, BudgetGate::Block { status: 402, .. }));
+    }
+
+    #[tokio::test]
+    async fn agent_scoped_preflight_keys_only_a_verified_agent() {
+        // WOR-2140: the wiring half. An agent-scoped limit produces an
+        // agent key from the request's A2A identity, and an unverified
+        // claim resolves to the shared unattributed bucket rather than
+        // to the named agent's key.
+        let cfg = BudgetConfig {
+            limits: vec![BudgetLimit {
+                scope: BudgetScope::Agent,
+                max_tokens: Some(1_000),
+                max_cost_usd: None,
+                period: Some("total".to_string()),
+                downgrade_to: None,
+            }],
+            on_exceed: OnExceedAction::Block,
+            soft_landing: None,
+        };
+        let host = "agent-preflight";
+
+        let (verified, _) = scoped_budget_preflight(
+            &cfg,
+            &[],
+            host,
+            None,
+            None,
+            None,
+            Some(host),
+            None,
+            AgentIdentity {
+                id: Some("planner"),
+                verified: true,
+            },
+        )
+        .await;
+        assert_eq!(
+            verified,
+            vec![(0, "agent:agent-preflight:planner".to_string())]
+        );
+
+        let (claimed, _) = scoped_budget_preflight(
+            &cfg,
+            &[],
+            host,
+            None,
+            None,
+            None,
+            Some(host),
+            None,
+            AgentIdentity {
+                id: Some("planner"),
+                verified: false,
+            },
+        )
+        .await;
+        assert_eq!(
+            claimed,
+            vec![(0, "agent:agent-preflight:__unattributed__".to_string())],
+            "an unverified claim must not address the verified agent's key"
+        );
+
+        // Traffic with no A2A envelope lands in that same bucket, so the
+        // limit still applies rather than dropping out.
+        let (anonymous, _) = scoped_budget_preflight(
+            &cfg,
+            &[],
+            host,
+            None,
+            None,
+            None,
+            Some(host),
+            None,
+            AgentIdentity::default(),
+        )
+        .await;
+        assert_eq!(anonymous, claimed);
+    }
+
+    #[test]
+    fn agent_scope_has_a_stable_metric_label() {
+        // WOR-2140: the 402 body and the utilization gauge both name the
+        // scope through this label, so it is part of the wire contract.
+        assert_eq!(super::scope_label(&BudgetScope::Agent), "agent");
+    }
+}
+
+#[cfg(test)]
+mod realtime_model_query_tests {
+    use super::{realtime_model_from_uri, replace_realtime_model_query};
+
+    #[test]
+    fn realtime_model_query_decodes_the_first_value() {
+        let uri: http::Uri = "/v1/realtime?model=gpt-4o%2Frealtime&model=ignored"
+            .parse()
+            .expect("URI");
+
+        assert_eq!(
+            realtime_model_from_uri(&uri).as_deref(),
+            Some("gpt-4o/realtime")
+        );
+    }
+
+    #[test]
+    fn realtime_model_override_adds_a_missing_parameter() {
+        let uri: http::Uri = "/v1/realtime?voice=alloy".parse().expect("URI");
+
+        let replaced = replace_realtime_model_query(&uri, "gpt-4o-mini").expect("rewritten URI");
+
+        assert_eq!(
+            replaced.path_and_query().map(|value| value.as_str()),
+            Some("/v1/realtime?voice=alloy&model=gpt-4o-mini")
+        );
+    }
+
+    #[test]
+    fn realtime_model_override_replaces_duplicates_and_encodes_the_value() {
+        let uri: http::Uri = "/v1/realtime?model=first&voice=alloy&model=second"
+            .parse()
+            .expect("URI");
+
+        let replaced = replace_realtime_model_query(&uri, "gpt 4o/mini").expect("rewritten URI");
+
+        assert_eq!(
+            replaced.path_and_query().map(|value| value.as_str()),
+            Some("/v1/realtime?voice=alloy&model=gpt+4o%2Fmini")
+        );
+    }
+}
+
 /// Stable label for the budget metric `scope` dimension.
 pub(super) fn scope_label(scope: &sbproxy_ai::budget::BudgetScope) -> &'static str {
     match scope {
@@ -1057,6 +1413,7 @@ pub(super) fn scope_label(scope: &sbproxy_ai::budget::BudgetScope) -> &'static s
         sbproxy_ai::budget::BudgetScope::Model => "model",
         sbproxy_ai::budget::BudgetScope::Origin => "origin",
         sbproxy_ai::budget::BudgetScope::Tag => "tag",
+        sbproxy_ai::budget::BudgetScope::Agent => "agent",
     }
 }
 
@@ -1068,49 +1425,6 @@ pub(super) fn scope_label(scope: &sbproxy_ai::budget::BudgetScope) -> &'static s
 pub(super) fn extract_usage(body: &[u8]) -> (u64, u64) {
     let (input, output, _cached, _creation) = extract_usage_full(body);
     (input, output)
-}
-
-/// Parse provider token usage while preserving the distinction between an
-/// explicit zero and a missing/unparseable usage block. Governance needs that
-/// distinction: zero settles the request unit and refunds token holds, while a
-/// billable response with missing usage must retain the conservative ceiling.
-pub(super) fn extract_governance_usage(body: &[u8]) -> Option<(u64, u64)> {
-    let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let usage = parsed.get("usage")?;
-    let prompt = usage
-        .get("prompt_tokens")
-        .or_else(|| usage.get("input_tokens"))
-        .and_then(serde_json::Value::as_u64);
-    let completion = usage
-        .get("completion_tokens")
-        .or_else(|| usage.get("output_tokens"))
-        .and_then(serde_json::Value::as_u64);
-    if prompt.is_none() && completion.is_none() {
-        return None;
-    }
-    let cached = usage
-        .get("prompt_tokens_details")
-        .and_then(|details| details.get("cached_tokens"))
-        .and_then(serde_json::Value::as_u64)
-        .or_else(|| {
-            usage
-                .get("cache_read_input_tokens")
-                .and_then(serde_json::Value::as_u64)
-        })
-        .unwrap_or(0);
-    let creation = usage
-        .get("cache_creation_input_tokens")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    let input = if usage.get("prompt_tokens").is_some() {
-        prompt.unwrap_or(0)
-    } else {
-        prompt
-            .unwrap_or(0)
-            .saturating_add(cached)
-            .saturating_add(creation)
-    };
-    Some((input, completion.unwrap_or(0)))
 }
 
 /// Parse token usage into `(input, output, cached_input, cache_creation)`
@@ -1169,7 +1483,7 @@ pub(super) fn extract_usage_full(body: &[u8]) -> (u64, u64, u64, u64) {
 
 #[cfg(test)]
 mod usage_extract_tests {
-    use super::{extract_governance_usage, extract_usage_full};
+    use super::extract_usage_full;
 
     #[test]
     fn openai_cached_tokens_are_within_prompt() {
@@ -1179,16 +1493,6 @@ mod usage_extract_tests {
         let body = br#"{"usage":{"prompt_tokens":1000,"completion_tokens":50,"prompt_tokens_details":{"cached_tokens":300}}}"#;
         let (input, output, cached, creation) = extract_usage_full(body);
         assert_eq!((input, output, cached, creation), (1000, 50, 300, 0));
-    }
-
-    #[test]
-    fn governance_usage_distinguishes_explicit_zero_from_missing() {
-        assert_eq!(
-            extract_governance_usage(br#"{"usage":{"prompt_tokens":0,"completion_tokens":0}}"#,),
-            Some((0, 0))
-        );
-        assert_eq!(extract_governance_usage(br#"{"usage":{}}"#), None);
-        assert_eq!(extract_governance_usage(b"not-json"), None);
     }
 
     #[test]
@@ -1275,7 +1579,7 @@ pub(super) fn record_ai_response_span_metadata(span: &tracing::Span, body: &[u8]
 /// (OpenAI chat shape), falling back to `choices[].text` (legacy
 /// completions), then runs the canonical token estimator
 /// ([`sbproxy_ai::estimate_tokens`], which uses the model's BPE when
-/// known and a `chars/4` heuristic otherwise). Returns 0 when the body
+/// known and a UTF-8 byte-length heuristic otherwise). Returns 0 when the body
 /// yields no assistant text (so the caller can decide not to debit).
 ///
 /// This is intentionally a coarse safety-net estimate: it only runs on
@@ -1488,9 +1792,7 @@ pub(super) fn build_signature_verification_request(
 }
 
 /// Cache of compiled `MessageSignatureVerifier` instances keyed by
-/// the configuration's memory address. Same pattern as
-/// `cached_guardrails_pipeline`: hot reload swaps in a new config
-/// address, so stale entries fall out of use.
+/// the configuration's memory address.
 pub(super) static MESSAGE_SIGNATURE_VERIFIER_CACHE: std::sync::LazyLock<
     std::sync::Mutex<
         std::collections::HashMap<
@@ -1547,8 +1849,18 @@ pub(super) fn cached_message_signature_verifier(
     }
 }
 
+/// Emit a billing event for a request that no caller agent is
+/// attributable to.
+///
+/// A thin wrapper over [`emit_ai_billing_event`], which is the
+/// real choke point. Kept for the surfaces that bill outside
+/// `handle_ai_proxy` and therefore have no A2A identity in hand, notably
+/// the realtime WebSocket session-close hook in `proxy_http::logging`.
+/// Anything that can reach `ctx.a2a` should call the agent-aware form so
+/// the spend lands on a named agent rather than the unattributed bucket.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_ai_billing_event(
+    origin: &str,
     surface_label: &str,
     provider_name: &str,
     model: Option<String>,
@@ -1558,6 +1870,8 @@ pub(super) fn emit_ai_billing_event(
     tags: &sbproxy_ai::attribution::AttributionTags,
     tenant_id: &str,
     api_key_id: &str,
+    rollup_properties: &std::collections::BTreeMap<String, String>,
+    agent: sbproxy_ai::budget::AgentIdentity<'_>,
     ai_span: &tracing::Span,
 ) -> u64 {
     let cost_usd_micros = cost_usd_to_micros(cost_usd);
@@ -1587,6 +1901,7 @@ pub(super) fn emit_ai_billing_event(
         sbproxy_ai::tracing_spans::record_token_usage(ai_span, input_tokens, output_tokens);
     }
     sbproxy_ai::ai_metrics::record_ai_request_attributed(
+        origin,
         provider_name,
         model_label,
         surface_label,
@@ -1600,14 +1915,6 @@ pub(super) fn emit_ai_billing_event(
         0,
         cost_usd,
     );
-    // WOR-1563: cross-replica per-key spend. Recorded from the single billing
-    // choke point so every surface contributes once; coherent across the fleet
-    // via the mesh CRDT when the mesh tier is on, local otherwise.
-    if !api_key_id.is_empty() {
-        if let Some(counters) = crate::mesh_counters::current_mesh_counters() {
-            counters.record_spend(api_key_id, input_tokens + output_tokens, cost_usd);
-        }
-    }
     // WOR-1213: stamp and count the same exact micro-USD value from
     // the single billing choke point. Dollar-valued span attributes
     // are derived from this integer for trace-backend compatibility.
@@ -1646,12 +1953,20 @@ pub(super) fn emit_ai_billing_event(
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
             dims: sbproxy_observe::usage_rollup::RollupDims {
+                origin: origin.to_string(),
                 provider: provider_name.to_string(),
                 model: model_label.to_string(),
                 tenant: tenant_id.to_string(),
                 team: tags.team.clone().unwrap_or_default(),
                 api_key_id: api_key_id.to_string(),
                 project: tags.project.clone().unwrap_or_default(),
+                // WOR-2140: read off the same `tags.agent_id` the
+                // `agent_id` metric label uses, rather than re-deriving
+                // it from `agent` here. Two derivations is how a
+                // dashboard and a durable rollup end up disagreeing
+                // about which agent spent the money.
+                agent_id: tags.agent_id.clone().unwrap_or_default(),
+                properties: rollup_properties.clone(),
             },
             kind: sbproxy_observe::usage_rollup::RollupKind::Usage {
                 tokens_in: input_tokens,
@@ -1680,12 +1995,12 @@ pub(super) fn emit_ai_billing_event(
     let event =
         sbproxy_ai::budget::AiBillingEvent::from_label(surface_label, provider_name, model, usage)
             .with_cost(cost_usd)
-            .with_scope_keys(scope_keys);
-    // Enforcement accounting is written by `record_budget_usage` (and, for
-    // governed keys, the reservation store) before this observability event is
-    // emitted. Recording the event into `BUDGET_TRACKER` again double-debits
-    // every configured origin scope. Keep the event as the single telemetry
-    // choke point, but never mutate enforcement state here.
+            .with_scope_keys(scope_keys)
+            // WOR-2140: the agent is the unit of cost. Stamped here so
+            // every sink reading the event off the bus sees the same
+            // identity the budget keys were derived from.
+            .with_agent(agent);
+    sbproxy_ai::budget::record_billing_event(&BUDGET_TRACKER, &event);
     // WOR-1809: debug, not info. This fires per billing scope, so one
     // completion can emit a burst of identical lines; the ledger sinks
     // and metrics are the durable record, the log line is a trace.
@@ -1694,6 +2009,11 @@ pub(super) fn emit_ai_billing_event(
         ai.provider = event.provider.as_str(),
         ai.cost_usd = event.cost_usd,
         ai.occurred_at_unix_secs = event.occurred_at_unix_secs,
+        // WOR-2140: `agent_id` is what the caller claimed;
+        // `identity_verified` says whether it was worth believing. Both
+        // are needed to read the line, so neither ships alone.
+        a2a.agent_id = event.agent_id.as_str(),
+        a2a.identity_verified = event.agent_identity_verified,
         "AI billing event"
     );
     cost_usd_micros
@@ -1727,7 +2047,6 @@ fn usage_event_from_context(
 ) -> sbproxy_ai::usage_sink::LlmUsageEvent {
     let prompt_tokens = ctx.ai_tokens_in.unwrap_or(0);
     let completion_tokens = ctx.ai_tokens_out.unwrap_or(0);
-    let api_key_id = ctx.principal.api_key_id();
     sbproxy_ai::usage_sink::LlmUsageEvent {
         provider,
         model: ctx.ai_model.clone().unwrap_or_default(),
@@ -1743,7 +2062,9 @@ fn usage_event_from_context(
             .map(|s| s.elapsed().as_millis() as u64)
             .unwrap_or(0),
         status: ctx.response_status.unwrap_or(0),
-        key_id: (!api_key_id.is_empty()).then(|| api_key_id.to_string()),
+        // WOR-2093: the canonical accountability id, matching every
+        // other per-request surface.
+        key_id: ctx.accountable_key_id().map(str::to_string),
         tenant_id: (!ctx.tenant_id.is_empty()).then(|| ctx.tenant_id.to_string()),
         project: ctx.principal.attrs.project.clone(),
         user: ctx.principal.attrs.user.clone(),
@@ -1751,9 +2072,55 @@ fn usage_event_from_context(
         tags: ctx.principal.attrs.tags.clone(),
         metadata: ctx.principal.attrs.metadata.clone(),
         request_id: (!ctx.request_id.is_empty()).then(|| ctx.request_id.to_string()),
+        session_id: ctx.session_id.map(|id| id.to_string()),
         tag: ctx.ai_policy_sink_tag.clone(),
         priority: ctx.ai_lane_priority.map(|p| p.as_str().to_string()),
+        // WOR-1906: a served (local) request still holds its deployment
+        // permit here, which captured the running engine's version at
+        // route time. Hosted lanes carry no permit, so this stays None.
+        engine_version: ctx
+            .managed_model_permit
+            .as_ref()
+            .and_then(|permit| permit.engine_version()),
+        // WOR-2140: agent-as-unit attribution on the durable, verifiable
+        // record. Unlike the metric label, the ledger keeps the *claimed*
+        // id even when it was not verified, because the money was really
+        // spent and dropping the id would lose that. The trust flag rides
+        // beside it so a per-agent total can filter on it. Capped here at
+        // the same limit every other surface uses, so the ledger, the
+        // span, and the metric cannot name three different agents.
+        agent_id: ctx.a2a.as_ref().and_then(|a2a| {
+            let id = sbproxy_ai::tracing_spans::cap_agent_id(a2a.caller_agent_id.as_str());
+            (!id.is_empty()).then(|| id.to_string())
+        }),
+        // Unlike the agent id, this one *is* reachable by the end of the
+        // request: the A2A `contextId` is stamped at the body phase, and
+        // usage events are emitted from the logging hook, which is after
+        // it. So the ledger carries run identity even on surfaces where
+        // the request span was opened too early to see it (WOR-2144).
+        a2a_context_id: ctx.a2a_context_id.clone(),
+        a2a_identity_verified: ctx.a2a.as_ref().map(|a2a| a2a.identity_verified),
+        // The workflow leg. It already reaches the access log through
+        // the attribution tags, but a per-workflow cost figure that has
+        // to hold up in an argument cannot be assembled by joining a
+        // sampled surface to a rotated one.
+        workflow_id: ctx
+            .attribution_tags
+            .trace_id
+            .clone()
+            .filter(|id| !id.is_empty()),
     }
+}
+
+/// Copy request identity into a shadow-only usage record without touching the
+/// primary billing path. The background shadow task fills provider, model,
+/// tokens, cost, latency, and status before emitting to these same sinks.
+pub(super) fn shadow_usage_record_from_context(
+    ctx: &crate::context::RequestContext,
+) -> Option<sbproxy_ai::client::ShadowUsageRecord> {
+    let sinks = ctx.ai_usage_sinks.as_ref()?.clone();
+    let event = usage_event_from_context(ctx, String::new());
+    Some(sbproxy_ai::client::ShadowUsageRecord::new(event, sinks))
 }
 
 /// WOR-1541: fold this request's realized outcome into the global routing
@@ -1900,6 +2267,7 @@ pub(super) fn record_cache_hit_savings(
         .and_then(serde_json::Value::as_str)
         .unwrap_or(fallback_model);
     sbproxy_ai::ai_metrics::record_ai_request_attributed(
+        origin,
         provider,
         model,
         surface,
@@ -2002,7 +2370,7 @@ pub(super) fn inprocess_embed(
     }
 }
 
-pub(super) fn record_budget_usage(
+pub(crate) fn record_budget_usage(
     cfg: &sbproxy_ai::BudgetConfig,
     keys: &[(usize, String)],
     model: &str,
@@ -2036,26 +2404,25 @@ pub(super) fn req_header_value(session: &Session, name: &str) -> Option<String> 
 }
 
 /// Build a redacted snapshot of the inbound request headers for the
-/// AI hook surface (`ClassifyRequest::headers`,
-/// `LookupRequest::request_headers`).
+/// AI hook surface (`ClassifyRequest::headers`).
 ///
 /// Names are lower-cased to match the HTTP/2 and HTTP/3 framing the
 /// rest of the hook surface assumes. Values that are not valid UTF-8
 /// are dropped silently because the hook contract is `String:String`
 /// and lossy decoding would obscure the real wire bytes from any
 /// implementation that wants to reason about them. Headers whose
-/// lower-cased name appears in [`crate::hooks::REDACTED_REQUEST_HEADERS`]
-/// are dropped before the snapshot is returned so credential carriers
-/// (Authorization, Cookie, Proxy-Authorization) never reach the
-/// classifier or semantic cache.
+/// lower-cased name is sensitive according to the built-in denylist or the
+/// active config's primary inbound credential-carrier union are dropped before
+/// the snapshot is returned.
 ///
 /// The returned map is fresh per call. Callers that fan a single
 /// request out across multiple hooks should build the snapshot once
 /// and clone it.
 pub(super) fn snapshot_request_headers(
     session: &Session,
+    pipeline: &crate::pipeline::CompiledPipeline,
 ) -> std::collections::HashMap<String, String> {
-    snapshot_request_headers_from(session.req_header())
+    snapshot_request_headers_from(session.req_header(), pipeline)
 }
 
 /// Inner form of [`snapshot_request_headers`] that operates on a
@@ -2063,12 +2430,23 @@ pub(super) fn snapshot_request_headers(
 /// `RequestHeader` in-process without a live Pingora session.
 pub(super) fn snapshot_request_headers_from(
     req: &pingora_http::RequestHeader,
+    pipeline: &crate::pipeline::CompiledPipeline,
+) -> std::collections::HashMap<String, String> {
+    snapshot_request_headers_from_with_sensitive(req, |name| pipeline.is_sensitive_header(name))
+}
+
+/// Testable inner snapshot seam. Production passes the active config-aware
+/// sensitive-header predicate; tests can supply a local predicate without
+/// mutating process-global reload state.
+pub(super) fn snapshot_request_headers_from_with_sensitive(
+    req: &pingora_http::RequestHeader,
+    is_sensitive: impl Fn(&str) -> bool,
 ) -> std::collections::HashMap<String, String> {
     let raw = &req.headers;
     let mut out = std::collections::HashMap::with_capacity(raw.len());
     for (name, value) in raw.iter() {
         let lname = name.as_str().to_ascii_lowercase();
-        if crate::hooks::REDACTED_REQUEST_HEADERS.contains(&lname.as_str()) {
+        if is_sensitive(&lname) {
             continue;
         }
         if let Ok(v) = value.to_str() {
@@ -2093,10 +2471,11 @@ pub(super) enum AiIdempotencyEngagement {
     /// origin index missing). The caller proceeds with the upstream
     /// call unchanged.
     NotApplicable,
-    /// Cache hit on a matching body hash. The cached response has
-    /// already been written to the session; the caller short-circuits
-    /// the AI gateway path without contacting the provider.
-    Replayed,
+    /// Cache hit on a matching body hash. The caller owns replay so it
+    /// can enforce the current response policy before writing any bytes.
+    Replayed {
+        response: sbproxy_middleware::idempotency::CachedResponse,
+    },
     /// Cache hit with a different body hash. The 409 conflict body
     /// has already been written to the session. Caller short-circuits.
     Conflict,
@@ -2217,13 +2596,8 @@ pub(super) async fn engage_ai_idempotency(
             // inside the middleware). Treat as a passthrough.
             Ok(AiIdempotencyEngagement::NotApplicable)
         }
-        sbproxy_middleware::idempotency::IdempotencyOutcome::CacheHit(resp) => {
-            // Replay the cached `(status, headers, body)` triple
-            // verbatim. Strip framing headers Pingora will re-derive
-            // for the new client connection so a stale
-            // `transfer-encoding: chunked` does not race the replay.
-            write_ai_cached_response(session, resp.status, &resp.headers, &resp.body).await?;
-            Ok(AiIdempotencyEngagement::Replayed)
+        sbproxy_middleware::idempotency::IdempotencyOutcome::CacheHit(response) => {
+            Ok(AiIdempotencyEngagement::Replayed { response })
         }
         sbproxy_middleware::idempotency::IdempotencyOutcome::Conflict => {
             let (status, content_type, body) = sbproxy_middleware::idempotency::conflict_response();
@@ -2267,6 +2641,7 @@ pub(super) async fn write_ai_cached_response(
             || lname == "connection"
             || lname == "keep-alive"
             || lname == "x-sbproxy-idempotency"
+            || lname == AI_IDEMPOTENCY_BODY_FORMAT_HEADER
         {
             continue;
         }
@@ -2300,9 +2675,8 @@ pub(super) struct AiIdempotencyCapture {
 
 impl AiIdempotencyCapture {
     /// Persist the recorded response under `(workspace_id, key)`.
-    /// `body` is the **post-translation** OpenAI-shape bytes the
-    /// client saw, so retries replay byte-identical to the original
-    /// served response.
+    /// `body` contains the final client-wire bytes after format adaptation
+    /// and reversible restoration, so retries replay byte-identically.
     pub(super) fn record(self, status: u16, headers: Vec<(String, String)>, body: Vec<u8>) {
         sbproxy_middleware::idempotency::record_response(
             self.idem.cache.as_ref(),
@@ -2374,6 +2748,8 @@ pub(super) async fn relay_ai_response_with_idempotency(
     // the body to the client AND before recording it into the
     // idempotency cache.
     reversible_pairs: Vec<(String, String, String)>,
+    ai_span: &tracing::Span,
+    provider_name: &str,
 ) -> Result<()> {
     let status = resp.status().as_u16();
     let content_type = resp
@@ -2388,8 +2764,19 @@ pub(super) async fn relay_ai_response_with_idempotency(
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
     let resp_body = read_capped_response_body(resp, max_body_size).await?;
-    let translated = sbproxy_ai::translators::translate_response_bytes(format, &resp_body);
-    let translated = sbproxy_ai::format::rewrap_response_for_inbound(inbound_format, &translated);
+    let translated =
+        sbproxy_ai::translators::translate_success_response_bytes(format, status, &resp_body);
+    crate::server::ai_dispatch::record_ai_provider_response_failure(
+        ai_span,
+        provider_name,
+        status,
+        Some(&translated),
+    );
+    let translated = sbproxy_ai::format::rewrap_success_response_for_inbound(
+        status,
+        inbound_format,
+        &translated,
+    );
 
     // WOR-1044 PR3: restore reversible PII placeholders before both
     // the cache write and the response send. See
@@ -2441,8 +2828,13 @@ pub(super) async fn relay_ai_response_with_idempotency(
         // we send back: at minimum the content-type so a replay
         // surfaces the same shape. Skip framing headers Pingora will
         // recompute.
-        let headers: Vec<(String, String)> =
-            vec![("content-type".to_string(), content_type.clone())];
+        let headers: Vec<(String, String)> = vec![
+            ("content-type".to_string(), content_type.clone()),
+            (
+                AI_IDEMPOTENCY_BODY_FORMAT_HEADER.to_string(),
+                AI_IDEMPOTENCY_WIRE_BODY_FORMAT.to_string(),
+            ),
+        ];
         cap.record(status, headers, translated_bytes.to_vec());
     }
 
@@ -2551,6 +2943,783 @@ pub(super) fn make_native_bypass_body(
     parsed["model"] = serde_json::Value::String(resolved_model.to_string());
     let remapped = serde_json::to_vec(&parsed)?;
     Ok(bytes::Bytes::from(remapped))
+}
+
+// ============================================================================
+// Semantic cache request identity (WOR-2099)
+// ============================================================================
+//
+// `sbproxy-ai` owns the namespace, key, and configuration digests. Core owns
+// the three inputs only the request boundary can produce: the semantic prompt
+// and its non-prompt request context, the compiled static action policy, and
+// the safe credential identity. Every helper here returns a digest or an
+// already-safe label. A raw prompt, tenant id, credential, header value, or
+// policy body never leaves one of them.
+
+/// Fixed domain for the canonical non-prompt request context digest.
+const SEMANTIC_REQUEST_CONTEXT_DOMAIN: &str = "sbproxy-semcache-request-context-v2";
+
+/// Fixed domain for the compiled static action policy projection.
+const SEMANTIC_STATIC_POLICY_DOMAIN: &str = "sbproxy-semcache-static-policy-v2";
+
+/// Fixed domain for the request-time response policy fence.
+const SEMANTIC_RESPONSE_POLICY_DOMAIN: &str = "sbproxy-semcache-response-policy-v2";
+
+/// Typed sentinel written into the semantic query slot before the request
+/// context is hashed.
+///
+/// It keeps the slot's position and content-block shape inside the canonical
+/// context while the query text itself travels separately, so a paraphrase
+/// finds candidates but a changed system message, tool schema, sampling
+/// control, or asset reference does not.
+const SEMANTIC_QUERY_SENTINEL: &str = "\u{0}sbproxy-semantic-query\u{0}";
+
+/// Closed set of response headers a semantic cache may store and replay.
+///
+/// Everything else is dropped, including cookies, authentication
+/// challenges, request correlation, quota state, and any content coding
+/// that may no longer match the buffered response bytes.
+const SEMANTIC_CACHE_RETAINED_HEADERS: [&str; 2] = ["content-type", "content-language"];
+
+/// Why a semantic identity projection could not be built.
+///
+/// Closed and secret free: an operator sees only that the compiled action
+/// policy could not be canonicalized, never the policy text itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum SemanticIdentityError {
+    /// The compiled action policy for this slot could not be projected into
+    /// a canonical form, so no compatibility fence can be derived from it.
+    #[error("semantic action policy cannot be canonicalized")]
+    InvalidActionPolicy,
+}
+
+/// Deterministic domain-separated digest builder for core-side semantic
+/// identity projections.
+///
+/// The encoding mirrors the one `sbproxy-ai` uses for namespace identity:
+/// the literal domain bytes and one zero byte, then, for every ordered
+/// field, its length as one unsigned 64-bit big-endian integer, the field
+/// bytes, and one zero byte. That fixed framing rules out concatenation
+/// aliases. Nothing fed into it is ever formatted or retained, so a raw
+/// prompt, header, or credential cannot reach a log line from here.
+struct SemanticFieldDigest {
+    hasher: sha2::Sha256,
+}
+
+impl SemanticFieldDigest {
+    /// Open an encoding under one fixed domain label.
+    fn new(domain: &str) -> Self {
+        use sha2::Digest as _;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(domain.as_bytes());
+        hasher.update([0u8]);
+        Self { hasher }
+    }
+
+    /// Append one length-delimited byte field.
+    fn bytes(&mut self, value: &[u8]) -> &mut Self {
+        use sha2::Digest as _;
+        // `usize` is never wider than 64 bits on a supported target, so the
+        // saturating widen is lossless there and keeps the encoder total on
+        // a wider hypothetical target instead of truncating a length prefix.
+        let width = u64::try_from(value.len()).unwrap_or(u64::MAX);
+        self.hasher.update(width.to_be_bytes());
+        self.hasher.update(value);
+        self.hasher.update([0u8]);
+        self
+    }
+
+    /// Append one length-delimited UTF-8 text field.
+    fn text(&mut self, value: &str) -> &mut Self {
+        self.bytes(value.as_bytes())
+    }
+
+    /// Append one 32-byte child digest as raw bytes, never as hexadecimal.
+    fn child(&mut self, value: &[u8; 32]) -> &mut Self {
+        self.bytes(value)
+    }
+
+    /// Append one host-sized count at the fixed 64-bit field width.
+    fn count(&mut self, value: usize) -> &mut Self {
+        let width = u64::try_from(value).unwrap_or(u64::MAX);
+        self.bytes(&width.to_be_bytes())
+    }
+
+    /// Close the encoding and return the digest.
+    fn finish(self) -> [u8; 32] {
+        use sha2::Digest as _;
+        self.hasher.finalize().into()
+    }
+}
+
+/// Feed one JSON value into a digest in a canonical, order-independent form.
+///
+/// Objects are visited in sorted key order, so a map that serializes its
+/// keys in a different order still digests identically. Every value carries
+/// a fixed type tag and every container carries its length, so a string, a
+/// number, and a boolean with the same rendering cannot alias each other and
+/// no nesting rearrangement can collide.
+fn digest_canonical_json(digest: &mut SemanticFieldDigest, value: &serde_json::Value) {
+    match value {
+        serde_json::Value::Null => {
+            digest.text("null");
+        }
+        serde_json::Value::Bool(flag) => {
+            digest.text("bool").bytes(&[u8::from(*flag)]);
+        }
+        serde_json::Value::Number(number) => {
+            digest.text("number").text(&number.to_string());
+        }
+        serde_json::Value::String(text) => {
+            digest.text("string").text(text);
+        }
+        serde_json::Value::Array(items) => {
+            digest.text("array").count(items.len());
+            for item in items {
+                digest_canonical_json(digest, item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            digest.text("object").count(map.len());
+            let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            for key in keys {
+                digest.text("key").text(key);
+                if let Some(child) = map.get(key) {
+                    digest_canonical_json(digest, child);
+                }
+            }
+        }
+    }
+}
+
+/// The semantic query plus a digest of everything else in the request.
+///
+/// `text` is the only value handed to the embedding source and to the prompt
+/// digest. `request_context_digest` fences reuse across different
+/// instructions, history, tools, sampling controls, or assets.
+pub(super) struct SemanticPromptInput {
+    /// Semantic query text, empty when the body has no unambiguous slot.
+    pub text: String,
+    /// Digest of the canonical request with the query slot replaced.
+    pub request_context_digest: [u8; 32],
+}
+
+/// Split one canonical AI request into its semantic query and its context.
+///
+/// Call this after canonical request translation, any retrieval context
+/// injection, and the final input guardrail pass, so retrieved context is
+/// part of the context digest while the final user query stays the text sent
+/// to the embedding source. `extract_prompt_text` keeps its full system,
+/// history, tool, and asset representation for guardrails, classifiers,
+/// tracing, and policy; this helper is only for semantic identity.
+///
+/// An ambiguous or batch-shaped body yields empty text and leaves the whole
+/// body in context, which the request path treats as "skip semantic
+/// caching" rather than as a body with no context.
+pub(super) fn extract_semantic_prompt(body: &serde_json::Value) -> SemanticPromptInput {
+    let mut normalized = body.clone();
+    let text = replace_semantic_query_slot(&mut normalized);
+    let mut digest = SemanticFieldDigest::new(SEMANTIC_REQUEST_CONTEXT_DOMAIN);
+    digest_canonical_json(&mut digest, &normalized);
+    SemanticPromptInput {
+        text,
+        request_context_digest: digest.finish(),
+    }
+}
+
+/// Replace the semantic query slot with the sentinel and return its text.
+///
+/// Returns an empty string, and leaves `body` untouched, when no single
+/// slot can be identified.
+fn replace_semantic_query_slot(body: &mut serde_json::Value) -> String {
+    if let Some(messages) = body.get_mut("messages").and_then(|v| v.as_array_mut()) {
+        if let Some(turn) = messages
+            .iter_mut()
+            .rev()
+            .find(|turn| turn.get("role").and_then(|r| r.as_str()) == Some("user"))
+        {
+            if let Some(content) = turn.get_mut("content") {
+                return replace_content_query_slot(content);
+            }
+        }
+        return String::new();
+    }
+    if let Some(input) = body.get_mut("input") {
+        if input.is_string() || input.is_array() {
+            return replace_responses_input_query_slot(input);
+        }
+        return String::new();
+    }
+    if let Some(prompt) = body.get_mut("prompt") {
+        if prompt.is_string() {
+            return replace_string_query_slot(prompt);
+        }
+    }
+    String::new()
+}
+
+/// Replace the query text inside one OpenAI Responses `input` field.
+fn replace_responses_input_query_slot(input: &mut serde_json::Value) -> String {
+    if input.is_string() {
+        return replace_string_query_slot(input);
+    }
+    let Some(items) = input.as_array_mut() else {
+        return String::new();
+    };
+    let Some(item) = items
+        .iter_mut()
+        .rev()
+        .find(|item| item.get("role").and_then(|r| r.as_str()) == Some("user"))
+    else {
+        return String::new();
+    };
+    match item.get_mut("content") {
+        Some(content) => replace_content_query_slot(content),
+        None => String::new(),
+    }
+}
+
+/// Replace every text-bearing part of one message content field.
+///
+/// A string content is replaced wholesale. An array content keeps its block
+/// shape, so a final-turn image, audio, or file reference stays in the
+/// canonical context while only its sibling text parts move to the query.
+fn replace_content_query_slot(content: &mut serde_json::Value) -> String {
+    if content.is_string() {
+        return replace_string_query_slot(content);
+    }
+    let Some(parts) = content.as_array_mut() else {
+        return String::new();
+    };
+    let mut collected: Vec<String> = Vec::new();
+    for part in parts.iter_mut() {
+        let Some(object) = part.as_object_mut() else {
+            continue;
+        };
+        let Some(text) = object.get_mut("text") else {
+            continue;
+        };
+        let replaced = replace_string_query_slot(text);
+        if !replaced.is_empty() {
+            collected.push(replaced);
+        }
+    }
+    collected.join("\n")
+}
+
+/// Take one string value and leave the typed sentinel behind.
+fn replace_string_query_slot(slot: &mut serde_json::Value) -> String {
+    let Some(text) = slot.as_str() else {
+        return String::new();
+    };
+    let text = text.to_string();
+    *slot = serde_json::Value::String(SEMANTIC_QUERY_SENTINEL.to_string());
+    text
+}
+
+/// Digest the compiled static action policy for one routed slot.
+///
+/// `forward_rule_idx: None` addresses the origin's main action; `Some(index)`
+/// addresses one of its forward rules and covers that rule's matchers,
+/// modifiers, and inline origin, so a forward rule can never share a fence
+/// with the origin it hangs off.
+///
+/// The selected action's own `semantic_cache` block is removed before the
+/// projection is hashed. `semantic_configuration_digest` already owns that
+/// block's behavior and does so without the credential values and
+/// memory-only tuning the raw action carries; leaving the raw block here
+/// would put both back into distributed compatibility identity.
+///
+/// The origin compression block stays in the projection even though a
+/// compressed session bypasses lookup, because a change to response
+/// representation policy must not share a static response fence.
+pub(crate) fn semantic_static_action_policy_digest(
+    origin: &sbproxy_config::CompiledOrigin,
+    forward_rule_idx: Option<usize>,
+) -> Result<[u8; 32], SemanticIdentityError> {
+    let (slot_tag, action) = match forward_rule_idx {
+        None => (
+            "main".to_string(),
+            action_without_semantic_cache(&origin.action_config),
+        ),
+        Some(index) => {
+            let rule = origin
+                .forward_rules
+                .get(index)
+                .ok_or(SemanticIdentityError::InvalidActionPolicy)?;
+            (
+                format!("forward_rule:{index}"),
+                forward_rule_without_semantic_cache(rule),
+            )
+        }
+    };
+    let response_modifiers = serde_json::to_value(origin.response_modifiers.as_slice())
+        .map_err(|_| SemanticIdentityError::InvalidActionPolicy)?;
+    let compression = serde_json::to_value(origin.compression.as_ref())
+        .map_err(|_| SemanticIdentityError::InvalidActionPolicy)?;
+    let auto_content_negotiate = origin
+        .auto_content_negotiate
+        .clone()
+        .unwrap_or(serde_json::Value::Null);
+
+    let mut digest = SemanticFieldDigest::new(SEMANTIC_STATIC_POLICY_DOMAIN);
+    digest.text(&slot_tag);
+    digest.text("action");
+    digest_canonical_json(&mut digest, &action);
+    digest.text("policies").count(origin.policy_configs.len());
+    for policy in &origin.policy_configs {
+        digest_canonical_json(&mut digest, policy);
+    }
+    digest
+        .text("transforms")
+        .count(origin.transform_configs.len());
+    for transform in &origin.transform_configs {
+        digest_canonical_json(&mut digest, transform);
+    }
+    digest.text("auth");
+    let auth = origin
+        .auth_config
+        .clone()
+        .unwrap_or(serde_json::Value::Null);
+    digest_canonical_json(&mut digest, &auth);
+    digest.text("response_modifiers");
+    digest_canonical_json(&mut digest, &response_modifiers);
+    digest.text("compression");
+    digest_canonical_json(&mut digest, &compression);
+    digest.text("auto_content_negotiate");
+    digest_canonical_json(&mut digest, &auto_content_negotiate);
+    digest
+        .text("content_signal")
+        .text(origin.content_signal.unwrap_or(""));
+    Ok(digest.finish())
+}
+
+/// One action projection with its own `semantic_cache` block removed.
+fn action_without_semantic_cache(action: &serde_json::Value) -> serde_json::Value {
+    let mut action = action.clone();
+    if let Some(object) = action.as_object_mut() {
+        object.remove("semantic_cache");
+    }
+    action
+}
+
+/// One forward rule with only its nested inline action's `semantic_cache`
+/// block removed.
+///
+/// Matchers, request and response modifiers, and every other
+/// behavior-bearing field of the rule stay in the projection.
+fn forward_rule_without_semantic_cache(rule: &serde_json::Value) -> serde_json::Value {
+    let mut rule = rule.clone();
+    if let Some(action) = rule
+        .get_mut("origin")
+        .and_then(|origin| origin.get_mut("action"))
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        action.remove("semantic_cache");
+    }
+    rule
+}
+
+/// Combine the compiled static fence with the request-pinned governed
+/// policy revision and the API surface.
+///
+/// Only the resulting digest reaches namespace construction, so a governed
+/// key's policy generation fences replay without the request path reparsing
+/// or rehashing the policy itself.
+pub(super) fn semantic_response_policy_digest(
+    static_action_policy_digest: &[u8; 32],
+    governed_policy_revision: &str,
+    api_surface: &str,
+) -> [u8; 32] {
+    let mut digest = SemanticFieldDigest::new(SEMANTIC_RESPONSE_POLICY_DOMAIN);
+    digest
+        .child(static_action_policy_digest)
+        .text(governed_policy_revision)
+        .text(api_surface);
+    digest.finish()
+}
+
+/// Build the safe credential identity for this request's scope digest.
+///
+/// Selection follows one fixed order: the API key identifier when it is
+/// nonempty, then the principal source with a nonempty subject, then the
+/// SHA-256 of the authorization value when a header exists, then the fixed
+/// anonymous marker. The raw authorization value is hashed before it leaves
+/// this function and is never returned, logged, or metered.
+pub(super) fn semantic_credential_identity(
+    session: &Session,
+    principal: &sbproxy_plugin::Principal,
+) -> String {
+    let authorization = req_header_value(session, "authorization");
+    sbproxy_ai::semantic_cache::semantic_credential_identity(
+        principal.api_key_id(),
+        principal.source.as_str(),
+        principal.sub.as_str(),
+        authorization.as_deref(),
+    )
+}
+
+/// Project upstream response headers down to the closed set a semantic
+/// cache may store and replay.
+///
+/// Names are matched case-insensitively and written back in their canonical
+/// lowercase form. Values are validated through the HTTP header parsers and
+/// capped by the semantic wire constants, and the result is deduplicated and
+/// sorted by name. Apply this both before storage and again to a decoded
+/// hit, so a tampered distributed value cannot turn an allowlisted name into
+/// an invalid response header.
+///
+/// A cached response must not replay a prior caller's cookie, challenge,
+/// request id, quota state, trace correlation, or a content encoding that no
+/// longer matches the buffered bytes, so everything outside the allowlist is
+/// dropped rather than sanitized.
+pub(super) fn semantic_cache_response_headers(
+    headers: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut retained: Vec<(String, String)> = Vec::new();
+    let mut total = 0usize;
+    for (name, value) in headers {
+        let Some(canonical) = SEMANTIC_CACHE_RETAINED_HEADERS
+            .iter()
+            .copied()
+            .find(|allowed| name.eq_ignore_ascii_case(allowed))
+        else {
+            continue;
+        };
+        if canonical.len() > sbproxy_ai::semantic_cache::MAX_SEMANTIC_HEADER_NAME_BYTES
+            || value.len() > sbproxy_ai::semantic_cache::MAX_SEMANTIC_HEADER_VALUE_BYTES
+        {
+            continue;
+        }
+        // A value carrying control bytes is rejected outright rather than
+        // trimmed, because a trimmed value is a different header.
+        if http::HeaderName::from_bytes(canonical.as_bytes()).is_err()
+            || http::HeaderValue::from_str(value).is_err()
+        {
+            continue;
+        }
+        if retained.iter().any(|(existing, _)| existing == canonical) {
+            continue;
+        }
+        let Some(next_total) = total
+            .checked_add(canonical.len())
+            .and_then(|sum| sum.checked_add(value.len()))
+        else {
+            continue;
+        };
+        if next_total > sbproxy_ai::semantic_cache::MAX_SEMANTIC_TOTAL_HEADER_BYTES
+            || retained.len() >= sbproxy_ai::semantic_cache::MAX_SEMANTIC_RESPONSE_HEADERS
+        {
+            continue;
+        }
+        total = next_total;
+        retained.push((canonical.to_string(), value.clone()));
+    }
+    retained.sort_by(|left, right| left.0.cmp(&right.0));
+    retained
+}
+
+#[cfg(test)]
+mod semantic_identity_tests {
+    use super::*;
+
+    /// Sentinels that must never survive the header projection.
+    const DROPPED_HEADERS: [&str; 19] = [
+        "connection",
+        "transfer-encoding",
+        "content-length",
+        "set-cookie",
+        "set-cookie2",
+        "www-authenticate",
+        "proxy-authenticate",
+        "authentication-info",
+        "retry-after",
+        "date",
+        "age",
+        "server",
+        "vary",
+        "etag",
+        "x-ratelimit-remaining",
+        "ratelimit-reset",
+        "x-request-id",
+        "traceparent",
+        "server-timing",
+    ];
+
+    fn pairs(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+        entries
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn semantic_cache_response_headers_retains_only_the_closed_set() {
+        let retained = semantic_cache_response_headers(&pairs(&[
+            ("Content-Type", "application/json"),
+            ("content-language", "en-US"),
+        ]));
+        assert_eq!(
+            retained,
+            vec![
+                ("content-language".to_string(), "en-US".to_string()),
+                ("content-type".to_string(), "application/json".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn semantic_cache_response_headers_drops_every_unlisted_field() {
+        let mut headers: Vec<(String, String)> = DROPPED_HEADERS
+            .iter()
+            .map(|name| ((*name).to_string(), "sentinel".to_string()))
+            .collect();
+        headers.push((
+            "x-vendor-experiment".to_string(),
+            "unrecognized".to_string(),
+        ));
+        headers.push(("content-encoding".to_string(), "gzip".to_string()));
+        assert!(semantic_cache_response_headers(&headers).is_empty());
+    }
+
+    #[test]
+    fn semantic_cache_response_headers_deduplicates_and_rejects_control_bytes() {
+        let retained = semantic_cache_response_headers(&pairs(&[
+            ("content-type", "application/json"),
+            ("Content-Type", "text/plain"),
+            ("content-language", "en\u{0}US"),
+        ]));
+        assert_eq!(
+            retained,
+            vec![("content-type".to_string(), "application/json".to_string())],
+            "a duplicate keeps the first value and a control byte is dropped"
+        );
+    }
+
+    #[test]
+    fn semantic_cache_response_headers_rejects_an_oversized_value() {
+        let oversized = "a".repeat(sbproxy_ai::semantic_cache::MAX_SEMANTIC_HEADER_VALUE_BYTES + 1);
+        let retained = semantic_cache_response_headers(&[("content-type".to_string(), oversized)]);
+        assert!(retained.is_empty());
+    }
+
+    #[test]
+    fn semantic_credential_identity_prefers_the_api_key_id() {
+        let identity = sbproxy_ai::semantic_cache::semantic_credential_identity(
+            "key_01",
+            "virtual_key",
+            "subject-secret-a",
+            Some("Bearer secret-value"),
+        );
+        assert_eq!(identity, "api_key_id:key_01");
+        assert!(!identity.contains("secret-value"));
+    }
+
+    #[test]
+    fn semantic_credential_identity_falls_back_through_subject_then_authorization() {
+        let subject = sbproxy_ai::semantic_cache::semantic_credential_identity(
+            "",
+            "jwt",
+            "subject-secret-a",
+            Some("Bearer secret-value"),
+        );
+        assert_eq!(subject, "principal:jwt:subject-secret-a");
+
+        let authorization = sbproxy_ai::semantic_cache::semantic_credential_identity(
+            "",
+            "bearer",
+            "",
+            Some("Bearer secret-value"),
+        );
+        assert!(authorization.starts_with("authorization:"));
+        assert!(!authorization.contains("secret-value"));
+
+        let anonymous =
+            sbproxy_ai::semantic_cache::semantic_credential_identity("", "plugin", "", None);
+        assert_eq!(
+            anonymous,
+            sbproxy_ai::semantic_cache::SEMANTIC_ANONYMOUS_CREDENTIAL
+        );
+    }
+
+    #[test]
+    fn extract_semantic_prompt_takes_the_final_user_turn_and_keeps_the_rest_in_context() {
+        let base = serde_json::json!({
+            "model": "gpt-4o-mini",
+            "temperature": 0.2,
+            "messages": [
+                {"role": "system", "content": "be terse"},
+                {"role": "user", "content": "what is the refund policy"}
+            ]
+        });
+        let extracted = extract_semantic_prompt(&base);
+        assert_eq!(extracted.text, "what is the refund policy");
+
+        let mut paraphrased = base.clone();
+        paraphrased["messages"][1]["content"] =
+            serde_json::json!("how do refunds work around here");
+        let paraphrase = extract_semantic_prompt(&paraphrased);
+        assert_ne!(paraphrase.text, extracted.text);
+        assert_eq!(
+            paraphrase.request_context_digest, extracted.request_context_digest,
+            "a paraphrase of the query must keep the same context"
+        );
+
+        let mut resystemed = base.clone();
+        resystemed["messages"][0]["content"] = serde_json::json!("be verbose");
+        let resystemed = extract_semantic_prompt(&resystemed);
+        assert_eq!(resystemed.text, extracted.text);
+        assert_ne!(
+            resystemed.request_context_digest, extracted.request_context_digest,
+            "a changed system message must fence reuse"
+        );
+
+        let mut sampled = base.clone();
+        sampled["temperature"] = serde_json::json!(0.9);
+        assert_ne!(
+            extract_semantic_prompt(&sampled).request_context_digest,
+            extracted.request_context_digest
+        );
+    }
+
+    #[test]
+    fn extract_semantic_prompt_keeps_a_final_turn_asset_in_context() {
+        let with_image = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe this"},
+                    {"type": "image_url", "image_url": {"url": "https://example/a.png"}}
+                ]
+            }]
+        });
+        let first = extract_semantic_prompt(&with_image);
+        assert_eq!(first.text, "describe this");
+
+        let mut other_image = with_image.clone();
+        other_image["messages"][0]["content"][1]["image_url"]["url"] =
+            serde_json::json!("https://example/b.png");
+        assert_ne!(
+            extract_semantic_prompt(&other_image).request_context_digest,
+            first.request_context_digest
+        );
+    }
+
+    #[test]
+    fn extract_semantic_prompt_is_stable_across_object_key_order() {
+        let first = extract_semantic_prompt(&serde_json::json!({
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "hello"}]
+        }));
+        let second = extract_semantic_prompt(&serde_json::json!({
+            "messages": [{"content": "hello", "role": "user"}],
+            "model": "gpt-4o-mini"
+        }));
+        assert_eq!(first.request_context_digest, second.request_context_digest);
+    }
+
+    #[test]
+    fn extract_semantic_prompt_skips_an_ambiguous_body() {
+        let extracted = extract_semantic_prompt(&serde_json::json!({
+            "model": "gpt-4o-mini",
+            "requests": [{"prompt": "batch one"}, {"prompt": "batch two"}]
+        }));
+        assert!(extracted.text.is_empty());
+    }
+
+    #[test]
+    fn semantic_request_context_ignores_the_query_text_entirely() {
+        let first = extract_semantic_prompt(&serde_json::json!({
+            "messages": [{"role": "user", "content": "refund policy"}]
+        }));
+        let second = extract_semantic_prompt(&serde_json::json!({
+            "messages": [{"role": "user", "content": "a completely different question"}]
+        }));
+        assert_ne!(first.text, second.text);
+        assert_eq!(
+            first.request_context_digest, second.request_context_digest,
+            "the context digest must be built from the sentinel, never the query"
+        );
+    }
+
+    fn origin_with(action: serde_json::Value) -> sbproxy_config::CompiledOrigin {
+        let source = serde_json::json!({
+            "origins": {"digest.test": {"action": action}}
+        });
+        let compiled =
+            sbproxy_config::compile_config(&source.to_string()).expect("compile digest origin");
+        compiled
+            .origins
+            .into_iter()
+            .next()
+            .expect("one compiled origin")
+    }
+
+    #[test]
+    fn static_action_policy_projection_excludes_the_semantic_cache_block() {
+        let without = origin_with(serde_json::json!({
+            "type": "ai_proxy",
+            "providers": []
+        }));
+        let with = origin_with(serde_json::json!({
+            "type": "ai_proxy",
+            "providers": [],
+            "semantic_cache": {
+                "enabled": true,
+                "threshold": 0.95,
+                "embedding": {"provider": "openai", "model": "text-embedding-3-small"}
+            }
+        }));
+        assert_eq!(
+            semantic_static_action_policy_digest(&without, None).expect("projection"),
+            semantic_static_action_policy_digest(&with, None).expect("projection"),
+            "semantic_configuration_digest owns the semantic block, not this fence"
+        );
+    }
+
+    #[test]
+    fn static_action_policy_digest_changes_with_action_behavior() {
+        let base = origin_with(serde_json::json!({
+            "type": "ai_proxy",
+            "providers": []
+        }));
+        let changed = origin_with(serde_json::json!({
+            "type": "ai_proxy",
+            "providers": [{"name": "openai", "api_key": "test"}]
+        }));
+        assert_ne!(
+            semantic_static_action_policy_digest(&base, None).expect("projection"),
+            semantic_static_action_policy_digest(&changed, None).expect("projection"),
+        );
+    }
+
+    #[test]
+    fn static_action_policy_digest_rejects_a_missing_forward_rule() {
+        let origin = origin_with(serde_json::json!({"type": "ai_proxy", "providers": []}));
+        assert_eq!(
+            semantic_static_action_policy_digest(&origin, Some(0)),
+            Err(SemanticIdentityError::InvalidActionPolicy)
+        );
+    }
+
+    #[test]
+    fn semantic_response_policy_digest_fences_revision_and_surface() {
+        let static_digest = [7u8; 32];
+        let base = semantic_response_policy_digest(&static_digest, "rev-1", "chat_completions");
+        assert_ne!(
+            base,
+            semantic_response_policy_digest(&static_digest, "rev-2", "chat_completions")
+        );
+        assert_ne!(
+            base,
+            semantic_response_policy_digest(&static_digest, "rev-1", "responses")
+        );
+        assert_ne!(
+            base,
+            semantic_response_policy_digest(&[8u8; 32], "rev-1", "chat_completions")
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2771,7 +3940,18 @@ mod ai_response_span_metadata_tests {
 
 #[cfg(test)]
 mod governed_usage_attribution_tests {
-    use super::usage_event_from_context;
+    use super::{shadow_usage_record_from_context, usage_event_from_context};
+
+    #[derive(Debug)]
+    struct NoopUsageSink;
+
+    impl sbproxy_ai::usage_sink::UsageSink for NoopUsageSink {
+        fn record(&self, _event: &sbproxy_ai::usage_sink::LlmUsageEvent) {}
+
+        fn name(&self) -> &str {
+            "noop"
+        }
+    }
 
     #[test]
     fn usage_event_uses_immutable_key_identity_and_safe_policy_attribution() {
@@ -2816,6 +3996,21 @@ mod governed_usage_attribution_tests {
             Some("cc-42")
         );
         assert_ne!(event.key_id.as_deref(), Some("mutable display name"));
+    }
+
+    #[test]
+    fn shadow_usage_record_reuses_configured_sinks_only() {
+        let mut ctx = crate::context::RequestContext::new();
+        assert!(
+            shadow_usage_record_from_context(&ctx).is_none(),
+            "an origin without usage sinks must not create shadow accounting work"
+        );
+
+        ctx.ai_usage_sinks = Some(vec![std::sync::Arc::new(NoopUsageSink)]);
+        assert!(
+            shadow_usage_record_from_context(&ctx).is_some(),
+            "shadow accounting must fan out through the origin's existing sinks"
+        );
     }
 }
 
@@ -2894,7 +4089,17 @@ mod budget_window_tests {
             soft_landing: None,
         };
         let now = 100_000u64;
-        let keys = budget_scope_keys_at(&cfg, "host", None, None, None, None, None, now);
+        let keys = budget_scope_keys_at(
+            &cfg,
+            "host",
+            None,
+            None,
+            None,
+            None,
+            None,
+            sbproxy_ai::budget::AgentIdentity::default(),
+            now,
+        );
         assert_eq!(keys.len(), 3);
         assert_ne!(keys[0].1, keys[1].1);
         assert_ne!(keys[0].1, keys[2].1);
@@ -2902,7 +4107,17 @@ mod budget_window_tests {
         // The cumulative limit keeps the bare scope key.
         assert_eq!(keys[2].1, "workspace:host");
         // The daily key rolls to a new bucket in the next window...
-        let later = budget_scope_keys_at(&cfg, "host", None, None, None, None, None, now + 86_400);
+        let later = budget_scope_keys_at(
+            &cfg,
+            "host",
+            None,
+            None,
+            None,
+            None,
+            None,
+            sbproxy_ai::budget::AgentIdentity::default(),
+            now + 86_400,
+        );
         assert_ne!(keys[0].1, later[0].1);
         // ...while the cumulative key never rolls.
         assert_eq!(keys[2].1, later[2].1);

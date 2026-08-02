@@ -13,7 +13,8 @@ A single OpenAI-compatible endpoint that sits in front of your model providers. 
 
 ## Install
 
-One line installs the prebuilt binary on macOS or Linux; no toolchain required:
+One line installs the prebuilt binary on Linux amd64/arm64 or Apple Silicon
+macOS; no toolchain is required:
 
 ```bash
 curl -fsSL https://download.sbproxy.dev | sh

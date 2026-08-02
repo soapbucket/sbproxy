@@ -1,6 +1,6 @@
 # SBproxy scripting reference: CEL, Lua, JavaScript, and WASM
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-01*
 
 SBproxy includes four scripting engines for custom logic: CEL (Common Expression Language), Lua, JavaScript, and WASM. All run in sandboxed environments with access to request context.
 
@@ -77,6 +77,7 @@ The CEL context is built per request. Every namespace below is available to `exp
 | `request.agent_purpose` | string | Operator-stated purpose (`training`, `search`, `assistant`, ...) |
 | `request.agent_id_source` | string | Which resolver signal matched (`bot_auth`, `rdns`, `user_agent`, `anonymous_bot_auth`, `fallback`) |
 | `request.agent_rdns_hostname` | string | Forward-confirmed reverse-DNS hostname when the rDNS path matched |
+| `request.trust_tier` | string | Conservative identity tier: `suspicious`, `strong`, `named`, or `anonymous` |
 | `request.aipref.train` | bool | Parsed `aipref:` header, training axis (default `true`) |
 | `request.aipref.search` | bool | Search axis (default `true`) |
 | `request.aipref.ai_input` | bool | Inference-input axis (default `true`) |
@@ -88,7 +89,19 @@ The CEL context is built per request. Every namespace below is available to `exp
 
 > Header normalization: header keys are lowercased only; hyphens are preserved. Always use bracket notation: `request.headers["content-type"]`, not `request.headers["Content-Type"]` or `request.headers.content_type`.
 
-Enterprise builds additionally populate `request.kya.*` (Know-Your-Agent verifier verdict) and `request.ml_classification.*` (ML agent classifier verdict) when those subsystems run.
+`request.kya.*` (Know-Your-Agent verifier verdict) and
+`request.ml_classification.*` (ML agent classifier verdict) are available when their
+respective subsystems run.
+
+The trust tier is computed once after identity enrichment and authentication.
+An observed denial wins over positive evidence; verified Web Bot Auth, CAP,
+KYA, or another signed agent verdict is `strong`; a sufficiently confident
+unsigned rule-pack identity is `named`; and missing evidence is `anonymous`.
+For example:
+
+```cel
+request.trust_tier == "strong" || request.trust_tier == "named"
+```
 
 #### `connection` - peer information
 
@@ -198,9 +211,13 @@ CEL includes the standard operators (`+`, `-`, `*`, `/`, `%`, `in`, `==`, `!=`, 
 | `flag_enabled(name, key)` | bool | Resolve a feature flag against the live flag store; unknown flags evaluate false |
 | `tls_fingerprint_matches(ja4, agent_class_id)` | bool | True when `ja4` is a known fingerprint for the catalogued agent class, or when the catalogue has no entry for the class (conservative) |
 
+`flag_enabled` reads the process-wide set declared by the top-level `flags:` block. Its second argument is the stable bucketing key; use a user, tenant, or subject identifier rather than a random request ID. Successful hot reloads replace the full flag set atomically, and an absent `flags:` block clears it. Unknown flags evaluate to `false`. See [Edge feature flags](feature-flags.md) for the rule grammar.
+
 ### 3.3 CEL policy examples
 
 The scripted request gate is the `expression` policy. It takes one CEL expression; `false` (or an evaluation error) denies the request with `deny_status` (default 403) and `deny_message`.
+
+The expression is compiled once, when the config compiles. An expression that does not parse rejects the whole config: at boot the proxy refuses to start, and on a hot reload the candidate config is rejected and the previously active config keeps serving traffic. The error names the origin, the policy, and the bad expression. At request time only evaluation can fail, and an evaluation error (a missing map key, a non-boolean result) denies the request: the expression could not prove the request is allowed.
 
 #### Gate a route on a header value
 
@@ -405,7 +422,7 @@ end
 
 On both paths, the only field the proxy applies from the returned table is `set_headers`: a map of header name to string value, inserted onto the upstream request or the client response. Lua modifiers cannot change the path, method, query, status, or body; use the typed modifier fields for those (section 7).
 
-A legacy Go-style request script that defines `match_request(req, ctx)` and calls `req:set_header(name, value)` also works: the proxy falls back to it when `modify_request` is not defined.
+A legacy request script that defines `match_request(req, ctx)` and calls `req:set_header(name, value)` also works: the proxy falls back to it when `modify_request` is not defined.
 
 ### 4.2 Context tables
 
@@ -416,9 +433,13 @@ req.method    -- "GET", "POST", ...
 req.path      -- "/api/users"
 req.headers   -- table, keys lowercase
 req.host      -- the origin hostname that routed the request
+req.tls.ja3   -- TLS fingerprints, empty strings on plain HTTP
+req.tls.ja4
+req.tls.ja4h
+req.tls.trustworthy  -- boolean, false when no fingerprint was captured
 ```
 
-That is the full request surface. Anything else you need (client IP, agent class, claims) has to arrive as a header or be handled in CEL, where the wider namespace lives.
+Anything else you need (client IP, agent class) has to arrive as a header or be handled in CEL, where the wider namespace lives. Caller identity is on `ctx.principal`, below.
 
 #### `resp` (response modifiers)
 
@@ -429,15 +450,30 @@ resp.headers      -- response headers table
 
 #### `ctx` (second argument)
 
-Response modifiers and JSON transforms receive a context table carrying the parsed aipref signal:
+Request modifiers, response modifiers, and the Lua / JavaScript JSON transforms all receive the same context table. It carries the parsed aipref signal, the TLS fingerprint, and the unified caller identity:
 
 ```lua
 ctx.request.aipref.train     -- boolean, default true
 ctx.request.aipref.search    -- boolean, default true
 ctx.request.aipref.ai_input  -- boolean, default true
+
+ctx.request.tls.ja4          -- same fields as req.tls above
+
+ctx.principal.tenant_id      -- tenant the request resolved to
+ctx.principal.sub            -- subject id, "" for anonymous callers
+ctx.principal.source         -- provider slug ("jwt", "virtual_key", ...)
+ctx.principal.virtual_key.name
+ctx.principal.virtual_key.allowed_providers  -- list
+ctx.principal.attrs.project  -- attribution fields, "" when unset
+ctx.principal.attrs.user
+ctx.principal.attrs.team
+ctx.principal.attrs.tags     -- list
+ctx.principal.attrs.metadata -- map
+ctx.principal.attrs.roles    -- list
+ctx.principal.claims         -- verbatim JWT/OIDC claims map, {} otherwise
 ```
 
-Request modifiers currently receive an empty `ctx` table.
+The `principal` shape is field-for-field the CEL `principal.*` namespace from section 3.1, so a policy written for CEL ports to Lua or JavaScript by swapping the dot paths. Empty and missing values render as empty strings, lists, and maps rather than being omitted, so a script can branch on `ctx.principal.attrs.team` without probing for presence first.
 
 ### 4.3 JSON helpers
 
@@ -634,21 +670,17 @@ transforms:
       }
 ```
 
-The `ctx` argument carries `ctx.request.aipref.train`, `ctx.request.aipref.search`, and `ctx.request.aipref.ai_input`, each defaulting to `true` when the request has no valid `aipref` header.
+The `ctx` argument carries the same context table as the Lua surfaces in section 4.2: `ctx.request.aipref.*` (each flag defaulting to `true` when the request has no valid `aipref` header), `ctx.request.tls.*` (JA3/JA4/JA4H fingerprints, empty strings on plain HTTP), and `ctx.principal.*` (the unified caller identity, mirroring the CEL `principal.*` namespace from section 3.1).
 
-Sandbox limits live under `proxy.scripting.javascript.sandbox`:
+QuickJS always runs with a sandbox: a 100 ms CPU budget, 16 MiB heap cap, and
+1 MiB native-stack cap. A script that exceeds the CPU budget is aborted by a
+watchdog with an uncatchable exception; the modifier or transform is skipped
+and the error is logged.
 
-```yaml
-proxy:
-  scripting:
-    javascript:
-      sandbox:
-        budget_ms: 100    # CPU time budget per invocation
-        memory_mb: 16     # QuickJS heap cap
-        stack_kb: 1024    # native stack cap
-```
-
-A script that exceeds `budget_ms` is aborted by a watchdog with an uncatchable exception; the modifier or transform is skipped and the error is logged.
+The `proxy.scripting.javascript.sandbox` YAML subtree remains parseable for
+compatibility but is not installed into `JsEngine::new` today, so changing
+those YAML values does not tune the live engine. Rust integrations that
+construct `JsEngine::with_sandbox` directly can supply different limits.
 
 ---
 
@@ -657,6 +689,8 @@ A script that exceeds `budget_ms` is aborted by a watchdog with an uncatchable e
 WASM modules run in `wasmtime` against the WASI preview-1 ABI. The host pipes the response body in on the module's stdin and captures whatever the module writes to stdout. There is no custom calling convention to learn; any `wasm32-wasi` binary that reads stdin and writes stdout works.
 
 WASM is currently exposed as a body transform (`type: wasm`), not as a request/response modifier. Use it when you need to mutate the response body in a language that does not have a first-class engine here (Rust, TinyGo, AssemblyScript, Zig, etc.) or when you want stronger isolation than CEL or Lua provide.
+
+Because the contract is raw bytes on stdin, WASM modules do not receive the `ctx` context the Lua and JavaScript surfaces get: there is no JSON envelope to carry `principal` or `request.tls`, and inventing one would break every deployed module that parses its body off stdin. If a module needs caller identity or fingerprint data, gate the transform with a CEL policy or stamp the needed value into a header with a Lua/JS modifier ahead of it.
 
 ```yaml
 origins:
@@ -733,7 +767,7 @@ request_modifiers:
 |---|---|---|
 | `headers.set` / `headers.add` / `headers.remove` | map / map / list | Same semantics as the request side |
 | `status.code` | int | Override the response status code |
-| `status.text` | string | Optional reason phrase (informational; not sent in HTTP/2) |
+| `status.text` | string | Compatibility-only reason phrase; accepted with a warning and ignored |
 | `body.replace` | string | Replace the response body with this string |
 | `body.replace_json` | any | Replace the response body with this JSON value |
 | `lua_script` | string | Lua `modify_response(resp, ctx)`; returned `set_headers` applied |
@@ -825,7 +859,7 @@ Validate your config before deployment:
 sbproxy validate sb.yml
 ```
 
-Validation checks the YAML shape and typed fields. Script bodies (CEL expressions, Lua, JavaScript) are strings to the validator; their syntax errors surface at request time in the logs, not at validation time. Exercise a scripted route once in staging before relying on it.
+Validation checks the YAML shape and typed fields, and compiles every `expression` policy, so CEL syntax errors in request gates surface here (and at boot or reload) rather than at request time. Other script bodies (Lua, JavaScript, rate-limit `key:` expressions) are strings to the validator; their syntax errors surface at request time in the logs. Exercise a scripted route once in staging before relying on it.
 
 ### Enabling debug logging
 
@@ -839,7 +873,7 @@ With debug logging on, script failures are logged with the engine, the error mes
 
 | Surface | On error |
 |---|---|
-| `expression` policy | Fails open on a CEL parse error (misconfiguration), fails closed on an evaluation error (the expression could not prove the request is allowed) |
+| `expression` policy | A CEL parse error rejects the config at compile time (boot refuses to start; a reload keeps the previous config active); an evaluation error fails closed and denies the request (the expression could not prove the request is allowed) |
 | Lua / JS modifiers | Error logged per request; the modifier's headers are not applied; the request proceeds |
 | `lua_json` / `js_json` / `javascript` transforms | Error logged per request; the body is left unchanged |
 | `cel` transform | Missing both `on_response` and `headers` fails config compile; runtime evaluation errors leave the body unchanged |

@@ -1,11 +1,23 @@
 # Glossary
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-28*
 
-A plain-English mapping of the acronyms and protocol names that appear
-in SBproxy commits, configuration, and documentation. If you have ever
-wondered what `OLP`, `CAP`, `MPP`, `DPoP`, `aipref`, or `RFC 8693` mean
-in the context of this proxy, this is the page.
+A plain-English mapping of the terms that appear in SBproxy configuration and documentation. Start with the gateway words below, then use the longer protocol list when you meet an acronym.
+
+| Term | What it means in SBproxy |
+|---|---|
+| Origin | A client-facing hostname and the configuration that handles requests for it. An `origins:` entry selects an action, policy, authentication, and transforms. |
+| Action | The work an origin performs after SBproxy accepts a request. Common actions proxy an HTTP API, serve an MCP endpoint, or route an AI completion. |
+| Upstream | The service SBproxy calls on the other side of an action. It can be an application backend, an MCP server, or an OpenAI-compatible inference service. |
+| Provider | An AI source configured under an `ai_proxy` action. A provider can be hosted or local and may expose one or more model names. |
+| Data plane | The listener that serves client traffic through origins and actions. Local examples use port 8080. |
+| Admin plane | Authenticated endpoints and UI that inspect or change a running proxy, including health, keys, config, and reload. |
+| Configuration compilation | The startup and validation step that parses `sb.yml` and constructs the request pipeline before the proxy accepts traffic. |
+| Reload | Recompiling a candidate config in a running process, then swapping it in only when compilation succeeds. The old pipeline keeps serving when it fails. |
+| MCP | A JSON-RPC protocol for clients to discover and call tools. MCP does not generate model completions. |
+| OpenAI-compatible | An HTTP API shape that accepts endpoints such as `/v1/chat/completions` and returns the corresponding response format. Compatibility describes the wire protocol, not the model itself. |
+
+See [core-concepts.md](core-concepts.md) for the request flow and [configuration.md](configuration.md) for configuration fields.
 
 | Term                | Stands for / source                                  | What it means in SBproxy                                                                                                                                          |
 |---------------------|------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -28,7 +40,7 @@ in the context of this proxy, this is the page.
 | Web Bot Auth        | IETF draft (HTTP message signatures + key directory) | The signed-bot-traffic standard. SBproxy fetches `/.well-known/http-message-signatures-directory` from a vendor, caches the JWKS with TTL, and verifies signatures on inbound bot requests. |
 | KYA                 | Know-Your-Agent (Skyfire)                            | A token format for verified agent identity. The proxy verifies KYA tokens and exposes `request.kya` to scripting. |
 | JA3 / JA4 / JA4H    | TLS fingerprinting algorithms                        | ClientHello fingerprints supplied by a trusted TLS-terminating sidecar via `x-sbproxy-tls-*` request headers (accepted only from peers in `proxy.trusted_proxies`) and stamped onto the request context. JA3 plus the JA4 family power the headless-detection signals. |
-| schema-v1           | Internal config schema label                         | The `sb.yml` schema shared by the archived Go `v0.1.x` line and the Rust `v1.x` line. Schema-v1 is independent of binary version and is pinned by `v1_compat::v1_fixtures_compile_unmodified` in `crates/sbproxy-config/`. |
+| schema-v1           | Internal config schema label                         | The `sb.yml` schema shared by the [archived `v0.1.x` line](https://github.com/soapbucket/sbproxy-go) and the Rust `v1.x` line. Schema-v1 is independent of binary version and is pinned by `v1_compat::v1_fixtures_compile_unmodified` in `crates/sbproxy-config/`. |
 | Apache 2.0          | Apache License, Version 2.0                          | The open source licence under which SBproxy is published. Free for any use, including production and commercial, with no field-of-use restriction. See [LICENSE](../LICENSE). |
 | Pingora             | Cloudflare's Rust proxy framework                    | The async runtime SBproxy is built on. The `sbproxy-core` crate plugs into Pingora's `request_filter`, `response_filter`, and `response_body_filter` lifecycle. |
 | CEL                 | Common Expression Language                           | Google's expression language. Used for per-origin policy rules, request modifiers, and response transforms. Powered by `cel-rust`. |

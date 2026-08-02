@@ -1,5 +1,14 @@
 # MCP tool rollout
 
+> **Snippet, depends on a live upstream.** Both `federated_servers[].origin`
+> entries here are `test.sbproxy.dev`, the project's public HTTP echo
+> service (like httpbin), not an MCP server, so neither `legacy-api` nor
+> `new-api` publishes a real `search` tool and this cannot complete
+> end-to-end as shipped. Point the origins at your own MCP server(s) to
+> exercise the rollout and pinning behavior below. See
+> [`examples/mcp-federation`](../mcp-federation/) for the base federation
+> mechanics and its own end-to-end caveat.
+
 MCP has no tool version field, so shipping a breaking change to a tool
 normally breaks every caller at once. This example publishes two
 versions of `search` behind one gateway: the default consumer gets

@@ -9,14 +9,25 @@
 #   diff <(sbproxy config import-litellm config.yaml 2>/dev/null) \
 #        <(grep -vE '^[[:space:]]*(#|$)' sb.yml)
 #
-# The importer also printed two warnings for this input (max_budget and
-# master_key); the comments below say where each one lands.
+# The importer also printed one warning for this input (master_key); the
+# comment below says where it lands. max_budget maps automatically to the
+# action-level budget: block.
 origins:
   # The importer emits a single ai_proxy origin under the placeholder host
   # ai.local. Send requests with -H 'Host: ai.local', or rename the key to
   # your real hostname.
   ai.local:
     action:
+      # From litellm_params.max_budget on the claude entry (default period
+      # monthly when budget_duration is omitted). A single clean cap emits
+      # an action-level budget window; differing per-model caps would warn
+      # instead. See examples/ai-budget/sb.yml and docs/configuration.md.
+      budget:
+        limits:
+        - max_cost_usd: 25.0
+          period: monthly
+          scope: workspace
+        on_exceed: block
       # From litellm_params.rpm / tpm on the gpt-4 entry, keyed by the
       # public model name.
       model_rate_limits:
@@ -47,27 +58,15 @@ origins:
         - claude
         name: anthropic
         provider_type: anthropic
-        # config.yaml also set max_budget on this entry. That key has no
-        # automatic mapping, so the importer warned instead of emitting
-        # anything. The manual follow-up is an action-level budget block:
-        #
-        #   budget:
-        #     on_exceed: block
-        #     limits:
-        #       - scope: workspace
-        #         max_cost_usd: 25.0
-        #         period: monthly
-        #
-        # See examples/ai-budget/sb.yml and docs/configuration.md.
       # router_settings.routing_strategy: latency-based-routing.
       routing: lowest_latency
       # litellm_settings.cache: true. Tuning is left to defaults.
       semantic_cache:
         enabled: true
       type: ai_proxy
-      # general_settings.master_key was the second warning. SBproxy has no
-      # master key; client keys are declared in config instead, either as
-      # action-level virtual_keys or as a credentials block. See
+      # general_settings.master_key was the remaining warning. SBproxy has
+      # no master key; client keys are declared in config instead, either
+      # as action-level virtual_keys or as a credentials block. See
       # examples/ai-virtual-keys/sb.yml and docs/configuration.md.
 proxy:
   http_bind_port: 8080

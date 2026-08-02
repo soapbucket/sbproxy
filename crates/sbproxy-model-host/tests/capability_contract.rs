@@ -2,11 +2,20 @@
 // Copyright 2026 Soap Bucket LLC
 
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
 use sbproxy_model_host::{
     capability_registry, CapabilityDomain, ModelHostConfig, SupportLevel,
     CAPABILITY_REGISTRY_VERSION,
 };
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("crates/sbproxy-model-host -> crates -> repo root")
+        .to_path_buf()
+}
 
 #[test]
 fn registry_covers_every_domain_and_validates() {
@@ -183,9 +192,16 @@ fn markdown_is_deterministic_and_exposes_all_support_levels() {
     assert_eq!(first, second);
     assert!(first.starts_with("# Model-host capability matrix\n*Last modified: 2026-07-13*\n"));
     assert!(first.contains("Registry version: `1`"));
-    for status in ["stable", "preview", "config_only"] {
+    // WOR-1910 gave serve.cache_budget_gib, the last config_only field,
+    // an executable GC consumer, so only stable and preview levels remain
+    // in use.
+    for status in ["stable", "preview"] {
         assert!(first.contains(&format!("`{status}`")), "missing {status}");
     }
+    assert!(
+        !first.contains("`config_only`"),
+        "no registry entry should remain config_only"
+    );
     assert!(first.contains("| `cluster.remote_dispatch` | `cluster` | `preview` |"));
     assert!(
         !first.contains('\u{2014}'),
@@ -198,6 +214,20 @@ fn generated_schema_labels_every_nonstable_field() {
     capability_registry()
         .validate_schema_descriptions()
         .expect("preview, config-only, and unsupported fields must be labeled in JSON Schema");
+}
+
+#[test]
+fn the_committed_model_host_capabilities_doc_is_current() {
+    let path = repo_root().join("docs/model-host-capabilities.md");
+    let committed = std::fs::read_to_string(&path).expect("read docs/model-host-capabilities.md");
+
+    assert_eq!(
+        committed,
+        capability_registry().render_markdown(),
+        "docs/model-host-capabilities.md is stale. Regenerate it:\n\n    \
+         cargo run -q -p sbproxy-model-host --bin generate-model-host-capabilities > \
+         docs/model-host-capabilities.md\n"
+    );
 }
 
 #[test]

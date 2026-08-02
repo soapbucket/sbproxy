@@ -97,6 +97,9 @@ pub fn begin_drain() {
 /// Global pipeline store. Initialized lazily on first access with an empty default.
 static PIPELINE: OnceLock<ArcSwap<CompiledPipeline>> = OnceLock::new();
 
+#[cfg(test)]
+pub(crate) static FEATURE_FLAG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Global ACME challenge store for HTTP-01 interception.
 static CHALLENGE_STORE: OnceLock<Arc<Http01ChallengeStore>> = OnceLock::new();
 
@@ -109,6 +112,27 @@ static ALT_SVC: OnceLock<ArcSwap<String>> = OnceLock::new();
 /// Initializes with `CompiledPipeline::default()` on first call.
 fn pipeline_store() -> &'static ArcSwap<CompiledPipeline> {
     PIPELINE.get_or_init(|| ArcSwap::from_pointee(CompiledPipeline::default()))
+}
+
+fn feature_flag_store(
+    config: &sbproxy_config::CompiledConfig,
+) -> Arc<sbproxy_extension::flags::FlagStore> {
+    use sbproxy_extension::flags::{FlagConfig, FlagRule, FlagStore};
+
+    let flags = config.flags.iter().map(|flag| FlagConfig {
+        name: flag.name.clone(),
+        default: flag.default,
+        rules: FlagRule {
+            allow_list: flag.rules.allow_list.iter().cloned().collect(),
+            block_list: flag.rules.block_list.iter().cloned().collect(),
+            rollout_percent: flag.rules.rollout_percent,
+            // The shipped CEL helper intentionally has two arguments
+            // (`name`, `key`), so top-level YAML rejects `segments`
+            // instead of accepting a rule no request could exercise.
+            segments: std::collections::HashSet::new(),
+        },
+    });
+    Arc::new(FlagStore::from_configs(flags))
 }
 
 /// Atomically replace the current pipeline with a new snapshot.
@@ -125,6 +149,7 @@ fn pipeline_store() -> &'static ArcSwap<CompiledPipeline> {
 /// derived from the pipeline's compiled config so any reader on the
 /// new path sees consistent data within sub-microsecond skew.
 pub fn load_pipeline(new_pipeline: CompiledPipeline) {
+    let next_feature_flags = feature_flag_store(&new_pipeline.config);
     // --- Wave 4 / G4.10 wire: projection cache refresh ---
     //
     // Compute projections before storing the pipeline so the cache is
@@ -146,7 +171,13 @@ pub fn load_pipeline(new_pipeline: CompiledPipeline) {
     // so the gap surfaces at load time instead of on the first
     // request that quietly fails over.
     crate::server::model_host::preflight_serve_warnings(&new_pipeline.actions);
-    pipeline_store().store(Arc::new(new_pipeline));
+    // This is the only pipeline publisher. Hold the flag-store write lock
+    // while the pipeline pointer is swapped, then install its matching flag
+    // snapshot before CEL readers can resume. Direct/library callers therefore
+    // cannot publish flag-bearing config without seeding `flag_enabled`.
+    sbproxy_extension::flags::replace_global_store_after(next_feature_flags, || {
+        pipeline_store().store(Arc::new(new_pipeline));
+    });
 }
 
 /// Monotonically increasing counter used as the projection cache's
@@ -573,6 +604,7 @@ mod tests {
                 outbound_credential: None,
                 outbound_web_bot_auth: false,
                 observability: None,
+                attestation: None,
             }],
             host_map,
             server: sbproxy_config::ProxyServerConfig::default(),
@@ -584,6 +616,7 @@ mod tests {
             rate_limits: None,
             audit: None,
             session_ledger: None,
+            flags: Vec::new(),
         }
     }
 
@@ -615,6 +648,37 @@ mod tests {
         assert_eq!(guard2.config.origins.len(), 1);
         assert!(guard2.resolve_origin("new.example.com").is_some());
         assert!(guard2.resolve_origin("old.example.com").is_none());
+    }
+
+    #[test]
+    fn canonical_pipeline_publish_installs_compiled_flags_for_cel() {
+        let _guard = FEATURE_FLAG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = sbproxy_extension::flags::set_global_store(Arc::new(
+            sbproxy_extension::flags::FlagStore::new(),
+        ));
+        let config = sbproxy_config::compile_config(
+            r#"
+flags:
+  - name: canonical-publisher
+    default: true
+"#,
+        )
+        .expect("flag config compiles");
+        let pipeline = CompiledPipeline::from_config(config).expect("pipeline compiles");
+
+        load_pipeline(pipeline);
+
+        let engine = sbproxy_extension::cel::CelEngine::new();
+        let context = sbproxy_extension::cel::CelContext::new();
+        assert!(engine
+            .eval_bool_source(
+                r#"flag_enabled("canonical-publisher", "request-key")"#,
+                &context,
+            )
+            .expect("CEL flag evaluates"));
+        sbproxy_extension::flags::set_global_store(previous);
     }
 
     /// WOR-1164 regression: a second `set_agent_detect_loader` (e.g. a

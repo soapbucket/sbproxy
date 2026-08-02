@@ -1,6 +1,6 @@
 # SBproxy features manual
 
-*Last modified: 2026-07-12*
+*Last modified: 2026-07-29*
 
 The capability tour: each section covers what a feature does, a minimal config to turn it on, and a working example against `test.sbproxy.dev`, with a link to the doc that owns the full reference. Installation and runtime operations live in [manual.md](manual.md); the complete field schema lives in [configuration.md](configuration.md).
 
@@ -12,7 +12,7 @@ SBproxy is a reverse proxy and AI gateway shipped as a single binary, built on C
 
 Core capabilities:
 - Reverse proxy with hot reload, path routing, and forward rules
-- AI gateway with 66 native provider integrations reaching 200+ models behind one OpenAI-compatible API, model routing, and budget enforcement
+- AI gateway with 72 native provider integrations reaching 200+ models behind one OpenAI-compatible API, model routing, and budget enforcement
 - Load balancer with multiple algorithms, health checks, and circuit breakers
 - 7 authentication methods, 10 security policies, 25 response transforms
 - CEL, Lua, JavaScript, and WASM scripting for custom logic
@@ -30,7 +30,7 @@ Homebrew, Docker, binary downloads, and source builds are covered in the [runtim
 
 ```bash
 sbproxy serve -f sb.yml          # Start from config file
-sbproxy validate --config sb.yml # Validate config without starting
+sbproxy validate sb.yml          # Validate config without starting
 ```
 
 The full CLI (plan, apply, doctor, projections, flags) is in the [runtime manual](manual.md#2-cli-reference).
@@ -105,7 +105,7 @@ The `ai_proxy` action turns SBproxy into an OpenAI-compatible API gateway. It ac
 
 ### Providers
 
-SBproxy ships with 66 native providers behind one OpenAI-compatible API, including a native Anthropic translator. You bring your own key per provider and the model name passes straight through, so the gateway reaches 200+ models (and whatever a provider ships next) without enumerating them. Adapters include openai, anthropic, gemini, azure, bedrock, cohere, mistral, groq, deepseek, together, fireworks, cerebras, sambanova, nvidia, vertex, databricks, huggingface, openrouter, and local-runtime adapters (`tgi`, `lmstudio`, `llamacpp`). The `provider_type` field on a provider picks the adapter (when unset, SBproxy infers it from `name`). For an endpoint no adapter covers, point any provider at it with a custom `base_url`; `openrouter` is available as a single-key aggregator. The catalog is plain YAML and operator-extensible: see [providers.md](providers.md#extending-the-provider-catalog).
+SBproxy ships with 72 native providers behind one OpenAI-compatible API, including a native Anthropic translator. You bring your own key per provider and the model name passes straight through, so the gateway reaches 200+ models (and whatever a provider ships next) without enumerating them. Adapters include openai, anthropic, gemini, azure, bedrock, cohere, mistral, groq, deepseek, together, fireworks, cerebras, sambanova, nvidia, vertex, databricks, huggingface, openrouter, and local-runtime adapters (`tgi`, `lmstudio`, `llamacpp`). The `provider_type` field on a provider picks the adapter (when unset, SBproxy infers it from `name`). For an endpoint no adapter covers, point any provider at it with a custom `base_url`; `openrouter` is available as a single-key aggregator. The catalog is plain YAML and operator-extensible: see [providers.md](providers.md#extending-the-provider-catalog).
 
 ```yaml
 origins:
@@ -210,7 +210,7 @@ Per-request provider, model, token counts, and estimated USD cost land on the `s
 
 ### Guardrails, policy, and resilience
 
-The AI path composes with input/output guardrails (nine detector types plus an opt-in [guardrail mesh](ai-guardrail-mesh.md) that fuses verdicts under a quorum rule), a one-expression [AI policy plane](ai-policy-cel.md) over the pipeline's own signals, and [LLM-aware resilience](ai-llm-aware-resilience.md) that classifies upstream failures into typed causes and retries per class. Each link is the owning reference; [ai-gateway.md](ai-gateway.md) carries the end-to-end picture.
+The AI path composes with input/output guardrails (ten detector types plus an opt-in [guardrail mesh](ai-guardrail-mesh.md) that fuses verdicts under a quorum rule), a one-expression [AI policy plane](ai-policy-cel.md) over the pipeline's own signals, and [LLM-aware resilience](ai-llm-aware-resilience.md) that classifies upstream failures into typed causes and retries per class. Toxicity, jailbreak, and content-safety detection default to zero-dependency keyword matching and offer an explicit local-classifier mode; the [safety mode contract](ai-gateway.md#safety-guardrail-modes) states the limits of each. Each link is the owning reference; [ai-gateway.md](ai-gateway.md) carries the end-to-end picture.
 
 ---
 
@@ -569,7 +569,8 @@ curl -H "Host: api.test.sbproxy.dev" \
 
 The OSS WAF can subscribe to a remote feed that publishes signed rule bundles. The proxy downloads, verifies, and hot-loads bundles in the background; in-flight requests see a stable snapshot. This lets operators ship updated detection signatures without redeploying.
 
-The publisher side (the service that signs and serves bundles) is shipped as part of the enterprise build. The subscriber documented below is in the OSS proxy.
+The subscriber documented below is in the proxy. Operators provide the service that
+signs and serves rule bundles.
 
 ```yaml
 policies:
@@ -1556,9 +1557,25 @@ SBproxy emits structured JSON logs to stderr. Verbosity is controlled (in preced
 
 Each access log line carries: `timestamp`, `level`, `msg`, `origin`, `method`, `path`, `status`, `latency_ms`, `client_ip`, `request_id`, `trace_id`, `cache_result`, plus three phase-timing fields (`auth_ms`, `upstream_ttfb_ms`, `response_filter_ms`) that split `latency_ms` into the parts of the pipeline that produced it. The canonical access-log schema (with optional fields and stability rules) is [access-log.md](./access-log.md); the same phase observations appear as `sbproxy_phase_duration_seconds` in [metrics-stability.md](./metrics-stability.md).
 
+### Alert operations
+
+SBproxy evaluates built-in budget-exhaustion and provider-error rules and can
+deliver state changes through webhook, Slack, PagerDuty, or process-log
+channels. Provider error rate needs at least 10 attempts in its evaluation
+window; smaller samples stay inactive instead of paging on noisy fractions.
+
+The admin Alerts page shows current rule readings, sanitized channel delivery
+health, and up to 200 fired, resolved, and test events retained for the life of
+the process. Operators can test one configured channel, but the console is not
+a rule editor: `sb.yml` remains authoritative. Channel URLs are reduced to
+scheme and host, and routing keys, headers, credentials, and URL paths never
+appear in the API or UI. See [configuration.md](configuration.md#alerting-fields)
+and [admin-api-reference.md](admin-api-reference.md#get-apialerts).
+
 ### Request envelope: properties, sessions, users
 
-SBproxy stamps every request with a typed observability envelope so downstream tools (in-process subscribers today; the enterprise ingest pipeline and portal next) can slice traffic without re-deriving fields.
+SBproxy stamps every request with a typed observability envelope so downstream tools can
+slice traffic without re-deriving fields.
 
 Three caller-supplied dimensions land at request entry:
 
@@ -1569,7 +1586,7 @@ Tag any request with metadata for slicing. The proxy strips the prefix, lowercas
 ```text
 X-Sb-Property-Environment: prod
 X-Sb-Property-Feature-Flag: agent-v2
-X-Sb-Property-Customer-Tier: enterprise
+X-Sb-Property-Customer-Tier: premium
 ```
 
 Caps per request, all defaults:
@@ -1587,6 +1604,7 @@ Over-cap entries are dropped silently and counted; the request still serves a 20
 ```yaml
 properties:
   capture: true
+  rollup_keys: [environment, feature-flag]
   redact:
     keys: ["customer-email", "ssn"]
     value_regex:
@@ -1594,7 +1612,12 @@ properties:
       - '\b\d{3}-\d{2}-\d{4}\b'
 ```
 
-Captured properties feed structured logs, the in-memory event bus, and (with the enterprise ingest pipeline wired) ClickHouse. They are NOT exported as Prometheus labels: that would unbound metric cardinality.
+Captured properties feed structured logs, the in-memory request ring, and the
+event bus. Up to five explicitly configured `rollup_keys` also become durable
+usage-rollup dimensions after redaction, so Spend can group by
+`property:<key>`. Keys are lowercased and validated at config load. Promotion
+can increase rollup cardinality, which is why it is explicit and bounded.
+Properties are not exported as arbitrary Prometheus labels.
 
 #### Sessions
 
@@ -1614,6 +1637,13 @@ Format: ULID (26 chars, Crockford base32). Caller-supplied IDs survive intact; a
 | `always` | Auto-generate whenever the caller did not supply one |
 
 The proxy echoes the captured or auto-generated ID back as `X-Sb-Session-Id` on the response so stateless SDK callers can adopt it.
+
+The admin Sessions page groups the requests still present in the in-memory
+request ring, rolls up request count, tokens, cost, wall-clock duration, and
+worst status, and orders each session's calls oldest first. Parent session IDs
+form a navigable hierarchy when both sessions remain in the ring. This is a
+recent operational view, not durable trace storage, a span waterfall, or a
+request replay mechanism; restart and ring eviction remove its source rows.
 
 #### Users
 
@@ -1982,7 +2012,7 @@ Brief schemas for actions, policies, transforms, and origin fields not covered a
 
 | Type | Description |
 |---|---|
-| `graphql` | Proxy GraphQL requests to an upstream HTTP endpoint, with operation parsing |
+| `graphql` | Proxy GraphQL requests with optional syntax, depth, and introspection enforcement |
 | `storage` | Serve files from object storage (S3, GCS, Azure, local) |
 | `a2a` | Proxy to an Agent-to-Agent endpoint |
 | `mcp` | MCP (Model Context Protocol) gateway that federates one or more upstream MCP servers |
@@ -2052,9 +2082,9 @@ base64_decode, url_encode, and url_decode are the other modes ([config](../examp
 | `bot_detection` | Bot scoring and challenge configuration (opaque, see configuration.md) |
 | `threat_protection` | IP reputation and dynamic blocklist hooks |
 | `fallback_origin` | Origin used when the primary upstream fails |
-| `traffic_capture` | Mirror or capture request/response traffic |
+| `traffic_capture` | Config-only compatibility field; use `mirror` for live request mirroring |
 | `message_signatures` | RFC 9421 HTTP message signatures |
-| `connection_pool` | Per-origin pool tuning (size, idle timeout) |
+| `connection_pool` | Config-only compatibility field; Pingora's built-in pool settings apply |
 
 ![the primary upstream answering 503 while the client receives the fallback's 200 degraded body with an X-Fallback header](assets/fallback-origin.gif)
 
@@ -2092,7 +2122,7 @@ The proxy is split into focused crates:
 - `sbproxy-config`: YAML parsing, type definitions
 - `sbproxy-core`: CompiledOrigin, phase dispatch, plugin registry, hot reload
 - `sbproxy-modules`: actions, auth, policies, transforms
-- `sbproxy-ai`: AI gateway (66 providers, routing, guardrails, budgets, MCP)
+- `sbproxy-ai`: AI gateway (72 providers, routing, guardrails, budgets, MCP)
 - `sbproxy-middleware`: CORS, HSTS, compression, header modifiers
 - `sbproxy-extension`: WASM (wasmtime), Lua (mlua/Luau), CEL (cel-rust), JavaScript (QuickJS)
 - `sbproxy-cache`: response cache, pluggable backends
@@ -2299,4 +2329,4 @@ This flag only affects the plain `http_bind_port` listener. TLS-fronted HTTP/2 o
 
 ### HTTP/3 limitations
 
-HTTP/3 is currently disabled entirely until native QUIC support lands in Pingora. No QUIC listener is started; the `http3` config block still parses but is ignored, and setting `enabled: true` only logs a warning. Because there is no H3 dispatch path today, the per-action and per-auth limitations that previously applied over HTTP/3 do not apply: all traffic is served over HTTP/1.1 and HTTP/2, where every action and auth module is supported. These notes will be revisited when HTTP/3 returns.
+HTTP/3 is not served by this build. No QUIC listener is started, and config compilation rejects `proxy.http3.enabled: true` instead of accepting an inert setting. Omission and `enabled: false` remain valid for forward compatibility. Because there is no H3 dispatch path today, the per-action and per-auth limitations that previously applied over HTTP/3 do not apply: all traffic is served over HTTP/1.1 and HTTP/2, where every action and auth module is supported. Native support is tracked in WOR-1969.

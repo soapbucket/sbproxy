@@ -14,9 +14,25 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
+use crate::state::register::VersionedLwwMergeOutcome;
+
 /// Maximum permitted frame payload size, in bytes. Frames larger than this
 /// are rejected on the read path to bound memory usage from a hostile peer.
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+/// Maximum accepted byte length of a routed snapshot key prefix.
+///
+/// A prefix is a generated key scope, never caller text, so a kilobyte is
+/// already generous. Bounding it keeps a hostile peer from forcing a large
+/// per-request allocation before any work is done.
+pub const MAX_ROUTED_SNAPSHOT_PREFIX_BYTES: usize = 1_024;
+
+/// Maximum aggregate key-plus-value bytes one routed snapshot page may carry.
+///
+/// The owner stops cloning values once the next entry would cross this bound
+/// and marks the page truncated, so one snapshot cannot copy an arbitrarily
+/// large shard into a single reply.
+pub const MAX_ROUTED_SNAPSHOT_BYTES: usize = 1024 * 1024;
 
 // --- Request / Response wire types ---
 
@@ -46,6 +62,14 @@ pub struct Request {
 /// all purges. The server scans its local shard, deletes every matching
 /// key, and replies with `CacheResult::Purged(n)`. An empty `prefix` means
 /// "purge every entry" and is how the caller expresses a `PurgeScope::All`.
+///
+/// `SnapshotPrefix` is appended after `SyncDigest`. Postcard enum variants
+/// are not self-describing. A caller must verify the authenticated
+/// `semantic_cache_snapshot_v1` fleet capability before sending this
+/// operation. Existing operations keep their discriminants, so operators may
+/// roll the binary while semantic caching stays disabled, but neither this
+/// note nor a binary-version string is the gate. The enforceable gate is the
+/// typed cluster-state capability declaration every live member must publish.
 ///
 /// postcard does **not** honor `#[serde(default)]` on enum variants, so
 /// every additive change to `CacheOp` is a wire-format break relative to
@@ -83,6 +107,62 @@ pub enum CacheOp {
         /// Key prefix to match; an empty prefix purges every entry.
         prefix: String,
     },
+    /// Atomically merge a versioned LWW candidate on the owning node.
+    MergeVersioned {
+        /// Key whose current version participates in the merge.
+        key: String,
+        /// JSON-encoded versioned register candidate.
+        value: Bytes,
+        /// Lifetime in seconds applied only when the candidate wins.
+        ttl_secs: u64,
+    },
+    /// Apply a replicated-record candidate to the receiver's durable
+    /// replica shard using the causal merge (WOR-1947). Unlike
+    /// `MergeVersioned` this targets the replicated substrate, persists
+    /// the winning record before acking, and lets a strictly newer live
+    /// candidate re-create a tombstoned key.
+    ReplicaApply {
+        /// Replicated record key.
+        key: String,
+        /// JSON-encoded versioned register candidate.
+        value: Bytes,
+        /// Lifetime in seconds; `0` means no expiry.
+        ttl_secs: u64,
+    },
+    /// Fetch the full versioned register (including tombstones) for `key`
+    /// from the receiver's replica shard. Replies with
+    /// [`CacheResult::Value`] carrying the JSON-encoded register, or
+    /// `Value(None)` when the shard holds no record.
+    ReplicaFetch {
+        /// Replicated record key.
+        key: String,
+    },
+    /// Request one bounded page of the receiver's replica-shard digest for
+    /// anti-entropy comparison. Replies with [`CacheResult::DigestPage`].
+    SyncDigest {
+        /// Only keys starting with this prefix are digested; empty means
+        /// the whole shard.
+        prefix: String,
+        /// Resume after this key (exclusive); `None` starts from the
+        /// beginning.
+        page_token: Option<String>,
+        /// Maximum digest entries in the reply page.
+        limit: u32,
+    },
+    /// Request one bounded lexicographic page of the receiver's local cache
+    /// shard for a single generated key prefix. Replies with
+    /// [`CacheResult::Snapshot`].
+    ///
+    /// The request carries no routing key: the client resolves the owner
+    /// from the consistent hash ring before sending, and the server never
+    /// recurses into a routed method.
+    SnapshotPrefix {
+        /// Generated key prefix to page. Must be non-empty and at most
+        /// [`MAX_ROUTED_SNAPSHOT_PREFIX_BYTES`] bytes.
+        prefix: String,
+        /// Maximum entries in the reply page, in `1..=4096`.
+        maximum: u32,
+    },
 }
 
 /// Server reply to a [`Request`]. Carries the original `request_id` so the
@@ -112,14 +192,90 @@ pub enum CacheResult {
     /// Reply to `PurgePrefix`: count of entries removed on the server's
     /// local shard. Added in K2 as part of the cluster-wide purge fan-out.
     Purged(u64),
+    /// Closed result of an atomic version-aware LWW merge.
+    VersionedMerged(VersionedLwwMergeOutcome),
+    /// One bounded page of a replica-shard digest, replying to
+    /// [`CacheOp::SyncDigest`].
+    DigestPage(DigestPage),
+    /// One bounded lexicographic page of the server's local cache shard,
+    /// replying to [`CacheOp::SnapshotPrefix`]. Appended after `DigestPage`
+    /// so existing result discriminants do not shift.
+    Snapshot(CacheSnapshot),
+}
+
+/// One bounded lexicographic page of a peer's local cache shard.
+///
+/// Values are operator data, so the [`std::fmt::Debug`] implementation is
+/// deliberately redacted: it reports entry count, aggregate key-plus-value
+/// bytes, and the truncation flag, never a key or a value.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct CacheSnapshot {
+    /// Lexicographically ordered key/value pairs.
+    pub entries: Vec<(String, Bytes)>,
+    /// Whether additional matching keys were excluded by the entry or byte
+    /// bound.
+    pub truncated: bool,
+}
+
+impl CacheSnapshot {
+    /// Aggregate key-plus-value bytes carried by this page.
+    ///
+    /// Saturating rather than checked because this is only a diagnostic
+    /// measure; the storage and revalidation paths use checked arithmetic.
+    pub fn byte_len(&self) -> usize {
+        self.entries.iter().fold(0usize, |total, (key, value)| {
+            total.saturating_add(key.len()).saturating_add(value.len())
+        })
+    }
+}
+
+impl std::fmt::Debug for CacheSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CacheSnapshot")
+            .field("entries", &self.entries.len())
+            .field("bytes", &self.byte_len())
+            .field("truncated", &self.truncated)
+            .finish()
+    }
+}
+
+/// Compact per-key summary used by anti-entropy digest exchange. Carries
+/// enough version metadata to decide push/pull direction without shipping
+/// record values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyDigest {
+    /// Replicated record key.
+    pub key: String,
+    /// Monotonic application logical version of the stored register.
+    pub logical_version: u64,
+    /// LWW timestamp of the stored register, for equal-version diffing.
+    pub timestamp_ms: u64,
+    /// Stable writer node of the stored register, for equal-version diffing.
+    pub node_id: String,
+    /// Whether the stored register is a deletion marker.
+    pub tombstone: bool,
+}
+
+/// One page of [`KeyDigest`] entries plus the resume token for the next
+/// page. `next_page_token = None` means the scan is complete.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DigestPage {
+    /// Digest entries, lexicographically ordered by key.
+    pub entries: Vec<KeyDigest>,
+    /// Resume-after key for the following page; `None` when exhausted.
+    pub next_page_token: Option<String>,
 }
 
 // --- Framing helpers ---
 
 /// Write a framed payload to `w`. Frame layout is `[u32 BE length][payload]`.
 ///
-/// Returns the number of payload bytes written on success (matches
-/// `payload.len()`).
+/// The prefix and payload are coalesced into a single write. Writing them
+/// separately produces a write-write-read pattern on the socket, which
+/// stalls ~40ms per RPC when the peer's delayed ACK meets Nagle on either
+/// end (WOR-1949); it also keeps small frames to one TLS record when the
+/// stream is TLS-wrapped.
 pub async fn write_frame<W>(w: &mut W, payload: &[u8]) -> tokio::io::Result<()>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -136,8 +292,10 @@ where
         ));
     }
     let len = payload.len() as u32;
-    w.write_u32(len).await?;
-    w.write_all(payload).await?;
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    frame.extend_from_slice(&len.to_be_bytes());
+    frame.extend_from_slice(payload);
+    w.write_all(&frame).await?;
     Ok(())
 }
 
@@ -323,6 +481,267 @@ mod tests {
             CacheResult::Acked => {}
             other => panic!("expected Acked, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn versioned_merge_wire_round_trip_preserves_closed_outcome() {
+        use crate::state::register::VersionedLwwMergeOutcome;
+
+        let request = Request {
+            request_id: 77,
+            op: CacheOp::MergeVersioned {
+                key: "state:opaque".to_string(),
+                value: Bytes::from_static(b"candidate"),
+                ttl_secs: 60,
+            },
+        };
+        let encoded = crate::transport::wire::encode(&request).unwrap();
+        let decoded: Request = crate::transport::wire::decode(&encoded).unwrap();
+        assert!(matches!(
+            decoded.op,
+            CacheOp::MergeVersioned { ttl_secs: 60, .. }
+        ));
+
+        let response = Response {
+            request_id: 77,
+            result: CacheResult::VersionedMerged(VersionedLwwMergeOutcome::ConflictRetained),
+        };
+        let encoded = crate::transport::wire::encode(&response).unwrap();
+        let decoded: Response = crate::transport::wire::decode(&encoded).unwrap();
+        assert!(matches!(
+            decoded.result,
+            CacheResult::VersionedMerged(VersionedLwwMergeOutcome::ConflictRetained)
+        ));
+    }
+
+    #[tokio::test]
+    async fn replica_ops_wire_roundtrip() {
+        let apply = Request {
+            request_id: 200,
+            op: CacheOp::ReplicaApply {
+                key: "repl:k".to_string(),
+                value: Bytes::from_static(b"register-json"),
+                ttl_secs: 30,
+            },
+        };
+        let bytes = crate::transport::wire::encode(&apply).expect("serialize");
+        let back: Request = crate::transport::wire::decode(&bytes).expect("deserialize");
+        assert!(matches!(
+            back.op,
+            CacheOp::ReplicaApply { ttl_secs: 30, .. }
+        ));
+
+        let fetch = Request {
+            request_id: 201,
+            op: CacheOp::ReplicaFetch {
+                key: "repl:k".to_string(),
+            },
+        };
+        let bytes = crate::transport::wire::encode(&fetch).expect("serialize");
+        let back: Request = crate::transport::wire::decode(&bytes).expect("deserialize");
+        match back.op {
+            CacheOp::ReplicaFetch { key } => assert_eq!(key, "repl:k"),
+            other => panic!("expected ReplicaFetch, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_digest_wire_roundtrip_with_page() {
+        let req = Request {
+            request_id: 300,
+            op: CacheOp::SyncDigest {
+                prefix: "repl:".to_string(),
+                page_token: Some("repl:m".to_string()),
+                limit: 128,
+            },
+        };
+        let bytes = crate::transport::wire::encode(&req).expect("serialize");
+        let back: Request = crate::transport::wire::decode(&bytes).expect("deserialize");
+        match back.op {
+            CacheOp::SyncDigest {
+                prefix,
+                page_token,
+                limit,
+            } => {
+                assert_eq!(prefix, "repl:");
+                assert_eq!(page_token.as_deref(), Some("repl:m"));
+                assert_eq!(limit, 128);
+            }
+            other => panic!("expected SyncDigest, got {:?}", other),
+        }
+
+        let resp = Response {
+            request_id: 300,
+            result: CacheResult::DigestPage(DigestPage {
+                entries: vec![KeyDigest {
+                    key: "repl:k".to_string(),
+                    logical_version: 4,
+                    timestamp_ms: 1_000,
+                    node_id: "node-a".to_string(),
+                    tombstone: true,
+                }],
+                next_page_token: Some("repl:k".to_string()),
+            }),
+        };
+        let bytes = crate::transport::wire::encode(&resp).expect("serialize");
+        let back: Response = crate::transport::wire::decode(&bytes).expect("deserialize");
+        match back.result {
+            CacheResult::DigestPage(page) => {
+                assert_eq!(page.entries.len(), 1);
+                assert!(page.entries[0].tombstone);
+                assert_eq!(page.entries[0].logical_version, 4);
+                assert_eq!(page.next_page_token.as_deref(), Some("repl:k"));
+            }
+            other => panic!("expected DigestPage, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_wire_roundtrip_snapshot_prefix() {
+        // The request carries only prefix and maximum. It never carries a
+        // routing key, because the client selects the owner before sending.
+        let req = Request {
+            request_id: 400,
+            op: CacheOp::SnapshotPrefix {
+                prefix: "sbproxy:semcache:v2:o:ab:m:".to_string(),
+                maximum: 64,
+            },
+        };
+        let bytes = crate::transport::wire::encode(&req).expect("serialize");
+        let back: Request = crate::transport::wire::decode(&bytes).expect("deserialize");
+        assert_eq!(back.request_id, 400);
+        match back.op {
+            CacheOp::SnapshotPrefix { prefix, maximum } => {
+                assert_eq!(prefix, "sbproxy:semcache:v2:o:ab:m:");
+                assert_eq!(maximum, 64);
+            }
+            other => panic!("expected SnapshotPrefix, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn response_wire_roundtrip_snapshot() {
+        let resp = Response {
+            request_id: 400,
+            result: CacheResult::Snapshot(CacheSnapshot {
+                entries: vec![
+                    ("prefix:a".to_string(), Bytes::from_static(b"one")),
+                    ("prefix:b".to_string(), Bytes::from_static(b"two")),
+                ],
+                truncated: true,
+            }),
+        };
+        let bytes = crate::transport::wire::encode(&resp).expect("serialize");
+        let back: Response = crate::transport::wire::decode(&bytes).expect("deserialize");
+        match back.result {
+            CacheResult::Snapshot(snapshot) => {
+                assert_eq!(snapshot.entries.len(), 2);
+                assert_eq!(snapshot.entries[0].0, "prefix:a");
+                assert_eq!(snapshot.entries[1].1, Bytes::from_static(b"two"));
+                assert!(snapshot.truncated);
+            }
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_response_above_the_frame_cap_is_rejected() {
+        // A hostile or buggy owner cannot push a page past the 16 MiB frame
+        // cap: the write path refuses it before it reaches the socket, so
+        // the peer never has to read it back.
+        let entries: Vec<(String, Bytes)> = (0..17)
+            .map(|index| {
+                (
+                    format!("prefix:{index}"),
+                    Bytes::from(vec![0u8; 1024 * 1024]),
+                )
+            })
+            .collect();
+        let resp = Response {
+            request_id: 401,
+            result: CacheResult::Snapshot(CacheSnapshot {
+                entries,
+                truncated: false,
+            }),
+        };
+        let bytes = crate::transport::wire::encode(&resp).expect("serialize");
+        assert!(bytes.len() > MAX_FRAME_BYTES);
+        let (mut a, _b) = duplex(64);
+        let err = write_frame(&mut a, &bytes).await.unwrap_err();
+        assert_eq!(err.kind(), tokio::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn snapshot_debug_reports_only_count_bytes_and_truncated() {
+        let snapshot = CacheSnapshot {
+            entries: vec![
+                (
+                    "prefix:secret-key-name".to_string(),
+                    Bytes::from_static(b"secret-response-body"),
+                ),
+                (
+                    "prefix:other-key-name".to_string(),
+                    Bytes::from_static(b"other-response-body"),
+                ),
+            ],
+            truncated: true,
+        };
+        let rendered = format!("{snapshot:?}");
+        assert!(rendered.contains("entries: 2"), "{rendered}");
+        assert!(rendered.contains("bytes: 82"), "{rendered}");
+        assert!(rendered.contains("truncated: true"), "{rendered}");
+        assert!(!rendered.contains("secret-key-name"), "{rendered}");
+        assert!(!rendered.contains("secret-response-body"), "{rendered}");
+    }
+
+    /// Writer that counts discrete `poll_write` calls while collecting the
+    /// bytes, so tests can assert how many writes a helper issues.
+    #[derive(Default)]
+    struct CountingWriter {
+        writes: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl tokio::io::AsyncWrite for CountingWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<tokio::io::Result<usize>> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<tokio::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<tokio::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn write_frame_coalesces_prefix_and_body_into_one_write() {
+        // WOR-1949: a separate prefix write followed by a body write is the
+        // write-write-read pattern that stalls ~40ms per RPC against the
+        // peer's delayed ACK when Nagle is active on either socket. The
+        // frame must leave in a single write.
+        let mut w = CountingWriter::default();
+        write_frame(&mut w, b"hello").await.expect("write");
+        assert_eq!(
+            w.writes, 1,
+            "length prefix and body must be coalesced into one write"
+        );
+        assert_eq!(w.bytes[..4], 5u32.to_be_bytes());
+        assert_eq!(&w.bytes[4..], b"hello");
     }
 
     #[tokio::test]

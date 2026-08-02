@@ -483,6 +483,15 @@ impl ModelDirectory {
         let candidate_replicas = build_replica_index(&nodes, &active_generations);
         let eligible_replicas = build_eligible_replica_index(&candidate_replicas);
         let summary = summarize(&nodes, &eligible_replicas, deployment_digest_mismatch);
+        // Every node's classification is final at this point (all
+        // exclusion assignments above have already run), so this is the
+        // one place per refresh that sees the complete, final exclusion
+        // set rather than one candidate reason mid-evaluation.
+        for node in &nodes {
+            if let Some(reason) = node.exclusion_reason {
+                crate::ai_metrics::record_model_directory_exclusion(reason.as_str());
+            }
+        }
         let view = Arc::new(ModelDirectoryView {
             schema_version: DIRECTORY_SCHEMA_VERSION,
             collected_at_unix_ms,
@@ -844,18 +853,24 @@ fn apply_snapshot(
             return;
         }
     }
-    match snapshot.health.model_plane {
-        ModelPlaneHealth::Ready => {}
-        ModelPlaneHealth::Degraded => {
-            node.health = ModelDirectoryHealth::Degraded;
-            add_unhealthy_reason(node, "model_plane_degraded");
-        }
-        ModelPlaneHealth::Unavailable => {
-            node.health = ModelDirectoryHealth::Degraded;
-            add_unhealthy_reason(node, "model_plane_unavailable");
-        }
-    }
+    // Model-plane grading applies only to workers. A node without the
+    // worker role runs no model plane, so an unavailable model plane is
+    // its normal shape, not an impairment; grading it would pin every
+    // gateway-only cluster at degraded with zero healthy nodes forever.
+    // Non-model-plane causes (reported node health above, membership
+    // and snapshot exclusions in the callers) still apply to every node.
     if snapshot.node.roles.contains(&NodeRole::Worker) {
+        match snapshot.health.model_plane {
+            ModelPlaneHealth::Ready => {}
+            ModelPlaneHealth::Degraded => {
+                node.health = ModelDirectoryHealth::Degraded;
+                add_unhealthy_reason(node, "model_plane_degraded");
+            }
+            ModelPlaneHealth::Unavailable => {
+                node.health = ModelDirectoryHealth::Degraded;
+                add_unhealthy_reason(node, "model_plane_unavailable");
+            }
+        }
         node.model_eligible = true;
     } else {
         node.exclusion_reason = Some(ModelDirectoryExclusionReason::NotWorker);

@@ -8,11 +8,14 @@
 //! * [`orphan-ref`](validate#orphan-references): a `fallback_origin`
 //!   or forward-rule action target names a hostname that is not
 //!   present under `origins.*` in the same proposed config.
-//! * [`missing-secret`](validate#missing-secrets): a legacy
-//!   `secret:` / `secret://` template reference whose logical name
-//!   does not appear under `proxy.secrets.map` in the proposed
-//!   config. Provider-specific references such as `vault://`,
-//!   `awssm://`, `gcpsm://`, `k8ssecret://`, `secretfile://`, and
+//! * [`missing-secret`](validate#missing-secrets): a removed
+//!   `secret:<name>` reference or legacy logical-name
+//!   `secret://<name>` reference whose name does not appear under
+//!   `proxy.secrets.map` in the proposed config. This diagnostic
+//!   support does not make the removed colon form runtime-valid.
+//!   Provider-specific references such as `vault://`,
+//!   `awssm://`, `gcpsm://`, `azurekv://`, `k8ssecret://`,
+//!   `secretfile://`, and
 //!   `secret://<backend>/...` resolve through configured vault
 //!   backends rather than `proxy.secrets.map`, so this rule does not
 //!   treat them as map keys.
@@ -131,11 +134,13 @@ pub const KNOWN_AUTH_TYPES: &[&str] = &[
     "bot_auth",
     "web_bot_auth",
     "cap",
+    "oidc",
     "noop",
 ];
 
 /// Built-in OSS policy `type:` names. Mirrors `sbproxy_modules::compile_policy`.
 pub const KNOWN_POLICY_TYPES: &[&str] = &[
+    "rate_limit_budget",
     "rate_limiting",
     "ip_filter",
     "ip_filtering",
@@ -151,6 +156,7 @@ pub const KNOWN_POLICY_TYPES: &[&str] = &[
     "assertion",
     "response_assertion",
     "request_validator",
+    "content_digest",
     "concurrent_limit",
     "concurrent_limiting",
     "ai_crawl_control",
@@ -169,6 +175,7 @@ pub const KNOWN_POLICY_TYPES: &[&str] = &[
     // WOR-203 PR 3b: NL-as-a-policy via the LLM-as-judge backend.
     // See `crates/sbproxy-modules/src/policy/semantic_constraint.rs`.
     "semantic_constraint",
+    "agent_budget",
 ];
 
 /// Built-in OSS transform `type:` names. Mirrors `sbproxy_modules::compile_transform`.
@@ -197,6 +204,7 @@ pub const KNOWN_TRANSFORM_TYPES: &[&str] = &[
     "citation_block",
     "json_envelope",
     "cel",
+    "a2a_agent_card_rewrite",
     "noop",
 ];
 
@@ -270,7 +278,27 @@ pub fn validate(config: &ConfigFile, opts: &ValidationOptions) -> Vec<PlanFindin
         check_unknown_types(host, origin, opts, &mut findings);
     }
 
+    // -- update-config --
+    check_update_config(&config.update, &mut findings);
+
     findings
+}
+
+/// Flag an `update:` block that turns on the background check but sets a
+/// zero interval, which would poll with no delay. A warning, not an error:
+/// the field is only consulted when a background check is wired.
+fn check_update_config(update: &crate::types::UpdateConfig, out: &mut Vec<PlanFinding>) {
+    if update.auto && update.check_interval_secs == 0 {
+        out.push(PlanFinding {
+            severity: Severity::Warn,
+            rule_id: "update-zero-check-interval".to_string(),
+            path: "update.check_interval_secs".to_string(),
+            message: "update.auto is on but check_interval_secs is 0; set a \
+                      non-zero interval (for example 1d) so the background \
+                      freshness check does not poll without delay"
+                .to_string(),
+        });
+    }
 }
 
 // --- Orphan-ref check ----------------------------------------------
@@ -379,10 +407,11 @@ fn is_hostname_like(host: &str) -> bool {
 
 // --- Missing-secret check ------------------------------------------
 
-/// Walk a JSON value tree and emit a finding for each legacy
-/// `secret:` / `secret://` map reference whose logical name is not
-/// in `secret_keys`. References embedded in arbitrary string fields
-/// (e.g. `auth.secret: "secret:my_jwt"`) are caught.
+/// Walk a JSON value tree and emit a finding for each removed
+/// `secret:<name>` or legacy logical-name `secret://<name>` map
+/// reference whose name is not in `secret_keys`. References embedded
+/// in arbitrary string fields (e.g. `auth.secret:
+/// "secret:my_jwt"`) are caught for migration diagnostics.
 ///
 /// When the proxy has no `secrets:` block at all
 /// (`secrets_block_present = false`), missing references downgrade
@@ -451,10 +480,10 @@ fn walk_secrets(
     }
 }
 
-/// Pull every legacy `secret:` or `secret://` map reference out of a
-/// free-form string. Returns the bare logical name (the part after
-/// the prefix) for each match. Multiple references in one string
-/// (e.g. an interpolated template) are all returned.
+/// Pull every removed `secret:<name>` or legacy logical-name
+/// `secret://<name>` map reference out of a free-form string. Returns
+/// the bare logical name for each match. Multiple references in one
+/// string (e.g. an interpolated template) are all returned.
 fn extract_secret_refs(input: &str) -> Vec<String> {
     let mut out = Vec::new();
     for prefix in ["secret://", "secret:"] {
@@ -606,6 +635,38 @@ mod tests {
 
     fn parse(yaml: &str) -> ConfigFile {
         serde_yaml::from_str::<ConfigFile>(yaml).expect("ConfigFile parse")
+    }
+
+    // -- update-config --
+
+    #[test]
+    fn update_auto_with_zero_interval_warns() {
+        let cfg = parse("update:\n  auto: true\n  check_interval_secs: 0\n");
+        let findings = validate(&cfg, &ValidationOptions::default());
+        let zero: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "update-zero-check-interval")
+            .collect();
+        assert_eq!(zero.len(), 1, "got findings: {findings:?}");
+        assert_eq!(zero[0].severity, Severity::Warn);
+    }
+
+    #[test]
+    fn update_auto_with_positive_interval_is_clean() {
+        let cfg = parse("update:\n  auto: true\n  check_interval_secs: 1d\n");
+        let findings = validate(&cfg, &ValidationOptions::default());
+        assert!(!findings
+            .iter()
+            .any(|f| f.rule_id == "update-zero-check-interval"));
+    }
+
+    #[test]
+    fn update_block_absent_is_clean() {
+        let cfg = parse("proxy: {}\n");
+        let findings = validate(&cfg, &ValidationOptions::default());
+        assert!(!findings
+            .iter()
+            .any(|f| f.rule_id == "update-zero-check-interval"));
     }
 
     // -- orphan-ref --
@@ -827,6 +888,7 @@ origins:
         - "vault://primary/secret/data/inbound/admin-token?key=token"
         - "awssm://primary/prod/sbproxy-inbound-tokens?version=3&key=admin"
         - "gcpsm://primary/inbound-token?version=latest"
+        - "azurekv://primary/inbound-token?version=abc123def456"
         - "k8ssecret://primary/sbproxy-secrets/inbound-token"
         - "secretfile://local/inbound-admin?key=current"
         - "secret://local/inbound-admin-token"
@@ -943,6 +1005,104 @@ origins:
         assert!(
             findings.iter().all(|f| f.rule_id != "unknown-action-type"),
             "got findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_builtins_are_known_to_plan_validation() {
+        let cases = [
+            (
+                "oidc",
+                "unknown-auth-type",
+                r#"
+origins:
+  app.example.com:
+    action:
+      type: static
+      body: ok
+    authentication:
+      type: oidc
+      authorization_endpoint: https://idp.example.com/authorize
+      token_endpoint: https://idp.example.com/oauth/token
+      jwks_uri: https://idp.example.com/.well-known/jwks.json
+      issuer: https://idp.example.com
+      client_id: sbproxy
+      client_secret: super-secret-client-secret-of-arbitrary-length
+      cookie_secret: operator-supplied-32-plus-byte-cookie-secret
+"#,
+            ),
+            (
+                "rate_limit_budget",
+                "unknown-policy-type",
+                r#"
+origins:
+  api.example.com:
+    action:
+      type: static
+      body: ok
+    policies:
+      - type: rate_limit_budget
+"#,
+            ),
+            (
+                "content_digest",
+                "unknown-policy-type",
+                r#"
+origins:
+  webhook.example.com:
+    action:
+      type: static
+      body: ok
+    policies:
+      - type: content_digest
+"#,
+            ),
+            (
+                "agent_budget",
+                "unknown-policy-type",
+                r#"
+origins:
+  ai.example.com:
+    action:
+      type: static
+      body: ok
+    policies:
+      - type: agent_budget
+        requests_per_minute: 60
+        tokens_per_hour: 100000
+        burst: 10
+        on_exceed: deny
+"#,
+            ),
+            (
+                "a2a_agent_card_rewrite",
+                "unknown-transform-type",
+                r#"
+origins:
+  agent.example.com:
+    action:
+      type: static
+      body: ok
+    transforms:
+      - type: a2a_agent_card_rewrite
+"#,
+            ),
+        ];
+
+        let mut rejected_builtins = Vec::new();
+        for (type_name, unknown_rule, yaml) in cases {
+            let cfg = parse(yaml);
+            let findings = validate(&cfg, &ValidationOptions::default());
+            if findings
+                .iter()
+                .any(|finding| finding.rule_id == unknown_rule)
+            {
+                rejected_builtins.push(type_name);
+            }
+        }
+        assert!(
+            rejected_builtins.is_empty(),
+            "runtime built-ins rejected by plan validation: {rejected_builtins:?}"
         );
     }
 

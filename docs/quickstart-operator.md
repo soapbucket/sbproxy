@@ -1,108 +1,119 @@
-# Operator quickstart: first 24 hours
+# Kubernetes operator quickstart
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-28*
 
-This is the minimum production bring-up path for the OSS Kubernetes operator. Use
-[`kubernetes.md`](kubernetes.md) for the full CRD and hot-reload reference after
-the first deploy is healthy.
+This is a Kubernetes follow-on, not the first SBproxy exercise. Complete [Getting started](getting-started.md) first so you have seen an origin and `sbproxy validate` work on one machine.
 
-## 1. Deploy
+Before you begin, make sure you have:
 
-Install the chart into its own namespace:
+- A reachable Kubernetes cluster.
+- `kubectl` pointed at the intended context.
+- Helm 3.
+- Permission to create the namespace, namespaced RBAC resources, and the
+  cluster-scoped `sbproxies.sbproxy.dev` and `sbproxyconfigs.sbproxy.dev`
+  CRDs.
+- Registry access from each node to pull
+  `ghcr.io/soapbucket/sbproxy:1.9.0`.
+
+The operator watches its own namespace by default. Install another operator
+when you need a separate namespace boundary.
 
 ```bash
-helm install sbproxy ./deploy/helm/sbproxy \
+kubectl config current-context
+kubectl get nodes
+helm version
+```
+
+## Install the operator
+
+Run this from an SBproxy checkout. It installs the CRDs, operator Deployment, ServiceAccount, and namespaced RBAC:
+
+```bash
+helm upgrade --install sbproxy ./deploy/helm/sbproxy \
   --namespace sbproxy-system \
-  --create-namespace \
-  --set image.repository=ghcr.io/soapbucket/sbproxy-k8s-operator \
-  --set image.tag=0.1.0
+  --create-namespace
+
+kubectl rollout status deployment/sbproxy-k8s-operator -n sbproxy-system
 ```
 
-The chart's `values.yaml` already defaults to that repository and tag, so the two `--set` flags only matter when you pin something else.
+If the deployment name differs in your chart version, use `kubectl get deployments -n sbproxy-system` and pass that name to `kubectl rollout status`.
 
-For a single-node smoke check without the operator, run the data plane directly:
+## Create a small proxy
+
+Save this manifest as `demo.yaml`. Validate the same `sb.yml` with `sbproxy validate` before embedding a production configuration. The `SBProxyConfig` contains the proxy configuration. The `SBProxy` selects that config, image, listener port, and replica count.
+
+```yaml
+apiVersion: sbproxy.dev/v1alpha1
+kind: SBProxyConfig
+metadata:
+  name: demo-config
+  namespace: sbproxy-system
+spec:
+  config: |
+    origins:
+      "demo.example.com":
+        action:
+          type: mock
+          status: 200
+          body: "hello from sbproxy\\n"
+---
+apiVersion: sbproxy.dev/v1alpha1
+kind: SBProxy
+metadata:
+  name: demo
+  namespace: sbproxy-system
+spec:
+  image: ghcr.io/soapbucket/sbproxy:1.9.0
+  configRef: demo-config
+  replicas: 1
+  port: 8080
+```
+
+The `origins` map keys the client-facing hostname. The mock action makes this smoke check independent of an external backend. Replace the image tag with the release you have approved before using this shape outside a test cluster.
 
 ```bash
-docker run --rm -p 8080:8080 -p 9090:9090 \
-  -v "$PWD/sb.yml:/etc/sbproxy/sb.yml:ro" \
-  soapbucket/sbproxy:1.5.0 \
-  serve -f /etc/sbproxy/sb.yml
+kubectl apply -n sbproxy-system -f demo.yaml
+kubectl rollout status -n sbproxy-system deployment/demo-proxy
+kubectl get -n sbproxy-system sbproxy,sbproxyconfig,pods,svc
 ```
 
-Create an `SBProxyConfig` and `SBProxy` after the chart is installed. The
-operator reconciles them into a Deployment, Service, and ConfigMap.
+Kubernetes stores the embedded document in a ConfigMap and the proxy compiles it when the operator creates the workload.
 
-## 2. Verify Readiness
+## Verify client traffic
 
-Port-forward the proxy Service and check readiness:
+In one terminal, forward the generated Service:
 
 ```bash
-kubectl port-forward svc/demo-svc 8080:8080 9090:9090
-curl -fsS http://127.0.0.1:9090/readyz | jq .
+kubectl port-forward -n sbproxy-system svc/demo-svc 8080:8080
 ```
 
-Expected result: HTTP 200 with a top-level `"status": "ok"` and every required
-component reporting `healthy`. Optional integrations that are not configured
-should report `not_configured`, not `unhealthy`.
-
-Component statuses:
-
-- `healthy`: the component is configured and reporting nominal.
-- `degraded`: the component is reachable but impaired; readiness still passes.
-- `unhealthy`: the component is unreachable, failed its probe, or has gone stale past its freshness window; readiness fails so the load balancer drains the pod.
-- `not_configured`: the component is optional and disabled for this deployment; counts as ready.
-
-Use `/health` for the richer JSON payload with version, uptime, and readiness
-checks. Use `/healthz` only as a simple liveness probe.
-
-## 3. Scrape Metrics
-
-Check the Prometheus endpoint:
+In another terminal, call the data plane:
 
 ```bash
-curl -fsS http://127.0.0.1:9090/metrics | head
+curl -i -H 'Host: demo.example.com' http://127.0.0.1:8080/
 ```
 
-Import `dashboards/grafana/sbproxy-overview.json` into Grafana first. It gives
-the first-day view: request rate, latency, error rate, active connections, and
-origin health. Add `sbproxy-security.json`, `sbproxy-origins.json`, and
-`sbproxy-ai-gateway.json` after the overview dashboard is green.
-
-## 4. Tail Logs
-
-Tail the operator and one proxy pod:
+Expect HTTP 200 and `hello from sbproxy`. Check the operator when the workload does not appear or the proxy rejects the configuration:
 
 ```bash
-kubectl logs -n sbproxy-system deploy/sbproxy-operator -f
-kubectl logs deploy/demo -f
+kubectl logs -n sbproxy-system deployment/sbproxy-k8s-operator
+kubectl describe -n sbproxy-system sbproxy demo
+kubectl logs -n sbproxy-system deployment/demo-proxy
 ```
 
-A successful proxied request has a 2xx status and normal access-log fields such
-as method, hostname, path, status, and duration. A denied request has a 4xx
-status plus policy/auth context, for example `auth`, `rate_limit`, `waf`, or
-`policy` fields depending on which layer made the decision.
+## What changes do
 
-If a component sits at `unhealthy` with a staleness detail, check the matching
-integration first. If logs contain config parse errors, the operator will keep
-the last working Deployment while the bad config is corrected.
+Updating the `SBProxyConfig` applies the new `sb.yml`. Without `adminAuthSecretRef`, the operator updates a config hash and Kubernetes performs a rolling restart. With an enabled admin server and matching admin-auth Secret, the operator can request `POST /admin/reload` and preserve running pods. [kubernetes.md](kubernetes.md) documents the auth Secret, clustering, CRD fields, and fallback behavior.
 
-## 5. Roll Back
-
-For Helm-managed operator changes:
+## Remove the smoke test
 
 ```bash
-helm history sbproxy -n sbproxy-system
-helm rollback sbproxy <REVISION> -n sbproxy-system
+kubectl delete -n sbproxy-system -f demo.yaml
+helm uninstall sbproxy -n sbproxy-system
 ```
 
-For data-plane config changes, revert the `SBProxyConfig` manifest in Git and
-apply it again:
+Delete the namespace only when nothing else uses it:
 
 ```bash
-kubectl apply -f sbproxyconfig.yaml
-kubectl rollout status deploy/demo
+kubectl delete namespace sbproxy-system
 ```
-
-If hot reload is enabled, the operator posts the new config to each pod without
-restarting it. If hot reload fails or is disabled, it stamps a new config hash
-on the Deployment and Kubernetes performs a rolling restart.

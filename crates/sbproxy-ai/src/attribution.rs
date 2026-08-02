@@ -15,11 +15,11 @@
 //!
 //! ## Schema
 //!
-//! Eight optional tags, each accepted via a documented header
-//! convention `SB-Attr-<Key>`. Operators can also pin defaults
-//! per-route via config (see the wave-2 wiring in
-//! `sbproxy-config`); the request header wins when both are
-//! present.
+//! Nine header-settable tags, each accepted via a documented header
+//! convention `SB-Attr-<Key>`, plus one field the gateway fills
+//! itself. Operators can also pin defaults per-route via config (see
+//! the wave-2 wiring in `sbproxy-config`); the request header wins
+//! when both are present.
 //!
 //! | Tag         | Header             | Purpose                                                                                              |
 //! |-------------|--------------------|------------------------------------------------------------------------------------------------------|
@@ -31,7 +31,20 @@
 //! | environment | `SB-Attr-Env`      | `prod` / `staging` / `dev` (free-form; the spend dashboard expects three buckets).                   |
 //! | agent_type  | `SB-Attr-Agent`    | `runtime` (production agent) or `development` (CI / IDE / eval harness). Separates "real" spend.    |
 //! | risk_tier   | `SB-Attr-Risk`     | Free-form risk tier (`internal-only` / `customer-facing` / `regulated`); used by approval gates.    |
-//! | trace_id    | `SB-Attr-Trace-Id` | Caller-supplied workflow correlation id. The ledger's Allocate-layer join key.                       |
+//! | trace_id    | `SB-Attr-Trace-Id` | Caller-supplied workflow correlation id. The workflow join key, and the ledger's Allocate layer.     |
+//! | agent_id    | none               | Which agent spent this, filled from the verified request identity. Never read from a header.         |
+//!
+//! ## Workflow is `trace_id`, and there is only one of it
+//!
+//! Per-agent cost reporting wants to roll up by (agent, workflow,
+//! run). `agent_id` is the agent and the A2A `contextId` is the run.
+//! The workflow is `trace_id`: it is the caller-supplied id that spans
+//! the several requests one logical piece of work takes, which is
+//! exactly what a workflow is. Nothing else in the gateway means
+//! "workflow", and nothing should; a second correlation concept beside
+//! this one would give two answers to "what did this workflow cost"
+//! and no way to reconcile them. It stays off metric labels, where an
+//! unbounded per-workflow value would mint a time series per workflow.
 //!
 //! ## Bounds
 //!
@@ -141,10 +154,52 @@ pub struct AttributionTags {
     /// `regulated`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub risk_tier: Option<String>,
-    /// Caller-supplied workflow correlation id (the ledger's
-    /// Allocate-layer join key).
+    /// Caller-supplied workflow correlation id: the gateway's one and
+    /// only workflow join key, and the ledger's Allocate-layer join
+    /// key.
+    ///
+    /// Per-agent cost is reported by (agent, workflow, run). This is
+    /// the workflow leg. There is no separate workflow concept in the
+    /// gateway and there should not be one, because two correlation
+    /// ids for the same thing means two different answers to "what did
+    /// this workflow cost".
+    ///
+    /// Deliberately excluded from every metric label. A workflow id
+    /// takes a fresh value per piece of work, so as a label it mints a
+    /// time series per workflow and the series count grows with
+    /// traffic. It reaches the access log instead, through
+    /// [`Self::iter`], which is where an unbounded correlation key
+    /// belongs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
+    /// Which agent spent this, when the gateway resolved an agent
+    /// identity it trusts (WOR-2140).
+    ///
+    /// Unlike every field above it, this one is **not settable from a
+    /// request header**. `SB-Attr-Agent-Id` is not in the schema and
+    /// [`parse_from_headers`] rejects it like any other unknown tag.
+    /// Two reasons, and both matter:
+    ///
+    /// 1. This value becomes the `agent_id` metric label. A caller that
+    ///    could name its own agent could bill its spend to a different
+    ///    agent, or mint a fresh agent per request until the label's
+    ///    cardinality budget demotes every real agent to `__other__`.
+    ///    So it is filled from the resolved A2A identity, and only when
+    ///    that identity was verified.
+    /// 2. It has to be capped, and it has to be capped in the same
+    ///    place as the rest of the run identity, by
+    ///    [`crate::tracing_spans::cap_agent_id`]. A header path would
+    ///    apply this module's [`MAX_TAG_VALUE_LEN`] instead, and then
+    ///    the metric label and the ledger entry would disagree about
+    ///    which agent a long id names.
+    ///
+    /// `None` means the gateway could not attribute the request to a
+    /// verified agent, which is the honest answer for ordinary traffic
+    /// and for an agent that only asserted its own name. Spend from an
+    /// unverified agent is still recorded in full, in the usage ledger,
+    /// beside the flag that says the identity was not verified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
 }
 
 impl AttributionTags {
@@ -161,12 +216,19 @@ impl AttributionTags {
             && self.agent_type.is_none()
             && self.risk_tier.is_none()
             && self.trace_id.is_none()
+            && self.agent_id.is_none()
     }
 
     /// Compose self over a base set: each field of `self` falls
     /// back to the corresponding field of `base` when missing.
     /// Used by the request handler to apply per-route default
     /// tags from config beneath the per-request header overrides.
+    ///
+    /// [`agent_id`](Self::agent_id) composes the same way, and because
+    /// no header can set it, the header-parsed side is always `None`
+    /// and the base always wins. That is the intended shape: the base
+    /// is the gateway's own resolved identity, and there is nothing for
+    /// a caller to override it with.
     pub fn or_default_from(self, base: &AttributionTags) -> Self {
         Self {
             project: self.project.or_else(|| base.project.clone()),
@@ -178,6 +240,7 @@ impl AttributionTags {
             agent_type: self.agent_type.or_else(|| base.agent_type.clone()),
             risk_tier: self.risk_tier.or_else(|| base.risk_tier.clone()),
             trace_id: self.trace_id.or_else(|| base.trace_id.clone()),
+            agent_id: self.agent_id.or_else(|| base.agent_id.clone()),
         }
     }
 
@@ -196,6 +259,7 @@ impl AttributionTags {
             ("agent_type", self.agent_type.as_deref()),
             ("risk_tier", self.risk_tier.as_deref()),
             ("trace_id", self.trace_id.as_deref()),
+            ("agent_id", self.agent_id.as_deref()),
         ]
         .into_iter()
         .filter_map(|(k, v)| v.map(|s| (k, s)))
@@ -205,6 +269,12 @@ impl AttributionTags {
 /// Map an inbound HTTP header pair to the schema field name it
 /// represents. Returns `None` for non-`SB-Attr-` headers and for
 /// `SB-Attr-` headers whose key is outside the schema.
+///
+/// `agent_id` is deliberately absent from this table. There is no
+/// `SB-Attr-Agent-Id` header, so a caller that sends one is told so
+/// with a 400 rather than silently naming which agent its spend is
+/// charged to. (`SB-Attr-Agent` is a different tag: it resolves to
+/// `agent_type`, the runtime-vs-development bucket, and predates this.)
 fn schema_field_for(header_name: &str) -> Option<&'static str> {
     let lower = header_name.to_ascii_lowercase();
     let suffix = lower.strip_prefix(ATTR_HEADER_PREFIX)?;
@@ -433,11 +503,79 @@ mod tests {
             customer: Some("acme".to_string()),
             project: Some("growth".to_string()),
             trace_id: Some("01J6FQ7X".to_string()),
+            agent_id: Some("billing-orchestrator".to_string()),
             ..Default::default()
         };
         let names: Vec<&'static str> = tags.iter().map(|(k, _)| k).collect();
-        // Schema order: project before customer before trace_id.
-        assert_eq!(names, vec!["project", "customer", "trace_id"]);
+        // Schema order: project before customer before trace_id before
+        // agent_id, which is appended last so existing consumers of the
+        // order see the same prefix they always did.
+        assert_eq!(names, vec!["project", "customer", "trace_id", "agent_id"]);
+    }
+
+    /// WOR-2140: no header names `agent_id`. A caller that tries gets
+    /// the same rejection as any other unknown tag, which is the point:
+    /// the value becomes a metric label and the key an agent's spend
+    /// rolls up under, so a caller that could set it could bill another
+    /// agent or shard the label until every real agent is demoted.
+    #[test]
+    fn agent_id_is_not_settable_from_a_header() {
+        for header in [
+            "SB-Attr-Agent-Id",
+            "SB-Attr-Agent_Id",
+            "SB-Attr-AgentId",
+            "sb-attr-agent-id",
+        ] {
+            let result = parse_from_headers(h(&[(header, "somebody-elses-agent")]));
+            let err = match result {
+                Err(e) => e,
+                Ok(tags) => panic!("{header} must be rejected, parsed {tags:?}"),
+            };
+            assert!(
+                matches!(err, AttributionError::UnknownTag(_)),
+                "{header} should report an unknown tag, got {err:?}"
+            );
+        }
+    }
+
+    /// `SB-Attr-Agent` still means `agent_type`, not `agent_id`. The two
+    /// names are one character apart and they mean different things, so
+    /// pin that adding the second did not quietly repoint the first.
+    #[test]
+    fn sb_attr_agent_still_resolves_to_agent_type() {
+        let tags = parse_from_headers(h(&[("SB-Attr-Agent", "runtime")])).expect("parse");
+        assert_eq!(tags.agent_type.as_deref(), Some("runtime"));
+        assert!(
+            tags.agent_id.is_none(),
+            "the runtime/development bucket must not become an agent identity"
+        );
+    }
+
+    /// The gateway's own resolved agent identity composes underneath the
+    /// header-supplied tags, and nothing a caller sends can displace it.
+    #[test]
+    fn resolved_agent_id_survives_header_composition() {
+        let base = AttributionTags {
+            agent_id: Some("billing-orchestrator".to_string()),
+            team: Some("platform".to_string()),
+            ..Default::default()
+        };
+        let from_headers = parse_from_headers(h(&[("SB-Attr-Project", "growth")])).expect("parse");
+        let resolved = from_headers.or_default_from(&base);
+        assert_eq!(resolved.agent_id.as_deref(), Some("billing-orchestrator"));
+        assert_eq!(resolved.project.as_deref(), Some("growth"));
+    }
+
+    /// `is_empty` accounts for `agent_id`, so a request that carried no
+    /// business tags but did resolve an agent is not treated as
+    /// unattributed.
+    #[test]
+    fn agent_id_alone_is_not_an_empty_tag_set() {
+        let tags = AttributionTags {
+            agent_id: Some("billing-orchestrator".to_string()),
+            ..Default::default()
+        };
+        assert!(!tags.is_empty());
     }
 
     /// Duplicate header values for the same logical field

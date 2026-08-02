@@ -28,17 +28,21 @@ groups:
           summary: "AI provider {{ $labels.provider }} returning only errors"
           description: "Provider {{ $labels.provider }} has had zero successful requests and non-zero errors for the last 2 minutes."
 
+      # sbproxy_ai_guardrail_triggers_total has never existed. The counter is
+      # sbproxy_ai_guardrail_blocks_total, and it carries `category`, not
+      # `action`. Until this commit nothing incremented it either, so the alert
+      # was doubly dead.
       - alert: SBProxyGuardrailSpike
-        expr: rate(sbproxy_ai_guardrail_triggers_total{action="block"}[1m]) > 10
+        expr: sum(rate(sbproxy_ai_guardrail_blocks_total[1m])) > 10
         for: 1m
         labels:
           severity: warning
         annotations:
           summary: "High guardrail block rate (> 10/min)"
-          description: "Guardrail blocks are firing at a high rate. Type: {{ $labels.type }}. Current rate: {{ $value }}/sec."
+          description: "Guardrail blocks are firing at a high rate. Current rate: {{ $value }}/sec."
 
       - alert: SBProxyHighTokenUsage
-        expr: increase(sbproxy_ai_tokens_output_total[1h]) > 1000000
+        expr: increase(sbproxy_ai_tokens_attributed_total{direction="output"}[1h]) > 1000000
         for: 0m
         labels:
           severity: info
@@ -120,6 +124,24 @@ groups:
           summary: "Model-host load queue backed up"
           description: "More than 20 requests have been queued waiting for a cold model to load for 5 minutes. Cold starts are not keeping up; consider keep_alive to hold the model resident."
 
+      - alert: SBProxyModelPlaneSecurityRejections
+        expr: sum(rate(sbproxy_model_plane_rejections_total{retry_class="security"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Private model-plane security rejections"
+          description: "Authenticated model-plane requests have been refused on security grounds (identity, TLS, or replay) for 5 minutes. Check peer certificates and clock skew before assuming an attack."
+
+      - alert: SBProxyModelHostAdmissionCrashLoop
+        expr: increase(sbproxy_model_host_admission_rejections_total{reason="crash_loop"}[10m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Model-host deployment {{ $labels.deployment }} is crash-looping"
+          description: "Deployment {{ $labels.deployment }} has exhausted its engine launch budget and is rejecting admission for 5 minutes. Check the engine logs and reset the crash-loop budget once the underlying failure is fixed."
+
       - alert: SBProxyAIBudgetNearExhaustion
         expr: max by (scope) (sbproxy_ai_budget_utilization_ratio) > 0.9
         for: 5m
@@ -146,3 +168,58 @@ groups:
         annotations:
           summary: "AI spend velocity above $10/hour"
           description: "Derived AI spend has been running above $10 per hour for 15 minutes. Tune the threshold to your budget; the unit conversion is micro-USD/s to USD/h."
+
+      - alert: SBProxyAICompressionFailures
+        expr: sbproxy:ai_compression_failure_ratio_5m > 0.10 and sum(rate(sbproxy_ai_compression_requests_total[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "AI context compression failure ratio above 10%"
+          description: "More than 10% of non-empty compression pipelines have failed open for 10 minutes. Requests still dispatch with the last committed message list. Check the lever failure reason and state backend health."
+
+      - alert: SBProxyAICompressionStateRejections
+        expr: sum(rate(sbproxy_ai_compression_state_operations_total{outcome="error"}[5m])) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "AI compression state updates are being rejected"
+          description: "External compression state operations have failed above 0.1 events/second for 10 minutes. Inspect the operation label plus Redis lease and fence coordination metrics before changing compression policy."
+
+      - alert: SBProxyAICompressionValueUnpriced
+        expr: |
+          (
+            sum by (tenant_id, origin, model) (
+              rate(sbproxy_ai_compression_value_tokens_saved_total[15m])
+            ) > 10
+          )
+          unless on (tenant_id, origin, model)
+          (
+            sum by (tenant_id, origin, model) (
+              rate(sbproxy_ai_compression_value_cost_saved_micros_total[15m])
+            ) > 0
+          )
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Compression value for {{ $labels.model }} has no price"
+          description: "Successful compression is avoiding more than 10 estimated input tokens per second for this model, but no avoided-cost value is being recorded. Configure an input price or accept token-only value reporting for this model."
+
+      - alert: SBProxyOcspStapleStale
+        # WOR-2086: the staple refresh cadence is 12h, so an age past
+        # 26h means at least two consecutive refresh cycles failed (or
+        # the refresh task itself died; the gauge is published by a
+        # once-a-minute tick in the same task, so a fully dead task
+        # freezes the series and the absent/stale distinction still
+        # surfaces in the dashboard). Between the refresh stopping and
+        # the staple expiring, handshakes keep succeeding, which is why
+        # nothing else fires first.
+        expr: sbproxy_ocsp_staple_age_seconds > 93600
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OCSP staple for {{ $labels.host }} is stale"
+          description: "The cached OCSP staple for {{ $labels.host }} is {{ $value | humanizeDuration }} old against a 12h refresh cadence. The refresh loop is failing or dead; clients keep accepting the old staple only until it expires."

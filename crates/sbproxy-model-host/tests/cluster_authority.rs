@@ -18,6 +18,7 @@ fn deployment(model: &str) -> ModelDeployment {
         variant: Some("q4_k_m".to_string()),
         heterogeneous_variants: false,
         replicas: 1,
+        tensor_parallel: None,
         required_labels: BTreeMap::from([("pool".to_string(), "gpu".to_string())]),
         spread_by: vec!["zone".to_string()],
         pull: PullPolicy::OnDemand,
@@ -29,6 +30,14 @@ fn deployment(model: &str) -> ModelDeployment {
         queue_timeout_ms: 30_000,
         engine: EngineChoice::Auto,
         rollout: RolloutPolicy::Rolling,
+        extra_args: Vec::new(),
+        chunked_prefill: None,
+        tool_call_parser: None,
+        swap_space_gib: None,
+        cpu_offload_gib: None,
+        engine_version: None,
+        engine_image: None,
+        engine_sha256: None,
     }
 }
 

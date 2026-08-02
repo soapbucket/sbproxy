@@ -100,7 +100,7 @@ The `TTL` is the recommended starting point for a SaaS deployment. Hot-data dash
 
 Two map columns carry per-request labels, from different sources:
 
-* `attribution` is the resolved business attribution tag set: the credential's `attrs:` defaults (project, team) merged with the inbound `SB-Attr-*` headers (project, feature, okr, team, customer, environment, agent_type, risk_tier, trace_id). Per-request headers override the credential default. The metric side carries only a bounded projection of this, not the full map: `sbproxy_tokens_attributed_total{project,user,tag,direction}` counts tokens against the matched credential. Pivots on the higher-cardinality keys (`attribution['customer']`, `attribution['okr']`, and so on) are log-side queries; that is what this table is for.
+* `attribution` is the resolved business attribution tag set: the credential's live `attrs.project` default merged with the inbound `SB-Attr-*` headers (project, feature, okr, team, customer, environment, agent_type, risk_tier, trace_id). Per-request headers override the credential default. Credential `attrs.team` is currently config-only and does not populate this set; explicitly authoring it emits a warning. The metric side carries only a bounded projection of this, not the full map: `sbproxy_tokens_attributed_total{project,user,tag,direction}` counts tokens against the matched credential. Pivots on the higher-cardinality keys (`attribution['customer']`, `attribution['okr']`, and so on) are log-side queries; that is what this table is for.
 * `metadata` is free-form key/values the operator pins on the credential's `attrs.metadata:`. Use it for dimensions outside the fixed attribution schema (cost_center is lifted in here for back-compat).
 
 To pivot spend by any attribution dimension, group on the map value:
@@ -212,7 +212,7 @@ HAVING budget_tokens > 0
 ORDER BY percent_used DESC;
 ```
 
-The query reads each line's `tags` array (populated from the credential's `attrs.tags:` list). To slice by team instead, group on the first-class `team` column the same way. Free-form `metadata` is still available for any key/value an operator declares on the credential. Replace the inline `tag_budgets` map with a join against an operator-maintained budget table for production use.
+The query reads each line's `tags` array (populated from the credential's `attrs.tags:` list). To slice by team, supply the live inbound team attribution or encode the team as a credential tag; credential `attrs.team` itself is currently compatibility-only. Free-form `metadata` is still available for any key/value an operator declares on the credential. Replace the inline `tag_budgets` map with a join against an operator-maintained budget table for production use.
 
 ## Materialised view: per-day-per-project pre-aggregation
 

@@ -1,7 +1,27 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
-import { api, asList, ApiError, type TargetHealth } from "../api";
+import {
+  api,
+  asList,
+  ApiError,
+  type ConfigWriteConflict,
+  type EffectiveConfigResponse,
+  type TargetHealth,
+} from "../api";
+import {
+  isEditorLocked,
+  ownedElsewhere,
+  ownershipSummary,
+  provenanceLabel,
+  readOwnership,
+} from "../lib/config-ownership";
+import { applyEdits, PatchError } from "../lib/config-patch";
+import { authorityLabel, conflictsByPath } from "../lib/config-form";
+import { buildForm } from "../lib/config-schema";
+import ConfigForm from "../components/ConfigForm.vue";
+import { parse as parseYaml } from "yaml";
 import { useAsync } from "../composables/useAsync";
+import { toast } from "../composables/useToasts";
 import { formatMs } from "../lib/format";
 import PageHeader from "../components/PageHeader.vue";
 import StatusBadge from "../components/StatusBadge.vue";
@@ -12,13 +32,39 @@ const openapi = useAsync(() => api.openapi());
 const drift = useAsync(() => api.drift());
 const targetsReq = useAsync(() => api.targets());
 
+const effective = useAsync(() => api.effectiveConfig());
+const configSchema = useAsync(() => api.configSchema());
+
 function refresh() {
   openapi.run();
   drift.run();
   targetsReq.run();
+  effective.run();
+  configSchema.run();
   loadConfig();
 }
 onMounted(refresh);
+
+// ---- configuration ownership (WOR-2012) ----
+//
+// The editor is offered only on a node whose own file is the whole
+// configuration. This is a courtesy, not the enforcement: the server
+// refuses the same writes with a 409 whether they arrive from this page or
+// from curl. Showing the lock here just means an operator finds out before
+// they have typed an edit rather than after.
+//
+// The reading of the response lives in lib/config-ownership so the cases
+// that matter (an authority configured but never reached, a git base under
+// an overlay, a response that has not arrived) are testable without a
+// browser.
+const ownership = computed(() =>
+  readOwnership(effective.data.value as EffectiveConfigResponse | null),
+);
+const editorLocked = computed(() => isEditorLocked(ownership.value));
+const ownerSummary = computed(() => ownershipSummary(ownership.value));
+const notOwnedHere = computed(() =>
+  ownedElsewhere(effective.data.value as EffectiveConfigResponse | null),
+);
 
 // ---- live config editor (WOR-1763) ----
 const editorText = ref("");
@@ -27,6 +73,79 @@ const configLoading = ref(false);
 const configErr = ref<ApiError | null>(null);
 const saveBusy = ref(false);
 const saveBanner = ref<{ tone: "ok" | "err"; text: string } | null>(null);
+
+// ---- schema-generated form (WOR-2013) ----
+//
+// `editorText` stays the single source of truth for both views. A form edit
+// applies its patch to that text immediately rather than accumulating a
+// separate edit list, which is what makes switching between form and raw
+// unable to lose anything: there is only ever one document.
+//
+// The patch goes through the YAML document tree rather than a parse and
+// re-serialize, so comments and key order survive. A form that rewrote the
+// whole file on every change would be a worse editor than the textarea it
+// replaced.
+const mode = ref<"form" | "raw">("raw");
+// Paths the write guard rejected, indexed so each field renders its own
+// error. A 409 naming six paths as one toast is a puzzle; the same
+// information on the six fields is a to-do list.
+const fieldConflicts = ref<Record<string, true>>({});
+const patchError = ref<string | null>(null);
+
+/** The current document, parsed. `null` while the raw text does not parse. */
+const parsedDoc = computed<unknown>(() => {
+  if (!editorText.value.trim()) return {};
+  try {
+    return parseYaml(editorText.value) ?? {};
+  } catch {
+    return null;
+  }
+});
+
+const formNodes = computed(() => {
+  const schema = configSchema.data.value;
+  if (!schema || parsedDoc.value === null) return [];
+  return buildForm(schema, parsedDoc.value);
+});
+
+/**
+ * Under `mode: replace`, or on a git-sourced node, nothing on this node is
+ * editable and the form says so once at the top rather than on every field.
+ */
+const formOwnership = computed(() => ({
+  wholeDocumentLocked: editorLocked.value,
+  provenance:
+    (effective.data.value as EffectiveConfigResponse | null)?.provenance ?? {},
+  authorityLabel: authorityLabel(ownership.value?.authority),
+}));
+
+function onFormSet(path: string[], value: unknown) {
+  applyToDocument([{ path, value }]);
+}
+
+function onFormRemove(path: string[]) {
+  applyToDocument([{ path, remove: true as const }]);
+}
+
+function applyToDocument(edits: Parameters<typeof applyEdits>[1]) {
+  try {
+    editorText.value = applyEdits(editorText.value, edits);
+    patchError.value = null;
+    // An edited field is no longer the field the server complained about.
+    for (const edit of edits) delete fieldConflicts.value[edit.path.join(".")];
+  } catch (e) {
+    patchError.value =
+      e instanceof PatchError ? e.message : "could not apply that change to the document";
+  }
+}
+
+const formUnavailable = computed(() => {
+  if (configSchema.error.value) return "The config schema could not be loaded, so the form is unavailable.";
+  if (!configSchema.data.value) return "Loading the config schema...";
+  if (parsedDoc.value === null)
+    return "The raw text does not parse as YAML, so the form cannot render it. Fix it in the raw editor.";
+  return null;
+});
 
 async function loadConfig() {
   configLoading.value = true;
@@ -43,21 +162,62 @@ async function loadConfig() {
 }
 
 async function saveConfig() {
-  if (saveBusy.value || !editorText.value.trim()) return;
+  if (saveBusy.value || editorLocked.value || !editorText.value.trim()) return;
   saveBusy.value = true;
   saveBanner.value = null;
   try {
     await api.putConfig(editorText.value, editorRev.value || undefined);
-    saveBanner.value = { tone: "ok", text: "Config validated, saved, and hot-swapped." };
+    toast.success("Config saved", "Validated and hot-swapped into the live pipeline.");
+    saveBanner.value = null;
     await loadConfig(); // pick up the new revision
+    fieldConflicts.value = {};
     drift.run();
+    effective.run(); // ownership can move with the config
     targetsReq.run();
   } catch (e) {
+    // Validation detail and revision conflicts render next to the
+    // editor, where the fix happens; anything else raises a toast.
     if (e instanceof ApiError && e.status === 409) {
-      saveBanner.value = {
-        tone: "err",
-        text: "Revision mismatch: the on-disk config changed since you loaded it. Reload the editor and reapply your edits.",
-      };
+      // Two different 409s share this status and need opposite advice.
+      // A revision mismatch says reload and reapply. An ownership refusal
+      // says reapplying will fail exactly the same way, so name the paths
+      // and where they are actually set.
+      let conflict: ConfigWriteConflict | null = null;
+      try {
+        conflict = JSON.parse(e.body) as ConfigWriteConflict;
+      } catch {
+        // non-JSON body; fall through to the revision-mismatch wording
+      }
+      if (conflict?.code === "config_not_locally_owned") {
+        const paths = (conflict.conflicts ?? []).map((c) => c.path);
+        // Attach the rejection to the fields it names, so the form shows it
+        // where the fix is rather than only in a banner.
+        fieldConflicts.value = conflictsByPath(conflict.conflicts);
+        saveBanner.value = {
+          tone: "err",
+          text: [
+            paths.length === 1
+              ? `This node does not own ${paths[0]}.`
+              : `This node does not own these paths: ${paths.join(", ")}.`,
+            conflict.remedy ?? "",
+          ]
+            .filter(Boolean)
+            .join(" "),
+        };
+        effective.run(); // the layers may have moved since the page loaded
+      } else if (conflict?.code === "config_ownership_unknown") {
+        saveBanner.value = {
+          tone: "err",
+          text:
+            conflict.error ??
+            "Could not determine which paths this node owns, so the write was refused.",
+        };
+      } else {
+        saveBanner.value = {
+          tone: "err",
+          text: "Revision mismatch: the on-disk config changed since you loaded it. Reload the editor and reapply your edits.",
+        };
+      }
     } else if (e instanceof ApiError && e.status === 400) {
       let detail = e.body;
       try {
@@ -67,10 +227,7 @@ async function saveConfig() {
       }
       saveBanner.value = { tone: "err", text: detail || "Invalid config." };
     } else {
-      saveBanner.value = {
-        tone: "err",
-        text: e instanceof ApiError ? e.hint : String(e),
-      };
+      toast.error(e, "Save config");
     }
   } finally {
     saveBusy.value = false;
@@ -166,23 +323,19 @@ function targetHealthy(t: TargetHealth): string {
 
 // ---- reload ----
 const reloadBusy = ref(false);
-const reloadMsg = ref<string | null>(null);
-const reloadError = ref<ApiError | null>(null);
 
 async function reload() {
   if (!confirm("Reload configuration from disk? Active config will be replaced by the on-disk version.")) {
     return;
   }
   reloadBusy.value = true;
-  reloadMsg.value = null;
-  reloadError.value = null;
   try {
     await api.reload();
-    reloadMsg.value = "Reload requested. Refreshing drift and targets.";
+    toast.success("Config reloaded", "Refreshing drift and targets.");
     drift.run();
     targetsReq.run();
   } catch (e) {
-    reloadError.value = e instanceof ApiError ? e : new ApiError(0, String(e));
+    toast.error(e, "Reload config");
   } finally {
     reloadBusy.value = false;
   }
@@ -202,8 +355,57 @@ async function reload() {
     </template>
   </PageHeader>
 
-  <p class="ok-line" v-if="reloadMsg">{{ reloadMsg }}</p>
-  <ErrorState v-if="reloadError" :error="reloadError" title="Reload failed" @retry="reload" />
+
+  <!-- Where this node's configuration comes from -->
+  <section class="section" v-if="ownership">
+    <div class="section__head">
+      <h2>Configuration source</h2>
+      <StatusBadge
+        :tone="ownership.locallyOwned ? 'ok' : 'warn'"
+        :label="ownership.locallyOwned ? 'Local' : 'Managed elsewhere'"
+      />
+      <button class="sb-btn sb-btn--sm" :disabled="effective.loading.value" @click="effective.run">
+        {{ effective.loading.value ? "Checking..." : "Recheck" }}
+      </button>
+    </div>
+    <div class="sb-card">
+      <p>{{ ownerSummary }}</p>
+      <dl class="owner-grid">
+        <template v-if="ownership.base?.kind === 'git'">
+          <dt>Repository</dt>
+          <dd class="sb-mono">{{ ownership.base.repo }}</dd>
+          <dt>Reference</dt>
+          <dd class="sb-mono">{{ ownership.base.reference }}</dd>
+          <dt>Commit</dt>
+          <dd class="sb-mono">{{ ownership.base.commit }}</dd>
+        </template>
+        <template v-if="ownership.authority">
+          <dt>Authority</dt>
+          <dd class="sb-mono">{{ ownership.authority.authority_id }}</dd>
+          <dt>Revision applied</dt>
+          <dd class="sb-mono">{{ ownership.authority.revision }}</dd>
+          <dt>Merge mode</dt>
+          <dd class="sb-mono">{{ ownership.authority.mode }}</dd>
+        </template>
+        <dt>Settings this node owns</dt>
+        <dd class="sb-mono">{{ ownership.localLeaves }} of {{ ownership.totalLeaves }}</dd>
+      </dl>
+      <details class="owned-elsewhere" v-if="notOwnedHere.length">
+        <summary>
+          {{ notOwnedHere.length }} setting{{ notOwnedHere.length === 1 ? "" : "s" }}
+          set outside this node
+        </summary>
+        <table>
+          <tbody>
+            <tr v-for="row in notOwnedHere" :key="row.path">
+              <td class="sb-mono">{{ row.path }}</td>
+              <td class="sb-faint">{{ provenanceLabel(row.owner) }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </div>
+  </section>
 
   <!-- Live config editor -->
   <section class="section">
@@ -216,24 +418,76 @@ async function reload() {
     </div>
     <ErrorState v-if="configErr" :error="configErr" @retry="loadConfig" />
     <div v-else class="sb-card">
+      <p class="banner banner--warn" v-if="editorLocked">
+        This node does not own its configuration, so editing it here would have
+        no effect. {{ ownerSummary }} Change it at the source and this node
+        will pick it up on its next refresh. The file below is shown read-only;
+        on a git-sourced node it may be nothing but the pointer that selected
+        the repository.
+      </p>
       <p class="banner" v-if="saveBanner" :class="`banner--${saveBanner.tone}`">
         {{ saveBanner.text }}
       </p>
+      <p class="banner banner--err" v-if="patchError">{{ patchError }}</p>
+
+      <div class="mode-switch" role="tablist" aria-label="Editor mode">
+        <button
+          class="sb-btn sb-btn--sm"
+          role="tab"
+          :aria-selected="mode === 'form'"
+          :class="{ 'sb-btn--primary': mode === 'form' }"
+          @click="mode = 'form'"
+        >
+          Form
+        </button>
+        <button
+          class="sb-btn sb-btn--sm"
+          role="tab"
+          :aria-selected="mode === 'raw'"
+          :class="{ 'sb-btn--primary': mode === 'raw' }"
+          @click="mode = 'raw'"
+        >
+          Raw YAML
+        </button>
+        <span class="sb-faint">
+          Both views edit the same document, so switching never loses an edit.
+        </span>
+      </div>
+
+      <div v-if="mode === 'form'">
+        <p class="sb-faint" v-if="formUnavailable">{{ formUnavailable }}</p>
+        <ConfigForm
+          v-else
+          :nodes="formNodes"
+          :doc="parsedDoc"
+          :ownership="formOwnership"
+          :conflicts="fieldConflicts"
+          @set="onFormSet"
+          @remove="onFormRemove"
+        />
+      </div>
+
       <textarea
+        v-show="mode === 'raw'"
         v-model="editorText"
         class="sb-input editor"
         spellcheck="false"
+        :readonly="editorLocked"
         aria-label="Configuration YAML"
       ></textarea>
       <div class="editor-actions">
         <button
           class="sb-btn sb-btn--primary"
-          :disabled="saveBusy || !editorText.trim()"
+          :disabled="saveBusy || editorLocked || !editorText.trim()"
           @click="saveConfig"
         >
           {{ saveBusy ? "Saving..." : "Validate + save" }}
         </button>
-        <span class="sb-faint">
+        <span class="sb-faint" v-if="editorLocked">
+          Writes are refused by the server, not just hidden here. The same
+          request from curl gets the same answer.
+        </span>
+        <span class="sb-faint" v-else>
           Validated server-side, then hot-swapped. Optimistic concurrency by revision;
           a mismatch means the on-disk config changed under you.
         </span>
@@ -403,14 +657,6 @@ async function reload() {
   background: var(--sb-accent-tint);
   color: var(--sb-accent);
 }
-.ok-line {
-  background: var(--sb-ok-bg);
-  border: 1px solid rgba(15, 158, 110, 0.3);
-  border-radius: var(--sb-radius-sm);
-  padding: 8px 12px;
-  color: var(--sb-ok);
-  font-size: 0.85rem;
-}
 .editor {
   width: 100%;
   min-height: 340px;
@@ -442,5 +688,47 @@ async function reload() {
 .banner--err {
   background: #fdecea;
   color: #c0392b;
+}
+.banner--warn {
+  background: #fdf3e0;
+  color: #8a5a12;
+}
+.mode-switch {
+  display: flex;
+  align-items: center;
+  gap: var(--sb-space-2);
+  margin-bottom: var(--sb-space-3);
+  flex-wrap: wrap;
+}
+.owner-grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--sb-space-2) var(--sb-space-4);
+  margin: var(--sb-space-3) 0 0;
+}
+.owner-grid dt {
+  color: var(--sb-text-faint);
+}
+.owner-grid dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.owned-elsewhere {
+  margin-top: var(--sb-space-3);
+}
+.owned-elsewhere summary {
+  cursor: pointer;
+  color: var(--sb-text-faint);
+  font-size: 0.9rem;
+}
+.owned-elsewhere table {
+  width: 100%;
+  margin-top: var(--sb-space-2);
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+.owned-elsewhere td {
+  padding: 0.2rem 0.5rem 0.2rem 0;
+  vertical-align: top;
 }
 </style>

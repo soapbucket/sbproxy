@@ -1,62 +1,153 @@
 # yaml-language-server: $schema=../../schemas/sb-config.schema.json
-# 30 - rail-x402-base-sepolia
+# rail-x402-base-sepolia - x402 v2 `exact` settlement in front of an article
+# route.
 #
-# x402 v2 paywall in front of an article origin. The bundled stack
-# wires the proxy at a local mock x402 facilitator so the demo runs
-# end-to-end without real testnet keys; flip to the Base Sepolia
-# facilitator (see sb-testnet.yml) when you want a live settlement.
+# Two blocks do the work, and they own different things:
 #
-# Bundle layout:
-#   sb.yml                      - this file (mock facilitator wiring)
-#   sb-testnet.yml              - Base Sepolia facilitator override
-#   docker-compose.yml          - sbproxy + mock-x402-facilitator + mock-origin
-#   mock-x402-facilitator/      - tiny stub; honours `?reorg=depth=N`
-#   mock-origin/                - nginx serving a single article
-#   Makefile                    - up / down / logs / test wrappers
-#   smoke.json                  - examples-smoke.sh probe schema
+#   proxy.payments   - how a payment settles. Rails, credentials, durable
+#                      state, timeouts. One owner for every price input.
+#   ai_crawl_control - which requests are payable and what they cost.
+#
+# Nothing here resolves a secret, opens the SQLite file, or contacts a
+# facilitator. Config load only checks shape and cross-field rules, so this
+# file validates on a machine that holds none of its credentials:
+#
+#   sbproxy validate -f examples/rail-x402-base-sepolia/sb.yml
 #
 # Run:
-#   cd examples/rail-x402-base-sepolia
-#   docker compose up -d --wait
+#   sbproxy serve -f examples/rail-x402-base-sepolia/sb.yml
 #
-# Probe (multi-rail challenge):
-#   curl -i \
-#     -H 'Host: blog.test.sbproxy.dev' \
-#     -H 'User-Agent: GPTBot/1.0' \
-#     -H 'Accept-Payment: x402' \
-#     http://127.0.0.1:8080/article
-#   # => 402 with Content-Type: application/sbproxy-multi-rail+json
+# Test (a reader, never charged):
+#   curl -s -o /dev/null -w '%{http_code}\n' \
+#        -H 'Host: blog.test.sbproxy.dev' http://127.0.0.1:8080/article
 #
-# Tear down:
-#   docker compose down -v
+# Test (a declared crawler, charged):
+#   curl -is -H 'Host: blog.test.sbproxy.dev' \
+#        -H 'User-Agent: GPTBot/1.0' http://127.0.0.1:8080/article
+#   # => 402 Payment Required
+#
+# The binding key is named, never inlined. Export a value before serving:
+#   export SBPROXY_PAYMENT_BINDING_KEY="$(openssl rand -hex 32)"
 
 proxy:
   http_bind_port: 8080
 
+  payments:
+    # Authoritative state. A paid request reaches the origin because a row
+    # in this file says the payment settled, so back it up with the same
+    # care as any other ledger.
+    state_path: /var/lib/sbproxy/payments.sqlite3
+
+    # Names the key that binds a challenge to the proxy that issued it.
+    # Must be a reference; an inline key is rejected at load. `env:NAME`
+    # reads the environment at startup and `file:/path` reads a file,
+    # neither needing any other configuration. A provider URI such as
+    # `secret://<backend>/<name>` also works, but only with a matching
+    # backend declared under proxy.secrets.backends; without one the
+    # proxy refuses to boot.
+    challenge_binding_key: env:SBPROXY_PAYMENT_BINDING_KEY
+
+    # Total budget for the one synchronous provider interaction a paid
+    # request is allowed. 2000 ms is both the default and the hard ceiling.
+    authorization_timeout_ms: 2000
+
+    # Largest request body the payment path buffers, in bytes. A body has
+    # to be read once in full to bind a digest to the challenge, so this is
+    # the cap on what a single paid request can pin in memory.
+    max_body_bytes: 1048576
+
+    # What happens to a payable request when settlement infrastructure
+    # cannot answer (the durable store errors, a challenge cannot be
+    # prepared). Infrastructure failures only: a rejected, expired, or
+    # replayed payment always stays away from the origin whatever this
+    # says. `closed` (the default) refuses with 503; `open`, `degraded`,
+    # and `observe` admit the request unpaid, each leaving a different
+    # record behind.
+    failure_mode: closed
+
+    worker:
+      # The background worker recovers. It expires unredeemed challenges,
+      # takes back leases whose holder went away, and asks providers about
+      # writes left outstanding. It never settles a payment.
+      reconcile_interval_ms: 1000
+      max_reconcile_batch: 32
+      shutdown_timeout_ms: 5000
+
+    rails:
+      x402:
+        # The only scheme this release implements.
+        scheme: exact
+
+        # CAIP-2 chain identifier. A short nickname such as `base` is
+        # rejected: a signed payment requirement must not depend on a
+        # translation table. eip155:84532 is Base Sepolia.
+        network: "eip155:84532"
+
+        # Asset contract on that network. This one is the Base Sepolia
+        # USDC test contract.
+        asset: "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
+
+        # The currency the route prices in, and the asset's atomic depth.
+        # Quote micros convert to atomic units with checked integer
+        # arithmetic; a remainder is an error, never a rounding.
+        quote_currency: USD
+        asset_decimals: 6
+
+        # Where settled funds go. Replace with your own receive address
+        # before pointing this at a facilitator that moves real value.
+        pay_to: "0x1111111111111111111111111111111111111111"
+
+        # Copied into the requirement's maxTimeoutSeconds.
+        max_timeout_seconds: 60
+
+        # Scheme extras, copied verbatim into the signed requirement and
+        # echoed back by the client. The canonical encoding is byte-stable
+        # so the two sides can compare it exactly.
+        extra:
+          name: USDC
+          version: "2"
+
+        # The facilitator's complete API root. The adapter keeps every
+        # path segment, strips only trailing slashes, and appends exactly
+        # `/verify` or `/settle`. HTTPS is required. Replace this
+        # placeholder with the root your facilitator publishes.
+        facilitators:
+          - facilitator_url: https://facilitator.x402.test.sbproxy.dev/api
+
+        # Per-call budgets. Their sum may not exceed
+        # authorization_timeout_ms, because verify and settle share one
+        # deadline on the request path.
+        verify_timeout_ms: 700
+        settle_timeout_ms: 1200
+
+        breaker:
+          # Consecutive transport failures that open the breaker.
+          failure_threshold: 3
+          # How long it stays open, in milliseconds.
+          open_ms: 5000
+          # Probes admitted while half open. Exactly 1 in this release: a
+          # second concurrent probe can dispatch a settlement nobody is
+          # waiting to record.
+          half_open_max: 1
+
 origins:
   "blog.test.sbproxy.dev":
-    # Article origin running in the bundled compose stack. The proxy
-    # forwards every paid request unchanged; the 402 challenge is
-    # produced by the ai_crawl_control policy below before the proxy
-    # would otherwise dial the upstream.
     action:
       type: proxy
-      url: http://mock-origin:80
+      url: https://test.sbproxy.dev
 
     policies:
       - type: ai_crawl_control
-        # Default fallback price and currency. Tier-matched routes
-        # override this in the multi-rail challenge body. Wave 3
-        # operators typically advertise sub-cent x402 prices because
-        # EIP-3009 transferWithAuthorization is per-transfer cheap on
-        # an L2 chain.
+        # Fallback price for a payable route with no matching tier.
         price: 0.001
         currency: USD
+
+        # The request header the policy reads a redemption from, and the
+        # header it names in the challenge.
         header: crawler-payment
 
-        # Crawler classes recognised by User-Agent substring. The
-        # default list ships GPTBot, ClaudeBot, PerplexityBot, etc.;
-        # we redeclare it here so the file is self-explanatory.
+        # Case-insensitive User-Agent substrings that mark a crawler.
+        # Anything outside this list is a reader and is never charged.
         crawler_user_agents:
           - GPTBot
           - ChatGPT-User
@@ -66,9 +157,14 @@ origins:
           - PerplexityBot
           - Google-Extended
 
-        # Single tier so the demo path is obvious. Charges $0.001 USD
-        # per request to the article URL. Cooperative crawlers see
-        # the price up front and can decide whether to pay.
+        # Routes that stay free no matter who asks.
+        free_paths:
+          - /robots.txt
+          - /health
+
+        # One priced route. amount_micros is 1e-6 of the currency, so 1000
+        # micros is $0.001. The currency here has to match the rail's
+        # quote_currency; the proxy performs no currency conversion.
         tiers:
           - route_pattern: /article*
             price:
@@ -76,32 +172,3 @@ origins:
               currency: USD
             content_shape: html
             paywall_position: top_of_page
-
-        # Wave 3 multi-rail block. The x402 entry advertises Base
-        # Sepolia (chain `base`) routed at the local mock
-        # facilitator. Switch the facilitator URL to the LF-stewarded
-        # Base Sepolia endpoint for live settlement; see sb-testnet.yml
-        # for the override and the README for the broader walkthrough.
-        rails:
-          x402:
-            chain: base
-            facilitator: http://mock-x402-facilitator:80
-            asset: USDC
-            # Demo merchant address. Replace with the operator's own
-            # Base Sepolia receive address before pointing this at a
-            # real facilitator.
-            pay_to: "0x0000000000000000000000000000000000000000"
-            version: "2"
-
-        # Quote-token signing material. The active key_id ends up in
-        # every JWS header and in the JWKS document at
-        # /.well-known/sbproxy/quote-keys.json. Operators rotate by
-        # adding a second key alongside the first and bumping the
-        # `key_id` here once verifiers have caught up.
-        quote_token:
-          key_id: x402-base-sepolia-2026
-          # 32-byte Ed25519 seed, hex. Demo seed only; production
-          # configs read from `secret_ref:` (see sb-testnet.yml).
-          seed_hex: "1111111111111111111111111111111111111111111111111111111111111111"
-          issuer: "https://blog.test.sbproxy.dev"
-          default_ttl_seconds: 300

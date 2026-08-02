@@ -1,5 +1,5 @@
 # SBproxy Dashboards and Alerts
-*Last modified: 2026-06-23*
+*Last modified: 2026-07-18*
 
 Grafana dashboards and Prometheus alert/recording rules for monitoring SBproxy.
 
@@ -22,8 +22,8 @@ scrape_configs:
 | Dashboard | File | UID | Description |
 |-----------|------|-----|-------------|
 | SBProxy Overview | `grafana/sbproxy-overview.json` | `sbproxy-overview` | Request rate, latency percentiles, error rate, active connections, cache hit ratio, bandwidth |
-| AI Gateway | `grafana/sbproxy-ai-gateway.json` | `sbproxy-ai-gateway` | AI provider request rates, token usage, TTFT, guardrail triggers, fallbacks |
-| AI Value | `grafana/sbproxy-ai-value.json` | `sbproxy-ai-value` | Per-credential, multi-tenant, multi-model value tracking: spend by tenant / model / credential, token volume, p95 model latency, and value-vs-waste by outcome. Tenant and credential template variables. Built on the `sbproxy_ai_*_attributed_total` metrics |
+| AI Gateway | `grafana/sbproxy-ai-gateway.json` | `sbproxy-ai-gateway` | AI provider request rates, token usage, TTFT, guardrail triggers, fallbacks, and context-compression savings, latency, failures, and state coordination |
+| AI Value | `grafana/sbproxy-ai-value.json` | `sbproxy-ai-value` | Per-credential, multi-tenant, multi-model value tracking: spend, token volume, p95 model latency, value-vs-waste by outcome, and success-only compression tokens and cost saved. Tokenizer precision stays visible. |
 | Judge Backend | `grafana/sbproxy-judge-backend.json` | `sbproxy-judge-backend` | LLM-as-judge call rate by verdict, cache hit ratio, latency, cost per decision, budget exhaustion |
 | Policy Verdicts | `grafana/sbproxy-policy-verdicts.json` | `sbproxy-policy-verdicts` | Verdict rate by tag, audit bus drops per tenant, plugin vs built-in surface ratio, decision latency percentiles, top policies |
 | Security | `grafana/sbproxy-security.json` | `sbproxy-security` | WAF blocks, rate limiting, auth failures, IP filter blocks, bot detections |
@@ -74,6 +74,9 @@ rule_files:
 | SBProxyAIProviderDown | critical | AI provider returning only errors for 2 minutes |
 | SBProxyGuardrailSpike | warning | Guardrail block rate > 10/min for 1 minute |
 | SBProxyHighTokenUsage | info | Over 1M output tokens in the last hour |
+| SBProxyAICompressionFailures | warning | Compression failure ratio > 10% for 10 minutes |
+| SBProxyAICompressionStateRejections | warning | Compression state-operation errors > 0.1/sec for 10 minutes |
+| SBProxyAICompressionValueUnpriced | warning | Successful compression saves > 10 estimated tokens/sec for a model while avoided cost remains zero for 15 minutes |
 
 ## Recording Rules
 
@@ -94,39 +97,26 @@ rule_files:
 | `sbproxy:error_rate_5m` | 5xx error ratio (5m window) |
 | `sbproxy:ai_token_rate_5m` | AI output token rate (5m window) |
 | `sbproxy:ai_latency_p95_5m` | AI request P95 latency (5m window) |
+| `sbproxy:ai_compression_application_rate_5m` | Fraction of compression lever invocations that applied (5m window) |
+| `sbproxy:ai_compression_failure_ratio_5m` | Fraction of non-empty compression requests with any failed lever (5m window) |
+| `sbproxy:ai_compression_latency_p95_5m` | Compression lever P95 latency (5m window) |
+| `sbproxy:ai_compression_tokens_saved_rate_5m` | Reduction in SBproxy's shared token estimate from applied compression levers per second (5m window) |
+| `sbproxy:ai_compression_value_tokens_saved_by_tenant_model_lever_5m` | Success-only estimated tokens saved per second, preserving tenant, origin, model, lever, and tokenizer precision |
+| `sbproxy:ai_compression_value_cost_saved_dollars_by_tenant_model_lever_5m` | Success-only gross input cost saved per second in USD, preserving tenant, origin, model, lever, and tokenizer precision |
 
-## Metric Names Reference
+## Metric names reference
 
-### Core Proxy Metrics
+The catalogue lives in [`docs/metrics-stability.md`](../docs/metrics-stability.md),
+which is generated from the executable metric registry in
+`crates/sbproxy-observe/src/metric_registry.rs`. It lists every family SBproxy
+emits, its labels, whether anything increments it, and what we promise about
+its name.
 
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `sbproxy_requests_total` | Counter | `status`, `origin`, `instance` | Total HTTP requests |
-| `sbproxy_request_duration_seconds_bucket` | Histogram | `origin`, `le` | Request duration distribution |
-| `sbproxy_active_connections` | Gauge | `instance` | Current active connections |
-| `sbproxy_cache_hits_total` | Counter | | Cache hits |
-| `sbproxy_cache_misses_total` | Counter | | Cache misses |
-| `sbproxy_bandwidth_bytes_total` | Counter | `direction` (in/out) | Bytes transferred |
-
-### AI Gateway Metrics
-
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `sbproxy_ai_requests_attributed_total` | Counter | `provider`, `model`, `surface`, `tenant_id`, `api_key_id`, `outcome` | AI requests by attribution and outcome |
-| `sbproxy_ai_tokens_attributed_total` | Counter | `provider`, `model`, `surface`, `direction`, attribution labels | Tokens consumed, by direction and attribution |
-| `sbproxy_ai_request_duration_seconds_bucket` | Histogram | `provider`, `le` | AI request latency distribution |
-| `sbproxy_ai_ttft_seconds_bucket` | Histogram | `le` | Time to first token distribution |
-| `sbproxy_ai_cache_hits_total` | Counter | | AI semantic cache hits |
-| `sbproxy_ai_guardrail_triggers_total` | Counter | `type`, `action` | Guardrail trigger events |
-| `sbproxy_ai_provider_errors_total` | Counter | `provider` | Provider-level errors |
-| `sbproxy_ai_fallbacks_total` | Counter | `from_provider`, `to_provider` | Provider fallback events |
-
-### Security Metrics
-
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `sbproxy_waf_blocks_total` | Counter | `rule` | WAF rule blocks |
-| `sbproxy_rate_limit_hits_total` | Counter | `origin` | Rate limiter rejections |
-| `sbproxy_auth_failures_total` | Counter | `type` | Authentication failures |
-| `sbproxy_ip_filter_blocks_total` | Counter | `list_type` | IP filter rejections |
-| `sbproxy_bot_detections_total` | Counter | `category` | Bot detection events |
+A hand-written copy used to live here. It had drifted into fiction: it listed
+five metrics that no crate declares (`sbproxy_cache_misses_total`,
+`sbproxy_bandwidth_bytes_total`, `sbproxy_ai_cache_hits_total`,
+`sbproxy_ai_guardrail_triggers_total`, `sbproxy_ai_fallbacks_total`) and gave
+`sbproxy_requests_total` three labels it does not carry. Anyone who built a
+query from it got no data back and no explanation. That is precisely the class
+of drift the generated catalogue exists to end, so this section is a pointer
+now, and cannot rot.

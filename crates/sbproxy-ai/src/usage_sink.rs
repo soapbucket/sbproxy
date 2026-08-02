@@ -10,6 +10,9 @@
 //! Sinks must be non-blocking on the request hot path and must never propagate
 //! a failure: a broken sink cannot fail the request it is logging.
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+use sbproxy_security::egress::{EgressAuthorizer, EgressDenied, EgressPurpose, HostResolver};
 use serde::{Deserialize, Serialize};
 
 /// A record of one completed LLM call, handed to every configured sink.
@@ -17,6 +20,23 @@ use serde::{Deserialize, Serialize};
 /// Deserializable as well as serializable so the verifiable ledger
 /// (see [`crate::usage_ledger`]) can replay a persisted chain and
 /// re-derive its hashes.
+///
+/// # This struct's shape is a file format
+///
+/// The ledger's verifier re-serializes the event it parsed and requires
+/// byte-identical output against the bytes that were hashed. Field
+/// declaration order and every `skip_serializing_if` are therefore part
+/// of the on-disk contract, not just the Rust shape.
+///
+/// New fields go at the **end**, as `Option<...>` with
+/// `#[serde(default, skip_serializing_if = "Option::is_none")]`. That
+/// combination is what makes the addition invisible to a ledger written
+/// by an older binary: the old record has no key for the new field, so
+/// it deserializes to `None`, and `None` never serializes, so the
+/// re-serialized bytes match what was hashed. Insert one mid-struct, or
+/// leave off the skip, and every ledger already on a customer's disk
+/// stops verifying. `crates/sbproxy-ai/tests/ledger_golden.rs` checks
+/// two files written by an older binary on every run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmUsageEvent {
     /// Provider that served the request (e.g. `openai`).
@@ -62,6 +82,11 @@ pub struct LlmUsageEvent {
     /// exactly-once on replay. `None` events are never deduplicated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    /// Session the request belonged to, when the capture envelope
+    /// resolved one (WOR-2093). Lets a downstream store join spend to
+    /// the session a key has had without going through the access log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     /// Optional tag set by a `set_sink_tag` action from the AI policy
     /// plane (WOR-1542), so a policy decision is queryable in the spend
     /// record.
@@ -73,6 +98,80 @@ pub struct LlmUsageEvent {
     /// latency per lane.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<String>,
+    /// Resolved version of the local inference engine that served the
+    /// request (WOR-1906), captured at route time from the running
+    /// engine. Answers "what served this request" from the ledger after
+    /// the engine process is gone. Always `None` for hosted providers,
+    /// and `None` for a served request whose engine never reported a
+    /// version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_version: Option<String>,
+    /// Which agent spent this (WOR-2140), from
+    /// `A2AContext::caller_agent_id`, capped once at capture by
+    /// [`crate::tracing_spans::cap_agent_id`] so the ledger, the span,
+    /// and the metric label cannot name three different agents for one
+    /// request.
+    ///
+    /// `None` for traffic that carried no agent identity at all. Present
+    /// and unverified is a different statement from absent, which is why
+    /// [`Self::a2a_identity_verified`] is a separate field rather than
+    /// this one being cleared when the identity was not trusted: the
+    /// spend is real either way and dropping the id would lose it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// The A2A `contextId` this call belonged to (WOR-2140), capped at
+    /// [`crate::tracing_spans::MAX_RUN_ID_BYTES`].
+    ///
+    /// The run-scoped grouping key, and the same value the access log
+    /// writes under this name and the request span writes as
+    /// `session.id`. Task ids nest under a context id, so summing cost
+    /// over one value of this field is what "what did this run cost"
+    /// means. Never a metric label: it takes one distinct value per run,
+    /// so it would mint a time series per run.
+    ///
+    /// Populated later in the request than [`Self::agent_id`], and on
+    /// fewer surfaces. The `contextId` lives in the JSON-RPC request
+    /// body, so it only exists once the A2A body phase has parsed it,
+    /// whereas the agent id arrives in a header and is stamped during
+    /// the request filter. On the AI-gateway surface the request is
+    /// answered inside the request filter and the body phase never runs
+    /// (WOR-2144), so this is `None` there today and run correlation
+    /// rides the capture session instead. Absent is absent, not zero:
+    /// treat it as "this record does not name a run".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a2a_context_id: Option<String>,
+    /// Whether the identity in [`Self::agent_id`] and
+    /// [`Self::a2a_context_id`] came from a source the proxy trusts
+    /// (WOR-2140). `None` for traffic that carried no A2A envelope, so
+    /// "no claim was made" stays distinguishable from "a claim was made
+    /// and not trusted".
+    ///
+    /// This is not decoration. An untrusted caller names its own agent
+    /// and its own run, so it can merge its spend into another agent's
+    /// total, or shard itself across unbounded distinct agent ids until
+    /// per-agent totals mean nothing. A per-agent or per-run total
+    /// computed without filtering on this flag is a number the caller
+    /// chose. The gateway records the spend either way, because the
+    /// money was really spent, and marks it so a report cannot present
+    /// it as verified by accident. Same trust decision the access log
+    /// writes as `a2a_identity_verified` and the request span writes as
+    /// `sbproxy.a2a.identity_verified`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a2a_identity_verified: Option<bool>,
+    /// Caller-supplied workflow correlation id, from `SB-Attr-Trace-Id`.
+    ///
+    /// The third leg of (agent, workflow, run). It reaches the access
+    /// log through [`crate::attribution::AttributionTags`] already, but
+    /// the access log is not the ledger: spans and logs get sampled and
+    /// rotated, and this record does not. Per-workflow spend that has
+    /// to survive an argument has to be answerable from the tamper
+    /// evident chain rather than from a join through a sampled surface.
+    ///
+    /// Caller-supplied, so it carries exactly as much trust as the
+    /// caller does. Read it alongside `a2a_identity_verified` and treat
+    /// it as a grouping key rather than as an assertion of fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<String>,
 }
 
 /// A destination for completed-call usage events.
@@ -130,11 +229,37 @@ impl UsageSink for JsonlFileSink {
     }
 }
 
+/// Authorize an HTTP usage-sink / webhook URL when an authorizer is
+/// present. `None` preserves legacy ungated transport (omitted config).
+pub fn authorize_usage_http(
+    authorizer: Option<&EgressAuthorizer>,
+    purpose: EgressPurpose,
+    url: &str,
+    resolver: &dyn HostResolver,
+) -> Result<(), EgressDenied> {
+    let Some(auth) = authorizer else {
+        return Ok(());
+    };
+    auth.authorize(purpose, url, resolver).map(|_| ())
+}
+
+struct PublicPinResolver;
+
+impl HostResolver for PublicPinResolver {
+    fn resolve(&self, _host: &str, port: u16) -> Result<Vec<SocketAddr>, ()> {
+        Ok(vec![SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+            port,
+        )])
+    }
+}
+
 /// A sink that POSTs each event as JSON to a webhook URL, fire-and-forget.
 #[derive(Debug)]
 pub struct WebhookSink {
     url: String,
     client: reqwest::Client,
+    egress: Option<EgressAuthorizer>,
 }
 
 impl WebhookSink {
@@ -143,12 +268,28 @@ impl WebhookSink {
         Self {
             url: url.into(),
             client: reqwest::Client::new(),
+            egress: None,
         }
+    }
+
+    /// Attach a fail-closed egress authorizer (`EgressPurpose::Webhook`).
+    pub fn with_egress(mut self, authorizer: EgressAuthorizer) -> Self {
+        self.egress = Some(authorizer);
+        self
     }
 }
 
 impl UsageSink for WebhookSink {
     fn record(&self, event: &LlmUsageEvent) {
+        if let Err(denied) = authorize_usage_http(
+            self.egress.as_ref(),
+            EgressPurpose::Webhook,
+            &self.url,
+            &PublicPinResolver,
+        ) {
+            tracing::warn!(reason = ?denied, "usage sink: webhook egress denied");
+            return;
+        }
         let body = match serde_json::to_vec(event) {
             Ok(b) => b,
             Err(e) => {
@@ -184,6 +325,14 @@ impl UsageSink for WebhookSink {
 /// RFC-3339 string. Token counts go in `usage`; provider, cost, latency,
 /// status, and identifiers go in `metadata`. Kept pure (no clock, no IO) so
 /// the shape is unit-testable; the sink supplies the id and timestamp.
+///
+/// Agent attribution rides in `metadata` because Langfuse has nowhere
+/// better to put it: cost lives on `generation` and `embedding`
+/// observations, so the agent that spent the money is not a dimension
+/// its cost model has. `agent_id`, `a2a_context_id`, and
+/// `a2a_identity_verified` travel together for the same reason they do
+/// everywhere else, so a Langfuse query cannot read the first two
+/// without the third being right there.
 pub fn langfuse_ingestion_body(
     event: &LlmUsageEvent,
     event_id: &str,
@@ -201,10 +350,15 @@ pub fn langfuse_ingestion_body(
         ("user", &event.user),
         ("team", &event.team),
         ("tag", &event.tag),
+        ("agent_id", &event.agent_id),
+        ("a2a_context_id", &event.a2a_context_id),
     ] {
         if let Some(val) = v {
             metadata.insert(k.into(), serde_json::json!(val));
         }
+    }
+    if let Some(verified) = event.a2a_identity_verified {
+        metadata.insert("a2a_identity_verified".into(), serde_json::json!(verified));
     }
     if !event.tags.is_empty() {
         metadata.insert("tags".into(), serde_json::json!(event.tags));
@@ -236,6 +390,11 @@ pub fn langfuse_ingestion_body(
 /// Build the Datadog logs-intake request body (an array of one log object)
 /// for `event`, tagged with `service`. Pure (no clock, no IO); Datadog
 /// stamps the ingestion time itself.
+///
+/// Carries the same agent attribution as
+/// [`langfuse_ingestion_body`], and for the same reason: the trust flag
+/// travels beside the ids so a facet built on `agent_id` cannot silently
+/// mix verified and self-declared agents.
 pub fn datadog_log_body(event: &LlmUsageEvent, service: &str) -> serde_json::Value {
     let mut log = serde_json::Map::new();
     log.insert("ddsource".into(), serde_json::json!("sbproxy"));
@@ -265,10 +424,15 @@ pub fn datadog_log_body(event: &LlmUsageEvent, service: &str) -> serde_json::Val
         ("user", &event.user),
         ("team", &event.team),
         ("tag", &event.tag),
+        ("agent_id", &event.agent_id),
+        ("a2a_context_id", &event.a2a_context_id),
     ] {
         if let Some(val) = v {
             log.insert(k.into(), serde_json::json!(val));
         }
+    }
+    if let Some(verified) = event.a2a_identity_verified {
+        log.insert("a2a_identity_verified".into(), serde_json::json!(verified));
     }
     if !event.tags.is_empty() {
         log.insert("tags".into(), serde_json::json!(event.tags));
@@ -286,6 +450,7 @@ pub struct LangfuseSink {
     public_key: String,
     secret_key: String,
     client: reqwest::Client,
+    egress: Option<EgressAuthorizer>,
 }
 
 impl LangfuseSink {
@@ -297,12 +462,28 @@ impl LangfuseSink {
             public_key: public_key.into(),
             secret_key: secret_key.into(),
             client: reqwest::Client::new(),
+            egress: None,
         }
+    }
+
+    /// Attach a fail-closed egress authorizer (`EgressPurpose::UsageSink`).
+    pub fn with_egress(mut self, authorizer: EgressAuthorizer) -> Self {
+        self.egress = Some(authorizer);
+        self
     }
 }
 
 impl UsageSink for LangfuseSink {
     fn record(&self, event: &LlmUsageEvent) {
+        if let Err(denied) = authorize_usage_http(
+            self.egress.as_ref(),
+            EgressPurpose::UsageSink,
+            &self.url,
+            &PublicPinResolver,
+        ) {
+            tracing::warn!(reason = ?denied, "usage sink: langfuse egress denied");
+            return;
+        }
         let timestamp = chrono::Utc::now().to_rfc3339();
         let id = event
             .request_id
@@ -337,6 +518,7 @@ pub struct DatadogSink {
     api_key: String,
     service: String,
     client: reqwest::Client,
+    egress: Option<EgressAuthorizer>,
 }
 
 impl DatadogSink {
@@ -348,12 +530,28 @@ impl DatadogSink {
             api_key: api_key.into(),
             service: service.into(),
             client: reqwest::Client::new(),
+            egress: None,
         }
+    }
+
+    /// Attach a fail-closed egress authorizer (`EgressPurpose::UsageSink`).
+    pub fn with_egress(mut self, authorizer: EgressAuthorizer) -> Self {
+        self.egress = Some(authorizer);
+        self
     }
 }
 
 impl UsageSink for DatadogSink {
     fn record(&self, event: &LlmUsageEvent) {
+        if let Err(denied) = authorize_usage_http(
+            self.egress.as_ref(),
+            EgressPurpose::UsageSink,
+            &self.url,
+            &PublicPinResolver,
+        ) {
+            tracing::warn!(reason = ?denied, "usage sink: datadog egress denied");
+            return;
+        }
         let body = datadog_log_body(event, &self.service);
         let url = self.url.clone();
         let key = self.api_key.clone();
@@ -378,6 +576,224 @@ impl UsageSink for DatadogSink {
 
 fn default_dd_site() -> String {
     "datadoghq.com".to_string()
+}
+
+/// A sink that emits each usage event through the existing tracing /
+/// OpenInference seam (GenAI + `llm.*` attributes), fire-and-forget.
+///
+/// Export to an OTLP collector is handled by the process-wide observe
+/// pipeline (`sbproxy-observe`); this sink never blocks dispatch and
+/// never propagates a failure. INT may later wire a direct OTel metrics
+/// path by adding `opentelemetry` to `sbproxy-ai` if needed.
+#[derive(Debug, Default)]
+pub struct OtelSink;
+
+impl OtelSink {
+    /// Create an OTel usage sink that records via tracing attributes.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl UsageSink for OtelSink {
+    fn record(&self, event: &LlmUsageEvent) {
+        // Clone the safe attribution fields only: no raw prompts, tool
+        // output, tokens, or DSNs - matching the LiteLLM-style redaction
+        // contract already enforced by [`LlmUsageEvent`]'s shape.
+        let provider = event.provider.clone();
+        let model = event.model.clone();
+        let prompt_tokens = event.prompt_tokens;
+        let completion_tokens = event.completion_tokens;
+        let total_tokens = event.total_tokens;
+        let cost_usd = event.cost_usd;
+        let latency_ms = event.latency_ms;
+        let status = event.status;
+        let key_id = event.key_id.clone();
+        let tenant_id = event.tenant_id.clone();
+        let request_id = event.request_id.clone();
+        // WOR-2140: the agent, its run, and whether either was verified.
+        // Bounded identifiers already capped at capture, so they are the
+        // same class of value as the key and tenant ids beside them.
+        let agent_id = event.agent_id.clone();
+        let a2a_context_id = event.a2a_context_id.clone();
+        let identity_verified = event.a2a_identity_verified;
+        tokio::spawn(async move {
+            // Emit through the existing OpenInference / GenAI attribute
+            // vocabulary (`tracing_spans`). The process-wide observe
+            // pipeline exports these when OTLP is configured.
+            let span = tracing::info_span!(
+                "sbproxy.ai.usage_sink",
+                "gen_ai.system" = %provider,
+                "gen_ai.request.model" = %model,
+                "gen_ai.usage.input_tokens" = prompt_tokens,
+                "gen_ai.usage.output_tokens" = completion_tokens,
+                "llm.token_count.prompt" = prompt_tokens,
+                "llm.token_count.completion" = completion_tokens,
+                "llm.token_count.total" = total_tokens,
+                "gen_ai.usage.cost" = cost_usd,
+                "llm.usage.total_cost" = cost_usd,
+                "sbproxy.ai.latency_ms" = latency_ms,
+                "http.response.status_code" = status,
+                "sbproxy.key_id" = key_id.as_deref().unwrap_or(""),
+                "sbproxy.tenant_id" = tenant_id.as_deref().unwrap_or(""),
+                "gen_ai.response.id" = request_id.as_deref().unwrap_or(""),
+                "sbproxy.a2a.caller_agent_id" = agent_id.as_deref().unwrap_or(""),
+                "session.id" = a2a_context_id.as_deref().unwrap_or(""),
+                "sbproxy.a2a.identity_verified" = identity_verified,
+            );
+            let _entered = span.enter();
+        });
+    }
+
+    fn name(&self) -> &str {
+        "otel"
+    }
+}
+
+/// Which object-store backend a [`ObjectStoreSink`] targets.
+#[derive(Debug, Clone, Copy)]
+enum ObjectStoreKind {
+    S3,
+    Gcs,
+}
+
+/// A sink that writes each usage event as a JSON object to S3 or GCS,
+/// fire-and-forget.
+///
+/// Builds the backend from the process environment (`AWS_*` /
+/// `GOOGLE_APPLICATION_CREDENTIALS`, etc.) on each put. An empty bucket,
+/// missing credentials, or a put failure logs and returns — never panics
+/// or propagates to the request hot path.
+#[derive(Debug)]
+pub struct ObjectStoreSink {
+    kind: ObjectStoreKind,
+    bucket: String,
+    prefix: String,
+}
+
+impl ObjectStoreSink {
+    /// Create an S3 usage sink for `bucket` under `prefix`.
+    pub fn s3(bucket: impl Into<String>, prefix: impl Into<String>) -> Self {
+        Self {
+            kind: ObjectStoreKind::S3,
+            bucket: bucket.into(),
+            prefix: prefix.into(),
+        }
+    }
+
+    /// Create a GCS usage sink for `bucket` under `prefix`.
+    pub fn gcs(bucket: impl Into<String>, prefix: impl Into<String>) -> Self {
+        Self {
+            kind: ObjectStoreKind::Gcs,
+            bucket: bucket.into(),
+            prefix: prefix.into(),
+        }
+    }
+}
+
+impl UsageSink for ObjectStoreSink {
+    fn record(&self, event: &LlmUsageEvent) {
+        if self.bucket.is_empty() {
+            tracing::warn!(
+                sink = self.name(),
+                "usage sink: object store bucket missing"
+            );
+            return;
+        }
+        let body = match serde_json::to_vec(event) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, "usage sink: failed to serialize event");
+                return;
+            }
+        };
+        let kind = self.kind;
+        let bucket = self.bucket.clone();
+        let prefix = self.prefix.clone();
+        let sink_name = self.name().to_string();
+        let object_key = object_store_object_key(&prefix, event);
+        tokio::spawn(async move {
+            // Never log the event body (may carry governed metadata the
+            // operator treats as sensitive); bucket + key are enough.
+            if let Err(e) = object_store_put(kind, &bucket, &object_key, body).await {
+                tracing::warn!(
+                    error = %e,
+                    sink = %sink_name,
+                    bucket = %bucket,
+                    object_key = %object_key,
+                    "usage sink: object store put failed"
+                );
+            }
+        });
+    }
+
+    fn name(&self) -> &str {
+        match self.kind {
+            ObjectStoreKind::S3 => "s3",
+            ObjectStoreKind::Gcs => "gcs",
+        }
+    }
+}
+
+/// Put `body` to `bucket`/`object_key` via the matching object_store
+/// backend. Credentials come from the environment. Returns an error on
+/// build or put failure so the caller can log without panicking.
+async fn object_store_put(
+    kind: ObjectStoreKind,
+    bucket: &str,
+    object_key: &str,
+    body: Vec<u8>,
+) -> Result<(), String> {
+    use object_store::path::Path as ObjectPath;
+    use object_store::{ObjectStore, PutPayload};
+
+    let store: std::sync::Arc<dyn ObjectStore> = match kind {
+        ObjectStoreKind::S3 => {
+            let store = object_store::aws::AmazonS3Builder::from_env()
+                .with_bucket_name(bucket)
+                .build()
+                .map_err(|e| format!("s3 store build: {e}"))?;
+            std::sync::Arc::new(store)
+        }
+        ObjectStoreKind::Gcs => {
+            let store = object_store::gcp::GoogleCloudStorageBuilder::from_env()
+                .with_bucket_name(bucket)
+                .build()
+                .map_err(|e| format!("gcs store build: {e}"))?;
+            std::sync::Arc::new(store)
+        }
+    };
+    let path = ObjectPath::from(object_key);
+    store
+        .put(&path, PutPayload::from(body))
+        .await
+        .map_err(|e| format!("put: {e}"))?;
+    Ok(())
+}
+
+/// Build a stable object key under `prefix` for `event`. Prefers
+/// `request_id` when present so at-least-once delivery collapses on
+/// overwrite; otherwise falls back to a timestamped unique name.
+fn object_store_object_key(prefix: &str, event: &LlmUsageEvent) -> String {
+    let leaf = event
+        .request_id
+        .as_deref()
+        .map(|id| format!("{id}.json"))
+        .unwrap_or_else(|| {
+            format!(
+                "{}-{}-{}.json",
+                event.provider,
+                event.model.replace('/', "_"),
+                chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            )
+        });
+    if prefix.is_empty() {
+        leaf
+    } else if prefix.ends_with('/') {
+        format!("{prefix}{leaf}")
+    } else {
+        format!("{prefix}/{leaf}")
+    }
 }
 
 /// Declarative config for a usage sink, parsed from the action's
@@ -433,6 +849,24 @@ pub enum UsageSinkConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         service: Option<String>,
     },
+    /// Emit events through the process OTel / OpenInference seam.
+    Otel,
+    /// Write events as JSON objects to an S3 bucket.
+    S3 {
+        /// Destination bucket name.
+        bucket: String,
+        /// Key prefix (e.g. `llm/`). Empty when omitted.
+        #[serde(default)]
+        prefix: String,
+    },
+    /// Write events as JSON objects to a GCS bucket.
+    Gcs {
+        /// Destination bucket name.
+        bucket: String,
+        /// Key prefix (e.g. `llm/`). Empty when omitted.
+        #[serde(default)]
+        prefix: String,
+    },
 }
 
 impl UsageSinkConfig {
@@ -460,6 +894,13 @@ impl UsageSinkConfig {
                 api_key,
                 service.clone().unwrap_or_else(|| "sbproxy".to_string()),
             )),
+            UsageSinkConfig::Otel => std::sync::Arc::new(OtelSink::new()),
+            UsageSinkConfig::S3 { bucket, prefix } => {
+                std::sync::Arc::new(ObjectStoreSink::s3(bucket, prefix))
+            }
+            UsageSinkConfig::Gcs { bucket, prefix } => {
+                std::sync::Arc::new(ObjectStoreSink::gcs(bucket, prefix))
+            }
         }
     }
 }
@@ -491,8 +932,24 @@ mod tests {
             tags: Vec::new(),
             metadata: std::collections::BTreeMap::new(),
             request_id: None,
+            session_id: None,
             tag: None,
             priority: None,
+            engine_version: None,
+            agent_id: None,
+            a2a_context_id: None,
+            a2a_identity_verified: None,
+            workflow_id: None,
+        }
+    }
+
+    /// A sample event carrying a verified agent identity (WOR-2140).
+    fn agent_event() -> LlmUsageEvent {
+        LlmUsageEvent {
+            agent_id: Some("billing-orchestrator".into()),
+            a2a_context_id: Some("ctx-run-7".into()),
+            a2a_identity_verified: Some(true),
+            ..sample_event()
         }
     }
 
@@ -544,6 +1001,174 @@ mod tests {
         assert_eq!(value["team"], "platform");
         assert_eq!(value["tags"], serde_json::json!(["production", "chat"]));
         assert_eq!(value["metadata"]["cost_center"], "cc-42");
+    }
+
+    #[test]
+    fn engine_version_roundtrips_when_present() {
+        let mut event = sample_event();
+        event.engine_version = Some("0.11.0".to_string());
+
+        let value = serde_json::to_value(&event).expect("serialize usage event");
+        assert_eq!(value["engine_version"], "0.11.0");
+
+        let back: LlmUsageEvent =
+            serde_json::from_value(value).expect("deserialize usage event with engine_version");
+        assert_eq!(back.engine_version.as_deref(), Some("0.11.0"));
+    }
+
+    #[test]
+    fn engine_version_none_is_omitted_and_old_records_still_deserialize() {
+        // None never serializes, so hosted-provider records keep their
+        // pre-WOR-1906 wire shape byte-for-byte (the verifiable ledger
+        // re-derives hashes from this serialization on replay).
+        let value = serde_json::to_value(sample_event()).expect("serialize usage event");
+        assert!(value.get("engine_version").is_none());
+
+        // A record persisted before the field existed deserializes to None.
+        let old: LlmUsageEvent = serde_json::from_value(serde_json::json!({
+            "provider": "openai",
+            "model": "gpt-4o-mini",
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15,
+            "cost_usd": 0.001,
+            "latency_ms": 200,
+            "status": 200
+        }))
+        .expect("old usage record without engine_version");
+        assert!(old.engine_version.is_none());
+    }
+
+    /// WOR-2140: an event carrying agent identity round-trips through
+    /// the exact serialize / deserialize pair the ledger's verifier uses
+    /// on replay.
+    #[test]
+    fn agent_identity_round_trips() {
+        let value = serde_json::to_value(agent_event()).expect("serialize usage event");
+        assert_eq!(value["agent_id"], "billing-orchestrator");
+        assert_eq!(value["a2a_context_id"], "ctx-run-7");
+        assert_eq!(value["a2a_identity_verified"], true);
+
+        let back: LlmUsageEvent =
+            serde_json::from_value(value).expect("deserialize usage event with agent identity");
+        assert_eq!(back.agent_id.as_deref(), Some("billing-orchestrator"));
+        assert_eq!(back.a2a_context_id.as_deref(), Some("ctx-run-7"));
+        assert_eq!(back.a2a_identity_verified, Some(true));
+    }
+
+    /// Verified, unverified, and "no claim at all" are three different
+    /// states in the serialized event, not two.
+    ///
+    /// This is the whole reason the flag exists. An untrusted caller
+    /// names its own agent and its own run, so a per-agent total that
+    /// mixed the trusted rows with the self-declared ones would be a
+    /// number the caller chose. `false` has to be visible on the wire,
+    /// which means the flag cannot be skipped when it is false, and
+    /// absent has to stay distinguishable from `false`, which is why it
+    /// is an `Option<bool>` rather than a `bool` defaulting to false.
+    #[test]
+    fn verified_and_unverified_spend_are_distinguishable_on_the_wire() {
+        let verified = serde_json::to_value(agent_event()).expect("serialize");
+        assert_eq!(verified["a2a_identity_verified"], true);
+
+        let mut untrusted = agent_event();
+        untrusted.a2a_identity_verified = Some(false);
+        let unverified = serde_json::to_value(&untrusted).expect("serialize");
+        assert_eq!(
+            unverified["a2a_identity_verified"], false,
+            "a false flag must be written, not skipped as if it were absent"
+        );
+        // The spend itself is recorded either way: the money was really
+        // spent, so dropping the row would under-report, and dropping
+        // the id would lose which agent claimed it.
+        assert_eq!(unverified["agent_id"], "billing-orchestrator");
+        assert_eq!(unverified["cost_usd"], verified["cost_usd"]);
+
+        // Non-agent traffic makes no claim, and that is a third state.
+        let plain = serde_json::to_value(sample_event()).expect("serialize");
+        assert!(
+            plain.get("a2a_identity_verified").is_none(),
+            "traffic with no agent envelope must not assert a trust value"
+        );
+    }
+
+    /// The golden-fixture promise, asserted at the level this struct
+    /// controls: an event with no agent fields serializes to exactly the
+    /// bytes it did before the fields existed.
+    ///
+    /// `ledger_golden.rs` verifies two real files written by an older
+    /// binary, which is the authoritative check. This one localises the
+    /// failure: if the fields were inserted mid-struct, or shipped
+    /// without `skip_serializing_if`, this test names the struct while
+    /// the golden test can only say the chain broke.
+    #[test]
+    fn an_event_without_agent_fields_keeps_its_pre_wor2140_bytes() {
+        // Copied verbatim out of the `event` object of the first line of
+        // `tests/fixtures/ledger-v1-unsigned.jsonl`, which was written by
+        // a binary that predates all of this.
+        const LEGACY: &str = r#"{"provider":"openai","model":"gpt-4o-mini","prompt_tokens":10,"completion_tokens":5,"total_tokens":15,"cost_usd":1.0,"latency_ms":120,"status":200,"key_id":"k1","request_id":"req-0"}"#;
+
+        // Parse then re-serialize is exactly what the ledger verifier
+        // does before comparing against the bytes it hashed.
+        let parsed: LlmUsageEvent = serde_json::from_str(LEGACY).expect("legacy record parses");
+        assert!(parsed.agent_id.is_none());
+        assert!(parsed.a2a_context_id.is_none());
+        assert!(parsed.a2a_identity_verified.is_none());
+        assert_eq!(
+            serde_json::to_string(&parsed).expect("re-serialize"),
+            LEGACY,
+            "an event written before the agent fields existed must re-serialize \
+             byte-identically, or every ledger already on disk stops verifying"
+        );
+
+        // Unset fields contribute no keys at all, which is the property
+        // the assertion above depends on.
+        let json = serde_json::to_string(&sample_event()).expect("serialize");
+        for key in ["agent_id", "a2a_context_id", "a2a_identity_verified"] {
+            assert!(!json.contains(key), "{key} must not appear when unset");
+        }
+    }
+
+    /// The agent fields land at the END of the serialized object, after
+    /// every field that predates them. Field order is part of the ledger
+    /// file format, so this pins the one property that makes appending
+    /// safe.
+    #[test]
+    fn agent_fields_serialize_after_every_older_field() {
+        let mut event = agent_event();
+        event.engine_version = Some("0.11.0".into());
+        let json = serde_json::to_string(&event).expect("serialize");
+        let at = |key: &str| json.find(key).unwrap_or_else(|| panic!("{key} missing"));
+        assert!(at("\"engine_version\"") < at("\"agent_id\""));
+        assert!(at("\"agent_id\"") < at("\"a2a_context_id\""));
+        assert!(at("\"a2a_context_id\"") < at("\"a2a_identity_verified\""));
+    }
+
+    /// WOR-2140: agent attribution reaches the vendor sinks too, with
+    /// the trust flag beside the ids rather than a hop away from them.
+    #[test]
+    fn vendor_sink_bodies_carry_agent_attribution() {
+        let mut untrusted = agent_event();
+        untrusted.a2a_identity_verified = Some(false);
+
+        let body = langfuse_ingestion_body(&untrusted, "evt-2", "2026-08-01T00:00:00Z");
+        let meta = &body["batch"][0]["body"]["metadata"];
+        assert_eq!(meta["agent_id"], "billing-orchestrator");
+        assert_eq!(meta["a2a_context_id"], "ctx-run-7");
+        assert_eq!(meta["a2a_identity_verified"], false);
+
+        let dd = datadog_log_body(&untrusted, "sbproxy-ai");
+        let log = &dd[0];
+        assert_eq!(log["agent_id"], "billing-orchestrator");
+        assert_eq!(log["a2a_context_id"], "ctx-run-7");
+        assert_eq!(log["a2a_identity_verified"], false);
+
+        // Non-agent traffic adds no keys at all, so an existing
+        // dashboard's facets do not gain an empty dimension.
+        let plain = langfuse_ingestion_body(&sample_event(), "evt-3", "2026-08-01T00:00:00Z");
+        let plain_meta = &plain["batch"][0]["body"]["metadata"];
+        assert!(plain_meta.get("agent_id").is_none());
+        assert!(plain_meta.get("a2a_identity_verified").is_none());
     }
 
     #[test]
@@ -649,5 +1274,131 @@ mod tests {
             }
             other => panic!("expected datadog, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_otel_and_object_store_sink_configs() {
+        let cfgs: Vec<UsageSinkConfig> = serde_json::from_str(
+            r#"[
+                {"type":"otel"},
+                {"type":"s3","bucket":"usage","prefix":"llm/"},
+                {"type":"gcs","bucket":"usage","prefix":"llm/"}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(cfgs.len(), 3);
+        match &cfgs[0] {
+            UsageSinkConfig::Otel => {}
+            other => panic!("expected otel, got {other:?}"),
+        }
+        match &cfgs[1] {
+            UsageSinkConfig::S3 { bucket, prefix } => {
+                assert_eq!(bucket, "usage");
+                assert_eq!(prefix, "llm/");
+            }
+            other => panic!("expected s3, got {other:?}"),
+        }
+        match &cfgs[2] {
+            UsageSinkConfig::Gcs { bucket, prefix } => {
+                assert_eq!(bucket, "usage");
+                assert_eq!(prefix, "llm/");
+            }
+            other => panic!("expected gcs, got {other:?}"),
+        }
+        let sinks = build_sinks(&cfgs);
+        assert_eq!(sinks[0].name(), "otel");
+        assert_eq!(sinks[1].name(), "s3");
+        assert_eq!(sinks[2].name(), "gcs");
+    }
+
+    #[test]
+    fn object_store_object_key_prefers_request_id_under_prefix() {
+        let mut event = sample_event();
+        event.request_id = Some("req-42".into());
+        assert_eq!(object_store_object_key("llm/", &event), "llm/req-42.json");
+        assert_eq!(object_store_object_key("llm", &event), "llm/req-42.json");
+        assert_eq!(object_store_object_key("", &event), "req-42.json");
+    }
+
+    #[tokio::test]
+    async fn sink_failure_does_not_panic_or_propagate() {
+        // Broken / missing destinations must log and return: never panic or
+        // surface an error that would break usage dispatch.
+        let sinks = build_sinks(&[
+            UsageSinkConfig::Otel,
+            UsageSinkConfig::S3 {
+                bucket: String::new(),
+                prefix: "llm/".into(),
+            },
+            UsageSinkConfig::Gcs {
+                bucket: String::new(),
+                prefix: "llm/".into(),
+            },
+        ]);
+        let event = sample_event();
+        for sink in &sinks {
+            sink.record(&event);
+        }
+    }
+
+    fn enforce_purpose(purpose: EgressPurpose, hosts: &[&str]) -> EgressAuthorizer {
+        use sbproxy_security::egress::{EgressConfig, PurposeAllowlist};
+        use std::collections::HashMap;
+        let mut allow = PurposeAllowlist::default();
+        for h in hosts {
+            allow.hosts.insert((*h).to_string());
+        }
+        allow.schemes.insert("https".to_string());
+        allow.ports.insert(443);
+        let mut purposes = HashMap::new();
+        purposes.insert(purpose, allow);
+        EgressAuthorizer::new(EgressConfig { purposes })
+    }
+
+    #[test]
+    fn webhook_egress_denies_unlisted_host_with_shared_vocabulary() {
+        let auth = enforce_purpose(EgressPurpose::Webhook, &["collector.example.com"]);
+        let err = authorize_usage_http(
+            Some(&auth),
+            EgressPurpose::Webhook,
+            "https://evil.example/ingest",
+            &PublicPinResolver,
+        )
+        .expect_err("unlisted webhook host");
+        assert_eq!(err, EgressDenied::UnlistedHost);
+    }
+
+    #[test]
+    fn usage_sink_egress_denies_unlisted_host_with_shared_vocabulary() {
+        let auth = enforce_purpose(EgressPurpose::UsageSink, &["cloud.langfuse.com"]);
+        let err = authorize_usage_http(
+            Some(&auth),
+            EgressPurpose::UsageSink,
+            "https://evil.example/api/public/ingestion",
+            &PublicPinResolver,
+        )
+        .expect_err("unlisted usage-sink host");
+        assert_eq!(err, EgressDenied::UnlistedHost);
+    }
+
+    #[test]
+    fn omitted_egress_preserves_legacy_usage_sink_compatibility() {
+        authorize_usage_http(
+            None,
+            EgressPurpose::Webhook,
+            "https://evil.example/ingest",
+            &PublicPinResolver,
+        )
+        .expect("omitted egress must not deny");
+    }
+
+    #[test]
+    fn enforce_webhook_sink_skips_post_when_denied() {
+        // record() must not panic and must not attempt I/O when denied.
+        let sink = WebhookSink::new("https://evil.example/ingest").with_egress(enforce_purpose(
+            EgressPurpose::Webhook,
+            &["collector.example.com"],
+        ));
+        sink.record(&sample_event());
     }
 }

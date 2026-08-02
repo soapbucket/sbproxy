@@ -1,6 +1,6 @@
 # SBproxy Runtime Manual
 
-*Last modified: 2026-07-12*
+*Last modified: 2026-08-01*
 
 Vendor: Soap Bucket LLC - [www.soapbucket.com](https://www.soapbucket.com)
 
@@ -34,11 +34,21 @@ This section is the canonical install reference; other docs link here rather tha
 
 ### Install script
 
-The quickest path on macOS and Linux. The script detects your OS and architecture, fetches the matching release binary, and drops it in `~/.local/bin`:
+The quickest path for Linux on amd64 or arm64, and macOS on Apple Silicon. The
+script detects the platform, fetches the matching release binary, and drops it
+in `~/.local/bin`:
 
 ```bash
 curl -fsSL https://download.sbproxy.dev | sh
 ```
+
+On a Linux host with an NVIDIA GPU, the installer makes a best-effort attempt
+to prepare the optional container runtime used for managed model serving. Set
+`SBPROXY_SKIP_GPU_SETUP=1` to skip that step. It does not affect the gateway
+binary installation.
+
+Intel macOS binaries are not published. Use the Linux amd64 container or build
+from source on an Intel Mac.
 
 ### Homebrew
 
@@ -48,7 +58,10 @@ brew install soapbucket/tap/sbproxy
 
 ### Binary download
 
-Pre-built binaries for Linux, macOS, and Windows are on the releases page. Download the archive for your platform, extract it, and put the `sbproxy` binary somewhere in your `PATH`.
+The releases page publishes three archives: Linux amd64, Linux arm64, and
+macOS arm64. The Linux artifacts target the GNU ABI and require glibc 2.36 or
+newer. Download the archive for your platform, extract it, and put `sbproxy`
+somewhere in your `PATH`.
 
 ```bash
 # Linux (amd64)
@@ -68,26 +81,47 @@ sbproxy --version
 
 ### Docker
 
-The official image runs the statically-linked binary on a distroless base (`gcr.io/distroless/cc-debian12`); there is no shell or package manager in the runtime layer.
+The official image runs the matching Linux release binary on a distroless
+Debian 12 base; there is no shell or package manager in the runtime layer.
+
+The image has no default config path, so every `docker run` must name the config explicitly, either as `serve -f <path>` or as a positional argument. Mount your config at `/etc/sbproxy` and point the command at it:
 
 ```bash
 # Pull the image
 docker pull soapbucket/sbproxy:latest
-
-# Run with a local config directory
-docker run --rm \
-  -p 8080:8080 \
-  -p 8443:8443 \
-  -p 8443:8443/udp \
-  -v /path/to/config:/etc/sbproxy \
-  soapbucket/sbproxy:latest
 
 # Run with a specific config file
 docker run --rm \
   -p 8080:8080 \
   -v /path/to/sb.yml:/etc/sbproxy/sb.yml:ro \
   soapbucket/sbproxy:latest serve -f /etc/sbproxy/sb.yml
+
+# Run with a local config directory (certs, includes) mounted alongside
+docker run --rm \
+  -p 8080:8080 \
+  -p 8443:8443 \
+  -p 8443:8443/udp \
+  -v /path/to/config:/etc/sbproxy:ro \
+  soapbucket/sbproxy:latest serve -f /etc/sbproxy/sb.yml
 ```
+
+Features that persist state on disk (the [dynamic key management](key-management.md) keystore, usage rollups) default their paths to `/var/lib/sbproxy`. Mount a volume there so that state survives container replacement:
+
+```bash
+docker run --rm \
+  -p 8080:8080 \
+  -v /path/to/config:/etc/sbproxy:ro \
+  -v sbproxy-state:/var/lib/sbproxy \
+  soapbucket/sbproxy:latest serve -f /etc/sbproxy/sb.yml
+```
+
+Images up to v1.9.0 ship without the `/var/lib/sbproxy` directory, and the container runs as a nonroot user that cannot create it, so on those versions the mount is required for these features to start at all.
+
+Three PowerShell notes for Windows:
+
+- Quote the host path in the volume flag (`-v C:\Users\you\proxy:/etc/sbproxy:ro`).
+- `curl` is an alias for `Invoke-WebRequest` and rejects flags like `-H`; call `curl.exe` explicitly when testing the proxy (real curl ships with Windows 10 and later).
+- `export` does not exist in PowerShell. Set variables with `$env:NAME = "value"`, or pass them into the container with `-e NAME` or `--env-file`. Save any env file as UTF-8 without a byte order mark: Docker silently ignores every line of the UTF-16 files Windows PowerShell 5 produces by default with `>` redirection.
 
 ### From source
 
@@ -121,9 +155,23 @@ sbproxy serve -f <path> [--log-level <level>] [--request-log-level <level>]
 sbproxy validate <path> [--format text|json]
 sbproxy --config <path> --check
 sbproxy plan -f <yaml> [--against <yaml>] [--format json|text] [--out <plan-file>]
-sbproxy apply -f <yaml>
-sbproxy apply -p <plan-file>
+sbproxy apply -f <yaml> [--admin-url <url>] [--username <u>] [--password <p>]
+                        [--validate-only]
+sbproxy apply -p <plan-file> [--admin-url <url>] [--validate-only]
 sbproxy config {migrate|import-litellm|print}
+sbproxy config authority init --dir <path> [--key-id <id>] [--authority-id <id>]
+                              [--force] [--format text|json]
+sbproxy config authority publish -f <payload.yml> [--mode overlay|replace]
+                              [--validate-only] [--admin-url <url>]
+                              [--username <u>] [--password <p>] [--format text|json]
+sbproxy config authority status [--admin-url <url>] [--format text|json]
+sbproxy config authority rollback [--admin-url <url>] [--format text|json]
+sbproxy config authority subscriber add <subscriber-id> [--admin-url <url>]
+                              [--format text|json]
+sbproxy config authority subscriber list [--admin-url <url>] [--format text|json]
+sbproxy config authority subscriber revoke {--credential-id <id> | --subscriber-id <id>}
+                              [--admin-url <url>] [--format text|json]
+sbproxy config pull <path> --dry-run [--format text|json]
 sbproxy projections render --kind <kind> --config <path> [--hostname <h>]
 sbproxy run <catalog-id> [--name <alias>] [--variant <id>]
                            [--engine auto|vllm|llama_cpp]
@@ -132,9 +180,18 @@ sbproxy run <catalog-id> [--name <alias>] [--variant <id>]
                            [--cache-dir <path>] [--dry-run]
 sbproxy models [list|show <id>|pull [<id>...]|remove <id>|ps|stop <deployment>]
 sbproxy cluster {init|token create|enroll|status}
-sbproxy update [--self]
+sbproxy update [--self] [--engines] [--models] [--check] [--yes]
+                        [--cache-dir <path>] [--format text|json]
 sbproxy ai ledger <subcommand>
+sbproxy admin hash-password [--password <value> | --password-stdin]
 sbproxy doctor [--format text|json]
+sbproxy service install <catalog-id> [--name <alias>] [--variant <id>]
+                              [--engine auto|vllm|llama_cpp]
+                              [--accel auto|cuda|metal|cpu]
+                              [--port <port>] [--admin-port <port>]
+                              [--cache-dir <path>] [--dry-run] [--format text|json]
+sbproxy service uninstall [--format text|json]
+sbproxy service status [--format text|json]
 sbproxy completions {bash|zsh|fish|powershell|elvish}
 sbproxy version
 sbproxy --version
@@ -149,14 +206,16 @@ The full subcommand set, one line each:
 | `validate` | Validate an `sb.yml` without starting the proxy. |
 | `plan` | Diff a proposed config against a baseline. |
 | `apply` | Validate and reload a config in place; the same primitive the SIGHUP handler and file watcher use. |
-| `config` | Config maintenance: `migrate` rewrites deprecated syntax to the current form, `import-litellm` converts a LiteLLM `config.yaml` into an sbproxy `sb.yml`, `print` shows the effective config with secret values masked. |
+| `config` | Config maintenance: `migrate` rewrites deprecated syntax to the current form, `import-litellm` converts a LiteLLM `config.yaml` into an sbproxy `sb.yml`, `print` shows the effective config with secret values masked, `authority` operates a config authority (generate its key, publish, watch the rollout, roll back, manage subscriber credentials), `pull --dry-run` previews the bundle a subscriber would apply next. |
 | `projections` | Render projection documents (robots.txt, llms.txt, ...) for an origin without starting the proxy. |
 | `run` | Resolve a certified artifact, generate local admin auth, warm a canonical managed deployment, then print an OpenAI-compatible endpoint. |
 | `models` | List and show catalog entries, pull or remove exact artifacts, inspect running deployments, or drain and stop one. |
 | `cluster` | Initialize cluster identity, create one-time enrollment tokens, enroll nodes, or inspect the complete roster, placement, and unhealthy-node alerts. |
-| `update` | Check the engine release feed and cached models for freshness; `--self` also checks the sbproxy binary. Report-only. |
+| `update` | Update the engines and cached models (add `--self` for the binary): check the engine release feed and cached models, then fetch, verify, and swap what is out of date, with confirmation. `--check` reports only. Pinned or `path`/`brew`/`apt`-managed artifacts are reported, never replaced, unless the run targets them. |
 | `ai` | AI gateway tools; `ai ledger` verifies the usage ledger. |
+| `admin` | Admin-account maintenance: `hash-password` prints the `password_hash` value for `proxy.admin.operators[].password_hash`. |
 | `doctor` | Diagnose what this binary can do on the current host. |
+| `service` | Install, remove, or check a per-user `launchd` agent (macOS only) that runs a certified catalog model in the background; reuses the same secure config generation as `run`. |
 | `completions` | Print a shell-completion script for the requested shell. |
 | `version` | Print the version line. Synonym for `--version`. |
 
@@ -257,7 +316,7 @@ When `--against` is omitted, the baseline is empty, so every origin in
 the proposed config surfaces as `added`. The `--running` baseline
 (pulled from a live admin socket) is deferred.
 
-### `apply` - validate and reload in place
+### `apply` - validate, then apply to a running proxy
 
 Two flows:
 
@@ -267,13 +326,29 @@ sbproxy apply -p /tmp/sb.plan          # replay a plan file
 ```
 
 `apply -f` validates the proposed YAML, runs plan-time semantic
-checks, and calls the same hot-reload primitive the SIGHUP handler
-and file watcher use. `apply -p` reads a plan file from a prior
-`plan --out`, recomputes the plan against the current baseline, and
-refuses (exit 5) if the recorded `baseline_revision` no longer
-matches the live one. Both flows take an exclusive `flock(2)` on
-`<yaml_path>.applylock` so two operators cannot race the same
-reload.
+checks, then pushes the config to a running proxy over the admin API
+(`PUT /admin/config`) and reports what the server did with it.
+`apply -p` reads a plan file from a prior `plan --out`, recomputes the
+plan against the current baseline, and refuses (exit 5) if the recorded
+`baseline_revision` no longer matches the live one. Both flows take an
+exclusive `flock(2)` on `<yaml_path>.applylock` so two operators cannot
+race the same apply.
+
+The admin endpoint defaults to `http://127.0.0.1:9090`; override it with
+`--admin-url` or `SB_ADMIN_URL`, and supply credentials with
+`--username` / `--password` or `SB_ADMIN_USERNAME` / `SB_ADMIN_PASSWORD`.
+If no proxy answers, apply exits 7 and applies nothing rather than
+reporting a success it did not achieve.
+
+Use `--validate-only` where there is no proxy to apply to, which is the
+normal case in CI. It runs every check and stops, contacting nothing.
+
+Earlier versions did not contact the proxy at all: apply compiled the
+config into its own short-lived process, swapped that process's pipeline,
+printed success, and exited. A running server noticed only if its file
+watcher happened to see the file, so exit 0 was not evidence the config
+had been accepted or even seen. If you have a CI step calling `apply` as
+a validation gate, switch it to `--validate-only`.
 
 The `-p` form is intentionally env-var driven for the YAML path and
 baseline: the plan file does not embed an on-disk path, so the
@@ -288,11 +363,175 @@ Exit codes:
 
 | Code | Meaning |
 |------|---------|
-| 0 | Reload applied cleanly. |
-| 1 | CLI / IO / reload error. |
-| 3 | Semantic-validation errors. Apply refused. |
+| 0 | Applied cleanly, or validated cleanly under `--validate-only`. |
+| 1 | CLI / IO error. |
+| 3 | Semantic-validation errors. Apply refused, nothing sent. |
+| 4 | The proxy refused the config. Nothing was applied. |
 | 5 | Plan file is stale. Rerun `plan` and re-apply. |
 | 6 | Another `apply` already holds the applylock. |
+| 7 | No proxy answered at the admin URL. Nothing was applied. |
+| 8 | Applied, but a subsystem kept stale state. See the warning on stderr. |
+
+### `config authority` - operate a config authority
+
+A config authority signs one configuration and the fleet verifies and
+applies it. The schema, the wire contract, the deny list, and the
+subscriber side are documented in
+[configuration.md](configuration.md#config-authority-fleet-configuration-distribution);
+this section is the operator surface over it.
+
+```bash
+# Once, on the node that will publish.
+sbproxy config authority init --dir /etc/sbproxy/authority \
+  --authority-id control-plane-eu
+
+# Once per subscriber. Prints the credential exactly once.
+export SB_CONFIG_AUTHORITY_TOKEN="$(sbproxy config authority subscriber add edge-01)"
+
+# Every change.
+sbproxy config authority publish -f fleet.yml --mode overlay
+sbproxy config authority status
+sbproxy config authority rollback
+```
+
+Every command except `init` talks to the authority's admin API and
+reports what the server returned. None of them changes process-local
+state and calls that success: if the admin API cannot be reached, the
+command exits 7 and says nothing was changed. The endpoint defaults to
+`http://127.0.0.1:9090`; override it with `--admin-url` or `SB_ADMIN_URL`,
+and supply credentials with `--username` / `--password` or
+`SB_ADMIN_USERNAME` / `SB_ADMIN_PASSWORD`. A publishing node refuses the
+shipped default admin password, so an authority always has a real one.
+
+`--format json` is available on every one of these commands and emits a
+single object on stdout.
+
+#### `config authority init`
+
+Generates an Ed25519 key pair, writes `authority-signing.key` owner-only
+(0600) and `authority-keys.json` for distribution, and prints what to
+copy where. Local: it writes two files and contacts nothing, because a
+signing key that travelled over a network to reach its own authority has
+been somewhere else.
+
+The default `--key-id` is derived from the new public key
+(`authority-<12 chars>`), so a rotation never collides with the key it
+replaces. Pass `--key-id` to choose your own. `--authority-id` only
+affects the printed config snippet.
+
+It refuses to overwrite an existing signing key. `--force` rotates: the
+new signing key replaces the old one and the new verifying key is *added*
+to `authority-keys.json` alongside the old entry, so subscribers that
+still trust the old key keep verifying while they are updated. Drop the
+old entry a window later. The signing seed is printed by neither format.
+
+If the directory is reachable by other accounts on the host, `init` says
+so. It is a warning rather than a refusal: the key file itself is
+owner-only, and the loader refuses one that is not.
+
+#### `config authority publish`
+
+`-f <payload.yml>` is the payload subscribers apply, not this node's own
+config file. Before anything is sent, publish runs the same three checks
+the authority runs (`compile_config`, then the per-origin module
+constructors, then the model-host desired-state checks), through the same
+function the server route calls. A payload that would be refused is
+therefore refused here, and no revision number is spent on it. An
+unresolved `${VAR}` is a warning, not a refusal, because it may well
+resolve on the subscriber.
+
+`--mode` must match the `mode` each subscriber is configured for, or they
+refuse the bundle rather than guess. `--validate-only` runs every check
+and stops, contacting nothing, which is the CI form.
+
+#### `config authority status`
+
+Current revision and digest, the signing key id, the previous revision,
+the highest revision ever reserved, and every subscriber's last-seen
+revision with a `current` / `behind` / `never fetched` verdict. That last
+column is fleet drift, visible from a terminal.
+
+No secret appears in the output. Subscriber records carry a credential
+*id*, never the credential, and the authority stores only a SHA-256
+fingerprint of it in the first place. The verifying material is the
+public half of the signing key.
+
+#### `config authority rollback`
+
+Republishes the previous stored revision's payload. The store keeps the
+current bundle and the one before it for exactly this.
+
+The new revision number is *above* the one it replaces. A subscriber's
+anti-replay cursor refuses any revision that is not greater than the one
+it applied, so re-serving the old number would reach only the nodes that
+had not yet taken the revision being undone, which is the opposite of
+what you want at that moment. The output names all three numbers: what
+was restored, what it replaced, and what it was published as.
+
+The payload is revalidated on the way through, because a payload that
+published cleanly before a binary upgrade need not still construct after
+one.
+
+#### `config authority subscriber`
+
+`add <subscriber-id>` registers a node and mints its credential. The
+credential is printed **once**, here, and is not recoverable: the
+authority keeps only a fingerprint. In `--format text` it goes alone to
+stdout (so `export TOKEN="$(...)"` works) and the note saying so goes to
+stderr. Give it to the node as
+`proxy.config_authority.upstream.credential` by secret reference, not
+inline.
+
+`list` is the roster with each node's last-seen revision. `revoke`
+takes either `--credential-id` (one credential, which is how a rotation
+retires the old one) or `--subscriber-id` (every credential that node
+holds). A revoked node keeps serving what it already applied; it stops
+receiving updates.
+
+#### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Done, or a no-op. |
+| 1 | CLI / IO error, including naming no revoke selector. |
+| 3 | Refused locally, nothing sent: a payload that would not publish, or an `init` that would clobber a signing key. |
+| 4 | The authority answered and refused. Nothing changed on it. |
+| 7 | Nothing answered at the admin URL. Nothing was changed. |
+
+### `config pull` - preview the next bundle without applying it
+
+```bash
+sbproxy config pull /etc/sbproxy/sb.yml --dry-run
+```
+
+Runs a real subscriber cycle up to the point of applying: a conditional
+`GET` against the authority named in `proxy.config_authority.upstream`,
+signature and schema and digest and replay verification, the merge over
+this node's local document, and the unresolved-`${VAR}` screen. Then it
+prints the resulting plan diff, in `plan`'s format, and stops.
+
+Nothing is applied. The bundle cache is not written, the replay cursor is
+not advanced, and no reload happens. This is the one command in the group
+that is local, and it is local because it applies nothing: a short-lived
+CLI process cannot swap a running proxy's pipeline, and applying a bundle
+is the proxy's own poll loop's job. `--dry-run` is required for that
+reason, and the output says plainly that nothing was applied.
+
+The config path comes from the positional argument, then `-f/--config`,
+then `SB_CONFIG_FILE`.
+
+Because the fetch is conditional on this node's persisted cursor, a node
+that already holds the current revision gets a `304` and the command
+reports "no changes" rather than re-printing a diff of what it is already
+serving.
+
+| Code | Meaning |
+|------|---------|
+| 0 | Nothing to apply: the authority is serving the revision this node already holds. |
+| 1 | CLI / IO error, including a missing `--dry-run` or no `upstream` block. |
+| 2 | Changes present. The diff is on stdout. Nothing was applied. |
+| 3 | The bundle or the merged document was refused. The reason names which check fired. |
+| 7 | The authority could not be reached. Nothing was applied. |
 
 ### `projections render` - serve-time documents on demand
 
@@ -328,6 +567,110 @@ curl request, `OPENAI_BASE_URL`, and `OPENAI_API_KEY`. A raw `hf:` reference is
 rejected because it lacks the complete catalog v2 identity. The private
 temporary config is removed whenever the command returns, including startup and
 readiness failures.
+
+### `service` - run a model as a background launchd agent (macOS)
+
+`service install` takes the same model/engine/accel/port/variant surface as
+`run` (flattened onto the same flags) and generates the identical secure
+config: loopback bind, admin enabled with a random local password. The
+difference is what happens to the result: `run` serves it in the
+foreground of the current process; `install` persists the config and
+wraps it in a per-user `launchd` agent instead, so it keeps running (and
+restarts on failure or reboot) after the terminal closes.
+
+```bash
+sbproxy service install qwen2.5-0.5b-instruct --variant q4_k_m
+sbproxy service status
+sbproxy service uninstall
+```
+
+`install` writes four things under `$HOME`:
+
+- The config: `~/Library/Application Support/sbproxy/service/sb.yml`.
+  Unlike `run`'s private temporary config, this one is not removed on
+  exit; `launchd` rereads it on every future load, so it has to outlive
+  the command that wrote it. A prior install's config is replaced
+  outright, along with the admin password embedded in it.
+- The agent definition: `~/Library/LaunchAgents/dev.sbproxy.agent.plist`,
+  labeled `dev.sbproxy.agent`. One agent per host: installing again
+  replaces it rather than adding a second one, mirroring how `run` serves
+  one model at a time. The plist sets `RunAtLoad` and `KeepAlive`, so
+  `launchd` starts it now and relaunches it if the process ever exits.
+- Logs: `~/Library/Logs/sbproxy/service.log` (stdout) and
+  `service.err.log` (stderr), where `launchd` redirects the child
+  process's output.
+- The environment file:
+  `~/Library/Application Support/sbproxy/service/env`, mode 0600. A
+  `launchd` agent inherits almost nothing from the shell that installed
+  it, so an `HF_TOKEN` exported in a terminal is invisible to the agent
+  and a gated model fails to pull with no obvious cause. Put it here
+  instead, one `KEY=value` per line. This is a declarative file, not a shell
+  script: values are literal, and `export`, quotes, expansion, commands, and
+  inline comments are rejected. Duplicate keys are rejected too, so startup
+  and cleanup cannot choose different values. The file is created once with
+  a commented template and never rewritten, so a token set here survives
+  reinstalling to change the model or the port. If you set
+  `SBPROXY_ENGINE_OWNERSHIP_DIR`, use an absolute path. Both the service and
+  `service uninstall` read that value from this file.
+
+The agent starts a small built-in bootstrap that parses this file as data,
+sets the validated values, and then replaces itself with `sbproxy serve`.
+Before that replacement, it takes the private
+`~/Library/Application Support/sbproxy/service/lifecycle.lock` and durably
+registers its exact process generation in `uninstall-state.json`. The state
+keeps bootstrap registrations separate from process generations observed
+later by uninstall, so an observation cannot be mistaken for proof that a
+gateway cooperates with the lock. Nothing in the environment file is evaluated
+by a shell, credentials stay out of the plist, and `launchd` supervises the
+proxy at the same pid. The plist also raises `ExitTimeOut` above the proxy's
+default shutdown grace, so `launchd` cannot SIGKILL a drain that is still in
+progress.
+
+Managed engine ownership is durable across gateway death. Each engine record
+contains the owner and engine PID plus their process-start fingerprints;
+the record reaches durable storage before the engine can execute.
+`service uninstall` takes the same lifecycle lock and captures the exact
+process-start identity of the gateway reported by `launchd`. Before it calls
+`launchctl unload`, that identity must already be in the bootstrap-registration
+set read under the lock; a current-looking plist on disk is not enough. After
+the job exits, uninstall reaps only the process groups tied to exact recorded
+gateway generations. It reads
+`SBPROXY_ENGINE_OWNERSHIP_DIR` from the service environment file, not from the
+shell running the uninstall command. The lock stays held while uninstall reads
+the registry, verifies the first launchd PID it sees, unloads the job, and
+confirms that the job is gone. A `KeepAlive` replacement therefore either
+registered before uninstall took the lock, or cannot execute while unload is
+in progress. The plist and retry record stay in place until exact-owner cleanup
+succeeds.
+A loaded job with no PID, an owner-registry overflow, or an unload that makes
+no bounded progress fails closed and leaves both retry handles in place. The
+stable lock file is deliberately retained after success; unlinking a lock path
+could let future processes lock different file objects.
+
+An agent installed by an older release uses a shell command and never ran this
+registration bootstrap. A failed or interrupted reinstall can also leave an
+older generation running behind a newer plist. In either case, if the exact
+loaded generation is missing from the bootstrap-registration set, the current
+CLI stops before calling `launchctl` and keeps the plist and lifecycle state.
+Reinstall the intended model with the current
+`sbproxy service install <model>`, wait for `sbproxy service status` to report
+it running, then retry `service uninstall`.
+
+The reaper signals a process group only while the recorded engine PID still has
+the recorded start fingerprint. If the PID changed and the group is empty, the
+obsolete record can be removed. If the group is still occupied but the exact
+leader cannot be proved, cleanup fails closed and keeps the record for an
+operator to inspect. It never uses a process-name sweep.
+
+`--dry-run` (inherited from `run`'s flags) prints the plist and the
+generated config without installing or loading anything. `service
+status` asks `launchctl list` whether the agent is registered and
+running, and exits 0 when it is running, 1 otherwise (registered-but-
+stopped and never-installed alike), so it composes with
+`sbproxy service status || <restart it>` in a script. `service uninstall`
+accepts an agent that is already unloaded and resumes an interrupted cleanup
+from its retry record. All three subcommands refuse to run on a non-macOS host,
+since `launchd` is macOS-only; use `run` or `serve` elsewhere.
 
 ### `models` - artifact and runtime lifecycle
 
@@ -382,15 +725,63 @@ every blocker listed when it could not.
 ```bash
 sbproxy doctor
 sbproxy doctor --format json
+sbproxy doctor --strict /etc/sbproxy/sb.yml
 ```
 
 Collection is read-only: no engine starts, nothing is written. The
 released binary ships with GPU discovery compiled in and loads the
 NVIDIA driver library at runtime (falling back to `nvidia-smi`), so
 the same artifact reports "ready" on a GPU host and lists what is
-missing everywhere else. Always exits 0 once the report is produced;
-"this host cannot serve local models" is a finding, not an error. See
-[model-host.md](model-host.md) for canonical managed configuration.
+missing everywhere else. Without `--strict` it always exits 0 once the
+report is produced; "this host cannot serve local models" is a finding,
+not an error. See [model-host.md](model-host.md) for canonical managed
+configuration.
+
+#### `--strict`: the managed-worker startup gate
+
+`--strict` adds a `startup gate` block and exits 3 if any check blocks.
+It is meant for a VM bootstrap or a container entrypoint that should
+refuse to come up rather than fail at the first customer request. A
+worker that boots into a broken GPU configuration joins the cluster,
+advertises itself as eligible, and then fails every dispatch, which
+reads as a routing bug from the gateway side.
+
+Six checks, each named so a script can grep for one:
+
+| Check | Blocks when |
+|---|---|
+| `driver` | the config asks for CUDA and no NVIDIA driver is installed |
+| `visible_devices` | CUDA is asked for and the probe sees no accelerator, the usual sign a container was not given the devices |
+| `cuda_compatibility` | a configured model has no viable engine on this host |
+| `shared_memory` | `/dev/shm` is smaller than the largest `engines.*.shm_size_gib` the config asks for |
+| `cache_mount` | the weight-cache mount cannot hold `cache_budget_gib` |
+| `model_plane_identity` | `proxy.cluster` names mTLS or shared-key material that is not readable |
+| `unpinned_weights` | a node holding the `worker` role serves an unpinned raw `hf:` or `file:` reference without `serve.allow_unpinned_refs` |
+
+Each check compares the config's own demands against the host, so a
+config that asks for nothing local is not penalised: a check that does
+not apply reports `skip`, never a hollow `pass`. Both config forms are
+read, the inline provider-level `serve:` block and the canonical
+`proxy.model_host` block.
+
+Exit codes are distinct so a bootstrap can tell a hardware refusal from
+a config mistake without parsing output: `3` for a startup blocker, `1`
+when a configured model has no viable engine, `2` when the config could
+not be read.
+
+A missing engine *binary* is deliberately not a blocker. Acquisition
+fetches it at the first request, so failing the boot over it would be
+wrong.
+
+`unpinned_weights` is scoped to the `worker` role on purpose. A raw
+reference runs the engine in repo mode, where the container gets DNS and
+external egress instead of an isolated network, the weight cache is
+mounted writable instead of read-only, and no digest is verified because
+sbproxy never sees the download. That is the right trade for
+`sbproxy run <model>` on a workstation and for evaluating a model with no
+catalog entry, so neither is affected. It is the wrong trade for a
+long-lived fleet worker, which now has to say `serve.allow_unpinned_refs:
+true` to accept it. See [security-model-host.md](security-model-host.md).
 
 The same host state is checked at startup and on every hot reload. When a
 managed deployment is missing a prerequisite, candidate preparation reports
@@ -401,17 +792,104 @@ the last good runtime.
 
 The managed runtime resolves an engine in this order:
 
-- An explicit trusted `engines.<kind>.path` wins.
+- An explicit trusted binary path wins: set `engines.<kind>.acquire.path` with
+  `engines.<kind>.acquire.source: path`.
 - A compatible binary on `PATH` is next for ordinary binary launch.
-- llama.cpp can fetch a pinned release. Built-in prebuilt assets and the Linux
-  CUDA source archive have checked-in digests and identity-scoped caches.
+- llama.cpp can fetch a pinned CPU or Metal release. Built-in prebuilt assets
+  have checked-in digests and identity-scoped caches. On a compatible NVIDIA
+  Linux host, it can instead build digest-pinned source with CUDA.
 - vLLM can use a version-pinned managed uv environment or a digest-pinned
   private container.
 
-GPU drivers are never installed by sbproxy; a missing driver is
-reported with guidance only. See [model-host.md](model-host.md) for canonical
-fields, per-engine details, and host prerequisites. Live NVIDIA certification
-remains in the final GCP integration PR.
+GPU drivers are never installed by sbproxy; a missing driver is reported with
+guidance only. The NVIDIA certification procedure targets vLLM or SGLang, not
+the llama.cpp CUDA path. See [model-host.md](model-host.md) for canonical
+fields, per-engine details, and host prerequisites.
+
+Live single-GPU NVIDIA serving is recorded on an L4 as of 2026-07-30. Multi-GPU
+is not, so `platform.nvidia_cuda` stays at `preview` in the capability matrix.
+[model-host-certification.md](model-host-certification.md) has the evidence and
+what is still missing.
+
+### `update` - keep the binary, engines, and models current
+
+`sbproxy update` checks the engine release feed and the cached models,
+then fetches, verifies, and swaps what is out of date. With no target
+flag it covers the engines and the cached models; `--self` adds the
+sbproxy binary. `--engines` or `--models` narrow the run to that target.
+
+```bash
+# Report only, mutate nothing (the dry-run freshness report).
+sbproxy update --check
+
+# Update engines and models, confirming each swap.
+sbproxy update
+
+# Update the binary too, without prompts.
+sbproxy update --self --yes
+```
+
+Every swap is verified before it lands. An engine prebuilt and the
+sbproxy release archive are checked against their published SHA-256
+before the atomic replace, and a model re-pull runs through the same
+weight manager (and per-file digest verification) as `models pull`. The
+binary is replaced by writing the new file next to the running one and
+renaming it into place, so the swap is atomic on a POSIX host.
+
+Pinning always wins. An artifact that another tool owns, a binary already
+on `PATH`, or one installed by `brew` or `apt`, is reported as managed
+elsewhere and is never overwritten. An artifact pinned to an explicit
+version or digest is held on a blanket `sbproxy update` and moves only
+when the run names it (for example `sbproxy update --engines`). A newer
+llama.cpp tag has no vendored digest, so pin `engines.llama_cpp.acquire.sha256`
+to verify a moved engine, or leave the engine on its digest-pinned
+default.
+
+Behavior is tuned by the optional `update:` config block:
+
+```yaml
+update:
+  # stable (default) | latest | pinned. `pinned` freezes every artifact;
+  # only a run that explicitly targets one may move it.
+  channel: stable
+  # When true, a background freshness check runs on the interval below and
+  # reports to the logs and `sbproxy doctor`. A background check never
+  # swaps anything; applying an update is always an explicit run.
+  auto: false
+  # How often the background check runs. Humanized (6h, 1d) or bare
+  # seconds. Only consulted when auto is true. Defaults to once a day.
+  check_interval_secs: 1d
+```
+
+With `auto: true`, an `sbproxy update` run reports only and swaps nothing,
+so an unattended host never mutates a binary out from under itself.
+`--format json` always emits the machine-readable freshness report and
+takes no action; the acting path prints its progress on the text path.
+
+### `admin hash-password` - hash an operator password
+
+Prints the `password_hash` value to paste into
+`proxy.admin.operators[].password_hash`. Takes exactly one input source:
+
+```bash
+sbproxy admin hash-password --password 'correct horse battery staple'
+
+# Prefer stdin over --password: a literal value on the command line
+# stays in the shell history.
+printf '%s' 'correct horse battery staple' | sbproxy admin hash-password --password-stdin
+```
+
+The hash is HMAC-SHA256 of the password, keyed with the pepper, then
+hex-encoded. The pepper is resolved the same way the running server
+resolves it, so a hash printed here verifies against a server booted
+from the same config: pass `-f/--config` and, when that file sets
+`key_management.crypto.pepper`, the command reads it from there; without
+`-f`, or when the config has no `key_management` block, it falls back to
+a fixed default pepper built into the binary. That default is the same
+in every install, so a `password_hash` hashed against it is
+offline-crackable by anyone with the source; pin
+`key_management.crypto.pepper` before relying on this for anything
+beyond local development. See [admin.md](admin.md#authentication-and-roles).
 
 ### `completions` - shell tab-completion scripts
 
@@ -634,8 +1112,8 @@ plane, enterprise hooks) log and degrade instead of blocking.
     `SB_WORKER_THREADS` or auto-detection), binds the plain HTTP
     listener on `http_bind_port`, and adds the HTTPS listener (manual
     certs or the ACME dynamic-certificate resolver, with optional
-    mTLS). No QUIC port is bound even when `proxy.http3` is
-    configured; an enabled `http3` block only logs a warning.
+    mTLS). No QUIC port is bound. Config compilation rejects
+    `proxy.http3.enabled: true` because HTTP/3 is not served.
 11. **Admin server**: when `proxy.admin.enabled: true`, spawns the
     embedded admin listener (default `127.0.0.1:9090`) and registers
     the component health probes that `/readyz` and `/health` report.
@@ -787,7 +1265,7 @@ Label cardinality is capped by `metrics.max_cardinality_per_label` (default `100
 | `sbproxy_request_duration_seconds` | Histogram | `hostname` |
 | `sbproxy_errors_total` | Counter | `hostname`, `error_type` |
 | `sbproxy_active_connections` | Gauge | (none) |
-| `sbproxy_cache_hits_total` | Counter | `hostname`, `result` (`hit`, `miss`) |
+| `sbproxy_cache_results_total` | Counter | `origin`, `result` (`hit`, `miss`) |
 | `sbproxy_ai_tokens_attributed_total` | Counter | `provider`, `model`, `surface`, `direction` (`input`, `output`), attribution labels |
 
 #### Agent detection metrics
@@ -1108,62 +1586,41 @@ testing:
 
 ## 8. Connection tuning
 
-Upstream connection behavior is tuned per origin with a single
-`connection_pool` block, placed at the origin level alongside the
-`action` block.
-
-![ten concurrent requests completing over a bounded upstream pool, per-request timing shown](assets/connection-pool.gif)
-
-A 32-connection pool with idle and lifetime caps absorbs the burst ([config](../examples/connection-pool/)).
-
-### Per-origin connection pool
+Pingora owns the OSS runtime's upstream connection pool. The legacy
+per-origin `connection_pool` shape remains parseable for config compatibility,
+but none of its values are installed into Pingora today.
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `max_connections` | `128` | Maximum concurrent connections to the upstream. Additional requests queue until a connection frees up |
-| `idle_timeout_secs` | `90` | Idle keep-alive connections unused for longer than this are dropped from the pool |
-| `max_lifetime_secs` | `300` | Hard ceiling on any single connection's lifetime; older connections are replaced even when healthy |
+| `max_connections` | `128` | Config-only compatibility value; does not cap live connections |
+| `idle_timeout_secs` | `90` | Config-only compatibility value; does not change live idle reaping |
+| `max_lifetime_secs` | `300` | Config-only compatibility value; does not change live connection lifetime |
 
-```yaml
-origins:
-  "api.example.com":
-    connection_pool:
-      max_connections: 32
-      idle_timeout_secs: 60
-      max_lifetime_secs: 300
-    action:
-      type: proxy
-      url: https://backend.internal
-```
-
-Tune these when an upstream is sensitive to concurrent connection
-count, or when a load balancer aggressively terminates long-lived TCP
-sessions. Origins without a `connection_pool` block get the defaults
-above. There are no other per-origin transport knobs; buffer sizes and
-handshake timeouts follow Pingora's defaults.
+Do not use this block to satisfy an upstream concurrency or lifetime
+requirement. Buffer sizes, pooling, and handshake timeouts currently follow
+Pingora's runtime defaults.
 
 ### HTTP/3 (QUIC)
 
-HTTP/3 is temporarily disabled until native QUIC support lands in
-Pingora. The `proxy.http3` block still parses, but it is ignored: no
-QUIC listener is started, no `Alt-Svc` header is advertised, and
-setting `enabled: true` only logs a warning at startup. HTTP/2 is the
-highest version served. The fields are documented for when HTTP/3
-returns:
+HTTP/3 is not served by this build. No QUIC listener is started and no
+`Alt-Svc` header is advertised. The `proxy.http3` shape is retained for
+forward compatibility, but config compilation rejects `enabled: true`
+with a reference to WOR-1969. HTTP/2 is the highest version served. The
+reserved shape is:
 
 ```yaml
 proxy:
   http3:
-    enabled: true          # currently ignored; logs a warning
+    enabled: false         # true is rejected during config compilation
     idle_timeout_secs: 30
     max_streams: 100
 ```
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `enabled` | `false` | Whether to start the HTTP/3 (QUIC) listener. Currently inert |
-| `idle_timeout_secs` | `30` | Idle timeout for QUIC connections |
-| `max_streams` | `100` | Maximum concurrent QUIC streams per connection |
+| `enabled` | `false` | Reserved activation flag. Must remain false in this build |
+| `idle_timeout_secs` | `30` | Reserved idle timeout for QUIC connections |
+| `max_streams` | `100` | Reserved maximum concurrent QUIC streams per connection |
 
 ---
 
@@ -1314,7 +1771,11 @@ header / query parsing is wired today.
 
 ### Single container
 
-Mount a config directory containing `sb.yml` and map ports; the image's default command is `serve -f /etc/sbproxy/sb.yml`. The container exposes `8080/tcp`, `8443/tcp`, and `8443/udp` (UDP will be required for HTTP/3 QUIC when HTTP/3 returns; HTTP/3 is currently disabled, so the UDP mapping is presently unused).
+Mount a config directory containing `sb.yml`, map the listener ports, and pass
+the startup command explicitly. The published `soapbucket/sbproxy` and
+`ghcr.io/soapbucket/sbproxy` images set the `sbproxy` entrypoint but no default
+command. Their image metadata exposes 8080 and 9090; Docker can map any ports
+you configure.
 
 ```bash
 docker run -d \
@@ -1325,7 +1786,7 @@ docker run -d \
   -p 8443:8443/udp \
   -v /etc/sbproxy:/etc/sbproxy:ro \
   -e SB_LOG_LEVEL=info \
-  soapbucket/sbproxy:latest
+  soapbucket/sbproxy:latest serve -f /etc/sbproxy/sb.yml
 ```
 
 For a read-only config with a writable ACME certificate store (the default `proxy.acme.storage_path` is `/var/lib/sbproxy/certs`):
@@ -1339,7 +1800,7 @@ docker run -d \
   -v /etc/sbproxy/sb.yml:/etc/sbproxy/sb.yml:ro \
   -v sbproxy-acme-certs:/var/lib/sbproxy/certs \
   -e SB_LOG_LEVEL=info \
-  soapbucket/sbproxy:latest
+  soapbucket/sbproxy:latest serve -f /etc/sbproxy/sb.yml
 ```
 
 ### Docker Compose stack
@@ -1376,11 +1837,13 @@ make docker
 docker build -f Dockerfile.cloudbuild -t sbproxy:dev .
 ```
 
-The image uses a multi-stage build: the builder stages compile the
+This locally built image uses a multi-stage build: the builder stages compile the
 binary and the embedded admin UI, and the final image is
 `gcr.io/distroless/cc-debian12`, with no shell or package manager. The
 default command is `serve -f /etc/sbproxy/sb.yml`, so mounting a
-config at that path is all a derived deployment needs.
+config at that path is enough for this local image. The published release
+images are assembled separately in `.github/workflows/release.yml` and do not
+set that command.
 
 ---
 
@@ -1495,7 +1958,11 @@ admin server and make it reachable from the kubelet: set
 `proxy.admin.enabled: true`, `bind: "0.0.0.0"`, and an `allow_ips`
 list covering the node network (the probe endpoints themselves are
 unauthenticated, but the admin listener's IP allowlist applies to
-every connection). Then point the probes at port `9090`:
+every connection). Both of those fields make the admin surface
+reachable off loopback, so the same config needs a real `password`:
+the default `changeme` is a validation error once either one is set
+(see [admin.md](admin.md#the-default-credentials-are-refused-off-loopback)).
+Then point the probes at port `9090`:
 
 ```yaml
 livenessProbe:
@@ -1624,6 +2091,9 @@ restart.
 | `SB_GRACE_TIME` | `--grace-time` | (unset) | Legacy Pingora grace period and shutdown timeout in seconds. Superseded by `SBPROXY_SHUTDOWN_GRACE_MS`. |
 | `SB_WORKER_THREADS` | (none) | (auto) | Override the auto-detected Pingora worker thread count. Positive integers only. |
 | `SB_DISABLE_SB_FLAGS` | `--disable-sb-flags` | `false` | Lock off the per-request `x-sb-flags` surface. Accepts `1`, `true`, `yes`, `on`. |
+| `SB_ADMIN_URL` | `--admin-url` | `http://127.0.0.1:9090` | Admin API base URL for the commands that talk to a running proxy: `apply`, `models ps` / `stop` / `remove`, `cluster status`, and every `config authority` subcommand. |
+| `SB_ADMIN_USERNAME` | `--username` | `admin` | Admin Basic Auth username for the same commands. |
+| `SB_ADMIN_PASSWORD` | `--password` | (unset) | Admin Basic Auth password for the same commands. Never printed, and cleared from memory once the request header is built. |
 | `SB_APPLY_CONFIG` | (none) | (unset) | Path to the proposed YAML used by `sbproxy apply -p <plan-file>`. Required for the `-p` flow because the plan file does not embed the YAML path. |
 | `SB_APPLY_BASELINE` | (none) | (unset) | Optional baseline override for `sbproxy apply -p`. When set, apply compares the plan's recorded baseline revision against this YAML's revision; otherwise the empty config is the baseline. |
 
@@ -1675,7 +2145,7 @@ docker run --rm \
   -p 8443:8443 \
   -p 8443:8443/udp \
   -v /etc/sbproxy:/etc/sbproxy:ro \
-  soapbucket/sbproxy:latest
+  soapbucket/sbproxy:latest serve -f /etc/sbproxy/sb.yml
 ```
 
 ### HTTP/3 limitations

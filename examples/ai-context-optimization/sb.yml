@@ -1,0 +1,50 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+#
+# Stateless context optimization for marked retrieval text.
+#
+# Start an OSS classifier sidecar with a compatible token model before
+# exercising token_prune. The proxy still starts when the sidecar is absent;
+# that lever fails open and window_fit remains the final bound.
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "test.sbproxy.dev":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          models: [gpt-5-mini]
+      routing: round_robin
+
+      # Apply the smallest known native reasoning setting to eligible
+      # Chat Completions, Messages, and Responses requests. Tools and
+      # code-shaped prompts bypass this transform.
+      reasoning: concise
+
+      compression:
+        levers:
+          # Rank sentences against <sbproxy-query>, keep at most five
+          # per marked block, preserve source order inside each chunk,
+          # then place the strongest retained chunks at the block edges.
+          - type: query_select
+            max_sentences: 5
+
+          # Send only marked format="text" chunk bodies to the local
+          # classifier sidecar. The model ID must match --token-model.
+          - type: token_prune
+            min_tokens: 1
+            endpoint: http://127.0.0.1:9440
+            model: llmlingua-2
+            timeout_ms: 250
+            max_chunks: 16
+            target:
+              mode: retain_ratio
+              retain_percent: 70
+
+          # Always keep a dependency-free final limit. This preserves
+          # the protected instruction prefix and newest complete turn.
+          - type: window_fit
+            completion_reserve_tokens: 1024
+            input_budget_tokens: 4096

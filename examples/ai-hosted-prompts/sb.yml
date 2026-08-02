@@ -4,7 +4,7 @@
 # This example wires one hosted provider (Anthropic) behind the gateway
 # and turns on the admin server so you can manage prompt versions and
 # exercise the model from the dashboard. Clients send OpenAI-shaped chat
-# completions to ai.local; the gateway translates to the provider and
+# completions to test.sbproxy.dev; the gateway translates to the provider and
 # back, so OpenAI SDK clients work unchanged.
 #
 # What to do with it (see README.md for the full walkthrough):
@@ -25,7 +25,7 @@ proxy:
     password: change-this
 
 origins:
-  "ai.local":
+  "test.sbproxy.dev":
     action:
       type: ai_proxy
       providers:

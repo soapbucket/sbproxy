@@ -118,14 +118,14 @@ fn default_format() -> String {
 impl LoggingConfig {
     /// Initialize the global tracing subscriber.
     pub fn init(&self) {
-        self.init_inner(None, true);
+        self.init_inner(None, true, false);
     }
 
     /// Initialize the global tracing subscriber with an optional OTLP
     /// trace layer. `RUST_LOG` still overrides `self.level`, matching
     /// [`Self::init`].
     pub fn init_with_telemetry(&self, telemetry: Option<&crate::telemetry::TelemetryConfig>) {
-        self.init_inner(telemetry, true);
+        self.init_inner(telemetry, true, false);
     }
 
     /// Initialize with an already-resolved filter string. The binary
@@ -135,13 +135,24 @@ impl LoggingConfig {
         &self,
         telemetry: Option<&crate::telemetry::TelemetryConfig>,
     ) {
-        self.init_inner(telemetry, false);
+        self.init_inner(telemetry, false, false);
+    }
+
+    /// Initialize with an already-resolved filter and write tracing output to
+    /// stderr. CLI commands use this so their stdout remains a clean
+    /// machine-readable document.
+    pub fn init_with_resolved_filter_and_telemetry_to_stderr(
+        &self,
+        telemetry: Option<&crate::telemetry::TelemetryConfig>,
+    ) {
+        self.init_inner(telemetry, false, true);
     }
 
     fn init_inner(
         &self,
         telemetry: Option<&crate::telemetry::TelemetryConfig>,
         prefer_rust_log: bool,
+        write_to_stderr: bool,
     ) {
         let filter = if prefer_rust_log {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&self.level))
@@ -166,11 +177,21 @@ impl LoggingConfig {
                 }
             }
         });
+        if let Some(config) = telemetry {
+            if let Err(err) = crate::telemetry::init_otlp_metrics_pipeline(config) {
+                eprintln!("telemetry: failed to initialize OTLP metrics: {err:#}");
+            }
+        }
+        let writer = if write_to_stderr {
+            fmt::writer::BoxMakeWriter::new(std::io::stderr)
+        } else {
+            fmt::writer::BoxMakeWriter::new(std::io::stdout)
+        };
         match self.format.as_str() {
             "json" => {
                 tracing_subscriber::registry()
                     .with(filter_layer)
-                    .with(fmt::layer().json())
+                    .with(fmt::layer().json().with_writer(writer))
                     .with(otlp.as_ref().map(|pipeline| {
                         tracing_opentelemetry::layer().with_tracer(pipeline.tracer.clone())
                     }))
@@ -179,7 +200,7 @@ impl LoggingConfig {
             "pretty" => {
                 tracing_subscriber::registry()
                     .with(filter_layer)
-                    .with(fmt::layer().pretty())
+                    .with(fmt::layer().pretty().with_writer(writer))
                     .with(otlp.as_ref().map(|pipeline| {
                         tracing_opentelemetry::layer().with_tracer(pipeline.tracer.clone())
                     }))
@@ -188,7 +209,7 @@ impl LoggingConfig {
             _ => {
                 tracing_subscriber::registry()
                     .with(filter_layer)
-                    .with(fmt::layer().compact())
+                    .with(fmt::layer().compact().with_writer(writer))
                     .with(otlp.as_ref().map(|pipeline| {
                         tracing_opentelemetry::layer().with_tracer(pipeline.tracer.clone())
                     }))
@@ -716,6 +737,52 @@ fn apply_op_regex_patterns_with(
     out.into_owned()
 }
 
+/// Header names the inbound minted-key sweep reads, lowercased.
+///
+/// Fed from `key_management.inbound.headers` at load and on every reload
+/// rather than hardcoded, because an operator who configures a custom header
+/// would otherwise get no redaction at all: a name like `x-tool-auth` matches
+/// none of the `-key` / `-secret` / `-token` suffix rules below, and their live
+/// key would reach the access log in plaintext. Making the redactor follow the
+/// configuration means adding a sweep header cannot silently open that hole.
+static SWEPT_HEADERS: OnceLock<std::sync::RwLock<std::sync::Arc<Vec<String>>>> = OnceLock::new();
+
+fn swept_headers_slot() -> &'static std::sync::RwLock<std::sync::Arc<Vec<String>>> {
+    SWEPT_HEADERS.get_or_init(|| std::sync::RwLock::new(std::sync::Arc::new(Vec::new())))
+}
+
+/// Replace the set of header names treated as key-bearing for redaction.
+///
+/// Call on config load and on every reload with
+/// `KeyInboundConfig::header_names()`. Names are lowercased by the caller;
+/// this lowercases again so a hand-built list cannot slip through uncased.
+pub fn set_swept_header_names(names: Vec<String>) {
+    let lowered: Vec<String> = names
+        .into_iter()
+        .map(|n| n.trim().to_ascii_lowercase())
+        .filter(|n| !n.is_empty())
+        .collect();
+    if let Ok(mut slot) = swept_headers_slot().write() {
+        *slot = std::sync::Arc::new(lowered);
+    }
+}
+
+/// The currently configured sweep header names, for diagnostics and tests.
+pub fn swept_header_names() -> std::sync::Arc<Vec<String>> {
+    swept_headers_slot()
+        .read()
+        .map(|slot| slot.clone())
+        .unwrap_or_else(|_| std::sync::Arc::new(Vec::new()))
+}
+
+/// Whether `k` is a header the sweep reads, and therefore carries a live key.
+fn is_swept_header(k: &str) -> bool {
+    swept_headers_slot()
+        .read()
+        .map(|slot| slot.iter().any(|n| n == k))
+        .unwrap_or(false)
+}
+
 /// Recursively walk a JSON value and redact any field whose key is on
 /// the denylist. Replacements use the typed `[REDACTED:FOO]` marker
 /// (schema v2).
@@ -752,6 +819,12 @@ fn redact_value(value: &mut serde_json::Value, sink: Sink, extra_fields: &[Strin
 /// most-specific scope's additions fire.
 fn match_denylist(key: &str, sink: Sink, extra_fields: &[String]) -> Option<&'static str> {
     let k = key.to_ascii_lowercase();
+    // RFC 9449 proofs are bearer-adjacent sender-constraining material. A
+    // compact JWS does not match the value-shape redactor, so protect it by
+    // field name in every structured sink.
+    if k == "dpop" {
+        return Some("[REDACTED:DPOP_PROOF]");
+    }
     // Authorization headers + cookies: every sink redacts these.
     if k == "authorization" || k == "proxy-authorization" {
         return Some("[REDACTED:AUTHORIZATION]");
@@ -811,6 +884,9 @@ fn match_denylist(key: &str, sink: Sink, extra_fields: &[String]) -> Option<&'st
     // normalisation pass that the JSON renderer would do.
     if k == "api_key"
         || k == "x-api-key"
+        // Any header the operator configured the key sweep to read carries a
+        // live token by definition, whatever it happens to be called.
+        || is_swept_header(&k)
         || k.ends_with("_secret")
         || k.ends_with("_token")
         || k.ends_with("_key")
@@ -1032,6 +1108,36 @@ mod tests {
         assert!(
             !out.contains("<redacted:"),
             "legacy v1-shape marker leaked: {out}"
+        );
+    }
+
+    #[test]
+    fn structured_logs_redact_compact_dpop_proofs_by_field_key() {
+        const DPOP_PROOF: &str = concat!(
+            "eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IkVTMjU2IiwiandrIjp7Imt0eSI6IkVDIiwiY3J2",
+            "IjoiUC0yNTYiLCJ4IjoibDh0RnIzRjdrS3Rjb2J4NWVmMHlONUR1ejN0RDdmWUZQUmRaeFk1",
+            "VlFKMCIsInkiOiI0cE4tNUo3azZKbTZUdmVXZEVLd3FWRE1IWVE1bk5vVEhUY0xRa0cxZDVN",
+            "In19.",
+            "eyJqdGkiOiJmNmE4ZjMyZC00YzY1LTRjMjctYThiOS0zMDQ3ZjY4ZTI3MTUiLCJodG0iOiJH",
+            "RVQiLCJodHUiOiJodHRwczovL2FwaS5leGFtcGxlLmNvbS9yZXNvdXJjZSIsImlhdCI6MTc4",
+            "NTA5MTIwMH0.",
+            "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1",
+            "Njc4OWFiY2RlZg",
+        );
+        let json = serde_json::json!({
+            "request_headers": {
+                "dpop": DPOP_PROOF,
+            },
+        })
+        .to_string();
+
+        let out = apply_redaction(&json, Sink::AccessLog);
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+
+        assert_eq!(value["request_headers"]["dpop"], "[REDACTED:DPOP_PROOF]");
+        assert!(
+            !out.contains(DPOP_PROOF),
+            "compact DPoP proof leaked from structured log: {out}"
         );
     }
 
@@ -1515,6 +1621,44 @@ mod tests {
     }
 
     // --- Redaction ---
+
+    #[test]
+    fn the_default_sidecar_header_is_redacted() {
+        set_swept_header_names(vec!["x-sb-api".to_string()]);
+        let mut value = serde_json::json!({"x-sb-api": "sbp_secret_value"});
+        redact_value(&mut value, Sink::AccessLog, &[]);
+        assert_eq!(value["x-sb-api"], "[REDACTED:API_KEY]");
+        set_swept_header_names(Vec::new());
+    }
+
+    #[test]
+    fn a_custom_sweep_header_is_redacted_without_editing_any_denylist() {
+        // The trap this closes. `x-tool-auth` ends in none of -key, -secret or
+        // -token, so before the sweep list drove redaction an operator who
+        // configured it got their live key written to the access log.
+        let mut before = serde_json::json!({"x-tool-auth": "sbp_secret_value"});
+        redact_value(&mut before, Sink::AccessLog, &[]);
+        assert_eq!(
+            before["x-tool-auth"], "sbp_secret_value",
+            "precondition: nothing else redacts this name"
+        );
+
+        set_swept_header_names(vec!["x-tool-auth".to_string()]);
+        let mut after = serde_json::json!({"x-tool-auth": "sbp_secret_value"});
+        redact_value(&mut after, Sink::AccessLog, &[]);
+        assert_eq!(after["x-tool-auth"], "[REDACTED:API_KEY]");
+        set_swept_header_names(Vec::new());
+    }
+
+    #[test]
+    fn sweep_header_names_are_matched_case_insensitively() {
+        set_swept_header_names(vec!["  X-Tool-Auth ".to_string()]);
+        assert_eq!(*swept_header_names(), vec!["x-tool-auth".to_string()]);
+        let mut value = serde_json::json!({"x-tool-auth": "sbp_secret_value"});
+        redact_value(&mut value, Sink::AccessLog, &[]);
+        assert_eq!(value["x-tool-auth"], "[REDACTED:API_KEY]");
+        set_swept_header_names(Vec::new());
+    }
 
     #[test]
     fn redaction_replaces_authorization_header() {

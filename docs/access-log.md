@@ -1,6 +1,6 @@
 # Access log
 
-*Last modified: 2026-05-04*
+*Last modified: 2026-08-01*
 
 ![a GET and a POST proxied through an origin that emits a structured JSON access-log line for each](assets/access-log.gif)
 
@@ -33,11 +33,8 @@ origins:
       url: http://localhost:3000
 ```
 
-A request to `api.example.com` now produces a line such as:
-
-```json
-{"timestamp":"2026-04-27T12:00:03.521Z","request_id":"7f7c","origin":"api.example.com","method":"GET","path":"/health","status":200,"latency_ms":24.7,"auth_ms":1.2,"upstream_ttfb_ms":18.9,"response_filter_ms":4.1,"bytes_in":0,"bytes_out":1024,"client_ip":"203.0.113.10"}
-```
+A request to `api.example.com` now produces one JSON object on stdout.
+[Calling it](#calling-it) below shows a real one, captured end to end.
 
 The three `*_ms` phase fields (`auth_ms`, `upstream_ttfb_ms`,
 `response_filter_ms`) split `latency_ms` into the parts of the
@@ -54,6 +51,107 @@ Optional fields (`provider`, `model`, `tokens_in`, `tokens_out`,
 `cache_result`, `trace_id`, `request_headers`, `response_headers`,
 `upstream_host`) are omitted when not applicable, keeping non-AI lines
 compact.
+
+## Calling it
+
+The runnable configuration is
+[`examples/access-log/`](../examples/access-log/). It turns the block on and
+adds the filters, sampling, and header capture described below, in front of a
+plain proxy origin. Start it:
+
+```bash
+make run CONFIG=examples/access-log/sb.yml
+```
+
+Then send an ordinary request. Nothing about the client changes; the log line
+is a side effect of the response completing:
+
+```bash
+curl -s -o /dev/null -H 'Host: api.local' http://127.0.0.1:8080/anything
+```
+
+One JSON object appears on the proxy's stdout. It is a single line on the
+wire, shown here wrapped:
+
+```json
+{
+  "timestamp": "2026-08-01T14:56:33.863503+00:00",
+  "request_id": "019fbdd3ab8272e2a87d91f409911437",
+  "origin": "api.local",
+  "method": "GET",
+  "path": "/anything",
+  "protocol": "HTTP/1.1",
+  "host": "api.local",
+  "user_agent": "curl/8.18.0",
+  "status": 200,
+  "response_content_type": "application/json; charset=utf-8",
+  "latency_ms": 196.17337500000002,
+  "upstream_ttfb_ms": 195.80141700000001,
+  "response_filter_ms": 0.060958,
+  "bytes_in": 0,
+  "bytes_out": 2596,
+  "client_ip": "127.0.0.1",
+  "trace_id": "a242bdd5b2a948b683f9020924010054",
+  "envelope_request_id": "01KYYX7AWCH1C2E5GFP6BCJEGC",
+  "session_id": "01KYYX7AWCXXJ74WD2AAZV6EHT",
+  "tenant_id": "__default__",
+  "principal_kind": "none",
+  "key_mode": "none",
+  "served_from_cache": false,
+  "fallback_triggered": false,
+  "retry_count": 0,
+  "request_headers": {"user-agent": "curl/8.18.0"},
+  "response_headers": {
+    "content-length": "2596",
+    "content-type": "application/json; charset=utf-8"
+  }
+}
+```
+
+Every value there varies per run except the shapes. `timestamp`,
+`request_id`, `trace_id`, `envelope_request_id`, `session_id`, and the three
+`*_ms` numbers differ on every request, and `bytes_out` follows whatever the
+upstream returned.
+
+What is worth checking against your own run is which fields are *absent*.
+`auth_ms` is missing because this origin has no auth provider. `query` is
+missing because the request had none. `scheme` is missing because an HTTP/1.1
+request line carries a path rather than an absolute URI. `provider`, `model`,
+and the token counts are missing because this is not an AI route, and
+`cache_result` is missing because no response cache is configured. That is the
+`skip_serializing_if` behavior in practice: a non-AI, unauthenticated,
+uncached proxy hop carries the populated fields and nothing else.
+
+`request_headers` and `response_headers` are present only because the example
+configures `capture_headers`. It asks for `user-agent`, `x-request-id`, and
+`x-ratelimit-*` on the request side, and only `user-agent` was sent, so only
+that one appears. A header the allowlist does not name is never logged.
+
+Now ask the upstream for a failure:
+
+```bash
+curl -s -o /dev/null -H 'Host: api.local' http://127.0.0.1:8080/status/500
+```
+
+The line for that response differs in three places:
+
+```json
+{
+  "path": "/status/500",
+  "status": 500,
+  "response_content_type": "text/plain; charset=utf-8",
+  "error_class": "upstream_5xx",
+  "bytes_out": 97
+}
+```
+
+`error_class` appears only on a failure and is the field to alert on. Note
+what does *not* appear: `upstream_status` stays absent, because the proxy
+passed the upstream's 500 through unchanged and the field is only emitted
+when the status the client sees differs from the one the upstream sent. A
+retry chain, a fallback, or a `response_modifier` that rewrote the status is
+what makes it show up, and its absence here is the signal that nothing
+rewrote anything.
 
 ## Filters
 
@@ -131,8 +229,12 @@ that counts toward the cap.
 
 A hardcoded denylist of sensitive headers (`authorization`, `cookie`,
 `set-cookie`, `proxy-authorization`, `x-api-key`) is excluded from `*`
-and glob matches. To capture one of these, list it by exact name; the
-proxy logs a `WARN` at config load so the choice is visible.
+and glob matches. An exact name opts a denied header into capture, and the
+proxy logs a `WARN` at config load so the choice is visible. There are two
+hard exclusions: `dpop` is never loggable, and every header configured as a
+primary credential carrier under `key_management.inbound` remains excluded
+even when named exactly. The warning calls out these limits rather than
+promising that a carrier value will be captured.
 
 When `redact_pii: true`, the `sbproxy-security` PII redactor runs over
 captured header values. `redact_pii_rules` (empty by default) optionally
@@ -145,7 +247,7 @@ restricts the rule set; accepted names are `email`, `us_ssn`,
 | Field | Type | Notes |
 |-------|------|-------|
 | `timestamp` | string | RFC 3339 (UTC) of when the response was sent. |
-| `request_id` | string | Unique per request. Reuses the propagated `X-Request-Id` when set; otherwise a fresh UUIDv4. |
+| `request_id` | string | Unique per request. Reuses the propagated request-id header when set; otherwise a fresh UUIDv7 rendered as 32 lowercase hex characters with no hyphens. |
 | `origin` | string | Hostname routing matched. |
 | `method` | string | HTTP method. |
 | `path` | string | Request path, no query string. |
@@ -229,6 +331,12 @@ Rules:
 - A field whose script errors, or that resolves to the empty string, is
   omitted from the line rather than failing the request.
 - Custom values pass through the same redaction as every other field.
+- The request-header context omits every configured primary credential
+  carrier before interpolation or a script runs. `${request.header.NAME}`
+  therefore resolves to an empty string for a carrier, and
+  `request.headers["name"]` is absent in CEL, Lua, and JavaScript. A
+  `provider_hints[].also_header` is matching metadata, not a primary carrier,
+  so it remains available unless the same name is configured as a carrier.
 
 ### Scopes
 

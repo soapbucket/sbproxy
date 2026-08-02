@@ -1,5 +1,5 @@
 # Web Bot Auth
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-01*
 
 ![an unsigned crawler request rejected with 401 and a signature-required challenge](assets/web-bot-auth.gif)
 
@@ -62,7 +62,102 @@ The provider produces one of five verdicts; only the first allows the request:
 | `Failed` | `401` | Header parse failure, signature mismatch, expired, or required component missing. |
 | `DirectoryUnavailable` | `401` | The dynamic directory could not be fetched or validated (HTTPS violation, allowlist mismatch, fetch deadline, invalid self-signature, stale grace exceeded). The underlying reason lands in the structured log, and each failed fetch increments `sbproxy_bot_auth_directory_fetch_failures_total{url}` for alerting. |
 
-The denial body is intentionally generic (`bot_auth: signature required` / `bot_auth: verification failed`); detailed reasons land in the structured log under the `sbproxy::auth` target so an operator can see exactly which check failed without leaking the same detail to a probing crawler.
+The denial body is a JSON object with a single `error` field carrying an intentionally generic message (`{"error":"bot_auth: signature required"}` / `{"error":"bot_auth: verification failed"}`); the `UnknownAgent` verdict is the exception and names the unrecognised `keyid`. Detailed reasons land in the structured log under the `sbproxy::auth` target so an operator can see exactly which check failed without leaking the same detail to a probing crawler.
+
+## Calling it
+
+The runnable configuration is
+[`examples/web-bot-auth/`](../examples/web-bot-auth/), with three agents in an
+inline directory and `required_components` on the first one set to
+`@method`, `@target-uri`, and `@authority`. It also ships a signer at
+`bin/sign-request.sh`.
+
+The public keys in that config are hex placeholders, so out of the box no
+signature can verify against them. Mint a real key and paste its public half
+into the matching `public_key:` field first:
+
+```bash
+openssl genpkey -algorithm ed25519 -out openai-bot.pem
+openssl pkey -in openai-bot.pem -pubout -outform DER | tail -c 32 | xxd -p -c 64
+# ce5bce1af02c64075e1a43a51a8af21e88b06456cc4a1122d26b4c1166546414
+```
+
+Then start it:
+
+```bash
+sbproxy serve -f sb.yml
+```
+
+An unsigned request is refused before it reaches the origin:
+
+```bash
+curl -sS -i -H 'Host: blog.local' http://127.0.0.1:8080/article
+```
+
+```json
+{"error":"bot_auth: signature required"}
+```
+
+That is a `401`, and the body is JSON rather than the bare string the verdict
+table names. Sign the same request and it passes:
+
+```bash
+eval $(./bin/sign-request.sh \
+        --key openai-bot.pem \
+        --keyid openai-2026-01 \
+        --method GET \
+        --target-uri /article \
+        --authority blog.local)
+
+curl -sS -o /dev/null -w '%{http_code}\n' -H 'Host: blog.local' \
+  -H "Signature-Input: $SIG_INPUT" \
+  -H "Signature: $SIG" \
+  http://127.0.0.1:8080/article
+# 200
+```
+
+The `Signature-Input` the signer produced names exactly what was covered:
+
+```
+sig1=("@method" "@target-uri" "@authority");keyid="openai-2026-01";created=1785597678;alg="ed25519"
+```
+
+A `keyid` the directory does not know is refused before any cryptography runs,
+and the body says so:
+
+```json
+{"error":"bot_auth: unknown agent keyid not-in-directory"}
+```
+
+That is the one denial that names its cause, because a directory miss is not a
+signature failure and telling a legitimate operator their key is unregistered
+costs nothing.
+
+The two cases worth running yourself are the replays, because they are what
+`required_components` buys. Take the signature that just succeeded and send it
+at a different path, then at a different method:
+
+```bash
+curl -sS -H 'Host: blog.local' \
+  -H "Signature-Input: $SIG_INPUT" -H "Signature: $SIG" \
+  http://127.0.0.1:8080/other-article
+# {"error":"bot_auth: verification failed"}
+
+curl -sS -X POST -H 'Host: blog.local' \
+  -H "Signature-Input: $SIG_INPUT" -H "Signature: $SIG" \
+  http://127.0.0.1:8080/article
+# {"error":"bot_auth: verification failed"}
+```
+
+Both are `401`. The signature is genuine and unmodified; it simply does not
+cover the request being made, because `@target-uri` and `@method` are inside
+the signature base. Drop those from `required_components` and a captured
+signature becomes a bearer token for the whole origin.
+
+Both replays report the same generic `verification failed`. A mismatch, an
+expired `created` outside `clock_skew_seconds`, a malformed header, and a
+missing required component are indistinguishable to the caller; the specific
+reason goes to the structured log under the `sbproxy::auth` target.
 
 ## Agent-class resolver relationship
 

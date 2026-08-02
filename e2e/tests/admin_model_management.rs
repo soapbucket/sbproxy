@@ -148,6 +148,7 @@ fn put_deployments(
                     "replicas": 1,
                     "pull": "on_demand",
                     "warm": false,
+                    "cold_start": "wait",
                     "engine": "llama_cpp",
                     "rollout": "rolling"
                 }

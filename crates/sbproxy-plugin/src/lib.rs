@@ -44,7 +44,8 @@ pub use mcp::{
     McpPolicyHookEntry, McpToolCallCtx, NoOpMcpPolicyHook,
 };
 pub use principal::{
-    Credential, Principal, PrincipalAttrs, PrincipalSource, SecretRef, TenantId, VirtualKeyRef,
+    Credential, DelegationSubject, McpExecutionContext, Principal, PrincipalAttrs, PrincipalSource,
+    SecretRef, TenantId, VirtualKeyRef,
 };
 pub use registry::*;
 pub use traits::*;

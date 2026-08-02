@@ -224,9 +224,10 @@ fn wait_for<F: FnMut() -> bool>(mut f: F, timeout: Duration) -> bool {
 #[test]
 fn feed_rule_blocks_then_drops_then_signature_tamper_keeps_last_good() {
     // --- Shared HMAC key. Used by the test to sign bundles and by the
-    // proxy (via env var) to verify them. ---
+    // proxy (via an env var on the child's environment) to verify
+    // them. Passed per child rather than exported from this test
+    // runner's process (WOR-646). ---
     let key = b"e2e-test-shared-key";
-    std::env::set_var("SBPROXY_FEED_TEST_E2E_KEY", "e2e-test-shared-key");
 
     // --- Mock feed serves a bundle that blocks `evil-token`. ---
     let initial = bundle_with(&[("E2E-001", "evil-token")], key);
@@ -235,7 +236,11 @@ fn feed_rule_blocks_then_drops_then_signature_tamper_keeps_last_good() {
 
     // --- Proxy boots and pulls the bundle. The first poll lands
     //     within ~poll_interval seconds. ---
-    let harness = ProxyHarness::start_with_yaml(&config(&url)).expect("start proxy");
+    let harness = ProxyHarness::start_with_yaml_and_env(
+        &config(&url),
+        &[("SBPROXY_FEED_TEST_E2E_KEY", "e2e-test-shared-key")],
+    )
+    .expect("start proxy");
 
     // --- Phase 1: rule from feed blocks the request. ---
     let blocked = wait_for(

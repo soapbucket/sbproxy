@@ -1,0 +1,135 @@
+{
+  "getinfo": {
+    "jsonrpc": "2.0",
+    "id": "getinfo",
+    "result": {
+      "id": "02fixturenodeid",
+      "alias": "fixture",
+      "version": "v26.06"
+    }
+  },
+  "getinfo_too_old": {
+    "jsonrpc": "2.0",
+    "id": "getinfo",
+    "result": {
+      "id": "02fixturenodeid",
+      "alias": "fixture",
+      "version": "v24.11.1"
+    }
+  },
+  "getinfo_no_version": {
+    "jsonrpc": "2.0",
+    "id": "getinfo",
+    "result": {
+      "id": "02fixturenodeid",
+      "alias": "fixture"
+    }
+  },
+  "invoice": {
+    "jsonrpc": "2.0",
+    "id": "invoice",
+    "result": {
+      "bolt11": "lnbc1u1pfixtureinvoicedatafixture",
+      "payment_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+      "expires_at": 1770000600
+    }
+  },
+  "listinvoices_paid": {
+    "jsonrpc": "2.0",
+    "id": "listinvoices",
+    "result": {
+      "invoices": [
+        {
+          "label": "sbproxy-invoice-sbpi_fixture_intent_0001",
+          "status": "paid",
+          "payment_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+          "amount_msat": 100000,
+          "amount_received_msat": 100000,
+          "bolt11": "lnbc1u1pfixtureinvoicedatafixture",
+          "paid_at": 1770000100
+        }
+      ]
+    }
+  },
+  "listinvoices_unpaid": {
+    "jsonrpc": "2.0",
+    "id": "listinvoices",
+    "result": {
+      "invoices": [
+        {
+          "label": "sbproxy-invoice-sbpi_fixture_intent_0001",
+          "status": "unpaid",
+          "payment_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+          "amount_msat": 100000,
+          "bolt11": "lnbc1u1pfixtureinvoicedatafixture"
+        }
+      ]
+    }
+  },
+  "listinvoices_expired": {
+    "jsonrpc": "2.0",
+    "id": "listinvoices",
+    "result": {
+      "invoices": [
+        {
+          "label": "sbproxy-invoice-sbpi_fixture_intent_0001",
+          "status": "expired",
+          "payment_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+          "amount_msat": 100000,
+          "bolt11": "lnbc1u1pfixtureinvoicedatafixture"
+        }
+      ]
+    }
+  },
+  "listinvoices_missing": {
+    "jsonrpc": "2.0",
+    "id": "listinvoices",
+    "result": {
+      "invoices": []
+    }
+  },
+  "listinvoices_duplicate": {
+    "jsonrpc": "2.0",
+    "id": "listinvoices",
+    "result": {
+      "invoices": [
+        {
+          "label": "sbproxy-invoice-sbpi_fixture_intent_0001",
+          "status": "paid",
+          "payment_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+          "amount_msat": 100000,
+          "amount_received_msat": 100000
+        },
+        {
+          "label": "sbproxy-invoice-sbpi_fixture_intent_0001",
+          "status": "unpaid",
+          "payment_hash": "2222222222222222222222222222222222222222222222222222222222222222",
+          "amount_msat": 100000
+        }
+      ]
+    }
+  },
+  "listinvoices_string_msat": {
+    "jsonrpc": "2.0",
+    "id": "listinvoices",
+    "result": {
+      "invoices": [
+        {
+          "label": "sbproxy-invoice-sbpi_fixture_intent_0001",
+          "status": "paid",
+          "payment_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+          "amount_msat": "100000msat",
+          "amount_received_msat": "100000msat"
+        }
+      ]
+    }
+  },
+  "method_not_found": {
+    "jsonrpc": "2.0",
+    "id": "xpay",
+    "error": {
+      "code": -32601,
+      "message": "Unknown command"
+    }
+  }
+}

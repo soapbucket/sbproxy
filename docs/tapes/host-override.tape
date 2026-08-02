@@ -20,7 +20,7 @@ Type `export PS1='$ '; clear`
 Enter
 Show
 
-Type `curl -H 'Host: localhost' http://127.0.0.1:8080/get`
+Type `curl -s -H 'Host: api.local' http://127.0.0.1:8080/headers | jq '.headers.host'`
 Enter
 Sleep 1.6s
 

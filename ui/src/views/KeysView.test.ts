@@ -106,48 +106,52 @@ describe("KeysView policy editing contract", () => {
     expect(keysView).toContain("statusOf(k) !== 'revoked'");
   });
 
-  it("loads usage for one selected key without adding caller introspection", () => {
+  it("loads governed usage for one selected key", () => {
     expect(keysView).toContain("api.keyUsage");
     expect(keysView).toContain("openUsage(k)");
     expect(keysView).toContain("Usage and reservations");
-    expect(keysView).not.toContain("/api/v1/key");
   });
 
-  it("shows every governed dimension and its reservation arithmetic", () => {
+  it("shows every governed dimension with its reservation arithmetic", () => {
     for (const value of [
-      "Requests per minute",
-      "Tokens per minute",
+      "Requests per window",
+      "Tokens per window",
       "Token budget",
       "Monetary budget",
       "dimension.snapshot.limit",
       "dimension.snapshot.used",
       "dimension.snapshot.reserved",
       "dimension.snapshot.remaining",
-      "dimension.snapshot.reset_at",
-      "formatUsageReset(dimension.snapshot.reset_at)",
-      'return resetAt ? formatTime(resetAt) : "Never"',
+      "dimension.snapshot.reset_at_millis",
+      "formatUsageReset(dimension.snapshot.reset_at_millis)",
+      'return resetAtMillis === null ? "Never" : formatTime(resetAtMillis)',
     ]) {
       expect(keysView).toContain(value);
     }
-    expect(keysView).toContain("formatUsageAmount");
-    expect(keysView).toContain("budget_micro_usd");
+    expect(keysView).toContain("formatUsageUnits");
+    expect(keysView).toContain("formatUsageLimit");
+    expect(keysView).toContain("total_micro_usd");
   });
 
-  it("renders a typed strict 503 outage before the generic error state", () => {
-    expect(keysView).toContain("KeyUsageUnavailableError");
-    expect(keysView).toContain("KeyUsageBackendUnavailable");
-    expect(keysView).toContain("usageOutage.value = e.outage");
-    expect(keysView).toContain('v-else-if="usage || usageOutage"');
-    const outageState = keysView.indexOf('v-else-if="usage || usageOutage"');
-    const genericError = keysView.indexOf('v-else-if="usageError"');
-    expect(outageState).toBeGreaterThan(-1);
-    expect(genericError).toBeGreaterThan(outageState);
-    expect(keysView).toContain("strictBackendUnavailable");
+  it("shows governance backend health and consistency mode", () => {
+    expect(keysView).toContain("usage.backend.consistency");
+    expect(keysView).toContain("usage.backend.status");
+    expect(keysView).toContain("usage.backend.backend");
+    expect(keysView).toContain("usage.backend.checked_at_millis");
+    expect(keysView).toContain("backendTone");
+    expect(keysView).toContain("backendUnhealthy");
     expect(keysView).toContain('role="alert"');
-    expect(keysView).toContain("Strict limits are unavailable");
-    expect(keysView).toContain("usageBackend.status");
-    expect(keysView).toContain("usageBackend.checked_at");
-    expect(keysView).toContain("Policy revision");
-    expect(keysView).toContain("policy_version.digest");
+  });
+
+  it("renders a generic error state when governed usage cannot be loaded", () => {
+    expect(keysView).toContain("usageError.value = e instanceof ApiError");
+    expect(keysView).toContain('v-else-if="usageError"');
+    expect(keysView).toContain("Usage unavailable");
+  });
+
+  it("does not let a stale usage request overwrite the selected key", () => {
+    expect(keysView).toContain("let usageInvocation = 0");
+    expect(keysView).toContain("const invocation = ++usageInvocation");
+    expect(keysView).toContain("invocation !== usageInvocation");
   });
 });

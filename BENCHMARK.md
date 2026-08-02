@@ -1,5 +1,5 @@
 # Benchmark
-*Last modified: 2026-05-03*
+*Last modified: 2026-07-28*
 
 Head-to-head results for SBproxy against the AI gateways and reverse
 proxies most teams already evaluate. Numbers are from the public
@@ -7,6 +7,9 @@ competitor campaign **`20260424-220610`** in
 [`sbproxy-bench`](https://github.com/soapbucket/sbproxy-bench), run on
 identical hardware, same kernel, same load generator, same scenario
 files.
+
+The `sbproxy-go` rows preserve results for the archived implementation at
+[`soapbucket/sbproxy-go`](https://github.com/soapbucket/sbproxy-go).
 
 If you only have time for one paragraph: SBproxy serves **68,512 RPS at
 0.69 ms p99** as an AI gateway, on an 8 vCPU GCE box, with a 100% 2xx
@@ -22,7 +25,7 @@ every engine.
 
 | Engine | RPS | 2xx | p50 (ms) | p95 (ms) | p99 (ms) | Total requests |
 |---|---:|---:|---:|---:|---:|---:|
-| **sbproxy-rust** | **68,512** | 1.00 | **0.27** | **0.44** | **0.69** | 3,083,085 |
+| **sbproxy** | **68,512** | 1.00 | **0.27** | **0.44** | **0.69** | 3,083,085 |
 | sbproxy-go (archived) | 21,144 | 1.00 | 0.87 | 1.58 | 2.48 | 951,492 |
 | bifrost | 18,159 | 1.00 | 0.87 | 2.47 | 4.30 | 817,146 |
 | kong-ai | 17,534 | 1.00 | 0.77 | 2.65 | 6.17 | 789,018 |
@@ -44,7 +47,7 @@ run.
 |---|---:|---:|---:|---:|---:|---:|
 | nginx | 90,376 | 1.00 | 0.20 | 0.29 | 0.73 | 4,066,957 |
 | haproxy | 77,427 | 1.00 | 0.22 | 0.51 | 1.02 | 3,484,283 |
-| **sbproxy-rust** | **69,915** | 1.00 | **0.25** | **0.46** | **0.69** | 3,146,201 |
+| **sbproxy** | **69,915** | 1.00 | **0.25** | **0.46** | **0.69** | 3,146,201 |
 | kong | 55,100 | 1.00 | 0.30 | 0.81 | 1.19 | 2,479,541 |
 | envoy | 39,462 | 1.00 | 0.47 | 0.95 | 1.29 | 1,775,816 |
 | traefik | 35,714 | 1.00 | 0.42 | 1.26 | 1.86 | 1,607,133 |

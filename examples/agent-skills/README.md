@@ -102,4 +102,4 @@ Every safety cap is configurable per entry:
 | `max_decompression_ratio` | 100 | Max compressed:expanded ratio. |
 | `max_entries` | 1000 | Max entries per archive. |
 | `max_expanded_bytes` | 10485760 | Max expanded archive bytes. |
-| `max_clock_skew_secs` | 60 | Tolerance for time-sensitive headers. |
+| `max_clock_skew_secs` | 60 | Reserved config-only value for future signed freshness headers; no v0.2 response consumes it. |

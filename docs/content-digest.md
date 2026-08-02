@@ -1,5 +1,5 @@
 # content_digest policy
-*Last modified: 2026-05-31*
+*Last modified: 2026-08-01*
 
 The `content_digest` policy verifies an inbound request body against the digest the client advertises in the `Content-Digest:` header (RFC 9530). On mismatch, malformed header, or unsupported algorithm, the proxy rejects the request before forwarding. The intended audience is integrity-critical inboxes: webhook receivers, agent endpoints, payment callbacks, audit-ingest paths.
 
@@ -35,6 +35,82 @@ origins:
 | Header present, parse error | Reject with `reject_status` |
 | Header absent, `on_missing: require` | Reject with `reject_status` |
 | Header absent, `on_missing: skip` | Pass through unverified |
+
+## Calling it
+
+The runnable configuration is
+[`examples/content-digest/`](../examples/content-digest/): the block above,
+`on_missing: require` and `reject_status: 400`, in front of a proxied webhook
+origin. Start it:
+
+```bash
+make run CONFIG=examples/content-digest/sb.yml
+```
+
+The header value is RFC 9530 structured-field syntax: the algorithm name, `=`,
+then the base64 digest wrapped in colons. Compute it over the exact bytes you
+are going to send:
+
+```bash
+BODY='{"event":"order.created","id":"ord-42"}'
+DIGEST=$(printf '%s' "$BODY" | openssl dgst -sha256 -binary | openssl base64)
+# LpIbFdddPyiKq5wV0XUOTWdb9kASIU+Rr2nMdu0b0BY=
+
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST \
+  -H 'Host: webhook.local' \
+  -H "Content-Digest: sha-256=:${DIGEST}:" \
+  -H 'Content-Type: application/json' \
+  -d "$BODY" \
+  http://127.0.0.1:8080/anything
+# 200
+```
+
+A `200` here is the upstream's own response. The policy is invisible when it
+passes, which is the point: a verified body is forwarded unchanged and the
+sender sees whatever the origin would have said anyway.
+
+Use `printf '%s'` rather than `echo` to compute the digest. `echo` appends a
+newline, so the hash covers a different byte string than the one `curl -d`
+sends, and the result is a mismatch that looks like a proxy bug.
+
+Each failure path answers with the same `error` and a different `detail`, so
+the reason is machine-readable without parsing prose. A body that does not
+match its digest:
+
+```bash
+WRONG=$(printf '%s' 'some other body' | openssl dgst -sha256 -binary | openssl base64)
+curl -sS -X POST -H 'Host: webhook.local' \
+  -H "Content-Digest: sha-256=:${WRONG}:" \
+  -H 'Content-Type: application/json' \
+  -d "$BODY" http://127.0.0.1:8080/anything
+```
+
+```json
+{"detail":"Content-Digest value does not match the request body","error":"content_digest verification failed"}
+```
+
+No digest header at all, under `on_missing: require`:
+
+```json
+{"detail":"Content-Digest header required but absent","error":"content_digest verification failed"}
+```
+
+And a header that is not valid structured-field syntax, which is a distinct
+case from a mismatch:
+
+```json
+{"detail":"Content-Digest header is malformed per RFC 9530 structured-fields syntax","error":"content_digest verification failed"}
+```
+
+That last one is easy to trigger by accident and easy to misread. A value like
+`sha-256=:wronghashbase64==:` never gets as far as being compared, because it
+is not a well-formed digest; it reports malformed rather than mismatch. If you
+are testing the mismatch path, use a real base64 digest of different content,
+as above, or you will be exercising the parser instead.
+
+All four responses carry `reject_status`, so changing that one field moves
+every failure path together. There is no way to answer `400` on a mismatch and
+`422` on a missing header.
 
 ## Why the verified flag matters
 

@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+sbproxy-capability.workspace = true
 sbproxy-plugin.workspace = true
 sbproxy-platform.workspace = true
 sbproxy-observe.workspace = true
@@ -29,8 +30,34 @@ tempfile = "3"
 # editor tooling (vscode-yaml, IntelliJ) validates `sb.yml`
 # against the runtime-truth types instead of a hand-rolled file.
 schemars = { workspace = true }
+# Signed config bundles (see `config_bundle`). Ed25519 is the default
+# algorithm; HMAC-SHA256 exists only for single-operator setups and refuses
+# to verify without an explicit acknowledgement. The digest and the signature
+# are compared with `subtle` rather than a hand-rolled constant-time helper,
+# and the signing input is the RFC 8785 canonical JSON that
+# `serde_json_canonicalizer` produces, so a signature survives any
+# re-serialization that preserves the parsed values.
+sha2 = { workspace = true }
+hmac = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+serde_json_canonicalizer = { workspace = true }
+subtle = { workspace = true }
+ed25519-dalek = "2"
 
 [dev-dependencies]
+rcgen = { workspace = true }
 serde_json = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# Killing a hung `git` has to reach the whole process group, not just the
+# direct child: git shells out, and reaping only the child orphans its
+# grandchildren with the scratch files still open.
+#
+# rustix rather than libc because this crate is `#![forbid(unsafe_code)]`,
+# which an `#[allow]` cannot override. rustix wraps the same syscall
+# safely, is already in the lockfile, and is Apache-2.0 WITH
+# LLVM-exception OR Apache-2.0 OR MIT, so NOTICE is unaffected.
+rustix = { version = "0.38", features = ["process"] }

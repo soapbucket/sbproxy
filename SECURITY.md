@@ -1,6 +1,6 @@
 # Security Policy
 
-*Last modified: 2026-04-26*
+*Last modified: 2026-07-28*
 
 The supply-chain detail lives separately in `SUPPLY-CHAIN.md`; this file covers the disclosure policy and a fast-path summary of how to verify a release.
 
@@ -38,10 +38,11 @@ We follow coordinated disclosure: we will work with you on a public advisory and
 
 | Version | Supported |
 |---|---|
-| v1.0.x (Rust, current) | Yes. Security patches, bug fixes, new features. |
-| v0.1.x (Go, archived) | No. Critical-severity security patches considered case-by-case for 90 days after v1.0.0 release; nothing else. After 90 days, no support. Existing artifacts remain available indefinitely but are not maintained. |
+| v1.9.x (Rust, current) | Yes. Security patches, bug fixes, new features. |
+| v0.1.x (Go, archived) | No. The repository is read-only; existing artifacts remain available but are not maintained. |
 
-The Go implementation source lives at https://github.com/soapbucket/sbproxy-go and on the `archive/go` branch of this repository.
+The Go implementation source lives in the archived, read-only
+[`soapbucket/sbproxy-go`](https://github.com/soapbucket/sbproxy-go) repository.
 
 ---
 
@@ -53,7 +54,7 @@ If you are pulling SBproxy into production, **verify before you run**. Four comm
 
 ```bash
 # 1. Download the artifact and its cosign bundle
-VERSION=1.5.0
+VERSION=1.9.0
 PLATFORM=linux_amd64
 BASE="https://github.com/soapbucket/sbproxy/releases/download/v${VERSION}"
 curl -fsSL -o sbproxy.tar.gz       "${BASE}/sbproxy_${PLATFORM}.tar.gz"
@@ -152,7 +153,7 @@ Specifics, including cipher suites and curve preferences, are documented in the 
 
 Sensitive configuration values (API keys, OAuth secrets) referenced from `sb.yml` should be sourced from environment variables, files mounted with restricted permissions, or a secrets manager. The gateway does not encrypt values it loads from disk; it relies on filesystem permissions and the surrounding deployment environment to protect them.
 
-The enterprise build's billing and audit-log surfaces persist data at rest; the storage backend you configure (Postgres, ClickHouse, etc.) is responsible for at-rest encryption per your standards.
+Storage backends you configure (Postgres, ClickHouse, and similar systems) are responsible for at-rest encryption per your standards.
 
 ---
 
@@ -161,7 +162,7 @@ The enterprise build's billing and audit-log surfaces persist data at rest; the 
 We track open hardening items publicly. As of the latest release:
 
 - **Streaming SSE response capture in the semantic cache** is intentionally bypassed. See `SUPPLY-CHAIN.md` for the rationale and the framing-aware capture roadmap (Q3 2026).
-- **First-party prompt-injection detection** is heuristic. For strict use cases, integrate one of the supported guardrail vendors (Aporia, Lakera, Model Armor, Patronus, Pangea, CrowdStrike) via the enterprise tier.
+- **First-party prompt-injection detection** is heuristic. For strict use cases, integrate an external guardrail service.
 - **Reproducible builds** are deterministic at the dependency-graph level: the committed `Cargo.lock` pins every dependency version and CI builds with `--locked`. The toolchain is a fixed Rust release channel installed in CI, and the workspace minimum is declared in `Cargo.toml` (`rust-version`). Bit-for-bit reproducibility across builders, including an exact pinned toolchain version, is on the roadmap; we publish CI verification status as it lands.
 
 ---

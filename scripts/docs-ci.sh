@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
 # Wave 1 / Q1.10 - Doc CI runner.
 #
-# Runs two checks over the rust + enterprise docs trees:
-#   1. lychee link checker (offline; external links live in .lycheeignore).
-#   2. Code-block syntax check: `rust` blocks go through `rust-script`,
-#      `bash` blocks go through `bash -n`. Blocks tagged `no_run` (rust)
-#      or `skip` (bash) are skipped.
+# Runs two checks over the documentation tree:
+#   1. lychee link checker over the complete tree (offline; external links
+#      live in .lycheeignore).
+#   2. Code-block syntax check over the public, flat `docs/*.md` corpus:
+#      `rust` blocks go through rustc and `bash` blocks go through `bash -n`.
+#      Blocks tagged `no_run` (rust) or `skip` (bash) are skipped. Internal
+#      implementation artifacts under `docs/superpowers/` remain link-checked
+#      but their pseudocode fences are not executable documentation.
 #
 # Exits non-zero on the first failure. The companion workflow at
 # `.github/workflows/docs-ci.yml` (B1.10) wraps this script.
 #
 # Usage:
-#   scripts/docs-ci.sh                     # both trees, both checks
+#   scripts/docs-ci.sh                     # documentation tree, both checks
 #   scripts/docs-ci.sh --links             # link check only
 #   scripts/docs-ci.sh --code              # code-block check only
-#   scripts/docs-ci.sh --tree rust         # one tree only
 #
 # Env knobs:
 #   LYCHEE_BIN     path to lychee (default: lychee on PATH)
@@ -26,12 +28,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUST_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# ENTERPRISE_ROOT is optional. The OSS repo has no companion enterprise
-# tree; we still let an outer caller set it (e.g. for a combined CI run
-# in a meta-repo) but default to empty so `set -u` does not trip on the
-# unset case.
-ENTERPRISE_ROOT="${ENTERPRISE_ROOT:-}"
-
 LYCHEE_BIN="${LYCHEE_BIN:-lychee}"
 RUST_SCRIPT="${RUST_SCRIPT:-rust-script}"
 
@@ -39,13 +35,11 @@ RUST_SCRIPT="${RUST_SCRIPT:-rust-script}"
 
 DO_LINKS=1
 DO_CODE=1
-TREE_FILTER=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --links)  DO_CODE=0; shift ;;
     --code)   DO_LINKS=0; shift ;;
-    --tree)   TREE_FILTER="$2"; shift 2 ;;
     -h|--help)
       sed -n '1,30p' "$0"
       exit 0
@@ -57,17 +51,10 @@ done
 # --- Tree resolution --------------------------------------------------
 
 declare -a TREES=()
-if [ -z "$TREE_FILTER" ] || [ "$TREE_FILTER" = "rust" ]; then
-  TREES+=("$RUST_ROOT/docs")
-fi
-if [ -z "$TREE_FILTER" ] || [ "$TREE_FILTER" = "enterprise" ]; then
-  if [ -n "$ENTERPRISE_ROOT" ] && [ -d "$ENTERPRISE_ROOT/docs" ]; then
-    TREES+=("$ENTERPRISE_ROOT/docs")
-  fi
-fi
+TREES+=("$RUST_ROOT/docs")
 
 if [ ${#TREES[@]} -eq 0 ]; then
-  echo "no doc trees found; tried $RUST_ROOT/docs and $ENTERPRISE_ROOT/docs" >&2
+  echo "no documentation tree found at $RUST_ROOT/docs" >&2
   exit 2
 fi
 
@@ -307,11 +294,17 @@ run_code() {
   local skipped=0
 
   for tree in "${TREES[@]}"; do
-    while IFS= read -r -d '' md; do
+    # Public documentation is flat at docs/*.md, which is also the source
+    # boundary used by regen-llms-full.sh. Nested docs/superpowers files are
+    # internal plans and specs: lychee checks their links above, but the Rust
+    # and Bash snippets they use to describe future work are not executable
+    # user documentation.
+    for md in "$tree"/*.md; do
+      [ -f "$md" ] || continue
       [ "${DOCS_CI_QUIET:-0}" = "1" ] || echo "[docs-ci] code blocks: $md"
       run_lang_pass "$md" rust check_rust_block rc checked skipped
       run_lang_pass "$md" bash check_bash_block rc checked skipped
-    done < <(find "$tree" -type f -name '*.md' -print0)
+    done
   done
 
   echo "[docs-ci] code-block check: checked=$checked skipped=$skipped rc=$rc"

@@ -123,12 +123,6 @@ impl ReserveCacheStore {
         self.stats.snapshot()
     }
 
-    /// Borrow the underlying stats handle. Useful when an external
-    /// metrics exporter wants a stable handle.
-    pub fn stats_handle(&self) -> Arc<ReserveStats> {
-        Arc::clone(&self.stats)
-    }
-
     fn admit(&self, value: &CachedResponse) -> bool {
         if value.body.len() < self.config.min_size_bytes {
             return false;
@@ -215,6 +209,7 @@ mod tests {
 
     fn entry(body: &[u8], ttl: u64) -> CachedResponse {
         CachedResponse {
+            generation: 0,
             status: 200,
             headers: vec![],
             body: body.to_vec(),

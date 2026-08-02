@@ -24,10 +24,10 @@
 //!   every published OpenAI / Azure deployment name to one of those BPEs;
 //!   we delegate to it.
 //! - Anthropic Claude does not publish its BPE vocabulary. We fall back to
-//!   a documented `chars / 4 + 1` heuristic for any model the tiktoken
-//!   prefix table cannot identify. This is the same heuristic the older
-//!   [`crate::context_compress::estimate_message_tokens`] uses and matches
-//!   Anthropic's own published rule of thumb. Reconcile against the real
+//!   a documented `UTF-8 bytes / 4 + 1` heuristic for any model the tiktoken
+//!   prefix table cannot identify. This is the same heuristic the deterministic
+//!   [`crate::compression`] window-fit lever uses and matches Anthropic's own
+//!   published rule of thumb. Reconcile against the real
 //!   `usage.input_tokens` in the response corrects any drift, and the
 //!   `sbproxy_ai_token_estimate_error_ratio` histogram surfaces the gap.
 //!
@@ -36,6 +36,7 @@
 //! `tiktoken-rs`'s own static singletons.
 
 use crate::types::Message;
+pub use sbproxy_model_host::TokenCountPrecision;
 
 /// Per-message framing overhead used by the OpenAI cookbook for
 /// `tiktoken`-based counting. Mirrors the constant `num_tokens_from_messages`
@@ -49,12 +50,31 @@ const TOKENS_PER_MESSAGE: u64 = 3;
 /// list (`<|start|>assistant<|message|>`).
 const REPLY_PRIMING: u64 = 3;
 
+/// Report which target-model counting path [`estimate_tokens`] and
+/// [`estimate_json_message_tokens`] will use.
+pub fn token_count_precision(model: &str) -> TokenCountPrecision {
+    if tiktoken_rs::bpe_for_model(model).is_ok() {
+        TokenCountPrecision::ModelTokenizer
+    } else {
+        TokenCountPrecision::Heuristic
+    }
+}
+
+/// Estimate target-model tokens for plain text without chat-message framing.
+pub(crate) fn estimate_text_tokens(model: &str, text: &str) -> u64 {
+    if let Ok(bpe) = tiktoken_rs::bpe_for_model(model) {
+        bpe.encode_with_special_tokens(text).len() as u64
+    } else {
+        (text.len() as u64 / 4).max(1)
+    }
+}
+
 /// Estimate prompt tokens for a chat-completion request.
 ///
 /// `model` selects the BPE: GPT-4-class models use `cl100k_base`, GPT-4o
 /// and the o-series use `o200k_base`, anything else (notably Anthropic and
 /// open-source endpoints exposed through this gateway) falls back to a
-/// `chars / 4 + 1` heuristic. The return value is always at least the
+/// `UTF-8 bytes / 4 + 1` heuristic. The return value is always at least the
 /// per-request reply-priming overhead so a request with no parseable
 /// content still books a non-zero reservation against TPM and TPD.
 ///
@@ -77,7 +97,7 @@ pub fn estimate_tokens(model: &str, messages: &[Message]) -> u64 {
     }
 
     // Path B: unknown model (Claude, unknown Azure deployment name,
-    // self-hosted endpoint). Fall back to chars/4 + per-message framing.
+    // self-hosted endpoint). Fall back to UTF-8 bytes/4 + per-message framing.
     // The reconciliation step in `Admission::reconcile` corrects the
     // estimate against the upstream's reported usage; the
     // `sbproxy_ai_token_estimate_error_ratio` histogram surfaces drift so
@@ -85,23 +105,7 @@ pub fn estimate_tokens(model: &str, messages: &[Message]) -> u64 {
     estimate_tokens_heuristic(messages)
 }
 
-/// Conservative prompt ceiling used by strict governed admission.
-///
-/// Recognized models use their exact BPE count. Unknown and self-hosted
-/// models reserve at least one token per raw UTF-8 request byte, which cannot
-/// under-reserve a byte-pair encoded prompt.
-pub fn estimate_tokens_for_reservation(
-    model: &str,
-    messages: &[Message],
-    request_body_bytes: usize,
-) -> u64 {
-    if tiktoken_rs::bpe_for_model(model).is_ok() {
-        return estimate_tokens(model, messages);
-    }
-    estimate_tokens_heuristic(messages).max(request_body_bytes as u64)
-}
-
-/// Heuristic estimator: `chars / 4 + 1` per message, plus per-message
+/// Heuristic estimator: `UTF-8 bytes / 4 + 1` per message, plus per-message
 /// framing and reply priming. Exported under the same name pattern as the
 /// model-specific path so call sites that want to bypass BPE lookup (e.g.
 /// embeddings input that does not parse as `Message`) can reach it.
@@ -116,8 +120,70 @@ pub fn estimate_tokens_heuristic(messages: &[Message]) -> u64 {
     n + REPLY_PRIMING
 }
 
+/// Estimate target-model tokens from complete raw JSON message values.
+///
+/// Role and content use the same model-aware estimator as [`estimate_tokens`].
+/// Provider-specific message fields are additionally counted from their JSON
+/// representation, while the original values remain available to compression
+/// safety checks and byte-for-byte message retention.
+pub fn estimate_json_message_tokens(model: &str, messages: &[serde_json::Value]) -> u64 {
+    let projected = messages
+        .iter()
+        .map(|message| Message {
+            role: message
+                .get("role")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            content: projected_message_content(message),
+        })
+        .collect::<Vec<_>>();
+    let mut tokens = estimate_tokens(model, &projected);
+
+    for content in messages.iter().filter_map(structured_content_json) {
+        tokens += estimate_text_tokens(model, &content);
+    }
+    for extra in messages.iter().filter_map(extra_message_fields_json) {
+        tokens += estimate_text_tokens(model, &extra);
+    }
+    tokens
+}
+
+fn projected_message_content(message: &serde_json::Value) -> serde_json::Value {
+    match message.as_object() {
+        Some(object) => match object.get("content") {
+            Some(content) if !content.is_array() => content.clone(),
+            _ => serde_json::Value::Null,
+        },
+        None if message.is_array() => serde_json::Value::Null,
+        None => message.clone(),
+    }
+}
+
+fn structured_content_json(message: &serde_json::Value) -> Option<String> {
+    let content = message
+        .as_object()
+        .and_then(|object| object.get("content"))
+        .unwrap_or(message);
+    content.is_array().then(|| content.to_string())
+}
+
+fn extra_message_fields_json(message: &serde_json::Value) -> Option<String> {
+    let object = message.as_object()?;
+    let extra = object
+        .iter()
+        .filter(|(key, _)| key.as_str() != "role" && key.as_str() != "content")
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<serde_json::Map<_, _>>();
+    if extra.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(extra).to_string())
+    }
+}
+
 fn role_tokens_heuristic(role: &str) -> u64 {
-    // Roles are short single words ("system", "user", ...). chars/4 gives
+    // Roles are short single words ("system", "user", ...). bytes/4 gives
     // 1 for everything reasonable; clamp to 1 for the empty role.
     ((role.len() as u64) / 4).max(1)
 }
@@ -128,7 +194,9 @@ fn role_tokens_heuristic(role: &str) -> u64 {
 /// either a bare string or an array of typed parts (text + image_url for
 /// multimodal). We count text parts only; image inputs are token-counted by
 /// the upstream out of band and would require model-specific lookup that
-/// belongs in the multimodal module rather than here.
+/// belongs in the multimodal module rather than here. The complete-JSON
+/// compression counter handles structured arrays separately in
+/// [`estimate_json_message_tokens`].
 fn content_tokens_with_bpe(bpe: &tiktoken_rs::CoreBPE, content: &serde_json::Value) -> u64 {
     match content {
         serde_json::Value::String(s) => bpe.encode_with_special_tokens(s).len() as u64,
@@ -204,6 +272,23 @@ mod tests {
     }
 
     #[test]
+    fn token_count_precision_is_closed_and_matches_the_model_counter_path() {
+        assert_eq!(
+            token_count_precision("gpt-4o"),
+            TokenCountPrecision::ModelTokenizer
+        );
+        assert_eq!(
+            token_count_precision("some-self-hosted-model"),
+            TokenCountPrecision::Heuristic
+        );
+        assert_eq!(
+            TokenCountPrecision::ModelTokenizer.as_str(),
+            "model_tokenizer"
+        );
+        assert_eq!(TokenCountPrecision::Heuristic.as_str(), "heuristic");
+    }
+
+    #[test]
     fn gpt4o_uses_o200k_base() {
         // gpt-4o maps to O200kBase per the tiktoken model table; the
         // function must still return a positive count.
@@ -215,8 +300,8 @@ mod tests {
     #[test]
     fn unknown_model_falls_back_to_heuristic() {
         // Claude model: tiktoken-rs has no BPE for it, so we hit the
-        // chars/4 path. 40 chars of content -> 10 token estimate from the
-        // content alone, plus per-message overhead and reply priming.
+        // UTF-8 bytes/4 path. 40 ASCII bytes of content -> 10 token estimate
+        // from the content alone, plus per-message overhead and reply priming.
         let content = "a".repeat(40);
         let messages = vec![msg("user", &content)];
         let est = estimate_tokens("claude-3-opus-20240229", &messages);
@@ -234,19 +319,73 @@ mod tests {
     }
 
     #[test]
-    fn multimodal_content_counts_text_parts() {
-        // Multimodal content with one text part and one image_url. The
-        // image is intentionally ignored; only the text contributes.
-        let messages = vec![Message {
+    fn raw_json_multimodal_content_counts_complete_structured_parts() {
+        let text_only = vec![json!({
+            "role": "user",
+            "content": [{"type": "text", "text": "What is in this image?"}]
+        })];
+        let with_image = vec![json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What is in this image?"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/x.png"}}
+            ]
+        })];
+        assert!(
+            estimate_json_message_tokens("gpt-4o", &with_image)
+                > estimate_json_message_tokens("gpt-4o", &text_only),
+            "non-text structured parts must contribute to the input estimate"
+        );
+    }
+
+    #[test]
+    fn typed_admission_estimator_keeps_legacy_text_only_multimodal_counting() {
+        let text_only = vec![Message {
+            role: "user".to_string(),
+            content: json!([{"type": "text", "text": "What is in this image?"}]),
+        }];
+        let with_image = vec![Message {
             role: "user".to_string(),
             content: json!([
                 {"type": "text", "text": "What is in this image?"},
                 {"type": "image_url", "image_url": {"url": "https://example.com/x.png"}},
             ]),
         }];
-        let est = estimate_tokens("gpt-4o", &messages);
-        // Sanity: at least the per-message overhead + reply priming.
-        assert!(est > REPLY_PRIMING);
+
+        assert_eq!(
+            estimate_tokens("gpt-4o", &with_image),
+            estimate_tokens("gpt-4o", &text_only),
+            "the complete-JSON change is scoped to compression accounting"
+        );
+    }
+
+    #[test]
+    fn structured_content_blocks_count_their_complete_json() {
+        let small = vec![json!({
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "tool-1",
+                "content": "ok"
+            }]
+        })];
+        let large = vec![json!({
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "tool-1",
+                "content": "tool payload ".repeat(1_000)
+            }]
+        })];
+
+        for model in ["gpt-4o", "unknown-self-hosted-model"] {
+            let small_tokens = estimate_json_message_tokens(model, &small);
+            let large_tokens = estimate_json_message_tokens(model, &large);
+            assert!(
+                large_tokens > small_tokens.saturating_add(100),
+                "{model} must count structured content payloads: small={small_tokens}, large={large_tokens}"
+            );
+        }
     }
 
     #[test]
@@ -283,20 +422,91 @@ mod tests {
     }
 
     #[test]
-    fn strict_unknown_model_reserves_at_least_one_token_per_request_byte() {
-        let messages = vec![msg("user", "short")];
+    fn raw_json_estimate_matches_typed_estimate_for_plain_messages() {
+        let raw = vec![json!({"role": "user", "content": "Hello, world!"})];
+        let typed = vec![msg("user", "Hello, world!")];
+
         assert_eq!(
-            estimate_tokens_for_reservation("local-unknown", &messages, 4_096),
-            4_096
+            estimate_json_message_tokens("gpt-4", &raw),
+            estimate_tokens("gpt-4", &typed)
         );
     }
 
     #[test]
-    fn strict_known_model_keeps_the_exact_bpe_estimate() {
-        let messages = vec![msg("user", "known tokenizer")];
-        assert_eq!(
-            estimate_tokens_for_reservation("gpt-4o", &messages, 65_536),
-            estimate_tokens("gpt-4o", &messages)
+    fn raw_json_estimate_accounts_for_provider_specific_message_fields() {
+        let plain = vec![json!({"role": "assistant", "content": "calling"})];
+        let structured = vec![json!({
+            "role": "assistant",
+            "content": "calling",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{\"id\":42}"}
+            }]
+        })];
+
+        assert!(
+            estimate_json_message_tokens("gpt-4", &structured)
+                > estimate_json_message_tokens("gpt-4", &plain)
         );
+    }
+
+    #[test]
+    fn missing_content_counts_structured_fields_once_like_explicit_null() {
+        let missing = vec![json!({
+            "role": "assistant",
+            "tool_calls": [{"id": "call_1", "type": "function"}]
+        })];
+        let explicit_null = vec![json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{"id": "call_1", "type": "function"}]
+        })];
+
+        assert_eq!(
+            estimate_json_message_tokens("gpt-4", &missing),
+            estimate_json_message_tokens("gpt-4", &explicit_null)
+        );
+    }
+
+    #[test]
+    fn text_estimator_uses_the_known_model_bpe() {
+        let text = "Hello, target model!";
+        let expected = tiktoken_rs::bpe_for_model("gpt-4")
+            .expect("known model BPE")
+            .encode_with_special_tokens(text)
+            .len() as u64;
+
+        assert_eq!(estimate_text_tokens("gpt-4", text), expected);
+    }
+
+    #[test]
+    fn text_estimator_uses_bytes_divided_by_four_for_unknown_models() {
+        assert_eq!(
+            estimate_text_tokens("unknown-self-hosted-model", &"a".repeat(40)),
+            10
+        );
+    }
+
+    #[test]
+    fn text_estimator_empty_text_has_no_message_framing() {
+        assert_eq!(estimate_text_tokens("gpt-4", ""), 0);
+        assert_eq!(estimate_text_tokens("unknown-self-hosted-model", ""), 1);
+    }
+
+    #[test]
+    fn text_estimator_matches_plain_message_content_contribution() {
+        let text = "Count only this content contribution.";
+        let with_text = vec![json!({"role": "user", "content": text})];
+        let without_text = vec![json!({"role": "user", "content": null})];
+
+        for model in ["gpt-4", "unknown-self-hosted-model"] {
+            assert_eq!(
+                estimate_text_tokens(model, text),
+                estimate_json_message_tokens(model, &with_text)
+                    - estimate_json_message_tokens(model, &without_text),
+                "text estimate must equal the content-only contribution for {model}"
+            );
+        }
     }
 }

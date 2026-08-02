@@ -12,6 +12,215 @@ use super::*;
 
 static CONFIG_RELOAD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Fingerprint of the effective `proxy.secrets:` block this process
+/// owns, captured the first time a config is loaded.
+///
+/// The secret resolver behind `proxy.secrets:` is installed into a
+/// set-once slot in `sbproxy-vault` at binary boot, so a later reload
+/// that changes the block cannot take effect. Recording the fingerprint
+/// lets the reload path reject the change loudly instead of accepting a
+/// config whose secret backends will never be honoured.
+static PROCESS_SECRETS_FINGERPRINT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// One subsystem that did not apply during a reload that nonetheless
+/// succeeded.
+///
+/// Every variant corresponds to a failure the reload path deliberately
+/// tolerates: aborting on any of them would let one broken subsystem
+/// pin an operator on an old config. Surfacing them here means an
+/// automated config authority can tell "applied" from "applied, but
+/// this part of the node is stale".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DegradedSubsystem {
+    /// The AI provider catalog could not be rebuilt; the node keeps
+    /// serving the catalog it had before the reload.
+    AiProviderRegistry,
+    /// The dynamic key plane could not be reconciled from
+    /// `key_management:`; the previously installed plane stays live.
+    KeyPlane,
+    /// One or more `listings/*.yaml` entries failed to load; the
+    /// pipeline went live without them.
+    Listings,
+    /// The pipeline lifecycle hook returned an error, or its runtime
+    /// could not be built. Optional slots on the new pipeline may
+    /// carry prior state.
+    PipelineLifecycleHook,
+    /// The telemetry sink dispatcher could not be installed; log and
+    /// event export falls back to the legacy tracing subscriber.
+    SinkDispatcher,
+}
+
+impl DegradedSubsystem {
+    /// Stable machine-readable identifier, suitable for a JSON body or
+    /// a structured log field. Never changes for a given variant.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AiProviderRegistry => "ai_provider_registry",
+            Self::KeyPlane => "key_plane",
+            Self::Listings => "listings",
+            Self::PipelineLifecycleHook => "pipeline_lifecycle_hook",
+            Self::SinkDispatcher => "sink_dispatcher",
+        }
+    }
+}
+
+impl std::fmt::Display for DegradedSubsystem {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = match self {
+            Self::AiProviderRegistry => "AI provider registry",
+            Self::KeyPlane => "key plane",
+            Self::Listings => "listings",
+            Self::PipelineLifecycleHook => "pipeline lifecycle hook",
+            Self::SinkDispatcher => "sink dispatcher",
+        };
+        formatter.write_str(text)
+    }
+}
+
+/// What a reload actually accomplished.
+///
+/// A reload that returns `Ok` has published the new pipeline. It has
+/// not necessarily applied every subsystem: the ones listed by
+/// [`Self::degraded()`] failed in a way the reload path tolerates on
+/// purpose. Check [`Self::is_fully_applied`] before reporting a reload
+/// as clean.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReloadOutcome {
+    /// Subsystems that failed to apply while the reload still succeeded.
+    degraded: Vec<DegradedSubsystem>,
+}
+
+impl ReloadOutcome {
+    /// Record one subsystem that failed to apply. Repeated records of
+    /// the same subsystem collapse into one entry.
+    fn degrade(&mut self, subsystem: DegradedSubsystem) {
+        if !self.degraded.contains(&subsystem) {
+            self.degraded.push(subsystem);
+        }
+    }
+
+    /// Whether every subsystem this reload touched applied cleanly.
+    pub fn is_fully_applied(&self) -> bool {
+        self.degraded.is_empty()
+    }
+
+    /// The subsystems that failed to apply, in the order the reload
+    /// reached them. Empty when [`Self::is_fully_applied`] is true.
+    pub fn degraded(&self) -> &[DegradedSubsystem] {
+        &self.degraded
+    }
+}
+
+impl std::fmt::Display for ReloadOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.degraded.is_empty() {
+            return formatter.write_str("fully applied");
+        }
+        for (index, subsystem) in self.degraded.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str(", ")?;
+            }
+            write!(formatter, "{subsystem}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Fingerprint the effective `proxy.secrets:` block.
+///
+/// An absent block fingerprints differently from any present one, so
+/// adding or removing the block is itself a change. The serialization
+/// goes through `serde_json::Value`, whose object representation is
+/// key-ordered, so a `HashMap` field cannot make the fingerprint vary
+/// between two runs over identical config.
+fn secrets_fingerprint(secrets: Option<&sbproxy_config::types::SecretsConfig>) -> String {
+    let value = match secrets {
+        Some(cfg) => serde_json::to_value(cfg).unwrap_or(serde_json::Value::Null),
+        None => serde_json::Value::Null,
+    };
+    let serialized = serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string());
+    crate::identity::config_revision(serialized.as_bytes())
+}
+
+/// Record the `proxy.secrets:` block this process is going to own.
+///
+/// Called from `run` with the boot config. A second call is ignored, so
+/// a process that boots normally pins the boot-time block and a process
+/// that only ever reloads (tests, embedders) pins whatever it saw
+/// first.
+fn record_process_secrets_fingerprint(secrets: Option<&sbproxy_config::types::SecretsConfig>) {
+    let _ = PROCESS_SECRETS_FINGERPRINT.set(secrets_fingerprint(secrets));
+}
+
+/// Reject a reload that changes the process-owned `proxy.secrets:`
+/// block.
+///
+/// The secret resolver assembled from that block is installed into a
+/// set-once slot (`sbproxy_vault::install_process_resolver`) at binary
+/// boot and nothing re-installs it. Accepting a changed block would
+/// leave the node resolving `secret://` references against the old
+/// backends and would only surface later, as a confusing
+/// handler-construction failure the first time a config referenced a
+/// backend that "exists" in the YAML. Rejecting here keeps the
+/// failure at the reload, where the operator can act on it.
+///
+/// Mirrors `cluster::reconcile_process_cluster`, which rejects
+/// restart-only cluster changes the same way.
+fn reconcile_process_secrets(
+    secrets: Option<&sbproxy_config::types::SecretsConfig>,
+) -> anyhow::Result<()> {
+    let candidate = secrets_fingerprint(secrets);
+    let installed = PROCESS_SECRETS_FINGERPRINT.get_or_init(|| candidate.clone());
+    if *installed == candidate {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "proxy.secrets backend, vault connection, named backends, rotation, or fallback changed; \
+         restart sbproxy to apply the new process-owned secret configuration"
+    )
+}
+
+/// Restores the previously live AI provider catalog when a reload that
+/// already installed a new one fails before it publishes.
+///
+/// The catalog has to be installed before
+/// [`CompiledPipeline::from_config`] runs, because AI handler
+/// construction resolves provider names against the live registry. That
+/// makes it the one process global the reload cannot defer to commit
+/// time, so it gets an explicit undo instead. Dropping an armed guard
+/// puts the old catalog back; [`Self::disarm`] at the commit point
+/// keeps the new one.
+struct ProviderRegistryRollback {
+    /// The catalog to restore, or `None` once the reload has committed.
+    snapshot: Option<sbproxy_ai::ProviderRegistrySnapshot>,
+}
+
+impl ProviderRegistryRollback {
+    fn new(snapshot: sbproxy_ai::ProviderRegistrySnapshot) -> Self {
+        Self {
+            snapshot: Some(snapshot),
+        }
+    }
+
+    /// Keep the newly installed catalog: the reload reached its commit
+    /// point and every fallible step behind it succeeded.
+    fn disarm(&mut self) {
+        self.snapshot = None;
+    }
+}
+
+impl Drop for ProviderRegistryRollback {
+    fn drop(&mut self) {
+        if let Some(snapshot) = self.snapshot.take() {
+            sbproxy_ai::restore_provider_registry(snapshot);
+            tracing::warn!(
+                "reload failed after the AI provider catalog was installed; \
+                 restored the catalog that was live before the reload",
+            );
+        }
+    }
+}
+
 /// Start a file watcher that reloads the config on changes.
 ///
 /// Spawns a background thread that watches the config file for modifications.
@@ -28,21 +237,26 @@ static CONFIG_RELOAD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 ///
 /// Reads the file, runs `compile_config` (which also drives the
 /// features.* migration), constructs a fresh
-/// [`CompiledPipeline`], invokes the enterprise reload hook
-/// (best-effort), and atomically swaps the live pipeline. Returns
-/// `Ok(())` on success; logs and returns `Err` on any step's failure
-/// so the caller can decide whether to retry.
+/// [`CompiledPipeline`], invokes the pipeline lifecycle hook
+/// (best-effort), and atomically swaps the live pipeline. Returns a
+/// [`ReloadOutcome`] on success; logs and returns `Err` on any step's
+/// failure so the caller can decide whether to retry.
+///
+/// An `Err` means nothing was applied: the node keeps serving the
+/// pipeline and the process globals it had before the call. An `Ok`
+/// whose [`ReloadOutcome::is_fully_applied`] is false means the
+/// pipeline went live but the subsystems it names did not.
 ///
 /// Idempotent: invoking back-to-back yields the same effect as one
 /// invocation. Safe to call from any thread; the global pipeline
 /// `ArcSwap` handles the publish.
-pub fn reload_from_config_path(config_path: &str) -> anyhow::Result<()> {
+pub fn reload_from_config_path(config_path: &str) -> anyhow::Result<ReloadOutcome> {
     // WOR-1101: stamp every reload outcome so operators can alert on
     // failures and watch the reload cadence from metrics, not just
     // logs. The inner function carries the original early-return body.
     let result = reload_from_config_path_inner(config_path);
     match &result {
-        Ok(()) => sbproxy_observe::metrics::record_config_reload("success"),
+        Ok(_) => sbproxy_observe::metrics::record_config_reload("success"),
         Err(_) => sbproxy_observe::metrics::record_config_reload("failure"),
     }
     result
@@ -98,18 +312,20 @@ fn install_session_ledger_sink(cfg: &sbproxy_config::types::SessionLedgerConfig)
 /// actually takes effect; every slot it touches is swap-backed and
 /// degrades to a warn on failure rather than blocking the reload.
 fn install_detection_singletons(compiled: &sbproxy_config::CompiledConfig) {
+    // Registered before any origin compiles its guardrail pipeline, since
+    // pipelines are built lazily on first request and need the factory.
+    super::ai_classifier::install_classifier_factory();
+
     // --- Wave 3 / G1.4: agent-class resolver ---
     //
     // Build the process-wide `AgentClassResolver` from the parsed
     // top-level `agent_classes:` block (or from defaults when the block
     // is absent), then install it in the global slot the request
-    // pipeline reads in `request_filter`. The catalog source toggles
-    // between the embedded `builtin` defaults, an external `hosted-feed`
-    // (placeholder until G2.2 lands the registry fetcher), or the two
-    // `merged` (currently equivalent to defaults; the registry overlay
-    // arrives in G2.2). All paths are infallible: a malformed
-    // `hosted_feed` block degrades gracefully to defaults so a
-    // misconfiguration does not block serving.
+    // pipeline reads in `request_filter`. `builtin` and `inline` are
+    // live. The compatibility values `hosted-feed` and `merged` warn
+    // and use the embedded defaults; the OSS runtime does not fetch or
+    // validate the reserved `hosted_feed` block. All paths are
+    // infallible so an unsupported selection does not block serving.
     #[cfg(feature = "agent-class")]
     {
         install_agent_class_resolver(compiled.agent_classes.as_ref());
@@ -217,7 +433,36 @@ fn install_detection_singletons(compiled: &sbproxy_config::CompiledConfig) {
     }
 }
 
-fn reload_from_config_path_inner(config_path: &str) -> anyhow::Result<()> {
+/// Construct enforcing safety classifiers before a candidate pipeline can
+/// become requestable.
+///
+/// Routing classifiers keep their inert-on-load-failure contract. The
+/// enforcing toxicity, jailbreak, and content-safety paths use shipped
+/// centroids bound to exact model bytes, so their construction is a required
+/// startup and reload preflight.
+fn preflight_default_safety_centroids(pipeline: &CompiledPipeline) -> anyhow::Result<()> {
+    fn preflight_action(action: &Action) -> anyhow::Result<()> {
+        if let Action::AiProxy(action) = action {
+            action
+                .config
+                .preflight_default_safety_centroids()
+                .map_err(|error| {
+                    anyhow::anyhow!("AI safety classifier startup preflight failed: {error}")
+                })?;
+        }
+        Ok(())
+    }
+
+    for action in &pipeline.actions {
+        preflight_action(action)?;
+    }
+    for rule in pipeline.forward_rules.iter().flatten() {
+        preflight_action(&rule.action)?;
+    }
+    Ok(())
+}
+
+fn reload_from_config_path_inner(config_path: &str) -> anyhow::Result<ReloadOutcome> {
     let yaml = std::fs::read_to_string(config_path)
         .map_err(|e| anyhow::anyhow!("failed to read config file '{config_path}': {e}"))?;
     reload_from_config_yaml(config_path, &yaml)
@@ -225,80 +470,173 @@ fn reload_from_config_path_inner(config_path: &str) -> anyhow::Result<()> {
 
 /// Reload one exact config payload through the same prepare and publish
 /// transaction used by file-watch and SIGHUP reloads.
-pub(crate) fn reload_from_config_yaml(config_path: &str, yaml: &str) -> anyhow::Result<()> {
+///
+/// The transaction has three phases and the order matters:
+///
+/// 1. **Reject.** Compile the YAML and run every check that can refuse
+///    the candidate outright, before anything observable changes.
+/// 2. **Construct.** Install the AI provider catalog (the one process
+///    global `CompiledPipeline::from_config` reads while it builds), then
+///    build the pipeline, load listings, run the pipeline lifecycle hook, and
+///    reconcile the model runtime. A failure anywhere in this phase
+///    returns `Err` and rolls the catalog back, so the node is left
+///    exactly as it was.
+/// 3. **Commit.** Install the request-path and admin-path process
+///    globals, then publish the pipeline. Nothing here can fail the
+///    reload; the subsystems that can fail softly record themselves in
+///    the returned [`ReloadOutcome`].
+///
+/// Keeping phase 3 after phase 2 is the whole point: a config that
+/// compiles but cannot construct a pipeline used to leave the node
+/// running new Lua sandbox limits, new redaction rules, a new key plane
+/// and a new sink dispatcher against the old pipeline, while the error
+/// claimed nothing had been applied.
+pub(crate) fn reload_from_config_yaml(
+    config_path: &str,
+    yaml: &str,
+) -> anyhow::Result<ReloadOutcome> {
     let _reload_guard = CONFIG_RELOAD_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let compiled = sbproxy_config::compile_config(yaml)?;
+    reload_from_config_yaml_locked(config_path, yaml)
+}
+
+/// What a non-blocking reload attempt did.
+///
+/// The distinction exists for callers on a timer. [`Self::Busy`] is not a
+/// failure and must not be reported as one: the candidate was never
+/// examined, so nothing about it is known yet.
+#[derive(Debug)]
+pub enum TryReloadOutcome {
+    /// The transaction ran. Carries what it accomplished, including any
+    /// subsystem that stayed on prior state.
+    Applied(ReloadOutcome),
+    /// Another reload held the reload lock, so this attempt did nothing:
+    /// no compile, no construct, no publish. The caller retries on its
+    /// own schedule.
+    Busy,
+}
+
+/// Reload one exact config payload, but only if no other reload is
+/// running. See [`reload_from_config_yaml`] for the transaction itself.
+///
+/// The blocking entry point holds `CONFIG_RELOAD_LOCK` across the whole
+/// prepare-and-publish body, which for a large config is not brief. A
+/// caller on a fixed interval that waits behind it queues up: every
+/// pending poll cycle wakes into the same lock, and a fleet-wide slow
+/// reload turns into a backlog of reloads for a revision that has since
+/// been superseded. Such a caller wants to skip this cycle and try again
+/// at the next interval, which is what [`TryReloadOutcome::Busy`] says.
+///
+/// # Errors
+///
+/// Returns `Err` under exactly the conditions [`reload_from_config_yaml`]
+/// does. Contention is `Ok(TryReloadOutcome::Busy)`, never an error.
+pub(crate) fn try_reload_from_config_yaml(
+    config_path: &str,
+    yaml: &str,
+) -> anyhow::Result<TryReloadOutcome> {
+    let _reload_guard = match CONFIG_RELOAD_LOCK.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::WouldBlock) => return Ok(TryReloadOutcome::Busy),
+        // A poisoned lock means some other reload panicked mid-flight.
+        // The guarded data is `()`, so there is no corrupt state to
+        // inherit, and refusing every future reload over it would be
+        // worse than proceeding.
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+    };
+    reload_from_config_yaml_locked(config_path, yaml).map(TryReloadOutcome::Applied)
+}
+
+/// Hold the reload lock so a test can prove that a caller which must not
+/// block on it does not.
+///
+/// The lock is a private static, and contention on it cannot be staged
+/// from another crate without this. Not for production use: holding the
+/// returned guard blocks every reload path in the process.
+#[doc(hidden)]
+pub fn hold_config_reload_lock_for_test() -> std::sync::MutexGuard<'static, ()> {
+    CONFIG_RELOAD_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The reload transaction body. Callers hold `CONFIG_RELOAD_LOCK`.
+fn reload_from_config_yaml_locked(config_path: &str, yaml: &str) -> anyhow::Result<ReloadOutcome> {
+    // Honour `source:` before anything else, so the file watcher,
+    // SIGHUP, and `POST /admin/reload` all reload what the source says
+    // rather than the pointer at it. A document with no `source:` block
+    // resolves to itself and does no I/O, which is every reload on a
+    // node whose config is its local file. A document that already came
+    // from a source carries no `source:` key, so an apply driven by the
+    // refresh poller or by the config-authority subscriber does not
+    // re-fetch.
+    let resolved = crate::config_source::resolve(yaml)?;
+    let compiled = sbproxy_config::compile_config(&resolved.text)?;
     if let Some(al) = compiled.access_log.as_ref() {
         log_capture_header_warnings(al);
     }
+
+    // --- Phase 1: reject-only checks, before anything installs ---
 
     // Reconcile process-owned cluster identity and listeners before any
     // dependent subsystem observes this candidate configuration. Restart-only
     // changes reject the reload and leave the installed handle untouched.
     crate::cluster::reconcile_process_cluster(&compiled.server)?;
 
-    // WOR-594: refresh the operator-configured Lua sandbox limits on
-    // reload so SIGHUP / hot-reload pick up changes to
-    // `proxy.scripting.lua.sandbox:` without restarting the process.
-    sbproxy_extension::lua::install_sandbox_config(sbproxy_extension::lua::SandboxConfig::from(
-        &compiled.server.scripting.lua.sandbox,
-    ));
+    // The secret resolver assembled from `proxy.secrets:` is set-once
+    // for the life of the process, so a changed block can never take
+    // effect. Refuse it here rather than accept a config whose secret
+    // backends are silently ignored.
+    reconcile_process_secrets(compiled.server.secrets.as_ref())?;
 
-    // Refresh the operator-extensible log redactor on reload so
-    // SIGHUP picks up changes to `proxy.observability.log.redact:`
-    // (proxy scope) as well as the tenant-scope and origin-scope
-    // `observability.log.redact.pii:` overrides (WOR-1043 PR2 / PR3).
-    install_op_redact_state(&compiled);
+    let mut outcome = ReloadOutcome::default();
 
-    // WOR-1067 PR2: refresh per-tenant cardinality caps on reload so
-    // SIGHUP picks up changes to `tenants[].observability.cardinality.max_series`
-    // without restarting the process. Tenants without an entry stay
-    // on the proxy-wide cap.
-    install_tenant_cardinality_state(&compiled.server);
+    // --- Phase 2: construct, with the catalog installed and undoable ---
 
-    // WOR-1045 PR1 + PR2: validate the declared sinks block and (PR2)
-    // build a SinkDispatcher from proxy + tenant + origin scopes so
-    // every declared sink receives the matching records. When no
-    // sinks block is declared, the dispatcher slot stays empty and
-    // the legacy `tracing::*!` fallback continues to drive stdout.
-    validate_sinks_config(&compiled.server);
-    install_sink_dispatcher_from_config(&compiled);
-    install_usage_rollups_from_config(&compiled);
-
-    // WOR-173: refresh the AI provider catalog and rebuild the AI
-    // client alongside the pipeline. Both globals live behind an
-    // `ArcSwap`, so this is a lock-free atomic swap from the reload
-    // thread's perspective. Failures fall back to the embedded
-    // catalog with a warn-level log inside `reload_provider_registry`,
-    // matching the startup behaviour. Note: `BUDGET_TRACKER` is
-    // deliberately *not* refreshed - in-memory accumulators must
-    // survive reload, see the doc comment on the static.
-    {
+    // WOR-173: refresh the AI provider catalog. This is the only
+    // process global that has to move before the pipeline is built:
+    // AI handler construction resolves provider names against the live
+    // registry and hard-errors on an unknown one. Everything else waits
+    // for the commit phase. The rollback guard puts the previous
+    // catalog back if any later step of this function fails.
+    //
+    // Failures to build fall back to the embedded catalog with a
+    // warn-level log inside `prepare_provider_registry`, matching the
+    // startup behaviour, and leave the live catalog untouched. Note:
+    // `BUDGET_TRACKER` is deliberately *not* refreshed - in-memory
+    // accumulators must survive reload, see the doc comment on the
+    // static.
+    let mut registry_rollback = {
         let override_path = compiled
             .server
             .ai_providers_file
             .as_deref()
             .map(std::path::Path::new);
-        if let Err(e) = sbproxy_ai::reload_provider_registry(override_path) {
-            tracing::error!(
-                error = %e,
-                "AI provider registry reload failed; serving with the previous catalog",
-            );
-        } else {
-            reload_ai_client();
+        match sbproxy_ai::prepare_provider_registry(override_path) {
+            Ok(prepared) => {
+                let rollback =
+                    ProviderRegistryRollback::new(sbproxy_ai::provider_registry_snapshot());
+                sbproxy_ai::install_prepared_provider_registry(prepared);
+                Some(rollback)
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "AI provider registry reload failed; serving with the previous catalog",
+                );
+                outcome.degrade(DegradedSubsystem::AiProviderRegistry);
+                None
+            }
         }
-    }
-
-    // WOR-1164: refresh the detection singletons (agent-class resolver,
-    // TLS-fingerprint catalogue + CEL matcher, agent-detect scorer) so
-    // a reload that changed `agent_classes:`, the resolver flags, or
-    // `agent_detect.*` takes effect.
-    // Runs before `compiled` is moved into the pipeline below.
-    install_detection_singletons(&compiled);
+    };
 
     let mut new_pipeline = CompiledPipeline::from_config(compiled)?;
+    preflight_default_safety_centroids(&new_pipeline)?;
+    // A settlement runtime that will not start fails the reload before the
+    // pipeline is swapped, so the previous generation keeps serving with its
+    // store and its worker untouched.
+    attach_payments_runtime(&mut new_pipeline)?;
 
     // WOR-196: pick up `listings/*.yaml` from the same Repo (the
     // directory the served `sb.yml` lives in) and stash the loaded
@@ -317,6 +655,9 @@ pub(crate) fn reload_from_config_yaml(config_path: &str, yaml: &str) -> anyhow::
         for err in &load_errors {
             tracing::warn!(error = %err, "listings load error; skipping entry");
         }
+        if !load_errors.is_empty() {
+            outcome.degrade(DegradedSubsystem::Listings);
+        }
         if !loaded.is_empty() {
             let mut findings: Vec<sbproxy_config::PlanFinding> = Vec::new();
             new_pipeline.listings =
@@ -332,24 +673,27 @@ pub(crate) fn reload_from_config_yaml(config_path: &str, yaml: &str) -> anyhow::
         }
     }
 
-    // Invoke the enterprise reload hook (best-effort): the OSS reload
+    // Invoke the pipeline lifecycle hook (best-effort): the reload
     // path must continue to swap the pipeline even if a downstream
-    // hook errors, otherwise a failing enterprise extension would
-    // permanently pin the operator on the old config. We spin up a
+    // hook errors, otherwise a failing lifecycle extension would
+    // permanently pin the operator on the old config. The failure is
+    // reported through `ReloadOutcome` instead. We spin up a
     // current-thread runtime when no ambient tokio runtime exists so
     // the file-watcher thread (plain std thread) can also call this.
     if let Some(startup) = new_pipeline.hooks.startup.clone() {
-        if tokio::runtime::Handle::try_current().is_ok() {
+        let hook_failed = if tokio::runtime::Handle::try_current().is_ok() {
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
                     if let Err(e) = startup.on_reload(&mut new_pipeline).await {
                         tracing::warn!(
                             error = %e,
-                            "enterprise reload hook failed; serving with prior hook state",
+                            "pipeline lifecycle hook failed; serving with prior hook state",
                         );
+                        return true;
                     }
-                });
-            });
+                    false
+                })
+            })
         } else {
             match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -359,8 +703,11 @@ pub(crate) fn reload_from_config_yaml(config_path: &str, yaml: &str) -> anyhow::
                     if let Err(e) = hook_rt.block_on(startup.on_reload(&mut new_pipeline)) {
                         tracing::warn!(
                             error = %e,
-                            "enterprise reload hook failed; serving with prior hook state",
+                            "pipeline lifecycle hook failed; serving with prior hook state",
                         );
+                        true
+                    } else {
+                        false
                     }
                 }
                 Err(e) => {
@@ -368,29 +715,136 @@ pub(crate) fn reload_from_config_yaml(config_path: &str, yaml: &str) -> anyhow::
                         error = %e,
                         "failed to build reload-hook runtime; skipping reload hook",
                     );
+                    true
                 }
             }
+        };
+        if hook_failed {
+            outcome.degrade(DegradedSubsystem::PipelineLifecycleHook);
         }
+    }
+    // Same check the boot path runs, but a reload cannot abort: refusing
+    // here would pin the operator on the old config until they fixed an
+    // extension, which is exactly what the reload contract avoids
+    // elsewhere. The violation is loud and shows up as a degraded
+    // subsystem in the /admin/reload response instead.
+    if let Err(e) = enforce_cache_at_rest_posture(&new_pipeline) {
+        tracing::error!(error = %e, "reloaded pipeline has a cache that stores plaintext at rest");
+        outcome.degrade(DegradedSubsystem::PipelineLifecycleHook);
     }
     let config_dir = std::path::Path::new(config_path)
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."));
     super::model_host::reconcile_model_runtime_blocking(&new_pipeline, config_dir)
         .map_err(|error| anyhow::anyhow!("model runtime reconciliation failed: {error}"))?;
-
-    // Reconcile the dynamic key and governance planes only after every other
-    // fallible candidate-build step succeeds. A failure aborts publication so
-    // request policy can never advance while the previous accounting plane is
-    // retained. Removing the block explicitly disables both planes instead of
-    // accidentally keeping stale key policy and leases alive.
-    match new_pipeline.config.server.key_management.as_ref() {
-        Some(key_management) => crate::key_plane::init_key_plane(key_management)
-            .map_err(|error| anyhow::anyhow!("failed to reconcile dynamic key plane: {error}"))?,
-        None => crate::key_plane::disable_key_plane(),
+    // --- Phase 3: commit ---
+    //
+    // Every fallible step is behind us. From here the reload returns
+    // `Ok`, so the process globals below are safe to move: nothing can
+    // leave them applied against the previous pipeline. They are read on
+    // the request path and the admin path, never during pipeline
+    // construction, which is what lets them wait this long. The compiled
+    // config was moved into the pipeline, so they read it back through
+    // `new_pipeline.config` rather than cloning it.
+    if let Some(rollback) = registry_rollback.as_mut() {
+        rollback.disarm();
     }
+    {
+        let compiled = &new_pipeline.config;
+
+        // Config seeds target the external system of record, whose generic
+        // backend contract has no cross-record transaction. Apply them only
+        // after every reject-only preflight has succeeded. A backend failure
+        // degrades this generation but still publishes plane B with pipeline B,
+        // never pipeline B against plane A.
+        if let Err(e) = crate::key_plane::seed_prepared_key_plane(
+            new_pipeline.key_plane(),
+            compiled.server.key_management.as_ref(),
+        ) {
+            tracing::error!(error = %e, "failed to seed dynamic key plane on reload");
+            outcome.degrade(DegradedSubsystem::KeyPlane);
+        }
+
+        // WOR-594: refresh the operator-configured Lua sandbox limits on
+        // reload so SIGHUP / hot-reload pick up changes to
+        // `proxy.scripting.lua.sandbox:` without restarting the process.
+        sbproxy_extension::lua::install_sandbox_config(
+            sbproxy_extension::lua::SandboxConfig::from(&compiled.server.scripting.lua.sandbox),
+        );
+
+        // Refresh the operator-extensible log redactor on reload so
+        // SIGHUP picks up changes to `proxy.observability.log.redact:`
+        // (proxy scope) as well as the tenant-scope and origin-scope
+        // `observability.log.redact.pii:` overrides (WOR-1043 PR2 / PR3).
+        install_op_redact_state(compiled);
+
+        // WOR-1067 PR2: refresh per-tenant cardinality caps on reload so
+        // SIGHUP picks up changes to `tenants[].observability.cardinality.max_series`
+        // without restarting the process. Tenants without an entry stay
+        // on the proxy-wide cap.
+        install_tenant_cardinality_state(&compiled.server);
+
+        // WOR-1045 PR1 + PR2: validate the declared sinks block and (PR2)
+        // build a SinkDispatcher from proxy + tenant + origin scopes so
+        // every declared sink receives the matching records. When no
+        // sinks block is declared, the dispatcher slot stays empty and
+        // the legacy `tracing::*!` fallback continues to drive stdout.
+        validate_sinks_config(&compiled.server);
+        if !install_sink_dispatcher_from_config(compiled) {
+            outcome.degrade(DegradedSubsystem::SinkDispatcher);
+        }
+        install_usage_rollups_from_config(compiled);
+
+        // Rebuild the AI client alongside the catalog. It lives behind an
+        // `ArcSwap`, so this is a lock-free atomic swap from the reload
+        // thread's perspective. The rebuild does not depend on the
+        // catalog reload succeeding, so it runs unconditionally.
+        reload_ai_client();
+
+        // WOR-1164: refresh the detection singletons (agent-class resolver,
+        // TLS-fingerprint catalogue + CEL matcher, agent-detect scorer) so
+        // a reload that changed `agent_classes:`, the resolver flags, or
+        // `agent_detect.*` takes effect.
+        install_detection_singletons(compiled);
+
+        // Publish the candidate key plane as the admin and cluster view. The
+        // request path uses the same Arc pinned inside `new_pipeline`, so a
+        // request that started on generation A cannot cross into B here.
+        crate::key_plane::activate_key_plane(
+            new_pipeline.key_plane().cloned(),
+            compiled.server.key_management.as_ref(),
+        );
+    }
+
+    // WOR-1835: same reasoning as the boot path above - retry starting
+    // governance dissemination now that this reload's key plane is
+    // installed. A no-op once the loop is already running, and a no-op
+    // until both clustering and approximate governance are configured.
+    crate::cluster::start_governance_dissemination();
+    crate::cluster::start_rate_limit_dissemination();
+    crate::cluster::start_meter_dissemination();
+
     reload::load_pipeline(new_pipeline);
-    tracing::info!("config reloaded successfully");
-    Ok(())
+
+    // Move the drift baseline here, in the one place every reload path
+    // converges, rather than in the individual callers. Only startup and
+    // `POST /admin/reload` used to record it, so after a file-watcher or
+    // SIGHUP reload `GET /admin/drift` compared the running config against
+    // a pre-reload hash and reported drift that did not exist.
+    crate::admin::record_loaded_config_content_hash(&crate::identity::config_revision(
+        yaml.as_bytes(),
+    ));
+
+    if outcome.is_fully_applied() {
+        tracing::info!("config reloaded successfully");
+    } else {
+        tracing::warn!(
+            degraded = %outcome,
+            "config reloaded, but some subsystems did not apply; the node is serving the new \
+             pipeline with stale state for those subsystems",
+        );
+    }
+    Ok(outcome)
 }
 
 pub(super) fn start_config_watcher(config_path: String) {
@@ -438,6 +892,9 @@ pub(super) fn start_config_watcher(config_path: String) {
                         || event.kind.is_remove() =>
                 {
                     tracing::info!("config directory changed, reloading...");
+                    // The outcome's degraded list is already logged by
+                    // the reload itself; the watcher only needs to know
+                    // whether the reload was refused outright.
                     if let Err(e) = reload_from_config_path(&config_path) {
                         tracing::error!(error = %e, "reload failed; serving prior pipeline");
                     }
@@ -490,7 +947,9 @@ pub fn install_sighup_handler(config_path: String) {
             let path = config_path.clone();
             let result = tokio::task::spawn_blocking(move || reload_from_config_path(&path)).await;
             match result {
-                Ok(Ok(())) => {}
+                // A degraded-but-applied reload already logged its own
+                // warning naming the subsystems; nothing to add here.
+                Ok(Ok(_outcome)) => {}
                 Ok(Err(e)) => {
                     tracing::error!(error = %e, "SIGHUP reload failed; serving prior pipeline");
                 }
@@ -503,6 +962,56 @@ pub fn install_sighup_handler(config_path: String) {
             }
         }
     });
+}
+
+/// Build and publish the settlement runtime for a freshly compiled pipeline.
+///
+/// A no-op when `proxy.payments` is absent, which is the default and leaves
+/// the existing non-settlement ledger behaviour exactly as it was.
+///
+/// Failure is fatal to the pipeline rather than degrading. Every other
+/// subsystem in this file that fails at boot can serve without itself:
+/// alerting stops evaluating, listings serve empty. Settlement cannot,
+/// because the thing it would degrade to is answering a payer's credential
+/// without a durable record of what was charged.
+///
+/// # Errors
+///
+/// Returns the startup failure, which names the configuration surface the
+/// operator wrote.
+#[cfg(feature = "payments")]
+fn attach_payments_runtime(pipeline: &mut CompiledPipeline) -> anyhow::Result<()> {
+    let Some(payments) = pipeline.config.server.payments.clone() else {
+        return Ok(());
+    };
+    let clustered = pipeline.config.server.cluster.is_some();
+    let runtime = crate::billing_runtime::install(&payments, clustered)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    tracing::info!(
+        rails = ?runtime.rails(),
+        schema_version = runtime.status().schema_version,
+        "payment settlement runtime published",
+    );
+    pipeline.payments = Some(runtime);
+    Ok(())
+}
+
+/// Settlement is not compiled into this build.
+///
+/// A configured `proxy.payments` block still fails, and names the feature,
+/// rather than being parsed and quietly ignored. The configuration crate
+/// carries no `cfg` of its own precisely so this check lives here.
+#[cfg(not(feature = "payments"))]
+fn attach_payments_runtime(pipeline: &mut CompiledPipeline) -> anyhow::Result<()> {
+    if pipeline.config.server.payments.is_some() {
+        anyhow::bail!(
+            "proxy.payments is configured but this binary was built without the `payments` \
+             cargo feature, so it has no settlement store, no authoritative service, and no \
+             recovery worker. Rebuild with `--features payments` plus the flag for each rail \
+             the routes advertise, or remove the block"
+        );
+    }
+    Ok(())
 }
 
 /// SIGHUP handler is a no-op on non-Unix targets.
@@ -668,20 +1177,42 @@ pub(super) fn spawn_shutdown_phase_logger(
         .ok();
 }
 
-/// Install the startup key and governance planes.
+/// Resolve the admin-operator password pepper, failing loud only when it is
+/// actually needed.
 ///
-/// Startup is fail-closed: serving with an invalid configured governance plane
-/// would silently drop strict cluster-wide enforcement. Reload intentionally
-/// keeps its separate best-effort path above so invalid governance cannot
-/// replace the previously installed governance plane.
-fn install_startup_key_plane(
-    server_config: &sbproxy_config::ProxyServerConfig,
-) -> anyhow::Result<()> {
-    if let Some(key_management) = server_config.key_management.as_ref() {
-        crate::key_plane::init_key_plane(key_management)
-            .map_err(|error| anyhow::anyhow!("failed to install dynamic key plane: {error}"))?;
+/// Reads `key_management.crypto.pepper` straight from config (independent
+/// of whether the dynamic key plane is enabled) and falls back to
+/// [`crate::key_plane::default_admin_operator_pepper`] when unset, so
+/// operator login works with no `key_management:` block at all.
+///
+/// An unresolvable pepper reference (e.g. `env:` naming an unset variable)
+/// only fails boot when `operators_configured` is true: `proxy.admin.operators`
+/// entries carry a `password_hash` that must verify against this pepper, so
+/// a bad reference there matches the repo's resolve-at-boot-or-fail-loud
+/// convention for secret references. With no operators configured, nothing
+/// depends on the pepper resolving, so a bad reference degrades to a logged
+/// warning and the default pepper, the same way `key_plane::init_key_plane`
+/// degrades rather than aborting boot.
+fn resolve_or_default_admin_operator_pepper(
+    key_management: Option<&sbproxy_config::types::KeyManagementConfig>,
+    operators_configured: bool,
+) -> anyhow::Result<Vec<u8>> {
+    match crate::key_plane::resolve_admin_operator_pepper(key_management) {
+        Ok(pepper) => Ok(pepper),
+        Err(e) if !operators_configured => {
+            tracing::warn!(
+                error = %e,
+                "key_management.crypto.pepper did not resolve, but no proxy.admin.operators \
+                 are configured, so nothing needs it; falling back to the default \
+                 admin-operator pepper"
+            );
+            Ok(crate::key_plane::default_admin_operator_pepper())
+        }
+        Err(e) => Err(anyhow::anyhow!(
+            "resolve admin operator pepper (required: proxy.admin.operators is configured, \
+             and their password_hash values must verify against it): {e}"
+        )),
     }
-    Ok(())
 }
 
 /// Create and start a Pingora server with the given config file path.
@@ -712,11 +1243,66 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     use pingora_core::server::Server;
     use pingora_proxy::http_proxy_service;
 
+    // Recover exact engines left by a prior forced gateway exit before
+    // reading desired state. This also cleans up when the replacement
+    // configuration no longer contains a model host, and keeps recovery
+    // ahead of listener bind and any replacement-engine spawn.
+    let recovered_engines =
+        sbproxy_model_host::reap_stale_managed_engines(std::time::Duration::from_secs(5))
+            .map_err(|error| anyhow::anyhow!("recover stale managed engines at boot: {error}"))?;
+    if recovered_engines > 0 {
+        tracing::info!(
+            recovered_engines,
+            "recovered stale managed engines before gateway boot"
+        );
+    }
+
     // Load and compile the config.
     let yaml = std::fs::read_to_string(config_path)
         .map_err(|e| anyhow::anyhow!("failed to read config file '{}': {}", config_path, e))?;
+    // The drift baseline is the LOCAL file, deliberately captured before
+    // any authority bundle is folded in: `GET /admin/drift` answers "has
+    // the file on disk changed since we read it?", and a subscriber whose
+    // baseline was the merged document would report drift on every scrape
+    // forever.
     let initial_content_hash = crate::identity::config_revision(yaml.as_bytes());
+
+    // Honour `source:` first. Resolution order is fixed and documented:
+    // the source produces the base document, then the config-authority
+    // overlay goes on top of it, then it compiles. A file with no
+    // `source:` block resolves to itself and does no I/O, so this is
+    // free on the historical path. A failure here is fatal on purpose: a
+    // node whose configuration lives in a repository it cannot reach has
+    // nothing to serve, and booting on the pointer file would serve an
+    // empty configuration while reporting success.
+    let resolved_source = crate::config_source::resolve(&yaml)?;
+    if resolved_source.is_remote() {
+        // Published before the subscriber is built, because the merge
+        // base a subscriber uses is this document rather than the pointer
+        // file on disk.
+        crate::config_source::publish_resolved_base(crate::config_source::ResolvedBase {
+            yaml: resolved_source.text.clone(),
+            origin: resolved_source.base_origin(),
+            fingerprint: resolved_source.revision_fingerprint(),
+        });
+    }
+    let source_poller =
+        crate::config_source::SourcePoller::from_boot(config_path, &yaml, &resolved_source)?;
+    let yaml = resolved_source.text.clone();
     let compiled = sbproxy_config::compile_config(&yaml)?;
+    // Fold a cached config-authority bundle into the boot document before
+    // anything downstream reads the compiled config: listener ports, TLS
+    // hostnames, and the request pipeline all have to describe the
+    // configuration this node actually serves. A no-op when
+    // `proxy.config_authority.upstream` is absent, and an error (so the
+    // process exits) when the subscriber requires a bundle it does not
+    // have. No network I/O happens here; see the module docs.
+    // The effective document itself is not needed past this point: the
+    // compiled form is what boots, and the drift baseline is deliberately
+    // the local file captured above.
+    let (_effective_yaml, compiled, config_subscriber) =
+        crate::config_subscriber::fold_boot_bundle(config_path, yaml, compiled)?;
+
     if let Some(al) = compiled.access_log.as_ref() {
         log_capture_header_warnings(al);
     }
@@ -725,6 +1311,12 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // Extract TLS-relevant fields before compiled is consumed by from_config.
     let server_config = compiled.server.clone();
     let hostnames: Vec<String> = compiled.host_map.keys().map(|k| k.to_string()).collect();
+
+    // Pin the `proxy.secrets:` block this process owns. The binary
+    // installs the matching resolver into a set-once slot before it
+    // calls `run`, so every later reload must present the same block;
+    // `reconcile_process_secrets` rejects the ones that do not.
+    record_process_secrets_fingerprint(server_config.secrets.as_ref());
 
     if let Some(metrics_cfg) = server_config.metrics.as_ref() {
         let _ = sbproxy_observe::metrics::init_cardinality_limiter(
@@ -746,7 +1338,9 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     install_op_redact_state(&compiled);
     install_tenant_cardinality_state(&server_config);
     validate_sinks_config(&server_config);
-    install_sink_dispatcher_from_config(&compiled);
+    // Boot has nothing to degrade into: the install result is already
+    // logged and metered inside the helper.
+    let _sinks_installed = install_sink_dispatcher_from_config(&compiled);
     // WOR-1875: this is the startup path (the earlier call site runs
     // on reload); the installer is set-once so both calling is safe.
     install_usage_rollups_from_config(&compiled);
@@ -796,17 +1390,10 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
         crate::rate_limit_budget::install_registry(rl);
     }
 
-    // --- WOR-1546: assemble and install the dynamic key plane ---
-    //
-    // Lowered from `proxy.key_management:`. Builds the store, policy cache, and
-    // at-rest crypto, seeds config records, and (for the redis backend/tier)
-    // starts the cross-replica invalidation subscriber. Inert when the block is
-    // absent or `enabled: false`.
-    // Install the one process-owned cluster before the key plane so the mesh
-    // cache tier consumes this handle instead of opening duplicate listeners.
+    // Install the one process-owned cluster before pipeline construction so a
+    // candidate mesh-backed key plane consumes this handle instead of opening
+    // duplicate listeners.
     crate::cluster::reconcile_process_cluster(&server_config)?;
-
-    install_startup_key_plane(&server_config)?;
 
     // --- WOR-1186: register the session-ledger sink when enabled ---
     //
@@ -831,8 +1418,8 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // Construct a bounded mpsc channel and install the sender as the
     // process-wide audit bus before the pipeline is loaded. The
     // dispatcher emits a `PolicyVerdictEvent` for every policy
-    // decision; the OSS drain stub on the receiver prints each event
-    // to stderr as a JSON line. Enterprise replaces the consumer
+    // decision; the default drain stub on the receiver prints each event
+    // to stderr as a JSON line. An extension can replace the consumer
     // with a NATS-backed audit-chain subscriber per
     // `docs/adr-policy-audit-binding.md`.
     //
@@ -866,6 +1453,8 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
 
     // Compile config into a pipeline with action/auth/policy module instances.
     let mut pipeline = CompiledPipeline::from_config(compiled)?;
+    preflight_default_safety_centroids(&pipeline)?;
+    attach_payments_runtime(&mut pipeline)?;
 
     // WOR-196: pick up `listings/*.yaml` from the same Repo (the
     // directory the served `sb.yml` lives in) and stash the loaded
@@ -897,7 +1486,7 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
         }
     }
 
-    // Give enterprise code a chance to wire its hooks, construct clients,
+    // Give the lifecycle extension a chance to wire its hooks, construct clients,
     // and register origins. Failures here do NOT block serving: they log
     // and return None-hooks, so request paths fall through to OSS behavior.
     //
@@ -916,10 +1505,16 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
         if let Err(e) = hook_rt.block_on(startup.on_startup(&mut pipeline)) {
             tracing::warn!(
                 error = %e,
-                "enterprise startup hook failed; continuing without enterprise features"
+                "pipeline lifecycle hook failed; continuing without optional features"
             );
         }
     }
+
+    // The lifecycle hook has now had its chance to install cache
+    // backends. Anything it wired that writes plaintext somewhere
+    // durable is refused here rather than discovered later by whoever
+    // reads the disk.
+    enforce_cache_at_rest_posture(&pipeline)?;
 
     // Prepare and publish the complete model desired state before the
     // pipeline becomes requestable. The permanent runtime exists even
@@ -946,11 +1541,56 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
         .unwrap_or(DEFAULT_MODEL_PLANE_BODY_LIMIT);
     let _model_plane_shutdown = start_process_model_plane(model_plane_body_limit)?;
 
+    // The pipeline constructor prepared this exact generation's key plane
+    // without touching global or store state. Boot has completed every other
+    // fallible preflight, so apply declarative seeds and then expose the plane
+    // to admin/cluster consumers immediately before publishing the matching
+    // request pipeline.
+    crate::key_plane::seed_prepared_key_plane(
+        pipeline.key_plane(),
+        pipeline.config.server.key_management.as_ref(),
+    )?;
+    crate::key_plane::activate_key_plane(
+        pipeline.key_plane().cloned(),
+        pipeline.config.server.key_management.as_ref(),
+    );
+    crate::cluster::start_governance_dissemination();
+    crate::cluster::start_rate_limit_dissemination();
+    crate::cluster::start_meter_dissemination();
+
     // Store in hot-reload slot.
     reload::load_pipeline(pipeline);
 
     // Start file watcher for config hot-reload.
     start_config_watcher(config_path.to_string());
+
+    // Start the config-authority poller. Its cycles apply through the
+    // non-blocking reload entry point, so a slow file-watcher or SIGHUP
+    // reload never queues up poll cycles behind it. No-op when no
+    // authority is configured.
+    crate::config_subscriber::spawn(config_subscriber);
+
+    // Start the config-source refresh loop. Same shape as the authority
+    // poller: an interval with jitter, the resolved commit playing the
+    // part an ETag plays, and the non-blocking reload entry point. No-op
+    // when the config has no `source:` block or set
+    // `refresh_interval_secs: 0`.
+    crate::config_source::spawn(source_poller);
+
+    // Start the config-authority publisher: load the signing key, open
+    // the durable revision store, and bind the bundle listener. Fatal on
+    // failure, and deliberately so. A node configured to publish that
+    // silently does not is a node whose whole fleet stops receiving
+    // configuration with nothing in the logs saying why. `compile_config`
+    // has already refused a non-loopback bind with no TLS and an
+    // unreadable signing key, so reaching an error here means the address
+    // is taken or the store directory is not writable.
+    crate::config_authority::spawn(
+        server_config
+            .config_authority
+            .as_ref()
+            .and_then(|authority| authority.publish.as_ref()),
+    )?;
 
     // --- Wave 5 day-6 Item 4: SIGHUP re-bootstrap handler ---
     //
@@ -960,7 +1600,7 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // background std thread so an operator-driven `kill -HUP $(pgrep
     // sbproxy)` re-runs `reload_from_config_path` (which threads
     // through compile_config + the day-6 features.* migration + the
-    // enterprise reload hook). Idempotent: each delivery atomically
+    // pipeline lifecycle hook). Idempotent: each delivery atomically
     // swaps the live pipeline; multiple back-to-back SIGHUPs coalesce.
     {
         let cfg_path = config_path.to_string();
@@ -1222,6 +1862,26 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
         }
     }
 
+    // Bind every public endpoint before handing the service to Pingora's
+    // background runtimes. A bind failure is a startup error with an exit
+    // code, not a panic in a detached listener task while the main signal
+    // loop remains alive. Pingora retains these exact sockets, so there is
+    // no probe/drop/rebind race between this check and `Server::run`.
+    //
+    // Tokio network resources retain the reactor on which they were
+    // created. Keep this one-thread runtime alive and driven for the whole
+    // server lifetime while Pingora's service tasks accept from the
+    // prepared listeners.
+    let listener_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name("sbproxy-listener-reactor")
+        .enable_all()
+        .build()
+        .map_err(|error| anyhow::anyhow!("build public-listener runtime: {error}"))?;
+    listener_runtime
+        .block_on(proxy_service.prepare_listeners())
+        .map_err(|error| anyhow::anyhow!("bind public listener: {error}"))?;
+
     server.add_service(proxy_service);
 
     // Spawn the embedded admin HTTP server on `proxy.admin.port`
@@ -1236,21 +1896,33 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
         let admin_cfg = crate::admin::AdminConfig {
             enabled: true,
             port: server_config.admin.as_ref().map(|a| a.port).unwrap_or(9090),
+            // The `unwrap_or_else` arms are unreachable (this branch only
+            // runs when `admin` is Some), but they must still read the
+            // shared default constants rather than repeat the literals:
+            // `compile_config` compares credentials against those
+            // constants to refuse a reachable admin surface that still
+            // carries the shipped defaults, and a second copy of the
+            // string here is how the two drift apart.
             username: server_config
                 .admin
                 .as_ref()
                 .map(|a| a.username.clone())
-                .unwrap_or_else(|| "admin".to_string()),
+                .unwrap_or_else(|| sbproxy_config::types::DEFAULT_ADMIN_USERNAME.to_string()),
             password: server_config
                 .admin
                 .as_ref()
                 .map(|a| a.password.clone())
-                .unwrap_or_else(|| "changeme".to_string()),
+                .unwrap_or_else(|| sbproxy_config::types::DEFAULT_ADMIN_PASSWORD.to_string()),
             max_log_entries: server_config
                 .admin
                 .as_ref()
                 .map(|a| a.max_log_entries)
                 .unwrap_or(1000),
+            rate_limit_per_minute: server_config
+                .admin
+                .as_ref()
+                .map(|a| a.rate_limit_per_minute)
+                .unwrap_or(240),
             // WOR-1717: carry the operator's admin TLS cert/key paths
             // through so the admin server serves HTTPS when configured.
             tls: server_config
@@ -1286,8 +1958,12 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
                         .iter()
                         .map(|o| crate::admin::AdminOperator {
                             username: o.username.clone(),
-                            password: o.password.clone(),
+                            password_hash: o.password_hash.clone(),
                             role: o.role,
+                            // WOR-2131: the meter's tenant scope for this
+                            // login. Carried through so the admin surface
+                            // reads it from config rather than from a token.
+                            tenant: o.tenant.clone(),
                         })
                         .collect()
                 })
@@ -1310,27 +1986,47 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
         // abort startup: an unreadable persistence file should not
         // brick the proxy. PR3-style ephemeral mutations keep
         // working on the failed path.
+        // At-rest sealing for the prompt file. Resolved before the open
+        // below, and a failure here is FATAL, unlike a failed open. The
+        // distinction matters: an unreadable file loses saved prompts and
+        // degrades to ephemeral mutations, but a key the operator asked for
+        // and we cannot supply would otherwise degrade to writing records in
+        // the clear, which is the one outcome the no-plaintext-fallback rule
+        // exists to prevent.
+        let prompt_sealer = build_prompt_sealer(server_config.admin.as_ref())?;
         let prompt_persistence = server_config
             .admin
             .as_ref()
             .and_then(|a| a.prompt_persistence_path.as_ref())
-            .and_then(|path| match crate::admin::PromptPersistence::open(path) {
-                Ok(p) => {
-                    tracing::info!(path = %path.display(), "opened prompt persistence");
-                    Some(std::sync::Arc::new(p))
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "failed to open prompt persistence; mutations will be ephemeral"
-                    );
-                    None
+            .and_then(|path| {
+                match crate::admin::PromptPersistence::open(path, prompt_sealer.clone()) {
+                    Ok(p) => {
+                        tracing::info!(path = %path.display(), "opened prompt persistence");
+                        Some(std::sync::Arc::new(p))
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "failed to open prompt persistence; mutations will be ephemeral"
+                        );
+                        None
+                    }
                 }
             });
+        // Resolve the operator-password pepper before constructing
+        // AdminState, so `check_operator_login` verifies against the same
+        // pepper `sbproxy admin hash-password` used to produce the stored
+        // hash. See `resolve_or_default_admin_operator_pepper` for the
+        // fail-loud-only-if-needed policy.
+        let operator_pepper = resolve_or_default_admin_operator_pepper(
+            server_config.key_management.as_ref(),
+            !admin_cfg.operators.is_empty(),
+        )?;
         let mut admin_state_inner = crate::admin::AdminState::new(admin_cfg)
             .with_config_path(config_path)
-            .with_loaded_config_content_hash(initial_content_hash.clone());
+            .with_loaded_config_content_hash(initial_content_hash.clone())
+            .with_operator_pepper(operator_pepper);
         if let Some(p) = prompt_persistence {
             admin_state_inner = admin_state_inner.with_prompt_persistence(p);
         }
@@ -1463,6 +2159,33 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
                 },
             )));
 
+        // keystore (WOR-2064): the mesh keystore's post-quarantine
+        // readiness. NotConfigured when the mesh backend is not active;
+        // Unhealthy while a node whose shard was quarantined after a
+        // long absence has not completed its first full anti-entropy
+        // round, because the backend refuses to serve authentication
+        // from an unrepopulated shard in that window.
+        admin_state_inner
+            .health_registry
+            .register(std::sync::Arc::new(sbproxy_observe::SyntheticProbe::new(
+                "keystore",
+                || match crate::mesh_keystore::current_readiness() {
+                    None => (
+                        sbproxy_observe::ComponentStatus::NotConfigured,
+                        Some("mesh keystore backend not active".to_string()),
+                    ),
+                    Some(readiness) if !readiness.ready() => (
+                        sbproxy_observe::ComponentStatus::Unhealthy,
+                        Some(
+                            "replica shard quarantined after long absence; holding \
+                             authentication until the first complete anti-entropy round"
+                                .to_string(),
+                        ),
+                    ),
+                    Some(_) => (sbproxy_observe::ComponentStatus::Healthy, None),
+                },
+            )));
+
         let admin_state = std::sync::Arc::new(admin_state_inner);
         // WOR-1718: install the global handle so the pipeline's logging
         // hook can feed the request-log ring buffer + SSE tail.
@@ -1490,25 +2213,10 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
         });
     }
 
-    // Register ACME challenge store and Alt-Svc header globally.
+    // Register the ACME challenge store globally.
     if let Some(ref tls) = tls_state {
         reload::set_challenge_store(std::sync::Arc::clone(&tls.challenge_store));
     }
-    // HTTP/3 (QUIC) is temporarily disabled, so we do not advertise it via
-    // Alt-Svc. The listener below is a standalone quinn/h3 stack that is not
-    // integrated with the Pingora request pipeline; advertising HTTP/3 would
-    // steer clients onto a transport that does not honor the full proxy
-    // feature set. Restore this block once Pingora ships native HTTP/3.
-    //
-    // if server_config.http3.as_ref().is_some_and(|h| h.enabled) {
-    //     if let Some(https_port) = server_config.https_bind_port {
-    //         reload::set_alt_svc(sbproxy_tls::alt_svc::h3_alt_svc_value(https_port));
-    //         tracing::info!(
-    //             "Alt-Svc header will advertise HTTP/3 on port {}",
-    //             https_port
-    //         );
-    //     }
-    // }
 
     // Start ACME renewal task if enabled.
     if let Some(ref tls) = tls_state {
@@ -1521,41 +2229,6 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
         tls.start_ocsp_refresh_task();
     }
 
-    // HTTP/3 (QUIC) support is temporarily disabled until native HTTP/3 lands
-    // in Pingora. The listener is a standalone quinn/h3 stack wired outside
-    // the Pingora pipeline, so enabling it would expose a transport path that
-    // does not run the full request chain. The `http3` config field stays
-    // parseable but is ignored; operators who set it get a warning so the
-    // behavior is visible. The original wiring is preserved below for the
-    // eventual cutover.
-    if server_config.http3.as_ref().is_some_and(|h| h.enabled) {
-        tracing::warn!(
-            "HTTP/3 (QUIC) is configured but not available in this build; the \
-             setting is ignored. HTTP/3 will return once native support lands \
-             in the proxy engine."
-        );
-    }
-    // if let Some(ref tls) = tls_state {
-    //     if server_config.http3.as_ref().is_some_and(|h| h.enabled) {
-    //         // Wire the real pipeline dispatch into the H3 listener.
-    //         let dispatch_fn: sbproxy_tls::h3_listener::DispatchFn =
-    //             std::sync::Arc::new(|method, uri, headers, body, client_ip| {
-    //                 Box::pin(crate::dispatch::dispatch_h3_request(
-    //                     method, uri, headers, body, client_ip,
-    //                 ))
-    //             });
-    //         match tls.start_h3_listener(&server_config, dispatch_fn) {
-    //             Ok(Some(_handle)) => {
-    //                 tracing::info!("HTTP/3 listener started");
-    //             }
-    //             Ok(None) => {}
-    //             Err(e) => {
-    //                 tracing::warn!(error = %e, "failed to start HTTP/3 listener, continuing without it");
-    //             }
-    //         }
-    //     }
-    // }
-
     server.bootstrap();
 
     // WOR-636: subscribe to Pingora's execution-phase broadcast
@@ -1565,13 +2238,30 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // the shutdown visible to operator-facing logs.
     spawn_shutdown_phase_logger(server.watch_execution_phase(), grace_seconds);
 
+    // Alerting: build a dispatcher from proxy.alerting.channels (installed
+    // pre-resolved by the binary) and run the evaluation loop, draining
+    // in-flight deliveries on the same execution-phase broadcast. A no-op when
+    // no channels are configured.
+    crate::alerting::install(
+        server.watch_execution_phase(),
+        tls_state
+            .as_ref()
+            .and_then(sbproxy_tls::TlsState::acme_expiry_reader),
+    );
+
     // `run_forever()` calls `std::process::exit(0)` after Pingora drains,
     // which skips Rust destructors and used to orphan managed engine
     // subprocesses. `run()` returns after the same signal-driven lifecycle,
     // allowing the model-runtime guard below to stop every engine first.
     server.run(pingora_core::server::RunArgs::default());
+    drop(listener_runtime);
     drop(_model_plane_shutdown);
     drop(_model_runtime_shutdown);
+    // Flush any spans still queued in the batch span processor; export
+    // runs on its own background worker that Pingora's shutdown does
+    // not wait on, so spans in flight at the signal were silently
+    // dropped without this.
+    sbproxy_observe::telemetry::shutdown_otlp_pipeline();
     Ok(())
 }
 
@@ -2164,6 +2854,18 @@ fn install_op_redact_state(compiled: &sbproxy_config::CompiledConfig) {
         tenant_pii,
         origin_pii,
     });
+
+    // Teach every redaction path which primary headers can carry inbound
+    // credentials. This union covers minted/configured carriers and native
+    // provider-hint carriers; match-only `also_header` values are excluded.
+    let credential_carriers = compiled
+        .server
+        .key_management
+        .as_ref()
+        .map(|km| km.inbound.credential_carrier_names())
+        .unwrap_or_default();
+    sbproxy_observe::logging::set_swept_header_names(credential_carriers.clone());
+    sbproxy_config::types::set_extra_sensitive_headers(credential_carriers);
 }
 
 /// Compose a child scope's `(enabled, rules)` from the parent's
@@ -2263,6 +2965,60 @@ fn build_pii_from_rule_names(
 /// Per-tenant and per-origin sink scopes land alongside the
 /// WOR-1051 credentials epic; this helper covers only the proxy scope
 /// today.
+/// Build the prompt-persistence sealer from `admin.prompt_persistence_encryption`.
+///
+/// Returns `Ok(None)` when the block is absent or disabled, which keeps records
+/// as plaintext JSON and matches the behaviour before this existed.
+///
+/// Every failure is fatal by design. `enabled: true` with no key, an
+/// unresolvable reference, and material under the minimum length all abort
+/// startup rather than falling back to plaintext. An operator who asked for
+/// encryption and did not get it must not learn that from a file they read
+/// months later.
+fn build_prompt_sealer(
+    admin: Option<&sbproxy_config::AdminConfig>,
+) -> anyhow::Result<Option<std::sync::Arc<crate::admin::PromptSealer>>> {
+    use anyhow::Context as _;
+
+    let Some(enc) = admin
+        .and_then(|a| a.prompt_persistence_encryption.as_ref())
+        .filter(|enc| enc.enabled)
+    else {
+        return Ok(None);
+    };
+
+    let reference = enc.key.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "admin.prompt_persistence_encryption.enabled is true but no `key` is set; point \
+             `key` at a secret reference such as `secret://local/prompt-persistence` or set \
+             `enabled: false`"
+        )
+    })?;
+
+    let resolve = |reference: &str| {
+        crate::pipeline::resolve_at_rest_key_material(
+            reference,
+            "admin.prompt_persistence_encryption",
+        )
+    };
+    let active = resolve(reference).context("admin.prompt_persistence_encryption.key")?;
+    let mut previous = Vec::with_capacity(enc.previous_keys.len());
+    for (index, reference) in enc.previous_keys.iter().enumerate() {
+        previous.push(resolve(reference).with_context(|| {
+            format!("admin.prompt_persistence_encryption.previous_keys[{index}]")
+        })?);
+    }
+
+    let sealer = crate::admin::prompt_key_ring(active, previous)
+        .context("admin.prompt_persistence_encryption")?;
+    tracing::info!(
+        key_id = %sealer.active_key_id(),
+        retired_keys = enc.previous_keys.len(),
+        "prompt persistence will seal records at rest"
+    );
+    Ok(Some(std::sync::Arc::new(sealer)))
+}
+
 fn validate_sinks_config(server: &sbproxy_config::ProxyServerConfig) {
     let sinks = match server
         .observability
@@ -2330,6 +3086,11 @@ fn validate_sinks_config(server: &sbproxy_config::ProxyServerConfig) {
 /// snapshot so `current_sink_dispatcher()` returns `None`; the
 /// `emit()` path then falls back to the legacy single `tracing::*!`
 /// subscriber and stdout behaviour is preserved.
+///
+/// Returns whether the dispatcher was installed. `false` means the
+/// dispatcher lock was poisoned and telemetry export is unavailable;
+/// the reload path records that as a degraded subsystem rather than
+/// failing the reload.
 /// WOR-1875: open the durable usage-rollup store and install the
 /// process-global writer. Default-on: an absent config block means
 /// the defaults apply. Idempotent (the writer slot is set-once), so
@@ -2379,7 +3140,7 @@ fn install_usage_rollups_from_config(compiled: &sbproxy_config::CompiledConfig) 
     }
 }
 
-fn install_sink_dispatcher_from_config(compiled: &sbproxy_config::CompiledConfig) {
+fn install_sink_dispatcher_from_config(compiled: &sbproxy_config::CompiledConfig) -> bool {
     use sbproxy_observe::sink_dispatcher::{
         install_sink_dispatcher, CompiledSink, SinkDispatcher, SinkScope,
     };
@@ -2447,7 +3208,8 @@ fn install_sink_dispatcher_from_config(compiled: &sbproxy_config::CompiledConfig
     // WOR-1099: a failed install (poisoned dispatcher lock) leaves the
     // proxy serving traffic with no log/event export. Surface it
     // instead of discarding the result bool.
-    if !install_sink_dispatcher(SinkDispatcher::new(compiled_sinks)) {
+    let installed = install_sink_dispatcher(SinkDispatcher::new(compiled_sinks));
+    if !installed {
         sbproxy_observe::metrics::record_sink_install_failure();
         tracing::error!(
             count,
@@ -2464,6 +3226,7 @@ fn install_sink_dispatcher_from_config(compiled: &sbproxy_config::CompiledConfig
             "WOR-1045 PR2: no sinks declared; emit() falls back to the legacy tracing subscriber"
         );
     }
+    installed
 }
 
 /// Compile a single declared sink. Returns `None` when the YAML
@@ -2626,21 +3389,197 @@ mod tests {
     use super::*;
 
     #[test]
-    fn startup_rejects_strict_governance_without_a_shared_backend() {
-        let mut server = sbproxy_config::ProxyServerConfig::default();
-        server.key_management = Some(sbproxy_config::types::KeyManagementConfig {
-            governance: sbproxy_config::types::GovernanceConfig {
-                consistency: sbproxy_config::types::GovernanceConsistency::Strict,
-                backend: None,
-                ..Default::default()
-            },
-            ..Default::default()
-        });
+    fn pipeline_lifecycle_hook_has_product_neutral_identifiers() {
+        let subsystem = DegradedSubsystem::PipelineLifecycleHook;
 
-        let error = install_startup_key_plane(&server).expect_err("startup must fail closed");
-        let message = format!("{error:#}");
-        assert!(message.contains("failed to install dynamic key plane"));
-        assert!(message.contains("strict consistency requires a Redis backend"));
+        assert_eq!(subsystem.as_str(), "pipeline_lifecycle_hook");
+        assert_eq!(subsystem.to_string(), "pipeline lifecycle hook");
+    }
+
+    #[test]
+    fn safety_centroid_preflight_rejects_mismatched_model_before_publication() {
+        super::ai_classifier::install_classifier_factory();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let model = dir.path().join("model.onnx");
+        let tokenizer = dir.path().join("tokenizer.json");
+        std::fs::write(&model, b"different model generation").expect("model fixture");
+        std::fs::write(&tokenizer, b"different tokenizer generation").expect("tokenizer fixture");
+        let yaml = format!(
+            r#"
+origins:
+  "ai.test":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: sk-test
+      guardrails:
+        input:
+          - type: jailbreak
+            mode: classifier
+            classifier:
+              backend:
+                kind: embedding
+                model_path: "{}"
+                tokenizer_path: "{}"
+"#,
+            model.display(),
+            tokenizer.display()
+        );
+        let compiled = sbproxy_config::compile_config(&yaml).expect("structurally valid config");
+        let pipeline =
+            CompiledPipeline::from_config(compiled).expect("action construction stays structural");
+
+        let error = preflight_default_safety_centroids(&pipeline)
+            .expect_err("mismatched default-centroid model must reject startup")
+            .to_string();
+
+        assert!(
+            error.contains("startup preflight"),
+            "unexpected error: {error}"
+        );
+        #[cfg(feature = "inprocess-classify")]
+        assert!(error.contains("model pin"), "unexpected error: {error}");
+        #[cfg(not(feature = "inprocess-classify"))]
+        assert!(
+            error.contains("without the `inprocess-classify` feature"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn safety_centroid_preflight_covers_live_forward_rule_ai_actions() {
+        super::ai_classifier::install_classifier_factory();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let model = dir.path().join("model.onnx");
+        let tokenizer = dir.path().join("tokenizer.json");
+        std::fs::write(&model, b"different model generation").expect("model fixture");
+        std::fs::write(&tokenizer, b"different tokenizer generation").expect("tokenizer fixture");
+        let yaml = format!(
+            r#"
+origins:
+  "front.test":
+    action:
+      type: static
+      status: 200
+      text_body: ok
+    forward_rules:
+      - rules:
+          - path:
+              prefix: /ai/
+        origin:
+          id: inline-ai
+          action:
+            type: ai_proxy
+            providers:
+              - name: openai
+                api_key: sk-test
+            guardrails:
+              input:
+                - type: jailbreak
+                  mode: classifier
+                  classifier:
+                    backend:
+                      kind: embedding
+                      model_path: "{}"
+                      tokenizer_path: "{}"
+"#,
+            model.display(),
+            tokenizer.display()
+        );
+        let compiled = sbproxy_config::compile_config(&yaml).expect("structurally valid config");
+        let pipeline =
+            CompiledPipeline::from_config(compiled).expect("forward action construction");
+
+        let error = preflight_default_safety_centroids(&pipeline)
+            .expect_err("forward-rule AI safety artifacts must be verified before publication")
+            .to_string();
+        assert!(
+            error.contains("startup preflight"),
+            "unexpected error: {error}"
+        );
+        #[cfg(feature = "inprocess-classify")]
+        assert!(error.contains("model pin"), "unexpected error: {error}");
+        #[cfg(not(feature = "inprocess-classify"))]
+        assert!(
+            error.contains("without the `inprocess-classify` feature"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn real_reload_seeds_replaces_clears_and_preserves_flags_on_rejection() {
+        let _guard = crate::reload::FEATURE_FLAG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = sbproxy_extension::flags::global_store();
+        let engine = sbproxy_extension::cel::CelEngine::new();
+        let context = sbproxy_extension::cel::CelContext::new();
+
+        reload_from_config_yaml(
+            "sb.yml",
+            r#"
+flags:
+  - name: new-auth-path
+    default: false
+    rules:
+      allow_list: [alice]
+"#,
+        )
+        .expect("initial flag config should reload");
+        assert!(engine
+            .eval_bool_source(r#"flag_enabled("new-auth-path", "alice")"#, &context)
+            .expect("CEL should evaluate"));
+        assert!(!engine
+            .eval_bool_source(r#"flag_enabled("new-auth-path", "mallory")"#, &context)
+            .expect("CEL should evaluate"));
+
+        reload_from_config_yaml(
+            "sb.yml",
+            r#"
+flags:
+  - name: replacement
+    default: true
+"#,
+        )
+        .expect("replacement flag config should reload");
+        assert!(!engine
+            .eval_bool_source(r#"flag_enabled("new-auth-path", "alice")"#, &context)
+            .expect("old flag should be absent after replacement"));
+        assert!(engine
+            .eval_bool_source(r#"flag_enabled("replacement", "any-key")"#, &context)
+            .expect("replacement flag should evaluate"));
+
+        let rejected = reload_from_config_yaml(
+            "sb.yml",
+            r#"
+flags:
+  - name: must-not-publish
+    default: true
+origins:
+  "invalid.example":
+    action:
+      type: action-that-does-not-exist
+"#,
+        );
+        assert!(
+            rejected.is_err(),
+            "pipeline construction must reject the invalid action"
+        );
+        assert!(engine
+            .eval_bool_source(r#"flag_enabled("replacement", "any-key")"#, &context)
+            .expect("prior flag should survive a rejected reload"));
+        assert!(!engine
+            .eval_bool_source(r#"flag_enabled("must-not-publish", "any-key")"#, &context)
+            .expect("rejected candidate must not publish flags"));
+
+        reload_from_config_yaml("sb.yml", "proxy: {}\n")
+            .expect("config without flags should reload");
+        assert!(!engine
+            .eval_bool_source(r#"flag_enabled("replacement", "any-key")"#, &context)
+            .expect("an absent block should clear flags"));
+
+        sbproxy_extension::flags::set_global_store(previous);
     }
 
     #[test]
@@ -2781,6 +3720,7 @@ mod tests {
             agents_json: None,
             outbound_credential: None,
             outbound_web_bot_auth: false,
+            attestation: None,
             observability: Some(OriginObservabilityConfig {
                 log: OriginObservabilityLogConfig {
                     sinks: Vec::new(),
@@ -2811,6 +3751,7 @@ mod tests {
             rate_limits: None,
             audit: None,
             session_ledger: None,
+            flags: Vec::new(),
         };
 
         install_op_redact_state(&compiled);
@@ -2872,5 +3813,271 @@ mod tests {
         sbproxy_observe::logging::install_op_redact_config(
             sbproxy_observe::logging::OpRedactState::empty(),
         );
+    }
+
+    // --- resolve_or_default_admin_operator_pepper ---
+
+    fn bad_pepper_key_management() -> sbproxy_config::types::KeyManagementConfig {
+        sbproxy_config::types::KeyManagementConfig {
+            crypto: sbproxy_config::types::KeyCryptoConfig {
+                pepper: Some(
+                    "env:SBPROXY_TEST_LIFECYCLE_PEPPER_DOES_NOT_EXIST_ANYWHERE".to_string(),
+                ),
+                master_key: None,
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn admin_operator_pepper_falls_back_and_warns_when_no_operators_need_it() {
+        let cfg = bad_pepper_key_management();
+        let pepper = resolve_or_default_admin_operator_pepper(Some(&cfg), false)
+            .expect("an unresolvable pepper must not fail boot with no operators configured");
+        assert_eq!(pepper, crate::key_plane::default_admin_operator_pepper());
+    }
+
+    #[test]
+    fn admin_operator_pepper_fails_loud_when_operators_are_configured() {
+        let cfg = bad_pepper_key_management();
+        let error = resolve_or_default_admin_operator_pepper(Some(&cfg), true)
+            .expect_err("an unresolvable pepper must fail boot when operators depend on it");
+        assert!(
+            error.to_string().contains("proxy.admin.operators"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn admin_operator_pepper_resolves_with_no_key_management_regardless_of_operators() {
+        assert_eq!(
+            resolve_or_default_admin_operator_pepper(None, false).unwrap(),
+            crate::key_plane::default_admin_operator_pepper()
+        );
+        assert_eq!(
+            resolve_or_default_admin_operator_pepper(None, true).unwrap(),
+            crate::key_plane::default_admin_operator_pepper()
+        );
+    }
+
+    #[test]
+    fn admin_operator_pepper_prefers_a_pinned_value_when_operators_are_configured() {
+        let cfg = sbproxy_config::types::KeyManagementConfig {
+            crypto: sbproxy_config::types::KeyCryptoConfig {
+                pepper: Some("pinned-pepper".to_string()),
+                master_key: None,
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_or_default_admin_operator_pepper(Some(&cfg), true).unwrap(),
+            b"pinned-pepper".to_vec()
+        );
+    }
+}
+
+/// Refuse a pipeline whose caches write plaintext somewhere durable.
+///
+/// Runs after the lifecycle hook has installed its backends, because
+/// that is the only point at which the full set of cache surfaces is
+/// known. The in-tree defaults are all memory-only, so this is a no-op
+/// for every OSS build; it exists so that the day a persistent or
+/// replicated backend is wired in, an operator hears about it at boot
+/// instead of finding prompts on disk later.
+///
+/// # Why the response cache is not covered here
+///
+/// The response cache is checked, but only to warn. Running it
+/// unencrypted over a file or Redis backend is a shipped, documented,
+/// deliberately-chosen configuration that predates this check, and
+/// turning it fatal would break working deployments on upgrade for no
+/// new information: the operator already knows, because they wrote the
+/// backend and left `encryption.enabled` off. An operator who wants it
+/// fatal turns encryption on, which is the same edit either way.
+///
+/// The pluggable surfaces are different. None of them has ever had a
+/// non-ephemeral backend in this repository, so nothing can break, and
+/// the whole point is that the exposure must not be able to appear
+/// silently.
+///
+/// # Why the distributed semantic cache warns rather than aborts
+///
+/// WOR-2099 gave the semantic cache Redis and mesh backends, so for the
+/// first time a semantic cache can outlive the process on purpose. That
+/// moves it into the same category as the response cache above: an
+/// operator who writes `backend: redis` chose a shared store knowingly,
+/// and aborting their boot on upgrade would break a documented feature
+/// rather than tell them something new. The values are prompts and model
+/// output, so the exposure still gets said out loud, once per backend.
+///
+/// This is deliberately not silent. The check that used to cover the
+/// semantic cache read it through a hook that WOR-2099 deleted, and
+/// leaving it at that would have turned a boot guard into a no-op in the
+/// same change that introduced the backends it was written to catch.
+fn enforce_cache_at_rest_posture(
+    pipeline: &crate::pipeline::CompiledPipeline,
+) -> anyhow::Result<()> {
+    let mut exposed = Vec::new();
+    for (name, posture) in pipeline.hooks.cache_surfaces() {
+        if posture.stores_plaintext_at_rest() {
+            exposed.push(format!(
+                "{name} (backend is {}, entries are not encrypted)",
+                posture.durability.as_str()
+            ));
+        }
+    }
+    if !exposed.is_empty() {
+        anyhow::bail!(
+            "these caches would store plaintext outside this process: {}. A cache whose \
+             backend survives a restart or is shared across replicas must encrypt what it \
+             writes. Configure encryption for the backend, or run it in memory.",
+            exposed.join("; ")
+        );
+    }
+
+    if let Some(store) = pipeline.cache_store.as_ref() {
+        let posture = store.at_rest_posture();
+        if posture.stores_plaintext_at_rest() {
+            tracing::warn!(
+                backend = store.backend_name(),
+                durability = posture.durability.as_str(),
+                "the response cache is storing response headers and bodies unencrypted on a \
+                 backend that outlives this process; set \
+                 proxy.response_cache_store.encryption.enabled to seal them"
+            );
+        }
+    }
+
+    warn_on_distributed_semantic_backends(pipeline);
+    Ok(())
+}
+
+/// Say once per distributed backend that the semantic cache is putting
+/// prompts and model output somewhere this process does not own.
+///
+/// Grouped by backend rather than by slot: an operator with forty origins
+/// on one Redis has one fact to learn, not forty. Memory never warns,
+/// because it dies with the process.
+fn warn_on_distributed_semantic_backends(pipeline: &crate::pipeline::CompiledPipeline) {
+    use sbproxy_ai::semantic_cache::SemanticCacheBackend;
+
+    let mut redis = 0_usize;
+    let mut mesh = 0_usize;
+    for registration in pipeline.semantic_caches.registrations() {
+        if registration.cache.is_none() {
+            continue;
+        }
+        match registration.backend {
+            Some(SemanticCacheBackend::Redis) => redis += 1,
+            Some(SemanticCacheBackend::Mesh) => mesh += 1,
+            Some(SemanticCacheBackend::Memory) | None => {}
+        }
+    }
+    for (backend, durability, routes) in
+        [("redis", "persistent", redis), ("mesh", "replicated", mesh)]
+    {
+        if routes > 0 {
+            tracing::warn!(
+                backend,
+                durability,
+                routes,
+                "the semantic cache is storing prompts and model output unencrypted on a \
+                 backend that outlives this process; treat it as sensitive operator data and \
+                 secure the backend transport and storage"
+            );
+        }
+    }
+}
+#[cfg(test)]
+mod at_rest_posture_tests {
+    use super::*;
+    use sbproxy_cache::{AtRestPosture, CacheDurability};
+    use std::sync::Arc;
+
+    /// A pluggable cache surface reporting whatever posture the test asks
+    /// for. WOR-2099 deleted the semantic lookup hook, so nothing in tree
+    /// registers a surface today; this keeps the fatal branch covered so a
+    /// future surface with a durable backend still cannot land quietly.
+    fn pipeline_with_surface(
+        name: &'static str,
+        posture: AtRestPosture,
+    ) -> crate::pipeline::CompiledPipeline {
+        let mut hooks = crate::hooks::Hooks::default();
+        hooks.test_cache_surfaces.push((name, posture));
+        crate::pipeline::CompiledPipeline {
+            hooks,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_pipeline_with_no_cache_surfaces_passes() {
+        assert!(
+            enforce_cache_at_rest_posture(&crate::pipeline::CompiledPipeline::default()).is_ok()
+        );
+    }
+
+    #[test]
+    fn the_default_memory_only_posture_passes() {
+        // Every in-tree implementation inherits this, so the check must be
+        // a no-op for an OSS build.
+        let pipeline = pipeline_with_surface("test surface", AtRestPosture::memory_only());
+        assert!(enforce_cache_at_rest_posture(&pipeline).is_ok());
+    }
+
+    #[test]
+    fn a_persistent_unencrypted_surface_aborts_boot() {
+        // The whole point of the guard: a backend swap that starts writing
+        // prompts to disk must not go unnoticed.
+        let pipeline = pipeline_with_surface(
+            "test surface",
+            AtRestPosture::new(CacheDurability::Persistent, false),
+        );
+        let err = enforce_cache_at_rest_posture(&pipeline)
+            .expect_err("an unencrypted persistent cache must fail loud");
+        let message = err.to_string();
+        assert!(message.contains("test surface"), "{message}");
+        assert!(message.contains("persistent"), "{message}");
+    }
+
+    #[test]
+    fn a_replicated_unencrypted_surface_aborts_boot() {
+        let pipeline = pipeline_with_surface(
+            "test surface",
+            AtRestPosture::new(CacheDurability::Replicated, false),
+        );
+        let err = enforce_cache_at_rest_posture(&pipeline)
+            .expect_err("an unencrypted replicated cache must fail loud");
+        assert!(err.to_string().contains("replicated"), "{err}");
+    }
+
+    #[test]
+    fn a_persistent_encrypted_surface_passes() {
+        // Encryption is the fix the error message asks for, so applying it
+        // has to actually clear the check.
+        let pipeline = pipeline_with_surface(
+            "test surface",
+            AtRestPosture::new(CacheDurability::Persistent, true),
+        );
+        assert!(enforce_cache_at_rest_posture(&pipeline).is_ok());
+    }
+
+    #[test]
+    fn an_in_memory_response_cache_is_not_flagged() {
+        let pipeline = crate::pipeline::CompiledPipeline {
+            cache_store: Some(Arc::new(sbproxy_cache::MemoryCacheStore::new(10))),
+            ..Default::default()
+        };
+        assert!(enforce_cache_at_rest_posture(&pipeline).is_ok());
+    }
+
+    #[test]
+    fn an_empty_semantic_registry_warns_about_nothing() {
+        // A default pipeline has no semantic registrations, so the
+        // distributed warning path must be a no-op rather than panicking on
+        // an empty registry.
+        let pipeline = crate::pipeline::CompiledPipeline::default();
+        warn_on_distributed_semantic_backends(&pipeline);
+        assert_eq!(pipeline.semantic_caches.registrations().count(), 0);
     }
 }

@@ -1,0 +1,83 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Per-tenant encryption keys over one shared response cache.
+#
+# One store serves every origin. By default one key seals every origin's
+# entries too, so the only thing separating two tenants in the cache is
+# the cache key. Give each origin its own key and a leaked key opens one
+# tenant's entries instead of all of them.
+#
+# Cross-tenant isolation does not depend on that choice. The origin is
+# authenticated into every entry either way, so an entry sealed for
+# tenant A fails to open when read as tenant B even when both inherit the
+# store-wide key. Separate keys add key separation on top of that.
+#
+# Setup:
+#   for t in store a b; do
+#     head -c 32 /dev/urandom | base64 > /tmp/sbproxy-cache-$t.key
+#     chmod 600 /tmp/sbproxy-cache-$t.key
+#   done
+#   make run CONFIG=examples/response-cache-per-origin-keys/sb.yml
+#
+# Test:
+#   # Each tenant caches independently.
+#   curl -s -D - -o /dev/null -H 'Host: tenant-a.local' \
+#     http://127.0.0.1:8080/get | grep -i x-sbproxy-cache
+#   curl -s -D - -o /dev/null -H 'Host: tenant-a.local' \
+#     http://127.0.0.1:8080/get | grep -i x-sbproxy-cache
+#   # Nothing on disk carries a response header or body.
+#   grep -rc 'content-type' /tmp/sbproxy-per-origin-cache/
+
+proxy:
+  http_bind_port: 8080
+
+  response_cache_store:
+    backend:
+      type: file
+      path: /tmp/sbproxy-per-origin-cache
+    encryption:
+      enabled: true
+      # Inherited by any caching origin that declares no key of its own.
+      key: "file:/tmp/sbproxy-cache-store.key"
+      # `inherit` is the default and is what every config written before
+      # per-origin keys existed gets. Switch to `required` and startup
+      # fails, naming every caching origin that has no key, which is what
+      # a deployment that must not share key material between tenants
+      # wants.
+      per_origin_keys: inherit
+
+origins:
+  # Holds its own key. Rotating it does not touch any other origin.
+  "tenant-a.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    response_cache:
+      enabled: true
+      ttl_secs: 60
+      encryption:
+        key: "file:/tmp/sbproxy-cache-a.key"
+        # After rotating tenant A, the retired reference moves here so
+        # entries sealed under it keep opening until they are rewritten.
+        # previous_keys:
+        #   - "file:/tmp/sbproxy-cache-a.key.old"
+
+  # Also holds its own key, unrelated to tenant A's.
+  "tenant-b.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    response_cache:
+      enabled: true
+      ttl_secs: 60
+      encryption:
+        key: "file:/tmp/sbproxy-cache-b.key"
+
+  # Declares no key, so it uses the store-wide one. Its entries are
+  # still bound to this origin and cannot be opened as tenant A or B.
+  "shared.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    response_cache:
+      enabled: true
+      ttl_secs: 60

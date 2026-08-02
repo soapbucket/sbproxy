@@ -1,0 +1,171 @@
+{
+  "schema_version": 4,
+  "profile": "query-select-smoke-v1",
+  "pipeline": [
+    {
+      "type": "query_select",
+      "max_sentences": 4
+    },
+    {
+      "type": "window_fit",
+      "completion_reserve_tokens": 8000,
+      "input_budget_tokens": 192
+    }
+  ],
+  "token_counter": "sbproxy_target_model",
+  "latency_mode": "omitted_for_deterministic_gate",
+  "verified_provenance": {
+    "manifest_sha256": "a9a08b96937b1f7b022d69806bf9b5a0ccbc18a036c7c3ffe225f8db30702542",
+    "artifacts": [
+      {
+        "path": "fixtures/query-select-smoke.jsonl",
+        "corpus": "query_select_smoke",
+        "provenance": "independently_authored_sanitized_shape",
+        "license": "Apache-2.0",
+        "contains_customer_data": false,
+        "official_benchmark_score": false,
+        "sha256": "13807fd82f05ee93912eaadb12e53540666dc0f39071bee296bc70c2237877a6"
+      }
+    ]
+  },
+  "cases": [
+    {
+      "id": "query_select_missing_query_fallback",
+      "corpus": "query_select_smoke",
+      "target_model": "gpt-4",
+      "quality_metric": "evidence_retention",
+      "off": {
+        "input_tokens": 364,
+        "output_tokens": 364,
+        "quality_score": 1.0
+      },
+      "on": {
+        "input_tokens": 364,
+        "output_tokens": 39,
+        "quality_score": 1.0
+      },
+      "tokens_saved": 325,
+      "savings_ratio": 0.892857,
+      "quality_delta": 0.0,
+      "levers": [
+        {
+          "lever": "query_select",
+          "outcome": "skipped",
+          "reason": "missing_query",
+          "before_tokens": 364,
+          "after_tokens": 364,
+          "tokens_saved": 0
+        },
+        {
+          "lever": "window_fit",
+          "outcome": "applied",
+          "reason": null,
+          "before_tokens": 364,
+          "after_tokens": 39,
+          "tokens_saved": 325
+        }
+      ],
+      "acceptance": {
+        "min_savings_ratio": 0.4,
+        "min_on_quality_score": 1.0,
+        "min_quality_delta": 0.0,
+        "require_non_expanding": true
+      },
+      "acceptance_passed": true,
+      "added_compression_latency_micros": null,
+      "outcome": "applied",
+      "reason": null
+    },
+    {
+      "id": "query_select_multi_document_qa",
+      "corpus": "query_select_smoke",
+      "target_model": "gpt-4",
+      "quality_metric": "evidence_retention",
+      "off": {
+        "input_tokens": 484,
+        "output_tokens": 484,
+        "quality_score": 1.0
+      },
+      "on": {
+        "input_tokens": 484,
+        "output_tokens": 214,
+        "quality_score": 1.0
+      },
+      "tokens_saved": 270,
+      "savings_ratio": 0.557851,
+      "quality_delta": 0.0,
+      "levers": [
+        {
+          "lever": "query_select",
+          "outcome": "applied",
+          "reason": null,
+          "before_tokens": 484,
+          "after_tokens": 214,
+          "tokens_saved": 270
+        },
+        {
+          "lever": "window_fit",
+          "outcome": "skipped",
+          "reason": "not_eligible",
+          "before_tokens": 214,
+          "after_tokens": 214,
+          "tokens_saved": 0
+        }
+      ],
+      "acceptance": {
+        "min_savings_ratio": 0.4,
+        "min_on_quality_score": 1.0,
+        "min_quality_delta": 0.0,
+        "require_non_expanding": true
+      },
+      "acceptance_passed": true,
+      "added_compression_latency_micros": null,
+      "outcome": "applied",
+      "reason": null
+    }
+  ],
+  "corpora": {
+    "query_select_smoke": {
+      "case_count": 2,
+      "input_tokens": 848,
+      "output_tokens": 253,
+      "tokens_saved": 595,
+      "savings_ratio": 0.701651,
+      "off_quality_score": 1.0,
+      "on_quality_score": 1.0,
+      "quality_delta": 0.0,
+      "added_compression_latency_micros": null,
+      "applied_count": 2,
+      "skipped_count": 0,
+      "fallback_count": 0,
+      "skip_rate": 0.0,
+      "outcomes": {
+        "applied": 2
+      },
+      "reasons": {},
+      "acceptance_passed": true,
+      "recommendation": "build"
+    }
+  },
+  "overall": {
+    "case_count": 2,
+    "input_tokens": 848,
+    "output_tokens": 253,
+    "tokens_saved": 595,
+    "savings_ratio": 0.701651,
+    "off_quality_score": 1.0,
+    "on_quality_score": 1.0,
+    "quality_delta": 0.0,
+    "added_compression_latency_micros": null,
+    "applied_count": 2,
+    "skipped_count": 0,
+    "fallback_count": 0,
+    "skip_rate": 0.0,
+    "outcomes": {
+      "applied": 2
+    },
+    "reasons": {},
+    "acceptance_passed": true,
+    "recommendation": "build"
+  }
+}

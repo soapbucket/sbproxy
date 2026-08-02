@@ -90,6 +90,10 @@ pub fn parse(body: &[u8], caller_agent_id: &str) -> Option<A2AContext> {
         chain_depth,
         chain,
         raw_envelope_version: "anthropic-v0".to_string(),
+        // Body-parsed fields are no more trustworthy than the
+        // headers that framed the request; the request filter sets
+        // this from the peer trust decision.
+        identity_verified: false,
     })
 }
 

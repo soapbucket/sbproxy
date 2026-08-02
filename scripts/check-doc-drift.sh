@@ -5,7 +5,7 @@
 # Guard against regression of provider-count, routing-strategy, and
 # unimplemented-feature claims in user-facing docs. Code reality:
 #
-#   - crates/sbproxy-ai/data/ai_providers.yml has 66 entries.
+#   - crates/sbproxy-ai/data/ai_providers.yml has 72 entries.
 #   - crates/sbproxy-ai/src/routing.rs defines 15 routing strategies
 #     (RoundRobin, Weighted, FallbackChain, Random, LowestLatency,
 #     LeastConnections, CostOptimized, TokenRate, LeastTokenUsage,
@@ -81,6 +81,133 @@ for needle in "${STALE_STRINGS[@]}"; do
     fi
   done
 done
+
+# Release-platform behavior. This reads the build matrix rather than matching
+# prose, so a newly added or removed artifact forces an installation-doc review.
+release_workflow="$ROOT_DIR/.github/workflows/release.yml"
+expected_platforms=$(printf '%s\n' darwin_arm64 linux_amd64 linux_arm64)
+actual_platforms=$(
+  sed -n '/^[[:space:]]*matrix:/,/^[[:space:]]*steps:/p' "$release_workflow" |
+    sed -n 's/^[[:space:]]*platform:[[:space:]]*//p' |
+    sort
+)
+if [ "$actual_platforms" != "$expected_platforms" ]; then
+  echo "release platform set changed; review installation documentation" >&2
+  echo "  expected:" >&2
+  echo "$expected_platforms" | sed 's/^/    /' >&2
+  echo "  actual:" >&2
+  echo "$actual_platforms" | sed 's/^/    /' >&2
+  rc=1
+fi
+
+# The public images are assembled dynamically by the release workflow. They
+# set only the binary entrypoint; operators must supply `serve -f ...`.
+release_dockerfile=$(
+  sed -n \
+    '/cat > docker-ctx\/Dockerfile <<'\''EOF'\''/,/^[[:space:]]*EOF$/p' \
+    "$release_workflow"
+)
+if ! printf '%s\n' "$release_dockerfile" |
+     grep -Fq 'ENTRYPOINT ["/usr/local/bin/sbproxy"]'; then
+  echo "published image entrypoint changed; review Docker documentation" >&2
+  rc=1
+fi
+if printf '%s\n' "$release_dockerfile" | grep -Eq '^[[:space:]]*CMD[[:space:]]'; then
+  echo "published image now has a default command; review Docker documentation" >&2
+  rc=1
+fi
+
+# The generated schema covers the typed envelope but intentionally leaves
+# module payloads and most objects open. Test the artifact's behavior directly.
+schema="${SBPROXY_DOC_DRIFT_SCHEMA:-$ROOT_DIR/schemas/sb-config.schema.json}"
+if ! python3 - "$schema" <<'PY'
+import json
+import sys
+
+problems = []
+
+
+def require(condition, message):
+    if not condition:
+        problems.append(message)
+
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        document = json.load(handle)
+    definitions = document["definitions"]
+    origin = definitions["RawOriginConfig"]
+    proxy = definitions["ProxyServerConfig"]
+    origin_properties = origin["properties"]
+    proxy_properties = proxy["properties"]
+except (OSError, json.JSONDecodeError, KeyError, TypeError) as error:
+    print(f"cannot inspect generated schema: {error}", file=sys.stderr)
+    raise SystemExit(1)
+
+opaque_keywords = ("type", "$ref", "oneOf", "anyOf", "allOf", "properties")
+for field in ("action", "authentication"):
+    payload = origin_properties.get(field)
+    require(isinstance(payload, dict), f"origin {field} schema is missing")
+    if isinstance(payload, dict):
+        typed_keywords = [key for key in opaque_keywords if key in payload]
+        require(
+            not typed_keywords,
+            f"origin {field} is no longer opaque; found {', '.join(typed_keywords)}",
+        )
+
+for field in ("policies", "transforms"):
+    payload = origin_properties.get(field)
+    require(isinstance(payload, dict), f"origin {field} schema is missing")
+    if isinstance(payload, dict):
+        require(payload.get("type") == "array", f"origin {field} is not an array")
+        require(
+            payload.get("items") is True,
+            f"origin {field} items are no longer an opaque schema boundary",
+        )
+
+# The root stays open for the v1 flat-file compatibility promise; the
+# proxy and origin envelopes are closed since WOR-1140 so a misspelled
+# key fails config load instead of silently dropping. A schema that
+# reopens one of them is a regression this check now catches.
+require(isinstance(document, dict), "root schema is not an object")
+if isinstance(document, dict):
+    require(
+        document.get("additionalProperties", True) is True,
+        "root schema is no longer open; the v1 flat-file promise needs it",
+    )
+for name, typed_object in (
+    ("proxy", proxy),
+    ("origin", origin),
+):
+    require(isinstance(typed_object, dict), f"{name} schema is not an object")
+    if isinstance(typed_object, dict):
+        require(
+            typed_object.get("additionalProperties", True) is False,
+            f"{name} schema is open again; unknown keys must fail config load (WOR-1140)",
+        )
+
+require(
+    "authentication" in origin_properties and "auth" not in origin_properties,
+    "origin authentication/auth alias boundary changed",
+)
+require(
+    "session" in origin_properties and "session_config" not in origin_properties,
+    "origin session/session_config alias boundary changed",
+)
+require(
+    "l2_cache_settings" in proxy_properties and "l2_cache" not in proxy_properties,
+    "proxy l2_cache_settings/l2_cache alias boundary changed",
+)
+
+if problems:
+    for problem in problems:
+        print(problem, file=sys.stderr)
+    raise SystemExit(1)
+PY
+then
+  echo "generated schema boundaries changed; review JSON Schema documentation" >&2
+  rc=1
+fi
 
 if [ "$rc" -eq 0 ]; then
   echo "doc-drift: ok"

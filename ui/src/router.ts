@@ -1,102 +1,201 @@
-import { createRouter, createWebHistory } from "vue-router";
+import { createMemoryHistory, createRouter, createWebHistory } from "vue-router";
+import { useAuth } from "./composables/useAuth";
 
 const routes = [
   {
     path: "/",
     name: "overview",
     component: () => import("./views/OverviewView.vue"),
-    meta: { title: "Overview" },
+    meta: { title: "Overview", documentation: "admin-ui" },
+  },
+  {
+    path: "/get-started",
+    name: "get-started",
+    component: () => import("./views/GetStartedView.vue"),
+    meta: { title: "Get started", documentation: "quickstart-serve" },
   },
   {
     path: "/keys",
     name: "keys",
     component: () => import("./views/KeysView.vue"),
-    meta: { title: "Keys" },
+    meta: { title: "Keys", documentation: "key-management" },
   },
   {
     path: "/credentials",
     name: "credentials",
     component: () => import("./views/CredentialsView.vue"),
-    meta: { title: "Credentials" },
+    meta: { title: "Credentials", documentation: "admin-ui" },
   },
   {
     path: "/config",
     name: "config",
     component: () => import("./views/ConfigView.vue"),
-    meta: { title: "Config" },
+    meta: { title: "Config", documentation: "configuration" },
   },
   {
     path: "/logs",
     name: "logs",
     component: () => import("./views/LogsView.vue"),
-    meta: { title: "Logs" },
+    meta: { title: "Logs", documentation: "admin-ui" },
+  },
+  {
+    path: "/sessions",
+    name: "sessions",
+    component: () => import("./views/SessionsView.vue"),
+    meta: { title: "Sessions", documentation: "admin-ui" },
+  },
+  {
+    path: "/sessions/:sessionId",
+    name: "session-detail",
+    component: () => import("./views/SessionDetailView.vue"),
+    meta: { title: "Session detail", documentation: "admin-ui" },
   },
   {
     path: "/metrics",
     name: "metrics",
     component: () => import("./views/MetricsView.vue"),
-    meta: { title: "Metrics" },
+    meta: { title: "Metrics", documentation: "observability" },
   },
   {
     path: "/spend",
     name: "spend",
     component: () => import("./views/SpendView.vue"),
-    meta: { title: "Spend" },
+    meta: { title: "Spend", documentation: "ai-usage-ledger" },
+  },
+  {
+    path: "/meter",
+    name: "meter",
+    component: () => import("./views/MeterView.vue"),
+    meta: { title: "Meter", documentation: "ai-usage-ledger" },
   },
   {
     path: "/ai-performance",
     name: "ai-performance",
     component: () => import("./views/AiPerformanceView.vue"),
-    meta: { title: "AI performance" },
+    meta: { title: "AI performance", documentation: "admin-ui" },
   },
   {
     path: "/guardrails",
     name: "guardrails",
     component: () => import("./views/GuardrailsView.vue"),
-    meta: { title: "Guardrails" },
+    meta: { title: "Guardrails", documentation: "guardrails" },
+  },
+  {
+    path: "/alerts",
+    name: "alerts",
+    component: () => import("./views/AlertsView.vue"),
+    meta: { title: "Alerts", documentation: "admin-ui" },
   },
   {
     path: "/prompts",
     name: "prompts",
     component: () => import("./views/PromptsView.vue"),
-    meta: { title: "Prompts" },
+    meta: { title: "Prompts", documentation: "admin-ui" },
   },
   {
     path: "/playground",
     name: "playground",
     component: () => import("./views/PlaygroundView.vue"),
-    meta: { title: "Playground" },
+    meta: { title: "Playground", documentation: "ai-gateway" },
   },
   {
     path: "/cache",
     name: "cache",
     component: () => import("./views/CacheView.vue"),
-    meta: { title: "Cache" },
+    meta: { title: "Cache", documentation: "admin-ui" },
   },
   {
     path: "/model-host",
     name: "model-host",
     component: () => import("./views/ModelHostView.vue"),
-    meta: { title: "Model host" },
+    meta: { title: "Model host", documentation: "model-host" },
+  },
+  {
+    path: "/jobs",
+    name: "jobs",
+    component: () => import("./views/JobsView.vue"),
+    meta: { title: "Jobs", documentation: "model-host" },
+  },
+  {
+    path: "/storage",
+    name: "storage",
+    component: () => import("./views/StorageView.vue"),
+    meta: { title: "Storage", documentation: "admin-ui" },
   },
   {
     path: "/audit",
     name: "audit",
     component: () => import("./views/AuditView.vue"),
-    meta: { title: "Audit" },
+    meta: { title: "Audit", documentation: "audit-log" },
   },
   {
     path: "/cluster",
     name: "cluster",
     component: () => import("./views/ClusterView.vue"),
-    meta: { title: "Cluster" },
+    meta: { title: "Cluster", documentation: "mesh-replication" },
   },
-  { path: "/:pathMatch(.*)*", redirect: "/" },
+  {
+    path: "/compression",
+    name: "compression",
+    component: () => import("./views/CompressionView.vue"),
+    meta: { title: "Compression", documentation: "ai-context-compression" },
+  },
+  {
+    path: "/users",
+    name: "users",
+    component: () => import("./views/UsersView.vue"),
+    meta: { title: "Users", documentation: "admin" },
+  },
+  {
+    path: "/operators",
+    name: "operators",
+    component: () => import("./views/OperatorsView.vue"),
+    meta: { title: "Operators", documentation: "admin" },
+  },
+  {
+    path: "/login",
+    name: "login",
+    component: () => import("./views/LoginView.vue"),
+    meta: { title: "Sign in", public: true, documentation: "admin-ui" },
+  },
+  {
+    path: "/:pathMatch(.*)*",
+    redirect: "/",
+    // Redirect-only records have no view to document, but remain explicit so
+    // the route coverage guard distinguishes them from an omitted mapping.
+    meta: { documentation: null },
+  },
 ];
 
 // History mode with the `/admin/ui/` base. The admin server does SPA
 // fallback to index.html so refreshing a deep link resolves.
 export const router = createRouter({
-  history: createWebHistory("/admin/ui/"),
+  history:
+    import.meta.env.MODE === "test"
+      ? createMemoryHistory("/admin/ui/")
+      : createWebHistory("/admin/ui/"),
   routes,
+});
+
+// Send an unauthenticated visitor to the login route rather than swapping
+// the form in beneath whatever URL they asked for. The destination rides
+// along as `next` so signing in returns them where they were headed, which
+// is what makes a bookmarked deep link survive a session expiry.
+//
+// The guard waits for the initial session check: routing before it settles
+// would bounce an authenticated operator to the login page on every cold
+// load.
+router.beforeEach(async (to) => {
+  const { authenticated, ready, refresh } = useAuth();
+  if (!ready.value) {
+    await refresh();
+  }
+  if (authenticated.value) {
+    // Nothing to sign in to; keep the login route out of the history.
+    return to.name === "login" ? { path: "/" } : true;
+  }
+  if (to.meta.public) {
+    return true;
+  }
+  return { name: "login", query: to.fullPath === "/" ? {} : { next: to.fullPath } };
 });

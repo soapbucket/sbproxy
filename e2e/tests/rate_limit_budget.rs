@@ -92,10 +92,6 @@ origins:
       body: "ok"
     policies:
       - type: rate_limit_budget
-        # Per-(workspace, route) inner cap from A2.5 § "Hot-key
-        # complement". Set high enough that the workspace ceiling
-        # is the binding constraint in this test.
-        per_route_rps: 100
         headers:
           # Full RFC 9239 header set is the new contract for
           # Wave 2; Wave 1 only emitted Retry-After.

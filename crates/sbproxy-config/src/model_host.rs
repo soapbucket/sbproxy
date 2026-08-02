@@ -44,8 +44,17 @@ pub enum ManagedEngineChoice {
     Auto,
     /// Use vLLM.
     Vllm,
+    /// Use SGLang (WOR-1905). An explicit opt-in that `Auto` never selects;
+    /// it serves the same safetensors weights as vLLM on a CUDA worker.
+    #[serde(rename = "sglang")]
+    SGLang,
     /// Use llama.cpp.
     LlamaCpp,
+    /// Use mistral.rs (WOR-1861). An explicit opt-in that `Auto` never
+    /// selects; the pure-Rust subprocess lane over the upstream pinned
+    /// prebuilt binary, serving safetensors weights.
+    #[serde(rename = "mistralrs")]
+    MistralRs,
 }
 
 /// Replacement behavior when a deployment changes.
@@ -71,8 +80,23 @@ pub enum ManagedColdStartPolicy {
     Fallback,
 }
 
+/// Chunked-prefill tuning for a managed deployment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedChunkedPrefill {
+    /// Explicit prefill chunk size (the engine's `max-num-batched-tokens`).
+    /// Omit to leave it to the engine default.
+    #[serde(default)]
+    pub max_batched_tokens: Option<u64>,
+    /// A time-to-first-token target in milliseconds; when set with no explicit
+    /// chunk size, the planner chooses a chunk size to hold it.
+    #[serde(default)]
+    pub target_ttft_ms: Option<u64>,
+}
+
 /// One desired local model deployment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ManagedDeploymentConfig {
     /// Logical ID from the certified model catalog.
     pub model: String,
@@ -85,6 +109,12 @@ pub struct ManagedDeploymentConfig {
     /// Desired local replica count.
     #[serde(default = "one_replica")]
     pub replicas: u32,
+    /// Fixed tensor-parallel degree per replica: the exact number of
+    /// devices each replica spans. Omit to let the fit planner pick the
+    /// smallest degree that fits. When set, `replicas * tensor_parallel`
+    /// devices are needed, since each replica claims a distinct device set.
+    #[serde(default)]
+    pub tensor_parallel: Option<u32>,
     /// Worker labels required by this deployment.
     #[serde(default)]
     pub required_labels: BTreeMap<String, String>,
@@ -118,6 +148,38 @@ pub struct ManagedDeploymentConfig {
     /// Replica replacement behavior.
     #[serde(default)]
     pub rollout: ManagedRolloutPolicy,
+    /// Extra engine command-line arguments appended after the runtime's own.
+    /// Validated against the resolved engine.
+    #[serde(default)]
+    pub extra_args: Vec<String>,
+    /// Chunked-prefill settings (vLLM). Omit to use the engine default.
+    #[serde(default)]
+    pub chunked_prefill: Option<ManagedChunkedPrefill>,
+    /// vLLM tool-call parser enabling auto tool-choice, e.g. `hermes`,
+    /// `llama3_json`, `mistral`. Omit to leave tool calling off.
+    #[serde(default)]
+    pub tool_call_parser: Option<String>,
+    /// CPU swap pool size in GiB (vLLM `--swap-space`). Omit to use the
+    /// engine default.
+    #[serde(default)]
+    pub swap_space_gib: Option<u64>,
+    /// GiB of model weights to keep in CPU RAM (vLLM `--cpu-offload-gb`).
+    /// Omit to disable offload.
+    #[serde(default)]
+    pub cpu_offload_gib: Option<u64>,
+    /// Per-deployment engine version pin, overriding the node-wide `engines:`
+    /// policy so one model can run a different backend version than another.
+    /// Never `latest`. Omit to inherit the node policy or the built-in default.
+    #[serde(default)]
+    pub engine_version: Option<String>,
+    /// Per-deployment engine container image, overriding the node policy.
+    /// Must be tag- or digest-pinned. Omit to inherit the node policy.
+    #[serde(default)]
+    pub engine_image: Option<String>,
+    /// Expected SHA-256 for the pinned engine binary or image digest. Omit to
+    /// inherit the node policy.
+    #[serde(default)]
+    pub engine_sha256: Option<String>,
 }
 
 const fn one_replica() -> u32 {
@@ -140,8 +202,17 @@ const fn default_max_queue_depth() -> usize {
 pub enum ManagedEngineKind {
     /// vLLM's OpenAI-compatible server.
     Vllm,
+    /// SGLang's OpenAI-compatible server (WOR-1905). Provisioned from a
+    /// pinned uv environment or a digest-pinned container, like vLLM.
+    #[serde(rename = "sglang")]
+    SGLang,
     /// llama.cpp's `llama-server`.
     LlamaCpp,
+    /// mistral.rs's unified `mistralrs` CLI (WOR-1861). A single-binary
+    /// engine acquired like llama.cpp: PATH-first, then the pinned
+    /// upstream prebuilt release, sha256-verified.
+    #[serde(rename = "mistralrs")]
+    MistralRs,
 }
 
 /// How a managed engine process is provisioned and launched.
@@ -176,6 +247,7 @@ pub enum ManagedEngineAcceleration {
 
 /// Provisioning policy for one managed inference engine.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ManagedEngineConfig {
     /// Launch mechanism.
     #[serde(default)]
@@ -202,6 +274,7 @@ pub struct ManagedEngineConfig {
 
 /// Content-addressed model cache policy.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ModelHostCacheConfig {
     /// Cache directory. Omission uses the platform default.
     #[serde(default)]
@@ -216,6 +289,7 @@ pub struct ModelHostCacheConfig {
 
 /// Canonical model-host desired state under `proxy.model_host`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ModelHostControlConfig {
     /// System authoritative for desired-state mutations.
     #[serde(default)]
@@ -379,9 +453,11 @@ fn validate_engine(
             "engine {kind:?} image is only valid for container launch"
         )));
     }
-    if engine.launch == ManagedEngineLaunch::Uv && kind != ManagedEngineKind::Vllm {
+    if engine.launch == ManagedEngineLaunch::Uv
+        && !matches!(kind, ManagedEngineKind::Vllm | ManagedEngineKind::SGLang)
+    {
         return Err(ModelHostConfigError::new(
-            "uv launch is supported only for vllm",
+            "uv launch is supported only for vllm and sglang",
         ));
     }
     if engine.version.as_deref() == Some("latest") {

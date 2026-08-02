@@ -5,6 +5,214 @@
 
 use super::*;
 
+#[test]
+fn cap_principal_preserves_verified_subject() {
+    let view = sbproxy_modules::auth::CapTokenView {
+        jti: "cap-jti".to_string(),
+        subject: "agent_acme_001".to_string(),
+        max_rps: 1.0,
+        max_bytes_per_day: 1024,
+        route_glob: "/**".to_string(),
+    };
+
+    let principal = cap_principal_from_verified_token(test_tenant(), &view);
+
+    assert_eq!(principal.sub, "agent_acme_001");
+    assert_eq!(principal.source, sbproxy_plugin::PrincipalSource::Cap);
+    assert!(!principal.is_anonymous());
+}
+
+#[test]
+fn forward_auth_refusals_require_explicit_invalid_proof_evidence() {
+    let no_challenge = reqwest::header::HeaderMap::new();
+    assert_eq!(
+        forward_auth_denial_trust_outcome(401, &no_challenge),
+        AuthTrustOutcome::Missing,
+        "a bare 401 is ambiguous and must remain neutral"
+    );
+
+    let mut challenge = reqwest::header::HeaderMap::new();
+    challenge.insert(
+        reqwest::header::WWW_AUTHENTICATE,
+        reqwest::header::HeaderValue::from_static("Bearer realm=\"api\""),
+    );
+    assert_eq!(
+        forward_auth_denial_trust_outcome(401, &challenge),
+        AuthTrustOutcome::Challenge,
+        "a protocol challenge is neutral"
+    );
+
+    let mut invalid_proof = reqwest::header::HeaderMap::new();
+    invalid_proof.insert(
+        reqwest::header::WWW_AUTHENTICATE,
+        reqwest::header::HeaderValue::from_static(
+            "Bearer realm=\"api\", ERROR = \"INVALID_TOKEN\"",
+        ),
+    );
+    assert_eq!(
+        forward_auth_denial_trust_outcome(401, &invalid_proof),
+        AuthTrustOutcome::InvalidProof,
+        "an explicit invalid_token auth parameter is suspicious"
+    );
+
+    let mut lookalike = reqwest::header::HeaderMap::new();
+    lookalike.insert(
+        reqwest::header::WWW_AUTHENTICATE,
+        reqwest::header::HeaderValue::from_static("Bearer error_description=\"invalid_token\""),
+    );
+    assert_eq!(
+        forward_auth_denial_trust_outcome(401, &lookalike),
+        AuthTrustOutcome::Challenge,
+        "an error-description substring is not explicit invalid-proof evidence"
+    );
+
+    assert_eq!(
+        forward_auth_denial_trust_outcome(503, &invalid_proof),
+        AuthTrustOutcome::BackendFailure,
+        "backend failures remain neutral even if an upstream header is misleading"
+    );
+}
+
+#[tokio::test]
+async fn forward_auth_client_does_not_follow_token_endpoint_redirects() {
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    let redirect_target = std::net::TcpListener::bind("127.0.0.1:0").expect("target listener");
+    redirect_target
+        .set_nonblocking(true)
+        .expect("nonblocking target listener");
+    let target_addr = redirect_target.local_addr().expect("target address");
+    let target_hit = Arc::new(AtomicBool::new(false));
+    let target_hit_thread = Arc::clone(&target_hit);
+    let target_thread = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            match redirect_target.accept() {
+                Ok((mut stream, _)) => {
+                    target_hit_thread.store(true, Ordering::SeqCst);
+                    let mut request = [0_u8; 4096];
+                    let _ = stream.read(&mut request);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("target accept failed: {error}"),
+            }
+        }
+    });
+
+    let redirect = std::net::TcpListener::bind("127.0.0.1:0").expect("redirect listener");
+    let redirect_addr = redirect.local_addr().expect("redirect address");
+    let redirect_thread = std::thread::spawn(move || {
+        let (mut stream, _) = redirect.accept().expect("redirect request");
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request);
+        let response = format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{target_addr}/token\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("redirect response");
+    });
+
+    let response = forward_auth_client()
+        .post(format!("http://{redirect_addr}/token"))
+        .send()
+        .await
+        .expect("token request");
+    redirect_thread.join().expect("redirect server");
+    target_thread.join().expect("target server");
+
+    assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+    assert!(
+        !target_hit.load(Ordering::SeqCst),
+        "the credential client must not replay an existing DPoP proof to a redirect target"
+    );
+}
+
+#[test]
+fn swr_write_back_does_not_resurrect_an_invalidated_entry() {
+    let store: std::sync::Arc<dyn sbproxy_cache::CacheStore> =
+        std::sync::Arc::new(sbproxy_cache::MemoryCacheStore::new(0));
+    let stale = sbproxy_cache::CachedResponse {
+        generation: 1,
+        status: 200,
+        headers: Vec::new(),
+        body: b"stale".to_vec(),
+        cached_at: 1,
+        ttl_secs: 60,
+    };
+    let refreshed = sbproxy_cache::CachedResponse {
+        generation: 2,
+        body: b"background".to_vec(),
+        ..stale.clone()
+    };
+    store.put("key", &stale).unwrap();
+    store.delete("key").unwrap();
+
+    assert!(!swr_cache_write_back(store.as_ref(), "key", &stale, &refreshed).unwrap());
+    assert!(store.get_including_expired("key").unwrap().is_none());
+}
+
+#[test]
+fn swr_revalidation_uses_the_matching_forward_action_and_vary_headers() {
+    let mut pipeline = CompiledPipeline::default();
+    pipeline.actions.push(
+        sbproxy_modules::compile_action(&serde_json::json!({
+            "type": "proxy",
+            "url": "https://main.example"
+        }))
+        .unwrap(),
+    );
+    pipeline
+        .forward_rules
+        .push(vec![crate::pipeline::CompiledForwardRule {
+            matchers: vec![crate::pipeline::MatcherEntry {
+                path: Some(crate::pipeline::PathMatch::Prefix("/forward".to_string())),
+                header: None,
+                query: None,
+            }],
+            action: sbproxy_modules::compile_action(&serde_json::json!({
+                "type": "proxy",
+                "url": "https://forward.example",
+                "host_override": "tenant.internal"
+            }))
+            .unwrap(),
+            request_modifiers: Vec::new(),
+            parameters: Vec::new(),
+        }]);
+    let mut request =
+        pingora_http::RequestHeader::build("GET", b"/forward/resource?view=full", None).unwrap();
+    request.insert_header("x-tenant", "tenant-a").unwrap();
+    request.insert_header("accept-language", "fr-CA").unwrap();
+    request.insert_header("x-not-vary", "discard-me").unwrap();
+
+    let plan = build_swr_revalidation_request(
+        &pipeline,
+        0,
+        &request,
+        &["X-Tenant".to_string(), "Accept-Language".to_string()],
+    )
+    .expect("matching forward proxy should be revalidatable");
+
+    assert_eq!(plan.upstream_url, "https://forward.example");
+    assert_eq!(plan.host_header, "tenant.internal");
+    assert_eq!(
+        plan.vary_headers,
+        vec![
+            ("x-tenant".to_string(), "tenant-a".to_string()),
+            ("accept-language".to_string(), "fr-CA".to_string())
+        ]
+    );
+}
+
 // --- WOR-168: mirror state drift no-panic regression ---
 
 /// Pre-WOR-168, `request_body_filter` called
@@ -93,6 +301,127 @@ fn js_response_modifier_reads_aipref_context_from_ctx() {
         out,
         vec![("x-aipref-train".to_string(), "false".to_string())]
     );
+}
+
+// --- WOR-2083: principal + request.tls across the script engines ---
+
+/// A context carrying a resolved principal and a TLS fingerprint, the
+/// two signals WOR-2083 wires into the non-CEL engines.
+fn ctx_with_principal_and_tls() -> RequestContext {
+    let mut ctx = RequestContext::new();
+    ctx.principal = sbproxy_plugin::Principal {
+        tenant_id: sbproxy_plugin::TenantId::from("acme".to_string()),
+        sub: "svc-batch".to_string(),
+        source: sbproxy_plugin::PrincipalSource::VirtualKey,
+        virtual_key: Some(sbproxy_plugin::VirtualKeyRef {
+            name: "vk-batch".to_string(),
+            allowed_providers: vec!["openai".to_string()],
+        }),
+        attrs: sbproxy_plugin::PrincipalAttrs {
+            team: Some("ml".to_string()),
+            ..Default::default()
+        },
+    };
+    ctx.tls_fingerprint = Some(sbproxy_tls::TlsFingerprint {
+        ja4: Some("t13d1516h2_8daaf6152771".to_string()),
+        trustworthy: true,
+        ..Default::default()
+    });
+    ctx
+}
+
+#[test]
+fn script_modifier_context_exposes_principal_and_tls() {
+    // The one seam every Lua / JS surface routes through: response
+    // modifiers, request modifiers, and the script body transforms.
+    let ctx = ctx_with_principal_and_tls();
+    let script_ctx = script_modifier_context(&ctx);
+
+    assert_eq!(script_ctx["principal"]["tenant_id"], "acme");
+    assert_eq!(script_ctx["principal"]["sub"], "svc-batch");
+    assert_eq!(script_ctx["principal"]["source"], "virtual_key");
+    assert_eq!(script_ctx["principal"]["virtual_key"]["name"], "vk-batch");
+    assert_eq!(script_ctx["principal"]["attrs"]["team"], "ml");
+    assert_eq!(
+        script_ctx["request"]["tls"]["ja4"],
+        "t13d1516h2_8daaf6152771"
+    );
+    assert_eq!(script_ctx["request"]["tls"]["trustworthy"], true);
+}
+
+#[test]
+fn script_modifier_context_renders_empty_principal_without_probing() {
+    // An anonymous request still gets the namespaces, as empty strings
+    // and empty containers, so scripts branch without presence checks.
+    let ctx = RequestContext::new();
+    let script_ctx = script_modifier_context(&ctx);
+
+    assert_eq!(script_ctx["principal"]["sub"], "");
+    assert_eq!(script_ctx["principal"]["attrs"]["team"], "");
+    assert_eq!(script_ctx["request"]["tls"]["ja4"], "");
+    assert_eq!(script_ctx["request"]["tls"]["trustworthy"], false);
+}
+
+#[test]
+fn lua_response_modifier_reads_principal_from_ctx() {
+    let ctx = ctx_with_principal_and_tls();
+    let headers = serde_json::Map::new();
+    let script = r#"
+        function modify_response(resp, ctx)
+          resp.headers["x-team"] = ctx.principal.attrs.team
+          resp.headers["x-tls-ja4"] = ctx.request.tls.ja4
+          return resp
+        end
+    "#;
+
+    let out = lua_response_modifier(script, 200, &headers, &ctx).unwrap();
+
+    assert!(out.contains(&("x-team".to_string(), "ml".to_string())));
+    assert!(out.contains(&(
+        "x-tls-ja4".to_string(),
+        "t13d1516h2_8daaf6152771".to_string()
+    )));
+}
+
+#[test]
+fn js_response_modifier_reads_principal_from_ctx() {
+    let ctx = ctx_with_principal_and_tls();
+    let headers = serde_json::Map::new();
+    let script = r#"
+        function modify_response(resp, ctx) {
+          resp.headers["x-team"] = ctx.principal.attrs.team;
+          resp.headers["x-tenant"] = ctx.principal.tenant_id;
+          return resp;
+        }
+    "#;
+
+    let out = js_response_modifier(script, 200, &headers, &ctx).unwrap();
+
+    assert!(out.contains(&("x-team".to_string(), "ml".to_string())));
+    assert!(out.contains(&("x-tenant".to_string(), "acme".to_string())));
+}
+
+#[test]
+fn lua_request_modifier_reads_tls_and_principal() {
+    let ctx = ctx_with_principal_and_tls();
+    let mut req_header = pingora_http::RequestHeader::build("GET", b"/v1/things", None).unwrap();
+    req_header.insert_header("x-probe", "1").unwrap();
+    let script = r#"
+        function modify_request(req, ctx)
+          return { set_headers = {
+            ["x-tls-ja4"] = req.tls.ja4,
+            ["x-team"] = ctx.principal.attrs.team,
+          } }
+        end
+    "#;
+
+    let out = lua_request_modifier(script, &req_header, &ctx).unwrap();
+
+    assert!(out.contains(&(
+        "x-tls-ja4".to_string(),
+        "t13d1516h2_8daaf6152771".to_string()
+    )));
+    assert!(out.contains(&("x-team".to_string(), "ml".to_string())));
 }
 
 // --- resolve_override parsing ---
@@ -213,9 +542,8 @@ fn webhook_signature_is_stable_per_input() {
 // a TODO. They now carry a snapshot of the inbound request headers
 // produced by `snapshot_request_headers_from`. This test pins the
 // contract: representative headers round-trip lower-cased, and the
-// three credential carriers in `REDACTED_REQUEST_HEADERS`
-// (Authorization, Cookie, Proxy-Authorization) are dropped before
-// any classifier or semantic-cache hook sees them.
+// built-in and config-declared credential carriers are dropped before any
+// classifier or semantic-cache hook sees them.
 fn test_request_header(headers: &[(&str, &str)]) -> pingora_http::RequestHeader {
     let mut req = pingora_http::RequestHeader::build("GET", b"/v1/chat/completions", None)
         .expect("build request header");
@@ -233,7 +561,8 @@ fn snapshot_request_headers_round_trips_non_credential_headers() {
         ("Content-Type", "application/json"),
         ("X-Customer-Id", "tenant-7"),
     ]);
-    let snap = snapshot_request_headers_from(&req);
+    let pipeline = crate::pipeline::CompiledPipeline::default();
+    let snap = snapshot_request_headers_from(&req, &pipeline);
     // Names land lower-cased to match HTTP/2 + HTTP/3 framing.
     assert_eq!(
         snap.get("x-request-id").map(String::as_str),
@@ -255,7 +584,8 @@ fn snapshot_request_headers_drops_authorization() {
         ("Authorization", "Bearer sk-secret"),
         ("X-Request-Id", "req-123"),
     ]);
-    let snap = snapshot_request_headers_from(&req);
+    let pipeline = crate::pipeline::CompiledPipeline::default();
+    let snap = snapshot_request_headers_from(&req, &pipeline);
     assert!(
         !snap.contains_key("authorization"),
         "Authorization must be redacted before reaching hook surfaces"
@@ -280,10 +610,57 @@ fn snapshot_request_headers_drops_cookie_and_proxy_authorization() {
         ("Proxy-Authorization", "Basic dXNlcjpwYXNz"),
         ("X-Trace-Id", "trace-7"),
     ]);
-    let snap = snapshot_request_headers_from(&req);
+    let pipeline = crate::pipeline::CompiledPipeline::default();
+    let snap = snapshot_request_headers_from(&req, &pipeline);
     assert!(!snap.contains_key("cookie"));
     assert!(!snap.contains_key("proxy-authorization"));
     assert_eq!(snap.get("x-trace-id").map(String::as_str), Some("trace-7"));
+}
+
+fn pipeline_with_inbound_carrier(name: &str) -> crate::pipeline::CompiledPipeline {
+    let mut config = sbproxy_config::CompiledConfig::default();
+    let mut key_management = sbproxy_config::KeyManagementConfig::default();
+    key_management.inbound.headers = vec![sbproxy_config::InboundHeaderConfig {
+        name: name.to_string(),
+        scheme: String::new(),
+    }];
+    key_management.inbound.provider_hints.clear();
+    config.server.key_management = Some(key_management);
+    crate::pipeline::CompiledPipeline::from_config_for_validation(config)
+        .expect("compile pipeline with custom inbound carrier")
+}
+
+#[test]
+fn snapshot_request_headers_uses_pinned_pipeline_carriers_across_reload() {
+    let req = test_request_header(&[
+        ("X-Carrier-A", "old-caller-secret"),
+        ("X-Carrier-B", "new-caller-secret"),
+        ("X-Trace-Id", "trace-8"),
+    ]);
+    let old_pipeline = pipeline_with_inbound_carrier("x-carrier-a");
+    let new_pipeline = pipeline_with_inbound_carrier("x-carrier-b");
+
+    let old_snapshot = snapshot_request_headers_from(&req, &old_pipeline);
+    let new_snapshot = snapshot_request_headers_from(&req, &new_pipeline);
+
+    assert!(!old_snapshot.contains_key("x-carrier-a"));
+    assert_eq!(
+        old_snapshot.get("x-carrier-b").map(String::as_str),
+        Some("new-caller-secret")
+    );
+    assert!(!new_snapshot.contains_key("x-carrier-b"));
+    assert_eq!(
+        new_snapshot.get("x-carrier-a").map(String::as_str),
+        Some("old-caller-secret")
+    );
+    assert!(
+        !format!("{old_snapshot:?}").contains("old-caller-secret"),
+        "old request hook snapshot must retain old-generation redaction"
+    );
+    assert!(
+        !format!("{new_snapshot:?}").contains("new-caller-secret"),
+        "new request hook snapshot must use new-generation redaction"
+    );
 }
 
 // --- BotAuth target-uri propagation tests ---
@@ -421,6 +798,7 @@ async fn bot_auth_rejects_signature_bound_to_different_path() {
         "expected Deny(401) when @target-uri does not match signed path; got {:?}",
         match result {
             AuthResult::Allow { .. } => "Allow",
+            AuthResult::RateLimited(_) => "RateLimited",
             AuthResult::Deny(s, _) => Box::leak(format!("Deny({s})").into_boxed_str()),
             AuthResult::DenyWithHeaders(s, _, _) => {
                 Box::leak(format!("DenyWithHeaders({s})").into_boxed_str())
@@ -505,7 +883,7 @@ async fn bot_auth_signature_agent_uses_async_directory_path() {
 // dispatches into the boxed `AuthProvider` and translates the
 // returned `AuthDecision` into an `AuthResult`.
 
-use sbproxy_plugin::{AuthDecision, AuthProvider};
+use sbproxy_plugin::{AuthDecision, AuthDenialKind, AuthProvider};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -540,6 +918,40 @@ impl AuthProvider for StubAuthProvider {
     }
 }
 
+/// Provider that explicitly classifies its header-bearing denial as a
+/// failed offered proof instead of the default protocol challenge.
+struct InvalidProofAuthProvider {
+    decision: AuthDecision,
+}
+
+impl AuthProvider for InvalidProofAuthProvider {
+    fn auth_type(&self) -> &'static str {
+        "stub-invalid-proof"
+    }
+
+    fn authenticate(
+        &self,
+        _req: &http::Request<bytes::Bytes>,
+        _ctx: &mut dyn std::any::Any,
+    ) -> Pin<Box<dyn Future<Output = sbproxy_plugin::PluginResult<AuthDecision>> + Send + '_>> {
+        let decision = self.decision.clone();
+        Box::pin(async move { Ok(decision) })
+    }
+
+    fn denial_kind(&self, decision: &AuthDecision) -> AuthDenialKind {
+        assert!(
+            matches!(
+                decision,
+                AuthDecision::Deny { status, .. }
+                    | AuthDecision::DenyWithHeaders { status, .. }
+                    if *status < 500
+            ),
+            "core must not ask a provider to classify an allow or backend failure"
+        );
+        AuthDenialKind::InvalidProof
+    }
+}
+
 /// Provider that always returns an error from authenticate(). Used
 /// to verify the engine treats a misbehaving plugin as a 500 deny
 /// rather than letting the request through.
@@ -562,6 +974,7 @@ impl AuthProvider for ErrorAuthProvider {
 fn auth_result_label(r: &AuthResult) -> String {
     match r {
         AuthResult::Allow { .. } => "Allow".to_string(),
+        AuthResult::RateLimited(_) => "RateLimited".to_string(),
         AuthResult::Deny(s, m) => format!("Deny({s}, {m:?})"),
         AuthResult::DenyWithHeaders(s, m, h) => {
             format!("DenyWithHeaders({s}, {m:?}, {} headers)", h.len())
@@ -659,6 +1072,134 @@ async fn plugin_deny_with_headers_propagates_custom_response_headers() {
 }
 
 #[tokio::test]
+async fn plugin_protocol_challenge_is_neutral_independent_of_request_shape() {
+    let cases = [
+        ("empty request", http::HeaderMap::new(), None),
+        (
+            "query credential",
+            http::HeaderMap::new(),
+            Some("api_key=invalid"),
+        ),
+        (
+            "custom-header credential",
+            {
+                let mut headers = http::HeaderMap::new();
+                headers.insert("x-api-key", http::HeaderValue::from_static("invalid"));
+                headers
+            },
+            None,
+        ),
+    ];
+
+    for (case, headers, query) in cases {
+        let provider = StubAuthProvider {
+            type_name: "stub-deny-headers",
+            decision: AuthDecision::DenyWithHeaders {
+                status: 401,
+                message: "credentials required".to_string(),
+                headers: vec![(
+                    "WWW-Authenticate".to_string(),
+                    "Bearer realm=\"api\"".to_string(),
+                )],
+            },
+            calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let auth = sbproxy_modules::Auth::Plugin(Box::new(provider));
+
+        let (result, _principal, trust_outcome) =
+            check_auth_with_outcome(&auth, &headers, query, "GET", "/", test_tenant(), None).await;
+        assert!(
+            matches!(
+                result,
+                AuthResult::DenyWithHeaders(
+                    401,
+                    ref message,
+                    ref response_headers
+                ) if message == "credentials required"
+                    && response_headers
+                        == &[(
+                            "WWW-Authenticate".to_string(),
+                            "Bearer realm=\"api\"".to_string(),
+                        )]
+            ),
+            "{case}: trust classification must not change the terminal response"
+        );
+
+        let mut ctx = RequestContext::new();
+        crate::trust_tier::finalize(&mut ctx, trust_outcome.is_suspicious());
+
+        assert_eq!(
+            ctx.trust_tier,
+            sbproxy_modules::auth::TrustTier::Anonymous,
+            "{case}: a protocol challenge is neutral"
+        );
+    }
+}
+
+#[tokio::test]
+async fn plugin_explicit_invalid_proof_is_suspicious_independent_of_request_shape() {
+    let cases = [
+        ("empty request", http::HeaderMap::new(), None),
+        (
+            "query credential",
+            http::HeaderMap::new(),
+            Some("api_key=invalid"),
+        ),
+        (
+            "custom-header credential",
+            {
+                let mut headers = http::HeaderMap::new();
+                headers.insert("x-api-key", http::HeaderValue::from_static("invalid"));
+                headers
+            },
+            None,
+        ),
+    ];
+
+    for (case, headers, query) in cases {
+        let provider = InvalidProofAuthProvider {
+            decision: AuthDecision::DenyWithHeaders {
+                status: 401,
+                message: "invalid token".to_string(),
+                headers: vec![(
+                    "WWW-Authenticate".to_string(),
+                    "Bearer error=\"invalid_token\"".to_string(),
+                )],
+            },
+        };
+        let auth = sbproxy_modules::Auth::Plugin(Box::new(provider));
+
+        let (result, _principal, trust_outcome) =
+            check_auth_with_outcome(&auth, &headers, query, "GET", "/", test_tenant(), None).await;
+        assert!(
+            matches!(
+                result,
+                AuthResult::DenyWithHeaders(
+                    401,
+                    ref message,
+                    ref response_headers
+                ) if message == "invalid token"
+                    && response_headers
+                        == &[(
+                            "WWW-Authenticate".to_string(),
+                            "Bearer error=\"invalid_token\"".to_string(),
+                        )]
+            ),
+            "{case}: trust classification must not change the terminal response"
+        );
+
+        let mut ctx = RequestContext::new();
+        crate::trust_tier::finalize(&mut ctx, trust_outcome.is_suspicious());
+
+        assert_eq!(
+            ctx.trust_tier,
+            sbproxy_modules::auth::TrustTier::Suspicious,
+            "{case}: the provider explicitly classified a failed proof"
+        );
+    }
+}
+
+#[tokio::test]
 async fn plugin_authenticate_error_denies_with_500() {
     // A plugin that returns Err must NOT fall through to Allow;
     // the engine must surface a generic 500 deny so a flaky
@@ -666,8 +1207,8 @@ async fn plugin_authenticate_error_denies_with_500() {
     let auth = sbproxy_modules::Auth::Plugin(Box::new(ErrorAuthProvider));
     let headers = http::HeaderMap::new();
 
-    let (result, _principal) =
-        check_auth(&auth, &headers, None, "GET", "/", test_tenant(), None).await;
+    let (result, _principal, trust_outcome) =
+        check_auth_with_outcome(&auth, &headers, None, "GET", "/", test_tenant(), None).await;
     match result {
         AuthResult::Deny(status, msg) => {
             assert_eq!(status, 500);
@@ -678,6 +1219,41 @@ async fn plugin_authenticate_error_denies_with_500() {
         }
         other => panic!("expected Deny(500,...); got {}", auth_result_label(&other)),
     }
+    assert_eq!(trust_outcome, AuthTrustOutcome::BackendFailure);
+
+    let mut ctx = RequestContext::new();
+    crate::trust_tier::finalize(&mut ctx, trust_outcome.is_suspicious());
+    assert_eq!(ctx.trust_tier, sbproxy_modules::auth::TrustTier::Anonymous);
+}
+
+#[tokio::test]
+async fn plugin_header_denial_5xx_is_backend_failure() {
+    let provider = InvalidProofAuthProvider {
+        decision: AuthDecision::DenyWithHeaders {
+            status: 503,
+            message: "identity service unavailable".to_string(),
+            headers: vec![("Retry-After".to_string(), "30".to_string())],
+        },
+    };
+    let auth = sbproxy_modules::Auth::Plugin(Box::new(provider));
+    let headers = http::HeaderMap::new();
+
+    let (result, _principal, trust_outcome) =
+        check_auth_with_outcome(&auth, &headers, None, "GET", "/", test_tenant(), None).await;
+    assert!(matches!(
+        result,
+        AuthResult::DenyWithHeaders(
+            503,
+            ref message,
+            ref response_headers
+        ) if message == "identity service unavailable"
+            && response_headers == &[("Retry-After".to_string(), "30".to_string())]
+    ));
+    assert_eq!(trust_outcome, AuthTrustOutcome::BackendFailure);
+
+    let mut ctx = RequestContext::new();
+    crate::trust_tier::finalize(&mut ctx, trust_outcome.is_suspicious());
+    assert_eq!(ctx.trust_tier, sbproxy_modules::auth::TrustTier::Anonymous);
 }
 
 #[tokio::test]
@@ -2446,231 +3022,6 @@ origins:
     );
 }
 
-struct DisableKeyPlaneOnDrop;
-
-impl Drop for DisableKeyPlaneOnDrop {
-    fn drop(&mut self) {
-        crate::key_plane::disable_key_plane();
-    }
-}
-
-fn static_reload_yaml(host: &str) -> String {
-    format!(
-        r#"
-proxy:
-  http_bind_port: 0
-origins:
-  "{host}":
-    action:
-      type: static
-      status_code: 200
-      content_type: text/plain
-      body: "ok"
-"#
-    )
-}
-
-fn enabled_key_plane_reload_yaml(host: &str, store_path: &std::path::Path) -> String {
-    format!(
-        r#"
-proxy:
-  http_bind_port: 0
-  key_management:
-    enabled: true
-    store:
-      backend: embedded
-      path: "{}"
-    crypto:
-      pepper: reload-test-pepper
-      master_key: reload-test-master-key
-origins:
-  "{host}":
-    action:
-      type: static
-      status_code: 200
-      content_type: text/plain
-      body: "ok"
-"#,
-        store_path.display()
-    )
-}
-
-#[test]
-fn strict_governance_reconciliation_failure_does_not_publish_candidate_pipeline() {
-    let _redact_guard = super::lifecycle::OP_REDACT_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    let _plane_guard = crate::key_plane::test_plane_guard();
-    let _cleanup = DisableKeyPlaneOnDrop;
-    crate::key_plane::disable_key_plane();
-
-    let temp = tempfile::tempdir().expect("tempdir");
-    let config_path = temp.path().join("sb.yml");
-    let baseline = static_reload_yaml("governance-before.test");
-    super::lifecycle::reload_from_config_yaml(
-        config_path.to_str().expect("utf-8 config path"),
-        &baseline,
-    )
-    .expect("install baseline pipeline");
-    let installed = reload::current_pipeline_full();
-
-    // The strict backend is syntactically valid and lazy-connects, while the
-    // missing crypto file makes key/governance-plane reconciliation fail after
-    // the candidate pipeline has been compiled but before it may be published.
-    let missing_pepper = temp.path().join("missing-pepper");
-    let store_path = temp.path().join("strict-keys.redb");
-    let candidate = format!(
-        r#"
-proxy:
-  http_bind_port: 0
-  key_management:
-    enabled: true
-    store:
-      backend: embedded
-      path: "{}"
-    crypto:
-      pepper: "file:{}"
-      master_key: reload-test-master-key
-    governance:
-      consistency: strict
-      backend:
-        type: redis
-        url: redis://127.0.0.1:6379/15
-origins:
-  "governance-candidate.test":
-    action:
-      type: static
-      status_code: 200
-      content_type: text/plain
-      body: "candidate"
-"#,
-        store_path.display(),
-        missing_pepper.display()
-    );
-
-    let error = super::lifecycle::reload_from_config_yaml(
-        config_path.to_str().expect("utf-8 config path"),
-        &candidate,
-    )
-    .expect_err("failed strict reconciliation must reject the candidate");
-
-    assert!(
-        format!("{error:#}").contains("failed to reconcile dynamic key plane"),
-        "unexpected reconciliation error: {error:#}"
-    );
-    let still_installed = reload::current_pipeline_full();
-    assert!(
-        std::sync::Arc::ptr_eq(&installed, &still_installed),
-        "a failed strict reconciliation must not publish a new pipeline"
-    );
-    assert!(still_installed
-        .config
-        .host_map
-        .contains_key("governance-before.test"));
-    assert!(!still_installed
-        .config
-        .host_map
-        .contains_key("governance-candidate.test"));
-}
-
-#[test]
-fn reload_without_key_management_clears_installed_auth_and_governance_planes() {
-    let _redact_guard = super::lifecycle::OP_REDACT_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    let _plane_guard = crate::key_plane::test_plane_guard();
-    let _cleanup = DisableKeyPlaneOnDrop;
-    crate::key_plane::disable_key_plane();
-
-    let temp = tempfile::tempdir().expect("tempdir");
-    let config_path = temp.path().join("sb.yml");
-    let enabled = enabled_key_plane_reload_yaml(
-        "key-plane-enabled.test",
-        &temp.path().join("enabled-keys.redb"),
-    );
-    super::lifecycle::reload_from_config_yaml(
-        config_path.to_str().expect("utf-8 config path"),
-        &enabled,
-    )
-    .expect("install enabled key plane");
-    assert!(crate::key_plane::current_key_plane().is_some());
-    assert!(crate::key_plane::current_governance_plane().is_some());
-
-    let without_key_management = static_reload_yaml("key-plane-removed.test");
-    super::lifecycle::reload_from_config_yaml(
-        config_path.to_str().expect("utf-8 config path"),
-        &without_key_management,
-    )
-    .expect("remove key management on reload");
-
-    assert!(
-        crate::key_plane::current_key_plane().is_none(),
-        "removed key_management must not retain stale key authentication"
-    );
-    assert!(
-        crate::key_plane::current_governance_plane().is_none(),
-        "removed key_management must restore the compatibility governance plane"
-    );
-}
-
-#[test]
-fn reload_with_key_management_disabled_clears_installed_auth_plane() {
-    let _redact_guard = super::lifecycle::OP_REDACT_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    let _plane_guard = crate::key_plane::test_plane_guard();
-    let _cleanup = DisableKeyPlaneOnDrop;
-    crate::key_plane::disable_key_plane();
-
-    let temp = tempfile::tempdir().expect("tempdir");
-    let config_path = temp.path().join("sb.yml");
-    let store_path = temp.path().join("disabled-keys.redb");
-    let enabled = enabled_key_plane_reload_yaml("key-plane-before-disable.test", &store_path);
-    super::lifecycle::reload_from_config_yaml(
-        config_path.to_str().expect("utf-8 config path"),
-        &enabled,
-    )
-    .expect("install enabled key plane");
-    assert!(crate::key_plane::current_key_plane().is_some());
-
-    let disabled = format!(
-        r#"
-proxy:
-  http_bind_port: 0
-  key_management:
-    enabled: false
-    store:
-      backend: embedded
-      path: "{}"
-    crypto:
-      pepper: reload-test-pepper
-      master_key: reload-test-master-key
-origins:
-  "key-plane-disabled.test":
-    action:
-      type: static
-      status_code: 200
-      content_type: text/plain
-      body: "ok"
-"#,
-        store_path.display()
-    );
-    super::lifecycle::reload_from_config_yaml(
-        config_path.to_str().expect("utf-8 config path"),
-        &disabled,
-    )
-    .expect("disable key management on reload");
-
-    assert!(
-        crate::key_plane::current_key_plane().is_none(),
-        "enabled: false must not retain stale key authentication"
-    );
-    assert!(
-        crate::key_plane::current_governance_plane().is_some(),
-        "the explicit block still owns governed accounting for configured keys"
-    );
-}
-
 #[test]
 fn reload_from_config_path_propagates_compile_errors() {
     use std::io::Write as _;
@@ -2680,6 +3031,78 @@ fn reload_from_config_path_propagates_compile_errors() {
     tmp.flush().unwrap();
     let err = reload_from_config_path(tmp.path().to_str().unwrap()).expect_err("expected err");
     let _ = format!("{err}");
+}
+
+// --- WOR-2162: a reload carrying invalid CEL is rejected whole ---
+
+#[test]
+fn reload_with_invalid_cel_expression_keeps_the_active_pipeline() {
+    use std::io::Write as _;
+    // Serialise against sibling tests that assert on the process-global
+    // redaction slot the reload path writes through (see the idempotence
+    // test above).
+    let _guard = super::lifecycle::OP_REDACT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let valid_yaml = r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "cel-reload.test":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+"#;
+    tmp.write_all(valid_yaml.as_bytes()).unwrap();
+    tmp.flush().unwrap();
+    reload_from_config_path(tmp.path().to_str().unwrap()).expect("valid config reloads");
+    let active_revision = reload::current_pipeline().config_revision.clone();
+
+    // The candidate changes the origin set AND carries a malformed CEL
+    // expression. If the reject phase failed to catch it, the revision
+    // (derived from the origin set) would change.
+    let invalid_yaml = r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "cel-reload-broken.test":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+    policies:
+      - type: expression
+        expression: 'this is not valid CEL !!!'
+"#;
+    std::fs::write(tmp.path(), invalid_yaml).unwrap();
+    let err = reload_from_config_path(tmp.path().to_str().unwrap())
+        .expect_err("invalid CEL must fail the reload");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("cel-reload-broken.test"),
+        "diagnostic must name the origin: {msg}"
+    );
+    assert!(
+        msg.contains("this is not valid CEL !!!"),
+        "diagnostic must quote the bad expression: {msg}"
+    );
+
+    // The previous pipeline stays active: nothing was applied.
+    assert_eq!(
+        reload::current_pipeline().config_revision,
+        active_revision,
+        "a failed reload must leave the previously active pipeline in place",
+    );
+
+    // And a subsequent valid reload still goes through.
+    std::fs::write(tmp.path(), valid_yaml).unwrap();
+    reload_from_config_path(tmp.path().to_str().unwrap())
+        .expect("the node recovers once the config is fixed");
 }
 
 // --- WOR-43: CSP report redaction ---

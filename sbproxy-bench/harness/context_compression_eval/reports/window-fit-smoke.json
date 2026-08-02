@@ -1,0 +1,337 @@
+{
+  "schema_version": 4,
+  "profile": "window-fit-smoke-v1",
+  "pipeline": [
+    {
+      "type": "window_fit",
+      "completion_reserve_tokens": 8000,
+      "input_budget_tokens": 192
+    }
+  ],
+  "token_counter": "sbproxy_target_model",
+  "latency_mode": "omitted_for_deterministic_gate",
+  "verified_provenance": {
+    "manifest_sha256": "a9a08b96937b1f7b022d69806bf9b5a0ccbc18a036c7c3ffe225f8db30702542",
+    "artifacts": [
+      {
+        "path": "fixtures/coding-agent-smoke.jsonl",
+        "corpus": "coding_agent_smoke",
+        "provenance": "independently_authored_sanitized_shape",
+        "license": "Apache-2.0",
+        "contains_customer_data": false,
+        "official_benchmark_score": false,
+        "sha256": "92d9e081601a18de7f16b334672542cb879077514aba0ad936c180d7102da575"
+      },
+      {
+        "path": "fixtures/ruler-smoke.jsonl",
+        "corpus": "ruler_smoke",
+        "provenance": "independently_authored_synthetic",
+        "license": "Apache-2.0",
+        "contains_customer_data": false,
+        "official_benchmark_score": false,
+        "sha256": "2df7a8acb71405294a99dffafdf8c08ad12fe471f09218f1be8cc68387504914"
+      }
+    ]
+  },
+  "cases": [
+    {
+      "id": "coding_agent_diff",
+      "corpus": "coding_agent_smoke",
+      "target_model": "gpt-4",
+      "quality_metric": "evidence_retention",
+      "off": {
+        "input_tokens": 328,
+        "output_tokens": 328,
+        "quality_score": 1.0
+      },
+      "on": {
+        "input_tokens": 328,
+        "output_tokens": 98,
+        "quality_score": 1.0
+      },
+      "tokens_saved": 230,
+      "savings_ratio": 0.70122,
+      "quality_delta": 0.0,
+      "levers": [
+        {
+          "lever": "window_fit",
+          "outcome": "applied",
+          "reason": null,
+          "before_tokens": 328,
+          "after_tokens": 98,
+          "tokens_saved": 230
+        }
+      ],
+      "acceptance": {
+        "min_savings_ratio": null,
+        "min_on_quality_score": null,
+        "min_quality_delta": null,
+        "require_non_expanding": false
+      },
+      "acceptance_passed": true,
+      "added_compression_latency_micros": null,
+      "outcome": "applied",
+      "reason": null
+    },
+    {
+      "id": "coding_agent_logs",
+      "corpus": "coding_agent_smoke",
+      "target_model": "gpt-4",
+      "quality_metric": "evidence_retention",
+      "off": {
+        "input_tokens": 321,
+        "output_tokens": 321,
+        "quality_score": 1.0
+      },
+      "on": {
+        "input_tokens": 321,
+        "output_tokens": 89,
+        "quality_score": 1.0
+      },
+      "tokens_saved": 232,
+      "savings_ratio": 0.722741,
+      "quality_delta": 0.0,
+      "levers": [
+        {
+          "lever": "window_fit",
+          "outcome": "applied",
+          "reason": null,
+          "before_tokens": 321,
+          "after_tokens": 89,
+          "tokens_saved": 232
+        }
+      ],
+      "acceptance": {
+        "min_savings_ratio": null,
+        "min_on_quality_score": null,
+        "min_quality_delta": null,
+        "require_non_expanding": false
+      },
+      "acceptance_passed": true,
+      "added_compression_latency_micros": null,
+      "outcome": "applied",
+      "reason": null
+    },
+    {
+      "id": "coding_agent_rg_output",
+      "corpus": "coding_agent_smoke",
+      "target_model": "gpt-4",
+      "quality_metric": "evidence_retention",
+      "off": {
+        "input_tokens": 414,
+        "output_tokens": 414,
+        "quality_score": 1.0
+      },
+      "on": {
+        "input_tokens": 414,
+        "output_tokens": 103,
+        "quality_score": 1.0
+      },
+      "tokens_saved": 311,
+      "savings_ratio": 0.751208,
+      "quality_delta": 0.0,
+      "levers": [
+        {
+          "lever": "window_fit",
+          "outcome": "applied",
+          "reason": null,
+          "before_tokens": 414,
+          "after_tokens": 103,
+          "tokens_saved": 311
+        }
+      ],
+      "acceptance": {
+        "min_savings_ratio": null,
+        "min_on_quality_score": null,
+        "min_quality_delta": null,
+        "require_non_expanding": false
+      },
+      "acceptance_passed": true,
+      "added_compression_latency_micros": null,
+      "outcome": "applied",
+      "reason": null
+    },
+    {
+      "id": "coding_agent_tool_output",
+      "corpus": "coding_agent_smoke",
+      "target_model": "gpt-4",
+      "quality_metric": "evidence_retention",
+      "off": {
+        "input_tokens": 262,
+        "output_tokens": 262,
+        "quality_score": 1.0
+      },
+      "on": {
+        "input_tokens": 262,
+        "output_tokens": 79,
+        "quality_score": 1.0
+      },
+      "tokens_saved": 183,
+      "savings_ratio": 0.698473,
+      "quality_delta": 0.0,
+      "levers": [
+        {
+          "lever": "window_fit",
+          "outcome": "applied",
+          "reason": null,
+          "before_tokens": 262,
+          "after_tokens": 79,
+          "tokens_saved": 183
+        }
+      ],
+      "acceptance": {
+        "min_savings_ratio": null,
+        "min_on_quality_score": null,
+        "min_quality_delta": null,
+        "require_non_expanding": false
+      },
+      "acceptance_passed": true,
+      "added_compression_latency_micros": null,
+      "outcome": "applied",
+      "reason": null
+    },
+    {
+      "id": "ruler_multi_hop_launch",
+      "corpus": "ruler_smoke",
+      "target_model": "gpt-4",
+      "quality_metric": "evidence_retention",
+      "off": {
+        "input_tokens": 295,
+        "output_tokens": 295,
+        "quality_score": 1.0
+      },
+      "on": {
+        "input_tokens": 295,
+        "output_tokens": 60,
+        "quality_score": 1.0
+      },
+      "tokens_saved": 235,
+      "savings_ratio": 0.79661,
+      "quality_delta": 0.0,
+      "levers": [
+        {
+          "lever": "window_fit",
+          "outcome": "applied",
+          "reason": null,
+          "before_tokens": 295,
+          "after_tokens": 60,
+          "tokens_saved": 235
+        }
+      ],
+      "acceptance": {
+        "min_savings_ratio": null,
+        "min_on_quality_score": null,
+        "min_quality_delta": null,
+        "require_non_expanding": false
+      },
+      "acceptance_passed": true,
+      "added_compression_latency_micros": null,
+      "outcome": "applied",
+      "reason": null
+    },
+    {
+      "id": "ruler_retrieval_orbit",
+      "corpus": "ruler_smoke",
+      "target_model": "gpt-4",
+      "quality_metric": "evidence_retention",
+      "off": {
+        "input_tokens": 309,
+        "output_tokens": 309,
+        "quality_score": 1.0
+      },
+      "on": {
+        "input_tokens": 309,
+        "output_tokens": 57,
+        "quality_score": 1.0
+      },
+      "tokens_saved": 252,
+      "savings_ratio": 0.815534,
+      "quality_delta": 0.0,
+      "levers": [
+        {
+          "lever": "window_fit",
+          "outcome": "applied",
+          "reason": null,
+          "before_tokens": 309,
+          "after_tokens": 57,
+          "tokens_saved": 252
+        }
+      ],
+      "acceptance": {
+        "min_savings_ratio": null,
+        "min_on_quality_score": null,
+        "min_quality_delta": null,
+        "require_non_expanding": false
+      },
+      "acceptance_passed": true,
+      "added_compression_latency_micros": null,
+      "outcome": "applied",
+      "reason": null
+    }
+  ],
+  "corpora": {
+    "coding_agent_smoke": {
+      "case_count": 4,
+      "input_tokens": 1325,
+      "output_tokens": 369,
+      "tokens_saved": 956,
+      "savings_ratio": 0.721509,
+      "off_quality_score": 1.0,
+      "on_quality_score": 1.0,
+      "quality_delta": 0.0,
+      "added_compression_latency_micros": null,
+      "applied_count": 4,
+      "skipped_count": 0,
+      "fallback_count": 0,
+      "skip_rate": 0.0,
+      "outcomes": {
+        "applied": 4
+      },
+      "reasons": {},
+      "acceptance_passed": true,
+      "recommendation": "build"
+    },
+    "ruler_smoke": {
+      "case_count": 2,
+      "input_tokens": 604,
+      "output_tokens": 117,
+      "tokens_saved": 487,
+      "savings_ratio": 0.806291,
+      "off_quality_score": 1.0,
+      "on_quality_score": 1.0,
+      "quality_delta": 0.0,
+      "added_compression_latency_micros": null,
+      "applied_count": 2,
+      "skipped_count": 0,
+      "fallback_count": 0,
+      "skip_rate": 0.0,
+      "outcomes": {
+        "applied": 2
+      },
+      "reasons": {},
+      "acceptance_passed": true,
+      "recommendation": "build"
+    }
+  },
+  "overall": {
+    "case_count": 6,
+    "input_tokens": 1929,
+    "output_tokens": 486,
+    "tokens_saved": 1443,
+    "savings_ratio": 0.748056,
+    "off_quality_score": 1.0,
+    "on_quality_score": 1.0,
+    "quality_delta": 0.0,
+    "added_compression_latency_micros": null,
+    "applied_count": 6,
+    "skipped_count": 0,
+    "fallback_count": 0,
+    "skip_rate": 0.0,
+    "outcomes": {
+      "applied": 6
+    },
+    "reasons": {},
+    "acceptance_passed": true,
+    "recommendation": "build"
+  }
+}

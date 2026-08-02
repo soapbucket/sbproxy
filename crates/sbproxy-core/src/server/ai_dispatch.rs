@@ -9,6 +9,68 @@ use super::*;
 #[cfg(test)]
 use crate::key_policy::StoredPolicyErrorKind;
 use crate::key_policy::{key_record_to_effective_policy, StoredPolicyError};
+use crate::model_discovery::ErrorEnvelope;
+
+fn provider_matches_native_key(
+    provider: &sbproxy_ai::ProviderConfig,
+    native_provider: &str,
+) -> bool {
+    provider.accepts_native_credential_for(native_provider)
+}
+
+fn apply_native_provider_credential(
+    provider: &mut sbproxy_ai::ProviderConfig,
+    native_api_key: Option<&str>,
+) {
+    if let Some(api_key) = native_api_key {
+        provider.api_key = Some(api_key.to_string());
+    }
+}
+
+#[cfg(test)]
+mod native_destination_tests {
+    use super::{model_rate_limit_identity, provider_matches_native_key};
+
+    #[test]
+    fn provider_wire_type_is_not_native_credential_authority() {
+        let unbound: sbproxy_ai::ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "custom-openai-wire",
+            "provider_type": "openai",
+            "base_url": "https://untrusted.example/v1"
+        }))
+        .unwrap();
+        assert!(!provider_matches_native_key(&unbound, "openai"));
+
+        let bound: sbproxy_ai::ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "trusted-openai-wire",
+            "provider_type": "openai",
+            "base_url": "https://trusted.example/v1",
+            "accept_native_credentials_for": "openai"
+        }))
+        .unwrap();
+        assert!(provider_matches_native_key(&bound, " OPENAI "));
+    }
+
+    #[test]
+    fn model_limiter_identity_is_carrier_independent_and_secret_free() {
+        let mut authorization = crate::context::RequestContext::new();
+        authorization.tenant_id = "tenant-a".into();
+        authorization.principal.attrs.key_id = Some("resolved-key-id".to_string());
+        authorization.inbound_key_header = Some("authorization".to_string());
+        authorization.request_id = "opaque-caller-secret-canary".into();
+
+        let mut custom = crate::context::RequestContext::new();
+        custom.tenant_id = "tenant-a".into();
+        custom.principal.attrs.key_id = Some("resolved-key-id".to_string());
+        custom.inbound_key_header = Some("x-opaque-carrier".to_string());
+
+        let first = model_rate_limit_identity(&authorization, "api.example");
+        let second = model_rate_limit_identity(&custom, "api.example");
+        assert_eq!(first, "resolved-key-id");
+        assert_eq!(first, second);
+        assert!(!first.contains("opaque-caller-secret-canary"));
+    }
+}
 
 /// Outcome of resolving an inbound bearer token against the dynamic key plane
 /// (WOR-1551).
@@ -20,6 +82,109 @@ enum DynamicKeyOutcome {
     Resolved(Box<sbproxy_keystore::record::KeyRecord>),
     /// Deny the request with this status and message.
     Deny(u16, String),
+}
+
+/// WOR-1881: feed provider quota headers into the shared router before
+/// retry/reselect so headroom and reset-aware strategies see live signals.
+/// Does not log header values (may contain operational detail; never secrets).
+fn update_router_quota_from_response(
+    router: &sbproxy_ai::Router,
+    provider_name: &str,
+    resp: &reqwest::Response,
+) {
+    let status = resp.status().as_u16();
+    let headers: Vec<(String, String)> = resp
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            let value = value.to_str().ok()?.to_string();
+            Some((name.as_str().to_string(), value))
+        })
+        .collect();
+    router.update_quota_from_headers(provider_name, &headers, status);
+}
+
+/// Run one selected provider attempt with shared load-balancer observation.
+///
+/// The in-flight guard is cancellation-safe. Successful response-header
+/// completion records latency for every forwarding surface; transport errors
+/// release the slot but remain owned by the router's failure signals.
+async fn run_routed_provider_attempt<T, E>(
+    router: &sbproxy_ai::Router,
+    provider_idx: usize,
+    attempt: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, E> {
+    let _in_flight = router.track_in_flight(provider_idx);
+    let started = std::time::Instant::now();
+    let result = attempt.await;
+    if result.is_ok() {
+        let elapsed_us = u64::try_from(started.elapsed().as_micros())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        router.record_latency(provider_idx, elapsed_us);
+    }
+    result
+}
+
+#[cfg(test)]
+mod routed_provider_observation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn routed_attempt_is_visible_as_in_flight_before_completion() {
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "openai", "api_key": "test"},
+                {"name": "anthropic", "api_key": "test"}
+            ],
+            "routing": {"strategy": "peak_ewma", "half_life": "10s"}
+        }))
+        .expect("valid AI config");
+        let router = config.router();
+        router.record_latency(0, 1_000);
+        router.record_latency(1, 1_000);
+
+        run_routed_provider_attempt(&router, 0, async {
+            assert_eq!(
+                router.select(&config.providers),
+                Some(1),
+                "the active attempt must raise provider 0's effective cost"
+            );
+            Ok::<(), ()>(())
+        })
+        .await
+        .expect("attempt succeeds");
+    }
+
+    #[test]
+    fn completed_upstream_usage_reaches_router_before_any_relay_early_return() {
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "openai", "api_key": "test"},
+                {"name": "anthropic", "api_key": "test"}
+            ],
+            "routing": {"strategy": "least_token_usage"}
+        }))
+        .expect("valid AI config");
+        let router = config.router();
+        let sink = RouterTokenSink {
+            router: &router,
+            config_providers: &config.providers,
+            provider_name: "openai",
+        };
+
+        record_router_tokens_from_response(
+            &sink,
+            200,
+            br#"{"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
+        );
+
+        assert_eq!(
+            router.select(&config.providers),
+            Some(1),
+            "provider usage must be visible even if relay later blocks the response"
+        );
+    }
 }
 
 fn effective_policy_to_virtual_key(
@@ -70,6 +235,7 @@ fn effective_policy_to_virtual_key(
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect(),
         route_to_model: policy.route_to_model.clone(),
+        compression_profile: policy.compression_profile.clone(),
         inject_tools: policy.inject_tools.clone(),
         inject_mcp: policy.inject_mcp.as_ref().map(|reference| {
             sbproxy_ai::identity::InjectMcpRef {
@@ -85,6 +251,7 @@ fn effective_policy_to_virtual_key(
         }),
         enabled: true,
         bypass_prompt_injection: policy.bypass_prompt_injection,
+        allow_content_capture: policy.allow_content_capture,
     }
 }
 
@@ -99,6 +266,253 @@ struct ResolvedRequestKey {
     virtual_key: sbproxy_ai::identity::VirtualKeyConfig,
     effective_policy: Option<sbproxy_ai::effective_key_policy::EffectiveKeyPolicy>,
     policy_origin: ResolvedPolicyOrigin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompressionSelectionSource {
+    Header,
+    GovernedKey,
+    CelPolicy,
+    RouteDefault,
+}
+
+impl CompressionSelectionSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Header => "header",
+            Self::GovernedKey => "governed_key",
+            Self::CelPolicy => "cel_policy",
+            Self::RouteDefault => "route_default",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CompressionSelectionIntent {
+    selector: sbproxy_ai::compression::CompressionSelector,
+    source: CompressionSelectionSource,
+    invalid_operator_selector: bool,
+}
+
+struct BoundCompressionSelection {
+    selected: Option<crate::compression_runtime::SelectedCompressionRuntime>,
+    source: CompressionSelectionSource,
+    invalid_operator_selector: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompressionSelectionError {
+    InvalidHeader,
+    UnknownHeaderProfile,
+}
+
+impl CompressionSelectionError {
+    const fn client_message(self) -> &'static str {
+        match self {
+            Self::InvalidHeader => {
+                "x-compression must contain exactly one of on, off, or a valid profile name"
+            }
+            Self::UnknownHeaderProfile => "x-compression selects an undeclared profile",
+        }
+    }
+
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::InvalidHeader => "invalid_header",
+            Self::UnknownHeaderProfile => "unknown_profile",
+        }
+    }
+}
+
+fn compression_header_value(
+    headers: &http::HeaderMap,
+) -> Result<Option<String>, CompressionSelectionError> {
+    let mut values = headers.get_all("x-compression").iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(CompressionSelectionError::InvalidHeader);
+    }
+    let value = value
+        .to_str()
+        .map_err(|_| CompressionSelectionError::InvalidHeader)?
+        .trim();
+    Ok(Some(value.to_string()))
+}
+
+fn resolve_compression_selection_intent(
+    header: Option<&str>,
+    governed_key: Option<&str>,
+    cel: Option<&sbproxy_ai::compression::CompressionSelector>,
+) -> Result<CompressionSelectionIntent, CompressionSelectionError> {
+    if let Some(header) = header {
+        let selector = sbproxy_ai::compression::CompressionSelector::parse(header)
+            .map_err(|_| CompressionSelectionError::InvalidHeader)?;
+        return Ok(CompressionSelectionIntent {
+            selector,
+            source: CompressionSelectionSource::Header,
+            invalid_operator_selector: false,
+        });
+    }
+    if let Some(governed_key) = governed_key {
+        return Ok(
+            match sbproxy_ai::compression::CompressionSelector::parse(governed_key) {
+                Ok(selector) => CompressionSelectionIntent {
+                    selector,
+                    source: CompressionSelectionSource::GovernedKey,
+                    invalid_operator_selector: false,
+                },
+                Err(_) => CompressionSelectionIntent {
+                    selector: sbproxy_ai::compression::CompressionSelector::Off,
+                    source: CompressionSelectionSource::GovernedKey,
+                    invalid_operator_selector: true,
+                },
+            },
+        );
+    }
+    if let Some(cel) = cel {
+        return Ok(CompressionSelectionIntent {
+            selector: cel.clone(),
+            source: CompressionSelectionSource::CelPolicy,
+            invalid_operator_selector: false,
+        });
+    }
+    Ok(CompressionSelectionIntent {
+        selector: sbproxy_ai::compression::CompressionSelector::On,
+        source: CompressionSelectionSource::RouteDefault,
+        invalid_operator_selector: false,
+    })
+}
+
+fn bind_compression_selection(
+    mut intent: CompressionSelectionIntent,
+    runtime_set: Option<&crate::compression_runtime::CompressionRuntimeSet>,
+) -> Result<BoundCompressionSelection, CompressionSelectionError> {
+    let selected = if let Some(runtime_set) = runtime_set {
+        match runtime_set.select(&intent.selector) {
+            Some(selected) => Some(selected),
+            None if intent.source == CompressionSelectionSource::Header => {
+                return Err(CompressionSelectionError::UnknownHeaderProfile);
+            }
+            None => {
+                intent.invalid_operator_selector = true;
+                runtime_set.select(&sbproxy_ai::compression::CompressionSelector::Off)
+            }
+        }
+    } else {
+        match &intent.selector {
+            sbproxy_ai::compression::CompressionSelector::Profile(_)
+                if intent.source == CompressionSelectionSource::Header =>
+            {
+                return Err(CompressionSelectionError::UnknownHeaderProfile);
+            }
+            sbproxy_ai::compression::CompressionSelector::Profile(_) => {
+                intent.invalid_operator_selector = true;
+                None
+            }
+            sbproxy_ai::compression::CompressionSelector::On
+            | sbproxy_ai::compression::CompressionSelector::Off => None,
+        }
+    };
+    Ok(BoundCompressionSelection {
+        selected,
+        source: intent.source,
+        invalid_operator_selector: intent.invalid_operator_selector,
+    })
+}
+
+fn compression_selection_bypasses_cache(
+    runtime_set: Option<&crate::compression_runtime::CompressionRuntimeSet>,
+    explicit_selection: bool,
+) -> bool {
+    explicit_selection || runtime_set.is_some_and(|set| set.requires_semantic_cache_bypass())
+}
+
+fn compression_selection_outcome(
+    source: CompressionSelectionSource,
+    invalid_operator_selector: bool,
+    runtime_selected: bool,
+) -> &'static str {
+    if invalid_operator_selector {
+        "invalid_operator"
+    } else if !runtime_selected {
+        "disabled"
+    } else if source == CompressionSelectionSource::RouteDefault {
+        "default"
+    } else {
+        "selected"
+    }
+}
+
+fn ai_policy_input_tokens_est(model: &str, body: &serde_json::Value) -> i64 {
+    let Some(messages) = body.get("messages").and_then(serde_json::Value::as_array) else {
+        return 0;
+    };
+    let tokens = sbproxy_ai::token_estimate::estimate_json_message_tokens(model, messages);
+    i64::try_from(tokens).unwrap_or(i64::MAX)
+}
+
+/// Whether one attempt may replay the original native request bytes to the
+/// upstream instead of the governed canonical body. Streaming, any request
+/// transform, and any selected RAG runtime (which pins the request to the
+/// canonical route for every retrieval outcome, including no-match,
+/// continue, and stale) each make the bypass unsafe on their own.
+fn native_bypass_is_safe(
+    is_stream: bool,
+    request_transform_selected: bool,
+    rag_requires_canonical_path: bool,
+) -> bool {
+    !is_stream && !request_transform_selected && !rag_requires_canonical_path
+}
+
+// A streaming request stays on the streaming relay only when the upstream
+// answered with a streaming body: SSE, or NDJSON (Ollama's framing, which
+// the usage-parser stack handles line-by-line). Anything else, JSON errors
+// and buffered JSON successes alike, takes the bounded buffered relay.
+fn upstream_response_is_successful_stream(status: u16, content_type: Option<&str>) -> bool {
+    (200..300).contains(&status)
+        && content_type
+            .and_then(|value| value.split(';').next())
+            .map(str::trim)
+            .is_some_and(|media_type| {
+                media_type.eq_ignore_ascii_case("text/event-stream")
+                    || media_type.eq_ignore_ascii_case("application/x-ndjson")
+            })
+}
+
+const DEFAULT_BUFFERED_AI_RESPONSE_BODY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_BUFFERED_AI_RESPONSE_BODY_BYTES: usize = 1024 * 1024 * 1024;
+
+fn buffered_ai_response_body_limit(configured: Option<usize>) -> usize {
+    configured
+        .filter(|maximum| *maximum > 0)
+        .unwrap_or(DEFAULT_BUFFERED_AI_RESPONSE_BODY_BYTES)
+        .min(MAX_BUFFERED_AI_RESPONSE_BODY_BYTES)
+}
+
+/// Compare the canonical request captured immediately after native inbound
+/// parsing with the body that is about to be dispatched. Provider model
+/// mapping is intentionally ignored because `make_native_bypass_body` applies
+/// the resolved model to the native body. Any other top-level change means a
+/// request transform would be lost by replaying the original native bytes.
+fn native_bypass_body_changed(
+    baseline: &serde_json::Value,
+    attempt_body: &serde_json::Value,
+) -> bool {
+    let (Some(baseline), Some(attempt)) = (baseline.as_object(), attempt_body.as_object()) else {
+        return baseline != attempt_body;
+    };
+    let baseline_len = baseline
+        .keys()
+        .filter(|key| key.as_str() != "model")
+        .count();
+    let attempt_len = attempt.keys().filter(|key| key.as_str() != "model").count();
+    baseline_len != attempt_len
+        || baseline
+            .iter()
+            .filter(|(key, _)| key.as_str() != "model")
+            .any(|(key, value)| attempt.get(key) != Some(value))
 }
 
 impl ResolvedRequestKey {
@@ -217,6 +631,13 @@ impl ResolvedRequestKey {
         )
     }
 
+    fn compression_profile(&self) -> Option<&str> {
+        self.policy().map_or_else(
+            || self.virtual_key.compression_profile.as_deref(),
+            |policy| policy.compression_profile.as_deref(),
+        )
+    }
+
     fn inject_tools(&self) -> &[serde_json::Value] {
         self.policy()
             .map_or(self.virtual_key.inject_tools.as_slice(), |policy| {
@@ -229,6 +650,38 @@ impl ResolvedRequestKey {
         // canonical policy. Configured records were typed during compilation.
         self.virtual_key.inject_mcp.as_ref()
     }
+}
+
+fn credential_requires_interpreted_model(resolved: &ResolvedRequestKey) -> bool {
+    resolved.route_to_model().is_some()
+        || !resolved.allowed_models().is_empty()
+        || !resolved.blocked_models().is_empty()
+}
+
+fn governed_effective_model(
+    resolved: Option<&ResolvedRequestKey>,
+    requested_model: Option<&str>,
+) -> std::result::Result<Option<String>, &'static str> {
+    let requested_model = requested_model.filter(|model| !model.trim().is_empty());
+    let Some(resolved) = resolved else {
+        return Ok(requested_model.map(str::to_string));
+    };
+    let effective = resolved.route_to_model().or(requested_model);
+    let Some(effective) = effective else {
+        return if credential_requires_interpreted_model(resolved) {
+            Err("model is required by this credential policy")
+        } else {
+            Ok(None)
+        };
+    };
+    if !resolved.is_model_allowed(effective) {
+        return Err("model is not allowed for this credential");
+    }
+    Ok(Some(effective.to_string()))
+}
+
+fn credential_requires_pii_redaction(resolved: Option<&ResolvedRequestKey>) -> bool {
+    resolved.is_some_and(|resolved| !resolved.require_pii_redaction().is_empty())
 }
 
 fn governed_key_requirement(
@@ -282,15 +735,158 @@ fn bounded_config_revision(config_revision: &str) -> String {
     format!("h:{}", &digest[..PEER_POLICY_DIGEST_PREFIX_LEN])
 }
 
+struct PreparedAiIdentity {
+    resolved_request_key: Option<ResolvedRequestKey>,
+    policy_revision: String,
+}
+
+async fn prepare_ai_request_identity(
+    session: &Session,
+    config: &AiHandlerConfig,
+    pipeline: &CompiledPipeline,
+    ctx: &mut RequestContext,
+    key_plane: Option<&crate::key_plane::KeyPlane>,
+) -> std::result::Result<PreparedAiIdentity, (u16, String)> {
+    let origin_tenant_id = ctx.tenant_id.to_string();
+    let resolved_request_key =
+        resolve_request_virtual_key(ctx, session, config, key_plane, &origin_tenant_id)
+            .await
+            .map_err(|(status, message)| {
+                warn!(status, reason = %message, "AI proxy: virtual key denied");
+                (status, message)
+            })?;
+
+    governed_key_requirement(config.require_governed_key, resolved_request_key.as_ref()).map_err(
+        |(status, message)| {
+            warn!(
+                reason = "governed_key_required",
+                "AI proxy: request did not resolve a governed credential"
+            );
+            (status, message.to_string())
+        },
+    )?;
+
+    if let Some(key) = resolved_request_key.as_ref() {
+        ctx.effective_key_policy = key.effective_policy.clone();
+        apply_resolved_virtual_key_context(session, config, ctx, key)
+            .map_err(|(status, message)| (status, message.to_string()))?;
+    }
+
+    let policy_revision =
+        peer_policy_revision(resolved_request_key.as_ref(), &pipeline.config_revision).map_err(
+            |_| {
+                warn!(
+                    reason = "policy_digest_failed",
+                    "AI proxy: effective credential policy rejected"
+                );
+                (403, "credential policy is invalid".to_string())
+            },
+        )?;
+
+    Ok(PreparedAiIdentity {
+        resolved_request_key,
+        policy_revision,
+    })
+}
+
 fn merged_request_budget<'a>(
     origin: Option<&'a sbproxy_ai::BudgetConfig>,
-    _policy: Option<&sbproxy_ai::effective_key_policy::EffectiveKeyPolicy>,
+    policy: Option<&sbproxy_ai::effective_key_policy::EffectiveKeyPolicy>,
 ) -> Option<std::borrow::Cow<'a, sbproxy_ai::BudgetConfig>> {
-    // Governed key budgets are exclusively enforced by the atomic
-    // reservation backend. Feeding them into the legacy process-local
-    // tracker as well would debit the same completion twice and make strict
-    // enforcement depend on which ingress replica handled the request.
-    origin.map(std::borrow::Cow::Borrowed)
+    let key_budget = policy
+        .and_then(|policy| policy.budget.as_ref())
+        .filter(|budget| budget.max_tokens.is_some() || budget.max_cost_usd.is_some());
+    let Some(key_budget) = key_budget else {
+        return origin.map(std::borrow::Cow::Borrowed);
+    };
+
+    let mut merged = origin.cloned().unwrap_or_else(|| sbproxy_ai::BudgetConfig {
+        limits: Vec::new(),
+        on_exceed: sbproxy_ai::OnExceedAction::Block,
+        soft_landing: None,
+    });
+    merged.limits.push(sbproxy_ai::budget::BudgetLimit {
+        scope: sbproxy_ai::budget::BudgetScope::ApiKey,
+        max_tokens: key_budget.max_tokens,
+        max_cost_usd: key_budget.max_cost_usd,
+        period: Some("total".to_string()),
+        downgrade_to: None,
+    });
+    Some(std::borrow::Cow::Owned(merged))
+}
+
+/// The calling agent's identity for one dispatch (WOR-2140).
+///
+/// `id` is the *claimed* agent id from `A2AContext::caller_agent_id`,
+/// capped once here by [`sbproxy_ai::tracing_spans::cap_agent_id`] so the
+/// span, the billing event, the usage ledger, and the metric label cannot
+/// name three different agents for the same request. `verified` mirrors
+/// `A2AContext::identity_verified`: true only when a trusted peer or a
+/// verified RFC 8693 `act` chain supplied the name.
+///
+/// `ctx.a2a` is available here. The request filter populates it
+/// unconditionally from header detection before any policy or action
+/// runs, so it is in place even though `handle_ai_proxy` terminates the
+/// request inside `request_filter`. `ctx.a2a_context_id` is *not*: that
+/// one is read from the JSON-RPC body at the body phase, which this path
+/// never reaches (WOR-2144). Run correlation on this surface therefore
+/// rides the capture session, not the A2A context id.
+///
+/// Held owned because the dispatcher keeps `ctx` borrowed as `&mut` for
+/// the rest of the request; [`Self::identity`] hands out the borrowed
+/// view the budget and billing APIs take.
+struct BillingAgent {
+    /// Claimed agent id, capped. Empty when the request carried no A2A
+    /// envelope, or carried one with no caller agent id.
+    id: String,
+    /// Whether the claim came from a source the proxy trusts.
+    verified: bool,
+}
+
+impl BillingAgent {
+    /// Read the A2A envelope the request filter stamped on the context.
+    fn from_context(ctx: &RequestContext) -> Self {
+        match ctx.a2a.as_ref() {
+            Some(a2a) => Self {
+                id: sbproxy_ai::tracing_spans::cap_agent_id(a2a.caller_agent_id.as_str())
+                    .to_string(),
+                verified: a2a.identity_verified,
+            },
+            None => Self {
+                id: String::new(),
+                verified: false,
+            },
+        }
+    }
+
+    /// The claimed id, or `None` when the request named no agent.
+    ///
+    /// Recorded on the span and the billing event regardless of trust,
+    /// so a spend report can show an unverified claim as unverified
+    /// rather than losing it.
+    fn claimed_id(&self) -> Option<&str> {
+        (!self.id.is_empty()).then_some(self.id.as_str())
+    }
+
+    /// Borrowed view for budget scoping and the billing choke point.
+    fn identity(&self) -> sbproxy_ai::budget::AgentIdentity<'_> {
+        sbproxy_ai::budget::AgentIdentity {
+            id: self.claimed_id(),
+            verified: self.verified,
+        }
+    }
+
+    /// The id that may be attributed to a *named* agent: verified and
+    /// non-empty.
+    ///
+    /// This is what fills `AttributionTags::agent_id`, which becomes the
+    /// bounded `agent_id` metric label and the durable rollup dimension.
+    /// An unverified caller must never reach it, or it could bill its
+    /// spend to somebody else's agent, or mint a fresh agent per request
+    /// until the label's cardinality budget demotes the real ones.
+    fn attributable_id(&self) -> Option<&str> {
+        self.identity().billable_id()
+    }
 }
 
 fn immutable_budget_key_id(ctx: &RequestContext) -> Option<String> {
@@ -303,6 +899,719 @@ fn immutable_budget_key_id(ctx: &RequestContext) -> Option<String> {
         })
 }
 
+/// Immutable, secret-free identity used by the per-model limiter.
+///
+/// Governed traffic uses the resolved policy/key id. Only genuinely
+/// ungoverned traffic falls back to an opaque fingerprint of structural
+/// request identity; wire credential text and carrier names are never inputs.
+fn model_rate_limit_identity(ctx: &RequestContext, hostname: &str) -> String {
+    if let Some(key_id) = immutable_budget_key_id(ctx) {
+        return key_id;
+    }
+
+    use sha2::{Digest as _, Sha256};
+    let mut hasher = Sha256::new();
+    for component in [
+        ctx.tenant_id.as_ref(),
+        hostname,
+        ctx.principal.source.as_str(),
+        ctx.principal.sub.as_str(),
+    ] {
+        hasher.update(component.len().to_be_bytes());
+        hasher.update(component.as_bytes());
+    }
+    let digest = hex::encode(hasher.finalize());
+    format!("ungoverned:{}", &digest[..32])
+}
+
+async fn ai_surface_budget_gate(
+    session: &Session,
+    config: &AiHandlerConfig,
+    hostname: &str,
+    ctx: &RequestContext,
+    model: Option<&str>,
+) -> BudgetGate {
+    let Some(effective_budget) =
+        merged_request_budget(config.budget.as_ref(), ctx.effective_key_policy.as_ref())
+    else {
+        return BudgetGate::Allow;
+    };
+    let api_key_id = immutable_budget_key_id(ctx);
+    let user =
+        req_header_value(session, "x-user-id").or_else(|| req_header_value(session, "x-end-user"));
+    let tag = req_header_value(session, "x-sbproxy-tag");
+    // WOR-2140: an agent-scoped cap has to bind here too, or a surface
+    // that admits through this gate spends against a per-agent budget it
+    // never consulted.
+    let agent = BillingAgent::from_context(ctx);
+    let (_, gate) = scoped_budget_preflight(
+        effective_budget.as_ref(),
+        &config.providers,
+        hostname,
+        api_key_id.as_deref(),
+        user.as_deref(),
+        model,
+        Some(hostname),
+        tag.as_deref(),
+        agent.identity(),
+    )
+    .await;
+    gate
+}
+
+pub(super) struct RealtimeAdmission {
+    pub(super) budget_gate: BudgetGate,
+    pub(super) provider_name: String,
+}
+
+pub(super) async fn realtime_budget_gate(
+    session: &Session,
+    config: &AiHandlerConfig,
+    pipeline: &CompiledPipeline,
+    hostname: &str,
+    ctx: &mut RequestContext,
+    model: Option<&str>,
+) -> std::result::Result<RealtimeAdmission, (u16, String)> {
+    let key_plane = pipeline.key_plane().cloned();
+    let prepared =
+        prepare_ai_request_identity(session, config, pipeline, ctx, key_plane.as_deref()).await?;
+
+    if credential_requires_pii_redaction(prepared.resolved_request_key.as_ref()) {
+        return Err((
+            403,
+            "required PII redaction is unsupported for realtime AI sessions".to_string(),
+        ));
+    }
+    let effective_model = governed_effective_model(prepared.resolved_request_key.as_ref(), model)
+        .map_err(|message| (403, message.to_string()))?;
+    if effective_model
+        .as_deref()
+        .is_some_and(|model| !config.is_model_allowed(model))
+    {
+        return Err((403, "model is not allowed".to_string()));
+    }
+
+    let mut budget_gate =
+        ai_surface_budget_gate(session, config, hostname, ctx, effective_model.as_deref()).await;
+    let final_model = match &budget_gate {
+        BudgetGate::Allow => effective_model.clone(),
+        BudgetGate::Block { .. } => effective_model.clone(),
+        BudgetGate::Downgrade { model } => {
+            if !config.is_model_allowed(model)
+                || prepared
+                    .resolved_request_key
+                    .as_ref()
+                    .is_some_and(|key| !key.is_model_allowed(model))
+            {
+                return Err((
+                    403,
+                    "budget downgrade model is not allowed for this credential".to_string(),
+                ));
+            }
+            Some(model.clone())
+        }
+    };
+    if matches!(budget_gate, BudgetGate::Allow)
+        && effective_model.as_deref() != model.filter(|model| !model.is_empty())
+    {
+        if let Some(model) = effective_model.clone() {
+            budget_gate = BudgetGate::Downgrade { model };
+        }
+    }
+
+    let allowed_providers = prepared
+        .resolved_request_key
+        .as_ref()
+        .map(ResolvedRequestKey::allowed_providers)
+        .unwrap_or(&[]);
+    let blocked_providers = prepared
+        .resolved_request_key
+        .as_ref()
+        .map(ResolvedRequestKey::blocked_providers)
+        .unwrap_or(&[]);
+    let native_provider = (ctx.inbound_key_mode == crate::context::InboundKeyMode::Native)
+        .then_some(ctx.native_key_provider.as_deref())
+        .flatten();
+    let provider = config.providers.iter().find(|provider| {
+        provider.enabled
+            && sbproxy_ai::api_routes::provider_supports_realtime(
+                provider.effective_provider_type(),
+            )
+            && sbproxy_ai::routing::provider_allowed_by_policy(
+                provider.name.as_str(),
+                allowed_providers,
+                blocked_providers,
+            )
+            && native_provider.is_none_or(|native| provider_matches_native_key(provider, native))
+            && final_model.as_deref().is_none_or(|model| {
+                provider.models.is_empty()
+                    || provider.models.iter().any(|candidate| *candidate == model)
+            })
+    });
+    let Some(provider) = provider else {
+        return Err((
+            403,
+            "no realtime AI provider satisfies this credential policy".to_string(),
+        ));
+    };
+
+    Ok(RealtimeAdmission {
+        budget_gate,
+        provider_name: provider.name.to_string(),
+    })
+}
+
+/// Translate a resolved effective key policy into governance limits.
+///
+/// This is the `GovernanceLimits` analog of [`merged_request_budget`]: it
+/// reads the same [`sbproxy_ai::effective_key_policy::EffectiveKeyPolicy`]
+/// fields the process-local rate limiter and budget tracker already read,
+/// but shapes them for [`sbproxy_ai::governance::GovernanceStore::reserve`]
+/// instead. Returns `None` when the policy carries no governed limit at all
+/// (nothing to enforce), so the caller can skip the reserve round-trip
+/// entirely for ungoverned or unlimited keys.
+fn governance_limits_from_policy(
+    policy: &sbproxy_ai::effective_key_policy::EffectiveKeyPolicy,
+) -> Option<sbproxy_ai::governance::GovernanceLimits> {
+    let total_micro_usd = policy
+        .budget
+        .as_ref()
+        .and_then(|budget| budget.max_cost_usd)
+        .map(crate::server::ai_support::cost_usd_to_micros);
+    let total_tokens = policy.budget.as_ref().and_then(|budget| budget.max_tokens);
+    let requests = policy.max_requests_per_minute;
+    let tokens = policy.max_tokens_per_minute;
+    if requests.is_none() && tokens.is_none() && total_tokens.is_none() && total_micro_usd.is_none()
+    {
+        return None;
+    }
+    Some(sbproxy_ai::governance::GovernanceLimits {
+        requests_per_window: requests,
+        tokens_per_window: tokens,
+        total_tokens,
+        total_micro_usd,
+        window_millis: 60_000,
+    })
+}
+
+/// Build the governance-store lookup key for `GET /v1/key/usage`, scoped
+/// strictly to the resolved caller's own key id and policy revision. The
+/// route takes no key id parameter, so this is the only key it can ever
+/// answer for. Returns the same rejection [`governed_key_requirement`]
+/// uses for a request with no governed policy, since there is nothing to
+/// look up for a key that carries none.
+fn key_usage_snapshot_key(
+    resolved: Option<&ResolvedRequestKey>,
+) -> std::result::Result<sbproxy_ai::governance::SnapshotKey, (u16, &'static str)> {
+    let policy = resolved
+        .and_then(ResolvedRequestKey::policy)
+        .ok_or((401, "governed credential required"))?;
+    Ok(sbproxy_ai::governance::SnapshotKey {
+        key_id: policy.key_id.clone(),
+        policy_revision: policy.policy_revision,
+        limits: governance_limits_from_policy(policy).unwrap_or_default(),
+    })
+}
+
+/// Answer `GET /v1/key/usage`: the resolved caller's own
+/// [`sbproxy_ai::governance::GovernanceSnapshot`], wrapped the same way
+/// the admin-plane key-usage lookup wraps it (`{"usage": <snapshot>}`), so
+/// a caller already parsing that shape can reuse it here.
+async fn key_usage_response(
+    store: &dyn sbproxy_ai::governance::GovernanceStore,
+    resolved: Option<&ResolvedRequestKey>,
+) -> std::result::Result<serde_json::Value, (u16, &'static str)> {
+    let snapshot_key = key_usage_snapshot_key(resolved)?;
+    match store.snapshot(snapshot_key).await {
+        Ok(snapshot) => Ok(serde_json::json!({ "usage": snapshot })),
+        // Same client-facing message the governed-key reserve path sends
+        // on a 503 for this same error further down in `handle_ai_proxy`.
+        Err(sbproxy_ai::governance::GovernanceError::BackendUnavailable { .. }) => {
+            Err((503, "governed key admission backend unavailable"))
+        }
+        Err(_) => Err((500, "governance snapshot failed")),
+    }
+}
+
+/// Decide the pre-request monetary ceiling for a governance reserve
+/// (WOR-1835, task 7), or signal that the request must be denied instead.
+///
+/// `estimated_cost_usd` is [`sbproxy_ai::budget::estimate_cost_for_usage`]
+/// priced against the request's estimated token ceiling. A model the price
+/// catalog and any configured rate card both miss prices at the
+/// pessimistic $5/$1M fallback (never silently $0), so in practice a $0
+/// estimate here means there was nothing to estimate against (an empty or
+/// unparseable `messages` array) rather than a genuinely-unpriced model;
+/// `missing_rate` treats both the same way, since neither can back a real
+/// monetary pre-gate.
+///
+/// [`sbproxy_config::types::GovernanceMissingRatePolicy::ZeroCost`]
+/// (default) admits with a `0` ceiling: no monetary pre-gate applies, but
+/// settlement still records the real cost once it is known.
+/// [`sbproxy_config::types::GovernanceMissingRatePolicy::RequireRate`]
+/// returns `Err(())` instead when `has_total_micro_usd_limit` is true,
+/// since a `0` ceiling cannot actually enforce that limit and silently
+/// admitting would leave it unenforced for the life of the request.
+fn governance_micro_usd_ceiling(
+    estimated_cost_usd: f64,
+    missing_rate: sbproxy_config::types::GovernanceMissingRatePolicy,
+    has_total_micro_usd_limit: bool,
+) -> Result<u64, ()> {
+    if estimated_cost_usd > 0.0 {
+        return Ok(crate::server::ai_support::cost_usd_to_micros(
+            estimated_cost_usd,
+        ));
+    }
+    if has_total_micro_usd_limit
+        && missing_rate == sbproxy_config::types::GovernanceMissingRatePolicy::RequireRate
+    {
+        return Err(());
+    }
+    Ok(0)
+}
+
+/// Whether a `GovernanceError::BackendUnavailable` reserve failure
+/// (WOR-1835, task 8) should admit the request without a reservation,
+/// under the resolved governance failure posture.
+///
+/// Applies only to that one error variant; every other reserve error
+/// (a real governed limit, a malformed request, a reused reservation id,
+/// arithmetic overflow) is unrelated to backend availability and keeps
+/// failing open unconditionally, unaffected by this setting.
+///
+/// Take the posture from
+/// [`sbproxy_config::types::KeyGovernanceConfig::failure_posture`], never
+/// from the legacy `failure_mode` field: the accessor is what resolves
+/// the new `failure_posture` key against it (WOR-2121).
+fn governance_admits_on_backend_unavailable(
+    failure_posture: sbproxy_config::types::FailureMode,
+) -> bool {
+    failure_posture.admits()
+}
+
+/// The one quota-pool failure mapping, shared with the realtime path in
+/// [`crate::context::RealtimeQuotaFailure`].
+///
+/// This dispatch path and the realtime path each carried their own copy
+/// of the mapping, written independently, and they had already drifted:
+/// a denial with no resolvable pool config produced a 429 on one and a
+/// 503 on the other. The shared helper resolves the posture through
+/// `QuotaPoolConfig::failure_posture`, so a `failure_posture` set on a
+/// pool now governs every path that pool can fail on (WOR-2121).
+type QuotaPoolErrorDisposition = sbproxy_ai::quota_pool::PoolErrorDisposition;
+
+fn quota_pool_error_from_attempt(
+    config: Option<&sbproxy_ai::QuotaPoolConfig>,
+    error: &anyhow::Error,
+) -> Option<QuotaPoolErrorDisposition> {
+    let pool_error = error.downcast_ref::<sbproxy_ai::PoolError>()?;
+    Some(sbproxy_ai::quota_pool::pool_error_disposition(
+        config, pool_error,
+    ))
+}
+
+async fn send_quota_pool_attempt_error(
+    session: &mut Session,
+    config: Option<&sbproxy_ai::QuotaPoolConfig>,
+    error: &anyhow::Error,
+) -> Result<bool> {
+    match quota_pool_error_from_attempt(config, error) {
+        Some(QuotaPoolErrorDisposition::Reject { status, message }) => {
+            send_error(session, status, message).await?;
+            Ok(true)
+        }
+        Some(QuotaPoolErrorDisposition::Admit) | None => Ok(false),
+    }
+}
+
+fn quota_pool_member_id(
+    principal: &sbproxy_plugin::Principal,
+    anonymous_is_uncredentialed: bool,
+) -> Result<String, sbproxy_ai::PoolError> {
+    let key_id = principal.api_key_id();
+    if !key_id.is_empty() {
+        return Ok(key_id.to_string());
+    }
+    if anonymous_is_uncredentialed && principal.is_anonymous() {
+        return Ok("__anonymous__".to_string());
+    }
+    Err(sbproxy_ai::PoolError::InvalidState)
+}
+
+/// Resolve quota membership from the request's authenticated context.
+///
+/// `Principal::anonymous()` and an out-of-tree auth plugin that allows a
+/// request without a subject currently have the same principal shape. Treat
+/// that shape as anonymous only when the origin has no auth provider or uses
+/// the explicit no-op provider. All authenticated or indeterminate empty
+/// identities fail closed instead of sharing the anonymous member.
+pub(super) fn quota_pool_member_id_for_request(
+    ctx: &RequestContext,
+) -> Result<String, sbproxy_ai::PoolError> {
+    let anonymous_is_uncredentialed =
+        if ctx.resolved_inbound_key.is_some() || ctx.native_key_policy_record.is_some() {
+            false
+        } else {
+            match ctx
+                .origin_idx
+                .and_then(|origin_idx| ctx.pipeline.auths.get(origin_idx))
+            {
+                Some(None) | Some(Some(sbproxy_modules::auth::Auth::Noop)) => true,
+                Some(Some(_)) | None => false,
+            }
+        };
+    quota_pool_member_id(&ctx.principal, anonymous_is_uncredentialed)
+}
+
+fn sequential_attempt_limit(
+    is_failover: bool,
+    content_policy_fallback: bool,
+    provider_count: usize,
+) -> usize {
+    if is_failover || content_policy_fallback {
+        provider_count
+    } else {
+        1
+    }
+}
+
+#[cfg(test)]
+async fn admit_quota_pool_attempt(
+    config: Option<&sbproxy_ai::QuotaPoolConfig>,
+    admission: &sbproxy_ai::quota_pool::QuotaPoolAdmission,
+    reservation_id: &str,
+) -> Result<(), QuotaPoolErrorDisposition> {
+    match admission.consume(reservation_id).await {
+        Ok(()) => Ok(()),
+        Err(error) => match sbproxy_ai::quota_pool::pool_error_disposition(config, &error) {
+            // `QuotaPoolAdmission` normally consumes this branch and
+            // records the metric itself. Keep the defensive fallback so
+            // a future admission implementation cannot accidentally turn
+            // an explicit admitting posture into a hard failure. Only a
+            // waived guarantee is counted; a plain `open` claims nothing,
+            // exactly as on the reserve path.
+            QuotaPoolErrorDisposition::Admit => {
+                if let Some(config) = config.filter(|c| c.failure_posture().guarantee_waived()) {
+                    sbproxy_ai::ai_metrics::record_quota_pool_fail_open(&config.name);
+                }
+                Ok(())
+            }
+            reject => Err(reject),
+        },
+    }
+}
+
+async fn reserve_quota_pool_attempt(
+    config: Option<&sbproxy_ai::QuotaPoolConfig>,
+    admission: &sbproxy_ai::quota_pool::QuotaPoolAdmission,
+    reservation_id: &str,
+) -> std::result::Result<sbproxy_ai::quota_pool::QuotaPoolAttemptGuard, QuotaPoolErrorDisposition> {
+    match admission.reserve_attempt(reservation_id).await {
+        Ok(attempt) => Ok(attempt),
+        Err(error) => match sbproxy_ai::quota_pool::pool_error_disposition(config, &error) {
+            QuotaPoolErrorDisposition::Admit => {
+                debug_assert!(
+                    false,
+                    "reserve_attempt must convert an admitting posture to a no-op guard"
+                );
+                Err(QuotaPoolErrorDisposition::Admit)
+            }
+            reject => Err(reject),
+        },
+    }
+}
+
+async fn reserve_quota_pool_attempt_or_respond(
+    session: &mut Session,
+    config: Option<&sbproxy_ai::QuotaPoolConfig>,
+    admission: &sbproxy_ai::quota_pool::QuotaPoolAdmission,
+    reservation_id: &str,
+) -> Result<Option<sbproxy_ai::quota_pool::QuotaPoolAttemptGuard>> {
+    match reserve_quota_pool_attempt(config, admission, reservation_id).await {
+        Ok(attempt) => Ok(Some(attempt)),
+        Err(QuotaPoolErrorDisposition::Reject { status, message }) => {
+            send_error(session, status, message).await?;
+            Ok(None)
+        }
+        Err(QuotaPoolErrorDisposition::Admit) => {
+            debug_assert!(
+                false,
+                "reserve_attempt must convert an admitting posture to a no-op guard"
+            );
+            send_error(session, 503, "fair-share quota state unavailable").await?;
+            Ok(None)
+        }
+    }
+}
+
+/// Launch an optional shadow only after the primary dispatch has produced a
+/// response. Primary traffic therefore has first claim on shared quota; a
+/// denied or unavailable shadow admission suppresses that copy without
+/// replacing an already-earned client response.
+#[allow(clippy::too_many_arguments)]
+fn try_spawn_governed_shadow_after_primary(
+    config: &AiHandlerConfig,
+    surface: &sbproxy_ai::handler::AiSurface,
+    path: &str,
+    body: &serde_json::Value,
+    is_stream: bool,
+    allowed_providers: &[String],
+    blocked_providers: &[String],
+    disallow_prompt_training: bool,
+    ctx: &RequestContext,
+    quota: &sbproxy_ai::quota_pool::QuotaPoolAdmission,
+    reasoning_eligibility: sbproxy_ai::ReasoningEligibility,
+) {
+    // A shadow is a second billable provider request. The caller authorized
+    // only the provider represented by their native credential, while this
+    // API currently accepts an operator-owned config snapshot. Suppress the
+    // copy rather than silently spending the operator credential.
+    if ctx.inbound_key_mode == crate::context::InboundKeyMode::Native {
+        return;
+    }
+    if !shadow_surface_is_eligible(surface) {
+        return;
+    }
+    let usage = super::ai_support::shadow_usage_record_from_context(ctx);
+    let reservation_prefix = format!("{}:quota-pool", ctx.request_id);
+    let _ = AI_CLIENT
+        .load()
+        .try_spawn_shadow_with_quota_detached_with_reasoning_eligibility(
+            config,
+            path,
+            body,
+            is_stream,
+            allowed_providers,
+            blocked_providers,
+            disallow_prompt_training,
+            usage,
+            quota.clone(),
+            &reservation_prefix,
+            reasoning_eligibility,
+        );
+}
+
+#[cfg(test)]
+mod quota_pool_dispatch_tests {
+    use super::*;
+
+    fn pool(failure_mode: sbproxy_ai::QuotaPoolFailureMode) -> sbproxy_ai::QuotaPoolConfig {
+        let mut config: sbproxy_ai::QuotaPoolConfig = serde_json::from_value(serde_json::json!({
+            "name": "shared-upstream",
+            "total_limit": 10,
+            "weights": {"virtual-key-a": 1},
+            "policy": "burst"
+        }))
+        .expect("quota fixture");
+        config.failure_mode = failure_mode;
+        config
+    }
+
+    fn disposition(
+        config: &sbproxy_ai::QuotaPoolConfig,
+        error: &sbproxy_ai::PoolError,
+    ) -> QuotaPoolErrorDisposition {
+        sbproxy_ai::quota_pool::pool_error_disposition(Some(config), error)
+    }
+
+    #[test]
+    fn quota_pool_denial_and_backend_failure_map_to_exact_statuses() {
+        let closed = pool(sbproxy_ai::QuotaPoolFailureMode::Closed);
+        assert_eq!(
+            disposition(
+                &closed,
+                &sbproxy_ai::PoolError::Denied(sbproxy_ai::PoolDeny::PoolExhausted {
+                    total_load: 10,
+                    total_limit: 10,
+                }),
+            ),
+            QuotaPoolErrorDisposition::Reject {
+                status: 429,
+                message: "fair-share quota pool exhausted",
+            }
+        );
+        assert_eq!(
+            disposition(&closed, &sbproxy_ai::PoolError::BackendUnavailable),
+            QuotaPoolErrorDisposition::Reject {
+                status: 503,
+                message: "fair-share quota backend unavailable",
+            }
+        );
+
+        let allow = pool(sbproxy_ai::QuotaPoolFailureMode::AllowUnreserved);
+        assert_eq!(
+            disposition(&allow, &sbproxy_ai::PoolError::BackendUnavailable),
+            QuotaPoolErrorDisposition::Admit
+        );
+        assert!(matches!(
+            disposition(&allow, &sbproxy_ai::PoolError::InvalidState),
+            QuotaPoolErrorDisposition::Reject { status: 503, .. }
+        ));
+    }
+
+    /// The legacy `failure_mode` and an explicit `failure_posture` produce
+    /// the same dispositions, and an explicit posture wins when both are
+    /// set. Same helper the realtime path calls, so the two agree by
+    /// construction rather than by review (WOR-2121).
+    #[test]
+    fn an_explicit_failure_posture_overrides_the_legacy_quota_failure_mode() {
+        use sbproxy_config::types::FailureMode;
+
+        // Legacy `allow_unreserved` and explicit `degraded` are the same
+        // answer, which is the migration promise.
+        let legacy = pool(sbproxy_ai::QuotaPoolFailureMode::AllowUnreserved);
+        let mut explicit = pool(sbproxy_ai::QuotaPoolFailureMode::Closed);
+        explicit.failure_posture = Some(FailureMode::Degraded);
+        assert_eq!(
+            disposition(&legacy, &sbproxy_ai::PoolError::BackendUnavailable),
+            disposition(&explicit, &sbproxy_ai::PoolError::BackendUnavailable),
+        );
+        assert_eq!(legacy.failure_posture(), FailureMode::Degraded);
+
+        // The explicit key wins in the other direction too.
+        let mut closed_over_allow = pool(sbproxy_ai::QuotaPoolFailureMode::AllowUnreserved);
+        closed_over_allow.failure_posture = Some(FailureMode::Closed);
+        assert_eq!(
+            disposition(
+                &closed_over_allow,
+                &sbproxy_ai::PoolError::BackendUnavailable
+            ),
+            QuotaPoolErrorDisposition::Reject {
+                status: 503,
+                message: "fair-share quota backend unavailable",
+            }
+        );
+
+        // `open` admits like `degraded` and waives no guarantee, which is
+        // what keeps the fail-open counter off for it.
+        let mut opened = pool(sbproxy_ai::QuotaPoolFailureMode::Closed);
+        opened.failure_posture = Some(FailureMode::Open);
+        assert_eq!(
+            disposition(&opened, &sbproxy_ai::PoolError::BackendUnavailable),
+            QuotaPoolErrorDisposition::Admit
+        );
+        assert!(!opened.failure_posture().guarantee_waived());
+        assert!(legacy.failure_posture().guarantee_waived());
+    }
+
+    #[tokio::test]
+    async fn allow_unreserved_applies_only_to_backend_unavailability() {
+        let allow = pool(sbproxy_ai::QuotaPoolFailureMode::AllowUnreserved);
+        let unavailable = sbproxy_ai::quota_pool::QuotaPoolAdmission::new(
+            Some(allow.clone()),
+            Err(sbproxy_ai::PoolError::BackendUnavailable),
+            Ok("virtual-key-a".to_string()),
+        );
+        assert!(
+            admit_quota_pool_attempt(Some(&allow), &unavailable, "request:0")
+                .await
+                .is_ok()
+        );
+
+        let invalid = sbproxy_ai::quota_pool::QuotaPoolAdmission::new(
+            Some(allow.clone()),
+            Err(sbproxy_ai::PoolError::InvalidState),
+            Ok("virtual-key-a".to_string()),
+        );
+        assert!(matches!(
+            admit_quota_pool_attempt(Some(&allow), &invalid, "request:1").await,
+            Err(QuotaPoolErrorDisposition::Reject { status: 503, .. })
+        ));
+    }
+
+    #[test]
+    fn quota_pool_members_use_immutable_key_ids_and_anonymous_sentinel() {
+        let anonymous = sbproxy_plugin::Principal::anonymous();
+        assert_eq!(
+            quota_pool_member_id(&anonymous, true).expect("anonymous sentinel"),
+            "__anonymous__"
+        );
+        assert!(matches!(
+            quota_pool_member_id(&anonymous, false),
+            Err(sbproxy_ai::PoolError::InvalidState)
+        ));
+
+        let identified = sbproxy_plugin::Principal {
+            attrs: sbproxy_plugin::PrincipalAttrs {
+                key_id: Some("virtual-key-a".to_string()),
+                ..Default::default()
+            },
+            ..sbproxy_plugin::Principal::anonymous()
+        };
+        assert_eq!(
+            quota_pool_member_id(&identified, false).expect("immutable key id"),
+            "virtual-key-a"
+        );
+
+        let credential_without_immutable_id = sbproxy_plugin::Principal {
+            sub: "authenticated-user".to_string(),
+            ..sbproxy_plugin::Principal::anonymous()
+        };
+        assert!(matches!(
+            quota_pool_member_id(&credential_without_immutable_id, false),
+            Err(sbproxy_ai::PoolError::InvalidState)
+        ));
+
+        let shared_bearer_without_immutable_id = sbproxy_plugin::Principal {
+            source: sbproxy_plugin::PrincipalSource::Bearer,
+            ..sbproxy_plugin::Principal::anonymous()
+        };
+        assert!(matches!(
+            quota_pool_member_id(&shared_bearer_without_immutable_id, false),
+            Err(sbproxy_ai::PoolError::InvalidState)
+        ));
+    }
+
+    fn request_with_auth(auth: Option<sbproxy_modules::auth::Auth>) -> RequestContext {
+        let mut pipeline = crate::pipeline::CompiledPipeline::default();
+        pipeline.auths.push(auth);
+        let mut ctx = RequestContext::new();
+        ctx.pipeline = std::sync::Arc::new(pipeline);
+        ctx.origin_idx = Some(0);
+        ctx
+    }
+
+    #[test]
+    fn request_context_distinguishes_uncredentialed_from_empty_authenticated_principals() {
+        let no_auth = request_with_auth(None);
+        assert_eq!(
+            quota_pool_member_id_for_request(&no_auth).expect("origin has no authentication"),
+            "__anonymous__"
+        );
+
+        let noop = request_with_auth(Some(sbproxy_modules::auth::Auth::Noop));
+        assert_eq!(
+            quota_pool_member_id_for_request(&noop).expect("explicit noop is uncredentialed"),
+            "__anonymous__"
+        );
+
+        let bearer = sbproxy_modules::compile_auth(&serde_json::json!({
+            "type": "bearer",
+            "tokens": ["test-token"]
+        }))
+        .expect("bearer fixture");
+        let authenticated_without_key_id = request_with_auth(Some(bearer));
+        assert!(matches!(
+            quota_pool_member_id_for_request(&authenticated_without_key_id),
+            Err(sbproxy_ai::PoolError::InvalidState)
+        ));
+
+        let mut indeterminate = RequestContext::new();
+        indeterminate.origin_idx = None;
+        assert!(matches!(
+            quota_pool_member_id_for_request(&indeterminate),
+            Err(sbproxy_ai::PoolError::InvalidState)
+        ));
+    }
+
+    #[test]
+    fn quota_pool_alone_does_not_enable_provider_failover() {
+        assert_eq!(sequential_attempt_limit(false, false, 3), 1);
+        assert_eq!(sequential_attempt_limit(true, false, 3), 3);
+        assert_eq!(sequential_attempt_limit(false, true, 3), 3);
+    }
+}
+
 /// Process-global per-key rate limiter (WOR-1558). Accumulates request counts
 /// per virtual key across requests; the limit itself is read per-request from
 /// the resolved record, so a live PATCH changes enforcement without a reload.
@@ -310,6 +1619,47 @@ pub(super) fn key_rate_limiter() -> &'static sbproxy_ai::identity::KeyRateLimite
     static LIMITER: std::sync::OnceLock<sbproxy_ai::identity::KeyRateLimiter> =
         std::sync::OnceLock::new();
     LIMITER.get_or_init(sbproxy_ai::identity::KeyRateLimiter::new)
+}
+
+/// Turn a key-store outage into a dynamic-key outcome, under the plane's
+/// configured failure posture.
+///
+/// The OIDC-claim path and the bearer path each had their own copy of this
+/// decision, as did the two inbound-key entry points in `request_phase`.
+/// All four now read `key_management.failure_posture` through
+/// [`crate::key_plane::KeyPlane::failure_posture`] (WOR-2121).
+///
+/// An admitting posture returns `NotApplicable`, which hands the request
+/// to the origin's own configured auth rather than admitting it outright.
+/// [`Degraded`](sbproxy_config::types::FailureMode::Degraded) and
+/// [`Open`](sbproxy_config::types::FailureMode::Open) take that same
+/// branch and differ only in whether the lost per-key policy, budget, and
+/// attribution are recorded as lost.
+fn dynamic_key_store_outage(
+    plane: &crate::key_plane::KeyPlane,
+    error: &anyhow::Error,
+) -> DynamicKeyOutcome {
+    let posture = plane.failure_posture();
+    if !posture.admits() {
+        return DynamicKeyOutcome::Deny(503, "key store unavailable".to_string());
+    }
+    if posture.guarantee_waived() {
+        tracing::warn!(
+            error = %error,
+            failure_posture = posture.as_label(),
+            guarantee_waived = true,
+            "key store unavailable; passing through with no per-key policy, budget, or \
+             attribution"
+        );
+    } else {
+        tracing::warn!(
+            error = %error,
+            failure_posture = posture.as_label(),
+            guarantee_waived = false,
+            "key store unavailable; passing through"
+        );
+    }
+    DynamicKeyOutcome::NotApplicable
 }
 
 /// WOR-1555: map a verified OIDC/JWT identity to a stored virtual-key record's
@@ -321,8 +1671,9 @@ pub(super) fn key_rate_limiter() -> &'static sbproxy_ai::identity::KeyRateLimite
 /// is not configured or the token carries no mapped claim. A claim that names a
 /// missing or inactive record DENIES: the identity declared itself governed by
 /// that record, so revoking the record blocks the JWT rather than degrading it
-/// to ungoverned access. A store outage fails closed unless
-/// `failure_mode_allow` is set, mirroring the bearer path.
+/// to ungoverned access. A store outage is resolved by
+/// [`dynamic_key_store_outage`] against `key_management.failure_posture`,
+/// which defaults to closed, mirroring the bearer path.
 async fn resolve_oidc_mapped_key(
     plane: &crate::key_plane::KeyPlane,
     principal: &sbproxy_plugin::Principal,
@@ -340,14 +1691,7 @@ async fn resolve_oidc_mapped_key(
         return DynamicKeyOutcome::NotApplicable;
     };
     match plane.cache().resolve_key(key_id).await {
-        Err(e) => {
-            if plane.failure_mode_allow() {
-                tracing::warn!(error = %e, "key store unavailable; failure_mode_allow set, passing through");
-                DynamicKeyOutcome::NotApplicable
-            } else {
-                DynamicKeyOutcome::Deny(503, "key store unavailable".to_string())
-            }
-        }
+        Err(e) => dynamic_key_store_outage(plane, &e),
         // Same status for a missing record as the bearer path's unknown id.
         Ok(None) => DynamicKeyOutcome::Deny(401, "invalid key".to_string()),
         Ok(Some(rec)) => {
@@ -361,9 +1705,10 @@ async fn resolve_oidc_mapped_key(
 }
 
 /// Resolve an inbound bearer token against the dynamic key plane: parse the
-/// `sk-<key_id>-<secret>` shape, look the id up through the cache then store,
-/// constant-time verify the secret, and gate on status/expiry. Fail-closed: a
-/// store outage denies unless `failure_mode_allow` is set.
+/// `sbp_<key_id>_<secret>` shape (or the legacy `sk-<key_id>-<secret>`), look
+/// the id up through the cache then store, constant-time verify the secret, and
+/// gate on status/expiry. Fail-closed by default: a store outage is resolved by
+/// [`dynamic_key_store_outage`] against `key_management.failure_posture`.
 async fn resolve_dynamic_virtual_key(
     plane: &crate::key_plane::KeyPlane,
     raw_token: Option<&str>,
@@ -371,23 +1716,25 @@ async fn resolve_dynamic_virtual_key(
     let Some(token) = raw_token else {
         return DynamicKeyOutcome::NotApplicable;
     };
-    let Some((key_id, secret)) = sbproxy_keystore::crypto::parse_token(token) else {
+    // Accept both shapes. `sbp_` is unambiguously ours. The legacy `sk-` rule
+    // is loose enough to swallow a genuine provider key (`sk-proj-...` parses
+    // with a key_id of "proj"), so a parse alone is not proof of ownership.
+    let Some((key_id, secret)) = sbproxy_keystore::crypto::parse_minted_token(token)
+        .or_else(|| sbproxy_keystore::crypto::parse_token(token))
+    else {
         // Not a virtual-key-shaped token; a different auth provider may own it.
         return DynamicKeyOutcome::NotApplicable;
     };
+    let conforming_id = sbproxy_keystore::crypto::is_conforming_key_id(key_id);
     let now = chrono::Utc::now();
     match plane.cache().resolve_key(key_id).await {
-        Err(e) => {
-            if plane.failure_mode_allow() {
-                tracing::warn!(error = %e, "key store unavailable; failure_mode_allow set, passing through");
-                DynamicKeyOutcome::NotApplicable
-            } else {
-                DynamicKeyOutcome::Deny(503, "key store unavailable".to_string())
-            }
-        }
+        Err(e) => dynamic_key_store_outage(plane, &e),
         // Unknown id and a wrong secret return the same status so neither is an
-        // existence oracle.
-        Ok(None) => DynamicKeyOutcome::Deny(401, "invalid key".to_string()),
+        // existence oracle. But only for an id that could plausibly have been
+        // minted here: a caller presenting their own `sk-proj-...` provider key
+        // must pass through to whoever owns it, not collect a 401 from us.
+        Ok(None) if conforming_id => DynamicKeyOutcome::Deny(401, "invalid key".to_string()),
+        Ok(None) => DynamicKeyOutcome::NotApplicable,
         Ok(Some(rec)) => {
             if !plane.crypto().verify_record(&rec, secret, now) {
                 DynamicKeyOutcome::Deny(401, "invalid key".to_string())
@@ -401,43 +1748,166 @@ async fn resolve_dynamic_virtual_key(
 }
 
 async fn resolve_request_virtual_key(
+    ctx: &mut RequestContext,
     session: &Session,
     config: &AiHandlerConfig,
-    principal: &sbproxy_plugin::Principal,
     plane: Option<&crate::key_plane::KeyPlane>,
     origin_tenant_id: &str,
 ) -> std::result::Result<Option<ResolvedRequestKey>, (u16, String)> {
-    let auth_value = req_header_value(session, "authorization");
-    let raw_key = auth_value.as_deref().map(|header| {
-        header
-            .strip_prefix("Bearer ")
-            .or_else(|| header.strip_prefix("bearer "))
-            .unwrap_or(header)
-            .trim()
-            .to_string()
-    });
+    // The pre-auth sweep may have already resolved the key, possibly from a
+    // header other than `authorization`, and consumed it. Prefer that record.
+    //
+    // Without this, a key swept out of `x-api-key` would find nothing here,
+    // fall through to the configured keys, find nothing there either, and
+    // dispatch UNGOVERNED: no model allowlist, no budget, no rate limit, no
+    // tool injection, no PII requirement, and no error or log to say so.
+    if ctx.resolved_inbound_key.is_some() {
+        stamp_minted_key_mode(ctx);
+        let record = ctx
+            .resolved_inbound_key
+            .as_deref()
+            .expect("resolved key checked above");
+        return lower_stored_request_key(record, origin_tenant_id).map(Some);
+    }
+    let presented_credentials: Vec<(String, std::borrow::Cow<'_, str>)> = if let Some(plane) = plane
+    {
+        crate::inbound_key::presented_credentials(&session.req_header().headers, plane.inbound())
+            .into_iter()
+            .map(|credential| {
+                (
+                    credential.header,
+                    std::borrow::Cow::Borrowed(credential.value),
+                )
+            })
+            .collect()
+    } else {
+        req_header_value(session, "authorization")
+            .map(|header| {
+                let key = header
+                    .strip_prefix("Bearer ")
+                    .or_else(|| header.strip_prefix("bearer "))
+                    .unwrap_or(header.as_str())
+                    .trim()
+                    .to_string();
+                vec![("authorization".to_string(), std::borrow::Cow::Owned(key))]
+            })
+            .unwrap_or_default()
+    };
     if let Some(plane) = plane {
-        match resolve_dynamic_virtual_key(plane, raw_key.as_deref()).await {
-            DynamicKeyOutcome::Resolved(record) => {
-                return lower_stored_request_key(&record, origin_tenant_id).map(Some);
-            }
-            DynamicKeyOutcome::NotApplicable => {
-                match resolve_oidc_mapped_key(plane, principal).await {
-                    DynamicKeyOutcome::Resolved(record) => {
-                        return lower_stored_request_key(&record, origin_tenant_id).map(Some);
-                    }
-                    DynamicKeyOutcome::NotApplicable => {}
-                    DynamicKeyOutcome::Deny(status, message) => return Err((status, message)),
+        for (header, credential) in &presented_credentials {
+            match resolve_dynamic_virtual_key(plane, Some(credential.as_ref())).await {
+                DynamicKeyOutcome::Resolved(record) => {
+                    stamp_minted_key_mode(ctx);
+                    ctx.inbound_key_header = Some(header.clone());
+                    sbproxy_observe::metrics::record_auth(
+                        ctx.hostname.as_str(),
+                        "virtual_key",
+                        true,
+                    );
+                    return lower_and_preserve_stored_request_key(ctx, record, origin_tenant_id)
+                        .map(Some);
+                }
+                DynamicKeyOutcome::NotApplicable => {}
+                DynamicKeyOutcome::Deny(status, message) => {
+                    stamp_minted_key_mode(ctx);
+                    ctx.inbound_key_header = Some(header.clone());
+                    crate::trust_tier::finalize(
+                        ctx,
+                        AuthTrustOutcome::InvalidProof.is_suspicious(),
+                    );
+                    sbproxy_observe::metrics::record_auth(
+                        ctx.hostname.as_str(),
+                        "virtual_key",
+                        false,
+                    );
+                    emit_auth_audit(
+                        "auth_denied",
+                        "virtual_key",
+                        status,
+                        ctx.hostname.as_str(),
+                        ctx,
+                        session,
+                    );
+                    return Err((status, message));
                 }
             }
+        }
+        match resolve_oidc_mapped_key(plane, &ctx.principal).await {
+            DynamicKeyOutcome::Resolved(record) => {
+                stamp_minted_key_mode(ctx);
+                return lower_and_preserve_stored_request_key(ctx, record, origin_tenant_id)
+                    .map(Some);
+            }
+            DynamicKeyOutcome::NotApplicable => {}
             DynamicKeyOutcome::Deny(status, message) => return Err((status, message)),
         }
     }
-    Ok(resolve_configured_virtual_key(
-        &config.virtual_keys,
-        raw_key.as_deref(),
-        origin_tenant_id,
-    ))
+
+    for (header, credential) in &presented_credentials {
+        if let Some(resolved) = resolve_configured_virtual_key(
+            &config.virtual_keys,
+            Some(credential.as_ref()),
+            origin_tenant_id,
+        ) {
+            stamp_minted_key_mode(ctx);
+            ctx.inbound_key_header = Some(header.clone());
+            return Ok(Some(resolved));
+        }
+    }
+
+    let Some(plane) = plane else {
+        return Ok(None);
+    };
+    match crate::inbound_key::resolve_native_key_policy(
+        &session.req_header().headers,
+        plane.inbound(),
+    ) {
+        crate::inbound_key::NativeKeyPolicyDecision::NotPresent => Ok(None),
+        crate::inbound_key::NativeKeyPolicyDecision::Allowed { provider } => {
+            let policy = plane
+                .inbound()
+                .native_key_policy
+                .as_ref()
+                .expect("allowed native key decision requires a policy");
+            let record = Box::new(crate::inbound_key::native_policy_record(
+                policy,
+                ctx.tenant_id.as_str(),
+                ctx.hostname.as_str(),
+                &provider,
+            ));
+            let resolved = lower_stored_request_key(&record, origin_tenant_id)?;
+            ctx.native_key_policy_record = Some(record);
+            ctx.native_key_provider = Some(provider);
+            ctx.inbound_key_mode = crate::context::InboundKeyMode::Native;
+            Ok(Some(resolved))
+        }
+        crate::inbound_key::NativeKeyPolicyDecision::PolicyMissing { provider }
+        | crate::inbound_key::NativeKeyPolicyDecision::ProviderDenied { provider } => {
+            ctx.native_key_provider = Some(provider);
+            ctx.inbound_key_mode = crate::context::InboundKeyMode::Native;
+            crate::trust_tier::finalize(ctx, AuthTrustOutcome::Missing.is_suspicious());
+            sbproxy_observe::metrics::record_auth(
+                ctx.hostname.as_str(),
+                "native_provider_key",
+                false,
+            );
+            emit_auth_audit(
+                "auth_denied",
+                "native_provider_key",
+                403,
+                ctx.hostname.as_str(),
+                ctx,
+                session,
+            );
+            Err((403, "native provider key is not allowed".to_string()))
+        }
+    }
+}
+
+fn stamp_minted_key_mode(ctx: &mut RequestContext) {
+    ctx.inbound_key_mode = crate::context::InboundKeyMode::Minted;
+    ctx.native_key_provider = None;
+    ctx.native_key_policy_record = None;
 }
 
 fn resolve_configured_virtual_key(
@@ -466,6 +1936,22 @@ fn lower_stored_request_key(
         );
         (403, "credential policy is invalid".to_string())
     })
+}
+
+/// Preserve the authenticated record for later Pingora phases after lowering
+/// its secret-free policy for AI dispatch.
+///
+/// Dynamic bearer and OIDC mapping can resolve after the pre-auth sweep. The
+/// upstream phase still needs the original record's credential binding, so
+/// retain it on the request context only after policy validation succeeds.
+fn lower_and_preserve_stored_request_key(
+    ctx: &mut RequestContext,
+    record: Box<sbproxy_keystore::record::KeyRecord>,
+    origin_tenant_id: &str,
+) -> std::result::Result<ResolvedRequestKey, (u16, String)> {
+    let resolved = lower_stored_request_key(&record, origin_tenant_id)?;
+    ctx.resolved_inbound_key = Some(record);
+    Ok(resolved)
 }
 
 const UNNAMED_VIRTUAL_KEY_PRINCIPAL: &str = "<unnamed>";
@@ -512,6 +1998,40 @@ fn principal_for_resolved_virtual_key(
     }
 }
 
+/// Stamp a guardrail block onto the request context, and count it.
+///
+/// These were two separate concerns until the counter turned out to have no
+/// writer at all. `sbproxy_ai_guardrail_blocks_total` was declared, published
+/// as a stable metric, and drawn on a Grafana panel, while
+/// `record_guardrail_block` was called from nowhere. The panel read a flat
+/// zero, which is indistinguishable from a guardrail that never fires, which
+/// is exactly what an operator would conclude.
+///
+/// Setting the context fields and the counter in one place is the only
+/// arrangement in which the dashboard cannot silently disagree with the access
+/// log: a new block path has to go through here to stamp the context, and
+/// stamping the context increments the counter.
+/// WOR-2096: both the origin flag and the governed key's policy must
+/// consent before any redacted content sample is retained. Fail closed:
+/// no effective policy (unkeyed or native traffic) means no capture.
+fn content_capture_allowed(config: &AiHandlerConfig, ctx: &RequestContext) -> bool {
+    config.capture_content
+        && ctx
+            .effective_key_policy
+            .as_ref()
+            .is_some_and(|policy| policy.allow_content_capture)
+}
+
+fn mark_guardrail_block(ctx: &mut RequestContext, category: String) {
+    sbproxy_ai::ai_metrics::record_guardrail_block(&category);
+    ctx.ai_outcome = Some("guardrail_block".to_string());
+    // WOR-2094: the ring row explains the block alongside the badge.
+    ctx.record_policy_decision("guardrail", "deny");
+    ctx.deny_reason = Some(format!("guardrail: {category}"));
+    ctx.ai_guardrail_category = Some(category);
+    ctx.ai_guardrail_action = Some("block".to_string());
+}
+
 fn apply_resolved_key_lane(ctx: &mut RequestContext, resolved: &ResolvedRequestKey) {
     ctx.ai_lane_priority = resolved.virtual_key.priority;
 }
@@ -555,12 +2075,7 @@ fn apply_resolved_virtual_key_context(
     ctx.attribution_tags =
         crate::server::ai_support::resolve_attribution_tags(session, &ctx.principal);
 
-    // Canonical governed policies enter the reservation backend after request
-    // parsing, when a conservative token and cost ceiling is available. Keep
-    // the legacy limiter only for configured credentials without a public
-    // immutable key id.
-    if resolved.policy().is_none()
-        && (key.max_requests_per_minute.is_some() || key.max_tokens_per_minute.is_some())
+    if (key.max_requests_per_minute.is_some() || key.max_tokens_per_minute.is_some())
         && !key_rate_limiter().check_rate(safe_runtime_key_id(key), key)
     {
         warn!(
@@ -569,612 +2084,38 @@ fn apply_resolved_virtual_key_context(
         );
         return Err((429, "rate limit exceeded for this key"));
     }
-    if resolved.policy().is_none() && key.max_tokens_per_minute.is_some() {
+    if key.max_tokens_per_minute.is_some() {
         ctx.ai_key_tpm_bucket = Some(safe_runtime_key_id(key).to_string());
     }
     apply_resolved_key_lane(ctx, resolved);
-    if let Some(counters) = crate::mesh_counters::current_mesh_counters() {
-        counters.record_request(safe_runtime_key_id(key));
-    }
 
     Ok(())
 }
 
-async fn admit_governed_request(
-    session: &mut Session,
-    hostname: &str,
+fn apply_json_request_pii_redaction(
+    config: &AiHandlerConfig,
     ctx: &mut RequestContext,
-    model: &str,
-    price: Option<sbproxy_ai::budget::ModelPrice>,
-    prompt_token_ceiling: u64,
-    output_token_ceiling: u64,
-) -> Result<bool> {
-    if ctx.governance_lease.is_some() {
-        return Ok(true);
-    }
-    let Some(policy) = ctx.effective_key_policy.clone() else {
-        return Ok(true);
-    };
-    let plane = crate::key_plane::governance_plane();
-    match crate::server::governance_admission::reserve(
-        plane.config(),
-        plane.store(),
-        &policy,
-        model,
-        price,
-        prompt_token_ceiling,
-        output_token_ceiling,
-    )
-    .await
-    {
-        Ok(crate::server::governance_admission::GovernanceAdmission::Reserved(charge)) => {
-            ctx.governance_lease = Some(charge);
-            Ok(true)
-        }
-        Ok(crate::server::governance_admission::GovernanceAdmission::NotLimited) => Ok(true),
-        Ok(crate::server::governance_admission::GovernanceAdmission::Unreserved { backend }) => {
-            let audit_reason = format!(
-                "backend_unavailable:{backend}:key={}:revision={}",
-                policy.key_id, policy.policy_revision
-            );
-            sbproxy_observe::SecurityAuditEntry::policy_violation(
-                "governance_allow_unreserved",
-                audit_reason,
-                200,
-                Some(hostname.to_string()),
-                None,
-                Some(ctx.request_id.to_string()),
-                Some(session.req_header().method.as_str().to_string()),
-            )
-            .with_tenant_id(ctx.tenant_id.to_string())
-            .emit();
-            sbproxy_observe::metrics::record_policy(hostname, "governance", "allow_unreserved");
-            Ok(true)
-        }
-        Err(error) => {
-            sbproxy_observe::metrics::record_policy(hostname, "governance", error.code);
-            let mut body = serde_json::json!({
-                "error": {
-                    "message": error.message,
-                    "type": "governance_error",
-                    "code": error.code,
-                }
-            });
-            if let Some(denial) = error.denial {
-                body["error"]["limit"] = serde_json::json!({
-                    "dimension": denial.dimension,
-                    "limit": denial.limit,
-                    "used": denial.used,
-                    "reserved": denial.reserved,
-                    "requested": denial.requested,
-                    "remaining": denial.remaining,
-                    "reset_at_millis": denial.reset_at_millis,
-                });
-            }
-            let bytes = serde_json::to_vec(&body).unwrap_or_default();
-            send_response(session, error.status, "application/json", &bytes).await?;
-            Ok(false)
-        }
-    }
-}
-
-fn arm_governance_ceiling(ctx: &mut RequestContext) {
-    if let Some(charge) = ctx.governance_lease.as_mut() {
-        let _ = charge.arm_conservative_drop_settlement();
-    }
-}
-
-async fn settle_governance_tokens(ctx: &mut RequestContext, input_tokens: u64, output_tokens: u64) {
-    if let Some(charge) = ctx.governance_lease.as_mut() {
-        if let Err(error) = charge.settle_tokens(input_tokens, output_tokens).await {
-            warn!(error = %error, "AI governance settlement failed");
-        }
-    }
-}
-
-async fn settle_governance_ceiling(ctx: &mut RequestContext) {
-    if let Some(charge) = ctx.governance_lease.as_mut() {
-        if let Err(error) = charge.settle_ceiling().await {
-            warn!(error = %error, "AI governance ceiling settlement failed");
-        }
-    }
-}
-
-async fn release_governance(ctx: &mut RequestContext) {
-    if let Some(charge) = ctx.governance_lease.as_mut() {
-        if let Err(error) = charge.release().await {
-            warn!(error = %error, "AI governance release failed");
-        }
-    }
-}
-
-fn accumulate_governance_retry_usage(ctx: &mut RequestContext, body: &[u8]) {
-    if ctx.governance_lease.is_none() {
-        return;
-    }
-    let Some((input, output)) = extract_governance_usage(body) else {
-        ctx.governance_retry_usage_missing = true;
-        return;
-    };
-    ctx.governance_retry_usage_observed = true;
-    match (
-        ctx.governance_retry_input_tokens.checked_add(input),
-        ctx.governance_retry_output_tokens.checked_add(output),
-    ) {
-        (Some(input_total), Some(output_total)) => {
-            ctx.governance_retry_input_tokens = input_total;
-            ctx.governance_retry_output_tokens = output_total;
-        }
-        _ => ctx.governance_retry_usage_missing = true,
-    }
-}
-
-async fn settle_governance_failed_attempts(ctx: &mut RequestContext) {
-    if ctx.governance_retry_usage_missing {
-        settle_governance_ceiling(ctx).await;
-    } else if ctx.governance_retry_usage_observed {
-        settle_governance_tokens(
-            ctx,
-            ctx.governance_retry_input_tokens,
-            ctx.governance_retry_output_tokens,
-        )
-        .await;
-    } else if governance_billable_work_started(ctx) {
-        settle_governance_ceiling(ctx).await;
-    } else {
-        release_governance(ctx).await;
-    }
-}
-
-fn mark_governance_retry_usage_missing(ctx: &mut RequestContext) {
-    if ctx.governance_lease.is_some() {
-        ctx.governance_retry_usage_missing = true;
-    }
-}
-
-fn governance_billable_work_started(ctx: &RequestContext) -> bool {
-    ctx.governance_lease
+    body: &mut serde_json::Value,
+) -> bool {
+    if !config
+        .pii
         .as_ref()
-        .is_some_and(|charge| charge.conservative_drop_settlement_armed())
-}
-
-async fn settle_governance_buffered_response(ctx: &mut RequestContext, status: u16, body: &[u8]) {
-    let final_usage = extract_governance_usage(body);
-    if ctx.governance_retry_usage_missing || (final_usage.is_none() && (200..300).contains(&status))
+        .is_some_and(|pii| pii.enabled && pii.redact_request)
     {
-        settle_governance_ceiling(ctx).await;
-    } else if let Some((input, output)) = final_usage {
-        match (
-            ctx.governance_retry_input_tokens.checked_add(input),
-            ctx.governance_retry_output_tokens.checked_add(output),
-        ) {
-            (Some(input), Some(output)) => settle_governance_tokens(ctx, input, output).await,
-            _ => settle_governance_ceiling(ctx).await,
-        }
-    } else if ctx.governance_retry_usage_observed {
-        settle_governance_tokens(
-            ctx,
-            ctx.governance_retry_input_tokens,
-            ctx.governance_retry_output_tokens,
-        )
-        .await;
-    } else if governance_billable_work_started(ctx) {
-        settle_governance_ceiling(ctx).await;
-    } else {
-        release_governance(ctx).await;
+        return false;
     }
-}
-
-fn mark_governance_output(ctx: &mut Option<&mut RequestContext>, output_emitted: &mut bool) {
-    if *output_emitted {
-        return;
-    }
-    *output_emitted = true;
-    if let Some(ctx) = ctx {
-        arm_governance_ceiling(ctx);
-    }
-}
-
-fn governance_reservation_ceiling(
-    surface: &sbproxy_ai::handler::AiSurface,
-    model: &str,
-    body: &serde_json::Value,
-    encoded_body_len: usize,
-    default_max_output_tokens: u64,
-    attempt_bound: u64,
-) -> Option<(u64, u64)> {
-    let messages = body
-        .get("messages")
-        .and_then(serde_json::Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| serde_json::from_value::<sbproxy_ai::Message>(item.clone()).ok())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let mut prompt =
-        sbproxy_ai::estimate_tokens_for_reservation(model, &messages, encoded_body_len);
-    // Reserve the complete encoded request, not only message text. This covers
-    // tools, response schemas, instructions, multimodal parts, and future
-    // prompt-bearing fields that a message-only tokenizer cannot see. The
-    // one-token-per-byte ceiling is intentionally conservative; optimize
-    // schema-complete exact tokenizers without weakening this invariant.
-    prompt = prompt.max(encoded_body_len as u64);
-    let generates_tokens = matches!(
-        surface,
-        sbproxy_ai::handler::AiSurface::ChatCompletions
-            | sbproxy_ai::handler::AiSurface::Messages
-            | sbproxy_ai::handler::AiSurface::Responses
-    );
-    let output_per_choice = body
-        .get("max_tokens")
-        .or_else(|| body.get("max_completion_tokens"))
-        .or_else(|| body.get("max_output_tokens"))
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(if generates_tokens {
-            default_max_output_tokens
-        } else {
-            0
-        });
-    let choices = if generates_tokens {
-        body.get("n")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(1)
-            .max(1)
-    } else {
-        1
+    let Some(redactor) = config.pii_redactor() else {
+        return false;
     };
-    let prompt = prompt.checked_mul(attempt_bound)?;
-    let output = output_per_choice
-        .checked_mul(choices)?
-        .checked_mul(attempt_bound)?;
-    Some((prompt, output))
-}
 
-fn governance_attempt_bound(
-    config: &sbproxy_ai::handler::AiHandlerConfig,
-    model: &str,
-    body: &serde_json::Value,
-    allowed_providers: &[String],
-    blocked_providers: &[String],
-) -> Option<u64> {
-    let is_stream = body
-        .get("stream")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let policy_candidates = config
-        .providers
-        .iter()
-        .filter(|provider| {
-            provider.enabled
-                && sbproxy_ai::routing::provider_allowed_by_policy(
-                    provider.name.as_str(),
-                    allowed_providers,
-                    blocked_providers,
-                )
-        })
-        .collect::<Vec<_>>();
-    let declared_matches = policy_candidates
-        .iter()
-        .filter(|provider| {
-            model.is_empty()
-                || provider.models.is_empty()
-                || provider.models.iter().any(|candidate| candidate == model)
-        })
-        .count();
-    // Routing deliberately treats a model that no provider enumerates as a
-    // pass-through model and leaves the full policy-filtered order intact.
-    // Mirror that wildcard behavior here so fallback/race reservations cover
-    // every provider that can actually receive billable work.
-    let eligible = if declared_matches == 0 {
-        policy_candidates.len()
-    } else {
-        declared_matches
+    let body_before_redaction = body.clone();
+    let mut capture = sbproxy_security::pii::ReversibleCapture::new();
+    redactor.redact_json_with_capture(body, &mut capture);
+    if !capture.is_empty() {
+        ctx.ai_reversible_redactions = capture.pairs;
     }
-    .max(1);
-    let content_policy_fallback = config
-        .resilience
-        .as_ref()
-        .is_some_and(|resilience| resilience.content_policy_fallback);
-    let has_managed_fallback = config.providers.iter().any(|provider| {
-        provider.enabled && (provider.serve.is_some() || provider.is_managed_model())
-    });
-    let base = match &config.routing {
-        sbproxy_ai::RoutingStrategy::Race if !is_stream => eligible,
-        sbproxy_ai::RoutingStrategy::Cascade(cascade) if !is_stream => cascade.tiers.len().max(1),
-        sbproxy_ai::RoutingStrategy::FallbackChain => eligible,
-        _ if content_policy_fallback || has_managed_fallback => eligible,
-        _ => 1,
-    };
-    // This dispatch path does not invoke the library client's shadow hook.
-    // Do not reserve or price work that cannot be dispatched here.
-    u64::try_from(base).ok()
-}
-
-fn governance_route_price(
-    config: &sbproxy_ai::handler::AiHandlerConfig,
-    model: &str,
-    allowed_providers: &[String],
-    blocked_providers: &[String],
-    require_every_rate: bool,
-) -> Option<sbproxy_ai::budget::ModelPrice> {
-    if model.is_empty() {
-        return None;
-    }
-    let policy_candidates = config
-        .providers
-        .iter()
-        .filter(|provider| {
-            provider.enabled
-                && sbproxy_ai::routing::provider_allowed_by_policy(
-                    provider.name.as_str(),
-                    allowed_providers,
-                    blocked_providers,
-                )
-        })
-        .collect::<Vec<_>>();
-    let declared_matches = policy_candidates
-        .iter()
-        .copied()
-        .filter(|provider| {
-            provider.models.is_empty() || provider.models.iter().any(|candidate| candidate == model)
-        })
-        .collect::<Vec<_>>();
-    let priced_candidates = if declared_matches.is_empty() {
-        policy_candidates
-    } else {
-        declared_matches
-    };
-    let mut route_models = priced_candidates
-        .into_iter()
-        .map(|provider| provider.map_model(model))
-        .collect::<Vec<_>>();
-    if let sbproxy_ai::RoutingStrategy::Cascade(cascade) = &config.routing {
-        route_models.extend(cascade.tiers.iter().filter_map(|tier| {
-            config
-                .providers
-                .iter()
-                .find(|provider| {
-                    provider.name == tier.provider_id
-                        && provider.enabled
-                        && sbproxy_ai::routing::provider_allowed_by_policy(
-                            provider.name.as_str(),
-                            allowed_providers,
-                            blocked_providers,
-                        )
-                })
-                .map(|_| tier.model.clone())
-        }));
-    }
-    if route_models.is_empty() {
-        route_models.push(model.to_string());
-    }
-
-    let mut greatest: Option<sbproxy_ai::budget::ModelPrice> = None;
-    for route_model in route_models {
-        let Some(price) = config.governance_model_price(&route_model) else {
-            if require_every_rate {
-                return None;
-            }
-            continue;
-        };
-        greatest = Some(match greatest {
-            None => price,
-            Some(current) => sbproxy_ai::budget::ModelPrice {
-                input_per_million: current.input_per_million.max(price.input_per_million),
-                output_per_million: current.output_per_million.max(price.output_per_million),
-                cache_read_per_million: current
-                    .cache_read_per_million
-                    .max(price.cache_read_per_million),
-                cache_write_per_million: current
-                    .cache_write_per_million
-                    .max(price.cache_write_per_million),
-            },
-        });
-    }
-    greatest
-}
-
-fn validate_effective_route_models(
-    config: &sbproxy_ai::handler::AiHandlerConfig,
-    key: Option<&ResolvedRequestKey>,
-    model: &str,
-    allowed_providers: &[String],
-    blocked_providers: &[String],
-) -> Result<(), String> {
-    let mut candidates = Vec::new();
-    if !model.is_empty() {
-        candidates.push(model);
-    }
-    if let sbproxy_ai::RoutingStrategy::Cascade(cascade) = &config.routing {
-        candidates.extend(
-            cascade
-                .tiers
-                .iter()
-                .filter(|tier| {
-                    config.providers.iter().any(|provider| {
-                        provider.name == tier.provider_id
-                            && provider.enabled
-                            && sbproxy_ai::routing::provider_allowed_by_policy(
-                                provider.name.as_str(),
-                                allowed_providers,
-                                blocked_providers,
-                            )
-                    })
-                })
-                .map(|tier| tier.model.as_str())
-                .filter(|candidate| !candidate.is_empty()),
-        );
-    }
-
-    for candidate in candidates {
-        if !config.is_model_allowed(candidate) {
-            return Err(format!("model '{candidate}' is not allowed"));
-        }
-        if key.is_some_and(|key| !key.is_model_allowed(candidate)) {
-            return Err(format!("model '{candidate}' is not allowed for this key"));
-        }
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod governance_ceiling_tests {
-    use super::{
-        governance_attempt_bound, governance_reservation_ceiling, validate_effective_route_models,
-    };
-    use sbproxy_ai::handler::AiSurface;
-
-    #[test]
-    fn tools_choices_and_fallback_attempts_expand_the_hard_ceiling() {
-        let body = serde_json::json!({
-            "model": "gpt-4o-mini",
-            "messages": [{"role": "user", "content": "hello"}],
-            "tools": [{"type": "function", "function": {
-                "name": "lookup",
-                "description": "a deliberately nontrivial schema",
-                "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}
-            }}],
-            "max_completion_tokens": 10,
-            "n": 2
-        });
-        let encoded_len = serde_json::to_vec(&body).unwrap().len();
-
-        let (prompt, output) = governance_reservation_ceiling(
-            &AiSurface::ChatCompletions,
-            "gpt-4o-mini",
-            &body,
-            encoded_len,
-            4_096,
-            3,
-        )
-        .unwrap();
-
-        assert!(prompt >= (encoded_len as u64) * 3);
-        assert_eq!(output, 60);
-    }
-
-    #[test]
-    fn responses_and_non_generation_surfaces_reserve_the_complete_payload() {
-        let responses = serde_json::json!({
-            "model": "gpt-4o-mini",
-            "input": "response API input",
-            "max_output_tokens": 7
-        });
-        let response_len = serde_json::to_vec(&responses).unwrap().len();
-        assert_eq!(
-            governance_reservation_ceiling(
-                &AiSurface::Responses,
-                "gpt-4o-mini",
-                &responses,
-                response_len,
-                4_096,
-                2,
-            )
-            .unwrap(),
-            ((response_len as u64) * 2, 14)
-        );
-
-        let embeddings = serde_json::json!({"model": "embed-local", "input": ["a", "b"]});
-        let embeddings_len = serde_json::to_vec(&embeddings).unwrap().len();
-        assert_eq!(
-            governance_reservation_ceiling(
-                &AiSurface::Embeddings,
-                "embed-local",
-                &embeddings,
-                embeddings_len,
-                4_096,
-                1,
-            )
-            .unwrap(),
-            (embeddings_len as u64, 0)
-        );
-    }
-
-    #[test]
-    fn reservation_ceiling_overflow_fails_closed() {
-        let body = serde_json::json!({"input": "x"});
-        assert!(governance_reservation_ceiling(
-            &AiSurface::Responses,
-            "gpt-4o-mini",
-            &body,
-            2,
-            u64::MAX,
-            2,
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn unenumerated_fallback_model_reserves_every_dispatch_candidate() {
-        let config: sbproxy_ai::handler::AiHandlerConfig = serde_json::from_value(
-            serde_json::json!({
-                "providers": [
-                    {"name": "one", "api_key": "k", "provider_type": "openai", "models": ["known-one"]},
-                    {"name": "two", "api_key": "k", "provider_type": "openai", "models": ["known-two"]},
-                    {"name": "three", "api_key": "k", "provider_type": "openai", "models": ["known-three"]}
-                ],
-                "routing": "fallback_chain",
-                "shadow": {"provider": "two"}
-            }),
-        )
-        .unwrap();
-
-        assert_eq!(
-            governance_attempt_bound(
-                &config,
-                "unlisted-model",
-                &serde_json::json!({}),
-                &[],
-                &[],
-            ),
-            Some(3),
-            "routing keeps all providers for an unenumerated model and this path does not dispatch shadow work",
-        );
-        assert_eq!(
-            governance_attempt_bound(
-                &config,
-                "unlisted-model",
-                &serde_json::json!({}),
-                &["one".to_string(), "three".to_string()],
-                &[],
-            ),
-            Some(2),
-        );
-    }
-
-    #[test]
-    fn rewritten_and_cascade_models_are_rechecked_against_origin_policy() {
-        let config = sbproxy_ai::handler::AiHandlerConfig::from_config(serde_json::json!({
-            "providers": [
-                {"name": "cheap", "api_key": "k"},
-                {"name": "smart", "api_key": "k"}
-            ],
-            "allowed_models": ["requested", "cheap-model"],
-            "routing": {
-                "strategy": "cascade",
-                "tiers": [
-                    {"provider_id": "cheap", "model": "cheap-model", "quality_threshold": 0.5},
-                    {"provider_id": "smart", "model": "blocked-model", "quality_threshold": 0.9}
-                ]
-            }
-        }))
-        .unwrap();
-
-        assert!(validate_effective_route_models(&config, None, "requested", &[], &[]).is_err());
-        assert!(
-            validate_effective_route_models(&config, None, "policy-rewrite", &[], &[]).is_err()
-        );
-        assert!(validate_effective_route_models(
-            &config,
-            None,
-            "requested",
-            &[],
-            &["smart".to_string()],
-        )
-        .is_ok());
-    }
+    tracing::debug!("AI proxy: applied request-body PII redaction");
+    *body != body_before_redaction
 }
 
 struct AiBodyPromptBlock {
@@ -1263,8 +2204,61 @@ fn any_allowed_provider_supports_surface(
 ) -> bool {
     providers.iter().any(|provider| {
         provider_allowed_for_request(provider, allowed, blocked)
-            && sbproxy_ai::api_routes::provider_supports_surface(&provider.name, surface)
+            && sbproxy_ai::api_routes::provider_supports_surface_for_modality(
+                &provider.name,
+                surface,
+                served_provider_modality(provider, surface),
+            )
     })
+}
+
+/// The modality of a locally served (`serve:`) provider that could handle
+/// `surface`, or `None` for a non-served provider (WOR-1908). A served
+/// provider is not in the provider catalog, so without this it would
+/// blanket-501 a non-chat surface even while serving an embedder. The
+/// served model's task comes from the built-in catalog (the certified
+/// catalog an embedding model is added to); an operator's custom-catalog
+/// modality is not resolved on this pre-dispatch path and keeps the
+/// chat-only default.
+fn served_provider_modality(
+    provider: &sbproxy_ai::ProviderConfig,
+    surface: &sbproxy_ai::handler::AiSurface,
+) -> Option<sbproxy_model_host::Modality> {
+    // Only the non-universal surfaces need a modality answer; chat/models
+    // are already universal, so skip the catalog work for them.
+    if matches!(
+        surface,
+        sbproxy_ai::handler::AiSurface::ChatCompletions
+            | sbproxy_ai::handler::AiSurface::Models
+            | sbproxy_ai::handler::AiSurface::Messages
+            | sbproxy_ai::handler::AiSurface::Responses
+    ) {
+        return None;
+    }
+    let serve = provider.serve.as_ref()?;
+    let catalog = builtin_catalog();
+    // A served provider hosts one or more models; report the first served
+    // model whose modality is non-chat, so its surface becomes legal. An
+    // explicit `modality:` on the serve entry wins (the only way to declare
+    // it for a raw `hf:` reference, which has no catalog entry); otherwise
+    // fall back to the certified catalog entry's modality.
+    serve
+        .models
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .modality
+                .or_else(|| catalog.get(&entry.model).map(|model| model.modality))
+        })
+        .find(|modality| !modality.uses_kv_cache())
+}
+
+/// The certified built-in catalog, parsed once. Used by the surface gate
+/// to resolve a served model's modality without re-parsing the embedded
+/// YAML per request.
+fn builtin_catalog() -> &'static sbproxy_model_host::Catalog {
+    static BUILTIN: std::sync::OnceLock<sbproxy_model_host::Catalog> = std::sync::OnceLock::new();
+    BUILTIN.get_or_init(sbproxy_model_host::Catalog::builtin)
 }
 
 fn has_allowed_openai_passthrough(
@@ -1316,6 +2310,321 @@ fn validate_caller_tools(
         }
     }
     Ok(())
+}
+
+fn compression_request_controls(
+    path: &str,
+    body: &serde_json::Value,
+) -> sbproxy_ai::compression::CompressionRequestControls {
+    sbproxy_ai::compression::CompressionRequestControls {
+        supported_chat: path == "/v1/chat/completions"
+            && body
+                .get("messages")
+                .is_some_and(serde_json::Value::is_array),
+        has_tools: body.get("tools").is_some(),
+        has_functions: body.get("functions").is_some(),
+        has_response_format: body.get("response_format").is_some(),
+        has_schema: ["schema", "json_schema", "output_schema"]
+            .iter()
+            .any(|field| body.get(*field).is_some()),
+    }
+}
+
+fn current_unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod compression_request_control_tests {
+    use super::compression_request_controls;
+    use serde_json::json;
+
+    #[test]
+    fn chat_shape_is_supported_and_structured_controls_are_closed() {
+        let ordinary = compression_request_controls(
+            "/v1/chat/completions",
+            &json!({"messages": [{"role": "user", "content": "hello"}]}),
+        );
+        assert!(ordinary.supported_chat);
+        assert!(!ordinary.has_structured_top_level_fields());
+
+        for field in [
+            "tools",
+            "functions",
+            "response_format",
+            "schema",
+            "json_schema",
+            "output_schema",
+        ] {
+            let mut body = json!({"messages": []});
+            body[field] = json!({});
+            assert!(
+                compression_request_controls("/v1/chat/completions", &body)
+                    .has_structured_top_level_fields(),
+                "field {field} must disable stateful summarization"
+            );
+        }
+    }
+
+    #[test]
+    fn non_chat_paths_and_non_array_messages_are_unsupported() {
+        assert!(
+            !compression_request_controls("/v1/embeddings", &json!({"messages": []}))
+                .supported_chat
+        );
+        assert!(
+            !compression_request_controls(
+                "/v1/chat/completions",
+                &json!({"messages": "not-an-array"})
+            )
+            .supported_chat
+        );
+    }
+}
+
+/// Stage at which [`evaluate_ai_input_guardrails`] runs for one request.
+///
+/// The original stage evaluates the client-supplied canonical request
+/// before any retrieval or provider egress. The augmented stage re-runs
+/// the same pipeline after RAG context injection, because retrieved
+/// content is untrusted input.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InputGuardrailStage {
+    /// The canonical client request, before any retrieval egress.
+    Original,
+    /// The request body after RAG context injection.
+    #[cfg(feature = "rag")]
+    RagAugmented,
+}
+
+impl InputGuardrailStage {
+    /// Bounded tracing label for this evaluation stage.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Original => "original",
+            #[cfg(feature = "rag")]
+            Self::RagAugmented => "rag_augmented",
+        }
+    }
+
+    /// True for the post-injection re-evaluation pass.
+    const fn is_rag_augmented(self) -> bool {
+        match self {
+            Self::Original => false,
+            #[cfg(feature = "rag")]
+            Self::RagAugmented => true,
+        }
+    }
+}
+
+/// Outcome of one pass of the shared AI input-guardrail evaluator.
+enum InputGuardrailDecision {
+    /// Every configured input guardrail allowed the request.
+    Allow {
+        /// Mesh detectors that flagged without reaching the block quorum.
+        flagged_count: usize,
+        /// Classified guardrail labels for the AI policy plane.
+        labels: Vec<String>,
+    },
+    /// A guardrail blocked the request. The caller preserves the original
+    /// wire behavior: `ErrorEnvelope::new("guardrail_violation", reason)`
+    /// with `code = name`, answered at `status`.
+    Block {
+        /// Guardrail name (or joined mesh security labels) for the envelope
+        /// `code` and the block-metric category.
+        name: String,
+        /// Block reason for the envelope message and span error.
+        reason: String,
+        /// HTTP status the caller must answer with.
+        status: u16,
+    },
+}
+
+/// Build an [`InputGuardrailDecision::Block`], adding the `rag_augmented`
+/// stage to tracing only; the response shape is identical across stages.
+fn blocked_input_decision(
+    stage: InputGuardrailStage,
+    name: String,
+    reason: String,
+    status: u16,
+) -> InputGuardrailDecision {
+    if stage.is_rag_augmented() {
+        warn!(
+            stage = stage.label(),
+            guardrail = %name,
+            "AI proxy: input guardrail blocked the RAG-augmented request"
+        );
+    }
+    InputGuardrailDecision::Block {
+        name,
+        reason,
+        status,
+    }
+}
+
+/// Run the complete input-guardrail pipeline over one canonical request body.
+///
+/// Behavior-preserving extraction of the input block that lived inline in
+/// [`handle_ai_proxy`]: external guardrails, mesh evaluation, message
+/// checks, body-aware checks, per-surface text checks, and configured mesh
+/// redaction, in the original order. The caller owns the response emission
+/// (span error, block metrics, envelope, status) so the original stage's
+/// wire behavior stays identical, and re-runs the evaluator with
+/// [`InputGuardrailStage::RagAugmented`] after RAG context injection.
+async fn evaluate_ai_input_guardrails(
+    config: &AiHandlerConfig,
+    guardrail_pipeline: Option<&std::sync::Arc<sbproxy_ai::guardrails::GuardrailPipeline>>,
+    surface: &sbproxy_ai::handler::AiSurface,
+    model: &str,
+    body: &mut serde_json::Value,
+    principal: &sbproxy_plugin::Principal,
+    stage: InputGuardrailStage,
+) -> InputGuardrailDecision {
+    let mut flagged_count = 0_usize;
+    let mut labels: Vec<String> = Vec::new();
+    let extracted_prompt = extract_prompt_text(body);
+    if let Some(ref guardrails_config) = config.guardrails {
+        // WOR-1529: external HTTP guardrail providers (Presidio / Lakera /
+        // Aporia / custom) run before the built-in pipeline. Input-mode
+        // guardrails inspect the request content and block on a not-allowed
+        // verdict; `logging_only` records only, and errors honor each
+        // guardrail's `fail_open` flag.
+        if !guardrails_config.external.is_empty() {
+            let blocked = if extracted_prompt.is_empty() {
+                sbproxy_ai::external_guardrail::run_input_external_guardrails_without_content(
+                    &guardrails_config.external,
+                )
+            } else {
+                sbproxy_ai::external_guardrail::run_input_external_guardrails(
+                    &guardrails_config.external,
+                    &extracted_prompt,
+                    model,
+                )
+                .await
+            };
+            if let Some((name, reason)) = blocked {
+                warn!(
+                    guardrail = %name,
+                    reason = %reason,
+                    "AI proxy: guardrail blocked content"
+                );
+                return blocked_input_decision(stage, name, reason, 400);
+            }
+        }
+        if let Some(pipeline) = guardrail_pipeline {
+            if pipeline.has_input() {
+                // Parse messages from the body. WOR-1145: deserialize
+                // each element independently rather than the whole array
+                // at once. A single malformed entry (e.g. a numeric
+                // `role`) must not make `from_value::<Vec<Message>>` fail
+                // and yield an EMPTY vec, which would silently skip the
+                // input guardrails on the remaining valid messages. The
+                // body-aware `check_input_body` below still scans the raw
+                // body, so content in an unparseable element is not lost.
+                let messages: Vec<sbproxy_ai::Message> = body
+                    .get("messages")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|m| {
+                                serde_json::from_value::<sbproxy_ai::Message>(m.clone()).ok()
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                // WOR-1543: when a guardrail mesh is configured, run the
+                // messages-path detectors as a cascade, collect the full
+                // verdict set, and fuse it (block on a quorum, optional
+                // redact-and-continue). The label set is stashed on the
+                // context so the AI policy plane can reason over it.
+                // Otherwise fall back to the serial block-on-any check.
+                if let Some(mesh_cfg) = guardrails_config.mesh.clone() {
+                    let mesh = sbproxy_ai::guardrails::GuardrailMesh::new(mesh_cfg);
+                    let text = sbproxy_ai::guardrails::message_text(&messages);
+                    let decision = mesh.evaluate_input(pipeline, &messages, &text);
+                    flagged_count = decision.flagged_count();
+                    labels = decision.labels.clone();
+                    if decision.block {
+                        warn!(
+                            guardrails = ?decision.security_labels,
+                            "AI proxy: guardrail mesh blocked request"
+                        );
+                        let reason = decision.reasons.join("; ");
+                        return blocked_input_decision(
+                            stage,
+                            decision.security_labels.join(","),
+                            reason,
+                            400,
+                        );
+                    }
+                    if decision.redact {
+                        if let Some(redactor) = config.pii_redactor() {
+                            redactor.redact_json(body);
+                        }
+                    }
+                } else {
+                    if let Some(block) = pipeline.check_input(&messages) {
+                        warn!(
+                            guardrail = %block.name,
+                            reason = %block.reason,
+                            "AI proxy: input guardrail blocked request"
+                        );
+                        return blocked_input_decision(stage, block.name, block.reason, 400);
+                    }
+                    labels = pipeline
+                        .classify_input(&messages)
+                        .into_iter()
+                        .map(|label| label.name)
+                        .collect();
+                }
+
+                // WOR-801: body-aware input guardrails (today only
+                // `agent_alignment`, which reads `messages[].tool_calls`
+                // out of the raw body because the `Message` struct
+                // strips them). Runs after the text-shaped check so
+                // the cheap path short-circuits first.
+                // WOR-1645: pass the principal so the agent-alignment
+                // guardrail's shared MCP rbac_policy is evaluated
+                // against each model-emitted tool call, the same deny
+                // rule the mcp action enforces on tools/call.
+                if let Some(block) = pipeline.check_input_body_with_principal(body, Some(principal))
+                {
+                    warn!(
+                        guardrail = %block.name,
+                        reason = %block.reason,
+                        "AI proxy: body-aware input guardrail blocked request"
+                    );
+                    return blocked_input_decision(stage, block.name, block.reason, 400);
+                }
+
+                // Per-surface input guardrails: image generation,
+                // audio speech, reranking, and moderations carry user
+                // input in a non-messages field (`prompt`, `input`,
+                // `query`). The same guardrail pipeline applies to
+                // that text via check_input_text. Chat-shape surfaces
+                // are already covered by the messages check above.
+                if let Some(text) = sbproxy_ai::handler::extract_input_text(surface, body) {
+                    if let Some(block) = pipeline.check_input_text(&text) {
+                        warn!(
+                            ai.surface = surface.label(),
+                            guardrail = %block.name,
+                            reason = %block.reason,
+                            "AI proxy: per-surface input guardrail blocked request"
+                        );
+                        return blocked_input_decision(stage, block.name, block.reason, 400);
+                    }
+                }
+            }
+        }
+    }
+    InputGuardrailDecision::Allow {
+        flagged_count,
+        labels,
+    }
 }
 
 pub(super) async fn handle_ai_proxy(
@@ -1371,12 +2680,87 @@ pub(super) async fn handle_ai_proxy(
     // guard is `!Send` and `request_filter` is an async function that
     // must be `Send`. The surface field is carried by the explicit
     // `debug!` above and by the per-surface metrics below.
-    let ai_span = sbproxy_ai::tracing_spans::ai_request_span(surface_label, &method_str);
+    // WOR-2085: the surface label identifies the endpoint for metrics;
+    // the OTel GenAI operation name is a separate, coarser vocabulary
+    // (`chat` / `embeddings` / `image_generation` / `audio`) that trace
+    // backends filter on. Stamping the label into the operation slot
+    // misreported every chat and audio request.
+    let ai_span = sbproxy_ai::tracing_spans::ai_request_span(
+        surface_label,
+        surface.operation_name(),
+        &method_str,
+    );
+    // Parent the exported span on the caller's trace when the inbound
+    // request carried a genuine traceparent/B3 header (request_phase.rs
+    // populated both trace_ctx and the is_remote flag). Explicit and
+    // request-scoped: no ambient/thread-local OTel state is touched, so
+    // there is nothing to leak and nothing for a later, unrelated
+    // request on a reused worker thread to inherit.
+    sbproxy_observe::telemetry::parent_span_on_remote_trace_context(
+        &ai_span,
+        ctx.trace_ctx.as_ref(),
+        ctx.trace_parent_is_remote,
+    );
     // WOR-1098: stamp the resolved tenant onto the request span so OTel
     // exporters can filter traces by tenant. The origin match has
     // already populated `ctx.tenant_id` (defaulting to `__default__`
     // when no tenant is configured) by the time dispatch runs.
     ai_span.record("sbproxy.tenant_id", ctx.tenant_id.as_str());
+    // WOR-2093: session linkage on the exported span, so key, session,
+    // and trace join in the collector.
+    let capture_session_id = ctx.session_id.map(|session_id| session_id.to_string());
+    if let Some(session_id) = capture_session_id.as_deref() {
+        ai_span.record("sbproxy.session_id", session_id);
+    }
+    // WOR-2139: run identity, so a fan-out of agent hops reconstructs as
+    // one tree instead of a pile of unrelated traces. `session.id` takes
+    // the A2A `contextId` when the hop carried one and the capture
+    // session otherwise; `graph.node.id` / `graph.node.parent_id` carry
+    // this hop and its caller; the trust flag rides alongside because an
+    // untrusted caller names its own run. The capture session keeps its
+    // own `sbproxy.session_id` slot above and is not overwritten: it is
+    // a validated ULID that also keys the semantic cache.
+    //
+    // Phase note. The A2A `contextId` lives in the JSON-RPC request body
+    // and is stamped on the context by `request_body_filter`. This
+    // handler completes inside `request_filter`, which runs earlier, so
+    // on the AI-gateway surface `session.id` normally resolves to the
+    // capture session and `sbproxy.run.id_source` says so. The A2A run
+    // id reaches the terminal access-log line rather than this span.
+    // See the run-identity section of `docs/observability.md`.
+    //
+    // WOR-2140: the agent is the unit of cost, so its identity is read
+    // once here and carried by value for the rest of dispatch. Every
+    // budget key and every billing event downstream derives from this
+    // one read, which is what keeps the enforced budget, the metric, and
+    // the ledger naming the same agent.
+    let billing_agent = BillingAgent::from_context(ctx);
+    sbproxy_ai::tracing_spans::record_run_identity(
+        &ai_span,
+        sbproxy_ai::tracing_spans::RunIdentity {
+            a2a_context_id: ctx.a2a_context_id.as_deref(),
+            capture_session_id: capture_session_id.as_deref(),
+            node_id: Some(ctx.request_id.as_str()),
+            // WOR-2140: refuse a self-parenting edge. `ctx.request_id` is
+            // adopted from the inbound correlation header when one is
+            // present, so a caller that propagates the id the proxy
+            // echoed to it (which is what the docs used to recommend for
+            // closing the edge) arrives with a parent equal to this hop's
+            // own node id. Emitting that would make a cost rollup walk a
+            // cycle, and a tree that says a hop is its own caller is
+            // worse than one that admits the edge is missing. WOR-2157
+            // fixes the root cause by minting a node id the caller
+            // cannot supply.
+            parent_node_id: ctx
+                .a2a
+                .as_ref()
+                .and_then(|a2a| a2a.parent_request_id.as_deref())
+                .filter(|parent| *parent != ctx.request_id.as_str()),
+            task_id: ctx.a2a.as_ref().map(|a2a| a2a.task_id.as_str()),
+            agent_id: billing_agent.claimed_id(),
+            identity_verified: ctx.a2a.as_ref().map(|a2a| a2a.identity_verified),
+        },
+    );
 
     // Increment the per-surface request counter and start the latency
     // clock. The latency guard records elapsed time at function exit
@@ -1389,64 +2773,67 @@ pub(super) async fn handle_ai_proxy(
     // Resolve authentication and its immutable effective policy before any AI
     // dispatch branch can return or contact a provider/cache. The key plane and
     // policy snapshots stay pinned for the rest of this request.
-    let key_plane = crate::key_plane::current_key_plane();
-    let resolved_request_vk = match resolve_request_virtual_key(
-        session,
-        config,
-        &ctx.principal,
-        key_plane.as_deref(),
-        ctx.tenant_id.as_str(),
-    )
-    .await
-    {
-        Ok(key) => key,
-        Err((status, message)) => {
-            warn!(status, reason = %message, "AI proxy: virtual key denied");
-            send_error(session, status, &message).await?;
-            return Ok(());
-        }
-    };
-    if let Err((status, message)) =
-        governed_key_requirement(config.require_governed_key, resolved_request_vk.as_ref())
-    {
-        warn!(
-            reason = "governed_key_required",
-            "AI proxy: request did not resolve a governed credential"
-        );
-        send_error(session, status, message).await?;
-        return Ok(());
-    }
-    if let Some(key) = resolved_request_vk.as_ref() {
-        ctx.effective_key_policy = key.effective_policy.clone();
-        if let Err((status, message)) =
-            apply_resolved_virtual_key_context(session, config, ctx, key)
+    let key_plane = pipeline.key_plane().cloned();
+    let prepared_identity =
+        match prepare_ai_request_identity(session, config, pipeline, ctx, key_plane.as_deref())
+            .await
         {
-            send_error(session, status, message).await?;
-            return Ok(());
-        }
-    }
-    let peer_policy_revision =
-        match peer_policy_revision(resolved_request_vk.as_ref(), &pipeline.config_revision) {
-            Ok(version) => version,
-            Err(_) => {
-                warn!(
-                    reason = "policy_digest_failed",
-                    "AI proxy: effective credential policy rejected"
-                );
-                send_error(session, 403, "credential policy is invalid").await?;
+            Ok(prepared) => prepared,
+            Err((status, message)) => {
+                send_error(session, status, &message).await?;
                 return Ok(());
             }
         };
+    let resolved_request_vk = prepared_identity.resolved_request_key;
+    let peer_policy_revision = prepared_identity.policy_revision;
+    // WOR-2140: stamp the agent onto the attribution tags, which is what
+    // feeds the bounded `agent_id` metric label and the durable rollup
+    // dimension. It has to happen after identity resolution, because
+    // that is where a matched credential replaces `ctx.attribution_tags`
+    // wholesale; setting it earlier would be silently discarded. Only a
+    // verified id lands here: an unverified caller must not be able to
+    // bill itself to another agent's series, nor to mint a fresh agent
+    // per request. Its spend is still recorded, against the unattributed
+    // bucket and beside the flag that says the claim was not trusted.
+    ctx.attribution_tags.agent_id = billing_agent.attributable_id().map(str::to_string);
     ai_span.record("sbproxy.policy_version", peer_policy_revision.as_str());
+    // WOR-2094: mirror the span's policy revision onto the request
+    // context so the admin ring row names the key-policy generation
+    // that governed this request.
+    ctx.ai_policy_version = Some(peer_policy_revision.clone());
+    let router = config.router();
+    if ctx.inbound_key_mode == crate::context::InboundKeyMode::Native
+        && router.cascade_config().is_some()
+    {
+        // Confidence cascade may select more than one provider/tier. A single
+        // caller-owned provider credential cannot be safely replayed across
+        // that boundary. Refuse before reading the request body or consulting
+        // idempotency/semantic/embedding caches so no local or upstream side
+        // effect can precede the denial.
+        send_error(
+            session,
+            503,
+            "native provider keys are unavailable for confidence cascade routing",
+        )
+        .await?;
+        return Ok(());
+    }
+    if ctx.inbound_key_mode == crate::context::InboundKeyMode::Native && router.is_race() {
+        // Race deliberately fans one request out to multiple destinations.
+        // A caller-owned provider secret has one authoritative destination
+        // and must not be copied into concurrent attempts.
+        send_error(
+            session,
+            403,
+            "native provider keys are unavailable for race routing",
+        )
+        .await?;
+        return Ok(());
+    }
     let effective_policy = ctx.effective_key_policy.as_ref();
-    let trace_key_id = effective_policy
-        .map(|policy| policy.key_id.as_str())
-        .filter(|key_id| !key_id.is_empty())
-        .or_else(|| {
-            let key_id = ctx.principal.api_key_id();
-            (!key_id.is_empty()).then_some(key_id)
-        });
-    if let Some(key_id) = trace_key_id {
+    // WOR-2093: the canonical accountability id, so the span agrees with
+    // the access log, the admin ring, and the inbound-key metric.
+    if let Some(key_id) = ctx.accountable_key_id() {
         ai_span.record("sbproxy.key_id", key_id);
     }
     let trace_project = effective_policy
@@ -1463,23 +2850,83 @@ pub(super) async fn handle_ai_proxy(
     if let Some(user) = trace_user {
         ai_span.record("sbproxy.user", user);
     }
-    // Own the principal fallback so the provider policy does not keep an
-    // immutable borrow of `ctx` alive across governance admission and stream
-    // settlement, both of which mutate request-scoped lease state.
-    let principal_allowed_providers = ctx
-        .principal
-        .virtual_key
+    let policy_allowed_providers: Vec<String> = resolved_request_vk
         .as_ref()
-        .map(|key| key.allowed_providers.clone())
+        .map(|key| key.allowed_providers().to_vec())
+        .or_else(|| {
+            ctx.principal
+                .virtual_key
+                .as_ref()
+                .map(|key| key.allowed_providers.clone())
+        })
         .unwrap_or_default();
-    let allowed_providers = resolved_request_vk
+    let blocked_provider_policy: Vec<String> = resolved_request_vk
         .as_ref()
-        .map(ResolvedRequestKey::allowed_providers)
-        .unwrap_or(principal_allowed_providers.as_slice());
-    let blocked_providers = resolved_request_vk
-        .as_ref()
-        .map(ResolvedRequestKey::blocked_providers)
-        .unwrap_or(&[]);
+        .map(|key| key.blocked_providers().to_vec())
+        .unwrap_or_default();
+    let blocked_providers = blocked_provider_policy.as_slice();
+    let native_provider = (ctx.inbound_key_mode == crate::context::InboundKeyMode::Native)
+        .then_some(ctx.native_key_provider.as_deref())
+        .flatten();
+    let native_api_key = if let Some(provider) = native_provider {
+        let Some(key_plane) = key_plane.as_deref() else {
+            send_error(
+                session,
+                503,
+                "native provider credential context is unavailable",
+            )
+            .await?;
+            return Ok(());
+        };
+        let Some(api_key) = crate::inbound_key::resolve_native_provider_credential(
+            &session.req_header().headers,
+            &key_plane.inbound().provider_hints,
+            provider,
+        ) else {
+            send_error(
+                session,
+                503,
+                "native provider credential context is unresolved",
+            )
+            .await?;
+            return Ok(());
+        };
+        Some(api_key.to_string())
+    } else {
+        None
+    };
+    let native_allowed_providers: Vec<String> = native_provider
+        .map(|native_provider| {
+            config
+                .providers
+                .iter()
+                .filter(|provider| {
+                    provider.enabled
+                        && provider_matches_native_key(provider, native_provider)
+                        && sbproxy_ai::routing::provider_allowed_by_policy(
+                            provider.name.as_str(),
+                            &policy_allowed_providers,
+                            blocked_providers,
+                        )
+                })
+                .map(|provider| provider.name.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    if native_provider.is_some() && native_allowed_providers.is_empty() {
+        send_error(
+            session,
+            403,
+            "native provider key does not match an AI provider",
+        )
+        .await?;
+        return Ok(());
+    }
+    let allowed_providers = if native_provider.is_some() {
+        native_allowed_providers.as_slice()
+    } else {
+        policy_allowed_providers.as_slice()
+    };
     let allowed_models = resolved_request_vk
         .as_ref()
         .map(ResolvedRequestKey::allowed_models)
@@ -1547,6 +2994,43 @@ pub(super) async fn handle_ai_proxy(
         }
     }
 
+    // Self-service key introspection (compatibility): the resolved
+    // caller's own governance usage, answered locally like `/v1/models`
+    // and the LiteLLM-parity endpoints further below. This is not a
+    // `classify_surface` surface and needs no configured provider at
+    // all, so it runs after the per-surface rate limit and provider-
+    // capability gates above (both of which already exempt `Unknown`)
+    // but before the gate just below, which 501s an `Unknown` path
+    // with no OpenAI-format provider to forward it to; that gate does
+    // not apply here since this path is never forwarded anywhere. It
+    // is scoped strictly to `resolved_request_vk`'s own key id, so
+    // there is no parameter path to another key's usage.
+    if method == http::Method::GET
+        && matches!(
+            path.split('?')
+                .next()
+                .unwrap_or(path.as_str())
+                .trim_end_matches('/'),
+            "/v1/key/usage"
+        )
+    {
+        let Some(plane) = key_plane.as_ref() else {
+            send_error(session, 401, "governed credential required").await?;
+            return Ok(());
+        };
+        let store = plane.governance_store();
+        match key_usage_response(store.as_ref(), resolved_request_vk.as_ref()).await {
+            Ok(body) => {
+                let bytes = serde_json::to_vec(&body).unwrap_or_default();
+                send_response(session, 200, "application/json", &bytes).await?;
+            }
+            Err((status, message)) => {
+                send_error(session, status, message).await?;
+            }
+        }
+        return Ok(());
+    }
+
     // WOR-752 Finding B: an unrecognized (`Unknown`) path can only be
     // forwarded verbatim. That is correct forward-compat for an
     // OpenAI-format upstream (a new OpenAI path the catalog has not
@@ -1580,14 +3064,17 @@ pub(super) async fn handle_ai_proxy(
     // config), so its per-provider latency / token / connection state
     // survives across requests. A per-request router would reset that
     // state every call and make the latency/usage-aware strategies inert.
-    let router = config.router();
+    let quota_pool_admission = sbproxy_ai::quota_pool::QuotaPoolAdmission::new(
+        config.quota_pool.clone(),
+        config.quota_pool_store(
+            key_plane
+                .as_ref()
+                .map(|plane| (plane.governance_store(), plane.governance_consistency())),
+        ),
+        quota_pool_member_id_for_request(ctx),
+    );
     // Serve model discovery locally; other GET surfaces use ordinary dispatch.
     if method == http::Method::GET {
-        if ctx.effective_key_policy.is_some()
-            && !admit_governed_request(session, hostname, ctx, "", None, 0, 0).await?
-        {
-            return Ok(());
-        }
         if matches!(
             path.split('?')
                 .next()
@@ -1614,7 +3101,6 @@ pub(super) async fn handle_ai_proxy(
                 )
             };
             let bytes = serde_json::to_vec(&body).unwrap_or_default();
-            settle_governance_tokens(ctx, 0, 0).await;
             send_response(session, 200, "application/json", &bytes).await?;
             return Ok(());
         }
@@ -1628,8 +3114,23 @@ pub(super) async fn handle_ai_proxy(
             blocked_models,
         ) {
             let bytes = serde_json::to_vec(&body).unwrap_or_default();
-            settle_governance_tokens(ctx, 0, 0).await;
             send_response(session, 200, "application/json", &bytes).await?;
+            return Ok(());
+        }
+        if resolved_request_vk
+            .as_ref()
+            .is_some_and(credential_requires_interpreted_model)
+        {
+            send_error(session, 403, "model is required by this credential policy").await?;
+            return Ok(());
+        }
+        if credential_requires_pii_redaction(resolved_request_vk.as_ref()) {
+            send_error(
+                session,
+                403,
+                "required PII redaction is unsupported for this AI request surface",
+            )
+            .await?;
             return Ok(());
         }
         let provider_idx = router
@@ -1638,7 +3139,11 @@ pub(super) async fn handle_ai_proxy(
                 warn!("AI proxy: no enabled providers");
                 Error::new(ErrorType::HTTPStatus(502))
             })?;
-        let provider = &config.providers[provider_idx];
+        let mut resolved_provider = config.providers[provider_idx].clone();
+        apply_native_provider_credential(&mut resolved_provider, native_api_key.as_deref());
+        let provider = &resolved_provider;
+        ctx.admin_load_balancer_strategy = Some(router.strategy_name().to_string());
+        ctx.admin_load_balancer_target = Some(provider.name.to_string());
 
         // WOR-1827: a served provider has no reachable upstream until its
         // engine is spawned, and `effective_base_url` would fall back to
@@ -1662,53 +3167,68 @@ pub(super) async fn handle_ai_proxy(
                     .collect();
                 let body = serde_json::json!({ "object": "list", "data": data });
                 let bytes = serde_json::to_vec(&body).unwrap_or_default();
-                settle_governance_tokens(ctx, 0, 0).await;
                 send_response(session, 200, "application/json", &bytes).await?;
                 return Ok(());
             }
-            let body = serde_json::json!({
-                "error": {
-                    "message": format!(
-                        "provider {} serves its model locally; `GET {}` has no upstream \
-                         to forward to. The engine starts on the first completion request.",
-                        provider.name, path
-                    ),
-                    "type": "engine_not_ready",
-                }
-            });
-            let bytes = serde_json::to_vec(&body).unwrap_or_default();
-            release_governance(ctx).await;
+            let message = format!(
+                "provider {} serves its model locally; `GET {}` has no upstream \
+                 to forward to. The engine starts on the first completion request.",
+                provider.name, path
+            );
+            let bytes = ErrorEnvelope::new("engine_not_ready", &message)
+                .request_id(ctx.request_id.as_str())
+                .to_bytes();
             send_response(session, 503, "application/json", &bytes).await?;
             return Ok(());
         }
 
-        arm_governance_ceiling(ctx);
-        let resp = AI_CLIENT
-            .load()
-            .forward_get_request(provider, &path)
-            .await
-            .map_err(|e| {
+        let reservation_id = format!("{}:quota-pool:get:0", ctx.request_id);
+        let Some(quota_attempt) = reserve_quota_pool_attempt_or_respond(
+            session,
+            config.quota_pool.as_ref(),
+            &quota_pool_admission,
+            &reservation_id,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        ctx.record_admin_ai_attempt(&provider.name);
+        let resp = match run_routed_provider_attempt(&router, provider_idx, async {
+            AI_CLIENT
+                .load()
+                .forward_get_request_with_quota(provider, &path, quota_attempt)
+                .await
+        })
+        .await
+        {
+            Ok(resp) => resp,
+            Err(error) => {
+                if send_quota_pool_attempt_error(session, config.quota_pool.as_ref(), &error)
+                    .await?
+                {
+                    return Ok(());
+                }
                 record_ai_transport_failure(
                     &ai_span,
                     Some(provider.name.as_str()),
-                    &e,
+                    &error,
                     "AI upstream GET request failed",
                 );
-                warn!(error = %e, "AI proxy: upstream GET request failed");
-                Error::because(ErrorType::ConnectError, "AI upstream request failed", e)
-            })?;
-        record_ai_provider_response_failure(
-            &ai_span,
-            provider.name.as_str(),
-            resp.status().as_u16(),
-            None,
-        );
-
+                warn!(error = %error, "AI proxy: upstream GET request failed");
+                return Err(Error::because(
+                    ErrorType::ConnectError,
+                    "AI upstream request failed",
+                    error,
+                ));
+            }
+        };
         // GET endpoints (e.g. /v1/models) aren't translated yet:
         // Anthropic's models listing has a different shape and most
         // OpenAI clients don't depend on it for routing decisions.
         let format = sbproxy_ai::client::provider_format(provider);
         emit_ai_billing_event(
+            hostname,
             surface_label,
             &provider.name,
             None,
@@ -1718,25 +3238,27 @@ pub(super) async fn handle_ai_proxy(
             &ctx.attribution_tags,
             ctx.tenant_id.as_str(),
             ctx.principal.api_key_id(),
+            &ctx.rollup_properties,
+            billing_agent.identity(),
             &ai_span,
         );
-        settle_governance_tokens(ctx, 0, 0).await;
         return relay_ai_response(
             session,
             resp,
             format,
             config.max_body_size,
             ctx.ai_inbound_format.as_deref(),
+            &ai_span,
+            provider.name.as_str(),
         )
         .await;
     }
 
-    // Methods other than GET/POST forward through the method-aware
-    // client without engaging the chat-completions body-parse pipeline
-    // (no body for DELETE/HEAD; body preserved as-is for PUT/PATCH).
-    // Per-surface guardrails, budget enforcement, and PII redaction for
-    // these methods are deferred to later phases; for Phase 1 the goal
-    // is to dispatch without misrouting DELETE as POST.
+    // Methods other than GET/POST forward through the method-aware client.
+    // DELETE/HEAD/OPTIONS have no interpretable body and fail closed when a
+    // credential requires model or PII enforcement. PUT/PATCH parse JSON so
+    // model policy, PII redaction, and budget admission run before replay or
+    // dispatch.
     if matches!(
         method,
         http::Method::DELETE
@@ -1745,32 +3267,11 @@ pub(super) async fn handle_ai_proxy(
             | http::Method::PATCH
             | http::Method::OPTIONS
     ) {
-        // These mutation surfaces do not yet run the JSON rewrite, tool,
-        // PII, guardrail, and AI-policy pipeline below. A governed request
-        // must never silently bypass those controls merely because it uses a
-        // non-POST verb, so reject it before provider selection or billing.
-        if ctx.effective_key_policy.is_some() {
-            send_error(
-                session,
-                501,
-                "governed AI requests do not support this HTTP method",
-            )
-            .await?;
-            return Ok(());
-        }
-        let provider_idx = router
-            .select_with_policy(&config.providers, allowed_providers, blocked_providers)
-            .ok_or_else(|| {
-                warn!("AI proxy: no enabled providers");
-                Error::new(ErrorType::HTTPStatus(502))
-            })?;
-        let provider = &config.providers[provider_idx];
-
         // Read the body for methods that typically carry one. DELETE,
         // HEAD, OPTIONS go through without a body. For PUT / PATCH we
-        // keep the raw bytes alongside the parsed JSON so the
-        // idempotency middleware can hash the verbatim payload.
-        let (body_opt, body_raw): (Option<serde_json::Value>, Vec<u8>) = if matches!(
+        // serialize the governed JSON alongside the parsed value so the
+        // idempotency middleware hashes the exact payload sent upstream.
+        let (mut body_opt, mut body_raw): (Option<serde_json::Value>, Vec<u8>) = if matches!(
             method,
             http::Method::PUT | http::Method::PATCH
         ) {
@@ -1797,6 +3298,84 @@ pub(super) async fn handle_ai_proxy(
             (None, Vec::new())
         };
 
+        if body_opt.is_none()
+            && resolved_request_vk
+                .as_ref()
+                .is_some_and(credential_requires_interpreted_model)
+        {
+            send_error(session, 403, "model is required by this credential policy").await?;
+            return Ok(());
+        }
+        if body_opt.is_none() && credential_requires_pii_redaction(resolved_request_vk.as_ref()) {
+            send_error(
+                session,
+                403,
+                "required PII redaction is unsupported for this AI request surface",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let mut effective_model = None;
+        if let Some(body) = body_opt.as_mut() {
+            apply_json_request_pii_redaction(config, ctx, body);
+            effective_model = match governed_effective_model(
+                resolved_request_vk.as_ref(),
+                body.get("model").and_then(serde_json::Value::as_str),
+            ) {
+                Ok(model) => model,
+                Err(message) => {
+                    send_error(session, 403, message).await?;
+                    return Ok(());
+                }
+            };
+            if let Some(model) = effective_model.as_deref() {
+                if !config.is_model_allowed(model) {
+                    send_error(session, 403, "model is not allowed").await?;
+                    return Ok(());
+                }
+                body["model"] = serde_json::Value::String(model.to_string());
+            }
+            body_raw = serde_json::to_vec(body).unwrap_or_default();
+        }
+
+        match ai_surface_budget_gate(session, config, hostname, ctx, effective_model.as_deref())
+            .await
+        {
+            BudgetGate::Allow => {}
+            BudgetGate::Block { status, body } => {
+                send_response(session, status, "application/json", &body).await?;
+                return Ok(());
+            }
+            BudgetGate::Downgrade { model } => {
+                if !config.is_model_allowed(&model)
+                    || resolved_request_vk
+                        .as_ref()
+                        .is_some_and(|key| !key.is_model_allowed(&model))
+                {
+                    send_error(
+                        session,
+                        403,
+                        "budget downgrade model is not allowed for this credential",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                let Some(body) = body_opt.as_mut() else {
+                    send_error(
+                        session,
+                        403,
+                        "budget model override is unsupported for this AI request surface",
+                    )
+                    .await?;
+                    return Ok(());
+                };
+                body["model"] = serde_json::Value::String(model.clone());
+                effective_model = Some(model);
+                body_raw = serde_json::to_vec(body).unwrap_or_default();
+            }
+        }
+
         // --- Idempotency middleware engagement (PUT / PATCH) ---
         //
         // Same four-branch flow as the POST path: replay cache hits
@@ -1808,12 +3387,17 @@ pub(super) async fn handle_ai_proxy(
         // fall through unchanged.
         let (idem_skip_reason, idem_capture) =
             match engage_ai_idempotency(session, pipeline, origin_idx, &body_raw, false).await? {
-                AiIdempotencyEngagement::Replayed => {
-                    settle_governance_tokens(ctx, 0, 0).await;
+                AiIdempotencyEngagement::Replayed { response } => {
+                    write_ai_cached_response(
+                        session,
+                        response.status,
+                        &response.headers,
+                        &response.body,
+                    )
+                    .await?;
                     return Ok(());
                 }
                 AiIdempotencyEngagement::Conflict => {
-                    release_governance(ctx).await;
                     return Ok(());
                 }
                 AiIdempotencyEngagement::NotApplicable => (None, None),
@@ -1836,35 +3420,94 @@ pub(super) async fn handle_ai_proxy(
                 ),
             };
 
-        arm_governance_ceiling(ctx);
-        let resp = AI_CLIENT
-            .load()
-            .forward_with_method(provider, &method_str, &path, body_opt.as_ref())
-            .await
-            .map_err(|e| {
+        let mut provider_candidates = config
+            .providers
+            .iter()
+            .enumerate()
+            .filter(|(_, provider)| {
+                provider.enabled
+                    && sbproxy_ai::routing::provider_allowed_by_policy(
+                        provider.name.as_str(),
+                        allowed_providers,
+                        blocked_providers,
+                    )
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if let Some(model) = effective_model.as_deref() {
+            if let Some(eligible) =
+                model_eligible_providers(&provider_candidates, &config.providers, model)
+            {
+                provider_candidates = eligible;
+            }
+        }
+        let provider_idx = router
+            .select_with_candidates(&config.providers, &provider_candidates)
+            .ok_or_else(|| {
+                warn!("AI proxy: no enabled provider satisfies method-aware policy");
+                Error::new(ErrorType::HTTPStatus(502))
+            })?;
+        let mut resolved_provider = config.providers[provider_idx].clone();
+        apply_native_provider_credential(&mut resolved_provider, native_api_key.as_deref());
+        let provider = &resolved_provider;
+        ctx.admin_load_balancer_strategy = Some(router.strategy_name().to_string());
+        ctx.admin_load_balancer_target = Some(provider.name.to_string());
+
+        let reservation_id = format!("{}:quota-pool:method:0", ctx.request_id);
+        let Some(quota_attempt) = reserve_quota_pool_attempt_or_respond(
+            session,
+            config.quota_pool.as_ref(),
+            &quota_pool_admission,
+            &reservation_id,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        ctx.record_admin_ai_attempt(&provider.name);
+        let resp = match run_routed_provider_attempt(&router, provider_idx, async {
+            AI_CLIENT
+                .load()
+                .forward_with_method_and_quota(
+                    provider,
+                    &method_str,
+                    &path,
+                    body_opt.as_ref(),
+                    quota_attempt,
+                )
+                .await
+        })
+        .await
+        {
+            Ok(resp) => resp,
+            Err(error) => {
+                if send_quota_pool_attempt_error(session, config.quota_pool.as_ref(), &error)
+                    .await?
+                {
+                    return Ok(());
+                }
                 record_ai_transport_failure(
                     &ai_span,
                     Some(provider.name.as_str()),
-                    &e,
+                    &error,
                     "AI upstream method-aware request failed",
                 );
                 warn!(
-                    error = %e,
+                    error = %error,
                     method = %method_str,
                     ai.surface = surface.label(),
                     "AI proxy: upstream method-aware request failed"
                 );
-                Error::because(ErrorType::ConnectError, "AI upstream request failed", e)
-            })?;
-        record_ai_provider_response_failure(
-            &ai_span,
-            provider.name.as_str(),
-            resp.status().as_u16(),
-            None,
-        );
-
+                return Err(Error::because(
+                    ErrorType::ConnectError,
+                    "AI upstream request failed",
+                    error,
+                ));
+            }
+        };
         let format = sbproxy_ai::client::provider_format(provider);
         emit_ai_billing_event(
+            hostname,
             surface_label,
             &provider.name,
             None,
@@ -1874,13 +3517,10 @@ pub(super) async fn handle_ai_proxy(
             &ctx.attribution_tags,
             ctx.tenant_id.as_str(),
             ctx.principal.api_key_id(),
+            &ctx.rollup_properties,
+            billing_agent.identity(),
             &ai_span,
         );
-        settle_governance_tokens(ctx, 0, 0).await;
-        // WOR-1044 PR3: the GET-method-aware path runs before the
-        // request body is read, so there is no reversible PII
-        // capture yet. Pass an empty pairs vector; restore is a
-        // no-op short-circuit.
         return relay_ai_response_with_idempotency(
             session,
             resp,
@@ -1890,7 +3530,9 @@ pub(super) async fn handle_ai_proxy(
             idem_capture,
             ctx.ai_inbound_format.as_deref(),
             Vec::new(),
-            Vec::new(),
+            ctx.ai_reversible_redactions.clone(),
+            &ai_span,
+            provider.name.as_str(),
         )
         .await;
     }
@@ -1919,6 +3561,11 @@ pub(super) async fn handle_ai_proxy(
     // rather than the inbound path so the bypass works even when the
     // proxy is fronting an idiosyncratic inbound URL.
     let native_request_bytes_for_bypass: bytes::Bytes = body_bytes.clone();
+    let native_request_is_losslessly_governable = surface
+        != sbproxy_ai::handler::AiSurface::Messages
+        || sbproxy_ai::format::anthropic_messages::native_request_is_losslessly_governable(
+            body_bytes.as_ref(),
+        );
 
     // --- Native-format inbound shim ---
     //
@@ -1991,56 +3638,16 @@ pub(super) async fn handle_ai_proxy(
         .to_ascii_lowercase()
         .starts_with("multipart/");
 
-    // --- Idempotency middleware engagement (POST) ---
-    //
-    // Engage before the upstream call (and before the multipart and
-    // semantic-cache hooks) so a cache hit can serve byte-identical
-    // to the original response without invoking any downstream
-    // logic. Multipart bodies are explicitly skipped for v1
-    // (see `engage_ai_idempotency`); the marker stamps the response
-    // so operators can spot the case in dashboards.
-    // Governed JSON requests engage idempotency after their atomic
-    // reservation below, so replays still consume an RPM unit while refunding
-    // all token/spend holds. Multipart is always explicitly skipped and
-    // ungoverned requests retain the legacy early engagement order.
-    let (mut idem_skip_reason, mut idem_capture) =
-        if is_multipart_request || ctx.effective_key_policy.is_none() {
-            match engage_ai_idempotency(
-                session,
-                pipeline,
-                origin_idx,
-                body_bytes.as_ref(),
-                is_multipart_request,
-            )
-            .await?
-            {
-                AiIdempotencyEngagement::Replayed | AiIdempotencyEngagement::Conflict => {
-                    return Ok(());
-                }
-                AiIdempotencyEngagement::NotApplicable => (None, None),
-                AiIdempotencyEngagement::Skipped { reason } => (Some(reason), None),
-                AiIdempotencyEngagement::Miss {
-                    idem,
-                    workspace_id,
-                    key,
-                    body_hash,
-                    permit,
-                } => (
-                    None,
-                    Some(AiIdempotencyCapture {
-                        idem,
-                        workspace_id,
-                        key,
-                        body_hash,
-                        _permit: permit,
-                    }),
-                ),
-            }
-        } else {
-            (None, None)
-        };
-
     if is_multipart_request {
+        if credential_requires_pii_redaction(resolved_request_vk.as_ref()) {
+            send_error(
+                session,
+                403,
+                "required PII redaction is unsupported for multipart AI requests",
+            )
+            .await?;
+            return Ok(());
+        }
         let maximum = config
             .max_body_size
             .filter(|maximum| *maximum > 0)
@@ -2080,6 +3687,40 @@ pub(super) async fn handle_ai_proxy(
             })?;
             requested_model = Some(route_to.to_string());
         }
+        if requested_model.is_none()
+            && resolved_request_vk
+                .as_ref()
+                .is_some_and(credential_requires_interpreted_model)
+        {
+            send_error(session, 403, "model is required by this credential policy").await?;
+            return Ok(());
+        }
+
+        match ai_surface_budget_gate(session, config, hostname, ctx, requested_model.as_deref())
+            .await
+        {
+            BudgetGate::Allow => {}
+            BudgetGate::Block { status, body } => {
+                send_response(session, status, "application/json", &body).await?;
+                return Ok(());
+            }
+            BudgetGate::Downgrade { model } => {
+                forwarded_body = crate::model_plane::rewrite_engine_model(
+                    forwarded_body.as_ref(),
+                    Some(&request_content_type),
+                    &model,
+                    maximum,
+                )
+                .map_err(|error| {
+                    Error::because(
+                        ErrorType::HTTPStatus(400),
+                        "invalid multipart budget model override",
+                        error,
+                    )
+                })?;
+                requested_model = Some(model);
+            }
+        }
         if let Some(model) = requested_model.as_deref() {
             let key_allows_model = resolved_request_vk
                 .as_ref()
@@ -2089,40 +3730,62 @@ pub(super) async fn handle_ai_proxy(
                 return Ok(());
             }
         }
-        if ctx.effective_key_policy.is_some() {
-            let model = requested_model.as_deref().unwrap_or("");
-            let attempt_bound = governance_attempt_bound(
-                config,
-                model,
-                &serde_json::Value::Null,
-                allowed_providers,
-                blocked_providers,
+        let multipart_external = config
+            .guardrails
+            .as_ref()
+            .map(|guardrails| guardrails.external.as_slice())
+            .unwrap_or_default();
+        if let Some((name, reason)) =
+            sbproxy_ai::external_guardrail::run_input_external_guardrails_without_content(
+                multipart_external,
             )
-            .and_then(|bound| u64::try_from(forwarded_body.len()).ok()?.checked_mul(bound));
-            let Some(prompt_ceiling) = attempt_bound else {
-                send_error(session, 500, "governance reservation ceiling overflow").await?;
-                return Ok(());
-            };
-            let governance = crate::key_plane::governance_plane();
-            let price = governance_route_price(
-                config,
-                model,
-                allowed_providers,
-                blocked_providers,
-                governance.config().missing_rate == sbproxy_config::MissingRatePolicy::RequireRate,
-            );
-            if !admit_governed_request(session, hostname, ctx, model, price, prompt_ceiling, 0)
+        {
+            send_guardrail_block_response(
+                session,
+                ctx,
+                &ai_span,
+                400,
+                sbproxy_ai::guardrails::GuardrailBlock { name, reason },
+            )
+            .await?;
+            return Ok(());
+        }
+
+        // Multipart input cannot be represented by the v1 idempotency cache.
+        // Engage only after the current input policy has run so the skip
+        // marker cannot become a policy bypass.
+        let idem_skip_reason =
+            match engage_ai_idempotency(session, pipeline, origin_idx, body_bytes.as_ref(), true)
                 .await?
             {
-                return Ok(());
-            }
-        }
-        let primary_idx = router
-            .select_with_policy(&config.providers, allowed_providers, blocked_providers)
-            .ok_or_else(|| {
-                warn!("AI proxy: no enabled providers");
-                Error::new(ErrorType::HTTPStatus(502))
-            })?;
+                AiIdempotencyEngagement::Replayed { response } => {
+                    if let Some(block) = ai_output_guardrail_block(
+                        response.status,
+                        None,
+                        multipart_external,
+                        &response.body,
+                        requested_model.as_deref().unwrap_or_default(),
+                    )
+                    .await
+                    {
+                        send_guardrail_block_response(session, ctx, &ai_span, 403, block).await?;
+                    } else {
+                        write_ai_cached_response(
+                            session,
+                            response.status,
+                            &response.headers,
+                            &response.body,
+                        )
+                        .await?;
+                    }
+                    return Ok(());
+                }
+                AiIdempotencyEngagement::Conflict => return Ok(()),
+                AiIdempotencyEngagement::NotApplicable => None,
+                AiIdempotencyEngagement::Skipped { reason } => Some(reason),
+                AiIdempotencyEngagement::Miss { .. } => None,
+            };
+
         let mut provider_order = config
             .providers
             .iter()
@@ -2144,17 +3807,30 @@ pub(super) async fn handle_ai_proxy(
                 provider_order = eligible;
             }
         }
+        provider_order = router.eligible_candidate_indices(&config.providers, &provider_order);
+        if provider_order.is_empty() {
+            send_error(session, 503, "no healthy eligible AI provider").await?;
+            return Ok(());
+        }
         let is_failover = matches!(config.routing, sbproxy_ai::RoutingStrategy::FallbackChain);
         if is_failover {
             provider_order
                 .sort_by_key(|&index| config.providers[index].priority.unwrap_or(u32::MAX));
-        } else if let Some(position) = provider_order
-            .iter()
-            .position(|&index| index == primary_idx)
+        } else if let Some(primary_idx) =
+            router.select_with_candidates(&config.providers, &provider_order)
         {
-            let primary = provider_order.remove(position);
-            provider_order.insert(0, primary);
+            if let Some(position) = provider_order
+                .iter()
+                .position(|&index| index == primary_idx)
+            {
+                let primary = provider_order.remove(position);
+                provider_order.insert(0, primary);
+            }
         }
+        ctx.admin_load_balancer_strategy = Some(router.strategy_name().to_string());
+        ctx.admin_load_balancer_target = provider_order
+            .first()
+            .map(|&index| config.providers[index].name.to_string());
 
         let mut selected = None;
         let mut last_error = None;
@@ -2162,84 +3838,110 @@ pub(super) async fn handle_ai_proxy(
             if attempt > 0 && !is_failover && ctx.managed_fallback_reason.is_none() {
                 break;
             }
-            let provider = &config.providers[provider_idx];
+            let mut resolved_provider = config.providers[provider_idx].clone();
+            apply_native_provider_credential(&mut resolved_provider, native_api_key.as_deref());
+            let provider = &resolved_provider;
+            let reservation_id = format!("{}:quota-pool:multipart:{attempt}", ctx.request_id);
+            let Some(quota_attempt) = reserve_quota_pool_attempt_or_respond(
+                session,
+                config.quota_pool.as_ref(),
+                &quota_pool_admission,
+                &reservation_id,
+            )
+            .await?
+            else {
+                return Ok(());
+            };
+            ctx.record_admin_ai_attempt(&provider.name);
             let distributed_managed =
                 crate::server::model_host::distributed_managed_provider(provider);
-            arm_governance_ceiling(ctx);
-            let response_result: anyhow::Result<reqwest::Response> = if distributed_managed {
-                let origin = ctx
-                    .origin_idx
-                    .and_then(|index| ctx.pipeline.config.origins.get(index))
-                    .map(|origin| origin.origin_id.to_string())
-                    .unwrap_or_else(|| ctx.hostname.to_string());
-                let preferred_region = ctx
-                    .principal
-                    .attrs
-                    .metadata
-                    .get("region")
-                    .cloned()
-                    .or_else(|| ctx.request_geo.clone());
-                let prefix_key = format!(
-                    "{}:{}",
-                    ctx.tenant_id,
-                    requested_model.as_deref().unwrap_or_default()
-                );
-                match crate::server::model_host::distributed_managed_upstream(
-                    crate::server::model_host::ManagedDistributedRequest {
-                        origin: &origin,
-                        provider,
-                        requested_model: requested_model.as_deref(),
-                        request_id: ctx.request_id.as_str(),
-                        tenant_id: ctx.tenant_id.as_str(),
-                        governed_key_id: ctx.principal.api_key_id(),
-                        policy_revision: &peer_policy_revision,
-                        path: &path,
-                        body: forwarded_body.clone(),
-                        content_type: Some(&request_content_type),
-                        priority: crate::server::model_host::lane_class_for(ctx.ai_lane_priority),
-                        prefix_key: prefix_key.as_bytes(),
-                        preferred_region: preferred_region.as_deref(),
-                        requested_adapter: None,
-                        max_body_bytes: maximum,
-                    },
-                )
-                .await
-                {
-                    Ok(Some(upstream)) => {
-                        ctx.ai_logical_model = Some(upstream.public_model.clone());
-                        ctx.ai_serve_model = Some(upstream.public_model);
-                        ctx.managed_model_permit = upstream.local_permit;
-                        ctx.managed_route_class = upstream.route_class;
-                        ctx.managed_route_trace = Some(upstream.trace);
-                        Ok(upstream.response)
-                    }
-                    Ok(None) => Err(anyhow::anyhow!(
-                        "distributed managed provider did not produce an attempt"
-                    )),
-                    Err(error) => {
-                        if let Some(trace) = error.trace() {
-                            ctx.managed_route_trace = Some(trace.clone());
+            let response_result: anyhow::Result<reqwest::Response> =
+                run_routed_provider_attempt(&router, provider_idx, async {
+                    if distributed_managed {
+                        let origin = ctx
+                            .origin_idx
+                            .and_then(|index| ctx.pipeline.config.origins.get(index))
+                            .map(|origin| origin.origin_id.to_string())
+                            .unwrap_or_else(|| ctx.hostname.to_string());
+                        let preferred_region = ctx
+                            .principal
+                            .attrs
+                            .metadata
+                            .get("region")
+                            .cloned()
+                            .or_else(|| ctx.request_geo.clone());
+                        let prefix_key = format!(
+                            "{}:{}",
+                            ctx.tenant_id,
+                            requested_model.as_deref().unwrap_or_default()
+                        );
+                        match crate::server::model_host::distributed_managed_upstream(
+                            crate::server::model_host::ManagedDistributedRequest {
+                                origin: &origin,
+                                provider,
+                                requested_model: requested_model.as_deref(),
+                                request_id: ctx.request_id.as_str(),
+                                tenant_id: ctx.tenant_id.as_str(),
+                                governed_key_id: ctx.principal.api_key_id(),
+                                policy_revision: &peer_policy_revision,
+                                path: &path,
+                                body: forwarded_body.clone(),
+                                content_type: Some(&request_content_type),
+                                priority: crate::server::model_host::lane_class_for(
+                                    ctx.ai_lane_priority,
+                                ),
+                                prefix_key: prefix_key.as_bytes(),
+                                preferred_region: preferred_region.as_deref(),
+                                requested_adapter: None,
+                                max_body_bytes: maximum,
+                                quota_attempt,
+                            },
+                        )
+                        .await
+                        {
+                            Ok(Some(upstream)) => {
+                                ctx.ai_logical_model = Some(upstream.public_model.clone());
+                                ctx.ai_serve_model = Some(upstream.public_model);
+                                ctx.managed_model_permit = upstream.local_permit;
+                                ctx.managed_route_class = upstream.route_class;
+                                ctx.managed_route_trace = Some(upstream.trace);
+                                Ok(upstream.response)
+                            }
+                            Ok(None) => Err(anyhow::anyhow!(
+                                "distributed managed provider did not produce an attempt"
+                            )),
+                            Err(crate::server::model_host::ManagedDistributedError::Quota(
+                                error,
+                            )) => Err(anyhow::Error::new(error)),
+                            Err(error) => {
+                                if let Some(trace) = error.trace() {
+                                    ctx.managed_route_trace = Some(trace.clone());
+                                }
+                                if let Some(reason) = error.public_reason() {
+                                    ctx.managed_fallback_reason = Some(reason);
+                                }
+                                Err(anyhow::Error::new(error))
+                            }
                         }
-                        if let Some(reason) = error.public_reason() {
-                            ctx.managed_fallback_reason = Some(reason);
-                        }
-                        Err(anyhow::Error::new(error))
+                    } else {
+                        AI_CLIENT
+                            .load()
+                            .forward_bytes_with_quota(
+                                provider,
+                                &method_str,
+                                &path,
+                                forwarded_body.clone(),
+                                &request_content_type,
+                                quota_attempt,
+                            )
+                            .await
                     }
-                }
-            } else {
-                AI_CLIENT
-                    .load()
-                    .forward_bytes(
-                        provider,
-                        &method_str,
-                        &path,
-                        forwarded_body.clone(),
-                        &request_content_type,
-                    )
-                    .await
-            };
+                })
+                .await;
             match response_result {
                 Ok(response) => {
+                    // WOR-1881: refresh quota snapshots before failover reselect.
+                    update_router_quota_from_response(&router, &provider.name, &response);
                     let retryable_status = matches!(response.status().as_u16(), 500 | 502 | 503);
                     let has_next = attempt + 1 < provider_order.len();
                     if is_failover
@@ -2254,6 +3956,11 @@ pub(super) async fn handle_ai_proxy(
                     break;
                 }
                 Err(error) => {
+                    if send_quota_pool_attempt_error(session, config.quota_pool.as_ref(), &error)
+                        .await?
+                    {
+                        return Ok(());
+                    }
                     record_ai_transport_failure(
                         &ai_span,
                         Some(provider.name.as_str()),
@@ -2282,8 +3989,48 @@ pub(super) async fn handle_ai_proxy(
             Error::because(ErrorType::ConnectError, "AI upstream request failed", error)
         })?;
         let provider = &config.providers[provider_idx];
-
         let format = sbproxy_ai::client::provider_format(provider);
+        let selected_model = requested_model
+            .as_deref()
+            .map(|requested| provider.map_model(requested))
+            .unwrap_or_default();
+        ctx.ai_provider = Some(provider.name.to_string());
+        if !selected_model.is_empty() {
+            ctx.ai_model = Some(selected_model.clone());
+        }
+
+        let status = resp.status().as_u16();
+        let upstream_content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let resp_ct = upstream_content_type
+            .clone()
+            .unwrap_or_else(|| "application/json".to_string());
+        let retry_after = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let raw_response = read_capped_response_body(resp, config.max_body_size).await?;
+        let response_body = sbproxy_ai::translators::translate_success_response_bytes(
+            format,
+            status,
+            raw_response.as_ref(),
+        );
+        record_ai_provider_response_failure(
+            &ai_span,
+            provider.name.as_str(),
+            status,
+            Some(response_body.as_ref()),
+        );
+        let response_body =
+            bytes::Bytes::from(sbproxy_ai::format::rewrap_success_response_for_inbound(
+                status,
+                ctx.ai_inbound_format.as_deref(),
+                &response_body,
+            ));
 
         // For audio_transcription requests, peek at the response body
         // to extract `duration` (present when the operator requests
@@ -2293,31 +4040,12 @@ pub(super) async fn handle_ai_proxy(
         // continue to emit PerCall here; their per-unit usage is
         // captured on the request side and emitted in the chat path.
         if surface_label == "audio_transcription" {
-            let status = resp.status().as_u16();
-            let resp_ct = resp
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("application/json")
-                .to_string();
-            let retry_after = resp
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string);
-            let resp_bytes = read_capped_response_body(resp, config.max_body_size).await?;
-            record_ai_provider_response_failure(
-                &ai_span,
-                provider.name.as_str(),
-                status,
-                Some(resp_bytes.as_ref()),
-            );
             // Whisper is the only OpenAI transcription model today;
             // the inbound body is multipart so the model is not in a
             // JSON field. Default to `whisper-1` for cost lookup; a
             // future commit that parses multipart fields can refine.
             let model = Some("whisper-1".to_string());
-            let duration = serde_json::from_slice::<serde_json::Value>(&resp_bytes)
+            let duration = serde_json::from_slice::<serde_json::Value>(&raw_response)
                 .ok()
                 .and_then(|v| v.get("duration").and_then(|d| d.as_f64()));
             let usage = match duration {
@@ -2326,6 +4054,7 @@ pub(super) async fn handle_ai_proxy(
             };
             let cost = sbproxy_ai::budget::estimate_cost_for_usage("whisper-1", &usage);
             let cost_micros = emit_ai_billing_event(
+                hostname,
                 surface_label,
                 &provider.name,
                 model,
@@ -2335,12 +4064,25 @@ pub(super) async fn handle_ai_proxy(
                 &ctx.attribution_tags,
                 ctx.tenant_id.as_str(),
                 ctx.principal.api_key_id(),
+                &ctx.rollup_properties,
+                billing_agent.identity(),
                 &ai_span,
             );
             if cost_micros > 0 {
                 ctx.ai_cost_usd_micros = Some(cost_micros);
             }
-            settle_governance_tokens(ctx, 0, 0).await;
+            if let Some(block) = multipart_external_output_guardrail_block(
+                status,
+                multipart_external,
+                response_body.as_ref(),
+                &selected_model,
+                upstream_content_type.as_deref(),
+            )
+            .await
+            {
+                send_guardrail_block_response(session, ctx, &ai_span, 403, block).await?;
+                return Ok(());
+            }
             let mut extras = public_route_headers(ctx);
             if let Some(reason) = idem_skip_reason {
                 extras.push(("x-sbproxy-idempotency".to_string(), reason.to_string()));
@@ -2348,11 +4090,12 @@ pub(super) async fn handle_ai_proxy(
             if let Some(retry_after) = retry_after {
                 extras.push(("retry-after".to_string(), retry_after));
             }
-            return send_response_with_extras(session, status, &resp_ct, &resp_bytes, &extras)
+            return send_response_with_extras(session, status, &resp_ct, &response_body, &extras)
                 .await;
         }
 
         emit_ai_billing_event(
+            hostname,
             surface_label,
             &provider.name,
             None,
@@ -2362,34 +4105,30 @@ pub(super) async fn handle_ai_proxy(
             &ctx.attribution_tags,
             ctx.tenant_id.as_str(),
             ctx.principal.api_key_id(),
+            &ctx.rollup_properties,
+            billing_agent.identity(),
             &ai_span,
         );
-        record_ai_provider_response_failure(
-            &ai_span,
-            provider.name.as_str(),
-            resp.status().as_u16(),
-            None,
-        );
-        settle_governance_tokens(ctx, 0, 0).await;
-        // Multipart never captures for idempotency (engagement
-        // skipped with SKIPPED-MULTIPART). Pass the skip reason
-        // through so the marker still lands on the response.
-        //
-        // WOR-1044 PR3: multipart bodies are not JSON-parsed for
-        // reversible PII capture (the redactor walks JSON), so the
-        // capture is empty and the restore call short-circuits.
-        return relay_ai_response_with_idempotency(
-            session,
-            resp,
-            format,
-            config.max_body_size,
-            idem_skip_reason,
-            None,
-            ctx.ai_inbound_format.as_deref(),
-            public_route_headers(ctx),
-            ctx.ai_reversible_redactions.clone(),
+        if let Some(block) = multipart_external_output_guardrail_block(
+            status,
+            multipart_external,
+            response_body.as_ref(),
+            &selected_model,
+            upstream_content_type.as_deref(),
         )
-        .await;
+        .await
+        {
+            send_guardrail_block_response(session, ctx, &ai_span, 403, block).await?;
+            return Ok(());
+        }
+        let mut extras = public_route_headers(ctx);
+        if let Some(reason) = idem_skip_reason {
+            extras.push(("x-sbproxy-idempotency".to_string(), reason.to_string()));
+        }
+        if let Some(retry_after) = retry_after {
+            extras.push(("retry-after".to_string(), retry_after));
+        }
+        return send_response_with_extras(session, status, &resp_ct, &response_body, &extras).await;
     }
 
     let mut body: serde_json::Value = match serde_json::from_slice(&body_bytes) {
@@ -2400,6 +4139,12 @@ pub(super) async fn handle_ai_proxy(
             return Ok(());
         }
     };
+    // Native bypass may only reuse the original client bytes while every
+    // content-bearing field still matches this post-parse baseline. Keep the
+    // snapshot only for the one native surface that can currently bypass.
+    let native_bypass_canonical_baseline =
+        (ctx.ai_inbound_format.as_deref() == Some("anthropic")).then(|| body.clone());
+    let reasoning_eligibility = sbproxy_ai::reasoning_eligibility(&body);
 
     // PII redaction (request body): walk the parsed JSON in place so
     // every downstream code path - guardrails, classifier, semantic
@@ -2408,24 +4153,9 @@ pub(super) async fn handle_ai_proxy(
     // is false. Replaces email, SSN, credit-card-with-Luhn, phone,
     // IPv4, and common API-key shapes with `[REDACTED:<KIND>]`
     // markers; see `sbproxy_security::pii::PiiRedactor`.
-    if let Some(pii_cfg) = config.pii.as_ref() {
-        if pii_cfg.enabled && pii_cfg.redact_request {
-            if let Some(redactor) = config.pii_redactor() {
-                // WOR-1044: capture-aware path so reversible rules can be
-                // restored on the response. Capture lives on the request
-                // context; the response handler reads it via `ctx`.
-                // Non-reversible rules behave identically to the old
-                // `redact_json` (replace with the static replacement;
-                // capture is unused for them).
-                let mut capture = sbproxy_security::pii::ReversibleCapture::new();
-                redactor.redact_json_with_capture(&mut body, &mut capture);
-                if !capture.is_empty() {
-                    ctx.ai_reversible_redactions = capture.pairs;
-                }
-                tracing::debug!("AI proxy: applied request-body PII redaction");
-            }
-        }
-    }
+    // WOR-1044: the helper captures reversible replacements on `ctx`; every
+    // JSON-capable surface uses the same redaction seam.
+    apply_json_request_pii_redaction(config, ctx, &mut body);
 
     // Body-aware prompt injection runs only on parsed, PII-rewritten prompt
     // segments. Dynamic key resolution and request quota admission already
@@ -2469,9 +4199,7 @@ pub(super) async fn handle_ai_proxy(
                 sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
                 "body-aware prompt injection policy blocked request",
             );
-            ctx.ai_outcome = Some("guardrail_block".to_string());
-            ctx.ai_guardrail_category = Some("prompt_injection_v2".to_string());
-            ctx.ai_guardrail_action = Some("block".to_string());
+            mark_guardrail_block(ctx, "prompt_injection_v2".to_string());
             send_response(session, 403, &block.content_type, block.body.as_bytes()).await?;
             return Ok(());
         }
@@ -2656,20 +4384,19 @@ pub(super) async fn handle_ai_proxy(
         } else {
             Some(model.as_str())
         };
-        let keys = budget_scope_keys(
+        let (keys, gate) = scoped_budget_preflight(
             budget_cfg,
+            &config.providers,
             hostname,
             budget_api_key_id.as_deref(),
             user_header.as_deref(),
             model_for_scope,
             Some(hostname),
             tag_header.as_deref(),
-        );
-        // WOR-1722: pre-fetch the cluster-shared spend for these keys so
-        // the preflight enforces against the fleet total (empty map, hence
-        // local-only, when shared budgets are off).
-        let shared_spend = super::budget_share::read_shared_for_keys(&keys).await;
-        match budget_preflight(budget_cfg, &keys, &config.providers, &shared_spend) {
+            billing_agent.identity(),
+        )
+        .await;
+        match gate {
             BudgetGate::Allow => {
                 // WOR-1544: predictive soft-landing. Below the hard cap,
                 // warn and then downgrade as a scope approaches its
@@ -2709,7 +4436,7 @@ pub(super) async fn handle_ai_proxy(
                                     // without clobbering an explicit tag.
                                     ctx.ai_policy_sink_tag
                                         .get_or_insert_with(|| "budget_soft_landing".to_string());
-                                    budget_scope_keys(
+                                    budget_scope_keys_for_agent(
                                         budget_cfg,
                                         hostname,
                                         budget_api_key_id.as_deref(),
@@ -2717,6 +4444,7 @@ pub(super) async fn handle_ai_proxy(
                                         Some(model.as_str()),
                                         Some(hostname),
                                         tag_header.as_deref(),
+                                        billing_agent.identity(),
                                     )
                                 }
                                 _ => keys,
@@ -2743,7 +4471,7 @@ pub(super) async fn handle_ai_proxy(
                 // Recompute scope keys against the rewritten model so
                 // post-dispatch usage records on the chosen model
                 // rather than the original.
-                budget_scope_keys(
+                budget_scope_keys_for_agent(
                     budget_cfg,
                     hostname,
                     budget_api_key_id.as_deref(),
@@ -2751,6 +4479,7 @@ pub(super) async fn handle_ai_proxy(
                     Some(model.as_str()),
                     Some(hostname),
                     tag_header.as_deref(),
+                    billing_agent.identity(),
                 )
             }
         }
@@ -2765,6 +4494,230 @@ pub(super) async fn handle_ai_proxy(
         body.get("top_p").and_then(serde_json::Value::as_f64),
     );
 
+    // --- Governed-key admission (reserve) ---
+    //
+    // WOR-1835: reserve against `GovernanceStore` for keys whose effective
+    // policy carries a governed limit. This runs alongside the three
+    // existing per-key mechanisms above and below (`key_rate_limiter()`,
+    // `merged_request_budget`/`budget_preflight`, and the
+    // `AI_MODEL_RATE_LIMITER` reservation just below) without touching or
+    // replacing any of them; it is intentionally additive for this wiring
+    // pass. Gated on a governance store being configured, an effective key
+    // policy being resolved, and that policy carrying at least one
+    // governed limit (`governance_limits_from_policy` returns `None`
+    // otherwise, so ungoverned/unlimited keys skip the reserve round-trip).
+    // Unlike the `AI_MODEL_RATE_LIMITER` block below, this is NOT gated on
+    // `model_rate_limits` containing the resolved model: governance must
+    // apply to any governed key regardless of that origin-level config.
+    if let (Some(plane), Some(policy)) = (key_plane.as_ref(), ctx.effective_key_policy.as_ref()) {
+        let store = plane.governance_store();
+        // Copy the two `Copy` config knobs out now so nothing below holds
+        // a borrow of `plane` (and transitively of `key_plane`) across the
+        // `store.reserve(..).await` further down.
+        let governance_cfg = plane.governance();
+        // Resolved through the accessor, which prefers an explicit
+        // `governance.failure_posture` and converts the legacy
+        // `failure_mode` when it is absent (WOR-2121).
+        let failure_posture = governance_cfg.failure_posture();
+        let missing_rate = governance_cfg.missing_rate;
+        if let Some(limits) = governance_limits_from_policy(policy) {
+            // Capture the owned fields we still need before touching `ctx`
+            // again: `policy` is a shared reborrow of `ctx.effective_key_policy`
+            // through the `&mut RequestContext` parameter, so ending its last
+            // use here (rather than reading it again from inside the `match`
+            // arms below, one of which writes `ctx.governance_lease`) keeps
+            // the borrow checker happy without relying on per-arm liveness.
+            let key_id = policy.key_id.clone();
+            let policy_revision = policy.policy_revision;
+            let parsed_messages = body
+                .get("messages")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|m| {
+                            serde_json::from_value::<sbproxy_ai::Message>(m.clone()).ok()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let token_ceiling = sbproxy_ai::estimate_tokens(&model, &parsed_messages);
+            // WOR-1835 (task 7): price the same token ceiling against the
+            // resolved model so a governed key's `total_micro_usd` limit is
+            // pre-gated instead of only caught after the fact at
+            // settlement. `governance_micro_usd_ceiling` folds in the
+            // `missing_rate` policy for the model-has-no-rate case.
+            let estimated_usage = sbproxy_ai::budget::AiUsage::Tokens {
+                input: token_ceiling,
+                output: 0,
+                cached_input: 0,
+                cache_creation: 0,
+            };
+            let estimated_cost_usd =
+                sbproxy_ai::budget::estimate_cost_for_usage(&model, &estimated_usage);
+            let micro_usd_ceiling = match governance_micro_usd_ceiling(
+                estimated_cost_usd,
+                missing_rate,
+                limits.total_micro_usd.is_some(),
+            ) {
+                Ok(ceiling) => ceiling,
+                Err(()) => {
+                    // `missing_rate: require_rate` and this key has a real
+                    // total_micro_usd limit: deny rather than admit with an
+                    // unenforceable $0 ceiling. Mirrors the `budget_preflight`
+                    // 402 `Block` shape above.
+                    warn!(
+                        ai.key_id = %key_id,
+                        model = %model,
+                        "AI proxy: governed key has a total_micro_usd limit but the \
+                         resolved model has no estimable rate; denying (missing_rate: \
+                         require_rate)"
+                    );
+                    sbproxy_ai::tracing_spans::record_error(
+                        &ai_span,
+                        sbproxy_ai::tracing_spans::error_type::BUDGET_EXCEEDED,
+                        "governed key cost limit cannot be pre-gated: model has no rate",
+                    );
+                    let bytes = ErrorEnvelope::new(
+                        "budget_exceeded",
+                        "this key has a monetary limit but the resolved \
+                                model has no estimable rate; denying rather than \
+                                admitting with an unenforced cost limit",
+                    )
+                    .scope("governed_key")
+                    .request_id(ctx.request_id.as_str())
+                    .to_bytes();
+                    send_response(session, 402, "application/json", &bytes).await?;
+                    return Ok(());
+                }
+            };
+            let reserve = sbproxy_ai::governance::ReserveRequest {
+                reservation_id: ctx.request_id.to_string(),
+                key_id: key_id.clone(),
+                policy_revision,
+                limits,
+                token_ceiling,
+                micro_usd_ceiling,
+            };
+            match store.reserve(reserve).await {
+                Ok(reservation) => {
+                    ctx.governance_lease = Some(crate::governance_runtime::GovernanceLease::new(
+                        store,
+                        reservation,
+                    ));
+                }
+                Err(sbproxy_ai::governance::GovernanceError::LimitExceeded(denial)) => {
+                    // Governed limit hit: deny with 429 before contacting
+                    // any upstream, mirroring the `AI_MODEL_RATE_LIMITER`
+                    // 429 shape just below.
+                    warn!(
+                        ai.key_id = %key_id,
+                        dimension = ?denial.dimension,
+                        "AI proxy: governed key limit exceeded pre-flight; returning 429"
+                    );
+                    sbproxy_ai::tracing_spans::record_error(
+                        &ai_span,
+                        sbproxy_ai::tracing_spans::error_type::RATE_LIMITED,
+                        "governed key limit exceeded",
+                    );
+                    let retry_after_secs = denial
+                        .reset_at_millis
+                        .map(|reset_at| {
+                            let now_millis = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|elapsed| elapsed.as_millis() as u64)
+                                .unwrap_or(0);
+                            reset_at.saturating_sub(now_millis) / 1000 + 1
+                        })
+                        .unwrap_or(1)
+                        .max(1);
+                    let retry = retry_after_secs.to_string();
+                    let extra: Option<(&str, &str)> = Some(("retry-after", &retry));
+                    let bytes =
+                        ErrorEnvelope::new("rate_limit_error", "governed key limit exceeded")
+                            .request_id(ctx.request_id.as_str())
+                            .retryable(true)
+                            .to_bytes();
+                    send_response_with_extra(session, 429, "application/json", &bytes, extra)
+                        .await?;
+                    return Ok(());
+                }
+                Err(sbproxy_ai::governance::GovernanceError::BackendUnavailable { backend }) => {
+                    // WOR-1835 (task 8): a backend outage is the one reserve
+                    // failure the posture governs; every other reserve
+                    // error below keeps failing open unconditionally.
+                    if governance_admits_on_backend_unavailable(failure_posture) {
+                        warn!(
+                            ai.key_id = %key_id,
+                            backend,
+                            failure_posture = failure_posture.as_label(),
+                            guarantee_waived = failure_posture.guarantee_waived(),
+                            "AI proxy: governance backend unavailable; admitting without \
+                             a reservation"
+                        );
+                        // `degraded` (which is what the legacy
+                        // `allow_unreserved` resolves to) says the governed
+                        // limits this request should have been held to were
+                        // not enforced, so it is audited and counted: an
+                        // operator watching a sick backend needs to see how
+                        // often that happens. A plain `open` admits without
+                        // claiming anything was lost, and records neither.
+                        // That difference is the only thing separating the
+                        // two postures here, and it is real information.
+                        if failure_posture.guarantee_waived() {
+                            sbproxy_observe::SecurityAuditEntry::policy_violation(
+                                "governance_fail_open",
+                                format!(
+                                    "governance backend '{backend}' unavailable; admitted \
+                                     without a reservation"
+                                ),
+                                200,
+                                Some(hostname.to_string()),
+                                ctx.client_ip,
+                                Some(ctx.request_id.to_string()),
+                                Some(session.req_header().method.as_str().to_string()),
+                            )
+                            .with_tenant_id(ctx.tenant_id.as_str())
+                            .with_key_context(
+                                ctx.native_key_provider.clone(),
+                                ctx.inbound_key_mode.as_str(),
+                            )
+                            .with_api_key_id(ctx.accountable_key_id())
+                            .emit();
+                            sbproxy_observe::metrics::record_governance_fail_open(&key_id);
+                        }
+                        // No lease: there is no reservation to settle or
+                        // release, so `ctx.governance_lease` stays `None`.
+                    } else {
+                        warn!(
+                            ai.key_id = %key_id,
+                            backend,
+                            "AI proxy: governance backend unavailable; failing closed (503)"
+                        );
+                        sbproxy_ai::tracing_spans::record_error(
+                            &ai_span,
+                            sbproxy_ai::tracing_spans::error_type::PROVIDER_ERROR,
+                            "governance backend unavailable",
+                        );
+                        send_error(session, 503, "governed key admission backend unavailable")
+                            .await?;
+                        return Ok(());
+                    }
+                }
+                Err(error) => {
+                    // Non-backend error (invalid request shape, a reused
+                    // reservation id with different input, arithmetic
+                    // overflow, internal invariant): unrelated to backend
+                    // availability, so `failure_mode` does not apply here.
+                    // This wiring pass keeps failing OPEN (admit) and logs.
+                    debug!(
+                        %error,
+                        "AI proxy: governance reserve error; admitting (fail-open for now)"
+                    );
+                }
+            }
+        }
+    }
+
     // --- Pre-request token estimate + TPM reservation ---
     //
     // For chat completions only: we have the parsed `messages` array,
@@ -2774,14 +4727,11 @@ pub(super) async fn handle_ai_proxy(
     // their byte-size budgets land at reconcile time the same way the
     // WOR-223 default path handles them.
     //
-    // The reservation is keyed on the hashed authorization value the
-    // budget block already extracted shape-for-shape (or an empty
-    // string when no header was sent). When `model_rate_limits` does
-    // not list the resolved model, the limiter still books a per-key
-    // reservation against a zero-cap bucket and admits the request
-    // without gating, so the cost of a miss is one HashMap lookup.
+    // The reservation is keyed on the immutable resolved policy/key identity.
+    // Genuinely ungoverned requests use an opaque structural fingerprint;
+    // credential header text is never read by this limiter.
     if let Some(rate_cfg) = config.model_rate_limits.get(&model) {
-        let apikey = req_header_value(session, "authorization").unwrap_or_default();
+        let rate_identity = model_rate_limit_identity(ctx, hostname);
         let parsed_messages = body
             .get("messages")
             .and_then(|v| v.as_array())
@@ -2793,7 +4743,7 @@ pub(super) async fn handle_ai_proxy(
             .unwrap_or_default();
         let estimated = sbproxy_ai::estimate_tokens(&model, &parsed_messages);
         match AI_MODEL_RATE_LIMITER.admit_with_tenant(
-            &apikey,
+            &rate_identity,
             &model,
             ctx.tenant_id.as_ref(),
             rate_cfg,
@@ -2818,14 +4768,11 @@ pub(super) async fn handle_ai_proxy(
                     sbproxy_ai::tracing_spans::error_type::RATE_LIMITED,
                     "model rate limit exceeded",
                 );
-                send_response_with_extra(
-                    session,
-                    429,
-                    "application/json",
-                    br#"{"error":{"message":"rate limit exceeded","type":"rate_limit_error"}}"#,
-                    extra,
-                )
-                .await?;
+                let bytes = ErrorEnvelope::new("rate_limit_error", "rate limit exceeded")
+                    .request_id(ctx.request_id.as_str())
+                    .retryable(true)
+                    .to_bytes();
+                send_response_with_extra(session, 429, "application/json", &bytes, extra).await?;
                 return Ok(());
             }
         }
@@ -2843,7 +4790,8 @@ pub(super) async fn handle_ai_proxy(
     // Keep a single extraction available to both the prompt classifier
     // and the intent detection hook so we do not re-parse the body twice.
     let extracted_prompt = extract_prompt_text(&body);
-    let trace_content = AiTraceContentArgs::from_config(config);
+    let trace_content =
+        AiTraceContentArgs::from_config(config).with_capture(content_capture_allowed(config, ctx));
 
     // WOR-1228: emit the prompt as the OpenInference `input.value` span
     // attribute when the origin opts into content capture. Off by default;
@@ -2853,6 +4801,28 @@ pub(super) async fn handle_ai_proxy(
     if trace_content.enabled() && !extracted_prompt.is_empty() {
         let trace_messages = extract_prompt_trace_messages(&body);
         record_ai_input_trace(&ai_span, trace_content, &extracted_prompt, &trace_messages);
+    }
+    // WOR-2096: retain a redacted console sample when the origin opts in
+    // AND the governed key's policy consents. Independent of the
+    // trace_content span gate; same redaction stack and caps.
+    if trace_content.capture_enabled() && !extracted_prompt.is_empty() {
+        let capture_messages = captured_content_messages(
+            &extracted_prompt,
+            &extract_prompt_trace_messages(&body),
+            trace_content.redactor(),
+        );
+        if !capture_messages.is_empty() {
+            crate::content_capture::store_input(crate::content_capture::ContentSample {
+                request_id: ctx.request_id.to_string(),
+                api_key_id: ctx.accountable_key_id().map(str::to_string),
+                tenant_id: ctx.tenant_id.to_string(),
+                origin: hostname.to_string(),
+                model: (!model.is_empty()).then(|| model.clone()),
+                captured_at: chrono::Utc::now().to_rfc3339(),
+                input_messages: capture_messages,
+                output_text: None,
+            });
+        }
     }
 
     if let Some(hook) = pipeline.hooks.prompt_classifier.as_ref().cloned() {
@@ -2872,7 +4842,7 @@ pub(super) async fn handle_ai_proxy(
                 origin: hostname.to_string(),
                 model_id,
                 prompt: extracted_prompt.clone(),
-                headers: snapshot_request_headers(session),
+                headers: snapshot_request_headers(session, pipeline),
             };
             if let Some(verdict) = hook.classify_prompt(&classify_req).await {
                 debug!(
@@ -2919,233 +4889,272 @@ pub(super) async fn handle_ai_proxy(
     // WOR-1154: input guardrails run BEFORE the semantic-cache
     // lookup below, so a prompt a guardrail would block cannot be
     // served from a cache hit that short-circuits the request.
-    // --- Input guardrails: check messages before forwarding ---
-    if let Some(ref guardrails_config) = config.guardrails {
-        // WOR-1529: external HTTP guardrail providers (Presidio / Lakera /
-        // Aporia / custom) run before the built-in pipeline. Input-mode
-        // guardrails inspect the request content and block on a not-allowed
-        // verdict; `logging_only` records only, and errors honor each
-        // guardrail's `fail_open` flag.
-        if !guardrails_config.external.is_empty() {
-            let input_text = {
-                let messages: Vec<sbproxy_ai::Message> = body
-                    .get("messages")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|m| {
-                                serde_json::from_value::<sbproxy_ai::Message>(m.clone()).ok()
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                if messages.is_empty() {
-                    sbproxy_ai::handler::extract_input_text(&surface, &body).unwrap_or_default()
-                } else {
-                    sbproxy_ai::guardrails::message_text(&messages)
-                }
-            };
-            if !input_text.is_empty() {
-                if let Some((name, reason)) =
-                    sbproxy_ai::external_guardrail::run_input_external_guardrails(
-                        &guardrails_config.external,
-                        &input_text,
-                    )
-                    .await
-                {
-                    warn!(
-                        guardrail = %name,
-                        reason = %reason,
-                        "AI proxy: external input guardrail blocked request"
-                    );
-                    sbproxy_ai::tracing_spans::record_error(
-                        &ai_span,
-                        sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
-                        &reason,
-                    );
-                    ctx.ai_outcome = Some("guardrail_block".to_string());
-                    ctx.ai_guardrail_category = Some(name.to_string());
-                    ctx.ai_guardrail_action = Some("block".to_string());
-                    let error_body = serde_json::json!({
-                        "error": {
-                            "message": reason,
-                            "type": "guardrail_violation",
-                            "code": name,
-                        }
-                    });
-                    let body_bytes = serde_json::to_vec(&error_body).unwrap_or_default();
-                    send_response(session, 400, "application/json", &body_bytes).await?;
-                    return Ok(());
-                }
-            }
+    let guardrail_pipeline = match config.guardrail_pipeline() {
+        Ok(pipeline) => pipeline,
+        Err(error) => {
+            // Publication validates the configuration structure. Classifier
+            // artifacts load lazily while building this request-time
+            // pipeline, so an unavailable enforcing backend lands here too.
+            // Keep every such failure closed.
+            tracing::error!(
+                error = %error,
+                "AI proxy: guardrail pipeline compilation failed; rejecting request"
+            );
+            sbproxy_ai::tracing_spans::record_error(
+                &ai_span,
+                sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                "guardrail configuration failed to compile",
+            );
+            let body_bytes = ErrorEnvelope::new(
+                "configuration_error",
+                "AI guardrail configuration failed to compile",
+            )
+            .code("guardrail_configuration_error")
+            .request_id(ctx.request_id.as_str())
+            .to_bytes();
+            send_response(session, 500, "application/json", &body_bytes).await?;
+            return Ok(());
         }
-        if let Some(pipeline) = cached_guardrails_pipeline(guardrails_config) {
-            if pipeline.has_input() {
-                // Parse messages from the body. WOR-1145: deserialize
-                // each element independently rather than the whole array
-                // at once. A single malformed entry (e.g. a numeric
-                // `role`) must not make `from_value::<Vec<Message>>` fail
-                // and yield an EMPTY vec, which would silently skip the
-                // input guardrails on the remaining valid messages. The
-                // body-aware `check_input_body` below still scans the raw
-                // body, so content in an unparseable element is not lost.
-                let messages: Vec<sbproxy_ai::Message> = body
-                    .get("messages")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|m| {
-                                serde_json::from_value::<sbproxy_ai::Message>(m.clone()).ok()
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
+    };
 
-                // WOR-1543: when a guardrail mesh is configured, run the
-                // messages-path detectors as a cascade, collect the full
-                // verdict set, and fuse it (block on a quorum, optional
-                // redact-and-continue). The label set is stashed on the
-                // context so the AI policy plane can reason over it.
-                // Otherwise fall back to the serial block-on-any check.
-                if let Some(mesh_cfg) = guardrails_config.mesh.clone() {
-                    let mesh = sbproxy_ai::guardrails::GuardrailMesh::new(mesh_cfg);
-                    let text = sbproxy_ai::guardrails::message_text(&messages);
-                    let decision = mesh.evaluate_input(&pipeline, &messages, &text);
-                    ctx.ai_guardrail_labels = decision.labels.clone();
-                    if decision.block {
-                        warn!(
-                            guardrails = ?decision.labels,
-                            "AI proxy: guardrail mesh blocked request"
-                        );
-                        let reason = decision.reasons.join("; ");
-                        sbproxy_ai::tracing_spans::record_error(
-                            &ai_span,
-                            sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
-                            &reason,
-                        );
-                        ctx.ai_outcome = Some("guardrail_block".to_string());
-                        ctx.ai_guardrail_category = Some(decision.labels.join(","));
-                        ctx.ai_guardrail_action = Some("block".to_string());
-                        let error_body = serde_json::json!({
-                            "error": {
-                                "message": reason,
-                                "type": "guardrail_violation",
-                                "code": decision.labels.join(","),
+    // --- Input guardrails: check messages before forwarding ---
+    // `mut` is exercised only when the rag feature compiles the augmented
+    // guardrail stage below; without it the original stage's value is final.
+    #[cfg_attr(not(feature = "rag"), allow(unused_mut))]
+    let mut guardrail_flagged_count = match evaluate_ai_input_guardrails(
+        config,
+        guardrail_pipeline.as_ref(),
+        &surface,
+        &model,
+        &mut body,
+        &ctx.principal,
+        InputGuardrailStage::Original,
+    )
+    .await
+    {
+        InputGuardrailDecision::Allow {
+            flagged_count,
+            labels,
+        } => {
+            ctx.ai_guardrail_labels = labels;
+            flagged_count
+        }
+        InputGuardrailDecision::Block {
+            name,
+            reason,
+            status,
+        } => {
+            sbproxy_ai::tracing_spans::record_error(
+                &ai_span,
+                sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                &reason,
+            );
+            // WOR-1496: a guardrail block surfaces as a generic
+            // 400, so stamp the precise outcome for the
+            // value-vs-waste metric.
+            mark_guardrail_block(ctx, name.clone());
+            let body_bytes = ErrorEnvelope::new("guardrail_violation", &reason)
+                .code(&name)
+                .request_id(ctx.request_id.as_str())
+                .to_bytes();
+            send_response(session, status, "application/json", &body_bytes).await?;
+            return Ok(());
+        }
+    };
+
+    // --- WOR-2098: retrieval-augmented generation ---
+    //
+    // Retrieval runs strictly after the original input guardrails (the
+    // embedding call is egress, so a blocked prompt must never leave the
+    // process) and before the AI policy plane, budgets, caches, and
+    // routing. A selected runtime pins the request to the canonical
+    // dispatch route for every retrieval outcome, so the augmented
+    // canonical body can never be replaced by a replay of the original
+    // native request bytes.
+    #[cfg(feature = "rag")]
+    let mut rag_requires_canonical_path = false;
+    #[cfg(not(feature = "rag"))]
+    let rag_requires_canonical_path = false;
+    #[cfg(feature = "rag")]
+    if matches!(
+        surface,
+        sbproxy_ai::handler::AiSurface::ChatCompletions
+            | sbproxy_ai::handler::AiSurface::Messages
+            | sbproxy_ai::handler::AiSurface::Responses
+    ) {
+        if let Some(runtime) =
+            origin_idx.and_then(|index| pipeline.rag_runtimes.get(index, ctx.forward_rule_idx))
+        {
+            rag_requires_canonical_path = true;
+            let embedding_provider = runtime.embedding_provider();
+            let vector_store_provider = runtime.vector_store_provider();
+            let retrieval_started = std::time::Instant::now();
+            let retrieval = runtime
+                .retrieve(sbproxy_rag::RetrievalRequest {
+                    body: &body,
+                    tenant_id: ctx.tenant_id.as_str(),
+                })
+                .await;
+            let retrieval_total_secs = retrieval_started.elapsed().as_secs_f64();
+            match retrieval {
+                Ok(result) => {
+                    let outcome_label = match &result.outcome {
+                        sbproxy_rag::RetrievalOutcome::Retrieved => "retrieved",
+                        sbproxy_rag::RetrievalOutcome::NoMatch => "no_match",
+                        sbproxy_rag::RetrievalOutcome::Continued => "continued",
+                        sbproxy_rag::RetrievalOutcome::Stale => "stale",
+                    };
+                    sbproxy_ai::ai_metrics::record_rag_request(
+                        embedding_provider,
+                        vector_store_provider,
+                        outcome_label,
+                    );
+                    sbproxy_ai::ai_metrics::record_rag_latency(
+                        "embedding",
+                        embedding_provider,
+                        result.stats.embedding_ms as f64 / 1_000.0,
+                    );
+                    sbproxy_ai::ai_metrics::record_rag_latency(
+                        "search",
+                        vector_store_provider,
+                        result.stats.search_ms as f64 / 1_000.0,
+                    );
+                    sbproxy_ai::ai_metrics::record_rag_latency(
+                        "total",
+                        embedding_provider,
+                        retrieval_total_secs,
+                    );
+                    sbproxy_ai::ai_metrics::record_rag_context_bytes(result.stats.context_bytes);
+                    // Safe tracing only: provider kinds, outcome, latency,
+                    // counts, and bounded source IDs. Never the query text,
+                    // chunk content, filter values, bodies, credentials, or
+                    // provider URLs.
+                    let source_ids: Vec<&str> = result
+                        .chunks
+                        .iter()
+                        .take(8)
+                        .map(|chunk| chunk.source_id.as_str())
+                        .collect();
+                    debug!(
+                        rag.embedding = embedding_provider,
+                        rag.vector_store = vector_store_provider,
+                        rag.outcome = outcome_label,
+                        rag.embedding_ms = result.stats.embedding_ms,
+                        rag.search_ms = result.stats.search_ms,
+                        rag.total_secs = retrieval_total_secs,
+                        rag.chunk_count = result.stats.chunk_count,
+                        rag.context_bytes = result.stats.context_bytes,
+                        rag.source_ids = ?source_ids,
+                        "AI proxy: RAG retrieval completed"
+                    );
+                    if result.rendered_context.is_some() {
+                        if let Err(error) = runtime.inject(&mut body, &result) {
+                            // The operator enabled RAG but the canonical body
+                            // cannot accept its context. Treat exactly like a
+                            // fail-closed retrieval error; the typed RagError
+                            // display carries a provider name and class, never
+                            // content or credentials, and the client only ever
+                            // sees the bounded envelope below.
+                            warn!(
+                                rag.embedding = embedding_provider,
+                                rag.vector_store = vector_store_provider,
+                                error = %error,
+                                "AI proxy: RAG context injection failed; failing closed"
+                            );
+                            sbproxy_ai::tracing_spans::record_error(
+                                &ai_span,
+                                sbproxy_ai::tracing_spans::error_type::PROVIDER_ERROR,
+                                "RAG context injection failed",
+                            );
+                            let body_bytes = ErrorEnvelope::new(
+                                "rag_retrieval_failed",
+                                "retrieval context was unavailable",
+                            )
+                            .code("rag_retrieval_failed")
+                            .request_id(ctx.request_id.as_str())
+                            .to_bytes();
+                            send_response(session, 502, "application/json", &body_bytes).await?;
+                            return Ok(());
+                        }
+                        // Retrieved context is untrusted text. Run the full
+                        // input pipeline once more over the augmented body
+                        // before AI policy, budgets, caches, routing, or any
+                        // provider dispatch can see it.
+                        match evaluate_ai_input_guardrails(
+                            config,
+                            guardrail_pipeline.as_ref(),
+                            &surface,
+                            &model,
+                            &mut body,
+                            &ctx.principal,
+                            InputGuardrailStage::RagAugmented,
+                        )
+                        .await
+                        {
+                            InputGuardrailDecision::Allow {
+                                flagged_count,
+                                labels,
+                            } => {
+                                guardrail_flagged_count = flagged_count;
+                                ctx.ai_guardrail_labels = labels;
                             }
-                        });
-                        let body_bytes = serde_json::to_vec(&error_body).unwrap_or_default();
-                        send_response(session, 400, "application/json", &body_bytes).await?;
-                        return Ok(());
-                    }
-                    if decision.redact {
-                        if let Some(redactor) = config.pii_redactor() {
-                            redactor.redact_json(&mut body);
+                            InputGuardrailDecision::Block {
+                                name,
+                                reason,
+                                status,
+                            } => {
+                                sbproxy_ai::tracing_spans::record_error(
+                                    &ai_span,
+                                    sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                                    &reason,
+                                );
+                                mark_guardrail_block(ctx, name.clone());
+                                let body_bytes = ErrorEnvelope::new("guardrail_violation", &reason)
+                                    .code(&name)
+                                    .request_id(ctx.request_id.as_str())
+                                    .to_bytes();
+                                send_response(session, status, "application/json", &body_bytes)
+                                    .await?;
+                                return Ok(());
+                            }
                         }
                     }
-                } else if let Some(block) = pipeline.check_input(&messages) {
+                }
+                Err(error) => {
+                    sbproxy_ai::ai_metrics::record_rag_request(
+                        embedding_provider,
+                        vector_store_provider,
+                        "error",
+                    );
+                    sbproxy_ai::ai_metrics::record_rag_latency(
+                        "total",
+                        embedding_provider,
+                        retrieval_total_secs,
+                    );
+                    // The configured continue and stale policies already
+                    // resolved inside `retrieve`; an error here is the
+                    // fail-closed result. Answer with a bounded envelope
+                    // and never the provider's own error.
                     warn!(
-                        guardrail = %block.name,
-                        reason = %block.reason,
-                        "AI proxy: input guardrail blocked request"
+                        rag.embedding = embedding_provider,
+                        rag.vector_store = vector_store_provider,
+                        error = %error,
+                        "AI proxy: RAG retrieval failed; failing closed"
                     );
                     sbproxy_ai::tracing_spans::record_error(
                         &ai_span,
-                        sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
-                        &block.reason,
+                        sbproxy_ai::tracing_spans::error_type::PROVIDER_ERROR,
+                        "RAG retrieval failed",
                     );
-                    // WOR-1496: a guardrail block surfaces as a generic
-                    // 400, so stamp the precise outcome for the
-                    // value-vs-waste metric.
-                    ctx.ai_outcome = Some("guardrail_block".to_string());
-                    ctx.ai_guardrail_category = Some(block.name.clone());
-                    ctx.ai_guardrail_action = Some("block".to_string());
-                    let error_body = serde_json::json!({
-                        "error": {
-                            "message": block.reason,
-                            "type": "guardrail_violation",
-                            "code": block.name,
-                        }
-                    });
-                    let body_bytes = serde_json::to_vec(&error_body).unwrap_or_default();
-                    send_response(session, 400, "application/json", &body_bytes).await?;
+                    let body_bytes = ErrorEnvelope::new(
+                        "rag_retrieval_failed",
+                        "retrieval context was unavailable",
+                    )
+                    .code("rag_retrieval_failed")
+                    .request_id(ctx.request_id.as_str())
+                    .to_bytes();
+                    send_response(session, 502, "application/json", &body_bytes).await?;
                     return Ok(());
-                }
-
-                // WOR-801: body-aware input guardrails (today only
-                // `agent_alignment`, which reads `messages[].tool_calls`
-                // out of the raw body because the `Message` struct
-                // strips them). Runs after the text-shaped check so
-                // the cheap path short-circuits first.
-                // WOR-1645: pass the principal so the agent-alignment
-                // guardrail's shared MCP rbac_policy is evaluated
-                // against each model-emitted tool call, the same deny
-                // rule the mcp action enforces on tools/call.
-                if let Some(block) =
-                    pipeline.check_input_body_with_principal(&body, Some(&ctx.principal))
-                {
-                    warn!(
-                        guardrail = %block.name,
-                        reason = %block.reason,
-                        "AI proxy: body-aware input guardrail blocked request"
-                    );
-                    sbproxy_ai::tracing_spans::record_error(
-                        &ai_span,
-                        sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
-                        &block.reason,
-                    );
-                    // WOR-1496: a guardrail block surfaces as a generic
-                    // 400, so stamp the precise outcome for the
-                    // value-vs-waste metric.
-                    ctx.ai_outcome = Some("guardrail_block".to_string());
-                    ctx.ai_guardrail_category = Some(block.name.clone());
-                    ctx.ai_guardrail_action = Some("block".to_string());
-                    let error_body = serde_json::json!({
-                        "error": {
-                            "message": block.reason,
-                            "type": "guardrail_violation",
-                            "code": block.name,
-                        }
-                    });
-                    let body_bytes = serde_json::to_vec(&error_body).unwrap_or_default();
-                    send_response(session, 400, "application/json", &body_bytes).await?;
-                    return Ok(());
-                }
-
-                // Per-surface input guardrails: image generation,
-                // audio speech, reranking, and moderations carry user
-                // input in a non-messages field (`prompt`, `input`,
-                // `query`). The same guardrail pipeline applies to
-                // that text via check_input_text. Chat-shape surfaces
-                // are already covered by the messages check above.
-                if let Some(text) = sbproxy_ai::handler::extract_input_text(&surface, &body) {
-                    if let Some(block) = pipeline.check_input_text(&text) {
-                        warn!(
-                            ai.surface = surface_label,
-                            guardrail = %block.name,
-                            reason = %block.reason,
-                            "AI proxy: per-surface input guardrail blocked request"
-                        );
-                        sbproxy_ai::tracing_spans::record_error(
-                            &ai_span,
-                            sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
-                            &block.reason,
-                        );
-                        // WOR-1496: stamp the precise outcome (the wire
-                        // status is a generic 400).
-                        ctx.ai_outcome = Some("guardrail_block".to_string());
-                        ctx.ai_guardrail_category = Some(block.name.clone());
-                        ctx.ai_guardrail_action = Some("block".to_string());
-                        let error_body = serde_json::json!({
-                            "error": {
-                                "message": block.reason,
-                                "type": "guardrail_violation",
-                                "code": block.name,
-                            }
-                        });
-                        let body_bytes = serde_json::to_vec(&error_body).unwrap_or_default();
-                        send_response(session, 400, "application/json", &body_bytes).await?;
-                        return Ok(());
-                    }
                 }
             }
         }
@@ -3158,7 +5167,14 @@ pub(super) async fn handle_ai_proxy(
     // its closed action set (block / redact / route_to / set_sink_tag /
     // audit). Default off: the hook only runs when an `ai_policy` block is
     // configured and compiled. A policy bug fails open (see `on_error`).
+    let mut cel_compression_selector = None;
+    let mut cel_compression_selector_invalid = false;
     if let Some(policy) = config.ai_policy() {
+        // This estimate must be computed before CEL runs. The request-path
+        // accounting estimate below intentionally runs after compression and
+        // describes what is dispatched; CEL needs the current uncompressed
+        // target-model input in order to select that compression policy.
+        let policy_input_tokens_est = ai_policy_input_tokens_est(&model, &body);
         let view = sbproxy_ai::ai_policy::AiDecisionView {
             surface: surface_label.to_string(),
             model: model.clone(),
@@ -3177,10 +5193,11 @@ pub(super) async fn handle_ai_proxy(
             tier: ctx.attribution_tags.risk_tier.clone().unwrap_or_default(),
             // Populated by the guardrail mesh (WOR-1543) when configured.
             guardrail_labels: ctx.ai_guardrail_labels.clone(),
+            guardrail_flagged_count,
             // Populated by predictive soft-landing (WOR-1544).
             budget_fraction: ctx.ai_budget_fraction,
             budget_exceeded: ctx.ai_budget_fraction >= 1.0,
-            input_tokens_est: ctx.ai_prompt_tokens_est.unwrap_or(0) as i64,
+            input_tokens_est: policy_input_tokens_est,
         };
         let decision = policy.evaluate(&view);
 
@@ -3196,13 +5213,9 @@ pub(super) async fn handle_ai_proxy(
         if decision.is_block() {
             warn!(ai.surface = surface_label, "AI policy: blocked request");
             ctx.ai_outcome = Some("policy_block".to_string());
-            let error_body = serde_json::json!({
-                "error": {
-                    "message": "blocked by AI policy",
-                    "type": "ai_policy_block",
-                }
-            });
-            let body_bytes = serde_json::to_vec(&error_body).unwrap_or_default();
+            let body_bytes = ErrorEnvelope::new("ai_policy_block", "blocked by AI policy")
+                .request_id(ctx.request_id.as_str())
+                .to_bytes();
             send_response(session, 403, "application/json", &body_bytes).await?;
             return Ok(());
         }
@@ -3225,257 +5238,263 @@ pub(super) async fn handle_ai_proxy(
         if let Some(tag) = decision.sink_tag() {
             ctx.ai_policy_sink_tag = Some(tag.to_string());
         }
-    }
-
-    // Budget soft-landing, hard-budget downgrade, and AI policy can all
-    // rewrite the effective model after the early model checks. Re-run both
-    // origin and governed-key policy against every model that this route can
-    // dispatch, including cascade substitutions, before reservation.
-    if let Err(message) = validate_effective_route_models(
-        config,
-        resolved_request_vk.as_ref(),
-        &model,
-        allowed_providers,
-        blocked_providers,
-    ) {
-        warn!(model = %model, reason = %message, "AI proxy: rewritten route model blocked");
-        send_error(session, 403, &message).await?;
-        return Ok(());
+        cel_compression_selector_invalid = decision.compression_selector_invalid();
+        cel_compression_selector = if cel_compression_selector_invalid {
+            Some(sbproxy_ai::compression::CompressionSelector::Off)
+        } else {
+            decision.compression_selector().cloned()
+        };
     }
 
     ctx.ai_logical_model = (!model.is_empty()).then(|| model.clone());
 
-    // Reserve after every request rewrite and policy/guardrail gate, but
-    // before any semantic-cache lookup or provider/local/peer selection. One
-    // immutable reservation therefore owns every possible dispatch attempt;
-    // cache hits settle only the request unit and refund token/spend holds.
-    if ctx.effective_key_policy.is_some() {
-        let governance = crate::key_plane::governance_plane();
-        let encoded_governance_body_len = match serde_json::to_vec(&body) {
-            // Native Anthropic/Responses bypass may forward the original
-            // wire body after only remapping its model. Reserve against the
-            // larger representation so omitted translation fields, tools,
-            // system instructions, and thinking config cannot understate the
-            // strict byte ceiling.
-            Ok(encoded) => encoded.len().max(native_request_bytes_for_bypass.len()),
-            Err(_) => {
-                send_error(session, 500, "failed to encode governed request").await?;
-                return Ok(());
-            }
-        };
-        let attempt_bound = match governance_attempt_bound(
-            config,
-            &model,
-            &body,
-            allowed_providers,
-            blocked_providers,
-        ) {
-            Some(bound) => bound,
-            None => {
-                send_error(session, 500, "governance attempt bound overflow").await?;
-                return Ok(());
-            }
-        };
-        let Some((prompt_ceiling, output_ceiling)) = governance_reservation_ceiling(
-            &surface,
-            &model,
-            &body,
-            encoded_governance_body_len,
-            governance.config().default_max_output_tokens,
-            attempt_bound,
-        ) else {
-            send_error(session, 500, "governance reservation ceiling overflow").await?;
-            return Ok(());
-        };
-        let price = governance_route_price(
-            config,
-            &model,
-            allowed_providers,
-            blocked_providers,
-            governance.config().missing_rate == sbproxy_config::MissingRatePolicy::RequireRate,
-        );
-        if !admit_governed_request(
-            session,
-            hostname,
-            ctx,
-            &model,
-            price,
-            prompt_ceiling,
-            output_ceiling,
-        )
-        .await?
-        {
+    // Resolve one immutable compression pipeline before either semantic-cache
+    // implementation can read or create write-on-miss state.
+    let compression_header = match compression_header_value(&session.req_header().headers) {
+        Ok(value) => value,
+        Err(error) => {
+            crate::compression_metrics::record_compression_selection(
+                ctx.tenant_id.as_str(),
+                "header",
+                "rejected",
+            );
+            warn!(
+                target: "ai_compression",
+                event = "ai_compression_selection",
+                tenant_id = %ctx.tenant_id,
+                source = "header",
+                outcome = "rejected",
+                reason = error.reason(),
+                "AI compression: request policy rejected"
+            );
+            let body = ErrorEnvelope::new("invalid_request_error", error.client_message())
+                .code("invalid_compression_selector")
+                .request_id(ctx.request_id.as_str())
+                .to_bytes();
+            send_response(session, 400, "application/json", &body).await?;
             return Ok(());
         }
+    };
+    let runtime_set = origin_idx.and_then(|index| pipeline.compression_runtimes.get_set(index));
+    let mut intent = resolve_compression_selection_intent(
+        compression_header.as_deref(),
+        resolved_request_vk
+            .as_ref()
+            .and_then(ResolvedRequestKey::compression_profile),
+        cel_compression_selector.as_ref(),
+    )
+    .expect("validated header parsing is stable");
+    if intent.source == CompressionSelectionSource::CelPolicy && cel_compression_selector_invalid {
+        intent.invalid_operator_selector = true;
+    }
+    let explicit_compression_selection = compression_header.is_some()
+        || resolved_request_vk
+            .as_ref()
+            .and_then(ResolvedRequestKey::compression_profile)
+            .is_some()
+        || cel_compression_selector.is_some();
+    let bound = match bind_compression_selection(intent, runtime_set.map(|set| set.as_ref())) {
+        Ok(bound) => bound,
+        Err(error) => {
+            crate::compression_metrics::record_compression_selection(
+                ctx.tenant_id.as_str(),
+                "header",
+                "rejected",
+            );
+            warn!(
+                target: "ai_compression",
+                event = "ai_compression_selection",
+                tenant_id = %ctx.tenant_id,
+                source = "header",
+                outcome = "rejected",
+                reason = error.reason(),
+                "AI compression: request policy rejected"
+            );
+            let body = ErrorEnvelope::new("invalid_request_error", error.client_message())
+                .code("invalid_compression_selector")
+                .request_id(ctx.request_id.as_str())
+                .to_bytes();
+            send_response(session, 400, "application/json", &body).await?;
+            return Ok(());
+        }
+    };
+    let compression_runtime = bound
+        .selected
+        .as_ref()
+        .and_then(|selected| selected.runtime())
+        .cloned();
+    let compression_selection_outcome = compression_selection_outcome(
+        bound.source,
+        bound.invalid_operator_selector,
+        compression_runtime.is_some(),
+    );
+    if explicit_compression_selection
+        || runtime_set.is_some_and(|set| set.requires_semantic_cache_bypass())
+    {
+        crate::compression_metrics::record_compression_selection_event(
+            ctx.tenant_id.as_str(),
+            bound.source.as_str(),
+            compression_selection_outcome,
+            bound
+                .invalid_operator_selector
+                .then_some("invalid_or_undeclared_operator_selector"),
+        );
+    }
+    let compression_cache_bypass = compression_selection_bypasses_cache(
+        runtime_set.map(|set| set.as_ref()),
+        explicit_compression_selection,
+    ) || compression_runtime
+        .as_ref()
+        .is_some_and(|runtime| runtime.bypasses_semantic_cache(ctx.session_id.is_some()));
+    // Reasoning controls are applied after provider selection, while semantic
+    // cache lookups happen before dispatch. Existing cache keys do not carry
+    // the route reasoning policy, so replaying a hit could silently bypass a
+    // newly configured reasoning or output budget. Conservatively bypass both
+    // semantic cache implementations for every supported, non-off policy.
+    let semantic_cache_bypass = compression_cache_bypass
+        || (surface.supports_reasoning_policy()
+            && config.reasoning != sbproxy_ai::ReasoningPolicy::Off);
 
-        match engage_ai_idempotency(session, pipeline, origin_idx, body_bytes.as_ref(), false)
-            .await?
+    // Streaming responses cannot be buffered for external post-call
+    // inspection. Apply each configured no-content fail mode before any
+    // replay, cache lookup, embedding call, or provider attempt.
+    let is_stream = body
+        .get("stream")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let output_external = config
+        .guardrails
+        .as_ref()
+        .map(|guardrails| guardrails.external.as_slice())
+        .unwrap_or_default();
+    if is_stream {
+        if let Some((name, reason)) =
+            sbproxy_ai::external_guardrail::run_output_external_guardrails_without_content(
+                output_external,
+            )
         {
-            AiIdempotencyEngagement::Replayed => {
-                settle_governance_tokens(ctx, 0, 0).await;
-                return Ok(());
+            send_guardrail_block_response(
+                session,
+                ctx,
+                &ai_span,
+                403,
+                sbproxy_ai::guardrails::GuardrailBlock { name, reason },
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+
+    // POST idempotency is owned by the AI path and runs only after canonical
+    // input guardrails and the current request safety policy. Exact replay
+    // deliberately preserves the response from the original accepted key,
+    // even if request transforms such as compression or reasoning changed
+    // after a route reload. Replayed output is still evaluated against today's
+    // output guardrails before any cached bytes leave.
+    let idempotency_request_body = if ctx.ai_inbound_format.is_some() {
+        native_request_bytes_for_bypass.as_ref()
+    } else {
+        body_bytes.as_ref()
+    };
+    let (idem_skip_reason, mut idem_capture) = match engage_ai_idempotency(
+        session,
+        pipeline,
+        origin_idx,
+        idempotency_request_body,
+        false,
+    )
+    .await?
+    {
+        AiIdempotencyEngagement::Replayed { response } => {
+            if let Some(block) = ai_output_guardrail_block(
+                response.status,
+                guardrail_pipeline.as_deref(),
+                output_external,
+                &response.body,
+                &model,
+            )
+            .await
+            {
+                send_guardrail_block_response(session, ctx, &ai_span, 403, block).await?;
+            } else {
+                let replay_body = if ai_idempotency_body_is_wire(&response.headers) {
+                    response.body
+                } else {
+                    // Migration path for unversioned entries. Historical
+                    // caches may contain canonical or already-native bytes;
+                    // the rewrapper is shape-aware and byte-stable for the
+                    // latter.
+                    sbproxy_ai::format::rewrap_success_response_for_inbound(
+                        response.status,
+                        ctx.ai_inbound_format.as_deref(),
+                        &response.body,
+                    )
+                };
+                write_ai_cached_response(session, response.status, &response.headers, &replay_body)
+                    .await?;
             }
-            AiIdempotencyEngagement::Conflict => {
-                release_governance(ctx).await;
-                return Ok(());
-            }
-            AiIdempotencyEngagement::NotApplicable => {}
-            AiIdempotencyEngagement::Skipped { reason } => {
-                idem_skip_reason = Some(reason);
-            }
-            AiIdempotencyEngagement::Miss {
+            return Ok(());
+        }
+        AiIdempotencyEngagement::Conflict => return Ok(()),
+        AiIdempotencyEngagement::NotApplicable => (None, None),
+        AiIdempotencyEngagement::Skipped { reason } => (Some(reason), None),
+        AiIdempotencyEngagement::Miss {
+            idem,
+            workspace_id,
+            key,
+            body_hash,
+            permit,
+        } => (
+            None,
+            Some(AiIdempotencyCapture {
                 idem,
                 workspace_id,
                 key,
                 body_hash,
-                permit,
-            } => {
-                idem_capture = Some(AiIdempotencyCapture {
-                    idem,
-                    workspace_id,
-                    key,
-                    body_hash,
-                    _permit: permit,
-                });
-            }
-        }
-    }
+                _permit: permit,
+            }),
+        ),
+    };
 
-    // --- Semantic lookup hook (A21/F3+F4, fail-open) ---
+    // --- WOR-2099: compiled semantic cache (lookup) ---
     //
-    // When the enterprise semantic cache is wired, ask the hook whether
-    // an equivalent response is already cached. On HIT we short-circuit
-    // the upstream dispatch by replaying the cached status, headers, and
-    // body directly to the client. The return path here matches the OSS
-    // `response_cache` replay in `request_filter`: write the response
-    // header, then write the body with `end_of_stream = true`. Callers
-    // in `handle_action` treat a successful return from `handle_ai_proxy`
-    // as a short-circuit (Ok(true)), so no additional signaling is
-    // required.
+    // Selection is per origin and per forward rule, exactly like the RAG
+    // registry above. A forward rule without its own `semantic_cache:`
+    // block has no cache and never inherits the origin's, because it may
+    // route to a different model, guardrail set, response shape, or
+    // credential policy. Reversible PII clears the block during action
+    // compilation, so a redaction policy that can restore the original
+    // text leaves an unconfigured slot here and semantic caching stays off
+    // for that action.
     //
-    // On MISS, we remember the composed cache `miss_key` plus the per-
-    // origin gating policy (`cacheable_status`, `max_response_size`) so
-    // the write-on-miss branch further down can persist the upstream
-    // response into the cache without re-running the embedding + LSH
-    // pipeline.
+    // A streaming request skips embedding, lookup, and write outright. An
+    // SSE stream cannot be admitted as one buffered entry, and gating only
+    // the later response store would still pay for the embedding call and
+    // still touch the backend.
     //
-    // When populated, the relay path below dispatches a `hook.store`
-    // after the upstream call completes (subject to status + size gates).
-    let mut semcache_miss: Option<PendingSemcacheMiss> = None;
-    if let Some(hook) = pipeline.hooks.semantic_lookup.as_ref().cloned() {
-        if !extracted_prompt.is_empty() {
-            let model_id = if model.is_empty() {
-                None
-            } else {
-                Some(model.clone())
-            };
-            let lookup_req = crate::hooks::LookupRequest {
-                origin: hostname.to_string(),
-                model_id: model_id.clone(),
-                prompt: extracted_prompt.clone(),
-                request_headers: snapshot_request_headers(session),
-                request_body: body_bytes.clone(),
-                method: method.as_str().to_string(),
-                path: path.clone(),
-            };
-            let outcome = hook.lookup(&lookup_req).await;
-            if let Some(cached) = outcome.hit {
-                debug!(
-                    origin = %hostname,
-                    status = cached.status,
-                    body_len = cached.body.len(),
-                    "AI proxy: semantic cache HIT; replaying cached response"
-                );
-
-                // Build a Pingora ResponseHeader from the cached entry.
-                // Size hint: cached headers + x-semcache marker.
-                let mut header = pingora_http::ResponseHeader::build(
-                    cached.status,
-                    Some(cached.headers.len() + 1),
-                )
-                .map_err(|e| {
-                    Error::because(
-                        ErrorType::InternalError,
-                        "semantic cache: failed to build response header",
-                        e,
-                    )
-                })?;
-                for (name, value) in &cached.headers {
-                    // Skip hop-by-hop / framing headers that Pingora will
-                    // recompute for us. We intentionally preserve content-type
-                    // and any origin-provided response metadata.
-                    let lname = name.to_ascii_lowercase();
-                    if lname == "transfer-encoding" || lname == "connection" {
-                        continue;
-                    }
-                    let _ = header.insert_header(name.clone(), value.clone());
-                }
-                // Always emit the debug marker so operators and integration
-                // tests can distinguish a replayed hit from an upstream
-                // response. Matches OSS `x-sbproxy-cache: HIT` convention.
-                let _ = header.insert_header("x-semcache", "HIT");
-
-                // A cache replay consumes one request-rate unit but no model
-                // tokens or spend. Settle before the first response byte so a
-                // client disconnect cannot leave the full token hold behind.
-                settle_governance_tokens(ctx, 0, 0).await;
-
-                session
-                    .write_response_header(Box::new(header), false)
-                    .await?;
-                session
-                    .write_response_body(Some(cached.body.clone()), true)
-                    .await?;
-                return Ok(());
-            }
-            // MISS with a usable key: remember enough state to populate the
-            // cache once we get the upstream response back.
-            if let Some(key) = outcome.miss_key {
-                semcache_miss = Some((
-                    hook,
-                    key,
-                    outcome.cacheable_status,
-                    outcome.max_response_size,
-                    model_id,
-                ));
-            }
-        }
-    }
-
-    // --- WOR-796: OSS embedding semantic cache (lookup) ---
-    //
-    // Runs only when the enterprise `SemanticLookupHook` is absent, so
-    // the two never double-cache. On a miss we embed the prompt once,
-    // cosine-scan the cache, and replay the closest response that meets
-    // the configured threshold. A miss remembers the key + vector so
-    // the relay can store the upstream response. Embedding failures
-    // fail open (proceed to the upstream uncached).
+    // Every failure below is a cache miss. An unusable embedding, an
+    // unavailable backend, a malformed record, and an incompatible record
+    // all fall through to ordinary provider routing; none of them can fail
+    // the request.
     let mut embed_miss: Option<PendingEmbedMiss> = None;
-    if pipeline.hooks.semantic_lookup.is_none() {
-        if let Some(cache) = config.embedding_cache() {
-            // WOR-1142: scope cache entries to the caller so one
-            // tenant/credential never receives another's cached response.
-            let cache_scope = sbproxy_ai::EmbeddingCache::scope_key(
-                ctx.tenant_id.as_str(),
-                req_header_value(session, "authorization").as_deref(),
-            );
-            if !extracted_prompt.is_empty() {
+    if !semantic_cache_bypass && !is_stream {
+        if let Some((origin_index, selection)) = origin_idx.and_then(|index| {
+            pipeline
+                .semantic_caches
+                .get(index, ctx.forward_rule_idx)
+                .map(|selection| (index, selection))
+        }) {
+            let cache = selection.cache;
+            // The semantic query is split out only here. Every guardrail,
+            // classifier, intent, trace, and policy call site above keeps
+            // the full `extracted_prompt` value.
+            let semantic_prompt = extract_semantic_prompt(&body);
+            if !semantic_prompt.text.is_empty() {
                 // WOR-1223: vectorize the prompt via the configured source.
                 // Provider hits the embedding API (costs money, egresses the
                 // prompt); sidecar uses the local classifier sidecar (free, no
                 // egress). Any error falls through to an uncached upstream call.
-                let strict_governance = ctx.governance_lease.is_some()
-                    && crate::key_plane::governance_plane().config().consistency
-                        == sbproxy_config::GovernanceConsistency::Strict;
                 let query_vec_result: anyhow::Result<Vec<f32>> = match cache.source() {
-                    sbproxy_ai::semantic_cache::EmbeddingSource::Provider
-                    | sbproxy_ai::semantic_cache::EmbeddingSource::Openai
-                        if strict_governance =>
-                    {
-                        Err(anyhow::anyhow!(
-                            "external semantic-cache embeddings are disabled under strict governance"
-                        ))
-                    }
                     sbproxy_ai::semantic_cache::EmbeddingSource::Provider => {
                         match config.providers.iter().find(|provider| {
                             provider.name == cache.provider()
@@ -3486,12 +5505,29 @@ pub(super) async fn handle_ai_proxy(
                                 )
                         }) {
                             Some(provider) => {
+                                // Embedding is a separate provider call. Keep
+                                // it on the operator credential rather than
+                                // replaying a caller-owned native secret.
+                                let resolved_provider = provider.clone();
+                                let reservation_id =
+                                    format!("{}:quota-pool:embedding:provider", ctx.request_id);
+                                let Some(quota_attempt) = reserve_quota_pool_attempt_or_respond(
+                                    session,
+                                    config.quota_pool.as_ref(),
+                                    &quota_pool_admission,
+                                    &reservation_id,
+                                )
+                                .await?
+                                else {
+                                    return Ok(());
+                                };
                                 let ai_client = AI_CLIENT.load_full();
-                                sbproxy_ai::semantic_cache::compute_embedding(
+                                sbproxy_ai::semantic_cache::compute_embedding_with_quota(
                                     &ai_client,
-                                    provider,
+                                    &resolved_provider,
                                     cache.model(),
-                                    &extracted_prompt,
+                                    &semantic_prompt.text,
+                                    quota_attempt,
                                 )
                                 .await
                             }
@@ -3506,7 +5542,7 @@ pub(super) async fn handle_ai_proxy(
                             Some(sc) => {
                                 sbproxy_ai::semantic_cache::compute_embedding_sidecar(
                                     sc,
-                                    &extracted_prompt,
+                                    &semantic_prompt.text,
                                 )
                                 .await
                             }
@@ -3521,7 +5557,7 @@ pub(super) async fn handle_ai_proxy(
                             match cache.inprocess_config() {
                                 Some(cfg) => crate::server::ai_support::inprocess_embed(
                                     cfg,
-                                    &extracted_prompt,
+                                    &semantic_prompt.text,
                                 ),
                                 None => Err(anyhow::anyhow!(
                                     "inprocess embedding source has no inprocess config"
@@ -3545,9 +5581,22 @@ pub(super) async fn handle_ai_proxy(
                             allowed_providers.is_empty() && blocked_providers.is_empty()
                         }) {
                             Some(oc) => {
-                                sbproxy_ai::semantic_cache::compute_embedding_openai(
+                                let reservation_id =
+                                    format!("{}:quota-pool:embedding:openai", ctx.request_id);
+                                let Some(quota_attempt) = reserve_quota_pool_attempt_or_respond(
+                                    session,
+                                    config.quota_pool.as_ref(),
+                                    &quota_pool_admission,
+                                    &reservation_id,
+                                )
+                                .await?
+                                else {
+                                    return Ok(());
+                                };
+                                sbproxy_ai::semantic_cache::compute_embedding_openai_with_quota(
                                     oc,
-                                    &extracted_prompt,
+                                    &semantic_prompt.text,
+                                    quota_attempt,
                                 )
                                 .await
                             }
@@ -3557,15 +5606,84 @@ pub(super) async fn handle_ai_proxy(
                         }
                     }
                 };
+                if let Err(error) = &query_vec_result {
+                    if send_quota_pool_attempt_error(session, config.quota_pool.as_ref(), error)
+                        .await?
+                    {
+                        return Ok(());
+                    }
+                }
                 let source_label: &str = match cache.source() {
                     sbproxy_ai::semantic_cache::EmbeddingSource::Provider => "provider",
                     sbproxy_ai::semantic_cache::EmbeddingSource::Sidecar => "sidecar",
                     sbproxy_ai::semantic_cache::EmbeddingSource::Inprocess => "inprocess",
                     sbproxy_ai::semantic_cache::EmbeddingSource::Openai => "openai",
                 };
-                match query_vec_result {
-                    Ok(query_vec) => {
-                        if let Some(hit) = cache.lookup(&query_vec, &cache_scope) {
+                let query_vec = match query_vec_result {
+                    Ok(query_vec) => Some(query_vec),
+                    Err(_) => {
+                        sbproxy_observe::metrics::record_semantic_cache(
+                            ctx.tenant_id.as_str(),
+                            hostname,
+                            source_label,
+                            "error",
+                        );
+                        // A request-client error can carry an endpoint, so
+                        // only the closed source label and a fixed failure
+                        // class are logged from this path.
+                        warn!(
+                            tenant = %ctx.tenant_id,
+                            origin = %hostname,
+                            source = source_label,
+                            failure = "embedding_unavailable",
+                            "AI proxy: semantic cache embedding failed (fail-open)"
+                        );
+                        None
+                    }
+                };
+                // The namespace is derived only after embedding succeeds, so
+                // a failed embedding never touches the backend. Owned values
+                // are held in locals before they are borrowed, and none of
+                // them is ever traced.
+                let namespace = query_vec.as_ref().and_then(|query_vec| {
+                    let compiled_origin = pipeline.config.origins.get(origin_index)?;
+                    let response_policy_digest = semantic_response_policy_digest(
+                        selection.static_action_policy_digest,
+                        peer_policy_revision.as_str(),
+                        surface_label,
+                    );
+                    let credential_identity = semantic_credential_identity(session, &ctx.principal);
+                    Some(sbproxy_ai::SemanticNamespace::derive(
+                        sbproxy_ai::SemanticNamespaceInput {
+                            origin_route: compiled_origin.hostname.as_str(),
+                            request_host: ctx.hostname.as_str(),
+                            tenant_id: ctx.tenant_id.as_str(),
+                            credential_identity: credential_identity.as_str(),
+                            requested_model: model.as_str(),
+                            api_surface: surface_label,
+                            request_context_digest: &semantic_prompt.request_context_digest,
+                            embedding_identity: cache.embedding_identity(),
+                            embedding_dimensions: query_vec.len(),
+                            semantic_config_digest: cache.configuration_digest(),
+                            response_policy_digest: &response_policy_digest,
+                            schema_version: sbproxy_ai::SEMANTIC_CACHE_SCHEMA_VERSION,
+                        },
+                    ))
+                });
+                if let (Some(query_vec), Some(namespace)) = (query_vec, namespace) {
+                    ctx.admin_cache_status
+                        .record(crate::context::AdminCacheStatus::Miss);
+                    let outcome = cache
+                        .lookup(sbproxy_ai::SemanticLookupRequest {
+                            namespace,
+                            prompt: &semantic_prompt.text,
+                            embedding: &query_vec,
+                        })
+                        .await;
+                    match outcome {
+                        Ok(sbproxy_ai::SemanticLookupOutcome::Hit(hit)) => {
+                            ctx.admin_cache_status
+                                .record(crate::context::AdminCacheStatus::SemanticHit);
                             sbproxy_ai::ai_metrics::record_cache_result(
                                 cache.provider(),
                                 "semantic",
@@ -3586,36 +5704,49 @@ pub(super) async fn handle_ai_proxy(
                                 origin = %hostname,
                                 score = hit.score,
                                 status = hit.response.status,
-                                "AI proxy: embedding semantic cache HIT; replaying"
+                                "AI proxy: semantic cache HIT; replaying"
                             );
-                            let mut header = pingora_http::ResponseHeader::build(
+                            // The stored body is behind one reference count.
+                            // Cloning the handle here costs a refcount bump,
+                            // not a copy of the response.
+                            let body = hit.response.body.clone();
+                            if let Some(block) = ai_output_guardrail_block(
                                 hit.response.status,
-                                Some(hit.response.headers.len() + 1),
+                                guardrail_pipeline.as_deref(),
+                                output_external,
+                                body.as_ref(),
+                                &model,
                             )
-                            .map_err(|e| {
-                                Error::because(
-                                    ErrorType::InternalError,
-                                    "embedding cache: failed to build response header",
-                                    e,
-                                )
-                            })?;
-                            for (name, value) in &hit.response.headers {
-                                if name == "transfer-encoding" || name == "connection" {
-                                    continue;
-                                }
-                                let _ = header.insert_header(name.clone(), value.clone());
+                            .await
+                            {
+                                send_guardrail_block_response(session, ctx, &ai_span, 403, block)
+                                    .await?;
+                                return Ok(());
                             }
-                            let _ = header.insert_header("x-semcache", "HIT");
-                            // `hit.response` is a shared `Arc` (WOR-1703);
-                            // materialize the body for replay off the
-                            // cache lock rather than deep-cloning the
-                            // response inside the critical section.
-                            let body = bytes::Bytes::from(hit.response.body.clone());
-                            // WOR-1094: a cache hit is a zero-cost
-                            // ledger transaction, not an absent one.
-                            // Record the served tokens under the
-                            // cache_read dimension so the hit still
-                            // shows up as savings.
+                            // Re-run the allowlist over the decoded record so
+                            // a tampered distributed value cannot turn an
+                            // allowlisted name into an invalid header.
+                            let stored_headers =
+                                semantic_cache_response_headers(&hit.response.headers);
+                            let content_type = stored_headers
+                                .iter()
+                                .find(|(name, _)| name == "content-type")
+                                .map(|(_, value)| value.clone())
+                                .unwrap_or_else(|| "application/json".to_string());
+                            // Route metadata is rebuilt from the current
+                            // request. An earlier caller's route headers are
+                            // never stored and never replayed.
+                            let mut extras = public_route_headers(ctx);
+                            for (name, value) in &stored_headers {
+                                if name == "content-language" {
+                                    extras.push((name.clone(), value.clone()));
+                                }
+                            }
+                            extras.push(("x-semcache".to_string(), "HIT".to_string()));
+                            // WOR-1094: a cache hit is a zero-cost ledger
+                            // transaction, not an absent one. Record the
+                            // served tokens under the cache_read dimension so
+                            // the hit still shows up as savings.
                             crate::server::ai_support::record_cache_hit_savings(
                                 ctx.tenant_id.as_str(),
                                 ctx.principal.api_key_id(),
@@ -3626,84 +5757,101 @@ pub(super) async fn handle_ai_proxy(
                                 &body,
                                 &ctx.attribution_tags,
                             );
-                            settle_governance_tokens(ctx, 0, 0).await;
-                            session
-                                .write_response_header(Box::new(header), false)
-                                .await?;
-                            session.write_response_body(Some(body), true).await?;
-                            return Ok(());
+                            let replay_body =
+                                sbproxy_ai::format::rewrap_success_response_for_inbound(
+                                    hit.response.status,
+                                    ctx.ai_inbound_format.as_deref(),
+                                    body.as_ref(),
+                                );
+                            return send_response_with_extras(
+                                session,
+                                hit.response.status,
+                                &content_type,
+                                &replay_body,
+                                &extras,
+                            )
+                            .await;
                         }
-                        sbproxy_ai::ai_metrics::record_cache_result(
-                            cache.provider(),
-                            "semantic",
-                            false,
-                        );
-                        sbproxy_observe::metrics::record_semantic_cache(
-                            ctx.tenant_id.as_str(),
-                            hostname,
-                            source_label,
-                            "miss",
-                        );
-                        embed_miss = Some((
-                            std::sync::Arc::clone(cache),
-                            sbproxy_ai::EmbeddingCache::prompt_key(&cache_scope, &extracted_prompt),
-                            query_vec,
-                            cache_scope,
-                        ));
-                    }
-                    Err(e) => {
-                        sbproxy_observe::metrics::record_semantic_cache(
-                            ctx.tenant_id.as_str(),
-                            hostname,
-                            source_label,
-                            "error",
-                        );
-                        warn!(
-                            tenant = %ctx.tenant_id,
-                            origin = %hostname,
-                            error = %e,
-                            "AI proxy: embedding cache lookup failed (fail-open)"
-                        );
+                        Ok(sbproxy_ai::SemanticLookupOutcome::Miss(token)) => {
+                            sbproxy_ai::ai_metrics::record_cache_result(
+                                cache.provider(),
+                                "semantic",
+                                false,
+                            );
+                            sbproxy_observe::metrics::record_semantic_cache(
+                                ctx.tenant_id.as_str(),
+                                hostname,
+                                source_label,
+                                "miss",
+                            );
+                            embed_miss = Some((std::sync::Arc::clone(cache), *token));
+                        }
+                        Err(error) => {
+                            sbproxy_observe::metrics::record_semantic_cache(
+                                ctx.tenant_id.as_str(),
+                                hostname,
+                                source_label,
+                                "error",
+                            );
+                            // Backend, failure class, and nothing else. A key,
+                            // namespace digest, embedding, prompt, response
+                            // body, or Redis and mesh error must never reach a
+                            // log line from the request path.
+                            warn!(
+                                tenant = %ctx.tenant_id,
+                                origin = %hostname,
+                                backend = semantic_backend_label(cache.backend()),
+                                failure = semantic_lookup_failure_class(&error),
+                                "AI proxy: semantic cache lookup failed (fail-open)"
+                            );
+                        }
                     }
                 }
             }
         }
     }
 
-    // Check if streaming is requested.
-    let is_stream = body
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    // WOR-1545: LLM-aware context-window compression. When enabled, fit an
-    // over-long prompt to the resolved model's context window before
-    // dispatch, dropping the oldest non-system turns, so the request
-    // succeeds on the same model instead of being rejected with a
-    // context-length error. No-op for unknown models, non-chat surfaces, or
-    // prompts that already fit.
-    if let Some(llm) = config
-        .resilience
-        .as_ref()
-        .and_then(|r| r.llm_aware.as_ref())
-    {
-        if llm.context_compress && !model.is_empty() {
-            if let Some(messages) = body.get("messages").and_then(|v| v.as_array()) {
-                let reserve = llm.completion_reserve_tokens.unwrap_or(1024);
-                if let Some(trimmed) =
-                    sbproxy_ai::context_compress::fit_messages_to_model(messages, &model, reserve)
-                {
-                    let removed = messages.len().saturating_sub(trimmed.len());
-                    if removed > 0 {
-                        warn!(
-                            model = %model,
-                            removed,
-                            "AI proxy: context-window compress, trimmed oldest messages to fit"
-                        );
-                        body["messages"] = serde_json::Value::Array(trimmed);
-                    }
-                }
-            }
+    // Apply the request-pinned ordered pipeline at the legacy mutable-body
+    // seam. The runner owns a local working list and this assignment is the
+    // only mutation visible to routing/failover. Runtime failures preserve the
+    // last committed list and later levers continue.
+    if !model.is_empty() {
+        if let (Some(runtime), Some(messages)) = (
+            compression_runtime.as_ref(),
+            body.get("messages").and_then(serde_json::Value::as_array),
+        ) {
+            let messages = messages.clone();
+            let session_id = ctx.session_id.map(|session| session.to_bytes());
+            let run = runtime
+                .run(
+                    crate::compression_runtime::CompressionExecution {
+                        model: &model,
+                        tenant_id: ctx.tenant_id.as_str(),
+                        api_key_id: budget_api_key_id.as_deref(),
+                        origin: hostname,
+                        session_id,
+                        controls: compression_request_controls(&path, &body),
+                        now_unix_ms: current_unix_millis(),
+                        allowed_providers,
+                        blocked_providers,
+                        allowed_models,
+                        blocked_models,
+                        budget: effective_budget.as_deref(),
+                    },
+                    &messages,
+                )
+                .await;
+            runtime.record_telemetry(
+                ctx.tenant_id.as_str(),
+                budget_api_key_id.as_deref(),
+                compression_cache_bypass,
+                bound.source.as_str(),
+                compression_selection_outcome,
+                &run,
+            );
+            ctx.pending_compression_value =
+                sbproxy_ai::PendingCompressionValue::from_run(model.clone(), &run);
+            body["messages"] = serde_json::Value::Array(run.messages);
         }
     }
 
@@ -3796,12 +5944,11 @@ pub(super) async fn handle_ai_proxy(
         .unwrap_or(false);
 
     // Parse retry config from the action config's routing.retry section.
-    // This is done by inspecting the raw handler config.
-    let max_attempts = if is_failover || content_policy_fallback {
-        config.providers.len()
-    } else {
-        1
-    };
+    // This is done by inspecting the raw handler config. Quota membership
+    // follows the caller identity, so switching providers cannot make a
+    // denied member eligible and a quota pool alone never enables failover.
+    let max_attempts =
+        sequential_attempt_limit(is_failover, content_policy_fallback, config.providers.len());
 
     // Build sorted provider list for failover (by priority).
     let mut provider_order: Vec<usize> = config
@@ -3854,15 +6001,22 @@ pub(super) async fn handle_ai_proxy(
     if disallow_training {
         provider_order.retain(|&i| config.providers[i].no_prompt_training);
         if provider_order.is_empty() {
-            let err = serde_json::json!({"error": {
-                "message": "disallow_prompt_training requested but no configured provider is marked no_prompt_training",
-                "type": "no_compliant_provider",
-            }});
-            let body_bytes = serde_json::to_vec(&err).unwrap_or_default();
+            let body_bytes = ErrorEnvelope::new(
+                "no_compliant_provider",
+                "disallow_prompt_training requested but no configured provider is marked no_prompt_training",
+            )
+            .request_id(ctx.request_id.as_str())
+            .to_bytes();
             send_response(session, 400, "application/json", &body_bytes).await?;
             return Ok(());
         }
     }
+    // Shadow dispatch is deferred until after the primary response so primary
+    // quota wins. Own its policy lists now rather than extending a borrow from
+    // `ctx.principal` across the mutable primary-attempt bookkeeping below.
+    let shadow_allowed_providers = allowed_providers.to_vec();
+    let shadow_blocked_providers = blocked_providers.to_vec();
+
     // WOR-1534: model-based provider routing. When the requested model is
     // declared in one or more providers' `models` lists, restrict the routing
     // set to those providers so the model name selects the vendor (a provider
@@ -3873,6 +6027,16 @@ pub(super) async fn handle_ai_proxy(
     // all choose from the model-eligible set.
     if let Some(eligible) = model_eligible_providers(&provider_order, &config.providers, &model) {
         provider_order = eligible;
+    }
+
+    // Intersect the request's final policy/model candidate set with live
+    // resilience state before any strategy can choose or order providers.
+    // This strict path never revives an unhealthy, ejected, or breaker-blocked
+    // provider when the intersection is empty.
+    provider_order = router.eligible_candidate_indices(&config.providers, &provider_order);
+    if provider_order.is_empty() {
+        send_error(session, 503, "no healthy eligible AI provider").await?;
+        return Ok(());
     }
 
     // WOR-797: cost/quality routing. When configured, score the inbound
@@ -3923,21 +6087,24 @@ pub(super) async fn handle_ai_proxy(
     // order; the remaining providers stay as fallbacks. Failover
     // (priority sort above), cascade, and cost_quality manage their own
     // ordering and are left untouched.
+    let routing_prefix = router
+        .is_prefix_affinity()
+        .then(|| {
+            let namespace = body
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(model.as_str());
+            sbproxy_ai::normalize_prefix(&body, namespace)
+        })
+        .flatten();
     if !is_failover && router.cascade_config().is_none() && router.cost_quality_config().is_none() {
-        // WOR-798: prefix-affinity strategies (self-hosted vLLM /
-        // SGLang KV-cache reuse) need the request's prompt prefix
-        // to hash to a sticky upstream. Other strategies ignore the
-        // prefix and select() handles them.
+        // Prefix-affinity consults the bounded observed-holder directory over
+        // the exact candidates this dispatch can run. Other strategies use
+        // their ordinary selection path.
         let primary = if router.is_prefix_affinity() {
-            let prefix = extract_prefix_key(&body, 1024);
-            router.select_with_prefix_policy(
-                &config.providers,
-                &prefix,
-                allowed_providers,
-                blocked_providers,
-            )
+            router.select_with_prefix_candidates(&config.providers, routing_prefix, &provider_order)
         } else {
-            router.select_with_policy(&config.providers, allowed_providers, blocked_providers)
+            router.select_with_candidates(&config.providers, &provider_order)
         };
         if let Some(primary) = primary {
             if let Some(pos) = provider_order.iter().position(|&i| i == primary) {
@@ -3946,6 +6113,10 @@ pub(super) async fn handle_ai_proxy(
             }
         }
     }
+    ctx.admin_load_balancer_strategy = Some(router.strategy_name().to_string());
+    ctx.admin_load_balancer_target = provider_order
+        .first()
+        .map(|&index| config.providers[index].name.to_string());
     // Cascade + streaming: cascade does not retry mid-stream, so
     // we dispatch to tier 1 only and let the streaming relay
     // handle the response unchanged. The model substitution is
@@ -3989,10 +6160,6 @@ pub(super) async fn handle_ai_proxy(
         let provider = &config.providers[index];
         provider.serve.is_some() || provider.is_managed_model()
     });
-    // From this point forward every branch may initiate provider or managed
-    // worker computation. Unknown transport/cancellation outcomes must retain
-    // the conservative reservation rather than default-release it.
-    arm_governance_ceiling(ctx);
 
     // --- Cascade routing ---
     //
@@ -4012,9 +6179,10 @@ pub(super) async fn handle_ai_proxy(
         .filter(|_| !disallow_training && !has_managed_local)
     {
         if !is_stream {
+            let cascade_quota_reservation = format!("{}:quota-pool:cascade", ctx.request_id);
             let outcome = AI_CLIENT
                 .load()
-                .forward_cascade_with_policy(
+                .forward_cascade_with_policy_and_quota_with_reasoning_eligibility(
                     config,
                     cascade_cfg,
                     allowed_providers,
@@ -4023,10 +6191,30 @@ pub(super) async fn handle_ai_proxy(
                     &body,
                     &ctx.attribution_tags,
                     surface_label,
+                    &quota_pool_admission,
+                    &cascade_quota_reservation,
+                    reasoning_eligibility,
                 )
                 .await;
             match outcome {
                 Ok(o) => {
+                    try_spawn_governed_shadow_after_primary(
+                        config,
+                        &surface,
+                        &path,
+                        &body,
+                        is_stream,
+                        &shadow_allowed_providers,
+                        &shadow_blocked_providers,
+                        disallow_training,
+                        ctx,
+                        &quota_pool_admission,
+                        reasoning_eligibility,
+                    );
+                    ctx.admin_load_balancer_target = Some(o.provider_name.clone());
+                    for provider in &o.attempted_providers {
+                        ctx.record_admin_ai_attempt(provider);
+                    }
                     ctx.ai_provider = Some(o.provider_name.clone());
                     if !o.model.is_empty() {
                         ctx.ai_model = Some(o.model.clone());
@@ -4037,11 +6225,8 @@ pub(super) async fn handle_ai_proxy(
                         .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
                         .map(|(_, v)| v.clone())
                         .unwrap_or_else(|| "application/json".to_string());
-                    let translated = sbproxy_ai::format::rewrap_response_for_inbound(
-                        ctx.ai_inbound_format.as_deref(),
-                        &o.body,
-                    );
                     emit_ai_billing_event(
+                        hostname,
                         surface_label,
                         &o.provider_name,
                         Some(o.model.clone()),
@@ -4051,18 +6236,62 @@ pub(super) async fn handle_ai_proxy(
                         &ctx.attribution_tags,
                         ctx.tenant_id.as_str(),
                         ctx.principal.api_key_id(),
+                        &ctx.rollup_properties,
+                        billing_agent.identity(),
                         &ai_span,
                     );
-                    if o.billable_usage_missing {
-                        settle_governance_ceiling(ctx).await;
-                    } else {
-                        settle_governance_tokens(
-                            ctx,
-                            o.aggregate_input_tokens,
-                            o.aggregate_output_tokens,
-                        )
-                        .await;
+                    if (200..300).contains(&o.status) {
+                        let output_external = config
+                            .guardrails
+                            .as_ref()
+                            .map(|guardrails| guardrails.external.as_slice())
+                            .unwrap_or_default();
+                        if let Some(block) =
+                            external_output_guardrail_block(output_external, &o.body, &o.model)
+                                .await
+                        {
+                            warn!(
+                                guardrail = %block.name,
+                                reason = %block.reason,
+                                "AI proxy: cascade output guardrail blocked response"
+                            );
+                            sbproxy_ai::tracing_spans::record_error(
+                                &ai_span,
+                                sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                                &block.reason,
+                            );
+                            mark_guardrail_block(ctx, block.name.clone());
+                            let body_bytes =
+                                ErrorEnvelope::new("guardrail_violation", &block.reason)
+                                    .code(&block.name)
+                                    .request_id(ctx.request_id.as_str())
+                                    .to_bytes();
+                            // Cascade bodies are materialized outside the relay
+                            // path, so a blocked body must not reach the
+                            // idempotency cache or the downstream client.
+                            let _ = idem_capture.take();
+                            let extras = public_route_headers(ctx);
+                            return send_response_with_extras(
+                                session,
+                                403,
+                                "application/json",
+                                &body_bytes,
+                                &extras,
+                            )
+                            .await;
+                        }
                     }
+                    record_ai_provider_response_failure(
+                        &ai_span,
+                        &o.provider_name,
+                        o.status,
+                        Some(o.body.as_ref()),
+                    );
+                    let translated = sbproxy_ai::format::rewrap_success_response_for_inbound(
+                        o.status,
+                        ctx.ai_inbound_format.as_deref(),
+                        o.body.as_ref(),
+                    );
                     // Drop any idempotency capture: cascade does not
                     // engage the idempotency cache write in v1
                     // because the response body is already
@@ -4080,6 +6309,17 @@ pub(super) async fn handle_ai_proxy(
                     .await;
                 }
                 Err(e) => {
+                    if let (Some(error), Some(pool)) = (
+                        e.downcast_ref::<sbproxy_ai::PoolError>(),
+                        config.quota_pool.as_ref(),
+                    ) {
+                        if let QuotaPoolErrorDisposition::Reject { status, message } =
+                            sbproxy_ai::quota_pool::pool_error_disposition(Some(pool), error)
+                        {
+                            send_error(session, status, message).await?;
+                            return Ok(());
+                        }
+                    }
                     warn!(
                         error = %e,
                         "AI proxy: cascade dispatch failed; returning 502"
@@ -4099,7 +6339,6 @@ pub(super) async fn handle_ai_proxy(
              failover path so local admission and engine lifecycle remain governed"
         );
     }
-
     // --- Hedged / raced dispatch (WOR-1545) ---
     //
     // When the configured strategy is `race`, fan the request out to every
@@ -4112,29 +6351,81 @@ pub(super) async fn handle_ai_proxy(
     let race_mode =
         router.is_race() && !is_stream && provider_order.len() >= 2 && !has_managed_local;
     if race_mode {
-        // Loser responses are cancelled without a trustworthy usage record.
-        // The reservation already covers every eligible leg, so retain that
-        // full ceiling instead of settling only the winning provider and
-        // silently refunding potentially billable work.
-        mark_governance_retry_usage_missing(ctx);
-        arm_governance_ceiling(ctx);
         use futures::stream::{FuturesUnordered, StreamExt as _};
+        enum RacedAttemptError {
+            Upstream(anyhow::Error),
+            Quota(QuotaPoolErrorDisposition),
+        }
+
         let client = AI_CLIENT.load();
         let race_start = std::time::Instant::now();
         let mut futs = FuturesUnordered::new();
-        for &idx in &provider_order {
-            let provider = &config.providers[idx];
+        for (race_attempt, &idx) in provider_order.iter().enumerate() {
+            let mut provider = config.providers[idx].clone();
+            apply_native_provider_credential(&mut provider, native_api_key.as_deref());
             let mut attempt_body = body.clone();
-            if !model.is_empty() {
+            let resolved_model = if !model.is_empty() {
                 let mapped = provider.map_model(&model);
                 if mapped != model {
-                    attempt_body["model"] = serde_json::Value::String(mapped);
+                    attempt_body["model"] = serde_json::Value::String(mapped.clone());
                 }
-            }
+                mapped
+            } else {
+                attempt_body
+                    .get("model")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let reasoning = sbproxy_ai::apply_reasoning_policy_with_eligibility(
+                if surface.supports_reasoning_policy() {
+                    config.reasoning
+                } else {
+                    sbproxy_ai::ReasoningPolicy::Off
+                },
+                &provider,
+                &resolved_model,
+                &mut attempt_body,
+                reasoning_eligibility,
+            );
+            let reasoning_outcome = reasoning.outcome_label();
             let path_ref = path.as_str();
             let cl = &client;
+            let attempt_router = std::sync::Arc::clone(&router);
+            let quota_config = config.quota_pool.as_ref();
+            let quota_admission = quota_pool_admission.clone();
+            let quota_reservation_id = format!("{}:quota-pool:race:{race_attempt}", ctx.request_id);
             futs.push(async move {
-                let r = cl.forward_request(provider, path_ref, &attempt_body).await;
+                let quota_attempt = match reserve_quota_pool_attempt(
+                    quota_config,
+                    &quota_admission,
+                    &quota_reservation_id,
+                )
+                .await
+                {
+                    Ok(attempt) => attempt,
+                    Err(rejection) => return (idx, Err(RacedAttemptError::Quota(rejection))),
+                };
+                sbproxy_ai::ai_metrics::record_reasoning_policy_attempt(
+                    &provider.name,
+                    reasoning_outcome,
+                );
+                let r = run_routed_provider_attempt(
+                    &attempt_router,
+                    idx,
+                    cl.forward_request_with_quota(
+                        &provider,
+                        path_ref,
+                        &attempt_body,
+                        quota_attempt,
+                    ),
+                )
+                .await
+                .map_err(|error| {
+                    quota_pool_error_from_attempt(quota_config, &error)
+                        .map(RacedAttemptError::Quota)
+                        .unwrap_or(RacedAttemptError::Upstream(error))
+                });
                 (idx, r)
             });
         }
@@ -4144,11 +6435,13 @@ pub(super) async fn handle_ai_proxy(
         // synthetic one when every candidate fails.
         let mut winner: Option<(usize, reqwest::Response)> = None;
         let mut fallback: Option<(usize, reqwest::Response)> = None;
+        let mut quota_rejection = None;
         while let Some((idx, res)) = futs.next().await {
             match res {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
-                    router.record_latency(idx, race_start.elapsed().as_micros() as u64);
+                    // WOR-1881: race losers still contribute quota signals.
+                    update_router_quota_from_response(&router, &config.providers[idx].name, &resp);
                     let outcome = if (200..300).contains(&status) {
                         "success"
                     } else {
@@ -4165,13 +6458,16 @@ pub(super) async fn handle_ai_proxy(
                         fallback = Some((idx, resp));
                     }
                 }
-                Err(e) => {
+                Err(RacedAttemptError::Upstream(e)) => {
                     sbproxy_observe::metrics::record_provider_attempt(
                         &config.providers[idx].name,
                         "error",
                     );
                     last_error_type = ai_transport_error_type(&e);
                     last_error = Some(e);
+                }
+                Err(RacedAttemptError::Quota(rejection)) => {
+                    quota_rejection = Some(rejection);
                 }
             }
         }
@@ -4181,6 +6477,7 @@ pub(super) async fn handle_ai_proxy(
 
         if let Some((idx, resp)) = winner.or(fallback) {
             let provider = &config.providers[idx];
+            ctx.admin_load_balancer_target = Some(provider.name.to_string());
             let resolved_model = if model.is_empty() {
                 String::new()
             } else {
@@ -4219,6 +6516,11 @@ pub(super) async fn handle_ai_proxy(
                 .and_then(|u| u.host_str().map(|h| h.to_string()));
             last_provider_name = provider.name.to_string();
             last_resp = Some(resp);
+        } else if last_error.is_none() {
+            if let Some(QuotaPoolErrorDisposition::Reject { status, message }) = quota_rejection {
+                send_error(session, status, message).await?;
+                return Ok(());
+            }
         }
     }
 
@@ -4236,12 +6538,17 @@ pub(super) async fn handle_ai_proxy(
         if attempt >= effective_max_attempts {
             break;
         }
+        // Native bypass is an attempt-local transport decision. A retryable
+        // Anthropic failure must not make a later OpenAI fallback skip the
+        // Anthropic response adapter.
+        ctx.ai_native_bypass = false;
         // A failed prior managed attempt may still hold deployment capacity.
         // Release it before this attempt queues or dispatches.
         ctx.managed_model_permit = None;
         ctx.managed_route_trace = None;
         ctx.managed_route_class = None;
         let mut resolved_provider = config.providers[provider_idx].clone();
+        apply_native_provider_credential(&mut resolved_provider, native_api_key.as_deref());
         let mut local_public_model = None;
         let mut local_engine_model = None;
         let distributed_managed =
@@ -4271,6 +6578,43 @@ pub(super) async fn handle_ai_proxy(
                     ctx.managed_model_permit = Some(upstream.permit);
                     ctx.managed_route_class =
                         Some(sbproxy_ai::managed_replica::ManagedRouteClass::Local);
+
+                    // Pre-flight context-fit gate (WOR-1671): count the
+                    // prompt against the served model's own tokenizer and
+                    // refuse an over-context prompt with a legible error,
+                    // rather than forwarding a request the engine will only
+                    // reject after a full cold path. A model that shipped no
+                    // tokenizer, or a non-chat body, skips the gate.
+                    if let Some(messages) = body.get("messages").and_then(|value| value.as_array())
+                    {
+                        let deployment = ctx
+                            .managed_model_permit
+                            .as_ref()
+                            .map(|permit| permit.deployment().to_string());
+                        if let Some(fit) = deployment.and_then(|deployment| {
+                            crate::server::model_host::model_runtime_manager()
+                                .prompt_token_fit(&deployment, messages)
+                        }) {
+                            if !fit.fits() {
+                                warn!(
+                                    provider = %resolved_provider.name,
+                                    prompt_tokens = fit.tokens,
+                                    context_limit = fit.context_limit,
+                                    "AI proxy: refusing an over-context prompt for a local model"
+                                );
+                                let message = format!(
+                                    "prompt is {} tokens but the served model's context \
+                                     window is {}; shorten the prompt or messages",
+                                    fit.tokens, fit.context_limit
+                                );
+                                let bytes = ErrorEnvelope::new("context_length_exceeded", &message)
+                                    .request_id(ctx.request_id.as_str())
+                                    .to_bytes();
+                                send_response(session, 400, "application/json", &bytes).await?;
+                                return Ok(());
+                            }
+                        }
+                    }
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -4308,6 +6652,22 @@ pub(super) async fn handle_ai_proxy(
         if let Some(engine_model) = local_engine_model.as_deref() {
             rewrite_managed_request_model(&mut attempt_body, engine_model);
         }
+        let reasoning_model = attempt_body
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(resolved_model.as_str())
+            .to_string();
+        let reasoning = sbproxy_ai::apply_reasoning_policy_with_eligibility(
+            if surface.supports_reasoning_policy() {
+                config.reasoning
+            } else {
+                sbproxy_ai::ReasoningPolicy::Off
+            },
+            provider,
+            &reasoning_model,
+            &mut attempt_body,
+            reasoning_eligibility,
+        );
 
         // Stamp the resolved provider + model on the context so the
         // access log captures them even when the upstream errors out
@@ -4341,7 +6701,26 @@ pub(super) async fn handle_ai_proxy(
         // emit as-is, which is a separate code path. Track this as a
         // follow-up.
         let provider_format = sbproxy_ai::client::provider_format(provider);
-        let bypass = if is_stream {
+        // Anthropic native bypass reconstructs the original inbound body.
+        // Disable it whenever a configured or already-applied request
+        // transform could make those original bytes differ from the governed
+        // body in `attempt_body`.
+        let request_pii_redaction_enabled = config
+            .pii
+            .as_ref()
+            .is_some_and(|pii| pii.enabled && pii.redact_request);
+        let request_transform_selected = request_pii_redaction_enabled
+            || compression_runtime.is_some()
+            || reasoning.applied
+            || !native_request_is_losslessly_governable
+            || native_bypass_canonical_baseline
+                .as_ref()
+                .is_some_and(|baseline| native_bypass_body_changed(baseline, &attempt_body));
+        let bypass = if !native_bypass_is_safe(
+            is_stream,
+            request_transform_selected,
+            rag_requires_canonical_path,
+        ) {
             None
         } else {
             sbproxy_ai::format::native_bypass_for(
@@ -4394,12 +6773,31 @@ pub(super) async fn handle_ai_proxy(
                     sbproxy_ai::format::NativeBypass::OpenAiChat.inbound_label(),
                     sbproxy_ai::format::NativeBypass::OpenAiChat.provider_label(),
                 );
-                ctx.ai_native_bypass = true;
                 None
             }
             None => None,
         };
 
+        // Reserve one shared-quota unit after local validation. The selected
+        // transport commits it immediately before bytes can leave the
+        // process; any local preparation failure drops and releases it.
+        let quota_reservation_id = format!("{}:quota-pool:attempt:{attempt}", ctx.request_id);
+        let Some(quota_attempt) = reserve_quota_pool_attempt_or_respond(
+            session,
+            config.quota_pool.as_ref(),
+            &quota_pool_admission,
+            &quota_reservation_id,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        sbproxy_ai::ai_metrics::record_reasoning_policy_attempt(
+            &provider.name,
+            reasoning.outcome_label(),
+        );
+
+        ctx.record_admin_ai_attempt(&provider.name);
         let attempt_start = std::time::Instant::now();
         // WOR-1103: wrap each upstream attempt in its own span so a
         // forced failover shows one child span per provider tried, with
@@ -4414,108 +6812,127 @@ pub(super) async fn handle_ai_proxy(
             provider = %provider.name,
             attempt = attempt,
         );
-        let result: anyhow::Result<reqwest::Response> = if distributed_managed {
-            let managed_body = serde_json::to_vec(&attempt_body)
-                .map(bytes::Bytes::from)
-                .map_err(anyhow::Error::from);
-            match managed_body {
-                Ok(managed_body) => {
-                    let origin = ctx
-                        .origin_idx
-                        .and_then(|index| ctx.pipeline.config.origins.get(index))
-                        .map(|origin| origin.origin_id.to_string())
-                        .unwrap_or_else(|| ctx.hostname.to_string());
-                    let prefix_key = extract_prefix_key(&attempt_body, 1024);
-                    let requested_adapter = attempt_body
-                        .get("adapter")
-                        .or_else(|| attempt_body.get("lora_adapter"))
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_string);
-                    let preferred_region = ctx
-                        .principal
-                        .attrs
-                        .metadata
-                        .get("region")
-                        .cloned()
-                        .or_else(|| ctx.request_geo.clone());
-                    let maximum = config
-                        .max_body_size
-                        .filter(|maximum| *maximum > 0)
-                        .unwrap_or(64 * 1024 * 1024)
-                        .min(1024 * 1024 * 1024);
-                    let managed = crate::server::model_host::distributed_managed_upstream(
-                        crate::server::model_host::ManagedDistributedRequest {
-                            origin: &origin,
-                            provider,
-                            requested_model: (!model.is_empty()).then_some(model.as_str()),
-                            request_id: ctx.request_id.as_str(),
-                            tenant_id: ctx.tenant_id.as_str(),
-                            governed_key_id: ctx.principal.api_key_id(),
-                            policy_revision: &peer_policy_revision,
-                            path: &path,
-                            body: managed_body,
-                            content_type: Some("application/json"),
-                            priority: crate::server::model_host::lane_class_for(
-                                ctx.ai_lane_priority,
-                            ),
-                            prefix_key: &prefix_key,
-                            preferred_region: preferred_region.as_deref(),
-                            requested_adapter: requested_adapter.as_deref(),
-                            max_body_bytes: maximum,
-                        },
-                    )
-                    .instrument(attempt_span)
-                    .await;
-                    match managed {
-                        Ok(Some(upstream)) => {
-                            local_public_model = Some(upstream.public_model);
-                            ctx.managed_model_permit = upstream.local_permit;
-                            ctx.managed_route_class = upstream.route_class;
-                            ctx.managed_route_trace = Some(upstream.trace);
-                            Ok(upstream.response)
+        let result: anyhow::Result<reqwest::Response> =
+            run_routed_provider_attempt(&router, provider_idx, async {
+                if distributed_managed {
+                    let managed_body = serde_json::to_vec(&attempt_body)
+                        .map(bytes::Bytes::from)
+                        .map_err(anyhow::Error::from);
+                    match managed_body {
+                        Ok(managed_body) => {
+                            let origin = ctx
+                                .origin_idx
+                                .and_then(|index| ctx.pipeline.config.origins.get(index))
+                                .map(|origin| origin.origin_id.to_string())
+                                .unwrap_or_else(|| ctx.hostname.to_string());
+                            let prefix_key = extract_prefix_key(&attempt_body, 1024);
+                            let requested_adapter = attempt_body
+                                .get("adapter")
+                                .or_else(|| attempt_body.get("lora_adapter"))
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string);
+                            let preferred_region = ctx
+                                .principal
+                                .attrs
+                                .metadata
+                                .get("region")
+                                .cloned()
+                                .or_else(|| ctx.request_geo.clone());
+                            let maximum = config
+                                .max_body_size
+                                .filter(|maximum| *maximum > 0)
+                                .unwrap_or(64 * 1024 * 1024)
+                                .min(1024 * 1024 * 1024);
+                            let managed = crate::server::model_host::distributed_managed_upstream(
+                                crate::server::model_host::ManagedDistributedRequest {
+                                    origin: &origin,
+                                    provider,
+                                    requested_model: (!model.is_empty()).then_some(model.as_str()),
+                                    request_id: ctx.request_id.as_str(),
+                                    tenant_id: ctx.tenant_id.as_str(),
+                                    governed_key_id: ctx.principal.api_key_id(),
+                                    policy_revision: &peer_policy_revision,
+                                    path: &path,
+                                    body: managed_body,
+                                    content_type: Some("application/json"),
+                                    priority: crate::server::model_host::lane_class_for(
+                                        ctx.ai_lane_priority,
+                                    ),
+                                    prefix_key: &prefix_key,
+                                    preferred_region: preferred_region.as_deref(),
+                                    requested_adapter: requested_adapter.as_deref(),
+                                    max_body_bytes: maximum,
+                                    quota_attempt,
+                                },
+                            )
+                            .instrument(attempt_span)
+                            .await;
+                            match managed {
+                                Ok(Some(upstream)) => {
+                                    local_public_model = Some(upstream.public_model);
+                                    ctx.managed_model_permit = upstream.local_permit;
+                                    ctx.managed_route_class = upstream.route_class;
+                                    ctx.managed_route_trace = Some(upstream.trace);
+                                    Ok(upstream.response)
+                                }
+                                Ok(None) => Err(anyhow::anyhow!(
+                                    "distributed managed provider did not produce an attempt"
+                                )),
+                                Err(crate::server::model_host::ManagedDistributedError::Quota(
+                                    error,
+                                )) => Err(anyhow::Error::new(error)),
+                                Err(error) => {
+                                    if let Some(trace) = error.trace() {
+                                        ctx.managed_route_trace = Some(trace.clone());
+                                    }
+                                    if let Some(reason) = error.public_reason() {
+                                        ctx.managed_fallback_reason = Some(reason);
+                                    }
+                                    Err(anyhow::Error::new(error))
+                                }
+                            }
                         }
-                        Ok(None) => Err(anyhow::anyhow!(
-                            "distributed managed provider did not produce an attempt"
-                        )),
-                        Err(error) => {
-                            if let Some(trace) = error.trace() {
-                                ctx.managed_route_trace = Some(trace.clone());
-                            }
-                            if let Some(reason) = error.public_reason() {
-                                ctx.managed_fallback_reason = Some(reason);
-                            }
-                            Err(anyhow::Error::new(error))
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    async {
+                        if let Some((bypass_body, native_path)) = upstream_call {
+                            AI_CLIENT
+                                .load()
+                                .forward_native_bypass_with_quota(
+                                    provider,
+                                    &method_str,
+                                    native_path,
+                                    bypass_body,
+                                    quota_attempt,
+                                )
+                                .await
+                        } else {
+                            AI_CLIENT
+                                .load()
+                                .forward_request_with_quota(
+                                    provider,
+                                    &path,
+                                    &attempt_body,
+                                    quota_attempt,
+                                )
+                                .await
                         }
                     }
+                    .instrument(attempt_span)
+                    .await
                 }
-                Err(error) => Err(error),
-            }
-        } else {
-            async {
-                if let Some((bypass_body, native_path)) = upstream_call {
-                    AI_CLIENT
-                        .load()
-                        .forward_native_bypass(provider, &method_str, native_path, bypass_body)
-                        .await
-                } else {
-                    AI_CLIENT
-                        .load()
-                        .forward_request(provider, &path, &attempt_body)
-                        .await
-                }
-            }
-            .instrument(attempt_span)
-            .await
-        };
+            })
+            .await;
         ctx.ai_serve_model = local_public_model.clone();
 
         match result {
             Ok(resp) => {
-                // WOR-798: feed the latency-aware LB. Record the upstream
-                // round-trip latency for this provider so `peak_ewma` /
-                // `lowest_latency` reflect live data on the next request.
-                router.record_latency(provider_idx, attempt_start.elapsed().as_micros() as u64);
                 let status = resp.status().as_u16();
+                // WOR-1881: update quota snapshots before retry/reselect so
+                // headroom and reset-aware strategies see this response's
+                // headers (including 429 Retry-After).
+                update_router_quota_from_response(&router, &provider.name, &resp);
                 // WOR-1545 / WOR-1524: retry on the default status-code set,
                 // or on a per-error-class policy decision when configured.
                 // Classification from status alone is enough for the
@@ -4558,13 +6975,8 @@ pub(super) async fn handle_ai_proxy(
                         attempt = %attempt,
                         "AI proxy: provider returned error, trying next"
                     );
-                    // Consume the response body to avoid a connection leak and
-                    // retain any billable usage for the one terminal ingress
-                    // settlement after fallback completes.
-                    match resp.bytes().await {
-                        Ok(body) => accumulate_governance_retry_usage(ctx, &body),
-                        Err(_) => mark_governance_retry_usage_missing(ctx),
-                    }
+                    // Consume the response body to avoid connection leak.
+                    let _ = resp.bytes().await;
                     continue;
                 }
                 if managed_provider_fallback
@@ -4572,10 +6984,7 @@ pub(super) async fn handle_ai_proxy(
                     && (retry_by_status || retry_by_policy)
                 {
                     sbproxy_observe::metrics::record_provider_attempt(&provider.name, "error");
-                    match resp.bytes().await {
-                        Ok(body) => accumulate_governance_retry_usage(ctx, &body),
-                        Err(_) => mark_governance_retry_usage_missing(ctx),
-                    }
+                    let _ = resp.bytes().await;
                     last_error = Some(anyhow::anyhow!(
                         "fallback provider returned retryable HTTP status {status}"
                     ));
@@ -4621,12 +7030,29 @@ pub(super) async fn handle_ai_proxy(
                             to = %to_provider,
                             "AI proxy: content-policy refusal, failing over to a more permissive provider"
                         );
-                        accumulate_governance_retry_usage(ctx, &body_bytes);
                         continue;
                     }
+                    record_ai_provider_response_failure(
+                        &ai_span,
+                        provider.name.as_str(),
+                        status,
+                        Some(body_bytes.as_ref()),
+                    );
                     sbproxy_observe::metrics::record_provider_attempt(&provider.name, "error");
+                    try_spawn_governed_shadow_after_primary(
+                        config,
+                        &surface,
+                        &path,
+                        &body,
+                        is_stream,
+                        &shadow_allowed_providers,
+                        &shadow_blocked_providers,
+                        disallow_training,
+                        ctx,
+                        &quota_pool_admission,
+                        reasoning_eligibility,
+                    );
                     let extras = public_route_headers(ctx);
-                    settle_governance_buffered_response(ctx, status, &body_bytes).await;
                     return send_response_with_extras(
                         session,
                         status,
@@ -4685,10 +7111,18 @@ pub(super) async fn handle_ai_proxy(
                     upstream_secs,
                 );
                 last_provider_name = provider.name.to_string();
+                if (200..300).contains(&status) {
+                    if let Some(prefix) = routing_prefix {
+                        router.record_prefix(provider_idx, prefix);
+                    }
+                }
                 last_resp = Some(resp);
                 break;
             }
             Err(e) => {
+                if send_quota_pool_attempt_error(session, config.quota_pool.as_ref(), &e).await? {
+                    return Ok(());
+                }
                 // WOR-1103: a transport-level failure is an attempt
                 // outcome too; count it per provider.
                 sbproxy_observe::metrics::record_provider_attempt(&provider.name, "error");
@@ -4731,77 +7165,113 @@ pub(super) async fn handle_ai_proxy(
     }
 
     if let Some(resp) = last_resp {
+        try_spawn_governed_shadow_after_primary(
+            config,
+            &surface,
+            &path,
+            &body,
+            is_stream,
+            &shadow_allowed_providers,
+            &shadow_blocked_providers,
+            disallow_training,
+            ctx,
+            &quota_pool_admission,
+            reasoning_eligibility,
+        );
         if is_stream {
-            // SSE streaming with idempotency engaged: drop the capture
-            // (releases the per-origin pool permit) and abandon
-            // caching for this request. v1 does not buffer SSE
-            // chunks into the idempotency cache because framing-aware
-            // capture is out of scope here; the response headers
-            // have already been written when the relay realizes
-            // we'd exceed the cap on a chunked body, so the
-            // skip marker is not visible to the client. The
-            // operator-visible signal is the absence of a cache hit
-            // on retry, plus the debug log line below.
+            let response_content_type = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok());
+            if !upstream_response_is_successful_stream(
+                resp.status().as_u16(),
+                response_content_type,
+            ) {
+                // A provider may reject a streaming request with an ordinary
+                // JSON error, or may return a buffered JSON success. Both use
+                // the normal bounded relay, including idempotency capture.
+                // Success responses run canonical provider translation and
+                // inbound rewrapping; errors remain byte-exact.
+                let recorder = effective_budget.as_deref().map(|b| BudgetRecorderArgs {
+                    origin: hostname.to_string(),
+                    config: b,
+                    keys: &budget_keys,
+                    model: model.as_str(),
+                    surface_label,
+                    provider_name: last_provider_name.as_str(),
+                    image_resolution: image_resolution_for_billing.clone(),
+                    audio_speech_characters: audio_speech_characters_for_billing,
+                    rerank_documents: rerank_documents_for_billing,
+                    attribution_tags: ctx.attribution_tags.clone(),
+                    tenant_id: ctx.tenant_id.to_string(),
+                    api_key_id: ctx.principal.api_key_id().to_string(),
+                    rollup_properties: ctx.rollup_properties.clone(),
+                    estimated_prompt_tokens: estimated_prompt_tokens_for_budget,
+                    agent_id: billing_agent.id.clone(),
+                    agent_identity_verified: billing_agent.verified,
+                });
+                let router_sink = RouterTokenSink {
+                    router: &router,
+                    config_providers: &config.providers,
+                    provider_name: last_provider_name.as_str(),
+                };
+                return relay_ai_response_with_cache(
+                    session,
+                    resp,
+                    last_format,
+                    hostname,
+                    None,
+                    Some(buffered_ai_response_body_limit(config.max_body_size)),
+                    recorder,
+                    router_sink,
+                    Some(ctx),
+                    ai_span.clone(),
+                    trace_content,
+                    idem_skip_reason,
+                    idem_capture,
+                    config
+                        .guardrails
+                        .as_ref()
+                        .and(guardrail_pipeline.clone())
+                        .filter(|pipeline| pipeline.has_output()),
+                    output_external,
+                )
+                .await;
+            }
+            // Streaming with idempotency engaged: drop the capture
+            // (releases the per-origin pool permit) and abandon caching only
+            // after the response has been confirmed as a successful stream.
             if idem_capture.take().is_some() {
                 debug!(
                     "AI proxy: idempotency miss on streaming request; abandoning cache record (SSE framing-aware capture is out of scope for v1)"
                 );
             }
-            let _ = idem_skip_reason;
             let model_id = if model.is_empty() {
                 None
             } else {
                 Some(model.clone())
             };
-            // NOTE: semantic-cache write-on-miss is intentionally skipped
-            // for streaming responses. Accumulating an SSE stream into a
-            // single cache entry would change its delivery semantics;
-            // supporting it requires framing-aware capture that is out of
-            // scope for F4. Any stashed `semcache_miss` state is simply
-            // dropped here.
+            // NOTE: a streaming request never reaches the semantic cache.
+            // The lookup gate above skips embedding, lookup, and write for
+            // `stream: true`, so there is no pending admission to drop
+            // here. Accumulating an SSE stream into one buffered entry
+            // would change its delivery semantics, and framing-aware
+            // capture remains out of scope.
             //
-            // SSE event-shape translation for non-OpenAI providers
-            // (Anthropic `content_block_delta` to OpenAI `delta`) is
-            // also out of scope for the first translator landing; non-
-            // OpenAI streams pass through in their native shape today
-            // and this is documented as a known limitation in
-            // docs/providers.md.
-            // The semcache_miss tuple captures the key the lookup hook
-            // composed for a non-streaming MISS path. We do not write
-            // the assembled SSE body back into the literal semantic
-            // cache (framing-aware capture is out of scope here), but
-            // we do hand the same key to the streaming cache recorder
-            // so the enterprise impl can record the chunk stream
-            // against it.
-            let semcache_key: Option<String> =
-                semcache_miss.as_ref().map(|(_, key, _, _, _)| key.clone());
-            let _ = semcache_miss;
-            // SSE event-shape translation for non-OpenAI providers
-            //. When the upstream emits Anthropic
-            // `event: content_block_delta`, Gemini
-            // `streamGenerateContent`, or Bedrock Converse-stream
-            // payloads, the relay reframes them into the hub
-            // vocabulary and re-emits in the inbound format's wire
-            // shape so clients see a uniform stream. The
-            // OpenAI-in-OpenAI-out branch stays a pure byte forward.
+            // SSE event-shape translation for non-OpenAI providers. When
+            // the upstream emits Anthropic `event: content_block_delta`,
+            // Gemini `streamGenerateContent`, or Bedrock Converse-stream
+            // payloads, the relay reframes them into the hub vocabulary
+            // and re-emits in the inbound format's wire shape so clients
+            // see a uniform stream. The OpenAI-in-OpenAI-out branch stays
+            // a pure byte forward.
             let stream_inbound_format: Option<String> = ctx.ai_inbound_format.clone();
-            // Opaque pass-through of the AI handler's
-            // `semantic_cache.streaming` block. The OSS proxy never
-            // validates this; the enterprise recorder reads whatever
-            // shape it expects (e.g. `enabled`, `replay_pacing`).
-            let stream_policy = config
-                .semantic_cache
-                .as_ref()
-                .and_then(|sc| sc.get("streaming"))
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            let request_id = ctx.request_id.to_string();
-            let origin_id = origin_idx.map(|i| i.to_string()).unwrap_or_default();
             // The streaming relay receives the same budget recorder the
             // non-streaming path does so a stream that emits a terminal
             // `usage` block (OpenAI) or a `message_delta` (Anthropic)
             // still charges the configured scopes after it closes.
             let stream_recorder = effective_budget.as_deref().map(|b| BudgetRecorderArgs {
+                origin: hostname.to_string(),
                 config: b,
                 keys: &budget_keys,
                 model: model.as_str(),
@@ -4813,7 +7283,10 @@ pub(super) async fn handle_ai_proxy(
                 attribution_tags: ctx.attribution_tags.clone(),
                 tenant_id: ctx.tenant_id.to_string(),
                 api_key_id: ctx.principal.api_key_id().to_string(),
+                rollup_properties: ctx.rollup_properties.clone(),
                 estimated_prompt_tokens: estimated_prompt_tokens_for_budget,
+                agent_id: billing_agent.id.clone(),
+                agent_identity_verified: billing_agent.verified,
             });
             let stream_router_sink = RouterTokenSink {
                 router: &router,
@@ -4852,12 +7325,6 @@ pub(super) async fn handle_ai_proxy(
                 hostname,
                 model_id,
                 origin_idx,
-                StreamCacheRecorderArgs {
-                    request_id,
-                    origin_id,
-                    semantic_key: semcache_key,
-                    policy: stream_policy,
-                },
                 stream_recorder,
                 stream_router_sink,
                 StreamUsageParserArgs {
@@ -4878,7 +7345,7 @@ pub(super) async fn handle_ai_proxy(
                 config
                     .guardrails
                     .as_ref()
-                    .and_then(cached_guardrails_pipeline)
+                    .and(guardrail_pipeline.clone())
                     .filter(|p| p.has_output()),
                 // WOR-1810: identity for the streamed tool-call rbac
                 // rule, mirroring the buffered input check.
@@ -4889,11 +7356,12 @@ pub(super) async fn handle_ai_proxy(
             )
             .await
         } else {
-            // Non-streaming: relay plus optional cache write on miss.
-            // When a miss_key was captured during the lookup phase and
-            // the upstream response passes the status + size gates, we
-            // dispatch `hook.store` best-effort (fail-open).
+            // Non-streaming: relay plus the semantic write on miss. When a
+            // write token was captured during the lookup phase and the
+            // upstream response passes the status gate and the output
+            // guardrails, the relay awaits `cache.store` and fails open.
             let recorder = effective_budget.as_deref().map(|b| BudgetRecorderArgs {
+                origin: hostname.to_string(),
                 config: b,
                 keys: &budget_keys,
                 model: model.as_str(),
@@ -4905,7 +7373,10 @@ pub(super) async fn handle_ai_proxy(
                 attribution_tags: ctx.attribution_tags.clone(),
                 tenant_id: ctx.tenant_id.to_string(),
                 api_key_id: ctx.principal.api_key_id().to_string(),
+                rollup_properties: ctx.rollup_properties.clone(),
                 estimated_prompt_tokens: estimated_prompt_tokens_for_budget,
+                agent_id: billing_agent.id.clone(),
+                agent_identity_verified: billing_agent.verified,
             });
             let cache_router_sink = RouterTokenSink {
                 router: &router,
@@ -4917,7 +7388,6 @@ pub(super) async fn handle_ai_proxy(
                 resp,
                 last_format,
                 hostname,
-                semcache_miss,
                 embed_miss,
                 config.max_body_size,
                 recorder,
@@ -4934,15 +7404,14 @@ pub(super) async fn handle_ai_proxy(
                 config
                     .guardrails
                     .as_ref()
-                    .and_then(cached_guardrails_pipeline)
+                    .and(guardrail_pipeline.clone())
                     .filter(|p| p.has_output()),
                 // WOR-1529: external output guardrails (post_call) run on the
-                // response after the sync pipeline; empty when none configured.
-                config
-                    .guardrails
-                    .as_ref()
-                    .map(|g| g.external.clone())
-                    .unwrap_or_default(),
+                // buffered response after the sync pipeline; empty when none
+                // are configured. They are intentionally not given to the
+                // streaming relay because it can send bytes before a post-call
+                // guardrail has a complete response to inspect.
+                output_external,
             )
             .await
         }
@@ -4956,7 +7425,6 @@ pub(super) async fn handle_ai_proxy(
             crate::server::model_host::managed_error_body(ctx.request_id.as_str(), reason, true);
         let mut extras = public_logical_model_header(ctx);
         extras.push(("retry-after".to_string(), "1".to_string()));
-        settle_governance_failed_attempts(ctx).await;
         send_response_with_extras(session, 503, "application/json", &body, &extras).await
     } else if let Some(e) = last_error {
         sbproxy_ai::tracing_spans::record_error(
@@ -4964,7 +7432,6 @@ pub(super) async fn handle_ai_proxy(
             last_error_type,
             "AI upstream request failed (all providers)",
         );
-        settle_governance_failed_attempts(ctx).await;
         Err(Error::because(
             ErrorType::ConnectError,
             "AI upstream request failed (all providers)",
@@ -4977,7 +7444,6 @@ pub(super) async fn handle_ai_proxy(
             sbproxy_ai::tracing_spans::error_type::PROVIDER_ERROR,
             "no enabled AI providers",
         );
-        release_governance(ctx).await;
         Err(Error::new(ErrorType::HTTPStatus(502)))
     }
 }
@@ -5009,7 +7475,7 @@ fn ai_transport_error_type(error: &anyhow::Error) -> &'static str {
     }
 }
 
-fn record_ai_provider_response_failure(
+pub(super) fn record_ai_provider_response_failure(
     span: &tracing::Span,
     provider: &str,
     status: u16,
@@ -5020,11 +7486,152 @@ fn record_ai_provider_response_failure(
     };
     let message = ai_provider_response_error_message(status, kind);
     sbproxy_ai::tracing_spans::record_error(span, kind, message.as_str());
+    let diagnostic = ai_provider_error_diagnostic(body);
+    warn!(
+        provider = %provider,
+        status,
+        error_type = kind,
+        upstream_error_code = %diagnostic.code.unwrap_or("unavailable"),
+        upstream_error_status = %diagnostic.status.unwrap_or("unavailable"),
+        upstream_error_reason = %diagnostic.reason.unwrap_or("unavailable"),
+        "AI proxy: provider returned error response"
+    );
     if !provider.is_empty() {
         sbproxy_ai::ai_metrics::record_provider_error(
             provider,
             ai_metric_error_kind_for_span_error_type(kind),
         );
+    }
+}
+
+#[derive(Default)]
+struct AiProviderErrorDiagnostic {
+    code: Option<&'static str>,
+    status: Option<&'static str>,
+    reason: Option<&'static str>,
+}
+
+/// Extract low-cardinality provider error labels without retaining an
+/// arbitrary upstream message or body. Only values mapped to the fixed
+/// vocabulary in [`safe_provider_error_label`] can enter the event.
+fn ai_provider_error_diagnostic(body: Option<&[u8]>) -> AiProviderErrorDiagnostic {
+    let Some(value) = body.and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok())
+    else {
+        return AiProviderErrorDiagnostic::default();
+    };
+    let error = value.get("error").unwrap_or(&value);
+    let code = error.get("code").and_then(safe_provider_error_label);
+    let status = error.get("status").and_then(safe_provider_error_label);
+    let reason = error
+        .get("reason")
+        .and_then(safe_provider_error_label)
+        .or_else(|| {
+            error
+                .get("details")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|details| {
+                    details
+                        .iter()
+                        .find_map(|detail| detail.get("reason").and_then(safe_provider_error_label))
+                })
+        });
+    AiProviderErrorDiagnostic {
+        code,
+        status,
+        reason,
+    }
+}
+
+fn safe_provider_error_label(value: &serde_json::Value) -> Option<&'static str> {
+    // These are deliberately exact, finite provider taxonomies rather than
+    // syntactic validators. A UUID, tenant id, credential, or newly invented
+    // enum therefore maps to `unavailable` at the log site until an operator
+    // intentionally adds a canonical label here.
+    const CANONICAL_LABELS: &[&str] = &[
+        "CANCELLED",
+        "UNKNOWN",
+        "INVALID_ARGUMENT",
+        "DEADLINE_EXCEEDED",
+        "NOT_FOUND",
+        "ALREADY_EXISTS",
+        "PERMISSION_DENIED",
+        "RESOURCE_EXHAUSTED",
+        "FAILED_PRECONDITION",
+        "ABORTED",
+        "OUT_OF_RANGE",
+        "UNIMPLEMENTED",
+        "INTERNAL",
+        "UNAVAILABLE",
+        "DATA_LOSS",
+        "UNAUTHENTICATED",
+        "API_KEY_INVALID",
+        "API_KEY_EXPIRED",
+        "RATE_LIMIT_EXCEEDED",
+        "QUOTA_EXCEEDED",
+        "BILLING_DISABLED",
+        "ACCESS_TOKEN_EXPIRED",
+        "ACCESS_TOKEN_SCOPE_INSUFFICIENT",
+        "IP_REFERER_BLOCKED",
+        "PROJECT_DENIED",
+        "USER_PROJECT_DENIED",
+        "CONSUMER_INVALID",
+        "CONSUMER_SUSPENDED",
+        "SERVICE_DISABLED",
+        "content_filter",
+        "content_policy",
+        "context_length_exceeded",
+        "invalid_request_error",
+        "authentication_error",
+        "permission_error",
+        "not_found_error",
+        "rate_limit_error",
+        "api_error",
+        "overloaded_error",
+    ];
+
+    match value {
+        serde_json::Value::Number(value) => match value.as_u64()? {
+            400 => Some("400"),
+            401 => Some("401"),
+            403 => Some("403"),
+            404 => Some("404"),
+            408 => Some("408"),
+            409 => Some("409"),
+            413 => Some("413"),
+            422 => Some("422"),
+            429 => Some("429"),
+            500 => Some("500"),
+            502 => Some("502"),
+            503 => Some("503"),
+            504 => Some("504"),
+            _ => None,
+        },
+        serde_json::Value::String(value) => {
+            let label = value.trim();
+            if let Ok(numeric) = label.parse::<u64>() {
+                return match numeric {
+                    400 => Some("400"),
+                    401 => Some("401"),
+                    403 => Some("403"),
+                    404 => Some("404"),
+                    408 => Some("408"),
+                    409 => Some("409"),
+                    413 => Some("413"),
+                    422 => Some("422"),
+                    429 => Some("429"),
+                    500 => Some("500"),
+                    502 => Some("502"),
+                    503 => Some("503"),
+                    504 => Some("504"),
+                    _ => None,
+                };
+            }
+            CANONICAL_LABELS
+                .iter()
+                .copied()
+                .find(|canonical| label.eq_ignore_ascii_case(canonical))
+        }
+        _ => None,
     }
 }
 
@@ -5134,6 +7741,36 @@ fn public_route_headers(ctx: &RequestContext) -> Vec<(String, String)> {
     )]
 }
 
+/// Closed operator-facing label for one semantic cache backend.
+fn semantic_backend_label(backend: sbproxy_ai::SemanticCacheBackend) -> &'static str {
+    match backend {
+        sbproxy_ai::SemanticCacheBackend::Memory => "memory",
+        sbproxy_ai::SemanticCacheBackend::Redis => "redis",
+        sbproxy_ai::SemanticCacheBackend::Mesh => "mesh",
+    }
+}
+
+/// Closed failure class for a semantic lookup that could not answer.
+///
+/// The concrete backend error is deliberately dropped: it can name a DSN, a
+/// peer address, or a key, and this value reaches an operator log line.
+fn semantic_lookup_failure_class(error: &sbproxy_ai::SemanticLookupError) -> &'static str {
+    match error {
+        sbproxy_ai::SemanticLookupError::InvalidEmbedding => "invalid_embedding",
+        sbproxy_ai::SemanticLookupError::Store(error) => semantic_store_failure_class(error),
+    }
+}
+
+/// Closed failure class for a semantic backend operation.
+fn semantic_store_failure_class(error: &sbproxy_ai::SemanticStoreError) -> &'static str {
+    match error {
+        sbproxy_ai::SemanticStoreError::Unavailable => "backend_unavailable",
+        sbproxy_ai::SemanticStoreError::InvalidWrite => "write_rejected",
+        sbproxy_ai::SemanticStoreError::InvalidState => "backend_invalid_state",
+        sbproxy_ai::SemanticStoreError::OperationFailed => "operation_failed",
+    }
+}
+
 fn public_logical_model_header(ctx: &RequestContext) -> Vec<(String, String)> {
     ctx.ai_serve_model
         .as_deref()
@@ -5154,6 +7791,8 @@ pub(super) async fn relay_ai_response(
     format: sbproxy_ai::providers::ProviderFormat,
     max_body_size: Option<usize>,
     inbound_format: Option<&str>,
+    ai_span: &tracing::Span,
+    provider_name: &str,
 ) -> Result<()> {
     let status = resp.status().as_u16();
 
@@ -5172,8 +7811,14 @@ pub(super) async fn relay_ai_response(
 
     let resp_body = read_capped_response_body(resp, max_body_size).await?;
 
-    let translated = sbproxy_ai::translators::translate_response_bytes(format, &resp_body);
-    let translated = sbproxy_ai::format::rewrap_response_for_inbound(inbound_format, &translated);
+    let translated =
+        sbproxy_ai::translators::translate_success_response_bytes(format, status, &resp_body);
+    record_ai_provider_response_failure(ai_span, provider_name, status, Some(&translated));
+    let translated = sbproxy_ai::format::rewrap_success_response_for_inbound(
+        status,
+        inbound_format,
+        &translated,
+    );
     let extras = retry_after
         .map(|value| vec![("retry-after".to_string(), value)])
         .unwrap_or_default();
@@ -5232,27 +7877,126 @@ pub(super) async fn read_capped_response_body(
     Ok(buf.freeze())
 }
 
-/// Relay a non-streaming AI response and, when `miss_info` is present,
-/// write the response back into the semantic cache on behalf of the hook.
+async fn external_output_guardrail_block(
+    configs: &[sbproxy_ai::external_guardrail::ExternalGuardrailConfig],
+    body: &[u8],
+    model: &str,
+) -> Option<sbproxy_ai::guardrails::GuardrailBlock> {
+    if configs.is_empty() {
+        return None;
+    }
+
+    let blocked = match std::str::from_utf8(body) {
+        Ok(content) => {
+            sbproxy_ai::external_guardrail::run_output_external_guardrails(configs, content, model)
+                .await
+        }
+        Err(_) => {
+            sbproxy_ai::external_guardrail::run_output_external_guardrails_without_content(configs)
+        }
+    };
+    blocked.map(|(name, reason)| sbproxy_ai::guardrails::GuardrailBlock { name, reason })
+}
+
+async fn ai_output_guardrail_block(
+    status: u16,
+    builtin: Option<&sbproxy_ai::guardrails::GuardrailPipeline>,
+    external: &[sbproxy_ai::external_guardrail::ExternalGuardrailConfig],
+    body: &[u8],
+    model: &str,
+) -> Option<sbproxy_ai::guardrails::GuardrailBlock> {
+    if !(200..300).contains(&status) {
+        return None;
+    }
+    if let Some(block) = builtin.and_then(|pipeline| pipeline.check_output_bytes(body)) {
+        return Some(block);
+    }
+    external_output_guardrail_block(external, body, model).await
+}
+
+fn external_guardrail_text_media_type(content_type: &str) -> bool {
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    media_type.starts_with("text/")
+        || matches!(
+            media_type.as_str(),
+            "application/json"
+                | "application/json-seq"
+                | "application/x-ndjson"
+                | "application/xml"
+                | "application/javascript"
+                | "application/x-javascript"
+        )
+        || media_type.ends_with("+json")
+        || media_type.ends_with("+xml")
+}
+
+async fn multipart_external_output_guardrail_block(
+    status: u16,
+    configs: &[sbproxy_ai::external_guardrail::ExternalGuardrailConfig],
+    body: &[u8],
+    model: &str,
+    content_type: Option<&str>,
+) -> Option<sbproxy_ai::guardrails::GuardrailBlock> {
+    if !(200..300).contains(&status) {
+        return None;
+    }
+    if !content_type.is_some_and(external_guardrail_text_media_type) {
+        return sbproxy_ai::external_guardrail::run_output_external_guardrails_without_content(
+            configs,
+        )
+        .map(|(name, reason)| sbproxy_ai::guardrails::GuardrailBlock { name, reason });
+    }
+    external_output_guardrail_block(configs, body, model).await
+}
+
+async fn send_guardrail_block_response(
+    session: &mut Session,
+    ctx: &mut RequestContext,
+    ai_span: &tracing::Span,
+    status: u16,
+    block: sbproxy_ai::guardrails::GuardrailBlock,
+) -> Result<()> {
+    warn!(
+        guardrail = %block.name,
+        reason = %block.reason,
+        "AI proxy: guardrail blocked content"
+    );
+    sbproxy_ai::tracing_spans::record_error(
+        ai_span,
+        sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+        &block.reason,
+    );
+    mark_guardrail_block(ctx, block.name.clone());
+    let body = ErrorEnvelope::new("guardrail_violation", &block.reason)
+        .code(&block.name)
+        .request_id(ctx.request_id.as_str())
+        .to_bytes();
+    send_response(session, status, "application/json", &body).await
+}
+
+/// Relay a non-streaming AI response and, when `embed_miss` is present,
+/// admit that response into the semantic cache.
 ///
-/// `miss_info` is populated only when the preceding lookup missed and
-/// produced a usable key. The write is gated by:
+/// `embed_miss` is populated only when the preceding lookup missed and
+/// produced a write token. The write runs after output guardrails and
+/// response rewrapping, so a blocked or rewritten response is never
+/// admitted, and only a status 200 is cacheable.
 ///
-/// * `cacheable_status`: defaults to `[200]` when empty.
-/// * `max_response_size`: defaults to no cap when `None`.
-///
-/// All failures (read, encode, store) are logged and swallowed so that
-/// a cache write problem never turns into a client-visible error. The
-/// actual `store` call is dispatched on the existing async runtime; the
-/// underlying `RedisSemanticCacheStore` already performs its blocking
-/// I/O via `spawn_blocking`, so no additional wrapping is needed here.
+/// The write is awaited rather than detached: a fire-and-forget task could
+/// outlive its request-pinned pipeline and would hide a failed distributed
+/// write. Every failure is counted and swallowed so a cache problem never
+/// turns into a client-visible error.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn relay_ai_response_with_cache(
     session: &mut Session,
     resp: reqwest::Response,
     format: sbproxy_ai::providers::ProviderFormat,
     hostname: &str,
-    miss_info: Option<PendingSemcacheMiss>,
     embed_miss: Option<PendingEmbedMiss>,
     max_body_size: Option<usize>,
     budget_recorder: Option<BudgetRecorderArgs<'_>>,
@@ -5263,17 +8007,9 @@ pub(super) async fn relay_ai_response_with_cache(
     idem_skip_reason: Option<&'static str>,
     idem_capture: Option<AiIdempotencyCapture>,
     output_guardrails: Option<std::sync::Arc<sbproxy_ai::guardrails::GuardrailPipeline>>,
-    output_external: Vec<sbproxy_ai::external_guardrail::ExternalGuardrailConfig>,
+    output_external: &[sbproxy_ai::external_guardrail::ExternalGuardrailConfig],
 ) -> Result<()> {
     let status = resp.status().as_u16();
-    if (200..300).contains(&status) {
-        if let Some(ctx) = ctx.as_deref_mut() {
-            // Once a successful provider response exists, a body read/client
-            // failure may hide usage. Drop must conservatively settle the
-            // admitted ceiling rather than refunding the reservation.
-            arm_governance_ceiling(ctx);
-        }
-    }
 
     // Collect relevant headers from upstream. We preserve the full header
     // map (lossy to String/String) for the cache entry separately from
@@ -5293,41 +8029,39 @@ pub(super) async fn relay_ai_response_with_cache(
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
 
-    // Snapshot headers before we consume the response body.
-    let mut captured_headers: std::collections::HashMap<String, String> =
-        std::collections::HashMap::with_capacity(resp.headers().len());
-    for (name, value) in resp.headers() {
-        if let Ok(v) = value.to_str() {
-            let n = name.as_str().to_ascii_lowercase();
-            // Skip hop-by-hop / framing headers so replayed hits don't
-            // smuggle e.g. a stale `transfer-encoding: chunked` that no
-            // longer matches the replay body.
-            if matches!(
-                n.as_str(),
-                "connection"
-                    | "transfer-encoding"
-                    | "keep-alive"
-                    | "proxy-authenticate"
-                    | "proxy-authorization"
-                    | "te"
-                    | "trailer"
-                    | "upgrade"
-            ) {
-                continue;
-            }
-            captured_headers.insert(n, v.to_string());
-        }
-    }
+    // Snapshot the response headers before the body is consumed, then
+    // project them down to the closed set a semantic cache may store. A
+    // replayed hit must not carry a prior caller's cookie, challenge,
+    // request id, quota state, trace correlation, or a content coding that
+    // no longer matches the buffered bytes.
+    let cacheable_headers: Vec<(String, String)> = if embed_miss.is_some() {
+        let upstream_headers: Vec<(String, String)> = resp
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_ascii_lowercase(), value.to_string()))
+            })
+            .collect();
+        semantic_cache_response_headers(&upstream_headers)
+    } else {
+        Vec::new()
+    };
 
     let raw_body = read_capped_response_body(resp, max_body_size).await?;
+    let inbound_format: Option<String> = ctx.as_ref().and_then(|c| c.ai_inbound_format.clone());
+    let native_bypass = ctx.as_ref().map(|c| c.ai_native_bypass).unwrap_or(false);
+    let direct_response_body = native_bypass.then(|| raw_body.clone());
 
     // Translate the upstream body into OpenAI shape once, then both
     // cache and serve the translated form. Caching the translated body
     // means semantic-cache hits replay correctly to OpenAI clients
     // without re-running the translator on every hit.
     let resp_body: bytes::Bytes = if sbproxy_ai::translators::requires_translation(format) {
-        bytes::Bytes::from(sbproxy_ai::translators::translate_response_bytes(
-            format, &raw_body,
+        bytes::Bytes::from(sbproxy_ai::translators::translate_success_response_bytes(
+            format, status, &raw_body,
         ))
     } else {
         raw_body
@@ -5337,8 +8071,8 @@ pub(super) async fn relay_ai_response_with_cache(
     // in the response's `model` field. Rewrite it to the serve-entry
     // name the client asked for, before the rewrap and the cache
     // writes, so local lanes echo a model id exactly like hosted
-    // lanes. Streaming responses keep the engine's string for now
-    // (the SSE relay does not materialize chunks).
+    // lanes. Streaming responses get the same rewrite per SSE frame
+    // in `relay_ai_stream` (WOR-1811, `rewrite_stream_chunk_model`).
     let resp_body: bytes::Bytes = match ctx
         .as_ref()
         .and_then(|c| c.ai_serve_model.as_deref())
@@ -5348,18 +8082,13 @@ pub(super) async fn relay_ai_response_with_cache(
         None => resp_body,
     };
 
-    // Native-format inbound rewrap. When the client entered
-    // on a `/v1/messages` or `/v1/responses` path the cached body stays
-    // in OpenAI Chat shape (so cross-format cache hits remain cheap)
-    // and only the bytes leaving the gateway are re-emitted in the
-    // client-expected wire shape.
-    //
-    // WOR-229 native bypass: when the inbound format matched the
-    // upstream provider's wire format, the response is already in the
-    // client's expected shape (it came directly from the native
-    // upstream path), so the rewrap step is skipped.
-    let inbound_format: Option<String> = ctx.as_ref().and_then(|c| c.ai_inbound_format.clone());
-    let native_bypass = ctx.as_ref().map(|c| c.ai_native_bypass).unwrap_or(false);
+    record_ai_provider_response_failure(
+        &ai_span,
+        router_sink.provider_name,
+        status,
+        Some(resp_body.as_ref()),
+    );
+
     // WOR-1044: snapshot the reversible redaction pairs before any
     // later branch in this function moves `ctx`. The vec is small
     // (one entry per reversible match this request fired), so the
@@ -5368,34 +8097,17 @@ pub(super) async fn relay_ai_response_with_cache(
         .as_ref()
         .map(|c| c.ai_reversible_redactions.clone())
         .unwrap_or_default();
-    let resp_body: bytes::Bytes = if native_bypass {
-        resp_body
-    } else {
-        match inbound_format.as_deref() {
-            Some("anthropic") | Some("responses") => {
-                bytes::Bytes::from(sbproxy_ai::format::rewrap_response_for_inbound(
-                    inbound_format.as_deref(),
-                    &resp_body,
-                ))
-            }
-            _ => resp_body,
-        }
-    };
-
-    record_ai_provider_response_failure(
-        &ai_span,
-        router_sink.provider_name,
-        status,
-        Some(resp_body.as_ref()),
-    );
-
+    let direct_client_body = direct_response_body
+        .as_ref()
+        .map(|body| restore_reversible_pii(body, &reversible_pairs));
     if (200..300).contains(&status) {
         record_ai_response_span_metadata(&ai_span, &resp_body);
     }
-
-    if let Some(ctx) = ctx.as_deref_mut() {
-        settle_governance_buffered_response(ctx, status, &resp_body).await;
-    }
+    // The upstream has already performed and billed this generation. Feed the
+    // router before output guardrails or any later relay branch can return
+    // early, then omit token recording from the mutually exclusive budget
+    // branches below so every completed response is counted exactly once.
+    record_router_tokens_from_response(&router_sink, status, &resp_body);
 
     // --- WOR-1141: enforce OUTPUT guardrails ---
     //
@@ -5409,35 +8121,32 @@ pub(super) async fn relay_ai_response_with_cache(
     // we return a 403 with a `guardrail_violation` envelope and skip
     // every cache write below via the early return.
     // WOR-1529: an output-guardrail block can come from the compiled sync
-    // pipeline or from an external provider (`post_call` / `during_call`).
-    // Only 2xx text is checked; external runs only when the sync pipeline
-    // did not already block, and works even when no sync pipeline is set.
-    let output_block: Option<sbproxy_ai::guardrails::GuardrailBlock> = if (200..300)
-        .contains(&status)
-    {
-        match std::str::from_utf8(&resp_body) {
-            Ok(text) => {
-                let sync_block = output_guardrails
-                    .as_ref()
-                    .and_then(|g| g.check_output(text));
-                if sync_block.is_some() {
-                    sync_block
-                } else if output_external.is_empty() {
-                    None
-                } else {
-                    sbproxy_ai::external_guardrail::run_output_external_guardrails(
-                        &output_external,
-                        text,
-                    )
-                    .await
-                    .map(|(name, reason)| sbproxy_ai::guardrails::GuardrailBlock { name, reason })
-                }
+    // pipeline or from an external provider (`post_call`, `during_call`, or
+    // nonblocking `logging_only`).
+    // Only 2xx bodies are checked; external runs only when the sync pipeline
+    // did not already block, and applies its configured fail mode when bytes
+    // cannot be represented as text.
+    let output_block: Option<sbproxy_ai::guardrails::GuardrailBlock> =
+        if (200..300).contains(&status) {
+            let governed_client_body = direct_client_body.as_ref().unwrap_or(&resp_body);
+            let sync_block = output_guardrails
+                .as_ref()
+                .and_then(|g| g.check_output_bytes(governed_client_body));
+            if sync_block.is_some() {
+                sync_block
+            } else {
+                external_output_guardrail_block(
+                    output_external,
+                    governed_client_body,
+                    ctx.as_ref()
+                        .and_then(|context| context.ai_model.as_deref())
+                        .unwrap_or(""),
+                )
+                .await
             }
-            Err(_) => None,
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
     if let Some(block) = output_block {
         warn!(
             guardrail = %block.name,
@@ -5454,9 +8163,7 @@ pub(super) async fn relay_ai_response_with_cache(
         // `auth_denied`; stamp the precise outcome so the
         // value-vs-waste metric attributes it correctly.
         if let Some(c) = ctx.as_mut() {
-            c.ai_outcome = Some("guardrail_block".to_string());
-            c.ai_guardrail_category = Some(block.name.clone());
-            c.ai_guardrail_action = Some("block".to_string());
+            mark_guardrail_block(c, block.name.clone());
         }
         // WOR-1093: the upstream already produced (and
         // billed) this 2xx response; an output guardrail
@@ -5487,96 +8194,63 @@ pub(super) async fn relay_ai_response_with_cache(
                 );
             }
         }
-        let error_body = serde_json::json!({
-            "error": {
-                "message": block.reason,
-                "type": "guardrail_violation",
-                "code": block.name,
-            }
-        });
-        let body_bytes = serde_json::to_vec(&error_body).unwrap_or_default();
+        let mut envelope =
+            ErrorEnvelope::new("guardrail_violation", &block.reason).code(&block.name);
+        // Unlike every other retrofit site in this file, `ctx` here is
+        // `Option<&mut RequestContext>` (this relay path also serves
+        // callers with no request context), so request_id can only be
+        // populated when one was actually supplied.
+        if let Some(request_ctx) = ctx.as_ref() {
+            envelope = envelope.request_id(request_ctx.request_id.as_str());
+        }
+        let body_bytes = envelope.to_bytes();
         return send_response(session, 403, "application/json", &body_bytes).await;
     }
 
-    // --- WOR-796: OSS embedding cache write on miss ---
+    // --- WOR-2099: semantic cache write on miss ---
     //
-    // Store the upstream response under the prompt's embedding so a
-    // future near-duplicate prompt replays it. Only 200 responses are
-    // cached. Mutually exclusive with the enterprise hook store below
-    // (the lookup gates on the hook being absent). `captured_headers`
-    // is cloned here so the enterprise branch can still move it.
-    if let Some((cache, key, embedding, cache_scope)) = embed_miss {
+    // Admit the canonical response under the token the lookup produced, so
+    // a later near-duplicate prompt in the same namespace replays it. The
+    // write runs after the output guardrails above, so a blocked response
+    // is never admitted, and it runs before the reversible-PII restore
+    // below, so masked text is what a hit would ever replay. Only a status
+    // 200 is cacheable.
+    //
+    // The write is awaited. A detached task could outlive its
+    // request-pinned pipeline and would hide a failed distributed write.
+    // The store timestamp is taken inside `store`, after the provider and
+    // the guardrails have finished, so provider latency never consumes the
+    // operator time-to-live.
+    if let Some((cache, token)) = embed_miss {
         if status == 200 {
-            let cached = sbproxy_ai::CachedHttpResponse {
+            let backend = semantic_backend_label(cache.backend());
+            let response = sbproxy_ai::CachedHttpResponse {
                 status,
-                headers: captured_headers
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-                body: resp_body.to_vec(),
-            };
-            cache.store(key, &embedding, cached, cache_scope);
-            debug!(
-                origin = %hostname,
-                body_len = resp_body.len(),
-                "AI proxy: embedding semantic cache write-on-miss stored"
-            );
-        }
-    }
-
-    // --- Semantic cache write on miss ---
-    //
-    // We write before relaying so the cache entry is durable even if
-    // the client disconnects mid-body. `store` is async but non-blocking
-    // for our purposes: the Redis-backed implementation already uses
-    // `spawn_blocking` internally.
-    if let Some((hook, key, cacheable_status, max_size, model_id)) = miss_info {
-        let status_ok = if cacheable_status.is_empty() {
-            status == 200
-        } else {
-            cacheable_status.contains(&status)
-        };
-        let size_ok = max_size.map(|cap| resp_body.len() <= cap).unwrap_or(true);
-        if status_ok && size_ok {
-            let cached = crate::hooks::CachedResponse {
-                status,
-                headers: captured_headers,
+                headers: cacheable_headers,
+                // A `Bytes` handle clone is a reference count bump, so the
+                // response body stays behind one allocation after admission.
                 body: resp_body.clone(),
-                cached_at: std::time::SystemTime::now(),
             };
-            let store_req = crate::hooks::StoreRequest {
-                origin: hostname.to_string(),
-                model_id,
-                key: key.clone(),
-            };
-            // Fire-and-forget. Any error is logged and does not affect
-            // the client response.
-            match hook.store(store_req, cached).await {
+            match cache.store(token, response).await {
                 Ok(()) => {
                     debug!(
                         origin = %hostname,
-                        key = %key,
+                        backend,
                         body_len = resp_body.len(),
-                        "AI proxy: semantic cache write-on-miss succeeded"
+                        "AI proxy: semantic cache write-on-miss stored"
                     );
                 }
-                Err(e) => {
+                Err(error) => {
+                    // Backend and failure class only. The already approved
+                    // response still goes to the client.
                     warn!(
                         origin = %hostname,
-                        error = %e,
+                        backend,
+                        failure = semantic_store_failure_class(&error),
                         "AI proxy: semantic cache write-on-miss failed (fail-open)"
                     );
                 }
             }
-        } else {
-            debug!(
-                origin = %hostname,
-                status = %status,
-                body_len = resp_body.len(),
-                status_ok = %status_ok,
-                size_ok = %size_ok,
-                "AI proxy: semantic cache write-on-miss skipped (gate failed)"
-            );
         }
     }
 
@@ -5641,6 +8315,7 @@ pub(super) async fn relay_ai_response_with_cache(
             if let Some(ctx) = ctx.as_mut() {
                 ctx.ai_tokens_in = Some(prompt_tokens);
                 ctx.ai_tokens_out = Some(completion_tokens);
+                ctx.ai_tokens_cached = (cached_input > 0).then_some(cached_input);
                 let project = ctx.principal.attrs.project.as_deref().unwrap_or("");
                 let user = ctx.principal.attrs.user.as_deref().unwrap_or("");
                 if ctx.principal.attrs.tags.is_empty() {
@@ -5677,12 +8352,6 @@ pub(super) async fn relay_ai_response_with_cache(
                     }
                 }
             }
-            // WOR-798: feed the router's per-provider token counter
-            // so the `LeastTokenUsage` / `TokenRate` strategies see
-            // the load this provider just absorbed. The minute
-            // window resets via the existing `reset_tokens` ticker
-            // (sbproxy-ai/src/routing.rs).
-            router_sink.record(budget_prompt_tokens + budget_completion_tokens);
             record_budget_usage(
                 args.config,
                 args.keys,
@@ -5741,6 +8410,7 @@ pub(super) async fn relay_ai_response_with_cache(
             let cost = sbproxy_ai::budget::estimate_cost_for_usage(args.model, &usage);
             let scope_keys = args.keys.iter().map(|(_, k)| k.clone()).collect::<Vec<_>>();
             let cost_micros = emit_ai_billing_event(
+                &args.origin,
                 args.surface_label,
                 args.provider_name,
                 Some(args.model.to_string()),
@@ -5750,11 +8420,26 @@ pub(super) async fn relay_ai_response_with_cache(
                 &args.attribution_tags,
                 args.tenant_id.as_str(),
                 args.api_key_id.as_str(),
+                &args.rollup_properties,
+                args.agent_identity(),
                 &ai_span,
             );
             if cost_micros > 0 {
                 if let Some(ctx_ref) = ctx.as_mut() {
                     ctx_ref.ai_cost_usd_micros = Some(cost_micros);
+                }
+            }
+            // WOR-1835: governed-key settlement. Charges the reservation
+            // taken at ingress with actual usage now that both token
+            // counts and `cost_micros` are known. Runs alongside the
+            // `ai_admission` reconcile above; best-effort on error (the
+            // lease's `Drop` repairs a failed settle on the eventual
+            // `RequestContext` drop).
+            if let Some(ctx_ref) = ctx.as_mut() {
+                if let Some(mut lease) = ctx_ref.governance_lease.take() {
+                    let _ = lease
+                        .settle(prompt_tokens + completion_tokens, cost_micros)
+                        .await;
                 }
             }
         }
@@ -5773,6 +8458,7 @@ pub(super) async fn relay_ai_response_with_cache(
             if prompt_tokens != 0 || completion_tokens != 0 {
                 ctx.ai_tokens_in = Some(prompt_tokens);
                 ctx.ai_tokens_out = Some(completion_tokens);
+                ctx.ai_tokens_cached = (cached_input > 0).then_some(cached_input);
                 let usage = sbproxy_ai::budget::AiUsage::Tokens {
                     input: prompt_tokens,
                     output: completion_tokens,
@@ -5787,7 +8473,13 @@ pub(super) async fn relay_ai_response_with_cache(
                     .unwrap_or_else(|| router_sink.provider_name.to_string());
                 let surface = ctx.ai_surface.clone().unwrap_or_default();
                 let model_for_event = (!model.is_empty()).then_some(model);
+                // WOR-2140: this branch bills without a budget recorder,
+                // so it re-reads the agent off the context rather than
+                // carrying it in `BudgetRecorderArgs`. Same envelope,
+                // same cap, so the two paths name the same agent.
+                let agent = BillingAgent::from_context(ctx);
                 let cost_micros = emit_ai_billing_event(
+                    ctx.hostname.as_str(),
                     surface.as_str(),
                     provider.as_str(),
                     model_for_event,
@@ -5797,27 +8489,24 @@ pub(super) async fn relay_ai_response_with_cache(
                     &ctx.attribution_tags,
                     ctx.tenant_id.as_str(),
                     ctx.principal.api_key_id(),
+                    &ctx.rollup_properties,
+                    agent.identity(),
                     &ai_span,
                 );
                 if cost_micros > 0 {
                     ctx.ai_cost_usd_micros = Some(cost_micros);
                 }
+                // WOR-1835: governed-key settlement, mirroring the
+                // budget-recorder branch above so origins without a
+                // configured budget still settle a governance reservation
+                // taken at ingress. Best-effort on error (the lease's
+                // `Drop` repairs a failed settle).
+                if let Some(mut lease) = ctx.governance_lease.take() {
+                    let _ = lease
+                        .settle(prompt_tokens + completion_tokens, cost_micros)
+                        .await;
+                }
             }
-            // WOR-798: feed the router's per-provider token counter
-            // even on no-budget origins. The previous wire only
-            // fired when `budget_recorder` was Some, which made
-            // `LeastTokenUsage` invisible to origins that opted out
-            // of budgets. The wire is independent of budgeting.
-            router_sink.record(prompt_tokens + completion_tokens);
-        }
-    } else {
-        // No budget AND no ctx (rare; the dispatch path almost always
-        // hands one). Still record router observations off the
-        // upstream usage block so the router stays accurate for
-        // unattached requests.
-        if (200..300).contains(&status) {
-            let (prompt_tokens, completion_tokens) = extract_usage(&resp_body);
-            router_sink.record(prompt_tokens + completion_tokens);
         }
     }
 
@@ -5845,7 +8534,11 @@ pub(super) async fn relay_ai_response_with_cache(
     // `AiHandlerConfig::from_config`). So the masked body never
     // reaches the semantic cache even though it is written above
     // in the order-of-operations sense.
-    let resp_body = restore_reversible_pii(&resp_body, &reversible_pairs);
+    let resp_body = if direct_client_body.is_some() {
+        resp_body
+    } else {
+        restore_reversible_pii(&resp_body, &reversible_pairs)
+    };
     if (200..300).contains(&status) {
         // WOR-1877: tool-call span events. Names + ids always
         // (bounded); arguments only under the trace_content gate.
@@ -5855,6 +8548,29 @@ pub(super) async fn relay_ai_response_with_cache(
         let completion = extract_completion_text(&resp_body);
         record_ai_output_trace(&ai_span, trace_content, &completion);
     }
+    // WOR-2096: attach the redacted response to the console sample.
+    if (200..300).contains(&status) && trace_content.capture_enabled() {
+        if let Some(request_id) = ctx.as_ref().map(|c| c.request_id.to_string()) {
+            let completion = extract_completion_text(&resp_body);
+            let redacted = redact_ai_trace_content(&completion, trace_content.redactor());
+            if !redacted.trim().is_empty() {
+                crate::content_capture::attach_output(&request_id, redacted);
+            }
+        }
+    }
+
+    // Keep the internal response canonical through policy, accounting, and
+    // semantic-cache writes. Adapt the bytes crossing the client boundary
+    // exactly once. Native bypass relays the restored upstream wire body
+    // directly; every translated response is wrapped for the inbound client.
+    let client_body = match direct_client_body {
+        Some(body) => body,
+        None => bytes::Bytes::from(sbproxy_ai::format::rewrap_success_response_for_inbound(
+            status,
+            inbound_format.as_deref(),
+            &resp_body,
+        )),
+    };
 
     // --- Idempotency record on miss ---
     //
@@ -5865,17 +8581,22 @@ pub(super) async fn relay_ai_response_with_cache(
     // point).
     let final_skip_reason = match idem_capture {
         Some(cap) => {
-            if resp_body.len() > cap.idem.max_response_body_bytes {
+            if client_body.len() > cap.idem.max_response_body_bytes {
                 debug!(
-                    body_len = resp_body.len(),
+                    body_len = client_body.len(),
                     max_bytes = cap.idem.max_response_body_bytes,
                     "AI proxy: idempotency response body exceeds cap; abandoning cache record"
                 );
                 Some("SKIPPED-OVERSIZE-RESPONSE")
             } else {
-                let recorded_headers: Vec<(String, String)> =
-                    vec![("content-type".to_string(), content_type.clone())];
-                cap.record(status, recorded_headers, resp_body.to_vec());
+                let recorded_headers: Vec<(String, String)> = vec![
+                    ("content-type".to_string(), content_type.clone()),
+                    (
+                        AI_IDEMPOTENCY_BODY_FORMAT_HEADER.to_string(),
+                        AI_IDEMPOTENCY_WIRE_BODY_FORMAT.to_string(),
+                    ),
+                ];
+                cap.record(status, recorded_headers, client_body.to_vec());
                 idem_skip_reason
             }
         }
@@ -5889,7 +8610,8 @@ pub(super) async fn relay_ai_response_with_cache(
     if let Some(retry_after) = retry_after {
         extras.push(("retry-after".to_string(), retry_after));
     }
-    send_response_with_extras(session, status, &content_type, &resp_body, &extras).await
+
+    send_response_with_extras(session, status, &content_type, &client_body, &extras).await
 }
 
 /// WOR-1044: restore reversible PII placeholders. Walks the body and
@@ -6138,6 +8860,9 @@ impl StreamingReversibleRestore {
 /// body can be parsed for `usage` and recorded against every scope
 /// computed at pre-flight time.
 pub(super) struct BudgetRecorderArgs<'a> {
+    /// Origin hostname the request arrived on. Stamped onto the
+    /// attributed spend metrics so the admin UI can slice by origin.
+    origin: String,
     /// Reference to the AI handler's `BudgetConfig`. Used to look up
     /// each fired limit's scope label for the utilization gauge.
     config: &'a sbproxy_ai::BudgetConfig,
@@ -6186,12 +8911,36 @@ pub(super) struct BudgetRecorderArgs<'a> {
     /// metric without borrowing the request context. Empty string when
     /// the request was not credentialed.
     api_key_id: String,
+    /// Bounded, redacted custom properties explicitly promoted for
+    /// durable spend grouping by the matched origin.
+    rollup_properties: std::collections::BTreeMap<String, String>,
     /// WOR-1146: estimated prompt tokens for a chat_completions
     /// request, captured from the request body at dispatch. Used only
     /// as the prompt side of the fallback budget debit when a 2xx
     /// response carries no parseable `usage` block. `None` for
     /// non-chat surfaces.
     estimated_prompt_tokens: Option<u64>,
+    /// WOR-2140: the claimed agent id, already capped, carried by value
+    /// alongside `tenant_id` and `api_key_id` for the same reason: the
+    /// relay holds the request context only as an `Option<&mut>` and
+    /// cannot re-read it while it owns this bundle. Empty when the
+    /// request carried no A2A envelope.
+    agent_id: String,
+    /// WOR-2140: whether `agent_id` came from a source the proxy
+    /// trusts. Kept beside the id rather than folded into it, because
+    /// the billing event records the claim either way and only
+    /// enforcement cares about the flag.
+    agent_identity_verified: bool,
+}
+
+impl BudgetRecorderArgs<'_> {
+    /// Borrowed view of the agent identity for the billing choke point.
+    fn agent_identity(&self) -> sbproxy_ai::budget::AgentIdentity<'_> {
+        sbproxy_ai::budget::AgentIdentity {
+            id: (!self.agent_id.is_empty()).then_some(self.agent_id.as_str()),
+            verified: self.agent_identity_verified,
+        }
+    }
 }
 
 /// WOR-798: the bundle a relay needs to feed
@@ -6225,17 +8974,15 @@ impl<'a> RouterTokenSink<'a> {
     }
 }
 
-/// Inputs to the streaming-cache recorder hook, bundled to keep
-/// [`relay_ai_stream`]'s parameter list short.
-///
-/// The OSS proxy never inspects these fields beyond passing them to
-/// [`crate::hooks::StreamCacheRecorderHook::start_session`]; all policy
-/// decisions live in the enterprise impl.
-pub(super) struct StreamCacheRecorderArgs {
-    request_id: String,
-    origin_id: String,
-    semantic_key: Option<String>,
-    policy: serde_json::Value,
+fn record_router_tokens_from_response(
+    router_sink: &RouterTokenSink<'_>,
+    status: u16,
+    response_body: &[u8],
+) {
+    if (200..300).contains(&status) {
+        let (prompt_tokens, completion_tokens) = extract_usage(response_body);
+        router_sink.record(prompt_tokens.saturating_add(completion_tokens));
+    }
 }
 
 /// Inputs the streaming relay needs to construct the right
@@ -6293,21 +9040,11 @@ pub(super) struct StreamFormatArgs {
 ///   spec section 5 row 9) to avoid interrupting an in-flight user
 ///   response on a transient classifier hiccup.
 ///
-/// # Stream cache recorder integration
+/// # Semantic caching
 ///
-/// If the pipeline has a `StreamCacheRecorderHook` wired, a recorder
-/// session is opened at stream start. Every chunk forwarded to the
-/// client is also fanned into the recorder's channel; the terminal
-/// `End { complete }` event reports whether the stream finished
-/// cleanly (true) or aborted mid-stream (false). All caching policy
-/// decisions (deterministic tool calls only, image data by reference
-/// only, replay pacing) live in the enterprise impl. OSS just
-/// forwards.
-//
-// Eight inputs is one over Clippy's default limit but each is doing
-// real work: enterprise hooks (safety + cache recorder), OSS budget
-// recorder, and the per-request identifiers the recorder session
-// needs. Splitting them into a struct would just move the noise.
+/// A streaming response is never cached. The request-path gate skips
+/// embedding, lookup, and write for `stream: true`, so this relay has no
+/// cache state to carry and never touches a semantic backend.
 /// Build the native-stream translator + inbound emitter pair for a
 /// given `(upstream, inbound)` format combination.
 ///
@@ -6424,10 +9161,11 @@ fn process_guard_events(
     for ev in events {
         match ev {
             HubChunk::ContentDelta {
+                index,
                 delta: ContentPartDelta::Text(t),
                 ..
             } => {
-                if let Some(block) = sessn.on_content_delta(t) {
+                if let Some(block) = sessn.on_content_delta_at(*index, t) {
                     return (Some(block), released);
                 }
             }
@@ -6460,6 +9198,532 @@ fn process_guard_events(
     (None, released)
 }
 
+#[derive(Debug)]
+struct RelayBodyHoldback {
+    guardrail: Option<String>,
+    max_bytes: usize,
+    buffered_bytes: usize,
+    chunks: Vec<Bytes>,
+    failed: bool,
+    sse_framer: sbproxy_ai::format::SseFramer,
+    canonical_protocol: Option<CanonicalSseProtocol>,
+    canonical_terminal: bool,
+    canonical_invalid: bool,
+    canonical_validated: bool,
+}
+
+/// The canonical stream syntax used for a classifier-held response body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CanonicalSseProtocol {
+    OpenAiChat,
+    AnthropicMessages,
+    OpenAiResponses,
+}
+
+impl RelayBodyHoldback {
+    fn new(guardrail: Option<&str>, max_bytes: usize) -> Self {
+        Self {
+            guardrail: guardrail.map(str::to_string),
+            max_bytes,
+            buffered_bytes: 0,
+            chunks: Vec::new(),
+            failed: false,
+            sse_framer: sbproxy_ai::format::SseFramer::new(),
+            canonical_protocol: None,
+            canonical_terminal: false,
+            canonical_invalid: false,
+            canonical_validated: false,
+        }
+    }
+
+    fn stage(
+        &mut self,
+        bytes: Bytes,
+    ) -> std::result::Result<Option<Bytes>, sbproxy_ai::guardrails::GuardrailBlock> {
+        let Some(guardrail) = self.guardrail.as_deref() else {
+            return Ok(Some(bytes));
+        };
+        self.canonical_validated = false;
+        if self.failed || self.buffered_bytes.saturating_add(bytes.len()) > self.max_bytes {
+            self.failed = true;
+            self.buffered_bytes = 0;
+            self.chunks.clear();
+            return Err(sbproxy_ai::guardrails::GuardrailBlock {
+                name: guardrail.to_string(),
+                reason: format!(
+                    "{guardrail} enforcing stream exceeded the {}-byte relay hold-back limit; \
+                     failed closed",
+                    self.max_bytes
+                ),
+            });
+        }
+        self.buffered_bytes += bytes.len();
+        let frames = self.sse_framer.feed(&bytes);
+        self.chunks.push(bytes);
+        for frame in frames {
+            self.observe_canonical_sse_frame(&frame);
+        }
+        Ok(None)
+    }
+
+    fn release(&mut self) -> Vec<Bytes> {
+        if self.failed || (self.guardrail.is_some() && !self.canonical_validated) {
+            return Vec::new();
+        }
+        self.buffered_bytes = 0;
+        self.canonical_validated = false;
+        std::mem::take(&mut self.chunks)
+    }
+
+    fn decode_fallback_block(&self) -> Option<sbproxy_ai::guardrails::GuardrailBlock> {
+        let guardrail = self.guardrail.as_deref()?;
+        Some(sbproxy_ai::guardrails::GuardrailBlock {
+            name: guardrail.to_string(),
+            reason: format!(
+                "{guardrail} enforcing stream could not decode a canonical assistant response; \
+                 failed closed"
+            ),
+        })
+    }
+
+    fn close_decode_block(
+        &mut self,
+        _decoder_yielded: bool,
+    ) -> Option<sbproxy_ai::guardrails::GuardrailBlock> {
+        self.canonical_validated = false;
+        if self.buffered_bytes == 0 {
+            self.canonical_validated = true;
+            return None;
+        }
+        if self.sse_framer.flush().is_some() {
+            // A complete canonical event always ends in a blank line. A
+            // syntactically valid partial event at EOF is still incomplete.
+            self.canonical_invalid = true;
+        }
+        if self.sse_framer.error().is_some()
+            || self.canonical_invalid
+            || self.canonical_protocol.is_none()
+        {
+            return self.decode_fallback_block();
+        }
+        if !self.canonical_terminal {
+            let guardrail = self.guardrail.as_deref()?;
+            return Some(sbproxy_ai::guardrails::GuardrailBlock {
+                name: guardrail.to_string(),
+                reason: format!(
+                    "{guardrail} enforcing stream ended without its canonical terminal event; \
+                     failed closed"
+                ),
+            });
+        }
+        self.canonical_validated = true;
+        None
+    }
+
+    fn observe_canonical_sse_frame(&mut self, frame: &str) {
+        let (event, data) = sbproxy_ai::format::split_sse_frame(frame);
+        let data = data.trim();
+        if data.is_empty() {
+            // Comments, id, and retry fields are valid SSE metadata but do
+            // not contribute a canonical assistant response event.
+            return;
+        }
+        if self.canonical_terminal {
+            self.canonical_invalid = true;
+            return;
+        }
+        if data == "[DONE]" {
+            self.observe_openai_terminal(event.as_deref());
+            return;
+        }
+
+        let payload: serde_json::Value = match serde_json::from_str(data) {
+            Ok(payload) => payload,
+            Err(_) => {
+                self.canonical_invalid = true;
+                return;
+            }
+        };
+        if payload.get("error").is_some() {
+            self.canonical_invalid = true;
+            return;
+        }
+
+        let event = event.as_deref();
+        let ty = payload.get("type").and_then(serde_json::Value::as_str);
+        if let Some(event) = event.filter(|event| event.starts_with("response.")) {
+            self.observe_responses_event(event, ty, &payload);
+        } else if let Some(event) = event.filter(|event| {
+            matches!(
+                *event,
+                "message_start"
+                    | "content_block_start"
+                    | "content_block_delta"
+                    | "content_block_stop"
+                    | "message_delta"
+                    | "message_stop"
+                    | "ping"
+            )
+        }) {
+            self.observe_anthropic_event(event, ty);
+        } else if event.is_none() && payload.get("choices").is_some() {
+            self.observe_openai_event(&payload);
+        } else {
+            self.canonical_invalid = true;
+        }
+    }
+
+    fn select_protocol(&mut self, protocol: CanonicalSseProtocol) -> bool {
+        match self.canonical_protocol {
+            Some(existing) if existing != protocol => {
+                self.canonical_invalid = true;
+                false
+            }
+            Some(_) => true,
+            None => {
+                self.canonical_protocol = Some(protocol);
+                true
+            }
+        }
+    }
+
+    fn observe_openai_event(&mut self, payload: &serde_json::Value) {
+        if !self.select_protocol(CanonicalSseProtocol::OpenAiChat)
+            || !payload
+                .get("choices")
+                .is_some_and(serde_json::Value::is_array)
+        {
+            self.canonical_invalid = true;
+        }
+    }
+
+    fn observe_openai_terminal(&mut self, event: Option<&str>) {
+        if event.is_some() || !self.select_protocol(CanonicalSseProtocol::OpenAiChat) {
+            self.canonical_invalid = true;
+            return;
+        }
+        self.canonical_terminal = true;
+    }
+
+    fn observe_anthropic_event(&mut self, event: &str, ty: Option<&str>) {
+        if !self.select_protocol(CanonicalSseProtocol::AnthropicMessages) || ty != Some(event) {
+            self.canonical_invalid = true;
+            return;
+        }
+        if event == "message_stop" {
+            self.canonical_terminal = true;
+        }
+    }
+
+    fn observe_responses_event(
+        &mut self,
+        event: &str,
+        ty: Option<&str>,
+        payload: &serde_json::Value,
+    ) {
+        const RESPONSES_EVENTS: &[&str] = &[
+            "response.created",
+            "response.in_progress",
+            "response.output_item.added",
+            "response.output_item.done",
+            "response.content_part.added",
+            "response.content_part.done",
+            "response.output_text.delta",
+            "response.output_text.done",
+            "response.function_call_arguments.delta",
+            "response.function_call_arguments.done",
+            "response.completed",
+        ];
+        if !self.select_protocol(CanonicalSseProtocol::OpenAiResponses)
+            || !RESPONSES_EVENTS.contains(&event)
+            || ty != Some(event)
+        {
+            self.canonical_invalid = true;
+            return;
+        }
+        if event == "response.completed" {
+            if payload.get("response").is_none() {
+                self.canonical_invalid = true;
+            } else {
+                self.canonical_terminal = true;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod stream_classifier_holdback_tests {
+    use super::RelayBodyHoldback;
+    use bytes::Bytes;
+
+    fn relay_one(
+        holdback: &mut RelayBodyHoldback,
+        downstream: &mut Vec<Bytes>,
+        bytes: &'static [u8],
+    ) -> std::result::Result<(), sbproxy_ai::guardrails::GuardrailBlock> {
+        if let Some(ready) = holdback.stage(Bytes::from_static(bytes))? {
+            downstream.push(ready);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn relay_emits_no_body_bytes_before_classifier_close_verdict() {
+        let mut holdback = RelayBodyHoldback::new(Some("jailbreak"), 1024);
+        let mut downstream = Vec::new();
+
+        relay_one(
+            &mut holdback,
+            &mut downstream,
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"safe\"}}]}\n\n",
+        )
+        .expect("content frame");
+        relay_one(&mut holdback, &mut downstream, b"data: [DONE]\n\n").expect("terminal frame");
+
+        assert!(
+            downstream.is_empty(),
+            "no response-body frame may reach the client before the close verdict"
+        );
+        assert!(holdback.close_decode_block(true).is_none());
+
+        downstream.extend(holdback.release());
+        assert_eq!(
+            downstream.concat(),
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"safe\"}}]}\n\ndata: [DONE]\n\n",
+            "a clean close releases the original frames in order"
+        );
+    }
+
+    #[test]
+    fn relay_holdback_overflow_fails_closed_without_releasing_a_prefix() {
+        let mut holdback = RelayBodyHoldback::new(Some("toxicity"), 5);
+        let mut downstream = Vec::new();
+        relay_one(&mut holdback, &mut downstream, b"12345").expect("at limit");
+
+        let block = relay_one(&mut holdback, &mut downstream, b"6")
+            .expect_err("one byte above the limit must fail closed");
+
+        assert_eq!(block.name, "toxicity");
+        assert!(block.reason.contains("hold-back limit"));
+        assert!(downstream.is_empty());
+        assert!(
+            holdback.release().is_empty(),
+            "an overflowed prefix must never become releasable"
+        );
+    }
+
+    #[test]
+    fn relay_without_a_close_classifier_forwards_immediately() {
+        let mut holdback = RelayBodyHoldback::new(None, 1);
+        let mut downstream = Vec::new();
+
+        relay_one(&mut holdback, &mut downstream, b"unbounded").expect("pass-through");
+
+        assert_eq!(downstream.concat(), b"unbounded");
+    }
+
+    #[test]
+    fn undecodable_enforcing_stream_fails_closed_instead_of_classifying_raw_sse() {
+        let protected = RelayBodyHoldback::new(Some("content_safety"), 1024);
+        let block = protected
+            .decode_fallback_block()
+            .expect("canonical text is mandatory for an enforcing classifier");
+        assert_eq!(block.name, "content_safety");
+        assert!(block.reason.contains("decode"));
+
+        let unprotected = RelayBodyHoldback::new(None, 1024);
+        assert!(
+            unprotected.decode_fallback_block().is_none(),
+            "ordinary stream guardrails retain their raw fallback"
+        );
+    }
+
+    #[test]
+    fn short_undecodable_enforcing_body_fails_closed_at_stream_end() {
+        let mut protected = RelayBodyHoldback::new(Some("jailbreak"), 1024);
+        assert!(protected
+            .stage(Bytes::from_static(b"not valid SSE"))
+            .expect("stage")
+            .is_none());
+
+        let block = protected
+            .close_decode_block(false)
+            .expect("a nonempty body with no decoded event must fail closed");
+        assert_eq!(block.name, "jailbreak");
+        assert!(
+            protected.close_decode_block(true).is_some(),
+            "an invalid stream remains unreleasable after a repeated close check"
+        );
+
+        let mut empty = RelayBodyHoldback::new(Some("jailbreak"), 1024);
+        assert!(
+            empty.close_decode_block(false).is_none(),
+            "an actually empty response has no unclassified body bytes"
+        );
+    }
+
+    #[test]
+    fn malformed_frame_after_a_decoded_event_still_fails_closed() {
+        let mut protected = RelayBodyHoldback::new(Some("jailbreak"), 1024);
+        assert!(protected
+            .stage(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"safe\"}}]}\n\n"
+            ))
+            .expect("valid frame")
+            .is_none());
+        assert!(protected
+            .stage(Bytes::from_static(b"data: not-json\n\n"))
+            .expect("malformed frame is still held")
+            .is_none());
+
+        let block = protected
+            .close_decode_block(true)
+            .expect("unclassified malformed data must not be released");
+
+        assert_eq!(block.name, "jailbreak");
+        assert!(block.reason.contains("decode"));
+    }
+
+    #[test]
+    fn canonical_openai_stream_requires_done_before_release() {
+        let mut protected = RelayBodyHoldback::new(Some("jailbreak"), 1024);
+        let mut downstream = Vec::new();
+        relay_one(
+            &mut protected,
+            &mut downstream,
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"prefix\"}}]}\n\n",
+        )
+        .expect("stage");
+
+        let block = protected
+            .close_decode_block(true)
+            .expect("early EOF without [DONE] must fail closed");
+
+        assert_eq!(block.name, "jailbreak");
+        assert!(block.reason.contains("terminal"));
+    }
+
+    #[test]
+    fn canonical_validation_is_invalidated_by_a_late_tail_before_release() {
+        let mut protected = RelayBodyHoldback::new(Some("jailbreak"), 2048);
+        let mut downstream = Vec::new();
+        relay_one(
+            &mut protected,
+            &mut downstream,
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"safe\"}}]}\n\n",
+        )
+        .expect("stage content");
+        relay_one(&mut protected, &mut downstream, b"data: [DONE]\n\n").expect("stage terminal");
+        assert!(
+            protected.close_decode_block(true).is_none(),
+            "the complete prefix is initially valid"
+        );
+
+        relay_one(
+            &mut protected,
+            &mut downstream,
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"late\"}}]}\n\n",
+        )
+        .expect("stage late tail");
+        assert!(
+            protected.close_decode_block(true).is_some(),
+            "an event after the terminal invalidates the canonical stream"
+        );
+        assert!(
+            protected.release().is_empty(),
+            "bytes staged after validation must not remain releasable"
+        );
+    }
+
+    #[test]
+    fn canonical_stream_rejects_valid_error_and_unsupported_events() {
+        for event in [
+            b"data: {\"error\":{\"message\":\"provider failed\"}}\n\n".as_slice(),
+            b"data: {\"unsupported\":\"valid json\"}\n\n".as_slice(),
+        ] {
+            let mut protected = RelayBodyHoldback::new(Some("content_safety"), 1024);
+            let mut downstream = Vec::new();
+            relay_one(
+                &mut protected,
+                &mut downstream,
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"safe\"}}]}\n\n",
+            )
+            .expect("stage content");
+            relay_one(&mut protected, &mut downstream, event).expect("stage event");
+            relay_one(&mut protected, &mut downstream, b"data: [DONE]\n\n")
+                .expect("stage terminal");
+
+            let block = protected
+                .close_decode_block(true)
+                .expect("unclassified valid JSON must fail closed");
+            assert_eq!(block.name, "content_safety");
+        }
+    }
+
+    #[test]
+    fn canonical_stream_rejects_invalid_utf8_even_when_fragmented() {
+        let mut protected = RelayBodyHoldback::new(Some("toxicity"), 1024);
+        let mut downstream = Vec::new();
+        relay_one(
+            &mut protected,
+            &mut downstream,
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"",
+        )
+        .expect("stage prefix");
+        relay_one(&mut protected, &mut downstream, b"\xf0\x28\x8c\x28")
+            .expect("stage invalid UTF-8");
+        relay_one(
+            &mut protected,
+            &mut downstream,
+            b"\"}}]}\n\ndata: [DONE]\n\n",
+        )
+        .expect("stage suffix");
+
+        assert!(
+            protected.close_decode_block(true).is_some(),
+            "invalid UTF-8 must never be released"
+        );
+    }
+
+    #[test]
+    fn canonical_anthropic_and_responses_streams_require_their_terminal_event() {
+        for prefix in [
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"prefix\"}}\n\n".as_slice(),
+            b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"prefix\"}\n\n".as_slice(),
+        ] {
+            let mut protected = RelayBodyHoldback::new(Some("jailbreak"), 2048);
+            let mut downstream = Vec::new();
+            relay_one(&mut protected, &mut downstream, prefix).expect("stage provider event");
+            assert!(
+                protected.close_decode_block(true).is_some(),
+                "provider-specific early EOF must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_terminal_allows_fragmented_sse_grammar_without_changing_bytes() {
+        let wire = b": keepalive\r\nid: 7\r\nretry: 1000\r\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"caf\xc3\xa9\"}}]}\r\n\r\ndata: [DONE]\r\n\r\n";
+        for split in 1..wire.len() {
+            let mut protected = RelayBodyHoldback::new(Some("jailbreak"), 4096);
+            let mut downstream = Vec::new();
+            let first = Bytes::copy_from_slice(&wire[..split]);
+            let second = Bytes::copy_from_slice(&wire[split..]);
+            if let Some(ready) = protected.stage(first).expect("stage first") {
+                downstream.push(ready);
+            }
+            if let Some(ready) = protected.stage(second).expect("stage second") {
+                downstream.push(ready);
+            }
+            assert!(
+                protected.close_decode_block(true).is_none(),
+                "valid terminal stream rejected at byte split {split}"
+            );
+            assert_eq!(protected.release().concat(), wire);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn relay_ai_stream(
     session: &mut Session,
@@ -6468,7 +9732,6 @@ pub(super) async fn relay_ai_stream(
     hostname: &str,
     model_id: Option<String>,
     origin_idx: Option<usize>,
-    recorder_args: StreamCacheRecorderArgs,
     budget_recorder: Option<BudgetRecorderArgs<'_>>,
     router_sink: RouterTokenSink<'_>,
     parser_args: StreamUsageParserArgs,
@@ -6498,6 +9761,19 @@ pub(super) async fn relay_ai_stream(
 ) -> Result<()> {
     let status = resp.status().as_u16();
     record_ai_provider_response_failure(&ai_span, router_sink.provider_name, status, None);
+
+    // WOR-1811: a served (local) engine stamps its internal model id
+    // (historically the weights file path or the internal deployment
+    // id) on every SSE chunk. Capture the public serve-entry name so
+    // the chunk loop rewrites each frame's `model` field to match
+    // what the buffered path reports. `ai_serve_model` is only set on
+    // managed local attempts, so hosted passthrough lanes skip the
+    // rewrite entirely.
+    let serve_model: Option<String> = if (200..300).contains(&status) {
+        ctx.as_deref().and_then(|c| c.ai_serve_model.clone())
+    } else {
+        None
+    };
 
     // --- Start safety session (fail-closed on None) ---
     //
@@ -6541,33 +9817,6 @@ pub(super) async fn relay_ai_stream(
         None
     };
 
-    // --- Start stream-cache recorder session (fail-open on None) ---
-    //
-    // Gating on `hooks.stream_cache_recorder.is_some()` ties this
-    // feature to enterprise opt-in. The recorder decides per session
-    // whether it wants to record this stream (it returns `None` to
-    // skip, e.g. when the cache key cannot be derived). On accept we
-    // wrap the channel in a `StreamCacheGuard` so the terminal `End`
-    // event lands exactly once: either via `finish()` on a clean
-    // end-of-stream or via the guard's `Drop` impl on any other exit
-    // path (client cancel, upstream error, mid-stream abort).
-    let recorder_guard: Option<crate::hooks::StreamCacheGuard> =
-        if let Some(hook) = pipeline.hooks.stream_cache_recorder.as_ref().cloned() {
-            let ctx = crate::hooks::StreamCacheCtx {
-                hostname: hostname.to_string(),
-                origin_id: recorder_args.origin_id.clone(),
-                request_id: recorder_args.request_id.clone(),
-                semantic_key: recorder_args.semantic_key.clone(),
-                model_id: model_id.clone(),
-                policy: recorder_args.policy.clone(),
-            };
-            hook.start_session(ctx)
-                .await
-                .map(crate::hooks::StreamCacheGuard::new)
-        } else {
-            None
-        };
-
     // Write SSE response headers.
     let route_headers = ctx.as_deref().map(public_route_headers).unwrap_or_default();
     let mut header = pingora_http::ResponseHeader::build(status, Some(3 + route_headers.len()))
@@ -6601,8 +9850,8 @@ pub(super) async fn relay_ai_stream(
     // `upstream_complete` tracks whether the upstream stream ran to
     // its natural end without an error. It is only set to `true`
     // when the chunk loop exits via the `None` arm (no `break` from
-    // an upstream error). The flag gates whether the recorder
-    // guard's terminal event reports `complete: true`.
+    // an upstream error). The flag classifies the waste marker the
+    // budget branch below records for a truncated stream.
     //
     // `usage_scanner` is materialised only when a budget recorder
     // is wired so the scan cost stays opt-in. Each chunk is fed to
@@ -6617,16 +9866,12 @@ pub(super) async fn relay_ai_stream(
     // `sbproxy_ai_output_throughput_tokens_per_second` at stream close.
     let stream_started = std::time::Instant::now();
     let mut first_token_at: Option<std::time::Instant> = None;
-    let mut output_emitted = false;
     // Build the per-stream usage parser when a budget recorder is
     // wired. `select_parser` returns `None` only when the operator
     // sets `usage_parser: none`; every other branch yields a live
     // parser whose snapshot is read at stream close.
-    let needs_usage_parser = budget_recorder.is_some()
-        || ctx
-            .as_ref()
-            .is_some_and(|ctx| ctx.governance_lease.is_some() || ctx.ai_admission.is_some());
-    let mut usage_parser: Option<Box<dyn sbproxy_ai::SseUsageParser>> = if needs_usage_parser {
+    let mut usage_parser: Option<Box<dyn sbproxy_ai::SseUsageParser>> = if budget_recorder.is_some()
+    {
         let hints = sbproxy_ai::UsageParserHints {
             upstream_host: parser_args.upstream_host.as_deref(),
             content_type: parser_args.content_type.as_deref(),
@@ -6659,6 +9904,14 @@ pub(super) async fn relay_ai_stream(
     let holds_tool_frames = guard_session
         .as_ref()
         .is_some_and(|s| s.holds_tool_frames());
+    let response_holdback_guardrail = guard_session
+        .as_ref()
+        .and_then(|session| session.response_holdback_guardrail())
+        .map(str::to_string);
+    let mut response_body_holdback = RelayBodyHoldback::new(
+        response_holdback_guardrail.as_deref(),
+        sbproxy_ai::guardrails::stream::MAX_STREAM_GUARD_BUFFER_BYTES,
+    );
 
     // --- Native-format streaming translator ---
     //
@@ -6712,11 +9965,14 @@ pub(super) async fn relay_ai_stream(
     // a per-chunk `is_noop` short-circuit so byte-forward streaming
     // stays zero-overhead.
     let mut reversible_restore = StreamingReversibleRestore::new(reversible_pairs);
-    let mut trace_stream_content = trace_content.enabled().then(AiTraceStreamContent::default);
+    // WOR-2096: reassemble streamed text when either the span gate or
+    // the console capture gate wants the completion.
+    let mut trace_stream_content = (trace_content.enabled() || trace_content.capture_enabled())
+        .then(AiTraceStreamContent::default);
     // WOR-1144: set when the stream-safety classifier rejects a chunk so
     // the relay stops forwarding (fail closed) instead of delivering
-    // flagged content. Leaves `upstream_complete` false so the recorder
-    // guard emits `End { complete: false }`.
+    // flagged content. Leaves `upstream_complete` false so the stream is
+    // accounted as a partial delivery.
     let mut safety_blocked = false;
     // WOR-1141: set when a streaming-safe output guardrail matches an
     // outbound chunk so the relay stops forwarding (the violating chunk
@@ -6725,8 +9981,7 @@ pub(super) async fn relay_ai_stream(
     // violating output does not reach the client.
     let mut output_guard_blocked = false;
     'relay: loop {
-        let next_chunk = stream.next().await;
-        match next_chunk {
+        match stream.next().await {
             Some(Ok(chunk)) => {
                 let chunk_bytes = Bytes::copy_from_slice(&chunk);
                 // WOR-895: first non-empty chunk marks TTFT.
@@ -6766,16 +10021,6 @@ pub(super) async fn relay_ai_stream(
                             break 'relay;
                         }
                     }
-                }
-
-                // --- Per-chunk recorder fan-out (best-effort) ---
-                //
-                // Forward a copy of every chunk to the cache recorder
-                // before writing to the client. `chunk` swallows
-                // SendError, so a closed recorder channel (enterprise
-                // dropped early) is not fatal.
-                if let Some(g) = recorder_guard.as_ref() {
-                    g.chunk(chunk_bytes.clone());
                 }
 
                 // --- Per-chunk usage capture for budget recording ---
@@ -6821,6 +10066,27 @@ pub(super) async fn relay_ai_stream(
                         None
                     };
 
+                if guard_raw_mode {
+                    if let Some(block) = response_body_holdback.decode_fallback_block() {
+                        warn!(
+                            guardrail = %block.name,
+                            reason = %block.reason,
+                            "AI proxy: enforcing output classifier stream decode failed closed"
+                        );
+                        sbproxy_ai::ai_metrics::record_stream_guardrail_violation(&block.name);
+                        sbproxy_ai::tracing_spans::record_error(
+                            &ai_span,
+                            sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                            &block.reason,
+                        );
+                        if let Some(c) = ctx.as_deref_mut() {
+                            mark_guardrail_block(c, block.name.clone());
+                        }
+                        output_guard_blocked = true;
+                        break 'relay;
+                    }
+                }
+
                 let mut released_tool_chunks: Vec<sbproxy_ai::format::HubChunk> = Vec::new();
                 if let Some(sessn) = guard_session.as_mut() {
                     let pending_block = if let Some(events) = decoded.as_deref() {
@@ -6858,9 +10124,7 @@ pub(super) async fn relay_ai_stream(
                         // WOR-1874: stamp the guardrail columns for the
                         // access log and admin request ring.
                         if let Some(c) = ctx.as_deref_mut() {
-                            c.ai_outcome = Some("guardrail_block".to_string());
-                            c.ai_guardrail_category = Some(block.name.clone());
-                            c.ai_guardrail_action = Some("block".to_string());
+                            mark_guardrail_block(c, block.name.clone());
                         }
                         output_guard_blocked = true;
                         break 'relay;
@@ -6908,6 +10172,16 @@ pub(super) async fn relay_ai_stream(
                 } else {
                     chunk_bytes
                 };
+                // WOR-1811: served-local lanes rewrite each frame's
+                // `model` field to the public serve-entry name so
+                // streamed chunks echo the same id the buffered path
+                // reports. Runs before the restorer so any bytes it
+                // holds back are already rewritten. No-op (zero-copy)
+                // for hosted lanes and frames without a model field.
+                let outbound_bytes = match serve_model.as_deref() {
+                    Some(name) => rewrite_stream_chunk_model(outbound_bytes, name),
+                    None => outbound_bytes,
+                };
                 // WOR-1044 PR2: run the outbound bytes through the
                 // reversible PII restorer before writing to the
                 // client. The restorer is a no-op (clone-only) when
@@ -6923,13 +10197,33 @@ pub(super) async fn relay_ai_stream(
                     // and wait for the next chunk to flush.
                     continue;
                 }
-                if let Some(trace) = trace_stream_content.as_mut() {
-                    trace.feed(&outbound_bytes);
+                match response_body_holdback.stage(outbound_bytes) {
+                    Ok(Some(ready)) => {
+                        if let Some(trace) = trace_stream_content.as_mut() {
+                            trace.feed(&ready);
+                        }
+                        session.write_response_body(Some(ready), false).await?;
+                    }
+                    Ok(None) => {}
+                    Err(block) => {
+                        warn!(
+                            guardrail = %block.name,
+                            reason = %block.reason,
+                            "AI proxy: output guardrail relay hold-back failed closed"
+                        );
+                        sbproxy_ai::ai_metrics::record_stream_guardrail_violation(&block.name);
+                        sbproxy_ai::tracing_spans::record_error(
+                            &ai_span,
+                            sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                            &block.reason,
+                        );
+                        if let Some(c) = ctx.as_deref_mut() {
+                            mark_guardrail_block(c, block.name.clone());
+                        }
+                        output_guard_blocked = true;
+                        break 'relay;
+                    }
                 }
-                session
-                    .write_response_body(Some(outbound_bytes), false)
-                    .await?;
-                mark_governance_output(&mut ctx, &mut output_emitted);
             }
             Some(Err(e)) => {
                 let kind = if e.is_timeout() {
@@ -6962,6 +10256,9 @@ pub(super) async fn relay_ai_stream(
                     } else {
                         Vec::new()
                     };
+                if guard_decoder.is_some() && !tail_events.is_empty() {
+                    guard_decoder_yielded = true;
+                }
 
                 // --- WOR-1810: final guardrail pass BEFORE tail
                 // emission: tail events, pending tool calls, the
@@ -7001,15 +10298,11 @@ pub(super) async fn relay_ai_stream(
                     // WOR-1874: stamp the guardrail columns for the
                     // access log and admin request ring.
                     if let Some(c) = ctx.as_deref_mut() {
-                        c.ai_outcome = Some("guardrail_block".to_string());
-                        c.ai_guardrail_category = Some(block.name.clone());
-                        c.ai_guardrail_action = Some("block".to_string());
+                        mark_guardrail_block(c, block.name.clone());
                     }
                     output_guard_blocked = true;
                     break;
                 }
-                upstream_complete = true;
-
                 if let Some(emitter) = inbound_emitter
                     .as_ref()
                     .filter(|_| native_translator.is_some())
@@ -7028,21 +10321,46 @@ pub(super) async fn relay_ai_stream(
                     }
                     if !translated.is_empty() {
                         let bytes = Bytes::from(translated);
+                        // WOR-1811: tail frames get the same serve-entry
+                        // model rewrite as the chunk loop.
+                        let bytes = match serve_model.as_deref() {
+                            Some(name) => rewrite_stream_chunk_model(bytes, name),
+                            None => bytes,
+                        };
                         let bytes = if reversible_restore.is_noop() {
                             bytes
                         } else {
                             reversible_restore.process_chunk(&bytes)
                         };
                         if !bytes.is_empty() {
-                            if let Some(trace) = trace_stream_content.as_mut() {
-                                trace.feed(&bytes);
-                            }
-                            if session
-                                .write_response_body(Some(bytes), false)
-                                .await
-                                .is_ok()
-                            {
-                                mark_governance_output(&mut ctx, &mut output_emitted);
+                            match response_body_holdback.stage(bytes) {
+                                Ok(Some(ready)) => {
+                                    if let Some(trace) = trace_stream_content.as_mut() {
+                                        trace.feed(&ready);
+                                    }
+                                    session.write_response_body(Some(ready), false).await?;
+                                }
+                                Ok(None) => {}
+                                Err(block) => {
+                                    warn!(
+                                        guardrail = %block.name,
+                                        reason = %block.reason,
+                                        "AI proxy: output guardrail relay hold-back failed closed"
+                                    );
+                                    sbproxy_ai::ai_metrics::record_stream_guardrail_violation(
+                                        &block.name,
+                                    );
+                                    sbproxy_ai::tracing_spans::record_error(
+                                        &ai_span,
+                                        sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                                        &block.reason,
+                                    );
+                                    if let Some(c) = ctx.as_deref_mut() {
+                                        mark_guardrail_block(c, block.name.clone());
+                                    }
+                                    output_guard_blocked = true;
+                                    break 'relay;
+                                }
                             }
                         }
                     }
@@ -7057,63 +10375,76 @@ pub(super) async fn relay_ai_stream(
                 )
                 .finish();
                 if !tail.is_empty() {
-                    if let Some(trace) = trace_stream_content.as_mut() {
-                        trace.feed(&tail);
-                    }
-                    if session.write_response_body(Some(tail), false).await.is_ok() {
-                        mark_governance_output(&mut ctx, &mut output_emitted);
+                    match response_body_holdback.stage(tail) {
+                        Ok(Some(ready)) => {
+                            if let Some(trace) = trace_stream_content.as_mut() {
+                                trace.feed(&ready);
+                            }
+                            session.write_response_body(Some(ready), false).await?;
+                        }
+                        Ok(None) => {}
+                        Err(block) => {
+                            warn!(
+                                guardrail = %block.name,
+                                reason = %block.reason,
+                                "AI proxy: output guardrail relay hold-back failed closed"
+                            );
+                            sbproxy_ai::ai_metrics::record_stream_guardrail_violation(&block.name);
+                            sbproxy_ai::tracing_spans::record_error(
+                                &ai_span,
+                                sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                                &block.reason,
+                            );
+                            if let Some(c) = ctx.as_deref_mut() {
+                                mark_guardrail_block(c, block.name.clone());
+                            }
+                            output_guard_blocked = true;
+                            break 'relay;
+                        }
                     }
                 }
+                if let Some(block) =
+                    response_body_holdback.close_decode_block(guard_decoder_yielded)
+                {
+                    warn!(
+                        guardrail = %block.name,
+                        reason = %block.reason,
+                        "AI proxy: enforcing output classifier stream decode failed closed"
+                    );
+                    sbproxy_ai::ai_metrics::record_stream_guardrail_violation(&block.name);
+                    sbproxy_ai::tracing_spans::record_error(
+                        &ai_span,
+                        sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                        &block.reason,
+                    );
+                    if let Some(c) = ctx.as_deref_mut() {
+                        mark_guardrail_block(c, block.name.clone());
+                    }
+                    output_guard_blocked = true;
+                    break;
+                }
+                for ready in response_body_holdback.release() {
+                    if let Some(trace) = trace_stream_content.as_mut() {
+                        trace.feed(&ready);
+                    }
+                    session.write_response_body(Some(ready), false).await?;
+                }
+                upstream_complete = true;
                 break;
             }
         }
     }
 
-    // Signal end of stream to the client. A failure here is treated
-    // as a partial recording: we let the guard drop emit
-    // `End { complete: false }`.
+    // Signal end of stream to the client. A failure here leaves
+    // `upstream_complete` false, which the budget branch below reports as
+    // a partial delivery.
     session.write_response_body(None, true).await?;
-
-    let parsed_usage = usage_parser.as_ref().and_then(|parser| parser.snapshot());
-    if let Some(ctx) = ctx {
-        if let Some(tokens) = parsed_usage.as_ref() {
-            if let Some(admission) = ctx.ai_admission.take() {
-                admission.reconcile(tokens.prompt_tokens as u64);
-            }
-        }
-        if ctx.governance_retry_usage_missing {
-            settle_governance_ceiling(ctx).await;
-        } else if let Some(tokens) = parsed_usage.as_ref() {
-            match (
-                ctx.governance_retry_input_tokens
-                    .checked_add(tokens.prompt_tokens as u64),
-                ctx.governance_retry_output_tokens
-                    .checked_add(tokens.completion_tokens as u64),
-            ) {
-                (Some(input), Some(output)) => settle_governance_tokens(ctx, input, output).await,
-                _ => settle_governance_ceiling(ctx).await,
-            }
-        } else if output_emitted && (200..300).contains(&status) {
-            settle_governance_ceiling(ctx).await;
-        } else if ctx.governance_retry_usage_observed {
-            settle_governance_tokens(
-                ctx,
-                ctx.governance_retry_input_tokens,
-                ctx.governance_retry_output_tokens,
-            )
-            .await;
-        } else if governance_billable_work_started(ctx) {
-            settle_governance_ceiling(ctx).await;
-        } else {
-            release_governance(ctx).await;
-        }
-    }
 
     if safety_blocked {
         // WOR-1144: the stream was cut short by an output-safety verdict.
-        // `upstream_complete` stayed false, so the recorder guard emits
-        // `End { complete: false }`. Budget is still recorded best-effort
-        // below for whatever the upstream produced before the cut.
+        // `upstream_complete` stayed false. Budget is still recorded
+        // best-effort below for whatever the upstream produced before the
+        // cut.
         debug!("AI proxy: streaming response terminated early by stream-safety enforcement");
     }
     if output_guard_blocked {
@@ -7125,6 +10456,15 @@ pub(super) async fn relay_ai_stream(
         if let Some(trace) = trace_stream_content.take() {
             let completion = trace.finish();
             record_ai_output_trace(&ai_span, trace_content, &completion);
+            // WOR-2096: same completion, console sample gate.
+            if trace_content.capture_enabled() {
+                if let Some(request_id) = ctx.as_ref().map(|c| c.request_id.to_string()) {
+                    let redacted = redact_ai_trace_content(&completion, trace_content.redactor());
+                    if !redacted.trim().is_empty() {
+                        crate::content_capture::attach_output(&request_id, redacted);
+                    }
+                }
+            }
         }
     }
 
@@ -7179,7 +10519,12 @@ pub(super) async fn relay_ai_stream(
                 };
                 let cost = sbproxy_ai::budget::estimate_cost_for_usage(args.model, &usage);
                 let scope_keys = args.keys.iter().map(|(_, k)| k.clone()).collect::<Vec<_>>();
-                emit_ai_billing_event(
+                // WOR-1835: bind the billing event's micro-USD return
+                // (previously discarded here) so a streaming response can
+                // settle its governance reservation with the same figure
+                // just recorded to the budget ledger.
+                let cost_micros = emit_ai_billing_event(
+                    &args.origin,
                     args.surface_label,
                     args.provider_name,
                     Some(args.model.to_string()),
@@ -7189,8 +10534,22 @@ pub(super) async fn relay_ai_stream(
                     &args.attribution_tags,
                     args.tenant_id.as_str(),
                     args.api_key_id.as_str(),
+                    &args.rollup_properties,
+                    args.agent_identity(),
                     &ai_span,
                 );
+                // WOR-1835: governed-key settlement. `ai_admission` never
+                // reconciles on the streaming path (its reservation is
+                // simply refunded in full on drop), a pre-existing gap
+                // this settle deliberately does not inherit: streaming
+                // responses settle their governance reservation with
+                // actual usage here. Best-effort on error (the lease's
+                // `Drop` repairs a failed settle).
+                if let Some(c) = ctx.as_mut() {
+                    if let Some(mut lease) = c.governance_lease.take() {
+                        let _ = lease.settle(prompt + completion, cost_micros).await;
+                    }
+                }
 
                 // WOR-1093: a stream that did not run to a clean
                 // upstream completion still consumed the prompt (and
@@ -7269,20 +10628,13 @@ pub(super) async fn relay_ai_stream(
         }
     }
 
-    // Clean end-of-stream: emit terminal `End { complete: true }`
-    // to the recorder. If the upstream broke mid-stream (`break`
-    // above) we deliberately leave the guard untouched so its drop
-    // emits `complete: false`.
-    if upstream_complete {
-        if let Some(g) = recorder_guard {
-            g.finish();
-        }
-    }
     Ok(())
 }
 
 /// WOR-798: extract a stable prefix key from an AI chat / completion
-/// request body for prefix-affinity routing. Preference order:
+/// request body for distributed managed-replica placement. The ordinary
+/// provider router uses `sbproxy_ai::normalize_prefix` instead. Preference
+/// order:
 ///
 /// 1. `body["messages"]` - the chat history is the prefix that
 ///    matters for KV-cache reuse on vLLM / SGLang. Two requests
@@ -7295,8 +10647,7 @@ pub(super) async fn relay_ai_stream(
 /// the leading bytes (which is exactly what KV-cache reuse needs;
 /// the divergent tail is the new tokens that won't be cached
 /// anyway). Returns an empty `Vec<u8>` when no JSON-serialisable
-/// prefix exists, in which case `select_with_prefix` falls back to
-/// round-robin so body-less requests do not herd onto one upstream.
+/// prefix exists.
 fn extract_prefix_key(body: &serde_json::Value, max_bytes: usize) -> Vec<u8> {
     let source = body
         .get("messages")
@@ -7381,6 +10732,80 @@ fn rewrite_response_model(body: bytes::Bytes, model: &str) -> bytes::Bytes {
     }
 }
 
+/// WOR-1811: streaming counterpart of [`rewrite_response_model`].
+/// Rewrite the top-level `model` field of every complete `data:` frame
+/// in an SSE chunk to `model`. A served (local) engine stamps its
+/// internal id (historically the weights file path or the internal
+/// deployment id) on every streamed chunk; the serve-entry name is
+/// what the client asked for and what the buffered path reports.
+///
+/// The relay's pass-through path forwards network reads as-is, so a
+/// chunk may end mid-frame. Any `data:` line whose payload does not
+/// parse as JSON (a partial frame, a keepalive comment, `[DONE]`)
+/// passes through byte-identical; the rewrite is best-effort per
+/// complete frame, exactly matching the relay's no-buffering contract.
+/// Chunks with no `model` key anywhere, and frames already carrying
+/// the target name, return the input `Bytes` untouched so the hot
+/// path stays allocation-free.
+fn rewrite_stream_chunk_model(chunk: bytes::Bytes, model: &str) -> bytes::Bytes {
+    // Cheap pre-scan: a chunk with no `"model"` key needs no parse.
+    if !chunk.windows(b"\"model\"".len()).any(|w| w == b"\"model\"") {
+        return chunk;
+    }
+    let Ok(text) = std::str::from_utf8(&chunk) else {
+        return chunk;
+    };
+    // Lazily materialized output: stays `None` (zero-copy return)
+    // until the first frame actually needs a rewrite. `mirrored`
+    // counts the prefix bytes already scanned so the first rewrite
+    // can copy everything before it verbatim.
+    let mut out: Option<String> = None;
+    let mut mirrored = 0usize;
+    // `split_inclusive` keeps each line's terminator, so lines we do
+    // not rewrite are re-emitted byte-identical (including a trailing
+    // partial line with no terminator).
+    for line in text.split_inclusive('\n') {
+        let rewritten = line
+            .strip_prefix("data:")
+            .map(|rest| rest.strip_prefix(' ').unwrap_or(rest))
+            .and_then(|payload| {
+                let json = payload.trim_end_matches(['\r', '\n']);
+                let mut v = serde_json::from_str::<serde_json::Value>(json).ok()?;
+                match v.get("model").and_then(|m| m.as_str()) {
+                    Some(existing) if existing != model => {
+                        v["model"] = serde_json::Value::String(model.to_string());
+                        // Reattach the line's original terminator bytes.
+                        let terminator = &payload[json.len()..];
+                        serde_json::to_string(&v)
+                            .ok()
+                            .map(|body| format!("data: {body}{terminator}"))
+                    }
+                    _ => None,
+                }
+            });
+        match rewritten {
+            Some(frame) => {
+                let buf = out.get_or_insert_with(|| {
+                    let mut s = String::with_capacity(text.len() + 32);
+                    s.push_str(&text[..mirrored]);
+                    s
+                });
+                buf.push_str(&frame);
+            }
+            None => {
+                if let Some(buf) = out.as_mut() {
+                    buf.push_str(line);
+                }
+            }
+        }
+        mirrored += line.len();
+    }
+    match out {
+        Some(s) => bytes::Bytes::from(s),
+        None => chunk,
+    }
+}
+
 fn model_eligible_providers(
     order: &[usize],
     providers: &[sbproxy_ai::ProviderConfig],
@@ -7398,6 +10823,2341 @@ fn model_eligible_providers(
         })
         .collect();
     (!eligible.is_empty() && eligible.len() < order.len()).then_some(eligible)
+}
+
+fn shadow_surface_is_eligible(surface: &sbproxy_ai::handler::AiSurface) -> bool {
+    surface.supports_shadow_eval()
+}
+
+#[cfg(test)]
+mod external_guardrail_context_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use crate::server::{ai_idempotency_body_is_wire, AI_IDEMPOTENCY_BODY_FORMAT_HEADER};
+    use pingora_core::protocols::l4::stream::Stream;
+    use pingora_proxy::Session;
+    use sbproxy_ai::external_guardrail::{
+        run_input_external_guardrails, run_output_external_guardrails, ExternalGuardrailConfig,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[derive(Clone)]
+    struct WarningCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    struct WarningCaptureGuard(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for WarningCapture {
+        type Writer = WarningCaptureGuard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            WarningCaptureGuard(Arc::clone(&self.0))
+        }
+    }
+
+    impl std::io::Write for WarningCaptureGuard {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("warning capture")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn handle_with_captured_warnings(
+        session: &mut Session,
+        config: &sbproxy_ai::AiHandlerConfig,
+        pipeline: &crate::pipeline::CompiledPipeline,
+        context: &mut crate::context::RequestContext,
+        origin_idx: Option<usize>,
+    ) -> String {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(WarningCapture(Arc::clone(&captured)))
+            .finish();
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            super::handle_ai_proxy(session, config, pipeline, "ai.test", context, origin_idx)
+                .await
+                .expect("AI provider error is handled");
+        }
+        let bytes = captured.lock().expect("warning capture").clone();
+        String::from_utf8(bytes).expect("UTF-8 warnings")
+    }
+
+    fn assert_single_body_aware_provider_diagnostic(output: &str, provider: &str, status: u16) {
+        assert_eq!(
+            output
+                .matches("AI proxy: provider returned error response")
+                .count(),
+            1,
+            "{output}"
+        );
+        assert!(output.contains(&format!("provider={provider}")), "{output}");
+        assert!(output.contains(&format!("status={status}")), "{output}");
+        assert!(output.contains("upstream_error_code=400"), "{output}");
+        assert!(
+            output.contains("upstream_error_status=INVALID_ARGUMENT"),
+            "{output}"
+        );
+        assert!(
+            output.contains("upstream_error_reason=API_KEY_INVALID"),
+            "{output}"
+        );
+        assert!(!output.contains("provider-private-sentinel"), "{output}");
+    }
+
+    /// Counts every connection the semantic cache's embedding source
+    /// receives.
+    ///
+    /// Semantic caching is compiled per action now rather than registered as
+    /// a hook, so the request-path observable is the embedding call itself:
+    /// the dispatcher embeds the prompt before it may consult or populate any
+    /// backend. A probe that stays at zero proves the semantic path was never
+    /// entered; a probe at one proves it ran exactly once. The fixture never
+    /// answers with a usable vector, so every lookup fails open and the
+    /// request continues to the provider uncached.
+    struct EmbeddingProbe {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl EmbeddingProbe {
+        /// Embedding calls observed so far.
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Orchestration counters for one compiled slot's semantic cache.
+    fn semantic_stats(
+        pipeline: &crate::pipeline::CompiledPipeline,
+        origin_idx: usize,
+        forward_rule_idx: Option<usize>,
+    ) -> sbproxy_ai::EmbeddingCacheStats {
+        pipeline
+            .semantic_caches
+            .get(origin_idx, forward_rule_idx)
+            .map(|selection| selection.cache.stats())
+            .unwrap_or_default()
+    }
+
+    #[derive(Default)]
+    struct RecordingIdempotencyCache {
+        gets: AtomicUsize,
+        puts: AtomicUsize,
+        hit: std::sync::Mutex<Option<sbproxy_middleware::idempotency::CachedResponse>>,
+        stored: std::sync::Mutex<Option<sbproxy_middleware::idempotency::CachedResponse>>,
+    }
+
+    impl sbproxy_middleware::idempotency::IdempotencyCache for RecordingIdempotencyCache {
+        fn get(
+            &self,
+            _workspace_id: &str,
+            _key: &str,
+        ) -> Option<sbproxy_middleware::idempotency::CachedResponse> {
+            self.gets.fetch_add(1, Ordering::SeqCst);
+            self.hit.lock().expect("idempotency hit lock").clone()
+        }
+
+        fn put(
+            &self,
+            _workspace_id: &str,
+            _key: &str,
+            response: sbproxy_middleware::idempotency::CachedResponse,
+        ) {
+            self.puts.fetch_add(1, Ordering::SeqCst);
+            *self.stored.lock().expect("idempotency stored lock") = Some(response);
+        }
+    }
+
+    /// Bind a counting embedding endpoint that never returns a vector.
+    ///
+    /// Every accepted connection is counted and then dropped, so the
+    /// dispatcher's embedding call fails and semantic caching fails open.
+    /// That is exactly what the ordering assertions in this module need: an
+    /// observable that fires the moment the semantic path is entered without
+    /// changing what the client receives.
+    async fn embedding_probe() -> (String, EmbeddingProbe) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind embedding probe");
+        let address = listener.local_addr().expect("embedding probe address");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        drop(stream);
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        (format!("http://{address}/v1"), EmbeddingProbe { calls })
+    }
+
+    /// One `ai.test` origin with idempotency and a compiled memory semantic
+    /// cache whose embedding source is the counting probe.
+    async fn pipeline_with_recording_caches() -> (
+        crate::pipeline::CompiledPipeline,
+        EmbeddingProbe,
+        Arc<RecordingIdempotencyCache>,
+    ) {
+        let (embedding_url, probe) = embedding_probe().await;
+        let source = serde_json::json!({
+            "origins": {
+                "ai.test": {
+                    "action": {
+                        "type": "ai_proxy",
+                        "providers": [],
+                        "semantic_cache": {
+                            "enabled": true,
+                            "backend": "memory",
+                            "source": "openai",
+                            "openai": {
+                                "base_url": embedding_url,
+                                "model": "text-embedding-3-small",
+                                "timeout_ms": 2000,
+                                "allow_private_base_url": true
+                            }
+                        }
+                    },
+                    "idempotency": {"enabled": true}
+                }
+            }
+        });
+        let compiled =
+            sbproxy_config::compile_config(&source.to_string()).expect("compile test origin");
+        let mut pipeline = crate::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+            .expect("construct test pipeline");
+        assert!(
+            pipeline.semantic_caches.get(0, None).is_some(),
+            "the fixture origin must carry a live semantic cache"
+        );
+
+        let configured = pipeline.idempotencies[0]
+            .as_ref()
+            .expect("compiled idempotency");
+        let recording_idempotency = Arc::new(RecordingIdempotencyCache::default());
+        let replacement = crate::pipeline::CompiledIdempotency {
+            cache: recording_idempotency.clone(),
+            header_name: configured.header_name.clone(),
+            ttl_secs: configured.ttl_secs,
+            methods: configured.methods.clone(),
+            max_request_body_bytes: configured.max_request_body_bytes,
+            max_response_body_bytes: configured.max_response_body_bytes,
+            permits: configured.permits.clone(),
+        };
+        pipeline.idempotencies[0] = Some(Arc::new(replacement));
+
+        (pipeline, probe, recording_idempotency)
+    }
+
+    async fn blocking_guardrail() -> (String, tokio::sync::oneshot::Receiver<serde_json::Value>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind guardrail fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept guardrail request");
+            let mut bytes = Vec::new();
+            let mut chunk = [0_u8; 2048];
+            loop {
+                let read = stream
+                    .read(&mut chunk)
+                    .await
+                    .expect("read guardrail request");
+                if read == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&chunk[..read]);
+                if let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    let headers = std::str::from_utf8(&bytes[..header_end]).expect("headers utf8");
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length: "))
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or_default();
+                    if bytes.len() >= header_end + 4 + content_length {
+                        let body = &bytes[header_end + 4..header_end + 4 + content_length];
+                        sender
+                            .send(serde_json::from_slice(body).expect("guardrail JSON"))
+                            .expect("receive guardrail body");
+                        break;
+                    }
+                }
+            }
+            let body = r#"{"allowed":false}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(), body
+            );
+            stream.write_all(response.as_bytes()).await.expect("reply");
+        });
+        (format!("http://{address}/check"), receiver)
+    }
+
+    fn guardrail_config(url: String, mode: &str) -> ExternalGuardrailConfig {
+        serde_json::from_value(serde_json::json!({
+            "name": "customer-policy",
+            "url": url,
+            "mode": mode,
+            "default_on": true,
+            "allow_private_url": true
+        }))
+        .expect("guardrail config")
+    }
+
+    struct DownstreamClient {
+        task: Option<tokio::task::JoinHandle<Vec<u8>>>,
+    }
+
+    impl DownstreamClient {
+        fn new(task: tokio::task::JoinHandle<Vec<u8>>) -> Self {
+            Self { task: Some(task) }
+        }
+
+        async fn abort_and_wait(&mut self) {
+            if let Some(task) = self.task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+    }
+
+    impl Drop for DownstreamClient {
+        fn drop(&mut self) {
+            if let Some(task) = self.task.as_ref() {
+                task.abort();
+            }
+        }
+    }
+
+    /// Whether `buffer` holds a complete HTTP/1.1 response: a terminated
+    /// header block plus at least `content-length` body bytes.
+    ///
+    /// Used to tell a reset that arrived after the whole response from one
+    /// that truncated it. A response with no `content-length` is treated as
+    /// complete once its headers terminate, which is what the close-delimited
+    /// bodies in these fixtures look like.
+    fn http_response_is_complete(buffer: &[u8]) -> bool {
+        let Some(header_end) = buffer
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|position| position + 4)
+        else {
+            return false;
+        };
+        let headers = String::from_utf8_lossy(&buffer[..header_end]);
+        let declared = headers.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        });
+        match declared {
+            Some(length) => buffer.len() - header_end >= length,
+            None => true,
+        }
+    }
+
+    async fn live_downstream_body(mut client: DownstreamClient) -> Vec<u8> {
+        let task = client.task.as_mut().expect("downstream client task");
+        match tokio::time::timeout(Duration::from_secs(2), task).await {
+            Ok(result) => result.expect("downstream client"),
+            Err(error) => {
+                client.abort_and_wait().await;
+                panic!("downstream response timed out after session close: {error:?}");
+            }
+        }
+    }
+
+    async fn downstream_session(body: serde_json::Value) -> (Session, DownstreamClient) {
+        downstream_bytes_session(
+            "/v1/chat/completions",
+            "application/json",
+            serde_json::to_vec(&body).expect("request JSON"),
+        )
+        .await
+    }
+
+    async fn downstream_bytes_session(
+        path: &str,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> (Session, DownstreamClient) {
+        downstream_method_bytes_session("POST", path, content_type, body).await
+    }
+
+    async fn downstream_method_bytes_session(
+        method: &str,
+        path: &str,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> (Session, DownstreamClient) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind downstream fixture");
+        let address = listener.local_addr().expect("downstream address");
+        let method = method.to_string();
+        let path = path.to_string();
+        let content_type = content_type.to_string();
+        let mut client = DownstreamClient::new(tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect downstream fixture");
+            let request = format!(
+                "{method} {path} HTTP/1.1\r\nHost: ai.test\r\ncontent-type: {content_type}\r\nIdempotency-Key: guardrail-test\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(request.as_bytes())
+                .await
+                .expect("write request headers");
+            stream.write_all(&body).await.expect("write request body");
+            // Half-close after the request. An early policy refusal never
+            // reads the body, and a close with unread data in the socket
+            // buffer is what turns the server's FIN into an RST; the RST
+            // can arrive between the response headers and the response
+            // body, truncating the read below.
+            let _ = stream.shutdown().await;
+            let mut response = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                match stream.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(read) => response.extend_from_slice(&chunk[..read]),
+                    // A reset counts as EOF only once the response is whole.
+                    // Accepting it on any non-empty buffer is what made this
+                    // fixture flaky: a reset after the headers but before the
+                    // body returned a header-only response, and assertions on
+                    // the body then failed with an empty one.
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::ConnectionReset
+                            && http_response_is_complete(&response) =>
+                    {
+                        break;
+                    }
+                    Err(error) => panic!(
+                        "read downstream response: {error:?} after {} bytes: {}",
+                        response.len(),
+                        String::from_utf8_lossy(&response)
+                    ),
+                }
+            }
+            response
+        }));
+        let (stream, _) =
+            match tokio::time::timeout(Duration::from_secs(2), listener.accept()).await {
+                Ok(Ok(accepted)) => accepted,
+                Ok(Err(error)) => {
+                    client.abort_and_wait().await;
+                    panic!("accept downstream request: {error}");
+                }
+                Err(error) => {
+                    client.abort_and_wait().await;
+                    panic!("accept downstream request timed out: {error:?}");
+                }
+            };
+        let mut session = Session::new_h1(Box::new(Stream::from(stream)));
+        match tokio::time::timeout(
+            Duration::from_secs(2),
+            session.as_downstream_mut().read_request(),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                client.abort_and_wait().await;
+                panic!("parse downstream request: {error}");
+            }
+            Err(error) => {
+                client.abort_and_wait().await;
+                panic!("parse downstream request timed out: {error:?}");
+            }
+        }
+        (session, client)
+    }
+
+    fn proxy_config(
+        upstream_url: &str,
+        guardrail_url: String,
+        mode: &str,
+    ) -> sbproxy_ai::AiHandlerConfig {
+        proxy_config_with_fail_mode(upstream_url, guardrail_url, mode, false)
+    }
+
+    fn proxy_config_with_fail_mode(
+        upstream_url: &str,
+        guardrail_url: String,
+        mode: &str,
+        fail_open: bool,
+    ) -> sbproxy_ai::AiHandlerConfig {
+        sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key",
+                "model_map": {"requested-model": "selected-model"}
+            }],
+            "guardrails": {"external": [{
+                "name": "customer-policy",
+                "url": guardrail_url,
+                "mode": mode,
+                "default_on": true,
+                "fail_open": fail_open,
+                "allow_private_url": true
+            }]}
+        }))
+        .expect("proxy config")
+    }
+
+    async fn upstream_fixture(body: &'static str) -> (String, Arc<AtomicUsize>) {
+        upstream_bytes_fixture(body.as_bytes().to_vec(), "application/json").await
+    }
+
+    async fn upstream_bytes_fixture(
+        body: Vec<u8>,
+        content_type: &'static str,
+    ) -> (String, Arc<AtomicUsize>) {
+        upstream_bytes_fixture_with_optional_content_type(body, Some(content_type)).await
+    }
+
+    async fn upstream_bytes_fixture_with_optional_content_type(
+        body: Vec<u8>,
+        content_type: Option<&'static str>,
+    ) -> (String, Arc<AtomicUsize>) {
+        upstream_bytes_fixture_with_status(body, content_type, 200).await
+    }
+
+    async fn upstream_bytes_fixture_with_status(
+        body: Vec<u8>,
+        content_type: Option<&'static str>,
+        status: u16,
+    ) -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream fixture");
+        let address = listener.local_addr().expect("upstream address");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&hits);
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept upstream request");
+            observed.fetch_add(1, Ordering::SeqCst);
+            let mut request = [0_u8; 4096];
+            let _ = stream
+                .read(&mut request)
+                .await
+                .expect("read upstream request");
+            let content_type_header = content_type
+                .map(|content_type| format!("content-type: {content_type}\r\n"))
+                .unwrap_or_default();
+            let response = format!(
+                "HTTP/1.1 {status} Fixture\r\n{content_type_header}content-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write upstream response");
+            stream
+                .write_all(&body)
+                .await
+                .expect("write upstream response body");
+        });
+        (format!("http://{address}/v1"), hits)
+    }
+
+    fn gemini_proxy_config(upstream_url: &str) -> sbproxy_ai::AiHandlerConfig {
+        sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "gemini-fixture",
+                "provider_type": "gemini",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key",
+                "model_map": {"requested-model": "gemini-2.5-flash"}
+            }]
+        }))
+        .expect("Gemini proxy config")
+    }
+
+    fn openai_proxy_config(upstream_url: &str) -> sbproxy_ai::AiHandlerConfig {
+        sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key"
+            }]
+        }))
+        .expect("OpenAI proxy config")
+    }
+
+    fn anthropic_proxy_config(upstream_url: &str) -> sbproxy_ai::AiHandlerConfig {
+        sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "anthropic",
+                "provider_type": "anthropic",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key"
+            }]
+        }))
+        .expect("Anthropic proxy config")
+    }
+
+    fn cascade_error_proxy_config(upstream_url: &str) -> sbproxy_ai::AiHandlerConfig {
+        sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key"
+            }],
+            "routing": {
+                "strategy": "cascade",
+                "tiers": [{
+                    "provider_id": "openai",
+                    "model": "selected-model",
+                    "quality_threshold": 0.5
+                }]
+            }
+        }))
+        .expect("cascade error proxy config")
+    }
+
+    fn content_policy_fallback_proxy_config(upstream_url: &str) -> sbproxy_ai::AiHandlerConfig {
+        sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key"
+            }],
+            "resilience": {
+                "content_policy_fallback": true
+            }
+        }))
+        .expect("content-policy fallback proxy config")
+    }
+
+    fn response_json(response: &[u8]) -> serde_json::Value {
+        let header_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("HTTP response header terminator");
+        serde_json::from_slice(&response[header_end + 4..]).expect("JSON response body")
+    }
+
+    fn anthropic_messages_request() -> serde_json::Value {
+        serde_json::json!({
+            "model": "requested-model",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        })
+    }
+
+    fn canonical_chat_response(text: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "id": "chatcmpl-cache",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "selected-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+        }))
+        .expect("canonical response JSON")
+    }
+
+    fn provider_error_body() -> serde_json::Value {
+        serde_json::json!({
+            "error": {
+                "code": 400,
+                "status": "INVALID_ARGUMENT",
+                "message": "provider-private-sentinel content policy violation",
+                "details": [{"reason": "API_KEY_INVALID"}]
+            }
+        })
+    }
+
+    fn multipart_audio_request() -> (&'static str, Vec<u8>) {
+        const BOUNDARY: &str = "sbproxy-guardrail-boundary";
+        let body = format!(
+            "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nrequested-model\r\n\
+             --{BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"fixture.wav\"\r\n\
+             Content-Type: audio/wav\r\n\r\nfixture-audio\r\n--{BOUNDARY}--\r\n"
+        );
+        (
+            "multipart/form-data; boundary=sbproxy-guardrail-boundary",
+            body.into_bytes(),
+        )
+    }
+
+    fn cascade_proxy_config(
+        upstream_url: &str,
+        guardrail_url: String,
+    ) -> sbproxy_ai::AiHandlerConfig {
+        sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "cascade-fixture",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key"
+            }],
+            "routing": {
+                "strategy": "cascade",
+                "tiers": [{
+                    "provider_id": "cascade-fixture",
+                    "model": "cascade-selected-model",
+                    "quality_threshold": 0.5
+                }]
+            },
+            "guardrails": {"external": [{
+                "name": "customer-policy",
+                "url": guardrail_url,
+                "mode": "post_call",
+                "default_on": true,
+                "allow_private_url": true
+            }]}
+        }))
+        .expect("cascade proxy config")
+    }
+
+    #[tokio::test]
+    async fn external_guardrail_runners_send_model_and_exact_phase() {
+        let (input_url, input_received) = blocking_guardrail().await;
+        let input = run_input_external_guardrails(
+            &[guardrail_config(input_url, "pre_call")],
+            "fixture prompt",
+            "requested-model",
+        )
+        .await;
+        assert!(
+            input.is_some(),
+            "blocking input guardrail must stop dispatch"
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), input_received)
+                .await
+                .expect("input guardrail request timed out")
+                .expect("input fixture dropped"),
+            serde_json::json!({
+                "input": "fixture prompt",
+                "model": "requested-model",
+                "phase": "input"
+            })
+        );
+
+        let (output_url, output_received) = blocking_guardrail().await;
+        let output = run_output_external_guardrails(
+            &[guardrail_config(output_url, "post_call")],
+            "provider-controlled text",
+            "selected-model",
+        )
+        .await;
+        let (_, reason) =
+            output.expect("blocking output guardrail must reject the buffered response");
+        assert!(
+            !reason.contains("provider-controlled text"),
+            "provider-controlled output must not become the guardrail response"
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), output_received)
+                .await
+                .expect("output guardrail request timed out")
+                .expect("output fixture dropped"),
+            serde_json::json!({
+                "input": "provider-controlled text",
+                "model": "selected-model",
+                "phase": "output"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn gemini_error_to_anthropic_path_preserves_error_envelope() {
+        let upstream_error = serde_json::json!({
+            "error": {
+                "code": 400,
+                "status": "INVALID_ARGUMENT",
+                "details": [{"reason": "API_KEY_INVALID"}]
+            }
+        });
+        let (upstream_url, upstream_hits) = upstream_bytes_fixture_with_status(
+            serde_json::to_vec(&upstream_error).expect("upstream JSON"),
+            Some("application/json"),
+            400,
+        )
+        .await;
+        let config = gemini_proxy_config(&upstream_url);
+        let request = serde_json::json!({
+            "model": "requested-model",
+            "max_tokens": 32,
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        });
+        let (mut session, client) = downstream_bytes_session(
+            "/v1/messages",
+            "application/json",
+            serde_json::to_vec(&request).expect("request JSON"),
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("Gemini provider error is handled");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 400"), "{response:?}");
+        assert_eq!(response_json(&response), upstream_error);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn gemini_error_to_responses_path_preserves_error_envelope() {
+        let upstream_error = serde_json::json!({
+            "error": {
+                "code": 400,
+                "status": "INVALID_ARGUMENT",
+                "details": [{"reason": "API_KEY_INVALID"}]
+            }
+        });
+        let (upstream_url, upstream_hits) = upstream_bytes_fixture_with_status(
+            serde_json::to_vec(&upstream_error).expect("upstream JSON"),
+            Some("application/json"),
+            400,
+        )
+        .await;
+        let config = gemini_proxy_config(&upstream_url);
+        let request = serde_json::json!({
+            "model": "requested-model",
+            "input": "fixture prompt"
+        });
+        let (mut session, client) = downstream_bytes_session(
+            "/v1/responses",
+            "application/json",
+            serde_json::to_vec(&request).expect("request JSON"),
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("Gemini provider error is handled");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 400"), "{response:?}");
+        assert_eq!(response_json(&response), upstream_error);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn buffered_get_error_logs_one_body_aware_diagnostic() {
+        let upstream_error = provider_error_body();
+        let (upstream_url, upstream_hits) = upstream_bytes_fixture_with_status(
+            serde_json::to_vec(&upstream_error).expect("upstream JSON"),
+            Some("application/json"),
+            400,
+        )
+        .await;
+        let config = openai_proxy_config(&upstream_url);
+        let (mut session, client) =
+            downstream_method_bytes_session("GET", "/v1/files/file-1", "application/json", vec![])
+                .await;
+        let mut context = crate::context::RequestContext::new();
+
+        let warnings = handle_with_captured_warnings(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            &mut context,
+            None,
+        )
+        .await;
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 400"), "{response:?}");
+        assert_eq!(response_json(&response), upstream_error);
+        assert_single_body_aware_provider_diagnostic(&warnings, "openai", 400);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn buffered_method_idempotency_error_logs_one_body_aware_diagnostic() {
+        let upstream_error = provider_error_body();
+        let (upstream_url, upstream_hits) = upstream_bytes_fixture_with_status(
+            serde_json::to_vec(&upstream_error).expect("upstream JSON"),
+            Some("application/json"),
+            400,
+        )
+        .await;
+        let config = openai_proxy_config(&upstream_url);
+        let (mut session, client) = downstream_method_bytes_session(
+            "PUT",
+            "/v1/files/file-1",
+            "application/json",
+            br#"{"value":1}"#.to_vec(),
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        let warnings = handle_with_captured_warnings(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            &mut context,
+            None,
+        )
+        .await;
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 400"), "{response:?}");
+        assert_eq!(response_json(&response), upstream_error);
+        assert_single_body_aware_provider_diagnostic(&warnings, "openai", 400);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn buffered_cascade_error_logs_one_body_aware_diagnostic() {
+        let upstream_error = provider_error_body();
+        let (upstream_url, upstream_hits) = upstream_bytes_fixture_with_status(
+            serde_json::to_vec(&upstream_error).expect("upstream JSON"),
+            Some("application/json"),
+            400,
+        )
+        .await;
+        let config = cascade_error_proxy_config(&upstream_url);
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        let warnings = handle_with_captured_warnings(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            &mut context,
+            None,
+        )
+        .await;
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 400"), "{response:?}");
+        assert_eq!(response_json(&response), upstream_error);
+        assert_single_body_aware_provider_diagnostic(&warnings, "openai", 400);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn buffered_content_policy_fallback_error_logs_one_body_aware_diagnostic() {
+        let upstream_error = provider_error_body();
+        let (upstream_url, upstream_hits) = upstream_bytes_fixture_with_status(
+            serde_json::to_vec(&upstream_error).expect("upstream JSON"),
+            Some("application/json"),
+            400,
+        )
+        .await;
+        let config = content_policy_fallback_proxy_config(&upstream_url);
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        let warnings = handle_with_captured_warnings(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            &mut context,
+            None,
+        )
+        .await;
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 400"), "{response:?}");
+        assert_eq!(response_json(&response), upstream_error);
+        assert_single_body_aware_provider_diagnostic(&warnings, "openai", 400);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn external_input_guardrail_blocks_before_the_proxy_contacts_upstream() {
+        let (guardrail_url, received) = blocking_guardrail().await;
+        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"choices":[]}"#).await;
+        let config = proxy_config(&upstream_url, guardrail_url, "pre_call");
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("input block is a handled response");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        let response = std::str::from_utf8(&response).expect("response utf8");
+        assert!(
+            response.starts_with("HTTP/1.1 400"),
+            "input violation must be returned to the client"
+        );
+        assert!(
+            response.contains("guardrail_violation"),
+            "input violation must use the safe guardrail envelope: {response}"
+        );
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            0,
+            "input violation must not contact the upstream model"
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), received)
+                .await
+                .expect("input guardrail request timed out")
+                .expect("input fixture dropped"),
+            serde_json::json!({
+                "input": "fixture prompt",
+                "model": "requested-model",
+                "phase": "input"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn external_input_guardrail_receives_text_from_malformed_forwarded_messages() {
+        let (guardrail_url, received) = blocking_guardrail().await;
+        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"choices":[]}"#).await;
+        let config = proxy_config(&upstream_url, guardrail_url, "pre_call");
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "messages": [
+                {"role": "user", "content": "safe prefix"},
+                {"role": 7, "content": "malformed forwarded sentinel"}
+            ]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("malformed-message guardrail block is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response utf8");
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+        let payload = tokio::time::timeout(Duration::from_secs(1), received)
+            .await
+            .expect("guardrail request timed out")
+            .expect("guardrail fixture dropped");
+        assert!(
+            payload["input"]
+                .as_str()
+                .is_some_and(|input| input.contains("malformed forwarded sentinel")),
+            "the canonical extractor must not discard forwarded malformed entries: {payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_output_guardrail_fails_closed_for_stream_before_any_replay_or_lookup() {
+        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"choices":[]}"#).await;
+        let config = proxy_config(
+            &upstream_url,
+            "https://8.8.8.8/check".to_string(),
+            "post_call",
+        );
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+        let (pipeline, semantic, idempotency) = pipeline_with_recording_caches().await;
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("uninspectable stream is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response utf8");
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert!(response.contains("guardrail_violation"), "{response}");
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(semantic.calls(), 0);
+        assert_eq!(idempotency.gets.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn reasoning_policy_bypasses_semantic_hit_before_provider_dispatch() {
+        let (upstream_url, upstream_hits) =
+            upstream_fixture(r#"{"choices":[{"message":{"content":"fresh-under-budget"}}]}"#).await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key",
+                "models": ["gpt-5-mini"]
+            }],
+            "reasoning": {"budget": 32}
+        }))
+        .expect("reasoning config");
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "gpt-5-mini",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+        let (pipeline, semantic, _) = pipeline_with_recording_caches().await;
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("reasoning request is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response utf8");
+        assert!(response.contains("fresh-under-budget"), "{response}");
+        // A configured reasoning policy bypasses semantic caching entirely,
+        // so the dispatcher must not even embed the prompt.
+        assert_eq!(semantic.calls(), 0);
+        let stats = semantic_stats(&pipeline, 0, None);
+        assert_eq!(stats.lookups, 0);
+        assert_eq!(stats.writes, 0);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// A streaming request must never reach the semantic cache. The gate
+    /// runs before the embedding call, so neither the embedding source nor
+    /// the backend is touched.
+    #[tokio::test]
+    async fn streaming_request_skips_embedding_lookup_and_store() {
+        let (upstream_url, upstream_hits) = upstream_bytes_fixture(
+            canonical_chat_response("buffered stream"),
+            "application/json",
+        )
+        .await;
+        let config = openai_proxy_config(&upstream_url);
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+        let (pipeline, semantic, _) = pipeline_with_recording_caches().await;
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("streaming request is handled");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            semantic.calls(),
+            0,
+            "a streaming request must not pay for an embedding call"
+        );
+        let stats = semantic_stats(&pipeline, 0, None);
+        assert_eq!(stats.lookups, 0, "a streaming request must not look up");
+        assert_eq!(stats.writes, 0, "a streaming request must not be admitted");
+        assert_eq!(stats.write_errors, 0);
+    }
+
+    /// A non-streaming request does run the semantic path, which is what
+    /// makes the streaming assertions above meaningful.
+    #[tokio::test]
+    async fn buffered_request_enters_the_semantic_path_once() {
+        let (upstream_url, upstream_hits) =
+            upstream_bytes_fixture(canonical_chat_response("fresh"), "application/json").await;
+        let config = openai_proxy_config(&upstream_url);
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+        let (pipeline, semantic, _) = pipeline_with_recording_caches().await;
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("buffered request is handled");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+        assert_eq!(semantic.calls(), 1);
+        // The probe never returns a vector, so the lookup fails open and the
+        // request is served from the provider uncached.
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        let stats = semantic_stats(&pipeline, 0, None);
+        assert_eq!(stats.lookups, 0);
+        assert_eq!(stats.writes, 0);
+    }
+
+    #[tokio::test]
+    async fn anthropic_messages_idempotency_hit_rewraps_canonical_success() {
+        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"choices":[]}"#).await;
+        let config = openai_proxy_config(&upstream_url);
+        let request = anthropic_messages_request();
+        let native_request = serde_json::to_vec(&request).expect("request JSON");
+        let request_hash = sbproxy_middleware::idempotency::hash_body(&native_request);
+        let (mut session, client) =
+            downstream_bytes_session("/v1/messages", "application/json", native_request).await;
+        let mut context = crate::context::RequestContext::new();
+        let (pipeline, semantic, idempotency) = pipeline_with_recording_caches().await;
+        *idempotency.hit.lock().expect("idempotency hit lock") =
+            Some(sbproxy_middleware::idempotency::CachedResponse {
+                status: 200,
+                headers: vec![("content-type".to_string(), "application/json".to_string())],
+                body: canonical_chat_response("idempotency replay"),
+                request_body_hash: request_hash,
+                expires_at_unix: u64::MAX,
+            });
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("idempotency replay is handled");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+        let body = response_json(&response);
+        assert_eq!(body["type"], "message");
+        assert_eq!(body["content"][0]["text"], "idempotency replay");
+        assert!(body.get("choices").is_none(), "{body}");
+        assert_eq!(semantic.calls(), 0);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn anthropic_messages_idempotency_hit_preserves_error_response() {
+        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"choices":[]}"#).await;
+        let config = openai_proxy_config(&upstream_url);
+        let request = anthropic_messages_request();
+        let native_request = serde_json::to_vec(&request).expect("request JSON");
+        let request_hash = sbproxy_middleware::idempotency::hash_body(&native_request);
+        let (mut session, client) =
+            downstream_bytes_session("/v1/messages", "application/json", native_request).await;
+        let mut context = crate::context::RequestContext::new();
+        let (pipeline, semantic, idempotency) = pipeline_with_recording_caches().await;
+        let cached_error = br#"{"error":{"type":"rate_limit_error","message":"try later"}}"#;
+        *idempotency.hit.lock().expect("idempotency hit lock") =
+            Some(sbproxy_middleware::idempotency::CachedResponse {
+                status: 429,
+                headers: vec![("content-type".to_string(), "application/json".to_string())],
+                body: cached_error.to_vec(),
+                request_body_hash: request_hash,
+                expires_at_unix: u64::MAX,
+            });
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("idempotency error replay is handled");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 429"), "{response:?}");
+        let header_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("HTTP response header terminator");
+        assert_eq!(&response[header_end + 4..], cached_error);
+        assert_eq!(semantic.calls(), 0);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn anthropic_messages_error_miss_stores_and_replays_provider_envelope() {
+        let error =
+            br#"{"type":"error","error":{"type":"rate_limit_error","message":"try later"}}"#;
+        let (upstream_url, upstream_hits) =
+            upstream_bytes_fixture_with_status(error.to_vec(), Some("application/json"), 429).await;
+        let config = anthropic_proxy_config(&upstream_url);
+        let request = anthropic_messages_request();
+        let request_bytes = serde_json::to_vec(&request).expect("request JSON");
+        let (pipeline, semantic, idempotency) = pipeline_with_recording_caches().await;
+
+        let (mut first_session, first_client) =
+            downstream_bytes_session("/v1/messages", "application/json", request_bytes.clone())
+                .await;
+        let mut first_context = crate::context::RequestContext::new();
+        super::handle_ai_proxy(
+            &mut first_session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut first_context,
+            Some(0),
+        )
+        .await
+        .expect("initial error response is handled");
+        drop(first_session);
+        let first_response = live_downstream_body(first_client).await;
+        let first_header_end = first_response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("first HTTP response header terminator");
+        assert_eq!(&first_response[first_header_end + 4..], error);
+
+        let stored = idempotency
+            .stored
+            .lock()
+            .expect("idempotency stored lock")
+            .clone()
+            .expect("error response stored");
+        assert_eq!(stored.body, error);
+        let semantic_calls_after_miss = semantic.calls();
+        assert_eq!(semantic_calls_after_miss, 1);
+        *idempotency.hit.lock().expect("idempotency hit lock") = Some(stored);
+
+        let (mut replay_session, replay_client) =
+            downstream_bytes_session("/v1/messages", "application/json", request_bytes).await;
+        let mut replay_context = crate::context::RequestContext::new();
+        super::handle_ai_proxy(
+            &mut replay_session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut replay_context,
+            Some(0),
+        )
+        .await
+        .expect("cached error response is handled");
+        drop(replay_session);
+        let replay_response = live_downstream_body(replay_client).await;
+        let replay_header_end = replay_response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("replay HTTP response header terminator");
+        assert_eq!(&replay_response[replay_header_end + 4..], error);
+        assert_eq!(
+            semantic.calls(),
+            semantic_calls_after_miss,
+            "an idempotency replay must short-circuit before the semantic path"
+        );
+        assert_eq!(idempotency.gets.load(Ordering::SeqCst), 2);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn buffered_stream_success_stores_and_replays_exact_client_wire_body() {
+        let canonical_response = canonical_chat_response("buffered stream response");
+        let (upstream_url, upstream_hits) =
+            upstream_bytes_fixture(canonical_response, "application/json").await;
+        let config = openai_proxy_config(&upstream_url);
+        let mut request = anthropic_messages_request();
+        request["stream"] = serde_json::Value::Bool(true);
+        let request_bytes = serde_json::to_vec(&request).expect("request JSON");
+        let (pipeline, _, idempotency) = pipeline_with_recording_caches().await;
+
+        let (mut first_session, first_client) =
+            downstream_bytes_session("/v1/messages", "application/json", request_bytes.clone())
+                .await;
+        let mut first_context = crate::context::RequestContext::new();
+        super::handle_ai_proxy(
+            &mut first_session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut first_context,
+            Some(0),
+        )
+        .await
+        .expect("buffered stream response is handled");
+        drop(first_session);
+        let first_response = live_downstream_body(first_client).await;
+        assert!(
+            first_response.starts_with(b"HTTP/1.1 200"),
+            "{first_response:?}"
+        );
+        let first_body = response_json(&first_response);
+        assert_eq!(first_body["type"], "message");
+        assert_eq!(first_body["content"][0]["text"], "buffered stream response");
+
+        let stored = idempotency
+            .stored
+            .lock()
+            .expect("idempotency stored lock")
+            .clone()
+            .expect("buffered stream response stored");
+        let first_header_end = first_response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("first HTTP response header terminator");
+        assert_eq!(stored.body, first_response[first_header_end + 4..]);
+        assert!(ai_idempotency_body_is_wire(&stored.headers));
+        *idempotency.hit.lock().expect("idempotency hit lock") = Some(stored);
+
+        let (mut replay_session, replay_client) =
+            downstream_bytes_session("/v1/messages", "application/json", request_bytes).await;
+        let mut replay_context = crate::context::RequestContext::new();
+        super::handle_ai_proxy(
+            &mut replay_session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut replay_context,
+            Some(0),
+        )
+        .await
+        .expect("buffered stream replay is handled");
+        drop(replay_session);
+        let replay_response = live_downstream_body(replay_client).await;
+        let replay_header_end = replay_response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("replay HTTP response header terminator");
+        assert_eq!(
+            &replay_response[replay_header_end + 4..],
+            &first_response[first_header_end + 4..]
+        );
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn native_only_request_fields_participate_in_idempotency_conflicts() {
+        let (upstream_url, upstream_hits) = upstream_bytes_fixture(
+            canonical_chat_response("first response"),
+            "application/json",
+        )
+        .await;
+        let config = openai_proxy_config(&upstream_url);
+        let request_with_document = |text: &str| {
+            serde_json::json!({
+                "model": "requested-model",
+                "max_tokens": 64,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "same canonical prompt"},
+                        {
+                            "type": "document",
+                            "source": {"type": "text", "data": text}
+                        }
+                    ]
+                }]
+            })
+        };
+        let first_request =
+            serde_json::to_vec(&request_with_document("first native document")).unwrap();
+        let conflicting_request =
+            serde_json::to_vec(&request_with_document("different native document")).unwrap();
+        assert_eq!(
+            sbproxy_ai::format::anthropic_messages::translate_anthropic_request_to_openai(
+                &first_request
+            )
+            .unwrap(),
+            sbproxy_ai::format::anthropic_messages::translate_anthropic_request_to_openai(
+                &conflicting_request
+            )
+            .unwrap(),
+            "the regression requires fields omitted by canonical translation"
+        );
+        let (pipeline, _, idempotency) = pipeline_with_recording_caches().await;
+
+        let (mut first_session, first_client) =
+            downstream_bytes_session("/v1/messages", "application/json", first_request).await;
+        let mut first_context = crate::context::RequestContext::new();
+        super::handle_ai_proxy(
+            &mut first_session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut first_context,
+            Some(0),
+        )
+        .await
+        .expect("first native request is handled");
+        drop(first_session);
+        let first_response = live_downstream_body(first_client).await;
+        assert!(
+            first_response.starts_with(b"HTTP/1.1 200"),
+            "{first_response:?}"
+        );
+
+        let stored = idempotency
+            .stored
+            .lock()
+            .expect("idempotency stored lock")
+            .clone()
+            .expect("first response stored");
+        *idempotency.hit.lock().expect("idempotency hit lock") = Some(stored);
+
+        let (mut conflict_session, conflict_client) =
+            downstream_bytes_session("/v1/messages", "application/json", conflicting_request).await;
+        let mut conflict_context = crate::context::RequestContext::new();
+        super::handle_ai_proxy(
+            &mut conflict_session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut conflict_context,
+            Some(0),
+        )
+        .await
+        .expect("native idempotency conflict is handled");
+        drop(conflict_session);
+        let conflict_response = live_downstream_body(conflict_client).await;
+        assert!(
+            conflict_response.starts_with(b"HTTP/1.1 409"),
+            "{conflict_response:?}"
+        );
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// The idempotency record holds the exact client wire bytes while the
+    /// semantic path stays on the canonical body. The canonical half is
+    /// pinned end to end by `semantic_cache_e2e`; here the observable is
+    /// that the semantic path ran exactly once and did not disturb the
+    /// idempotency record.
+    #[tokio::test]
+    async fn anthropic_messages_miss_keeps_semantic_canonical_and_idempotency_wire_exact() {
+        let canonical_response = canonical_chat_response("fresh upstream");
+        let (upstream_url, upstream_hits) =
+            upstream_bytes_fixture(canonical_response.clone(), "application/json").await;
+        let config = openai_proxy_config(&upstream_url);
+        let request = anthropic_messages_request();
+        let (mut session, client) = downstream_bytes_session(
+            "/v1/messages",
+            "application/json",
+            serde_json::to_vec(&request).expect("request JSON"),
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+        let (pipeline, semantic, idempotency) = pipeline_with_recording_caches().await;
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("cache miss is handled");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+        let header_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("HTTP response header terminator");
+        let client_wire_body = &response[header_end + 4..];
+        let client_body = response_json(&response);
+        assert_eq!(client_body["type"], "message");
+        assert_eq!(client_body["content"][0]["text"], "fresh upstream");
+
+        assert_eq!(semantic.calls(), 1);
+        let idempotency_response = idempotency
+            .stored
+            .lock()
+            .expect("idempotency stored lock")
+            .clone()
+            .expect("idempotency response stored");
+        assert_ne!(
+            idempotency_response.body, canonical_response,
+            "the idempotency record holds client wire bytes, not the canonical body"
+        );
+        assert_eq!(idempotency_response.body, client_wire_body);
+        assert!(ai_idempotency_body_is_wire(&idempotency_response.headers));
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn anthropic_native_idempotency_miss_and_replay_are_byte_identical() {
+        let native_response = br#"{ "id":"msg_exact", "type":"message", "role":"assistant", "content":[{"type":"text","text":"native response"}], "model":"claude-3-5-sonnet", "stop_reason":"end_turn", "usage":{"input_tokens":4,"output_tokens":2}, "native_only":{"service_tier":"priority"} }"#.to_vec();
+        let (upstream_url, upstream_hits) =
+            upstream_bytes_fixture(native_response.clone(), "application/json").await;
+        let config = anthropic_proxy_config(&upstream_url);
+        let request_bytes =
+            serde_json::to_vec(&anthropic_messages_request()).expect("request JSON");
+        let (pipeline, semantic, idempotency) = pipeline_with_recording_caches().await;
+
+        let (mut first_session, first_client) =
+            downstream_bytes_session("/v1/messages", "application/json", request_bytes.clone())
+                .await;
+        let mut first_context = crate::context::RequestContext::new();
+        super::handle_ai_proxy(
+            &mut first_session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut first_context,
+            Some(0),
+        )
+        .await
+        .expect("initial native response is handled");
+        drop(first_session);
+        let first_response = live_downstream_body(first_client).await;
+        let first_header_end = first_response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("first HTTP response header terminator");
+        assert_eq!(&first_response[first_header_end + 4..], native_response);
+
+        let stored = idempotency
+            .stored
+            .lock()
+            .expect("idempotency stored lock")
+            .clone()
+            .expect("native response stored");
+        assert_eq!(stored.body, native_response);
+        assert!(ai_idempotency_body_is_wire(&stored.headers));
+        let semantic_calls_after_miss = semantic.calls();
+        *idempotency.hit.lock().expect("idempotency hit lock") = Some(stored.clone());
+
+        let (mut replay_session, replay_client) =
+            downstream_bytes_session("/v1/messages", "application/json", request_bytes.clone())
+                .await;
+        let mut replay_context = crate::context::RequestContext::new();
+        super::handle_ai_proxy(
+            &mut replay_session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut replay_context,
+            Some(0),
+        )
+        .await
+        .expect("cached native response is handled");
+        drop(replay_session);
+        let replay_response = live_downstream_body(replay_client).await;
+        let replay_header_end = replay_response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("replay HTTP response header terminator");
+        assert_eq!(&replay_response[replay_header_end + 4..], native_response);
+        assert!(
+            !String::from_utf8_lossy(&replay_response[..replay_header_end])
+                .contains(AI_IDEMPOTENCY_BODY_FORMAT_HEADER),
+            "internal cache metadata leaked to the client"
+        );
+
+        // Migration coverage: entries written before the wire-format marker
+        // may already contain native bytes. The shape-aware legacy path must
+        // leave their formatting and native-only fields untouched.
+        let mut legacy_native = stored;
+        legacy_native
+            .headers
+            .retain(|(name, _)| !name.eq_ignore_ascii_case(AI_IDEMPOTENCY_BODY_FORMAT_HEADER));
+        *idempotency.hit.lock().expect("idempotency hit lock") = Some(legacy_native);
+        let (mut legacy_session, legacy_client) =
+            downstream_bytes_session("/v1/messages", "application/json", request_bytes).await;
+        let mut legacy_context = crate::context::RequestContext::new();
+        super::handle_ai_proxy(
+            &mut legacy_session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut legacy_context,
+            Some(0),
+        )
+        .await
+        .expect("legacy native cache response is handled");
+        drop(legacy_session);
+        let legacy_response = live_downstream_body(legacy_client).await;
+        let legacy_header_end = legacy_response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("legacy HTTP response header terminator");
+        assert_eq!(&legacy_response[legacy_header_end + 4..], native_response);
+        assert_eq!(
+            semantic.calls(),
+            semantic_calls_after_miss,
+            "an idempotency replay must short-circuit before the semantic path"
+        );
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    }
+
+    // A semantic hit is evaluated against today's output guardrails before
+    // any replay byte leaves. Seeding an entry now requires a real backend
+    // write under a derived namespace, so that contract is pinned end to
+    // end by `semantic_cache_e2e` instead of from a seeded hook here.
+
+    #[tokio::test]
+    async fn external_output_guardrail_checks_idempotency_hit_before_replay() {
+        let request = serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        });
+        let request_bytes = serde_json::to_vec(&request).expect("request JSON");
+        let (guardrail_url, received) = blocking_guardrail().await;
+        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"choices":[]}"#).await;
+        let config = proxy_config(&upstream_url, guardrail_url, "post_call");
+        let (mut session, client) = downstream_session(request).await;
+        let mut context = crate::context::RequestContext::new();
+        let (pipeline, semantic, idempotency) = pipeline_with_recording_caches().await;
+        *idempotency.hit.lock().expect("idempotency hit lock") =
+            Some(sbproxy_middleware::idempotency::CachedResponse {
+                status: 200,
+                headers: vec![("content-type".to_string(), "application/json".to_string())],
+                body: br#"{"cached":"provider-controlled"}"#.to_vec(),
+                request_body_hash: sbproxy_middleware::idempotency::hash_body(&request_bytes),
+                expires_at_unix: u64::MAX,
+            });
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("guarded idempotency replay is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response utf8");
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert!(!response.contains("provider-controlled"), "{response}");
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(semantic.calls(), 0);
+        assert_eq!(idempotency.gets.load(Ordering::SeqCst), 1);
+        let payload = tokio::time::timeout(Duration::from_secs(1), received)
+            .await
+            .expect("guardrail request timed out")
+            .expect("guardrail fixture dropped");
+        assert_eq!(payload["phase"], "output");
+    }
+
+    async fn run_native_cascade_refusal(
+        config: &sbproxy_ai::AiHandlerConfig,
+        pipeline: &crate::pipeline::CompiledPipeline,
+        body: serde_json::Value,
+    ) -> String {
+        let (mut session, client) = downstream_session(body).await;
+        let mut context = crate::context::RequestContext::new();
+        context.inbound_key_mode = crate::context::InboundKeyMode::Native;
+        context.native_key_provider = Some("openai".to_string());
+
+        super::handle_ai_proxy(
+            &mut session,
+            config,
+            pipeline,
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("native cascade refusal is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response utf8");
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert!(
+            response.contains("native provider keys are unavailable for confidence cascade"),
+            "{response}"
+        );
+        assert!(
+            context.ai_model.is_none(),
+            "refusal must precede model routing and managed-local preparation"
+        );
+        response
+    }
+
+    #[tokio::test]
+    async fn native_race_refuses_before_cache_or_upstream_side_effects() {
+        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"choices":[]}"#).await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "accept_native_credentials_for": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key"
+            }],
+            "routing": "race"
+        }))
+        .expect("race proxy config");
+        let (pipeline, semantic, idempotency) = pipeline_with_recording_caches().await;
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+        context.inbound_key_mode = crate::context::InboundKeyMode::Native;
+        context.native_key_provider = Some("openai".to_string());
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("native race refusal is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response utf8");
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert!(
+            response.contains("native provider keys are unavailable for race routing"),
+            "{response}"
+        );
+        assert_eq!(semantic.calls(), 0);
+        assert_eq!(idempotency.gets.load(Ordering::SeqCst), 0);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn native_cascade_refuses_before_stream_managed_cache_and_idempotency_side_effects() {
+        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"choices":[]}"#).await;
+        let config = cascade_error_proxy_config(&upstream_url);
+
+        // Idempotency hit: the early refusal must not even ask the cache.
+        let (idempotency_pipeline, semantic, idempotency) = pipeline_with_recording_caches().await;
+        *idempotency.hit.lock().expect("idempotency hit lock") =
+            Some(sbproxy_middleware::idempotency::CachedResponse {
+                status: 200,
+                headers: vec![("content-type".to_string(), "application/json".to_string())],
+                body: br#"{"cached":true}"#.to_vec(),
+                request_body_hash: [0; 32],
+                expires_at_unix: u64::MAX,
+            });
+        run_native_cascade_refusal(
+            &config,
+            &idempotency_pipeline,
+            serde_json::json!({
+                "model": "requested-model",
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            }),
+        )
+        .await;
+        assert_eq!(idempotency.gets.load(Ordering::SeqCst), 0);
+        assert_eq!(semantic.calls(), 0);
+
+        // A pass with idempotency disabled, so nothing but the refusal can
+        // explain an untouched semantic path.
+        {
+            let (mut pipeline, semantic, idempotency) = pipeline_with_recording_caches().await;
+            pipeline.idempotencies[0] = None;
+            run_native_cascade_refusal(
+                &config,
+                &pipeline,
+                serde_json::json!({
+                    "model": "requested-model",
+                    "messages": [{"role": "user", "content": "fixture prompt"}]
+                }),
+            )
+            .await;
+            assert_eq!(semantic.calls(), 0);
+            let stats = semantic_stats(&pipeline, 0, None);
+            assert_eq!(stats.lookups, 0);
+            assert_eq!(stats.writes, 0);
+            assert_eq!(idempotency.gets.load(Ordering::SeqCst), 0);
+        }
+
+        // Streaming previously fell through to tier one; it now refuses at
+        // the same pre-body seam.
+        let (stream_pipeline, semantic, idempotency) = pipeline_with_recording_caches().await;
+        run_native_cascade_refusal(
+            &config,
+            &stream_pipeline,
+            serde_json::json!({
+                "model": "requested-model",
+                "stream": true,
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            }),
+        )
+        .await;
+        assert_eq!(semantic.calls(), 0);
+        assert_eq!(idempotency.gets.load(Ordering::SeqCst), 0);
+
+        // Managed-local routing must refuse before engine preparation.
+        let managed = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "local",
+                "serve": {"models": [{"model": "qwen3-14b"}]}
+            }],
+            "routing": {
+                "strategy": "cascade",
+                "tiers": [{
+                    "provider_id": "local",
+                    "model": "qwen3-14b",
+                    "quality_threshold": 0.5
+                }]
+            }
+        }))
+        .expect("managed cascade config");
+        let (managed_pipeline, semantic, idempotency) = pipeline_with_recording_caches().await;
+        run_native_cascade_refusal(
+            &managed,
+            &managed_pipeline,
+            serde_json::json!({
+                "model": "qwen3-14b",
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            }),
+        )
+        .await;
+        assert_eq!(semantic.calls(), 0);
+        assert_eq!(idempotency.gets.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            0,
+            "native cascade refusal must never contact an upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_input_guardrail_fails_closed_for_multipart_before_upstream() {
+        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"text":"ignored"}"#).await;
+        let config = proxy_config(
+            &upstream_url,
+            "https://8.8.8.8/check".to_string(),
+            "pre_call",
+        );
+        let (content_type, body) = multipart_audio_request();
+        let (mut session, client) =
+            downstream_bytes_session("/v1/audio/transcriptions", content_type, body).await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("multipart input block is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response utf8");
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        assert!(response.contains("guardrail_violation"), "{response}");
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn external_output_guardrail_checks_materialized_multipart_response() {
+        let (guardrail_url, received) = blocking_guardrail().await;
+        let (upstream_url, upstream_hits) =
+            upstream_fixture(r#"{"text":"provider-controlled","duration":1.5}"#).await;
+        let config = proxy_config(&upstream_url, guardrail_url, "post_call");
+        let (content_type, body) = multipart_audio_request();
+        let (mut session, client) =
+            downstream_bytes_session("/v1/audio/transcriptions", content_type, body).await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("multipart output block is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response utf8");
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert!(response.contains("guardrail_violation"), "{response}");
+        assert!(!response.contains("provider-controlled"), "{response}");
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        let payload = tokio::time::timeout(Duration::from_secs(1), received)
+            .await
+            .expect("guardrail request timed out")
+            .expect("guardrail fixture dropped");
+        assert_eq!(payload["phase"], "output");
+        assert!(payload["input"]
+            .as_str()
+            .is_some_and(|input| input.contains("provider-controlled")));
+    }
+
+    #[tokio::test]
+    async fn external_output_guardrail_uses_no_content_mode_for_uninspectable_multipart() {
+        for (upstream_body, upstream_content_type) in [
+            (
+                b"valid UTF-8 bytes with a binary media type".to_vec(),
+                Some("application/octet-stream"),
+            ),
+            (vec![0xff, 0xfe, 0xfd], Some("application/json")),
+            (b"valid UTF-8 bytes without a media type".to_vec(), None),
+        ] {
+            let (guardrail_url, guardrail_hits) = upstream_fixture(r#"{"allowed":true}"#).await;
+            let (upstream_url, upstream_hits) = upstream_bytes_fixture_with_optional_content_type(
+                upstream_body,
+                upstream_content_type,
+            )
+            .await;
+            let config = proxy_config(&upstream_url, guardrail_url, "post_call");
+            let (content_type, body) = multipart_audio_request();
+            let (mut session, client) =
+                downstream_bytes_session("/v1/audio/transcriptions", content_type, body).await;
+            let mut context = crate::context::RequestContext::new();
+
+            super::handle_ai_proxy(
+                &mut session,
+                &config,
+                &crate::pipeline::CompiledPipeline::default(),
+                "ai.test",
+                &mut context,
+                None,
+            )
+            .await
+            .expect("uninspectable multipart output block is handled");
+            drop(session);
+
+            let response =
+                String::from_utf8(live_downstream_body(client).await).expect("safe response utf8");
+            assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+            assert!(response.contains("guardrail_violation"), "{response}");
+            assert!(!response.contains('\u{fffd}'), "{response}");
+            assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                guardrail_hits.load(Ordering::SeqCst),
+                0,
+                "uninspectable multipart bytes must not leave the gateway"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn external_output_guardrail_rejects_buffered_provider_text_before_it_can_be_served() {
+        let (guardrail_url, received) = blocking_guardrail().await;
+        let (upstream_url, upstream_hits) = upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"provider-controlled text"}}]}"#,
+        )
+        .await;
+        let config = proxy_config(&upstream_url, guardrail_url, "post_call");
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+        let (pipeline, recording_semantic, recording_idempotency) =
+            pipeline_with_recording_caches().await;
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("output block is a handled response");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response utf8");
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "response was {response}"
+        );
+        assert!(
+            response.contains("guardrail_violation"),
+            "response was {response}"
+        );
+        assert!(
+            !response.contains("provider-controlled text"),
+            "provider-controlled text must not be served after a block: {response}"
+        );
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            1,
+            "buffered output guardrails run after exactly one upstream response"
+        );
+        assert_eq!(recording_semantic.calls(), 1);
+        assert_eq!(
+            semantic_stats(&pipeline, 0, None).writes,
+            0,
+            "blocked output must not be written to the semantic cache"
+        );
+        assert_eq!(recording_idempotency.gets.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            recording_idempotency.puts.load(Ordering::SeqCst),
+            0,
+            "blocked output must not be written to the idempotency cache"
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), received)
+                .await
+                .expect("output guardrail request timed out")
+                .expect("output fixture dropped"),
+            serde_json::json!({
+                "input": r#"{"choices":[{"message":{"role":"assistant","content":"provider-controlled text"}}]}"#,
+                "model": "selected-model",
+                "phase": "output"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn cascade_external_output_guardrail_blocks_the_selected_tier_model() {
+        let (guardrail_url, received) = blocking_guardrail().await;
+        let (upstream_url, upstream_hits) = upstream_fixture(
+            r#"{"confidence_score":1.0,"choices":[{"message":{"role":"assistant","content":"cascade provider text"}}]}"#,
+        )
+        .await;
+        let config = cascade_proxy_config(&upstream_url, guardrail_url);
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+        let (pipeline, recording_semantic, recording_idempotency) =
+            pipeline_with_recording_caches().await;
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("cascade output block is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response utf8");
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "response was {response}"
+        );
+        assert!(
+            response.contains("guardrail_violation"),
+            "response was {response}"
+        );
+        assert!(
+            !response.contains("cascade provider text"),
+            "blocked cascade output reached the client: {response}"
+        );
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(context.ai_model.as_deref(), Some("cascade-selected-model"));
+        assert_eq!(context.ai_outcome.as_deref(), Some("guardrail_block"));
+        assert_eq!(recording_semantic.calls(), 1);
+        assert_eq!(
+            semantic_stats(&pipeline, 0, None).writes,
+            0,
+            "blocked cascade output must not be written to the semantic cache"
+        );
+        assert_eq!(recording_idempotency.gets.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            recording_idempotency.puts.load(Ordering::SeqCst),
+            0,
+            "blocked cascade output must not be written to the idempotency cache"
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), received)
+                .await
+                .expect("cascade guardrail request timed out")
+                .expect("cascade guardrail fixture dropped"),
+            serde_json::json!({
+                "input": r#"{"confidence_score":1.0,"choices":[{"message":{"role":"assistant","content":"cascade provider text"}}]}"#,
+                "model": "cascade-selected-model",
+                "phase": "output"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_output_external_guardrail_honors_fail_mode_without_egress() {
+        for (fail_open, expected_status) in [(false, 403), (true, 200)] {
+            let (upstream_url, _) =
+                upstream_bytes_fixture(vec![0xff, 0xfe, 0xfd], "application/octet-stream").await;
+            let config = proxy_config_with_fail_mode(
+                &upstream_url,
+                "https://8.8.8.8/check".to_string(),
+                "post_call",
+                fail_open,
+            );
+            let (mut session, client) = downstream_session(serde_json::json!({
+                "model": "requested-model",
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            }))
+            .await;
+            let mut context = crate::context::RequestContext::new();
+
+            super::handle_ai_proxy(
+                &mut session,
+                &config,
+                &crate::pipeline::CompiledPipeline::default(),
+                "ai.test",
+                &mut context,
+                None,
+            )
+            .await
+            .expect("invalid UTF-8 output is handled");
+            drop(session);
+
+            let response = live_downstream_body(client).await;
+            assert!(
+                response.starts_with(format!("HTTP/1.1 {expected_status}").as_bytes()),
+                "unexpected response status: {response:?}"
+            );
+            if fail_open {
+                assert!(response.ends_with(&[0xff, 0xfe, 0xfd]));
+            } else {
+                let response = std::str::from_utf8(&response).expect("safe block response utf8");
+                assert!(response.contains("guardrail_violation"));
+                assert!(!response.contains('\u{fffd}'));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod shadow_surface_tests {
+    use super::shadow_surface_is_eligible;
+    use sbproxy_ai::handler::AiSurface;
+
+    #[test]
+    fn v1_shadow_eval_excludes_mutating_and_non_chat_surfaces() {
+        for surface in [
+            AiSurface::ChatCompletions,
+            AiSurface::Messages,
+            AiSurface::Responses,
+        ] {
+            assert!(shadow_surface_is_eligible(&surface), "{surface:?}");
+        }
+
+        for surface in [
+            AiSurface::Assistants,
+            AiSurface::Threads,
+            AiSurface::Batches,
+            AiSurface::FineTuning,
+            AiSurface::Files,
+            AiSurface::Embeddings,
+            AiSurface::ImageGeneration,
+            AiSurface::Moderations,
+            AiSurface::Reranking,
+        ] {
+            assert!(!shadow_surface_is_eligible(&surface), "{surface:?}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -7790,11 +13550,317 @@ mod request_policy_tests {
 }
 
 #[cfg(test)]
+mod compression_selection_tests {
+    use super::{
+        ai_policy_input_tokens_est, bind_compression_selection, buffered_ai_response_body_limit,
+        compression_header_value, compression_selection_bypasses_cache,
+        compression_selection_outcome, native_bypass_body_changed, native_bypass_is_safe,
+        resolve_compression_selection_intent, upstream_response_is_successful_stream,
+        CompressionSelectionError, CompressionSelectionSource, ResolvedRequestKey,
+    };
+    use http::{HeaderMap, HeaderValue};
+    use sbproxy_ai::compression::CompressionSelector;
+
+    #[test]
+    fn compression_selector_precedence_is_header_key_cel_then_default() {
+        let cel = CompressionSelector::Profile("cel-profile".into());
+        let header =
+            resolve_compression_selection_intent(Some("off"), Some("key-profile"), Some(&cel))
+                .unwrap();
+        assert_eq!(header.source, CompressionSelectionSource::Header);
+        assert_eq!(header.selector, CompressionSelector::Off);
+
+        let governed_key =
+            resolve_compression_selection_intent(None, Some("key-profile"), Some(&cel)).unwrap();
+        assert_eq!(governed_key.source, CompressionSelectionSource::GovernedKey);
+        assert_eq!(
+            governed_key.selector,
+            CompressionSelector::Profile("key-profile".into())
+        );
+
+        let cel_policy = resolve_compression_selection_intent(None, None, Some(&cel)).unwrap();
+        assert_eq!(cel_policy.source, CompressionSelectionSource::CelPolicy);
+        assert_eq!(cel_policy.selector, cel);
+
+        let route_default = resolve_compression_selection_intent(None, None, None).unwrap();
+        assert_eq!(
+            route_default.source,
+            CompressionSelectionSource::RouteDefault
+        );
+        assert_eq!(route_default.selector, CompressionSelector::On);
+
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "test"}],
+            "virtual_keys": [{
+                "key": "sb_test",
+                "key_id": "key_01",
+                "compression_profile": "off"
+            }]
+        }))
+        .unwrap();
+        let resolved = ResolvedRequestKey::from_configured(
+            config.virtual_keys.into_iter().next().unwrap(),
+            "tenant-a",
+        );
+        assert_eq!(resolved.compression_profile(), Some("off"));
+    }
+
+    #[test]
+    fn malformed_or_unknown_operator_selectors_disable_but_headers_fail() {
+        let invalid_key =
+            resolve_compression_selection_intent(None, Some("Bad Name"), None).unwrap();
+        assert!(invalid_key.invalid_operator_selector);
+        assert_eq!(invalid_key.selector, CompressionSelector::Off);
+
+        let unknown_key =
+            resolve_compression_selection_intent(None, Some("missing"), None).unwrap();
+        let bound = bind_compression_selection(unknown_key, None).unwrap();
+        assert!(bound.invalid_operator_selector);
+        assert!(bound.selected.is_none());
+
+        let unknown_header =
+            resolve_compression_selection_intent(Some("missing"), None, None).unwrap();
+        assert!(matches!(
+            bind_compression_selection(unknown_header, None),
+            Err(CompressionSelectionError::UnknownHeaderProfile)
+        ));
+        assert!(matches!(
+            resolve_compression_selection_intent(Some("Bad Name"), None, None),
+            Err(CompressionSelectionError::InvalidHeader)
+        ));
+    }
+
+    #[test]
+    fn compression_header_requires_one_utf8_value() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(compression_header_value(&headers).unwrap(), None);
+        headers.insert("x-compression", HeaderValue::from_static("  off  "));
+        assert_eq!(
+            compression_header_value(&headers).unwrap().as_deref(),
+            Some("off")
+        );
+        headers.append("x-compression", HeaderValue::from_static("on"));
+        assert_eq!(
+            compression_header_value(&headers),
+            Err(CompressionSelectionError::InvalidHeader)
+        );
+
+        let mut non_utf8 = HeaderMap::new();
+        non_utf8.insert(
+            "x-compression",
+            HeaderValue::from_bytes(&[0xff]).expect("opaque header bytes"),
+        );
+        assert_eq!(
+            compression_header_value(&non_utf8),
+            Err(CompressionSelectionError::InvalidHeader)
+        );
+    }
+
+    #[test]
+    fn explicit_compression_selection_bypasses_semantic_caches() {
+        assert!(!compression_selection_bypasses_cache(None, false));
+        assert!(compression_selection_bypasses_cache(None, true));
+    }
+
+    #[test]
+    fn route_default_request_specific_compression_bypasses_cache_reads_and_writes_without_session()
+    {
+        let config = serde_json::json!({
+            "origins": {
+                "ai.example.com": {
+                    "action": {
+                        "type": "ai_proxy",
+                        "providers": [{"name": "openai", "api_key": "test-key"}],
+                        "compression": {
+                            "levers": [{
+                                "type": "rag_select",
+                                "min_tokens": 512,
+                                "max_chunks": 8
+                            }]
+                        }
+                    }
+                }
+            }
+        });
+        let compiled = sbproxy_config::compile_config(&config.to_string())
+            .expect("request-specific route default compiles");
+        let pipeline = crate::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+            .expect("request-specific runtime compiles without Redis");
+        let runtime_set = pipeline
+            .compression_runtimes
+            .get_set(0)
+            .expect("compiled compression runtime set");
+        let selected = runtime_set.select_default();
+        let runtime = selected.runtime().expect("route-default runtime");
+        let has_captured_session = false;
+
+        let cache_bypass = compression_selection_bypasses_cache(Some(runtime_set.as_ref()), false)
+            || runtime.bypasses_semantic_cache(has_captured_session);
+        let semantic_cache_read_enabled = !cache_bypass;
+        let semantic_cache_write_enabled = !cache_bypass;
+
+        assert!(!semantic_cache_read_enabled);
+        assert!(!semantic_cache_write_enabled);
+    }
+
+    #[test]
+    fn compression_disables_native_body_bypass() {
+        assert!(native_bypass_is_safe(false, false, false));
+        assert!(!native_bypass_is_safe(true, false, false));
+        assert!(!native_bypass_is_safe(false, true, false));
+    }
+
+    #[test]
+    fn rag_selection_disables_native_body_bypass() {
+        // A selected RAG runtime pins the request to the canonical route
+        // for every retrieval outcome, so the third argument alone must
+        // veto the bypass regardless of the other inputs.
+        assert!(!native_bypass_is_safe(false, false, true));
+        assert!(!native_bypass_is_safe(true, false, true));
+        assert!(!native_bypass_is_safe(false, true, true));
+    }
+
+    #[test]
+    fn native_body_comparison_ignores_only_provider_model_mapping() {
+        let baseline = serde_json::json!({
+            "model": "public-model",
+            "messages": [{"role": "user", "content": "original"}],
+            "max_tokens": 64
+        });
+        let mut mapped = baseline.clone();
+        mapped["model"] = serde_json::Value::String("provider-model".to_string());
+        assert!(!native_bypass_body_changed(&baseline, &mapped));
+
+        let mut redacted = mapped.clone();
+        redacted["messages"][0]["content"] = serde_json::Value::String("[REDACTED]".to_string());
+        assert!(native_bypass_body_changed(&baseline, &redacted));
+
+        let mut injected = mapped;
+        injected["tools"] = serde_json::json!([{"name": "lookup"}]);
+        assert!(native_bypass_body_changed(&baseline, &injected));
+    }
+
+    #[test]
+    fn only_successful_streaming_responses_enter_stream_relay() {
+        assert!(upstream_response_is_successful_stream(
+            200,
+            Some("text/event-stream; charset=utf-8")
+        ));
+        // Ollama streams NDJSON rather than SSE; it must stay on the
+        // streaming relay or its usage parser never sees the body.
+        assert!(upstream_response_is_successful_stream(
+            200,
+            Some("application/x-ndjson")
+        ));
+        assert!(!upstream_response_is_successful_stream(
+            400,
+            Some("text/event-stream")
+        ));
+        assert!(!upstream_response_is_successful_stream(
+            400,
+            Some("application/x-ndjson")
+        ));
+        assert!(!upstream_response_is_successful_stream(
+            200,
+            Some("application/json")
+        ));
+        assert!(!upstream_response_is_successful_stream(200, None));
+    }
+
+    #[test]
+    fn buffered_stream_fallback_always_has_a_bounded_body_limit() {
+        assert_eq!(buffered_ai_response_body_limit(None), 64 * 1024 * 1024);
+        assert_eq!(buffered_ai_response_body_limit(Some(0)), 64 * 1024 * 1024);
+        assert_eq!(buffered_ai_response_body_limit(Some(1024)), 1024);
+        assert_eq!(
+            buffered_ai_response_body_limit(Some(usize::MAX)),
+            1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn selection_outcomes_distinguish_defaults_selections_and_disabled() {
+        assert_eq!(
+            compression_selection_outcome(CompressionSelectionSource::RouteDefault, false, true),
+            "default"
+        );
+        assert_eq!(
+            compression_selection_outcome(CompressionSelectionSource::GovernedKey, false, true),
+            "selected"
+        );
+        assert_eq!(
+            compression_selection_outcome(CompressionSelectionSource::Header, false, false),
+            "disabled"
+        );
+        assert_eq!(
+            compression_selection_outcome(CompressionSelectionSource::RouteDefault, false, false),
+            "disabled"
+        );
+        assert_eq!(
+            compression_selection_outcome(CompressionSelectionSource::CelPolicy, true, false),
+            "invalid_operator"
+        );
+    }
+
+    #[test]
+    fn cel_compression_policy_sees_the_pre_compression_target_model_estimate() {
+        let body = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "history ".repeat(100)},
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{\"id\":42}"}
+                    }]
+                }
+            ]
+        });
+        let messages = body["messages"].as_array().unwrap();
+        let expected = sbproxy_ai::token_estimate::estimate_json_message_tokens("gpt-4o", messages);
+
+        assert_eq!(
+            ai_policy_input_tokens_est("gpt-4o", &body),
+            i64::try_from(expected).unwrap()
+        );
+        assert!(ai_policy_input_tokens_est("gpt-4o", &body) > 0);
+    }
+}
+
+#[cfg(test)]
 mod ai_error_classification_tests {
     use super::{
         ai_metric_error_kind_for_span_error_type, ai_provider_response_error_type,
-        ai_response_body_indicates_content_filter,
+        ai_response_body_indicates_content_filter, record_ai_provider_response_failure,
+        safe_provider_error_label,
     };
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    struct SharedLogGuard(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLogWriter {
+        type Writer = SharedLogGuard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedLogGuard(Arc::clone(&self.0))
+        }
+    }
+
+    impl std::io::Write for SharedLogGuard {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log capture").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn provider_429_maps_to_rate_limited() {
@@ -7848,6 +13914,82 @@ mod ai_error_classification_tests {
         assert_eq!(
             ai_provider_response_error_type(400, Some(br#"{"error":{"code":"bad_request"}}"#)),
             Some(sbproxy_ai::tracing_spans::error_type::PROVIDER_ERROR)
+        );
+    }
+
+    #[test]
+    fn provider_error_log_reports_safe_metadata_without_upstream_message() {
+        // Capture the actual tracing event emitted by the dispatch failure
+        // boundary.
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(SharedLogWriter(Arc::clone(&captured)))
+            .finish();
+        let body = br#"{
+            "error": {
+                "code": 400,
+                "status": "INVALID_ARGUMENT",
+                "message": "request rejected for key AIzaSyA123456789012345678901234567890123",
+                "details": [{"reason": "API_KEY_INVALID"}]
+            }
+        }"#;
+
+        tracing::subscriber::with_default(subscriber, || {
+            record_ai_provider_response_failure(&tracing::Span::none(), "gemini", 400, Some(body));
+        });
+
+        let output =
+            String::from_utf8(captured.lock().expect("log capture").clone()).expect("UTF-8 log");
+        assert!(
+            output.contains("AI proxy: provider returned error response"),
+            "{output}"
+        );
+        assert!(output.contains("provider=gemini"), "{output}");
+        assert!(output.contains("status=400"), "{output}");
+        assert!(output.contains("upstream_error_code=400"), "{output}");
+        assert!(
+            output.contains("upstream_error_status=INVALID_ARGUMENT"),
+            "{output}"
+        );
+        assert!(
+            output.contains("upstream_error_reason=API_KEY_INVALID"),
+            "{output}"
+        );
+        assert!(!output.contains("request rejected for key"), "{output}");
+        assert!(
+            !output.contains("AIzaSyA123456789012345678901234567890123"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn provider_error_metadata_rejects_unmapped_provider_values() {
+        let arbitrary_lowercase =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        assert_eq!(arbitrary_lowercase.len(), 64);
+        for provider_controlled_value in [
+            "AIzaSyA123456789012345678901234567890123",
+            "sk-abcdefghijklmnopqrstu1234567890",
+            arbitrary_lowercase,
+            "550e8400-e29b-41d4-a716-446655440000",
+            "tenant_123456789",
+            "UNKNOWN_PROVIDER_ENUM_VALUE",
+        ] {
+            assert_eq!(
+                safe_provider_error_label(&serde_json::Value::String(
+                    provider_controlled_value.to_string()
+                )),
+                None,
+                "{provider_controlled_value}"
+            );
+        }
+        assert_eq!(
+            safe_provider_error_label(&serde_json::json!(123456789)),
+            None,
+            "arbitrary numeric identifiers must not become labels"
         );
     }
 
@@ -8215,6 +14357,32 @@ mod dynamic_key_resolution_tests {
         let admission = crate::server::model_host::lane_class_for(context.ai_lane_priority);
 
         assert_eq!(admission, sbproxy_model_host::PriorityClass::Interactive);
+    }
+
+    #[test]
+    fn dynamically_resolved_record_retains_bound_upstream_credential() {
+        let mut record = KeyRecord::new("bound-key", "hash", chrono::Utc::now());
+        record.credential_id = Some("credential-1".into());
+        let mut context = RequestContext::new();
+
+        let resolved =
+            lower_and_preserve_stored_request_key(&mut context, Box::new(record), "tenant-a")
+                .expect("valid stored policy");
+
+        assert_eq!(
+            context
+                .resolved_inbound_key
+                .as_deref()
+                .and_then(|record| record.credential_id.as_deref()),
+            Some("credential-1")
+        );
+        assert_eq!(
+            resolved
+                .effective_policy
+                .as_ref()
+                .map(|policy| policy.key_id.as_str()),
+            Some("bound-key")
+        );
     }
 
     #[test]
@@ -8630,9 +14798,11 @@ mod dynamic_key_resolution_tests {
             resolve_dynamic_virtual_key(&plane, Some(&wrong)).await,
             DynamicKeyOutcome::Deny(401, _)
         ));
-        // Unknown id is also 401.
+        // Unknown but CONFORMING id is also 401: it could have been minted
+        // here, so it is a revoked or bogus key of ours and must keep denying.
+        let unknown_conforming = format!("sk-{}-secretsecret", "0".repeat(16));
         assert!(matches!(
-            resolve_dynamic_virtual_key(&plane, Some("sk-nope-secretsecret")).await,
+            resolve_dynamic_virtual_key(&plane, Some(&unknown_conforming)).await,
             DynamicKeyOutcome::Deny(401, _)
         ));
         // Revoked key with the correct secret is 403 (known but not active).
@@ -8645,6 +14815,22 @@ mod dynamic_key_resolution_tests {
             resolve_dynamic_virtual_key(&plane, Some("opaque-jwt")).await,
             DynamicKeyOutcome::NotApplicable
         ));
+        // A caller's OWN provider key must pass through, not collect a 401.
+        // Under the loose legacy rule each of these parses with a key_id of
+        // "proj" / "ant" / "or", misses the store, and used to deny.
+        for provider in [
+            "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789",
+            "sk-ant-api03-abcdefghijklmnopqrstuvwxyz01234",
+            "sk-or-v1-abcdefghijklmnopqrstuvwxyz012345678",
+        ] {
+            assert!(
+                matches!(
+                    resolve_dynamic_virtual_key(&plane, Some(provider)).await,
+                    DynamicKeyOutcome::NotApplicable
+                ),
+                "{provider} must fall through to its real owner"
+            );
+        }
         // No token at all is also not applicable.
         assert!(matches!(
             resolve_dynamic_virtual_key(&plane, None).await,
@@ -8756,6 +14942,83 @@ mod dynamic_key_resolution_tests {
     }
 }
 
+/// WOR-2140: the agent identity the dispatcher reads off the request
+/// context, and the trust rule that decides which surfaces may name it.
+#[cfg(test)]
+mod billing_agent_tests {
+    use super::BillingAgent;
+    use crate::context::RequestContext;
+    use sbproxy_modules::{A2AContext, A2ASpec};
+
+    fn ctx_with_agent(caller_agent_id: &str, identity_verified: bool) -> RequestContext {
+        let mut ctx = RequestContext::new();
+        let mut a2a = A2AContext::empty(A2ASpec::V1_0);
+        a2a.caller_agent_id = caller_agent_id.to_string();
+        a2a.identity_verified = identity_verified;
+        ctx.a2a = Some(a2a);
+        ctx
+    }
+
+    #[test]
+    fn agent_identity_reaches_dispatch_from_the_a2a_envelope() {
+        // `ctx.a2a` is populated from header detection in the request
+        // filter, before any policy or action runs, which is why the
+        // AI-gateway path can read it even though it terminates the
+        // request inside `request_filter`.
+        let agent = BillingAgent::from_context(&ctx_with_agent("planner", true));
+        assert_eq!(agent.claimed_id(), Some("planner"));
+        assert!(agent.verified);
+        assert_eq!(agent.identity().billable_id(), Some("planner"));
+        assert_eq!(agent.attributable_id(), Some("planner"));
+    }
+
+    #[test]
+    fn an_unverified_claim_is_recorded_but_never_attributed() {
+        // The claim reaches the span and the billing event so a report
+        // can show it as unverified; it must not reach the budget key or
+        // the metric label, where it would let a caller bill itself to
+        // another agent's series.
+        let agent = BillingAgent::from_context(&ctx_with_agent("planner", false));
+        assert_eq!(agent.claimed_id(), Some("planner"));
+        assert!(!agent.verified);
+        assert_eq!(
+            agent.identity().billable_id(),
+            None,
+            "an unverified claim must not address a named agent's budget"
+        );
+        assert_eq!(agent.attributable_id(), None);
+    }
+
+    #[test]
+    fn traffic_with_no_a2a_envelope_names_no_agent() {
+        let agent = BillingAgent::from_context(&RequestContext::new());
+        assert_eq!(agent.claimed_id(), None);
+        assert!(!agent.verified);
+        assert_eq!(agent.attributable_id(), None);
+        // An envelope that carries no caller agent id is the same thing.
+        let empty = BillingAgent::from_context(&ctx_with_agent("", true));
+        assert_eq!(empty.claimed_id(), None);
+        assert_eq!(empty.attributable_id(), None);
+    }
+
+    #[test]
+    fn the_agent_id_is_capped_once_at_capture() {
+        // Capping here rather than at each reader is what keeps the
+        // span, the ledger, and the metric label naming one agent.
+        let long = "a".repeat(sbproxy_ai::tracing_spans::MAX_AGENT_ID_BYTES * 3);
+        let agent = BillingAgent::from_context(&ctx_with_agent(&long, true));
+        assert_eq!(
+            agent.id.len(),
+            sbproxy_ai::tracing_spans::MAX_AGENT_ID_BYTES
+        );
+        assert_eq!(
+            agent.id,
+            sbproxy_ai::tracing_spans::cap_agent_id(&long),
+            "capture must use the shared cap, not a second implementation"
+        );
+    }
+}
+
 #[cfg(test)]
 mod effective_key_budget_tests {
     use super::*;
@@ -8775,14 +15038,62 @@ mod effective_key_budget_tests {
         key_record_to_effective_policy(&record, "tenant-a").expect("valid governed policy")
     }
 
-    #[test]
-    fn record_budget_is_not_duplicated_in_the_legacy_tracker() {
-        let policy = governed_policy("budget-block-key", Some(100), None);
-        assert!(merged_request_budget(None, Some(&policy)).is_none());
+    fn scope_keys(config: &BudgetConfig, key_id: &str, workspace: &str) -> Vec<(usize, String)> {
+        budget_scope_keys(
+            config,
+            workspace,
+            Some(key_id),
+            None,
+            Some("gpt-4.1"),
+            Some(workspace),
+            None,
+        )
     }
 
     #[test]
-    fn origin_budget_remains_on_the_legacy_path_without_record_composition() {
+    fn record_budget_creates_a_blocking_lifetime_api_key_limit() {
+        let policy = governed_policy("budget-block-key", Some(100), None);
+        let merged = merged_request_budget(None, Some(&policy))
+            .expect("record budget creates config")
+            .into_owned();
+
+        assert_eq!(merged.on_exceed, OnExceedAction::Block);
+        assert_eq!(merged.limits.len(), 1);
+        assert_eq!(merged.limits[0].scope, BudgetScope::ApiKey);
+        assert_eq!(merged.limits[0].max_tokens, Some(100));
+        assert_eq!(merged.limits[0].period.as_deref(), Some("total"));
+
+        let keys = scope_keys(&merged, &policy.key_id, "budget-block-origin");
+        BUDGET_TRACKER.record_usage(&keys[0].1, 100, 0.0);
+        assert!(matches!(
+            budget_preflight(&merged, &keys, &[], &std::collections::HashMap::new()),
+            BudgetGate::Block { status: 402, .. }
+        ));
+    }
+
+    #[test]
+    fn record_budgets_are_independent_by_immutable_key_id() {
+        let policy = governed_policy("budget-independent-a", Some(50), None);
+        let merged = merged_request_budget(None, Some(&policy))
+            .expect("record budget creates config")
+            .into_owned();
+        let keys_a = scope_keys(&merged, "budget-independent-a", "budget-independent-origin");
+        let keys_b = scope_keys(&merged, "budget-independent-b", "budget-independent-origin");
+        assert_ne!(keys_a[0].1, keys_b[0].1);
+
+        BUDGET_TRACKER.record_usage(&keys_a[0].1, 50, 0.0);
+        assert!(matches!(
+            budget_preflight(&merged, &keys_a, &[], &std::collections::HashMap::new()),
+            BudgetGate::Block { .. }
+        ));
+        assert!(matches!(
+            budget_preflight(&merged, &keys_b, &[], &std::collections::HashMap::new()),
+            BudgetGate::Allow
+        ));
+    }
+
+    #[test]
+    fn origin_and_record_budget_limits_compose_in_one_snapshot() {
         let origin = BudgetConfig {
             limits: vec![BudgetLimit {
                 scope: BudgetScope::Workspace,
@@ -8797,19 +15108,330 @@ mod effective_key_budget_tests {
         let policy = governed_policy("budget-composed-key", Some(500), Some(2.5));
 
         let merged = merged_request_budget(Some(&origin), Some(&policy))
-            .expect("origin budget remains configured")
+            .expect("origin and record budgets compose")
             .into_owned();
 
-        assert_eq!(merged.on_exceed, OnExceedAction::Block);
-        assert_eq!(merged.limits.len(), 1);
+        assert_eq!(merged.limits.len(), 2);
         assert_eq!(merged.limits[0].scope, BudgetScope::Workspace);
-        assert_eq!(merged.limits[0].max_tokens, Some(10_000));
+        assert_eq!(merged.limits[1].scope, BudgetScope::ApiKey);
+        assert_eq!(merged.limits[1].max_tokens, Some(500));
+        assert_eq!(merged.limits[1].max_cost_usd, Some(2.5));
+        assert_eq!(merged.limits[1].period.as_deref(), Some("total"));
+        assert_eq!(
+            scope_keys(&merged, &policy.key_id, "composed-origin").len(),
+            2
+        );
+    }
+}
+
+#[cfg(test)]
+mod governance_limits_from_policy_tests {
+    use super::*;
+    use sbproxy_ai::governance::GovernanceLimits;
+    use sbproxy_keystore::record::{KeyRecord, RecordBudget};
+
+    fn policy_with(
+        max_requests_per_minute: Option<u64>,
+        max_tokens_per_minute: Option<u64>,
+        max_tokens: Option<u64>,
+        max_cost_usd: Option<f64>,
+    ) -> sbproxy_ai::effective_key_policy::EffectiveKeyPolicy {
+        let mut record = KeyRecord::new("governed-key", "secret-hash", chrono::Utc::now());
+        record.max_requests_per_minute = max_requests_per_minute;
+        record.max_tokens_per_minute = max_tokens_per_minute;
+        if max_tokens.is_some() || max_cost_usd.is_some() {
+            record.budget = Some(RecordBudget {
+                max_tokens,
+                max_cost_usd,
+            });
+        }
+        key_record_to_effective_policy(&record, "tenant-a").expect("valid governed policy")
+    }
+
+    #[test]
+    fn returns_none_for_a_policy_with_no_governed_limit() {
+        let policy = policy_with(None, None, None, None);
+        assert!(governance_limits_from_policy(&policy).is_none());
+    }
+
+    #[test]
+    fn maps_request_and_token_window_limits() {
+        let policy = policy_with(Some(60), Some(120_000), None, None);
+        let limits = governance_limits_from_policy(&policy).expect("rpm/tpm limit is governed");
+        assert_eq!(
+            limits,
+            GovernanceLimits {
+                requests_per_window: Some(60),
+                tokens_per_window: Some(120_000),
+                total_tokens: None,
+                total_micro_usd: None,
+                window_millis: 60_000,
+            }
+        );
+    }
+
+    #[test]
+    fn maps_budget_total_tokens_and_converts_max_cost_usd_to_micro_usd() {
+        let policy = policy_with(None, None, Some(1_000_000), Some(12.5));
+        let limits = governance_limits_from_policy(&policy).expect("budget is governed");
+        assert_eq!(
+            limits,
+            GovernanceLimits {
+                requests_per_window: None,
+                tokens_per_window: None,
+                total_tokens: Some(1_000_000),
+                total_micro_usd: Some(crate::server::ai_support::cost_usd_to_micros(12.5)),
+                window_millis: 60_000,
+            }
+        );
+        // `cost_usd_to_micros` rounds to the nearest whole micro-USD; pin the
+        // literal value too so a change to that helper's rounding is caught
+        // here, not just as "some conversion happened".
+        assert_eq!(limits.total_micro_usd, Some(12_500_000));
+    }
+
+    #[test]
+    fn a_single_governed_field_is_enough_to_produce_limits() {
+        // Only `max_requests_per_minute` set: the other three fields stay
+        // `None` in the mapped `GovernanceLimits`, but the policy as a whole
+        // still counts as governed (not skipped).
+        let policy = policy_with(Some(30), None, None, None);
+        let limits = governance_limits_from_policy(&policy).expect("rpm alone is governed");
+        assert_eq!(limits.requests_per_window, Some(30));
+        assert_eq!(limits.tokens_per_window, None);
+        assert_eq!(limits.total_tokens, None);
+        assert_eq!(limits.total_micro_usd, None);
+    }
+}
+
+#[cfg(test)]
+mod key_usage_route_tests {
+    use super::*;
+    use sbproxy_ai::governance::{InMemoryGovernanceConfig, InMemoryGovernanceStore};
+    use sbproxy_keystore::record::KeyRecord;
+
+    #[test]
+    fn key_usage_snapshot_key_rejects_a_caller_with_no_governed_policy() {
+        // No resolved key at all (anonymous caller).
+        assert_eq!(
+            key_usage_snapshot_key(None),
+            Err((401, "governed credential required"))
+        );
+
+        // A statically configured key with no `key_id` never resolves a
+        // policy, the same "legacy" case `governed_key_requirement`
+        // rejects.
+        let legacy: sbproxy_ai::identity::VirtualKeyConfig =
+            serde_json::from_value(serde_json::json!({"key": "legacy-secret", "name": "legacy"}))
+                .expect("legacy key");
+        let legacy = ResolvedRequestKey::from_configured(legacy, "tenant-a");
+        assert_eq!(
+            key_usage_snapshot_key(Some(&legacy)),
+            Err((401, "governed credential required"))
+        );
+    }
+
+    #[test]
+    fn key_usage_snapshot_key_scopes_to_the_resolved_callers_own_id() {
+        let mut record = KeyRecord::new("usage-key", "secret-hash", chrono::Utc::now());
+        record.max_requests_per_minute = Some(60);
+        let resolved =
+            ResolvedRequestKey::from_record(&record, "tenant-a").expect("valid stored policy");
+
+        let snapshot_key = key_usage_snapshot_key(Some(&resolved))
+            .expect("a governed key resolves its own snapshot key");
+
+        // There is no parameter path to another key's id: the snapshot key
+        // is always the resolved caller's own `key_id`.
+        assert_eq!(snapshot_key.key_id, "usage-key");
+        assert_eq!(snapshot_key.limits.requests_per_window, Some(60));
+    }
+
+    #[tokio::test]
+    async fn key_usage_response_returns_the_resolved_callers_own_snapshot() {
+        let mut record = KeyRecord::new("usage-response-key", "secret-hash", chrono::Utc::now());
+        record.max_requests_per_minute = Some(60);
+        let resolved =
+            ResolvedRequestKey::from_record(&record, "tenant-a").expect("valid stored policy");
+        let store = InMemoryGovernanceStore::new(InMemoryGovernanceConfig::default())
+            .expect("in-memory governance store");
+
+        let body = key_usage_response(&store, Some(&resolved))
+            .await
+            .expect("a governed key returns its own usage");
+
+        let usage: sbproxy_ai::governance::GovernanceSnapshot =
+            serde_json::from_value(body["usage"].clone())
+                .expect("the response wraps a GovernanceSnapshot under \"usage\"");
+        assert_eq!(usage.key_id, "usage-response-key");
+        assert_eq!(usage.requests_per_window.limit, Some(60));
+        assert_eq!(usage.requests_per_window.used, 0);
+    }
+
+    #[tokio::test]
+    async fn key_usage_response_rejects_a_caller_with_no_governed_key() {
+        // Same 401 status and message `governed_key_requirement` uses
+        // elsewhere in this file for a request with no governed
+        // credential: an anonymous caller has no usage to show.
+        let store = InMemoryGovernanceStore::new(InMemoryGovernanceConfig::default())
+            .expect("in-memory governance store");
+
+        let err = key_usage_response(&store, None)
+            .await
+            .expect_err("an unresolved caller has no key to look up");
+
+        assert_eq!(err, (401, "governed credential required"));
+    }
+}
+
+#[cfg(test)]
+mod governance_reserve_decision_tests {
+    use super::*;
+    use sbproxy_config::types::{GovernanceFailureMode, GovernanceMissingRatePolicy};
+
+    // --- governance_micro_usd_ceiling (WOR-1835, task 7) ---
+
+    #[test]
+    fn a_priced_estimate_converts_to_micro_usd_regardless_of_missing_rate_policy() {
+        // 12.5 USD -> 12_500_000 micro-USD, same conversion pinned in
+        // `governance_limits_from_policy_tests`.
+        for missing_rate in [
+            GovernanceMissingRatePolicy::ZeroCost,
+            GovernanceMissingRatePolicy::RequireRate,
+        ] {
+            assert_eq!(
+                governance_micro_usd_ceiling(12.5, missing_rate, true),
+                Ok(12_500_000)
+            );
+        }
+    }
+
+    #[test]
+    fn zero_cost_policy_admits_a_zero_estimate_with_a_zero_ceiling_even_with_a_dollar_limit() {
+        assert_eq!(
+            governance_micro_usd_ceiling(0.0, GovernanceMissingRatePolicy::ZeroCost, true),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn require_rate_policy_admits_a_zero_estimate_when_the_key_has_no_dollar_limit() {
+        // No `total_micro_usd` limit on the key: nothing for a $0 ceiling
+        // to fail to enforce, so `require_rate` has nothing to require.
+        assert_eq!(
+            governance_micro_usd_ceiling(0.0, GovernanceMissingRatePolicy::RequireRate, false),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn require_rate_policy_denies_a_zero_estimate_when_the_key_has_a_dollar_limit() {
+        assert_eq!(
+            governance_micro_usd_ceiling(0.0, GovernanceMissingRatePolicy::RequireRate, true),
+            Err(())
+        );
+    }
+
+    // --- governance_admits_on_backend_unavailable (WOR-1835, task 8;
+    //     rewired onto `failure_posture` in WOR-2121) ---
+
+    /// A governance block carrying only the legacy `failure_mode`.
+    fn legacy_governance(
+        failure_mode: GovernanceFailureMode,
+    ) -> sbproxy_config::types::KeyGovernanceConfig {
+        sbproxy_config::types::KeyGovernanceConfig {
+            failure_mode,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn closed_failure_mode_denies_on_backend_unavailable() {
+        assert!(!governance_admits_on_backend_unavailable(
+            legacy_governance(GovernanceFailureMode::Closed).failure_posture()
+        ));
+    }
+
+    #[test]
+    fn allow_unreserved_failure_mode_admits_on_backend_unavailable() {
+        assert!(governance_admits_on_backend_unavailable(
+            legacy_governance(GovernanceFailureMode::AllowUnreserved).failure_posture()
+        ));
+    }
+
+    #[test]
+    fn default_failure_mode_is_closed() {
+        assert_eq!(
+            GovernanceFailureMode::default(),
+            GovernanceFailureMode::Closed
+        );
+        assert!(!governance_admits_on_backend_unavailable(
+            legacy_governance(GovernanceFailureMode::default()).failure_posture()
+        ));
+    }
+
+    /// The legacy `allow_unreserved` keeps its audit and its counter,
+    /// because it resolves to `degraded` rather than to a plain `open`.
+    /// An operator who explicitly asks for `open` gets the admission
+    /// without the bookkeeping, and that is the only difference between
+    /// the two at this site.
+    #[test]
+    fn degraded_is_distinguishable_from_open_at_the_governance_site() {
+        use sbproxy_config::types::FailureMode;
+
+        let legacy = legacy_governance(GovernanceFailureMode::AllowUnreserved);
+        assert_eq!(legacy.failure_posture(), FailureMode::Degraded);
+        assert!(governance_admits_on_backend_unavailable(
+            legacy.failure_posture()
+        ));
+        assert!(
+            legacy.failure_posture().guarantee_waived(),
+            "the audit event and sbproxy_governance_fail_open_total hang off this"
+        );
+
+        let opened = sbproxy_config::types::KeyGovernanceConfig {
+            failure_posture: Some(FailureMode::Open),
+            ..Default::default()
+        };
+        assert!(governance_admits_on_backend_unavailable(
+            opened.failure_posture()
+        ));
+        assert!(
+            !opened.failure_posture().guarantee_waived(),
+            "a plain open admits and claims nothing, so it records nothing"
+        );
+    }
+
+    /// An explicit posture wins over the legacy field, in both directions.
+    #[test]
+    fn an_explicit_governance_posture_overrides_the_legacy_failure_mode() {
+        use sbproxy_config::types::FailureMode;
+
+        let closed_over_allow = sbproxy_config::types::KeyGovernanceConfig {
+            failure_mode: GovernanceFailureMode::AllowUnreserved,
+            failure_posture: Some(FailureMode::Closed),
+            ..Default::default()
+        };
+        assert!(!governance_admits_on_backend_unavailable(
+            closed_over_allow.failure_posture()
+        ));
+
+        let degraded_over_closed = sbproxy_config::types::KeyGovernanceConfig {
+            failure_mode: GovernanceFailureMode::Closed,
+            failure_posture: Some(FailureMode::Degraded),
+            ..Default::default()
+        };
+        assert!(governance_admits_on_backend_unavailable(
+            degraded_over_closed.failure_posture()
+        ));
     }
 }
 
 #[cfg(test)]
 mod served_model_rewrite_tests {
-    use super::{rewrite_managed_request_model, rewrite_response_model};
+    use super::{
+        rewrite_managed_request_model, rewrite_response_model, rewrite_stream_chunk_model,
+    };
 
     #[test]
     fn rewrites_public_model_to_the_engine_served_deployment() {
@@ -8842,5 +15464,62 @@ mod served_model_rewrite_tests {
         assert_eq!(rewrite_response_model(sse.clone(), "m"), sse);
         let err = bytes::Bytes::from(r#"{"error":{"message":"boom"}}"#);
         assert_eq!(rewrite_response_model(err.clone(), "m"), err);
+    }
+
+    #[test]
+    fn stream_chunk_rewrites_engine_model_to_serve_name() {
+        let chunk = bytes::Bytes::from(
+            "data: {\"model\":\"/var/lib/sbproxy/models/Qwen/Qwen3-14B-GGUF/main/Qwen3-14B-Q4_K_M.gguf\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        );
+        let out = rewrite_stream_chunk_model(chunk, "qwen3-14b");
+        let text = std::str::from_utf8(&out).expect("utf8");
+        let payload = text
+            .strip_prefix("data: ")
+            .and_then(|rest| rest.strip_suffix("\n\n"))
+            .expect("data frame shape");
+        let v: serde_json::Value = serde_json::from_str(payload).expect("json");
+        assert_eq!(v["model"], "qwen3-14b");
+        assert_eq!(v["choices"][0]["delta"]["content"], "hi");
+    }
+
+    #[test]
+    fn stream_chunk_rewrites_only_frames_carrying_a_model() {
+        // A multi-frame chunk: one frame carries the engine id, the
+        // trailing [DONE] sentinel must survive byte-identical.
+        let chunk = bytes::Bytes::from(
+            "data: {\"model\":\"internal-0\",\"choices\":[]}\n\ndata: [DONE]\n\n",
+        );
+        let out = rewrite_stream_chunk_model(chunk, "qwen3-14b");
+        let text = std::str::from_utf8(&out).expect("utf8");
+        assert!(text.contains("\"model\":\"qwen3-14b\""));
+        assert!(text.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[test]
+    fn stream_chunk_passes_done_sentinel_through_untouched() {
+        let done = bytes::Bytes::from("data: [DONE]\n\n");
+        assert_eq!(rewrite_stream_chunk_model(done.clone(), "m"), done);
+    }
+
+    #[test]
+    fn stream_chunk_passes_non_json_through_untouched() {
+        // A keepalive comment and a partial frame cut mid-JSON: both
+        // must pass through byte-identical (the relay does not buffer
+        // partial frames, so neither can be parsed here).
+        let keepalive = bytes::Bytes::from(": ping\n\n");
+        assert_eq!(
+            rewrite_stream_chunk_model(keepalive.clone(), "m"),
+            keepalive
+        );
+        let partial = bytes::Bytes::from("data: {\"model\":\"internal-0\",\"choi");
+        assert_eq!(rewrite_stream_chunk_model(partial.clone(), "m"), partial);
+    }
+
+    #[test]
+    fn stream_chunk_leaves_matching_model_untouched() {
+        let chunk = bytes::Bytes::from("data: {\"model\":\"qwen3-14b\",\"choices\":[]}\n\n");
+        let out = rewrite_stream_chunk_model(chunk.clone(), "qwen3-14b");
+        // Zero-copy pass-through: same bytes, not a re-serialization.
+        assert_eq!(out, chunk);
     }
 }

@@ -10,6 +10,15 @@ use std::collections::HashMap;
 // --- Top-Level Config ---
 
 /// Top-level config file structure (sb.yml).
+///
+/// This is the one container in the schema without
+/// `#[serde(deny_unknown_fields)]` (WOR-1140). The archived Go v0.1.x
+/// schema was a flat single-origin file whose keys all sit at the top
+/// level, and the schema-v1 compatibility promise
+/// (`v1_compat::v1_fixtures_compile_unmodified`) keeps those files
+/// compiling. Unknown top-level keys therefore warn via the
+/// `serde_ignored` pass in [`crate::compile_config`] instead of failing
+/// the parse; every nested container rejects unknown keys outright.
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ConfigFile {
     /// Optional source descriptor.
@@ -36,9 +45,10 @@ pub struct ConfigFile {
     /// Top-level agent-class catalog selection and resolver tuning.
     /// When unset, the binary constructs a resolver from the embedded
     /// default catalog (so per-agent metric labels keep firing);
-    /// operators only set this block when they want to point at a
-    /// hosted feed, merge a custom catalog, or change the rDNS /
-    /// bot-auth / cache settings.
+    /// operators set this block to provide an inline catalog or change
+    /// the rDNS / bot-auth / cache settings. Hosted-feed fields remain
+    /// parseable for compatibility but are not fetched by the OSS
+    /// runtime.
     #[serde(default)]
     pub agent_classes: Option<AgentClassesConfig>,
     /// WOR-1130: top-level workspace rate-limit budget + auto-suspend
@@ -47,9 +57,9 @@ pub struct ConfigFile {
     /// with a soft / throttle / auto-suspend state machine.
     #[serde(default)]
     pub rate_limits: Option<RateLimitsConfig>,
-    /// WOR-1130: audit sink selection for admin-action audit rows
-    /// (e.g. the auto-suspend transition). `memory` keeps the last N
-    /// rows queryable via `/api/audit/recent` (used by tests + ops).
+    /// WOR-1130: compatibility-only audit sink shape. The OSS runtime
+    /// always retains admin-action rows in memory and mirrors them to
+    /// tracing; selecting a sink here has no effect.
     #[serde(default)]
     pub audit: Option<AuditConfig>,
     /// WOR-1186: emit the canonical session ledger (per-tool-call run
@@ -57,10 +67,171 @@ pub struct ConfigFile {
     /// block is present and `enabled: true`.
     #[serde(default)]
     pub session_ledger: Option<SessionLedgerConfig>,
+    /// Process-wide feature flags available to CEL through
+    /// `flag_enabled(name, key)`. An absent or empty list installs an
+    /// empty runtime store, including on hot reload.
+    #[serde(default)]
+    pub flags: Vec<FeatureFlagConfig>,
+    /// WOR-1804: how `sbproxy update` behaves for the binary and the
+    /// managed inference engines. Optional; an absent block is the same
+    /// as the defaults (stable channel, no background check).
+    #[serde(default)]
+    pub update: UpdateConfig,
+}
+
+/// One process-wide feature flag exposed to CEL.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FeatureFlagConfig {
+    /// Unique name passed as the first argument to `flag_enabled`.
+    pub name: String,
+    /// Value returned when none of the configured rules match.
+    #[serde(default)]
+    pub default: bool,
+    /// Allow/block lists and sticky rollout rules.
+    #[serde(default)]
+    pub rules: FeatureFlagRuleConfig,
+}
+
+/// Rules for a process-wide feature flag.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FeatureFlagRuleConfig {
+    /// Bucketing keys that always evaluate to true.
+    #[serde(default)]
+    pub allow_list: Vec<String>,
+    /// Bucketing keys that always evaluate to false.
+    #[serde(default)]
+    pub block_list: Vec<String>,
+    /// Sticky rollout cutoff in the inclusive range 0..=100.
+    #[serde(default)]
+    #[schemars(range(max = 100))]
+    pub rollout_percent: u32,
+}
+
+#[cfg(test)]
+mod feature_flag_config_tests {
+    use super::*;
+
+    #[test]
+    fn schema_rejects_unknown_flag_fields_and_caps_rollout() {
+        let flag_schema =
+            serde_json::to_value(schemars::schema_for!(FeatureFlagConfig)).expect("flag schema");
+        assert_eq!(flag_schema["additionalProperties"], false);
+
+        let rule_schema = serde_json::to_value(schemars::schema_for!(FeatureFlagRuleConfig))
+            .expect("rule schema");
+        assert_eq!(rule_schema["additionalProperties"], false);
+        assert_eq!(
+            rule_schema["properties"]["rollout_percent"]["maximum"].as_f64(),
+            Some(100.0)
+        );
+    }
+}
+
+/// Which release stream `sbproxy update` follows for the binary and the
+/// managed inference engines (WOR-1804).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateChannel {
+    /// Track the latest stable release. The default.
+    #[default]
+    Stable,
+    /// Track the newest release, pre-releases included.
+    Latest,
+    /// Never move automatically. Every artifact is held; only an
+    /// `sbproxy update` run that explicitly targets an artifact may
+    /// replace it.
+    Pinned,
+}
+
+/// The `update:` block: how `sbproxy update` behaves (WOR-1804).
+///
+/// Pinning always wins. A `path` / `brew` / `apt`-managed artifact, or
+/// one pinned to an explicit version or digest, is reported but never
+/// replaced unless a run explicitly targets it. A background check (see
+/// `auto`) only ever reports; applying an update is always an explicit
+/// `sbproxy update` run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateConfig {
+    /// Release stream the binary and managed engines follow.
+    #[serde(default)]
+    pub channel: UpdateChannel,
+    /// When true, a background freshness check runs every
+    /// `check_interval` and reports to `sbproxy doctor` and the logs. A
+    /// background check never replaces an artifact; it only reports.
+    #[serde(default)]
+    pub auto: bool,
+    /// How often the background check runs, in seconds. Accepts a
+    /// humanized duration (`6h`, `1d`) or bare seconds. Only consulted
+    /// when `auto` is true. Defaults to once a day.
+    #[serde(
+        default = "default_update_check_interval_secs",
+        deserialize_with = "crate::duration::deserialize_secs"
+    )]
+    pub check_interval_secs: u64,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            channel: UpdateChannel::default(),
+            auto: false,
+            check_interval_secs: default_update_check_interval_secs(),
+        }
+    }
+}
+
+/// Default background freshness-check interval: once a day.
+fn default_update_check_interval_secs() -> u64 {
+    86_400
+}
+
+#[cfg(test)]
+mod update_config_tests {
+    use super::*;
+
+    #[test]
+    fn absent_block_uses_defaults() {
+        // An existing config with no `update:` block parses unchanged and
+        // yields the stable, no-background defaults.
+        let cfg: ConfigFile = serde_yaml::from_str("proxy: {}\n").unwrap();
+        assert_eq!(cfg.update.channel, UpdateChannel::Stable);
+        assert!(!cfg.update.auto);
+        assert_eq!(cfg.update.check_interval_secs, 86_400);
+    }
+
+    #[test]
+    fn empty_update_block_uses_defaults() {
+        let cfg: UpdateConfig = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(cfg, UpdateConfig::default());
+        assert_eq!(cfg.channel, UpdateChannel::Stable);
+    }
+
+    #[test]
+    fn parses_channel_and_auto_and_humanized_interval() {
+        let cfg: UpdateConfig =
+            serde_yaml::from_str("channel: pinned\nauto: true\ncheck_interval_secs: 6h\n").unwrap();
+        assert_eq!(cfg.channel, UpdateChannel::Pinned);
+        assert!(cfg.auto);
+        assert_eq!(cfg.check_interval_secs, 21_600);
+    }
+
+    #[test]
+    fn channel_round_trips_snake_case() {
+        let cfg: UpdateConfig = serde_yaml::from_str("channel: latest\n").unwrap();
+        assert_eq!(cfg.channel, UpdateChannel::Latest);
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(json["channel"], "latest");
+    }
 }
 
 /// WOR-1130: top-level workspace rate-limit budget configuration.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RateLimitsConfig {
     /// Budget applied to the default workspace (the only workspace in
     /// the OSS single-tenant build; enterprise multi-tenant resolves a
@@ -79,6 +250,7 @@ pub struct RateLimitsConfig {
 
 /// WOR-1130: the per-workspace request budget.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceBudgetConfig {
     /// Sustained inbound HTTP requests-per-second ceiling (the token
     /// bucket refill rate).
@@ -114,6 +286,7 @@ fn default_http_rps_burst() -> u32 {
 
 /// WOR-1130: throttle -> auto-suspend escalation tuning.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RateLimitEscalationConfig {
     /// Consecutive-throttle count that promotes a workspace from
     /// `Throttle` to `AutoSuspend`. A2.5 default is 1000.
@@ -162,15 +335,17 @@ pub enum RateLimitClockMode {
     Manual,
 }
 
-/// WOR-1130: audit sink selection.
+/// WOR-1130: compatibility-only audit sink selection.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AuditConfig {
-    /// Where admin-action audit rows are kept.
+    /// Accepted for config compatibility but not consumed by the OSS
+    /// runtime. Rows always use both the in-memory ring and tracing.
     #[serde(default)]
     pub sink: AuditSinkKind,
 }
 
-/// WOR-1130: audit sink kinds.
+/// WOR-1130: accepted audit sink names.
 #[derive(
     Debug,
     Clone,
@@ -184,15 +359,18 @@ pub struct AuditConfig {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum AuditSinkKind {
-    /// Keep the last N rows in memory, queryable via `/api/audit/recent`.
+    /// Compatibility value; rows remain queryable via `/api/audit/recent`
+    /// and are also mirrored to tracing.
     #[default]
     Memory,
-    /// Emit to the structured `security_audit` tracing target only.
+    /// Compatibility value; rows are still retained in memory as well
+    /// as emitted to the structured `security_audit` tracing target.
     Tracing,
 }
 
 /// WOR-1186: session-ledger emission configuration.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SessionLedgerConfig {
     /// Turn ledger emission on. When false (the default), the
     /// `tools/call` path pays a single atomic load and emits nothing.
@@ -247,8 +425,14 @@ pub enum SessionLedgerSinkKind {
 ///   sources, merging each in order. A `db` form is reserved for a
 ///   later iteration but is intentionally not part of this primitive
 ///   yet.
+///
+/// A git source is transport trust: HTTPS plus whatever the git host
+/// authenticated, and nothing more. Pin `revision` to a full commit sha
+/// and set `verify_signature` to close most of that gap; see
+/// [`crate::source`] for the resolution contract.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum ConfigSource {
     /// The inline file is the config; nothing is fetched. This is the
     /// historical behaviour and the implied default when `source:`
@@ -259,13 +443,35 @@ pub enum ConfigSource {
     Git {
         /// Repository URL (https, ssh, or any URL `git clone` accepts).
         repo: String,
-        /// Optional branch, tag, or commit sha. When `None`, the
-        /// default branch is used.
+        /// Optional branch, tag, or full commit sha. When `None`, the
+        /// default branch is used. A full commit sha is a pin: the
+        /// loader verifies the resolved `HEAD` equals it, so a branch
+        /// moving underneath the node cannot be followed silently.
         #[serde(default)]
         revision: Option<String>,
         /// Path inside the repository to the config file, relative
         /// to the repository root.
         path: String,
+        /// Optional credential reference for a private repository, as
+        /// `env:NAME`, `${NAME}`, `file:/path`, or `secret://backend/name`.
+        /// An inline literal is refused: a token in a config file is a
+        /// token in every copy of that file.
+        #[serde(default)]
+        credential: Option<String>,
+        /// Require a valid signature on the resolved tag or commit.
+        /// Off by default, because most repositories are not signed.
+        #[serde(default)]
+        verify_signature: bool,
+        /// Hard timeout for one fetch, in seconds. The child `git`
+        /// process is killed when it expires; a config-load path with
+        /// no timeout hangs startup.
+        #[serde(default = "default_source_timeout_secs")]
+        timeout_secs: u64,
+        /// How often to re-resolve this source while the proxy runs, in
+        /// seconds. `0` disables refresh, so the document is resolved
+        /// once at boot and on every ordinary reload.
+        #[serde(default = "default_source_refresh_secs")]
+        refresh_interval_secs: u64,
     },
     /// Compose a base source with one or more overlays. Each overlay
     /// is merged onto the accumulated result in the order it appears
@@ -280,6 +486,23 @@ pub enum ConfigSource {
     },
 }
 
+/// Default hard timeout for one git fetch, in seconds.
+///
+/// Long enough for a shallow clone of a config repository over a slow
+/// link, short enough that a hung remote does not hold boot open.
+fn default_source_timeout_secs() -> u64 {
+    60
+}
+
+/// Default refresh cadence for a git source, in seconds.
+///
+/// A GitOps deployment wants the repository to be the live source of
+/// truth, so refresh is on by default. Set `refresh_interval_secs: 0`
+/// to resolve once at boot instead.
+fn default_source_refresh_secs() -> u64 {
+    60
+}
+
 // --- Agent-class top-level config ---
 
 /// Top-level `agent_classes:` block. Tunes the agent-class resolver
@@ -290,12 +513,12 @@ pub enum ConfigSource {
 /// resolver from `AgentClassCatalog::defaults()` plus the default
 /// resolver tuning. Most operators leave it untouched.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AgentClassesConfig {
-    /// Catalog source. `builtin` (default) loads the embedded YAML
-    /// catalog. `inline` loads the entries in `entries`. `hosted-feed`
-    /// fetches from `hosted_feed.url`. `merged` loads the hosted feed
-    /// and overlays it on top of the embedded defaults so an operator's
-    /// feed only needs to ship deltas.
+    /// Catalog source. `builtin` (default) loads the embedded YAML and
+    /// `inline` loads `entries`. The compatibility values `hosted-feed`
+    /// and `merged` currently warn and fall back to the embedded
+    /// defaults; the OSS runtime does not fetch `hosted_feed.url`.
     #[serde(default = "default_agent_classes_catalog")]
     pub catalog: String,
     /// Inline catalog entries. Used when `catalog: inline`; each entry
@@ -303,8 +526,8 @@ pub struct AgentClassesConfig {
     /// embedded catalog.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entries: Vec<serde_json::Value>,
-    /// Hosted-feed configuration. Required when `catalog: hosted-feed`
-    /// or `catalog: merged`.
+    /// Compatibility-only hosted-feed configuration. It remains
+    /// parseable but the OSS runtime does not fetch or merge it.
     #[serde(default)]
     pub hosted_feed: Option<HostedFeedConfig>,
     /// Resolver tuning (rDNS toggle, bot-auth toggle, cache size).
@@ -330,19 +553,18 @@ fn default_agent_classes_catalog() -> String {
 
 /// Hosted-feed source for the agent-class catalog.
 ///
-/// Pulled at startup and refreshed on a schedule the registry owns.
-/// The fetch loop is not implemented in this crate; the field is
-/// reserved here so YAML written against the merged or hosted-feed
-/// shapes parses cleanly.
+/// Reserved so YAML written against the `hosted-feed` or `merged`
+/// shapes parses cleanly. The OSS runtime does not fetch, refresh, or
+/// verify this feed; selecting either catalog value warns and falls
+/// back to the embedded defaults.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct HostedFeedConfig {
-    /// Feed URL. Plain `http://` is allowed only against `127.0.0.1`
-    /// and `localhost` for local development; the registry crate
-    /// enforces HTTPS at fetch time for any other host.
+    /// Reserved feed URL. It is accepted but not fetched or validated
+    /// by the OSS runtime.
     pub url: String,
-    /// Bootstrap public keys (base64-encoded ed25519 keys) used to
-    /// verify the feed's detached signature on the first fetch.
-    /// Empty in dev configs; required for production.
+    /// Reserved bootstrap public keys. They are accepted but no
+    /// signature verification is installed in the OSS runtime.
     #[serde(default)]
     pub bootstrap_keys: Vec<String>,
 }
@@ -354,6 +576,7 @@ pub struct HostedFeedConfig {
 /// only when they need to disable a specific signal (typically rDNS
 /// in environments without a working PTR resolver).
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AgentClassResolverConfig {
     /// Run forward-confirmed reverse-DNS as resolver step 2. Default
     /// `true`. Disable when the runtime has no working DNS resolver.
@@ -395,6 +618,21 @@ fn default_resolver_cache_size() -> usize {
 
 // --- Server Config ---
 
+/// Process-owned settings for the embedded compression-state database.
+///
+/// This block controls where the process opens its durable Local backend.
+/// It is intentionally independent of route-level compression policy.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct CompressionStateRuntimeConfig {
+    /// Explicit absolute path to the redb database file.
+    ///
+    /// When omitted, startup selects the first suitable platform state
+    /// directory. Validation checks only the string contract; filesystem
+    /// availability is a startup concern.
+    pub local_path: Option<String>,
+}
+
 /// Server-level proxy configuration parsed from the top-level `proxy:`
 /// block of sb.yml.
 ///
@@ -405,6 +643,7 @@ fn default_resolver_cache_size() -> usize {
 /// messenger). Out-of-tree top-level blocks live in
 /// [`Self::extensions`] and are ignored by the compiler.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ProxyServerConfig {
     /// HTTP listener port. Defaults to 8080.
     #[serde(default = "default_http_port")]
@@ -432,25 +671,20 @@ pub struct ProxyServerConfig {
     /// overrides the manual `tls_cert_file` / `tls_key_file` pair.
     #[serde(default)]
     pub acme: Option<AcmeConfig>,
-    /// Optional HTTP/3 (QUIC) listener configuration.
+    /// Reserved HTTP/3 (QUIC) listener configuration.
     ///
-    /// Temporarily inert: HTTP/3 is disabled until native QUIC support lands
-    /// in the underlying proxy engine. The field still parses so existing
-    /// configs keep loading, but enabling it only logs a warning and does not
-    /// start a listener.
+    /// The block remains in the schema for forward compatibility. Omission or
+    /// `enabled: false` compiles, but `enabled: true` is rejected because this
+    /// build does not serve HTTP/3. Native support is tracked in WOR-1969.
     #[serde(default)]
     pub http3: Option<Http3Config>,
     /// Metrics collection settings, including cardinality limiting.
     #[serde(default)]
     pub metrics: Option<MetricsConfig>,
-    /// Top-level observability block: groups `log` (tracing-subscriber
-    /// filter / format / sampling) and `telemetry` (OTLP exporter)
-    /// under one block so an operator configures the whole surface
-    /// from YAML instead of CLI flags + env vars.
-    ///
-    /// When absent, CLI / env precedence still applies; the YAML
-    /// fields are a third source of truth that wins over the existing
-    /// `RUST_LOG` default but loses to `--log-level` / `SB_LOG_LEVEL`.
+    /// Top-level observability block: live log sinks, redaction and custom
+    /// fields plus the OTLP exporter and durable usage rollups. The parent log
+    /// level, format, and sampling fields are compatibility-only; process
+    /// tracing uses CLI/environment selection and built-in sampling defaults.
     #[serde(default)]
     pub observability: Option<ObservabilityConfig>,
     /// Alert notification channel configuration.
@@ -465,6 +699,14 @@ pub struct ProxyServerConfig {
     /// Optional shared cluster substrate for keys, metrics, and managed models.
     #[serde(default)]
     pub cluster: Option<crate::cluster::ClusterConfig>,
+    /// Optional config-authority participation: subscribe to signed
+    /// configuration bundles published by an upstream authority.
+    ///
+    /// The whole block sits on [`crate::config_merge::AUTHORITY_DENIED_PATHS`],
+    /// so a bundle can never repoint a subscriber at a different authority
+    /// or relax its verification.
+    #[serde(default)]
+    pub config_authority: Option<ConfigAuthorityConfig>,
     /// Secrets management configuration.
     #[serde(default)]
     pub secrets: Option<SecretsConfig>,
@@ -491,6 +733,18 @@ pub struct ProxyServerConfig {
     /// entry back into the hot tier on hit.
     #[serde(default)]
     pub cache_reserve: Option<CacheReserveConfig>,
+    /// Optional selection of the shared response-cache backing store.
+    ///
+    /// One store serves every origin: the cache key already carries
+    /// workspace, hostname, method, and path, so origins never collide.
+    /// When this block is absent, the store is chosen the way it always
+    /// was, Redis if `l2_cache` is set and an in-process map otherwise,
+    /// so an existing config keeps the backend it has today.
+    #[serde(default)]
+    pub response_cache_store: Option<ResponseCacheStoreConfig>,
+    /// Process-owned path configuration for durable Local compression state.
+    #[serde(default)]
+    pub compression_state: Option<CompressionStateRuntimeConfig>,
     /// Optional shared message bus for inter-component eventing (config
     /// updates, semantic-cache purges, etc.). When unset, components that
     /// need a bus degrade to no-op semantics.
@@ -582,6 +836,13 @@ pub struct ProxyServerConfig {
     /// configs are unaffected.
     #[serde(default)]
     pub web_bot_auth: Option<WebBotAuthConfig>,
+    /// Consumption attestation (WOR-2127): whether this proxy asserts
+    /// what a call is going to cost, records what it actually
+    /// consumed, and what it charges for. Absent leaves the whole
+    /// mechanism off, so an existing config is unaffected. See
+    /// [`AttestationConfig`].
+    #[serde(default)]
+    pub attestation: Option<AttestationConfig>,
     /// WOR-1053: declared tenants. Each entry carries an `id`
     /// referenced by `origin.tenant_id`. Future PRs add per-tenant
     /// `credentials`, `policies`, and `vault` blocks; PR1 lands the
@@ -606,6 +867,19 @@ pub struct ProxyServerConfig {
     /// `docs/migration-credentials.md`.
     #[serde(default)]
     pub credentials: Vec<CredentialBlock>,
+    /// Durable payment settlement. When absent, the proxy keeps its
+    /// existing non-settlement crawl-ledger behaviour exactly. When
+    /// present, a paid request reaches the origin only after its
+    /// durable intent has committed `Succeeded`.
+    ///
+    /// The block is always parsed, on every build, so `sbproxy
+    /// validate` reads the same document everywhere. The consumer
+    /// compares [`crate::payments::PaymentsConfig::required_features`]
+    /// against its own compiled feature set and fails startup naming
+    /// the missing feature, so a configured rail that was not compiled
+    /// in never reaches a first request.
+    #[serde(default)]
+    pub payments: Option<crate::payments::PaymentsConfig>,
 }
 
 /// Web Bot Auth signing identity for the proxy. See the
@@ -617,6 +891,7 @@ pub struct ProxyServerConfig {
 /// Bot Auth. Treat `ed25519_seed_hex` as a secret (source it via an
 /// env interpolation rather than committing it).
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct WebBotAuthConfig {
     /// Key id advertised as the JWK `kid` and the RFC 9421 `keyid`.
     /// Must be non-empty.
@@ -635,6 +910,466 @@ pub struct WebBotAuthConfig {
     pub directory_url: Option<String>,
 }
 
+// --- Consumption attestation (WOR-2127) ---
+
+/// The one `sign_with` target this build knows how to resolve.
+///
+/// A config path rather than a key name, because the operator is
+/// pointing at an identity that already exists in their document rather
+/// than declaring a second one. Kept as a validated string so the day a
+/// second signing identity ships, an old config still parses and the
+/// error tells the operator what is on offer.
+pub const ATTESTATION_SIGN_WITH_WEB_BOT_AUTH: &str = "proxy.web_bot_auth";
+
+/// Largest `queue.max_entries` this build accepts.
+///
+/// The queue is an in-process hold for claims that have not settled
+/// yet. Past ten million entries an operator is describing a database,
+/// and sizing one by accident (an extra zero) should fail at config
+/// compile rather than at the memory ceiling.
+pub const MAX_ATTESTATION_QUEUE_ENTRIES: usize = 10_000_000;
+
+const fn default_attestation_queue_max_entries() -> usize {
+    100_000
+}
+
+const fn default_attestation_failure_mode() -> FailureMode {
+    FailureMode::Degraded
+}
+
+const fn default_measured_per() -> u64 {
+    1
+}
+
+/// What part this proxy plays in attesting to consumption.
+///
+/// The two halves answer the two halves of a billing dispute and are
+/// independently useful, which is why this is four values rather than a
+/// boolean. A claim is made before the call and says what it is going
+/// to cost; a receipt is written after it and says what it actually
+/// consumed. A gateway in front of somebody else's metered API wants
+/// [`Self::Claim`] alone. A proxy selling its own upstream wants
+/// [`Self::Receipt`] alone. An operator reselling metered capacity
+/// wants [`Self::Both`], because they have to answer to a buyer and a
+/// supplier at once.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AttestationRole {
+    /// Attest to nothing. The default, and what every config that does
+    /// not mention the block gets.
+    #[default]
+    Off,
+    /// Assert what a call is going to cost, before it is served.
+    Claim,
+    /// Record what a call actually consumed, after it is served.
+    Receipt,
+    /// Both halves. The posture for reselling metered capacity.
+    Both,
+}
+
+impl AttestationRole {
+    /// True when this role asserts a cost before the call is served.
+    pub fn makes_claims(self) -> bool {
+        matches!(self, Self::Claim | Self::Both)
+    }
+
+    /// True when this role records consumption after the call is
+    /// served. The half that needs a signing identity, because a
+    /// receipt nobody can verify is a log line.
+    pub fn writes_receipts(self) -> bool {
+        matches!(self, Self::Receipt | Self::Both)
+    }
+}
+
+/// The billing answer for one outcome, in the configuration
+/// vocabulary.
+///
+/// A deliberate mirror of `sbproxy_meter::Billable` rather than a
+/// re-export. The meter crate depends on no other crate in this
+/// workspace, which is what lets an operator metering a plain REST API
+/// compile it without the AI stack; deriving [`schemars::JsonSchema`]
+/// on its types would end that. So the wire vocabulary lives here, the
+/// billing vocabulary lives there, and `sbproxy-core` converts between
+/// them. The two are kept in step by
+/// `sbproxy_meter::BillableOutcome::ALL`: adding an outcome there stops
+/// the conversion compiling until this surface answers for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BillableRule {
+    /// Bill every unit the call produced.
+    Yes,
+    /// Bill nothing. The call is still recorded, because a receipt that
+    /// omits the free calls cannot be reconciled against a request log.
+    No,
+    /// Bill the work the origin actually performed, even though the
+    /// request was cut short.
+    Partial,
+    /// Fold this attempt into the invoice line its claim names, so a
+    /// flaky origin costs the buyer once rather than once per attempt.
+    Collapse,
+}
+
+/// `proxy.attestation.billable`: what the operator charges for.
+///
+/// Every field is `Option` so that an incomplete block is a config
+/// error this crate can describe rather than a serde error that names
+/// one missing field at a time. The operator owes an answer for all
+/// eight, and [`Self::missing_outcomes`] hands them the whole list in
+/// one message. Nothing is defaulted: an unstated billing rule still
+/// runs, it just runs as whatever the code happened to do, and nobody
+/// discovers what that was until a buyer asks.
+///
+/// `cache_hit` is the case that proves the rule. A vendor selling
+/// compute can argue a cache hit cost them nothing; a vendor selling
+/// answers can argue the answer is what was bought and where it came
+/// from is their business. Both are positions real companies hold, so
+/// this surface holds neither.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct AttestationBillableConfig {
+    /// The response was served to the client in full.
+    pub delivered: Option<BillableRule>,
+    /// The client went away before the response finished.
+    pub client_disconnected: Option<BillableRule>,
+    /// The origin rejected the request as the caller's fault.
+    pub origin_4xx: Option<BillableRule>,
+    /// The origin failed.
+    pub origin_5xx: Option<BillableRule>,
+    /// A policy refused the call before it reached the origin.
+    pub policy_blocked: Option<BillableRule>,
+    /// A rate limit rejected the call.
+    pub rate_limited: Option<BillableRule>,
+    /// The response was served from cache without touching the origin.
+    pub cache_hit: Option<BillableRule>,
+    /// One attempt of a call that was retried.
+    pub retry: Option<BillableRule>,
+}
+
+impl AttestationBillableConfig {
+    /// Every outcome the operator has not answered, in the order
+    /// `sbproxy_meter::BillableOutcome::ALL` declares them.
+    ///
+    /// Returned rather than checked so the caller can name the whole
+    /// set in one error. An operator who left three outcomes blank
+    /// should not have to compile three times to find that out.
+    pub fn missing_outcomes(&self) -> Vec<&'static str> {
+        let answered: [(&'static str, bool); 8] = [
+            ("delivered", self.delivered.is_some()),
+            ("client_disconnected", self.client_disconnected.is_some()),
+            ("origin_4xx", self.origin_4xx.is_some()),
+            ("origin_5xx", self.origin_5xx.is_some()),
+            ("policy_blocked", self.policy_blocked.is_some()),
+            ("rate_limited", self.rate_limited.is_some()),
+            ("cache_hit", self.cache_hit.is_some()),
+            ("retry", self.retry.is_some()),
+        ];
+        answered
+            .into_iter()
+            .filter_map(|(name, given)| (!given).then_some(name))
+            .collect()
+    }
+}
+
+/// `proxy.attestation.queue`: where claims wait until they settle.
+///
+/// A claim is written when the call starts and settled when it
+/// finishes, and the gap between those is where a crash loses money.
+/// The queue is that gap made durable.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttestationQueueConfig {
+    /// Filesystem path of the queue. Required: an attestation role with
+    /// nowhere to hold unsettled claims silently drops them on restart,
+    /// which is the failure the whole mechanism exists to prevent.
+    pub path: String,
+    /// How many unsettled claims to hold before the configured
+    /// [`AttestationConfig::failure_mode`] applies. Defaults to
+    /// 100,000, which is roughly a minute of unsettled work at a
+    /// thousand requests a second.
+    #[serde(default = "default_attestation_queue_max_entries")]
+    pub max_entries: usize,
+}
+
+/// `proxy.attestation.ledger`: where settled records are chained.
+///
+/// The ledger answers the half of a billing dispute a signature cannot:
+/// "I made calls you never credited". Each record is hash-chained to
+/// the one before it, so a gap is visible rather than merely absent.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttestationLedgerConfig {
+    /// Filesystem path of the append-only ledger file.
+    pub path: String,
+}
+
+/// Which observed quantity a measured unit counts, in the
+/// configuration vocabulary.
+///
+/// A deliberate mirror of `sbproxy_meter::MeasuredQuantity` rather than
+/// a re-export, for the same reason [`BillableRule`] mirrors
+/// `sbproxy_meter::Billable`. The meter crate depends on no other crate
+/// in this workspace, which is what lets an operator metering a plain
+/// REST API compile it without the gateway around it; deriving
+/// [`schemars::JsonSchema`] on its types would end that. So the config
+/// vocabulary lives here, the metering vocabulary lives there, and
+/// `sbproxy-core` converts between them. Both spell the variants the
+/// same way on the wire, so a config written against one reads the same
+/// as a receipt written by the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AttestationMeasuredQuantity {
+    /// The request itself, which is always one. What a flat per-call
+    /// charge is built from.
+    Requests,
+    /// Request bytes received from the client.
+    BytesIn,
+    /// Response bytes written to the client. What was actually written,
+    /// so a response that was cut short bills what crossed the wire.
+    BytesOut,
+    /// Wall-clock milliseconds the request was in flight.
+    DurationMs,
+}
+
+/// `proxy.attestation.measured[]`: one unit the proxy counted itself.
+///
+/// The only unit source with nothing outside the process in it. The
+/// proxy saw the bytes and held the clock, so nobody else contributed
+/// to the number and there is no third party whose word has to be
+/// taken. That is why it is the resolver to reach for first: a route
+/// weight is only as honest as the document it was read from, and an
+/// origin header is only as honest as the party being paid for it,
+/// whereas this one is arithmetic over things that demonstrably
+/// happened.
+///
+/// A partial unit is billed as a whole one. Twelve thousand and
+/// forty-three bytes against a kibibyte rule is twelve units, not
+/// eleven and a bit, because the operator delivered those bytes and
+/// there is no fraction of a kibibyte to hand back. See
+/// `sbproxy_meter::MeasuredRule`.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttestationMeasuredConfig {
+    /// Unit name that appears on the invoice line, for example
+    /// `egress_kib`. Unique across every resolver: two units sharing a
+    /// name on one receipt is an invoice line that cannot be read.
+    pub name: String,
+    /// The observed quantity this entry counts. See
+    /// [`AttestationMeasuredQuantity`].
+    pub quantity: AttestationMeasuredQuantity,
+    /// How much of the raw quantity makes one unit.
+    ///
+    /// This is the key that turns bytes into kibibytes: `1024` against
+    /// [`AttestationMeasuredQuantity::BytesOut`] bills one unit per
+    /// kibibyte written. A divisor rather than a multiplier because the
+    /// raw quantity is always the smaller currency and the invoice line
+    /// is always the larger one. Nobody sells thousandths of a request,
+    /// but plenty of people sell kibibytes and compute-seconds, and
+    /// writing `per: 1000` against `duration_ms` says "a second" in the
+    /// units the proxy actually observed rather than asking the
+    /// operator to express a rate as a fraction.
+    ///
+    /// Defaults to `1`, which bills one unit per observed item and is
+    /// the only sensible reading of an entry that omits it. Zero is
+    /// rejected at config compile: a divisor of zero has no answer to
+    /// fall back on, and the request path is the wrong place to find
+    /// that out.
+    #[serde(default = "default_measured_per")]
+    pub per: u64,
+}
+
+/// `proxy.attestation.route_weights[]`: one route the operator priced.
+///
+/// The simplest thing an operator can say about what a call costs, and
+/// the only one that needs nothing from anybody: the weight is written
+/// down, so the number is a pure function of the route and the document
+/// it was read from. That document is already signed, so naming its
+/// revision on the receipt is all it takes for a buyer to check the
+/// price themselves. See `sbproxy_meter::RouteWeightTable`.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttestationRouteWeightConfig {
+    /// Unit name that appears on the invoice line, for example
+    /// `search_call`. Repeating a name across entries is how one line
+    /// gets different prices on different routes; see [`Self::path`].
+    pub name: String,
+    /// HTTP method this entry prices, or absent for any method.
+    /// Matched case-insensitively.
+    #[serde(default)]
+    pub method: Option<String>,
+    /// The path this entry prices: either exact (`/v1/search`) or a
+    /// prefix ending in `/*` (`/v1/search/*`), which covers everything
+    /// below that segment and deliberately not the segment itself.
+    ///
+    /// When several entries share a [`Self::name`] and all match, the
+    /// most specific wins: a named method beats an unnamed one, an exact
+    /// path beats a prefix, and a longer prefix beats a shorter one. One
+    /// name still bills one line.
+    pub path: String,
+    /// What one matching call costs.
+    ///
+    /// Zero is allowed and means the route is metered and free, which is
+    /// not the same as having no entry for it. No entry means this line
+    /// does not price the route at all, and the receipt then carries no
+    /// unit rather than a zero.
+    pub weight: u64,
+}
+
+/// `proxy.attestation.origin_headers[]`: one count the upstream reports.
+///
+/// The only unit source that can be wrong without the proxy being wrong,
+/// because the party supplying the number is the party being paid for
+/// it. That is not a reason to refuse it: an API selling result rows has
+/// to bill result rows, and only the origin knows how many there were.
+/// What the proxy does instead is attest rather than vouch. The receipt
+/// records the header name and the value exactly as it arrived, so the
+/// claim on the invoice is "the origin sent this", which is a claim the
+/// proxy can actually stand behind.
+///
+/// There is deliberately no knob for what to do with a value that will
+/// not parse. Substituting a number the proxy counted would put the
+/// proxy's provenance on the origin's claim, and a receipt that cannot
+/// separate "the origin lied" from "the proxy miscounted" is worthless
+/// in the dispute it exists for. A value that does not parse bills zero
+/// and goes on the receipt verbatim. See
+/// `sbproxy_meter::OriginHeaderRule`.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttestationOriginHeaderConfig {
+    /// Unit name that appears on the invoice line, for example
+    /// `result_row`. Unique across every resolver: two units sharing a
+    /// name on one receipt is an invoice line that cannot be read.
+    pub name: String,
+    /// Response header the count is read from. Matched
+    /// case-insensitively, and quoted back on the receipt in the
+    /// spelling written here.
+    ///
+    /// A header rather than a body path. Reading a JSON body means
+    /// buffering one, and what that costs a streaming response is its
+    /// own decision rather than a side effect of a metering key.
+    pub header: String,
+}
+
+/// `proxy.attestation`: the proxy-wide consumption attestation block.
+///
+/// Off unless [`Self::role`] says otherwise, and inert in every config
+/// that does not mention it. When a role is set, the queue, the ledger,
+/// and a complete [`AttestationBillableConfig`] all become required,
+/// because a role with any of them missing is a proxy that claims to
+/// meter and does not.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct AttestationConfig {
+    /// Which halves of attestation this proxy performs. See
+    /// [`AttestationRole`]. Individual origins may narrow or widen this
+    /// through `origins.<host>.attestation.role`.
+    pub role: AttestationRole,
+    /// What happens when attestation itself cannot run: the queue is
+    /// full, the ledger will not accept an append, the signing identity
+    /// is unusable.
+    ///
+    /// Defaults to [`FailureMode::Degraded`], which departs from the
+    /// `closed` default the rest of this config surface takes, and the
+    /// departure is the point. Fail-closed is right for a control that
+    /// enforces a security boundary, because a control that silently
+    /// admits traffic when it breaks is worse than no control at all.
+    /// Billing is not a security boundary. A full ledger disk taking
+    /// the whole API down is a worse outcome than a provable hole in
+    /// the record, and `degraded` is precisely the posture that leaves
+    /// the hole detectable: the call proceeds, the guarantee is marked
+    /// as not made, and the gap is countable so an operator can alert
+    /// on it and reconcile afterwards. An operator who genuinely cannot
+    /// serve unbilled traffic sets `closed` and means it.
+    #[serde(default = "default_attestation_failure_mode")]
+    pub failure_mode: FailureMode,
+    /// What happens when attestation *does* reach a verdict and that
+    /// verdict is "refuse": a claim that exceeds an agreement's ceiling,
+    /// for instance. [`EnforcementMode::Observe`] is the rollout
+    /// posture, and it is a different question from
+    /// [`Self::failure_mode`]: a control can reasonably observe while it
+    /// is being tuned and still need to fail closed when its backend
+    /// disappears.
+    pub enforcement_mode: EnforcementMode,
+    /// Which existing signing identity signs receipts, as the config
+    /// path that declares it. The only accepted value today is
+    /// [`ATTESTATION_SIGN_WITH_WEB_BOT_AUTH`], and that block must
+    /// actually be configured. Required whenever the role writes
+    /// receipts.
+    pub sign_with: Option<String>,
+    /// Where unsettled claims wait. Required when the role is not
+    /// [`AttestationRole::Off`].
+    pub queue: Option<AttestationQueueConfig>,
+    /// Where settled records are chained. Required when the role is not
+    /// [`AttestationRole::Off`].
+    pub ledger: Option<AttestationLedgerConfig>,
+    /// What the operator charges for. Required, and required complete,
+    /// when the role is not [`AttestationRole::Off`].
+    pub billable: Option<AttestationBillableConfig>,
+    /// Units this proxy counted for itself. See
+    /// [`AttestationMeasuredConfig`].
+    ///
+    /// Listed first because it is the resolver that needs nothing from
+    /// anybody, and a receipt is easier to argue about when an
+    /// unarguable line is sitting next to the contested ones.
+    pub measured: Vec<AttestationMeasuredConfig>,
+    /// Routes priced in this document. See
+    /// [`AttestationRouteWeightConfig`].
+    ///
+    /// A sibling list rather than a variant of one `units:` block, and
+    /// the same goes for [`Self::measured`] and [`Self::origin_headers`].
+    /// Each resolver has its own provenance and its own way of being
+    /// wrong, so each declares itself in its own vocabulary and none of
+    /// them can be mistaken for another when a receipt is read back. It
+    /// also means the expression resolver arrives later as a fourth list
+    /// rather than as a variant every existing entry has to be
+    /// retrofitted into.
+    pub route_weights: Vec<AttestationRouteWeightConfig>,
+    /// Counts this proxy reads back from its upstreams. See
+    /// [`AttestationOriginHeaderConfig`].
+    pub origin_headers: Vec<AttestationOriginHeaderConfig>,
+}
+
+impl Default for AttestationConfig {
+    fn default() -> Self {
+        Self {
+            role: AttestationRole::Off,
+            // Not `FailureMode::default()`. See the field's rustdoc:
+            // billing is not a security boundary, so this one control
+            // defaults away from the surface-wide `closed`.
+            failure_mode: default_attestation_failure_mode(),
+            enforcement_mode: EnforcementMode::Block,
+            sign_with: None,
+            queue: None,
+            ledger: None,
+            billable: None,
+            measured: Vec::new(),
+            route_weights: Vec::new(),
+            origin_headers: Vec::new(),
+        }
+    }
+}
+
+/// `origins.<host>.attestation`: per-origin attestation overrides.
+///
+/// Two fields, and they are here for different reasons. `role` is an
+/// override, because one gateway commonly fronts both a partner API it
+/// resells (claims) and its own service (receipts). `agreement_id` has
+/// no proxy-wide equivalent at all: it names the commercial agreement
+/// the units are billed under, and that is a property of who is on the
+/// other end of the connection, never of the proxy.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct OriginAttestationConfig {
+    /// Narrows or widens `proxy.attestation.role` for this origin.
+    /// Absent inherits the proxy-wide role.
+    pub role: Option<AttestationRole>,
+    /// The commercial agreement this origin's units are billed under.
+    /// Without it a receipt says how much was consumed but not which
+    /// contract turns that into money.
+    pub agreement_id: Option<String>,
+}
+
 impl Default for ProxyServerConfig {
     fn default() -> Self {
         Self {
@@ -651,10 +1386,13 @@ impl Default for ProxyServerConfig {
             admin: None,
             model_host: None,
             cluster: None,
+            config_authority: None,
             secrets: None,
             key_management: None,
             l2_cache: None,
             cache_reserve: None,
+            response_cache_store: None,
+            compression_state: None,
             messenger_settings: None,
             ai_providers_file: None,
             device_parser_file: None,
@@ -666,9 +1404,681 @@ impl Default for ProxyServerConfig {
             extensions: HashMap::new(),
             http_client_timeouts: HttpClientTimeoutsConfig::default(),
             web_bot_auth: None,
+            attestation: None,
             tenants: Vec::new(),
             credentials: Vec::new(),
+            payments: None,
         }
+    }
+}
+
+// --- Config authority: subscriber side ---
+
+/// Default poll cadence against the upstream authority, in seconds.
+const DEFAULT_CONFIG_AUTHORITY_POLL_SECS: u64 = 30;
+
+/// Default staleness window for a cached bundle, in seconds.
+const DEFAULT_CONFIG_AUTHORITY_STALENESS_SECS: u64 = 24 * 60 * 60;
+
+/// Shortest poll cadence a subscriber may configure, in seconds.
+///
+/// A one-second poll is a denial-of-service tool aimed at the authority,
+/// and no configuration distribution needs sub-five-second latency.
+pub const MIN_CONFIG_AUTHORITY_POLL_SECS: u64 = 5;
+
+/// Longest poll cadence a subscriber may configure, in seconds.
+pub const MAX_CONFIG_AUTHORITY_POLL_SECS: u64 = 24 * 60 * 60;
+
+/// Longest staleness window a subscriber may configure, in seconds.
+///
+/// Past a month a cached bundle is an archaeological record rather than a
+/// configuration, so the schema refuses to call it fresh.
+pub const MAX_CONFIG_AUTHORITY_STALENESS_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// Largest accepted path or identifier in this block, in bytes.
+const MAX_CONFIG_AUTHORITY_VALUE_BYTES: usize = 4_096;
+
+const fn default_config_authority_poll_secs() -> u64 {
+    DEFAULT_CONFIG_AUTHORITY_POLL_SECS
+}
+
+const fn default_config_authority_staleness_secs() -> u64 {
+    DEFAULT_CONFIG_AUTHORITY_STALENESS_SECS
+}
+
+/// `proxy.config_authority`: how this node takes part in config authority.
+///
+/// Both halves live here, and they are mutually exclusive.
+/// [`Self::upstream`] makes this node a subscriber: it pulls signed
+/// bundles from an authority, verifies them, merges them over the local
+/// document, and applies the result through the ordinary reload
+/// transaction. [`Self::publish`] makes it an authority: it validates,
+/// signs, and serves bundles to subscribers of its own.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct ConfigAuthorityConfig {
+    /// Upstream authority this node subscribes to. Absent means this node
+    /// pulls no remote configuration.
+    pub upstream: Option<ConfigAuthorityUpstreamConfig>,
+    /// Publication settings that make this node an authority. Absent
+    /// means this node serves no bundles.
+    pub publish: Option<ConfigAuthorityPublishConfig>,
+}
+
+impl ConfigAuthorityConfig {
+    /// Whether this node publishes bundles to subscribers of its own.
+    ///
+    /// Feeds the one-role rule in [`Self::validate`]: a node that both
+    /// publishes and subscribes is refused, because the deny list keeps a
+    /// bundle from rewriting `proxy.config_authority` and the republished
+    /// provenance would name this node rather than the authority the
+    /// values came from.
+    pub const fn publishes_bundles(&self) -> bool {
+        self.publish.is_some()
+    }
+
+    /// Validate the block, including the rules that cross fields.
+    ///
+    /// Run from `compile_config`, so `sbproxy validate` reports these
+    /// before a node boots on them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigAuthorityConfigError`] when a node both subscribes
+    /// and publishes, or when either half fails any of its own rules. See
+    /// [`ConfigAuthorityUpstreamConfig::validate`] and
+    /// [`ConfigAuthorityPublishConfig::validate`].
+    pub fn validate(&self) -> Result<(), ConfigAuthorityConfigError> {
+        if let Some(upstream) = &self.upstream {
+            // One node cannot be both the authority and a subscriber of
+            // another authority: the deny list stops a bundle from
+            // rewriting `proxy.config_authority`, so a node in both roles
+            // would republish a document it does not fully own, and the
+            // provenance an auditor reads downstream would name this node
+            // rather than the authority the values actually came from.
+            if self.publishes_bundles() {
+                return Err(ConfigAuthorityConfigError::BothRoles);
+            }
+            upstream.validate()?;
+        }
+        if let Some(publish) = &self.publish {
+            publish.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// Default per-subscriber request budget on the bundle listener, per minute.
+///
+/// A subscriber polls once per interval and the shortest interval the
+/// schema accepts is [`MIN_CONFIG_AUTHORITY_POLL_SECS`], so twelve
+/// requests a minute is the most a well-behaved subscriber ever needs.
+/// The rest is headroom for a retry or a manual `curl`, and it still
+/// leaves no room for a node polling in a loop.
+const DEFAULT_PUBLISH_SUBSCRIBER_RATE_LIMIT: u64 = 30;
+
+/// Default fleet-wide request budget on the bundle listener, per minute.
+///
+/// The per-subscriber cap alone does not bound the authority: a thousand
+/// nodes restarting together each stay inside their own limit while
+/// collectively saturating it. This is the cap that turns a restart storm
+/// into a queue of `429`s the subscribers retry through, rather than an
+/// authority that stops answering anyone.
+const DEFAULT_PUBLISH_TOTAL_RATE_LIMIT: u64 = 1_200;
+
+/// Largest per-subscriber or fleet-wide rate limit the schema accepts.
+///
+/// Neither limit can be set to zero: an authority with no bound is an
+/// authority one misconfigured subscriber can take down, and the whole
+/// fleet loses configuration distribution with it.
+pub const MAX_PUBLISH_RATE_LIMIT: u64 = 1_000_000;
+
+const fn default_publish_subscriber_rate_limit() -> u64 {
+    DEFAULT_PUBLISH_SUBSCRIBER_RATE_LIMIT
+}
+
+const fn default_publish_total_rate_limit() -> u64 {
+    DEFAULT_PUBLISH_TOTAL_RATE_LIMIT
+}
+
+/// `proxy.config_authority.publish`: this node signs and serves
+/// configuration bundles to subscribers.
+///
+/// ```yaml
+/// proxy:
+///   config_authority:
+///     publish:
+///       authority_id: control-plane-eu
+///       key_id: authority-2026-07
+///       signing_key_file: /etc/sbproxy/authority-signing.key
+///       store_dir: /var/lib/sbproxy/config-authority
+///       bind: 0.0.0.0:9443
+///       tls:
+///         cert_file: /etc/sbproxy/authority.pem
+///         key_file: /etc/sbproxy/authority-key.pem
+/// ```
+///
+/// The bundle endpoint gets its own listener on [`Self::bind`], separate
+/// from the admin server, and serves exactly one path. Publication,
+/// status, and subscriber management are admin routes on the admin
+/// listener, because those are operator actions authenticated with
+/// operator credentials, while a bundle fetch is a fleet action
+/// authenticated with a per-subscriber credential.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigAuthorityPublishConfig {
+    /// Stable identifier stamped into every bundle this node signs.
+    /// Subscribers read it as `authority_id` in the envelope.
+    pub authority_id: String,
+    /// Key ID stamped into every envelope, selecting which entry of a
+    /// subscriber's `verifying_keys_file` verifies the signature.
+    ///
+    /// Rotation publishes under a new ID while subscribers still trust the
+    /// old one, so this changes without a synchronized fleet restart.
+    pub key_id: String,
+    /// Path to the Ed25519 signing key: one standard-base64 32-byte seed.
+    ///
+    /// Must be owner-only on unix. A node with `publish` configured and no
+    /// readable signing key refuses to start, because an authority that
+    /// cannot sign cannot serve, and finding that out at the first publish
+    /// attempt means finding it out during a change window.
+    pub signing_key_file: String,
+    /// Directory holding the durable revision counter, the current and
+    /// previous signed bundles, and the subscriber registry.
+    pub store_dir: String,
+    /// `host:port` for the bundle listener, for example `0.0.0.0:9443`.
+    ///
+    /// Its own listener, not the admin port: subscribers authenticate with
+    /// a per-subscriber credential rather than operator credentials, and
+    /// nothing on this listener answers `/admin/*`, `/metrics`, or the UI.
+    pub bind: String,
+    /// TLS material for the bundle listener.
+    ///
+    /// Required whenever [`Self::bind`] is not a loopback address. The
+    /// admin listener leaves TLS optional on a remote bind; this one does
+    /// not, because the credential a subscriber presents here is a
+    /// long-lived fleet credential and the payload is the whole
+    /// configuration.
+    #[serde(default)]
+    pub tls: Option<ConfigAuthorityPublishTlsConfig>,
+    /// Requests one subscriber may make per minute before the listener
+    /// answers `429`.
+    #[serde(default = "default_publish_subscriber_rate_limit")]
+    pub rate_limit_per_subscriber_per_minute: u64,
+    /// Requests the listener serves per minute across the whole fleet
+    /// before it answers `429`.
+    #[serde(default = "default_publish_total_rate_limit")]
+    pub rate_limit_total_per_minute: u64,
+}
+
+impl ConfigAuthorityPublishConfig {
+    /// Whether [`Self::bind`] names a loopback address.
+    ///
+    /// A bind that does not parse counts as remote, so an unparseable
+    /// value cannot slip past the TLS requirement by being unreadable.
+    /// [`Self::validate`] rejects it separately with a clearer message.
+    pub fn binds_loopback_only(&self) -> bool {
+        self.bind
+            .trim()
+            .parse::<std::net::SocketAddr>()
+            .is_ok_and(|addr| addr.ip().to_canonical().is_loopback())
+    }
+
+    /// The parsed listener address.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigAuthorityConfigError::PublishBind`] when `bind` is
+    /// not an IP address and port.
+    pub fn socket_addr(&self) -> Result<std::net::SocketAddr, ConfigAuthorityConfigError> {
+        self.bind
+            .trim()
+            .parse()
+            .map_err(|_| ConfigAuthorityConfigError::PublishBind {
+                bind: self.bind.clone(),
+                reason: "must be an IP address and port, for example 0.0.0.0:9443 or \
+                         127.0.0.1:9443; a hostname is not accepted because the listener binds \
+                         rather than resolves",
+            })
+    }
+
+    /// Validate every rule this block owns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigAuthorityConfigError`] when an identifier or path
+    /// is empty or oversized, when `authority_id` or `key_id` carries a
+    /// character the signature envelope refuses, when `bind` is not a
+    /// fixed IP address and port, when a non-loopback bind carries no
+    /// `tls` block, or when a rate limit is zero, above
+    /// [`MAX_PUBLISH_RATE_LIMIT`], or smaller than the per-subscriber
+    /// limit it is supposed to bound.
+    pub fn validate(&self) -> Result<(), ConfigAuthorityConfigError> {
+        for (field, value) in [
+            ("authority_id", &self.authority_id),
+            ("key_id", &self.key_id),
+            ("signing_key_file", &self.signing_key_file),
+            ("store_dir", &self.store_dir),
+            ("bind", &self.bind),
+        ] {
+            validate_publish_value(field, value)?;
+        }
+        // The envelope bounds these two more tightly than a filesystem
+        // path does, so a value that would produce a bundle no subscriber
+        // accepts is caught here rather than at the first publish.
+        for (field, value) in [
+            ("authority_id", &self.authority_id),
+            ("key_id", &self.key_id),
+        ] {
+            if !crate::config_bundle::is_valid_bundle_identifier(value) {
+                return Err(ConfigAuthorityConfigError::PublishIdentifier { field });
+            }
+        }
+        if self.socket_addr()?.port() == 0 {
+            return Err(ConfigAuthorityConfigError::PublishBind {
+                bind: self.bind.clone(),
+                reason: "must name a fixed port; port 0 would move on every restart and no \
+                         subscriber URL could point at it",
+            });
+        }
+        if let Some(tls) = &self.tls {
+            validate_publish_value("tls.cert_file", &tls.cert_file)?;
+            validate_publish_value("tls.key_file", &tls.key_file)?;
+        } else if !self.binds_loopback_only() {
+            return Err(ConfigAuthorityConfigError::PublishTlsRequired {
+                bind: self.bind.clone(),
+            });
+        }
+        for (field, found) in [
+            (
+                "rate_limit_per_subscriber_per_minute",
+                self.rate_limit_per_subscriber_per_minute,
+            ),
+            (
+                "rate_limit_total_per_minute",
+                self.rate_limit_total_per_minute,
+            ),
+        ] {
+            if found == 0 || found > MAX_PUBLISH_RATE_LIMIT {
+                return Err(ConfigAuthorityConfigError::PublishRateLimit { field, found });
+            }
+        }
+        if self.rate_limit_total_per_minute < self.rate_limit_per_subscriber_per_minute {
+            return Err(ConfigAuthorityConfigError::PublishRateLimitInverted {
+                total: self.rate_limit_total_per_minute,
+                per_subscriber: self.rate_limit_per_subscriber_per_minute,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// TLS material for the config-authority bundle listener.
+///
+/// Both fields are required together. Unlike the admin listener's TLS
+/// block, this one is mandatory on any non-loopback bind.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigAuthorityPublishTlsConfig {
+    /// Path to the PEM certificate chain, leaf first.
+    pub cert_file: String,
+    /// Path to the PEM private key (PKCS#8 or RSA).
+    pub key_file: String,
+}
+
+/// Validate one bounded, non-empty, control-character-free publish value.
+fn validate_publish_value(
+    field: &'static str,
+    value: &str,
+) -> Result<(), ConfigAuthorityConfigError> {
+    if value.trim().is_empty()
+        || value.len() > MAX_CONFIG_AUTHORITY_VALUE_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(ConfigAuthorityConfigError::PublishValue { field });
+    }
+    Ok(())
+}
+
+/// `proxy.config_authority.upstream`: the authority this node pulls
+/// signed configuration bundles from.
+///
+/// ```yaml
+/// proxy:
+///   config_authority:
+///     upstream:
+///       url: https://control.example.com
+///       mode: overlay
+///       subscriber_id: edge-01
+///       credential: env:SB_CONFIG_TOKEN
+///       verifying_keys_file: /etc/sbproxy/authority-keys.json
+///       poll_interval: 30s
+///       cache_path: /var/lib/sbproxy/config-bundle.json
+///       max_staleness: 24h
+///       require_bundle_on_boot: false
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigAuthorityUpstreamConfig {
+    /// Absolute base URL of the authority, for example
+    /// `https://control.example.com`. The subscriber appends its own
+    /// path; a path on this URL is kept as a prefix.
+    ///
+    /// Must be `https` unless [`Self::allow_insecure_http`] is set.
+    pub url: String,
+    /// Whether a bundle merges over the local document or replaces it.
+    ///
+    /// Required rather than defaulted: the answer decides whether the
+    /// local file still describes what this node serves, which is not a
+    /// question to answer by omission.
+    pub mode: crate::config_bundle::BundleMode,
+    /// Stable identity this node presents to the authority. Sent on
+    /// every fetch so an authority can scope what it publishes.
+    pub subscriber_id: String,
+    /// Reference to the bearer credential presented to the authority.
+    ///
+    /// Resolved through the process secret resolver, so the accepted
+    /// forms are `env:NAME`, `${NAME}`, `file:/path`, and a
+    /// provider-URI reference such as `secret://backend/name`. An inline
+    /// literal is refused: a token committed to a config file is a token
+    /// in every git history that ever held it.
+    #[serde(default)]
+    pub credential: Option<String>,
+    /// Path to the JSON file naming every key this subscriber trusts.
+    /// See `VerifyingKeySet::from_file` for the file shape.
+    pub verifying_keys_file: String,
+    /// How often the subscriber polls the authority, in seconds. Accepts
+    /// a humanized duration (`30s`, `5m`) or bare seconds.
+    ///
+    /// The real interval carries jitter, so a fleet restarting together
+    /// does not synchronize onto the authority.
+    #[serde(
+        rename = "poll_interval",
+        alias = "poll_interval_secs",
+        default = "default_config_authority_poll_secs",
+        deserialize_with = "crate::duration::deserialize_secs"
+    )]
+    pub poll_interval_secs: u64,
+    /// Where the verified bundle is cached so the node can boot on the
+    /// last known configuration when the authority is unreachable. The
+    /// anti-replay cursor is stored beside it.
+    pub cache_path: String,
+    /// How old a cached bundle may be and still be used at boot, in
+    /// seconds. Accepts a humanized duration (`24h`, `7d`) or bare
+    /// seconds.
+    ///
+    /// A running node that exceeds this window keeps serving and logs at
+    /// error level every cycle; the window is a boot-time gate, not a
+    /// kill switch on a node that is already up.
+    #[serde(
+        rename = "max_staleness",
+        alias = "max_staleness_secs",
+        default = "default_config_authority_staleness_secs",
+        deserialize_with = "crate::duration::deserialize_secs"
+    )]
+    pub max_staleness_secs: u64,
+    /// Whether the node refuses to start without a usable bundle.
+    ///
+    /// Absent means `false` under `mode: overlay` and `true` under
+    /// `mode: replace`. An explicit `false` under `mode: replace` is a
+    /// config error rather than a silently overridden value: under
+    /// replace the local document is not a servable configuration, so
+    /// there would be nothing to boot on.
+    #[serde(default)]
+    pub require_bundle_on_boot: Option<bool>,
+    /// Permit a plaintext `http://` authority URL. Development only.
+    ///
+    /// Bundle signatures are checked either way, so this does not let an
+    /// attacker forge a configuration, but it does expose the credential
+    /// this node presents and reveals the whole configuration to anyone
+    /// on the path.
+    #[serde(default)]
+    pub allow_insecure_http: bool,
+    /// Acknowledge that `hmac_sha256` entries in the verifying-key file
+    /// may verify bundles. Development only.
+    ///
+    /// A shared secret is symmetric: every subscriber holding it can
+    /// forge a bundle for every other subscriber. Off by default, and
+    /// verification refuses those bundles until it is on.
+    #[serde(default)]
+    pub allow_shared_secret_keys: bool,
+}
+
+impl ConfigAuthorityUpstreamConfig {
+    /// Whether this node refuses to start without a usable bundle.
+    ///
+    /// Resolves the documented default: `replace` implies `true`,
+    /// `overlay` implies `false`, and an explicit value wins in the
+    /// combinations [`Self::validate`] accepts.
+    pub fn requires_bundle_on_boot(&self) -> bool {
+        self.require_bundle_on_boot
+            .unwrap_or(self.mode == crate::config_bundle::BundleMode::Replace)
+    }
+
+    /// The merge mode this subscriber applies a bundle with.
+    pub fn merge_mode(&self) -> crate::config_merge::MergeMode {
+        match self.mode {
+            crate::config_bundle::BundleMode::Overlay => crate::config_merge::MergeMode::Overlay,
+            crate::config_bundle::BundleMode::Replace => crate::config_merge::MergeMode::Replace,
+        }
+    }
+
+    /// Validate every rule this block owns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigAuthorityConfigError`] when the URL is not an
+    /// absolute `https` URL (and `allow_insecure_http` is unset), when
+    /// an identifier or path is empty or oversized, when the credential
+    /// is an inline literal rather than a reference, when a duration is
+    /// outside its documented bounds, or when `mode: replace` is paired
+    /// with an explicit `require_bundle_on_boot: false`.
+    pub fn validate(&self) -> Result<(), ConfigAuthorityConfigError> {
+        validate_authority_url(&self.url, self.allow_insecure_http)?;
+        validate_authority_value("subscriber_id", &self.subscriber_id)?;
+        validate_authority_value("verifying_keys_file", &self.verifying_keys_file)?;
+        validate_authority_value("cache_path", &self.cache_path)?;
+        if let Some(credential) = self.credential.as_deref() {
+            validate_authority_value("credential", credential)?;
+            if !is_secret_reference(credential) {
+                return Err(ConfigAuthorityConfigError::InlineCredential);
+            }
+        }
+        if self.poll_interval_secs < MIN_CONFIG_AUTHORITY_POLL_SECS
+            || self.poll_interval_secs > MAX_CONFIG_AUTHORITY_POLL_SECS
+        {
+            return Err(ConfigAuthorityConfigError::PollInterval {
+                found: self.poll_interval_secs,
+            });
+        }
+        if self.max_staleness_secs < self.poll_interval_secs
+            || self.max_staleness_secs > MAX_CONFIG_AUTHORITY_STALENESS_SECS
+        {
+            return Err(ConfigAuthorityConfigError::MaxStaleness {
+                found: self.max_staleness_secs,
+                poll_interval_secs: self.poll_interval_secs,
+            });
+        }
+        if self.mode == crate::config_bundle::BundleMode::Replace
+            && self.require_bundle_on_boot == Some(false)
+        {
+            return Err(ConfigAuthorityConfigError::ReplaceWithoutBundleOnBoot);
+        }
+        Ok(())
+    }
+}
+
+/// Why a `proxy.config_authority` block was refused.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ConfigAuthorityConfigError {
+    /// The node both subscribes to an authority and publishes to
+    /// subscribers of its own.
+    #[error("proxy.config_authority declares both `upstream` and a publishing role; one node cannot both subscribe to an authority and publish to subscribers, because the deny list keeps a bundle from rewriting proxy.config_authority and the republished provenance would name this node rather than the authority the values came from")]
+    BothRoles,
+    /// The authority URL was not usable.
+    #[error("proxy.config_authority.upstream.url {url:?} is invalid: {reason}")]
+    Url {
+        /// URL as configured.
+        url: String,
+        /// What was wrong with it.
+        reason: &'static str,
+    },
+    /// A required identifier or path was empty, oversized, or carried
+    /// control characters.
+    #[error("proxy.config_authority.upstream.{field} must be a bounded value with no control characters")]
+    Value {
+        /// Offending field name.
+        field: &'static str,
+    },
+    /// The credential was an inline literal rather than a reference.
+    #[error("proxy.config_authority.upstream.credential must be a secret reference (`env:NAME`, `${{NAME}}`, `file:/path`, or `secret://backend/name`), not an inline token: a token in a config file is a token in every copy of that file")]
+    InlineCredential,
+    /// The poll interval was outside its documented bounds.
+    #[error("proxy.config_authority.upstream.poll_interval is {found}s; it must be between {MIN_CONFIG_AUTHORITY_POLL_SECS}s and {MAX_CONFIG_AUTHORITY_POLL_SECS}s")]
+    PollInterval {
+        /// Configured interval, in seconds.
+        found: u64,
+    },
+    /// The staleness window was outside its documented bounds.
+    #[error("proxy.config_authority.upstream.max_staleness is {found}s; it must be at least the {poll_interval_secs}s poll interval and no more than {MAX_CONFIG_AUTHORITY_STALENESS_SECS}s")]
+    MaxStaleness {
+        /// Configured window, in seconds.
+        found: u64,
+        /// Configured poll interval, in seconds.
+        poll_interval_secs: u64,
+    },
+    /// `mode: replace` was paired with an explicit
+    /// `require_bundle_on_boot: false`.
+    #[error("proxy.config_authority.upstream sets `mode: replace` with `require_bundle_on_boot: false`; under replace the local document is not a servable configuration, so there is nothing to boot on. Remove the field (replace implies true) or switch to `mode: overlay`")]
+    ReplaceWithoutBundleOnBoot,
+    /// A required publish identifier or path was empty, oversized, or
+    /// carried control characters.
+    #[error(
+        "proxy.config_authority.publish.{field} must be a bounded value with no control characters"
+    )]
+    PublishValue {
+        /// Offending field name.
+        field: &'static str,
+    },
+    /// A publish identifier carried a character the signed envelope
+    /// refuses.
+    #[error("proxy.config_authority.publish.{field} must be printable ASCII limited to letters, digits, and `. - _ :`; the signed bundle envelope refuses anything else, so a bundle carrying this value would be rejected by every subscriber")]
+    PublishIdentifier {
+        /// Offending field name.
+        field: &'static str,
+    },
+    /// The publish listener bind was not a usable address and port.
+    #[error("proxy.config_authority.publish.bind {bind:?} is invalid: {reason}")]
+    PublishBind {
+        /// Bind as configured.
+        bind: String,
+        /// What was wrong with it.
+        reason: &'static str,
+    },
+    /// The publish listener binds off loopback with no TLS material.
+    #[error("proxy.config_authority.publish.bind is `{bind}`, which is not a loopback address, and no `tls` block is set. The bundle listener refuses to start rather than serve plaintext: subscribers present a long-lived fleet credential on it and the response body is the whole configuration. Set publish.tls.cert_file and publish.tls.key_file, or bind to loopback and terminate TLS in front")]
+    PublishTlsRequired {
+        /// Bind as configured.
+        bind: String,
+    },
+    /// A publish rate limit was zero or above the accepted maximum.
+    #[error("proxy.config_authority.publish.{field} is {found}; it must be between 1 and {MAX_PUBLISH_RATE_LIMIT} requests per minute (the bundle listener's rate limit cannot be turned off, because an unbounded authority is one a single misconfigured subscriber can take down and the whole fleet loses config distribution with it)")]
+    PublishRateLimit {
+        /// Offending field name.
+        field: &'static str,
+        /// Configured value.
+        found: u64,
+    },
+    /// The fleet-wide rate limit was below the per-subscriber limit it is
+    /// supposed to bound.
+    #[error("proxy.config_authority.publish.rate_limit_total_per_minute is {total}, below the {per_subscriber} allowed to a single subscriber; the fleet-wide cap is meant to bound the sum, so a value under the per-subscriber cap means one subscriber can exhaust the whole authority")]
+    PublishRateLimitInverted {
+        /// Configured fleet-wide limit.
+        total: u64,
+        /// Configured per-subscriber limit.
+        per_subscriber: u64,
+    },
+}
+
+/// Whether `value` names a secret rather than carrying one inline.
+///
+/// Mirrors the forms the process secret resolver accepts. Deliberately a
+/// shape check only: `sbproxy validate` must not need the environment
+/// variable to be exported or the secret backend to be reachable.
+pub(crate) fn is_secret_reference(value: &str) -> bool {
+    let trimmed = value.trim();
+    for prefix in ["env:", "file:"] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            return !rest.is_empty();
+        }
+    }
+    if trimmed.starts_with("${") && trimmed.ends_with('}') && trimmed.len() > 3 {
+        return true;
+    }
+    // A provider-URI reference (`secret://`, `vault://`, `awssm://`, ...).
+    // Matched structurally rather than against a scheme allowlist, which
+    // lives in the vault crate; an unknown scheme fails loudly at
+    // resolution rather than being mistaken for an inline token here.
+    match trimmed.split_once("://") {
+        Some((scheme, rest)) => {
+            !scheme.is_empty()
+                && scheme
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'+' | b'.'))
+                && !matches!(scheme, "http" | "https")
+                && !rest.is_empty()
+        }
+        None => false,
+    }
+}
+
+/// Validate one bounded, non-empty, control-character-free value.
+fn validate_authority_value(
+    field: &'static str,
+    value: &str,
+) -> Result<(), ConfigAuthorityConfigError> {
+    if value.trim().is_empty()
+        || value.len() > MAX_CONFIG_AUTHORITY_VALUE_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(ConfigAuthorityConfigError::Value { field });
+    }
+    Ok(())
+}
+
+/// Validate the authority URL: absolute, `https` unless explicitly
+/// downgraded, with a host and no query or fragment.
+fn validate_authority_url(
+    url: &str,
+    allow_insecure_http: bool,
+) -> Result<(), ConfigAuthorityConfigError> {
+    let invalid = |reason: &'static str| ConfigAuthorityConfigError::Url {
+        url: url.to_string(),
+        reason,
+    };
+    validate_authority_value("url", url).map_err(|_| invalid("empty or oversized"))?;
+    if url.contains('?') || url.contains('#') {
+        return Err(invalid(
+            "must not carry a query string or fragment; the subscriber appends its own path",
+        ));
+    }
+    let uri: http::Uri = url.parse().map_err(|_| invalid("is not a valid URL"))?;
+    let scheme = uri.scheme_str().ok_or_else(|| {
+        invalid("must be absolute, including the scheme, for example https://control.example.com")
+    })?;
+    if uri.host().is_none_or(str::is_empty) {
+        return Err(invalid("must name a host"));
+    }
+    match scheme {
+        "https" => Ok(()),
+        "http" if allow_insecure_http => Ok(()),
+        "http" => Err(invalid(
+            "is plaintext http; set allow_insecure_http: true to accept the exposed \
+             credential and configuration, or use https",
+        )),
+        _ => Err(invalid(
+            "must use the https scheme (or http in development)",
+        )),
     }
 }
 
@@ -689,10 +2099,935 @@ fn default_key_cache_negative_ttl_secs() -> u64 {
 fn default_key_cache_max_entries() -> usize {
     10_000
 }
+fn default_governance_lease_ttl_secs() -> u64 {
+    120
+}
+fn default_governance_terminal_retention_secs() -> u64 {
+    300
+}
+
+/// Consistency guarantee for governed key admission and accounting.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum GovernanceConsistency {
+    /// Process-local atomic counters. Fast and safe on one gateway, but totals
+    /// across multiple gateways are approximate.
+    #[default]
+    Approximate,
+    /// Cluster-wide atomic reservations backed by Redis scripts.
+    Strict,
+}
+
+/// Shared backend used for strict governed key accounting.
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GovernanceBackendConfig {
+    /// A dedicated Redis connection. This is intentionally explicit and is not
+    /// inherited from the key store or cache configuration.
+    Redis {
+        /// Redis or TLS-enabled Redis connection URL.
+        url: String,
+    },
+}
+
+impl std::fmt::Debug for GovernanceBackendConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Redis { .. } => formatter
+                .debug_struct("Redis")
+                .field("url", &"[redacted]")
+                .finish(),
+        }
+    }
+}
+
+/// `key_management.governance:` admission, accounting, and introspection
+/// controls for governed virtual keys.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct KeyGovernanceConfig {
+    /// Accounting consistency. Approximate is the backward-compatible default.
+    pub consistency: GovernanceConsistency,
+    /// Dedicated backend for strict accounting.
+    pub backend: Option<GovernanceBackendConfig>,
+    /// Reservation lease duration. Expired reservations are released when a
+    /// gateway exits before settling or releasing them.
+    pub lease_ttl_secs: u64,
+    /// Retention for settled, released, and expired reservation outcomes.
+    /// Must be at least the lease duration so retries remain idempotent.
+    pub terminal_retention_secs: u64,
+    /// Superseded by `failure_posture`. Behavior when the governance
+    /// backend cannot serve a reserve call at request time
+    /// (`GovernanceError::BackendUnavailable`). The default denies the
+    /// request (fail closed): governed limits must not be silently
+    /// bypassed by a backend outage. Setting `allow_unreserved` admits the
+    /// request instead, but every such decision is always audited on the
+    /// `security_audit` channel and counted on
+    /// `sbproxy_governance_fail_open_total`.
+    ///
+    ///
+    /// Still parsed, and still the value used when `failure_posture` is
+    /// absent, so an existing config keeps behaving exactly as it did.
+    /// Nothing in the runtime reads this field directly any more: the read
+    /// path goes through [`KeyGovernanceConfig::failure_posture`], which
+    /// reports `allow_unreserved` as `degraded` because the call proceeds
+    /// without the reservation this control exists to make.
+    #[serde(default)]
+    pub failure_mode: GovernanceFailureMode,
+    /// Failure posture for a governance backend outage, in the shared
+    /// [`FailureMode`] vocabulary.
+    ///
+    ///
+    /// Set this in preference to `failure_mode`. When present it wins;
+    /// when absent the legacy `failure_mode` value is converted
+    /// (`closed` stays `closed`, `allow_unreserved` becomes `degraded`).
+    /// It is `Option` on purpose, so "the operator said nothing" stays
+    /// distinguishable from "the operator explicitly asked for the
+    /// default".
+    ///
+    ///
+    /// `closed` denies with 503. `degraded` admits without a reservation
+    /// and records that fact on the `security_audit` channel and on
+    /// `sbproxy_governance_fail_open_total`. `open` also admits but
+    /// records neither, which is why `degraded` is the honest spelling of
+    /// the old `allow_unreserved`. `observe` is meaningless here and is
+    /// rejected at config-compile time: a reserve call that could not
+    /// reach its backend produced no counterfactual verdict to record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_posture: Option<FailureMode>,
+    /// Behavior when a governed key carries a `total_micro_usd` limit but
+    /// the resolved model has no rate to estimate a pre-request cost
+    /// ceiling from. The default (`zero_cost`) admits with no monetary
+    /// pre-gate; `require_rate` denies instead, since a limit that cannot
+    /// be pre-gated must not be silently treated as unlimited.
+    #[serde(default)]
+    pub missing_rate: GovernanceMissingRatePolicy,
+    /// Reserved caller-introspection switch. The OSS runtime does not install
+    /// `GET /api/v1/key`; retained for config compatibility.
+    pub key_introspection: bool,
+    /// Require AI requests to resolve to a governed key instead of accepting
+    /// origin credentials or anonymous access.
+    pub require_governed_key: bool,
+}
+
+impl Default for KeyGovernanceConfig {
+    fn default() -> Self {
+        Self {
+            consistency: GovernanceConsistency::Approximate,
+            backend: None,
+            lease_ttl_secs: default_governance_lease_ttl_secs(),
+            terminal_retention_secs: default_governance_terminal_retention_secs(),
+            failure_mode: GovernanceFailureMode::default(),
+            failure_posture: None,
+            missing_rate: GovernanceMissingRatePolicy::default(),
+            key_introspection: false,
+            require_governed_key: false,
+        }
+    }
+}
+
+/// What a control does when it cannot reach a decision.
+///
+/// A "control" here is anything that gates a request and can itself
+/// fail: a policy whose backend is unreachable, a guardrail whose
+/// provider times out, a detector that never engaged, a store that
+/// cannot be read. The question is always the same, so the knob is too,
+/// and it is spelled `failure_posture` everywhere it appears:
+///
+/// ```yaml
+/// failure_posture: closed     # refuse the request
+/// failure_posture: open       # admit it
+/// failure_posture: degraded   # admit it, but record that the guarantee was not made
+/// failure_posture: observe    # admit it, and record what would have happened
+/// ```
+///
+/// # The four postures
+///
+/// Only [`Closed`](Self::Closed) refuses. The other three all admit the
+/// request and differ in what they leave behind, which is the part that
+/// matters six months later when someone asks whether a control was
+/// actually protecting anything:
+///
+/// - **`open`** admits and claims nothing. Cheapest, and the least
+///   recoverable after the fact.
+/// - **`degraded`** admits while explicitly marking the guarantee as
+///   not made. This is the posture behind the existing
+///   `AllowUnreserved` modes: the request proceeds, but no quota was
+///   reserved and no governance decision was recorded, and that fact is
+///   itself counted so it can be alerted on.
+/// - **`observe`** admits and records the decision the control *would*
+///   have taken. For rolling a control out against live traffic before
+///   letting it refuse anything.
+///
+/// # Relationship to `test_mode` and tag actions
+///
+/// `observe` is deliberately close in spirit to the WAF's `test_mode`
+/// and the prompt-injection `Tag` action, and the overlap is worth
+/// naming so the two do not drift into meaning different things. They
+/// are not the same axis:
+///
+/// - `test_mode` / `Tag` describe what the control does when it
+///   **works** and finds a hit.
+/// - `failure_posture: observe` describes what it does when it **cannot
+///   run at all**.
+///
+/// A control can legitimately be in `test_mode` and still need a
+/// failure posture, because "the detector matched" and "the detector
+/// was unreachable" are different events. Where a site already has
+/// `test_mode`, leave it alone and let `failure_posture` govern only the
+/// cannot-decide path.
+///
+/// # Why this type exists
+///
+/// The same decision was previously spelled six different ways across
+/// the config surface: `fail_open: bool`, `fail_closed: bool`,
+/// `failure_mode_allow: bool`, two separately-declared `failure_mode`
+/// enums, an `on_failure` enum, and an unvalidated `on_error: String`.
+/// Two of those booleans carry **opposite** polarity, so `true` means
+/// "admit" in one struct and "refuse" in another. An operator had to
+/// re-derive the meaning at every site, and a reviewer had to check the
+/// field name before they could read a diff.
+///
+/// New and migrated controls take `failure_posture: FailureMode`. The
+/// name is deliberately not `failure_mode`: two blocks already declare a
+/// field by that exact name carrying a narrower enum, and a test pins
+/// that `failure_mode: open` must fail to parse there. One new word that
+/// works at every site beats one that collides at two.
+///
+/// The legacy fields still parse, because [`schema-v1` compatibility] is
+/// pinned by test, and each site's `failure_posture()` accessor converts
+/// from them when the new key is absent. They carry no `#[deprecated]`
+/// attribute on purpose: `-D warnings` would then turn every remaining
+/// read into a build failure, including the conversion itself. They are
+/// deprecated in prose and by having no other reader left.
+///
+/// # Choosing a default
+///
+/// Default closed for anything that enforces a security boundary: a
+/// control that silently admits traffic when it breaks is worse than no
+/// control, because the config still advertises protection and the
+/// dashboard still reads green.
+///
+/// Default open only where refusing would take the gateway down over a
+/// non-security concern, and say so at the site. A policy-expression
+/// bug should not black-hole every request; an unreachable authorization
+/// backend should.
+///
+/// [`schema-v1` compatibility]: https://github.com/soapbucket/sbproxy
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureMode {
+    /// Refuse the request. The safe default for anything enforcing a
+    /// security boundary: a control that silently admits traffic when
+    /// it breaks is worse than no control, because the config still
+    /// advertises protection and the dashboard still reads green.
+    #[default]
+    Closed,
+    /// Admit the request and claim nothing. Cheapest, and the least
+    /// recoverable after the fact.
+    Open,
+    /// Admit the request while explicitly marking the guarantee as not
+    /// made. The posture behind the legacy `AllowUnreserved` modes: the
+    /// call proceeds, but no quota was reserved and no governance
+    /// decision was recorded, and that fact is counted so it can be
+    /// alerted on.
+    Degraded,
+    /// Admit the request and record the decision the control would have
+    /// taken. For rolling a control out against live traffic before
+    /// letting it refuse anything.
+    Observe,
+}
+
+impl FailureMode {
+    /// True when this posture lets the request proceed.
+    ///
+    /// Three of the four postures admit; they differ in what they leave
+    /// behind, not in whether traffic flows. Callers deciding "do I
+    /// return Deny" want this; callers deciding "what do I record" want
+    /// to match on the variant.
+    pub fn admits(self) -> bool {
+        !matches!(self, Self::Closed)
+    }
+
+    /// True when the control should record what it would have done.
+    pub fn records_counterfactual(self) -> bool {
+        matches!(self, Self::Observe)
+    }
+
+    /// True when the request proceeds without the guarantee this
+    /// control exists to provide. Separately countable from a plain
+    /// `Open` so an operator can alert on lost guarantees specifically.
+    pub fn guarantee_waived(self) -> bool {
+        matches!(self, Self::Degraded)
+    }
+
+    /// Build from a legacy `fail_open`-style boolean, where `true`
+    /// means admit. Use at call sites migrating off such a field so the
+    /// polarity conversion lives in one place rather than being
+    /// re-derived per site.
+    pub fn from_fail_open(fail_open: bool) -> Self {
+        if fail_open {
+            Self::Open
+        } else {
+            Self::Closed
+        }
+    }
+
+    /// Build from a legacy `fail_closed`-style boolean, where `true`
+    /// means refuse. The inverse polarity of [`Self::from_fail_open`],
+    /// and the reason both constructors are named rather than left to a
+    /// bare `if` at each site.
+    pub fn from_fail_closed(fail_closed: bool) -> Self {
+        if fail_closed {
+            Self::Closed
+        } else {
+            Self::Open
+        }
+    }
+
+    /// Stable label for metrics and audit events.
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::Open => "open",
+            Self::Degraded => "degraded",
+            Self::Observe => "observe",
+        }
+    }
+}
+
+/// What a control does when it *does* reach a decision and that
+/// decision is "refuse".
+///
+/// This is the second of two axes, and keeping them apart is the point.
+/// [`FailureMode`] answers "the control could not run, now what".
+/// `EnforcementMode` answers "the control ran, it matched, now what".
+/// Those are different events and an operator needs both: a detector
+/// can reasonably be in `observe` while it is being tuned, and still
+/// need to fail closed when its backend disappears.
+///
+/// This type replaces the ad-hoc spellings of the same idea that grew
+/// per policy: the WAF's `test_mode: bool`, the prompt-injection
+/// `Tag` action, and similar. They all meant "match, but do not
+/// block". `observe` is spelled the same here as in [`FailureMode`] on
+/// purpose, so one word means one thing across the config surface.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum EnforcementMode {
+    /// Refuse the request when the control matches.
+    #[default]
+    Block,
+    /// Admit the request but record the match. The rollout posture.
+    Observe,
+}
+
+impl EnforcementMode {
+    /// True when a match should refuse the request.
+    pub fn blocks(self) -> bool {
+        matches!(self, Self::Block)
+    }
+
+    /// Build from a legacy `test_mode`-style boolean, where `true`
+    /// means "log but do not block".
+    pub fn from_test_mode(test_mode: bool) -> Self {
+        if test_mode {
+            Self::Observe
+        } else {
+            Self::Block
+        }
+    }
+
+    /// Stable label for metrics and audit events.
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::Observe => "observe",
+        }
+    }
+}
+
+/// Superseded by [`FailureMode`]. Behavior when the governance backend
+/// cannot serve a reserve call
+/// (`sbproxy_ai::governance::GovernanceStore::reserve`).
+///
+/// Applies only to a reserve call that fails with
+/// `GovernanceError::BackendUnavailable`. Every other reserve error
+/// (invalid request shape, a reservation id reused with different input,
+/// a hit against a real governed limit, arithmetic overflow) is unrelated
+/// to backend availability and is not affected by this setting.
+///
+/// Kept because `failure_mode: closed | allow_unreserved` is pinned by
+/// test and by shipped configs. Read it through
+/// [`KeyGovernanceConfig::failure_posture`], never directly.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum GovernanceFailureMode {
+    /// Deny the request (`503`) when the governance backend is
+    /// unavailable.
+    #[default]
+    Closed,
+    /// Admit the request without a governance reservation when the
+    /// backend is unavailable. Always emits a `security_audit` event and
+    /// increments `sbproxy_governance_fail_open_total` so the decision
+    /// stays observable.
+    AllowUnreserved,
+}
+
+/// Behavior when a governed key's monetary limit cannot be pre-gated
+/// because the resolved model has no rate to estimate a cost ceiling
+/// from.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum GovernanceMissingRatePolicy {
+    /// Treat the estimated cost as zero. No monetary pre-gate applies to
+    /// this request; a key's `total_micro_usd` limit is still enforced at
+    /// settlement, from actually billed usage.
+    #[default]
+    ZeroCost,
+    /// Deny the request when the key carries a `total_micro_usd` limit
+    /// but the resolved model has no rate: a limit that cannot be
+    /// pre-gated must not be silently treated as unlimited.
+    RequireRate,
+}
+
+/// Validation failure for governed key admission configuration.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid key governance configuration: {message}")]
+pub struct KeyGovernanceConfigError {
+    message: String,
+}
+
+impl KeyGovernanceConfigError {
+    fn invalid(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl KeyGovernanceConfig {
+    /// This control's posture expressed in the shared [`FailureMode`]
+    /// vocabulary. The one read path for a governance backend outage.
+    ///
+    /// Precedence: an explicit `failure_posture` wins; otherwise the
+    /// legacy `failure_mode` is converted. `closed` maps to
+    /// [`FailureMode::Closed`], and `allow_unreserved` maps to
+    /// [`FailureMode::Degraded`] rather than a plain open, because the
+    /// request proceeds without the reservation this control exists to
+    /// make and that fact is separately recorded.
+    ///
+    /// Reading the posture only here is the point of the whole exercise:
+    /// a config key that nothing reads reproduces the defect this key
+    /// exists to fix, so `failure_mode` has no other consumer left.
+    pub fn failure_posture(&self) -> FailureMode {
+        if let Some(explicit) = self.failure_posture {
+            return explicit;
+        }
+        match self.failure_mode {
+            GovernanceFailureMode::Closed => FailureMode::Closed,
+            GovernanceFailureMode::AllowUnreserved => FailureMode::Degraded,
+        }
+    }
+
+    /// Reject a posture that has no meaning for a governance reserve call.
+    ///
+    /// [`FailureMode::Observe`] records the decision a control *would*
+    /// have taken. A reserve call that never reached its backend produced
+    /// no such decision, so accepting `observe` here would mean silently
+    /// picking some other behaviour on the operator's behalf. Refusing at
+    /// config-compile time is the honest alternative.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operator-facing message, naming the exact config path,
+    /// when the posture cannot be honoured at this site.
+    pub fn validate_failure_posture(&self) -> Result<(), String> {
+        if self.failure_posture == Some(FailureMode::Observe) {
+            return Err(
+                "key_management.governance.failure_posture: `observe` is meaningless for a \
+                 governance backend outage, because a reserve call that never reached its \
+                 backend has no counterfactual verdict to record. Use `closed`, `degraded`, \
+                 or `open`."
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Reservation lease duration converted to runtime milliseconds.
+    pub fn lease_ttl_millis(&self) -> Result<u64, KeyGovernanceConfigError> {
+        self.lease_ttl_secs.checked_mul(1_000).ok_or_else(|| {
+            KeyGovernanceConfigError::invalid("lease_ttl_secs overflows milliseconds")
+        })
+    }
+
+    /// Terminal outcome retention converted to runtime milliseconds.
+    pub fn terminal_retention_millis(&self) -> Result<u64, KeyGovernanceConfigError> {
+        self.terminal_retention_secs
+            .checked_mul(1_000)
+            .ok_or_else(|| {
+                KeyGovernanceConfigError::invalid("terminal_retention_secs overflows milliseconds")
+            })
+    }
+
+    /// Validate governance invariants before pipeline construction or reload.
+    pub fn validate(&self) -> Result<(), KeyGovernanceConfigError> {
+        self.validate_failure_posture()
+            .map_err(KeyGovernanceConfigError::invalid)?;
+        if self.lease_ttl_secs == 0 {
+            return Err(KeyGovernanceConfigError::invalid(
+                "lease_ttl_secs must be positive",
+            ));
+        }
+        if self.terminal_retention_secs == 0 {
+            return Err(KeyGovernanceConfigError::invalid(
+                "terminal_retention_secs must be positive",
+            ));
+        }
+        if self.terminal_retention_secs < self.lease_ttl_secs {
+            return Err(KeyGovernanceConfigError::invalid(
+                "terminal_retention_secs must be at least lease_ttl_secs",
+            ));
+        }
+        self.lease_ttl_millis()?;
+        self.terminal_retention_millis()?;
+
+        match (self.consistency, &self.backend) {
+            (GovernanceConsistency::Approximate, Some(_)) => {
+                return Err(KeyGovernanceConfigError::invalid(
+                    "redis governance backend requires strict consistency",
+                ));
+            }
+            (GovernanceConsistency::Strict, None) => {
+                return Err(KeyGovernanceConfigError::invalid(
+                    "strict governance requires an explicit redis backend",
+                ));
+            }
+            (GovernanceConsistency::Approximate, None)
+            | (GovernanceConsistency::Strict, Some(_)) => {}
+        }
+
+        if let Some(GovernanceBackendConfig::Redis { url }) = &self.backend {
+            if !url.starts_with("redis://") && !url.starts_with("rediss://") {
+                return Err(KeyGovernanceConfigError::invalid(
+                    "redis backend URL must start with redis:// or rediss://",
+                ));
+            }
+            let authority = url
+                .split_once("://")
+                .map(|(_, authority)| authority)
+                .unwrap_or_default()
+                .split('/')
+                .next()
+                .unwrap_or_default();
+            let host = authority
+                .rsplit_once('@')
+                .map_or(authority, |(_, host)| host);
+            if host.is_empty() || host.starts_with(':') {
+                return Err(KeyGovernanceConfigError::invalid(
+                    "redis backend URL must include a host",
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// One entry in `key_management.inbound.headers:`.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InboundHeaderConfig {
+    /// Header name, matched case-insensitively.
+    pub name: String,
+    /// Prefix stripped from the value before the token shape is tested,
+    /// matched case-insensitively. Empty for raw-value headers such as
+    /// `x-api-key`.
+    #[serde(default)]
+    pub scheme: String,
+}
+
+/// One rule mapping an inbound credential's shape to a provider label, for
+/// attribution of native (non-minted) keys.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderHintConfig {
+    /// Provider label stamped on the request when this rule matches
+    /// (canonical AI-provider spelling: `anthropic`, `openai`, ...).
+    pub provider: String,
+    /// Header the credential arrives in, matched case-insensitively.
+    pub header: String,
+    /// Scheme prefix stripped before the value test, matched
+    /// case-insensitively. Empty for raw-value headers.
+    #[serde(default)]
+    pub scheme: String,
+    /// Prefix the credential value must start with (`sk-ant-`). Empty
+    /// matches any non-empty value.
+    #[serde(default)]
+    pub value_prefix: String,
+    /// A second header that must also be present for this rule to match
+    /// (`anthropic-version`). `None` requires nothing extra.
+    #[serde(default)]
+    pub also_header: Option<String>,
+}
+
+/// Default admission policy for caller-owned native provider keys.
+///
+/// Native keys cannot carry an SBproxy policy record because the caller, not
+/// the operator, owns their secret. This block supplies the equivalent default
+/// policy for every native key recognized by `provider_hints`. Leaving it
+/// absent fails closed for recognized native-key traffic.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NativeKeyPolicyConfig {
+    /// Canonical provider labels admitted to use caller-owned credentials.
+    ///
+    /// Matching is case-insensitive and ignores surrounding whitespace. The
+    /// list must be non-empty and may not contain duplicates.
+    pub allowed_providers: Vec<String>,
+    /// Max requests per minute for each origin/provider native-key bucket.
+    #[serde(default)]
+    pub max_requests_per_minute: Option<u64>,
+    /// Max input and output tokens per minute.
+    #[serde(default)]
+    pub max_tokens_per_minute: Option<u64>,
+    /// Max total tokens for the native-key budget window.
+    #[serde(default)]
+    pub max_budget_tokens: Option<u64>,
+    /// Max total cost in USD for the native-key budget window.
+    #[serde(default)]
+    pub max_budget_usd: Option<f64>,
+    /// Models native-key traffic may use (empty = all).
+    #[serde(default)]
+    pub allowed_models: Vec<String>,
+    /// Models native-key traffic may not use.
+    #[serde(default)]
+    pub blocked_models: Vec<String>,
+    /// Named PII redaction rules that must be active before dispatch.
+    #[serde(default)]
+    pub require_pii_redaction: Vec<String>,
+}
+
+impl NativeKeyPolicyConfig {
+    /// Whether this policy admits the canonical provider label.
+    pub fn allows(&self, provider: &str) -> bool {
+        self.allowed_providers
+            .iter()
+            .any(|allowed| allowed.trim().eq_ignore_ascii_case(provider.trim()))
+    }
+}
+
+/// `key_management.inbound:` block. Controls which request headers are swept
+/// for a minted key, and whether a route refuses requests that carry none.
+///
+/// The header a key arrives in is a property of the calling tool, not of the
+/// key: to know which header holds the key you would have to have resolved it
+/// already. So extraction is configured per route here rather than per key.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct KeyInboundConfig {
+    /// Ordered candidate headers. One well-shaped minted token resolves; two
+    /// distinct tokens are ambiguous and fail closed. An empty list disables
+    /// the sweep and leaves the legacy `authorization` path as the only front
+    /// door.
+    #[serde(default = "default_inbound_headers")]
+    pub headers: Vec<InboundHeaderConfig>,
+    /// Deny with 401 when no minted key resolved. Off by default, so an
+    /// upgrade changes nothing. Set per origin to make the proxy the only door
+    /// on a route that has no other auth provider.
+    #[serde(default)]
+    pub require: bool,
+    /// Ordered rules attributing a native (non-minted) inbound credential to
+    /// a provider. First matching hint wins, so more specific value prefixes
+    /// belong before general ones. A matching hint then enters native-key
+    /// policy admission; a credential matching no hint remains unattributed.
+    #[serde(default = "default_provider_hints")]
+    pub provider_hints: Vec<ProviderHintConfig>,
+    /// Explicit default policy for recognized caller-owned native provider
+    /// keys. Absent by default, which fails closed if a provider hint matches.
+    #[serde(default)]
+    pub native_key_policy: Option<NativeKeyPolicyConfig>,
+}
+
+impl Default for KeyInboundConfig {
+    fn default() -> Self {
+        Self {
+            headers: default_inbound_headers(),
+            require: false,
+            provider_hints: default_provider_hints(),
+            native_key_policy: None,
+        }
+    }
+}
+
+/// Built-in attribution rules for the common provider key shapes.
+///
+/// Ordered most-specific first: `sk-ant-` and `sk-or-` must precede the bare
+/// `sk-` rule or every Anthropic and OpenRouter key would attribute to OpenAI.
+fn default_provider_hints() -> Vec<ProviderHintConfig> {
+    fn hint(
+        provider: &str,
+        header: &str,
+        scheme: &str,
+        value_prefix: &str,
+        also_header: Option<&str>,
+    ) -> ProviderHintConfig {
+        ProviderHintConfig {
+            provider: provider.to_string(),
+            header: header.to_string(),
+            scheme: scheme.to_string(),
+            value_prefix: value_prefix.to_string(),
+            also_header: also_header.map(str::to_string),
+        }
+    }
+    vec![
+        hint("anthropic", "x-api-key", "", "sk-ant-", None),
+        hint("anthropic", "authorization", "Bearer ", "sk-ant-", None),
+        // A non-Anthropic-shaped x-api-key still attributes to Anthropic when
+        // the SDK's version header rides along.
+        hint("anthropic", "x-api-key", "", "", Some("anthropic-version")),
+        hint("openrouter", "authorization", "Bearer ", "sk-or-", None),
+        hint("gemini", "x-goog-api-key", "", "", None),
+        hint("azure", "api-key", "", "", None),
+        // Last: the loose OpenAI shape, which would otherwise swallow the
+        // more specific prefixes above.
+        hint("openai", "authorization", "Bearer ", "sk-", None),
+    ]
+}
+
+/// Header names that may never be swept: standard hop-by-hop and framing
+/// headers, the widely used de-facto `proxy-connection` hop-by-hop header, plus
+/// `cookie`, which has its own redaction and capture rules.
+pub const FORBIDDEN_SWEEP_HEADERS: &[&str] = &[
+    "host",
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "content-length",
+    "transfer-encoding",
+    "cookie",
+];
+
+/// Whether a header is unavailable as an inbound or outbound credential
+/// carrier.
+///
+/// In addition to headers that cannot be swept safely, credentials may not
+/// claim realtime handshake metadata, distributed tracing state, outbound
+/// Web Bot Auth signature fields, or headers promoted into governance, logs,
+/// and capture envelopes. Those values have independent protocol meaning or
+/// leave the raw request-header surface before generic secret redaction can
+/// protect them.
+pub fn credential_header_is_reserved(header: &str) -> bool {
+    let lower = header.trim().to_ascii_lowercase();
+    FORBIDDEN_SWEEP_HEADERS.contains(&lower.as_str())
+        || matches!(
+            lower.as_str(),
+            "upgrade"
+                | "openai-beta"
+                | "proxy-authorization"
+                | "proxy-authenticate"
+                | "traceparent"
+                | "tracestate"
+                | "signature-input"
+                | "signature"
+                | "signature-agent"
+                | "x-user-id"
+                | "x-end-user"
+                | "x-sbproxy-tag"
+                | "x-sb-user-id"
+                | "x-sb-session-id"
+                | "x-sb-parent-session-id"
+                | "user-agent"
+                | "referer"
+                | "b3"
+                | "x-b3-traceid"
+                | "x-b3-spanid"
+                | "x-b3-sampled"
+                | "x-b3-parentspanid"
+        )
+        || lower.starts_with("sec-websocket-")
+        || lower.starts_with("x-a2a-")
+        || lower.starts_with("x-sb-property-")
+}
+
+fn default_inbound_headers() -> Vec<InboundHeaderConfig> {
+    vec![
+        InboundHeaderConfig {
+            name: "authorization".to_string(),
+            scheme: "Bearer ".to_string(),
+        },
+        InboundHeaderConfig {
+            name: "x-api-key".to_string(),
+            scheme: String::new(),
+        },
+        InboundHeaderConfig {
+            name: "x-sb-api".to_string(),
+            scheme: String::new(),
+        },
+    ]
+}
+
+impl KeyInboundConfig {
+    /// Reject header names that are not valid HTTP field names, are hop-by-hop
+    /// or framing headers, or repeat case-insensitively.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable message naming the offending entry.
+    pub fn validate(&self) -> Result<(), String> {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for entry in &self.headers {
+            let lower = entry.name.trim().to_ascii_lowercase();
+            if lower.is_empty() || http::header::HeaderName::from_bytes(lower.as_bytes()).is_err() {
+                return Err(format!(
+                    "key_management.inbound.headers: {:?} is not a valid HTTP header name",
+                    entry.name
+                ));
+            }
+            if credential_header_is_reserved(&lower) {
+                return Err(format!(
+                    "key_management.inbound.headers: {:?} may not carry a key",
+                    entry.name
+                ));
+            }
+            if !seen.insert(lower) {
+                return Err(format!(
+                    "key_management.inbound.headers: {:?} is listed more than once",
+                    entry.name
+                ));
+            }
+        }
+        for hint in &self.provider_hints {
+            if hint.provider.trim().is_empty() {
+                return Err(
+                    "key_management.inbound.provider_hints: provider must not be empty".to_string(),
+                );
+            }
+            for name in std::iter::once(hint.header.as_str()).chain(hint.also_header.as_deref()) {
+                let lower = name.trim().to_ascii_lowercase();
+                if lower.is_empty()
+                    || http::header::HeaderName::from_bytes(lower.as_bytes()).is_err()
+                {
+                    return Err(format!(
+                        "key_management.inbound.provider_hints: {name:?} is not a valid HTTP header name"
+                    ));
+                }
+            }
+            if credential_header_is_reserved(&hint.header) {
+                return Err(format!(
+                    "key_management.inbound.provider_hints: {:?} may not carry a key",
+                    hint.header
+                ));
+            }
+        }
+        if let Some(policy) = &self.native_key_policy {
+            if policy.allowed_providers.is_empty() {
+                return Err(
+                    "key_management.inbound.native_key_policy.allowed_providers must not be empty"
+                        .to_string(),
+                );
+            }
+            let mut providers = std::collections::HashSet::new();
+            for provider in &policy.allowed_providers {
+                let canonical = provider.trim().to_ascii_lowercase();
+                if canonical.is_empty() {
+                    return Err(
+                        "key_management.inbound.native_key_policy.allowed_providers entries must not be empty"
+                            .to_string(),
+                    );
+                }
+                if !providers.insert(canonical) {
+                    return Err(format!(
+                        "key_management.inbound.native_key_policy.allowed_providers: {provider:?} is listed more than once"
+                    ));
+                }
+            }
+            for (name, value) in [
+                ("max_requests_per_minute", policy.max_requests_per_minute),
+                ("max_tokens_per_minute", policy.max_tokens_per_minute),
+            ] {
+                if value == Some(0) {
+                    return Err(format!(
+                        "key_management.inbound.native_key_policy.{name} must be greater than zero"
+                    ));
+                }
+            }
+            if policy
+                .max_budget_usd
+                .is_some_and(|value| !value.is_finite() || value < 0.0)
+            {
+                return Err(
+                    "key_management.inbound.native_key_policy.max_budget_usd must be finite and non-negative"
+                        .to_string(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Lowercased names of every swept header, for the redaction and capture
+    /// denylists so a custom header does not have to be added to them by hand.
+    pub fn header_names(&self) -> Vec<String> {
+        self.headers
+            .iter()
+            .map(|entry| entry.name.trim().to_ascii_lowercase())
+            .collect()
+    }
+
+    /// Lowercased union of every primary header that may carry an inbound
+    /// credential.
+    ///
+    /// This includes minted/configured carriers and provider-hint carriers.
+    /// `provider_hints[].also_header` is deliberately excluded: it is only
+    /// match metadata and never contains the credential value.
+    pub fn credential_carrier_names(&self) -> Vec<String> {
+        let mut names = Vec::with_capacity(self.headers.len() + self.provider_hints.len());
+        for name in self
+            .headers
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .chain(self.provider_hints.iter().map(|hint| hint.header.as_str()))
+        {
+            let canonical = name.trim().to_ascii_lowercase();
+            if !canonical.is_empty() && !names.contains(&canonical) {
+                names.push(canonical);
+            }
+        }
+        names
+    }
+
+    /// Whether `header_name` is a primary inbound credential carrier.
+    ///
+    /// Match-only `provider_hints[].also_header` metadata is deliberately
+    /// excluded because it never contains the credential value.
+    pub fn is_credential_carrier(&self, header_name: &str) -> bool {
+        let canonical = header_name.trim();
+        self.headers
+            .iter()
+            .any(|entry| entry.name.trim().eq_ignore_ascii_case(canonical))
+            || self
+                .provider_hints
+                .iter()
+                .any(|hint| hint.header.trim().eq_ignore_ascii_case(canonical))
+    }
+}
 
 /// Top-level `key_management:` block: the runtime key plane (mutable store,
-/// policy cache, at-rest crypto, OIDC claim map, declarative seed).
+/// policy cache, governance, at-rest crypto, OIDC claim map, declarative seed).
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct KeyManagementConfig {
     /// Turn the dynamic key plane on. When false (default), inbound auth keeps
     /// using the compiled virtual-key registry and this block is inert.
@@ -704,376 +3039,119 @@ pub struct KeyManagementConfig {
     /// In-memory policy cache in front of the store.
     #[serde(default)]
     pub cache: KeyCacheConfig,
+    /// Governed key admission, accounting, and authenticated introspection.
+    #[serde(default)]
+    pub governance: KeyGovernanceConfig,
     /// At-rest crypto material.
     #[serde(default)]
     pub crypto: KeyCryptoConfig,
+    /// Which inbound headers carry a minted key, and whether one is required.
+    #[serde(default)]
+    pub inbound: KeyInboundConfig,
     /// Allow the admin API to override config-seeded records on reload. When
     /// false (default), config-seeded records are authoritative and re-asserted
     /// on every reload.
     #[serde(default)]
     pub allow_api_override: bool,
-    /// When the store is unreachable, allow the request through in a degraded
-    /// mode. Default false: fail closed (deny).
+    /// Superseded by `failure_posture`. When the store is unreachable,
+    /// allow the request through in a degraded mode. Default false: fail
+    /// closed (deny).
+    ///
+    ///
+    /// Note the polarity this field is named into: `true` here means
+    /// ALLOW, that is, fail open. Other booleans in this config carry
+    /// the opposite sense, which is the inconsistency [`FailureMode`]
+    /// exists to retire.
+    ///
+    ///
+    /// Still parsed, and still the value used when `failure_posture` is
+    /// absent, so an existing config keeps behaving exactly as it did.
+    /// Nothing in the runtime reads this field directly any more: every
+    /// store-outage decision goes through
+    /// [`KeyManagementConfig::failure_posture`].
     #[serde(default)]
     pub failure_mode_allow: bool,
+    /// Failure posture for a key-store outage, in the shared
+    /// [`FailureMode`] vocabulary.
+    ///
+    ///
+    /// Set this in preference to `failure_mode_allow`. When present it
+    /// wins; when absent the legacy boolean is converted (`false` becomes
+    /// `closed`, `true` becomes `degraded`). It is `Option` on purpose,
+    /// so "the operator said nothing" stays distinguishable from "the
+    /// operator explicitly asked for the default".
+    ///
+    ///
+    /// `closed` refuses with 503. `degraded` and `open` both let the
+    /// request fall through to the origin's own configured auth, which is
+    /// what `failure_mode_allow: true` has always done: it is not a
+    /// blanket admit. `degraded` is the honest label for it, because the
+    /// request proceeds with no per-key policy, no budget, and no
+    /// attribution, and that fact is recorded rather than passed over in
+    /// silence. `observe` is meaningless here and is rejected at
+    /// config-compile time: an unreachable store produced no
+    /// counterfactual verdict to record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_posture: Option<FailureMode>,
     /// Optional OIDC/JWT claim to virtual-key mapping.
     #[serde(default)]
     pub oidc_claim_map: Option<OidcClaimMapConfig>,
     /// Optional declarative seed of keys and credentials.
     #[serde(default)]
     pub seed: KeySeedConfig,
-    /// Governed-key request, token, and monetary reservation policy.
-    ///
-    /// Approximate mode keeps process-local counters. Strict mode requires the
-    /// configured Redis backend so every gateway reserves against the same
-    /// atomic state.
-    #[serde(default)]
-    pub governance: GovernanceConfig,
 }
 
 impl KeyManagementConfig {
-    /// Validate governed accounting configuration before startup or reload.
-    pub fn validate(&self) -> Result<(), GovernanceConfigError> {
-        self.governance.validate()?;
-        for (index, key) in self.seed.keys.iter().enumerate() {
-            for (field, value) in [
-                ("max_requests_per_minute", key.max_requests_per_minute),
-                ("max_tokens_per_minute", key.max_tokens_per_minute),
-                ("max_budget_tokens", key.max_budget_tokens),
-            ] {
-                if let Some(value) = value {
-                    validate_governed_seed_integer(index, field, value)?;
-                }
-            }
-            if let Some(value) = key.max_budget_usd {
-                validate_governed_seed_usd(index, value)?;
-            }
+    /// What the key plane does when the store cannot be reached, in the
+    /// shared [`FailureMode`] vocabulary. The one read path for a
+    /// key-store outage.
+    ///
+    /// Precedence: an explicit `failure_posture` wins; otherwise the
+    /// legacy `failure_mode_allow` boolean is converted. `false` maps to
+    /// [`FailureMode::Closed`], which is a 503. `true` maps to
+    /// [`FailureMode::Degraded`] rather than [`FailureMode::Open`]: the
+    /// request does proceed, but only by falling through to the origin's
+    /// own configured auth, with no per-key policy, no budget, and no
+    /// attribution. That is a guarantee waived, not a guarantee that was
+    /// never claimed, and it is worth being able to alert on separately.
+    ///
+    /// Both admitting postures behave identically at the four call sites
+    /// that read this. They differ in what they leave behind, which is
+    /// the whole distinction [`FailureMode`] exists to draw.
+    pub fn failure_posture(&self) -> FailureMode {
+        if let Some(explicit) = self.failure_posture {
+            return explicit;
         }
-        Ok(())
-    }
-}
-
-/// Largest integer represented exactly by the Redis Lua numeric runtime.
-pub const GOVERNANCE_MAX_EXACT_INTEGER: u64 = 9_007_199_254_740_991;
-
-/// Fixed RPM/TPM accounting window retained by terminal idempotency records.
-pub const GOVERNANCE_ACCOUNTING_WINDOW_SECS: u64 = 60;
-
-fn validate_governed_seed_integer(
-    index: usize,
-    field: &'static str,
-    value: u64,
-) -> Result<(), GovernanceConfigError> {
-    let path = format!("seed.keys[{index}].{field}");
-    validate_governance_integer(&path, value)
-}
-
-pub(crate) fn validate_governance_integer(
-    path: &str,
-    value: u64,
-) -> Result<(), GovernanceConfigError> {
-    if value == 0 {
-        return Err(GovernanceConfigError::new(format!(
-            "{path} must be positive"
-        )));
-    }
-    if value > GOVERNANCE_MAX_EXACT_INTEGER {
-        return Err(GovernanceConfigError::new(format!(
-            "{path} exceeds the exact Redis Lua integer range"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_governed_seed_usd(index: usize, value: f64) -> Result<(), GovernanceConfigError> {
-    let path = format!("seed.keys[{index}].max_budget_usd");
-    validate_governance_usd(&path, value)
-}
-
-pub(crate) fn validate_governance_usd(path: &str, value: f64) -> Result<(), GovernanceConfigError> {
-    if !value.is_finite() {
-        return Err(GovernanceConfigError::new(format!("{path} must be finite")));
-    }
-    if value <= 0.0 {
-        return Err(GovernanceConfigError::new(format!(
-            "{path} must be positive"
-        )));
-    }
-    let micro_usd = value * 1_000_000.0;
-    if micro_usd < 1.0 {
-        return Err(GovernanceConfigError::new(format!(
-            "{path} must be at least one micro-USD"
-        )));
-    }
-    if !micro_usd.is_finite() || micro_usd > GOVERNANCE_MAX_EXACT_INTEGER as f64 {
-        return Err(GovernanceConfigError::new(format!(
-            "{path} exceeds the exact Redis Lua integer range after conversion to micro-USD"
-        )));
-    }
-    Ok(())
-}
-
-const fn default_governance_lease_ttl_secs() -> u64 {
-    120
-}
-
-const fn default_governance_terminal_retention_secs() -> u64 {
-    300
-}
-
-const fn default_governance_max_output_tokens() -> u64 {
-    4_096
-}
-
-/// Distributed consistency guarantee for governed-key accounting.
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum GovernanceConsistency {
-    /// Exact within one process, but not coordinated between gateways.
-    #[default]
-    Approximate,
-    /// Atomic and cluster-wide through a supported shared backend.
-    Strict,
-}
-
-/// Behavior when a strict governance backend is unavailable.
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum GovernanceFailureMode {
-    /// Reject governed requests until the shared backend recovers.
-    #[default]
-    Closed,
-    /// Admit an explicitly unreserved request and surface degraded health.
-    AllowUnreserved,
-}
-
-/// Accounting policy for a self-hosted model without a configured rate.
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum MissingRatePolicy {
-    /// Charge zero monetary units while still enforcing request and token limits.
-    #[default]
-    ZeroCost,
-    /// Reject admission until the model has an input and output rate.
-    RequireRate,
-}
-
-/// Shared backend for strict governed-key reservations.
-#[derive(Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum GovernanceBackendConfig {
-    /// Redis backend using atomic scripts for reservation lifecycle changes.
-    Redis {
-        /// Redis connection URL. Debug formatting always redacts this value.
-        url: String,
-    },
-}
-
-impl std::fmt::Debug for GovernanceBackendConfig {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Redis { .. } => formatter
-                .debug_struct("Redis")
-                .field("url", &"[REDACTED]")
-                .finish(),
+        if self.failure_mode_allow {
+            FailureMode::Degraded
+        } else {
+            FailureMode::Closed
         }
     }
-}
 
-impl GovernanceBackendConfig {
-    /// Return the Redis connection URL for runtime backend construction.
-    pub fn redis_url(&self) -> &str {
-        match self {
-            Self::Redis { url } => url,
+    /// Reject a posture that has no meaning for a key-store outage, at
+    /// this block or at the nested `governance:` block.
+    ///
+    /// [`FailureMode::Observe`] records the decision a control *would*
+    /// have taken. A store that could not be read produced no such
+    /// decision, so accepting `observe` would mean silently picking some
+    /// other behaviour on the operator's behalf.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operator-facing message, naming the exact config path,
+    /// when the posture cannot be honoured at the site that declares it.
+    pub fn validate_failure_posture(&self) -> Result<(), String> {
+        if self.failure_posture == Some(FailureMode::Observe) {
+            return Err(
+                "key_management.failure_posture: `observe` is meaningless for a key-store \
+                 outage, because a store that could not be read has no counterfactual verdict \
+                 to record. Use `closed`, `degraded`, or `open`."
+                    .to_string(),
+            );
         }
+        self.governance.validate_failure_posture()
     }
-}
-
-/// Governed-key reservation and accounting behavior.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
-pub struct GovernanceConfig {
-    /// Process-local approximate or shared atomic strict accounting.
-    #[serde(default)]
-    pub consistency: GovernanceConsistency,
-    /// Shared atomic backend. Required in strict mode and rejected otherwise.
-    #[serde(default)]
-    pub backend: Option<GovernanceBackendConfig>,
-    /// Reservation lease lifetime. Gateways renew active long-running streams.
-    #[serde(default = "default_governance_lease_ttl_secs")]
-    pub lease_ttl_secs: u64,
-    /// Lifetime of terminal idempotency records after settle or release.
-    #[serde(default = "default_governance_terminal_retention_secs")]
-    pub terminal_retention_secs: u64,
-    /// Admission behavior while a configured strict backend is unavailable.
-    #[serde(default)]
-    pub failure_mode: GovernanceFailureMode,
-    /// Monetary accounting behavior when a self-hosted model has no rate.
-    #[serde(default)]
-    pub missing_rate: MissingRatePolicy,
-    /// Conservative output reservation when a request omits its token ceiling.
-    #[serde(default = "default_governance_max_output_tokens")]
-    pub default_max_output_tokens: u64,
-}
-
-impl Default for GovernanceConfig {
-    fn default() -> Self {
-        Self {
-            consistency: GovernanceConsistency::Approximate,
-            backend: None,
-            lease_ttl_secs: default_governance_lease_ttl_secs(),
-            terminal_retention_secs: default_governance_terminal_retention_secs(),
-            failure_mode: GovernanceFailureMode::Closed,
-            missing_rate: MissingRatePolicy::ZeroCost,
-            default_max_output_tokens: default_governance_max_output_tokens(),
-        }
-    }
-}
-
-/// Invalid governed-key reservation configuration.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("invalid governance configuration: {message}")]
-pub struct GovernanceConfigError {
-    message: String,
-}
-
-impl GovernanceConfigError {
-    fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-}
-
-impl GovernanceConfig {
-    /// Validate consistency, backend, duration, and token-count invariants.
-    pub fn validate(&self) -> Result<(), GovernanceConfigError> {
-        match (self.consistency, &self.backend) {
-            (GovernanceConsistency::Approximate, Some(_)) => {
-                return Err(GovernanceConfigError::new(
-                    "approximate consistency does not accept a backend",
-                ));
-            }
-            (GovernanceConsistency::Strict, None) => {
-                return Err(GovernanceConfigError::new(
-                    "strict consistency requires a Redis backend",
-                ));
-            }
-            _ => {}
-        }
-
-        if self.lease_ttl_secs == 0 {
-            return Err(GovernanceConfigError::new(
-                "lease_ttl_secs must be positive",
-            ));
-        }
-        if self.terminal_retention_secs < self.lease_ttl_secs.max(GOVERNANCE_ACCOUNTING_WINDOW_SECS)
-        {
-            return Err(GovernanceConfigError::new(
-                "terminal_retention_secs must be at least the lease TTL and 60-second accounting window",
-            ));
-        }
-        if self.default_max_output_tokens == 0 {
-            return Err(GovernanceConfigError::new(
-                "default_max_output_tokens must be positive",
-            ));
-        }
-        if self.default_max_output_tokens > u64::from(u32::MAX) {
-            return Err(GovernanceConfigError::new(
-                "default_max_output_tokens must fit in a 32-bit token count",
-            ));
-        }
-
-        checked_redis_milliseconds("lease_ttl_secs", self.lease_ttl_secs)?;
-        checked_redis_milliseconds("terminal_retention_secs", self.terminal_retention_secs)?;
-
-        if let Some(backend) = &self.backend {
-            let url = backend.redis_url();
-            if !is_valid_redis_url(url) {
-                return Err(GovernanceConfigError::new(
-                    "governance Redis backend url must use redis:// or rediss:// and include a valid host",
-                ));
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Convert the reservation lease to Redis' millisecond time unit.
-    pub fn lease_ttl_millis(&self) -> Result<u64, GovernanceConfigError> {
-        checked_redis_milliseconds("lease_ttl_secs", self.lease_ttl_secs)
-    }
-
-    /// Convert terminal-record retention to Redis' millisecond time unit.
-    pub fn terminal_retention_millis(&self) -> Result<u64, GovernanceConfigError> {
-        checked_redis_milliseconds("terminal_retention_secs", self.terminal_retention_secs)
-    }
-}
-
-fn checked_redis_milliseconds(field: &str, seconds: u64) -> Result<u64, GovernanceConfigError> {
-    let milliseconds = seconds.checked_mul(1_000).ok_or_else(|| {
-        GovernanceConfigError::new(format!("{field} overflows Redis millisecond time"))
-    })?;
-    if milliseconds > i64::MAX as u64 {
-        return Err(GovernanceConfigError::new(format!(
-            "{field} overflows Redis millisecond time"
-        )));
-    }
-    Ok(milliseconds)
-}
-
-fn is_valid_redis_url(url: &str) -> bool {
-    if url.is_empty() || url.trim() != url || url.chars().any(char::is_control) {
-        return false;
-    }
-
-    let Some(remainder) = url
-        .strip_prefix("redis://")
-        .or_else(|| url.strip_prefix("rediss://"))
-    else {
-        return false;
-    };
-    let authority = remainder.split(['/', '?', '#']).next().unwrap_or_default();
-    if authority.is_empty() || authority.matches('@').count() > 1 {
-        return false;
-    }
-    let host_and_port = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host);
-
-    if let Some(bracketed) = host_and_port.strip_prefix('[') {
-        let Some((host, suffix)) = bracketed.split_once(']') else {
-            return false;
-        };
-        return !host.is_empty()
-            && !host.chars().any(char::is_whitespace)
-            && (suffix.is_empty() || valid_port_suffix(suffix));
-    }
-
-    if host_and_port.matches(':').count() > 1 {
-        return false;
-    }
-    let (host, port) = host_and_port
-        .split_once(':')
-        .map_or((host_and_port, None), |(host, port)| (host, Some(port)));
-    !host.is_empty()
-        && !host
-            .chars()
-            .any(|character| character.is_whitespace() || matches!(character, '[' | ']'))
-        && port.is_none_or(valid_port)
-}
-
-fn valid_port_suffix(suffix: &str) -> bool {
-    suffix.strip_prefix(':').is_some_and(valid_port)
-}
-
-fn valid_port(port: &str) -> bool {
-    !port.is_empty() && port.parse::<u16>().is_ok()
 }
 
 /// Which store backend backs the key plane.
@@ -1089,10 +3167,20 @@ pub enum KeyStoreBackend {
     Redis,
     /// Secrets-manager-direct: a configured vault backend is the system of record.
     SecretsManager,
+    /// Cluster mesh replicated store (WOR-2064): records live on the
+    /// durable replicated state substrate configured by
+    /// `proxy.cluster.replication`, so a key minted on one node resolves
+    /// on its peers with no external store. Requires `proxy.cluster` with
+    /// a `replication` block. Consistency is pinned by the backend
+    /// (quorum writes, quorum reads, revocation written at one) and is
+    /// not operator-configurable; the replication factor comes from the
+    /// cluster's replication block.
+    Mesh,
 }
 
 /// `key_management.store:` block.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct KeyStoreConfig {
     /// Backend selector.
     #[serde(default)]
@@ -1103,8 +3191,8 @@ pub struct KeyStoreConfig {
     /// Redis connection URL (backend `redis`).
     #[serde(default)]
     pub url: Option<String>,
-    /// Treat Redis as the source of truth rather than a coherence tier
-    /// (backend `redis`).
+    /// Legacy compatibility switch. Selecting `backend: redis` already makes
+    /// Redis the key store; this value does not change runtime behavior.
     #[serde(default)]
     pub redis_source_of_truth: bool,
     /// Secret-reference namespace prefix (backend `secrets_manager`).
@@ -1155,6 +3243,7 @@ pub enum SecretsManagerProvider {
 
 /// `key_management.store.secrets_manager:` connection block.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SecretsManagerStoreConfig {
     /// Which external manager.
     #[serde(default)]
@@ -1212,6 +3301,7 @@ pub enum KeyCacheTier {
 
 /// `key_management.cache:` block.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct KeyCacheConfig {
     /// Positive-entry TTL in seconds (default 60).
     #[serde(default = "default_key_cache_ttl_secs")]
@@ -1250,6 +3340,7 @@ fn default_transport_port() -> u16 {
 
 /// `key_management.cache.mesh:` cluster bootstrap for the mesh cache tier.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MeshClusterConfig {
     /// Static seed peers (`host:port`) to join. An empty list bootstraps a
     /// single-node cluster.
@@ -1275,6 +3366,18 @@ pub struct MeshClusterConfig {
     /// unset.
     #[serde(default)]
     pub shared_key: Option<String>,
+    /// How `shared_key` becomes the AES-256-GCM wire key.
+    ///
+    /// Defaults to `sha256`, which is what every cluster runs today, so
+    /// an upgrade never changes the key a node seals under. `hkdf` moves
+    /// the mesh onto the same purpose-separated derivation every other
+    /// key in this workspace uses.
+    ///
+    /// Nodes open under both derivations regardless of this setting, so
+    /// a cluster can be flipped one node at a time without partitioning.
+    /// See `docs/mesh-replication.md`.
+    #[serde(default)]
+    pub key_derivation: MeshKeyDerivation,
     /// Optional peer mTLS (mutually-authenticated TLS) for the mesh transport.
     /// When set, inbound connections must present a CA-signed client
     /// certificate and outbound connections present this node's certificate,
@@ -1283,9 +3386,29 @@ pub struct MeshClusterConfig {
     pub peer_tls: Option<MeshPeerTlsConfig>,
 }
 
+/// How the mesh derives its AES-256-GCM wire key from the shared secret.
+///
+/// Both derivations are always accepted on the receive side, so this only
+/// selects what a node seals under and a cluster can be migrated one node
+/// at a time.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum MeshKeyDerivation {
+    /// `SHA-256(secret)`. The original scheme and the default, so an
+    /// upgrade never changes an existing cluster's key.
+    #[default]
+    Sha256,
+    /// HKDF-SHA256 under a mesh-specific purpose, matching how every
+    /// other key in this workspace is derived.
+    Hkdf,
+}
+
 /// `key_management.cache.mesh.peer_tls:` mutual-TLS material (file paths) for
 /// the mesh peer transport.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MeshPeerTlsConfig {
     /// Path to this node's PEM certificate chain (leaf first).
     pub cert_file: String,
@@ -1313,6 +3436,7 @@ impl Default for MeshClusterConfig {
             advertise_addr: None,
             transport_advertise_addr: None,
             shared_key: None,
+            key_derivation: MeshKeyDerivation::default(),
             peer_tls: None,
         }
     }
@@ -1336,6 +3460,7 @@ impl Default for KeyCacheConfig {
 /// (`vault://`, `env:`, `file:`, ...) resolved at boot, or an inline value
 /// (discouraged outside tests).
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct KeyCryptoConfig {
     /// Server pepper for inbound virtual-key hashing. When unset, a
     /// process-ephemeral pepper is generated, so stored hashes do not survive a
@@ -1350,6 +3475,7 @@ pub struct KeyCryptoConfig {
 
 /// `key_management.oidc_claim_map:` block.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct OidcClaimMapConfig {
     /// The verified JWT/OIDC claim whose value names the virtual-key record to
     /// resolve, so the bearer-token and OIDC front doors converge on one record.
@@ -1358,6 +3484,7 @@ pub struct OidcClaimMapConfig {
 
 /// `key_management.seed:` block: declarative records applied at boot.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct KeySeedConfig {
     /// Inbound virtual keys.
     #[serde(default)]
@@ -1369,6 +3496,7 @@ pub struct KeySeedConfig {
 
 /// A seeded inbound virtual key.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SeedKeyConfig {
     /// Stable public id and token prefix.
     pub key_id: String,
@@ -1425,6 +3553,9 @@ pub struct SeedKeyConfig {
     /// body `model` before routing.
     #[serde(default)]
     pub route_to_model: Option<String>,
+    /// Route-local compression selector (`on`, `off`, or a named profile).
+    #[serde(default)]
+    pub compression_profile: Option<String>,
     /// Provider tool definitions injected into the request when this key
     /// authenticates, replacing any client-supplied tools.
     #[serde(default)]
@@ -1435,6 +3566,12 @@ pub struct SeedKeyConfig {
     /// Skip the body-aware prompt-injection scan for this key. Default false.
     #[serde(default)]
     pub bypass_prompt_injection: bool,
+    /// Consent to the origin's opt-in redacted content capture for
+    /// console inspection. Default false. A sample is retained only
+    /// when the AI origin also sets `capture_content: true`, so both
+    /// the operator and the key owner must opt in.
+    #[serde(default)]
+    pub allow_content_capture: bool,
     /// Project attribution.
     #[serde(default)]
     pub project: Option<String>,
@@ -1457,6 +3594,7 @@ pub struct SeedKeyConfig {
 
 /// A seeded upstream credential.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SeedCredentialConfig {
     /// Stable id.
     pub id: String,
@@ -1487,31 +3625,29 @@ pub struct SeedCredentialConfig {
 /// Per-engine scripting sandbox limits, exposed under the
 /// `proxy.scripting:` block of sb.yml.
 ///
-/// Today this block carries sub-blocks for the Lua engine
-/// and the JavaScript engine. The CEL and WebAssembly
-/// engines manage their own budgets separately. Operators who omit
-/// the block get the documented defaults from each sub-block.
+/// The Lua sub-block is installed into the live engine. The JavaScript
+/// sub-block remains parseable for compatibility but `JsEngine::new` uses its
+/// built-in defaults; CEL and WebAssembly manage their own budgets separately.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ScriptingConfig {
     /// Lua sandbox limits. Always populated, even when the operator
     /// omitted the block, so callers never have to special-case
     /// `None`.
     #[serde(default)]
     pub lua: LuaScriptingConfig,
-    /// JavaScript engine sandbox knobs. Covers the QuickJS-backed
-    /// `JsEngine` used by transforms, request matchers, and WAF
-    /// custom rules.
+    /// Reserved JavaScript sandbox shape. It is not installed into the
+    /// QuickJS-backed `JsEngine` by the OSS boot path.
     #[serde(default)]
     pub javascript: JsScriptingConfig,
 }
 
 /// JavaScript engine config block (`proxy.scripting.javascript:`).
 ///
-/// Wraps the sandbox limits the engine enforces every time it runs a
-/// script. Adding fresh knobs here (module loader settings, host
-/// bindings, ...) should keep `sandbox:` as its own sub-block so
-/// existing configs keep parsing.
+/// Retained so existing configs keep parsing. Programmatic callers may pass
+/// this sandbox to `JsEngine::with_sandbox`, but the YAML boot path does not.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct JsScriptingConfig {
     /// Sandbox limits: CPU time budget, heap memory cap, and native
     /// stack cap. See [`JsSandboxConfig`].
@@ -1536,6 +3672,7 @@ pub struct JsScriptingConfig {
 /// recursive scripts in the same way the CPU budget guards against
 /// `while (true) {}`.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct JsSandboxConfig {
     /// Wall-clock CPU budget per script execution. Defaults to 100
     /// ms, which is comfortably above any reasonable transform /
@@ -1682,6 +3819,7 @@ scripting:
 /// `sbproxy_synthetic_probe_failures_total{reason}` whenever the
 /// driver records a failure.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SyntheticProbeConfig {
     /// Master switch. Disabled by default so operators with strict
     /// request-cost budgets do not pay for a synthetic transaction
@@ -1759,6 +3897,7 @@ fn default_synthetic_timeout_ms() -> u64 {
 /// future Lua-specific tunables (preloaded libraries, request-binding
 /// budgets, etc.) have a stable home.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct LuaScriptingConfig {
     /// Per-script execution limits.
     #[serde(default)]
@@ -1785,6 +3924,7 @@ pub struct LuaScriptingConfig {
 /// that is the unit operators reason about; the engine converts to
 /// bytes internally.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct LuaSandboxConfig {
     /// Wall-clock execution budget per Lua invocation, in
     /// milliseconds. Default: 100 ms.
@@ -1849,6 +3989,7 @@ fn default_lua_allow_patterns() -> bool {
 /// `require: true`, requests without a valid client cert are rejected
 /// during the TLS handshake and never reach `request_filter`.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MtlsListenerConfig {
     /// Path to a PEM-encoded CA bundle used to verify client certs.
     pub client_ca_file: String,
@@ -1888,6 +4029,7 @@ fn default_mtls_require() -> bool {
 /// 4. The chosen value is echoed back to the client on the response,
 ///    unless `echo_response` is `false`.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CorrelationIdConfig {
     /// Master switch. Default: `true`.
     #[serde(default = "default_correlation_id_enabled")]
@@ -1979,6 +4121,7 @@ mod correlation_id_tests {
 /// upstream is never blocked by mirror delivery. Useful for safe
 /// rollouts of new backends and replay-driven testing.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MirrorConfig {
     /// Mirror upstream URL (http:// or https://). IPv6 hosts must be
     /// bracketed in the URL (e.g. `http://[2001:db8::1]:8080`) per RFC
@@ -2030,6 +4173,7 @@ fn default_mirror_body_cap() -> usize {
 /// `l2_cache` block is set). See `CompiledPipeline` for where the backing store
 /// is selected.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ResponseCacheConfig {
     /// Global on/off switch for response caching on this origin.
     #[serde(default)]
@@ -2089,11 +4233,21 @@ pub struct ResponseCacheConfig {
     /// hostname + path, across every Vary fingerprint.
     #[serde(default = "default_invalidate_on_mutation")]
     pub invalidate_on_mutation: bool,
+
+    /// Key material sealing this origin's entries in the shared store.
+    ///
+    /// Absent means "follow `proxy.response_cache_store.encryption`",
+    /// which under the default [`PerOriginKeyMode::Inherit`] is the
+    /// store-wide key and under [`PerOriginKeyMode::Required`] is a
+    /// startup failure naming this origin.
+    #[serde(default)]
+    pub encryption: Option<OriginCacheEncryptionConfig>,
 }
 
 /// Query-string normalization policy applied when computing the cache key.
 #[derive(Debug, Clone, Deserialize, Serialize, Default, schemars::JsonSchema)]
 #[serde(tag = "mode", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum QueryNormalize {
     /// Drop the query string from the cache key entirely.
     IgnoreAll,
@@ -2137,6 +4291,7 @@ impl Default for ResponseCacheConfig {
             query_normalize: QueryNormalize::default(),
             stale_while_revalidate: None,
             invalidate_on_mutation: default_invalidate_on_mutation(),
+            encryption: None,
         }
     }
 }
@@ -2150,6 +4305,7 @@ impl Default for ResponseCacheConfig {
 /// against the same counters and cache pool. YAML key:
 /// `l2_cache_settings`.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct L2CacheConfig {
     /// Backend driver. Currently only `"redis"` is supported.
     pub driver: String,
@@ -2162,12 +4318,36 @@ pub struct L2CacheConfig {
 ///
 /// Kept separate from `L2CacheConfig` so future drivers can add fields
 /// (auth, pool size) without churning the parent struct.
-#[derive(Debug, Clone, Deserialize, Serialize, Default, schemars::JsonSchema)]
+#[derive(Clone, Deserialize, Serialize, Default, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct L2CacheParams {
-    /// Connection DSN. For `redis` drivers this is a `redis://host:port[/db]`
-    /// URL. Only the host:port portion is parsed today; the DB index is ignored.
+    /// Redis connection DSN. Supports `redis://`, `rediss://`, credentials,
+    /// bracketed IPv6 addresses, and a non-negative logical database.
     #[serde(default)]
     pub dsn: String,
+    /// Optional path to PEM-encoded Redis trust anchors for a private CA.
+    #[serde(default)]
+    pub ca_file: Option<String>,
+    /// Optional path to a PEM-encoded Redis client certificate chain.
+    /// Must be configured together with `key_file` and requires `rediss://`.
+    #[serde(default)]
+    pub cert_file: Option<String>,
+    /// Optional path to the PEM-encoded Redis client private key.
+    /// Must be configured together with `cert_file` and requires `rediss://`.
+    #[serde(default)]
+    pub key_file: Option<String>,
+}
+
+impl std::fmt::Debug for L2CacheParams {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("L2CacheParams")
+            .field("dsn_configured", &!self.dsn.is_empty())
+            .field("ca_file_configured", &self.ca_file.is_some())
+            .field("cert_file_configured", &self.cert_file.is_some())
+            .field("key_file_configured", &self.key_file.is_some())
+            .finish()
+    }
 }
 
 // --- Cache Reserve Config ---
@@ -2184,6 +4364,7 @@ pub struct L2CacheParams {
 /// so the in-tree memory / filesystem / redis backends can be
 /// extended without touching this schema.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CacheReserveConfig {
     /// Master switch. When `false`, the reserve is not built and the
     /// hot cache behaves exactly as it does without this block.
@@ -2233,6 +4414,7 @@ impl Default for CacheReserveConfig {
 /// logging a warning).
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum CacheReserveBackendConfig {
     /// In-process map. For tests and ephemeral single-replica setups.
     Memory,
@@ -2270,6 +4452,248 @@ fn default_reserve_max_size_bytes() -> u64 {
     1_048_576
 }
 
+// --- Response Cache Store Config ---
+
+/// Top-level selection of the response cache's backing store.
+///
+/// The response cache is process-wide: `CompiledPipeline` builds one
+/// store and every origin whose `response_cache.enabled` is true shares
+/// it. Origins do not collide because the cache key already includes
+/// workspace, hostname, method, path, canonical query, and the Vary
+/// fingerprint.
+///
+/// YAML key: `proxy.response_cache_store`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseCacheStoreConfig {
+    /// Which store holds cached responses. Defaults to the in-process
+    /// map.
+    #[serde(default)]
+    pub backend: ResponseCacheBackendConfig,
+
+    /// Optional encryption of cached payloads at rest. Absent or
+    /// `enabled: false` stores payloads as the backend receives them.
+    #[serde(default)]
+    pub encryption: Option<ResponseCacheEncryptionConfig>,
+}
+
+/// Backend selector for [`ResponseCacheStoreConfig`].
+///
+/// Tagged externally on `type`. This is a closed set: unlike
+/// `cache_reserve`, the response-cache store has no out-of-tree
+/// registration path, so an unrecognized `type` is a parse error rather
+/// than a silent fallback.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+pub enum ResponseCacheBackendConfig {
+    /// In-process map, capped by the largest per-origin
+    /// `response_cache.max_size`. Per-replica, so a multi-replica
+    /// deployment caches independently. The default.
+    #[default]
+    Memory,
+    /// One file per entry under `path`, named by the SHA-256 of the
+    /// cache key. Survives a restart and is shared by every process
+    /// pointed at the same directory. Prefix purge is unavailable
+    /// because keys are hashed into filenames, so
+    /// `invalidate_on_mutation` is a no-op on this backend and entries
+    /// fall out by TTL.
+    File {
+        /// Directory holding the cache files. Created at startup if it
+        /// does not exist; startup fails if it cannot be created.
+        path: String,
+        /// Ceiling on the total size of the directory, in megabytes.
+        /// `0`, the default, means no ceiling. When set, each write
+        /// walks the directory to measure it, so leave it at `0` unless
+        /// the disk budget is real.
+        #[serde(default)]
+        max_size_mb: u64,
+    },
+    /// Memcached over the ASCII protocol. Shared across replicas.
+    /// Stale-while-revalidate and prefix purge are both unavailable:
+    /// memcached expires items server-side and offers no key scan.
+    Memcached {
+        /// Server hostname or IP.
+        #[serde(default = "default_memcached_host")]
+        host: String,
+        /// Server port.
+        #[serde(default = "default_memcached_port")]
+        port: u16,
+    },
+    /// Redis, reusing the connection configured under
+    /// `proxy.l2_cache`. Selecting this without an `l2_cache` block is
+    /// a startup error.
+    Redis,
+}
+
+/// At-rest encryption settings for the prompt-persistence redb file.
+///
+/// Persisted `NamedPrompt` records are sealed with AES-256-GCM before
+/// they reach redb. Keys stay readable because hydration is a prefix
+/// scan over `prompts:<host>:<name>`, and the key is authenticated as
+/// associated data so a sealed value cannot be moved to another
+/// host or prompt name.
+///
+/// Same reference syntax and the same no-plaintext-fallback rule as
+/// [`ResponseCacheEncryptionConfig`]: a key that is missing,
+/// unresolvable, or shorter than 16 bytes aborts startup. That is
+/// deliberately stricter than the surrounding prompt-persistence
+/// behaviour, where an unreadable file only degrades to ephemeral
+/// mutations. An unreadable file loses saved prompts; a key the operator
+/// asked for and cannot supply would silently write secrets in the
+/// clear.
+///
+/// Derived under its own HKDF purpose, so pointing this and the response
+/// cache at one operator secret still yields two unrelated keys.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PromptPersistenceEncryptionConfig {
+    /// Master switch. Defaults to `false`.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Secret reference for the active key. Used to seal new records and
+    /// to open records sealed under it.
+    ///
+    /// Resolved through the same mechanism as every other config secret:
+    /// a provider URI (`secret://backend/name`, `vault://...`) against a
+    /// backend declared under `proxy.secrets.backends`, a `file:/path`
+    /// reference, or a whole-value `${ENV_VAR}`. Required when
+    /// [`Self::enabled`] is `true`.
+    ///
+    /// The resolved value should be 32 random bytes (base64 or hex
+    /// encoded) rather than a human-chosen passphrase.
+    #[serde(default)]
+    pub key: Option<String>,
+
+    /// Retired keys, used only to open records sealed before a rotation.
+    /// Same reference syntax as [`Self::key`].
+    ///
+    /// To rotate: move the current `key` into this list and name the new
+    /// one as `key`. Records reseal under the active key the next time
+    /// they are written.
+    #[serde(default)]
+    pub previous_keys: Vec<String>,
+}
+
+/// At-rest encryption settings for [`ResponseCacheStoreConfig`].
+///
+/// Cached response headers and bodies are sealed with AES-256-GCM
+/// before they reach the backing store. Status, cache time, and TTL
+/// stay readable because the file and memcached backends need them to
+/// compute expiry; status is authenticated so it cannot be altered.
+///
+/// There is no plaintext fallback. A key that is missing, unresolvable,
+/// or shorter than 16 bytes aborts startup.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseCacheEncryptionConfig {
+    /// Master switch. Defaults to `false`.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Secret reference for the active key. Used to seal new entries
+    /// and to open entries sealed under it.
+    ///
+    /// Resolved through the same mechanism as every other config
+    /// secret: a provider URI (`secret://backend/name`, `vault://...`)
+    /// against a backend declared under `proxy.secrets.backends`, a
+    /// `file:/path` reference, or a whole-value `${ENV_VAR}`. An
+    /// unresolvable reference aborts startup rather than being used as
+    /// key material verbatim. Required when `enabled` is `true`.
+    ///
+    /// The resolved value should be 32 random bytes (base64 or hex
+    /// encoded), not a human-chosen passphrase: the logged key
+    /// fingerprint is a weak offline oracle against a short passphrase,
+    /// but not against 256 bits of real entropy.
+    #[serde(default)]
+    pub key: Option<String>,
+
+    /// Retired keys, used only to open entries sealed before a
+    /// rotation. Same reference syntax as [`Self::key`].
+    ///
+    /// To rotate: move the current `key` into this list and name the
+    /// new one as `key`. Entries reseal under the active key as they
+    /// are rewritten. Removing a reference from this list retires its
+    /// entries; they are evicted the next time they are read.
+    #[serde(default)]
+    pub previous_keys: Vec<String>,
+
+    /// What happens when an origin that caches does not declare its own
+    /// key under `origins.<host>.response_cache.encryption`.
+    ///
+    /// Defaults to [`PerOriginKeyMode::Inherit`], which is the
+    /// backwards-compatible behaviour and is safe on its own terms: the
+    /// origin is bound into the associated data either way, so an entry
+    /// sealed for one origin never opens as another even when both
+    /// inherit this key. Set [`PerOriginKeyMode::Required`] when the
+    /// deployment's threat model needs every tenant to hold key material
+    /// nobody else holds.
+    #[serde(default)]
+    pub per_origin_keys: PerOriginKeyMode,
+}
+
+/// How the response cache treats an origin that declares no key of its own.
+///
+/// Both modes bind the origin into the AEAD associated data, so
+/// cross-origin isolation is cryptographic in both. The difference is
+/// whether tenants share master key material.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PerOriginKeyMode {
+    /// An origin with no key of its own uses the store-wide key. The
+    /// default, and what every config written before per-origin keys
+    /// existed gets.
+    ///
+    /// Cross-origin isolation still holds, because the origin id is
+    /// authenticated in every envelope. What an operator does *not* get
+    /// is key separation: one leaked store-wide key opens every tenant's
+    /// entries.
+    #[default]
+    Inherit,
+    /// Every origin with `response_cache.enabled: true` must declare its
+    /// own `encryption.key`. Startup fails, naming each origin that does
+    /// not, rather than quietly sealing that tenant under shared
+    /// material.
+    Required,
+}
+
+/// Per-origin at-rest encryption keys for the shared response cache.
+///
+/// Lives at `origins.<host>.response_cache.encryption`. The backing store
+/// and its `enabled` switch stay global at
+/// `proxy.response_cache_store.encryption`; this block only says which key
+/// material seals *this* origin's entries. Declaring it while store-wide
+/// encryption is off is a config error rather than a silent no-op, because
+/// an operator who wrote a key here plainly expected sealing to happen.
+///
+/// Reference syntax and the no-plaintext-fallback rule are identical to
+/// [`ResponseCacheEncryptionConfig`]: an unresolvable reference aborts
+/// startup with an error naming this origin.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OriginCacheEncryptionConfig {
+    /// Secret reference for this origin's active key. When absent, the
+    /// behaviour follows [`ResponseCacheEncryptionConfig::per_origin_keys`].
+    #[serde(default)]
+    pub key: Option<String>,
+
+    /// This origin's retired keys, used only to open entries sealed
+    /// before a rotation. Rotating one origin does not touch any other.
+    #[serde(default)]
+    pub previous_keys: Vec<String>,
+}
+
+fn default_memcached_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_memcached_port() -> u16 {
+    11211
+}
+
 // --- Messenger Settings ---
 
 /// Configuration for the shared message bus used by inter-component events
@@ -2286,6 +4710,7 @@ fn default_reserve_max_size_bytes() -> u64 {
 /// Unknown drivers cause `build_messenger` to return an error; the caller
 /// decides whether to treat that as fatal or fall back to no-bus semantics.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MessengerSettings {
     /// Backend driver name.
     pub driver: String,
@@ -2298,6 +4723,7 @@ pub struct MessengerSettings {
 
 /// Configuration for the embedded read-only admin/stats API server.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AdminConfig {
     /// Whether the admin server is enabled. Defaults to false.
     #[serde(default)]
@@ -2315,6 +4741,11 @@ pub struct AdminConfig {
     /// Defaults to 1000.
     #[serde(default = "default_max_log")]
     pub max_log_entries: usize,
+    /// Maximum admin API requests per client IP per minute. The global
+    /// cap across all clients is ten times this value. Must be between
+    /// 1 and 100000; the limiter cannot be turned off. Defaults to 240.
+    #[serde(default = "default_admin_rate_limit")]
+    pub rate_limit_per_minute: u64,
     /// WOR-800 PR5: filesystem path to a redb file that persists the
     /// prompt-store runtime overlay. When set, every successful
     /// `POST /admin/prompts/.../versions` and `PUT /admin/prompts/.../pin`
@@ -2323,6 +4754,12 @@ pub struct AdminConfig {
     /// Absent means PR3-style ephemeral mutations.
     #[serde(default)]
     pub prompt_persistence_path: Option<std::path::PathBuf>,
+    /// At-rest encryption for [`Self::prompt_persistence_path`]. Absent
+    /// or disabled stores prompt records as plaintext JSON, which is the
+    /// pre-existing behaviour and stays the default so an upgrade cannot
+    /// orphan an existing file.
+    #[serde(default)]
+    pub prompt_persistence_encryption: Option<PromptPersistenceEncryptionConfig>,
     /// URL template for trace deep-links in the admin UI. The literal
     /// `{trace_id}` is replaced with the request's trace id, e.g.
     /// `https://jaeger.internal/trace/{trace_id}`. Unset renders trace
@@ -2363,6 +4800,7 @@ pub struct AdminConfig {
 /// together; supplying `tls` makes the admin server, including the
 /// built-in UI, serve HTTPS instead of plaintext HTTP.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AdminTlsConfig {
     /// Path to the PEM certificate chain file.
     pub cert: std::path::PathBuf,
@@ -2372,14 +4810,30 @@ pub struct AdminTlsConfig {
 
 /// An admin operator identity with a role, for RBAC (WOR-1716).
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AdminOperator {
     /// Login username.
     pub username: String,
-    /// Login password.
-    pub password: String,
+    /// HMAC-SHA256 hash of the login password, hex-encoded, using the same
+    /// pepper as the inbound key plane (sbproxy-keystore::crypto).
+    /// Compute with `sbproxy admin hash-password`.
+    pub password_hash: String,
     /// Role governing which admin actions this operator may perform.
     #[serde(default)]
     pub role: AdminRole,
+    /// Billing tenant whose metered consumption this operator may read
+    /// (WOR-2131). Absent means the whole deployment, which is what every
+    /// operator written before this field existed keeps getting.
+    ///
+    /// A receipt names one buyer's traffic, so the meter routes treat a
+    /// cross-tenant read as a disclosure rather than a reporting mistake:
+    /// naming a tenant here narrows `/api/meter/*` to that tenant and
+    /// refuses a request for any other. The scope is read from this
+    /// document on every request rather than carried in the session token,
+    /// so revoking it is a config reload rather than a wait for tokens to
+    /// expire.
+    #[serde(default)]
+    pub tenant: Option<String>,
 }
 
 /// Admin RBAC role (WOR-1716). `read_only` may call read (GET) endpoints
@@ -2400,16 +4854,34 @@ fn default_admin_port() -> u16 {
     9090
 }
 
+/// The shipped default admin username, so a first run works without any
+/// credential config. Public so every consumer of the default reads this
+/// constant instead of repeating the literal; the same string used to be
+/// hardcoded in three places, which is how such a default drifts.
+pub const DEFAULT_ADMIN_USERNAME: &str = "admin";
+
+/// The shipped default admin password, the counterpart to
+/// [`DEFAULT_ADMIN_USERNAME`]. Public for the same reason, plus one of
+/// its own: because it is a published constant, a config that still uses
+/// it is unauthenticated in practice, so `compile_config` compares
+/// against this value and rejects it whenever the admin surface is
+/// reachable off loopback.
+pub const DEFAULT_ADMIN_PASSWORD: &str = "changeme";
+
 fn default_admin_user() -> String {
-    "admin".to_string()
+    DEFAULT_ADMIN_USERNAME.to_string()
 }
 
 fn default_admin_pass() -> String {
-    "changeme".to_string()
+    DEFAULT_ADMIN_PASSWORD.to_string()
 }
 
 fn default_max_log() -> usize {
     1000
+}
+
+fn default_admin_rate_limit() -> u64 {
+    240
 }
 
 fn default_http_port() -> u16 {
@@ -2442,6 +4914,7 @@ fn default_http_port() -> u16 {
 ///     callback_client_secs: 15
 /// ```
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct HttpClientTimeoutsConfig {
     /// Outer client-level timeout for the shared forward-auth
     /// `reqwest::Client`. The per-request timeout from each
@@ -2508,6 +4981,7 @@ fn default_callback_client_secs() -> u64 {
 
 /// ACME (Automatic Certificate Management Environment) configuration for automatic TLS.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AcmeConfig {
     /// Master switch for ACME-managed TLS certificates.
     #[serde(default)]
@@ -2563,6 +5037,7 @@ fn default_renew_before_days() -> u32 {
 
 /// Metrics collection configuration.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MetricsConfig {
     /// Max unique label values allowed per metric label before new values are
     /// collapsed to `__other__`. Defaults to 1 000.
@@ -2588,6 +5063,7 @@ fn default_max_cardinality() -> usize {
 
 /// Per-label metrics cardinality overrides.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MetricsCardinalityConfig {
     /// Optional override for the `hostname` label cap.
     pub hostname_cap: Option<usize>,
@@ -2610,6 +5086,7 @@ pub struct MetricsCardinalityConfig {
 ///   listed methods (case-insensitive on emit).
 /// - `sample_rate` is applied last and accepts a value in `[0.0, 1.0]`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AccessLogConfig {
     /// Master switch. When false (the default), no access-log lines are
     /// emitted regardless of the other fields.
@@ -2698,6 +5175,7 @@ fn default_access_log_sample_rate() -> f64 {
 
 /// Access-log output sink.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AccessLogOutputConfig {
     /// Sink type: `stderr` (default) or `file`.
     #[serde(default = "default_access_log_output_type", rename = "type")]
@@ -2758,6 +5236,7 @@ fn default_access_log_max_backups() -> usize {
 /// it by exact name; the proxy logs a `WARN` at config load so the
 /// choice is visible.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CaptureHeadersConfig {
     /// Request-side allowlist. Empty (the default) captures nothing.
     #[serde(default)]
@@ -2816,14 +5295,61 @@ fn default_capture_max_value_bytes() -> usize {
 }
 
 /// Header names excluded from `*` and glob matches. Listing one of
-/// these by exact name still works (intentional opt-in).
+/// these by exact name still works as an intentional opt-in, except
+/// `dpop`: sender-constraining proofs are never loggable.
 pub const SENSITIVE_HEADER_DENYLIST: &[&str] = &[
     "authorization",
     "cookie",
     "set-cookie",
     "proxy-authorization",
     "x-api-key",
+    "dpop",
+    // Default sidecar header for a minted virtual key. It matches none of the
+    // `-key` / `-secret` / `-token` suffix rules the log redactor uses, so
+    // without this entry a `capture_headers: ["*"]` glob logs a live key.
+    // Operator-configured sweep headers are added dynamically at reload.
+    "x-sb-api",
 ];
+
+/// Extra header names excluded from `*` and glob capture, on top of
+/// [`SENSITIVE_HEADER_DENYLIST`].
+///
+/// Holds every primary carrier named by `key_management.inbound.headers` and
+/// `key_management.inbound.provider_hints`, set at load and on every reload.
+/// Without it a custom carrier could be captured by a
+/// `capture_headers: ["*"]` glob.
+static EXTRA_SENSITIVE_HEADERS: std::sync::OnceLock<
+    std::sync::RwLock<std::sync::Arc<Vec<String>>>,
+> = std::sync::OnceLock::new();
+
+fn extra_sensitive_slot() -> &'static std::sync::RwLock<std::sync::Arc<Vec<String>>> {
+    EXTRA_SENSITIVE_HEADERS.get_or_init(|| std::sync::RwLock::new(std::sync::Arc::new(Vec::new())))
+}
+
+/// Replace the operator-configured set of key-bearing headers that globs must
+/// never capture. Pass [`KeyInboundConfig::credential_carrier_names`].
+pub fn set_extra_sensitive_headers(names: Vec<String>) {
+    let lowered: Vec<String> = names
+        .into_iter()
+        .map(|n| n.trim().to_ascii_lowercase())
+        .filter(|n| !n.is_empty())
+        .collect();
+    if let Ok(mut slot) = extra_sensitive_slot().write() {
+        *slot = std::sync::Arc::new(lowered);
+    }
+}
+
+/// Whether `header_name` is sensitive: on the built-in denylist, or named by
+/// the operator's inbound credential configuration.
+pub fn is_sensitive_header(header_name: &str) -> bool {
+    if SENSITIVE_HEADER_DENYLIST.contains(&header_name) {
+        return true;
+    }
+    extra_sensitive_slot()
+        .read()
+        .map(|slot| slot.iter().any(|n| n == header_name))
+        .unwrap_or(false)
+}
 
 /// Compiled allowlist suitable for the request hot path. Built once
 /// per config-reload from a [`CaptureHeadersConfig`] list.
@@ -2858,7 +5384,7 @@ impl CompiledHeaderAllowlist {
                 compiled.prefixes.push(prefix.to_string());
                 continue;
             }
-            if SENSITIVE_HEADER_DENYLIST.contains(&entry.as_str()) {
+            if is_sensitive_header(&entry) {
                 warnings.push(entry.clone());
             }
             compiled.exact.insert(entry);
@@ -2873,12 +5399,30 @@ impl CompiledHeaderAllowlist {
 
     /// Decide whether `header_name` (already lowercased) should be
     /// captured. The denylist always wins for `*` and glob matches;
-    /// exact matches override the denylist.
+    /// exact matches override the denylist except for DPoP proofs,
+    /// which are never loggable.
     pub fn matches(&self, header_name: &str) -> bool {
+        self.matches_with_sensitive(header_name, is_sensitive_header)
+    }
+
+    /// Decide whether `header_name` should be captured using the supplied
+    /// sensitive-header predicate.
+    ///
+    /// Request paths that pin a compiled config generation use this form so
+    /// a concurrent reload cannot change which custom credential carriers
+    /// are excluded from wildcard and prefix captures.
+    pub fn matches_with_sensitive(
+        &self,
+        header_name: &str,
+        is_sensitive: impl Fn(&str) -> bool,
+    ) -> bool {
+        if header_name == "dpop" {
+            return false;
+        }
         if self.exact.contains(header_name) {
             return true;
         }
-        let denied = SENSITIVE_HEADER_DENYLIST.contains(&header_name);
+        let denied = is_sensitive(header_name);
         if denied {
             return false;
         }
@@ -2893,21 +5437,21 @@ impl CompiledHeaderAllowlist {
 
 /// Top-level alerting configuration block.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AlertingConfig {
     /// List of notification channels to fire alerts to.
     #[serde(default)]
     pub channels: Vec<AlertChannelConfig>,
 }
 
-/// Top-level observability block: groups the `log` and `telemetry`
-/// sub-blocks so an operator can configure both from YAML rather than
-/// CLI flags + env vars. Re-uses the existing `LoggingConfig` and
-/// `TelemetryConfig` shapes from `sbproxy-observe`.
+/// Top-level observability block grouping live log extensions, telemetry, and
+/// durable usage rollups. The legacy process-logger fields under `log` remain
+/// parseable but are not installed into the tracing subscriber.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ObservabilityConfig {
-    /// `tracing-subscriber` configuration: level, format, per-level
-    /// sampling. CLI / env still wins where applicable; this block is
-    /// the YAML source-of-truth for everything else.
+    /// Log sinks, redaction, and custom fields, plus compatibility-only parent
+    /// level, format, and per-level sampling values.
     #[serde(default)]
     pub log: Option<ObservabilityLogConfig>,
     /// OTLP exporter configuration. When `enabled = true`, the
@@ -2928,6 +5472,7 @@ pub struct ObservabilityConfig {
 /// prompt content and no raw key material, so the file is safe to
 /// back up. Aggregation is deterministic.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UsageRollupsConfig {
     /// Whether rollups are recorded. Defaults to `true`. When the
     /// store path cannot be opened the proxy logs a warning and runs
@@ -2971,14 +5516,18 @@ fn default_rollup_daily_days() -> u32 {
 /// through serde without dragging a serde dependency back into the
 /// observe crate.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ObservabilityLogConfig {
-    /// Log level filter. `debug | info | warn | error`. Default `info`.
+    /// Compatibility-only process log level. Use CLI/environment controls;
+    /// this YAML value is not installed into the tracing subscriber.
     #[serde(default)]
     pub level: Option<String>,
-    /// Output format. `compact | pretty | json`. Default `compact`.
+    /// Compatibility-only process output format. Sink-local `format` remains
+    /// live, while the process subscriber uses CLI/environment controls.
     #[serde(default)]
     pub format: Option<String>,
-    /// Per-level emission sampling rates. Default 1.0 / 0.1 / 0.01.
+    /// Compatibility-only per-level sampling rates. The process logger uses
+    /// its built-in sampling defaults.
     #[serde(default)]
     pub sampling: Option<ObservabilitySamplingConfig>,
     /// Operator-extensible redaction block. `fields` extends the
@@ -3022,6 +5571,7 @@ pub struct ObservabilityLogConfig {
 /// error. `engine` must be one of `cel`, `lua`, `js`. (`wasm` is
 /// rejected: it is a compiled module, not inline source.)
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CustomLogFieldConfig {
     /// Key the computed value lands under in the access line's `custom`
     /// object. Must be unique within the scope.
@@ -3047,6 +5597,7 @@ pub struct CustomLogFieldConfig {
 /// `proxy.observability.log.redact:` (today) and will surface at
 /// tenant and origin scopes once multi-tenant scaffolding lands.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ObservabilityRedactConfig {
     /// Additional JSON field keys whose values are replaced with
     /// `[REDACTED:<NAME>]`. Matched case-insensitively against the
@@ -3076,6 +5627,7 @@ pub struct ObservabilityRedactConfig {
 /// per-origin `PiiConfig` used by the AI handler but applies to every
 /// emitted log line, regardless of origin.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ObservabilityPiiConfig {
     /// Master switch. When `Some(false)`, the redactor is never built
     /// and the pipeline shorts the PII pass at this scope (and any
@@ -3103,6 +5655,7 @@ pub struct ObservabilityPiiConfig {
 /// One named regex mask. `name` is reported on cardinality / counter
 /// metrics; `replacement` defaults to `[REDACTED:<NAME>]` when empty.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ObservabilityRedactPattern {
     /// Operator-supplied label; appears in metrics + the marker.
     pub name: String,
@@ -3138,6 +5691,7 @@ pub struct ObservabilityRedactPattern {
 ///   default to `external` because the operator usually does not
 ///   control the downstream backend.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ObservabilitySinkConfig {
     /// Unique name within the declaring scope (proxy / tenant / origin).
     /// Duplicates within a scope are rejected at config compile.
@@ -3169,6 +5723,7 @@ pub struct ObservabilitySinkConfig {
 /// planned follow-up. Unknown `type:` values fail compilation.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum ObservabilitySinkOutput {
     /// Write to process stdout. The default for a freshly-installed
     /// proxy.
@@ -3222,6 +5777,7 @@ pub enum ObservabilitySinkOutput {
 
 /// Per-level sample rates for the structured-log emitter.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ObservabilitySamplingConfig {
     /// Fraction of `info` lines to emit (default 1.0).
     #[serde(default)]
@@ -3236,6 +5792,7 @@ pub struct ObservabilitySamplingConfig {
 
 /// Subset of `sbproxy-observe::TelemetryConfig` exposed in the YAML.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ObservabilityTelemetryConfig {
     /// Whether OTLP export is enabled.
     #[serde(default)]
@@ -3261,7 +5818,8 @@ pub struct ObservabilityTelemetryConfig {
     /// Keep any completed trace at or above this wall-clock latency.
     #[serde(default)]
     pub keep_slower_than_secs: Option<f64>,
-    /// Propagation format: `w3c` (default), `b3`, `jaeger`.
+    /// Propagation format. Only `w3c` (the default) is wired; the
+    /// binary refuses to start with any other value.
     #[serde(default)]
     pub propagation: Option<String>,
     /// Free-form resource attributes attached to every span.
@@ -3287,6 +5845,7 @@ pub struct ObservabilityTelemetryConfig {
 
 /// Configuration for a single alert notification channel.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AlertChannelConfig {
     /// Channel type: `"webhook"`, `"slack"`, `"pagerduty"`, or `"log"`.
     #[serde(rename = "type")]
@@ -3307,15 +5866,16 @@ pub struct AlertChannelConfig {
 
 /// HTTP/3 (QUIC) configuration.
 ///
-/// Temporarily inert: HTTP/3 is disabled until native QUIC support lands in
-/// the underlying proxy engine. These fields still parse, but the listener is
-/// not started; enabling it logs a warning instead.
+/// The shape is reserved for forward compatibility. The config compiler
+/// accepts an omitted or disabled block, but rejects `enabled: true` because
+/// this build does not serve HTTP/3. Native support is tracked in WOR-1969.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Http3Config {
     /// Whether to enable the HTTP/3 (QUIC) listener.
     ///
-    /// Currently ignored: HTTP/3 is temporarily disabled (see the struct
-    /// docs). Setting this to `true` logs a warning and starts no listener.
+    /// Must remain `false` in this build. Setting it to `true` fails config
+    /// compilation because HTTP/3 is not served.
     #[serde(default)]
     pub enabled: bool,
     /// Maximum number of concurrent QUIC streams per connection.
@@ -3338,31 +5898,28 @@ fn default_idle_timeout() -> u32 {
 
 // --- ConnectionPoolConfig ---
 
-/// Per-origin connection pool tuning parameters.
+/// Legacy per-origin connection-pool shape.
 ///
-/// Controls how many concurrent connections are maintained to an upstream,
-/// how long idle connections are kept alive, and the maximum lifetime of
-/// any individual connection.
+/// The OSS runtime does not install these values into Pingora. They remain in
+/// the schema so existing configuration files continue to parse.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ConnectionPoolConfig {
     /// Maximum number of concurrent connections to the upstream.
     ///
-    /// Additional requests will queue until a connection is available.
-    /// Default: 128.
+    /// Config-only compatibility value. Default: 128.
     #[serde(default = "default_max_connections")]
     pub max_connections: u32,
 
     /// Maximum idle time before a connection is closed, in seconds.
     ///
-    /// Connections that have been unused for longer than this will be
-    /// dropped from the pool.  Default: 90 s.
+    /// Config-only compatibility value. Default: 90 s.
     #[serde(default = "default_idle_timeout_secs")]
     pub idle_timeout_secs: u32,
 
     /// Maximum total lifetime of a connection, in seconds.
     ///
-    /// Connections older than this will be closed and replaced even if they
-    /// are still healthy.  Default: 300 s.
+    /// Config-only compatibility value. Default: 300 s.
     #[serde(default = "default_max_lifetime_secs")]
     pub max_lifetime_secs: u32,
 }
@@ -3398,6 +5955,7 @@ impl Default for ConnectionPoolConfig {
 /// operator never declares `__default__` explicitly; doing so fails
 /// config compile.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ProxyTenantConfig {
     /// Operator-supplied stable identifier. Referenced from
     /// `origin.tenant_id` and stamped on every request the origin
@@ -3427,6 +5985,7 @@ pub struct ProxyTenantConfig {
 /// the same name), and `cardinality` (per-tenant metric label budget)
 /// are all consumed at runtime.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TenantObservabilityConfig {
     /// Tenant-scoped log block. See [`TenantObservabilityLogConfig`].
     #[serde(default)]
@@ -3447,6 +6006,7 @@ pub struct TenantObservabilityConfig {
 /// `CardinalityLimiter` (in `sbproxy-observe`) so single-tenant
 /// deployments stay bit-for-bit identical to pre-WOR-1067 behaviour.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TenantCardinalityConfig {
     /// Maximum unique label values per metric, per label name, for
     /// requests resolving to this tenant. When omitted the
@@ -3473,6 +6033,7 @@ pub const TENANT_CARDINALITY_DEFAULT_MAX_SERIES: u32 = 10_000;
 /// tenant into each declared sink; cross-tenant records never reach
 /// here.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TenantObservabilityLogConfig {
     /// Tenant-scope `redact:` sub-block. See
     /// [`TenantObservabilityRedactConfig`].
@@ -3498,6 +6059,7 @@ pub struct TenantObservabilityLogConfig {
 /// they touch the rendered JSON, which is tenant-agnostic in the
 /// emitter.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TenantObservabilityRedactConfig {
     /// WOR-1042: tenant-scope additions to the field-key denylist.
     /// Additive only; a tenant CANNOT disable a proxy-level field
@@ -3536,14 +6098,15 @@ pub struct TenantObservabilityRedactConfig {
 /// * Which provider produces it (`type`, `provider`).
 /// * Where the secret material lives (`key`, a provider-specific
 ///   secret reference such as `vault://`, `awssm://`, `gcpsm://`,
-///   `k8ssecret://`, `secretfile://`, or `secret://`, or a legacy
-///   `${ENV}` / `file:` / `secret:` reference).
+///   `azurekv://`, `k8ssecret://`, `secretfile://`, or `secret://`,
+///   or a legacy `${ENV}` / `file:` reference).
 /// * Which inbound principals can use it (`principals` selectors).
 /// * Per-credential attribution metadata (`attrs`).
 /// * Allow / deny model lists that stack on top of the origin-level
 ///   allowlist (most-restrictive wins).
 /// * Per-credential sub-policies (rate limit, PII redaction, ...).
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CredentialBlock {
     /// Operator-supplied stable name. Unique within the declaring
     /// scope. Used to identify the credential in metrics and logs.
@@ -3559,10 +6122,11 @@ pub struct CredentialBlock {
     #[serde(default)]
     pub provider: Option<String>,
     /// Secret material reference. Provider-specific schemes include
-    /// `vault://`, `awssm://`, `gcpsm://`, `k8ssecret://`,
-    /// `secretfile://`, and `secret://`; legacy `${ENV}`, `file:`,
-    /// and `secret:` forms also remain valid. The resolver dispatches
-    /// at runtime; the config parser carries it as a string.
+    /// `vault://`, `awssm://`, `gcpsm://`, `azurekv://`,
+    /// `k8ssecret://`, `secretfile://`, and `secret://`; legacy
+    /// `${ENV}` and `file:` forms also remain valid. The removed `secret:<name>` form is
+    /// rejected. The resolver dispatches at runtime; the config parser
+    /// carries the value as a string.
     #[serde(default)]
     pub key: Option<String>,
     /// Principal selectors that match this credential to inbound
@@ -3571,7 +6135,8 @@ pub struct CredentialBlock {
     /// match the request.
     #[serde(default)]
     pub principals: Vec<PrincipalSelector>,
-    /// Attribution attributes copied onto matched principals.
+    /// Attribution attributes lowered onto matched principals. Individual
+    /// compatibility-only fields are documented on their definitions.
     #[serde(default)]
     pub attrs: CredentialAttrs,
     /// Model allow / deny lists. Stacks on top of the origin-level
@@ -3587,6 +6152,9 @@ pub struct CredentialBlock {
     /// `route_to_model` field on the underlying `VirtualKeyConfig`.
     #[serde(default)]
     pub route_to_model: Option<String>,
+    /// Select `on`, `off`, or a named route-local compression profile.
+    #[serde(default)]
+    pub compression_profile: Option<String>,
     /// Replace the request's `tools` array with these entries. The
     /// shape is provider-native (`function` objects today); the AI
     /// dispatch forwards the array verbatim. Empty == no injection.
@@ -3609,6 +6177,7 @@ pub struct CredentialBlock {
 /// one field must be set; an entirely empty selector is rejected at
 /// compile.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PrincipalSelector {
     /// Glob matching `Principal.virtual_key.name`. `*` matches any
     /// virtual key. `vk_frontend_*` matches every key with that
@@ -3635,6 +6204,7 @@ pub struct PrincipalSelector {
 
 /// Attribution attributes copied onto matched principals.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CredentialAttrs {
     /// Project the credential's spend rolls up to.
     #[serde(default)]
@@ -3643,8 +6213,10 @@ pub struct CredentialAttrs {
     /// inbound request authenticates as).
     #[serde(default)]
     pub user: Option<String>,
-    /// Team grouping. Drives the team partition on the
-    /// per-credential attribution metric.
+    /// Compatibility-only team grouping. The field remains parseable, but
+    /// credential lowering does not currently copy it onto the matched
+    /// principal. Use `tags` or `metadata` for live attribution until
+    /// WOR-1976 wires this value.
     #[serde(default)]
     pub team: Option<String>,
     /// Cost center. Lifted onto `Principal.attrs.metadata` under
@@ -3667,17 +6239,20 @@ pub struct CredentialAttrs {
     pub budget: Option<CredentialBudget>,
 }
 
-/// Per-credential budget. Reset windows use the LiteLLM-style
-/// `30s|30m|30h|30d` syntax.
+/// Per-credential budget. The token and cost caps are lowered into
+/// the live credential registry. `reset` remains a reserved,
+/// compatibility-only field and does not install a reset schedule.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CredentialBudget {
-    /// Maximum tokens (input + output combined) per reset window.
+    /// Maximum input + output tokens enforced for this credential.
     #[serde(default)]
     pub max_tokens: Option<u64>,
-    /// Maximum USD spend per reset window.
+    /// Maximum USD spend enforced for this credential.
     #[serde(default)]
     pub max_cost_usd: Option<f64>,
-    /// Reset window. Parsed at config-load.
+    /// Reserved reset-window hint. It is accepted but not parsed or
+    /// enforced by the OSS runtime.
     #[serde(default)]
     pub reset: Option<String>,
 }
@@ -3685,6 +6260,7 @@ pub struct CredentialBudget {
 /// Model allow / deny lists scoped to this credential. Stacks on top
 /// of the origin-level allowlist. Most-restrictive wins.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CredentialModels {
     /// Models this credential is allowed to use. Empty allows all
     /// origin-allowed models.
@@ -3702,6 +6278,7 @@ pub struct CredentialModels {
 /// widening this enum.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum CredentialPolicy {
     /// Per-credential rate limit. Stacks on top of the origin-level
     /// rate limit (most-restrictive wins).
@@ -3719,9 +6296,95 @@ pub enum CredentialPolicy {
     },
 }
 
+/// Schema-only mirror of the deferred outbound credential enum. Runtime
+/// parsing remains in `sbproxy-modules`; this keeps generated editor tooling
+/// precise without introducing a crate dependency cycle.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[allow(dead_code)]
+enum OutboundCredentialSchema {
+    TokenExchange {
+        token_endpoint: String,
+        audience: String,
+        #[serde(default)]
+        scope: Option<String>,
+        #[serde(default)]
+        subject_token_issuers: Vec<String>,
+        #[serde(default)]
+        allowed_audiences: Vec<String>,
+        #[serde(default = "default_outbound_act_depth")]
+        act_depth_cap: usize,
+        #[serde(default)]
+        client_id: Option<String>,
+        #[serde(default)]
+        client_secret: Option<String>,
+        #[serde(default)]
+        dpop: Option<OutboundDpopSchema>,
+    },
+    ClientCredentials {
+        token_endpoint: String,
+        client_id: String,
+        client_secret: String,
+        #[serde(default)]
+        scope: Option<String>,
+        #[serde(default)]
+        audience: Option<String>,
+        #[serde(default)]
+        dpop: Option<OutboundDpopSchema>,
+    },
+    VaultSecret {
+        secret: String,
+        #[serde(default = "default_outbound_credential_header")]
+        header: String,
+        #[serde(default = "default_outbound_credential_scheme")]
+        scheme: String,
+        #[serde(default)]
+        dpop: Option<OutboundDpopSchema>,
+    },
+}
+
+fn default_outbound_act_depth() -> usize {
+    4
+}
+
+fn default_outbound_credential_header() -> String {
+    "authorization".to_string()
+}
+
+fn default_outbound_credential_scheme() -> String {
+    "Bearer".to_string()
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct OutboundDpopSchema {
+    /// Existing provider URI or `file:` secret reference. Inline PEM is
+    /// rejected and SBproxy never generates this key.
+    key: String,
+    /// Public-only JWK matching the referenced private key.
+    jwk: serde_json::Value,
+    /// Asymmetric signing algorithm accepted for RFC 9449 proofs.
+    alg: OutboundDpopAlgorithmSchema,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+enum OutboundDpopAlgorithmSchema {
+    ES256,
+    ES384,
+    RS256,
+    RS384,
+    RS512,
+    PS256,
+    PS384,
+    PS512,
+    EdDSA,
+}
+
 /// A single origin config as it appears in YAML.
 /// Plugin-specific fields are kept as `serde_json::Value` for deferred parsing.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RawOriginConfig {
     /// Action describing what the origin does (proxy, redirect, static, etc.).
     pub action: serde_json::Value,
@@ -3807,7 +6470,8 @@ pub struct RawOriginConfig {
     /// Threat protection (IP reputation, blocklist) configuration.
     #[serde(default)]
     pub threat_protection: Option<serde_json::Value>,
-    /// Configuration for rate-limit response headers (`X-RateLimit-*`, `Retry-After`).
+    /// Compatibility-only origin-level rate-limit header shape. Configure the
+    /// live rate-limit policy's `headers` block instead.
     #[serde(default)]
     pub rate_limit_headers: Option<serde_json::Value>,
     /// Per-status custom error response bodies. Each entry covers one
@@ -3832,7 +6496,8 @@ pub struct RawOriginConfig {
     /// wide branding (e.g. `acme-edge`).
     #[serde(default)]
     pub proxy_status: Option<ProxyStatusConfig>,
-    /// Traffic capture / mirroring configuration.
+    /// Compatibility-only traffic-capture shape. The OSS runtime has no
+    /// consumer; use [`MirrorConfig`] for live request mirroring.
     #[serde(default)]
     pub traffic_capture: Option<serde_json::Value>,
     /// Shadow traffic mirror, fire-and-forget copy of each request to
@@ -3864,8 +6529,8 @@ pub struct RawOriginConfig {
     /// header. See [`IdempotencyConfig`].
     #[serde(default)]
     pub idempotency: Option<IdempotencyConfig>,
-    /// Per-origin connection pool tuning.  Falls back to proxy-wide defaults
-    /// when not specified.
+    /// Compatibility-only per-origin connection-pool shape. Pingora's built-in
+    /// pool settings apply regardless of these values.
     #[serde(default)]
     pub connection_pool: Option<ConnectionPoolConfig>,
     /// Opaque per-origin extensions for out-of-tree config blocks.
@@ -3953,6 +6618,7 @@ pub struct RawOriginConfig {
     /// `sbproxy-modules`). Secret fields use the standard `${ENV}`
     /// interpolation, resolved at config load.
     #[serde(default)]
+    #[schemars(with = "Option<OutboundCredentialSchema>")]
     pub outbound_credential: Option<serde_json::Value>,
     /// Opt this origin into outbound Web Bot Auth signing (WOR-805).
     /// When `true` and `proxy.web_bot_auth` is configured, the proxy
@@ -3961,6 +6627,14 @@ pub struct RawOriginConfig {
     /// Bot Auth accepts SBproxy as a verified agent. Default `false`.
     #[serde(default)]
     pub outbound_web_bot_auth: bool,
+    /// Per-origin consumption attestation overrides (WOR-2127). Absent
+    /// leaves the origin on the proxy-wide role with no agreement named.
+    /// Authoring this block without a `proxy.attestation` block fails
+    /// config compile: a per-origin role with no queue, ledger, or
+    /// billing table behind it can never produce a record. See
+    /// [`OriginAttestationConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation: Option<OriginAttestationConfig>,
     /// Origin-scope observability block. Today the only nested surface
     /// is `log.redact.pii`, which composes against the tenant-scope
     /// block (or proxy-scope when the origin has no tenant). See
@@ -3975,6 +6649,7 @@ pub struct RawOriginConfig {
 /// override tenant- and proxy-scope fields of the same name) are all
 /// consumed at runtime.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct OriginObservabilityConfig {
     /// Origin-scope log block. See [`OriginObservabilityLogConfig`].
     #[serde(default)]
@@ -3986,6 +6661,7 @@ pub struct OriginObservabilityConfig {
 /// (WOR-1045 PR2). The dispatcher routes every record whose stamped
 /// `route` matches this origin's hostname into each declared sink.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct OriginObservabilityLogConfig {
     /// Origin-scope `redact:` sub-block. See
     /// [`OriginObservabilityRedactConfig`].
@@ -4010,6 +6686,7 @@ pub struct OriginObservabilityLogConfig {
 /// operator regex pass (WOR-1042 `patterns:` + `disable:`), and the
 /// rule-driven PII redactor (WOR-1043 `pii:`).
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct OriginObservabilityRedactConfig {
     /// WOR-1042: origin-scope additions to the field-key denylist.
     /// Additive only on top of the merged proxy + tenant set; an
@@ -4041,6 +6718,7 @@ pub struct OriginObservabilityRedactConfig {
 /// [`RawOriginConfig::agents_json`] field and the agents.json v0.1 spec
 /// at <https://github.com/wild-card-ai/agents-json>.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AgentsJsonConfig {
     /// `info` block (title, version, description).
     pub info: AgentsJsonInfo,
@@ -4061,6 +6739,7 @@ pub struct AgentsJsonConfig {
 
 /// The `info` block of an agents.json manifest.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AgentsJsonInfo {
     /// Human-readable manifest title.
     pub title: String,
@@ -4089,6 +6768,7 @@ pub struct AgentsJsonInfo {
 /// have sensible defaults, and v1 configs that omit `agent_skills:`
 /// pay nothing for the new schema field.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AgentSkillEntry {
     /// Stable identifier (used as the manifest `name` and as the
     /// audit-event subject). Must be unique within the origin's
@@ -4159,6 +6839,7 @@ fn default_agent_skill_visibility() -> String {
 
 /// CORS configuration.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CorsConfig {
     /// Origins permitted by `Access-Control-Allow-Origin`. Alias: `allow_origins`.
     #[serde(default, alias = "allow_origins")]
@@ -4187,6 +6868,7 @@ pub struct CorsConfig {
 
 /// HSTS configuration.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct HstsConfig {
     /// `max-age` directive of the `Strict-Transport-Security` header, in seconds.
     #[serde(default = "default_hsts_max_age")]
@@ -4205,6 +6887,7 @@ fn default_hsts_max_age() -> u64 {
 
 /// Compression configuration.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CompressionConfig {
     /// Master switch for response compression. Alias: `enable`.
     #[serde(default = "default_true", alias = "enable")]
@@ -4226,6 +6909,7 @@ fn default_true() -> bool {
 
 /// Session configuration.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SessionConfig {
     /// Name of the session cookie.
     pub cookie_name: Option<String>,
@@ -4256,6 +6940,7 @@ pub struct SessionConfig {
 /// entry's `origin`. Within a single entry the present matchers (path,
 /// header, query) are ANDed; across entries they are ORed.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RawForwardRule {
     /// Path matchers. The rule fires when any one of these matches the request path.
     #[serde(default)]
@@ -4278,6 +6963,7 @@ pub struct RawForwardRule {
 /// direct passthrough. The `schema` field is kept as `serde_json::Value`
 /// because the OpenAPI Schema Object is large and we forward it verbatim.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Parameter {
     /// Parameter name. For path params this must match a `{name}` segment
     /// in one of the rule's `template` matchers.
@@ -4321,6 +7007,7 @@ pub enum ParameterLocation {
 /// same rule the semantics are OR: any matching entry triggers the rule.
 /// The shorthand `match: <prefix>` is equivalent to `path: { prefix: ... }`.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ForwardRuleMatcher {
     /// Structured path matcher.
     #[serde(default)]
@@ -4342,6 +7029,7 @@ pub struct ForwardRuleMatcher {
 /// `value` wins (exact comparison). Header name matching is case-insensitive
 /// per RFC 7230; value comparison is case-sensitive.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct HeaderMatcher {
     /// Header name (case-insensitive lookup).
     pub name: String,
@@ -4359,6 +7047,7 @@ pub struct HeaderMatcher {
 /// matcher succeeds if any occurrence of `name` equals `value`. When `value`
 /// is omitted the matcher succeeds whenever the parameter is present at all.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct QueryMatcher {
     /// Query parameter name (case-sensitive).
     pub name: String,
@@ -4379,6 +7068,7 @@ pub struct QueryMatcher {
 /// (`/users/{id:[0-9]+}`). Constraint compilation happens at config-load time;
 /// the runtime only re-validates constrained params after the trie match.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PathMatcher {
     /// Matches any path that starts with this prefix.
     #[serde(default)]
@@ -4398,19 +7088,22 @@ pub struct PathMatcher {
 }
 
 /// Inline child origin used when a forward rule fires. Carries the action plus
-/// optional request modifiers and identifying metadata.
+/// optional request modifiers. Compatibility metadata fields remain parseable
+/// but are not copied into the compiled child origin.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ForwardRuleOrigin {
     /// Optional identifier used in metrics and logs.
     #[serde(default)]
     pub id: Option<String>,
-    /// Optional hostname tag (informational; the parent origin's hostname is what routed the request).
+    /// Compatibility-only hostname tag. The parent origin's hostname
+    /// routes the request; this value is not consumed.
     #[serde(default)]
     pub hostname: Option<String>,
-    /// Optional workspace identifier.
+    /// Compatibility-only workspace identifier; not consumed.
     #[serde(default)]
     pub workspace_id: Option<String>,
-    /// Optional version label.
+    /// Compatibility-only version label; not consumed.
     #[serde(default)]
     pub version: Option<String>,
     /// Action executed when the rule fires. Stays as raw JSON because action
@@ -4429,6 +7122,7 @@ pub struct ForwardRuleOrigin {
 /// `method`, `body`, or `lua_script`. Multiple modifier entries in the list
 /// are applied in order.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RequestModifierConfig {
     /// Header set/add/remove operations.
     #[serde(default)]
@@ -4455,6 +7149,7 @@ pub struct RequestModifierConfig {
 
 /// URL path rewrite configuration.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UrlModifier {
     /// Path rewrite rules.
     #[serde(default)]
@@ -4463,6 +7158,7 @@ pub struct UrlModifier {
 
 /// Path rewrite: replace a substring in the path.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PathRewrite {
     /// Replace a substring in the path.
     #[serde(default)]
@@ -4471,6 +7167,7 @@ pub struct PathRewrite {
 
 /// A simple string-replace operation on the URL path.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PathReplace {
     /// The substring to search for.
     pub old: String,
@@ -4480,6 +7177,7 @@ pub struct PathReplace {
 
 /// Query parameter modification operations.
 #[derive(Debug, Clone, Deserialize, Serialize, Default, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct QueryModifier {
     /// Set (overwrite) query parameters.
     #[serde(default)]
@@ -4494,6 +7192,7 @@ pub struct QueryModifier {
 
 /// Body replacement configuration for request modifiers.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BodyModifier {
     /// Replace the request body with this JSON value.
     #[serde(default)]
@@ -4508,11 +7207,13 @@ pub struct BodyModifier {
 /// Each modifier entry can contain one or more of: `headers`, `status`, `body`,
 /// or `lua_script`. Multiple modifier entries in the list are applied in order.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ResponseModifierConfig {
     /// Header set/add/remove operations.
     #[serde(default)]
     pub headers: Option<HeaderModifiers>,
-    /// Override the response status code and optional reason text.
+    /// Override the response status code. A supplied `text` value is
+    /// accepted for compatibility but ignored.
     #[serde(default)]
     pub status: Option<StatusOverride>,
     /// Response body replacement.
@@ -4528,16 +7229,19 @@ pub struct ResponseModifierConfig {
 
 /// Status code override for response modifiers.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StatusOverride {
     /// The HTTP status code to set.
     pub code: u16,
-    /// Optional reason phrase (not sent in HTTP/2, informational only).
+    /// Compatibility-only reason phrase. The runtime applies `code`
+    /// and ignores this value for every HTTP version.
     #[serde(default)]
     pub text: Option<String>,
 }
 
 /// Body replacement configuration for response modifiers.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ResponseBodyModifier {
     /// Replace the response body with this string.
     #[serde(default)]
@@ -4549,6 +7253,7 @@ pub struct ResponseBodyModifier {
 
 /// Header modification operations (set, add, remove).
 #[derive(Debug, Clone, Deserialize, Serialize, Default, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct HeaderModifiers {
     /// Headers to set, replacing any existing value.
     #[serde(default)]
@@ -4565,16 +7270,16 @@ pub struct HeaderModifiers {
 
 /// Top-level secrets management configuration.
 ///
-/// Controls which vault backend is used to resolve `secret:` references in
-/// config values and how secret rotation is handled.
+/// The live surface is [`SecretsConfig::backends`], selected by provider URI
+/// references. The legacy single-backend and rotation fields remain parseable
+/// for compatibility but are not consumed by the OSS runtime.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SecretsConfig {
-    /// Backend to use for resolving secrets.
-    ///
-    /// Supported values: `"env"` (default), `"local"`, `"hashicorp"`.
+    /// Legacy single-backend selector. Use [`SecretsConfig::backends`].
     #[serde(default = "default_secrets_backend")]
     pub backend: String,
-    /// HashiCorp Vault connection settings. Required when `backend = "hashicorp"`.
+    /// Legacy HashiCorp block. Declare a named `hashicorp` backend instead.
     #[serde(default)]
     pub hashicorp: Option<HashiCorpSecretsConfig>,
     /// Logical name to vault path mapping. INERT since the removal of
@@ -4583,12 +7288,11 @@ pub struct SecretsConfig {
     /// Use `secret://<backend>/<name>` references instead.
     #[serde(default)]
     pub map: HashMap<String, String>,
-    /// Secret rotation settings.
+    /// Reserved rotation shape; no OSS scheduler consumes it.
     #[serde(default)]
     pub rotation: Option<RotationConfig>,
-    /// Fallback strategy when the vault backend is unavailable.
-    ///
-    /// Supported values: `"cache"` (default), `"reject"`, `"env"`.
+    /// Legacy fallback selector; provider URI resolution fails loudly and does
+    /// not consult this value.
     #[serde(default = "default_fallback")]
     pub fallback: String,
     /// Named secret backends that provider-URI references resolve against
@@ -4607,6 +7311,7 @@ pub struct SecretsConfig {
 /// vault manager from these at boot.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum SecretBackendConfig {
     /// In-config secrets, referenced as `secret://<name>/<key>`. Entry
     /// values may themselves be `${ENV}` so real secrets stay out of YAML.
@@ -4679,6 +7384,19 @@ pub enum SecretBackendConfig {
         #[serde(default)]
         auth: GcpBackendAuth,
     },
+    /// Azure Key Vault, referenced as `azurekv://<name>/<secret>`.
+    Azure {
+        /// Backend name used in the `azurekv://<name>/...` reference.
+        name: String,
+        /// Key Vault URL, e.g. `https://acme-prod.vault.azure.net`.
+        vault_url: String,
+        /// Cache TTL in seconds for resolved reads.
+        #[serde(default)]
+        cache_ttl_secs: Option<u64>,
+        /// Authentication method (defaults to managed identity).
+        #[serde(default)]
+        auth: AzureBackendAuth,
+    },
     /// Kubernetes Secrets, referenced as `k8ssecret://<name>/<secret>/<key>`.
     K8s {
         /// Backend name used in the `k8ssecret://<name>/...` reference.
@@ -4722,6 +7440,7 @@ fn default_secret_mount() -> String {
 /// Authentication for a `hashicorp` secret backend (WOR-1767).
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum HashiCorpBackendAuth {
     /// Static token.
     Token {
@@ -4754,6 +7473,7 @@ pub enum HashiCorpBackendAuth {
 /// Authentication for an `aws` secret backend (WOR-1767).
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum AwsBackendAuth {
     /// Static access keys.
     StaticKeys {
@@ -4784,6 +7504,7 @@ pub enum AwsBackendAuth {
 /// to match the bare-string `application_default` default.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum GcpBackendAuth {
     /// Application Default Credentials (default).
     #[default]
@@ -4805,9 +7526,40 @@ pub enum GcpBackendAuth {
     },
 }
 
+/// Authentication for an `azure` secret backend. Externally tagged to
+/// match the bare-string `managed_identity` default.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+pub enum AzureBackendAuth {
+    /// System-assigned managed identity (default).
+    #[default]
+    ManagedIdentity,
+    /// User-assigned managed identity, selected by client id.
+    UserAssignedIdentity {
+        /// Client id of the user-assigned identity.
+        client_id: String,
+    },
+    /// Service-principal client credentials.
+    ServicePrincipal {
+        /// Microsoft Entra tenant id.
+        tenant_id: String,
+        /// App registration client id.
+        client_id: String,
+        /// App registration client secret (may be `${ENV}`).
+        client_secret: String,
+        /// Optional authority host override for sovereign clouds.
+        #[serde(default)]
+        authority: Option<String>,
+    },
+    /// The logged-in Azure CLI (`az account get-access-token`).
+    AzureCli,
+}
+
 /// Authentication for a `k8s` secret backend (WOR-1767).
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum K8sBackendAuth {
     /// In-cluster service-account credentials.
     InCluster,
@@ -4821,8 +7573,12 @@ pub enum K8sBackendAuth {
     },
 }
 
-/// HashiCorp Vault connection settings.
+/// Legacy HashiCorp Vault connection settings.
+///
+/// The OSS resolver consumes the `hashicorp` variant in
+/// [`SecretsConfig::backends`], not this compatibility block.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct HashiCorpSecretsConfig {
     /// Vault server address (e.g. `"https://vault.example.com:8200"`).
     pub addr: String,
@@ -4834,8 +7590,11 @@ pub struct HashiCorpSecretsConfig {
     pub mount: String,
 }
 
-/// Secret rotation configuration.
+/// Reserved secret-rotation configuration.
+///
+/// No OSS scheduler consumes this compatibility block.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RotationConfig {
     /// Seconds the previous secret value remains valid after rotation.
     /// Defaults to 300 (5 minutes).
@@ -4877,6 +7636,7 @@ fn default_re_resolve() -> u64 {
 ///
 /// Spec: <https://www.rfc-editor.org/rfc/rfc9209.html>.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ProxyStatusConfig {
     /// Whether to stamp the `Proxy-Status` header on non-2xx responses.
     /// Defaults to `false`; opt in per origin so existing operator
@@ -4925,6 +7685,7 @@ impl StatusSpec {
 /// same status code are content-negotiated against the inbound request's
 /// `Accept` header.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ErrorPageEntry {
     /// Which HTTP status code(s) this entry covers.
     pub status: StatusSpec,
@@ -4949,6 +7710,7 @@ pub struct ErrorPageEntry {
 ///
 /// Spec: <https://www.rfc-editor.org/rfc/rfc9457.html>.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ProblemDetailsConfig {
     /// Whether to render unmatched proxy-generated errors as
     /// `application/problem+json`. Defaults to `false`; existing
@@ -4988,6 +7750,7 @@ fn default_include_detail() -> bool {
 /// compile time. Single-instance deployments leave `backend: memory`
 /// (the default).
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct IdempotencyConfig {
     /// Whether to engage the idempotency middleware on this origin.
     /// Defaults to false; opt in per origin.
@@ -5957,6 +8720,18 @@ backends:
     name: gcp1
     project_id: acme-prod
     auth: application_default
+  - type: azure
+    name: azure1
+    vault_url: https://acme-prod.vault.azure.net
+    auth: managed_identity
+  - type: azure
+    name: azure2
+    vault_url: https://acme-ci.vault.azure.net
+    auth:
+      service_principal:
+        tenant_id: my-tenant
+        client_id: my-app
+        client_secret: "${AZURE_CLIENT_SECRET}"
   - type: k8s
     name: k8s1
     namespace: apps
@@ -5964,7 +8739,7 @@ backends:
       type: in_cluster
 "#;
         let cfg: SecretsConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(cfg.backends.len(), 4);
+        assert_eq!(cfg.backends.len(), 6);
         match &cfg.backends[0] {
             SecretBackendConfig::Hashicorp {
                 name,
@@ -5995,8 +8770,38 @@ backends:
                 ..
             }
         ));
+        match &cfg.backends[3] {
+            SecretBackendConfig::Azure {
+                name,
+                vault_url,
+                auth,
+                ..
+            } => {
+                assert_eq!(name, "azure1");
+                assert_eq!(vault_url, "https://acme-prod.vault.azure.net");
+                assert!(matches!(auth, AzureBackendAuth::ManagedIdentity));
+            }
+            other => panic!("expected azure backend, got {other:?}"),
+        }
+        match &cfg.backends[4] {
+            SecretBackendConfig::Azure { auth, .. } => match auth {
+                AzureBackendAuth::ServicePrincipal {
+                    tenant_id,
+                    client_id,
+                    client_secret,
+                    authority,
+                } => {
+                    assert_eq!(tenant_id, "my-tenant");
+                    assert_eq!(client_id, "my-app");
+                    assert_eq!(client_secret, "${AZURE_CLIENT_SECRET}");
+                    assert!(authority.is_none());
+                }
+                other => panic!("expected service-principal auth, got {other:?}"),
+            },
+            other => panic!("expected azure backend, got {other:?}"),
+        }
         assert!(matches!(
-            &cfg.backends[3],
+            &cfg.backends[5],
             SecretBackendConfig::K8s {
                 auth: K8sBackendAuth::InCluster,
                 ..
@@ -6020,10 +8825,11 @@ rotation:
 
     #[test]
     fn secrets_config_rotation_defaults() {
-        let yaml = r#"
-rotation: {}
-"#;
-        let cfg: RotationConfig = serde_yaml::from_str(yaml).unwrap();
+        // The fixture used to be `rotation: {}`, which only parsed as a
+        // `RotationConfig` because serde dropped the unknown `rotation`
+        // wrapper key. With `deny_unknown_fields` the struct parses the
+        // block's contents, so the fixture is the empty block itself.
+        let cfg: RotationConfig = serde_yaml::from_str("{}").unwrap();
         assert_eq!(cfg.grace_period_secs, 300);
         assert_eq!(cfg.re_resolve_interval_secs, 60);
     }
@@ -6068,7 +8874,7 @@ proxy:
   extensions:
     classifier:
       endpoint: "http://127.0.0.1:9500"
-    semantic_cache:
+    custom_metadata:
       enabled: true
 origins: {}
 "#;
@@ -6076,8 +8882,8 @@ origins: {}
         let ext = cfg.proxy.extensions;
         assert!(ext.contains_key("classifier"), "classifier ext present");
         assert!(
-            ext.contains_key("semantic_cache"),
-            "semantic_cache ext present"
+            ext.contains_key("custom_metadata"),
+            "custom_metadata ext present"
         );
         let cls = ext.get("classifier").unwrap();
         assert_eq!(
@@ -6099,8 +8905,9 @@ origins: {}
 
     #[test]
     fn origin_extensions_accepts_arbitrary_nested_yaml() {
-        // Per-origin enterprise extensions (e.g. semantic_cache) live in
-        // a sibling opaque map that OSS never inspects.
+        // Per-origin extensions live in a sibling opaque map that nothing
+        // in this workspace inspects. The map keeps arbitrary nested
+        // shapes intact for whoever reads it.
         let yaml = r#"
 origins:
   api.example.com:
@@ -6108,22 +8915,22 @@ origins:
       type: proxy
       url: http://localhost:3000
     extensions:
-      semantic_cache:
+      custom_metadata:
         enabled: true
         ttl_secs: 1200
-        key_template: "{embedding_model}:{lsh_bucket}"
+        label: "{team}:{tier}"
 "#;
         let cfg: ConfigFile = serde_yaml::from_str(yaml).expect("parse");
         let origin = &cfg.origins["api.example.com"];
-        let sc = origin
+        let custom = origin
             .extensions
-            .get("semantic_cache")
-            .expect("semantic_cache extension parsed");
-        assert!(sc.get("enabled").unwrap().as_bool().unwrap());
-        assert_eq!(sc.get("ttl_secs").unwrap().as_u64().unwrap(), 1200);
+            .get("custom_metadata")
+            .expect("custom_metadata extension parsed");
+        assert!(custom.get("enabled").unwrap().as_bool().unwrap());
+        assert_eq!(custom.get("ttl_secs").unwrap().as_u64().unwrap(), 1200);
         assert_eq!(
-            sc.get("key_template").unwrap().as_str().unwrap(),
-            "{embedding_model}:{lsh_bucket}"
+            custom.get("label").unwrap().as_str().unwrap(),
+            "{team}:{tier}"
         );
     }
 
@@ -6608,6 +9415,7 @@ observability:
 ///
 /// Spec: <https://www.rfc-editor.org/rfc/rfc9421.html>.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MessageSignaturesConfig {
     /// Whether to enforce signature verification on inbound requests.
     #[serde(default)]
@@ -6635,10 +9443,10 @@ fn default_signature_clock_skew_seconds() -> u64 {
 /// When set, the proxy stands up two well-known endpoints on the
 /// origin:
 ///
-/// - `POST /.well-known/olp/token` — issues a license token signed
+/// - `POST /.well-known/olp/token` issues a license token signed
 ///   with the configured Ed25519 key, body shaped per RFC 6749
 ///   (`access_token` + `token_type: "License"` + `expires_in`).
-/// - `GET /.well-known/olp/key` — publishes the verification JWK
+/// - `GET /.well-known/olp/key` publishes the verification JWK
 ///   set (RFC 7517) so external introspectors can verify tokens
 ///   without contacting the issuer per-token.
 ///
@@ -6646,13 +9454,13 @@ fn default_signature_clock_skew_seconds() -> u64 {
 /// proxy serves two unauthenticated well-known endpoints on this
 /// origin:
 ///
-/// * `GET /.well-known/http-message-signatures-directory` — JWKS
+/// * `GET /.well-known/http-message-signatures-directory`: JWKS
 ///   document carrying SBproxy's own Ed25519 signing-key public
 ///   key. Verifiers (Cloudflare, AWS WAF, any third-party origin
 ///   that runs a Web Bot Auth verifier) fetch this to verify the
 ///   `Signature-Input` + `Signature` headers SBproxy attaches to
 ///   outbound requests.
-/// * `GET /.well-known/web-bot-auth/agent-card` — the discovery
+/// * `GET /.well-known/web-bot-auth/agent-card`: the discovery
 ///   document that points verifiers at the directory; carries the
 ///   operator-facing agent name, description, and contact URL.
 ///
@@ -6665,6 +9473,7 @@ fn default_signature_clock_skew_seconds() -> u64 {
 /// endpoint; requests to those paths fall through to the upstream
 /// proxy (or return 404 if no route matches).
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct WebBotAuthPublishConfig {
     /// Whether the publish endpoints are enabled.
     #[serde(default)]
@@ -6707,6 +9516,7 @@ pub struct WebBotAuthPublishConfig {
 #[derive(
     Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq, schemars::JsonSchema,
 )]
+#[serde(deny_unknown_fields)]
 pub struct OlpConfig {
     /// Master toggle. When false the well-known endpoints 404.
     #[serde(default)]
@@ -6753,13 +9563,13 @@ pub struct OlpConfig {
 ///
 /// When this block is present the proxy exposes:
 ///
-/// * `POST /.well-known/olp/introspect` — RFC 7662 §2 introspection.
+/// * `POST /.well-known/olp/introspect`: RFC 7662 §2 introspection.
 ///   Returns `{ "active": true, ... }` for valid + un-revoked tokens
 ///   issued by this origin's signing key, mirroring every OLP claim.
 ///   Returns `{ "active": false }` for any token that does not
 ///   verify, has expired, or has been revoked (§2.2 forbids leaking
 ///   the reason).
-/// * `POST /.well-known/olp/revoke` — RFC 7009 §2. Writes the token's
+/// * `POST /.well-known/olp/revoke`: RFC 7009 §2. Writes the token's
 ///   `jti` to the configured revocation store with a TTL that matches
 ///   the token's remaining lifetime, so subsequent introspections
 ///   return `active: false`.
@@ -6772,6 +9582,7 @@ pub struct OlpConfig {
 #[derive(
     Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq, Default, schemars::JsonSchema,
 )]
+#[serde(deny_unknown_fields)]
 pub struct OlpIntrospectConfig {
     /// Master toggle. When false the well-known endpoints 404 even if
     /// the rest of the block is configured. Lets an operator wire the
@@ -6835,22 +9646,23 @@ fn default_olp_introspect_mirror_cnf() -> bool {
 
 /// Auth policy for the introspect + revoke endpoints. Three modes:
 ///
-/// * `self` (default) — the caller proves possession of the token by
+/// * `self` (default): the caller proves possession of the token by
 ///   sending the same value in `Authorization: License <token>`
 ///   *and* in the `token=` form parameter. Reasonable for the common
 ///   "RP introspects tokens it already holds" case and requires no
 ///   operator credential management.
-/// * `basic` — HTTP Basic with operator-managed credentials. Pass
+/// * `basic`: HTTP Basic with operator-managed credentials. Pass
 ///   `{ username, password_hash }` pairs in `clients`; passwords are
 ///   stored as Argon2id hashes. RFC 7662 §2.1's "client
 ///   authentication" path.
-/// * `none` — no auth. ONLY appropriate for fully-private deployments
+/// * `none`: no auth. ONLY appropriate for fully-private deployments
 ///   behind a service mesh that already authenticates the caller.
 ///   The proxy logs a `warn!` at startup when this is selected.
 #[derive(
     Debug, Clone, Default, serde::Deserialize, serde::Serialize, PartialEq, Eq, schemars::JsonSchema,
 )]
 #[serde(tag = "mode", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum OlpIntrospectAuth {
     /// Caller proves possession of the token they are introspecting.
     #[default]
@@ -6871,6 +9683,7 @@ pub enum OlpIntrospectAuth {
 #[derive(
     Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq, schemars::JsonSchema,
 )]
+#[serde(deny_unknown_fields)]
 pub struct OlpIntrospectBasicClient {
     /// Username sent over Basic auth.
     pub username: String,
@@ -6886,6 +9699,7 @@ pub struct OlpIntrospectBasicClient {
     Debug, Clone, Default, serde::Deserialize, serde::Serialize, PartialEq, Eq, schemars::JsonSchema,
 )]
 #[serde(tag = "backend", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum OlpRevocationStoreConfig {
     /// Process-local, lost on restart. Default; appropriate for dev
     /// and CI only.
@@ -6915,4 +9729,953 @@ fn default_olp_scope() -> String {
 
 fn default_olp_ttl_secs() -> u64 {
     3600
+}
+
+#[cfg(test)]
+mod config_authority_tests {
+    use super::*;
+    use crate::config_bundle::BundleMode;
+    use crate::config_merge::MergeMode;
+
+    /// The block from the field documentation, so the documented example
+    /// is also the parsed fixture.
+    const UPSTREAM_YAML: &str = r#"
+upstream:
+  url: https://control.example.com
+  mode: overlay
+  subscriber_id: edge-01
+  credential: env:SB_CONFIG_TOKEN
+  verifying_keys_file: /etc/sbproxy/authority-keys.json
+  poll_interval: 30s
+  cache_path: /var/lib/sbproxy/config-bundle.json
+  max_staleness: 24h
+  require_bundle_on_boot: false
+"#;
+
+    fn parse(yaml: &str) -> ConfigAuthorityConfig {
+        serde_yaml::from_str(yaml).expect("config_authority parses")
+    }
+
+    fn base_upstream() -> ConfigAuthorityUpstreamConfig {
+        parse(UPSTREAM_YAML).upstream.expect("upstream present")
+    }
+
+    #[test]
+    fn documented_block_parses_and_validates() {
+        let authority = parse(UPSTREAM_YAML);
+        authority.validate().expect("documented block validates");
+        let upstream = authority.upstream.expect("upstream present");
+        assert_eq!(upstream.url, "https://control.example.com");
+        assert_eq!(upstream.mode, BundleMode::Overlay);
+        assert_eq!(upstream.merge_mode(), MergeMode::Overlay);
+        assert_eq!(upstream.subscriber_id, "edge-01");
+        assert_eq!(upstream.credential.as_deref(), Some("env:SB_CONFIG_TOKEN"));
+        // Humanized durations land on the seconds fields.
+        assert_eq!(upstream.poll_interval_secs, 30);
+        assert_eq!(upstream.max_staleness_secs, 86_400);
+        assert!(!upstream.requires_bundle_on_boot());
+        assert!(!upstream.allow_insecure_http);
+        assert!(!upstream.allow_shared_secret_keys);
+    }
+
+    #[test]
+    fn omitted_durations_take_their_defaults() {
+        let authority = parse(
+            r#"
+upstream:
+  url: https://control.example.com
+  mode: overlay
+  subscriber_id: edge-01
+  verifying_keys_file: /etc/sbproxy/authority-keys.json
+  cache_path: /var/lib/sbproxy/config-bundle.json
+"#,
+        );
+        let upstream = authority.upstream.expect("upstream present");
+        assert_eq!(upstream.poll_interval_secs, 30);
+        assert_eq!(upstream.max_staleness_secs, 86_400);
+        assert!(upstream.credential.is_none());
+    }
+
+    #[test]
+    fn absent_block_and_absent_upstream_both_validate() {
+        assert!(ConfigAuthorityConfig::default().upstream.is_none());
+        ConfigAuthorityConfig::default()
+            .validate()
+            .expect("an empty block is not a misconfiguration");
+    }
+
+    #[test]
+    fn replace_implies_require_bundle_on_boot() {
+        let authority = parse(
+            r#"
+upstream:
+  url: https://control.example.com
+  mode: replace
+  subscriber_id: edge-01
+  verifying_keys_file: /etc/sbproxy/authority-keys.json
+  cache_path: /var/lib/sbproxy/config-bundle.json
+"#,
+        );
+        authority
+            .validate()
+            .expect("replace without the field is fine");
+        let upstream = authority.upstream.expect("upstream present");
+        assert_eq!(upstream.merge_mode(), MergeMode::Replace);
+        assert!(
+            upstream.requires_bundle_on_boot(),
+            "replace has nothing to serve without a bundle",
+        );
+    }
+
+    #[test]
+    fn replace_with_explicit_false_is_refused_rather_than_overridden() {
+        let authority = parse(
+            r#"
+upstream:
+  url: https://control.example.com
+  mode: replace
+  subscriber_id: edge-01
+  verifying_keys_file: /etc/sbproxy/authority-keys.json
+  cache_path: /var/lib/sbproxy/config-bundle.json
+  require_bundle_on_boot: false
+"#,
+        );
+        let error = authority.validate().expect_err("must be refused");
+        assert_eq!(
+            error,
+            ConfigAuthorityConfigError::ReplaceWithoutBundleOnBoot
+        );
+        let message = error.to_string();
+        assert!(message.contains("nothing to boot on"), "{message}");
+    }
+
+    #[test]
+    fn overlay_keeps_an_explicit_true() {
+        let authority = parse(
+            r#"
+upstream:
+  url: https://control.example.com
+  mode: overlay
+  subscriber_id: edge-01
+  verifying_keys_file: /etc/sbproxy/authority-keys.json
+  cache_path: /var/lib/sbproxy/config-bundle.json
+  require_bundle_on_boot: true
+"#,
+        );
+        authority.validate().expect("valid");
+        assert!(authority
+            .upstream
+            .expect("upstream present")
+            .requires_bundle_on_boot());
+    }
+
+    #[test]
+    fn plaintext_http_needs_the_escape_hatch() {
+        let mut upstream = base_upstream();
+        upstream.url = "http://control.example.com".to_string();
+        let error = upstream.validate().expect_err("plaintext must be refused");
+        let message = error.to_string();
+        assert!(message.contains("allow_insecure_http"), "{message}");
+
+        upstream.allow_insecure_http = true;
+        upstream
+            .validate()
+            .expect("the acknowledged development form is accepted");
+    }
+
+    #[test]
+    fn the_url_must_be_absolute_https_with_a_host_and_no_query() {
+        for (url, label) in [
+            ("control.example.com", "no scheme"),
+            ("/config-authority", "path only"),
+            ("https:///bundle", "no host"),
+            ("ftp://control.example.com", "unsupported scheme"),
+            ("https://control.example.com?tenant=a", "query string"),
+            ("https://control.example.com#frag", "fragment"),
+            ("", "empty"),
+        ] {
+            let mut upstream = base_upstream();
+            upstream.url = url.to_string();
+            // `allow_insecure_http` must not launder any of these.
+            upstream.allow_insecure_http = true;
+            assert!(
+                matches!(
+                    upstream.validate(),
+                    Err(ConfigAuthorityConfigError::Url { .. })
+                ),
+                "{label} ({url:?}) must be refused",
+            );
+        }
+
+        // A base path is kept; the subscriber appends its own path under it.
+        let mut upstream = base_upstream();
+        upstream.url = "https://control.example.com/fleet".to_string();
+        upstream.validate().expect("a base path is allowed");
+    }
+
+    #[test]
+    fn the_credential_must_be_a_reference_not_an_inline_token() {
+        for reference in [
+            "env:SB_CONFIG_TOKEN",
+            "${SB_CONFIG_TOKEN}",
+            "file:/etc/sbproxy/authority-token",
+            "secret://primary/authority-token",
+            "vault://primary/secret/data/authority",
+        ] {
+            let mut upstream = base_upstream();
+            upstream.credential = Some(reference.to_string());
+            upstream
+                .validate()
+                .unwrap_or_else(|error| panic!("{reference} must be accepted: {error}"));
+        }
+
+        for inline in [
+            "sk-live-abcdef",
+            "Bearer sk-live-abcdef",
+            "https://control.example.com/token",
+            "",
+        ] {
+            let mut upstream = base_upstream();
+            upstream.credential = Some(inline.to_string());
+            assert!(
+                upstream.validate().is_err(),
+                "{inline:?} must be refused as an inline credential",
+            );
+        }
+    }
+
+    #[test]
+    fn durations_are_bounded_and_ordered() {
+        let mut upstream = base_upstream();
+        upstream.poll_interval_secs = 1;
+        assert!(matches!(
+            upstream.validate(),
+            Err(ConfigAuthorityConfigError::PollInterval { found: 1 })
+        ));
+
+        let mut upstream = base_upstream();
+        upstream.poll_interval_secs = MAX_CONFIG_AUTHORITY_POLL_SECS + 1;
+        assert!(matches!(
+            upstream.validate(),
+            Err(ConfigAuthorityConfigError::PollInterval { .. })
+        ));
+
+        // A staleness window shorter than one poll interval declares every
+        // bundle stale the moment it arrives.
+        let mut upstream = base_upstream();
+        upstream.poll_interval_secs = 300;
+        upstream.max_staleness_secs = 60;
+        assert!(matches!(
+            upstream.validate(),
+            Err(ConfigAuthorityConfigError::MaxStaleness { .. })
+        ));
+
+        let mut upstream = base_upstream();
+        upstream.max_staleness_secs = MAX_CONFIG_AUTHORITY_STALENESS_SECS + 1;
+        assert!(matches!(
+            upstream.validate(),
+            Err(ConfigAuthorityConfigError::MaxStaleness { .. })
+        ));
+    }
+
+    #[test]
+    fn empty_identifiers_and_paths_are_refused() {
+        for (label, mutate) in [
+            (
+                "subscriber_id",
+                (|upstream: &mut ConfigAuthorityUpstreamConfig| {
+                    upstream.subscriber_id = String::new();
+                }) as fn(&mut ConfigAuthorityUpstreamConfig),
+            ),
+            ("verifying_keys_file", |upstream| {
+                upstream.verifying_keys_file = "  ".to_string();
+            }),
+            ("cache_path", |upstream| {
+                upstream.cache_path = String::new();
+            }),
+        ] {
+            let mut upstream = base_upstream();
+            mutate(&mut upstream);
+            assert!(
+                matches!(
+                    upstream.validate(),
+                    Err(ConfigAuthorityConfigError::Value { field }) if field == label
+                ),
+                "{label} must be refused when empty",
+            );
+        }
+    }
+
+    #[test]
+    fn a_misspelled_key_is_refused_rather_than_defaulted() {
+        let error = serde_yaml::from_str::<ConfigAuthorityConfig>(
+            r#"
+upstream:
+  url: https://control.example.com
+  mode: overlay
+  subscriber_id: edge-01
+  verifying_keys_file: /etc/sbproxy/authority-keys.json
+  cache_path: /var/lib/sbproxy/config-bundle.json
+  poll_intervall: 30s
+"#,
+        )
+        .expect_err("a typo must not silently take the default");
+        assert!(error.to_string().contains("poll_intervall"), "{error}");
+    }
+
+    // --- publish half -------------------------------------------------
+
+    /// The block from the field documentation, so the documented example
+    /// is also the parsed fixture.
+    const PUBLISH_YAML: &str = r#"
+publish:
+  authority_id: control-plane-eu
+  key_id: authority-2026-07
+  signing_key_file: /etc/sbproxy/authority-signing.key
+  store_dir: /var/lib/sbproxy/config-authority
+  bind: 0.0.0.0:9443
+  tls:
+    cert_file: /etc/sbproxy/authority.pem
+    key_file: /etc/sbproxy/authority-key.pem
+"#;
+
+    fn base_publish() -> ConfigAuthorityPublishConfig {
+        parse(PUBLISH_YAML).publish.expect("publish present")
+    }
+
+    #[test]
+    fn the_documented_publish_block_parses_and_validates() {
+        let authority = parse(PUBLISH_YAML);
+        assert!(authority.publishes_bundles());
+        assert!(authority.upstream.is_none());
+        authority.validate().expect("documented block validates");
+        let publish = authority.publish.expect("publish present");
+        assert_eq!(publish.authority_id, "control-plane-eu");
+        assert_eq!(publish.key_id, "authority-2026-07");
+        assert_eq!(publish.bind, "0.0.0.0:9443");
+        assert_eq!(publish.socket_addr().expect("addr").port(), 9443);
+        assert!(!publish.binds_loopback_only());
+        let tls = publish.tls.expect("tls present");
+        assert_eq!(tls.cert_file, "/etc/sbproxy/authority.pem");
+        assert_eq!(tls.key_file, "/etc/sbproxy/authority-key.pem");
+        // The rate limits are on by default and the fleet cap bounds the
+        // per-subscriber one.
+        assert_eq!(publish.rate_limit_per_subscriber_per_minute, 30);
+        assert_eq!(publish.rate_limit_total_per_minute, 1_200);
+    }
+
+    #[test]
+    fn publishing_and_subscribing_at_once_is_refused() {
+        // The seam CA-03 left behind: with a publish block present the
+        // conflict rule is finally reachable.
+        let mut authority = parse(UPSTREAM_YAML);
+        authority.publish = Some(base_publish());
+        assert!(authority.publishes_bundles());
+        let error = authority
+            .validate()
+            .expect_err("one node cannot be both an authority and a subscriber");
+        assert_eq!(error, ConfigAuthorityConfigError::BothRoles);
+        let message = error.to_string();
+        assert!(message.contains("upstream"), "{message}");
+        assert!(message.contains("publish"), "{message}");
+        // Each half alone still validates, which pins the failure on the
+        // combination rather than on either block.
+        authority.upstream = None;
+        authority.validate().expect("publish alone is fine");
+        assert!(parse(UPSTREAM_YAML).validate().is_ok());
+    }
+
+    #[test]
+    fn a_non_loopback_bind_without_tls_is_refused() {
+        let mut publish = base_publish();
+        publish.tls = None;
+        let error = publish
+            .validate()
+            .expect_err("a remote bundle listener must terminate TLS");
+        assert_eq!(
+            error,
+            ConfigAuthorityConfigError::PublishTlsRequired {
+                bind: "0.0.0.0:9443".to_string()
+            }
+        );
+        let message = error.to_string();
+        assert!(message.contains("refuses to start"), "{message}");
+        assert!(message.contains("cert_file"), "{message}");
+
+        // Loopback without TLS is the local-development path and stays
+        // valid, which is the one place this differs from proxy.admin.
+        for bind in ["127.0.0.1:9443", "[::1]:9443", "[::ffff:127.0.0.1]:9443"] {
+            let mut loopback = base_publish();
+            loopback.tls = None;
+            loopback.bind = bind.to_string();
+            assert!(loopback.binds_loopback_only(), "{bind}");
+            loopback
+                .validate()
+                .unwrap_or_else(|error| panic!("{bind} must validate: {error}"));
+        }
+
+        // And TLS on a remote bind is accepted, so the rule is about the
+        // missing block rather than about the bind.
+        base_publish().validate().expect("remote bind with tls");
+    }
+
+    #[test]
+    fn an_unusable_bind_is_refused_rather_than_treated_as_loopback() {
+        for (bind, needle) in [
+            // A hostname cannot be bound, only resolved.
+            ("authority.example.com:9443", "IP address and port"),
+            ("0.0.0.0", "IP address and port"),
+            // Port 0 would move on every restart.
+            ("127.0.0.1:0", "fixed port"),
+        ] {
+            let mut publish = base_publish();
+            publish.bind = bind.to_string();
+            let error = publish.validate().expect_err("must be refused");
+            assert!(error.to_string().contains(needle), "{bind}: {error}");
+        }
+
+        // A bind that does not parse counts as remote, so an unreadable
+        // value cannot slip past the TLS requirement by being unreadable.
+        let mut unparseable = base_publish();
+        unparseable.bind = "authority.example.com:9443".to_string();
+        unparseable.tls = None;
+        assert!(!unparseable.binds_loopback_only());
+    }
+
+    #[test]
+    fn publish_identifiers_the_envelope_would_refuse_are_caught_at_compile_time() {
+        for field in ["authority_id", "key_id"] {
+            let mut publish = base_publish();
+            // A space is fine in a filesystem path and fatal in a bundle
+            // identifier, so the two are validated separately.
+            match field {
+                "authority_id" => publish.authority_id = "control plane".to_string(),
+                _ => publish.key_id = "key/2026".to_string(),
+            }
+            let error = publish.validate().expect_err("must be refused");
+            assert_eq!(
+                error,
+                ConfigAuthorityConfigError::PublishIdentifier { field }
+            );
+            assert!(
+                error.to_string().contains("every subscriber"),
+                "the message must name the consequence: {error}"
+            );
+        }
+    }
+
+    /// A named edit that blanks one required field of a publish block.
+    type PublishFieldSetter = (&'static str, fn(&mut ConfigAuthorityPublishConfig));
+
+    #[test]
+    fn every_required_publish_value_is_refused_when_empty() {
+        let setters: [PublishFieldSetter; 5] = [
+            ("authority_id", |publish| {
+                publish.authority_id = String::new();
+            }),
+            ("key_id", |publish| publish.key_id = String::new()),
+            ("signing_key_file", |publish| {
+                publish.signing_key_file = "   ".to_string();
+            }),
+            ("store_dir", |publish| publish.store_dir = String::new()),
+            ("bind", |publish| publish.bind = String::new()),
+        ];
+        for (field, apply) in setters {
+            let mut publish = base_publish();
+            apply(&mut publish);
+            assert_eq!(
+                publish.validate(),
+                Err(ConfigAuthorityConfigError::PublishValue { field }),
+                "{field} must be refused when empty",
+            );
+        }
+        for field in ["tls.cert_file", "tls.key_file"] {
+            let mut publish = base_publish();
+            let tls = publish.tls.as_mut().expect("tls present");
+            if field.ends_with("cert_file") {
+                tls.cert_file = String::new();
+            } else {
+                tls.key_file = String::new();
+            }
+            assert_eq!(
+                publish.validate(),
+                Err(ConfigAuthorityConfigError::PublishValue { field }),
+            );
+        }
+    }
+
+    #[test]
+    fn the_bundle_listener_rate_limits_cannot_be_turned_off_or_inverted() {
+        for field in [
+            "rate_limit_per_subscriber_per_minute",
+            "rate_limit_total_per_minute",
+        ] {
+            let mut publish = base_publish();
+            if field.starts_with("rate_limit_per_subscriber") {
+                publish.rate_limit_per_subscriber_per_minute = 0;
+            } else {
+                publish.rate_limit_total_per_minute = 0;
+            }
+            let error = publish.validate().expect_err("zero is not off");
+            assert_eq!(
+                error,
+                ConfigAuthorityConfigError::PublishRateLimit { field, found: 0 }
+            );
+            assert!(
+                error.to_string().contains("cannot be turned off"),
+                "{error}"
+            );
+
+            let mut over = base_publish();
+            if field.starts_with("rate_limit_per_subscriber") {
+                over.rate_limit_per_subscriber_per_minute = MAX_PUBLISH_RATE_LIMIT + 1;
+                over.rate_limit_total_per_minute = MAX_PUBLISH_RATE_LIMIT + 1;
+            } else {
+                over.rate_limit_total_per_minute = MAX_PUBLISH_RATE_LIMIT + 1;
+            }
+            assert!(matches!(
+                over.validate(),
+                Err(ConfigAuthorityConfigError::PublishRateLimit { .. })
+            ));
+        }
+
+        let mut inverted = base_publish();
+        inverted.rate_limit_per_subscriber_per_minute = 100;
+        inverted.rate_limit_total_per_minute = 50;
+        let error = inverted
+            .validate()
+            .expect_err("a fleet cap below the per-subscriber cap bounds nothing");
+        assert_eq!(
+            error,
+            ConfigAuthorityConfigError::PublishRateLimitInverted {
+                total: 50,
+                per_subscriber: 100,
+            }
+        );
+    }
+
+    #[test]
+    fn a_misspelled_publish_key_is_refused_rather_than_defaulted() {
+        let error = serde_yaml::from_str::<ConfigAuthorityConfig>(
+            r#"
+publish:
+  authority_id: control-plane-eu
+  key_id: authority-2026-07
+  signing_key_file: /etc/sbproxy/authority-signing.key
+  store_dir: /var/lib/sbproxy/config-authority
+  bind: 127.0.0.1:9443
+  rate_limit_totall_per_minute: 10
+"#,
+        )
+        .expect_err("a typo must not silently take the default");
+        assert!(
+            error.to_string().contains("rate_limit_totall_per_minute"),
+            "{error}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod inbound_key_header_tests {
+    use super::*;
+
+    #[test]
+    fn native_key_policy_requires_a_nonempty_unique_provider_allowlist() {
+        let mut cfg = KeyInboundConfig {
+            native_key_policy: Some(NativeKeyPolicyConfig {
+                allowed_providers: vec!["openai".to_string(), "anthropic".to_string()],
+                ..NativeKeyPolicyConfig::default()
+            }),
+            ..KeyInboundConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
+
+        cfg.native_key_policy = Some(NativeKeyPolicyConfig {
+            allowed_providers: Vec::new(),
+            ..NativeKeyPolicyConfig::default()
+        });
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .contains("allowed_providers must not be empty"));
+
+        cfg.native_key_policy = Some(NativeKeyPolicyConfig {
+            allowed_providers: vec!["OpenAI".to_string(), " openai ".to_string()],
+            ..NativeKeyPolicyConfig::default()
+        });
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .contains("listed more than once"));
+    }
+
+    #[test]
+    fn native_key_policy_is_absent_by_default_so_native_traffic_fails_closed() {
+        assert!(KeyInboundConfig::default().native_key_policy.is_none());
+    }
+
+    #[test]
+    fn native_key_policy_accepts_key_record_governance_fields() {
+        let cfg: KeyInboundConfig = serde_yaml::from_str(
+            r#"
+native_key_policy:
+  allowed_providers: [openai]
+  max_requests_per_minute: 12
+  max_tokens_per_minute: 3456
+  max_budget_tokens: 7890
+  max_budget_usd: 1.25
+  allowed_models: [gpt-5]
+  blocked_models: [gpt-4]
+  require_pii_redaction: [email]
+"#,
+        )
+        .expect("native KeyRecord policy fields should deserialize");
+
+        let policy = cfg.native_key_policy.expect("policy");
+        assert_eq!(policy.max_requests_per_minute, Some(12));
+        assert_eq!(policy.max_tokens_per_minute, Some(3456));
+        assert_eq!(policy.max_budget_tokens, Some(7890));
+        assert_eq!(policy.max_budget_usd, Some(1.25));
+        assert_eq!(policy.allowed_models, ["gpt-5"]);
+        assert_eq!(policy.blocked_models, ["gpt-4"]);
+        assert_eq!(policy.require_pii_redaction, ["email"]);
+    }
+
+    #[test]
+    fn native_key_policy_rejects_zero_limits_and_invalid_cost_budget() {
+        let mut cfg = KeyInboundConfig {
+            native_key_policy: Some(NativeKeyPolicyConfig {
+                allowed_providers: vec!["openai".to_string()],
+                max_requests_per_minute: Some(0),
+                ..NativeKeyPolicyConfig::default()
+            }),
+            ..KeyInboundConfig::default()
+        };
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .contains("must be greater than zero"));
+
+        cfg.native_key_policy = Some(NativeKeyPolicyConfig {
+            allowed_providers: vec!["openai".to_string()],
+            max_budget_usd: Some(f64::NAN),
+            ..NativeKeyPolicyConfig::default()
+        });
+        assert!(cfg.validate().unwrap_err().contains("finite"));
+    }
+
+    #[test]
+    fn inbound_header_defaults_cover_the_three_common_shapes() {
+        let cfg = KeyInboundConfig::default();
+        let names: Vec<&str> = cfg.headers.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(names, ["authorization", "x-api-key", "x-sb-api"]);
+        assert_eq!(cfg.headers[0].scheme, "Bearer ");
+        assert_eq!(cfg.headers[1].scheme, "");
+        assert!(
+            !cfg.require,
+            "require is opt-in so an upgrade changes nothing"
+        );
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn inbound_validation_rejects_invalid_header_names() {
+        let bad = KeyInboundConfig {
+            headers: vec![InboundHeaderConfig {
+                name: "not a header".into(),
+                scheme: String::new(),
+            }],
+            require: false,
+            provider_hints: Vec::new(),
+            native_key_policy: None,
+        };
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn inbound_validation_rejects_hop_by_hop_and_framing_headers() {
+        for forbidden in FORBIDDEN_SWEEP_HEADERS {
+            let cfg = KeyInboundConfig {
+                headers: vec![InboundHeaderConfig {
+                    name: (*forbidden).to_string(),
+                    scheme: String::new(),
+                }],
+                require: false,
+                provider_hints: Vec::new(),
+                native_key_policy: None,
+            };
+            assert!(cfg.validate().is_err(), "{forbidden} must be rejected");
+        }
+    }
+
+    #[test]
+    fn inbound_validation_rejects_realtime_protocol_and_proxy_owned_headers() {
+        for forbidden in [
+            "OpenAI-Beta",
+            "SEC-WebSocket-Key",
+            "Upgrade",
+            "TraceParent",
+            "TRACESTATE",
+            "Signature-Input",
+            "Signature",
+            "Signature-Agent",
+        ] {
+            let cfg = KeyInboundConfig {
+                headers: vec![InboundHeaderConfig {
+                    name: forbidden.to_string(),
+                    scheme: String::new(),
+                }],
+                require: false,
+                provider_hints: Vec::new(),
+                native_key_policy: None,
+            };
+            assert!(cfg.validate().is_err(), "{forbidden} must be rejected");
+        }
+    }
+
+    #[test]
+    fn inbound_validation_rejects_observability_and_capture_owned_headers() {
+        for forbidden in [
+            "X-Sb-User-Id",
+            "x-sb-session-id",
+            "X-SB-PARENT-SESSION-ID",
+            "x-sb-property-credential",
+            "User-Agent",
+            "Referer",
+            "b3",
+            "x-b3-traceid",
+            "x-b3-spanid",
+            "x-b3-sampled",
+            "x-b3-parentspanid",
+            "x-user-id",
+            "x-end-user",
+            "x-sbproxy-tag",
+            "x-a2a-caller-agent-id",
+            "x-a2a-callee-agent-id",
+            "x-a2a-task-id",
+            "x-a2a-parent-request-id",
+            "x-a2a-chain-depth",
+            "x-a2a-chain",
+        ] {
+            for provider_hint in [false, true] {
+                let cfg = KeyInboundConfig {
+                    headers: if provider_hint {
+                        Vec::new()
+                    } else {
+                        vec![InboundHeaderConfig {
+                            name: format!("  {forbidden}  "),
+                            scheme: String::new(),
+                        }]
+                    },
+                    require: false,
+                    provider_hints: if provider_hint {
+                        vec![ProviderHintConfig {
+                            provider: "custom".into(),
+                            header: format!("  {forbidden}  "),
+                            scheme: String::new(),
+                            value_prefix: String::new(),
+                            also_header: None,
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                    native_key_policy: None,
+                };
+                assert!(
+                    cfg.validate().is_err(),
+                    "{forbidden} must not be a primary credential carrier"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inbound_validation_rejects_case_insensitive_duplicates() {
+        let dupe = KeyInboundConfig {
+            headers: vec![
+                InboundHeaderConfig {
+                    name: "x-api-key".into(),
+                    scheme: String::new(),
+                },
+                InboundHeaderConfig {
+                    name: "X-API-Key".into(),
+                    scheme: String::new(),
+                },
+            ],
+            require: false,
+            provider_hints: Vec::new(),
+            native_key_policy: None,
+        };
+        assert!(dupe.validate().is_err());
+    }
+
+    #[test]
+    fn inbound_empty_header_list_is_valid_and_disables_the_sweep() {
+        let cfg = KeyInboundConfig {
+            headers: vec![],
+            require: false,
+            provider_hints: Vec::new(),
+            native_key_policy: None,
+        };
+        assert!(cfg.validate().is_ok());
+        assert!(cfg.header_names().is_empty());
+    }
+
+    #[test]
+    fn header_names_are_lowercased_for_the_redaction_denylists() {
+        let cfg = KeyInboundConfig {
+            headers: vec![InboundHeaderConfig {
+                name: "  X-Tool-Auth  ".into(),
+                scheme: String::new(),
+            }],
+            require: false,
+            provider_hints: Vec::new(),
+            native_key_policy: None,
+        };
+        assert_eq!(cfg.header_names(), ["x-tool-auth"]);
+    }
+
+    #[test]
+    fn credential_carrier_names_include_provider_hint_headers_only() {
+        let cfg = KeyInboundConfig {
+            headers: vec![
+                InboundHeaderConfig {
+                    name: "  X-Tool-Auth  ".into(),
+                    scheme: String::new(),
+                },
+                InboundHeaderConfig {
+                    name: "Authorization".into(),
+                    scheme: "Bearer ".into(),
+                },
+            ],
+            require: false,
+            provider_hints: vec![
+                ProviderHintConfig {
+                    provider: "openai".into(),
+                    header: "X-Native-Provider-Key".into(),
+                    scheme: String::new(),
+                    value_prefix: "native-".into(),
+                    also_header: Some("X-Provider-Version".into()),
+                },
+                ProviderHintConfig {
+                    provider: "openai".into(),
+                    header: "authorization".into(),
+                    scheme: "Bearer ".into(),
+                    value_prefix: "sk-".into(),
+                    also_header: None,
+                },
+            ],
+            native_key_policy: None,
+        };
+
+        assert_eq!(
+            cfg.credential_carrier_names(),
+            ["x-tool-auth", "authorization", "x-native-provider-key"]
+        );
+        assert!(
+            !cfg.credential_carrier_names()
+                .contains(&"x-provider-version".to_string()),
+            "also_header is match metadata, not a credential carrier"
+        );
+    }
+
+    #[test]
+    fn provider_hint_primary_carriers_reuse_reserved_header_rules() {
+        for reserved in [
+            "cookie",
+            "host",
+            "keep-alive",
+            "proxy-connection",
+            "te",
+            "trailer",
+            "traceparent",
+            "proxy-authorization",
+            "sec-websocket-protocol",
+        ] {
+            let cfg = KeyInboundConfig {
+                headers: Vec::new(),
+                require: false,
+                provider_hints: vec![ProviderHintConfig {
+                    provider: "openai".into(),
+                    header: reserved.into(),
+                    scheme: String::new(),
+                    value_prefix: String::new(),
+                    also_header: None,
+                }],
+                native_key_policy: None,
+            };
+            assert!(
+                cfg.validate().is_err(),
+                "{reserved} must not be a provider-hint credential carrier"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_hint_match_metadata_may_use_reserved_headers() {
+        let cfg = KeyInboundConfig {
+            headers: Vec::new(),
+            require: false,
+            provider_hints: vec![ProviderHintConfig {
+                provider: "openai".into(),
+                header: "x-provider-key".into(),
+                scheme: String::new(),
+                value_prefix: String::new(),
+                also_header: Some("traceparent".into()),
+            }],
+            native_key_policy: None,
+        };
+
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn every_default_sweep_header_is_excluded_from_capture_globs() {
+        // A swept header carries a live secret. If a default one is missing
+        // from the denylist, `capture_headers: ["*"]` logs it in plaintext.
+        for entry in KeyInboundConfig::default().headers {
+            assert!(
+                SENSITIVE_HEADER_DENYLIST.contains(&entry.name.as_str()),
+                "{} must be excluded from capture globs",
+                entry.name
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod sweep_header_capture_tests {
+    use super::*;
+
+    #[test]
+    fn a_configured_sweep_header_is_excluded_from_a_wildcard_glob() {
+        // Same trap as the log redactor: a custom name is on no static list,
+        // so `capture_headers: ["*"]` would capture a live minted key.
+        let (compiled, _) = CompiledHeaderAllowlist::compile(&["*".to_string()]);
+
+        set_extra_sensitive_headers(Vec::new());
+        assert!(
+            compiled.matches("x-tool-auth"),
+            "precondition: a wildcard captures it when nothing marks it sensitive"
+        );
+
+        set_extra_sensitive_headers(vec!["x-tool-auth".to_string()]);
+        assert!(!compiled.matches("x-tool-auth"));
+
+        // An exact listing still wins, which is the documented opt-in.
+        let (exact, warnings) = CompiledHeaderAllowlist::compile(&["x-tool-auth".to_string()]);
+        assert!(exact.matches("x-tool-auth"));
+        assert_eq!(warnings, vec!["x-tool-auth".to_string()]);
+
+        set_extra_sensitive_headers(Vec::new());
+    }
+
+    #[test]
+    fn the_builtin_denylist_still_applies_with_no_extras_configured() {
+        set_extra_sensitive_headers(Vec::new());
+        let (compiled, _) = CompiledHeaderAllowlist::compile(&["*".to_string()]);
+        for name in SENSITIVE_HEADER_DENYLIST {
+            assert!(!compiled.matches(name), "{name} must stay excluded");
+        }
+    }
 }

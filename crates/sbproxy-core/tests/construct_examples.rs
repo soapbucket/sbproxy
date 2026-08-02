@@ -1,7 +1,7 @@
-//! Sweep every published example sb.yml through the full boot-time
-//! construction path: `compile_config` followed by
-//! `CompiledPipeline::from_config`, the same pair the server, the
-//! reload handler, and (since WOR-1815) the `validate` subcommand run.
+//! Sweep every published example sb.yml through full module construction:
+//! `compile_config` followed by
+//! `CompiledPipeline::from_config_for_validation`, the same declared-
+//! dependency path used by the `validate` subcommand.
 //!
 //! The sibling sweep in `sbproxy-config/tests/validate_examples.rs`
 //! stops at `compile_config`, which cannot see constructor-level
@@ -10,6 +10,72 @@
 //! that sweep and refused to boot; this test closes the gap.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+struct RedisTlsExampleFixtures {
+    _directory: tempfile::TempDir,
+    ca_file: String,
+    cert_file: String,
+    key_file: String,
+}
+
+fn redis_tls_example_fixtures() -> &'static RedisTlsExampleFixtures {
+    static FIXTURES: OnceLock<RedisTlsExampleFixtures> = OnceLock::new();
+    FIXTURES.get_or_init(|| {
+        let directory = tempfile::tempdir().expect("create Redis TLS example fixture directory");
+        let key = rcgen::KeyPair::generate().expect("generate Redis TLS example key");
+        let certificate = rcgen::CertificateParams::new(vec!["redis-client.example".to_string()])
+            .expect("create Redis TLS example certificate parameters")
+            .self_signed(&key)
+            .expect("self-sign Redis TLS example certificate");
+
+        let ca_file = directory.path().join("ca.pem");
+        let cert_file = directory.path().join("client.pem");
+        let key_file = directory.path().join("client.key");
+        std::fs::write(&ca_file, certificate.pem()).expect("write Redis TLS example CA");
+        std::fs::write(&cert_file, certificate.pem())
+            .expect("write Redis TLS example client certificate");
+        std::fs::write(&key_file, key.serialize_pem()).expect("write Redis TLS example client key");
+
+        RedisTlsExampleFixtures {
+            _directory: directory,
+            ca_file: ca_file.to_string_lossy().into_owned(),
+            cert_file: cert_file.to_string_lossy().into_owned(),
+            key_file: key_file.to_string_lossy().into_owned(),
+        }
+    })
+}
+
+/// A signing key for the config-authority example.
+///
+/// `compile_config` refuses a publishing node whose signing key cannot be
+/// loaded, so the sweep has to materialize one the way that example's README
+/// tells a reader to. Owner-only, because the loader refuses a key any other
+/// account on the box could read. Absolute, because this sweep chdirs to the
+/// workspace root.
+fn config_authority_signing_key() -> &'static (tempfile::TempDir, String) {
+    static FIXTURE: OnceLock<(tempfile::TempDir, String)> = OnceLock::new();
+    FIXTURE.get_or_init(|| {
+        use base64::Engine as _;
+
+        let directory =
+            tempfile::tempdir().expect("create config-authority example fixture directory");
+        let path = directory.path().join("authority-signing.key");
+        std::fs::write(
+            &path,
+            base64::engine::general_purpose::STANDARD.encode([7u8; 32]),
+        )
+        .expect("write config-authority example signing key");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("tighten config-authority example signing key permissions");
+        }
+        let rendered = path.to_string_lossy().into_owned();
+        (directory, rendered)
+    })
+}
 
 fn workspace_root() -> PathBuf {
     // sbproxy-core lives at crates/sbproxy-core/ inside the workspace.
@@ -32,7 +98,13 @@ fn collect_yml_files(root: &Path) -> Vec<PathBuf> {
             }
         }
     }
+    out.extend(
+        ["upstream.yml", "api.yml", "mcp.yml", "sb.yml"]
+            .into_iter()
+            .map(|name| root.join("enterprise-ai-gateway").join(name)),
+    );
     out.sort();
+    out.dedup();
     out
 }
 
@@ -41,6 +113,21 @@ fn collect_yml_files(root: &Path) -> Vec<PathBuf> {
 /// Constructor checks fail loud on unresolved credential references
 /// (WOR-1818), so the sweep provides placeholders.
 fn export_example_env_dummies() {
+    static EXPORTED: OnceLock<()> = OnceLock::new();
+    EXPORTED.get_or_init(export_example_env_dummies_once);
+}
+
+/// One-shot body of [`export_example_env_dummies`].
+///
+/// The mutation runs exactly once per test binary, inside a `OnceLock`
+/// initializer, and every test calls the wrapper before its first
+/// environment read; concurrent callers block until the environment is
+/// fully populated, so a `set_var` can never race a parallel test's
+/// `getenv` (WOR-646). The values stay exported for the life of the
+/// process: they are this binary's fixture and every test reads them,
+/// so there is nothing to restore. This is the only place this binary
+/// mutates the environment.
+fn export_example_env_dummies_once() {
     const DUMMIES: &[(&str, &str)] = &[
         ("OPENAI_API_KEY", "sk-test-dummy-openai"),
         ("ANTHROPIC_API_KEY", "sk-ant-test-dummy"),
@@ -72,10 +159,19 @@ fn export_example_env_dummies() {
         ),
         ("ENV_VAR", "dummy"),
         ("VAR", "dummy"),
+        ("REDIS_PASSWORD", "redis-example-dummy"),
     ];
     for (k, v) in DUMMIES {
         std::env::set_var(k, v);
     }
+
+    let redis = redis_tls_example_fixtures();
+    std::env::set_var("REDIS_CA_FILE", &redis.ca_file);
+    std::env::set_var("REDIS_CLIENT_CERT_FILE", &redis.cert_file);
+    std::env::set_var("REDIS_CLIENT_KEY_FILE", &redis.key_file);
+
+    let (_directory, signing_key) = config_authority_signing_key();
+    std::env::set_var("SB_CONFIG_AUTHORITY_SIGNING_KEY", signing_key);
 }
 
 #[test]
@@ -117,21 +213,66 @@ fn every_oss_example_constructs_its_pipeline() {
                 continue;
             }
         };
-        if let Err(e) = sbproxy_core::pipeline::CompiledPipeline::from_config(compiled) {
-            failures.push(format!(
-                "{}: pipeline construction: {:#}",
-                file.display(),
-                e
-            ));
+        // examples/ai-rag-local configures gateway-side retrieval, which
+        // only exists behind the `rag` feature family. A default-feature
+        // build of this crate compiles none of it, so the sweep expects
+        // the documented missing-feature rejection there instead of a
+        // successful construction. Every other outcome (any other error,
+        // or an unexpected success without the feature) is a failure.
+        let is_rag_example = file
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "ai-rag-local");
+        let expect_missing_rag_feature = is_rag_example && !cfg!(feature = "rag");
+        match sbproxy_core::pipeline::CompiledPipeline::from_config_for_validation(compiled) {
+            Ok(_) => {
+                if expect_missing_rag_feature {
+                    failures.push(format!(
+                        "{}: constructed without the `rag` feature; expected the \
+                         \"rebuild with feature 'rag'\" rejection",
+                        file.display()
+                    ));
+                }
+            }
+            Err(e) => {
+                let rendered = format!("{:#}", e);
+                if expect_missing_rag_feature && rendered.contains("rebuild with feature 'rag'") {
+                    // Expected: the config is valid, this build just
+                    // ships no RAG runtime.
+                } else {
+                    failures.push(format!(
+                        "{}: pipeline construction: {}",
+                        file.display(),
+                        rendered
+                    ));
+                }
+            }
         }
     }
     if !failures.is_empty() {
         let summary = failures.join("\n  ");
         panic!(
-            "{} of {} example(s) failed boot-time construction:\n  {}",
+            "{} of {} example(s) failed module construction:\n  {}",
             failures.len(),
             files.len(),
             summary
         );
     }
+}
+
+/// With the RAG adapters compiled in (`--features rag-full`, which the
+/// released binary ships by default), the ai-rag-local example must
+/// construct its pipeline end to end, not just compile its config.
+#[cfg(feature = "rag-full")]
+#[test]
+fn ai_rag_local_constructs_with_rag_features() {
+    export_example_env_dummies();
+    let root = workspace_root();
+    let file = root.join("examples").join("ai-rag-local").join("sb.yml");
+    let yaml =
+        std::fs::read_to_string(&file).unwrap_or_else(|e| panic!("read {}: {}", file.display(), e));
+    let compiled = sbproxy_config::compile_config(&yaml)
+        .unwrap_or_else(|e| panic!("{}: compile_config: {:#}", file.display(), e));
+    sbproxy_core::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+        .unwrap_or_else(|e| panic!("{}: pipeline construction: {:#}", file.display(), e));
 }

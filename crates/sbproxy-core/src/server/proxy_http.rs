@@ -7,6 +7,8 @@
 //! every helper into scope. Behavior-preserving move, no logic changes.
 
 use super::*;
+use crate::context::{LoadBalancerActionKey, LoadBalancerAttemptToken};
+use anyhow::Context as _;
 
 fn active_action<'a>(pipeline: &'a CompiledPipeline, ctx: &RequestContext) -> Option<&'a Action> {
     let origin_idx = ctx.origin_idx?;
@@ -21,11 +23,292 @@ fn active_action<'a>(pipeline: &'a CompiledPipeline, ctx: &RequestContext) -> Op
     }
 }
 
+/// Make the GraphQL-validated POST body authoritative at the request-body
+/// boundary.
+///
+/// Hold every discarded inbound chunk and replace the end-of-stream chunk
+/// before any downstream body policy, idempotency state, accounting, or
+/// upstream emission can observe it.
+fn emit_graphql_validated_request_body(
+    body: &mut Option<Bytes>,
+    end_of_stream: bool,
+    ctx: &mut RequestContext,
+) {
+    if ctx.graphql_validated_request_body.is_none() {
+        return;
+    }
+
+    if end_of_stream {
+        *body = ctx.graphql_validated_request_body.take();
+        // The authoritative slot supersedes the ordinary modifier slot.
+        ctx.replacement_request_body = None;
+    } else {
+        *body = None;
+    }
+}
+
+/// Hold a consumed request-body chunk back from the upstream without
+/// ending the stream.
+///
+/// This is the one place the `Some(Bytes::new())`-vs-`None` rule lives:
+/// Pingora treats `None` from `request_body_filter` as end-of-body on
+/// both HTTP/1.1 and HTTP/2, so a branch that moved a mid-stream chunk
+/// into a local buffer must leave an empty chunk in the slot. Leaving
+/// `None` ends the upstream body at whatever bytes were already
+/// forwarded and the upstream sees a silently truncated request
+/// (WOR-2138). Every buffering branch that consumes a chunk before
+/// end-of-stream goes through this function rather than writing the
+/// slot directly.
+fn hold_request_body_chunk(body: &mut Option<Bytes>) {
+    *body = Some(Bytes::new());
+}
+
+/// Complete a deferred body-bound authentication proof against the bytes the
+/// client actually sent.
+///
+/// GraphQL request modifiers may replace those bytes before body policies and
+/// idempotency run. A signature over `content-digest` still authenticates the
+/// inbound representation, so finish that proof before a late cache hit can
+/// short-circuit and mark the deferred check as consumed.
+fn verify_graphql_inbound_body_binding(
+    headers: &http::HeaderMap,
+    inbound_body: &[u8],
+    ctx: &mut RequestContext,
+) -> bool {
+    if !ctx.bot_auth_digest_check_required {
+        return true;
+    }
+
+    let verified = headers
+        .get("content-digest")
+        .or_else(|| headers.get("repr-digest"))
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            sbproxy_middleware::digest::verify_content_digest(value, inbound_body)
+        });
+    if verified {
+        ctx.content_digest_verified = true;
+        ctx.bot_auth_digest_check_required = false;
+    }
+    verified
+}
+
+/// Engage idempotency only after GraphQL validation has established the final
+/// authoritative request body.
+///
+/// The ordinary path probes in `request_filter` so cache hits avoid policies
+/// and upstream selection. Validated GraphQL requests cannot safely do that:
+/// request modifiers do not produce the final method, headers, and body until
+/// `upstream_request_filter`. This late path preserves the cached response
+/// payload and conflict semantics while ensuring an older entry never bypasses
+/// the current validation rules.
+fn engage_validated_graphql_idempotency(
+    request_headers: &http::HeaderMap,
+    method: &http::Method,
+    authoritative_body: &[u8],
+    ctx: &mut RequestContext,
+) -> bool {
+    let pipeline = ctx.pipeline.clone();
+    let Some(origin_idx) = ctx.origin_idx else {
+        return false;
+    };
+    let Some(idem) = pipeline
+        .idempotencies
+        .get(origin_idx)
+        .and_then(|entry| entry.as_ref())
+        .cloned()
+    else {
+        return false;
+    };
+    if !idem.methods.contains(method) {
+        return false;
+    }
+    let Some(key) = request_headers
+        .get(idem.header_name.as_str())
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+    else {
+        return false;
+    };
+    if authoritative_body.len() > idem.max_request_body_bytes {
+        ctx.idempotency_skip_reason = Some("SKIPPED-OVERSIZE-REQUEST");
+        return false;
+    }
+    let Ok(permit) = idem.permits.clone().try_acquire_owned() else {
+        ctx.idempotency_skip_reason = Some("SKIPPED-POOL-FULL");
+        return false;
+    };
+    let workspace = pipeline.config.origins[origin_idx].workspace_id.to_string();
+    ctx.idempotency_workspace = Some(workspace.clone());
+    ctx.idempotency_permit = Some(permit);
+
+    let body_hash = sbproxy_middleware::idempotency::hash_body(authoritative_body);
+    if let Some(cached) = idem.cache.get(&workspace, &key) {
+        ctx.idempotency_permit = None;
+        if cached.request_body_hash == body_hash {
+            ctx.idempotency_deferred_hit = Some(cached);
+        } else {
+            let (status, content_type, body) = sbproxy_middleware::idempotency::conflict_response();
+            ctx.validator_failed = Some((
+                status.as_u16(),
+                String::from_utf8_lossy(&body).into_owned(),
+                content_type.to_string(),
+            ));
+        }
+        return true;
+    }
+
+    ctx.idempotency_miss = Some((key, body_hash));
+    ctx.idempotency_response_body_buf = Some(bytes::BytesMut::with_capacity(8192));
+    false
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadBalancerAttemptOutcome {
+    Success,
+    Failure,
+    Neutral,
+}
+
+fn load_balancer_for_action_key(
+    pipeline: &CompiledPipeline,
+    action_key: LoadBalancerActionKey,
+) -> Option<&sbproxy_modules::LoadBalancerAction> {
+    let action = if let Some(forward_rule_index) = action_key.forward_rule_index {
+        pipeline
+            .forward_rules
+            .get(action_key.origin_index)
+            .and_then(|rules| rules.get(forward_rule_index))
+            .map(|rule| &rule.action)
+    } else {
+        pipeline.actions.get(action_key.origin_index)
+    }?;
+    match action {
+        Action::LoadBalancer(load_balancer) => Some(load_balancer.as_ref()),
+        _ => None,
+    }
+}
+
+fn finish_load_balancer_attempt(ctx: &mut RequestContext, outcome: LoadBalancerAttemptOutcome) {
+    let Some(attempt) = ctx.lb_attempt.take() else {
+        return;
+    };
+
+    let pipeline = ctx.pipeline.clone();
+    let Some(load_balancer) = load_balancer_for_action_key(&pipeline, attempt.action) else {
+        warn!(
+            origin_index = attempt.action.origin_index,
+            forward_rule_index = ?attempt.action.forward_rule_index,
+            target_index = attempt.target_index,
+            "load balancer attempt owner disappeared from its pinned pipeline"
+        );
+        return;
+    };
+
+    let success = match outcome {
+        LoadBalancerAttemptOutcome::Success => Some(true),
+        LoadBalancerAttemptOutcome::Failure => Some(false),
+        LoadBalancerAttemptOutcome::Neutral => None,
+    };
+    if let Some(success) = success {
+        load_balancer.record_strategy_outcome(
+            attempt.target_index,
+            sbproxy_modules::RoutingOutcome {
+                success,
+                latency: attempt.started_at.elapsed(),
+            },
+        );
+        if success {
+            load_balancer.record_target_success(attempt.target_index);
+            load_balancer.record_breaker_success(attempt.target_index);
+        } else {
+            load_balancer.record_target_failure(attempt.target_index);
+            load_balancer.record_breaker_failure(attempt.target_index);
+        }
+    }
+    load_balancer.record_disconnect(attempt.target_index);
+}
+
+fn begin_load_balancer_attempt(
+    ctx: &mut RequestContext,
+    action: LoadBalancerActionKey,
+    selection: &sbproxy_modules::action::TargetSelection,
+) {
+    // Defensive replacement cleanup. Normal retry/error paths finish the old
+    // token before Pingora asks for another peer, but this guard keeps a
+    // surprise second selection from leaking or underflowing connection state.
+    finish_load_balancer_attempt(ctx, LoadBalancerAttemptOutcome::Neutral);
+
+    let pipeline = ctx.pipeline.clone();
+    let Some(load_balancer) = load_balancer_for_action_key(&pipeline, action) else {
+        warn!(
+            origin_index = action.origin_index,
+            forward_rule_index = ?action.forward_rule_index,
+            target_index = selection.target_index,
+            "cannot start load balancer attempt without its owning action"
+        );
+        return;
+    };
+    load_balancer.record_connect(selection.target_index);
+    ctx.lb_attempt = Some(LoadBalancerAttemptToken {
+        action,
+        target_index: selection.target_index,
+        started_at: std::time::Instant::now(),
+        observed_upstream_status: None,
+    });
+    ctx.admin_load_balancer_strategy = Some(selection.selection_method.clone());
+    ctx.admin_load_balancer_target = Some(format!("{}:{}", selection.host, selection.port));
+}
+
+fn capture_load_balancer_upstream_response(
+    ctx: &mut RequestContext,
+    upstream_response: &pingora_http::ResponseHeader,
+) {
+    if let Some(attempt) = ctx.lb_attempt.as_mut() {
+        attempt.observed_upstream_status = Some(upstream_response.status.as_u16());
+    }
+}
+
+fn active_load_balancer_target_index(ctx: &RequestContext) -> Option<usize> {
+    ctx.lb_attempt.as_ref().map(|attempt| attempt.target_index)
+}
+
+fn terminal_load_balancer_attempt_outcome(
+    status: u16,
+    error_source: Option<&pingora_error::ErrorSource>,
+) -> LoadBalancerAttemptOutcome {
+    if status >= 500 || matches!(error_source, Some(pingora_error::ErrorSource::Upstream)) {
+        LoadBalancerAttemptOutcome::Failure
+    } else if error_source.is_some() {
+        // Downstream, internal, and unclassified failures are not evidence
+        // against the selected upstream.
+        LoadBalancerAttemptOutcome::Neutral
+    } else {
+        LoadBalancerAttemptOutcome::Success
+    }
+}
+
+fn finish_terminal_load_balancer_attempt(
+    ctx: &mut RequestContext,
+    error_source: Option<&pingora_error::ErrorSource>,
+) {
+    let observed_upstream_status = ctx
+        .lb_attempt
+        .as_ref()
+        .and_then(|attempt| attempt.observed_upstream_status)
+        .unwrap_or(0);
+    let outcome = terminal_load_balancer_attempt_outcome(observed_upstream_status, error_source);
+    finish_load_balancer_attempt(ctx, outcome);
+}
+
 /// Scheme-agnostic host + path of an upstream URL (WOR-1698).
 struct ParsedUpstreamUrl {
-    /// `Url::host_str()` of the upstream, or `None` when the URL has no
-    /// host or does not parse.
+    /// `Url::host_str()` of the upstream.
     host: Option<String>,
+    /// Configured transport scheme.
+    scheme: Option<String>,
     /// `Url::path()` of the upstream (empty string when the URL does not
     /// parse), used to derive the base-path prefix for the Proxy action.
     path: String,
@@ -57,7 +340,10 @@ fn parsed_upstream_url(url: &str) -> std::sync::Arc<ParsedUpstreamUrl> {
     }
     let parsed = url::Url::parse(url).ok();
     let info = std::sync::Arc::new(ParsedUpstreamUrl {
-        host: parsed.as_ref().and_then(|u| u.host_str().map(String::from)),
+        host: parsed
+            .as_ref()
+            .and_then(|url| url.host_str().map(str::to_string)),
+        scheme: parsed.as_ref().map(|u| u.scheme().to_string()),
         path: parsed
             .as_ref()
             .map(|u| u.path().to_string())
@@ -77,6 +363,21 @@ fn final_response_status(
     ctx.response_status
         .or_else(|| written.map(|header| header.status.as_u16()))
         .unwrap_or(0)
+}
+
+fn is_billable_provider_success(status: u16, provider: Option<&str>) -> bool {
+    (200..300).contains(&status) && provider.is_some_and(|value| !value.is_empty())
+}
+
+fn take_realized_compression_value(
+    ctx: &mut RequestContext,
+    status: u16,
+    terminal_error: bool,
+) -> Option<sbproxy_ai::PendingCompressionValue> {
+    let pending = ctx.pending_compression_value.take();
+    (!terminal_error && is_billable_provider_success(status, ctx.ai_provider.as_deref()))
+        .then_some(pending)
+        .flatten()
 }
 
 fn retry_config_for_action(action: &Action) -> Option<&sbproxy_modules::action::RetryConfig> {
@@ -119,24 +420,464 @@ fn status_retry_skip_reason(session: &mut Session) -> Option<&'static str> {
     None
 }
 
+fn dpop_retry_skip_reason(session: &mut Session) -> Option<&'static str> {
+    if session.as_mut().is_body_empty() {
+        return None;
+    }
+    if !session.as_mut().is_body_done() {
+        return Some("streaming_body");
+    }
+    if session.as_ref().retry_buffer_truncated() {
+        return Some("body_too_large");
+    }
+    if session.as_ref().get_retry_buffer().is_none() {
+        return Some("body_unavailable");
+    }
+    None
+}
+
+fn dpop_resource_htu(scheme: &str, request: &RequestHeader) -> anyhow::Result<String> {
+    let scheme = match scheme {
+        "http" | "ws" | "grpc" => "http",
+        "https" | "wss" | "grpcs" => "https",
+        _ => anyhow::bail!("outbound DPoP requires an HTTP or HTTPS upstream scheme"),
+    };
+    let authority = request
+        .headers
+        .get(http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| request.uri.authority().map(http::uri::Authority::as_str))
+        .filter(|value| !value.is_empty())
+        .context("outbound DPoP request has no final authority")?;
+    let path = if request.uri.path().is_empty() {
+        "/"
+    } else {
+        request.uri.path()
+    };
+    let mut target = url::Url::parse(&format!("{scheme}://{authority}{path}"))
+        .context("outbound DPoP request target is not a valid absolute URI")?;
+    target.set_query(None);
+    target.set_fragment(None);
+    Ok(target.to_string())
+}
+
+fn response_dpop_nonce(response: &ResponseHeader) -> Option<String> {
+    let values: Vec<_> = response.headers.get_all("dpop-nonce").iter().collect();
+    if values.len() != 1 {
+        return None;
+    }
+    let nonce = values[0].to_str().ok()?;
+    sbproxy_modules::auth::dpop_outbound::validate_nonce(nonce).ok()?;
+    Some(nonce.to_string())
+}
+
+/// Return whether one `WWW-Authenticate` field contains a DPoP challenge with
+/// the exact `error=use_dpop_nonce` auth parameter.
+///
+/// Commas are ambiguous in RFC 9110 authentication fields: they delimit both
+/// challenges and auth parameters. Track the current challenge while scanning
+/// comma-separated segments outside quoted strings so a combined
+/// `Bearer ..., DPoP ...` field is handled without letting near-name
+/// parameters such as `fooerror` match.
+fn dpop_authenticate_value_requests_nonce(header: &str) -> bool {
+    let bytes = header.as_bytes();
+    let mut segment_start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut current_challenge_is_dpop = false;
+
+    for segment_end in (0..=bytes.len()).filter(|&index| {
+        if index == bytes.len() {
+            return true;
+        }
+        let byte = bytes[index];
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = false;
+            }
+            false
+        } else if byte == b'"' {
+            quoted = true;
+            false
+        } else {
+            byte == b','
+        }
+    }) {
+        let segment = header[segment_start..segment_end].trim();
+        segment_start = segment_end.saturating_add(1);
+        if segment.is_empty() {
+            continue;
+        }
+
+        let segment_bytes = segment.as_bytes();
+        let token_end = segment_bytes
+            .iter()
+            .position(|byte| !is_auth_token_byte(*byte))
+            .unwrap_or(segment_bytes.len());
+        if token_end == 0 {
+            current_challenge_is_dpop = false;
+            continue;
+        }
+        let mut after_token = token_end;
+        while segment_bytes
+            .get(after_token)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            after_token += 1;
+        }
+
+        if segment_bytes.get(after_token) == Some(&b'=') {
+            if current_challenge_is_dpop
+                && auth_challenge_has_parameter(segment, "error", "use_dpop_nonce")
+            {
+                return true;
+            }
+            continue;
+        }
+
+        current_challenge_is_dpop = segment[..token_end].eq_ignore_ascii_case("DPoP");
+        if current_challenge_is_dpop
+            && auth_challenge_has_parameter(&segment[token_end..], "error", "use_dpop_nonce")
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn dpop_resource_nonce_challenge_present(response: &ResponseHeader) -> bool {
+    if response.status != http::StatusCode::UNAUTHORIZED {
+        return false;
+    }
+    response
+        .headers
+        .get_all(http::header::WWW_AUTHENTICATE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(dpop_authenticate_value_requests_nonce)
+}
+
+fn dpop_resource_nonce_challenge(response: &ResponseHeader) -> Option<String> {
+    dpop_resource_nonce_challenge_present(response)
+        .then(|| response_dpop_nonce(response))
+        .flatten()
+}
+
+fn maybe_retry_dpop_nonce(
+    session: &mut Session,
+    upstream_response: &ResponseHeader,
+    ctx: &mut RequestContext,
+) -> Option<Box<Error>> {
+    if !ctx.outbound_dpop_active {
+        return None;
+    }
+    let challenged = dpop_resource_nonce_challenge_present(upstream_response);
+    let nonce = if challenged {
+        dpop_resource_nonce_challenge(upstream_response)?
+    } else {
+        response_dpop_nonce(upstream_response)?
+    };
+    let pipeline = ctx.pipeline.clone();
+    let runtime = pipeline
+        .outbound_creds
+        .get(ctx.origin_idx?)
+        .and_then(Option::as_ref)
+        .and_then(|credential| credential.dpop_runtime().ok().flatten())?;
+    let htu = ctx.outbound_dpop_htu.as_deref()?;
+
+    if !challenged || ctx.dpop_nonce_retry_used || dpop_retry_skip_reason(session).is_some() {
+        let _ = runtime.set_resource_nonce(htu, &nonce);
+        return None;
+    }
+
+    if runtime.set_resource_nonce(htu, &nonce).is_err() {
+        return None;
+    }
+    ctx.dpop_nonce_retry_used = true;
+    finish_load_balancer_attempt(ctx, LoadBalancerAttemptOutcome::Failure);
+    let mut error = Error::explain(
+        ErrorType::HTTPStatus(http::StatusCode::UNAUTHORIZED.as_u16()),
+        "protected resource requested a DPoP nonce",
+    );
+    error.set_retry(true);
+    Some(error)
+}
+
+fn insert_outbound_credential_header(
+    request: &mut RequestHeader,
+    header_name: String,
+    header_value: &str,
+) -> Result<()> {
+    request
+        .insert_header(header_name, header_value)
+        .map_err(|_| {
+            pingora_error::Error::explain(
+                pingora_error::ErrorType::HTTPStatus(503),
+                "outbound credential header rejected",
+            )
+        })
+}
+
+/// A realtime credential kept only on the request stack.
+///
+/// Deliberately does not implement `Debug`: the value is an upstream secret
+/// and must never become loggable through request context diagnostics.
+struct RealtimeCredential {
+    header: String,
+    value: String,
+}
+
+fn realtime_provider_credential(
+    provider: &sbproxy_ai::ProviderConfig,
+) -> Option<RealtimeCredential> {
+    provider
+        .api_key
+        .as_deref()
+        .filter(|api_key| !api_key.trim().is_empty())?;
+    let (header, value) = provider.auth_header();
+    Some(RealtimeCredential { header, value })
+}
+
+fn realtime_native_provider_credential(
+    provider: &sbproxy_ai::ProviderConfig,
+    headers: &http::HeaderMap,
+    hints: &[sbproxy_config::types::ProviderHintConfig],
+    native_provider: &str,
+) -> Option<RealtimeCredential> {
+    if !provider.accepts_native_credential_for(native_provider) {
+        return None;
+    }
+    let api_key =
+        crate::inbound_key::resolve_native_provider_credential(headers, hints, native_provider)?;
+    let mut resolved_provider = provider.clone();
+    resolved_provider.api_key = Some(api_key.to_string());
+    realtime_provider_credential(&resolved_provider)
+}
+
+fn realtime_native_provider_credential_for_pipeline(
+    provider: &sbproxy_ai::ProviderConfig,
+    headers: &http::HeaderMap,
+    pipeline: &CompiledPipeline,
+    native_provider: &str,
+) -> Option<RealtimeCredential> {
+    let inbound = pipeline.inbound_key_config()?;
+    realtime_native_provider_credential(provider, headers, &inbound.provider_hints, native_provider)
+}
+
+fn realtime_inbound_carrier_names(ctx: &RequestContext) -> Vec<String> {
+    let mut headers = Vec::new();
+    if let Some(header) = ctx.inbound_key_header.as_ref() {
+        headers.push(header.clone());
+    }
+    if let Some(inbound) = ctx.pipeline.inbound_key_config() {
+        headers.extend(inbound.credential_carrier_names());
+    }
+    headers
+}
+
+fn choose_realtime_credential(
+    bound: Option<RealtimeCredential>,
+    provider: Option<RealtimeCredential>,
+) -> anyhow::Result<RealtimeCredential> {
+    bound
+        .or(provider)
+        .context("realtime credential unavailable")
+}
+
+fn realtime_credential_headers(
+    bound: Option<&RealtimeCredential>,
+    provider: Option<&RealtimeCredential>,
+    origin: Option<&sbproxy_modules::auth::outbound_credential::OutboundCredentialConfig>,
+) -> Vec<String> {
+    use sbproxy_modules::auth::outbound_credential::OutboundCredentialConfig;
+
+    let mut headers = Vec::with_capacity(3);
+    for header in bound
+        .into_iter()
+        .chain(provider)
+        .map(|credential| credential.header.as_str())
+        .chain(origin.map(|credential| match credential {
+            OutboundCredentialConfig::TokenExchange(_)
+            | OutboundCredentialConfig::ClientCredentials(_) => "authorization",
+            OutboundCredentialConfig::VaultSecret(config) => config.header.as_str(),
+        }))
+    {
+        let canonical = header.trim().to_ascii_lowercase();
+        if !headers.contains(&canonical) {
+            headers.push(canonical);
+        }
+    }
+    headers
+}
+
+fn scrub_realtime_credentials(
+    request: &mut RequestHeader,
+    inbound_key_headers: &[String],
+    credential_headers: &[String],
+    authoritative_header: &str,
+) {
+    for header in [
+        "authorization",
+        "proxy-authorization",
+        "dpop",
+        "x-api-key",
+        "api-key",
+        "x-goog-api-key",
+        "x-sb-api",
+    ] {
+        request.remove_header(header);
+    }
+    for header in inbound_key_headers.iter().chain(credential_headers) {
+        let canonical = header.trim().to_ascii_lowercase();
+        request.remove_header(&canonical);
+    }
+    let authoritative = authoritative_header.trim().to_ascii_lowercase();
+    request.remove_header(&authoritative);
+}
+
+fn apply_realtime_credential(
+    request: &mut RequestHeader,
+    credential: &RealtimeCredential,
+    inbound_key_headers: &[String],
+    credential_headers: &[String],
+) -> Result<()> {
+    for header in credential_headers
+        .iter()
+        .map(String::as_str)
+        .chain(std::iter::once(credential.header.as_str()))
+    {
+        if sbproxy_config::types::credential_header_is_reserved(header) {
+            return Err(pingora_error::Error::explain(
+                pingora_error::ErrorType::HTTPStatus(503),
+                "realtime credential header is reserved",
+            ));
+        }
+    }
+    scrub_realtime_credentials(
+        request,
+        inbound_key_headers,
+        credential_headers,
+        &credential.header,
+    );
+    insert_outbound_credential_header(request, credential.header.clone(), &credential.value)
+}
+
+async fn commit_realtime_quota_attempt(ctx: &mut RequestContext) -> Result<()> {
+    let Some(attempt) = ctx.ai_realtime_quota_attempt.take() else {
+        ctx.ai_realtime_quota_config.take();
+        return Ok(());
+    };
+
+    match attempt.commit().await {
+        Ok(()) => {
+            ctx.ai_realtime_quota_config.take();
+            Ok(())
+        }
+        Err(error) => {
+            let config = ctx.ai_realtime_quota_config.take();
+            let Some(failure) =
+                crate::context::RealtimeQuotaFailure::from_pool_error(config.as_ref(), &error)
+            else {
+                // The guard normally handles this branch itself. Retain a
+                // defensive fail-open path if a future store returns backend
+                // unavailability after settlement semantics evolve.
+                if let Some(config) = config.as_ref() {
+                    sbproxy_ai::ai_metrics::record_quota_pool_fail_open(&config.name);
+                }
+                return Ok(());
+            };
+            ctx.ai_realtime_quota_failure = Some(failure);
+            Err(pingora_error::Error::explain(
+                pingora_error::ErrorType::HTTPStatus(failure.status),
+                failure.message,
+            ))
+        }
+    }
+}
+
+fn realtime_response_accepts_session(status: u16) -> bool {
+    status == http::StatusCode::SWITCHING_PROTOCOLS.as_u16()
+}
+
+fn take_accepted_realtime_dispatch(
+    dispatch: &mut Option<crate::context::RealtimeDispatchCtx>,
+    response_status: u16,
+) -> Option<crate::context::RealtimeDispatchCtx> {
+    let dispatch = dispatch.take();
+    realtime_response_accepts_session(response_status)
+        .then_some(dispatch)
+        .flatten()
+}
+
+fn ensure_dpop_credential_source(
+    bound_credential_id: Option<&str>,
+    origin_dpop_enabled: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !(origin_dpop_enabled && bound_credential_id.is_some()),
+        "bound credential cannot satisfy origin DPoP"
+    );
+    Ok(())
+}
+
+fn final_dpop_access_token<'a>(
+    request: &'a RequestHeader,
+    expected_token: &str,
+) -> anyhow::Result<&'a str> {
+    let mut values = request.headers.get_all(http::header::AUTHORIZATION).iter();
+    let value = values
+        .next()
+        .context("outbound DPoP authorization header is missing")?;
+    anyhow::ensure!(
+        values.next().is_none(),
+        "outbound DPoP authorization header is duplicated"
+    );
+    let value = value
+        .to_str()
+        .context("outbound DPoP authorization header is invalid")?;
+    let token = value
+        .strip_prefix("DPoP ")
+        .filter(|token| !token.is_empty())
+        .context("outbound DPoP authorization scheme is invalid")?;
+    anyhow::ensure!(
+        token == expected_token,
+        "outbound DPoP authorization token was modified"
+    );
+    Ok(token)
+}
+
+/// Decide whether the upstream response status triggers a retry.
+///
+/// `Some(retryable error)` means the status matched the action's
+/// `retry.retry_on`, attempts remain under `max_attempts`, and the
+/// request can be replayed from Pingora's retry buffer; the caller
+/// (`upstream_response_decision`) returns it so Pingora discards the
+/// response before any bytes reach the downstream, drops the upstream
+/// connection, and re-runs `upstream_peer`. `None` lets the response
+/// flow through untouched; a skipped-but-matching status stamps
+/// `ctx.status_retry_skip_reason` so `response_filter` can surface
+/// `x-sbproxy-retry-skip-reason` on the passed-through response.
 async fn maybe_retry_upstream_status(
     session: &mut Session,
     upstream_response: &ResponseHeader,
     ctx: &mut RequestContext,
-) -> Result<()> {
+) -> Option<Box<Error>> {
     let status = upstream_response.status.as_u16();
     let pipeline = ctx.pipeline.clone();
-    let Some(action) = active_action(&pipeline, ctx) else {
-        return Ok(());
-    };
-    let Some(cfg) = retry_config_for_action(action) else {
-        return Ok(());
-    };
+    let action = active_action(&pipeline, ctx)?;
+    let cfg = retry_config_for_action(action)?;
     if !cfg.enabled() || !cfg.allows_status(status) {
-        return Ok(());
+        return None;
     }
 
-    if ctx.retry_count + 1 >= cfg.max_attempts {
+    // Status and connect-error retries share `ctx.retry_count`, so a
+    // mixed failure sequence stays under one `max_attempts` cap.
+    if !cfg.attempts_remaining(ctx.retry_count) {
         ctx.status_retry_skip_reason = Some("max_attempts_exhausted");
         debug!(
             hostname = %ctx.hostname,
@@ -144,7 +885,7 @@ async fn maybe_retry_upstream_status(
             attempts = %cfg.max_attempts,
             "upstream status matched retry_on but max attempts were exhausted"
         );
-        return Ok(());
+        return None;
     }
 
     if let Some(reason) = status_retry_skip_reason(session) {
@@ -155,19 +896,16 @@ async fn maybe_retry_upstream_status(
             reason = %reason,
             "upstream status matched retry_on but request is not replayable"
         );
-        return Ok(());
+        return None;
     }
 
     let backoff_ms = cfg.backoff_for_attempt(ctx.retry_count);
-    if let (Action::LoadBalancer(lb), Some(target_idx)) = (action, ctx.lb_target_idx) {
-        lb.record_target_failure(target_idx);
-        lb.record_breaker_failure(target_idx);
-        ctx.lb_target_idx = None;
-    }
+    finish_load_balancer_attempt(ctx, LoadBalancerAttemptOutcome::Failure);
 
     ctx.status_retry_skip_reason = None;
     ctx.retry_count += 1;
     ctx.retry_backoff_ms = Some(backoff_ms);
+    sbproxy_observe::metrics::record_upstream_status_retry(ctx.hostname.as_str(), status);
     debug!(
         hostname = %ctx.hostname,
         upstream_status = %status,
@@ -182,7 +920,58 @@ async fn maybe_retry_upstream_status(
         "upstream status matched retry_on",
     );
     error.set_retry(true);
-    Err(error)
+    Some(error)
+}
+
+/// Metric phase label for a timeout-classed Pingora error, or `None`
+/// when the error type is not honestly a timeout. `connect` covers
+/// deadlines hit while establishing the upstream connection (TCP
+/// connect, TLS handshake); `upstream` covers read and write
+/// deadlines on the established connection. This is the closed label
+/// set for `sbproxy_upstream_timeout_retries_total{phase}`.
+fn timeout_error_phase(etype: &ErrorType) -> Option<&'static str> {
+    match etype {
+        ErrorType::ConnectTimedout | ErrorType::TLSHandshakeTimedout => Some("connect"),
+        ErrorType::ReadTimedout | ErrorType::WriteTimedout => Some("upstream"),
+        _ => None,
+    }
+}
+
+/// Decide whether an error surfaced by `error_while_proxy` schedules
+/// a timeout retry.
+///
+/// Mirrors `maybe_retry_upstream_status` for the mid-proxy leg:
+/// `Some(phase)` means the error is a timeout class on the upstream
+/// side, the action's `retry.retry_on` lists `timeout`, attempts
+/// remain under the shared `max_attempts` cap, no response bytes have
+/// been written downstream, and the request is replayable; the caller
+/// then increments `ctx.retry_count` and marks the error retryable.
+/// `None` leaves the error exactly as Pingora produced it.
+///
+/// Both safety gates live here because Pingora's proxy loop retries
+/// blindly on `e.retry()`: `response_started` guards bytes that can
+/// never be recalled from the client, and `replay_skip` (from
+/// `status_retry_skip_reason`) guards requests whose method or body
+/// must not be replayed after they already reached the upstream.
+fn maybe_retry_upstream_timeout(
+    cfg: &sbproxy_modules::action::RetryConfig,
+    etype: &ErrorType,
+    esource: &pingora_error::ErrorSource,
+    retries_used: u32,
+    response_started: bool,
+    replay_skip: Option<&'static str>,
+) -> Option<&'static str> {
+    let phase = timeout_error_phase(etype)?;
+    if *esource != pingora_error::ErrorSource::Upstream {
+        return None;
+    }
+    if !cfg.allows("timeout") || !cfg.attempts_remaining(retries_used) {
+        return None;
+    }
+    if response_started || replay_skip.is_some() {
+        return None;
+    }
+    Some(phase)
 }
 
 #[async_trait]
@@ -252,6 +1041,11 @@ impl ProxyHttp for SbProxy {
             peer
         }
 
+        // `upstream_peer` starts a new attempt. Every ordinary retry path
+        // already finishes the prior token, while this neutral guard handles
+        // Pingora replacement paths that bypass those callbacks.
+        finish_load_balancer_attempt(ctx, LoadBalancerAttemptOutcome::Neutral);
+
         if let Some(backoff_ms) = ctx.retry_backoff_ms.take() {
             if backoff_ms > 0 {
                 debug!(
@@ -268,6 +1062,7 @@ impl ProxyHttp for SbProxy {
             warn!("upstream_peer called without origin_idx");
             Error::new(ErrorType::HTTPStatus(500))
         })?;
+        let load_balancer_action_key = LoadBalancerActionKey::new(origin_idx, ctx.forward_rule_idx);
 
         // If a forward rule matched, use its action instead of the origin's.
         let effective_action: &Action = if let Some(fwd_idx) = ctx.forward_rule_idx {
@@ -365,33 +1160,45 @@ impl ProxyHttp for SbProxy {
                 Ok(Box::new(peer))
             }
             Action::LoadBalancer(lb) => {
-                let client_ip_str = ctx.client_ip.map(|ip| ip.to_string());
-                let uri = _session.req_header().uri.path();
-                let headers = &_session.req_header().headers;
+                let request_header = _session.req_header();
+                let path = request_header.uri.path_and_query().map_or_else(
+                    || request_header.uri.path().to_string(),
+                    |value| value.to_string(),
+                );
+                let mut routing_request = sbproxy_modules::RoutingRequest::new(
+                    request_header.method.as_str(),
+                    path,
+                    ctx.hostname.as_str(),
+                );
+                routing_request.headers = request_header.headers.clone();
+                routing_request.client_ip = ctx.client_ip.map(|ip| ip.to_string());
+                let selection = lb.select_target_for_request(routing_request).map_err(|e| {
+                    warn!(error = %e, "load balancer target selection failed");
+                    Error::because(ErrorType::ConnectError, "lb target selection failed", e)
+                })?;
 
-                let (host, port, tls, target_idx) = lb
-                    .select_target(client_ip_str.as_deref(), uri, headers)
-                    .map_err(|e| {
-                        warn!(error = %e, "load balancer target selection failed");
-                        Error::because(ErrorType::ConnectError, "lb target selection failed", e)
-                    })?;
+                guard_upstream(
+                    &selection.host,
+                    selection.port,
+                    selection.tls,
+                    allow_private,
+                )
+                .await?;
 
-                guard_upstream(&host, port, tls, allow_private).await?;
-
-                lb.record_connect(target_idx);
-                ctx.lb_target_idx = Some(target_idx);
+                begin_load_balancer_attempt(ctx, load_balancer_action_key, &selection);
 
                 debug!(
                     hostname = %ctx.hostname,
-                    upstream_host = %host,
-                    upstream_port = %port,
-                    tls = %tls,
-                    target_idx = %target_idx,
+                    upstream_host = %selection.host,
+                    upstream_port = %selection.port,
+                    tls = %selection.tls,
+                    target_idx = %selection.target_index,
+                    selection_method = %selection.selection_method,
                     "load balancer routing request to upstream"
                 );
 
-                let addr = format!("{host}:{port}");
-                let peer = tune_peer(HttpPeer::new(&*addr, tls, host));
+                let addr = format!("{}:{}", selection.host, selection.port);
+                let peer = tune_peer(HttpPeer::new(&*addr, selection.tls, selection.host));
                 Ok(Box::new(peer))
             }
             Action::A2a(a2a) => {
@@ -539,6 +1346,13 @@ impl ProxyHttp for SbProxy {
     where
         Self::CTX: Send + Sync,
     {
+        let is_realtime = ctx.ai_realtime_dispatch.is_some();
+        let realtime_inbound_key_headers = if is_realtime {
+            realtime_inbound_carrier_names(ctx)
+        } else {
+            Vec::new()
+        };
+
         // Collect header modifications into owned Vecs, then drop the pipeline
         // guard before calling Pingora's insert_header (requires 'static borrows).
         let mut req_to_set: Vec<(String, String)> = Vec::new();
@@ -548,6 +1362,7 @@ impl ProxyHttp for SbProxy {
         let mut advanced_modifiers: Vec<sbproxy_config::RequestModifierConfig> = Vec::new();
         let mut upstream_url_path: Option<String> = None;
         let mut upstream_host_header: Option<String> = None;
+        let mut upstream_scheme: Option<String> = None;
         let mut disable_forwarded_host: bool = false;
         let mut forwarding = ForwardingHeaderControls::default();
         // WOR-802: outbound credential resolver config for this origin,
@@ -556,6 +1371,11 @@ impl ProxyHttp for SbProxy {
         let mut outbound_cred: Option<
             sbproxy_modules::auth::outbound_credential::OutboundCredentialConfig,
         > = None;
+        let mut dpop_resource: Option<(
+            std::sync::Arc<sbproxy_modules::auth::dpop_outbound::DpopRuntime>,
+            String,
+        )> = None;
+        let mut realtime_provider_auth: Option<RealtimeCredential> = None;
         // WOR-805: outbound Web Bot Auth signer + Signature-Agent for
         // this origin, cloned (Arc) out of the pipeline so they outlive
         // the pipeline guard dropped below.
@@ -647,6 +1467,27 @@ impl ProxyHttp for SbProxy {
                 } else {
                     &pipeline.actions[idx]
                 };
+                if let (Some(dispatch), Action::AiProxy(ai)) =
+                    (ctx.ai_realtime_dispatch.as_ref(), effective_action)
+                {
+                    realtime_provider_auth = ai
+                        .config
+                        .providers
+                        .iter()
+                        .find(|provider| provider.name.as_str() == dispatch.provider_name)
+                        .and_then(|provider| {
+                            if ctx.inbound_key_mode != crate::context::InboundKeyMode::Native {
+                                return realtime_provider_credential(provider);
+                            }
+                            let native_provider = ctx.native_key_provider.as_deref()?;
+                            realtime_native_provider_credential_for_pipeline(
+                                provider,
+                                &session.req_header().headers,
+                                &pipeline,
+                                native_provider,
+                            )
+                        });
+                }
 
                 // WOR-819: REST -> gRPC transcoding. When the resolved
                 // grpc action carries a compiled transcoder and the
@@ -688,6 +1529,19 @@ impl ProxyHttp for SbProxy {
                 // upstreams (Vercel, Cloudflare, AWS ALB, K8s ingresses) reject
                 // the request because the client's Host header was forwarded
                 // verbatim.
+                let selected_upstream_url = match effective_action {
+                    Action::Proxy(action) => Some(action.url.as_str()),
+                    Action::LoadBalancer(action) => active_load_balancer_target_index(ctx)
+                        .and_then(|index| action.targets.get(index))
+                        .map(|target| target.url.as_str()),
+                    Action::WebSocket(action) => Some(action.url.as_str()),
+                    Action::Grpc(action) => Some(action.url.as_str()),
+                    Action::A2a(action) => Some(action.url.as_str()),
+                    Action::GraphQL(action) => Some(action.url.as_str()),
+                    _ => None,
+                };
+                upstream_scheme =
+                    selected_upstream_url.and_then(|url| parsed_upstream_url(url).scheme.clone());
                 let mut fc = ForwardingHeaderControls::default();
                 upstream_host_header = match effective_action {
                     Action::Proxy(p) => {
@@ -696,8 +1550,7 @@ impl ProxyHttp for SbProxy {
                             .clone()
                             .or_else(|| parsed_upstream_url(&p.url).host.clone())
                     }
-                    Action::LoadBalancer(lb) => ctx
-                        .lb_target_idx
+                    Action::LoadBalancer(lb) => active_load_balancer_target_index(ctx)
                         .and_then(|i| lb.targets.get(i))
                         .and_then(|t| {
                             fc = t.forwarding;
@@ -987,6 +1840,14 @@ impl ProxyHttp for SbProxy {
         // request. Always strip any inbound X-Client-Cert-* headers
         // from the client first so a non-TLS client cannot forge
         // them.
+        // The header a minted virtual key arrived in is consumed here. The
+        // proxy's own key is not an upstream credential, and forwarding it
+        // would hand a governed secret to every origin the proxy talks to.
+        // Same reasoning as the X-Client-Cert-* strip below.
+        if let Some(header) = ctx.inbound_key_header.as_deref() {
+            upstream_request.remove_header(header);
+        }
+
         upstream_request.remove_header("x-client-cert-verified");
         upstream_request.remove_header("x-client-cert-cn");
         upstream_request.remove_header("x-client-cert-san");
@@ -1074,10 +1935,100 @@ impl ProxyHttp for SbProxy {
         // secrets are already `${ENV}`-interpolated at load, so the
         // request-path secret lookup is identity. Minted tokens are
         // cached (by origin + subject) until they near expiry. On
-        // failure we fail open: the request goes upstream without the
-        // minted credential (the upstream rejects it) rather than the
-        // proxy 500ing; a fail-closed flag can follow.
-        if let Some(cred_cfg) = outbound_cred.as_ref() {
+        // resolver failure for a legacy non-DPoP credential fails open:
+        // the request goes upstream without the minted credential (the
+        // upstream rejects it). DPoP failures and rejected credential
+        // headers fail closed because continuing could forward the caller's
+        // identity without the configured sender constraint.
+        // A credential bound to the resolved minted key wins, and SUPPRESSES
+        // the origin-level resolver rather than running it and overwriting the
+        // result. Two concrete reasons: the origin's `token_exchange` mode
+        // makes a network round-trip per request, and it reads the inbound
+        // bearer as the RFC 8693 subject token, which the inbound-key phase
+        // may have just stripped. Running it here would burn a call and
+        // exchange against a subject that is no longer present.
+        let bound_credential_id = ctx
+            .resolved_inbound_key
+            .as_deref()
+            .and_then(|record| record.credential_id.clone());
+        let origin_dpop_enabled = !is_realtime
+            && outbound_cred
+                .as_ref()
+                .is_some_and(|credential| credential.is_dpop_enabled());
+        if origin_dpop_enabled {
+            // Never forward a caller-supplied proof as the proxy's proof.
+            upstream_request.remove_header("dpop");
+        }
+        if let Err(error) =
+            ensure_dpop_credential_source(bound_credential_id.as_deref(), origin_dpop_enabled)
+        {
+            warn!(
+                origin = %ctx.hostname,
+                error = %error,
+                "bound credential conflicts with origin DPoP; refusing the request"
+            );
+            return Err(pingora_error::Error::explain(
+                pingora_error::ErrorType::HTTPStatus(503),
+                "bound credential cannot satisfy origin DPoP",
+            ));
+        }
+
+        let mut realtime_bound_auth: Option<RealtimeCredential> = None;
+        if let Some(credential_id) = bound_credential_id {
+            let Some(plane) = ctx.pipeline.key_plane().cloned() else {
+                warn!(
+                    credential_id = %credential_id,
+                    "a key binds a credential but no key plane is installed"
+                );
+                return Err(pingora_error::Error::explain(
+                    pingora_error::ErrorType::HTTPStatus(503),
+                    "credential resolution unavailable",
+                ));
+            };
+            let tenant = ctx
+                .resolved_inbound_key
+                .as_deref()
+                .and_then(|record| record.tenant_id.clone());
+            match plane
+                .resolve_credential_secret(&credential_id, tenant.as_deref())
+                .await
+            {
+                Ok(resolved) => {
+                    if is_realtime {
+                        realtime_bound_auth = Some(RealtimeCredential {
+                            header: resolved.header,
+                            value: resolved.value,
+                        });
+                    } else {
+                        insert_outbound_credential_header(
+                            upstream_request,
+                            resolved.header,
+                            &resolved.value,
+                        )?;
+                    }
+                }
+                Err(e) => {
+                    // Fail CLOSED, unlike the origin-level resolver below.
+                    // That one fails open because a failed mint there just
+                    // means the upstream rejects the request. Here a
+                    // wrong-credential path is available, and taking it would
+                    // hand this key an upstream identity it was never bound
+                    // to.
+                    warn!(
+                        origin = %ctx.hostname,
+                        credential_id = %credential_id,
+                        error = %e,
+                        "bound credential could not be resolved; refusing the request"
+                    );
+                    return Err(pingora_error::Error::explain(
+                        pingora_error::ErrorType::HTTPStatus(503),
+                        "bound credential unavailable",
+                    ));
+                }
+            }
+        } else if let Some(cred_cfg) = outbound_cred.as_ref().filter(|_| {
+            !is_realtime && ctx.inbound_key_mode != crate::context::InboundKeyMode::Native
+        }) {
             let inbound_bearer: Option<String> = session
                 .req_header()
                 .headers
@@ -1099,10 +2050,48 @@ impl ProxyHttp for SbProxy {
             .await
             {
                 Ok(minted) => {
-                    let _ =
-                        upstream_request.insert_header(minted.header_name, &minted.header_value);
+                    let dpop_access_token = minted.dpop_access_token().map(str::to_string);
+                    insert_outbound_credential_header(
+                        upstream_request,
+                        minted.header_name,
+                        &minted.header_value,
+                    )?;
+                    if cred_cfg.is_dpop_enabled() {
+                        let access_token = dpop_access_token.ok_or_else(|| {
+                            pingora_error::Error::explain(
+                                pingora_error::ErrorType::HTTPStatus(503),
+                                "DPoP credential did not contain a DPoP access token",
+                            )
+                        })?;
+                        let runtime = cred_cfg
+                            .dpop_runtime()
+                            .map_err(|_| {
+                                pingora_error::Error::explain(
+                                    pingora_error::ErrorType::HTTPStatus(503),
+                                    "DPoP signer unavailable",
+                                )
+                            })?
+                            .ok_or_else(|| {
+                                pingora_error::Error::explain(
+                                    pingora_error::ErrorType::HTTPStatus(503),
+                                    "DPoP signer unavailable",
+                                )
+                            })?;
+                        dpop_resource = Some((runtime, access_token));
+                    }
                 }
                 Err(e) => {
+                    if cred_cfg.is_dpop_enabled() {
+                        warn!(
+                            origin = %ctx.hostname,
+                            error = %e,
+                            "outbound DPoP credential resolution failed; refusing the request"
+                        );
+                        return Err(pingora_error::Error::explain(
+                            pingora_error::ErrorType::HTTPStatus(503),
+                            "outbound DPoP credential unavailable",
+                        ));
+                    }
                     warn!(
                         origin = %ctx.hostname,
                         error = %e,
@@ -1111,10 +2100,33 @@ impl ProxyHttp for SbProxy {
                 }
             }
         }
+        let realtime_credential_headers = realtime_credential_headers(
+            realtime_bound_auth.as_ref(),
+            realtime_provider_auth.as_ref(),
+            outbound_cred.as_ref(),
+        );
+        let realtime_auth = if is_realtime {
+            Some(
+                choose_realtime_credential(realtime_bound_auth, realtime_provider_auth).map_err(
+                    |_| {
+                        warn!(
+                            origin = %ctx.hostname,
+                            "AI realtime credential unavailable; refusing the request"
+                        );
+                        pingora_error::Error::explain(
+                            pingora_error::ErrorType::HTTPStatus(503),
+                            "realtime credential unavailable",
+                        )
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
 
         // Apply Lua script request modifiers
         for script in &lua_scripts {
-            match lua_request_modifier(script, session.req_header(), &ctx.hostname) {
+            match lua_request_modifier(script, session.req_header(), ctx) {
                 Ok(headers_to_set) => {
                     for (key, value) in headers_to_set {
                         let _ = upstream_request.insert_header(key, &value);
@@ -1124,6 +2136,22 @@ impl ProxyHttp for SbProxy {
                     warn!(error = %e, "Lua request modifier script error");
                 }
             }
+        }
+
+        if let Some(model_override) = ctx
+            .ai_realtime_dispatch
+            .as_ref()
+            .and_then(|dispatch| dispatch.model_override.as_deref())
+        {
+            let rewritten = replace_realtime_model_query(&upstream_request.uri, model_override)
+                .map_err(|error| {
+                    pingora_error::Error::because(
+                        pingora_error::ErrorType::InternalError,
+                        "failed to apply realtime model override",
+                        error,
+                    )
+                })?;
+            upstream_request.set_uri(rewritten);
         }
 
         // --- Distributed tracing: inject child traceparent into upstream request ---
@@ -1190,23 +2218,225 @@ impl ProxyHttp for SbProxy {
             }
         }
 
+        // Validate GraphQL only after every request modifier has produced the
+        // outbound method, URI, headers, and replacement body. This closes the
+        // gap where a benign client document could pass validation and then
+        // be rewritten into a forbidden request before proxying.
+        if ctx.graphql_validation_pending {
+            ctx.graphql_validated_request_body = None;
+            let pipeline = ctx.pipeline.clone();
+            let (validation_result, validated_request_body) = if let Some(origin_idx) =
+                ctx.origin_idx
+            {
+                let forwarded_action = ctx.forward_rule_idx.and_then(|forward_idx| {
+                    pipeline
+                        .forward_rules
+                        .get(origin_idx)
+                        .and_then(|rules| rules.get(forward_idx))
+                        .map(|rule| &rule.action)
+                });
+                let effective_action =
+                    forwarded_action.or_else(|| pipeline.actions.get(origin_idx));
+                match effective_action {
+                    Some(Action::GraphQL(graphql)) => match upstream_request.method {
+                        http::Method::GET => {
+                            let has_replacement_body = ctx
+                                .replacement_request_body
+                                .as_ref()
+                                .is_some_and(|body| !body.is_empty());
+                            let has_inbound_body = ctx
+                                .graphql_request_body
+                                .as_ref()
+                                .is_some_and(|body| !body.is_empty());
+                            if has_replacement_body || has_inbound_body {
+                                (
+                                    Err("validated GraphQL GET requests must not contain a body"
+                                        .to_string()),
+                                    None,
+                                )
+                            } else {
+                                (
+                                    graphql.validate_get_query(upstream_request.uri.query()),
+                                    None,
+                                )
+                            }
+                        }
+                        http::Method::POST => {
+                            let content_type = upstream_request
+                                .headers
+                                .get(http::header::CONTENT_TYPE)
+                                .and_then(|value| value.to_str().ok());
+                            let body = ctx
+                                .replacement_request_body
+                                .clone()
+                                .or_else(|| ctx.graphql_request_body.clone())
+                                .unwrap_or_default();
+                            (graphql.validate_post_body(content_type, &body), Some(body))
+                        }
+                        _ => (
+                            Err("validated GraphQL actions accept GET or POST only".to_string()),
+                            None,
+                        ),
+                    },
+                    _ => (
+                        Err("validated GraphQL action is no longer available".to_string()),
+                        None,
+                    ),
+                }
+            } else {
+                (
+                    Err("validated GraphQL action has no resolved origin".to_string()),
+                    None,
+                )
+            };
+
+            if let Err(detail) = validation_result {
+                debug!(detail = %detail, "GraphQL request validation failed");
+                let body = serde_json::json!({
+                    "error": "GraphQL request validation failed",
+                    "detail": detail,
+                })
+                .to_string();
+                ctx.validator_failed = Some((400, body, "application/json".to_string()));
+                return Err(pingora_error::Error::explain(
+                    pingora_error::ErrorType::HTTPStatus(400),
+                    "GraphQL request validation failed",
+                ));
+            }
+            ctx.graphql_validated_request_body = validated_request_body;
+
+            // A body-bound inbound signature authenticates the bytes the
+            // client sent, before a request modifier replaces them. Complete
+            // that proof before an idempotency hit can short-circuit.
+            let inbound_body = ctx.graphql_request_body.clone().unwrap_or_default();
+            if !verify_graphql_inbound_body_binding(
+                &session.req_header().headers,
+                &inbound_body,
+                ctx,
+            ) {
+                let body = serde_json::json!({
+                    "error": "bot_auth: content-digest body mismatch",
+                })
+                .to_string();
+                ctx.validator_failed = Some((401, body, "application/json".to_string()));
+                return Err(pingora_error::Error::explain(
+                    pingora_error::ErrorType::HTTPStatus(401),
+                    "bot_auth: content-digest body binding failed",
+                ));
+            }
+
+            let authoritative_body = ctx
+                .graphql_validated_request_body
+                .clone()
+                .unwrap_or_default();
+            if engage_validated_graphql_idempotency(
+                &session.req_header().headers,
+                &upstream_request.method,
+                &authoritative_body,
+                ctx,
+            ) {
+                return Err(pingora_error::Error::explain(
+                    pingora_error::ErrorType::InternalError,
+                    "validated GraphQL idempotency response",
+                ));
+            }
+        }
+
+        // Mint at the final outbound request seam. Every URI/method/header
+        // rewrite and GraphQL validation has completed, and retries re-enter
+        // this hook, so each attempt receives a fresh proof.
+        ctx.outbound_dpop_active = false;
+        ctx.outbound_dpop_htu = None;
+        if let Some((runtime, access_token)) = dpop_resource {
+            let final_access_token = final_dpop_access_token(upstream_request, &access_token)
+                .map_err(|_| {
+                    pingora_error::Error::explain(
+                        pingora_error::ErrorType::HTTPStatus(503),
+                        "outbound DPoP authorization header was modified",
+                    )
+                })?;
+            let scheme = upstream_scheme.as_deref().ok_or_else(|| {
+                pingora_error::Error::explain(
+                    pingora_error::ErrorType::HTTPStatus(503),
+                    "outbound DPoP upstream scheme unavailable",
+                )
+            })?;
+            let htu = dpop_resource_htu(scheme, upstream_request).map_err(|_| {
+                pingora_error::Error::explain(
+                    pingora_error::ErrorType::HTTPStatus(503),
+                    "outbound DPoP target unavailable",
+                )
+            })?;
+            let proof = runtime
+                .mint_resource_proof(upstream_request.method.as_str(), &htu, final_access_token)
+                .map_err(|_| {
+                    pingora_error::Error::explain(
+                        pingora_error::ErrorType::HTTPStatus(503),
+                        "outbound DPoP proof minting failed",
+                    )
+                })?;
+            upstream_request
+                .insert_header("dpop", &proof)
+                .map_err(|_| {
+                    pingora_error::Error::explain(
+                        pingora_error::ErrorType::HTTPStatus(503),
+                        "outbound DPoP proof header rejected",
+                    )
+                })?;
+            ctx.outbound_dpop_active = true;
+            ctx.outbound_dpop_htu = Some(htu);
+        }
+
+        // Credential authority is the final outbound-header seam. Caller,
+        // configured modifier, Lua, tracing, and signature headers have all
+        // been applied; scrub every known carrier before installing exactly
+        // one selected provider credential.
+        if let Some(credential) = realtime_auth.as_ref() {
+            apply_realtime_credential(
+                upstream_request,
+                credential,
+                &realtime_inbound_key_headers,
+                &realtime_credential_headers,
+            )?;
+        }
+
+        if is_realtime {
+            commit_realtime_quota_attempt(ctx).await?;
+        }
+
         Ok(())
     }
 
-    /// Inspect upstream response headers before cache/downstream handling.
+    /// Decide whether to discard the upstream response and retry.
     ///
-    /// Status-code retries are decided here so a retryable upstream
-    /// response can be discarded before headers are written to the
-    /// downstream client.
-    async fn upstream_response_filter(
+    /// Runs once per upstream response, right after
+    /// `upstream_response_filter` and before any bytes reach the
+    /// downstream client. Status-code retries are decided here:
+    /// returning an error with `set_retry(true)` makes Pingora drop
+    /// the upstream connection and re-run `upstream_peer`, exactly
+    /// like a connect-time retry. Request-body replay is gated by
+    /// Pingora's retry buffer; a matching status the proxy cannot
+    /// safely replay passes through with `x-sbproxy-retry-skip-reason`.
+    async fn upstream_response_decision(
         &self,
         session: &mut Session,
-        upstream_response: &mut ResponseHeader,
+        upstream_response: &ResponseHeader,
         ctx: &mut Self::CTX,
-    ) -> Result<()>
+    ) -> Option<Box<Error>>
     where
         Self::CTX: Send + Sync,
     {
+        capture_load_balancer_upstream_response(ctx, upstream_response);
+        let dpop_nonce_challenge =
+            ctx.outbound_dpop_active && dpop_resource_nonce_challenge_present(upstream_response);
+        if let Some(error) = maybe_retry_dpop_nonce(session, upstream_response, ctx) {
+            return Some(error);
+        }
+        if dpop_nonce_challenge {
+            // The RFC 9449 retry has its own exact one-attempt budget.
+            // Never let a generic status retry multiply it.
+            return None;
+        }
         maybe_retry_upstream_status(session, upstream_response, ctx).await
     }
 
@@ -1233,6 +2463,15 @@ impl ProxyHttp for SbProxy {
         // Set unconditionally because a single request only enters
         // this hook once per upstream response.
         ctx.upstream_first_byte_at = Some(std::time::Instant::now());
+
+        // WOR-2145: snapshot the response headers the attestation config
+        // meters, before this hook starts rewriting headers of its own.
+        // The evidence on a receipt has to be what the origin actually
+        // sent: a value read after the proxy edited it would be the
+        // proxy quoting itself and calling it the upstream's claim.
+        // A no-op unless this origin writes receipts and declares
+        // origin-header rules.
+        crate::meter_runtime::capture_origin_headers(ctx, upstream_response);
 
         // --- WOR-808: RSL `Link: rel="license"` discovery header ---
         //
@@ -1950,7 +3189,7 @@ impl ProxyHttp for SbProxy {
                         let resp_headers = upstream_response.headers.clone();
                         for policy in policies {
                             if let Policy::Assertion(a) = policy {
-                                let passed = a.evaluate(
+                                let passed = a.evaluate_with_trust_tier(
                                     &method,
                                     &path,
                                     &req_headers,
@@ -1960,6 +3199,7 @@ impl ProxyHttp for SbProxy {
                                     resp_status,
                                     &resp_headers,
                                     None,
+                                    Some(ctx.trust_tier.as_str()),
                                 );
                                 if passed {
                                     tracing::info!(
@@ -2054,30 +3294,15 @@ impl ProxyHttp for SbProxy {
             }
         }
 
-        // Capture response status for metrics in the logging phase.
-        ctx.response_status = Some(upstream_response.status.as_u16());
-
-        // --- Outlier detection + circuit breaker: per-target signals ---
-        // 5xx counts as a failure for both the sliding-window outlier
-        // detector and the formal circuit breaker. Earlier phases
-        // already record connect/timeout failures via Pingora's
-        // upstream error path; here we capture application-level
-        // errors from the response itself.
-        if let Some(target_idx) = ctx.lb_target_idx {
-            let pipeline_o = ctx.pipeline.clone();
-            if let Some(origin_idx) = ctx.origin_idx {
-                if let Some(Action::LoadBalancer(lb)) = pipeline_o.actions.get(origin_idx) {
-                    let status = upstream_response.status.as_u16();
-                    if status >= 500 {
-                        lb.record_target_failure(target_idx);
-                        lb.record_breaker_failure(target_idx);
-                    } else {
-                        lb.record_target_success(target_idx);
-                        lb.record_breaker_success(target_idx);
-                    }
-                }
-            }
+        // Capture response status for metrics in the logging phase. A
+        // realtime dispatch becomes an active session only once the provider
+        // accepts the WebSocket handshake.
+        let response_status = upstream_response.status.as_u16();
+        if ctx.ai_realtime_dispatch.is_some() && realtime_response_accepts_session(response_status)
+        {
+            sbproxy_ai::ai_metrics::inc_realtime_sessions_active();
         }
+        ctx.response_status = Some(response_status);
 
         // --- Distributed tracing: echo traceparent/tracestate to downstream client ---
         if let Some(ref trace_ctx) = ctx.trace_ctx {
@@ -2339,6 +3564,43 @@ impl ProxyHttp for SbProxy {
             }
         }
 
+        // --- WOR-2145: refuse rather than serve work we cannot bill ---
+        //
+        // This is the last point at which the meter can refuse anything.
+        // The receipt itself is cut in `logging`, which runs after the
+        // response has been written and cannot recall a single byte, so
+        // `failure_mode: closed` has to make its decision here, on the
+        // strength of whether the chain is writable at all.
+        //
+        // Rewriting the status is not enough on its own. The body is
+        // suppressed in `response_body_filter` through `meter_refused`,
+        // because a 503 delivered with the upstream's body attached
+        // hands the buyer exactly the value the seller has just declared
+        // itself unable to record.
+        //
+        // Only `closed` reaches this branch. `degraded`, `open`, and
+        // `observe` all admit, and each leaves its own kind of trace
+        // when the receipt is cut.
+        if crate::meter_runtime::preflight_refuses(ctx) {
+            ctx.meter_refused = true;
+            ctx.response_status = Some(503);
+            upstream_response
+                .set_status(http::StatusCode::SERVICE_UNAVAILABLE)
+                .ok();
+            // A suppressed body is an empty body, and it has to say so.
+            // Leaving the upstream's framing in place would advertise
+            // bytes that are never sent and hang the client waiting for
+            // them.
+            upstream_response.remove_header("content-encoding");
+            upstream_response.remove_header("transfer-encoding");
+            let _ = upstream_response.insert_header("content-length", "0");
+            tracing::warn!(
+                tenant_id = %ctx.tenant_id,
+                host = %ctx.hostname,
+                "attestation: refusing under failure_mode closed; the receipt chain is not writable"
+            );
+        }
+
         // Phase-timing capture: snapshot the moment response_filter
         // returns. Paired with `ctx.upstream_first_byte_at` (set at
         // the top of this hook), this is the response-filter phase
@@ -2362,6 +3624,12 @@ impl ProxyHttp for SbProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // For validated GraphQL POSTs, replace the inbound replay stream
+        // before every downstream consumer. This is deliberately first:
+        // request limits, body policies, idempotency, and byte accounting must
+        // all agree with the exact bytes that can reach upstream.
+        emit_graphql_validated_request_body(body, end_of_stream, ctx);
+
         // Track total request body bytes for the access log /
         // billing / ML pipeline. Always-on; the size-limit policy
         // below tracks its own counter so the cap is enforced
@@ -2396,6 +3664,115 @@ impl ProxyHttp for SbProxy {
                         pingora_error::ErrorType::HTTPStatus(413),
                         "request body exceeded max_body_size",
                     ));
+                }
+            }
+        }
+
+        // --- Origin-level JSON threat protection ---
+        //
+        // request_filter marks threat-protected requests but must not read
+        // their bodies: doing so drains the downstream stream before Pingora
+        // can send it upstream. Hold JSON candidates here, enforce a bounded
+        // buffer while chunks arrive, scan the complete representation at
+        // end-of-stream, then release the exact bytes on success. A clearly
+        // non-JSON body is released as soon as its first non-whitespace byte
+        // is available.
+        if ctx.threat_scan_pending {
+            const THREAT_SCAN_HARD_CAP: usize = 8 * 1024 * 1024;
+
+            let pipeline = ctx.pipeline.clone();
+            let threat = ctx
+                .origin_idx
+                .and_then(|idx| pipeline.threat_protections.get(idx))
+                .and_then(Option::as_ref)
+                .filter(|threat| threat.enabled);
+
+            if let Some(threat) = threat {
+                let declared_json = session
+                    .req_header()
+                    .headers
+                    .get(http::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value.contains("application/json"));
+                let size_cap = threat
+                    .json
+                    .as_ref()
+                    .and_then(|json| json.max_total_size)
+                    .unwrap_or(THREAT_SCAN_HARD_CAP);
+                let buf = ctx
+                    .request_body_buf
+                    .get_or_insert_with(bytes::BytesMut::new);
+                let incoming_len = body.as_ref().map_or(0, Bytes::len);
+                let first_non_whitespace = buf
+                    .iter()
+                    .chain(body.as_ref().into_iter().flat_map(|chunk| chunk.iter()))
+                    .find(|byte| !byte.is_ascii_whitespace())
+                    .copied();
+                let looks_json = matches!(first_non_whitespace, Some(b'{' | b'['));
+                let json_candidate = declared_json || looks_json || first_non_whitespace.is_none();
+
+                if json_candidate && buf.len().saturating_add(incoming_len) > size_cap {
+                    debug!("threat protection blocked request: body exceeds size cap");
+                    ctx.validator_failed = Some((
+                        413,
+                        error_json_body("request entity too large"),
+                        "application/json".to_string(),
+                    ));
+                    *body = None;
+                    return Err(pingora_error::Error::explain(
+                        pingora_error::ErrorType::HTTPStatus(413),
+                        "threat protection body exceeded size cap",
+                    ));
+                }
+
+                if let Some(chunk) = body.take() {
+                    buf.extend_from_slice(&chunk);
+                }
+
+                if !json_candidate {
+                    let collected = ctx.request_body_buf.take().unwrap_or_default();
+                    ctx.threat_scan_pending = false;
+                    if !collected.is_empty() {
+                        *body = Some(collected.freeze());
+                    }
+                } else if end_of_stream {
+                    let collected = ctx.request_body_buf.take().unwrap_or_default();
+                    ctx.threat_scan_pending = false;
+                    if !collected.is_empty() {
+                        if let Err(detail) = threat.check_json_body(&collected) {
+                            debug!(detail = %detail, "threat protection blocked request");
+                            ctx.validator_failed = Some((
+                                413,
+                                error_json_body("request entity too large"),
+                                "application/json".to_string(),
+                            ));
+                            return Err(pingora_error::Error::explain(
+                                pingora_error::ErrorType::HTTPStatus(413),
+                                "threat protection rejected request body",
+                            ));
+                        }
+                        *body = Some(collected.freeze());
+                    }
+                } else {
+                    // Hold JSON candidates until the complete body can be
+                    // scanned; `hold_request_body_chunk` documents why the
+                    // slot must not be left `None`. Other body consumers
+                    // receive the released representation after this branch
+                    // completes.
+                    hold_request_body_chunk(body);
+                    return Ok(());
+                }
+            } else {
+                // A hot reload may remove threat protection after the
+                // request phase. Do not strand the request body in that case.
+                ctx.threat_scan_pending = false;
+                if let Some(mut buffered) = ctx.request_body_buf.take() {
+                    if let Some(chunk) = body.take() {
+                        buffered.extend_from_slice(&chunk);
+                    }
+                    if !buffered.is_empty() {
+                        *body = Some(buffered.freeze());
+                    }
                 }
             }
         }
@@ -2571,23 +3948,73 @@ impl ProxyHttp for SbProxy {
         // --- Accumulate body for the request validator ---
         //
         // While `validate_request_body` is set we buffer every chunk
-        // locally and emit `None` to Pingora, so the upstream does
-        // not see a partial body until validation passes. On
-        // end-of-stream we run all matching `RequestValidator`
-        // policies; on success we release the buffered bytes as a
-        // single chunk to the upstream. On failure we record a
-        // status + body for the response phase, signal the validator
-        // failure via `validator_failed`, and emit `None` so the
-        // upstream is not contacted.
+        // locally and emit an empty chunk to Pingora (see
+        // `hold_request_body_chunk`), so the upstream does not see a
+        // partial body until validation passes. On end-of-stream we
+        // run all matching `RequestValidator` policies; on success we
+        // release the buffered bytes as a single chunk to the
+        // upstream. On failure we record a status + body for the
+        // response phase, signal the validator failure via
+        // `validator_failed`, and emit `None` so the upstream is not
+        // contacted.
         if ctx.validate_request_body {
+            // Mirror of THREAT_SCAN_HARD_CAP above: the validator
+            // accumulator is the other buffer-then-release dance in
+            // this filter and gets the same bound, so a client that
+            // streams an oversize or unterminated body cannot grow
+            // proxy memory with it (WOR-2137). Overflow takes the same
+            // exit as the threat-scan cap: reject with 413 before the
+            // chunk is buffered, never run the validators, never
+            // contact the upstream.
+            const VALIDATE_BODY_HARD_CAP: usize = 8 * 1024 * 1024;
+
             let buf = ctx
                 .request_body_buf
                 .get_or_insert_with(bytes::BytesMut::new);
+            let incoming_len = body.as_ref().map_or(0, Bytes::len);
+            if buf.len().saturating_add(incoming_len) > VALIDATE_BODY_HARD_CAP {
+                debug!(
+                    received = buf.len().saturating_add(incoming_len),
+                    cap = VALIDATE_BODY_HARD_CAP,
+                    "request body validation blocked request: body exceeds buffering cap"
+                );
+                ctx.validator_failed = Some((
+                    413,
+                    error_json_body("request entity too large"),
+                    "application/json".to_string(),
+                ));
+                *body = None;
+                return Err(pingora_error::Error::explain(
+                    pingora_error::ErrorType::HTTPStatus(413),
+                    "request body validation exceeded buffering cap",
+                ));
+            }
             if let Some(chunk) = body.take() {
                 buf.extend_from_slice(&chunk);
             }
             if end_of_stream {
                 let collected = ctx.request_body_buf.take().unwrap_or_default();
+                // A verified header signature that covers content-digest is
+                // provisional until the complete pre-transform body arrives.
+                // Authenticate that body before any validator can short
+                // circuit so a mismatch is always attributed to the failed
+                // proof and never reaches the upstream.
+                if !crate::trust_tier::verify_and_finalize_body_proof(
+                    ctx,
+                    &session.req_header().headers,
+                    &collected,
+                ) {
+                    debug!("bot_auth content-digest body binding check failed; rejecting request");
+                    let body_str = serde_json::json!({
+                        "error": "bot_auth: content-digest body mismatch",
+                    })
+                    .to_string();
+                    ctx.validator_failed = Some((401, body_str, "application/json".into()));
+                    return Err(pingora_error::Error::explain(
+                        pingora_error::ErrorType::HTTPStatus(401),
+                        "bot_auth: content-digest body binding failed",
+                    ));
+                }
                 let pipeline = ctx.pipeline.clone();
                 let content_type = session
                     .req_header()
@@ -2596,6 +4023,49 @@ impl ProxyHttp for SbProxy {
                     .and_then(|v| v.to_str().ok())
                     .map(|s| s.to_string());
                 let mut failed: Option<(u16, String, String)> = None;
+                let mut graphql_content_digest_body = None;
+                let mut graphql_content_digest_body_taken = false;
+                let content_digest_uses_graphql_original = ctx.graphql_validation_pending;
+                // WOR-2118: parse the agent-to-agent envelope once,
+                // before the policy loop, so the `a2a` arm and the
+                // prompt-injection arm read one structure rather than
+                // each re-parsing the body. `ctx.a2a` is the envelope
+                // the A2A enforcer resolved, which is not the same as
+                // the one header detection stamped: it also carries the
+                // operator's `route_glob` match and the verified `act`
+                // chain overlay.
+                //
+                // The identifiers are cloned rather than borrowed
+                // because the loop below mutates `ctx`, and they are
+                // cloned only when the body actually parsed as A2A so a
+                // plain validated POST pays nothing for this.
+                let a2a_ctx = ctx.a2a.clone();
+                let a2a_v1 = a2a_ctx
+                    .as_ref()
+                    .filter(|c| c.spec == sbproxy_modules::A2ASpec::V1_0)
+                    .and_then(|_| sbproxy_modules::a2a_v1::parse_request(&collected));
+                let a2a_idents = a2a_v1.as_ref().map(|_| {
+                    (
+                        ctx.hostname.to_string(),
+                        ctx.request_id.to_string(),
+                        ctx.tenant_id.to_string(),
+                    )
+                });
+                // WOR-2139: capture the run correlation id off the same
+                // parse. `params.contextId` groups every hop of one
+                // multi-agent run, and this is the first phase where it
+                // exists: the request filter builds the A2A envelope
+                // from headers, which do not carry it. Stamped on the
+                // context so the terminal surfaces (access log, and any
+                // span opened later in the request) all read one bounded
+                // value. Nothing is added to the upstream request here,
+                // because `upstream_request_filter` already ran.
+                if let Some(context_id) = a2a_v1
+                    .as_ref()
+                    .and_then(crate::server::a2a_body_phase::run_context_id)
+                {
+                    ctx.a2a_context_id = Some(context_id);
+                }
                 if let Some(origin_idx) = ctx.origin_idx {
                     if let Some(policies) = pipeline.policies.get(origin_idx) {
                         for policy in policies {
@@ -2621,16 +4091,28 @@ impl ProxyHttp for SbProxy {
                                     }
                                 }
                                 Policy::ContentDigest(cd) => {
-                                    // WOR-805: verify inbound RFC 9530
-                                    // `Content-Digest` against the
-                                    // buffered request body. IMPORTANT:
-                                    // this arm runs BEFORE any
-                                    // request-body modifier
-                                    // (transcoders, body modifiers).
-                                    // The digest applies to the
-                                    // pre-transform bytes, so the
-                                    // ordering must not be swapped.
-                                    if collected.len() > cd.max_body_bytes {
+                                    // RFC 9530 digests bind the inbound
+                                    // representation. A validated GraphQL
+                                    // modifier makes `collected` authoritative
+                                    // for every downstream consumer, but the
+                                    // digest alone must inspect the saved
+                                    // pre-transform bytes. Take that slot once
+                                    // at EOS and reuse it if configuration
+                                    // contains more than one digest policy.
+                                    if !graphql_content_digest_body_taken {
+                                        graphql_content_digest_body =
+                                            ctx.graphql_request_body.take();
+                                        graphql_content_digest_body_taken = true;
+                                    }
+                                    let representation_body =
+                                        if content_digest_uses_graphql_original {
+                                            graphql_content_digest_body
+                                                .as_deref()
+                                                .unwrap_or_default()
+                                        } else {
+                                            &collected
+                                        };
+                                    if representation_body.len() > cd.max_body_bytes {
                                         // Mirror the request_limit
                                         // pattern: reject 413 the
                                         // moment the cap is exceeded.
@@ -2638,7 +4120,7 @@ impl ProxyHttp for SbProxy {
                                             "error": "request body exceeds content_digest max_body_bytes",
                                             "detail": format!(
                                                 "body length {} > cap {}",
-                                                collected.len(),
+                                                representation_body.len(),
                                                 cd.max_body_bytes
                                             ),
                                         })
@@ -2662,7 +4144,7 @@ impl ProxyHttp for SbProxy {
                                         .get("content-digest")
                                         .or_else(|| req_headers.get("repr-digest"))
                                         .and_then(|v| v.to_str().ok());
-                                    let outcome = cd.verify(header_value, &collected);
+                                    let outcome = cd.verify(header_value, representation_body);
                                     // WOR-805 PR2: on a verified body,
                                     // stamp the audit flag so the
                                     // Message Signatures composition
@@ -2722,7 +4204,91 @@ impl ProxyHttp for SbProxy {
                                         | OpenApiValidationResult::OutOfScope => {}
                                     }
                                 }
+                                Policy::A2A(p) => {
+                                    // WOR-2118: the A2A 1.0
+                                    // push-notification SSRF check. It
+                                    // runs here rather than in the
+                                    // request filter because the
+                                    // enforcer's request snapshot always
+                                    // carries an empty body, so the
+                                    // check was gated on a condition
+                                    // that could never hold and never
+                                    // fired once. The buffered body is
+                                    // the first place the registration
+                                    // is actually visible.
+                                    let (Some(a2a), Some(parsed), Some((route, _, _))) =
+                                        (a2a_ctx.as_ref(), a2a_v1.as_ref(), a2a_idents.as_ref())
+                                    else {
+                                        continue;
+                                    };
+                                    if let Some(rejection) =
+                                        crate::server::a2a_body_phase::check_push_notification(
+                                            p,
+                                            route,
+                                            a2a.spec.as_label(),
+                                            a2a.identity_verified,
+                                            parsed,
+                                        )
+                                    {
+                                        ctx.a2a_denial_body = Some(rejection.body.clone());
+                                        ctx.deny_policy_type = Some(rejection.deny_policy_type);
+                                        failed = Some((
+                                            rejection.status,
+                                            rejection.body,
+                                            rejection.content_type,
+                                        ));
+                                        break;
+                                    }
+                                }
                                 Policy::PromptInjectionV2(p) => {
+                                    // WOR-2118: an agent-to-agent hop
+                                    // goes through the structured seam,
+                                    // which scores each message part on
+                                    // its own and picks the action from
+                                    // the hop's delegation depth. The
+                                    // generic path below fuses the whole
+                                    // JSON-RPC envelope into one string,
+                                    // which is what that seam exists to
+                                    // stop doing.
+                                    if let (
+                                        Some(a2a),
+                                        Some(parsed),
+                                        Some((route, request_id, tenant_id)),
+                                    ) = (a2a_ctx.as_ref(), a2a_v1.as_ref(), a2a_idents.as_ref())
+                                    {
+                                        let audit = sbproxy_modules::BodyAwareAuditContext {
+                                            hostname: route.as_str(),
+                                            request_id: Some(request_id.as_str()),
+                                            tenant_id: Some(tenant_id.as_str()),
+                                            virtual_key_id: None,
+                                            policy_version: None,
+                                        };
+                                        if let Some(rejection) =
+                                            crate::server::a2a_body_phase::scan_message_parts(
+                                                p, route, a2a, parsed, &collected, audit,
+                                            )
+                                        {
+                                            ctx.deny_policy_type = Some(rejection.deny_policy_type);
+                                            failed = Some((
+                                                rejection.status,
+                                                rejection.body,
+                                                rejection.content_type,
+                                            ));
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                    // WOR-2137: the generic body scan is
+                                    // opt-in. The enforcer only requests
+                                    // buffering when `enable_body_aware`
+                                    // is set, but the buffer may exist
+                                    // because another policy asked for
+                                    // it, and a body buffered for a
+                                    // validator must not feed a scan the
+                                    // operator switched off.
+                                    if !p.body_aware_enabled() {
+                                        continue;
+                                    }
                                     // WOR-801: body-aware scan. The URI +
                                     // headers were scanned synchronously by
                                     // the request_filter enforcer; here we
@@ -2747,10 +4313,14 @@ impl ProxyHttp for SbProxy {
                                                     label = %result.label,
                                                     "blocked: detector matched request body"
                                                 );
+                                                // WOR-2159: honour the
+                                                // configured content type,
+                                                // as the ai_proxy and A2A
+                                                // block paths already do.
                                                 failed = Some((
                                                     403,
                                                     p.block_body().to_string(),
-                                                    "text/plain; charset=utf-8".to_string(),
+                                                    p.block_content_type().to_string(),
                                                 ));
                                                 break;
                                             }
@@ -2772,6 +4342,12 @@ impl ProxyHttp for SbProxy {
                         }
                     }
                 }
+                if graphql_content_digest_body_taken {
+                    // Preserve the captured original for a possible upstream
+                    // retry. The representation slot is borrowed by digest
+                    // verification exactly once per body-filter pass.
+                    ctx.graphql_request_body = graphql_content_digest_body;
+                }
                 if let Some((status, body_str, ct)) = failed {
                     debug!(status = %status, "request body validator rejected");
                     ctx.validator_failed = Some((status, body_str, ct));
@@ -2784,50 +4360,30 @@ impl ProxyHttp for SbProxy {
                         "request body failed schema validation",
                     ));
                 }
-                // WOR-805 F1.6.1: the auth phase flagged that
-                // `bot_auth` verified a signature covering
-                // `content-digest`, so the body's actual SHA-256 has
-                // to match the `Content-Digest` header value the
-                // signature attests to. Run the deferred check now
-                // that the body is fully buffered. A failure here is
-                // an authentication failure (the body the client
-                // sent does not match the body the client signed),
-                // so map it to 401 with a generic message.
-                if ctx.bot_auth_digest_check_required {
-                    let header_value = session
+                // Body validation and idempotency share the same request
+                // buffer. When both are active, the validator branch owns
+                // the end-of-stream chunk and must also register the
+                // idempotency miss; otherwise the response is never cached
+                // and the key-only replay path cannot engage.
+                if ctx.idempotency_buffering {
+                    let body_hash = sbproxy_middleware::idempotency::hash_body(&collected);
+                    let header_name = ctx
+                        .origin_idx
+                        .and_then(|i| pipeline.idempotencies.get(i))
+                        .and_then(|opt| opt.as_ref())
+                        .map(|i| i.header_name.clone())
+                        .unwrap_or_else(|| "Idempotency-Key".to_string());
+                    let key = session
                         .req_header()
                         .headers
-                        .get("content-digest")
-                        .or_else(|| session.req_header().headers.get("repr-digest"))
-                        .and_then(|v| v.to_str().ok())
-                        .map(|s| s.to_string());
-                    let ok = match header_value.as_deref() {
-                        Some(hv) => {
-                            sbproxy_middleware::digest::verify_content_digest(hv, &collected)
-                        }
-                        // A signature that covered `content-digest`
-                        // without a corresponding header is a wire-
-                        // shape contradiction; reject.
-                        None => false,
-                    };
-                    if !ok {
-                        debug!(
-                            "bot_auth content-digest body binding check failed; rejecting request"
-                        );
-                        let body_str = serde_json::json!({
-                            "error": "bot_auth: content-digest body mismatch",
-                        })
+                        .get(header_name.as_str())
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::trim)
+                        .unwrap_or_default()
                         .to_string();
-                        ctx.validator_failed = Some((401, body_str, "application/json".into()));
-                        return Err(pingora_error::Error::explain(
-                            pingora_error::ErrorType::HTTPStatus(401),
-                            "bot_auth: content-digest body binding failed",
-                        ));
-                    }
-                    // Mirror the content_digest-policy path: surface
-                    // a single audit flag so downstream composition
-                    // can attest "body matches signed digest".
-                    ctx.content_digest_verified = true;
+                    ctx.idempotency_miss = Some((key, body_hash));
+                    ctx.idempotency_response_body_buf = Some(bytes::BytesMut::with_capacity(8192));
+                    ctx.idempotency_buffering = false;
                 }
                 // Validation passed - release the buffered body as one
                 // chunk so the upstream sees the full payload.
@@ -2882,7 +4438,13 @@ impl ProxyHttp for SbProxy {
                     }
                 }
             }
-            // Mid-stream chunks: hold off forwarding until end_of_stream.
+            if !end_of_stream {
+                // The chunk above was consumed into the accumulator;
+                // `hold_request_body_chunk` documents why the slot must
+                // carry an empty chunk here rather than `None`.
+                hold_request_body_chunk(body);
+            }
+            emit_graphql_validated_request_body(body, end_of_stream, ctx);
             return Ok(());
         }
 
@@ -2923,6 +4485,7 @@ impl ProxyHttp for SbProxy {
                 ctx.request_body_buf = None;
                 ctx.idempotency_permit = None;
                 ctx.idempotency_skip_reason = Some("SKIPPED-OVERSIZE-REQUEST");
+                emit_graphql_validated_request_body(body, end_of_stream, ctx);
                 return Ok(());
             }
             if let Some(chunk) = body.as_ref() {
@@ -2949,7 +4512,8 @@ impl ProxyHttp for SbProxy {
                 ctx.idempotency_miss = Some((key, body_hash));
                 ctx.idempotency_response_body_buf = Some(bytes::BytesMut::with_capacity(8192));
             }
-            // Pass the chunk through to upstream unchanged.
+            emit_graphql_validated_request_body(body, end_of_stream, ctx);
+            // Non-GraphQL requests pass the chunk through unchanged.
             return Ok(());
         }
 
@@ -2990,7 +4554,9 @@ impl ProxyHttp for SbProxy {
             }
         }
 
-        if let Some(replacement) = ctx.replacement_request_body.take() {
+        if ctx.graphql_validated_request_body.is_some() {
+            emit_graphql_validated_request_body(body, end_of_stream, ctx);
+        } else if let Some(replacement) = ctx.replacement_request_body.take() {
             *body = Some(replacement);
         }
         Ok(())
@@ -3012,6 +4578,18 @@ impl ProxyHttp for SbProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // WOR-2145: the meter refused this response in `response_filter`
+        // under `failure_mode: closed`. Drop every chunk so the buyer
+        // receives none of the work the proxy cannot record.
+        //
+        // Ahead of the byte accounting below on purpose. `bytes_out` is
+        // the evidence behind a measured unit, so it has to be what
+        // actually crossed the wire and not what the upstream offered.
+        if ctx.meter_refused {
+            *body = None;
+            return Ok(None);
+        }
+
         // Track outbound body bytes for the access log. Counts what
         // the client receives, including transformed / fallback /
         // cached bodies, since those are what downstream egress
@@ -3235,8 +4813,20 @@ impl ProxyHttp for SbProxy {
                             .unwrap_or(300)
                     };
                     let pipeline_for_write = ctx.pipeline.clone();
-                    if let Some(cache_store) = pipeline_for_write.cache_store.clone() {
+                    // The write-back must seal under the same origin the
+                    // lookup opened under, so resolve the per-origin
+                    // handle rather than the shared one.
+                    let write_origin_id = ctx
+                        .origin_idx
+                        .and_then(|idx| pipeline_for_write.config.origins.get(idx))
+                        .map(|o| o.origin_id.to_string())
+                        .unwrap_or_default();
+                    if let Some(cache_store) = pipeline_for_write
+                        .cache_store_for(&write_origin_id)
+                        .cloned()
+                    {
                         let entry = sbproxy_cache::CachedResponse {
+                            generation: sbproxy_cache::new_cache_generation(),
                             status,
                             headers,
                             body: body_buf.to_vec(),
@@ -3256,11 +4846,7 @@ impl ProxyHttp for SbProxy {
                             pipeline_for_write.cache_reserve.clone(),
                             pipeline_for_write.cache_reserve_admission,
                         ) {
-                            let origin_id_for_reserve = ctx
-                                .origin_idx
-                                .and_then(|idx| pipeline_for_write.config.origins.get(idx))
-                                .map(|o| o.origin_id.to_string())
-                                .unwrap_or_default();
+                            let origin_id_for_reserve = write_origin_id.clone();
                             maybe_admit_to_reserve(
                                 reserve,
                                 admission,
@@ -3715,11 +5301,11 @@ impl ProxyHttp for SbProxy {
 
     /// Pingora calls this when establishing the upstream TCP/TLS
     /// connection fails. If the action has a `retry` policy that
-    /// allows `connect_error` and we are still under `max_attempts`,
-    /// mark the error retryable so Pingora calls `upstream_peer`
-    /// again. For load_balancer actions, the failed target is
-    /// reported to the outlier detector so the next selection skips
-    /// it.
+    /// allows `connect_error` (or `timeout`, for the timeout-classed
+    /// connect failures) and we are still under `max_attempts`, mark
+    /// the error retryable so Pingora calls `upstream_peer` again.
+    /// For load_balancer actions, the failed target is reported to
+    /// the outlier detector so the next selection skips it.
     fn fail_to_connect(
         &self,
         _session: &mut Session,
@@ -3728,6 +5314,7 @@ impl ProxyHttp for SbProxy {
         mut e: Box<Error>,
     ) -> Box<Error> {
         let pipeline = ctx.pipeline.clone();
+        finish_load_balancer_attempt(ctx, LoadBalancerAttemptOutcome::Failure);
         let Some(origin_idx) = ctx.origin_idx else {
             return e;
         };
@@ -3744,30 +5331,103 @@ impl ProxyHttp for SbProxy {
         let Some(cfg) = retry_cfg else {
             return e;
         };
-        if !cfg.enabled() || !cfg.allows("connect_error") {
-            return e;
-        }
-        // ctx.retry_count == 0 on first attempt; max_attempts == 3
-        // means we allow attempts 0, 1, 2.
-        if ctx.retry_count + 1 >= cfg.max_attempts {
+        // A connect-phase timeout (TCP connect or TLS handshake
+        // deadline) is both a connect error and a timeout, so either
+        // `retry_on` token enables the retry.
+        let timeout_phase = timeout_error_phase(e.etype());
+        let allowed =
+            cfg.allows("connect_error") || (timeout_phase.is_some() && cfg.allows("timeout"));
+        // `retry_count` is shared with status-code and mid-proxy
+        // timeout retries (`maybe_retry_upstream_status`,
+        // `error_while_proxy`), so `max_attempts` caps the combined
+        // total, never each source separately.
+        if !allowed || !cfg.attempts_remaining(ctx.retry_count) {
             return e;
         }
         let backoff_ms = cfg.backoff_for_attempt(ctx.retry_count);
-        // For LB, mark the failed target so the next select_target
-        // skips it via outlier detection AND advances the breaker
-        // state (a connect failure is a failure for both signals).
-        if let (Some(Action::LoadBalancer(lb)), Some(idx)) = (action, ctx.lb_target_idx) {
-            lb.record_target_failure(idx);
-            lb.record_breaker_failure(idx);
-            ctx.lb_target_idx = None;
-        }
         ctx.retry_count += 1;
         ctx.retry_backoff_ms = Some(backoff_ms);
+        // The timeout metric keys on the error class, not on which
+        // `retry_on` token enabled the retry: a ConnectTimedout
+        // retried under `connect_error` is still a timeout retry.
+        if let Some(phase) = timeout_phase {
+            sbproxy_observe::metrics::record_upstream_timeout_retry(ctx.hostname.as_str(), phase);
+        }
         debug!(
             attempt = %ctx.retry_count,
             max = %cfg.max_attempts,
             backoff_ms = %backoff_ms,
             "upstream connect error, retrying"
+        );
+        e.set_retry(true);
+        e
+    }
+
+    /// Pingora calls this when the request fails after the upstream
+    /// connection was established (or reused). Two retry sources meet
+    /// here, in order:
+    ///
+    /// 1. Pingora's reused-connection retry: an error marked
+    ///    `ReusedOnly` (a stale pooled connection dying on first use)
+    ///    becomes retryable when the connection was reused and the
+    ///    retry buffer was not truncated. That default is preserved
+    ///    verbatim and does not consume the configured attempt cap.
+    /// 2. The action's `retry.retry_on: [timeout]` policy: a read or
+    ///    write deadline on the upstream leg schedules a retry under
+    ///    the same shared `max_attempts` counter as connect-error and
+    ///    status-code retries. The proxy loop retries blindly on
+    ///    `e.retry()`, so this callback must hold the two safety
+    ///    gates itself: no response bytes written downstream, and a
+    ///    request that is safe to replay (idempotent method, fully
+    ///    buffered body).
+    fn error_while_proxy(
+        &self,
+        peer: &HttpPeer,
+        session: &mut Session,
+        e: Box<Error>,
+        ctx: &mut Self::CTX,
+        client_reused: bool,
+    ) -> Box<Error> {
+        // Default fork behavior: peer context plus the
+        // reused-connection retry decision.
+        let mut e = e.more_context(format!("Peer: {peer}"));
+        e.retry
+            .decide_reuse(client_reused && !session.as_ref().retry_buffer_truncated());
+
+        let pipeline = ctx.pipeline.clone();
+        finish_terminal_load_balancer_attempt(ctx, Some(e.esource()));
+        let Some(action) = active_action(&pipeline, ctx) else {
+            return e;
+        };
+        if e.retry() {
+            return e;
+        }
+        let Some(cfg) = retry_config_for_action(action) else {
+            return e;
+        };
+        let response_started = session.as_ref().response_written().is_some();
+        let replay_skip = status_retry_skip_reason(session);
+        let Some(phase) = maybe_retry_upstream_timeout(
+            cfg,
+            e.etype(),
+            e.esource(),
+            ctx.retry_count,
+            response_started,
+            replay_skip,
+        ) else {
+            return e;
+        };
+
+        let backoff_ms = cfg.backoff_for_attempt(ctx.retry_count);
+        ctx.retry_count += 1;
+        ctx.retry_backoff_ms = Some(backoff_ms);
+        sbproxy_observe::metrics::record_upstream_timeout_retry(ctx.hostname.as_str(), phase);
+        debug!(
+            attempt = %ctx.retry_count,
+            max = %cfg.max_attempts,
+            backoff_ms = %backoff_ms,
+            phase = %phase,
+            "upstream timeout, retrying"
         );
         e.set_retry(true);
         e
@@ -3784,11 +5444,46 @@ impl ProxyHttp for SbProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // Quota settlement is intentionally the final realtime outbound seam.
+        // Preserve its exact response and bypass origin fallback if it fails
+        // after Pingora has selected an upstream.
+        if let Some(failure) = ctx.ai_realtime_quota_failure.take() {
+            let _ = send_error(session, failure.status, failure.message).await;
+            ctx.response_status = Some(failure.status);
+            return FailToProxy {
+                error_code: failure.status,
+                can_reuse_downstream: false,
+            };
+        }
+
         // --- Request body validator rejection ---
         // The body filter intentionally aborted the upstream after a
         // validation failure. Surface the configured status / body
         // here rather than the generic 502.
+        if let Some(cached) = ctx.idempotency_deferred_hit.take() {
+            let status = cached.status;
+            let _ = send_idempotency_cache_hit(session, cached).await;
+            ctx.response_status = Some(status);
+            return FailToProxy {
+                error_code: status,
+                can_reuse_downstream: false,
+            };
+        }
+
         if let Some((status, body, content_type)) = ctx.validator_failed.take() {
+            // GraphQL validation runs in `upstream_request_filter`, after
+            // Pingora selected an upstream. Pingora cannot reuse an HTTP/1
+            // downstream after an error at that phase, so advertise the
+            // close explicitly instead of emitting a misleading keep-alive.
+            let close_downstream = ctx.graphql_validation_pending;
+            let close_http1 = close_downstream
+                && matches!(
+                    session.req_header().version,
+                    http::Version::HTTP_10 | http::Version::HTTP_11
+                );
+            if close_http1 {
+                session.set_keepalive(None);
+            }
             let mut header = match pingora_http::ResponseHeader::build(status, Some(2)) {
                 Ok(h) => h,
                 Err(_) => {
@@ -3796,12 +5491,15 @@ impl ProxyHttp for SbProxy {
                     ctx.response_status = Some(status);
                     return FailToProxy {
                         error_code: status,
-                        can_reuse_downstream: true,
+                        can_reuse_downstream: !close_downstream,
                     };
                 }
             };
             let _ = header.insert_header("content-type", content_type);
             let _ = header.insert_header("content-length", body.len().to_string());
+            if close_http1 {
+                let _ = header.insert_header("connection", "close");
+            }
             let _ = session.write_response_header(Box::new(header), false).await;
             let _ = session
                 .write_response_body(Some(bytes::Bytes::from(body)), true)
@@ -3809,7 +5507,7 @@ impl ProxyHttp for SbProxy {
             ctx.response_status = Some(status);
             return FailToProxy {
                 error_code: status,
-                can_reuse_downstream: true,
+                can_reuse_downstream: !close_downstream,
             };
         }
 
@@ -3932,8 +5630,16 @@ impl ProxyHttp for SbProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // A body-bound BotAuth signature is provisional during the header
+        // and policy phases. If a short circuit prevented the body verifier
+        // from running, close the observation conservatively without
+        // granting Strong from the unverified body binding.
+        crate::trust_tier::finalize_pending_body_proof_at_request_end(ctx);
+
         // Decrement active connections gauge (global + per-origin).
         metrics().active_connections.dec();
+
+        let status_u16 = final_response_status(ctx, session.response_written());
 
         // Phase 7: AI realtime WebSocket session-close hook. When the
         // request opened a realtime session, observe duration, tick
@@ -3944,7 +5650,8 @@ impl ProxyHttp for SbProxy {
         // (not transparent forwarding); the duration approximation
         // is the right OSS-v1 substitute since the session
         // lifetime IS the audio call.
-        if let Some(rd) = ctx.ai_realtime_dispatch.take() {
+        if let Some(rd) = take_accepted_realtime_dispatch(&mut ctx.ai_realtime_dispatch, status_u16)
+        {
             let duration_secs = rd.started_at.elapsed().as_secs_f64();
             let close_reason = if e.is_some() {
                 "error"
@@ -3965,6 +5672,7 @@ impl ProxyHttp for SbProxy {
             // event without a fabricated dollar figure.
             let span = tracing::Span::current();
             emit_ai_billing_event(
+                ctx.hostname.as_str(),
                 rd.surface_label,
                 &rd.provider_name,
                 Some("gpt-4o-realtime-preview".to_string()),
@@ -3974,6 +5682,19 @@ impl ProxyHttp for SbProxy {
                 &ctx.attribution_tags,
                 ctx.tenant_id.as_str(),
                 ctx.principal.api_key_id(),
+                &ctx.rollup_properties,
+                // WOR-2140: the realtime surface bills like any other, so
+                // it carries the same agent identity. `billable_id` still
+                // refuses an unverified name, so this cannot become a way
+                // to spend against an agent's budget over a websocket.
+                sbproxy_ai::budget::AgentIdentity {
+                    id: ctx
+                        .a2a
+                        .as_ref()
+                        .map(|a2a| sbproxy_ai::tracing_spans::cap_agent_id(&a2a.caller_agent_id))
+                        .filter(|id| !id.is_empty()),
+                    verified: ctx.a2a.as_ref().is_some_and(|a2a| a2a.identity_verified),
+                },
                 &span,
             );
             info!(
@@ -3988,7 +5709,17 @@ impl ProxyHttp for SbProxy {
         // Record request metrics.
         let method = session.req_header().method.as_str().to_string();
         let hostname = ctx.hostname.to_string();
-        let status_u16 = final_response_status(ctx, session.response_written());
+
+        // WOR-1921: compression savings become realized value only after the
+        // terminal provider response succeeds. Always take the pending value
+        // so this end-of-request hook cannot record it more than once.
+        if let Some(pending) = take_realized_compression_value(ctx, status_u16, e.is_some()) {
+            crate::compression_value::record_pending_compression_value(
+                ctx.tenant_id.as_str(),
+                ctx.hostname.as_str(),
+                &pending,
+            );
+        }
 
         // WOR-1528 / WOR-1540: hand the completed AI call to the
         // configured usage sinks (the verifiable ledger among them).
@@ -3999,6 +5730,34 @@ impl ProxyHttp for SbProxy {
         // WOR-1541: fold the realized outcome into the routing feedback
         // store (no-op unless the origin uses outcome-aware routing).
         record_routing_feedback(ctx);
+
+        // WOR-2145: cut the attested consumption receipt.
+        //
+        // Here rather than in `response_filter` because this is the
+        // first point at which the facts a receipt states are all
+        // final: the status after every override, the bytes that
+        // actually crossed the wire, and whether the client stayed to
+        // receive them. Metering off the response header would bill
+        // intent rather than delivery.
+        //
+        // A downstream error source is the client going away. That is a
+        // different commercial event from the origin failing, and the
+        // outcome table prices the two separately, so the distinction
+        // is carried rather than flattened into "something went wrong".
+        //
+        // No-op unless this origin's resolved role writes receipts.
+        {
+            let client_disconnected =
+                e.is_some_and(|error| *error.esource() == pingora_error::ErrorSource::Downstream);
+            let path = session.req_header().uri.path().to_string();
+            crate::meter_runtime::record_response(
+                ctx,
+                &method,
+                &path,
+                status_u16,
+                client_disconnected,
+            );
+        }
 
         // --- Wave 3 / G1.6 wire: per-agent labels on the hot path ---
         //
@@ -4029,6 +5788,15 @@ impl ProxyHttp for SbProxy {
             ctx.response_body_bytes,
             agent_labels,
         );
+        // WOR-2093: one canonical id for the metric, the ring row below,
+        // the access log, and spans.
+        let accountable_key_id = ctx.accountable_key_id().map(str::to_string);
+        sbproxy_observe::metrics::record_inbound_key_request(
+            ctx.native_key_provider.as_deref(),
+            ctx.inbound_key_mode.as_str(),
+            ctx.tenant_id.as_str(),
+            accountable_key_id.as_deref(),
+        );
 
         // WOR-1718: mirror the completed request into the admin request-log
         // ring buffer (and its SSE tail) when the admin server is running.
@@ -4054,6 +5822,16 @@ impl ProxyHttp for SbProxy {
                 // expand usefully and the guardrail filters have data.
                 request_id: (!ctx.request_id.is_empty()).then(|| ctx.request_id.to_string()),
                 trace_id: ctx.trace_ctx.as_ref().map(|t| t.trace_id.clone()),
+                session_id: ctx.session_id.map(|id| id.to_string()),
+                parent_session_id: ctx.parent_session_id.map(|id| id.to_string()),
+                properties: ctx.properties.clone(),
+                cache_status: ctx.admin_cache_status.as_str().to_string(),
+                retry_count: ctx.admin_retry_count(),
+                failover_engaged: ctx.admin_failover_engaged(),
+                failover_from: ctx.admin_failover_from.clone(),
+                failover_to: ctx.admin_failover_to.clone(),
+                load_balancer_strategy: ctx.admin_load_balancer_strategy.clone(),
+                load_balancer_target: ctx.admin_load_balancer_target.clone(),
                 provider: ctx.ai_provider.clone(),
                 model: ctx.ai_model.clone(),
                 tokens_in: ctx.ai_tokens_in,
@@ -4061,6 +5839,21 @@ impl ProxyHttp for SbProxy {
                 cost_usd_micros: ctx.ai_cost_usd_micros,
                 guardrail_category: ctx.ai_guardrail_category.clone(),
                 guardrail_action: ctx.ai_guardrail_action.clone(),
+                // WOR-2093: key accountability columns, from the same
+                // canonical derivation as the metric emitted above.
+                api_key_id: accountable_key_id,
+                key_mode: ctx.inbound_key_mode.as_str().to_string(),
+                key_provider: ctx.native_key_provider.clone(),
+                tenant_id: ctx.tenant_id.to_string(),
+                user_id: ctx.user_id.clone(),
+                // WOR-2094: explainability columns; every row names the
+                // config and policy generations that governed it and why
+                // the gateway acted.
+                error_class: super::access_log::classify_error_class(status_u16),
+                config_revision: ctx.pipeline.config_revision.clone(),
+                policy_version: ctx.ai_policy_version.clone(),
+                policy_decisions: ctx.policy_decisions.clone(),
+                deny_reason: ctx.deny_reason.clone(),
             });
         }
 
@@ -4128,15 +5921,10 @@ impl ProxyHttp for SbProxy {
                 .inc();
         }
 
-        // Decrement load balancer connection count if this request used one.
-        if let Some(target_idx) = ctx.lb_target_idx.take() {
-            if let Some(origin_idx) = ctx.origin_idx {
-                let pipeline = ctx.pipeline.clone();
-                if let Action::LoadBalancer(lb) = &pipeline.actions[origin_idx] {
-                    lb.record_disconnect(target_idx);
-                }
-            }
-        }
+        // Close any attempt that did not already end in a retry/error
+        // callback. The token resolves its own main or forward-rule action, so
+        // strategy, outlier, breaker, and connection state are updated once.
+        finish_terminal_load_balancer_attempt(ctx, e.map(|error| error.esource()));
 
         // --- Access log emission (Prereq.A) ---
         //
@@ -4157,6 +5945,7 @@ impl ProxyHttp for SbProxy {
             let outcome =
                 crate::server::access_log::ai_outcome_label(status_u16, ctx.ai_outcome.as_deref());
             sbproxy_ai::ai_metrics::record_ai_outcome_attributed(
+                ctx.hostname.as_str(),
                 ctx.ai_provider.as_deref().unwrap_or(""),
                 ctx.ai_model.as_deref().unwrap_or(""),
                 ctx.ai_surface.as_deref().unwrap_or(""),
@@ -4175,12 +5964,20 @@ impl ProxyHttp for SbProxy {
                         .map(|d| d.as_secs())
                         .unwrap_or(0),
                     dims: sbproxy_observe::usage_rollup::RollupDims {
+                        origin: ctx.hostname.to_string(),
                         provider: ctx.ai_provider.clone().unwrap_or_default(),
                         model: ctx.ai_model.clone().unwrap_or_default(),
                         tenant: ctx.tenant_id.to_string(),
                         team: ctx.attribution_tags.team.clone().unwrap_or_default(),
                         api_key_id: ctx.principal.api_key_id().to_string(),
                         project: ctx.attribution_tags.project.clone().unwrap_or_default(),
+                        // WOR-2140: same source as the usage path and the
+                        // `agent_id` metric label. `attribution_tags` only
+                        // carries an agent the proxy verified, so an
+                        // unverified caller rolls up unattributed rather
+                        // than under a name it chose for itself.
+                        agent_id: ctx.attribution_tags.agent_id.clone().unwrap_or_default(),
+                        properties: ctx.rollup_properties.clone(),
                     },
                     kind: sbproxy_observe::usage_rollup::RollupKind::Outcome(
                         sbproxy_observe::usage_rollup::RollupOutcome::from_outcome_label(outcome),
@@ -4214,6 +6011,7 @@ impl ProxyHttp for SbProxy {
                 if let Some(est) = ctx.ai_prompt_tokens_est {
                     if est > 0 {
                         sbproxy_ai::ai_metrics::record_ai_request_attributed(
+                            ctx.hostname.as_str(),
                             ctx.ai_provider.as_deref().unwrap_or(""),
                             ctx.ai_model.as_deref().unwrap_or(""),
                             ctx.ai_surface.as_deref().unwrap_or(""),
@@ -4318,11 +6116,1075 @@ fn build_transcoded_json(ctx: &RequestContext, frame: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pingora_error::ErrorSource;
 
     #[test]
-    fn parsed_upstream_url_extracts_host_and_path() {
+    fn dpop_resource_htu_uses_final_authority_and_path_without_query() {
+        let mut request =
+            pingora_http::RequestHeader::build("PATCH", b"/v2/items/a%2Fb?debug=true", None)
+                .unwrap();
+        request
+            .insert_header("host", "api.example.test:8443")
+            .unwrap();
+
+        assert_eq!(
+            dpop_resource_htu("https", &request).unwrap(),
+            "https://api.example.test:8443/v2/items/a%2Fb"
+        );
+    }
+
+    #[test]
+    fn resource_nonce_challenge_requires_401_dpop_error_and_one_nonce() {
+        let mut response = pingora_http::ResponseHeader::build(401, Some(2)).unwrap();
+        response
+            .insert_header(
+                "www-authenticate",
+                r#"DPoP error="use_dpop_nonce", error_description="nonce required""#,
+            )
+            .unwrap();
+        response
+            .insert_header("dpop-nonce", "resource-nonce")
+            .unwrap();
+        assert_eq!(
+            dpop_resource_nonce_challenge(&response).as_deref(),
+            Some("resource-nonce")
+        );
+
+        response.status = http::StatusCode::BAD_REQUEST;
+        assert!(dpop_resource_nonce_challenge(&response).is_none());
+        response.status = http::StatusCode::UNAUTHORIZED;
+        response
+            .append_header("dpop-nonce", "second-resource-nonce")
+            .unwrap();
+        assert!(dpop_resource_nonce_challenge(&response).is_none());
+    }
+
+    #[test]
+    fn resource_nonce_challenge_finds_dpop_after_another_challenge() {
+        let mut response = pingora_http::ResponseHeader::build(401, Some(3)).unwrap();
+        response
+            .insert_header(
+                "www-authenticate",
+                r#"Bearer realm="api", DPoP error = "use_dpop_nonce""#,
+            )
+            .unwrap();
+        response.insert_header("dpop-nonce", "nonce-2").unwrap();
+
+        assert_eq!(
+            dpop_resource_nonce_challenge(&response).as_deref(),
+            Some("nonce-2")
+        );
+    }
+
+    #[test]
+    fn resource_nonce_challenge_requires_the_exact_error_parameter_name() {
+        let mut response = pingora_http::ResponseHeader::build(401, Some(3)).unwrap();
+        response
+            .insert_header(
+                "www-authenticate",
+                r#"DPoP fooerror="use_dpop_nonce", error_description="use_dpop_nonce""#,
+            )
+            .unwrap();
+        response.insert_header("dpop-nonce", "nonce-3").unwrap();
+
+        assert!(dpop_resource_nonce_challenge(&response).is_none());
+    }
+
+    #[test]
+    fn malformed_nonce_does_not_hide_the_dpop_challenge() {
+        let mut response = pingora_http::ResponseHeader::build(401, Some(3)).unwrap();
+        response
+            .insert_header("www-authenticate", r#"DPoP error="use_dpop_nonce""#)
+            .unwrap();
+        response
+            .insert_header("dpop-nonce", "contains a space")
+            .unwrap();
+
+        assert!(dpop_resource_nonce_challenge_present(&response));
+        assert!(dpop_resource_nonce_challenge(&response).is_none());
+    }
+
+    #[test]
+    fn final_dpop_authorization_must_match_the_minted_token() {
+        let mut request = pingora_http::RequestHeader::build("GET", b"/", None).unwrap();
+        request
+            .insert_header("authorization", "DPoP minted-token")
+            .unwrap();
+        assert_eq!(
+            final_dpop_access_token(&request, "minted-token").unwrap(),
+            "minted-token"
+        );
+
+        // A post-credential Lua modifier can overwrite Authorization. The
+        // final proof seam must reject that request instead of hashing the
+        // stale minted token into `ath`.
+        request
+            .insert_header("authorization", "DPoP lua-token")
+            .unwrap();
+        assert!(final_dpop_access_token(&request, "minted-token").is_err());
+
+        request
+            .insert_header("authorization", "Bearer minted-token")
+            .unwrap();
+        assert!(final_dpop_access_token(&request, "minted-token").is_err());
+    }
+
+    #[test]
+    fn malformed_outbound_credential_header_fails_closed() {
+        let mut request = pingora_http::RequestHeader::build("GET", b"/", None).unwrap();
+        request
+            .insert_header("authorization", "Bearer inbound-token")
+            .unwrap();
+
+        assert!(insert_outbound_credential_header(
+            &mut request,
+            "authorization".to_string(),
+            "DPoP invalid\r\nvalue",
+        )
+        .is_err());
+        assert_eq!(
+            request.headers.get("authorization").unwrap(),
+            "Bearer inbound-token"
+        );
+    }
+
+    #[test]
+    fn realtime_scrub_removes_caller_credentials_but_preserves_websocket_headers() {
+        let mut request = pingora_http::RequestHeader::build("GET", b"/v1/realtime", None).unwrap();
+        for (name, value) in [
+            ("authorization", "Bearer caller-secret"),
+            ("proxy-authorization", "Basic caller-secret"),
+            ("dpop", "caller-proof"),
+            ("x-api-key", "caller-secret"),
+            ("api-key", "caller-secret"),
+            ("x-goog-api-key", "caller-secret"),
+            ("x-sb-api", "caller-secret"),
+            ("x-custom-inbound-key", "caller-secret"),
+        ] {
+            request.insert_header(name, value).unwrap();
+        }
+        for (name, value) in [
+            ("upgrade", "websocket"),
+            ("connection", "Upgrade"),
+            ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+            ("openai-beta", "realtime=v1"),
+        ] {
+            request.insert_header(name, value).unwrap();
+        }
+
+        scrub_realtime_credentials(
+            &mut request,
+            &["x-custom-inbound-key".to_string()],
+            &[],
+            "authorization",
+        );
+
+        for name in [
+            "authorization",
+            "proxy-authorization",
+            "dpop",
+            "x-api-key",
+            "api-key",
+            "x-goog-api-key",
+            "x-sb-api",
+            "x-custom-inbound-key",
+        ] {
+            assert!(
+                request.headers.get(name).is_none(),
+                "{name} must be removed"
+            );
+        }
+        assert_eq!(request.headers.get("upgrade").unwrap(), "websocket");
+        assert_eq!(request.headers.get("connection").unwrap(), "Upgrade");
+        assert_eq!(
+            request.headers.get("sec-websocket-key").unwrap(),
+            "dGhlIHNhbXBsZSBub25jZQ=="
+        );
+        assert_eq!(request.headers.get("openai-beta").unwrap(), "realtime=v1");
+    }
+
+    #[test]
+    fn realtime_bound_credential_wins_over_provider_auth() {
+        let credential = choose_realtime_credential(
+            Some(RealtimeCredential {
+                header: "authorization".to_string(),
+                value: "Bearer bound-secret".to_string(),
+            }),
+            Some(RealtimeCredential {
+                header: "authorization".to_string(),
+                value: "Bearer provider-secret".to_string(),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(credential.header, "authorization");
+        assert_eq!(credential.value, "Bearer bound-secret");
+    }
+
+    #[test]
+    fn realtime_missing_provider_credential_fails_closed() {
+        let provider: sbproxy_ai::ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "openai",
+            "api_key": "   "
+        }))
+        .unwrap();
+
+        let provider_auth = realtime_provider_credential(&provider);
+        assert!(provider_auth.is_none(), "blank API keys are unavailable");
+        assert!(choose_realtime_credential(None, provider_auth).is_err());
+    }
+
+    #[test]
+    fn realtime_native_credential_requires_exact_destination_binding() {
+        let unbound: sbproxy_ai::ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "primary",
+            "provider_type": "openai",
+            "api_key": "operator-key-must-not-be-billed"
+        }))
+        .unwrap();
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer sk-caller-owned-canary"),
+        );
+        let inbound = sbproxy_config::types::KeyInboundConfig::default();
+
+        assert!(
+            realtime_native_provider_credential(
+                &unbound,
+                &headers,
+                &inbound.provider_hints,
+                "openai",
+            )
+            .is_none(),
+            "wire format alone must not authorize caller-secret forwarding"
+        );
+
+        let bound: sbproxy_ai::ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "primary",
+            "provider_type": "openai",
+            "api_key": "operator-key-must-not-be-billed",
+            "accept_native_credentials_for": "openai"
+        }))
+        .unwrap();
+        let credential = realtime_native_provider_credential(
+            &bound,
+            &headers,
+            &inbound.provider_hints,
+            "openai",
+        )
+        .expect("matching caller credential");
+        assert_eq!(credential.header, "Authorization");
+        assert_eq!(credential.value, "Bearer sk-caller-owned-canary");
+        assert!(!credential.value.contains("operator-key-must-not-be-billed"));
+        assert!(realtime_native_provider_credential(
+            &bound,
+            &headers,
+            &inbound.provider_hints,
+            "anthropic",
+        )
+        .is_none());
+    }
+
+    fn realtime_pipeline_with_provider_hint(
+        header: &str,
+        value_prefix: &str,
+    ) -> std::sync::Arc<CompiledPipeline> {
+        let mut config = sbproxy_config::CompiledConfig::default();
+        let mut key_management = sbproxy_config::KeyManagementConfig::default();
+        key_management.inbound.headers.clear();
+        key_management.inbound.provider_hints = vec![sbproxy_config::ProviderHintConfig {
+            provider: "openai".to_string(),
+            header: header.to_string(),
+            scheme: String::new(),
+            value_prefix: value_prefix.to_string(),
+            also_header: None,
+        }];
+        config.server.key_management = Some(key_management);
+        std::sync::Arc::new(
+            CompiledPipeline::from_config_for_validation(config)
+                .expect("compile realtime pipeline"),
+        )
+    }
+
+    #[test]
+    fn realtime_carriers_and_provider_hints_stay_pinned_across_reload() {
+        let old_pipeline =
+            realtime_pipeline_with_provider_hint("x-native-carrier-a", "old-caller-");
+        let new_pipeline =
+            realtime_pipeline_with_provider_hint("x-native-carrier-b", "new-caller-");
+        let old_ctx = RequestContext {
+            pipeline: std::sync::Arc::clone(&old_pipeline),
+            ..RequestContext::default()
+        };
+
+        let carriers = realtime_inbound_carrier_names(&old_ctx);
+        assert!(carriers.iter().any(|name| name == "x-native-carrier-a"));
+        assert!(!carriers.iter().any(|name| name == "x-native-carrier-b"));
+
+        let provider: sbproxy_ai::ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "primary",
+            "provider_type": "openai",
+            "api_key": "operator-key-must-not-be-billed",
+            "accept_native_credentials_for": "openai"
+        }))
+        .unwrap();
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-native-carrier-a",
+            http::HeaderValue::from_static("old-caller-credential"),
+        );
+
+        let credential = realtime_native_provider_credential_for_pipeline(
+            &provider,
+            &headers,
+            &old_pipeline,
+            "openai",
+        )
+        .expect("old pipeline resolves its own provider hint");
+        assert_eq!(credential.value, "Bearer old-caller-credential");
+        assert!(
+            realtime_native_provider_credential_for_pipeline(
+                &provider,
+                &headers,
+                &new_pipeline,
+                "openai",
+            )
+            .is_none(),
+            "new pipeline hints must not change an old request"
+        );
+    }
+
+    #[test]
+    fn realtime_final_credential_overwrites_lua_authorization() {
+        let mut request = pingora_http::RequestHeader::build("GET", b"/v1/realtime", None).unwrap();
+        request
+            .insert_header("authorization", "Bearer lua-secret")
+            .unwrap();
+
+        apply_realtime_credential(
+            &mut request,
+            &RealtimeCredential {
+                header: "authorization".to_string(),
+                value: "Bearer provider-secret".to_string(),
+            },
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        let mut values = request.headers.get_all(http::header::AUTHORIZATION).iter();
+        assert_eq!(values.next().unwrap(), "Bearer provider-secret");
+        assert!(values.next().is_none());
+    }
+
+    #[test]
+    fn realtime_final_credential_scrubs_all_custom_carriers_case_insensitively() {
+        let mut request = pingora_http::RequestHeader::build("GET", b"/v1/realtime", None).unwrap();
+        for (name, value) in [
+            ("x-custom-inbound", "caller-secret"),
+            ("x-custom-provider", "caller-provider-secret"),
+            ("x-custom-bound", "lua-bound-secret"),
+            ("openai-beta", "realtime=v1"),
+            ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+        ] {
+            request.insert_header(name, value).unwrap();
+        }
+        request
+            .append_header("X-Custom-Provider", "lua-provider-secret")
+            .unwrap();
+
+        apply_realtime_credential(
+            &mut request,
+            &RealtimeCredential {
+                header: "X-Custom-Bound".to_string(),
+                value: "bound-secret".to_string(),
+            },
+            &["X-CUSTOM-INBOUND".to_string()],
+            &[
+                "X-CUSTOM-PROVIDER".to_string(),
+                "x-custom-bound".to_string(),
+            ],
+        )
+        .unwrap();
+
+        assert!(request.headers.get("x-custom-inbound").is_none());
+        assert!(request.headers.get("x-custom-provider").is_none());
+        let mut bound_values = request.headers.get_all("x-custom-bound").iter();
+        assert_eq!(bound_values.next().unwrap(), "bound-secret");
+        assert!(bound_values.next().is_none());
+        assert_eq!(request.headers.get("openai-beta").unwrap(), "realtime=v1");
+        assert_eq!(
+            request.headers.get("sec-websocket-key").unwrap(),
+            "dGhlIHNhbXBsZSBub25jZQ=="
+        );
+    }
+
+    #[test]
+    fn realtime_carriers_include_the_origin_resolver_presentation_header() {
+        let cases = [
+            (
+                serde_json::json!({
+                    "type": "token_exchange",
+                    "token_endpoint": "https://issuer.example/token",
+                    "audience": "https://api.example"
+                }),
+                "authorization",
+            ),
+            (
+                serde_json::json!({
+                    "type": "client_credentials",
+                    "token_endpoint": "https://issuer.example/token",
+                    "client_id": "client",
+                    "client_secret": "secret"
+                }),
+                "authorization",
+            ),
+            (
+                serde_json::json!({
+                    "type": "vault_secret",
+                    "secret": "secret",
+                    "header": "X-Origin-Secret"
+                }),
+                "x-origin-secret",
+            ),
+        ];
+
+        for (config, expected_header) in cases {
+            let config = serde_json::from_value(config).unwrap();
+            assert_eq!(
+                realtime_credential_headers(None, None, Some(&config)),
+                [expected_header]
+            );
+        }
+    }
+
+    #[test]
+    fn realtime_rejects_protocol_and_proxy_owned_credential_headers() {
+        for header in [
+            "OpenAI-Beta",
+            "SEC-WebSocket-Key",
+            "Upgrade",
+            "TraceParent",
+            "TRACESTATE",
+            "Signature-Input",
+            "Signature",
+            "Signature-Agent",
+        ] {
+            let mut request =
+                pingora_http::RequestHeader::build("GET", b"/v1/realtime", None).unwrap();
+            let result = apply_realtime_credential(
+                &mut request,
+                &RealtimeCredential {
+                    header: header.to_string(),
+                    value: "provider-secret".to_string(),
+                },
+                &[],
+                &[],
+            );
+
+            assert!(result.is_err(), "{header} must fail closed");
+        }
+    }
+
+    #[test]
+    fn realtime_session_accounting_requires_a_101_handshake() {
+        let dispatch = || {
+            Some(crate::context::RealtimeDispatchCtx {
+                provider_name: "openai".to_string(),
+                upstream_host: "api.openai.com".to_string(),
+                upstream_port: 443,
+                upstream_tls: true,
+                model_override: None,
+                started_at: std::time::Instant::now(),
+                surface_label: "realtime",
+            })
+        };
+
+        let mut rejected = dispatch();
+        assert!(take_accepted_realtime_dispatch(&mut rejected, 401).is_none());
+        assert!(rejected.is_none(), "failed dispatch state must be consumed");
+
+        let mut accepted = dispatch();
+        assert!(take_accepted_realtime_dispatch(&mut accepted, 101).is_some());
+        assert!(
+            accepted.is_none(),
+            "accepted dispatch state must be consumed"
+        );
+    }
+
+    #[test]
+    fn origin_dpop_rejects_a_bound_credential_override() {
+        let error = ensure_dpop_credential_source(Some("bound-credential"), true)
+            .expect_err("bound credentials cannot silently bypass origin DPoP");
+        assert!(error
+            .to_string()
+            .contains("bound credential cannot satisfy origin DPoP"));
+
+        ensure_dpop_credential_source(None, true).unwrap();
+        ensure_dpop_credential_source(Some("bound-credential"), false).unwrap();
+    }
+
+    fn target_selection(
+        target_index: usize,
+        selection_method: &str,
+    ) -> sbproxy_modules::action::TargetSelection {
+        sbproxy_modules::action::TargetSelection {
+            host: format!("target-{target_index}.example.com"),
+            port: 443,
+            tls: true,
+            target_index,
+            selection_method: selection_method.to_string(),
+        }
+    }
+
+    fn pending_compression_value() -> sbproxy_ai::PendingCompressionValue {
+        let run = sbproxy_ai::compression::CompressionRun {
+            messages: Vec::new(),
+            initial_tokens: 20,
+            final_tokens: 10,
+            tokens_saved: 10,
+            token_count_precision: sbproxy_ai::TokenCountPrecision::ModelTokenizer,
+            lever_results: vec![sbproxy_ai::compression::LeverResult {
+                lever: sbproxy_ai::compression::LeverKind::WindowFit,
+                backend: None,
+                outcome: sbproxy_ai::compression::LeverOutcome::Applied,
+                before_tokens: 20,
+                after_tokens: 10,
+                tokens_saved: 10,
+                duration: std::time::Duration::from_millis(1),
+            }],
+        };
+        sbproxy_ai::PendingCompressionValue::from_run("gpt-4o", &run)
+            .expect("pending compression value")
+    }
+
+    fn timeout_retry_cfg(
+        retry_on: &[&str],
+        max_attempts: u32,
+    ) -> sbproxy_modules::action::RetryConfig {
+        sbproxy_modules::action::RetryConfig {
+            max_attempts,
+            retry_on: retry_on.iter().map(|s| s.to_string()).collect(),
+            backoff_ms: 0,
+        }
+    }
+
+    fn lifecycle_load_balancer_action(target_urls: &[&str], open_duration_secs: u64) -> Action {
+        let targets = target_urls
+            .iter()
+            .map(|url| serde_json::json!({ "url": url }))
+            .collect::<Vec<_>>();
+        sbproxy_modules::compile_action(&serde_json::json!({
+            "type": "load_balancer",
+            "targets": targets,
+            "circuit_breaker": {
+                "failure_threshold": 1,
+                "success_threshold": 1,
+                "open_duration_secs": open_duration_secs
+            },
+            "outlier_detection": {
+                "threshold": 0.5,
+                "window_secs": 60,
+                "min_requests": 1,
+                "ejection_duration_secs": 60
+            }
+        }))
+        .unwrap()
+    }
+
+    fn lifecycle_pipeline_with_breaker_duration(
+        open_duration_secs: u64,
+    ) -> std::sync::Arc<CompiledPipeline> {
+        let mut pipeline = CompiledPipeline::default();
+        pipeline.actions.push(lifecycle_load_balancer_action(
+            &["http://main-a:8080", "http://main-b:8080"],
+            open_duration_secs,
+        ));
+        pipeline
+            .forward_rules
+            .push(vec![crate::pipeline::CompiledForwardRule {
+                matchers: Vec::new(),
+                action: lifecycle_load_balancer_action(
+                    &["http://forward-a:8080", "http://forward-b:8080"],
+                    open_duration_secs,
+                ),
+                request_modifiers: Vec::new(),
+                parameters: Vec::new(),
+            }]);
+        std::sync::Arc::new(pipeline)
+    }
+
+    fn lifecycle_pipeline() -> std::sync::Arc<CompiledPipeline> {
+        lifecycle_pipeline_with_breaker_duration(60)
+    }
+
+    fn load_balancer(action: &Action) -> std::sync::Arc<sbproxy_modules::LoadBalancerAction> {
+        match action {
+            Action::LoadBalancer(load_balancer) => std::sync::Arc::clone(load_balancer),
+            other => panic!("expected load balancer, got {other:?}"),
+        }
+    }
+
+    fn breaker_state(
+        load_balancer: &sbproxy_modules::LoadBalancerAction,
+        target_index: usize,
+    ) -> sbproxy_platform::CircuitState {
+        load_balancer.circuit_breakers.as_ref().unwrap()[target_index].state()
+    }
+
+    #[test]
+    fn retry_finishes_the_previous_attempt_before_selecting_a_replacement() {
+        let pipeline = lifecycle_pipeline();
+        let main = load_balancer(&pipeline.actions[0]);
+        let mut ctx = RequestContext {
+            pipeline: std::sync::Arc::clone(&pipeline),
+            ..RequestContext::default()
+        };
+        let action = LoadBalancerActionKey::new(0, None);
+
+        begin_load_balancer_attempt(&mut ctx, action, &target_selection(0, "bandit"));
+        finish_load_balancer_attempt(&mut ctx, LoadBalancerAttemptOutcome::Failure);
+        begin_load_balancer_attempt(&mut ctx, action, &target_selection(1, "bandit"));
+
+        assert_eq!(main.connection_count(0), 0);
+        assert_eq!(main.connection_count(1), 1);
+        assert_eq!(
+            breaker_state(&main, 0),
+            sbproxy_platform::CircuitState::Open,
+            "the failed retry attempt must train its own breaker",
+        );
+    }
+
+    #[test]
+    fn selection_replacement_disconnects_an_unfinished_attempt_without_training_it() {
+        let pipeline = lifecycle_pipeline();
+        let main = load_balancer(&pipeline.actions[0]);
+        let mut ctx = RequestContext {
+            pipeline: std::sync::Arc::clone(&pipeline),
+            ..RequestContext::default()
+        };
+        let action = LoadBalancerActionKey::new(0, None);
+
+        begin_load_balancer_attempt(&mut ctx, action, &target_selection(0, "bandit"));
+        begin_load_balancer_attempt(&mut ctx, action, &target_selection(1, "bandit"));
+
+        assert_eq!(main.connection_count(0), 0);
+        assert_eq!(main.connection_count(1), 1);
+        assert_eq!(
+            breaker_state(&main, 0),
+            sbproxy_platform::CircuitState::Closed
+        );
+        assert!(
+            !main
+                .outlier_detector
+                .as_ref()
+                .unwrap()
+                .is_ejected(&main.target_id(0)),
+            "replacement cleanup is neutral, not a fabricated failure"
+        );
+    }
+
+    #[test]
+    fn forward_rule_success_cleans_up_its_own_attempt() {
+        let pipeline = lifecycle_pipeline_with_breaker_duration(0);
+        let main = load_balancer(&pipeline.actions[0]);
+        let forward = load_balancer(&pipeline.forward_rules[0][0].action);
+        let mut ctx = RequestContext {
+            pipeline: std::sync::Arc::clone(&pipeline),
+            ..RequestContext::default()
+        };
+        forward.record_breaker_failure(0);
+        assert_eq!(
+            breaker_state(&forward, 0),
+            sbproxy_platform::CircuitState::HalfOpen
+        );
+
+        begin_load_balancer_attempt(
+            &mut ctx,
+            LoadBalancerActionKey::new(0, Some(0)),
+            &target_selection(0, "bandit"),
+        );
+        finish_load_balancer_attempt(&mut ctx, LoadBalancerAttemptOutcome::Success);
+
+        assert_eq!(forward.connection_count(0), 0);
+        assert_eq!(main.connection_count(0), 0);
+        assert_eq!(
+            breaker_state(&forward, 0),
+            sbproxy_platform::CircuitState::Closed,
+            "success must close the forward rule's half-open breaker"
+        );
+        assert!(ctx.lb_attempt.is_none());
+    }
+
+    #[test]
+    fn forward_rule_failure_updates_its_own_breaker_and_outlier() {
+        let pipeline = lifecycle_pipeline();
+        let main = load_balancer(&pipeline.actions[0]);
+        let forward = load_balancer(&pipeline.forward_rules[0][0].action);
+        let mut ctx = RequestContext {
+            pipeline: std::sync::Arc::clone(&pipeline),
+            ..RequestContext::default()
+        };
+
+        begin_load_balancer_attempt(
+            &mut ctx,
+            LoadBalancerActionKey::new(0, Some(0)),
+            &target_selection(0, "bandit"),
+        );
+        finish_load_balancer_attempt(&mut ctx, LoadBalancerAttemptOutcome::Failure);
+
+        assert_eq!(forward.connection_count(0), 0);
+        assert_eq!(
+            breaker_state(&forward, 0),
+            sbproxy_platform::CircuitState::Open
+        );
+        assert!(forward
+            .outlier_detector
+            .as_ref()
+            .unwrap()
+            .is_ejected(&forward.target_id(0)));
+        assert_eq!(
+            breaker_state(&main, 0),
+            sbproxy_platform::CircuitState::Closed
+        );
+        assert!(!main
+            .outlier_detector
+            .as_ref()
+            .unwrap()
+            .is_ejected(&main.target_id(0)));
+    }
+
+    #[test]
+    fn terminal_attempt_cleanup_is_exactly_once_without_counter_underflow() {
+        let pipeline = lifecycle_pipeline();
+        let main = load_balancer(&pipeline.actions[0]);
+        let mut ctx = RequestContext {
+            pipeline: std::sync::Arc::clone(&pipeline),
+            ..RequestContext::default()
+        };
+
+        begin_load_balancer_attempt(
+            &mut ctx,
+            LoadBalancerActionKey::new(0, None),
+            &target_selection(0, "bandit"),
+        );
+        finish_load_balancer_attempt(&mut ctx, LoadBalancerAttemptOutcome::Success);
+        finish_load_balancer_attempt(&mut ctx, LoadBalancerAttemptOutcome::Failure);
+
+        assert_eq!(main.connection_count(0), 0);
+        assert!(ctx.lb_attempt.is_none());
+        assert_eq!(
+            breaker_state(&main, 0),
+            sbproxy_platform::CircuitState::Closed,
+            "the second cleanup must not record a second outcome"
+        );
+        assert!(!main
+            .outlier_detector
+            .as_ref()
+            .unwrap()
+            .is_ejected(&main.target_id(0)));
+    }
+
+    #[test]
+    fn downstream_errors_do_not_train_a_healthy_upstream_as_failed() {
+        let pipeline = lifecycle_pipeline();
+        let main = load_balancer(&pipeline.actions[0]);
+        let mut ctx = RequestContext {
+            pipeline: std::sync::Arc::clone(&pipeline),
+            ..RequestContext::default()
+        };
+        begin_load_balancer_attempt(
+            &mut ctx,
+            LoadBalancerActionKey::new(0, None),
+            &target_selection(0, "bandit"),
+        );
+        let downstream_outcome =
+            terminal_load_balancer_attempt_outcome(200, Some(&ErrorSource::Downstream));
+        finish_load_balancer_attempt(&mut ctx, downstream_outcome);
+
+        assert_eq!(main.connection_count(0), 0);
+        assert_eq!(
+            breaker_state(&main, 0),
+            sbproxy_platform::CircuitState::Closed
+        );
+        assert!(!main
+            .outlier_detector
+            .as_ref()
+            .unwrap()
+            .is_ejected(&main.target_id(0)));
+        assert_eq!(downstream_outcome, LoadBalancerAttemptOutcome::Neutral);
+        assert_eq!(
+            terminal_load_balancer_attempt_outcome(200, Some(&ErrorSource::Upstream)),
+            LoadBalancerAttemptOutcome::Failure
+        );
+        assert_eq!(
+            terminal_load_balancer_attempt_outcome(200, None),
+            LoadBalancerAttemptOutcome::Success
+        );
+        assert_eq!(
+            terminal_load_balancer_attempt_outcome(503, Some(&ErrorSource::Downstream)),
+            LoadBalancerAttemptOutcome::Failure,
+            "a downstream write error must not erase an upstream 5xx"
+        );
+    }
+
+    #[test]
+    fn attempt_feedback_uses_observed_upstream_status_not_rewritten_downstream_status() {
+        let pipeline = lifecycle_pipeline();
+        let main = load_balancer(&pipeline.actions[0]);
+        let mut ctx = RequestContext {
+            pipeline: std::sync::Arc::clone(&pipeline),
+            ..RequestContext::default()
+        };
+        let action = LoadBalancerActionKey::new(0, None);
+
+        begin_load_balancer_attempt(&mut ctx, action, &target_selection(0, "bandit"));
+        let upstream_ok = pingora_http::ResponseHeader::build(200, None).unwrap();
+        capture_load_balancer_upstream_response(&mut ctx, &upstream_ok);
+        ctx.response_status = Some(503);
+        finish_terminal_load_balancer_attempt(&mut ctx, Some(&ErrorSource::Downstream));
+
+        assert_eq!(main.connection_count(0), 0);
+        assert_eq!(
+            breaker_state(&main, 0),
+            sbproxy_platform::CircuitState::Closed,
+            "a downstream 5xx rewrite must not train an observed upstream 200 as failed"
+        );
+        assert!(!main
+            .outlier_detector
+            .as_ref()
+            .unwrap()
+            .is_ejected(&main.target_id(0)));
+
+        begin_load_balancer_attempt(&mut ctx, action, &target_selection(1, "bandit"));
+        let upstream_failure = pingora_http::ResponseHeader::build(503, None).unwrap();
+        capture_load_balancer_upstream_response(&mut ctx, &upstream_failure);
+        ctx.response_status = Some(200);
+        finish_terminal_load_balancer_attempt(&mut ctx, None);
+
+        assert_eq!(main.connection_count(1), 0);
+        assert_eq!(
+            breaker_state(&main, 1),
+            sbproxy_platform::CircuitState::Open,
+            "a downstream 2xx rewrite must not erase an observed upstream 503"
+        );
+        assert!(main
+            .outlier_detector
+            .as_ref()
+            .unwrap()
+            .is_ejected(&main.target_id(1)));
+    }
+
+    #[test]
+    fn deferred_strategy_selection_records_the_builtin_algorithm() {
+        let pipeline = lifecycle_pipeline();
+        let mut ctx = RequestContext {
+            pipeline: std::sync::Arc::clone(&pipeline),
+            ..RequestContext::default()
+        };
+        let selection = target_selection(0, "round_robin");
+
+        begin_load_balancer_attempt(&mut ctx, LoadBalancerActionKey::new(0, None), &selection);
+
+        assert_eq!(
+            ctx.admin_load_balancer_strategy.as_deref(),
+            Some("round_robin")
+        );
+        assert_eq!(
+            ctx.admin_load_balancer_target.as_deref(),
+            Some("target-0.example.com:443")
+        );
+        finish_load_balancer_attempt(&mut ctx, LoadBalancerAttemptOutcome::Neutral);
+    }
+
+    #[test]
+    fn timeout_retry_allows_upstream_timeouts_under_the_policy() {
+        let cfg = timeout_retry_cfg(&["timeout"], 3);
+
+        assert_eq!(
+            maybe_retry_upstream_timeout(
+                &cfg,
+                &ErrorType::ReadTimedout,
+                &ErrorSource::Upstream,
+                0,
+                false,
+                None,
+            ),
+            Some("upstream")
+        );
+        assert_eq!(
+            maybe_retry_upstream_timeout(
+                &cfg,
+                &ErrorType::WriteTimedout,
+                &ErrorSource::Upstream,
+                1,
+                false,
+                None,
+            ),
+            Some("upstream")
+        );
+    }
+
+    #[test]
+    fn timeout_retry_classifies_connect_phase_timeouts() {
+        let cfg = timeout_retry_cfg(&["timeout"], 3);
+
+        assert_eq!(
+            maybe_retry_upstream_timeout(
+                &cfg,
+                &ErrorType::ConnectTimedout,
+                &ErrorSource::Upstream,
+                0,
+                false,
+                None,
+            ),
+            Some("connect")
+        );
+        assert_eq!(
+            timeout_error_phase(&ErrorType::TLSHandshakeTimedout),
+            Some("connect")
+        );
+    }
+
+    #[test]
+    fn timeout_retry_requires_the_timeout_token() {
+        for retry_on in [&["connect_error"][..], &["502", "503"][..]] {
+            let cfg = timeout_retry_cfg(retry_on, 3);
+            assert_eq!(
+                maybe_retry_upstream_timeout(
+                    &cfg,
+                    &ErrorType::ReadTimedout,
+                    &ErrorSource::Upstream,
+                    0,
+                    false,
+                    None,
+                ),
+                None,
+                "retry_on {retry_on:?} must not enable timeout retries"
+            );
+        }
+    }
+
+    #[test]
+    fn timeout_retry_enforces_the_shared_attempt_cap() {
+        // max_attempts: 2 permits exactly one retry: retries_used 0
+        // passes, 1 is the cap. 1 total attempt disables retries.
+        let cfg = timeout_retry_cfg(&["timeout"], 2);
+        assert!(maybe_retry_upstream_timeout(
+            &cfg,
+            &ErrorType::ReadTimedout,
+            &ErrorSource::Upstream,
+            0,
+            false,
+            None,
+        )
+        .is_some());
+        assert_eq!(
+            maybe_retry_upstream_timeout(
+                &cfg,
+                &ErrorType::ReadTimedout,
+                &ErrorSource::Upstream,
+                1,
+                false,
+                None,
+            ),
+            None
+        );
+        let disabled = timeout_retry_cfg(&["timeout"], 1);
+        assert_eq!(
+            maybe_retry_upstream_timeout(
+                &disabled,
+                &ErrorType::ReadTimedout,
+                &ErrorSource::Upstream,
+                0,
+                false,
+                None,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn timeout_retry_leaves_non_timeout_errors_untouched() {
+        let cfg = timeout_retry_cfg(&["timeout"], 3);
+        for etype in [
+            ErrorType::ConnectionClosed,
+            ErrorType::ReadError,
+            ErrorType::WriteError,
+            ErrorType::ConnectRefused,
+            ErrorType::HTTPStatus(504),
+        ] {
+            assert_eq!(
+                maybe_retry_upstream_timeout(&cfg, &etype, &ErrorSource::Upstream, 0, false, None),
+                None,
+                "{etype:?} is not a timeout and must never schedule a timeout retry"
+            );
+        }
+    }
+
+    #[test]
+    fn timeout_retry_requires_the_upstream_leg() {
+        let cfg = timeout_retry_cfg(&["timeout"], 3);
+        for esource in [
+            ErrorSource::Downstream,
+            ErrorSource::Internal,
+            ErrorSource::Unset,
+        ] {
+            assert_eq!(
+                maybe_retry_upstream_timeout(
+                    &cfg,
+                    &ErrorType::ReadTimedout,
+                    &esource,
+                    0,
+                    false,
+                    None,
+                ),
+                None,
+                "{esource:?} timeouts are not upstream failures"
+            );
+        }
+    }
+
+    #[test]
+    fn timeout_retry_blocks_once_the_response_started_downstream() {
+        let cfg = timeout_retry_cfg(&["timeout"], 3);
+        assert_eq!(
+            maybe_retry_upstream_timeout(
+                &cfg,
+                &ErrorType::ReadTimedout,
+                &ErrorSource::Upstream,
+                0,
+                true,
+                None,
+            ),
+            None,
+            "bytes already written downstream can never be recalled"
+        );
+    }
+
+    #[test]
+    fn timeout_retry_blocks_unreplayable_requests() {
+        let cfg = timeout_retry_cfg(&["timeout"], 3);
+        assert_eq!(
+            maybe_retry_upstream_timeout(
+                &cfg,
+                &ErrorType::ReadTimedout,
+                &ErrorSource::Upstream,
+                0,
+                false,
+                Some("non_idempotent_method"),
+            ),
+            None,
+            "a request that already reached the upstream must pass the replay gate"
+        );
+    }
+
+    #[test]
+    fn parsed_upstream_url_extracts_host_scheme_and_path() {
         let info = parsed_upstream_url("https://api.example.com:8443/v1/base");
         assert_eq!(info.host.as_deref(), Some("api.example.com"));
+        assert_eq!(info.scheme.as_deref(), Some("https"));
         assert_eq!(info.path, "/v1/base");
     }
 
@@ -4364,5 +7226,57 @@ mod tests {
         assert_eq!(final_response_status(&ctx, Some(&header)), 429);
         ctx.response_status = None;
         assert_eq!(final_response_status(&ctx, None), 0);
+    }
+
+    #[test]
+    fn compression_value_requires_a_terminal_provider_success() {
+        assert!(is_billable_provider_success(200, Some("openai")));
+        assert!(is_billable_provider_success(299, Some("local")));
+        assert!(!is_billable_provider_success(302, Some("openai")));
+        assert!(!is_billable_provider_success(429, Some("openai")));
+        assert!(!is_billable_provider_success(200, None));
+    }
+
+    #[test]
+    fn terminal_success_realizes_pending_compression_value_exactly_once() {
+        let mut ctx = RequestContext {
+            ai_provider: Some("openai".to_string()),
+            pending_compression_value: Some(pending_compression_value()),
+            ..RequestContext::default()
+        };
+
+        let realized = take_realized_compression_value(&mut ctx, 200, false);
+
+        assert!(realized.is_some());
+        assert!(ctx.pending_compression_value.is_none());
+        assert!(take_realized_compression_value(&mut ctx, 200, false).is_none());
+    }
+
+    #[test]
+    fn terminal_failure_consumes_pending_compression_value_without_realizing_it() {
+        let mut ctx = RequestContext {
+            ai_provider: Some("openai".to_string()),
+            pending_compression_value: Some(pending_compression_value()),
+            ..RequestContext::default()
+        };
+
+        let realized = take_realized_compression_value(&mut ctx, 500, false);
+
+        assert!(realized.is_none());
+        assert!(ctx.pending_compression_value.is_none());
+    }
+
+    #[test]
+    fn fatal_error_after_success_headers_consumes_value_without_realizing_it() {
+        let mut ctx = RequestContext {
+            ai_provider: Some("openai".to_string()),
+            pending_compression_value: Some(pending_compression_value()),
+            ..RequestContext::default()
+        };
+
+        let realized = take_realized_compression_value(&mut ctx, 200, true);
+
+        assert!(realized.is_none());
+        assert!(ctx.pending_compression_value.is_none());
     }
 }

@@ -1,0 +1,101 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Stateful AI context compression with mesh-replicated session summaries.
+#
+# Redis-free variant of examples/ai-context-compression-redis: the versioned
+# running-summary record is stored on the cluster replication substrate
+# (proxy.cluster.replication) instead of Redis. Redis remains the default and
+# recommended backend; choose mesh for fleets that already run cluster
+# replication and accept eventually consistent session summaries. See
+# docs/ai-context-compression.md for the contract differences.
+#
+# Run this same file on every node with per-node SB_NODE_ID, SB_SEED, and
+# port environment overrides, exactly like examples/model-cluster-symmetric.
+
+proxy:
+  http_bind_port: ${SB_HTTP_PORT:-8080}
+
+  admin:
+    enabled: true
+    bind: 127.0.0.1
+    port: ${SB_ADMIN_PORT:-9090}
+    username: admin
+    # Demo password for local validate/run. Change before any non-loopback bind.
+    password: ${SB_ADMIN_PASSWORD:-demo-change-me}
+
+  cluster:
+    cluster_id: compression-mesh-demo
+    node_id: ${SB_NODE_ID:-node-a}
+    roles: [gateway]
+    seeds: ["${SB_SEED:-127.0.0.1:17946}"]
+    gossip_port: ${SB_GOSSIP_PORT:-17946}
+    transport_port: ${SB_TRANSPORT_PORT:-18946}
+    advertise_addr: "127.0.0.1:${SB_GOSSIP_PORT:-17946}"
+    transport_advertise_addr: "127.0.0.1:${SB_TRANSPORT_PORT:-18946}"
+    state_dir: "${SB_STATE_DIR:-./state/compression-mesh-demo}"
+    security:
+      mode: shared_key
+      development: true
+      shared_key: ${SB_CLUSTER_KEY:-local-compression-mesh-secret}
+    # compression.state.backend: mesh binds to this replicated substrate.
+    # Without this block, selecting the mesh backend fails at startup.
+    replication:
+      factor: 2
+      write_consistency: quorum
+      read_consistency: quorum
+
+  tenants:
+    - id: compression-mesh-demo
+
+origins:
+  "ai.local":
+    tenant_id: compression-mesh-demo
+
+    # Stateful compression never invents its own session identifier. Capture
+    # only a valid caller-provided X-Sb-Session-Id ULID.
+    sessions:
+      capture: true
+      auto_generate: never
+
+    action:
+      type: ai_proxy
+      routing: round_robin
+
+      providers:
+        - name: openai-primary
+          provider_type: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o
+          models:
+            - gpt-4o
+
+        # This provider and model are selected directly by summary_buffer.
+        # They do not recursively enter the ordinary AI request pipeline.
+        - name: openai-summarizer
+          provider_type: openai
+          api_key: ${OPENAI_API_KEY}
+          models:
+            - gpt-4o-mini
+
+      compression:
+        state:
+          backend: mesh
+          ttl: 24h
+
+        # Summary content remains unavailable through the Admin API.
+        allow_admin_content_inspection: false
+
+        # Levers run in declaration order. The stateful summary reduces old
+        # history first, then deterministic window fitting is the final bound.
+        levers:
+          - type: summary_buffer
+            min_tokens: 4096
+            retain_recent_messages: 4
+            target_summary_tokens: 768
+            summarizer:
+              provider: openai-summarizer
+              model: gpt-4o-mini
+              timeout: 8s
+
+          - type: window_fit
+            completion_reserve_tokens: 2048
+            input_budget_tokens: 16384

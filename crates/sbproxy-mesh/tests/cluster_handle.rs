@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use sbproxy_mesh::{
     ClusterHandle, ClusterIdentity, ClusterMemberState, ClusterMode, ClusterNodeRole,
-    ClusterStateError, ClusterStateRead, MeshNode,
+    ClusterStateError, ClusterStateRead, ClusterVersionedStateKind, ClusterVersionedStateRead,
+    MeshNode, VersionedLwwMergeOutcome,
 };
 use serde::{Deserialize, Serialize};
 
@@ -90,6 +91,190 @@ async fn typed_state_round_trips_generation_publisher_and_payload() {
     assert_eq!(record.schema_version, 1);
     assert_eq!(record.payload.value, "ready");
     assert!(record.expires_at_unix_ms > record.published_at_unix_ms);
+}
+
+#[tokio::test]
+async fn versioned_state_rejects_stale_writes_and_marks_competing_children() {
+    let handle = ClusterHandle::local(identity("local-a")).expect("local handle");
+    assert_eq!(
+        handle
+            .merge_versioned_state(
+                "compression",
+                "opaque-a",
+                1,
+                1,
+                None,
+                ClusterVersionedStateKind::Live,
+                Duration::from_secs(30),
+                &Payload {
+                    value: "left".to_string(),
+                },
+            )
+            .await
+            .unwrap(),
+        VersionedLwwMergeOutcome::Replaced
+    );
+    let competing = handle
+        .merge_versioned_state(
+            "compression",
+            "opaque-a",
+            1,
+            1,
+            None,
+            ClusterVersionedStateKind::Live,
+            Duration::from_secs(30),
+            &Payload {
+                value: "right".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        competing,
+        VersionedLwwMergeOutcome::ConflictReplaced | VersionedLwwMergeOutcome::ConflictRetained
+    ));
+    assert_eq!(
+        handle
+            .merge_versioned_state(
+                "compression",
+                "opaque-a",
+                1,
+                0,
+                None,
+                ClusterVersionedStateKind::Live,
+                Duration::from_secs(30),
+                &Payload {
+                    value: "stale".to_string(),
+                },
+            )
+            .await
+            .unwrap(),
+        VersionedLwwMergeOutcome::StaleRejected
+    );
+
+    let ClusterVersionedStateRead::Present(record) = handle
+        .read_versioned_state::<Payload>("compression", "opaque-a", 1)
+        .await
+    else {
+        panic!("versioned state should remain readable");
+    };
+    assert_eq!(record.logical_version, 1);
+    assert!(record.conflict_detected);
+    assert!(matches!(record.payload.value.as_str(), "left" | "right"));
+}
+
+#[tokio::test]
+async fn versioned_tombstone_blocks_live_state_until_its_ttl_expires() {
+    let handle = ClusterHandle::local(identity("local-a")).expect("local handle");
+    handle
+        .merge_versioned_state(
+            "compression",
+            "opaque-a",
+            1,
+            1,
+            None,
+            ClusterVersionedStateKind::Live,
+            Duration::from_secs(30),
+            &Payload {
+                value: "sensitive".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    handle
+        .merge_versioned_state(
+            "compression",
+            "opaque-a",
+            1,
+            2,
+            Some(1),
+            ClusterVersionedStateKind::Tombstone,
+            Duration::from_secs(1),
+            &Payload {
+                value: "deleted".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        handle
+            .merge_versioned_state(
+                "compression",
+                "opaque-a",
+                1,
+                3,
+                Some(2),
+                ClusterVersionedStateKind::Live,
+                Duration::from_secs(30),
+                &Payload {
+                    value: "stale replica".to_string(),
+                },
+            )
+            .await
+            .unwrap(),
+        VersionedLwwMergeOutcome::TombstoneRetained
+    );
+
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    assert_eq!(
+        handle
+            .merge_versioned_state(
+                "compression",
+                "opaque-a",
+                1,
+                1,
+                None,
+                ClusterVersionedStateKind::Live,
+                Duration::from_secs(30),
+                &Payload {
+                    value: "new history".to_string(),
+                },
+            )
+            .await
+            .unwrap(),
+        VersionedLwwMergeOutcome::Replaced
+    );
+}
+
+#[tokio::test]
+async fn local_state_key_snapshot_is_stable_sorted_and_bounded() {
+    let handle = ClusterHandle::local(identity("local-a")).expect("local handle");
+    for key in ["opaque-z", "opaque-a", "opaque-m"] {
+        handle
+            .merge_versioned_state(
+                "compression",
+                key,
+                1,
+                1,
+                None,
+                ClusterVersionedStateKind::Live,
+                Duration::from_secs(30),
+                &Payload {
+                    value: key.to_string(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    handle
+        .merge_versioned_state(
+            "other",
+            "opaque-0",
+            1,
+            1,
+            None,
+            ClusterVersionedStateKind::Live,
+            Duration::from_secs(30),
+            &Payload {
+                value: "other".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let snapshot = handle.local_state_key_snapshot("compression", 2).unwrap();
+    assert_eq!(snapshot.keys, vec!["opaque-a", "opaque-m"]);
+    assert!(snapshot.truncated);
 }
 
 #[tokio::test]

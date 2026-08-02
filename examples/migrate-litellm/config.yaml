@@ -14,9 +14,9 @@ model_list:
       api_key: os.environ/OPENAI_API_KEY
       rpm: 100
       tpm: 200000
-  # Public name "claude", served by Anthropic. The budget kwarg has no
-  # automatic translation; the importer warns and points at the migration
-  # guide instead of dropping it silently.
+  # Public name "claude", served by Anthropic. A single clean max_budget
+  # emits an action-level budget: window (monthly when budget_duration is
+  # omitted). Differing per-model caps would warn instead.
   - model_name: claude
     litellm_params:
       model: anthropic/claude-haiku-4-5

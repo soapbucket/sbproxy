@@ -1,7 +1,8 @@
 # Frequently asked questions
-*Last modified: 2026-07-09*
 
-Quick answers to the questions operators hit most often when standing up SBproxy, picking between OSS and enterprise, debugging a config that will not load, or wiring observability. For the full reference of any feature, follow the link to the matching doc.
+*Last modified: 2026-07-29*
+
+Quick answers to the questions operators hit most often when standing up SBproxy, debugging a config that will not load, or wiring observability. For the full reference of any feature, follow the link to the matching doc.
 
 ## Install + first run
 
@@ -10,7 +11,7 @@ Quick answers to the questions operators hit most often when standing up SBproxy
 Pick whichever fits your platform:
 
 ```bash
-# Linux / macOS, single static binary, no Rust toolchain required:
+# Linux amd64/arm64 or Apple Silicon macOS, no Rust toolchain required:
 curl -fsSL https://download.sbproxy.dev | sh
 
 # macOS via Homebrew:
@@ -28,45 +29,36 @@ See [manual.md](./manual.md) for systemd unit files, the Kubernetes manifest, an
 sbproxy serve --config sb.yml
 ```
 
-The only required flag is `--config` (alias `-f`). Run `sbproxy --help` for the full surface; common alternates are `sbproxy validate --config sb.yml` (validate without starting) and `sbproxy version`.
+The serving command accepts `--config` (alias `-f`). Run `sbproxy --help` for
+the full surface. To validate without starting, pass the config as a positional
+path with `sbproxy validate sb.yml`.
 
 There is no directory-loading mode. The binary reads a single YAML file; compose multi-file configs via your CI or a wrapper script.
 
 ### My config will not load. How do I see why?
 
 ```bash
-sbproxy validate --config sb.yml
+sbproxy validate sb.yml
 ```
 
 The validator runs the same schema check the server uses at boot, prints the offending field path plus a one-line explanation, and exits non-zero. JSON output is available via `sbproxy validate --format json sb.yml` for tooling.
 
 See [troubleshooting.md](./troubleshooting.md) for the most common validation errors.
 
-## OSS vs enterprise
+## Distribution
 
-### What is in the OSS distribution?
+### What is included?
 
-Everything in this repo:
+Everything in this repository ships under Apache-2.0:
 
 * The full proxy: HTTP/1.1, HTTP/2, websockets, gRPC, GraphQL, MCP.
-* The AI gateway: 66 native providers, routing strategies, guardrails, budgets, streaming, semantic cache, virtual keys.
+* The AI gateway: 72 native providers, routing strategies, guardrails, budgets, streaming, semantic cache, virtual keys.
 * Every auth provider (API key, Basic, Bearer, JWT, Digest, forward-auth, Web Bot Auth, CAP, OIDC).
 * Every policy (rate limit, WAF, IP filter, CORS, HSTS, CSRF, agent budget, content digest, BOLA / `object_authz`, ...).
 * Every transform (26 types, including `json`, `template`, `wasm`).
 * Scripting via CEL, Lua, JavaScript, and WebAssembly.
 * The embedded admin server, the access log, the metrics and tracing wiring, the audit log.
 * All examples and dashboards.
-
-### What is enterprise-only?
-
-Three categories: hosted infrastructure, multi-tenant orchestration, and analytics. Concretely:
-
-* The hosted control plane (a managed cluster you point your OSS proxies at).
-* The portal: per-workspace dashboards, billing, virtual-key issuance, audit search.
-* Long-haul event ingestion (Kafka / NATS, S3 archives, Datadog / Splunk forwarders).
-* HSM-backed key custody, SPIFFE workload identity, multi-source entitlements.
-
-See [enterprise.md](./enterprise.md) for the buyer-facing overview.
 
 ### Can I run SBproxy in production?
 
@@ -79,25 +71,40 @@ Yes. SBproxy is licensed under the Apache License 2.0, which permits any use, in
 The most common causes, in order:
 
 1. The auth provider was never matched on the request's `Host`. SBproxy routes by `Host` first; an auth block on `api.example.com` does not apply to a request with `Host: api.test`. Check `sbproxy_auth_results_total{origin}` in metrics to confirm.
-2. Trusted-proxy CIDRs are wrong. If SBproxy sits behind another LB, `X-Forwarded-For` headers from outside `proxy.trusted_proxies` are stripped on ingress and the real client IP is the LB. Auth providers that key off the client IP (rate-limit, IP allowlist, OIDC session bind) then see the wrong address.
-3. The auth header was stripped by a transform. `headers_to_forward` on the upstream block is an allowlist; auth headers absent from it never reach the upstream. The proxy still validates them locally, but a downstream that re-validates will see nothing.
+2. Trusted-proxy CIDRs are wrong. If SBproxy sits behind another LB,
+   `X-Forwarded-For` headers from outside `proxy.trusted_proxies` are stripped
+   on ingress and the real client IP is the LB. This affects only policies and
+   authentication that use the client address, such as IP filtering or an
+   IP-based rate limit.
+3. A forward-auth service never received the credential. On an
+   `authentication.type: forward_auth` block, `headers_to_forward` controls
+   which original request headers are copied into the authentication
+   subrequest. Include `Authorization` or `Cookie` when that service needs it.
 
-The structured access log carries `auth_type` and `auth_ms` for every request; grep those to localise the failure.
+When authentication runs, the structured access log can include `auth_type`
+and `auth_ms`. These fields are optional and can be absent on requests that did
+not run an auth provider. In a query or dashboard, alias `auth_type` to
+`auth_provider` when that name is clearer for operators.
 
 ### How do I configure OIDC?
 
 `docs/configuration.md` has the full schema; for the minimal case:
 
 ```yaml
-auth:
-  type: oidc
-  issuer: https://idp.example.com
-  client_id: sbproxy
-  client_secret: vault://primary/secret/data/oidc/client?key=client_secret
-  cookie_secret: vault://primary/secret/data/oidc/cookie?key=cookie_secret
-  authorization_endpoint: https://idp.example.com/authorize
-  token_endpoint: https://idp.example.com/oauth/token
-  jwks_uri: https://idp.example.com/.well-known/jwks.json
+origins:
+  "app.example.com":
+    action:
+      type: proxy
+      url: http://upstream-app:3000
+    authentication:
+      type: oidc
+      issuer: https://idp.example.com
+      client_id: sbproxy
+      client_secret: vault://primary/secret/data/oidc/client?key=client_secret
+      cookie_secret: vault://primary/secret/data/oidc/cookie?key=cookie_secret
+      authorization_endpoint: https://idp.example.com/authorize
+      token_endpoint: https://idp.example.com/oauth/token
+      jwks_uri: https://idp.example.com/.well-known/jwks.json
 ```
 
 `cookie_secret` must be at least 32 bytes. Optional `userinfo_endpoint`, `end_session_endpoint`, and `post_logout_redirect_allowlist` enable the userinfo trust-header projection and RP-initiated logout.
@@ -106,21 +113,35 @@ auth:
 
 ### Where are the metrics? How do I scrape them?
 
-The Prometheus endpoint is served by the embedded admin server. Enable it in YAML:
+The same Prometheus series are available in two places. The main data-plane
+listener always serves `/metrics` on `proxy.http_bind_port` (8080 by default)
+without admin authentication:
 
-```yaml
-admin:
-  enabled: true
-  port: 9090
+```text
+http://<host>:8080/metrics
 ```
 
-Then scrape `http://<host>:9090/metrics` from Prometheus. `admin.username` + `admin.password` gate the route via HTTP Basic.
+For an access-controlled scrape, enable the admin listener:
+
+```yaml
+proxy:
+  admin:
+    enabled: true
+    port: 9090
+    username: metrics
+    password: ${SB_ADMIN_PASSWORD}
+```
+
+Then scrape `http://<host>:9090/metrics` with HTTP Basic credentials. The
+admin mirror sits behind `proxy.admin.username` and `proxy.admin.password`,
+the same authentication used by the other protected admin routes. Health
+probes remain unauthenticated.
 
 The canonical metric catalog with stability promises is [metrics-stability.md](./metrics-stability.md).
 
 ### Where does the access log go?
 
-`stderr` by default, structured JSON, one line per request. Enable via the top-level `access_log:` block; route to a file via stdout/stderr redirection, or to a sink (S3, Kafka, Datadog) via the enterprise build. The full schema is in [access-log.md](./access-log.md).
+`stderr` by default, structured JSON, one line per request. Enable via the top-level `access_log:` block; route to a file via stdout/stderr redirection. The full schema is in [access-log.md](./access-log.md).
 
 The log carries phase timings (`auth_ms`, `upstream_ttfb_ms`, `response_filter_ms`) so a slow request reveals which part of the pipeline produced the latency without cross-referencing histograms.
 
@@ -142,7 +163,10 @@ Sub-millisecond p99 at 50k+ rps on commodity hardware for plain proxy paths; AI 
 
 ### Where are the examples?
 
-`examples/` in this repo, indexed in `examples/README.md`. 166 examples on disk; pick the one closest to your scenario, copy `sb.yml`, and edit from there. Every example validates against the schema and ships with a README plus runnable curl commands.
+`examples/` in this repo, indexed in `examples/README.md`. Pick the directory
+closest to your scenario, copy its `sb.yml`, and edit from there. The
+configuration examples are checked in CI, and their READMEs carry the commands
+needed to exercise each feature.
 
 ### How do I run an example against my local SBproxy?
 
@@ -173,4 +197,3 @@ Accepted levels: `trace`, `debug`, `info`, `warn`, `error`. Default is `info`. `
 * [manual.md](./manual.md) - install, CLI, runtime, TLS, deployment patterns.
 * [configuration.md](./configuration.md) - every `sb.yml` field with examples.
 * [troubleshooting.md](./troubleshooting.md) - common failure modes and fixes.
-* [enterprise.md](./enterprise.md) - the OSS / enterprise split.

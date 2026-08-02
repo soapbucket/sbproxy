@@ -321,16 +321,16 @@ fn build_responses(origin: &sbproxy_config::CompiledOrigin) -> Value {
 /// A pluggable mapper from a gateway auth config to an OpenAPI 3.0
 /// SecurityScheme.
 ///
-/// OSS ships baseline mappers for the auth types the open-source proxy
-/// implements (api_keys, basic_auth, oauth_client_creds). Enterprise
-/// crates register richer mappers via [`inventory::submit!`] for
-/// enterprise-only auth types (SAML, biscuit, oauth_introspection,
+/// SBproxy ships baseline mappers for the auth types the open-source proxy
+/// implements (api_keys, basic_auth, oauth_client_creds). Extensions
+/// register richer mappers via [`inventory::submit!`] for
+/// extension-provided auth types (SAML, biscuit, oauth_introspection,
 /// ext_authz) and may override OSS mappers when they want to publish
 /// fuller metadata.
 ///
 /// Registration is link-time: any crate compiled into the final binary
 /// that submits an entry contributes its mapping. Resolution iterates
-/// registered mappers in inventory order; enterprise crates that
+/// registered mappers in inventory order; extensions that
 /// deliberately want last-word semantics should pick a unique
 /// `auth_type` rather than relying on registration order.
 pub struct AuthSchemeMapper {
@@ -348,8 +348,8 @@ inventory::collect!(AuthSchemeMapper);
 ///
 /// Resolution order:
 /// 1. Registered [`AuthSchemeMapper`] entries with a matching
-///    `auth_type` (enterprise override path).
-/// 2. OSS built-in mappers for the auth types the open-source proxy
+///    `auth_type` (extension override path).
+/// 2. Built-in mappers for the auth types the open-source proxy
 ///    implements directly.
 /// 3. Generic fallback: `apiKey` placeholder + `x-sbproxy-auth-type`
 ///    extension so the doc still validates and operators see the
@@ -412,7 +412,7 @@ fn map_auth(auth: &Value, scheme_name: &str) -> Option<Value> {
             "name": "Authorization",
             "x-sbproxy-auth-type": auth_type,
             "description": format!(
-                "Auth handled by the gateway-side plugin '{}'; richer SecurityScheme metadata is available in the enterprise build (see docs/enterprise.md).",
+                "Gateway auth type '{}' has no registered OpenAPI mapper; emitted as a generic API key scheme.",
                 auth_type
             ),
         }),
@@ -458,6 +458,7 @@ mod tests {
             rate_limits: None,
             audit: None,
             session_ledger: None,
+            flags: Vec::new(),
         }
     }
 
@@ -511,6 +512,7 @@ mod tests {
             outbound_credential: None,
             outbound_web_bot_auth: false,
             observability: None,
+            attestation: None,
         }
     }
 
@@ -600,14 +602,18 @@ mod tests {
     fn build_unknown_auth_type_falls_through_with_extension() {
         let mut snap = make_minimal_snapshot();
         snap.origins[0].auth_config = Some(serde_json::json!({
-            "type": "custom_enterprise_auth"
+            "type": "custom_plugin_auth"
         }));
         let spec = build(&snap, None);
         let schemes = spec["components"]["securitySchemes"]
             .as_object()
             .expect("securitySchemes object");
         let scheme = schemes.values().next().unwrap();
-        assert_eq!(scheme["x-sbproxy-auth-type"], "custom_enterprise_auth");
+        assert_eq!(scheme["x-sbproxy-auth-type"], "custom_plugin_auth");
+        assert_eq!(
+            scheme["description"],
+            "Gateway auth type 'custom_plugin_auth' has no registered OpenAPI mapper; emitted as a generic API key scheme."
+        );
     }
 
     #[test]

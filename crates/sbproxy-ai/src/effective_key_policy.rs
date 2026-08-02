@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 /// Schema version included in effective-policy previews and digest material.
-pub const EFFECTIVE_KEY_POLICY_SCHEMA_VERSION: u16 = 1;
+pub const EFFECTIVE_KEY_POLICY_SCHEMA_VERSION: u16 = 2;
 
 /// Source that produced an effective key policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +120,8 @@ pub enum PolicyEnforcementProof {
     ProviderGate,
     /// The effective route override is applied before model enforcement.
     RouteOverride,
+    /// Request dispatch resolves the key's compression selector by precedence.
+    CompressionSelection,
     /// Inbound principal attributes pass through the selector gate.
     PrincipalGate,
     /// Required PII rules are checked before upstream dispatch.
@@ -136,6 +138,9 @@ pub enum PolicyEnforcementProof {
     Budget,
     /// Served-model admission uses the key's priority lane.
     AdmissionPriority,
+    /// Request dispatch reads the effective content-capture consent bit
+    /// before retaining any redacted sample (WOR-2096).
+    Observability,
 }
 
 impl PolicyEnforcementProof {
@@ -148,6 +153,7 @@ impl PolicyEnforcementProof {
             Self::ModelGate => "model_gate",
             Self::ProviderGate => "provider_gate",
             Self::RouteOverride => "route_override",
+            Self::CompressionSelection => "compression_selection",
             Self::PrincipalGate => "principal_gate",
             Self::PiiGuardrail => "pii_guardrail",
             Self::ToolGate => "tool_gate",
@@ -156,6 +162,7 @@ impl PolicyEnforcementProof {
             Self::RateLimit => "rate_limit",
             Self::Budget => "budget",
             Self::AdmissionPriority => "admission_priority",
+            Self::Observability => "observability",
         }
     }
 }
@@ -392,6 +399,15 @@ declare_policy_fields! {
     ),
     /// Model route override.
     RouteToModel => ("route_to_model", RouteOverride, Patch, ["route_to_model"], Text, Null),
+    /// Route-local compression selector.
+    CompressionProfile => (
+        "compression_profile",
+        CompressionSelection,
+        Patch,
+        ["compression_profile"],
+        Text,
+        Null
+    ),
     /// Inbound principal selectors.
     PrincipalSelectors => (
         "principal_selectors",
@@ -436,6 +452,15 @@ declare_policy_fields! {
         PromptInjection,
         Patch,
         ["bypass_prompt_injection"],
+        Boolean,
+        False
+    ),
+    /// WOR-2096: consent bit for the origin's opt-in content capture.
+    AllowContentCapture => (
+        "allow_content_capture",
+        Observability,
+        Patch,
+        ["allow_content_capture"],
         Boolean,
         False
     ),
@@ -516,6 +541,9 @@ pub struct EffectiveKeyPolicy {
     pub blocked_providers: Vec<String>,
     /// Optional model override applied before model enforcement.
     pub route_to_model: Option<String>,
+    /// Route-local compression selector applied before cache lookup.
+    #[serde(default)]
+    pub compression_profile: Option<String>,
     /// Typed inbound-principal selectors. Empty permits any principal.
     pub principal_selectors: Vec<PrincipalSelector>,
     /// PII redaction rules required before upstream dispatch.
@@ -528,6 +556,10 @@ pub struct EffectiveKeyPolicy {
     pub inject_mcp: Option<PolicyMcpRef>,
     /// Whether body-aware prompt-injection evaluation is bypassed.
     pub bypass_prompt_injection: bool,
+    /// WOR-2096: whether this key consents to the origin's opt-in
+    /// redacted content capture. Both this and the origin flag must be
+    /// true before any sample is retained.
+    pub allow_content_capture: bool,
     /// Maximum requests per minute.
     pub max_requests_per_minute: Option<u64>,
     /// Maximum completed tokens per minute.
@@ -571,6 +603,7 @@ impl EffectiveKeyPolicy {
             allowed_providers: key.allowed_providers.clone(),
             blocked_providers: key.blocked_providers.clone(),
             route_to_model: key.route_to_model.clone(),
+            compression_profile: key.compression_profile.clone(),
             principal_selectors: key
                 .principal_selectors
                 .iter()
@@ -581,6 +614,7 @@ impl EffectiveKeyPolicy {
             inject_tools: key.inject_tools.clone(),
             inject_mcp: key.inject_mcp.as_ref().map(PolicyMcpRef::from),
             bypass_prompt_injection: key.bypass_prompt_injection,
+            allow_content_capture: key.allow_content_capture,
             max_requests_per_minute: key.max_requests_per_minute,
             max_tokens_per_minute: key.max_tokens_per_minute,
             budget: key.budget.as_ref().map(|budget| KeyBudgetPolicy {

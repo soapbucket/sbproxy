@@ -80,8 +80,9 @@ pub fn translate_response(format: ProviderFormat, body: serde_json::Value) -> se
 
 /// Convenience: translate raw response bytes back into OpenAI-shaped
 /// JSON bytes. Returns the original bytes unchanged when the format is
-/// `OpenAi`, when JSON parsing fails, or when re-serialization fails;
-/// this keeps the relay path lossless on unexpected upstream shapes.
+/// `OpenAi`, when the body is a top-level provider error envelope,
+/// when JSON parsing fails, or when re-serialization fails; this keeps
+/// the relay path lossless on unexpected upstream shapes.
 pub fn translate_response_bytes(format: ProviderFormat, body: &[u8]) -> Vec<u8> {
     if matches!(format, ProviderFormat::OpenAi) {
         return body.to_vec();
@@ -90,8 +91,28 @@ pub fn translate_response_bytes(format: ProviderFormat, body: &[u8]) -> Vec<u8> 
         Ok(v) => v,
         Err(_) => return body.to_vec(),
     };
+    if parsed
+        .get("error")
+        .is_some_and(|provider_error| !provider_error.is_null())
+    {
+        return body.to_vec();
+    }
     let translated = translate_response(format, parsed);
     serde_json::to_vec(&translated).unwrap_or_else(|_| body.to_vec())
+}
+
+/// Translate only successful upstream responses into the canonical
+/// OpenAI shape. Provider error bodies are relayed byte-for-byte so
+/// callers can preserve their native error envelopes.
+pub fn translate_success_response_bytes(
+    format: ProviderFormat,
+    status: u16,
+    body: &[u8],
+) -> Vec<u8> {
+    if !(200..300).contains(&status) {
+        return body.to_vec();
+    }
+    translate_response_bytes(format, body)
 }
 
 /// Whether this format requires request/response translation. Streaming
@@ -100,4 +121,30 @@ pub fn translate_response_bytes(format: ProviderFormat, body: &[u8]) -> Vec<u8> 
 /// before enabling SSE relay against a translated provider.
 pub fn requires_translation(format: ProviderFormat) -> bool {
     !matches!(format, ProviderFormat::OpenAi)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn anthropic_top_level_error_envelope_is_not_translated_as_a_message() {
+        let body =
+            br#"{"type":"error","error":{"type":"invalid_request_error","message":"bad input"}}"#;
+
+        assert_eq!(
+            translate_response_bytes(ProviderFormat::Anthropic, body),
+            body
+        );
+    }
+
+    #[test]
+    fn non_success_anthropic_response_is_not_translated() {
+        let body = br#"{"type":"message","content":[{"type":"text","text":"upstream details"}]}"#;
+
+        assert_eq!(
+            translate_success_response_bytes(ProviderFormat::Anthropic, 400, body),
+            body
+        );
+    }
 }

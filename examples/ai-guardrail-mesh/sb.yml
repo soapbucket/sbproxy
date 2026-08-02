@@ -21,6 +21,12 @@
 #
 # A prompt that trips a single detector is masked and forwarded; one that
 # trips two is blocked with a 400 listing the labels.
+#
+# Test:
+#   # 400 - two detectors agree (pii + regex), blocked before upstream
+#   curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: ai.local' -H 'Content-Type: application/json' \
+#     -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Contact me at test@example.com about forbidden-term issue"}]}' \
+#     http://127.0.0.1:8080/v1/chat/completions
 
 proxy:
   http_bind_port: 8080

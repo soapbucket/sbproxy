@@ -15,16 +15,31 @@ use crate::{
     AcceleratorKind, AcquireSource, ArtifactFormat, CommandOutput, EngineAvailability,
     EngineCapabilities, EngineCommand, EngineDetection, EngineDriver, EngineDriverError,
     EngineFailureReason, EngineHealth, EngineKind, EngineLaunchMethod, EngineProcessRunner,
-    EngineProvisioning, KvCacheQuant, LaunchRequest, ProvisionRequest, ProvisionedEngine,
-    RunningEngine, WorkerProfile,
+    EngineProvisioning, LaunchRequest, ProvisionRequest, ProvisionedEngine, RunningEngine,
+    WorkerProfile,
 };
 
 /// Default vLLM package pin used by managed uv provisioning.
 pub const DEFAULT_VLLM_VERSION: &str = "0.10.0";
 
+/// Curated digest-pinned default vLLM container image (WOR-1917).
+///
+/// This exact digest is validated: it served real tokens on an NVIDIA L4.
+/// It matches [`DEFAULT_VLLM_VERSION`] (vLLM 0.10.0). The container-first
+/// default selects it when the operator has not configured vLLM
+/// provisioning and the worker has a container runtime, because the image
+/// packages the whole CUDA and Python toolchain and serves cleanly with no
+/// host build cascade. It is pinned by an immutable sha256 digest, never a
+/// floating tag.
+pub const DEFAULT_VLLM_IMAGE: &str =
+    "vllm/vllm-openai@sha256:05a31dc4185b042e91f4d2183689ac8a87bd845713d5c3f987563c5899878271";
+
 const DEFAULT_SHM_SIZE_GIB: u64 = 4;
 const CONTAINER_PORT: u16 = 8000;
 const PRIVATE_NETWORK: &str = "sbproxy-model-host";
+/// Fallback vLLM `--gpu-memory-utilization` when the fit did not derive a
+/// device-capacity-aware fraction (e.g. the probe reported no total VRAM).
+const DEFAULT_GPU_MEMORY_UTILIZATION: f32 = 0.90;
 const HEALTH_PATH: &str = "/health";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const PROBE_OUTPUT_LIMIT: usize = 16 * 1024;
@@ -633,6 +648,7 @@ impl EngineDriver for VllmDriver {
             accelerator: request.accelerator,
             started_at_ms: unix_time_ms()?,
             artifact_digest: request.artifact.artifact_digest.clone(),
+            engine_version: provisioned.version.clone(),
             memory: request.fit.memory.clone(),
             process,
         })
@@ -699,13 +715,22 @@ pub fn build_vllm_container_plan(
             "verified snapshot path contains a comma unsupported by OCI mount syntax",
         ));
     }
+    // The private network is `--internal` (no egress) for pinned launches
+    // that serve locally mounted weights. A repo-mode (unpinned raw `hf:`)
+    // launch must self-download from Hugging Face, so it runs on the default
+    // bridge, which has external DNS and egress via the host resolver.
+    let network = if request.artifact.repo.is_some() {
+        "bridge"
+    } else {
+        PRIVATE_NETWORK
+    };
     let mut arguments = vec![
         "run".to_string(),
         "--rm".to_string(),
         "--name".to_string(),
         format!("sbproxy-{}-g{}", request.deployment, request.generation),
         "--network".to_string(),
-        PRIVATE_NETWORK.to_string(),
+        network.to_string(),
     ];
     match runtime {
         ContainerRuntime::Docker => {
@@ -715,7 +740,11 @@ pub fn build_vllm_container_plan(
                 .map(u32::to_string)
                 .collect::<Vec<_>>()
                 .join(",");
-            arguments.extend(["--gpus".to_string(), format!("device={devices}")]);
+            // The device set must be double-quoted: `--gpus device=0,1`
+            // makes Docker read the `,1` as a GPU count and reject the
+            // request ("cannot set both Count and DeviceIDs"). The quoted
+            // form is a single device-id spec and works for one or many.
+            arguments.extend(["--gpus".to_string(), format!("\"device={devices}\"")]);
         }
         ContainerRuntime::Podman => {
             for device in &request.selected_devices {
@@ -723,16 +752,40 @@ pub fn build_vllm_container_plan(
             }
         }
     }
+    // Repo mode (unpinned raw `hf:` ref): mount a writable, shared Hugging
+    // Face cache and let vLLM download `--model <repo>` itself. Pinned
+    // mode: mount the verified immutable snapshot read-only and serve it.
+    let (mount_arg, model_arg) = match request.artifact.repo.as_deref() {
+        Some(repo) => (
+            format!("type=bind,src={snapshot},dst=/root/.cache/huggingface"),
+            repo.to_string(),
+        ),
+        None => (
+            format!("type=bind,src={snapshot},dst=/models/model,readonly"),
+            "/models/model".to_string(),
+        ),
+    };
+    if request.artifact.repo.is_some() {
+        arguments.extend([
+            "--env".to_string(),
+            "HF_HOME=/root/.cache/huggingface".to_string(),
+        ]);
+        if std::env::var_os("HF_TOKEN").is_some() {
+            // Pass the token through from the launching process's
+            // environment without placing its value on the argv.
+            arguments.extend(["--env".to_string(), "HF_TOKEN".to_string()]);
+        }
+    }
     arguments.extend([
         "--shm-size".to_string(),
         format!("{shm_size_gib}g"),
         "--mount".to_string(),
-        format!("type=bind,src={snapshot},dst=/models/model,readonly"),
+        mount_arg,
         "-p".to_string(),
         format!("127.0.0.1:{}:{CONTAINER_PORT}", request.port),
         image.to_string(),
         "--model".to_string(),
-        "/models/model".to_string(),
+        model_arg,
         "--host".to_string(),
         "0.0.0.0".to_string(),
         "--port".to_string(),
@@ -743,10 +796,19 @@ pub fn build_vllm_container_plan(
         request.fit.seq_len.to_string(),
         "--max-num-seqs".to_string(),
         request.max_concurrency.to_string(),
-        "--kv-cache-memory-bytes".to_string(),
-        request.fit.memory.kv_bytes.to_string(),
+        "--gpu-memory-utilization".to_string(),
+        format!(
+            "{:.4}",
+            request
+                .fit
+                .gpu_memory_fraction
+                .unwrap_or(DEFAULT_GPU_MEMORY_UTILIZATION)
+        ),
     ]);
+    append_tensor_parallel_arguments(&mut arguments, &request.selected_devices);
     append_vllm_precision_arguments(&mut arguments, request);
+    append_vllm_passthrough_arguments(&mut arguments, &request.engine_tuning);
+    append_vllm_task_argument(&mut arguments, request);
     arguments.extend(crate::validate_engine_args(
         EngineKind::Vllm,
         &request.extra_args,
@@ -772,15 +834,150 @@ fn direct_vllm_arguments(request: &LaunchRequest) -> Result<Vec<String>, EngineD
         request.fit.seq_len.to_string(),
         "--max-num-seqs".to_string(),
         request.max_concurrency.to_string(),
-        "--kv-cache-memory-bytes".to_string(),
-        request.fit.memory.kv_bytes.to_string(),
+        "--gpu-memory-utilization".to_string(),
+        format!(
+            "{:.4}",
+            request
+                .fit
+                .gpu_memory_fraction
+                .unwrap_or(DEFAULT_GPU_MEMORY_UTILIZATION)
+        ),
     ];
+    append_tensor_parallel_arguments(&mut arguments, &request.selected_devices);
     append_vllm_precision_arguments(&mut arguments, request);
+    append_vllm_passthrough_arguments(&mut arguments, &request.engine_tuning);
+    append_vllm_task_argument(&mut arguments, request);
     arguments.extend(crate::validate_engine_args(
         EngineKind::Vllm,
         &request.extra_args,
     )?);
     Ok(arguments)
+}
+
+/// Emit the runtime-owned vLLM `--task` flag for a non-chat modality
+/// (WOR-1908). vLLM serves a chat model in its default mode, but an
+/// embedder or reranker must be launched with `--task embed` / `--task
+/// score`. The runtime owns this decision (it follows from the served
+/// model's catalog modality), so it is never an operator `extra_args`
+/// flag; a chat modality emits nothing.
+fn append_vllm_task_argument(arguments: &mut Vec<String>, request: &LaunchRequest) {
+    if let Some(task) = request.modality.vllm_task_arg() {
+        arguments.push("--task".to_string());
+        arguments.push(task.to_string());
+    }
+}
+
+/// Emit the runtime-owned tensor-parallel degree: one rank per selected CUDA
+/// device. The operator cannot set `--tensor-parallel-size` (it is on the
+/// rejected-argument denylist), so the runtime derives it from the placement
+/// and config can never contradict the device assignment. Single-device
+/// deployments emit nothing, since vLLM defaults to a degree of one.
+fn append_tensor_parallel_arguments(arguments: &mut Vec<String>, selected_devices: &[u32]) {
+    if selected_devices.len() > 1 {
+        arguments.extend([
+            "--tensor-parallel-size".to_string(),
+            selected_devices.len().to_string(),
+        ]);
+    }
+}
+
+/// Emit the runtime-owned vLLM tuning passthroughs from the served-model
+/// config: chunked prefill, tool-call parsing, and CPU KV/weight offload.
+/// These flags are not on the operator `extra_args` allowlist, so the
+/// runtime owns them here (the same pattern as tensor parallelism); the
+/// desired-state validator rejects a non-vLLM model that sets them, so
+/// only vLLM launches ever reach this path with them populated.
+fn append_vllm_passthrough_arguments(arguments: &mut Vec<String>, tuning: &crate::EngineTuning) {
+    // Tool calling: vLLM rejects `tool_choice: auto` unless launched with a
+    // model-specific parser, so the operator declares it and we enable it.
+    if let Some(parser) = &tuning.tool_call_parser {
+        arguments.push("--enable-auto-tool-choice".to_string());
+        arguments.push("--tool-call-parser".to_string());
+        arguments.push(parser.clone());
+    }
+    // CPU KV tier: `--swap-space` sizes the CPU pool vLLM spills GPU KV
+    // blocks into; `--cpu-offload-gb` keeps that many GiB of weights in RAM.
+    if let Some(gib) = tuning.swap_space_gib {
+        arguments.push("--swap-space".to_string());
+        arguments.push(gib.to_string());
+    }
+    if let Some(gib) = tuning.cpu_offload_gib {
+        arguments.push("--cpu-offload-gb".to_string());
+        arguments.push(gib.to_string());
+    }
+    // LoRA (WOR-1945): serve one or more adapters over the resident base.
+    // `--enable-lora` turns the feature on, `--max-loras` caps the resident
+    // adapter slots, and each `--lora-modules <name>=<path>` registers an
+    // adapter the client can request by name. An `hf:Org/Repo` source is
+    // handed to vLLM as the bare repo id, which it resolves from the Hub
+    // (or the mounted cache); a local path passes through unchanged.
+    if !tuning.lora_adapters.is_empty() {
+        arguments.push("--enable-lora".to_string());
+        arguments.push("--max-loras".to_string());
+        arguments.push(tuning.max_loras.max(1).to_string());
+        for adapter in &tuning.lora_adapters {
+            let path = adapter
+                .source
+                .strip_prefix("hf:")
+                .unwrap_or(&adapter.source);
+            arguments.push("--lora-modules".to_string());
+            arguments.push(format!("{}={}", adapter.name, path));
+        }
+    }
+    // Chunked prefill: enable it and pass a chunk size through. An explicit
+    // `max_batched_tokens` always wins; otherwise a `target_ttft_ms` derives
+    // one at launch time (WOR-1678); with neither, the engine default holds.
+    if let Some(chunked_prefill) = &tuning.chunked_prefill {
+        arguments.push("--enable-chunked-prefill".to_string());
+        let chunk_tokens = chunked_prefill.max_batched_tokens.or_else(|| {
+            chunked_prefill
+                .target_ttft_ms
+                .map(chunk_tokens_for_ttft_target)
+        });
+        if let Some(chunk_tokens) = chunk_tokens {
+            arguments.push("--max-num-batched-tokens".to_string());
+            arguments.push(chunk_tokens.to_string());
+        }
+    }
+}
+
+/// Conservative prefill throughput assumed by the chunked-prefill
+/// auto-tune, in tokens per second. The fit plan's throughput estimate
+/// models decode (a memory-bandwidth weight read), not compute-bound
+/// prefill, so no clean per-device prefill rate reaches the driver; this
+/// deliberately low constant stands in for it. Any datacenter-class GPU
+/// prefills well above this rate, so the error direction is smaller
+/// chunks: the TTFT target still holds, at some prefill-throughput cost
+/// on faster devices.
+const PREFILL_TOKENS_PER_SEC_ESTIMATE: u64 = 5_000;
+
+/// Auto-tuned chunk sizes are emitted in multiples of this many tokens,
+/// matching vLLM's scheduling granularity.
+const CHUNK_TOKEN_QUANTUM: u64 = 256;
+
+/// Floor on an auto-tuned chunk size, so a tiny TTFT target cannot
+/// starve prefill entirely.
+const MIN_AUTO_CHUNK_TOKENS: u64 = 256;
+
+/// Ceiling on an auto-tuned chunk size; past this, a chunk no longer
+/// buys prefill throughput and only pushes TTFT out.
+const MAX_AUTO_CHUNK_TOKENS: u64 = 16_384;
+
+/// Derive a chunked-prefill chunk size (vLLM `--max-num-batched-tokens`)
+/// from a TTFT target in milliseconds (WOR-1678).
+///
+/// Model: while the engine works through one prefill chunk, a newly
+/// arrived request waits roughly one chunk before its own first token can
+/// be scheduled, so the largest chunk that holds a TTFT target is the
+/// target in seconds times the device's prefill rate. That rate is
+/// approximated by the conservative [`PREFILL_TOKENS_PER_SEC_ESTIMATE`]
+/// constant (see its doc for why no fit-derived signal is used). The
+/// result is rounded down to a multiple of [`CHUNK_TOKEN_QUANTUM`] and
+/// clamped to `[MIN_AUTO_CHUNK_TOKENS, MAX_AUTO_CHUNK_TOKENS]`.
+fn chunk_tokens_for_ttft_target(target_ttft_ms: u64) -> u64 {
+    let raw = target_ttft_ms.saturating_mul(PREFILL_TOKENS_PER_SEC_ESTIMATE) / 1000;
+    (raw / CHUNK_TOKEN_QUANTUM * CHUNK_TOKEN_QUANTUM)
+        .clamp(MIN_AUTO_CHUNK_TOKENS, MAX_AUTO_CHUNK_TOKENS)
 }
 
 fn append_vllm_precision_arguments(arguments: &mut Vec<String>, request: &LaunchRequest) {
@@ -797,11 +994,11 @@ fn append_vllm_precision_arguments(arguments: &mut Vec<String>, request: &Launch
     if let Some(quantization) = quantization {
         arguments.extend(["--quantization".to_string(), quantization.to_string()]);
     }
-    let kv_dtype = match request.kv_quant {
-        KvCacheQuant::Auto | KvCacheQuant::F16 => None,
-        KvCacheQuant::Fp8 | KvCacheQuant::Int8 | KvCacheQuant::Int4 => Some("fp8"),
-    };
-    if let Some(kv_dtype) = kv_dtype {
+    // The dtype and the bytes-per-element the fit planner sized with come
+    // from one table, so the two cannot drift apart (WOR-2069).
+    if let Some(kv_dtype) =
+        crate::config::effective_kv_cache(request.kv_quant, EngineKind::Vllm).flag_value
+    {
         arguments.extend(["--kv-cache-dtype".to_string(), kv_dtype.to_string()]);
     }
 }
@@ -868,8 +1065,10 @@ fn compatibility_command(mode: &VllmLaunchMode) -> (PathBuf, Vec<String>) {
                 "--rm".to_string(),
                 "--network".to_string(),
                 "none".to_string(),
+                // The digest-pinned vLLM images ship `python3`, not a bare
+                // `python`; the base entrypoint is `python3 -m vllm...`.
                 "--entrypoint".to_string(),
-                "python".to_string(),
+                "python3".to_string(),
                 image.clone(),
                 "-c".to_string(),
                 COMPATIBILITY_SCRIPT.to_string(),
@@ -1015,4 +1214,170 @@ fn unix_time_ms() -> Result<u64, EngineDriverError> {
             false,
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        append_tensor_parallel_arguments, append_vllm_passthrough_arguments,
+        chunk_tokens_for_ttft_target, digest_pinned_image, DEFAULT_VLLM_IMAGE,
+        MAX_AUTO_CHUNK_TOKENS, MIN_AUTO_CHUNK_TOKENS,
+    };
+    use crate::{ChunkedPrefill, EngineTuning};
+
+    #[test]
+    fn default_vllm_image_is_digest_pinned() {
+        // The curated container-first default must be an immutable digest so
+        // the container driver accepts it without an operator override.
+        assert!(digest_pinned_image(DEFAULT_VLLM_IMAGE));
+        assert!(DEFAULT_VLLM_IMAGE.starts_with("vllm/vllm-openai@sha256:"));
+    }
+
+    fn value_after(arguments: &[String], flag: &str) -> String {
+        let index = arguments
+            .iter()
+            .position(|argument| argument == flag)
+            .unwrap_or_else(|| panic!("{flag} not emitted"));
+        arguments[index + 1].clone()
+    }
+
+    #[test]
+    fn tensor_parallel_size_is_emitted_only_for_a_multi_gpu_group() {
+        let mut single = Vec::new();
+        append_tensor_parallel_arguments(&mut single, &[0]);
+        assert!(
+            single.is_empty(),
+            "a single GPU keeps vLLM's default of one"
+        );
+
+        let mut pair = Vec::new();
+        append_tensor_parallel_arguments(&mut pair, &[0, 1]);
+        assert_eq!(
+            pair,
+            vec!["--tensor-parallel-size".to_string(), "2".to_string()]
+        );
+    }
+
+    #[test]
+    fn empty_tuning_emits_no_passthrough_flags() {
+        let mut arguments = Vec::new();
+        append_vllm_passthrough_arguments(&mut arguments, &EngineTuning::default());
+        assert!(arguments.is_empty());
+    }
+
+    #[test]
+    fn every_tuning_knob_maps_to_its_vllm_flag() {
+        let tuning = EngineTuning {
+            chunked_prefill: Some(ChunkedPrefill {
+                max_batched_tokens: Some(2048),
+                target_ttft_ms: None,
+            }),
+            tool_call_parser: Some("hermes".to_string()),
+            swap_space_gib: Some(16),
+            cpu_offload_gib: Some(8),
+            lora_adapters: vec![
+                crate::config::LoraAdapter {
+                    name: "support-bot".to_string(),
+                    source: "hf:Org/support-lora".to_string(),
+                },
+                crate::config::LoraAdapter {
+                    name: "local-tune".to_string(),
+                    source: "/models/adapters/local".to_string(),
+                },
+            ],
+            max_loras: 2,
+        };
+        let mut arguments = Vec::new();
+        append_vllm_passthrough_arguments(&mut arguments, &tuning);
+
+        assert!(arguments.iter().any(|a| a == "--enable-auto-tool-choice"));
+        assert_eq!(value_after(&arguments, "--tool-call-parser"), "hermes");
+        assert_eq!(value_after(&arguments, "--swap-space"), "16");
+        assert_eq!(value_after(&arguments, "--cpu-offload-gb"), "8");
+        assert!(arguments.iter().any(|a| a == "--enable-chunked-prefill"));
+        assert_eq!(value_after(&arguments, "--max-num-batched-tokens"), "2048");
+        // LoRA: enabled, capacity set, and each adapter registered by
+        // name=source (the hf: prefix stripped so vLLM sees the repo id).
+        assert!(arguments.iter().any(|a| a == "--enable-lora"));
+        assert_eq!(value_after(&arguments, "--max-loras"), "2");
+        let lora_modules: Vec<&String> = arguments
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| {
+                arguments.get(i.wrapping_sub(1)).map(String::as_str) == Some("--lora-modules")
+            })
+            .map(|(_, value)| value)
+            .collect();
+        assert!(lora_modules
+            .iter()
+            .any(|m| *m == "support-bot=Org/support-lora"));
+        assert!(lora_modules
+            .iter()
+            .any(|m| *m == "local-tune=/models/adapters/local"));
+    }
+
+    #[test]
+    fn target_ttft_only_auto_tunes_a_chunk_size() {
+        let tuning = EngineTuning {
+            chunked_prefill: Some(ChunkedPrefill {
+                max_batched_tokens: None,
+                target_ttft_ms: Some(250),
+            }),
+            ..EngineTuning::default()
+        };
+        let mut arguments = Vec::new();
+        append_vllm_passthrough_arguments(&mut arguments, &tuning);
+
+        assert!(arguments.iter().any(|a| a == "--enable-chunked-prefill"));
+        // 250 ms at the 5000 tok/s conservative estimate is 1250 tokens,
+        // rounded down to the 256-token quantum.
+        let chunk: u64 = value_after(&arguments, "--max-num-batched-tokens")
+            .parse()
+            .expect("chunk size is numeric");
+        assert_eq!(chunk, 1024);
+        assert_eq!(chunk % 256, 0, "chunk size aligns to the 256-token quantum");
+        assert!((MIN_AUTO_CHUNK_TOKENS..=MAX_AUTO_CHUNK_TOKENS).contains(&chunk));
+    }
+
+    #[test]
+    fn explicit_chunk_size_wins_over_target_ttft() {
+        let tuning = EngineTuning {
+            chunked_prefill: Some(ChunkedPrefill {
+                max_batched_tokens: Some(2048),
+                target_ttft_ms: Some(250),
+            }),
+            ..EngineTuning::default()
+        };
+        let mut arguments = Vec::new();
+        append_vllm_passthrough_arguments(&mut arguments, &tuning);
+
+        assert_eq!(value_after(&arguments, "--max-num-batched-tokens"), "2048");
+    }
+
+    #[test]
+    fn chunked_prefill_with_neither_knob_leaves_the_engine_default() {
+        let tuning = EngineTuning {
+            chunked_prefill: Some(ChunkedPrefill::default()),
+            ..EngineTuning::default()
+        };
+        let mut arguments = Vec::new();
+        append_vllm_passthrough_arguments(&mut arguments, &tuning);
+
+        assert!(arguments.iter().any(|a| a == "--enable-chunked-prefill"));
+        assert!(
+            !arguments.iter().any(|a| a == "--max-num-batched-tokens"),
+            "no chunk size configured means the engine default holds"
+        );
+    }
+
+    #[test]
+    fn ttft_auto_tune_clamps_and_quantizes() {
+        // A 1 ms target rounds to zero tokens and clamps up to the floor.
+        assert_eq!(chunk_tokens_for_ttft_target(1), MIN_AUTO_CHUNK_TOKENS);
+        // A one-minute target overshoots the ceiling and clamps down.
+        assert_eq!(chunk_tokens_for_ttft_target(60_000), MAX_AUTO_CHUNK_TOKENS);
+        // A mid-range target rounds down to the 256-token quantum:
+        // 2000 ms at 5000 tok/s is 10000 tokens, floored to 9984.
+        assert_eq!(chunk_tokens_for_ttft_target(2_000), 9_984);
+    }
 }

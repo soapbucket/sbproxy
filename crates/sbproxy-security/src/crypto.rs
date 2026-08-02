@@ -49,6 +49,29 @@ pub enum HkdfPurpose {
     /// operator master key with this purpose, keeping envelope wrapping
     /// in a distinct keyspace from cookies and other derivations.
     KeyEnvelope,
+    /// AES-256-GCM key material for response-cache payloads at rest.
+    /// Each cache entry derives its own key from the operator master
+    /// key and a per-entry random salt, so a fresh 96-bit nonce is
+    /// only ever used once under any derived key.
+    ResponseCacheAtRest,
+    /// AES-256-GCM key material for the mesh wire cipher (gossip
+    /// heartbeats and transport RPCs), derived from
+    /// `mesh.encryption.shared_key`.
+    ///
+    /// The mesh historically derived its key as a plain `SHA-256` of the
+    /// shared secret, which is the one derivation in this workspace that
+    /// sat outside this enum. Migrating changes the key, and a cluster
+    /// whose nodes disagree about the key cannot talk, so the move is
+    /// staged: `sbproxy_mesh::Cipher` opens under both derivations and
+    /// seals under whichever the operator selected. See that type's
+    /// module docs for the rollout.
+    MeshWire,
+    /// AES-256-GCM key material for persisted prompt-overlay records at
+    /// rest. Deliberately distinct from [`Self::ResponseCacheAtRest`]:
+    /// the two surfaces may be configured from the same operator secret,
+    /// and purpose separation is what keeps one derived key from opening
+    /// the other's records.
+    PromptPersistenceAtRest,
 }
 
 impl HkdfPurpose {
@@ -65,6 +88,9 @@ impl HkdfPurpose {
             HkdfPurpose::OidcSessionCookie => b"sbproxy.hkdf.oidc-session-cookie.v1",
             HkdfPurpose::OidcTxCookie => b"sbproxy.hkdf.oidc-tx-cookie.v1",
             HkdfPurpose::KeyEnvelope => b"sbproxy.hkdf.key-envelope.v1",
+            HkdfPurpose::MeshWire => b"sbproxy.hkdf.mesh-wire.v1",
+            HkdfPurpose::ResponseCacheAtRest => b"sbproxy.hkdf.response-cache-at-rest.v1",
+            HkdfPurpose::PromptPersistenceAtRest => b"sbproxy.hkdf.prompt-persistence-at-rest.v1",
         }
     }
 }
@@ -395,5 +421,26 @@ mod aead_tests {
         let env = hkdf_derive_purpose(b"master", b"", HkdfPurpose::KeyEnvelope, 32);
         let cookie = hkdf_derive_purpose(b"master", b"", HkdfPurpose::OidcSessionCookie, 32);
         assert_ne!(env, cookie);
+    }
+
+    #[test]
+    fn response_cache_purpose_has_distinct_keyspace() {
+        // The response-cache-at-rest key must never collide with the
+        // envelope or cookie keyspaces derived from the same master.
+        let cache = hkdf_derive_purpose(b"master", b"", HkdfPurpose::ResponseCacheAtRest, 32);
+        let env = hkdf_derive_purpose(b"master", b"", HkdfPurpose::KeyEnvelope, 32);
+        let cookie = hkdf_derive_purpose(b"master", b"", HkdfPurpose::OidcSessionCookie, 32);
+        assert_ne!(cache, env);
+        assert_ne!(cache, cookie);
+        assert_eq!(cache.len(), 32);
+    }
+
+    #[test]
+    fn response_cache_purpose_separates_by_salt() {
+        // Per-entry salts are what keep two cache entries from sharing a
+        // derived key, so a salt change must change the output.
+        let a = hkdf_derive_purpose(b"master", b"salt-a", HkdfPurpose::ResponseCacheAtRest, 32);
+        let b = hkdf_derive_purpose(b"master", b"salt-b", HkdfPurpose::ResponseCacheAtRest, 32);
+        assert_ne!(a, b);
     }
 }

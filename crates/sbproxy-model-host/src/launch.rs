@@ -43,7 +43,7 @@ pub fn build_launch_spec(
     extra_args: &[String],
 ) -> LaunchSpec {
     let mut args: Vec<String> = Vec::new();
-    let mut env: Vec<(String, String)> = Vec::new();
+    let env: Vec<(String, String)> = Vec::new();
 
     match engine {
         EngineKind::Vllm => {
@@ -65,8 +65,32 @@ pub fn build_launch_spec(
             }
             args.push("--max-model-len".to_string());
             args.push(plan.seq_len.to_string());
-            // Enable the dev endpoints the sleep/wake phase drives.
-            env.push(("VLLM_SERVER_DEV_MODE".to_string(), "1".to_string()));
+        }
+        EngineKind::SGLang => {
+            // SGLang mirrors vLLM here: an OpenAI-compatible server. The
+            // real launch is `python -m sglang.launch_server`; the managed
+            // SGLangDriver owns that prefix (and the uvx wrap), so this
+            // legacy template emits the server flags keyed off
+            // `--model-path`, the SGLang equivalent of `vllm serve <repo>`.
+            args.push("--model-path".to_string());
+            args.push(model.hf_repo.clone());
+            args.push("--host".to_string());
+            args.push("127.0.0.1".to_string());
+            args.push("--port".to_string());
+            args.push(port.to_string());
+            if let Some(q) = vllm_quantization(&plan.quant_name) {
+                args.push("--quantization".to_string());
+                args.push(q.to_string());
+            }
+            // This template previously emitted no KV dtype at all, so a
+            // configured `kv_quant` was silently dropped here while the
+            // fit planner had already sized the cache for it (WOR-2069).
+            if let Some(dtype) = sglang_kv_cache_dtype(kv_quant) {
+                args.push("--kv-cache-dtype".to_string());
+                args.push(dtype.to_string());
+            }
+            args.push("--context-length".to_string());
+            args.push(plan.seq_len.to_string());
         }
         EngineKind::LlamaCpp => {
             // `llama-server --hf-repo <repo> --host 127.0.0.1
@@ -87,6 +111,15 @@ pub fn build_launch_spec(
             // any host.
             args.push("--n-gpu-layers".to_string());
             args.push("999".to_string());
+            // WOR-1866: MoE placement keeps attention/shared/dense tensors on
+            // the GPU and spills the routed experts of `cpu_moe_layers` layers
+            // to CPU RAM, so a MoE model too large to fit whole still serves.
+            if let Some(moe) = &plan.moe {
+                if moe.cpu_moe_layers > 0 {
+                    args.push("--n-cpu-moe".to_string());
+                    args.push(moe.cpu_moe_layers.to_string());
+                }
+            }
             if let Some(t) = llama_cache_type(kv_quant) {
                 // Quantize both K and V caches.
                 args.push("--cache-type-k".to_string());
@@ -95,18 +128,23 @@ pub fn build_launch_spec(
                 args.push(t.to_string());
             }
         }
-        EngineKind::Embedded => {
-            // WOR-1658: in-process engine. No subprocess is spawned; the
-            // launcher reads these args to load the model into the
-            // gateway. The first arg is the model repo, then the loopback
-            // port the in-process server binds (so the runtime routes to
-            // it like any other engine), then the context window.
+        EngineKind::MistralRs => {
+            // WOR-1861: `mistralrs serve -m <repo> --host 127.0.0.1
+            //   --port <p> --no-ui --max-seq-len <ctx>`. The unified v0.9
+            // CLI serves an OpenAI-compatible surface on the loopback
+            // port; `--no-ui` keeps it an API server. mistral.rs takes no
+            // KV dtype flag, so a configured `kv_quant` is deliberately
+            // not emitted (see `effective_kv_cache`, which books no
+            // saving for this engine).
+            args.push("serve".to_string());
+            args.push("-m".to_string());
             args.push(model.hf_repo.clone());
             args.push("--host".to_string());
             args.push("127.0.0.1".to_string());
             args.push("--port".to_string());
             args.push(port.to_string());
-            args.push("--ctx-size".to_string());
+            args.push("--no-ui".to_string());
+            args.push("--max-seq-len".to_string());
             args.push(plan.seq_len.to_string());
         }
     }
@@ -122,23 +160,51 @@ pub fn build_launch_spec(
     }
 }
 
-/// Wrap a vLLM launch spec to run through `uvx` (`uv tool run`), so vLLM
-/// is provisioned by `uv` at `uv_path` rather than needing `vllm` on PATH
-/// (WOR-1812). The original argv (`serve <repo> ...`) is preserved after
-/// the `vllm` command name: `uv tool run --from vllm[==<v>] vllm <argv>`.
+/// Wrap a Python-package launch spec to run through `uvx` (`uv tool run`),
+/// so the engine is provisioned by `uv` at `uv_path` rather than needing it
+/// on PATH (WOR-1812, WOR-1905). `package_version` pins the engine package.
+/// The original argv is preserved after the package's run command:
+/// - vLLM: `uv tool run --from vllm[==<v>] vllm <argv>` (argv starts `serve
+///   <repo> ...`).
+/// - SGLang: `uv tool run --from sglang[all][==<v>] python -m
+///   sglang.launch_server <argv>` (argv starts `--model-path <repo> ...`).
+///
 /// The engine, env, and VRAM estimate carry over unchanged.
-pub fn wrap_uvx(spec: &LaunchSpec, uv_path: &str, vllm_version: Option<&str>) -> LaunchSpec {
-    let from = match vllm_version {
-        Some(v) => format!("vllm=={v}"),
-        None => "vllm".to_string(),
+pub fn wrap_uvx(spec: &LaunchSpec, uv_path: &str, package_version: Option<&str>) -> LaunchSpec {
+    let (from, command): (String, Vec<String>) = match spec.engine {
+        EngineKind::SGLang => {
+            let from = match package_version {
+                Some(v) => format!("sglang[all]=={v}"),
+                None => "sglang[all]".to_string(),
+            };
+            (
+                from,
+                vec![
+                    "python".to_string(),
+                    "-m".to_string(),
+                    "sglang.launch_server".to_string(),
+                ],
+            )
+        }
+        // vLLM is the default uvx package; llama.cpp and
+        // mistral.rs never reach this wrapper (they are not
+        // Python-package engines: config validation rejects `uvx` for
+        // them and the acquisition planner never yields a uvx plan).
+        _ => {
+            let from = match package_version {
+                Some(v) => format!("vllm=={v}"),
+                None => "vllm".to_string(),
+            };
+            (from, vec!["vllm".to_string()])
+        }
     };
     let mut args = vec![
         "tool".to_string(),
         "run".to_string(),
         "--from".to_string(),
         from,
-        "vllm".to_string(),
     ];
+    args.extend(command);
     args.extend(spec.args.iter().cloned());
     LaunchSpec {
         engine: spec.engine,
@@ -170,6 +236,29 @@ pub fn llama_use_local_model(args: &mut [String], model_path: &std::path::Path) 
 pub fn vllm_use_local_snapshot(args: &mut [String], snapshot: &std::path::Path) {
     if args.first().map(String::as_str) == Some("serve") {
         if let Some(model) = args.get_mut(1) {
+            *model = snapshot.display().to_string();
+        }
+    }
+}
+
+/// Retarget an SGLang `--model-path <source>` argv to one verified local
+/// snapshot (WOR-1905), mirroring [`vllm_use_local_snapshot`]. The rest of
+/// the generated argv is unchanged. A no-op when `--model-path` is absent.
+pub fn sglang_use_local_snapshot(args: &mut [String], snapshot: &std::path::Path) {
+    if let Some(index) = args.iter().position(|argument| argument == "--model-path") {
+        if let Some(model) = args.get_mut(index + 1) {
+            *model = snapshot.display().to_string();
+        }
+    }
+}
+
+/// Retarget a mistral.rs `serve -m <source>` argv to one verified local
+/// snapshot directory (WOR-1861), mirroring [`vllm_use_local_snapshot`].
+/// The rest of the generated argv is unchanged. A no-op when `-m` is
+/// absent.
+pub fn mistralrs_use_local_model(args: &mut [String], snapshot: &std::path::Path) {
+    if let Some(index) = args.iter().position(|argument| argument == "-m") {
+        if let Some(model) = args.get_mut(index + 1) {
             *model = snapshot.display().to_string();
         }
     }
@@ -208,26 +297,24 @@ fn vllm_quantization(quant_name: &str) -> Option<&'static str> {
 
 /// Map a KV-quant mode to vLLM's `--kv-cache-dtype`, or `None` when no
 /// flag is needed (`Auto` / `F16` are vLLM's default).
+///
+/// Delegates to the shared table so this template, the managed vLLM
+/// driver, and the fit planner all agree on what the engine will run
+/// (WOR-2069).
 fn vllm_kv_cache_dtype(kv: KvCacheQuant) -> Option<&'static str> {
-    match kv {
-        KvCacheQuant::Auto | KvCacheQuant::F16 => None,
-        KvCacheQuant::Fp8 => Some("fp8"),
-        // vLLM exposes fp8 variants; int8/int4 KV map to the nearest
-        // supported low-precision dtype it accepts.
-        KvCacheQuant::Int8 => Some("fp8"),
-        KvCacheQuant::Int4 => Some("fp8"),
-    }
+    crate::config::effective_kv_cache(kv, EngineKind::Vllm).flag_value
+}
+
+/// Map a KV-quant mode to SGLang's `--kv-cache-dtype`, or `None` for the
+/// engine default.
+fn sglang_kv_cache_dtype(kv: KvCacheQuant) -> Option<&'static str> {
+    crate::config::effective_kv_cache(kv, EngineKind::SGLang).flag_value
 }
 
 /// Map a KV-quant mode to llama.cpp's `--cache-type-{k,v}` value, or
 /// `None` for the f16 default.
 fn llama_cache_type(kv: KvCacheQuant) -> Option<&'static str> {
-    match kv {
-        KvCacheQuant::Auto | KvCacheQuant::F16 => None,
-        KvCacheQuant::Fp8 => Some("q8_0"),
-        KvCacheQuant::Int8 => Some("q8_0"),
-        KvCacheQuant::Int4 => Some("q4_0"),
-    }
+    crate::config::effective_kv_cache(kv, EngineKind::LlamaCpp).flag_value
 }
 
 /// Additional engine flags for the serving knobs on a
@@ -265,9 +352,14 @@ pub fn serving_flags(engine: EngineKind, entry: &crate::config::ServeEntry) -> V
         args.push("--tool-call-parser".to_string());
         args.push(parser.clone());
     }
-    // WOR-1687: KV-cache tiering to CPU. `--swap-space` sizes the CPU
-    // pool vLLM spills GPU KV blocks into under pressure; `--cpu-offload-gb`
-    // keeps that many GiB of weights in CPU RAM.
+    // Automatic prefix caching: reuse already-computed KV blocks across
+    // requests that share a prompt prefix.
+    if entry.enable_prefix_caching == Some(true) {
+        args.push("--enable-prefix-caching".to_string());
+    }
+    // Engine-native CPU memory controls. `--swap-space` sizes the CPU pool
+    // vLLM uses for request KV blocks; `--cpu-offload-gb` keeps that many
+    // GiB of weights in CPU RAM.
     if let Some(gib) = entry.swap_space_gib {
         args.push("--swap-space".to_string());
         args.push(gib.to_string());
@@ -322,6 +414,25 @@ pub fn serving_flags(engine: EngineKind, entry: &crate::config::ServeEntry) -> V
     args
 }
 
+/// Runtime-owned launch flags for a served model's modality (WOR-1908).
+///
+/// vLLM will not serve an embedder or reranker in its default causal-LM
+/// mode: it needs `--task embed` / `--task score`. That decision belongs
+/// to the runtime, not the operator, so it is emitted here (appended
+/// after [`build_launch_spec`] and [`serving_flags`]) rather than on the
+/// operator `extra_args` allowlist. A chat modality, an engine with no
+/// task concept (llama.cpp, embedded), or a modality with no vLLM task
+/// mapping yet returns an empty vec.
+pub fn modality_flags(engine: EngineKind, modality: crate::catalog::Modality) -> Vec<String> {
+    if engine != EngineKind::Vllm {
+        return Vec::new();
+    }
+    match modality.vllm_task_arg() {
+        Some(task) => vec!["--task".to_string(), task.to_string()],
+        None => Vec::new(),
+    }
+}
+
 /// Whether speculation should be active right now, given the current
 /// batch occupancy (running sequences / max batch). Speculation helps
 /// when the batch is memory-bound (occupancy below the threshold) and
@@ -333,19 +444,6 @@ pub fn should_speculate(batch_occupancy: f64, threshold: f64) -> bool {
 
 /// Default batch-occupancy threshold below which speculation is on.
 pub const SPECULATE_OCCUPANCY_THRESHOLD: f64 = 0.5;
-
-/// Choose a chunked-prefill chunk size (`max-num-batched-tokens`) to
-/// hold a target TTFT, given the engine's estimated prefill throughput
-/// in tokens/sec (WOR-1678). Larger chunks raise throughput but push
-/// TTFT out; the chunk that fits the SLO is `throughput * ttft`,
-/// clamped to a sane floor so a tiny SLO does not starve prefill.
-pub fn chunk_size_for_ttft(target_ttft_ms: u64, prefill_tokens_per_sec: f64) -> u64 {
-    let budget = prefill_tokens_per_sec * (target_ttft_ms as f64 / 1000.0);
-    (budget as u64).max(MIN_PREFILL_CHUNK)
-}
-
-/// Floor on an auto-tuned prefill chunk size.
-pub const MIN_PREFILL_CHUNK: u64 = 512;
 
 /// The production launcher: spawns the engine binary as a child
 /// process, waits for its readiness endpoint, and kills it on evict.
@@ -361,10 +459,6 @@ pub struct ProcessEngineLauncher {
     runner: EngineProcessRunner,
     /// Opaque running process handle so `kill` can reach it.
     process: std::sync::Arc<tokio::sync::Mutex<Option<std::sync::Arc<dyn EngineProcess>>>>,
-    /// In-process embedded engine (WOR-1658), when the launched engine is
-    /// `EngineKind::Embedded`. Present only under the `embedded` feature.
-    #[cfg(feature = "embedded")]
-    embedded: std::sync::Arc<tokio::sync::Mutex<Option<crate::embedded::EmbeddedServer>>>,
 }
 
 impl Default for ProcessEngineLauncher {
@@ -374,8 +468,6 @@ impl Default for ProcessEngineLauncher {
             health_path: "/health".to_string(),
             runner: EngineProcessRunner::default(),
             process: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
-            #[cfg(feature = "embedded")]
-            embedded: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 }
@@ -399,29 +491,6 @@ impl ProcessEngineLauncher {
             }
         }
         None
-    }
-
-    /// Launch the in-process embedded engine (WOR-1658). With the
-    /// `embedded` feature, loads the model with mistral.rs and serves an
-    /// OpenAI endpoint on `port` (so the runtime routes to it like any
-    /// other engine); the model id is the first argv element from
-    /// `build_launch_spec`'s embedded arm. Without the feature it returns
-    /// a state-accurate error (the plan-time
-    /// [`EngineDoctor`](crate::config::EngineDoctor) also flags it).
-    #[cfg(feature = "embedded")]
-    async fn launch_embedded(&self, spec: &LaunchSpec, port: u16) -> Result<u16, String> {
-        let repo = spec
-            .args
-            .first()
-            .ok_or_else(|| "embedded launch spec has no model repo".to_string())?;
-        let server = crate::embedded::EmbeddedServer::start(repo, port).await?;
-        *self.embedded.lock().await = Some(server);
-        Ok(port)
-    }
-
-    #[cfg(not(feature = "embedded"))]
-    async fn launch_embedded(&self, _spec: &LaunchSpec, _port: u16) -> Result<u16, String> {
-        Err("engine: embedded needs a build with --features embedded (WOR-1658)".to_string())
     }
 }
 
@@ -524,12 +593,6 @@ impl EngineLauncher for ProcessEngineLauncher {
     async fn launch(&self, spec: &LaunchSpec) -> Result<u16, String> {
         let port = Self::port_from_spec(spec)
             .ok_or_else(|| "launch spec has no --port to probe".to_string())?;
-        // WOR-1658: an in-process engine is not a subprocess. Dispatch to
-        // the embedded path, which starts a server inside the gateway on
-        // `port` (behind the `embedded` feature) rather than spawning.
-        if spec.engine.is_in_process() {
-            return self.launch_embedded(spec, port).await;
-        }
         let command = EngineCommand {
             executable: spec.program.clone().into(),
             arguments: spec.args.clone(),
@@ -549,13 +612,6 @@ impl EngineLauncher for ProcessEngineLauncher {
     }
 
     async fn kill(&self) {
-        // WOR-1658: an in-process embedded engine has no child process;
-        // stop its server task and drop the model to free memory.
-        #[cfg(feature = "embedded")]
-        if let Some(server) = self.embedded.lock().await.take() {
-            server.shutdown().await;
-            return;
-        }
         if let Some(process) = self.process.lock().await.take() {
             if let Err(error) = process.shutdown(Duration::from_secs(10)).await {
                 tracing::warn!(reason = %error.reason(), "managed engine shutdown failed");
@@ -574,9 +630,12 @@ mod tests {
             quant_name: quant_name.to_string(),
             quant: Quant::classify(quant_name),
             estimated_vram_bytes: 12 * crate::fit::GIB,
-            gpu_index: 0,
+            gpu_indexes: vec![0],
             seq_len: 8192,
             memory: crate::MemoryEstimate::from_total(0, 12 * crate::fit::GIB),
+            moe: None,
+            throughput: None,
+            gpu_memory_fraction: None,
         }
     }
 
@@ -611,11 +670,7 @@ mod tests {
             .position(|a| a == "--quantization")
             .unwrap();
         assert_eq!(spec.args[qi + 1], "fp8");
-        // dev mode env for the sleep/wake phase
-        assert!(spec
-            .env
-            .iter()
-            .any(|(k, v)| k == "VLLM_SERVER_DEV_MODE" && v == "1"));
+        assert!(spec.env.is_empty());
         assert_eq!(spec.vram_bytes, 12 * crate::fit::GIB);
     }
 
@@ -638,10 +693,10 @@ mod tests {
         // The original vLLM argv follows verbatim.
         assert_eq!(wrapped.args[5], "serve");
         assert_eq!(wrapped.args[6], "Qwen/Qwen3-14B");
-        // engine, env, and VRAM estimate carry over.
+        // Engine, environment, and VRAM estimate carry over.
         assert_eq!(wrapped.engine, EngineKind::Vllm);
         assert_eq!(wrapped.vram_bytes, spec.vram_bytes);
-        assert!(wrapped.env.iter().any(|(k, _)| k == "VLLM_SERVER_DEV_MODE"));
+        assert_eq!(wrapped.env, spec.env);
     }
 
     #[test]
@@ -698,6 +753,42 @@ mod tests {
     }
 
     #[test]
+    fn llama_cpp_moe_placement_emits_n_cpu_moe() {
+        // WOR-1866: a plan with a MoE placement adds --n-cpu-moe N so
+        // llama.cpp spills the routed experts of N layers to CPU RAM.
+        let mut p = plan("Q4_K_M");
+        p.moe = Some(crate::fit::MoePlacement {
+            cpu_moe_layers: 17,
+            gpu_expert_bytes: 8 * crate::fit::GIB,
+            ram_spilled_bytes: 6 * crate::fit::GIB,
+        });
+        let spec = build_launch_spec(
+            EngineKind::LlamaCpp,
+            &model(),
+            &p,
+            8030,
+            KvCacheQuant::Auto,
+            &[],
+        );
+        let i = spec
+            .args
+            .iter()
+            .position(|a| a == "--n-cpu-moe")
+            .expect("--n-cpu-moe present");
+        assert_eq!(spec.args[i + 1], "17");
+        // A dense plan (no placement) emits no such flag.
+        let dense = build_launch_spec(
+            EngineKind::LlamaCpp,
+            &model(),
+            &plan("Q4_K_M"),
+            8031,
+            KvCacheQuant::Auto,
+            &[],
+        );
+        assert!(!dense.args.iter().any(|a| a == "--n-cpu-moe"));
+    }
+
+    #[test]
     fn llama_local_model_replaces_hf_repo() {
         // WOR-1656: a pre-fetched GGUF turns --hf-repo into a local
         // --model (no HF download, no curl needed).
@@ -738,44 +829,6 @@ mod tests {
     }
 
     #[test]
-    fn embedded_spec_carries_engine_repo_and_port() {
-        // WOR-1658: the embedded spec is tagged as in-process and carries
-        // the repo + loopback port the in-process server binds.
-        let spec = build_launch_spec(
-            EngineKind::Embedded,
-            &model(),
-            &plan("Q4_K_M"),
-            8010,
-            KvCacheQuant::Auto,
-            &[],
-        );
-        assert_eq!(spec.engine, EngineKind::Embedded);
-        assert!(spec.engine.is_in_process());
-        assert_eq!(spec.args[0], "Qwen/Qwen3-14B");
-        let pi = spec.args.iter().position(|a| a == "--port").unwrap();
-        assert_eq!(spec.args[pi + 1], "8010");
-    }
-
-    #[tokio::test]
-    async fn embedded_launch_reports_state_not_a_spawn_error() {
-        // The launcher dispatches an in-process engine to the embedded
-        // path; without the backend it returns a state-accurate error
-        // (naming embedded / WOR-1658), never a generic spawn failure.
-        let spec = build_launch_spec(
-            EngineKind::Embedded,
-            &model(),
-            &plan("Q4_K_M"),
-            8011,
-            KvCacheQuant::Auto,
-            &[],
-        );
-        let launcher = ProcessEngineLauncher::with_timeout(Duration::from_secs(1));
-        let err = launcher.launch(&spec).await.unwrap_err();
-        assert!(err.contains("embedded"), "unexpected error: {err}");
-        assert!(!err.contains("spawn"), "should not be a spawn error: {err}");
-    }
-
-    #[test]
     fn kv_quant_adds_engine_flags() {
         // vLLM: Int4 KV maps to a --kv-cache-dtype flag.
         let v = build_launch_spec(
@@ -800,6 +853,24 @@ mod tests {
         assert!(l.args.iter().any(|a| a == "--cache-type-k"));
         assert!(l.args.iter().any(|a| a == "--cache-type-v"));
         assert!(l.args.iter().any(|a| a == "q4_0"));
+    }
+
+    #[test]
+    fn modality_flags_emit_vllm_task_only_for_non_chat() {
+        use crate::catalog::Modality;
+        // Chat: no task flag (default causal-LM mode).
+        assert!(modality_flags(EngineKind::Vllm, Modality::Chat).is_empty());
+        // Embedding / rerank map to the vLLM task the engine needs.
+        assert_eq!(
+            modality_flags(EngineKind::Vllm, Modality::Embedding),
+            vec!["--task".to_string(), "embed".to_string()]
+        );
+        assert_eq!(
+            modality_flags(EngineKind::Vllm, Modality::Rerank),
+            vec!["--task".to_string(), "score".to_string()]
+        );
+        // llama.cpp has no task concept, so nothing is emitted.
+        assert!(modality_flags(EngineKind::LlamaCpp, Modality::Embedding).is_empty());
     }
 
     #[test]
@@ -835,6 +906,7 @@ mod tests {
             max_context: None,
             extra_args: vec![],
             kv_quant: KvCacheQuant::Auto,
+            enable_prefix_caching: None,
             speculative: spec,
             chunked_prefill: cp,
             lora_adapters: loras,
@@ -844,6 +916,8 @@ mod tests {
             cpu_offload_gib: None,
             max_loras: None,
             gguf_file: None,
+            reference: None,
+            modality: None,
         }
     }
 
@@ -943,8 +1017,23 @@ mod tests {
     }
 
     #[test]
-    fn serving_flags_kv_tiering() {
-        // WOR-1687: swap_space / cpu_offload emit the CPU-tier flags.
+    fn enable_prefix_caching_adds_the_engine_flag() {
+        let mut e = entry_with(None, None, vec![]);
+        e.enable_prefix_caching = Some(true);
+        let f = serving_flags(EngineKind::Vllm, &e);
+        assert!(f.iter().any(|a| a == "--enable-prefix-caching"));
+    }
+
+    #[test]
+    fn prefix_caching_unset_omits_the_flag() {
+        let e = entry_with(None, None, vec![]);
+        let f = serving_flags(EngineKind::Vllm, &e);
+        assert!(!f.iter().any(|a| a.contains("prefix-caching")));
+    }
+
+    #[test]
+    fn serving_flags_emit_engine_native_cpu_memory_controls() {
+        // The retained settings map directly to vLLM's CPU memory flags.
         let mut e = entry_with(None, None, vec![]);
         e.swap_space_gib = Some(16);
         e.cpu_offload_gib = Some(8);
@@ -993,14 +1082,6 @@ mod tests {
         // batch (compute-bound) turns it off.
         assert!(should_speculate(0.2, SPECULATE_OCCUPANCY_THRESHOLD));
         assert!(!should_speculate(0.9, SPECULATE_OCCUPANCY_THRESHOLD));
-    }
-
-    #[test]
-    fn chunk_size_tracks_ttft_and_throughput() {
-        // 10k tok/s prefill, 250ms SLO -> ~2500 token chunk.
-        assert_eq!(chunk_size_for_ttft(250, 10_000.0), 2500);
-        // A tiny SLO clamps to the floor.
-        assert_eq!(chunk_size_for_ttft(1, 10_000.0), MIN_PREFILL_CHUNK);
     }
 
     // --- ProcessEngineLauncher against a fake process ---

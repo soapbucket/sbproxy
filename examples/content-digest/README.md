@@ -28,18 +28,30 @@ curl -X POST -H 'Host: webhook.local' \
 Send the wrong digest or omit it entirely to see the 400:
 
 ```bash
-# Mismatch.
+# Mismatch: a valid base64 digest of different content.
+WRONG=$(printf '%s' 'some other body' | openssl dgst -sha256 -binary | openssl base64)
+curl -X POST -H 'Host: webhook.local' \
+  -H "Content-Digest: sha-256=:${WRONG}:" \
+  -H 'Content-Type: application/json' \
+  -d "$BODY" \
+  http://127.0.0.1:8080/webhook
+# {"detail":"Content-Digest value does not match the request body","error":"content_digest verification failed"}
+
+# Malformed header: not well-formed base64, so it is a parse error
+# rather than a mismatch.
 curl -X POST -H 'Host: webhook.local' \
   -H 'Content-Digest: sha-256=:wronghashbase64==:' \
   -H 'Content-Type: application/json' \
   -d "$BODY" \
   http://127.0.0.1:8080/webhook
+# {"detail":"Content-Digest header is malformed per RFC 9530 structured-fields syntax","error":"content_digest verification failed"}
 
 # Missing header.
 curl -X POST -H 'Host: webhook.local' \
   -H 'Content-Type: application/json' \
   -d "$BODY" \
   http://127.0.0.1:8080/webhook
+# {"detail":"Content-Digest header required but absent","error":"content_digest verification failed"}
 ```
 
 See [docs/content-digest.md](../../docs/content-digest.md) for the full schema and the `Repr-Digest` fallback.

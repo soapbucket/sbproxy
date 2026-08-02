@@ -22,7 +22,7 @@ use http::HeaderMap;
 use once_cell::sync::OnceCell;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use ulid::Ulid;
@@ -35,6 +35,7 @@ use crate::request_event::UserIdSource;
 /// "capture on, no echo, no redaction" baseline; operators tune via
 /// `sb.yml`.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PropertiesConfig {
     /// Master switch. When `false`, [`capture_properties`] returns an
     /// empty map regardless of headers.
@@ -48,6 +49,10 @@ pub struct PropertiesConfig {
     /// observes the event.
     #[serde(default)]
     pub redact: RedactConfig,
+    /// Explicit property keys copied into durable usage-rollup dimensions.
+    /// Bounded to [`MAX_ROLLUP_PROPERTY_KEYS`] during config compilation.
+    #[serde(default)]
+    pub rollup_keys: Vec<String>,
 }
 
 impl Default for PropertiesConfig {
@@ -56,12 +61,52 @@ impl Default for PropertiesConfig {
             capture: true,
             echo: false,
             redact: RedactConfig::default(),
+            rollup_keys: Vec::new(),
         }
+    }
+}
+
+impl PropertiesConfig {
+    /// Normalize promoted keys and reject configurations that could create an
+    /// unbounded or ambiguous durable dimension set.
+    pub fn validate_and_normalize_rollup_keys(&mut self) -> Result<(), String> {
+        if self.rollup_keys.len() > MAX_ROLLUP_PROPERTY_KEYS {
+            return Err(format!(
+                "properties.rollup_keys accepts at most {MAX_ROLLUP_PROPERTY_KEYS} entries"
+            ));
+        }
+        let mut seen = HashSet::with_capacity(self.rollup_keys.len());
+        for key in &mut self.rollup_keys {
+            *key = key.to_ascii_lowercase();
+            if !is_valid_property_key(key) {
+                return Err(format!(
+                    "properties.rollup_keys contains invalid property key {key:?}"
+                ));
+            }
+            if !seen.insert(key.clone()) {
+                return Err(format!(
+                    "properties.rollup_keys contains duplicate property key {key:?}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Select only configured values from an already-captured and redacted map.
+    pub fn promoted_properties(
+        &self,
+        captured: &BTreeMap<String, String>,
+    ) -> BTreeMap<String, String> {
+        self.rollup_keys
+            .iter()
+            .filter_map(|key| captured.get(key).map(|value| (key.clone(), value.clone())))
+            .collect()
     }
 }
 
 /// Redaction rules for captured property values.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RedactConfig {
     /// Exact-match keys whose values are replaced with `"[redacted]"`.
     /// Match is case-insensitive on the lowercased captured key.
@@ -100,6 +145,8 @@ pub const MAX_PROPERTY_KEY_LEN: usize = 64;
 pub const MAX_PROPERTY_VALUE_LEN: usize = 512;
 /// Maximum cumulative wire payload (sum of key + value lengths).
 pub const MAX_PROPERTY_PAYLOAD_BYTES: usize = 8 * 1024;
+/// Maximum per-origin property dimensions promoted into durable rollups.
+pub const MAX_ROLLUP_PROPERTY_KEYS: usize = 5;
 /// Header prefix that triggers property capture. Lowercased here so
 /// `iter()`'s lowercased header name matches directly.
 const PROPERTY_HEADER_PREFIX: &str = "x-sb-property-";
@@ -111,6 +158,11 @@ fn default_true() -> bool {
 fn property_key_regex() -> &'static Regex {
     static RE: OnceCell<Regex> = OnceCell::new();
     RE.get_or_init(|| Regex::new(r"^[a-z0-9][a-z0-9_-]{0,63}$").expect("static regex compiles"))
+}
+
+/// Whether a normalized property key satisfies the capture contract.
+pub fn is_valid_property_key(key: &str) -> bool {
+    key.len() <= MAX_PROPERTY_KEY_LEN && property_key_regex().is_match(key)
 }
 
 fn redact_value_regexes(patterns: &[String]) -> Vec<Regex> {
@@ -233,6 +285,7 @@ pub enum AutoGenerate {
 
 /// Per-origin sessions configuration.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SessionsConfig {
     /// Master capture switch. When `false`, callers see no session ID
     /// regardless of headers or auto-generation policy.
@@ -242,9 +295,8 @@ pub struct SessionsConfig {
     /// supply one.
     #[serde(default)]
     pub auto_generate: AutoGenerate,
-    /// Sessions index TTL in seconds. The proxy itself does not
-    /// enforce TTL; this knob feeds the ClickHouse projections (T2.4)
-    /// which key storage on `(workspace_id, session_id)`.
+    /// Reserved sessions-index TTL hint. The OSS runtime does not expire the
+    /// in-process request ring or a downstream projection from this value.
     #[serde(default = "default_session_ttl")]
     pub ttl_seconds: u64,
     /// Cap on auto-generated session IDs per workspace per window.
@@ -382,6 +434,7 @@ pub fn capture_parent_session_id(headers: &HeaderMap) -> (Option<Ulid>, SessionD
 
 /// Per-origin user-ID configuration.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UserConfig {
     /// Master capture switch. When `false`, [`capture_user_id`] always
     /// returns `None`.
@@ -424,6 +477,7 @@ impl Default for UserConfig {
 /// See `docs/A30.md` (decision log) for the rationale on why this
 /// path drops rather than rejects.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BudgetConfig {
     /// Maximum admissions per window. Exceeding this floors further
     /// admissions in the same window to drop-with-metric.
@@ -828,6 +882,50 @@ mod tests {
         };
         let (props, _) = capture_properties(&headers, &cfg);
         assert_eq!(props.get("note").unwrap(), "[redacted]");
+    }
+
+    #[test]
+    fn rollup_keys_normalize_and_select_redacted_properties() {
+        let headers = headers_from(&[
+            ("X-Sb-Property-Customer-Email", "alice@example.com"),
+            ("X-Sb-Property-Feature", "assistant"),
+            ("X-Sb-Property-Unpromoted", "ignored"),
+        ]);
+        let mut cfg = PropertiesConfig {
+            rollup_keys: vec!["FEATURE".to_string(), "Customer-Email".to_string()],
+            redact: RedactConfig {
+                keys: vec!["customer-email".to_string()],
+                value_regex: vec![],
+            },
+            ..PropertiesConfig::default()
+        };
+
+        cfg.validate_and_normalize_rollup_keys().unwrap();
+        assert_eq!(cfg.rollup_keys, ["feature", "customer-email"]);
+        let (captured, _) = capture_properties(&headers, &cfg);
+        let promoted = cfg.promoted_properties(&captured);
+        assert_eq!(promoted.len(), 2);
+        assert_eq!(promoted["feature"], "assistant");
+        assert_eq!(promoted["customer-email"], "[redacted]");
+        assert!(!promoted.contains_key("unpromoted"));
+    }
+
+    #[test]
+    fn rollup_keys_reject_duplicates_invalid_syntax_and_unbounded_lists() {
+        for keys in [
+            vec!["Feature".to_string(), "feature".to_string()],
+            vec!["bad.key".to_string()],
+            vec!["".to_string()],
+            (0..=MAX_ROLLUP_PROPERTY_KEYS)
+                .map(|i| format!("key-{i}"))
+                .collect(),
+        ] {
+            let mut cfg = PropertiesConfig {
+                rollup_keys: keys,
+                ..PropertiesConfig::default()
+            };
+            assert!(cfg.validate_and_normalize_rollup_keys().is_err());
+        }
     }
 
     // --- sessions ---

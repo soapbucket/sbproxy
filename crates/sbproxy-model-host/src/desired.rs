@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     Catalog, DeploymentRevisionDraft, DeploymentSourceMode, EngineChoice, EngineKind,
     EngineProvisioning, EvictionPolicy, ModelDeployment, ModelHostConfig, PullPolicy,
-    RolloutPolicy, ServeEntry,
+    RolloutPolicy, ServeEntry, SpecMethod,
 };
 
 /// Canonical provider reference collected from one configured origin.
@@ -201,6 +201,8 @@ pub fn compile_desired_state(
     let mut compiled_deployments = BTreeMap::new();
     for (id, deployment) in &control.deployments {
         validate_catalog_deployment(id, deployment, catalog)?;
+        validate_canonical_engine_tuning(id, deployment)?;
+        validate_canonical_engine_pin(id, deployment)?;
         let desired = lower_canonical_deployment(deployment);
         revision_deployments.insert(id.clone(), desired.clone());
         compiled_deployments.insert(
@@ -435,30 +437,81 @@ pub(crate) fn validate_legacy_managed_compatibility(
     entry: &ServeEntry,
     resolved_engine: Option<EngineKind>,
 ) -> Result<(), String> {
+    // The four vLLM tuning passthroughs (chunked prefill, tool-call parser,
+    // CPU KV swap, weight offload) are emitted by the vLLM driver, so they
+    // are honored only when the resolved engine is vLLM. LoRA adapters and
+    // speculative decoding have no runtime consumer on a non-vLLM engine
+    // either (`serving_flags` early-returns an empty vec for any engine
+    // but vLLM) and are rejected the same way. At config-load the engine
+    // may still be `auto`; the reject is deferred to prepare (which
+    // re-runs this with the resolved engine) rather than guessing, so
+    // only a pinned non-vLLM engine trips the passthrough gate early.
+    // The four tuning passthroughs are vLLM flags emitted only by the vLLM
+    // driver. SGLang, like llama.cpp, does not consume them, so an
+    // explicitly non-vLLM engine that sets them is rejected.
+    let vllm_passthrough_supported = match resolved_engine {
+        Some(kind) => kind == EngineKind::Vllm,
+        None => !matches!(
+            entry.engine,
+            EngineChoice::LlamaCpp | EngineChoice::SGLang | EngineChoice::MistralRs
+        ),
+    };
+
     let mut unsupported = Vec::new();
-    if entry.speculative.is_some() {
-        unsupported.push("speculative");
+    let mut reasons = Vec::new();
+    if let Some(spec) = &entry.speculative {
+        if !vllm_passthrough_supported {
+            // Same as the four tuning passthroughs below: `serving_flags`
+            // early-returns an empty vec for any engine but vLLM, so a
+            // non-vLLM engine has no consumer for this at all. Folded
+            // into the generic vLLM-engine reason below, not flagged
+            // separately here.
+            unsupported.push("speculative");
+        } else if spec.method == SpecMethod::DraftModel {
+            // Draft-model speculation loads a second model alongside the
+            // base one; `fit::resolve_speculative_config` is the VRAM
+            // headroom check for that, but nothing calls it at prepare
+            // time yet, so accepting this would launch
+            // --speculative-model with no headroom check at all. Fail
+            // closed until that wiring lands. N-gram speculation loads
+            // no extra model, so it has no missing safety property and
+            // stays accepted on vLLM.
+            unsupported.push("speculative");
+            reasons.push(
+                "draft-model speculation is rejected until fit::resolve_speculative_config's VRAM headroom check is wired into a real prepare-time call site (it exists but has no caller today); n-gram speculation (the default method) needs no extra model and is accepted. Remove the speculative config or set method: ngram."
+                    .to_string(),
+            );
+        }
     }
-    if entry.chunked_prefill.is_some() {
-        unsupported.push("chunked_prefill");
+    if !vllm_passthrough_supported {
+        if entry.chunked_prefill.is_some() {
+            unsupported.push("chunked_prefill");
+        }
+        if entry.tool_call_parser.is_some() {
+            unsupported.push("tool_call_parser");
+        }
+        if entry.swap_space_gib.is_some() {
+            unsupported.push("swap_space_gib");
+        }
+        if entry.cpu_offload_gib.is_some() {
+            unsupported.push("cpu_offload_gib");
+        }
+        if !entry.lora_adapters.is_empty() || entry.max_loras.is_some() {
+            unsupported.push("lora_adapters/max_loras");
+        }
     }
-    if !entry.lora_adapters.is_empty() || entry.max_loras.is_some() {
-        unsupported.push("lora_adapters/max_loras");
-    }
-    if entry.tool_call_parser.is_some() {
-        unsupported.push("tool_call_parser");
-    }
-    if entry.swap_space_gib.is_some() {
-        unsupported.push("swap_space_gib");
-    }
-    if entry.cpu_offload_gib.is_some() {
-        unsupported.push("cpu_offload_gib");
+    if !vllm_passthrough_supported && !unsupported.is_empty() {
+        reasons.push(
+            "chunked_prefill, tool_call_parser, swap_space_gib, cpu_offload_gib, lora_adapters, and speculative decoding require the vLLM engine. Pin engine: vllm or remove them."
+                .to_string(),
+        );
     }
     if !unsupported.is_empty() {
         return Err(format!(
-            "legacy serve model {:?} uses fields not yet available through the verified managed driver: {}; remove them during migration instead of allowing the runtime to ignore them",
+            "legacy serve model {:?} sets serving fields the managed runtime cannot honor here: {}. {}",
             entry.model,
             unsupported.join(", "),
+            reasons.join(" "),
         ));
     }
 
@@ -480,12 +533,94 @@ pub(crate) fn validate_legacy_managed_compatibility(
         .map_err(|error| error.to_string())
 }
 
+/// Reject serving tuning a canonical deployment's engine cannot honor, and
+/// validate its extra engine arguments, mirroring the legacy `serve:` gate.
+fn validate_canonical_engine_tuning(
+    id: &str,
+    config: &ManagedDeploymentConfig,
+) -> Result<(), DesiredStateError> {
+    // The four vLLM tuning passthroughs are emitted only by the vLLM driver, so
+    // an explicitly non-vLLM engine that sets them is rejected. engine: auto
+    // defers to the resolved engine, which ignores them when it is not vLLM.
+    if matches!(
+        config.engine,
+        ManagedEngineChoice::LlamaCpp
+            | ManagedEngineChoice::SGLang
+            | ManagedEngineChoice::MistralRs
+    ) {
+        let mut unsupported = Vec::new();
+        if config.chunked_prefill.is_some() {
+            unsupported.push("chunked_prefill");
+        }
+        if config.tool_call_parser.is_some() {
+            unsupported.push("tool_call_parser");
+        }
+        if config.swap_space_gib.is_some() {
+            unsupported.push("swap_space_gib");
+        }
+        if config.cpu_offload_gib.is_some() {
+            unsupported.push("cpu_offload_gib");
+        }
+        if !unsupported.is_empty() {
+            return Err(DesiredStateError::Invalid(format!(
+                "managed deployment {id:?} sets vLLM-only serving fields on a non-vLLM engine: {}. pin engine: vllm or remove them.",
+                unsupported.join(", ")
+            )));
+        }
+    }
+    if config.extra_args.is_empty() {
+        return Ok(());
+    }
+    let engines: &[EngineKind] = match config.engine {
+        ManagedEngineChoice::Vllm => &[EngineKind::Vllm],
+        ManagedEngineChoice::SGLang => &[EngineKind::SGLang],
+        ManagedEngineChoice::LlamaCpp => &[EngineKind::LlamaCpp],
+        ManagedEngineChoice::MistralRs => &[EngineKind::MistralRs],
+        ManagedEngineChoice::Auto => &[EngineKind::LlamaCpp, EngineKind::Vllm],
+    };
+    for engine in engines {
+        crate::validate_engine_args(*engine, &config.extra_args).map_err(|error| {
+            DesiredStateError::Invalid(format!(
+                "managed deployment {id:?} sets extra_args not valid for engine {engine:?}: {error}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+/// Hold a per-deployment engine pin to the same strictness as the node-wide
+/// engine policy: a version is never `latest`, and an image is tag- or
+/// digest-pinned.
+fn validate_canonical_engine_pin(
+    id: &str,
+    config: &ManagedDeploymentConfig,
+) -> Result<(), DesiredStateError> {
+    if config.engine_version.as_deref() == Some("latest") {
+        return Err(DesiredStateError::Invalid(format!(
+            "managed deployment {id:?} engine_version must be a pinned version, not `latest`"
+        )));
+    }
+    if let Some(image) = &config.engine_image {
+        let provisioning = crate::EngineProvisioning {
+            image: Some(image.clone()),
+            ..Default::default()
+        };
+        if !provisioning.image_is_pinned() {
+            return Err(DesiredStateError::Invalid(format!(
+                "managed deployment {id:?} engine_image {image:?} must be tag- or digest-pinned, not `latest` or untagged"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn lower_canonical_deployment(config: &ManagedDeploymentConfig) -> ModelDeployment {
     ModelDeployment {
         model: config.model.clone(),
         variant: config.variant.clone(),
         heterogeneous_variants: config.heterogeneous_variants,
         replicas: config.replicas,
+        tensor_parallel: config.tensor_parallel,
         required_labels: config.required_labels.clone(),
         spread_by: config.spread_by.clone(),
         pull: match config.pull {
@@ -506,12 +641,25 @@ fn lower_canonical_deployment(config: &ManagedDeploymentConfig) -> ModelDeployme
         engine: match config.engine {
             ManagedEngineChoice::Auto => EngineChoice::Auto,
             ManagedEngineChoice::Vllm => EngineChoice::Vllm,
+            ManagedEngineChoice::SGLang => EngineChoice::SGLang,
             ManagedEngineChoice::LlamaCpp => EngineChoice::LlamaCpp,
+            ManagedEngineChoice::MistralRs => EngineChoice::MistralRs,
         },
         rollout: match config.rollout {
             ManagedRolloutPolicy::Rolling => RolloutPolicy::Rolling,
             ManagedRolloutPolicy::Recreate => RolloutPolicy::Recreate,
         },
+        extra_args: config.extra_args.clone(),
+        chunked_prefill: config.chunked_prefill.map(|prefill| crate::ChunkedPrefill {
+            max_batched_tokens: prefill.max_batched_tokens,
+            target_ttft_ms: prefill.target_ttft_ms,
+        }),
+        tool_call_parser: config.tool_call_parser.clone(),
+        swap_space_gib: config.swap_space_gib,
+        cpu_offload_gib: config.cpu_offload_gib,
+        engine_version: config.engine_version.clone(),
+        engine_image: config.engine_image.clone(),
+        engine_sha256: config.engine_sha256.clone(),
     }
 }
 
@@ -538,6 +686,7 @@ fn lower_legacy_deployment(
         variant: entry.variant.clone(),
         heterogeneous_variants: false,
         replicas: 1,
+        tensor_parallel: None,
         required_labels: BTreeMap::new(),
         spread_by: Vec::new(),
         pull,
@@ -551,6 +700,16 @@ fn lower_legacy_deployment(
         queue_timeout_ms: host.queue_timeout_ms.unwrap_or(30_000),
         engine: entry.engine,
         rollout: RolloutPolicy::Rolling,
+        // Legacy serving tuning stays on `legacy_entry`; the canonical
+        // ModelDeployment tuning fields are unused on this path.
+        extra_args: Vec::new(),
+        chunked_prefill: None,
+        tool_call_parser: None,
+        swap_space_gib: None,
+        cpu_offload_gib: None,
+        engine_version: None,
+        engine_image: None,
+        engine_sha256: None,
     })
 }
 
@@ -608,5 +767,174 @@ fn identifier_fragment(value: &str) -> String {
         "unnamed".to_string()
     } else {
         trimmed.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_legacy_managed_compatibility;
+    use crate::{EngineKind, ModelHostConfig, ServeEntry};
+
+    fn first_entry(yaml: &str) -> ServeEntry {
+        serde_yaml::from_str::<ModelHostConfig>(yaml)
+            .expect("fixture parses")
+            .models
+            .into_iter()
+            .next()
+            .expect("fixture declares a model")
+    }
+
+    #[test]
+    fn vllm_passthroughs_are_accepted_for_vllm() {
+        let entry = first_entry(
+            "models:\n  - model: qwen3-8b\n    engine: vllm\n    chunked_prefill: {}\n    tool_call_parser: hermes\n    swap_space_gib: 16\n    cpu_offload_gib: 8\n",
+        );
+        validate_legacy_managed_compatibility(&entry, Some(EngineKind::Vllm))
+            .expect("the vLLM driver emits every tuning passthrough");
+    }
+
+    #[test]
+    fn vllm_passthroughs_are_rejected_for_a_non_vllm_engine() {
+        let entry = first_entry("models:\n  - model: qwen3-8b\n    swap_space_gib: 16\n");
+        let error = validate_legacy_managed_compatibility(&entry, Some(EngineKind::LlamaCpp))
+            .expect_err("llama.cpp does not emit the vLLM tuning flags");
+        assert!(error.contains("swap_space_gib"), "{error}");
+    }
+
+    #[test]
+    fn ngram_speculation_is_accepted_on_vllm() {
+        // `speculative: {}` defaults to n-gram / prompt-lookup speculation,
+        // which needs no separate draft-model weights, so it has no
+        // missing VRAM-headroom safety property: `launch.rs` already
+        // emits the engine's speculation flags for it.
+        let entry =
+            first_entry("models:\n  - model: qwen3-8b\n    engine: vllm\n    speculative: {}\n");
+        validate_legacy_managed_compatibility(&entry, Some(EngineKind::Vllm))
+            .expect("n-gram speculation needs no draft model, so it always resolves");
+    }
+
+    #[test]
+    fn ngram_speculation_is_rejected_on_a_non_vllm_engine() {
+        // `serving_flags` early-returns for any engine but vLLM, so a
+        // non-vLLM engine has no consumer for speculative config at all,
+        // n-gram included; accepting it here would silently drop it
+        // rather than deploying it.
+        let entry = first_entry(
+            "models:\n  - model: qwen3-8b\n    engine: llama_cpp\n    speculative: {}\n",
+        );
+        let error = validate_legacy_managed_compatibility(&entry, Some(EngineKind::LlamaCpp))
+            .expect_err("llama.cpp has no speculation-flag consumer");
+        assert!(error.contains("speculative"), "{error}");
+        assert!(error.contains("vLLM engine"), "{error}");
+    }
+
+    #[test]
+    fn draft_model_speculation_is_rejected_pending_fit_planner_wiring() {
+        // fit::resolve_speculative_config (the VRAM headroom check) has
+        // no caller at prepare time yet, so draft-model speculation
+        // fails closed regardless of whether a draft model is named --
+        // accepting it would launch --speculative-model with no
+        // headroom check at all.
+        for yaml in [
+            "models:\n  - model: qwen3-8b\n    engine: vllm\n    speculative:\n      method: draft_model\n      draft_model: Qwen/Qwen3-0.6B\n",
+            "models:\n  - model: qwen3-8b\n    engine: vllm\n    speculative:\n      method: draft_model\n",
+        ] {
+            let entry = first_entry(yaml);
+            let error = validate_legacy_managed_compatibility(&entry, Some(EngineKind::Vllm))
+                .expect_err("draft-model speculation is fail-closed until fit-planner wiring lands");
+            assert!(error.contains("speculative"), "{error}");
+            assert!(error.contains("fit::resolve_speculative_config"), "{error}");
+            // The generic "Pin engine: vllm" trailer does not apply here
+            // (the engine already is vLLM); the message must not claim
+            // pinning the engine would fix it.
+            assert!(!error.contains("Pin engine"), "{error}");
+        }
+    }
+
+    #[test]
+    fn lora_adapters_are_accepted_on_vllm_and_rejected_elsewhere() {
+        // WOR-1945: LoRA is a vLLM passthrough. A vLLM model with adapters
+        // compiles; the same on llama.cpp fails closed with a clear reason.
+        let entry = first_entry(
+            "models:\n  - model: qwen3-8b\n    engine: vllm\n    lora_adapters:\n      - name: a\n        source: hf:o/a\n    max_loras: 1\n",
+        );
+        validate_legacy_managed_compatibility(&entry, Some(EngineKind::Vllm))
+            .expect("LoRA adapters serve on the vLLM engine");
+        let error = validate_legacy_managed_compatibility(&entry, Some(EngineKind::LlamaCpp))
+            .expect_err("LoRA needs the vLLM engine");
+        assert!(error.contains("lora_adapters"), "{error}");
+    }
+
+    fn canonical(yaml: &str) -> sbproxy_config::ManagedDeploymentConfig {
+        serde_yaml::from_str(yaml).expect("managed deployment parses")
+    }
+
+    #[test]
+    fn canonical_vllm_tuning_is_rejected_on_llama_cpp() {
+        let config = canonical("model: qwen3-8b\nengine: llama_cpp\nswap_space_gib: 16\n");
+        let error = super::validate_canonical_engine_tuning("local", &config)
+            .expect_err("llama.cpp does not emit the vLLM tuning flags");
+        assert!(error.to_string().contains("swap_space_gib"), "{error:?}");
+    }
+
+    #[test]
+    fn canonical_vllm_tuning_is_accepted_on_vllm_and_auto() {
+        for engine in ["vllm", "auto"] {
+            let config = canonical(&format!(
+                "model: qwen3-8b\nengine: {engine}\ntool_call_parser: hermes\nswap_space_gib: 16\n"
+            ));
+            super::validate_canonical_engine_tuning("local", &config)
+                .unwrap_or_else(|error| panic!("engine {engine} accepts the tuning: {error:?}"));
+        }
+    }
+
+    #[test]
+    fn canonical_tuning_lowers_onto_the_deployment() {
+        let config = canonical(
+            "model: qwen3-8b\nengine: vllm\ntool_call_parser: hermes\nswap_space_gib: 16\ncpu_offload_gib: 8\nchunked_prefill:\n  max_batched_tokens: 2048\n",
+        );
+        let lowered = super::lower_canonical_deployment(&config);
+        assert_eq!(lowered.tool_call_parser.as_deref(), Some("hermes"));
+        assert_eq!(lowered.swap_space_gib, Some(16));
+        assert_eq!(lowered.cpu_offload_gib, Some(8));
+        assert_eq!(
+            lowered
+                .chunked_prefill
+                .and_then(|prefill| prefill.max_batched_tokens),
+            Some(2048)
+        );
+    }
+
+    #[test]
+    fn engine_pin_lowers_and_accepts_a_pinned_version_and_image() {
+        let config = canonical(
+            "model: qwen3-8b\nengine: vllm\nengine_version: 0.11.0\nengine_image: vllm/vllm-openai:v0.11.0\nengine_sha256: abc123\n",
+        );
+        super::validate_canonical_engine_pin("local", &config).expect("a pinned version and image");
+        let lowered = super::lower_canonical_deployment(&config);
+        assert_eq!(lowered.engine_version.as_deref(), Some("0.11.0"));
+        assert_eq!(
+            lowered.engine_image.as_deref(),
+            Some("vllm/vllm-openai:v0.11.0")
+        );
+        assert_eq!(lowered.engine_sha256.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn engine_pin_rejects_latest_version() {
+        let config = canonical("model: qwen3-8b\nengine_version: latest\n");
+        let error = super::validate_canonical_engine_pin("local", &config)
+            .expect_err("latest is not a pinned version");
+        assert!(error.to_string().contains("latest"), "{error:?}");
+    }
+
+    #[test]
+    fn engine_pin_rejects_an_unpinned_image() {
+        for image in ["vllm/vllm-openai", "vllm/vllm-openai:latest"] {
+            let config = canonical(&format!("model: qwen3-8b\nengine_image: {image}\n"));
+            let error = super::validate_canonical_engine_pin("local", &config)
+                .expect_err(&format!("image {image} must be pinned"));
+            assert!(error.to_string().contains("pinned"), "{error:?}");
+        }
     }
 }

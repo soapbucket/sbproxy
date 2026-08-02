@@ -12,6 +12,953 @@ the next version cut.
 
 ### Added
 
+- **mistral.rs is a subprocess engine kind.** `engine: mistralrs` drives the
+  upstream v0.9 `mistralrs` CLI as a supervised subprocess over its
+  OpenAI-compatible surface, acquired exactly like llama.cpp: PATH-first,
+  then the pinned upstream prebuilt release (Metal on Apple Silicon; CPU
+  and per-compute-capability CUDA builds on Linux x86-64), sha256-verified
+  against checked-in digests. The lane serves safetensors weights with
+  native tool calls, appears in `sbproxy doctor` and `models list`, and is
+  an explicit opt-in: `auto` never resolves to it and placement ranks it
+  behind the certified lanes. See
+  [`docs/model-host.md`](docs/model-host.md).
+- **A managed worker refuses to boot into a configuration it cannot
+  serve.** `sbproxy doctor --strict <config>` runs six named startup checks
+  (NVIDIA driver, visible accelerators, per-entry engine compatibility,
+  `/dev/shm` against the size an engine asked for, the weight-cache mount
+  against `cache_budget_gib`, and `proxy.cluster` identity material) and
+  exits 3 when any of them blocks. Each check compares the config's own
+  demands against the host, reads both the provider-level `serve:` form and
+  the canonical `proxy.model_host` form, and reports `skip` rather than a
+  hollow pass when it does not apply. The worker image and the generic VM
+  bootstrap now boot behind it, so a box handed no GPU devices, a too-small
+  `/dev/shm`, an undersized cache mount, or unreadable model-plane identity
+  fails at boot with a named blocker instead of joining the cluster,
+  advertising itself as eligible, and failing every dispatch. See
+  [`docs/manual.md`](docs/manual.md).
+- **The self-host matrix has a runner and an evidence ledger.**
+  `scripts/certify-selfhost.sh` gives every lane in the certification table
+  one reproducible command, a recorded expected result, captured host and
+  version metadata, and a retained log. A lane passes only when its command
+  ran on this host and succeeded; a host that cannot provide what a lane
+  needs is recorded `unsupported` with the reason, never as a pass. Apple
+  Silicon and NVIDIA single-GPU CUDA now have live evidence dated
+  2026-07-30, including a real vLLM container completion on an L4. See
+  [`docs/model-host-certification.md`](docs/model-host-certification.md).
+- **The macOS launchd agent has an environment file.**
+  `sbproxy service install` creates
+  `~/Library/Application Support/sbproxy/service/env` (mode 0600) once and
+  never overwrites it, so an `HF_TOKEN` a gated model needs survives
+  reinstalling to change the model or the port. A launchd agent inherits
+  almost nothing from the shell that installed it, so a token exported in a
+  terminal was previously invisible to the agent. `service status` now also
+  reports the config, log, and environment-file paths.
+- **Rate limits converge across a gossip mesh with no Redis.** A clustered
+  deployment previously enforced `requests_per_minute` once per node, so 600 rpm
+  on three nodes admitted roughly 1800. Each node now admits against its own
+  count plus a view of its peers refreshed every 3 seconds, which bounds the
+  overshoot at `(nodes - 1) x rate_per_second x 3`: about 660 for that same
+  configuration. An L2 Redis store still enforces exactly and takes precedence
+  when configured. `requests_per_second` is unchanged and still per-node, since a
+  one second window closes before a peer count can arrive, and it now warns at
+  boot on a mesh cluster instead of silently enforcing N times the limit.
+  `sbproxy_rate_limit_cluster_peer_denials_total` makes the approximation
+  observable. See [`docs/configuration.md`](docs/configuration.md).
+
+- **External AI guardrails now use hardened vendor contracts.** Generic
+  webhooks and Presidio remain compatible, while Lakera, Aporia, Azure AI
+  Content Safety, Amazon Bedrock Guardrails, CrowdStrike AIDR, Mistral
+  moderation, Pangea AI Guard, and Patronus have typed adapters. Credentials
+  resolve through the existing secret providers; outbound URLs are validated
+  and DNS-pinned; redirects are disabled; and responses have a timeout and a
+  64 KiB limit. Fail policy now covers malformed responses, replayed output,
+  streaming, and uninspectable multipart content before bytes can leave the
+  gateway. See [`docs/guardrails.md`](docs/guardrails.md).
+- **AI routing learns live locality and shares caller quota across the
+  fleet.** Prefix affinity records bounded, expiring provider holders and
+  falls back by recent token load; outcome-aware routing blends learned
+  feedback during warm-up and keeps that feedback across config reloads;
+  and weighted request pools support local, approximate mesh, and strict
+  Redis accounting keyed by immutable credential ids. Each external
+  provider attempt reserves independently and settles only at its outbound
+  send boundary, with explicit closed or `allow_unreserved` backend failure
+  behavior.
+
+### Removed
+
+- **The in-process embedded engine (`engine: embedded`, WOR-1658).**
+  Never on by default (it required a build with `--features embedded`) and
+  never certified: no dedicated tests, no CI lane, and no capability-ledger
+  entry. llama.cpp already covers the CPU/Metal, zero-external-binary case
+  it existed for, and the new `mistralrs` subprocess engine (see above)
+  covers safetensors mistral.rs serving without the large in-process
+  dependency tree. A config that still sets `engine: embedded` now fails
+  to parse.
+
+### Fixed
+
+- **The `a2a` policy no longer decides on inputs the caller controls.**
+  Chain depth, chain membership, and caller and callee identity were read
+  from `X-A2A-*` request headers with no verification and no ingress
+  stripping, so a caller could send `X-A2A-Chain-Depth: 1` with no chain
+  and clear `max_chain_depth` and cycle detection together, or rename
+  itself off `caller_denylist`. The envelope now comes from the RFC 8693
+  `act` claim chain on the verified principal, which a caller cannot
+  flatten, and the `X-A2A-*` headers are honoured only from a peer in
+  `proxy.trusted_proxies` and stripped from everyone else. Operators
+  relying on the header transport must now list the peer that stamps it;
+  `examples/a2a-protocol/` shows the shape. The policy's `route_glob` is
+  also consulted for the first time: it was parsed, validated, and never
+  read, so the one detection signal a caller could not opt out of did
+  nothing. See [A2A gateway](docs/a2a-gateway.md).
+
+- **`sbproxy_a2a_hops_total` distinguishes verified allows from
+  unverified ones.** The `decision` label emitted a bare `allow` whether
+  the policy had checked a verified delegation chain or waved through an
+  envelope it could not trust, so a fully bypassed policy produced the
+  same green dashboard as a working one. Allows are now
+  `allow:verified` or `allow:unverified`, and a request the policy never
+  engaged on records `skip:undetected` rather than nothing at all.
+  Denials are unchanged. This relabels a `beta`-compatibility metric; no
+  dashboard or alert in this repository reads it.
+
+- **Ollama streaming keeps its stream and its usage accounting.** The
+  buffered-relay fallback for streaming requests keyed on `text/event-stream`
+  alone, so Ollama's NDJSON (`application/x-ndjson`) success responses were
+  buffered whole and their token counts never reached budget recording: a
+  workspace past its cap kept getting 200s. NDJSON responses now stay on the
+  streaming relay, where the Ollama usage parser reads them line by line.
+- **A bulk credential purge now reaches every node.** `invalidate_all` cleared
+  only the local shard, so peers kept serving stale resolved credentials until
+  TTL. It now fans out to every peer. The same change fixes the opposite problem
+  on the node running it: because a clustered node's key-plane cache is the
+  node-wide distributed cache, the old blanket purge also discarded unrelated
+  entries such as compression sessions. The purge is now scoped to the key-plane
+  prefixes.
+- **A clustered node now says what its node-local keystore does and does not
+  guarantee.** The `embedded` redb store is per-node, so a key minted on one node
+  is not durably resolvable by its peers and a revocation may not deny on all of
+  them. A node declaring `proxy.cluster.seeds` with `key_management.enabled: true`
+  and `store.backend: embedded` now warns at boot when a `mesh` or `redis`
+  `cache.tier` propagates records (resolution works while cached, but does not
+  survive expiry or a restart), and fails to start when `cache.tier: none` leaves
+  nothing to propagate through. A single node with no seeds keeps the embedded
+  default. See [`docs/key-management.md`](docs/key-management.md).
+- **The legacy `serve:` fit path books the KV cost the engine will run.** The
+  1.9.0 fix that made the fit planner and the engine drivers share one KV
+  table missed the single-node runtime behind a legacy `serve:` block, which
+  still sized its KV term from the requested `kv_quant`: `int4` on vLLM
+  booked 0.5 bytes per element while the engine allocated fp8 at 1.0,
+  halving the planned cache. That path now sizes from the shared table and
+  logs the same substitution warning, the single-replica managed activation
+  path warns too instead of substituting silently, and the llama.cpp
+  driver's own dtype mapping now derives from the table instead of
+  restating it. See [`docs/gpu-fit-planning.md`](docs/gpu-fit-planning.md).
+
+## [1.9.0] - 2026-07-28
+
+### Added
+
+- **AI routing and state now carry production authority end to end.** Peak
+  EWMA routing tracks complete provider attempts with configurable decay;
+  Realtime WebSocket upgrades replace caller credentials with one trusted
+  provider credential and apply governed-key budget admission; stateful
+  context compression defaults to a private, restart-durable Local redb store
+  while retaining explicit Redis and mesh choices; and verified crawler CAPs
+  enforce bounded per-subject request rates before policy evaluation while
+  exempting approved traffic from ledger pricing.
+- **Classifier safety guardrails now ship calibrated default centroids.**
+  `toxicity`, `jailbreak`, and `content_safety` classifier mode no longer
+  requires operator examples. Optional examples extend the versioned
+  defaults. The artifact pins the exact `all-MiniLM-L6-v2` revision, model,
+  tokenizer, and artifact digests, and incompatible bytes fail closed.
+  Repo-authored held-out fixtures, measured class precision and recall, and
+  deterministic regeneration live in
+  [`docs/ai-default-centroids-evaluation.md`](docs/ai-default-centroids-evaluation.md).
+- **Outbound credentials can use DPoP-bound tokens.** `client_credentials`,
+  token exchange, and vault-backed credentials can load an existing private
+  key from the secret-provider surface and mint fresh RFC 9449 proofs for
+  token and resource requests. Method and URI binding, access-token hashes,
+  nonce challenges, retry bounds, and proof-header redaction are enforced.
+  See [`docs/outbound-dpop.md`](docs/outbound-dpop.md).
+- **The admin API exposes model-host lifecycle jobs.** `GET
+  /admin/model-host/jobs` and `GET /admin/model-host/jobs/{id}` list and read
+  durable load/evict operations. `GET /admin/model-host/jobs/{id}/stream`
+  tails one job's progress as `text/event-stream`, with `Last-Event-ID`
+  reconnect replay. `POST /admin/model-host/load` and `/evict` now answer
+  `202` with a `job_id` and `poll_url` when a durable job store is
+  configured, instead of blocking the request until the engine finishes;
+  with no job store configured they keep the previous synchronous `200`
+  contract. See [`docs/admin-api-guide.md`](docs/admin-api-guide.md).
+- **The admin console playground dispatches through the real request
+  pipeline.** `POST /admin/api/playground/dispatch` impersonates a chosen
+  virtual key with a short-lived, single-use ticket and makes a genuine
+  loopback call into the server's own data-plane listener, so key policy,
+  governance, routing, and guardrails run exactly as they would for that
+  key's real traffic. Plain-HTTP AI origins only; an origin with
+  `force_ssl` set answers `501`. The existing `POST
+  /admin/api/playground/chat` (calls the AI client directly, bypassing the
+  data plane) is unchanged.
+- **A data-plane route reports a caller's own usage.** `GET /v1/key/usage`
+  returns the resolved caller's governance snapshot (requests, tokens,
+  spend, remaining budget), scoped strictly to its own key id. There is no
+  key-id parameter, so a key can never read another key's usage.
+- **Fleet VRAM aggregation and new admin console views.** `GET
+  /admin/cluster/vram` sums VRAM totals across every currently eligible
+  cluster node. The admin console adds a Get Started onboarding view, a
+  Jobs view backed by the new job API, four axes per deployment on the
+  Model host view instead of two (desired / runtime / assignment /
+  live-replica state), and a per-replica disclosure in the cluster node
+  roster.
+- **`sbproxy service install|uninstall|status` runs a model as a background
+  launchd agent on macOS.** `install` generates the same secure loopback
+  config `sbproxy run` would, persists it under `~/Library/Application
+  Support/sbproxy/service/`, and registers a per-user `launchd` agent that
+  restarts on failure; `uninstall` unloads and removes it; `status` reports
+  whether it is registered and running. See
+  [`docs/manual.md`](docs/manual.md).
+- **Recommended-model catalog entries are pinned.** Six of the seven
+  built-in `models.yaml` recommended entries now carry exact `variants:`
+  blocks (sha256, size, revision) instead of resolving loosely at pull
+  time.
+- **Worker and gateway container images are split, with a generic cloud
+  bootstrap script.** `Dockerfile.worker` (CUDA + vLLM) and
+  `Dockerfile.gateway` (lightweight, no GPU stack) replace one combined
+  image. `deploy/terraform/l4-demo/bootstrap-generic.sh` is a
+  cloud-agnostic install/validate/start script driven entirely by
+  environment variables, used by both the GCP Terraform path and
+  `cloud-init.yaml`. See [`docs/build.md`](docs/build.md).
+- **vLLM prefix caching is a config flag.** `enable_prefix_caching` on a
+  managed vLLM deployment emits `--enable-prefix-caching`. See
+  [`docs/model-host.md`](docs/model-host.md).
+- **An opt-in Xet-aware weight transport is available behind a feature
+  flag.** The new `hf-xet-transport` Cargo feature (off by default) adds a
+  second artifact transport built on `hf-hub` 1.0's managed, Xet-aware
+  client. It is not wired into the default build or either production
+  transport call site yet; this ships the transport for a follow-up to
+  adopt.
+- **Six new AI providers.** AI21 Labs (Jamba), Clarifai, Inception Labs
+  (Mercury), Azure AI Foundry Models, Snowflake Cortex, and Sarvam AI,
+  bringing the native provider catalog to 72. See
+  [`docs/providers.md`](docs/providers.md).
+- **OTLP metrics export actually exports.** `telemetry.export_metrics:
+  true` previously did nothing; boot now wires the metrics pipeline, and
+  fails loud if `export_metrics: true` is set without `enabled: true`.
+- **Six new self-host observability metrics, with alerts and dashboard
+  panels.** The previously dead `sbproxy_model_host_load_queue_depth` gauge
+  is now wired to a real signal, and five new counters cover artifact
+  acquisition failures (`sbproxy_model_host_artifact_errors_total`),
+  model-directory exclusions
+  (`sbproxy_ai_model_directory_exclusions_total`), replica-selection
+  exclusions (`sbproxy_ai_replica_selection_excluded_total`), placement
+  rejections (`sbproxy_model_host_placement_rejections_total`), and the
+  key-policy budget fail-closed path
+  (`sbproxy_key_policy_stored_rejections_total`). See
+  [`docs/metrics-stability.md`](docs/metrics-stability.md).
+- **CI gates on the admin UI's typecheck and tests.** Previously nothing in
+  CI ran `npm run typecheck` or `npm run test` for the admin console.
+
+### Removed
+
+- **Superseded `sbproxy-ai` library modules.** Removed unreachable local
+  emulation, prompt-cache, response-deduplication, context-relay,
+  structured-output, and streaming-tracker code. Provider passthrough
+  surfaces, semantic caching, idempotency, live streaming metrics, and the
+  shipped context-compression pipeline are unchanged.
+- **Unreachable policy prototypes no longer look supported.** The
+  `peer_pricing_preflight` policy and the inactive NL-to-Cedar compiler,
+  linter, and compiled-policy store had no production request-path caller
+  and have been removed. Delete `peer_pricing_preflight` entries from
+  configuration; there is no outbound peer-pricing replacement today.
+  Existing `semantic_constraint` policies remain supported, but must drop
+  the inert `policy_id` field and continue to configure their judge
+  directly. AI crawl payment negotiation keeps its live
+  `Accept-Payment` parser.
+- **Dead model-host residency prototypes.** Removed the unwired vLLM sleep/wake
+  client and policy-only KV tiering abstraction. Neither was a supported
+  capability, and vLLM development endpoints are no longer enabled by default.
+  The engine-native `swap_space_gib` and `cpu_offload_gib` settings remain.
+  Safe future sleep/wake wiring needs bounded asynchronous transition polling,
+  retained process ownership and accounting after cleanup failures, a bounded
+  host-RAM policy, isolated container development endpoints, and end-to-end
+  fake-engine coverage (WOR-1987).
+
+### Changed
+
+- **Admin operator passwords are now hashed at rest [BREAKING].**
+  `proxy.admin.operators[].password` is replaced by `password_hash`, an
+  HMAC-SHA256 hash (hex-encoded) using the same pepper the inbound key
+  plane hashes virtual keys with. A plaintext `password` field under
+  `operators:` no longer parses. Compute the hash with the new `sbproxy
+  admin hash-password` CLI helper (`--password` or `--password-stdin`),
+  which resolves `key_management.crypto.pepper` from config when set and
+  falls back to a fixed default otherwise, so hashing works with no
+  `key_management:` block configured. That default is a fixed public
+  constant, the same in every install, so a leaked `password_hash` is
+  offline-crackable unless `key_management.crypto.pepper` is pinned; pin
+  it in production. The admin console gains a read-only Operators page
+  (`GET /api/operators`) listing configured operator usernames and roles;
+  operators stay config-only, with no admin API to add, remove, or
+  re-role one.
+- **Unsupported `telemetry.propagation` values now fail boot.** Previously
+  any value other than `w3c` parsed successfully and was silently ignored,
+  since the installed propagator was always W3C regardless of what
+  `proxy.observability.telemetry.propagation` said. Boot now rejects it,
+  naming the unsupported value and the one supported value.
+- **Speculative decoding config is validated instead of silently dropped.**
+  A `speculative` block on a deployment pinned to a non-vLLM engine now
+  fails validation; previously it parsed and did nothing, since only vLLM
+  emits the corresponding engine flags. n-gram speculation on vLLM is
+  newly accepted. Draft-model speculation stays rejected, pending a
+  VRAM-headroom check at a real prepare-time call site.
+- **The HTTP OTLP transport's default endpoint is corrected.** With
+  `transport: http` and no explicit `endpoint`, sbproxy now defaults to
+  `http://localhost:4318/v1/traces` instead of the gRPC-oriented default
+  with no path suffix appended.
+
+### Fixed
+
+- **`kv_quant: int4` no longer under-sizes the KV cache on vLLM and SGLang.**
+  The fit planner sized the requested mode (int4 at 0.5 bytes per element)
+  while both CUDA engine drivers substituted fp8 at 1.0, because neither
+  exposes an integer KV kernel. The plan booked half the cache the engine
+  would allocate, and the plan is what derives `--gpu-memory-utilization`,
+  so a tight long-context config could fail at first-token graph capture.
+  The dtype passed to the engine and the bytes the planner books now come
+  from one table, so they cannot drift apart, and a substitution is logged
+  rather than silent. llama.cpp is unaffected: its `q8_0` and `q4_0` caches
+  are real. The legacy SGLang launch template also dropped the KV flag
+  entirely and now emits it. See
+  [`docs/gpu-fit-planning.md`](docs/gpu-fit-planning.md).
+- **The worker image pins vLLM.** `Dockerfile.worker` installed vLLM with a
+  bare `pip3 install vllm`, so every rebuild resolved to whatever version was
+  newest and drifted the image off `DEFAULT_VLLM_VERSION`, which the fit
+  planner, the argv builder, and the recorded NVIDIA certification all target.
+  It is now pinned through a `VLLM_VERSION` build arg. See
+  [`docs/build.md`](docs/build.md).
+- **The launchd agent gives a shutdown drain room to finish.** launchd's
+  default `ExitTimeOut` is 20 seconds, shorter than the proxy's 30-second
+  default shutdown grace, so an agent still draining in-flight requests was
+  SIGKILLed part-way through. The plist now sets it above the grace period.
+
+- **OTLP spans are flushed on graceful shutdown.** A
+  `shutdown_otlp_pipeline` call existed but nothing in the binary invoked
+  it; spans still in flight at shutdown could be dropped.
+- **Exported spans join the caller's trace.** An inbound `traceparent`
+  header is now honored when seeding an exported span's parent context.
+  Previously every exported span got a fresh random root trace ID
+  regardless of the caller's own trace.
+- **A latent boot panic in the gRPC OTLP exporter is fixed.** Building the
+  gRPC trace or metrics exporter synchronously spawned a background task
+  with no ambient Tokio runtime present at that point in boot, which
+  panicked with `telemetry.enabled: true` and the (default) gRPC
+  transport. Masked previously because the only test coverage of this path
+  ran inside `#[tokio::test]`, which supplies a runtime.
+- **Killed engines auto-recover on the next request.** A managed
+  deployment whose engine process died after reaching `ready` (for
+  example, `kill -9`, not a crash loop) previously stayed failed until an
+  operator called `POST /admin/model-host/reset`. It now retries the same
+  relaunch a fresh deployment uses; a deployment that is genuinely
+  crash-looping still fails closed.
+- **Stale cluster nodes no longer inflate fleet VRAM totals.** The cluster
+  VRAM aggregator counted a node's last-known VRAM forever, even after it
+  dropped out of eligibility. It now excludes any node that is not
+  currently model-eligible.
+
+## [1.8.0] - 2026-07-27
+
+Trust tier becomes live policy input, config authority grows a command
+line, and the admin console gains the pages it was missing. This release
+also moves the vendored Pingora fork onto upstream 0.8.1, which carries
+security fixes; see Security below.
+
+### Security
+
+- **Pingora updated to upstream 0.8.1.** The vendored fork was based on
+  0.8.0 and has been rebased onto 0.8.1, picking up an HTTP/2 server
+  limit bound that mitigates a memory-exhaustion vector, plus the fixes
+  for `RUSTSEC-2026-0098` and `RUSTSEC-2026-0099`. Every deployment
+  terminating HTTP/2 should take this release. SBproxy's three local
+  patches (dynamic rustls cert resolver, the
+  `upstream_response_decision` retry hook, and the refusal to retry once
+  response bytes have reached the client) are unchanged.
+
+### Added
+
+- **The admin console reports context compression.** A Compression page
+  lists the sessions whose history has been externalized to a summary,
+  with tokens covered, summary size, and the resulting ratio. Summary
+  text is never listed, only its size and provenance.
+- **The admin console reports who can sign in.** A Users page lists each
+  account and its role over a new read-only `GET /api/admin/users`.
+  Accounts remain config (`admin.username`, `admin.operators`), so the
+  route reports and does not mutate, and passwords are never included in
+  the response.
+- **Spend links through to the requests behind it.** Origin rows in the
+  spend breakdown open the request log filtered to that origin.
+- **Trust tier is now live policy input.** The request path combines
+  authentication and agent-detection evidence into `suspicious`, `strong`,
+  `named`, or `anonymous`; CEL expression and assertion policies can read
+  `request.trust_tier`, and `sbproxy_trust_tier_requests_total` reports the
+  closed-set distribution. Verified Web Bot Auth resolves to `strong`.
+- **Operate a config authority from the command line.** Running one used
+  to mean hand-rolled `curl`. `sbproxy config authority init` generates
+  the Ed25519 signing key owner-only, writes the verifying-key file
+  subscribers install, and prints what to copy where; it refuses to
+  overwrite an existing key, and `--force` rotates by adding the new
+  verifying key beside the old one so subscribers keep verifying while
+  they are updated. `publish` runs the same three validation steps the
+  authority runs, through the same code, so a payload that would be
+  refused is refused locally before a revision number is spent on it.
+  `status` shows the current revision, the key id, and every subscriber's
+  last-seen revision, which is fleet drift visible from a terminal.
+  `rollback` republishes the previous revision's payload under a new
+  revision number, because a subscriber's anti-replay cursor refuses
+  anything that does not move forward. `subscriber add | list | revoke`
+  manages credentials, and `add` prints the credential exactly once and
+  says so. Every command that changes what the fleet sees goes over the
+  admin API and reports what the server returned, and an unreachable
+  authority is a distinct non-zero exit rather than something local that
+  looks like success. New admin route:
+  `POST /admin/config-authority/rollback`.
+- **Preview the configuration an authority would push, before it lands.**
+  `sbproxy config pull --dry-run` runs a real subscriber cycle up to the
+  point of applying: conditional fetch, signature and digest and replay
+  verification, the merge over the local document, and the
+  unresolved-`${VAR}` screen. Then it prints the plan diff and stops. The
+  bundle cache is not written, the replay cursor is not advanced, and
+  nothing reloads.
+- **Subscribe to signed configuration from an upstream authority.** A new
+  `proxy.config_authority.upstream` block points a node at an authority
+  that publishes signed configuration bundles. The node polls, verifies
+  the signature against the keys it trusts, merges the payload over its
+  own file, and applies the result through the same reload transaction a
+  SIGHUP takes, so a bad bundle is rejected before anything is published
+  and the previously applied configuration keeps serving. Paths that
+  describe the box rather than the fleet are refused outright: listeners,
+  TLS material, the admin surface, secret backends, cluster identity, and
+  the authority block itself. A monotonic cursor refuses a replayed or
+  rolled-back revision, including across a restart, and the verified
+  bundle is cached so an unreachable authority costs nothing but a
+  climbing staleness gauge. `mode: overlay` merges over the local file;
+  `mode: replace` treats the bundle as the configuration and will not
+  start without one. Bundles that still reference an environment
+  variable the node does not set are refused rather than applied as
+  literal text, because nobody is reading the log on a hundred machines
+  at once. New metrics: `sbproxy_config_bundle_revision`,
+  `sbproxy_config_bundle_age_seconds`,
+  `sbproxy_config_bundle_fetch_total`,
+  `sbproxy_config_bundle_applied_total`, and
+  `sbproxy_config_bundle_applied_degraded_total`.
+- **A response-cache store you can pick.** The response cache has had
+  four storage backends for a while, but only one of them was reachable:
+  nothing in the pipeline built the others, so no config could ask for
+  them. The new top-level `proxy.response_cache_store` block selects
+  `memory`, `file`, `memcached`, or `redis` and the pipeline builds what
+  it names. `file` gives you a cache that survives a restart and can be
+  shared by replicas pointed at one directory; `memcached` gives you a
+  shared cache without standing up Redis. The block sits under `proxy`
+  rather than on an origin because one store serves the whole process,
+  and every origin with `response_cache.enabled` shares it. Leave it out
+  and nothing moves: the store is still Redis when `l2_cache_settings`
+  is configured and an in-process map otherwise. See
+  [`docs/configuration.md`](docs/configuration.md#choosing-the-backing-store).
+- **Encryption at rest for cached responses.** An `encryption` block
+  under `proxy.response_cache_store` seals cached headers and bodies
+  with AES-256-GCM on the way to whichever backend you chose, so a
+  cache directory or a shared memcached is no longer a plaintext copy
+  of everything your upstreams returned. The key is a secret reference
+  like any other in the config, so it stays out of the config file, and
+  it should be 32 random bytes rather than a passphrase. `previous_keys`
+  covers rotation: new writes seal under the active key while retired
+  keys keep opening older entries. There is no plaintext fallback. A key
+  that cannot be resolved stops startup instead of quietly caching in
+  the clear, and an entry that fails its integrity check is evicted
+  rather than served. Runnable example in
+  [`examples/response-cache-encrypted/`](examples/response-cache-encrypted/).
+- **Local classifier-based routing.** A `type: classifier` input guardrail
+  embeds a prompt with a verified local ONNX model, chooses the nearest
+  configured class centroid, and publishes the label to
+  `ai.guardrails.labels`. CEL can turn that label into
+  `route_to:<model>`, so the gateway routes on request intent without
+  sending the prompt to a classifier service. Invalid or unresolved
+  classifier artifacts remain inert, and score and margin thresholds prevent
+  ambiguous labels. See
+  [`docs/ai-gateway.md`](docs/ai-gateway.md#embedding-classifier) and the
+  runnable
+  [`examples/ai-classifier-routing/`](examples/ai-classifier-routing/).
+
+### Changed
+
+- **A reload that fails now really does change nothing.** Reloading a
+  config installed a dozen pieces of process state (log redaction,
+  cardinality caps, log sinks, the AI provider catalog, the key plane,
+  detection singletons, Lua sandbox limits) *before* it got to the two
+  steps most likely to reject the config. So a config that parsed but
+  failed to build left the box running the new redaction rules and the
+  new AI catalog against the old pipeline, while the log line said the
+  previous config was still serving. Everything that can refuse a config
+  now runs first, and nothing installs until every one of those checks
+  has passed. `POST /admin/reload` also reports what happened rather
+  than only whether it worked: the response carries `fully_applied` and,
+  when a subsystem loaded with stale state, a `degraded` list naming it.
+  A handful of subsystems are still allowed to fail without refusing the
+  reload, because a stale AI catalog beats a proxy pinned on an old
+  config, but they can no longer fail silently.
+- **Changing `proxy.secrets` is refused instead of ignored.** The secret
+  resolver owns live connections to Vault, AWS, GCP, or Kubernetes and
+  is built once at startup, so a reload never actually rebuilt it. The
+  change was dropped on the floor and the first reference to a
+  newly-declared backend then failed at handler construction with an
+  error naming the reference rather than the cause, long after the
+  reload had reported success. Such a reload is now rejected outright
+  with a message saying a restart is required, the way a cluster
+  identity change already was. Rotating a secret inside your vault still
+  needs no restart; only changing where SBproxy looks does. See
+  [`docs/secrets.md`](docs/secrets.md).
+- **The admin server no longer boots wide open on default credentials.**
+  `admin` / `changeme` exists so a first run works, but nothing stopped
+  it from being the credential on an admin API bound to `0.0.0.0` with a
+  private-range allowlist and no TLS, which is a published password in
+  front of key minting and config writes. Validation now refuses the
+  default password when the surface is reachable from another host,
+  meaning `bind` is not a loopback address or `allow_ips` contains an
+  entry outside loopback, and the error names which of the two tripped.
+  Loopback with the defaults is untouched, since that is the local
+  development path. Three related soft spots went with it: an empty
+  `allow_ips` denied nothing at the type level (the safe loopback-only
+  default lived in an `if` at the one call site, so the filter itself
+  was fail-open), loopback was matched by comparing text so an
+  IPv4-mapped peer such as `::ffff:127.0.0.1` was turned away from a
+  loopback-only server, and an unparseable `bind` silently fell back to
+  `127.0.0.1` rather than failing, which made a typo in a wide bind look
+  like it had worked. `sbproxy plan` also stops describing
+  `proxy.admin.**` as a reload: `AdminConfig` is read once at startup, so
+  a rotated admin password or a swapped certificate needs a restart, and
+  the plan now says so. See [`docs/admin.md`](docs/admin.md).
+- **Accepted configuration now has an accountable runtime owner.** GraphQL
+  depth, introspection, and syntax controls are enforced before upstream
+  dispatch; configured CEL feature flags publish atomically across reloads;
+  concurrent limits can be keyed by client, API key, header, or route; and AI
+  shadow requests run through a bounded, drop-on-saturation lane that cannot
+  delay the primary response. Enabling the reserved HTTP/3 listener now fails
+  configuration compilation instead of logging and continuing without QUIC.
+  A build-time schema audit rejects future keys that have neither a production
+  reader nor an exact reviewed `ConfigOnly` justification.
+- **Workspace rate-budget behavior now has one owner.** The
+  `rate_limit_budget` policy module owns the soft, throttle, and auto-suspend
+  state machine and its tests. The previously ignored `per_route_rps` field is
+  now a config error; use `rate_limiting` for a per-route ceiling. The
+  `headers.include_ratelimit_policy` switch now controls the corresponding
+  response header.
+
+### Fixed
+
+- **`GET /admin/drift` no longer invents drift after a hot reload.** The
+  baseline it compares against was recorded at startup and by
+  `POST /admin/reload`, but not by the file watcher or by `SIGHUP`. So
+  editing the config file and letting the watcher pick it up left the
+  running config correct and the baseline stale, and drift reported a
+  difference that did not exist until the next admin reload or restart.
+  Every path that loads a config now records the baseline.
+- **Saving config from the admin console no longer leaks health probes.**
+  Validating a config meant building the whole pipeline to see whether
+  every module would construct, and that construction spawned the active
+  health-check probes for any load-balancer target configured with
+  `health_check`. The pipeline was then thrown away, but the probes were
+  not: each one held the discarded pipeline alive and kept issuing real
+  requests at the upstream on its own timer, forever. Every save in the
+  admin console's config editor started another full set. An operator
+  iterating on a config could leave a target being probed by a dozen
+  generations of dead pipelines at once. Validation now constructs
+  without starting anything that outlives the check, and the admin write
+  path asks for a validation pipeline rather than a live one. The
+  `validate` and `plan` subcommands were never affected, because they
+  run outside an async runtime where the spawn was already a no-op.
+- **Memcached cache keys are hashed.** Memcached rejects a key longer
+  than 250 bytes outright, and a response-cache key carries the
+  hostname, path, query, and Vary fingerprint, so any reasonably long
+  URL produced a key the server refused. Those requests missed on every
+  single read. Keys are now hashed before they go on the wire.
+- **Memcached TTLs are clamped at 30 days.** The protocol reads any
+  expiry above 30 days as an absolute Unix timestamp rather than an
+  offset, so a longer configured TTL was stored as a moment in 1970 and
+  the entry was dead the instant it was written. Relative TTLs are now
+  capped at the protocol ceiling.
+- **The file cache no longer discards entries it was asked to keep.** A
+  stale-while-revalidate read deleted the entry it had just fetched, so
+  the grace window it existed to serve was gone after one request.
+- **Concurrent file-cache writes no longer tear.** Two threads writing
+  the same key shared one staging file and could interleave their bytes
+  into it, and the atomic rename then published the mixture. Each write
+  now stages in its own file.
+
+## [1.7.0] - 2026-07-22
+
+The admin release. The console is rebuilt around the editorial brand
+system, gains live sampled charts, and, most importantly, stops hiding
+data the proxy was already collecting: request sessions, custom
+properties, and the gateway's own decisions now reach the operator,
+and the alerting engine finally has a face. Per-origin scoping runs
+across the estate so a multi-tenant gateway reports per tenant.
+
+### Added
+
+- **Sessions.** Requests carrying `X-Sb-Session-Id` (and optionally
+  `X-Sb-Parent-Session-Id`) are reconstructed into logical
+  interactions. A session index ranks recent work by requests, tokens,
+  cost, wall-clock duration, and worst status, indenting child
+  sessions under their parent; a detail page reads one session's call
+  chain oldest first with each call's gateway decisions, identifiers,
+  AI route, tokens, cost, and properties. This is a view over the
+  in-memory request ring, not durable trace storage.
+- **Custom properties as first-class dimensions.** Bounded
+  `X-Sb-Property-*` headers are captured, redacted per configuration,
+  and carried on the request log, where they become filter and column
+  choices. Properties named in an origin's `properties.rollup_keys`
+  are promoted to durable spend dimensions, so the Spend page can
+  group a window by a business dimension the caller supplied.
+- **Gateway decisions on every request row.** The log now records what
+  the gateway actually did: cache result, retry count, whether
+  failover engaged and between which providers, the load-balancer
+  strategy and target, and the guardrail outcome. The console reads
+  them as one causal rail per row, answering whether the resilience
+  configuration fired without opening a body.
+- **Alerts page.** The alerting runtime is visible for the first time:
+  rule thresholds, current reading, sample floor, and evaluation
+  state; sanitized channel targets with delivery health and bounded
+  errors; and recent fired, resolved, and test events. A targeted
+  channel test exercises delivery without changing configuration.
+  `sb.yml` remains authoritative and the page is read-only.
+- **Live metrics.** The Metrics page samples the Prometheus endpoint
+  and charts what happened between samples: request rate, error rate,
+  latency percentiles from histogram bucket deltas, and AI token
+  throughput, with numeric tiles and trend sparklines.
+- **Per-origin scoping.** The attributed AI counters and the durable
+  usage rollups carry the origin the request arrived on, and Metrics,
+  Spend, Cache, and Logs can scope to one origin. Panels whose series
+  have no origin dimension say so rather than showing unscoped numbers
+  under a filter.
+- **Context-compression reporting.** The compression policies report
+  compressed requests, tokens and cost saved, per-lever savings,
+  outcomes, and average ratio per lever.
+
+### Changed
+
+- **`sbproxy apply` now actually applies to the running proxy.** It used
+  to compile the config into its own short-lived process, swap that
+  process's pipeline, print `apply: reloaded config from ...`, and exit
+  without ever contacting the proxy. A running server picked the change
+  up only if its file watcher happened to notice the file, so exit 0 was
+  not evidence that the config had been accepted, or even seen. A config
+  the server would have rejected still exited 0. Apply now pushes the
+  config over the admin API and reports what the server did with it, so
+  the exit code means something: 4 if the proxy refused the config, 7 if
+  no proxy answered, 8 if it loaded but a subsystem kept stale state.
+  The admin endpoint defaults to `http://127.0.0.1:9090` and is
+  overridable with `--admin-url` or `SB_ADMIN_URL`.
+
+  **This changes the contract.** Apply previously needed no running proxy
+  and always exited 0; it now needs to reach one. If you call `apply` in
+  CI as a validation step, switch it to the new `--validate-only`, which
+  runs every check and stops without contacting anything. That flag is
+  the honest name for what the old behaviour was actually doing.
+
+
+- **The admin console follows the sbproxy.dev editorial system.**
+  Paper and ink surfaces, a persistent top bar carrying the admin
+  host, a live health dot, and the cluster node count, mono
+  microcopy, and square corners. Every mutation confirms or fails
+  through a toast; validation detail and revision conflicts stay
+  inline next to the form that caused them.
+- **The admin rate-limit default is 240 requests per minute per
+  client IP**, up from 60, with the global cap still ten times that.
+  A busy console no longer trips its own limiter.
+
+### Fixed
+
+- **Cache hit and miss counts are no longer always zero.** The Cache
+  page read a metric name the server never emitted.
+- **The playground reaches locally served models.** A chat against a
+  served or managed deployment returned 404 because the request
+  skipped the runtime's endpoint resolution and fell back to a
+  localhost URL pointing at the proxy itself.
+- **Spend groups by a promoted property.** The group-by parameter was
+  read without percent-decoding, so the console's own
+  `property:<key>` selection failed as an unknown dimension.
+- **Spend history reports a disabled rollup store as a hint**, not as
+  a failed view.
+- **The overview lists managed models by name** with their reserved
+  memory, instead of "unknown".
+- **An engine that dies after reaching readiness reports why.** The
+  health path now carries the bounded, redacted stderr tail into the
+  retained error rather than logging only that the process exited.
+
+## [1.6.2] - 2026-07-21
+
+### Added
+
+- **The local llama.cpp engine pin follows your macOS version.** Pinned
+  builds now carry their measured minimum macOS, and the host selects the
+  newest compatible one: macOS 26 gets the current build, macOS 14 and 15
+  get the newest build published against the older toolchain. Previously
+  the single pin targeted macOS 26 and died at dynamic-link time on
+  anything older. A host older than every pin fails before download with
+  the versions named; an explicit `version:` still wins.
+
+### Fixed
+
+- **Loading the admin UI no longer spends the admin rate budget.** Static
+  UI bundle assets are exempt from the per-IP admin rate limiter, so
+  opening the dashboard cannot starve API polling behind 429s.
+- **`sbproxy --version` reports the real product version** instead of a
+  stale crate stub.
+- **The installer reports the binary it just installed**, not whatever an
+  earlier install left on PATH.
+
+## [1.6.1] - 2026-07-21
+
+A point release fixing operational defects found immediately after the
+1.6.0 cut.
+
+### Added
+
+- **Configurable admin rate limit.** `proxy.admin.rate_limit_per_minute`
+  (default 60, the previous hardcoded value; valid 1 to 100000). Automation
+  and dashboards that poll admin endpoints faster than once per second per
+  node can now raise the cap instead of silently reading 429s.
+
+### Fixed
+
+- **Docker images start again.** The published linux binaries are built
+  against glibc 2.36 so the container runtime image can execute them.
+- **Gateway-only clusters no longer report a standing pseudo-outage.**
+  Nodes without the worker role are not graded on the model plane, so a
+  cluster of pure gateways shows healthy nodes in `/admin/cluster/status`
+  and dashboards instead of a permanent degraded state. Worker health
+  semantics are unchanged.
+- **Model engine launch failures are diagnosable.** A failed engine start
+  logs its bounded, credential-redacted stderr tail instead of holding it
+  only in memory, and the release certification artifact carries the boot
+  log and durable job records.
+
+## [1.6.0] - 2026-07-20
+
+The cluster release. The mesh gains durable replicated state, governed
+budgets that mean the same thing on every node, full
+self-instrumentation, and a Kubernetes operator that forms it. Local
+model serving grows a real deployment control plane and serves across
+nodes, tensor-parallel GPU groups, replicas, LoRA adapters, and a
+second Python engine. Two load-time behavior changes to note under
+Changed: invalid `retry_on` entries and `max_attempts` above 16 now
+fail the load, and `sbproxy validate` now fails a config that would
+refuse to boot. The serve-related YAML fields remain unpinned, as in
+v1.5.0.
+
+### Added
+
+- **Managed model deployments.** Local serving gains a real control
+  plane: a canonical `model_host.deployments` desired state (existing
+  `serve:` entries lower onto it), content-addressed weight artifacts
+  with resumable sha256-verified pulls and protected LRU garbage
+  collection, durable deployment revisions and operation jobs, and one
+  process-wide runtime manager for atomic reload, warm rolling or
+  recreate rollouts with capacity preflight and rollback, admission,
+  keep-alive, idle eviction, drain, health, and crash-loop retention.
+  Operated through authenticated lifecycle APIs and `sbproxy models
+  pull / list / show / ps / stop / remove`.
+- **Governed multi-node model serving.** A fleet of gateways serves one
+  model estate: constrained node enrollment with strict manual-PKI
+  identity verification, a model directory carrying the full node
+  roster with stable exclusion reasons and explicit unhealthy-node
+  callouts, deterministic capability-aware placement with rolling
+  handoffs, durable generation fencing, and signed deployment-authority
+  state. A dedicated private HTTP/2 model plane (production mTLS,
+  signed one-hop dispatch envelopes, bounded replay protection) routes
+  governed requests across current-generation local and peer replicas
+  with coordinated cold starts, streaming backpressure, client
+  cancellation, and failover only before any client output. Model
+  discovery stays OpenAI-shaped and topology-free.
+- **Tensor-parallel groups and N replicas per node.** The fit planner
+  searches tensor-parallel degrees 1, 2, 4, and 8 over homogeneous GPU
+  groups and picks the smallest degree at which a candidate quant fits,
+  so a model larger than the largest single card (a 70B at fp16 needs
+  about 140 GB) shards across a group instead of being unservable. A
+  deployment can also run several replicas of one model on disjoint
+  device sets of the same node, so a dense GPU box no longer idles its
+  other cards; asking for more replicas than the node can hold fails
+  with a reason naming the shortfall.
+- **The fit planner understands model shape.** Catalog entries carry a
+  `modality` (`chat`, `embedding`, `rerank`, `speech_to_text`,
+  `text_to_speech`, `image`): a non-decode model stops being charged
+  autoregressive KV-cache VRAM, vLLM launches an embedder in embed
+  mode, and a locally served embedder answers `/v1/embeddings` instead
+  of a blanket 501. A mixture-of-experts model that does not fit VRAM
+  whole keeps attention, shared, and dense tensors on the GPU and
+  spills the fewest whole expert layers to CPU RAM (llama.cpp's
+  `--n-cpu-moe`), which is how a 30B-A3B-class model runs on a 12 GiB
+  card. The planner also predicts decode throughput per placement,
+  calibrated against live A100 measurements.
+- **SGLang engine driver.** `engine: sglang` serves safetensors models
+  on CUDA through SGLang, acquired via `uvx` or a digest-pinned
+  container and dispatched over the same OpenAI shape as vLLM. vLLM
+  stays the default; SGLang is a one-line opt-in for prefix-heavy agent
+  traffic, where the measured head-to-head favors it. The benchmark
+  behind that guidance is published in
+  `docs/serving-engine-benchmark.md`.
+- **Container engine provisioning is the default when a runtime is
+  present.** Standing up vLLM from a bare host environment needs its
+  whole build toolchain and fails in a cascade on a stock GPU box, so
+  when docker or podman is on PATH and the operator has not configured
+  provisioning, the Python engines (vLLM, SGLang) now provision from
+  curated digest-pinned container images, the exact digests validated
+  on real GPU hardware. The host `uvx` path remains available by
+  configuration.
+- **The embedded in-process engine moves to mistral.rs 0.9**
+  (PagedAttention default-on for CUDA, CUDA graphs, FlashInfer). The
+  dependency stays opt-in and off by default.
+- **Accurate prompt token counting with a pre-flight context-fit
+  gate.** Locally served models count prompt tokens against the
+  model's own tokenizer (prefetched alongside the weights, parsed once,
+  cached) instead of a chars/4 heuristic, and an over-context prompt is
+  rejected before dispatch with a clear error instead of failing
+  opaquely inside the engine.
+- **LoRA adapters over one resident base model.** A vLLM serve entry
+  with `lora_adapters` launches the base model with each adapter
+  registered by name, so a client requests a fine-tune by name over one
+  resident base instead of paying for a separate engine per fine-tune.
+  vLLM-only for now; other engines reject the fields with a clear
+  reason.
+- **Per-deployment engine tuning and version pins.** Canonical managed
+  deployments carry the engine tuning knobs (`chunked_prefill`,
+  including a TTFT-target mode that derives the batch size,
+  `tool_call_parser`, `swap_space_gib`, `cpu_offload_gib`,
+  `extra_args`), and the vLLM passthroughs now actually reach the
+  engine instead of being rejected at prepare. A deployment can pin its
+  own `engine_version` / `engine_image` / `engine_sha256` over the
+  node-wide engine policy, so two models on one node can run different
+  vLLM versions (canary an upgrade on one model, hold another to its
+  certified version); `latest` versions and unpinned images are
+  rejected at config validation, and the served engine version surfaces
+  in deployment status.
+- **Per-completion local-vs-cloud savings.** A serve entry can declare
+  the hosted model it displaces and that model's per-million-token
+  price in a `reference:` block; every completion the local model
+  serves is priced at the reference into a durable ledger, and
+  `GET /admin/model-host/value` reports completions and dollars saved
+  per model. Explicit config only: no reference means no savings claim,
+  never a guessed cloud price.
+- **`sbproxy update` acts on stale artifacts.** A plain run now
+  fetches, verifies, and atomically swaps a stale engine prebuilt, and
+  `--self` replaces the sbproxy binary from its release channel;
+  `--check` keeps the report-only behavior. A pinned artifact, or one
+  managed elsewhere (a `path`, brew, or apt engine), is reported and
+  never mutated; the new `update.{channel, auto, check_interval}`
+  block configures it, and `auto` only ever reports in the background.
+- **Weight-cache and artifact management.** The admin plane gains a
+  verified-artifact inventory (`GET /admin/model-host/files`),
+  fail-closed artifact deletion, on-demand garbage collection, per-node
+  cluster artifact totals, and a Storage view in the admin UI. A cache
+  miss can reuse a discovered Ollama, LM Studio, or Hugging Face cache
+  read-only instead of re-downloading weights. `sbproxy models lock`
+  pins resolved artifacts to a lockfile, `models verify-lock` reports
+  drift, and `--locked` refuses to serve anything off-lock. `sbproxy
+  models prune` reclaims content-addressed weight blobs no cached
+  artifact references.
+- **Served-model priority lanes.** `serve.max_concurrent_requests` caps
+  in-flight requests into a local engine behind a queue ordered by the
+  calling key's `priority` lane (`interactive`, `standard`, `batch`),
+  FIFO within a lane, so a batch flood cannot starve interactive keys;
+  an interactive request that would queue spills immediately to the
+  next non-served provider when one exists. The lane binds to the key
+  record, never a client header.
+- **Governed key policy enforces end to end.** One canonical
+  effective-policy contract covers configured and dynamically stored
+  keys, and lifecycle, tenant, model, provider, route, principal, PII,
+  tool, prompt-injection, rate, budget, and admission policy all act on
+  the live request path; admin mint, preview, and revisioned PATCH are
+  fail-closed and the Keys UI is driven by the server's schema. Keys
+  gain a working per-key tokens-per-minute cap, a priority lane,
+  `inject_mcp` on dynamically stored keys, and PATCHable metadata, and
+  immutable key and attribution dimensions propagate through usage,
+  access logs, metrics, traces, and bounded audit events.
+- **Cluster-coherent governed-key budgets.** A governed key's request,
+  token, and cost limits enforce through a reserve-then-settle flow on
+  the live AI path and mean the same thing on every gateway node, in
+  two tiers: approximate (the default; each node disseminates settled
+  usage over the mesh and admission weighs the whole fleet's spend
+  within a bounded staleness window, no external database) and strict
+  (atomic reserve and settle against a shared Redis backend, so two
+  nodes cannot both admit a request only one has budget for). Strict
+  without a Redis backend fails config validation.
+- **MCP guardrails.** Deterministic OpenAPI-derived egress policies
+  with redirect-target validation, lethal-trifecta session risk
+  tracking and enforcement, opt-in dual-LLM quarantine, run-as-user
+  credential minting that carries the caller's own Authorization on the
+  federation wire, token compaction, and a supervised local stdio MCP
+  transport.
+- **Traffic governance fills out, and LiteLLM import stops dropping
+  keys silently.** OTel, S3, and GCS usage sinks join the existing sink
+  set; purpose-scoped egress, quota headroom- and reset-aware routing,
+  and local fair-share pools land alongside them. `config
+  import-litellm` now classifies every unknown key as mapped, warned,
+  or unsupported instead of silently dropping it, and known sink
+  callbacks and `max_budget` emit real config.
+- **Durable replicated cluster state.** `proxy.cluster.replication`
+  turns the mesh's single-owner in-memory state into a replicated,
+  durable substrate: each key maps to a preference list of nodes on the
+  existing hash ring, writes and reads choose `one`, `quorum`, or `all`
+  consistency with read repair, every replica persists write-through to
+  redb so an owner restart loses nothing, deletes replicate as
+  tombstones collected only after every replica confirms them and a
+  grace period passes, and fleet admin runs over topology-safe bounded
+  pagination.
+- **The mesh reports on itself.** Gossip probe round-trip time and
+  indirect-probe retries, enrollment outcomes, transport RPC errors by
+  phase and durations by operation, owner-routing outcomes, and a live
+  peer-count gauge; every mesh metric now sits in the executable
+  stability catalogue under the sanctioned `mesh_` prefix.
+- **The Kubernetes operator forms the mesh.** With
+  `spec.clustering.enabled`, the operator reconciles a StatefulSet
+  (stable per-pod identity, one-peer-at-a-time rolling restarts), a
+  headless Service publishing the gossip and transport ports, a
+  shared-key Secret, and a rendered `proxy.cluster` block with
+  full-ordinal seed lists and per-pod node identity, built through the
+  typed config so invented fields are impossible. Includes the two
+  fixes live validation on kind surfaced: the operator now installs its
+  TLS crypto provider (it previously panicked on its first handshake
+  and reconciled nothing), and DNS-name gossip seeds resolve before the
+  probe path (they were silently skipped, leaving every pod a one-node
+  mesh).
+- **Compression session state can live on the mesh.** Stateful
+  compression's `state.backend: mesh` now runs on the durable
+  replicated substrate: conditional versioned session commits with
+  deterministic cross-node conflict resolution, tombstoned deletes that
+  survive partition and heal, and the same admin list, inspect, and
+  purge over fleet pagination. Redis remains the default and
+  recommended backend.
+- **Measured 3-node cluster benchmark.** `docs/performance.md` gains a
+  clustered section from a real 3-node GCP mesh run: forming the mesh
+  costs within noise on a single node (43,129 vs 43,958 requests per
+  second), three nodes sustain 119,178 requests per second aggregate
+  with zero errors, governed spend becomes visible on a peer in 15 to
+  20 seconds, and survivors run at 100% success through a mid-run node
+  kill, with rejoin about 10 seconds after restart.
+- **Request-selectable AI context compression.** Declare named route-local
+  profiles and explicit input budgets, then select them through
+  `X-Compression`, governed virtual keys, or CEL with deterministic precedence
+  and safe invalid-selector behavior. Phase 1 adds `rag_select`,
+  `compact_serialization`, and `position_reorder` for explicit line-delimited
+  retrieval blocks. The levers use deterministic ranking, reversible
+  `sbproxy_table_v1` encoding, closed fail-open outcomes, and semantic-cache
+  bypass before the final `window_fit` bound. Stateful summaries use Redis as
+  the canonical session store while request workers remain stateless;
+  authenticated Admin APIs list, inspect metadata for, and purge that state.
+  Per-lever results now appear in bounded metrics and one content-free summary
+  event per executed pipeline; reducing levers also feed bounded value metrics,
+  dashboards, and the model-host value report. Live request-path acceptance and
+  five independently authored structural smoke reports cover the production
+  stateless pipeline.
 - **MCP tool rollout plane.** Publish several versions of one tool at once
   and roll out breaking changes without breaking callers: a `rollout:` block
   under the `mcp` action's `tool_versioning` declares versions, where each
@@ -86,11 +1033,120 @@ the next version cut.
   span emits tool-call span events (ids and names always, arguments
   only under `trace_content`).
 - Admin views: AI performance (TTFT / TPOT / throughput and provider
-  health with failovers, cascade tiers, and router decisions),
+  health with failovers, cascade tiers, and router decisions), Spend
+  (live attributed cost, token, and request breakdowns by model,
+  provider, key, team, and project),
   Guardrails (blocks by category and wasted tokens / spend by kind),
   live tail on the Logs view with full-record row expansion and
   operator-configurable trace deep links
   (`admin.trace_url_template`).
+- **Executable capability registry.** SBproxy's claims about itself are
+  now checkable code: every capability claim carries a support level,
+  nothing may be called stable unless a test proves a production caller
+  consumes it, and config-only is the honest, permitted name for a
+  surface that parses and does nothing. Build guards fail on a
+  published metric no code writes and on a tenant-relevant metric
+  family missing its tenant labels, and the shipped Prometheus alert
+  rules are validated with promtool in CI. This machinery surfaced the
+  availability SLO that read 100 percent forever and the
+  never-incremented metric families fixed in this release.
+- **Getting started and framework integrations.** A dedicated
+  `docs/getting-started.md`, install and quick start grouped together
+  in the README, and five framework one-pagers (LangChain, Vercel AI
+  SDK, Pydantic AI, Mastra, n8n) whose snippets were all executed
+  against a running gateway before landing. The README lede now leads
+  with what the gateway does today.
+
+### Changed
+
+- **`sbproxy validate` runs the boot path.** `validate`, `plan`, and
+  `apply` now construct the same compiled pipeline the server and
+  reload paths construct, so a config that would refuse to boot fails
+  validation instead of validating clean (measured before the change:
+  five published examples validated but refused to boot). Custom YAML
+  tags are rejected at compile: serde_yaml strips unknown tags, so a
+  `password: !env ADMIN_PASSWORD` silently became the literal string
+  `ADMIN_PASSWORD`; the error now points at `${VAR}` interpolation,
+  and `${VAR:-default}` fallbacks work.
+- **Status-code upstream retries moved onto a dedicated decision
+  hook.** The retry decision fires on the pinned Pingora fork's new
+  upstream-response hook, once per upstream response and before any
+  bytes reach the client, replacing the response-filter workaround;
+  connect-time and status retries now share one attempt counter and
+  cap. Load-time validation is a behavior change: a `retry_on` entry
+  must be `connect_error`, `timeout`, or a status in 100..=599 (junk
+  entries used to deserialize and silently never match; they now fail
+  the load naming the entry), and `max_attempts` above 16 is rejected.
+  Retries land on
+  `sbproxy_upstream_status_retries_total{origin, status}`.
+
+### Fixed
+
+- **`retry_on: timeout` is honored, in both upstream phases.** The
+  token was accepted and documented but nothing consulted it. A
+  connect-phase timeout now retries under either `timeout` or
+  `connect_error`, and an established-connection upstream read or write
+  timeout retries when the policy allows it, sharing the same attempt
+  cap, and only when the request is replayable and no response bytes
+  have reached the client. The fork's retry loop also gains a backstop
+  refusing any retry after response bytes were sent, regardless of what
+  marked the error retryable.
+- **Redis L2 connections keep their TLS, AUTH, and database
+  semantics.** `redis://` and `rediss://` URLs preserve ACL and
+  percent-encoded credentials, IPv6 hosts, the selected database,
+  private CAs, and mutual TLS uniformly across the general L2 store,
+  compression state, and admin paths, compiled once per config
+  generation into an immutable connection snapshot. The blocking
+  plaintext RESP path is replaced with a real client, and connection,
+  TLS, authentication, and command failures classify without leaking
+  endpoints or credentials.
+- **Cross-node mesh RPCs no longer stall about 40 ms on Linux.** The
+  transport wrote a frame's length prefix and body as two separate
+  writes and never set TCP_NODELAY on accepted sockets, so Nagle plus
+  the delayed-ACK timer held every response leg. Frames now leave as
+  one write and the server sets nodelay on accept; a small-frame
+  replica fetch drops from about 41 ms back to sub-millisecond.
+- **The MCP gateway speaks the spec's camelCase on the wire.**
+  `initialize` results, tool results, and tool annotations serialized
+  as snake_case (`protocol_version`, `is_error`, `read_only_hint`),
+  which the official TypeScript SDK's schema rejects outright, so a
+  strict client could not connect at all and tolerant clients silently
+  dropped tool error flags. Serialization is now camelCase; snake_case
+  still parses so results from older nodes survive mixed-version
+  rollouts.
+- **Raw `hf:` references serve through the live path.** The production
+  runtime manager only resolved fully pinned catalog artifacts, so a
+  raw `hf:Org/Repo` reference in a `serve:` block failed reconciliation
+  and, in practice, no open-weight model could be served on a GPU from
+  the gateway. Raw references now resolve, pull, and serve end to end,
+  validated on real multi-GPU NVIDIA hardware across vLLM, SGLang,
+  embeddings, and tensor-parallel launches.
+- **SGLang serving hardening.** The launcher passes a runtime-owned
+  memory fraction so SGLang no longer OOMs at launch; liveness probes
+  hit a non-generating endpoint instead of one that generated tokens
+  (and returned 503 under load); one transient health-probe miss no
+  longer kills a ready engine; and the probed SGLang version is
+  recorded on the provisioned engine.
+- **Self-host admin edges.** Attributed AI token and cost metrics now
+  populate `/api/usage/spend` for locally served providers; direct AI
+  responses no longer log status 0 when a real response was written; an
+  upstream-TLS native-certificate failure on macOS is an actionable
+  startup error instead of a panic; and the admin Keys UI submits the
+  backend's full key-policy shape.
+- **The `alerting:` block alerts, and declared metrics record.** The
+  alerting config parsed and silently discarded its settings; it now
+  drives a live dispatcher (delivering through the Slack and PagerDuty
+  channels above). The response-cache hit/miss, circuit-breaker
+  transition, and guardrail-block families were declared and scraped
+  but always zero; they are now written by the live request path, and
+  the metric drift guard follows aliased writers it was blind to.
+- **The release provenance push no longer clobbers the SBOM
+  attestation.** The provenance step replaced the image's attestation
+  tag wholesale after the CycloneDX attest step, so
+  `cosign verify-attestation --type cyclonedx` failed on every
+  published image; the jobs are reordered so the SBOM attestation
+  appends last, and the offline verification recipe in
+  `SUPPLY-CHAIN.md` now works with current cosign.
 
 ### Removed
 
@@ -100,6 +1156,23 @@ the next version cut.
   live path, and counter series register lazily, so no released
   binary ever exposed a sample under these names. Consumers read the
   attributed families; details in docs/metrics-stability.md.
+- **The Go-era `secret:<name>` colon form.** It resolved through a
+  logical-name map with an environment fallback and was superseded by
+  the provider-URI `secret://<backend>/<name>` schemes; a stale
+  reference now fails config load with a migration pointer instead of
+  resolving through a side channel. `proxy.secrets.map` still parses
+  for schema-v1 compatibility and warns at boot that it has no effect.
+- **Dead mesh scaffolding and write-only key counters.** The
+  unreferenced leader-election, health-monitor, consistency, and
+  membership-protocol modules are gone (live membership is the gossip
+  loop), along with a legacy wire variant only tests constructed and
+  the per-request mesh key counters that were incremented on every AI
+  request but never read anywhere. Governed-key budget enforcement is
+  unaffected, and the AI hot path now does no counter work at all.
+- **Two dead metric families**: `sbproxy_dedup_cache_size` (registered,
+  never written, no readers) and the hostname-keyed
+  `sbproxy_cache_hits_total` duplicate; the overview dashboard reads
+  the now-live `sbproxy_cache_results_total` instead.
 
 ## [1.5.0] - 2026-07-08
 
@@ -391,11 +1464,13 @@ default-off.
   pinned model, injected tools, and an injection-scan bypass. Pluggable
   stores: embedded (redb), Redis, or a secrets manager. OIDC and JWT claims
   can map to a key. New `key_management:` config block. (#542, #543)
-- **Open-source mesh clustering.** The mesh layer (SWIM gossip, CRDTs, a
+- **Open-source mesh clustering.** The mesh layer (SWIM gossip, a
   consistent-hash distributed cache) is now Apache-2.0 in this repository.
-  Setting `cache.tier: mesh` keeps the key plane, budgets, and per-key spend
-  and rate counters coherent across a replica fleet, so the cluster
-  coordinates itself with no external Redis in the path. (#542)
+  Setting `cache.tier: mesh` keeps the key plane coherent across a replica
+  fleet: a key minted on one replica is usable on any, and a revocation on
+  one denies on the rest, with no external control plane in the path. Per-key
+  spend and rate counters remain node-local; cluster-wide budget enforcement
+  uses a shared backend. (#542)
 - **State-of-the-art AI-gateway differentiation.** A verifiable, hash-chained
   and optionally Ed25519-signed usage ledger; a single sandboxed CEL policy
   plane over guardrails, budgets, routing, and principal; a guardrail mesh
@@ -678,8 +1753,8 @@ AI providers behind one OpenAI-compatible API.
   with `x-sbproxy-idempotency: HIT` and never contacts the
   provider. On a body conflict the gateway returns 409
   `ledger.idempotency_conflict` per the RFC. On a miss the
-  gateway forwards, then records the post-translation OpenAI-shape
-  bytes the client actually saw so retries replay byte-identical.
+  gateway forwards, then records the final client-wire bytes.
+  Retries receive the same bytes.
   Reuses the same per-request and pool caps shipped on
   `CompiledIdempotency`: `max_request_body_bytes`,
   `max_response_body_bytes`, `max_concurrent_buffers`. The four
@@ -1199,14 +2274,11 @@ AI providers behind one OpenAI-compatible API.
   fresh delivery ULID on every retry attempt.
   ([crates/sbproxy-observe/src/notify.rs])
 
-- **AI client retry resilience.** `MemoryBatchStore` now uses
-  `parking_lot::Mutex` so a panic in one worker cannot poison the
-  in-memory batch map for every later operation. Provider retries now
-  honor `provider.max_retries` as same-provider retry attempts with
+- **AI client retry resilience.** Provider retries now honor
+  `provider.max_retries` as same-provider retry attempts with
   bounded jittered exponential backoff before recording provider
   failure and moving to the next eligible provider.
-  ([crates/sbproxy-ai/src/batch.rs],
-  [crates/sbproxy-ai/src/client.rs])
+  ([crates/sbproxy-ai/src/client.rs])
 
 - **Dynamic Web Bot Auth directory dispatch.** The main request auth
   path now invokes `BotAuthProvider::verify_async` when a configured
@@ -1276,8 +2348,8 @@ First Rust release of SBproxy on this repository.
   Pingora. The Go implementation that previously occupied this repo
   (`v0.1.0` through `v0.1.2`) has moved to
   [`soapbucket/sbproxy-go`](https://github.com/soapbucket/sbproxy-go),
-  preserved as the `v0.1.2-go-final` branch and tag, and is now in
-  maintenance-only mode.
+  which is archived and read-only; its `v0.1.2` release tag preserves
+  the final historical release.
 - **Data plane**: routing, AI gateway, MCP gateway, guardrails, security
   policies, and scripting (CEL, Lua, JavaScript, WebAssembly) all ship
   open source in this release. See [`docs/architecture.md`](docs/architecture.md)

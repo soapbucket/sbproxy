@@ -13,7 +13,7 @@ reviewable PRs over force-pushed branch updates.
 
 1. Identify the YAML file the change applies to.
 2. Apply the edit on a fresh branch (`feat/<short-slug>`).
-3. Run `sbproxy validate -c sb.yml` locally.
+3. Run `sbproxy validate sb.yml` locally.
 4. Open a PR and request review from a code owner.
 5. After CI is green, merge with the squash strategy.
 

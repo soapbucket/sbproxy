@@ -135,7 +135,12 @@ impl WorkerProfile {
             accelerator,
             compute_capability,
             memory_bytes: descriptor.free_vram_bytes,
-            engines: BTreeSet::from([EngineKind::Vllm, EngineKind::LlamaCpp, EngineKind::Embedded]),
+            engines: BTreeSet::from([
+                EngineKind::Vllm,
+                EngineKind::SGLang,
+                EngineKind::LlamaCpp,
+                EngineKind::MistralRs,
+            ]),
         })
     }
 }
@@ -186,6 +191,12 @@ pub struct ResolvedArtifact {
     pub stability: SupportLevel,
     /// Logical-model policy explicitly permits pickle execution risk.
     pub pickle_allowed: bool,
+    /// The task this model serves (WOR-1908). Carried from the catalog
+    /// entry so the fit planner and engine launch branch on it. It is a
+    /// property of the logical model, not the immutable bytes, so it is
+    /// deliberately excluded from the hashed digest material and does not
+    /// change `artifact_digest`.
+    pub modality: crate::catalog::Modality,
 }
 
 #[derive(Serialize)]
@@ -210,6 +221,7 @@ impl ResolvedArtifact {
         context_length: u64,
         license: &str,
         pickle_allowed: bool,
+        modality: crate::catalog::Modality,
     ) -> Result<Self, String> {
         let material = ArtifactDigestMaterial {
             catalog_revision,
@@ -239,7 +251,66 @@ impl ResolvedArtifact {
             license: license.to_string(),
             stability: variant.stability,
             pickle_allowed,
+            modality,
         })
+    }
+
+    /// Synthesize an UNPINNED artifact for a raw `hf:Org/Repo[:QUANT]`
+    /// reference that has no catalog-v2 variant. There are no pinned
+    /// bytes to stage or verify: the container engine self-downloads the
+    /// weights from the repo at launch. `files` is therefore empty (the
+    /// canonical "unpinned" predicate is `files.is_empty()`) and the
+    /// digest is derived from the source identity rather than file
+    /// hashes. `source` keeps the `hf:` scheme so the launch path can
+    /// recover the repo. Revision defaults to `main`.
+    pub fn unpinned(
+        logical_model: &str,
+        hf_repo: &str,
+        quant: &str,
+        format: ArtifactFormat,
+        engine: EngineKind,
+        context_length: u64,
+        modality: crate::catalog::Modality,
+    ) -> Self {
+        let source = format!("hf:{hf_repo}");
+        let revision = "main".to_string();
+        let material = ArtifactDigestMaterial {
+            catalog_revision: "unpinned",
+            logical_model,
+            variant_id: "raw",
+            format,
+            quant,
+            source: &source,
+            revision: &revision,
+            files: &[],
+        };
+        let artifact_digest = serde_json_canonicalizer::to_vec(&material)
+            .map(|canonical| hex::encode(Sha256::digest(canonical)))
+            .unwrap_or_else(|_| hex::encode(Sha256::digest(source.as_bytes())));
+        Self {
+            catalog_revision: "unpinned".to_string(),
+            logical_model: logical_model.to_string(),
+            variant_id: "raw".to_string(),
+            artifact_digest,
+            format,
+            quant: quant.to_string(),
+            engine,
+            source,
+            revision,
+            files: Vec::new(),
+            context_length,
+            license: "unknown".to_string(),
+            stability: SupportLevel::Preview,
+            pickle_allowed: false,
+            modality,
+        }
+    }
+
+    /// Whether this artifact has no pinned bytes (a raw `hf:` ref). The
+    /// runtime skips content-addressed staging/verification for these
+    /// and lets the engine self-download from the source repo.
+    pub fn is_unpinned(&self) -> bool {
+        self.files.is_empty()
     }
 }
 
@@ -247,8 +318,9 @@ pub(crate) fn forced_engine(choice: EngineChoice) -> Option<EngineKind> {
     match choice {
         EngineChoice::Auto => None,
         EngineChoice::Vllm => Some(EngineKind::Vllm),
+        EngineChoice::SGLang => Some(EngineKind::SGLang),
         EngineChoice::LlamaCpp => Some(EngineKind::LlamaCpp),
-        EngineChoice::Embedded => Some(EngineKind::Embedded),
+        EngineChoice::MistralRs => Some(EngineKind::MistralRs),
     }
 }
 

@@ -381,15 +381,27 @@ pub struct McpTokenCompactionConfig {
 }
 
 /// Opt-in MCP tool-output quarantine config (WOR-1789).
+///
+/// When enabled, untrusted tool text blocks are evaluated by a
+/// secondary LLM judge (`ToolOutputJudge`) before any served
+/// ledger/outcome or compaction. Fail closed on timeout, malformed
+/// judge response, or egress denial. Reason codes are digest/closed
+/// vocabulary only — never matched text or raw tool output.
 #[derive(Debug, Clone, Deserialize)]
 pub struct McpDualLlmQuarantineConfig {
     /// Master switch.
     #[serde(default)]
     pub enabled: bool,
-    /// Case-insensitive substrings that mark a tool result as
-    /// quarantined pending review by a secondary judge.
+    /// Judge model HTTP endpoint (OpenAI-compatible chat completions).
+    /// Required when `enabled` is true.
     #[serde(default)]
-    pub suspicious_patterns: Vec<String>,
+    pub endpoint: Option<String>,
+    /// Optional model id included in the judge request body.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Maximum time to wait for a judge response. Go duration syntax.
+    #[serde(default, with = "duration_str")]
+    pub timeout: Option<Duration>,
 }
 
 /// OAuth 2.0 Protected Resource Metadata (RFC 9728) for the MCP gateway.
@@ -445,11 +457,16 @@ pub struct McpFederatedServerConfig {
     /// request layer. WOR-186.
     #[serde(default, with = "duration_str")]
     pub timeout: Option<Duration>,
-    /// Attach a bounded caller identity envelope to outbound tool
-    /// arguments so the upstream can authorize as the authenticated
-    /// user. Defaults off to preserve existing tool schemas.
+    /// Opt into run-as-user upstream Authorization minting (WOR-1792).
+    /// When true, `upstream_auth` is required and credentials are
+    /// attached as HTTP Authorization headers — never as tool args.
+    /// Defaults off. `stdio` + run-as-user is a config error.
     #[serde(default)]
     pub run_as_user_auth: bool,
+    /// How to mint upstream Authorization when `run_as_user_auth` is
+    /// true. See [`sbproxy_extension::mcp::auth::McpUpstreamAuthConfig`].
+    #[serde(default)]
+    pub upstream_auth: Option<sbproxy_extension::mcp::auth::McpUpstreamAuthConfig>,
     /// Transport name. Defaults to `streamable_http`; alternative is `sse`.
     #[serde(default)]
     pub transport: Option<String>,
@@ -571,8 +588,12 @@ pub struct McpAction {
     pub sessions: Option<Arc<SessionStore>>,
     /// Opt-in result compaction config.
     pub token_compaction: Option<McpTokenCompactionConfig>,
-    /// Opt-in tool-output quarantine config.
+    /// Opt-in tool-output quarantine config (metadata; the live judge
+    /// is [`Self::tool_output_judge`]).
     pub dual_llm_quarantine: Option<McpDualLlmQuarantineConfig>,
+    /// Dual-LLM quarantine judge. Present when
+    /// `dual_llm_quarantine.enabled` compiled successfully.
+    pub tool_output_judge: Option<Arc<dyn sbproxy_extension::mcp::quarantine::ToolOutputJudge>>,
     /// Per-tool USD price map for cost attribution (WOR-1644).
     pub tool_pricing: HashMap<String, f64>,
     /// Built usage sinks for MCP tool-call attribution (WOR-1644),
@@ -593,9 +614,10 @@ pub struct McpServerPrefix {
     pub rbac: Option<String>,
     /// Optional per-server request timeout. WOR-186.
     pub timeout: Option<Duration>,
-    /// True when outbound tool calls should carry caller identity for
-    /// run-as-user upstream authorization.
+    /// True when outbound tool calls mint per-caller Authorization.
     pub run_as_user_auth: bool,
+    /// Upstream auth minting config when `run_as_user_auth` is true.
+    pub upstream_auth: Option<sbproxy_extension::mcp::auth::McpUpstreamAuthConfig>,
 }
 
 /// Configured tool classifications for the lethal-trifecta guardrail.
@@ -620,6 +642,49 @@ impl McpLethalTrifectaGuardrail {
                 .external_comm_tools
                 .iter()
                 .any(|p| sbproxy_util::prefix_glob_match(p, tool_name)),
+        }
+    }
+}
+
+/// HTTP judge transport for dual-LLM quarantine (WOR-1789 / GS).
+///
+/// Documents [`sbproxy_extension::mcp::quarantine::HttpToolOutputJudge::EGRESS_PURPOSE`]
+/// (`EgressPurpose::AiJudge`). A process-level authorizer is not yet
+/// threaded through `McpAction` compile; omitted authorizer preserves
+/// the G2 legacy-allow posture for ungated destinations.
+struct GovernedJudgeTransport {
+    client: reqwest::Client,
+    endpoint: String,
+    timeout: Duration,
+}
+
+#[async_trait::async_trait]
+impl sbproxy_extension::mcp::quarantine::JudgeTransport for GovernedJudgeTransport {
+    async fn call_judge(
+        &self,
+        request_body: &[u8],
+    ) -> Result<Vec<u8>, sbproxy_extension::mcp::quarantine::JudgeTransportError> {
+        use sbproxy_extension::mcp::quarantine::JudgeTransportError;
+        use sbproxy_security::egress::EgressPurpose;
+        let _purpose = EgressPurpose::AiJudge;
+        let _ = sbproxy_extension::mcp::quarantine::HttpToolOutputJudge::<Self>::EGRESS_PURPOSE;
+        let request = self
+            .client
+            .post(&self.endpoint)
+            .header("content-type", "application/json")
+            .body(request_body.to_vec());
+        match tokio::time::timeout(self.timeout, request.send()).await {
+            Err(_) => Err(JudgeTransportError::Timeout),
+            Ok(Err(_)) => Err(JudgeTransportError::TransportFailure),
+            Ok(Ok(resp)) => {
+                if !resp.status().is_success() {
+                    return Err(JudgeTransportError::TransportFailure);
+                }
+                match resp.bytes().await {
+                    Ok(b) if !b.is_empty() => Ok(b.to_vec()),
+                    _ => Err(JudgeTransportError::TransportFailure),
+                }
+            }
         }
     }
 }
@@ -697,6 +762,31 @@ impl McpAction {
                 .clone()
                 .unwrap_or_else(|| "streamable_http".to_string());
 
+            // WOR-1792: stdio + run-as-user is a hard config error until
+            // a safe secret-delivery path exists for local children.
+            if upstream.run_as_user_auth {
+                let auth_cfg = upstream.upstream_auth.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "mcp action: federated_servers[].run_as_user_auth requires upstream_auth (origin '{}')",
+                        upstream.origin
+                    )
+                })?;
+                let kind = match transport.as_str() {
+                    "stdio" => sbproxy_extension::mcp::auth::McpTransportKind::Stdio,
+                    "sse" => sbproxy_extension::mcp::auth::McpTransportKind::Sse,
+                    _ => sbproxy_extension::mcp::auth::McpTransportKind::Http,
+                };
+                sbproxy_extension::mcp::auth::validate_run_as_user_config(auth_cfg, kind).map_err(
+                    |e| {
+                        anyhow::anyhow!(
+                            "mcp action: run_as_user_auth incompatible with transport '{}' on origin '{}': {e}",
+                            transport,
+                            upstream.origin
+                        )
+                    },
+                )?;
+            }
+
             // WOR-1648: an `openapi` server derives its tools from a
             // spec and dispatches REST; the origin is the REST base
             // URL, not an MCP endpoint.
@@ -759,6 +849,7 @@ impl McpAction {
                     rbac: upstream.rbac,
                     timeout: upstream.timeout,
                     run_as_user_auth: upstream.run_as_user_auth,
+                    upstream_auth: upstream.upstream_auth,
                 },
             );
         }
@@ -863,6 +954,40 @@ impl McpAction {
             }),
         );
 
+        let dual_llm_quarantine = cfg.dual_llm_quarantine.filter(|c| c.enabled);
+        let tool_output_judge = match dual_llm_quarantine.as_ref() {
+            Some(qcfg) => {
+                let endpoint = qcfg
+                    .endpoint
+                    .as_deref()
+                    .filter(|e| !e.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "mcp action: dual_llm_quarantine.enabled requires dual_llm_quarantine.endpoint"
+                        )
+                    })?
+                    .to_string();
+                let timeout = qcfg.timeout.unwrap_or(Duration::from_secs(10));
+                let transport = GovernedJudgeTransport {
+                    client: reqwest::Client::new(),
+                    endpoint,
+                    timeout,
+                };
+                let judge = sbproxy_extension::mcp::quarantine::HttpToolOutputJudge::new(
+                    transport,
+                    sbproxy_extension::mcp::quarantine::DualLlmJudgeConfig {
+                        timeout,
+                        model: qcfg.model.clone(),
+                    },
+                );
+                Some(Arc::new(judge)
+                    as Arc<
+                        dyn sbproxy_extension::mcp::quarantine::ToolOutputJudge,
+                    >)
+            }
+            None => None,
+        };
+
         Ok(Self {
             mode: cfg.mode,
             server_name,
@@ -884,7 +1009,8 @@ impl McpAction {
                 ))
             }),
             token_compaction: cfg.token_compaction.filter(|c| c.enabled),
-            dual_llm_quarantine: cfg.dual_llm_quarantine.filter(|c| c.enabled),
+            dual_llm_quarantine,
+            tool_output_judge,
             tool_pricing: cfg.tool_pricing,
             usage_sinks: sbproxy_ai::usage_sink::build_sinks(&cfg.usage_sinks),
         })
@@ -918,6 +1044,21 @@ impl McpAction {
         self.prefix_for(server_name)
             .map(|p| p.run_as_user_auth)
             .unwrap_or(false)
+    }
+
+    /// Upstream auth minting config for a run-as-user server.
+    pub fn upstream_auth_for_server(
+        &self,
+        server_name: &str,
+    ) -> Option<&sbproxy_extension::mcp::auth::McpUpstreamAuthConfig> {
+        self.prefix_for(server_name)?.upstream_auth.as_ref()
+    }
+
+    /// Dual-LLM quarantine judge when configured.
+    pub fn tool_output_judge(
+        &self,
+    ) -> Option<&dyn sbproxy_extension::mcp::quarantine::ToolOutputJudge> {
+        self.tool_output_judge.as_deref()
     }
 
     /// Returns true when the named tool is allowed by the configured
@@ -1502,13 +1643,18 @@ mod tests {
             "federated_servers": [{
                 "origin": "github.example.com",
                 "prefix": "gh",
-                "run_as_user_auth": true
+                "run_as_user_auth": true,
+                "upstream_auth": {
+                    "type": "per_user_credential",
+                    "credential_template": "vault://users/{subject_id}/token"
+                }
             }]
         });
 
         let action = McpAction::from_config(value).expect("compile");
         assert!(action.run_as_user_for_server("gh"));
         assert!(!action.run_as_user_for_server("missing"));
+        assert!(action.upstream_auth_for_server("gh").is_some());
     }
 
     #[test]
@@ -1567,16 +1713,75 @@ mod tests {
             "mode": "gateway",
             "dual_llm_quarantine": {
                 "enabled": true,
-                "suspicious_patterns": ["ignore previous instructions"]
+                "endpoint": "https://judge.example/v1/chat/completions",
+                "model": "judge-model"
             },
             "federated_servers": [{ "origin": "example.com" }]
         }))
         .expect("compile");
 
-        let cfg = action.dual_llm_quarantine.expect("enabled");
+        let cfg = action.dual_llm_quarantine.as_ref().expect("enabled");
         assert_eq!(
-            cfg.suspicious_patterns,
-            vec!["ignore previous instructions"]
+            cfg.endpoint.as_deref(),
+            Some("https://judge.example/v1/chat/completions")
+        );
+        assert_eq!(cfg.model.as_deref(), Some("judge-model"));
+        assert!(action.tool_output_judge().is_some());
+    }
+
+    #[test]
+    fn dual_llm_quarantine_requires_endpoint_when_enabled() {
+        let err = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "dual_llm_quarantine": { "enabled": true },
+            "federated_servers": [{ "origin": "example.com" }]
+        }))
+        .expect_err("endpoint required");
+        assert!(
+            err.to_string().contains("endpoint"),
+            "error must mention endpoint, got: {err}"
+        );
+    }
+
+    #[test]
+    fn stdio_plus_run_as_user_is_config_error() {
+        let err = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "federated_servers": [{
+                "origin": "local-tools",
+                "transport": "stdio",
+                "command": "/usr/bin/true",
+                "run_as_user_auth": true,
+                "upstream_auth": {
+                    "type": "service_credential",
+                    "credential_ref": "vault://svc"
+                }
+            }]
+        }))
+        .expect_err("stdio + run_as_user must fail");
+        assert!(
+            err.to_string().contains("run_as_user") || err.to_string().contains("stdio"),
+            "error must mention run_as_user/stdio, got: {err}"
+        );
+    }
+
+    #[test]
+    fn run_as_user_requires_upstream_auth_config() {
+        let err = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "federated_servers": [{
+                "origin": "github.example.com",
+                "prefix": "gh",
+                "run_as_user_auth": true
+            }]
+        }))
+        .expect_err("upstream_auth required");
+        assert!(
+            err.to_string().contains("upstream_auth"),
+            "error must mention upstream_auth, got: {err}"
         );
     }
 
@@ -1945,6 +2150,7 @@ mod tests {
                 rbac: None,
                 timeout: Some(parse_duration_via_serde(raw)),
                 run_as_user_auth: false,
+                upstream_auth: None,
                 transport: None,
                 command: None,
                 args: Vec::new(),

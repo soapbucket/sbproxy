@@ -1,11 +1,12 @@
 # yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # AI shadow / side-by-side evaluation.
 #
-# Each request is forwarded to the primary provider as usual; a copy
-# is also sent to the shadow provider concurrently. The shadow
-# response is drained and never reaches the client; metadata is
-# logged at `target=sbproxy_ai_shadow` so it can be filtered into a
-# dedicated stream:
+# Each request is forwarded to the primary provider as usual. Eligible
+# sampled non-streaming chat evaluation requests may also be copied to
+# the shadow provider concurrently. Mutating and non-chat AI surfaces
+# are never copied. The shadow response is drained and never reaches
+# the client; metadata is logged at `target=sbproxy_ai_shadow` so it can
+# be filtered into a dedicated stream:
 #
 #   {provider, status, latency_ms, prompt_tokens, completion_tokens, finish_reason}
 #
@@ -47,8 +48,14 @@ origins:
         - name: anthropic
           api_key: ${ANTHROPIC_API_KEY}
           default_model: claude-haiku-4-5
+          # Exclude this provider from primary routing. A disabled provider
+          # may still be selected explicitly by the shadow block below.
+          enabled: false
       shadow:
         provider: anthropic
+        # Shadow evaluation is non-streaming only. Slow or failed shadow
+        # calls never delay or reject the primary response.
         sample_rate: 0.1
         timeout_ms: 30000
+        task_timeout_ms: 30000
         # model: claude-haiku-4-5   # uncomment to override

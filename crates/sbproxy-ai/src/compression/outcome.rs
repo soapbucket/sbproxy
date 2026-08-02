@@ -1,0 +1,265 @@
+//! Closed compression outcomes and token-accounting records.
+
+use crate::compression::CompressionBackend;
+use std::time::Duration;
+
+/// Stable identifier for a compression lever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeverKind {
+    /// Stateful running-summary compaction.
+    SummaryBuffer,
+    /// Deterministic target-window fitting.
+    WindowFit,
+    /// Sidecar-backed extractive token pruning.
+    TokenPrune,
+    /// Query-aware sentence selection from marked context.
+    QuerySelect,
+    /// Retrieval-aware selection of marked context chunks.
+    RagSelect,
+    /// Deterministic compact serialization of supported structured content.
+    CompactSerialization,
+    /// Reordering of marked context to mitigate position effects.
+    PositionReorder,
+}
+
+impl LeverKind {
+    /// Closed metric and log label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SummaryBuffer => "summary_buffer",
+            Self::WindowFit => "window_fit",
+            Self::TokenPrune => "token_prune",
+            Self::QuerySelect => "query_select",
+            Self::RagSelect => "rag_select",
+            Self::CompactSerialization => "compact_serialization",
+            Self::PositionReorder => "position_reorder",
+        }
+    }
+}
+
+/// Non-error reason that a lever left the working messages unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipReason {
+    /// A candidate did not strictly reduce the target-model token estimate.
+    NoSavings,
+    /// The request is outside this lever's supported eligibility rules.
+    NotEligible,
+    /// The request already satisfies the lever's target.
+    NotNeeded,
+    /// The target model has no known context-window size.
+    UnknownModelWindow,
+    /// No captured session identifier is available.
+    MissingSession,
+    /// The request is not a supported chat message array.
+    UnsupportedRequest,
+    /// The request is below the configured summary threshold.
+    BelowThreshold,
+    /// No eligible history remains after protecting the recent tail.
+    InsufficientHistory,
+    /// Structured tool, schema, or multimodal material prevents summarization.
+    StructuredRequest,
+    /// Stored history digests do not match the incoming branch.
+    BranchMismatch,
+    /// Stored state reached its logical expiration before Redis removed it.
+    StateExpired,
+    /// No additional eligible history needs summarization.
+    NoNewHistory,
+    /// Prior summary plus new source exceeds the summarizer input window.
+    SummarizerInputTooLarge,
+    /// Internal summarizer budget admission was denied.
+    BudgetDenied,
+    /// Credential governance disallows the configured summarizer destination.
+    PolicyDenied,
+    /// A bounded coordination permit was unavailable.
+    LockContended,
+    /// No marked context was present in the request.
+    NoMarkedContext,
+    /// No usable nonblank marked query was present.
+    MissingQuery,
+    /// Marked context could not be parsed without ambiguity.
+    MalformedMarkedContext,
+    /// Marked context exceeded the lever's bounded processing limit.
+    MarkedContextTooLarge,
+    /// A required caller-supplied relevance score was absent.
+    MissingRelevanceScore,
+    /// Selection rules retained no marked context chunks.
+    NoSelectedChunks,
+    /// Structured content could not be transformed safely.
+    UnsafeStructuredShape,
+    /// Marked context already had the requested order.
+    AlreadyOrdered,
+}
+
+impl SkipReason {
+    /// Closed metric and log label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoSavings => "no_savings",
+            Self::NotEligible => "not_eligible",
+            Self::NotNeeded => "not_needed",
+            Self::UnknownModelWindow => "unknown_model_window",
+            Self::MissingSession => "missing_session",
+            Self::UnsupportedRequest => "unsupported_request",
+            Self::BelowThreshold => "below_threshold",
+            Self::InsufficientHistory => "insufficient_history",
+            Self::StructuredRequest => "structured_request",
+            Self::BranchMismatch => "branch_mismatch",
+            Self::StateExpired => "state_expired",
+            Self::NoNewHistory => "no_new_history",
+            Self::SummarizerInputTooLarge => "summarizer_input_too_large",
+            Self::BudgetDenied => "budget_denied",
+            Self::PolicyDenied => "policy_denied",
+            Self::LockContended => "lock_contended",
+            Self::NoMarkedContext => "no_marked_context",
+            Self::MissingQuery => "missing_query",
+            Self::MalformedMarkedContext => "malformed_marked_context",
+            Self::MarkedContextTooLarge => "marked_context_too_large",
+            Self::MissingRelevanceScore => "missing_relevance_score",
+            Self::NoSelectedChunks => "no_selected_chunks",
+            Self::UnsafeStructuredShape => "unsafe_structured_shape",
+            Self::AlreadyOrdered => "already_ordered",
+        }
+    }
+}
+
+/// Sanitized runtime failure classification for a lever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureReason {
+    /// External canonical state could not be read or written.
+    StateUnavailable,
+    /// A Redis lease expired or ownership changed before commit.
+    LeaseLost,
+    /// The expected logical version was no longer current.
+    StaleVersion,
+    /// The internal summarizer exceeded its bounded deadline.
+    SummarizerTimeout,
+    /// The selected summarizer provider returned an error.
+    SummarizerProvider,
+    /// The summarizer response was empty, oversized, or malformed.
+    InvalidSummary,
+    /// The token-pruning sidecar could not complete the request.
+    TokenPruneUnavailable,
+    /// The token-pruning sidecar returned an invalid or over-budget result.
+    InvalidTokenPruneOutput,
+    /// A record or message could not be serialized safely.
+    Serialization,
+    /// A bounded internal invariant failed without exposing raw details.
+    Internal,
+}
+
+impl FailureReason {
+    /// Closed metric and log label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::StateUnavailable => "state_unavailable",
+            Self::LeaseLost => "lease_lost",
+            Self::StaleVersion => "stale_version",
+            Self::SummarizerTimeout => "summarizer_timeout",
+            Self::SummarizerProvider => "summarizer_provider",
+            Self::InvalidSummary => "invalid_summary",
+            Self::TokenPruneUnavailable => "token_prune_unavailable",
+            Self::InvalidTokenPruneOutput => "invalid_token_prune_output",
+            Self::Serialization => "serialization",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+/// Result category for one lever invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeverOutcome {
+    /// A transformation was committed.
+    Applied,
+    /// The lever did not need or could not safely attempt a replacement.
+    Skipped {
+        /// Closed reason for the skip.
+        reason: SkipReason,
+    },
+    /// A runtime dependency or validation step failed open.
+    Failed {
+        /// Closed sanitized failure classification.
+        reason: FailureReason,
+    },
+}
+
+/// Accounting record for one completed lever invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeverResult {
+    /// Lever that ran.
+    pub lever: LeverKind,
+    /// Stateful backend, or `None` for stateless levers.
+    pub backend: Option<CompressionBackend>,
+    /// Applied, skipped, or failed classification.
+    pub outcome: LeverOutcome,
+    /// Model-aware token estimate before the lever.
+    pub before_tokens: u64,
+    /// Model-aware token estimate after the lever.
+    pub after_tokens: u64,
+    /// Committed reduction in the shared estimate, zero for skips and failures.
+    pub tokens_saved: u64,
+    /// Wall-clock time added by the lever invocation.
+    pub duration: Duration,
+}
+
+/// Failure-first result for the completed request pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestOutcome {
+    /// At least one lever applied and no lever failed.
+    Applied,
+    /// Every lever skipped, or the pipeline was explicitly empty.
+    Skipped,
+    /// At least one lever failed, even if a later fallback applied.
+    Failed,
+}
+
+impl RequestOutcome {
+    /// Closed metric and log label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::Skipped => "skipped",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LeverKind, SkipReason};
+
+    #[test]
+    fn stateless_lever_kinds_have_stable_labels() {
+        assert_eq!(LeverKind::TokenPrune.as_str(), "token_prune");
+        assert_eq!(LeverKind::QuerySelect.as_str(), "query_select");
+        assert_eq!(LeverKind::RagSelect.as_str(), "rag_select");
+        assert_eq!(
+            LeverKind::CompactSerialization.as_str(),
+            "compact_serialization"
+        );
+        assert_eq!(LeverKind::PositionReorder.as_str(), "position_reorder");
+    }
+
+    #[test]
+    fn stateless_skip_reasons_have_stable_labels() {
+        assert_eq!(SkipReason::MissingQuery.as_str(), "missing_query");
+        assert_eq!(SkipReason::NoMarkedContext.as_str(), "no_marked_context");
+        assert_eq!(
+            SkipReason::MalformedMarkedContext.as_str(),
+            "malformed_marked_context"
+        );
+        assert_eq!(
+            SkipReason::MarkedContextTooLarge.as_str(),
+            "marked_context_too_large"
+        );
+        assert_eq!(
+            SkipReason::MissingRelevanceScore.as_str(),
+            "missing_relevance_score"
+        );
+        assert_eq!(SkipReason::NoSelectedChunks.as_str(), "no_selected_chunks");
+        assert_eq!(
+            SkipReason::UnsafeStructuredShape.as_str(),
+            "unsafe_structured_shape"
+        );
+        assert_eq!(SkipReason::AlreadyOrdered.as_str(), "already_ordered");
+    }
+}

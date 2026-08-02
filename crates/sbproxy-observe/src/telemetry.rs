@@ -6,15 +6,18 @@
 //!    helper used by request handlers to propagate `traceparent`
 //!    headers across hops. Has no dependency on the heavyweight OTel
 //!    SDK so it costs nothing when telemetry is disabled.
-//! 2. **OTLP exporter** ([`init_otlp_pipeline`]): builds and installs
-//!    a tracing-subscriber layer that forwards spans to an OTLP
-//!    collector. Startup code that already owns the process subscriber
-//!    uses [`build_otlp_trace_pipeline`] and layers the returned tracer
-//!    into that subscriber.
+//! 2. **OTLP exporter** ([`build_otlp_trace_pipeline`]): builds and
+//!    installs the global tracer provider. Callers that own the
+//!    process subscriber (`crate::logging::init_inner`, the only
+//!    production caller) layer the returned tracer into their own
+//!    `tracing-subscriber` stack.
 //! 3. **W3C TraceContext propagator** ([`init_propagator`]): registers
 //!    the OTel-default propagator as the global text-map propagator so
-//!    every outbound HTTP client that goes through
-//!    [`inject_into_headers`] picks up the current trace.
+//!    every carrier that goes through [`propagation_pairs`] picks up
+//!    the current trace. [`inject_into_headers`] and
+//!    [`inject_into_reqwest`] turn those pairs into HTTP headers;
+//!    carriers that are not headers (a JSON body, a queue envelope)
+//!    consume the pairs directly.
 //! 4. **Span-naming helper** ([`span`]): every pillar emits spans
 //!    named `sbproxy.<pillar>.<verb>` so dashboards group cleanly.
 
@@ -37,22 +40,20 @@ use opentelemetry_sdk::trace::{ShouldSample, SpanProcessor};
 use opentelemetry_sdk::{trace::Span, Resource};
 use opentelemetry_semantic_conventions as semconv;
 use serde::Deserialize;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
 
-/// Transport for the OTLP exporter. HTTP/proto is the lighter
-/// option (one less dep tree) and the default; gRPC is what most
-/// collectors expect and what the public OpenTelemetry tutorials
-/// assume.
+/// Transport for the OTLP exporter. gRPC is the default, matching the
+/// Day-1 reference stack (`examples/observability-stack/`) and what
+/// most collectors expect; HTTP/proto is the opt-in for environments
+/// that block gRPC.
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum OtlpTransport {
     /// OTLP over HTTP with protobuf payload (default endpoint
     /// `http://localhost:4318/v1/traces`).
-    #[default]
     Http,
-    /// OTLP over gRPC (default endpoint `http://localhost:4317`).
+    /// OTLP over gRPC (default endpoint `http://localhost:4327`, the
+    /// Day-1 reference stack's collector port).
+    #[default]
     Grpc,
 }
 
@@ -96,8 +97,9 @@ pub struct TelemetryConfig {
     /// latency-based keep. Like cost, this is evaluated at span end.
     #[serde(default)]
     pub keep_slower_than_secs: Option<f64>,
-    /// Propagation format: `"w3c"` (default), `"b3"`, or `"jaeger"`.
-    /// Only ships W3C; the other variants land in a follow-up.
+    /// Propagation format. Only `"w3c"` (the default, used when unset)
+    /// is wired; [`TelemetryConfig::validate_propagation`] rejects any
+    /// other value at boot instead of silently ignoring it.
     #[serde(default)]
     pub propagation: Option<String>,
     /// Free-form resource attributes attached to every span. Operators
@@ -163,6 +165,52 @@ impl Default for TelemetryConfig {
             export_metrics: false,
             metrics_interval_secs: None,
             headers: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+/// Boot-time configuration errors caught before any pipeline installs,
+/// so a misconfigured operator sees a clear failure instead of a
+/// silently inert flag.
+#[derive(Debug, thiserror::Error)]
+pub enum TelemetryConfigError {
+    /// `export_metrics: true` can never take effect while `enabled` is
+    /// `false`: [`init_otlp_metrics_pipeline`] no-ops whenever tracing
+    /// itself is disabled.
+    #[error(
+        "proxy.telemetry.export_metrics is true, but proxy.telemetry.enabled is false; the \
+         OTLP metrics pipeline never starts without tracing enabled"
+    )]
+    MetricsExportRequestedButTracingDisabled,
+    /// Only the W3C propagator is ever installed ([`init_propagator`]
+    /// always registers [`TraceContextPropagator`]); any other
+    /// configured value is silently ignored today.
+    #[error(
+        "proxy.telemetry.propagation = \"{0}\" is not supported; only \"w3c\" (the default) is \
+         wired today"
+    )]
+    UnsupportedPropagation(String),
+}
+
+impl TelemetryConfig {
+    /// Boot-time check: `export_metrics: true` must actually be able to
+    /// result in a running meter provider. Reject the combination that
+    /// can't, rather than leaving the flag inert.
+    pub fn validate_export_metrics(&self) -> Result<(), TelemetryConfigError> {
+        if self.export_metrics && !self.enabled {
+            return Err(TelemetryConfigError::MetricsExportRequestedButTracingDisabled);
+        }
+        Ok(())
+    }
+
+    /// Boot-time check: reject any `propagation` value other than the
+    /// one that is actually wired.
+    pub fn validate_propagation(&self) -> Result<(), TelemetryConfigError> {
+        match self.propagation.as_deref() {
+            None | Some("w3c") => Ok(()),
+            Some(other) => Err(TelemetryConfigError::UnsupportedPropagation(
+                other.to_string(),
+            )),
         }
     }
 }
@@ -357,14 +405,37 @@ struct OutcomeSamplingSpanProcessor {
 }
 
 impl OutcomeSamplingSpanProcessor {
-    fn new(exporter: Box<dyn SpanExporter>, policy: TraceSamplingPolicy) -> Self {
+    /// Builds the exporter itself on the export worker thread, inside
+    /// its Tokio runtime, rather than on the caller's thread before
+    /// spawning. tonic's `connect_lazy()` (invoked by
+    /// `opentelemetry_otlp::SpanExporter::builder().with_tonic()...build()`)
+    /// synchronously `tokio::spawn`s a background task that services
+    /// the client's request buffer for the exporter's entire lifetime;
+    /// that spawn panics with no ambient runtime, and the caller here
+    /// (`build_otlp_trace_pipeline`, called from `main()` before
+    /// Pingora builds any runtime) has none. Building inside the
+    /// worker thread's own runtime, which stays alive and gets driven
+    /// by every subsequent `rt.block_on` call in its message loop,
+    /// gives that background task an ambient runtime both at spawn
+    /// time and for as long as it needs to keep running. Blocks
+    /// (briefly, via `std::sync::mpsc`, not async) until the worker
+    /// reports the build succeeded or failed, so callers keep the same
+    /// synchronous `Result` contract they had when the exporter was
+    /// built inline.
+    fn new(config: TelemetryConfig, endpoint: String, policy: TraceSamplingPolicy) -> Result<Self> {
         let (tx, rx) = mpsc::sync_channel(TRACE_EXPORT_QUEUE_SIZE);
-        spawn_trace_export_worker(exporter, rx);
-        Self {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        spawn_trace_export_worker(config, endpoint, rx, ready_tx);
+        ready_rx
+            .recv_timeout(TRACE_EXPORT_FLUSH_TIMEOUT)
+            .map_err(|_| {
+                anyhow::anyhow!("OTLP trace export worker did not report ready in time")
+            })??;
+        Ok(Self {
             tx,
             policy,
             dropped_spans: AtomicUsize::new(0),
-        }
+        })
     }
 
     fn should_export(&self, span: &SpanData) -> bool {
@@ -437,9 +508,15 @@ impl SpanProcessor for OutcomeSamplingSpanProcessor {
 }
 
 fn spawn_trace_export_worker(
-    mut exporter: Box<dyn SpanExporter>,
+    config: TelemetryConfig,
+    endpoint: String,
     rx: mpsc::Receiver<TraceExportMessage>,
+    ready_tx: mpsc::Sender<Result<()>>,
 ) {
+    // Cloned so the outer spawn-failure branch below still has a
+    // sender to report through even though the closure (moved into
+    // `.spawn()`) also needs its own.
+    let spawn_failure_tx = ready_tx.clone();
     if let Err(e) = std::thread::Builder::new()
         .name("sbproxy-otel-trace-export".to_string())
         .spawn(move || {
@@ -453,9 +530,29 @@ fn spawn_trace_export_worker(
                         error = %e,
                         "telemetry: failed to build OTLP trace export runtime"
                     );
+                    let _ = ready_tx.send(Err(anyhow::anyhow!(
+                        "failed to build OTLP trace export runtime: {e}"
+                    )));
                     return;
                 }
             };
+
+            // Build the exporter here, inside this thread's runtime
+            // (`.enter()` is enough: the build itself is synchronous,
+            // it just needs `tokio::spawn` to find an ambient runtime).
+            let mut exporter = {
+                let _guard = rt.enter();
+                match build_span_exporter(&config, &endpoint) {
+                    Ok(exporter) => exporter,
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e));
+                        return;
+                    }
+                }
+            };
+            // Ignore a send failure here (the caller gave up waiting and
+            // timed out); still worth serving messages in case it didn't.
+            let _ = ready_tx.send(Ok(()));
 
             while let Ok(msg) = rx.recv() {
                 match msg {
@@ -484,7 +581,80 @@ fn spawn_trace_export_worker(
             error = %e,
             "telemetry: failed to spawn OTLP trace export worker"
         );
+        let _ = spawn_failure_tx.send(Err(anyhow::anyhow!(
+            "failed to spawn OTLP trace export worker thread: {e}"
+        )));
     }
+}
+
+/// Run `build` inside a dedicated thread's Tokio runtime, keep that
+/// runtime alive and actively driven for the life of the process, and
+/// return the value `build` produced.
+///
+/// For callers whose `build` closure constructs a tonic gRPC exporter:
+/// `connect_lazy()` synchronously `tokio::spawn`s a background task
+/// that services the client's request buffer for the exporter's entire
+/// lifetime. That spawn panics with no ambient runtime already
+/// entered, and needs the runtime it lands on to keep being driven
+/// afterward, not just during the spawn call -- a short-lived runtime
+/// built, used, and dropped immediately would have its spawned task
+/// cancelled the moment it drops, silently breaking every future call
+/// through the exporter. This is `spawn_trace_export_worker`'s "build
+/// inside a runtime that keeps running" fix, generalized for a caller
+/// (the OTLP metrics pipeline) that has no export-worker thread of its
+/// own to piggyback the build onto: `PeriodicReader`'s own worker
+/// thread (spawned by `runtime::TokioCurrentThread` once the exporter
+/// is handed to it) doesn't exist yet at the point the exporter itself
+/// needs to be built.
+///
+/// Blocks (briefly, via `std::sync::mpsc`, not async) until `build`
+/// reports success or failure, so callers keep a synchronous `Result`.
+fn build_on_a_runtime_that_outlives_this_call<T, F>(thread_name: &str, build: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    let (ready_tx, ready_rx) = mpsc::channel::<Result<T>>();
+    std::thread::Builder::new()
+        .name(thread_name.to_string())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ =
+                        ready_tx.send(Err(anyhow::anyhow!("failed to build export runtime: {e}")));
+                    return;
+                }
+            };
+            let result = {
+                let _guard = rt.enter();
+                build()
+            };
+            let build_ok = result.is_ok();
+            if ready_tx.send(result).is_err() || !build_ok {
+                // Either nothing is listening anymore, or the build
+                // itself failed: nothing to keep this thread alive for.
+                return;
+            }
+            // Keep this runtime alive and actively driven forever so
+            // the background task the build spawned keeps making
+            // progress for the life of the process. The exporter value
+            // already went back to the caller above; it is a plain,
+            // thread-agnostic handle from here on (a channel-backed
+            // client), so it works from whatever thread later calls it
+            // as long as this runtime keeps servicing the worker task
+            // behind it.
+            rt.block_on(std::future::pending::<()>());
+        })
+        .map_err(|e| anyhow::anyhow!("failed to spawn export runtime thread {thread_name}: {e}"))?;
+    ready_rx
+        .recv_timeout(TRACE_EXPORT_FLUSH_TIMEOUT)
+        .map_err(|_| {
+            anyhow::anyhow!("export runtime thread {thread_name} did not report ready in time")
+        })?
 }
 
 fn should_force_export_span(span: &SpanData, policy: &TraceSamplingPolicy) -> bool {
@@ -585,8 +755,8 @@ pub fn build_otlp_trace_pipeline(config: &TelemetryConfig) -> Result<Option<Otlp
     let endpoint = otlp_endpoint(config);
     let policy = TraceSamplingPolicy::from_config(config);
     let resource = otlp_resource(config);
-    let exporter = build_span_exporter(config, &endpoint)?;
-    let processor = OutcomeSamplingSpanProcessor::new(Box::new(exporter), policy.clone());
+    let processor =
+        OutcomeSamplingSpanProcessor::new(config.clone(), endpoint.clone(), policy.clone())?;
 
     let provider = sdktrace::TracerProvider::builder()
         .with_span_processor(processor)
@@ -606,11 +776,16 @@ pub fn build_otlp_trace_pipeline(config: &TelemetryConfig) -> Result<Option<Otlp
 }
 
 fn otlp_endpoint(config: &TelemetryConfig) -> String {
-    config
-        .endpoint
-        .clone()
-        .filter(|e| !e.is_empty())
-        .unwrap_or_else(|| DEFAULT_OTLP_ENDPOINT.to_string())
+    if let Some(endpoint) = config.endpoint.clone().filter(|e| !e.is_empty()) {
+        return endpoint;
+    }
+    match config.transport {
+        // gRPC's tonic exporter takes a bare authority; HTTP needs the
+        // per-signal path, which the SDK does not append for us when
+        // `with_endpoint` overrides the default.
+        OtlpTransport::Http => "http://localhost:4318/v1/traces".to_string(),
+        OtlpTransport::Grpc => DEFAULT_OTLP_ENDPOINT.to_string(),
+    }
 }
 
 /// Best-effort hostname for resource detection: `HOSTNAME` env var
@@ -732,52 +907,6 @@ fn build_span_exporter(
     }
 }
 
-/// Initialise the OTLP tracing pipeline.
-///
-/// When `config.enabled` is `false` or no endpoint is configured the
-/// function is a no-op. Otherwise it installs a global tracer
-/// provider that batches spans and ships them to the configured
-/// endpoint over HTTP/proto, plus a tracing-subscriber layer that
-/// converts every `tracing` span into an OTel span.
-///
-/// Returns `Err` when the exporter cannot be built (e.g. invalid
-/// endpoint URL); callers should log and continue rather than fail
-/// the whole startup.
-pub fn init_otlp_pipeline(config: &TelemetryConfig) -> Result<()> {
-    let Some(pipeline) = build_otlp_trace_pipeline(config)? else {
-        return Ok(());
-    };
-
-    // --- Tracing-subscriber bridge ---
-    //
-    // Honour `RUST_LOG` for filter levels; default to `info` if the
-    // env var is unset. The OpenTelemetry layer forwards every
-    // matching span to the global tracer provider we just installed.
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let otel_layer = tracing_opentelemetry::layer().with_tracer(pipeline.tracer);
-
-    // We `try_init` because operators may have already wired a
-    // tracing subscriber elsewhere; layering on top would panic.
-    if tracing_subscriber::registry()
-        .with(env_filter)
-        .with(otel_layer)
-        .try_init()
-        .is_err()
-    {
-        tracing::debug!(
-            "telemetry: a global subscriber is already installed; OTLP layer not reinstalled"
-        );
-    }
-
-    tracing::info!(
-        endpoint = %pipeline.endpoint,
-        service = %pipeline.service_name,
-        sample_rate = %pipeline.sample_rate,
-        "OTLP tracing pipeline initialised"
-    );
-    Ok(())
-}
-
 /// Shut down the OTLP pipeline cleanly. Should be called at process
 /// exit so any pending span batches get flushed.
 pub fn shutdown_otlp_pipeline() {
@@ -810,6 +939,24 @@ pub fn shutdown_otlp_pipeline() {
 /// Returns `Err` when the exporter cannot be built. Operators
 /// should log and continue rather than fail boot, mirroring the
 /// trace pipeline.
+///
+/// Uses [`opentelemetry_sdk::runtime::TokioCurrentThread`], not
+/// `runtime::Tokio`, for the `PeriodicReader`: registering the reader
+/// with the provider synchronously calls `Runtime::spawn`, and the
+/// `Tokio` binding's `spawn` is a bare `tokio::spawn`, which panics
+/// without an ambient runtime already entered. This function runs from
+/// `main()` before Pingora has built any runtime. `TokioCurrentThread`
+/// spawns its own dedicated OS thread with its own `current_thread`
+/// runtime for the reader's export loop (mirroring
+/// `spawn_trace_export_worker`'s dedicated-thread pattern for traces,
+/// just via the SDK's own equivalent binding instead of hand-rolled).
+///
+/// The gRPC exporter build itself needed the identical fix one level
+/// earlier: `opentelemetry_otlp::MetricExporter::builder().with_tonic()
+/// ...build()` calls tonic's `connect_lazy()`, which synchronously
+/// `tokio::spawn`s its own background task regardless of which runtime
+/// binding `PeriodicReader` uses. See
+/// `build_on_a_runtime_that_outlives_this_call`.
 pub fn init_otlp_metrics_pipeline(config: &TelemetryConfig) -> Result<()> {
     if !config.enabled || !config.export_metrics {
         return Ok(());
@@ -828,6 +975,10 @@ pub fn init_otlp_metrics_pipeline(config: &TelemetryConfig) -> Result<()> {
 
     let exporter = match config.transport {
         OtlpTransport::Http => {
+            // reqwest's client construction (the HTTP exporter's
+            // transport) needs no ambient runtime, only a runtime to
+            // actually send requests later -- safe to build here on
+            // the boot thread, same as the trace pipeline's HTTP branch.
             let mut builder = opentelemetry_otlp::MetricExporter::builder()
                 .with_http()
                 .with_endpoint(endpoint);
@@ -839,22 +990,30 @@ pub fn init_otlp_metrics_pipeline(config: &TelemetryConfig) -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("failed to build OTLP/HTTP metric exporter: {}", e))?
         }
         OtlpTransport::Grpc => {
-            let mut builder = opentelemetry_otlp::MetricExporter::builder()
-                .with_tonic()
-                .with_endpoint(endpoint);
-            if !config.headers.is_empty() {
-                builder = builder.with_metadata(tonic_metadata_from_headers(&config.headers));
-            }
-            builder
-                .build()
-                .map_err(|e| anyhow::anyhow!("failed to build OTLP/gRPC metric exporter: {}", e))?
+            // tonic's connect_lazy() synchronously tokio::spawns a
+            // background task that needs a runtime both to spawn onto
+            // and to keep being driven by afterward; see
+            // build_on_a_runtime_that_outlives_this_call's doc comment.
+            let config = config.clone();
+            let endpoint = endpoint.to_string();
+            build_on_a_runtime_that_outlives_this_call("sbproxy-otel-metrics-connect", move || {
+                let mut builder = opentelemetry_otlp::MetricExporter::builder()
+                    .with_tonic()
+                    .with_endpoint(endpoint.as_str());
+                if !config.headers.is_empty() {
+                    builder = builder.with_metadata(tonic_metadata_from_headers(&config.headers));
+                }
+                builder.build().map_err(|e| {
+                    anyhow::anyhow!("failed to build OTLP/gRPC metric exporter: {}", e)
+                })
+            })?
         }
     };
 
     let interval = std::time::Duration::from_secs(config.metrics_interval_secs.unwrap_or(30));
     let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(
         exporter,
-        opentelemetry_sdk::runtime::Tokio,
+        opentelemetry_sdk::runtime::TokioCurrentThread,
     )
     .with_interval(interval)
     .build();
@@ -891,68 +1050,59 @@ pub fn shutdown_otlp_metrics_pipeline() {
 /// Register the W3C TraceContext propagator as the global text-map
 /// propagator. Idempotent: safe to call multiple times.
 ///
-/// Called from [`init_otlp_pipeline`] on both the enabled and disabled
-/// paths so propagation works even when OTLP export is off.
+/// Called from [`build_otlp_trace_pipeline`] on both the enabled and
+/// disabled paths so propagation works even when OTLP export is off.
 pub fn init_propagator() {
     global::set_text_map_propagator(TraceContextPropagator::new());
 }
 
-/// Inject the active OTel context into outbound HTTP headers.
+/// Resolve which OTel context the propagator should read.
 ///
-/// Propagation invariant: every HTTP request leaving
-/// the proxy MUST carry `traceparent`. Outbound clients (ledger, Stripe,
-/// facilitators, registry feeds, KYA token verifier, OAuth, webhook
-/// delivery) call this to satisfy that invariant in one line.
+/// Two layers: the per-`tracing::Span` OTel context that the
+/// `tracing-opentelemetry` layer maintains (the one
+/// [`parent_span_on_remote_trace_context`] seeds), and the task-local
+/// `opentelemetry::Context::current()` as a fallback. The span layer
+/// wins whenever it carries an active span.
 ///
-/// Reads the OTel context from the current `tracing::Span` when the
-/// `tracing-opentelemetry` layer is installed. Falls back to the global
-/// `opentelemetry::Context::current()` (which `extract_from_headers`
-/// populates) so propagation works even when no OTLP tracer is wired,
-/// satisfying the invariant for the disabled path.
-///
-/// Quietly does nothing when no propagator has been registered (the
-/// global default is a no-op propagator).
-pub fn inject_into_headers(headers: &mut http::HeaderMap) {
-    use opentelemetry::propagation::Injector;
-
-    struct HeaderInjector<'a>(&'a mut http::HeaderMap);
-    impl Injector for HeaderInjector<'_> {
-        fn set(&mut self, key: &str, value: String) {
-            if let (Ok(name), Ok(val)) = (
-                http::header::HeaderName::from_bytes(key.as_bytes()),
-                http::header::HeaderValue::from_str(&value),
-            ) {
-                self.0.insert(name, val);
-            }
-        }
-    }
-
-    // Two layers of context: the per-`tracing::Span` OTel context that
-    // the `tracing-opentelemetry` layer maintains, and the
-    // task-local OTel context. When OTLP export is enabled, the
-    // span-scoped context is the one that carries the active trace.
-    // Otherwise we rely on the task-local context populated by
-    // `extract_from_headers` so propagation still works.
+/// The fallback is deliberate. It only runs when the span layer had
+/// nothing, so it costs a clone on a path that was about to propagate
+/// nothing at all, and it is the only thing that keeps working for a
+/// caller that attaches a scoped `Context` without a `tracing::Span`
+/// wrapped around it. Nothing in this crate populates it today; see
+/// [`extract_from_headers`]'s doc for why it no longer does.
+fn context_to_propagate() -> Context {
     let cx_from_span =
         tracing_opentelemetry::OpenTelemetrySpanExt::context(&tracing::Span::current());
-    let cx_from_global = opentelemetry::Context::current();
-    // Prefer the span context when it carries a non-default span, else
-    // the task-local one.
-    let cx = if opentelemetry::trace::TraceContextExt::has_active_span(&cx_from_span) {
+    if opentelemetry::trace::TraceContextExt::has_active_span(&cx_from_span) {
         cx_from_span
     } else {
-        cx_from_global
-    };
-
-    global::get_text_map_propagator(|prop| {
-        prop.inject_context(&cx, &mut HeaderInjector(headers));
-    });
+        Context::current()
+    }
 }
 
-/// Inject the active OTel context into a `reqwest::RequestBuilder`'s
-/// headers. Convenience wrapper around [`inject_into_headers`] for the
-/// outbound clients that are built on top of `reqwest`.
-pub fn inject_into_reqwest(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+/// The trace-context key/value pairs the registered propagator emits
+/// for the currently active context.
+///
+/// This is the carrier-agnostic shape, and the single implementation
+/// every other injector in this module is built on.
+/// [`inject_into_headers`] and [`inject_into_reqwest`] turn these pairs
+/// into HTTP headers. A caller whose carrier is not a header set (a
+/// JSON body, a queue envelope, a message attribute map) consumes the
+/// pairs directly. The MCP gateway does exactly that: MCP carries
+/// trace context in the JSON-RPC body's `params._meta` block, which is
+/// the one carrier that also works on the stdio transport, where there
+/// is no header surface to inject into at all.
+///
+/// Keys are whatever the registered propagator emits. With the W3C
+/// TraceContext propagator this crate installs, that means
+/// `traceparent` plus `tracestate` when the trace carries one.
+///
+/// Returns an empty vector when no trace context is active, or when no
+/// propagator has been registered (the global default is a no-op
+/// propagator). Treat empty as "attach no carrier", not "attach an
+/// empty one": a reader downstream can then tell an untraced request
+/// from a malformed one.
+pub fn propagation_pairs() -> Vec<(String, String)> {
     use opentelemetry::propagation::Injector;
 
     struct VecInjector(Vec<(String, String)>);
@@ -962,61 +1112,75 @@ pub fn inject_into_reqwest(req: reqwest::RequestBuilder) -> reqwest::RequestBuil
         }
     }
 
-    let cx = tracing_opentelemetry::OpenTelemetrySpanExt::context(&tracing::Span::current());
+    let cx = context_to_propagate();
     let mut sink = VecInjector(Vec::new());
     global::get_text_map_propagator(|prop| prop.inject_context(&cx, &mut sink));
+    sink.0
+}
+
+/// Inject the active OTel context into outbound HTTP headers.
+///
+/// The intended propagation invariant is that every HTTP request
+/// leaving the proxy carries `traceparent`, and this is the one-line
+/// way for an outbound client to satisfy it. The invariant is not met
+/// yet. Before WOR-2139 wired [`inject_into_reqwest`] into the MCP
+/// gateway's OpenAPI-backed tool dispatch, neither function had a
+/// single production caller, and the outbound clients this doc used to
+/// name on the invariant's behalf (ledger, Stripe, facilitators,
+/// registry feeds, KYA token verifier, OAuth) still leave without one.
+/// Wiring them is open work, not a claim this doc gets to make for
+/// them.
+///
+/// Pairs come from [`propagation_pairs`], so the header path and every
+/// non-header carrier propagate the same context from the same code. A
+/// key or value that is not a legal HTTP header is skipped rather than
+/// panicking; the W3C propagator emits neither.
+pub fn inject_into_headers(headers: &mut http::HeaderMap) {
+    for (key, value) in propagation_pairs() {
+        if let (Ok(name), Ok(val)) = (
+            http::header::HeaderName::from_bytes(key.as_bytes()),
+            http::header::HeaderValue::from_str(&value),
+        ) {
+            headers.insert(name, val);
+        }
+    }
+}
+
+/// Inject the active OTel context into a `reqwest::RequestBuilder`'s
+/// headers. The [`inject_into_headers`] equivalent for the outbound
+/// clients that are built on top of `reqwest`, reading the same
+/// [`propagation_pairs`].
+///
+/// The MCP gateway calls this on the REST dispatch for an
+/// OpenAPI-backed tool, where the outbound request is plain HTTP and
+/// has no JSON-RPC body to carry `params._meta` instead.
+pub fn inject_into_reqwest(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     let mut req = req;
-    for (k, v) in sink.0 {
-        req = req.header(k, v);
+    for (key, value) in propagation_pairs() {
+        req = req.header(key, value);
     }
     req
 }
 
-/// Extract the inbound trace context from request headers and attach it
-/// to the current span so the rest of the request runs under the
-/// caller's trace.
+/// Parse the inbound `traceparent`/`tracestate` request headers into a
+/// [`crate::trace_ctx::w3c::TraceContext`], for log-line correlation
+/// (access log / structured log emit the correct `trace_id` regardless
+/// of OTLP state).
 ///
-/// Returns the parsed [`crate::trace_ctx::w3c::TraceContext`] when a
-/// well-formed `traceparent` was present, even if no global tracer is
-/// configured. This lets the access log / structured log emit the
-/// correct `trace_id` regardless of OTLP state.
+/// Pure parsing only: no OTel SDK context is attached anywhere. An
+/// earlier version of this function attached the extracted context to
+/// the ambient thread/task-local `opentelemetry::Context` and
+/// deliberately leaked the attach guard so it outlived the call. That
+/// is a per-request leak (nothing ever detaches it), and worse, on a
+/// reused worker thread a *later* request with no `traceparent` of its
+/// own would inherit the *previous* request's remote span context via
+/// `Context::current()`, mixing traces (and tenants) together. Use
+/// [`parent_span_on_remote_trace_context`] to seed a specific span's
+/// parent instead: explicit, request-scoped, and left behind with no
+/// residue once the caller's stack frame returns.
 pub fn extract_from_headers(
     headers: &http::HeaderMap,
 ) -> Option<crate::trace_ctx::w3c::TraceContext> {
-    use opentelemetry::propagation::Extractor;
-
-    struct HeaderExtractor<'a>(&'a http::HeaderMap);
-    impl Extractor for HeaderExtractor<'_> {
-        fn get(&self, key: &str) -> Option<&str> {
-            self.0.get(key).and_then(|v| v.to_str().ok())
-        }
-        fn keys(&self) -> Vec<&str> {
-            self.0.keys().map(|k| k.as_str()).collect()
-        }
-    }
-
-    // Attach the extracted context to the current tracing span so any
-    // outbound `inject_into_headers` call further down the stack picks
-    // up the same trace_id. We also leak the attached context guard so
-    // the OTel task-local current() will return it for the rest of
-    // this scope; callers that need scoped attachment should use
-    // [`extract_with_guard`] instead.
-    let extractor = HeaderExtractor(headers);
-    let cx = global::get_text_map_propagator(|prop| prop.extract(&extractor));
-    tracing_opentelemetry::OpenTelemetrySpanExt::set_parent(&tracing::Span::current(), cx.clone());
-
-    // Wave 1: also attach to the task-local OTel context so
-    // `inject_into_headers` works on the same task even if the caller
-    // is not running inside a `tracing::Span` that the OpenTelemetry
-    // layer recognises (for example, when the OTLP exporter is off).
-    // We deliberately mem::forget the guard so the attachment lasts
-    // for the remainder of the task; callers that want a scoped
-    // attachment use the future-aware `with_context` adaptor on
-    // their async block instead.
-    let guard = cx.attach();
-    std::mem::forget(guard);
-
-    // Also return the parsed traceparent for log-line correlation.
     headers
         .get("traceparent")
         .and_then(|v| v.to_str().ok())
@@ -1024,6 +1188,53 @@ pub fn extract_from_headers(
             let ts = headers.get("tracestate").and_then(|v| v.to_str().ok());
             crate::trace_ctx::w3c::TraceContext::parse_with_state(tp, ts)
         })
+}
+
+/// Parent `span` on the caller's remote trace context, so the exported
+/// OTel span shares the inbound `trace_id` instead of rooting a fresh
+/// one.
+///
+/// Deliberately request-scoped and side-effect-free beyond the one
+/// `span` passed in: no ambient thread-local or task-local OTel state
+/// is touched, so there is nothing to leak and nothing for an
+/// unrelated later request on a reused worker thread to inherit. `is_
+/// remote` must be `true` only when `trace_ctx` came from actually
+/// parsing an inbound header (W3C or B3) rather than
+/// [`crate::trace_ctx::w3c::TraceContext::new_random`]'s locally
+/// synthesized root; parenting a span on a context we invented
+/// ourselves would be pointless. No-ops when `trace_ctx` is `None`,
+/// `is_remote` is `false`, or the hex IDs fail to parse.
+pub fn parent_span_on_remote_trace_context(
+    span: &tracing::Span,
+    trace_ctx: Option<&crate::trace_ctx::w3c::TraceContext>,
+    is_remote: bool,
+) {
+    if !is_remote {
+        return;
+    }
+    let Some(trace_ctx) = trace_ctx else {
+        return;
+    };
+    let Ok(trace_id) = opentelemetry::trace::TraceId::from_hex(&trace_ctx.trace_id) else {
+        return;
+    };
+    let Ok(span_id) = opentelemetry::trace::SpanId::from_hex(&trace_ctx.parent_id) else {
+        return;
+    };
+    let trace_flags = if trace_ctx.is_sampled() {
+        opentelemetry::trace::TraceFlags::SAMPLED
+    } else {
+        opentelemetry::trace::TraceFlags::default()
+    };
+    let span_context = opentelemetry::trace::SpanContext::new(
+        trace_id,
+        span_id,
+        trace_flags,
+        true, // is_remote
+        opentelemetry::trace::TraceState::NONE,
+    );
+    let cx = Context::new().with_remote_span_context(span_context);
+    tracing_opentelemetry::OpenTelemetrySpanExt::set_parent(span, cx);
 }
 
 // --- Span-naming helpers ---
@@ -1053,8 +1264,6 @@ pub enum Pillar {
     Rail,
     /// Audit-log emission.
     Audit,
-    /// Outbound webhook delivery.
-    Notify,
 }
 
 impl Pillar {
@@ -1068,7 +1277,6 @@ impl Pillar {
             Pillar::Ledger => "ledger",
             Pillar::Rail => "rail",
             Pillar::Audit => "audit",
-            Pillar::Notify => "notify",
         }
     }
 }
@@ -1116,6 +1324,62 @@ pub mod tracing_helper {
 /// Convenience re-export so callers can write `telemetry::span(...)`
 /// without going through the `tracing_helper` sub-module.
 pub use tracing_helper::span;
+
+// --- WOR-2100: payment settlement correlation ---
+
+/// Domain separator for the access log's settlement correlation digest.
+///
+/// Separated so this digest cannot be confused with, or replayed against,
+/// any of the settlement crate's own digests over the same input.
+const RECEIPT_CORRELATION_DOMAIN: &[u8] = b"sbproxy-access-log-receipt-correlation-v1";
+
+/// Build the span covering one settlement rail interaction.
+///
+/// The name is `sbproxy.rail.<verb>`, where `verb` is the settlement or
+/// recovery operation. The rail and the operation are the whole story that
+/// belongs on a span: a payer identifier, a credential, a client secret, a
+/// provider object identifier, or a provider body would all be readable by
+/// anyone with trace access, and none of them is needed to find a slow
+/// facilitator.
+///
+/// `verb` is `&'static str` so a caller cannot format a value into it.
+pub fn settlement_span(verb: &'static str) -> tracing::Span {
+    tracing_helper::span(Pillar::Rail, verb)
+}
+
+/// Derive the one-way correlation digest the access log carries for a
+/// settled payment.
+///
+/// `receipt_key` is the durable receipt's own key. The digest is what goes
+/// on the log line, and the mapping is deliberately one way: two lines for
+/// the same settled payment share a value an operator can group by, and the
+/// value on its own tells an attacker with log access nothing about the
+/// intent, the provider object, or the payer.
+///
+/// Returns lowercase hex of the full 32 bytes. Truncating would make
+/// collisions plausible at a volume this proxy reaches, and a collision
+/// here means two different payments joining into one row.
+///
+/// # Examples
+///
+/// ```
+/// use sbproxy_observe::telemetry::receipt_correlation_digest;
+///
+/// let digest = receipt_correlation_digest("sbpr_example");
+/// assert_eq!(digest.len(), 64);
+/// // Stable for the same receipt, and unrelated to its input's bytes.
+/// assert_eq!(digest, receipt_correlation_digest("sbpr_example"));
+/// assert_ne!(digest, receipt_correlation_digest("sbpr_other"));
+/// assert!(!digest.contains("sbpr_example"));
+/// ```
+pub fn receipt_correlation_digest(receipt_key: &str) -> String {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(RECEIPT_CORRELATION_DOMAIN);
+    hasher.update([0u8]);
+    hasher.update(receipt_key.as_bytes());
+    hex::encode(hasher.finalize())
+}
 
 /// W3C Trace Context span context.
 #[derive(Debug, Clone)]
@@ -1233,6 +1497,145 @@ mod tests {
         assert!(config.always_sample_errors);
         assert!(config.keep_over_budget_usd.is_none());
         assert!(config.keep_slower_than_secs.is_none());
+    }
+
+    #[test]
+    fn export_metrics_true_requires_tracing_enabled() {
+        let config = TelemetryConfig {
+            export_metrics: true,
+            ..TelemetryConfig::default()
+        };
+        assert!(config.validate_export_metrics().is_err());
+    }
+
+    #[test]
+    fn export_metrics_true_with_tracing_enabled_is_valid() {
+        let config = TelemetryConfig {
+            enabled: true,
+            export_metrics: true,
+            ..TelemetryConfig::default()
+        };
+        assert!(config.validate_export_metrics().is_ok());
+    }
+
+    #[test]
+    fn export_metrics_false_needs_no_validation() {
+        let config = TelemetryConfig {
+            export_metrics: false,
+            ..TelemetryConfig::default()
+        };
+        assert!(config.validate_export_metrics().is_ok());
+    }
+
+    #[test]
+    fn init_otlp_metrics_pipeline_does_not_panic_without_an_ambient_tokio_runtime() {
+        // A plain #[test] fn has no tokio runtime, matching main()'s
+        // context when it calls this at boot (Pingora builds its
+        // runtime later). TelemetryConfig::default()'s transport is
+        // Grpc, so this exercises both fixed panic points: building
+        // the tonic exporter itself (connect_lazy's synchronous
+        // tokio::spawn, build_on_a_runtime_that_outlives_this_call) and
+        // registering the PeriodicReader with the provider
+        // (runtime::TokioCurrentThread, not runtime::Tokio). Port 1
+        // never accepts a connection, so any background export attempt
+        // just fails quietly rather than hanging.
+        let config = TelemetryConfig {
+            enabled: true,
+            export_metrics: true,
+            endpoint: Some("http://127.0.0.1:1".to_string()),
+            metrics_interval_secs: Some(3600),
+            ..TelemetryConfig::default()
+        };
+        assert!(init_otlp_metrics_pipeline(&config).is_ok());
+    }
+
+    #[test]
+    fn build_otlp_trace_pipeline_does_not_panic_without_an_ambient_tokio_runtime() {
+        // Same reasoning as the metrics regression test above, for the
+        // trace side. TelemetryConfig::default()'s transport is Grpc
+        // (the documented, codebase-wide default; see Task 1.5), so
+        // this is exactly the config main() builds when an operator
+        // sets telemetry.enabled: true and does not override transport.
+        // Before this fix, OutcomeSamplingSpanProcessor::new built the
+        // tonic exporter directly on this (runtime-less) thread; tonic's
+        // connect_lazy() panics there via a bare tokio::spawn inside
+        // Channel::new (tonic-0.12.3 transport/channel/mod.rs:160,
+        // hyper-util-0.1.20 rt/tokio.rs:115) regardless of which
+        // runtime binding the *metrics* PeriodicReader uses -- this is
+        // an entirely separate code path. Port 1 never accepts a
+        // connection, so any background export attempt just fails
+        // quietly rather than hanging.
+        let config = TelemetryConfig {
+            enabled: true,
+            endpoint: Some("http://127.0.0.1:1".to_string()),
+            ..TelemetryConfig::default()
+        };
+        assert!(build_otlp_trace_pipeline(&config).is_ok());
+    }
+
+    #[test]
+    fn propagation_unset_or_w3c_is_valid() {
+        assert!(TelemetryConfig::default().validate_propagation().is_ok());
+        let config = TelemetryConfig {
+            propagation: Some("w3c".to_string()),
+            ..TelemetryConfig::default()
+        };
+        assert!(config.validate_propagation().is_ok());
+    }
+
+    #[test]
+    fn propagation_b3_is_rejected_with_a_message_naming_supported_values() {
+        let config = TelemetryConfig {
+            propagation: Some("b3".to_string()),
+            ..TelemetryConfig::default()
+        };
+        let error = config
+            .validate_propagation()
+            .expect_err("b3 propagation is not wired");
+        let message = error.to_string();
+        assert!(message.contains("b3"), "{message}");
+        assert!(message.contains("w3c"), "{message}");
+    }
+
+    #[test]
+    fn http_transport_defaults_to_4318_with_traces_path() {
+        let config = TelemetryConfig {
+            transport: OtlpTransport::Http,
+            endpoint: None,
+            ..TelemetryConfig::default()
+        };
+        assert_eq!(otlp_endpoint(&config), "http://localhost:4318/v1/traces");
+    }
+
+    #[test]
+    fn grpc_transport_defaults_to_4327_with_no_path() {
+        let config = TelemetryConfig {
+            transport: OtlpTransport::Grpc,
+            endpoint: None,
+            ..TelemetryConfig::default()
+        };
+        assert_eq!(otlp_endpoint(&config), DEFAULT_OTLP_ENDPOINT);
+    }
+
+    #[test]
+    fn explicit_http_endpoint_is_used_verbatim_with_no_suffix_appended() {
+        let config = TelemetryConfig {
+            transport: OtlpTransport::Http,
+            endpoint: Some("http://collector.internal:4318".to_string()),
+            ..TelemetryConfig::default()
+        };
+        assert_eq!(otlp_endpoint(&config), "http://collector.internal:4318");
+    }
+
+    #[test]
+    fn default_transport_agrees_with_the_documented_grpc_default() {
+        // TelemetryConfig::default(), the YAML-omitted-field serde
+        // default (default_transport()), and OtlpTransport's own
+        // #[default] must all agree: gRPC on the Day-1 reference
+        // endpoint (examples/observability-stack/, docs/observability.md).
+        // HTTP is the documented opt-in for environments that block gRPC.
+        assert_eq!(TelemetryConfig::default().transport, OtlpTransport::Grpc);
+        assert_eq!(OtlpTransport::default(), OtlpTransport::Grpc);
     }
 
     #[test]
@@ -1422,7 +1825,6 @@ mod tests {
         assert_eq!(Pillar::Ledger.as_str(), "ledger");
         assert_eq!(Pillar::Rail.as_str(), "rail");
         assert_eq!(Pillar::Audit.as_str(), "audit");
-        assert_eq!(Pillar::Notify.as_str(), "notify");
     }
 
     #[test]
@@ -1441,8 +1843,28 @@ mod tests {
 
     #[test]
     fn propagator_round_trip_preserves_traceparent() {
-        // Round-trip a known traceparent: extract from inbound headers,
-        // inject into outbound headers, assert trace_id is preserved.
+        // Round-trip a known traceparent: extract from inbound headers
+        // (pure parse, no side effects), parent a fresh span on it
+        // explicitly (the request-scoped replacement for the old
+        // ambient-attach mechanism), inject into outbound headers, and
+        // assert trace_id is preserved.
+        //
+        // parent_span_on_remote_trace_context calls
+        // tracing_opentelemetry::OpenTelemetrySpanExt::set_parent, and
+        // inject_into_headers calls ...::context -- both look up
+        // per-span OTel extension data that only exists when a real
+        // tracing_opentelemetry layer is part of the active subscriber.
+        // In production that's always true by the time any span is
+        // created (main() installs it before serving the first
+        // request); a bare #[test] fn has no subscriber installed at
+        // all by default, so both calls would silently no-op without
+        // one. Install a minimal in-process layer (no exporter, so no
+        // network/runtime dependency) scoped to this test, matching
+        // the shape production always runs under rather than
+        // resurrecting the ambient-attach mechanism this test used to
+        // rely on.
+        use tracing_subscriber::layer::SubscriberExt;
+
         init_propagator();
         let mut inbound = http::HeaderMap::new();
         let known_tp = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
@@ -1451,28 +1873,105 @@ mod tests {
             http::header::HeaderValue::from_static(known_tp),
         );
 
-        // Run inside a tracing span so inject_into_headers has an
-        // active context to work with.
-        let span = tracing::info_span!("test");
-        let _g = span.enter();
         let parsed = extract_from_headers(&inbound);
         let parsed = parsed.expect("traceparent must parse");
         assert_eq!(parsed.trace_id, "0af7651916cd43dd8448eb211c80319c");
         assert!(parsed.is_sampled());
 
+        let provider = sdktrace::TracerProvider::builder().build();
+        let tracer = opentelemetry::trace::TracerProvider::tracer(&provider, "test");
+        let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+        let subscriber = tracing_subscriber::registry().with(otel_layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            // Force a fresh interest re-evaluation against the
+            // just-installed subscriber. Without this, a span/event
+            // callsite whose Interest was already cached (e.g. by an
+            // earlier test's tracing::info_span!("test") at a
+            // different source line firing under no subscriber at
+            // all) can stay cached as Never and never reach this
+            // subscriber, regardless of it being installed correctly.
+            tracing::callsite::rebuild_interest_cache();
+
+            // Run inside a tracing span so inject_into_headers has an
+            // active context to work with.
+            let span = tracing::info_span!("test");
+            parent_span_on_remote_trace_context(&span, Some(&parsed), true);
+            let _g = span.enter();
+
+            let mut outbound = http::HeaderMap::new();
+            inject_into_headers(&mut outbound);
+            // The propagator may inject a fresh span_id but trace_id MUST
+            // round-trip. The injected traceparent header is present.
+            let injected = outbound
+                .get("traceparent")
+                .and_then(|v| v.to_str().ok())
+                .expect("outbound traceparent missing");
+            assert!(
+                injected.contains("0af7651916cd43dd8448eb211c80319c"),
+                "trace_id not preserved: {}",
+                injected
+            );
+        });
+    }
+
+    #[test]
+    fn parent_span_on_remote_trace_context_ignores_a_locally_synthesized_root() {
+        // TraceContext::new_random() (is_remote: false) must never seed
+        // a span's parent -- there is no real caller to be a child of.
+        init_propagator();
+        let local_root = crate::trace_ctx::w3c::TraceContext::new_random();
+        let span = tracing::info_span!("local_root_test");
+        parent_span_on_remote_trace_context(&span, Some(&local_root), false);
+        let _g = span.enter();
+
         let mut outbound = http::HeaderMap::new();
         inject_into_headers(&mut outbound);
-        // The propagator may inject a fresh span_id but trace_id MUST
-        // round-trip. The injected traceparent header is present.
-        let injected = outbound
-            .get("traceparent")
-            .and_then(|v| v.to_str().ok())
-            .expect("outbound traceparent missing");
-        assert!(
-            injected.contains("0af7651916cd43dd8448eb211c80319c"),
-            "trace_id not preserved: {}",
-            injected
-        );
+        if let Some(injected) = outbound.get("traceparent").and_then(|v| v.to_str().ok()) {
+            assert!(
+                !injected.contains(&local_root.trace_id),
+                "a locally synthesized root must not be injected as if it were a real \
+                 parent: {injected}"
+            );
+        }
+    }
+
+    #[test]
+    fn parent_span_on_remote_trace_context_noops_without_a_trace_ctx() {
+        init_propagator();
+        let span = tracing::info_span!("no_ctx_test");
+        parent_span_on_remote_trace_context(&span, None, true);
+        // No panic, no parent set; nothing further to assert beyond
+        // "this returns cleanly" since there is nothing to parent on.
+        let _g = span.enter();
+    }
+
+    #[test]
+    fn parent_span_on_remote_trace_context_does_not_leak_to_other_spans() {
+        // The property the old attach+forget mechanism violated: seeding
+        // one span's parent must never be observable from a different
+        // span, not even one created immediately afterward on the same
+        // thread (simulating the next request on a reused worker thread
+        // with no traceparent of its own).
+        init_propagator();
+        let known = crate::trace_ctx::w3c::TraceContext::parse(
+            "00-11112222333344445555666677778888-1111222233334444-01",
+        )
+        .expect("fixture traceparent parses");
+
+        let seeded = tracing::info_span!("seeded");
+        parent_span_on_remote_trace_context(&seeded, Some(&known), true);
+
+        let unrelated = tracing::info_span!("unrelated");
+        let _g = unrelated.enter();
+        let mut outbound = http::HeaderMap::new();
+        inject_into_headers(&mut outbound);
+        if let Some(injected) = outbound.get("traceparent").and_then(|v| v.to_str().ok()) {
+            assert!(
+                !injected.contains("11112222333344445555666677778888"),
+                "an unrelated span must not inherit a different span's remote parent: {injected}"
+            );
+        }
     }
 
     /// WOR-1869: header pairs become gRPC metadata; names or values
@@ -1533,6 +2032,145 @@ mod tests {
                 .get(opentelemetry::Key::from_static_str("service.name"))
                 .map(|v| v.to_string()),
             Some("sbproxy-test".to_string())
+        );
+    }
+
+    /// Regression: sbproxy-observe used to pin its own Cargo.toml
+    /// version independently of the workspace, so every OTLP resource
+    /// stamped `service.version = "0.1.0"` no matter what release was
+    /// actually running, silently defeating version-based correlation
+    /// across a rolling upgrade. sbproxy-observe now inherits
+    /// `version.workspace = true`, so its own CARGO_PKG_VERSION is the
+    /// same string `sbproxy --version` prints; this assertion breaks
+    /// again if that inheritance is ever reverted.
+    #[test]
+    fn otlp_resource_service_version_matches_the_workspace_version() {
+        let resource = otlp_resource(&TelemetryConfig::default());
+        assert_eq!(
+            resource
+                .get(opentelemetry::Key::from_static_str("service.version"))
+                .map(|v| v.to_string()),
+            Some(env!("CARGO_PKG_VERSION").to_string())
+        );
+    }
+
+    // --- WOR-2139: carrier-agnostic propagation pairs ---
+
+    /// Run `body` with a real `tracing-opentelemetry` layer installed
+    /// and one entered span, which is the only shape in which the
+    /// per-span OTel context exists at all. `remote_parent` seeds that
+    /// span's parent so the propagated trace id is a known value
+    /// instead of a fresh random root. Mirrors the setup in
+    /// `propagator_round_trip_preserves_traceparent`, including the
+    /// interest-cache rebuild that keeps a callsite cached as `Never`
+    /// by an earlier subscriber-less test from silently skipping this
+    /// subscriber.
+    fn with_active_span<T>(
+        remote_parent: Option<&crate::trace_ctx::w3c::TraceContext>,
+        body: impl FnOnce() -> T,
+    ) -> T {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        init_propagator();
+        let provider = sdktrace::TracerProvider::builder().build();
+        let tracer = opentelemetry::trace::TracerProvider::tracer(&provider, "test");
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            let span = tracing::info_span!("wor2139_propagation");
+            parent_span_on_remote_trace_context(&span, remote_parent, remote_parent.is_some());
+            let _guard = span.enter();
+            body()
+        })
+    }
+
+    /// The refactor's whole point: the header path is now a thin
+    /// rendering of the pairs, so the two can never disagree about
+    /// which context, which keys, or which values get propagated.
+    #[test]
+    fn propagation_pairs_match_the_header_injection_path() {
+        with_active_span(None, || {
+            let pairs = propagation_pairs();
+            assert!(
+                !pairs.is_empty(),
+                "an active span must propagate at least traceparent"
+            );
+
+            let mut headers = http::HeaderMap::new();
+            inject_into_headers(&mut headers);
+
+            assert_eq!(
+                headers.len(),
+                pairs.len(),
+                "header path emitted a different number of keys than the pairs: \
+                 {headers:?} vs {pairs:?}"
+            );
+            for (key, value) in &pairs {
+                assert_eq!(
+                    headers.get(key.as_str()).and_then(|v| v.to_str().ok()),
+                    Some(value.as_str()),
+                    "header {key} disagrees with the pair the JSON carrier would use"
+                );
+            }
+        });
+    }
+
+    /// The value a non-header carrier writes has to be a real W3C
+    /// traceparent, and it has to name the trace that is actually
+    /// active rather than a fresh root, or the correlation it exists
+    /// for does not happen.
+    #[test]
+    fn propagation_pairs_carry_a_wellformed_traceparent_for_the_active_trace() {
+        let known = crate::trace_ctx::w3c::TraceContext::parse(
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+        )
+        .expect("fixture traceparent parses");
+
+        with_active_span(Some(&known), || {
+            let pairs = propagation_pairs();
+            let traceparent = pairs
+                .iter()
+                .find(|(key, _)| key == "traceparent")
+                .map(|(_, value)| value.as_str())
+                .expect("an active span must propagate traceparent");
+
+            // W3C shape: version "-" 32-hex trace-id "-" 16-hex
+            // parent-id "-" 2-hex flags.
+            let fields: Vec<&str> = traceparent.split('-').collect();
+            assert_eq!(
+                fields.len(),
+                4,
+                "traceparent must have four fields: {traceparent}"
+            );
+            assert_eq!(fields[0], "00", "unexpected version: {traceparent}");
+            assert_eq!(fields[1].len(), 32, "trace id width: {traceparent}");
+            assert_eq!(fields[2].len(), 16, "span id width: {traceparent}");
+            assert_eq!(fields[3].len(), 2, "flags width: {traceparent}");
+            assert!(
+                traceparent
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() || b == b'-'),
+                "traceparent must be hex and dashes only: {traceparent}"
+            );
+            assert_eq!(
+                fields[1], "0af7651916cd43dd8448eb211c80319c",
+                "traceparent must name the active trace, not a fresh root: {traceparent}"
+            );
+        });
+    }
+
+    /// No trace, no carrier. A caller reading these pairs decides
+    /// whether to attach anything at all from the emptiness, so an
+    /// empty-but-present pair would turn "this request was not traced"
+    /// into "this request carries a broken trace".
+    #[test]
+    fn propagation_pairs_are_empty_with_no_active_trace_context() {
+        init_propagator();
+        assert!(
+            propagation_pairs().is_empty(),
+            "with no active context there is nothing to propagate"
         );
     }
 }

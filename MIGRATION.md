@@ -1,10 +1,13 @@
 # Migrating from v0.1.x (Go) to v1.0 (Rust)
 
-*Last modified: 2026-04-28*
+*Last modified: 2026-07-28*
 
 SBproxy v1.0 replaces the Go implementation with a Rust rewrite built on Cloudflare's Pingora. This document covers what changes for operators upgrading from a v0.1.x Go binary to a v1.0 Rust binary.
 
-The v0.1.x Go binary continues to be available at `github.com/soapbucket/sbproxy-go` (archived, read-only) at the `v0.1.2` release tag. New development happens only on v1.0 and later.
+The v0.1.x Go binary remains available in the archived, read-only
+[`soapbucket/sbproxy-go`](https://github.com/soapbucket/sbproxy-go)
+repository at the `v0.1.2` release tag. New development happens only on v1.0
+and later.
 
 ## TL;DR
 
@@ -53,13 +56,13 @@ These are additive and do not require config changes:
 
 1. **Read `CHANGELOG.md`** for the full list of changes between your starting v0.1.x version and v1.0.0.
 2. **Stage v1.0 alongside v0.1.x** in a non-production environment. Point a copy of your `sb.yml` at the v1.0 binary and run `sbproxy validate sb.yml`. Address any validation errors.
-3. **Run a smoke test** against a small percentage of real traffic. Observe `/api/metrics` and `/api/health/targets` for any regressions in 4xx/5xx rates or upstream latency.
+3. **Run a smoke test** against a small percentage of real traffic. Observe `/metrics` on the data-plane listener and `/api/health/targets` on the admin listener for regressions in 4xx/5xx rates or upstream latency.
 4. **Verify signed binary** before promoting to production. v1.0 ships with cosign signatures and an SBOM; see `SUPPLY-CHAIN.md` for the verification commands.
 5. **Promote to production** once smoke is clean.
-6. **Keep v0.1.x available for rollback** for at least one full deployment cycle. The v0.1.x binary at the `v0.1.2` tag of `github.com/soapbucket/sbproxy-go` is the recommended rollback target.
+6. **Keep v0.1.x available for rollback** for at least one full deployment cycle. The v0.1.x binary at the `v0.1.2` tag of the archived [`soapbucket/sbproxy-go`](https://github.com/soapbucket/sbproxy-go) repository is the recommended rollback target.
 
 ## Help
 
 - File migration questions as an issue tagged `migration` on `github.com/soapbucket/sbproxy`.
 - Security-sensitive issues go through `SECURITY.md`.
-- For paid migration support (e.g., enterprise customers with non-trivial v0.1.x customizations), contact support@soapbucket.dev.
+- For migration support with non-trivial v0.1.x customizations, contact support@soapbucket.dev.

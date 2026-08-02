@@ -1,0 +1,60 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Config authority: the node that validates, signs, and serves
+# configuration to a fleet of subscribers.
+#
+# The publishing half of config distribution. The subscriber half is in
+# `subscriber.yml` beside this file; the payload an operator publishes is
+# in `bundle.yml`.
+proxy:
+  http_bind_port: 8080
+
+  # Publication, status, and subscriber management are admin routes, so a
+  # publishing node needs the admin server on. The password may not be the
+  # shipped default on a publishing node, whatever `bind` says: this admin
+  # API signs configuration for every subscriber, so the blast radius is
+  # the fleet rather than the box.
+  admin:
+    enabled: true
+    bind: 127.0.0.1
+    port: 9090
+    username: admin
+    password: ${ADMIN_PASSWORD}
+
+  config_authority:
+    publish:
+      # Stamped into every bundle. Subscribers read it as `authority_id`.
+      authority_id: control-plane-lab
+      # Selects which entry of a subscriber's `verifying_keys_file`
+      # verifies the signature. Rotate by publishing under a new ID while
+      # subscribers still trust the old one.
+      key_id: authority-2026-07
+      # One standard-base64 32-byte Ed25519 seed, owner-only:
+      #   head -c 32 /dev/urandom | base64 > authority-signing.key
+      #   chmod 600 authority-signing.key
+      signing_key_file: ${SB_CONFIG_AUTHORITY_SIGNING_KEY}
+      # The durable revision counter, the current and previous signed
+      # bundles, and the subscriber registry.
+      store_dir: /var/lib/sbproxy/config-authority
+      # The bundle listener's own address, separate from the admin port.
+      # Loopback here so the example runs without certificates; a real
+      # deployment binds an interface subscribers can reach and must then
+      # set the `tls:` block below, because a non-loopback bind with no
+      # TLS refuses to start rather than serving plaintext.
+      bind: 127.0.0.1:9443
+      # tls:
+      #   cert_file: /etc/sbproxy/authority.pem
+      #   key_file: /etc/sbproxy/authority-key.pem
+      #
+      # Neither limit can be turned off. The per-subscriber cap stops one
+      # misconfigured node from polling in a loop; the fleet-wide cap is
+      # what keeps a restart storm from taking the authority down.
+      rate_limit_per_subscriber_per_minute: 30
+      rate_limit_total_per_minute: 1200
+
+# An authority is an ordinary proxy as well. Nothing about publishing
+# changes how it serves its own traffic.
+origins:
+  "authority.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev

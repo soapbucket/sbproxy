@@ -10,14 +10,15 @@
 //!
 //! Each flag carries a `default` plus an ordered list of rules:
 //!
-//! - `allow_list`: keys in this set always evaluate `true`.
 //! - `block_list`: keys in this set always evaluate `false`.
-//! - `rollout_percent`: sticky bucketing on `hash(flag_name + key) % 100`.
+//! - `allow_list`: keys in this set always evaluate `true`.
+//! - `rollout_percent`: sticky FNV-1a bucketing on
+//!   `hash(flag_name + key) % 100`.
 //! - `segments`: `true` when the request's segment label matches one
 //!   of the configured values.
 //!
-//! Rules apply in the listed order; the first match wins. When no rule
-//! matches, the flag falls back to `default`.
+//! Rules apply in the listed order (block, allow, segment, rollout); the
+//! first match wins. When no rule matches, the flag falls back to `default`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -57,9 +58,9 @@ pub struct FlagConfig {
     pub rules: FlagRule,
 }
 
-/// Run-time flag store. Reads are lock-free; writes take an exclusive
-/// lock on the underlying map. The intent is config-driven seeding plus
-/// occasional updates from a control plane.
+/// Run-time flag store. Reads take a shared lock and writes take an
+/// exclusive lock on the underlying map. Config reloads normally replace
+/// the process-wide `Arc<FlagStore>` instead of mutating this map in place.
 #[derive(Debug, Default)]
 pub struct FlagStore {
     inner: RwLock<HashMap<String, FlagConfig>>,
@@ -168,6 +169,23 @@ pub fn set_global_store(store: Arc<FlagStore>) -> Arc<FlagStore> {
     let prev = guard.clone();
     *guard = store;
     prev
+}
+
+/// Run `publish` and then replace the global store while CEL readers are
+/// excluded from the transition.
+///
+/// Embedders that publish another snapshot containing the flag configuration
+/// use this to keep the two pointer swaps adjacent: a reader that observes the
+/// newly published snapshot and calls [`global_store`] blocks until the
+/// matching flag store is installed.
+pub fn replace_global_store_after<T>(
+    store: Arc<FlagStore>,
+    publish: impl FnOnce() -> T,
+) -> (Arc<FlagStore>, T) {
+    let mut guard = GLOBAL_HANDLE.write();
+    let result = publish();
+    let previous = std::mem::replace(&mut *guard, store);
+    (previous, result)
 }
 
 /// Snapshot of the live global store handle.
@@ -348,5 +366,44 @@ mod tests {
         assert!(store.enabled("f", "alice", None));
         store.remove("f");
         assert!(!store.enabled("f", "alice", None));
+    }
+
+    #[test]
+    fn replacing_the_global_store_never_exposes_a_partial_flag_set() {
+        let previous = global_store();
+        let first = Arc::new(FlagStore::from_configs(vec![
+            flag("first-a", true, FlagRule::default()),
+            flag("first-b", true, FlagRule::default()),
+        ]));
+        let second = Arc::new(FlagStore::from_configs(vec![
+            flag("second-a", true, FlagRule::default()),
+            flag("second-b", true, FlagRule::default()),
+        ]));
+        set_global_store(first.clone());
+
+        let writer = std::thread::spawn(move || {
+            for index in 0..2_000 {
+                let next = if index % 2 == 0 {
+                    second.clone()
+                } else {
+                    first.clone()
+                };
+                set_global_store(next);
+            }
+        });
+
+        for _ in 0..10_000 {
+            let names: Vec<String> = global_store()
+                .snapshot()
+                .into_iter()
+                .map(|flag| flag.name)
+                .collect();
+            assert!(
+                names == ["first-a", "first-b"] || names == ["second-a", "second-b"],
+                "reader observed a torn flag set: {names:?}"
+            );
+        }
+        writer.join().expect("writer should finish");
+        set_global_store(previous);
     }
 }

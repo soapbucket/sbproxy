@@ -71,6 +71,7 @@ pub enum ClusterSecurityMode {
 
 /// Canonical peer-security configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ClusterSecurityConfig {
     /// Selected peer-security mode.
     pub mode: ClusterSecurityMode,
@@ -92,10 +93,19 @@ pub struct ClusterSecurityConfig {
     /// Cluster SAN bound into every enrolled peer identity.
     #[serde(default = "default_tls_server_name")]
     pub server_name: String,
+    /// How `shared_key` becomes the AES-256-GCM wire key.
+    ///
+    /// Defaults to `sha256`, which is what every existing cluster runs,
+    /// so an upgrade never changes the key a node seals under. Nodes open
+    /// under both derivations, so a cluster can be flipped one node at a
+    /// time. See `docs/mesh-replication.md`.
+    #[serde(default)]
+    pub key_derivation: crate::types::MeshKeyDerivation,
 }
 
 /// Optional one-time enrollment authority configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ClusterEnrollmentConfig {
     /// Durable authority directory created by `sbproxy cluster init`.
     pub authority_dir: String,
@@ -106,6 +116,7 @@ pub struct ClusterEnrollmentConfig {
 
 /// Signed deployment-authority configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ClusterDeploymentAuthorityConfig {
     /// Ed25519 private signing-key file, valid only on an authority node.
     #[serde(default)]
@@ -116,6 +127,7 @@ pub struct ClusterDeploymentAuthorityConfig {
 
 /// Stable `proxy.cluster` configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ClusterConfig {
     /// Logical cluster identity. Every member must use the same value.
     pub cluster_id: String,
@@ -171,6 +183,91 @@ pub struct ClusterConfig {
     /// Optional signed model deployment authority.
     #[serde(default)]
     pub deployment_authority: Option<ClusterDeploymentAuthorityConfig>,
+    /// Optional replicated durable state substrate (WOR-1947). Absent
+    /// keeps the single-owner in-memory typed-state cache semantics.
+    #[serde(default)]
+    pub replication: Option<ClusterReplicationConfig>,
+}
+
+/// Consistency level for replicated state reads and writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ClusterConsistencyLevel {
+    /// One replica acknowledgement (the coordinator's own shard counts).
+    One,
+    /// A majority of the key's replica set.
+    Quorum,
+    /// Every replica in the key's replica set.
+    All,
+}
+
+/// Replicated durable state substrate configuration (WOR-1947).
+///
+/// Enabling this block requires `state_dir`: the replica shard persists
+/// to `<state_dir>/replicated-state.redb` so a restarted node serves its
+/// committed records from disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterReplicationConfig {
+    /// Copies kept per record. Clamped to cluster size at placement time.
+    #[serde(default = "default_replication_factor")]
+    pub factor: usize,
+    /// Acknowledgements required before a write reports success.
+    #[serde(default = "default_write_consistency")]
+    pub write_consistency: ClusterConsistencyLevel,
+    /// Replicas consulted before a read reports its winner.
+    #[serde(default = "default_read_consistency")]
+    pub read_consistency: ClusterConsistencyLevel,
+    /// Cadence of the maintenance loop (anti-entropy, handoff, GC).
+    #[serde(default = "default_anti_entropy_interval_secs")]
+    pub anti_entropy_interval_secs: u64,
+    /// Age a tombstone must reach, with every replica confirming, before
+    /// it is physically collected. Also bounds how long a node may be
+    /// offline before its stored records are quarantined on rejoin.
+    #[serde(default = "default_tombstone_gc_grace_secs")]
+    pub tombstone_gc_grace_secs: u64,
+    /// Maximum records (live plus tombstones) per node shard.
+    #[serde(default = "default_replication_max_entries")]
+    pub max_entries: usize,
+    /// Maximum decoded record value size in bytes.
+    #[serde(default = "default_replication_max_value_bytes")]
+    pub max_value_bytes: usize,
+}
+
+impl Default for ClusterReplicationConfig {
+    fn default() -> Self {
+        Self {
+            factor: default_replication_factor(),
+            write_consistency: default_write_consistency(),
+            read_consistency: default_read_consistency(),
+            anti_entropy_interval_secs: default_anti_entropy_interval_secs(),
+            tombstone_gc_grace_secs: default_tombstone_gc_grace_secs(),
+            max_entries: default_replication_max_entries(),
+            max_value_bytes: default_replication_max_value_bytes(),
+        }
+    }
+}
+
+const fn default_replication_factor() -> usize {
+    2
+}
+const fn default_write_consistency() -> ClusterConsistencyLevel {
+    ClusterConsistencyLevel::Quorum
+}
+const fn default_read_consistency() -> ClusterConsistencyLevel {
+    ClusterConsistencyLevel::Quorum
+}
+const fn default_anti_entropy_interval_secs() -> u64 {
+    30
+}
+const fn default_tombstone_gc_grace_secs() -> u64 {
+    86_400
+}
+const fn default_replication_max_entries() -> usize {
+    65_536
+}
+const fn default_replication_max_value_bytes() -> usize {
+    1024 * 1024
 }
 
 /// Canonical cluster configuration validation failure.
@@ -279,6 +376,41 @@ impl ClusterConfig {
             return Err(ClusterConfigError::invalid(
                 "dead_peer_gc_secs must be between 1 and 86400 seconds",
             ));
+        }
+        if let Some(replication) = &self.replication {
+            if replication.factor == 0 || replication.factor > 8 {
+                return Err(ClusterConfigError::invalid(
+                    "replication.factor must be between 1 and 8",
+                ));
+            }
+            if replication.anti_entropy_interval_secs < 5
+                || replication.anti_entropy_interval_secs > 3_600
+            {
+                return Err(ClusterConfigError::invalid(
+                    "replication.anti_entropy_interval_secs must be between 5 and 3600",
+                ));
+            }
+            // The grace period must dominate the maintenance cadence by a
+            // wide margin: the no-resurrection argument relies on anti-
+            // entropy having repaired every reachable replica well before
+            // a tombstone becomes collectable.
+            if replication.tombstone_gc_grace_secs
+                < replication.anti_entropy_interval_secs.saturating_mul(10)
+            {
+                return Err(ClusterConfigError::invalid(
+                    "replication.tombstone_gc_grace_secs must be at least 10 anti-entropy intervals",
+                ));
+            }
+            if replication.max_entries == 0 || replication.max_entries > 1_048_576 {
+                return Err(ClusterConfigError::invalid(
+                    "replication.max_entries must be between 1 and 1048576",
+                ));
+            }
+            if replication.max_value_bytes == 0 || replication.max_value_bytes > 4 * 1024 * 1024 {
+                return Err(ClusterConfigError::invalid(
+                    "replication.max_value_bytes must be between 1 and 4194304",
+                ));
+            }
         }
         validate_security(&self.security)?;
         if let Some(enrollment) = &self.enrollment {
@@ -594,6 +726,8 @@ pub struct EffectiveClusterConfig {
     pub state_dir: Option<String>,
     /// Peer-security source material.
     pub security: EffectiveClusterSecurity,
+    /// How the shared secret becomes the AES-256-GCM wire key.
+    pub key_derivation: crate::types::MeshKeyDerivation,
     /// Snapshot lifetime.
     pub snapshot_ttl_secs: u64,
     /// Snapshot cadence.
@@ -604,6 +738,8 @@ pub struct EffectiveClusterConfig {
     pub enrollment: Option<ClusterEnrollmentConfig>,
     /// Optional deployment authority.
     pub deployment_authority: Option<ClusterDeploymentAuthorityConfig>,
+    /// Optional replicated durable state substrate.
+    pub replication: Option<ClusterReplicationConfig>,
     /// Actionable compatibility diagnostics.
     pub diagnostics: Vec<ClusterConfigDiagnostic>,
 }
@@ -639,10 +775,114 @@ pub struct ClusterRestartFingerprint {
     pub dead_peer_gc_secs: u64,
     /// Peer-security source material.
     pub security: EffectiveClusterSecurity,
+    /// How the shared secret becomes the AES-256-GCM wire key.
+    pub key_derivation: crate::types::MeshKeyDerivation,
     /// Enrollment authority loaded at startup.
     pub enrollment: Option<ClusterEnrollmentConfig>,
     /// Deployment signing authority loaded at startup.
     pub deployment_authority: Option<ClusterDeploymentAuthorityConfig>,
+    /// Replicated substrate bootstrap-time wiring. The shard, transport
+    /// ops, and maintenance loop are constructed at process start, so a
+    /// live replacement cannot take effect.
+    pub replication: Option<ClusterReplicationConfig>,
+}
+
+impl ClusterRestartFingerprint {
+    /// Name every field that differs between two fingerprints, using the
+    /// config path an operator would edit.
+    ///
+    /// The generic "something in the cluster block changed" message this
+    /// replaces was survivable when a human had just edited the file and
+    /// knew what they touched. It stops being survivable when the
+    /// document arrives from a shared git repository: the first thing a
+    /// GitOps operator hits is a repository whose `proxy.cluster` block
+    /// does not match this node, and "restart to apply" without naming
+    /// the field leaves them diffing the whole block by hand.
+    #[must_use]
+    pub fn changed_fields(&self, other: &Self) -> Vec<&'static str> {
+        let mut changed = Vec::new();
+        let mut check = |differs: bool, name: &'static str| {
+            if differs {
+                changed.push(name);
+            }
+        };
+        check(self.cluster_id != other.cluster_id, "proxy.cluster.id");
+        check(self.node_id != other.node_id, "proxy.cluster.node_id");
+        check(self.roles != other.roles, "proxy.cluster.roles");
+        check(self.labels != other.labels, "proxy.cluster.labels");
+        check(self.seeds != other.seeds, "proxy.cluster.seeds");
+        check(
+            self.gossip_port != other.gossip_port,
+            "proxy.cluster.gossip_port",
+        );
+        check(
+            self.transport_port != other.transport_port,
+            "proxy.cluster.transport_port",
+        );
+        check(
+            self.advertise_addr != other.advertise_addr,
+            "proxy.cluster.advertise_addr",
+        );
+        check(
+            self.transport_advertise_addr != other.transport_advertise_addr,
+            "proxy.cluster.transport_advertise_addr",
+        );
+        check(
+            self.model_bind != other.model_bind,
+            "proxy.cluster.model_bind",
+        );
+        check(
+            self.model_endpoint != other.model_endpoint,
+            "proxy.cluster.model_endpoint",
+        );
+        check(self.state_dir != other.state_dir, "proxy.cluster.state_dir");
+        check(
+            self.dead_peer_gc_secs != other.dead_peer_gc_secs,
+            "proxy.cluster.dead_peer_gc",
+        );
+        check(self.security != other.security, "proxy.cluster.security");
+        check(
+            self.enrollment != other.enrollment,
+            "proxy.cluster.enrollment",
+        );
+        check(
+            self.deployment_authority != other.deployment_authority,
+            "proxy.cluster.deployment_authority",
+        );
+        check(
+            self.replication != other.replication,
+            "proxy.cluster.replication",
+        );
+        changed
+    }
+
+    /// Human-readable description of how `candidate` differs from the
+    /// fingerprint this process installed, for a reload refusal.
+    ///
+    /// Handles the two shapes the generic message hid worst: a candidate
+    /// that removed `proxy.cluster` entirely, and one that added it to a
+    /// process that had none. Both reject the reload, and neither is
+    /// obvious from a message that only says "changed".
+    #[must_use]
+    pub fn describe_change(installed: Option<&Self>, candidate: Option<&Self>) -> String {
+        match (installed, candidate) {
+            (Some(installed), Some(candidate)) => {
+                let fields = installed.changed_fields(candidate);
+                if fields.is_empty() {
+                    "the cluster fingerprint changed".to_string()
+                } else {
+                    format!("changed field(s): {}", fields.join(", "))
+                }
+            }
+            (Some(_), None) => "`proxy.cluster` was removed, and a clustered process cannot \
+                 become unclustered while it is running"
+                .to_string(),
+            (None, Some(_)) => "`proxy.cluster` was added, and an unclustered process cannot \
+                 join a cluster while it is running"
+                .to_string(),
+            (None, None) => "the cluster fingerprint changed".to_string(),
+        }
+    }
 }
 
 impl EffectiveClusterConfig {
@@ -663,8 +903,12 @@ impl EffectiveClusterConfig {
             state_dir: self.state_dir.clone(),
             dead_peer_gc_secs: self.dead_peer_gc_secs,
             security: self.security.clone(),
+            // Changing the derivation changes the wire key, so it cannot
+            // be swapped under a running node without a restart.
+            key_derivation: self.key_derivation,
             enrollment: self.enrollment.clone(),
             deployment_authority: self.deployment_authority.clone(),
+            replication: self.replication.clone(),
         }
     }
 }
@@ -739,11 +983,13 @@ fn lower_canonical(config: &ClusterConfig, source: ClusterConfigSource) -> Effec
         model_endpoint: config.model_endpoint.clone(),
         state_dir: config.state_dir.clone(),
         security: lower_canonical_security(&config.security),
+        key_derivation: config.security.key_derivation,
         snapshot_ttl_secs: config.snapshot_ttl_secs,
         publish_interval_secs: config.publish_interval_secs,
         dead_peer_gc_secs: config.dead_peer_gc_secs,
         enrollment: config.enrollment.clone(),
         deployment_authority: config.deployment_authority.clone(),
+        replication: config.replication.clone(),
         diagnostics: Vec::new(),
     }
 }
@@ -780,11 +1026,15 @@ fn lower_legacy(node_id: Option<&str>, mesh: &MeshClusterConfig) -> EffectiveClu
         model_endpoint: None,
         state_dir: None,
         security: lower_legacy_security(mesh),
+        key_derivation: mesh.key_derivation,
         snapshot_ttl_secs: DEFAULT_SNAPSHOT_TTL_SECS,
         publish_interval_secs: DEFAULT_PUBLISH_INTERVAL_SECS,
         dead_peer_gc_secs: DEFAULT_DEAD_PEER_GC_SECS,
         enrollment: None,
         deployment_authority: None,
+        // The legacy mesh path has no durable state_dir, so it can never
+        // enable the replicated substrate.
+        replication: None,
         diagnostics: vec![legacy_diagnostic()],
     }
 }
@@ -862,4 +1112,170 @@ fn compare<T: PartialEq + std::fmt::Debug>(
         return Err(ClusterConfigError::conflict(field, canonical, legacy));
     }
     Ok(())
+}
+
+/// What a clustered node's keystore configuration means for cross-node keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClusteredKeystoreVerdict {
+    /// The keystore is shared, or there is nothing to share.
+    Fine,
+    /// Records reach peers through a shared cache tier, so a minted key does
+    /// resolve cluster-wide, but only while it stays cached. The system of
+    /// record is still node-local, so the guarantee does not survive cache
+    /// expiry or a restart. Carries the warning text.
+    NotDurable(String),
+    /// Nothing shares records at all. Carries the error text.
+    Broken(String),
+}
+
+/// Classify a clustered deployment's keystore for cross-node key resolution.
+///
+/// The distinction that matters is what shares records, not just what stores
+/// them. With `backend: embedded` the system of record is a redb file on local
+/// disk, but a `cache.tier` of `mesh` or `redis` still propagates records to
+/// peers: the mesh tier routes writes through the consistent-hash ring, so a
+/// key minted on node A is readable on node B for as long as it stays cached.
+/// That configuration is degraded rather than broken, so it warns loudly
+/// instead of refusing to boot, which would break working single-file
+/// two-node topologies.
+///
+/// With no shared tier there is nothing to propagate through, so a minted key
+/// is invisible to peers from the moment it is created. That fails at boot,
+/// because minting keys which silently do not work on the rest of the cluster
+/// is worse than not starting.
+///
+/// Every backend other than `embedded` shares records by construction and is
+/// never `Broken` here: `redis` and `secrets_manager` are external shared
+/// stores, and `mesh` (WOR-2064) stores records on the cluster's own
+/// replicated substrate. The mesh backend's converse requirement, that a
+/// cluster actually exists, is checked separately at config compile.
+///
+/// Gated on `seeds` being non-empty rather than on the cluster block merely
+/// being present. A node with seeds is explicitly joining other nodes; a
+/// seedless node may legitimately be a single-node deployment that happens to
+/// declare a cluster block. A node others join without itself having seeds is
+/// not classified here, but every node that joins it is, so the
+/// misconfiguration still surfaces.
+pub fn classify_clustered_keystore(
+    seeds: &[String],
+    key_management_enabled: bool,
+    backend: crate::types::KeyStoreBackend,
+    cache_tier: crate::types::KeyCacheTier,
+) -> ClusteredKeystoreVerdict {
+    use crate::types::{KeyCacheTier, KeyStoreBackend};
+
+    if seeds.is_empty() || !key_management_enabled || backend != KeyStoreBackend::Embedded {
+        return ClusteredKeystoreVerdict::Fine;
+    }
+
+    match cache_tier {
+        KeyCacheTier::Mesh | KeyCacheTier::Redis => ClusteredKeystoreVerdict::NotDurable(
+            "proxy.cluster declares seeds and proxy.key_management.store.backend is 'embedded', \
+             which is node-local. The configured cache tier does propagate records to peers, so \
+             a key minted on one node resolves on the others while it stays cached, but the \
+             system of record is still per-node: that resolution does not survive cache expiry \
+             or a restart, and a revocation may not deny on peers that never cached the record. \
+             Set the backend to 'redis' or 'secrets_manager' for a durable cluster-wide keystore."
+                .to_string(),
+        ),
+        KeyCacheTier::None => ClusteredKeystoreVerdict::Broken(
+            "proxy.cluster declares seeds, so this node is joining a cluster, but \
+             proxy.key_management.store.backend is 'embedded' with no shared cache tier. The \
+             embedded redb store is node-local and nothing propagates records, so a key minted \
+             on one node cannot be resolved by its peers and a revocation on one node will not \
+             deny on the rest. Set the backend to 'redis' or 'secrets_manager' so the keystore \
+             is shared, set proxy.key_management.cache.tier to 'mesh' or 'redis' to at least \
+             propagate cached records, or remove proxy.cluster.seeds if per-node keys are \
+             intended."
+                .to_string(),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod keystore_sharing_tests {
+    use super::{classify_clustered_keystore as classify, ClusteredKeystoreVerdict as V};
+    use crate::types::{KeyCacheTier, KeyStoreBackend};
+
+    fn seeds() -> Vec<String> {
+        vec!["10.0.0.1:7946".to_string()]
+    }
+
+    #[test]
+    fn embedded_with_no_shared_tier_is_broken() {
+        let V::Broken(msg) = classify(
+            &seeds(),
+            true,
+            KeyStoreBackend::Embedded,
+            KeyCacheTier::None,
+        ) else {
+            panic!("nothing propagates records, so this must be a hard failure");
+        };
+        assert!(msg.contains("embedded"), "names the backend: {msg}");
+        assert!(
+            msg.contains("redis") && msg.contains("secrets_manager"),
+            "names a durable fix: {msg}"
+        );
+        assert!(
+            msg.contains("mesh"),
+            "names the propagate-only fix too: {msg}"
+        );
+    }
+
+    #[test]
+    fn embedded_behind_a_shared_tier_warns_instead_of_refusing() {
+        // The mesh tier routes writes through the ring, so a minted key does
+        // reach peers while cached. Degraded is not broken, and refusing to
+        // boot here would break working two-node topologies.
+        for tier in [KeyCacheTier::Mesh, KeyCacheTier::Redis] {
+            let V::NotDurable(msg) = classify(&seeds(), true, KeyStoreBackend::Embedded, tier)
+            else {
+                panic!("a shared cache tier propagates records, so this warns");
+            };
+            assert!(
+                msg.contains("does not survive cache expiry"),
+                "says what the operator actually loses: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_shared_backend_is_fine_on_any_tier() {
+        // WOR-2064: `mesh` joins the not-Broken set. Its records live on
+        // the cluster's replicated substrate, which is exactly the
+        // sharing this check exists to demand.
+        for backend in [
+            KeyStoreBackend::Redis,
+            KeyStoreBackend::SecretsManager,
+            KeyStoreBackend::Mesh,
+        ] {
+            assert_eq!(
+                classify(&seeds(), true, backend, KeyCacheTier::None),
+                V::Fine
+            );
+        }
+    }
+
+    #[test]
+    fn a_single_node_deployment_keeps_the_embedded_default() {
+        // No seeds means nothing to share with, so the default must keep working.
+        assert_eq!(
+            classify(&[], true, KeyStoreBackend::Embedded, KeyCacheTier::None),
+            V::Fine
+        );
+    }
+
+    #[test]
+    fn key_management_off_is_not_this_checks_business() {
+        // Without a key plane there is nothing to mint, so the backend is moot.
+        assert_eq!(
+            classify(
+                &seeds(),
+                false,
+                KeyStoreBackend::Embedded,
+                KeyCacheTier::None
+            ),
+            V::Fine
+        );
+    }
 }

@@ -223,12 +223,22 @@ pub struct ReadyArtifact {
     pub metadata: ArtifactCacheMetadata,
     /// Durable operation job for this ensure call, including cache hits.
     pub job: OperationJob,
+    /// For an unpinned raw `hf:` reference, the source repo the engine
+    /// self-downloads from at launch (repo mode). `None` for a pinned,
+    /// content-addressed snapshot the engine loads from the local disk.
+    pub repo: Option<String>,
 }
 
 impl ReadyArtifact {
     /// Resolve one declared relative file in this verified snapshot.
     pub fn file(&self, relative_path: &str) -> Option<&Path> {
         self.files.get(relative_path).map(PathBuf::as_path)
+    }
+
+    /// Whether this artifact is an unpinned raw `hf:` reference the engine
+    /// self-downloads (repo mode), rather than a verified local snapshot.
+    pub fn is_repo_mode(&self) -> bool {
+        self.repo.is_some()
     }
 
     pub(crate) fn new(root: &Path, metadata: ArtifactCacheMetadata, job: OperationJob) -> Self {
@@ -244,7 +254,34 @@ impl ReadyArtifact {
             files,
             metadata,
             job,
+            repo: None,
         }
+    }
+
+    /// Build a repo-mode ready artifact for an unpinned `hf:Org/Repo`
+    /// reference. There are no verified bytes: the container engine
+    /// self-downloads the weights from `repo` into `hf_home` (a writable,
+    /// shared Hugging Face cache) at launch. `files` carries only
+    /// prefetched shape aids (`config.json`) so the fit planner can read
+    /// the model shape before the engine starts.
+    pub(crate) fn unpinned(
+        artifact: &ResolvedArtifact,
+        repo: String,
+        hf_home: PathBuf,
+        files: BTreeMap<String, PathBuf>,
+        job: OperationJob,
+        now_ms: u64,
+    ) -> Result<Self, ArtifactError> {
+        let mut metadata = ArtifactCacheMetadata::from_artifact(artifact, now_ms)?;
+        metadata.trust = "unpinned".to_string();
+        Ok(Self {
+            artifact_digest: artifact.artifact_digest.clone(),
+            snapshot_path: hf_home,
+            files,
+            metadata,
+            job,
+            repo: Some(repo),
+        })
     }
 }
 
@@ -501,6 +538,51 @@ impl ArtifactCache {
             sync_directory(&directory)?;
         }
         Ok(reclaimed)
+    }
+
+    /// Count the unreferenced blobs and their bytes without deleting them,
+    /// for a `prune --dry-run` report. Mirrors the reference set that
+    /// [`Self::remove_unreferenced_blobs`] would delete.
+    pub(crate) fn unreferenced_blob_bytes(&self) -> Result<(u64, u64), ArtifactError> {
+        let referenced: BTreeSet<_> = self
+            .metadata_entries()?
+            .into_iter()
+            .flat_map(|metadata| {
+                metadata
+                    .files
+                    .into_iter()
+                    .map(|file| file.sha256)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let directory = self.root.join("blobs/sha256");
+        let mut bytes = 0u64;
+        let mut count = 0u64;
+        for entry in fs::read_dir(&directory)
+            .map_err(|source| io_error("list artifact blobs", &directory, source))?
+        {
+            let entry =
+                entry.map_err(|source| io_error("read artifact blob entry", &directory, source))?;
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if validate_digest(name).is_err() || referenced.contains(name) {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|source| io_error("read artifact blob metadata", &path, source))?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                continue;
+            }
+            bytes = bytes.checked_add(metadata.len()).ok_or_else(|| {
+                ArtifactError::InvalidArtifact(
+                    "unreferenced artifact bytes overflow u64".to_string(),
+                )
+            })?;
+            count += 1;
+        }
+        Ok((bytes, count))
     }
 
     pub(crate) fn inspect(&self, digest: &str) -> Result<ArtifactCacheState, ArtifactError> {

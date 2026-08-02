@@ -38,6 +38,21 @@ pub enum AuthSubjectSource {
     Cookie,
 }
 
+/// Meaning of a denied authentication decision.
+///
+/// The distinction is trust-bearing. A [`Challenge`](Self::Challenge)
+/// asks the client to present credentials and is neutral, while an
+/// [`InvalidProof`](Self::InvalidProof) reports that offered credentials
+/// failed verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthDenialKind {
+    /// The client must present credentials or complete an authentication
+    /// protocol challenge.
+    Challenge,
+    /// The client offered credentials that failed verification.
+    InvalidProof,
+}
+
 /// Auth decision returned by an [`AuthProvider`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthDecision {
@@ -228,6 +243,26 @@ pub trait ActionHandler: Send + Sync + 'static {
 pub trait AuthProvider: Send + Sync + 'static {
     /// Returns the auth type identifier (e.g. "my-custom-auth").
     fn auth_type(&self) -> &'static str;
+
+    /// Classify the meaning of a denied authentication decision.
+    ///
+    /// The dispatcher calls this only for [`AuthDecision::Deny`] and
+    /// [`AuthDecision::DenyWithHeaders`] results below status 500.
+    /// Plain denials default to [`AuthDenialKind::InvalidProof`].
+    /// Header-bearing denials default to [`AuthDenialKind::Challenge`]
+    /// because their documented purpose is to carry protocol-mandated
+    /// challenge headers. Providers that attach headers to an invalid-proof
+    /// response must override this method and return
+    /// [`AuthDenialKind::InvalidProof`] for that decision.
+    ///
+    /// The explicit classification keeps trust decisions independent of
+    /// credential placement in request headers, cookies, or query parameters.
+    fn denial_kind(&self, decision: &AuthDecision) -> AuthDenialKind {
+        match decision {
+            AuthDecision::DenyWithHeaders { .. } => AuthDenialKind::Challenge,
+            AuthDecision::Allow { .. } | AuthDecision::Deny { .. } => AuthDenialKind::InvalidProof,
+        }
+    }
 
     /// Authenticate an incoming request.
     ///

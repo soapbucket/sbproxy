@@ -1,26 +1,28 @@
 # SBproxy
 
-> The AI gateway built like a real proxy. One binary, built on Pingora. Open source under Apache 2.0.
+> SBproxy is a self-hosted AI gateway. It governs your AI traffic in both directions: which apps and agents can call which models, on whose keys, at what spend. Built like a real proxy: one binary on Pingora, open source under Apache 2.0.
 
 Most teams run nginx or Traefik for HTTP traffic, then route AI requests through a separate LiteLLM or Portkey instance. SBproxy handles both in a single binary. One config file covers everything.
 
 ## Key facts
 
-- 200+ LLM models reachable through 66 native providers (OpenAI, Anthropic, Google, Mistral, Cohere, Groq, DeepSeek, Together, Fireworks, Cerebras, and more) behind one OpenAI-compatible API. Bring your own keys; the model name passes straight through, so any model a provider serves works without per-model config.
+- 200+ LLM models reachable through 72 native providers (OpenAI, Anthropic, Google, Mistral, Cohere, Groq, DeepSeek, Together, Fireworks, Cerebras, and more) behind one OpenAI-compatible API. Bring your own keys; the model name passes straight through, so any model a provider serves works without per-model config.
 - Sub-millisecond p99 proxy overhead at 50k+ rps on commodity hardware
 - Hot reload with zero dropped connections
 - 14-phase compiled pipeline per origin (compiled once, zero per-request allocation)
-- Single binary, no required external dependencies. Redis is optional, only needed for distributed rate limiting and shared cache.
+- Single binary, no required external dependencies. Stateful context summaries default to a process-owned Local database; Redis remains optional for exact distributed rate limiting, shared cache, and cross-replica serialized summary state.
 - Built in Rust on Cloudflare's Pingora. Source available on GitHub.
 
 ## Documentation
 
 ### Repo docs
 - README: https://github.com/soapbucket/sbproxy/blob/main/README.md
+- Getting Started: https://github.com/soapbucket/sbproxy/blob/main/docs/getting-started.md
 - Manual: https://github.com/soapbucket/sbproxy/blob/main/docs/manual.md
 - Configuration: https://github.com/soapbucket/sbproxy/blob/main/docs/configuration.md
 - Features: https://github.com/soapbucket/sbproxy/blob/main/docs/features.md
 - AI Gateway: https://github.com/soapbucket/sbproxy/blob/main/docs/ai-gateway.md
+- AI Context Compression: https://github.com/soapbucket/sbproxy/blob/main/docs/ai-context-compression.md
 - AI Crawl Control + Pay Per Crawl: https://github.com/soapbucket/sbproxy/blob/main/docs/ai-crawl-control.md
 - 402 Challenge contract: https://github.com/soapbucket/sbproxy/blob/main/docs/402-challenge.md
 - Content for agents: https://github.com/soapbucket/sbproxy/blob/main/docs/content-for-agents.md
@@ -114,7 +116,7 @@ Origin fields:
 | Type | Description |
 |------|-------------|
 | proxy | Reverse proxy to upstream URL |
-| ai_proxy | AI gateway with 200+ models across 66 native providers (bring your own keys), 15 routing strategies (round_robin, weighted, fallback_chain, random, lowest_latency, least_connections, cost_optimized, token_rate, least_token_usage, prefix_affinity, peak_ewma, sticky, race, cascade, cost_quality), guardrails, budgets |
+| ai_proxy | AI gateway with 200+ models across 72 native providers (bring your own keys), 15 routing strategies (round_robin, weighted, fallback_chain, random, lowest_latency, least_connections, cost_optimized, token_rate, least_token_usage, prefix_affinity, peak_ewma, sticky, race, cascade, cost_quality), guardrails, budgets |
 | static | Static response (JSON or text) |
 | redirect | HTTP redirect (301/302/307/308) |
 | echo | Echo request as JSON (debugging) |

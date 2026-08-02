@@ -1,12 +1,14 @@
 # You bought a GPU. Prove it pays for itself.
 
-*Last modified: 2026-07-10*
+*Last modified: 2026-07-28*
+
+> **Compatibility form:** This walkthrough still uses provider `serve:`. Prefer `proxy.model_host` + `provider_type: managed_model` for new deployments; see [model-host.md](model-host.md) and [`examples/model-host-managed/`](../examples/model-host-managed/).
 
 ![A local Qwen3 answer from the GPU, a training-sensitive prompt pinned to the local lane, then the ledger split across both lanes and the dollars the GPU displaced](assets/use-case-local-first.gif)
 
 The recording above shows provider failover between two hosted providers, the closest recorded behavior to this story's local-to-cloud spill. The local-first recording is still to come.
 
-The card is racked, the driver loads, and most of your prompts would run fine on it. But traffic spikes past what one GPU can serve, a few requests genuinely need a frontier model, and finance keeps asking whether the hardware was worth it. SBproxy's pitch is "Call any model. Serve your own. Govern both.": one Apache-2.0 binary that routes to 66 providers or runs the weights on your own GPUs. This page uses both halves at once, and the ledger that comes with them answers the finance question.
+The card is racked, the driver loads, and most of your prompts would run fine on it. But traffic spikes past what one GPU can serve, a few requests genuinely need a frontier model, and finance keeps asking whether the hardware was worth it. SBproxy's pitch is "Call any model. Serve your own. Govern both.": one Apache-2.0 binary that routes to 72 providers or runs the weights on your own GPUs. This page uses both halves at once, and the ledger that comes with them answers the finance question.
 
 ## What you will build
 
@@ -19,12 +21,13 @@ An OpenAI-compatible endpoint backed by a single provider array. Provider zero i
 - An OpenAI API key (`OPENAI_API_KEY`) for the spill lane.
 - `curl` for sending requests, `jq` for reading responses and the ledger.
 
-One caveat. This page still shows the provider-level `serve:` compatibility form. New deployments should use `proxy.model_host` and `provider_type: managed_model`. Apple Metal runs the live gate before this PR is published; NVIDIA vLLM and CUDA validation remains in the final GCP PR. Run `sbproxy doctor` before trusting a box, and use [model-host.md](model-host.md) for the current contract.
+One caveat. This page still shows the provider-level `serve:` compatibility form. New deployments should use `proxy.model_host` and `provider_type: managed_model`. Apple Silicon Metal passed on 2026-07-11. NVIDIA vLLM, CUDA, and live GCP certification remain pending, with deterministic and local test evidence only. Run `sbproxy doctor` before trusting a box, and use [model-host.md](model-host.md) for the current contract.
 
 ## Install
 
 ```bash
-# Linux / macOS, single static binary:
+# Prebuilt release executable for Linux amd64/arm64 (glibc) or Apple Silicon macOS.
+# No Rust, Python, JVM, or Node toolchain/runtime is required.
 curl -fsSL https://download.sbproxy.dev | sh
 
 # macOS via Homebrew:
@@ -167,8 +170,8 @@ The `0.15` and `0.60` are gpt-4o-mini's list prices per million prompt and compl
 
 ## You are done when
 
-- The plain request returns `200` with `model` reading `qwen3-14b`, confirming the local lane answered.
-- The flagged request also returns `qwen3-14b`, and it never spills: with the local engine down it fails (a 502, or a 400 with `"type": "no_compliant_provider"` when no provider is marked) instead of landing on the unmarked cloud lane.
+- The plain request returns `200` with `model` reading `Qwen3-14B-Q4_K_M.gguf` (the served weights file, trimmed by the `jq` split above), confirming the local lane answered.
+- The flagged request also returns `Qwen3-14B-Q4_K_M.gguf`, and it never spills: with the local engine down it fails (a 502, or a 400 with `"type": "no_compliant_provider"` when no provider is marked) instead of landing on the unmarked cloud lane.
 - `/tmp/sb-local-first-ledger.jsonl` holds entries whose `.event.provider` is `local`, `sbproxy ai ledger verify` prints `ledger verify: OK` and exits 0, and the displaced-cost query prints a number.
 
 ## Next steps

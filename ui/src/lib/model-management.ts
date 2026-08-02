@@ -4,12 +4,15 @@ import type {
   CatalogVariant,
   ClusterDeploymentBundleDraft,
   ClusterDeploymentAuthority,
+  ClusterDeploymentRolloutStatus,
+  ClusterNode,
   DeploymentDocument,
   ModelDeployment,
   DeploymentReplacementRequest,
   DeploymentRuntimeStatus,
   DeploymentRuntimeState,
   ModelHostAuthority,
+  NodeReplicaSnapshot,
   ReconcilePlan,
 } from "../api";
 
@@ -109,6 +112,8 @@ export interface ModelDeploymentRow {
   deploymentId: string;
   desired: ModelDeployment | null;
   runtime: DeploymentRuntimeStatus | null;
+  assignment: ClusterDeploymentRolloutStatus | null;
+  liveReplicas: readonly NodeReplicaSnapshot[];
 }
 
 const AUTHORITY_LABELS: Record<ModelHostAuthority, string> = {
@@ -786,13 +791,31 @@ export function failDeploymentConflictReload(
 export function deploymentRows(
   desiredDeployments: Readonly<Record<string, ModelDeployment>> | null,
   runtimeDeployments: readonly DeploymentRuntimeStatus[],
+  clusterDeployments: readonly ClusterDeploymentRolloutStatus[] = [],
+  clusterNodes: readonly ClusterNode[] = [],
 ): ModelDeploymentRow[] {
   const runtimeById = new Map(
     runtimeDeployments.map((runtime) => [runtime.deployment, runtime]),
   );
+  const assignmentById = new Map(
+    clusterDeployments.map((deployment) => [deployment.deployment_id, deployment]),
+  );
+  const liveReplicasById = new Map<string, NodeReplicaSnapshot[]>();
+  for (const node of clusterNodes) {
+    for (const replica of node.replicas) {
+      const existing = liveReplicasById.get(replica.deployment);
+      if (existing) {
+        existing.push(replica);
+      } else {
+        liveReplicasById.set(replica.deployment, [replica]);
+      }
+    }
+  }
   const ids = new Set<string>([
     ...Object.keys(desiredDeployments ?? {}),
     ...runtimeById.keys(),
+    ...assignmentById.keys(),
+    ...liveReplicasById.keys(),
   ]);
   return [...ids]
     .sort((left, right) => left.localeCompare(right))
@@ -802,5 +825,7 @@ export function deploymentRows(
         ? ownValue(desiredDeployments, deploymentId) ?? null
         : null,
       runtime: runtimeById.get(deploymentId) ?? null,
+      assignment: assignmentById.get(deploymentId) ?? null,
+      liveReplicas: liveReplicasById.get(deploymentId) ?? [],
     }));
 }

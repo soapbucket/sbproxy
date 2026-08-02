@@ -1,19 +1,33 @@
 # Getting started: Sovereign / multi-cloud deployment
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-28*
 
 ## What you will build
 
-You will run SBproxy as a cluster-edge gateway that serves more than one tenant, where each tenant's data and secrets stay in its own cloud. The gateway recovers the real client IP behind a Kubernetes Ingress, re-resolves backend Pod endpoints as they rotate, and resolves each tenant's upstream credentials from a backend named per tenant scope, so the same provider reference can read from a different vault depending on which tenant the request belongs to. Every key in this guide comes from the runnable `examples/k8s-gateway` and `examples/vault-reference` configs.
+You will run SBproxy as a cluster-edge gateway that serves more than one
+tenant. The gateway recovers the real client IP behind a Kubernetes Ingress,
+re-resolves backend Pod endpoints as they rotate, and assigns each origin to a
+declared tenant. Tenant-scoped credential records can override proxy defaults.
+Secret backends themselves are declared once under `proxy.secrets`; use the
+backend's own Vault, IAM, or Kubernetes policy to enforce the cloud boundary.
+Every key in this guide comes from the runnable `examples/k8s-gateway` and
+`examples/vault-reference` configs.
 
 ## Prerequisites
 
 - `curl` for the test requests.
-- Scenario-specific: nothing extra to start. The runnable example uses `${ENV}` references, which the shipping resolver serves straight from the proxy process environment, so you can run the sovereign shape locally without standing up HashiCorp Vault, AWS Secrets Manager, GCP Secret Manager, or a cluster secret store. The provider-specific vault references are shown in `examples/vault-reference` for production wiring.
+- Scenario-specific: nothing extra to start. The runnable example uses
+  `${ENV}` references, which the shipping resolver reads from the proxy
+  process environment. You can run the tenant and cluster-edge shape locally
+  without standing up HashiCorp Vault, AWS Secrets Manager, GCP Secret
+  Manager, or a cluster secret store. `examples/vault-reference` shows the
+  provider-specific reference syntax and the proxy-scoped backend wiring used
+  in production.
 
 ## Install
 
-One line installs the prebuilt binary on macOS or Linux (the script detects OS and architecture and drops the binary in `~/.local/bin`):
+One line installs the prebuilt binary on Linux amd64/arm64 or Apple Silicon
+macOS and places it in `~/.local/bin`:
 
 ```bash
 curl -fsSL https://download.sbproxy.dev | sh
@@ -29,7 +43,10 @@ sbproxy serve -f sb.yml
 
 ## Minimal config
 
-Save this as `sb.yml`. It is the `examples/k8s-gateway` dataplane shape (trusted-proxy XFF recovery, service discovery, host override, correlation id, per-IP concurrency) with the `examples/vault-reference` multi-tenant model layered on: a declared tenant whose origin can read its upstream key from a tenant-scoped provider reference. `test.sbproxy.dev` stands in for the cluster Service so the config runs locally.
+Save this as `sb.yml`. It combines the `examples/k8s-gateway` data-plane shape
+with the tenant declaration used by `examples/vault-reference`. The origin is
+assigned to `acme-corp`; its bearer token comes from the process environment
+for this local run. `test.sbproxy.dev` stands in for the cluster Service.
 
 ```yaml
 # yaml-language-server: $schema=https://raw.githubusercontent.com/soapbucket/sbproxy/main/schemas/sb-config.schema.json
@@ -53,14 +70,14 @@ proxy:
 
   # Declared tenants. Each id is referenced by origin.tenant_id.
   # An origin that names an undeclared tenant fails config compile.
-  # Per-tenant vault backends land with the credentials block; the
-  # tenant scope itself resolves today.
+  # A tenant can carry credentials and observability overrides.
+  # Secret backends are declared at proxy scope under proxy.secrets.
   tenants:
     - id: acme-corp
 
 origins:
-  # Public-facing tenant hostname. Pin it to the acme-corp tenant so
-  # its credentials resolve in acme-corp's scope.
+  # Public-facing tenant hostname. Pin it to acme-corp so tenant
+  # credentials and observability settings resolve in that scope.
   "api.acme.example.com":
     tenant_id: acme-corp
     action:
@@ -83,9 +100,10 @@ origins:
         backoff_ms: 100
 
     # Inbound auth. The runnable token resolves from the proxy process
-    # environment. Production configs can use tenant-scoped provider
-    # references such as vault://primary, awssm://primary,
-    # gcpsm://primary, or k8ssecret://primary.
+    # environment. Production configs can use provider references such
+    # as vault://primary, awssm://primary, gcpsm://primary,
+    # azurekv://primary, or k8ssecret://primary. The named backend is
+    # configured under proxy.secrets and protected by its native ACL.
     authentication:
       type: bearer
       tokens:
@@ -96,7 +114,7 @@ origins:
       # preserves headroom for other clients.
       - type: concurrent_limit
         max: 100
-        key: ip
+        key_by: ip
         status: 503
         error_body: '{"error":"too many concurrent requests"}'
 ```
@@ -164,6 +182,7 @@ curl -i -H 'Host: api.acme.example.com' http://127.0.0.1:8080/headers
 ## Next steps
 
 - [docs/multi-tenant.md](multi-tenant.md) - declared tenants, scope resolution, and per-tenant policy.
-- [docs/secrets.md](secrets.md) - provider-specific secret references and wiring each tenant to its own cloud vault.
+- [docs/secrets.md](secrets.md) - proxy-scoped secret backends,
+  provider-specific references, and backend access controls.
 - [docs/kubernetes.md](kubernetes.md) - generating this dataplane from a `Gateway` plus `HTTPRoute` pair.
 - [docs/operator-runbook.md](operator-runbook.md) - running, reloading, and observing the gateway in production.

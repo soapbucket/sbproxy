@@ -246,14 +246,21 @@ fn hop_table() -> &'static Mutex<HopTable> {
 
 // --- Redaction ---
 
+/// Upper bound on one redacted string leaf in a ledger payload
+/// (WOR-2095). Tool results can embed entire fetched documents; an
+/// unbounded ledger line turns the audit trail into a disk-filling
+/// mirror of the traffic it observes.
+const LEDGER_STRING_LEAF_MAX_BYTES: usize = 8 * 1024;
+
 /// Recursively redact secrets from a JSON value, preserving structure so
 /// behavioral eval can still assert on individual argument fields. Only
-/// string leaves are rewritten (via [`redact_secrets`]); object keys,
-/// numbers, and booleans pass through unchanged.
+/// string leaves are rewritten (via [`redact_secrets`], then capped at
+/// the crate-internal 8 KiB leaf bound); object keys, numbers, and
+/// booleans pass through unchanged.
 pub fn redact_json(value: &serde_json::Value) -> serde_json::Value {
     use serde_json::Value;
     match value {
-        Value::String(s) => Value::String(redact_secrets(s)),
+        Value::String(s) => Value::String(bound_leaf(redact_secrets(s))),
         Value::Array(items) => Value::Array(items.iter().map(redact_json).collect()),
         Value::Object(map) => Value::Object(
             map.iter()
@@ -262,6 +269,18 @@ pub fn redact_json(value: &serde_json::Value) -> serde_json::Value {
         ),
         other => other.clone(),
     }
+}
+
+/// Cap one redacted string leaf on a UTF-8 boundary (WOR-2095).
+fn bound_leaf(leaf: String) -> String {
+    if leaf.len() <= LEDGER_STRING_LEAF_MAX_BYTES {
+        return leaf;
+    }
+    let mut end = LEDGER_STRING_LEAF_MAX_BYTES;
+    while end > 0 && !leaf.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...[truncated]", &leaf[..end])
 }
 
 // --- Emit ---

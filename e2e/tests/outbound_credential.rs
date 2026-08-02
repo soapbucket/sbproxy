@@ -11,6 +11,41 @@
 use base64::Engine as _;
 use sbproxy_e2e::{MockUpstream, ProxyHarness};
 use serde_json::json;
+use sha2::Digest as _;
+use std::io::{Read, Write};
+use std::sync::{Arc, Mutex};
+
+const DPOP_PRIVATE_KEY: &str =
+    include_str!("../../crates/sbproxy-modules/src/auth/dpop_test_ec_p256.pem");
+
+fn dpop_jwk() -> serde_json::Value {
+    json!({
+        "kty": "EC",
+        "crv": "P-256",
+        "x": "DpZdjog3y9hgIyKgEPltBi5ptXKUeuRwVOAPSmoQAu4",
+        "y": "bfVVYV9slbMcg4dvtvYbeekYtpFXsYCWcIa9RCrBmTc"
+    })
+}
+
+fn dpop_jkt() -> &'static str {
+    "IeJTwmoSPsFMO6w48KpbHar6spW4kZZ9UvgEXQ0hOwA"
+}
+
+fn proof_claims(proof: &str) -> serde_json::Value {
+    let encoded = proof.split('.').nth(1).expect("proof claims");
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .expect("base64url proof claims");
+    serde_json::from_slice(&decoded).expect("proof claims JSON")
+}
+
+fn raw_request_header(raw: &[u8], name: &str) -> Option<String> {
+    String::from_utf8_lossy(raw).lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.eq_ignore_ascii_case(name)
+            .then(|| value.trim().to_string())
+    })
+}
 
 const VAULT_CONFIG: &str = r#"
 proxy:
@@ -133,4 +168,139 @@ origins:
         !token_endpoint.captured().is_empty(),
         "token endpoint should be called for the exchange"
     );
+}
+
+#[test]
+fn dpop_mints_fresh_bound_resource_proofs_and_retries_one_nonce_challenge() {
+    let token_endpoint = MockUpstream::start(json!({
+        "access_token": "dpop-bound-token",
+        "token_type": "DPoP",
+        "expires_in": 3600
+    }))
+    .expect("token endpoint");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("resource listener");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking resource listener");
+    let port = listener.local_addr().unwrap().port();
+    let captured = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+    let server_captured = Arc::clone(&captured);
+    let resource_server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut attempt = 0;
+        while attempt < 2 && std::time::Instant::now() < deadline {
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => panic!("resource accept: {error}"),
+            };
+            stream
+                .set_nonblocking(false)
+                .expect("blocking resource stream");
+            let mut bytes = vec![0; 16 * 1024];
+            let count = stream.read(&mut bytes).expect("read resource request");
+            bytes.truncate(count);
+            server_captured.lock().unwrap().push(bytes);
+            let (status, headers, body) = if attempt == 0 {
+                (
+                    "401 Unauthorized",
+                    "WWW-Authenticate: DPoP error=\"use_dpop_nonce\"\r\nDPoP-Nonce: resource-nonce\r\n",
+                    r#"{"error":"use_dpop_nonce"}"#,
+                )
+            } else {
+                ("200 OK", "", r#"{"ok":true}"#)
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write resource response");
+            attempt += 1;
+        }
+    });
+
+    let mut key_file = tempfile::NamedTempFile::new().expect("DPoP key file");
+    key_file
+        .write_all(DPOP_PRIVATE_KEY.as_bytes())
+        .expect("write DPoP key");
+    let yaml = format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "dpop.localhost":
+    action:
+      type: proxy
+      url: "http://127.0.0.1:{resource_port}/api"
+    outbound_credential:
+      type: client_credentials
+      token_endpoint: "{token_endpoint}"
+      client_id: "sbproxy"
+      client_secret: "test-secret"
+      dpop:
+        key: "file:{key_path}"
+        alg: ES256
+        jwk: {jwk}
+"#,
+        resource_port = port,
+        token_endpoint = token_endpoint.base_url(),
+        key_path = key_file.path().display(),
+        jwk = dpop_jwk(),
+    );
+    let proxy = ProxyHarness::start_with_yaml(&yaml).expect("start DPoP proxy");
+    let response = proxy
+        .get("/items/a%2Fb?debug=true", "dpop.localhost")
+        .expect("DPoP resource call");
+    assert_eq!(response.status, 200, "{}", proxy.stderr_contents());
+    resource_server.join().expect("resource server");
+
+    let token_requests = token_endpoint.captured();
+    assert_eq!(token_requests.len(), 1);
+    let token_proof = token_requests[0]
+        .headers
+        .get("dpop")
+        .expect("token DPoP proof");
+    let token_claims = proof_claims(token_proof);
+    assert_eq!(token_claims["htm"], "POST");
+    assert!(token_claims.get("ath").is_none());
+
+    let requests = captured.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    let proofs: Vec<_> = requests
+        .iter()
+        .map(|request| raw_request_header(request, "dpop").expect("resource DPoP proof"))
+        .collect();
+    assert_ne!(proofs[0], proofs[1]);
+    for (attempt, proof) in proofs.iter().enumerate() {
+        let expected_htu = "http://127.0.0.1/api/items/a%2Fb".to_string();
+        let claims = proof_claims(proof);
+        assert_eq!(claims["htm"], "GET");
+        assert_eq!(claims["htu"], expected_htu);
+        let expected_ath = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(sha2::Sha256::digest(b"dpop-bound-token"));
+        assert_eq!(claims["ath"], expected_ath);
+        if attempt == 0 {
+            assert!(claims.get("nonce").is_none());
+        } else {
+            assert_eq!(claims["nonce"], "resource-nonce");
+        }
+        sbproxy_modules::auth::dpop::DpopVerifier::default()
+            .verify(
+                Some(proof),
+                "GET",
+                &expected_htu,
+                dpop_jkt(),
+                std::time::SystemTime::now(),
+            )
+            .expect("valid resource proof");
+        assert_eq!(
+            raw_request_header(&requests[attempt], "authorization").as_deref(),
+            Some("DPoP dpop-bound-token")
+        );
+    }
 }

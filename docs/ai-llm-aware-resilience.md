@@ -1,5 +1,6 @@
 # LLM-aware resilience
-*Last modified: 2026-06-24*
+
+*Last modified: 2026-08-01*
 
 Status-code retries treat every `5xx` the same and ignore the LLM-specific
 failure modes a provider signals in the response: a context-window
@@ -51,12 +52,12 @@ set (`500`/`502`/`503`) or when the classified cause clears the policy. A
 class with an explicit count caps its retries; a class with no entry uses
 its default retryability. The overall `max_attempts` still bounds the total.
 
-## Context-window compression
+## Context-window fitting compatibility
 
 A context-length overflow is not worth retrying as-is; the same prompt only
-fails again. With `llm_aware.context_compress`, the gateway fits an
-over-long prompt to the resolved model's context window before dispatch, so
-it succeeds on the same model instead of being rejected:
+fails again. The legacy `llm_aware.context_compress` switch enables stateless
+window fitting before dispatch, so an over-long prompt can stay on the same
+model instead of being rejected:
 
 ```yaml
 action:
@@ -67,9 +68,20 @@ action:
       completion_reserve_tokens: 1024  # reserve room for the response
 ```
 
-Only the oldest non-system turns are dropped; the system message and the
-most recent turns are preserved. It is a no-op for unknown models (where the
-window is not known), non-chat surfaces, and prompts that already fit.
+When no explicit `compression` block is present, this lowers to one
+`window_fit` lever. The leading system message is preserved and remaining
+messages are considered newest to oldest using the existing content-byte
+heuristic after the completion reserve. A message that does not fit is skipped,
+so a smaller older message may still be retained. It is a no-op for unknown
+models and prompts that already fit that heuristic. This compatibility behavior
+is not an exact tokenizer or hard provider-window guarantee. An explicit
+compression policy is authoritative, including an empty lever list.
+
+For the ordered compression pipeline, including `query_select`,
+sidecar-backed `token_prune`, `summary_buffer`, and `window_fit`, see the
+captured-session requirements, structured-content protection, failure
+semantics, and telemetry in
+[AI context compression](ai-context-compression.md).
 
 ## Hedged (raced) requests
 
@@ -137,7 +149,62 @@ it recovers, alongside the PeakEWMA latency model. Failover itself routes to
 a different provider, so a retry never re-runs a side-effecting request
 against the same upstream.
 
-## Try it
+## Calling it
 
-The runnable example is in
-[`examples/ai-llm-aware-resilience/`](../examples/ai-llm-aware-resilience/).
+The runnable configuration is
+[`examples/ai-llm-aware-resilience/`](../examples/ai-llm-aware-resilience/). It
+puts the `retry_policy` above on a `fallback_chain` across two deployments,
+`openai-primary` at `priority: 1` and `openai-secondary` at `priority: 2`.
+Start it:
+
+```bash
+export OPENAI_API_KEY=sk-...
+make run CONFIG=examples/ai-llm-aware-resilience/sb.yml
+```
+
+Send an ordinary chat request. The retry policy is server-side, so the client
+sends nothing extra:
+
+```bash
+curl -sS http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Host: ai.local' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Say hi in one word."}]}'
+```
+
+With a working key that returns the provider's own chat completion, so the
+body comes from the model rather than from SBproxy. The part this page is
+about is not visible in a successful response: it is what happens when the
+provider fails.
+
+The classifier half is reachable without any provider key. Send a body that is
+not JSON:
+
+```bash
+curl -sS -i http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Host: ai.local' \
+  -H 'Content-Type: application/json' \
+  -d 'not json'
+```
+
+That returns `400` with:
+
+```json
+{"error": "invalid JSON body"}
+```
+
+Note the shape. This is the flat parse-failure body the gateway emits before a
+request is understood well enough to have a provider, a model, or an error
+class. It is deliberately not the structured `{"error": {"message", "type",
+"code", "request_id"}}` envelope that a guardrail block or a classified
+provider failure returns, because at this point nothing has been classified.
+Neither deployment was touched and no retry was counted.
+
+To watch the retry policy itself, point a provider at an upstream you control
+and have it answer `429`. Each rejected attempt logs at `WARN` with the
+message `AI proxy: provider returned error, trying next` and the fields
+`provider`, `status`, and `attempt`, where `attempt` is a zero-based index.
+With `rate_limit: 3` you see that line for attempts `0`, `1`, and `2` against
+`openai-primary` before the chain advances to `openai-secondary`. A `400` that
+classifies as `bad_request` logs the line once and advances immediately,
+because its policy entry is `0`.

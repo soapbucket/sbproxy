@@ -111,9 +111,9 @@ Resolution at request time walks origin → tenant → proxy. A credential at or
 | `name` | string | Stable operator-supplied name. Unique within the declaring scope. |
 | `type` | enum | One of `ai_provider`, `bearer`, `api_key`, `jwt`, `basic`, `oidc_client`, `outbound_token_exchange`, `outbound_client_credentials`. |
 | `provider` | string | Provider name for `ai_provider` credentials. Matches an entry in the origin's `providers:` list. |
-| `key` | string | Secret reference. Accepts provider-specific schemes such as `vault://`, `awssm://`, `gcpsm://`, `k8ssecret://`, `secretfile://`, and `secret://`, plus `${ENV}`, `file:`, and `secret:`. |
+| `key` | string | Secret reference. Accepts provider-specific schemes such as `vault://`, `awssm://`, `gcpsm://`, `azurekv://`, `k8ssecret://`, `secretfile://`, and `secret://`, plus `${ENV}`, `file:`, and `secret:`. |
 | `principals` | list | Principal selectors. Empty matches every principal. |
-| `attrs` | object | Attribution attributes copied onto matched principals. See below. |
+| `attrs` | object | Attribution attributes lowered onto matched principals, except the documented compatibility-only fields. See below. |
 | `models.allow` / `models.deny` | lists | Stack on top of the origin-level allowlist. Most-restrictive wins. |
 | `policies` | list | Per-credential sub-policies. Closed enum: `rate_limit`, `require_pii_redaction`. |
 
@@ -123,13 +123,13 @@ Resolution at request time walks origin → tenant → proxy. A credential at or
 |---|---|---|
 | `project` | string | Project the credential's spend rolls up to. |
 | `user` | string | User the credential is owned by. |
-| `team` | string | Team grouping. |
+| `team` | string | Compatibility-only team grouping. Accepted with a warning but not copied into the principal; use `tags` or `metadata` instead. |
 | `cost_center` | string | Cost center. Lifted onto `Principal.attrs.metadata` under the `cost_center` key. |
 | `tags` | list | Operator-supplied tags. Each tag becomes a separate attribution row. |
 | `metadata` | map | Free-form metadata copied verbatim onto `Principal.attrs.metadata`. |
-| `budget.max_tokens` | int | Total input + output tokens per reset window. |
-| `budget.max_cost_usd` | float | USD spend cap per reset window. |
-| `budget.reset` | string | Reset window in LiteLLM-style `30s|30m|30h|30d`. |
+| `budget.max_tokens` | int | Enforced input + output token cap for the credential. |
+| `budget.max_cost_usd` | float | Enforced USD spend cap for the credential. |
+| `budget.reset` | string | Compatibility-only reset hint. Accepted with a warning; no reset schedule is installed. |
 
 ## Secret Reference Migration
 

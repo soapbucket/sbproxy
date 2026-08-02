@@ -1,10 +1,10 @@
-//! WOR-1546: assembly and process-global handle for the dynamic key plane.
+//! WOR-1546: assembly and publication for the dynamic key plane.
 //!
 //! The `key_management:` config block is lowered here into a live `KeyPlane`:
 //! a `KeyCrypto` handle (pepper + master), a `KeyStore` backend, and a
-//! fail-closed `TtlCache` in front of it. The plane is held in a global
-//! `ArcSwapOption` (like the rate-limit registry and the compiled pipeline) so
-//! the auth dispatch and the admin API resolve against one shared instance.
+//! fail-closed `TtlCache` in front of it. Each compiled pipeline owns its exact
+//! plane generation for request processing. A global `ArcSwapOption` follows
+//! the published generation for admin and cluster control-plane consumers.
 //!
 //! Async work (seeding the config records, the Redis invalidation subscriber)
 //! runs on a dedicated, process-lifetime runtime so it is independent of the
@@ -23,9 +23,9 @@ use sbproxy_ai::governance::{
 };
 use sbproxy_ai::governance_redis::{RedisGovernanceConfig, RedisGovernanceStore};
 use sbproxy_config::types::{
-    GovernanceBackendConfig, GovernanceConfig,
-    GovernanceConsistency as ConfigGovernanceConsistency, KeyCacheTier, KeyManagementConfig,
-    KeyStoreBackend, SeedCredentialConfig, SeedKeyConfig,
+    FailureMode, GovernanceBackendConfig, GovernanceConsistency as ConfigGovernanceConsistency,
+    KeyCacheTier, KeyGovernanceConfig, KeyManagementConfig, KeyStoreBackend, SeedCredentialConfig,
+    SeedKeyConfig,
 };
 use sbproxy_keystore::crypto::KeyCrypto;
 use sbproxy_keystore::record::{
@@ -37,48 +37,19 @@ use sbproxy_keystore::{EmbeddedKeyStore, KeyStore, TtlCache, TtlCacheConfig};
 pub struct KeyPlane {
     crypto: KeyCrypto,
     cache: Arc<TtlCache>,
-    failure_mode_allow: bool,
+    resolved_credentials: ResolvedCredentialCache,
+    failure_posture: FailureMode,
     allow_api_override: bool,
     oidc_claim_field: Option<String>,
-}
-
-/// Live governed-key reservation backend, independent of mutable key storage.
-///
-/// Keeping this plane separate allows configured virtual keys to use governed
-/// accounting even when dynamic key administration is disabled.
-pub struct GovernancePlane {
-    config: GovernanceConfig,
-    store: Arc<dyn GovernanceStore>,
-}
-
-impl GovernancePlane {
-    /// Validated operator configuration installed with this backend.
-    pub fn config(&self) -> &GovernanceConfig {
-        &self.config
-    }
-
-    /// Shared request admission and accounting store.
-    pub fn store(&self) -> Arc<dyn GovernanceStore> {
-        Arc::clone(&self.store)
-    }
-
-    /// Runtime consistency label exposed to admin and metrics surfaces.
-    pub fn consistency(&self) -> RuntimeGovernanceConsistency {
-        match self.config.consistency {
-            ConfigGovernanceConsistency::Approximate => RuntimeGovernanceConsistency::Approximate,
-            ConfigGovernanceConsistency::Strict => RuntimeGovernanceConsistency::Strict,
-        }
-    }
-
-    /// Secret-free backend health snapshot.
-    pub async fn health(&self) -> GovernanceBackendHealth {
-        self.store.health().await
-    }
+    governance: KeyGovernanceConfig,
+    governance_store: Arc<dyn GovernanceStore>,
+    approximate_store: Option<Arc<InMemoryGovernanceStore>>,
+    inbound: sbproxy_config::types::KeyInboundConfig,
 }
 
 impl KeyPlane {
-    /// Assemble a plane from already-built parts. Used by the config-driven
-    /// [`init_key_plane`] and by tests that wire a store directly.
+    /// Assemble a test plane from already-built key-store parts.
+    #[cfg(test)]
     pub(crate) fn from_parts(
         crypto: KeyCrypto,
         cache: Arc<TtlCache>,
@@ -86,13 +57,85 @@ impl KeyPlane {
         allow_api_override: bool,
         oidc_claim_field: Option<String>,
     ) -> Self {
-        Self {
+        let governance = KeyGovernanceConfig::default();
+        let (governance_store, approximate_store) = build_governance_store(&governance)
+            .expect("default governance store configuration is valid");
+        Self::from_parts_with_governance(
             crypto,
             cache,
             failure_mode_allow,
             allow_api_override,
             oidc_claim_field,
+            governance,
+            governance_store,
+            approximate_store,
+        )
+    }
+
+    /// Assemble a plane with explicit governed key runtime controls.
+    ///
+    /// `approximate_store` carries the concrete in-memory counter store when
+    /// `governance_store` is backed by it (approximate consistency mode), so
+    /// cross-node dissemination can be spawned against the concrete type.
+    /// Pass `None` for strict (Redis) governance or when `governance_store`
+    /// is not actually an `InMemoryGovernanceStore` (for example, a test
+    /// double).
+    // Wide by design: the key plane wires several independent subsystems in one place.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_parts_with_governance(
+        crypto: KeyCrypto,
+        cache: Arc<TtlCache>,
+        failure_mode_allow: bool,
+        allow_api_override: bool,
+        oidc_claim_field: Option<String>,
+        governance: KeyGovernanceConfig,
+        governance_store: Arc<dyn GovernanceStore>,
+        approximate_store: Option<Arc<InMemoryGovernanceStore>>,
+    ) -> Self {
+        Self {
+            crypto,
+            cache,
+            resolved_credentials: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            // The legacy boolean's own conversion, kept identical to
+            // `KeyManagementConfig::failure_posture`: `true` admits, but it
+            // admits by falling through with no per-key policy, budget, or
+            // attribution, which is a waived guarantee rather than an open
+            // door. `prepare_key_plane` overrides this with the resolved
+            // posture; the bool parameter stays so callers that only have
+            // the legacy value keep compiling.
+            failure_posture: if failure_mode_allow {
+                FailureMode::Degraded
+            } else {
+                FailureMode::Closed
+            },
+            allow_api_override,
+            oidc_claim_field,
+            governance,
+            governance_store,
+            approximate_store,
+            inbound: sbproxy_config::types::KeyInboundConfig::default(),
         }
+    }
+
+    /// Pin the posture resolved from `key_management.failure_posture`,
+    /// replacing whatever the legacy `failure_mode_allow` boolean implied.
+    pub(crate) fn with_failure_posture(mut self, posture: FailureMode) -> Self {
+        self.failure_posture = posture;
+        self
+    }
+
+    /// Attach the inbound header-sweep settings.
+    ///
+    /// Held on the plane rather than read from the pipeline per request, so the
+    /// request path reaches them through one already-cloned `Arc`.
+    pub(crate) fn with_inbound(mut self, inbound: sbproxy_config::types::KeyInboundConfig) -> Self {
+        self.inbound = inbound;
+        self
+    }
+
+    /// Which inbound headers carry a minted key, and whether one is required.
+    pub fn inbound(&self) -> &sbproxy_config::types::KeyInboundConfig {
+        &self.inbound
     }
 
     /// The shared crypto handle (pepper for inbound hashing, master for the
@@ -106,10 +149,20 @@ impl KeyPlane {
         &self.cache
     }
 
-    /// When true, a store outage allows the request through (degraded) instead
-    /// of denying. Default false.
-    pub fn failure_mode_allow(&self) -> bool {
-        self.failure_mode_allow
+    /// What this plane does when the key store cannot be reached.
+    ///
+    /// Resolved once at plane construction from
+    /// `key_management.failure_posture`, falling back to the legacy
+    /// `failure_mode_allow` boolean. Every store-outage decision in the
+    /// request path reads this and nothing else.
+    ///
+    /// [`FailureMode::Closed`] (the default) denies with 503.
+    /// [`FailureMode::Degraded`] and [`FailureMode::Open`] both fall
+    /// through to the origin's configured auth, which is not a blanket
+    /// admit; they differ only in whether the lost per-key policy, budget,
+    /// and attribution are recorded as lost.
+    pub fn failure_posture(&self) -> FailureMode {
+        self.failure_posture
     }
 
     /// When true, the admin API may override config-seeded records on reload.
@@ -122,50 +175,207 @@ impl KeyPlane {
     pub fn oidc_claim_field(&self) -> Option<&str> {
         self.oidc_claim_field.as_deref()
     }
+
+    /// Governed key admission and caller-introspection controls installed with
+    /// this key-plane snapshot.
+    pub fn governance(&self) -> &KeyGovernanceConfig {
+        &self.governance
+    }
+
+    /// Shared admission and accounting store for governed requests.
+    pub fn governance_store(&self) -> Arc<dyn GovernanceStore> {
+        Arc::clone(&self.governance_store)
+    }
+
+    /// The concrete approximate counter store, present only in approximate
+    /// consistency mode. Used to spawn cross-node dissemination.
+    pub fn approximate_store(&self) -> Option<Arc<InMemoryGovernanceStore>> {
+        self.approximate_store.clone()
+    }
+
+    /// Runtime consistency guarantee mapped explicitly from operator config.
+    pub fn governance_consistency(&self) -> RuntimeGovernanceConsistency {
+        runtime_governance_consistency(self.governance.consistency)
+    }
+
+    /// Secret-free health information from the active governance backend.
+    pub async fn governance_health(&self) -> GovernanceBackendHealth {
+        self.governance_store.health().await
+    }
+}
+
+/// An upstream credential resolved into the exact header the proxy writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedCredential {
+    /// Lowercase header name to set on the upstream request.
+    pub header: String,
+    /// Full header value, scheme prefix already applied.
+    pub value: String,
+}
+
+/// Why a key's bound credential could not be presented.
+///
+/// Every variant refuses the request. None falls back to the origin's own
+/// `outbound_credential`, because that would hand the key an upstream identity
+/// it was never bound to. That is the one failure mode this whole path exists
+/// to prevent, so it is encoded in the type rather than left to a caller's
+/// `unwrap_or_default`.
+#[derive(Debug, Clone)]
+pub enum CredentialResolveError {
+    /// No credential with that id.
+    NotFound,
+    /// Present but blocked or revoked.
+    NotUsable,
+    /// The credential belongs to a different tenant than the key that binds it.
+    TenantMismatch,
+    /// Present and usable, but the secret could not be obtained: a vault
+    /// outage, an unsupported reference scheme, or an envelope sealed under a
+    /// master key this process does not hold.
+    Unresolvable(String),
+}
+
+impl std::fmt::Display for CredentialResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => write!(f, "credential not found"),
+            Self::NotUsable => write!(f, "credential is not active"),
+            Self::TenantMismatch => write!(f, "credential belongs to another tenant"),
+            Self::Unresolvable(reason) => write!(f, "credential unresolvable: {reason}"),
+        }
+    }
+}
+
+/// How long a resolved credential secret stays cached.
+///
+/// Vault resolution is a network round-trip and must not run per request.
+/// Dropped by [`KeyPlane::invalidate_resolved_credential`] on any admin
+/// mutation, so a rotation takes effect on the same signal that drops the
+/// record itself.
+const RESOLVED_CREDENTIAL_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+type ResolvedCredentialCache =
+    parking_lot::Mutex<std::collections::HashMap<String, (std::time::Instant, ResolvedCredential)>>;
+
+/// Drop any cached resolved secret for `id`. Called from the admin mutation
+/// path alongside the record-cache invalidation.
+pub fn invalidate_resolved_credential(id: &str) {
+    if let Some(plane) = current_key_plane() {
+        plane.invalidate_resolved_credential(id);
+    }
+}
+
+/// Drop every cached resolved secret.
+pub fn invalidate_all_resolved_credentials() {
+    if let Some(plane) = current_key_plane() {
+        plane.invalidate_all_resolved_credentials();
+    }
+}
+
+impl KeyPlane {
+    /// Drop one resolved upstream secret from this plane generation.
+    pub(crate) fn invalidate_resolved_credential(&self, id: &str) {
+        self.resolved_credentials.lock().remove(id);
+    }
+
+    /// Drop every resolved upstream secret from this plane generation.
+    pub(crate) fn invalidate_all_resolved_credentials(&self) {
+        self.resolved_credentials.lock().clear();
+    }
+
+    /// Resolve a key's bound credential into the header the upstream carries.
+    ///
+    /// `tenant_id` is the owning tenant of the key that names this credential.
+    /// A cross-tenant binding is refused here as well as at the admin
+    /// boundary, because either record's tenant can be patched after the
+    /// binding was made.
+    ///
+    /// # Errors
+    ///
+    /// Every [`CredentialResolveError`] variant means "refuse the request".
+    /// There is deliberately no success path that omits the credential.
+    pub async fn resolve_credential_secret(
+        &self,
+        id: &str,
+        tenant_id: Option<&str>,
+    ) -> std::result::Result<ResolvedCredential, CredentialResolveError> {
+        if let Some(hit) = {
+            let cache = self.resolved_credentials.lock();
+            cache.get(id).and_then(|(at, value)| {
+                (at.elapsed() < RESOLVED_CREDENTIAL_TTL).then(|| value.clone())
+            })
+        } {
+            return Ok(hit);
+        }
+
+        let record = self
+            .cache()
+            .resolve_credential(id)
+            .await
+            .map_err(|e| CredentialResolveError::Unresolvable(e.to_string()))?
+            .ok_or(CredentialResolveError::NotFound)?;
+
+        if !record.is_usable() {
+            return Err(CredentialResolveError::NotUsable);
+        }
+        // A credential with no tenant is shared; one with a tenant may only be
+        // bound by a key of that same tenant.
+        if record.tenant_id.is_some() && record.tenant_id.as_deref() != tenant_id {
+            return Err(CredentialResolveError::TenantMismatch);
+        }
+
+        let secret = match &record.material {
+            CredentialMaterial::Plaintext { value } => value.clone(),
+            CredentialMaterial::Envelope { envelope } => {
+                let bytes = self.crypto().open(&record.id, envelope).map_err(|e| {
+                    // Distinct message: after a master-key rotation every
+                    // existing envelope stops opening, and that is otherwise
+                    // very hard to tell apart from a corrupt store.
+                    CredentialResolveError::Unresolvable(format!(
+                        "envelope did not open under the configured master key: {e}"
+                    ))
+                })?;
+                String::from_utf8(bytes).map_err(|_| {
+                    CredentialResolveError::Unresolvable("secret is not utf-8".to_string())
+                })?
+            }
+            CredentialMaterial::VaultRef { reference } => {
+                let resolver = sbproxy_vault::process_resolver().ok_or_else(|| {
+                    CredentialResolveError::Unresolvable(
+                        "no secret resolver is installed for a vault-referenced credential"
+                            .to_string(),
+                    )
+                })?;
+                resolver
+                    .resolve_async(reference.clone())
+                    .await
+                    .map_err(|e| CredentialResolveError::Unresolvable(e.to_string()))?
+            }
+        };
+
+        let resolved = ResolvedCredential {
+            header: record.header.trim().to_ascii_lowercase(),
+            value: format!("{}{}", record.scheme, secret),
+        };
+        self.resolved_credentials.lock().insert(
+            id.to_string(),
+            (std::time::Instant::now(), resolved.clone()),
+        );
+        Ok(resolved)
+    }
+}
+
+fn runtime_governance_consistency(
+    consistency: ConfigGovernanceConsistency,
+) -> RuntimeGovernanceConsistency {
+    match consistency {
+        ConfigGovernanceConsistency::Approximate => RuntimeGovernanceConsistency::Approximate,
+        ConfigGovernanceConsistency::Strict => RuntimeGovernanceConsistency::Strict,
+    }
 }
 
 fn plane_slot() -> &'static ArcSwapOption<KeyPlane> {
     static SLOT: OnceLock<ArcSwapOption<KeyPlane>> = OnceLock::new();
     SLOT.get_or_init(|| ArcSwapOption::from(None))
-}
-
-fn governance_plane_slot() -> &'static ArcSwapOption<GovernancePlane> {
-    static SLOT: OnceLock<ArcSwapOption<GovernancePlane>> = OnceLock::new();
-    SLOT.get_or_init(|| ArcSwapOption::from(None))
-}
-
-/// The currently installed governed-key accounting backend.
-pub fn current_governance_plane() -> Option<Arc<GovernancePlane>> {
-    governance_plane_slot().load_full()
-}
-
-/// Installed governed accounting, or the process-local compatibility default
-/// when no `key_management` block configured a backend.
-pub fn governance_plane() -> Arc<GovernancePlane> {
-    if let Some(plane) = current_governance_plane() {
-        return plane;
-    }
-    static DEFAULT: OnceLock<Arc<GovernancePlane>> = OnceLock::new();
-    Arc::clone(DEFAULT.get_or_init(|| {
-        Arc::new(
-            build_governance_plane(&GovernanceConfig::default())
-                .expect("default governance configuration is valid"),
-        )
-    }))
-}
-
-fn install_governance_plane(plane: Arc<GovernancePlane>) {
-    governance_plane_slot().store(Some(plane));
-}
-
-fn build_or_reuse_governance_plane(cfg: &GovernanceConfig) -> Result<Arc<GovernancePlane>> {
-    cfg.validate()?;
-    if let Some(current) = current_governance_plane() {
-        if current.config() == cfg {
-            return Ok(current);
-        }
-    }
-    Ok(Arc::new(build_governance_plane(cfg)?))
 }
 
 /// The currently installed key plane, or `None` when the dynamic key plane is
@@ -179,15 +389,10 @@ pub fn install_key_plane(plane: Arc<KeyPlane>) {
     plane_slot().store(Some(plane));
 }
 
-/// Disable dynamic key administration and return governed accounting to the
-/// process-local compatibility default.
-///
-/// The key plane is cleared first so requests fail authentication during the
-/// very small publication window instead of resolving an old key against a
-/// newly reset accounting backend.
-pub fn disable_key_plane() {
+/// Remove the live key plane when dynamic key management is disabled or
+/// removed during reload.
+pub fn uninstall_key_plane() {
     plane_slot().store(None);
-    governance_plane_slot().store(None);
 }
 
 /// A dedicated, process-lifetime runtime that hosts key-plane async work
@@ -236,6 +441,54 @@ fn resolve_secret_material(reference: &str) -> Result<Vec<u8>> {
         return std::fs::read(path).with_context(|| format!("read crypto material file '{path}'"));
     }
     Ok(reference.as_bytes().to_vec())
+}
+
+/// Fixed fallback pepper for admin-operator password hashing, used when no
+/// `key_management.crypto.pepper` is configured. Lets
+/// `proxy.admin.operators` and `sbproxy admin hash-password` work with no
+/// `key_management:` block at all, which is the common case. It is a
+/// fixed, source-visible constant, so it offers no real secrecy: a leaked
+/// `password_hash` is offline-crackable unless a real pepper is pinned.
+/// Unlike [`build_crypto`]'s ephemeral-random fallback (fine for the dynamic
+/// key plane, whose hashes are computed and verified within the same
+/// process lifetime), this pepper must be stable across a restart and
+/// across the separate `hash-password` CLI invocation, so it cannot be
+/// random. Pin `key_management.crypto.pepper` for anything beyond a single
+/// trusted node; that value always takes precedence over this default.
+const DEFAULT_ADMIN_OPERATOR_PEPPER: &[u8] = b"sbproxy-admin-operator-default-pepper-v1";
+
+/// The fallback pepper [`resolve_admin_operator_pepper`] uses when no
+/// `key_management.crypto.pepper` is configured. Exposed separately so
+/// `AdminState::new` has an infallible default to start from.
+pub fn default_admin_operator_pepper() -> Vec<u8> {
+    DEFAULT_ADMIN_OPERATOR_PEPPER.to_vec()
+}
+
+/// Resolve the pepper used to hash and verify `AdminOperator.password_hash`.
+///
+/// Independent of whether the dynamic key plane is enabled: reads
+/// `key_management.crypto.pepper` directly from config when set (the same
+/// `env:`/`file:`/inline resolution `build_crypto` uses for the key plane's
+/// own pepper), so the running server and the offline `sbproxy admin
+/// hash-password` CLI agree without either needing a live installed key
+/// plane. Falls back to [`default_admin_operator_pepper`] when
+/// `key_management` is `None` or carries no pepper, so admin login works
+/// with no `key_management:` block configured at all.
+pub fn resolve_admin_operator_pepper(
+    key_management: Option<&KeyManagementConfig>,
+) -> Result<Vec<u8>> {
+    match key_management.and_then(|cfg| cfg.crypto.pepper.as_ref()) {
+        Some(reference) => resolve_secret_material(reference),
+        None => Ok(default_admin_operator_pepper()),
+    }
+}
+
+/// Hash a password for `AdminOperator.password_hash`. Thin wrapper over
+/// `sbproxy_keystore::crypto::hash_secret` so callers outside
+/// this crate (the `sbproxy admin hash-password` CLI) do not need their own
+/// `sbproxy-keystore` dependency for this one call.
+pub fn hash_admin_operator_password(password: &str, pepper: &[u8]) -> String {
+    sbproxy_keystore::crypto::hash_secret(password, pepper)
 }
 
 /// Build the `KeyCrypto` handle from config, generating ephemeral secrets
@@ -295,6 +548,28 @@ fn build_store(cfg: &KeyManagementConfig) -> Result<Arc<dyn KeyStore>> {
                     .context("build secrets-manager keystore")?,
             ))
         }
+        KeyStoreBackend::Mesh => {
+            // WOR-2064: the cluster's replicated state substrate is the
+            // system of record. Config compile already refuses this
+            // backend without proxy.cluster and its replication block;
+            // this is the runtime end of the same guard, for the case
+            // where the substrate failed to come up.
+            let substrate = crate::cluster::current_cluster_handle()
+                .and_then(|handle| handle.mesh_node())
+                .and_then(|node| node.replicated_store())
+                .context(
+                    "key_management.store.backend is 'mesh' but no cluster replication \
+                     substrate is running. A mesh keystore on a node with no mesh is an \
+                     embedded keystore with extra steps; configure proxy.cluster with a \
+                     replication block",
+                )?;
+            let store = crate::mesh_keystore::MeshKeyStore::new(substrate);
+            // Publish the readiness view the `keystore` health probe
+            // reads; a later committed generation without the mesh
+            // backend clears it again in activate_key_plane.
+            crate::mesh_keystore::install_readiness(store.readiness());
+            Ok(Arc::new(store))
+        }
     }
 }
 
@@ -343,11 +618,15 @@ fn build_secrets_manager_spec(
 /// Build the `TtlCache` wrapping `store`, attaching a Redis L2 tier when
 /// configured.
 fn build_cache(cfg: &KeyManagementConfig, store: Arc<dyn KeyStore>) -> Arc<TtlCache> {
+    // No `fail_closed` here any more (WOR-2121). It was `!failure_mode_allow`,
+    // an inverted second spelling of the same operator knob that nothing ever
+    // read: the cache propagates a store error unconditionally and the
+    // admission decision belongs to the request path, which reads
+    // `KeyPlane::failure_posture`.
     let cache_cfg = TtlCacheConfig {
         ttl: std::time::Duration::from_secs(cfg.cache.ttl_secs),
         negative_ttl: std::time::Duration::from_secs(cfg.cache.negative_ttl_secs),
         max_entries: cfg.cache.max_entries,
-        fail_closed: !cfg.failure_mode_allow,
     };
     let mut cache = TtlCache::new(store, cache_cfg);
     match cfg.cache.tier {
@@ -392,51 +671,63 @@ fn build_cache(cfg: &KeyManagementConfig, store: Arc<dyn KeyStore>) -> Arc<TtlCa
     Arc::new(cache)
 }
 
-/// Build governance accounting without opening a network connection. Redis
-/// connects lazily on the first operation.
-fn build_governance_plane(config: &GovernanceConfig) -> Result<GovernancePlane> {
-    config.validate().map_err(|error| anyhow::anyhow!(error))?;
-    let reservation_ttl_millis = config
+/// Build the governance accounting backend without opening a network
+/// connection. The Redis client connects lazily on the first operation.
+///
+/// Returns both the trait-object handle used for admission/accounting and,
+/// only in approximate consistency mode, the concrete `InMemoryGovernanceStore`
+/// (WOR-1835: needed to spawn cross-node counter dissemination, which applies
+/// solely to the approximate tier; strict/Redis governance owns its own
+/// coherence and the second element is `None`).
+// The trait-object store plus, in approximate mode, the concrete store used to
+// spawn dissemination; the tuple is documented above.
+#[allow(clippy::type_complexity)]
+fn build_governance_store(
+    cfg: &KeyGovernanceConfig,
+) -> Result<(
+    Arc<dyn GovernanceStore>,
+    Option<Arc<InMemoryGovernanceStore>>,
+)> {
+    cfg.validate()
+        .map_err(|error| anyhow::anyhow!("validate key_management.governance: {error}"))?;
+    let reservation_ttl_millis = cfg
         .lease_ttl_millis()
         .context("convert governance lease TTL")?;
-    let terminal_retention_millis = config
+    let terminal_retention_millis = cfg
         .terminal_retention_millis()
         .context("convert governance terminal retention")?;
 
-    let store: Arc<dyn GovernanceStore> = match config.consistency {
-        ConfigGovernanceConsistency::Approximate => Arc::new(
-            InMemoryGovernanceStore::new(InMemoryGovernanceConfig {
-                reservation_ttl_millis,
-                terminal_retention_millis,
-            })
-            .context("build approximate governance store")?,
-        ),
+    match cfg.consistency {
+        ConfigGovernanceConsistency::Approximate => {
+            let store = Arc::new(
+                InMemoryGovernanceStore::new(InMemoryGovernanceConfig {
+                    reservation_ttl_millis,
+                    terminal_retention_millis,
+                })
+                .context("build approximate governance store")?,
+            );
+            Ok((store.clone(), Some(store)))
+        }
         ConfigGovernanceConsistency::Strict => {
-            let url = match config.backend.as_ref() {
+            let url = match cfg.backend.as_ref() {
                 Some(GovernanceBackendConfig::Redis { url }) => url,
-                None => anyhow::bail!("strict consistency requires a Redis backend"),
+                None => anyhow::bail!("strict governance requires an explicit redis backend"),
             };
             let redis = sbproxy_platform::storage::AsyncRedisKVStore::new(
                 sbproxy_platform::storage::AsyncRedisConfig::new(url),
             );
-            Arc::new(
-                RedisGovernanceStore::new(
-                    redis,
-                    RedisGovernanceConfig {
-                        reservation_ttl_millis,
-                        terminal_retention_millis,
-                        ..RedisGovernanceConfig::default()
-                    },
-                )
-                .context("build strict Redis governance store")?,
+            let store = RedisGovernanceStore::new(
+                redis,
+                RedisGovernanceConfig {
+                    reservation_ttl_millis,
+                    terminal_retention_millis,
+                    ..RedisGovernanceConfig::default()
+                },
             )
+            .context("build strict Redis governance store")?;
+            Ok((Arc::new(store), None))
         }
-    };
-
-    Ok(GovernancePlane {
-        config: config.clone(),
-        store,
-    })
+    }
 }
 
 /// The default mesh node id: the `HOSTNAME` environment variable (set per pod
@@ -492,9 +783,11 @@ fn lower_seed_key(
     rec.require_pii_redaction = seed.require_pii_redaction.clone();
     rec.principal_selectors = seed.principal_selectors.clone();
     rec.route_to_model = seed.route_to_model.clone();
+    rec.compression_profile = seed.compression_profile.clone();
     rec.inject_tools = seed.inject_tools.clone();
     rec.inject_mcp = seed.inject_mcp.clone();
     rec.bypass_prompt_injection = seed.bypass_prompt_injection;
+    rec.allow_content_capture = seed.allow_content_capture;
     rec.project = seed.project.clone();
     rec.user = seed.user.clone();
     rec.tags = seed.tags.clone();
@@ -535,6 +828,8 @@ fn lower_seed_credential(
             .kind
             .clone()
             .unwrap_or_else(|| "ai_provider".to_string()),
+        header: sbproxy_keystore::record::default_cred_header(),
+        scheme: sbproxy_keystore::record::default_cred_scheme(),
         material,
         status: RecordStatus::Active,
         tenant_id: seed.tenant.clone(),
@@ -573,68 +868,91 @@ async fn seed_records(
     Ok(())
 }
 
-/// Build, seed, and install the key plane from config. Idempotent across
-/// reloads: re-seeds config records and replaces the installed plane. A no-op
-/// when the block is disabled.
-///
-/// Synchronous: runs async seeding on the dedicated key runtime and returns once
-/// the seed is applied, so seeded keys are usable as soon as the server accepts
-/// traffic.
-pub fn init_key_plane(cfg: &KeyManagementConfig) -> Result<()> {
-    // A no-op config reload retains the live store, including approximate
-    // counters and active leases. Rebuilding an in-memory store here would
-    // silently reset lifetime budgets on every unrelated reload.
-    let governance = build_or_reuse_governance_plane(&cfg.governance)?;
-    if !cfg.enabled {
-        // A reload from enabled to explicitly disabled must not leave the
-        // previous credential store/cache reachable. Clear authentication
-        // first (fail closed), then publish the configured accounting plane.
-        plane_slot().store(None);
-        install_governance_plane(governance);
-        return Ok(());
+/// Build a candidate key plane without changing process-global or store state.
+pub(crate) fn prepare_key_plane(
+    cfg: Option<&KeyManagementConfig>,
+) -> Result<Option<Arc<KeyPlane>>> {
+    // Checked before the `enabled` filter on purpose: a posture this site
+    // cannot honour is an operator mistake whether or not the block is
+    // switched on, and finding out at the moment it is switched on is the
+    // worst time to find out.
+    if let Some(cfg) = cfg {
+        cfg.validate_failure_posture()
+            .map_err(|error| anyhow::anyhow!("config compile: {error}"))?;
     }
+    let Some(cfg) = cfg.filter(|cfg| cfg.enabled) else {
+        return Ok(None);
+    };
+    let (governance_store, approximate_store) = build_governance_store(&cfg.governance)?;
     let crypto = build_crypto(cfg)?;
     let store = build_store(cfg)?;
     let cache = build_cache(cfg, store.clone());
 
+    let plane = Arc::new(
+        KeyPlane::from_parts_with_governance(
+            crypto,
+            cache.clone(),
+            cfg.failure_mode_allow,
+            cfg.allow_api_override,
+            cfg.oidc_claim_map.as_ref().map(|m| m.claim_field.clone()),
+            cfg.governance.clone(),
+            governance_store,
+            approximate_store,
+        )
+        .with_failure_posture(cfg.failure_posture())
+        .with_inbound(cfg.inbound.clone()),
+    );
+    Ok(Some(plane))
+}
+
+/// Apply declarative seeds after every other candidate preflight succeeds.
+///
+/// Keeping this separate from [`prepare_key_plane`] prevents a later model or
+/// pipeline preflight failure from exposing candidate records through
+/// generation A's shared store. The generic `KeyStore` contract has no
+/// cross-backend batch transaction, so reload treats an error here as a
+/// degraded generation B after all reject-only work has passed; boot still
+/// returns the error.
+pub(crate) fn seed_prepared_key_plane(
+    plane: Option<&Arc<KeyPlane>>,
+    cfg: Option<&KeyManagementConfig>,
+) -> Result<()> {
+    let Some((plane, cfg)) = plane.zip(cfg.filter(|cfg| cfg.enabled)) else {
+        return Ok(());
+    };
+    let store = plane.cache().store().clone();
     let now = Utc::now();
-    // Seed on a fresh thread driving the dedicated key runtime. A fresh thread
-    // is never already inside a runtime, so `block_on` is safe whether
-    // `init_key_plane` is called at boot (no runtime) or on reload (which may
-    // run on a tokio worker, where a nested `block_on` would otherwise panic).
     std::thread::scope(|scope| {
         scope
-            .spawn(|| key_runtime().block_on(seed_records(&store, &crypto, cfg, now)))
+            .spawn(|| key_runtime().block_on(seed_records(&store, plane.crypto(), cfg, now)))
             .join()
             .expect("key-plane seed thread panicked")
     })
-    .context("seed key_management records")?;
+    .context("seed key_management records")
+}
 
-    let plane = Arc::new(KeyPlane::from_parts(
-        crypto,
-        cache.clone(),
-        cfg.failure_mode_allow,
-        cfg.allow_api_override,
-        cfg.oidc_claim_map.as_ref().map(|m| m.claim_field.clone()),
-    ));
-    // Publish both planes only after every fallible build/seed step succeeds,
-    // so a failed hot reload cannot install new governance while retaining an
-    // old key store and policy cache.
-    install_governance_plane(governance);
-    install_key_plane(plane);
+/// Install a prepared key plane as the process-global admin and cluster view.
+///
+/// Request paths do not read this slot. They use the plane pinned to their
+/// [`crate::pipeline::CompiledPipeline`] generation, so this back-to-back
+/// control-plane swap cannot change an in-flight request.
+pub(crate) fn activate_key_plane(plane: Option<Arc<KeyPlane>>, cfg: Option<&KeyManagementConfig>) {
+    plane_slot().store(plane.clone());
 
-    // WOR-1563: with the mesh tier, install cross-replica per-key spend + rate
-    // counters (CRDTs coherent across the fleet via gossip).
-    if cfg.cache.tier == KeyCacheTier::Mesh {
-        let node_id = cfg
-            .cache
-            .mesh_node_id
-            .clone()
-            .unwrap_or_else(default_node_id);
-        crate::mesh_counters::install_mesh_counters(Arc::new(
-            crate::mesh_counters::MeshKeyCounters::new(node_id),
-        ));
+    // WOR-2064: the `keystore` readiness probe follows the committed
+    // generation. Clear the published view when this generation does not
+    // run the mesh backend, so /readyz stops reporting a backend that is
+    // gone. (Installation happens when the backend is built, in
+    // `build_store`.)
+    let mesh_active =
+        cfg.is_some_and(|cfg| cfg.enabled && cfg.store.backend == KeyStoreBackend::Mesh);
+    if !mesh_active {
+        crate::mesh_keystore::clear_readiness();
     }
+
+    let Some((plane, cfg)) = plane.zip(cfg.filter(|cfg| cfg.enabled)) else {
+        return;
+    };
 
     // Cross-replica invalidation: subscribe to the Redis channel so a peer's
     // mutation drops the matching local cache entry. Runs forever on the key
@@ -661,6 +979,7 @@ pub fn init_key_plane(cfg: &KeyManagementConfig) -> Result<()> {
     }
 
     if let Some(url) = subscribe_url {
+        let cache = plane.cache().clone();
         key_runtime().spawn(async move {
             loop {
                 if let Err(e) =
@@ -679,6 +998,19 @@ pub fn init_key_plane(cfg: &KeyManagementConfig) -> Result<()> {
         cache_tier = ?cfg.cache.tier,
         "dynamic key plane installed"
     );
+}
+
+/// Build, seed, and immediately install a key plane.
+///
+/// Boot and reload use the crate-internal `prepare_key_plane`,
+/// `seed_prepared_key_plane`, and `activate_key_plane` steps directly so the
+/// plane can be committed with its matching pipeline. This wrapper remains for
+/// callers and tests that intentionally manage only the process-global admin
+/// view.
+pub fn init_key_plane(cfg: &KeyManagementConfig) -> Result<()> {
+    let plane = prepare_key_plane(Some(cfg))?;
+    seed_prepared_key_plane(plane.as_ref(), Some(cfg))?;
+    activate_key_plane(plane, Some(cfg));
     Ok(())
 }
 
@@ -751,10 +1083,152 @@ mod tests {
     }
 
     #[test]
+    fn strict_governance_without_redis_fails_before_installing_the_plane() {
+        let _guard = test_plane_guard();
+        let path = temp_db();
+        let mut cfg = base_cfg(&path);
+        cfg.governance.consistency = sbproxy_config::GovernanceConsistency::Strict;
+
+        let error = init_key_plane(&cfg).expect_err("strict governance needs Redis");
+        assert!(
+            error
+                .to_string()
+                .contains("strict governance requires an explicit redis backend"),
+            "unexpected error: {error}"
+        );
+        assert!(current_key_plane().is_none());
+    }
+
+    #[test]
+    fn candidate_preparation_does_not_seed_the_live_store_before_commit() {
+        let _guard = test_plane_guard();
+        let path = temp_db();
+        let mut cfg = base_cfg(&path);
+        cfg.seed.keys.push(
+            serde_json::from_value(serde_json::json!({
+                "key_id": "candidate-only",
+                "secret": "candidate-secret"
+            }))
+            .expect("seed fixture"),
+        );
+
+        let plane = prepare_key_plane(Some(&cfg))
+            .expect("prepare candidate")
+            .expect("enabled plane");
+        let store = plane.cache().store().clone();
+        assert!(
+            key_runtime()
+                .block_on(store.get_key("candidate-only"))
+                .expect("read candidate store")
+                .is_none(),
+            "candidate construction must not mutate the store before commit",
+        );
+
+        seed_prepared_key_plane(Some(&plane), Some(&cfg)).expect("seed at commit boundary");
+        assert!(
+            key_runtime()
+                .block_on(store.get_key("candidate-only"))
+                .expect("read committed store")
+                .is_some(),
+            "the explicit commit step applies declarative seeds",
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn approximate_governance_installs_a_healthy_process_local_store() {
+        let _guard = test_plane_guard();
+        let path = temp_db();
+        let mut cfg = base_cfg(&path);
+        cfg.governance.lease_ttl_secs = 2;
+        cfg.governance.terminal_retention_secs = 7;
+
+        init_key_plane(&cfg).expect("install approximate governance");
+        let plane = current_key_plane().expect("plane installed");
+
+        assert_eq!(plane.governance().lease_ttl_secs, 2);
+        assert_eq!(plane.governance().terminal_retention_secs, 7);
+        assert_eq!(
+            plane.governance_consistency(),
+            sbproxy_ai::governance::GovernanceConsistency::Approximate
+        );
+        let direct_health = key_runtime().block_on(plane.governance_store().health());
+        assert_eq!(direct_health.backend, "memory");
+        assert_eq!(
+            direct_health.status,
+            sbproxy_ai::governance::GovernanceBackendStatus::Healthy
+        );
+        let plane_health = key_runtime().block_on(plane.governance_health());
+        assert_eq!(plane_health.consistency, direct_health.consistency);
+        assert_eq!(plane_health.backend, direct_health.backend);
+
+        // WOR-1835: approximate mode retains the concrete counter store so
+        // cross-node dissemination can be spawned against it.
+        assert!(
+            plane.approximate_store().is_some(),
+            "approximate consistency must expose the concrete in-memory store"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn disabling_key_management_uninstalls_the_live_plane() {
+        let _guard = test_plane_guard();
+        let path = temp_db();
+        let mut cfg = base_cfg(&path);
+
+        init_key_plane(&cfg).expect("install enabled key plane");
+        assert!(current_key_plane().is_some());
+
+        cfg.enabled = false;
+        init_key_plane(&cfg).expect("disable key plane");
+        assert!(
+            current_key_plane().is_none(),
+            "disabled key management must not leave stale governance state installed"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn strict_governance_constructs_a_lazy_dedicated_redis_store() {
+        let _guard = test_plane_guard();
+        let path = temp_db();
+        let mut cfg = base_cfg(&path);
+        cfg.governance.consistency = sbproxy_config::GovernanceConsistency::Strict;
+        cfg.governance.backend = Some(sbproxy_config::GovernanceBackendConfig::Redis {
+            url: "redis://governance.invalid:6379/4".to_string(),
+        });
+        cfg.governance.lease_ttl_secs = 3;
+        cfg.governance.terminal_retention_secs = 9;
+
+        init_key_plane(&cfg).expect("Redis connection must remain lazy during installation");
+        let plane = current_key_plane().expect("plane installed");
+        assert_eq!(
+            plane.governance_consistency(),
+            sbproxy_ai::governance::GovernanceConsistency::Strict
+        );
+        assert_eq!(plane.governance().lease_ttl_secs, 3);
+        assert_eq!(plane.governance().terminal_retention_secs, 9);
+
+        // WOR-1835: strict (Redis) governance owns its own coherence and
+        // must not expose a concrete store for dissemination to spawn.
+        assert!(
+            plane.approximate_store().is_none(),
+            "strict consistency must not expose an in-memory store"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn init_seeds_keys_and_credentials_into_embedded_store() {
         let _guard = test_plane_guard();
         let path = temp_db();
         let mut cfg = base_cfg(&path);
+        cfg.governance.key_introspection = true;
+        cfg.governance.require_governed_key = true;
         cfg.seed = KeySeedConfig {
             keys: vec![SeedKeyConfig {
                 key_id: "seed1".into(),
@@ -774,9 +1248,11 @@ mod tests {
                 require_pii_redaction: vec![],
                 principal_selectors: vec![],
                 route_to_model: None,
+                compression_profile: Some("coding-agent".into()),
                 inject_tools: vec![],
                 inject_mcp: Some(serde_json::json!({ "ref": "toolhub" })),
                 bypass_prompt_injection: false,
+                allow_content_capture: false,
                 project: None,
                 user: None,
                 tags: vec!["production".into()],
@@ -799,6 +1275,8 @@ mod tests {
 
         init_key_plane(&cfg).unwrap();
         let plane = current_key_plane().expect("plane installed");
+        assert!(plane.governance().key_introspection);
+        assert!(plane.governance().require_governed_key);
 
         // The seeded key resolves and verifies the seeded secret.
         let rec = key_runtime()
@@ -811,6 +1289,7 @@ mod tests {
         assert_eq!(rec.priority.as_deref(), Some("interactive"));
         assert_eq!(rec.allowed_providers, ["openai", "vertex"]);
         assert_eq!(rec.blocked_providers, ["vertex"]);
+        assert_eq!(rec.compression_profile.as_deref(), Some("coding-agent"));
         assert_eq!(rec.allowed_tools, Some(vec!["search".to_string()]));
         assert_eq!(
             rec.inject_mcp,
@@ -840,19 +1319,134 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// A config written before `failure_posture` existed must reach the
+    /// plane with exactly the behaviour it always had. That is the whole
+    /// promise of this migration, so it is pinned in both directions.
     #[test]
-    fn disabled_key_store_installs_and_reuses_governance() {
+    fn a_legacy_failure_mode_allow_config_resolves_to_the_same_admission() {
+        let _guard = test_plane_guard();
+        // A separate store file per plane: redb takes an exclusive lock, so
+        // two live planes cannot share one path.
+        let closed_path = temp_db();
+        let admitting_path = temp_db();
+
+        let closed_cfg = base_cfg(&closed_path);
+        assert!(!closed_cfg.failure_mode_allow, "the legacy default is deny");
+        let closed = prepare_key_plane(Some(&closed_cfg))
+            .expect("prepare closed plane")
+            .expect("enabled plane");
+        assert_eq!(closed.failure_posture(), FailureMode::Closed);
+        assert!(!closed.failure_posture().admits());
+        drop(closed);
+
+        let mut admitting_cfg = base_cfg(&admitting_path);
+        admitting_cfg.failure_mode_allow = true;
+        let admitting = prepare_key_plane(Some(&admitting_cfg))
+            .expect("prepare admitting plane")
+            .expect("enabled plane");
+        assert!(admitting.failure_posture().admits());
+        // `true` has always meant "fall through with no per-key policy,
+        // budget, or attribution". That is a waived guarantee, and it is
+        // recorded as one rather than as a plain open.
+        assert_eq!(admitting.failure_posture(), FailureMode::Degraded);
+        assert!(admitting.failure_posture().guarantee_waived());
+        drop(admitting);
+
+        std::fs::remove_file(&closed_path).ok();
+        std::fs::remove_file(&admitting_path).ok();
+    }
+
+    /// An explicit posture wins over the legacy boolean, including when the
+    /// two disagree, and `degraded` stays distinguishable from `open`.
+    #[test]
+    fn an_explicit_failure_posture_overrides_the_legacy_boolean() {
+        let _guard = test_plane_guard();
+        let closed_path = temp_db();
+        let open_path = temp_db();
+
+        let mut closed_cfg = base_cfg(&closed_path);
+        closed_cfg.failure_mode_allow = true;
+        closed_cfg.failure_posture = Some(FailureMode::Closed);
+        let plane = prepare_key_plane(Some(&closed_cfg))
+            .expect("prepare plane")
+            .expect("enabled plane");
+        assert_eq!(
+            plane.failure_posture(),
+            FailureMode::Closed,
+            "the explicit key wins even when the legacy boolean says admit"
+        );
+        drop(plane);
+
+        let mut open_cfg = base_cfg(&open_path);
+        open_cfg.failure_mode_allow = false;
+        open_cfg.failure_posture = Some(FailureMode::Open);
+        let plane = prepare_key_plane(Some(&open_cfg))
+            .expect("prepare plane")
+            .expect("enabled plane");
+        assert_eq!(plane.failure_posture(), FailureMode::Open);
+        assert!(plane.failure_posture().admits());
+        assert!(
+            !plane.failure_posture().guarantee_waived(),
+            "a plain open claims nothing, which is what separates it from degraded"
+        );
+        assert_eq!(plane.failure_posture().as_label(), "open");
+        drop(plane);
+
+        std::fs::remove_file(&closed_path).ok();
+        std::fs::remove_file(&open_path).ok();
+    }
+
+    /// `observe` has no meaning for an unreachable store, so it is refused
+    /// before anything is built, and refused even with the block disabled.
+    #[test]
+    fn an_observe_posture_is_refused_before_the_plane_is_built() {
+        let _guard = test_plane_guard();
+        let path = temp_db();
+        let mut cfg = base_cfg(&path);
+        cfg.failure_posture = Some(FailureMode::Observe);
+
+        let error = prepare_key_plane(Some(&cfg))
+            .map(|_| ())
+            .expect_err("observe must not build a plane");
+        assert!(
+            error
+                .to_string()
+                .contains("key_management.failure_posture: `observe` is meaningless"),
+            "the error must name the site: {error}"
+        );
+
+        cfg.enabled = false;
+        let error = prepare_key_plane(Some(&cfg))
+            .map(|_| ())
+            .expect_err("a disabled block still rejects the typo");
+        assert!(
+            error.to_string().contains("key_management.failure_posture"),
+            "unexpected error: {error}"
+        );
+
+        let mut governed = base_cfg(&path);
+        governed.governance.failure_posture = Some(FailureMode::Observe);
+        let error = prepare_key_plane(Some(&governed))
+            .map(|_| ())
+            .expect_err("observe must not build a governance store either");
+        assert!(
+            error
+                .to_string()
+                .contains("key_management.governance.failure_posture"),
+            "the nested site names itself: {error}"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn disabled_block_installs_nothing() {
         let _guard = test_plane_guard();
         let path = temp_db();
         let mut cfg = base_cfg(&path);
         cfg.enabled = false;
+        // A fresh slot would be None anyway; assert init is a no-op error-free.
         init_key_plane(&cfg).unwrap();
-        let first = current_governance_plane().expect("governance plane installed");
-        assert!(current_key_plane().is_none());
-
-        init_key_plane(&cfg).unwrap();
-        let second = current_governance_plane().expect("governance plane retained");
-        assert!(Arc::ptr_eq(&first, &second));
         std::fs::remove_file(&path).ok();
     }
 
@@ -896,9 +1490,11 @@ mod tests {
                 require_pii_redaction: vec![],
                 principal_selectors: vec![],
                 route_to_model: None,
+                compression_profile: None,
                 inject_tools: vec![],
                 inject_mcp: None,
                 bypass_prompt_injection: false,
+                allow_content_capture: false,
                 project: None,
                 user: None,
                 tags: vec![],
@@ -916,5 +1512,287 @@ mod tests {
             .unwrap()
             .expect("seeded key present in secrets-manager store");
         assert_eq!(rec.name.as_deref(), Some("sm-seeded"));
+    }
+
+    #[test]
+    fn admin_operator_pepper_falls_back_to_the_default_with_no_key_management() {
+        // Admin login must work with no `key_management:` block at all,
+        // since that's the common case.
+        assert_eq!(
+            resolve_admin_operator_pepper(None).unwrap(),
+            default_admin_operator_pepper()
+        );
+        let cfg = KeyManagementConfig::default();
+        assert_eq!(
+            resolve_admin_operator_pepper(Some(&cfg)).unwrap(),
+            default_admin_operator_pepper()
+        );
+    }
+
+    #[test]
+    fn admin_operator_pepper_prefers_a_pinned_key_management_pepper() {
+        let cfg = KeyManagementConfig {
+            crypto: KeyCryptoConfig {
+                pepper: Some("pinned-pepper".to_string()),
+                master_key: None,
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_admin_operator_pepper(Some(&cfg)).unwrap(),
+            b"pinned-pepper".to_vec()
+        );
+    }
+
+    #[test]
+    fn admin_operator_pepper_reports_an_unresolvable_reference() {
+        let cfg = KeyManagementConfig {
+            crypto: KeyCryptoConfig {
+                pepper: Some("env:SBPROXY_TEST_ADMIN_PEPPER_DOES_NOT_EXIST".to_string()),
+                master_key: None,
+            },
+            ..Default::default()
+        };
+        assert!(resolve_admin_operator_pepper(Some(&cfg)).is_err());
+    }
+
+    #[test]
+    fn hash_admin_operator_password_matches_the_keystore_primitive() {
+        let pepper = b"p";
+        assert_eq!(
+            hash_admin_operator_password("pw", pepper),
+            sbproxy_keystore::crypto::hash_secret("pw", pepper)
+        );
+    }
+}
+
+#[cfg(test)]
+mod resolve_credential_secret_tests {
+    use super::*;
+    use sbproxy_keystore::MemoryKeyStore;
+
+    fn plane() -> KeyPlane {
+        let crypto = KeyCrypto::new(b"pep".to_vec(), b"master".to_vec());
+        let store = Arc::new(MemoryKeyStore::new());
+        let cache = Arc::new(TtlCache::new(
+            store as Arc<dyn KeyStore>,
+            TtlCacheConfig::default(),
+        ));
+        KeyPlane::from_parts(crypto, cache, false, false, None)
+    }
+
+    fn credential(id: &str, material: CredentialMaterial) -> CredentialRecord {
+        let now = Utc::now();
+        CredentialRecord {
+            id: id.to_string(),
+            name: id.to_string(),
+            provider: None,
+            kind: "api_key".to_string(),
+            header: sbproxy_keystore::record::default_cred_header(),
+            scheme: sbproxy_keystore::record::default_cred_scheme(),
+            material,
+            status: RecordStatus::Active,
+            tenant_id: None,
+            metadata: Default::default(),
+            created_at: now,
+            updated_at: now,
+            source: RecordSource::Api,
+        }
+    }
+
+    async fn put(plane: &KeyPlane, rec: CredentialRecord) {
+        plane.cache().store().put_credential(rec).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resolves_an_envelope_credential_into_a_presentable_header() {
+        invalidate_all_resolved_credentials();
+        let p = plane();
+        let envelope = p.crypto().seal("c1", b"upstream-secret").unwrap();
+        let mut rec = credential("c1", CredentialMaterial::Envelope { envelope });
+        rec.header = "x-api-key".to_string();
+        rec.scheme = String::new();
+        put(&p, rec).await;
+
+        let resolved = p.resolve_credential_secret("c1", None).await.unwrap();
+        assert_eq!(resolved.header, "x-api-key");
+        assert_eq!(resolved.value, "upstream-secret");
+    }
+
+    #[tokio::test]
+    async fn applies_the_scheme_prefix_when_one_is_configured() {
+        invalidate_all_resolved_credentials();
+        let p = plane();
+        put(
+            &p,
+            credential(
+                "c2",
+                CredentialMaterial::Plaintext {
+                    value: "abc123".into(),
+                },
+            ),
+        )
+        .await;
+
+        let resolved = p.resolve_credential_secret("c2", None).await.unwrap();
+        assert_eq!(resolved.header, "authorization");
+        assert_eq!(resolved.value, "Bearer abc123");
+    }
+
+    #[tokio::test]
+    async fn a_missing_credential_is_an_error_not_a_fallback() {
+        invalidate_all_resolved_credentials();
+        let p = plane();
+        assert!(matches!(
+            p.resolve_credential_secret("nope", None).await,
+            Err(CredentialResolveError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_revoked_credential_is_not_usable() {
+        invalidate_all_resolved_credentials();
+        let p = plane();
+        let mut rec = credential("c3", CredentialMaterial::Plaintext { value: "x".into() });
+        rec.status = RecordStatus::Revoked;
+        put(&p, rec).await;
+        assert!(matches!(
+            p.resolve_credential_secret("c3", None).await,
+            Err(CredentialResolveError::NotUsable)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_cross_tenant_binding_is_refused_at_resolution() {
+        // Checked here as well as at the admin boundary, because either
+        // record's tenant can be patched after the binding was made.
+        invalidate_all_resolved_credentials();
+        let p = plane();
+        let mut rec = credential("c4", CredentialMaterial::Plaintext { value: "x".into() });
+        rec.tenant_id = Some("tenant-a".to_string());
+        put(&p, rec).await;
+
+        assert!(matches!(
+            p.resolve_credential_secret("c4", Some("tenant-b")).await,
+            Err(CredentialResolveError::TenantMismatch)
+        ));
+        assert!(p
+            .resolve_credential_secret("c4", Some("tenant-a"))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_envelope_sealed_under_another_master_key_is_unresolvable() {
+        // A master-key rotation stops every existing envelope opening. That
+        // must be a loud, distinct error, never a silent fallback.
+        invalidate_all_resolved_credentials();
+        let sealer = KeyCrypto::new(b"pep".to_vec(), b"a-different-master".to_vec());
+        let envelope = sealer.seal("c5", b"secret").unwrap();
+        let p = plane();
+        put(
+            &p,
+            credential("c5", CredentialMaterial::Envelope { envelope }),
+        )
+        .await;
+
+        match p.resolve_credential_secret("c5", None).await {
+            Err(CredentialResolveError::Unresolvable(reason)) => {
+                assert!(reason.contains("master key"), "{reason}");
+            }
+            other => panic!("expected Unresolvable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_resolved_secret_is_cached_and_dropped_on_invalidation() {
+        invalidate_all_resolved_credentials();
+        let p = plane();
+        put(
+            &p,
+            credential(
+                "c6",
+                CredentialMaterial::Plaintext {
+                    value: "first".into(),
+                },
+            ),
+        )
+        .await;
+        assert_eq!(
+            p.resolve_credential_secret("c6", None).await.unwrap().value,
+            "Bearer first"
+        );
+
+        // Rotate the stored secret. The cache still holds the old one, which
+        // is the behaviour that makes invalidation load-bearing.
+        put(
+            &p,
+            credential(
+                "c6",
+                CredentialMaterial::Plaintext {
+                    value: "second".into(),
+                },
+            ),
+        )
+        .await;
+        assert_eq!(
+            p.resolve_credential_secret("c6", None).await.unwrap().value,
+            "Bearer first",
+            "served from cache until invalidated"
+        );
+
+        p.invalidate_resolved_credential("c6");
+        p.cache().invalidate("c6").await;
+        assert_eq!(
+            p.resolve_credential_secret("c6", None).await.unwrap().value,
+            "Bearer second",
+            "invalidation drops the resolved secret, not just the record"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolved_credential_cache_is_isolated_per_key_plane_generation() {
+        // The same record id can legitimately resolve differently after reload.
+        invalidate_all_resolved_credentials();
+        let plane_a = plane();
+        let plane_b = plane();
+        put(
+            &plane_a,
+            credential(
+                "shared-id",
+                CredentialMaterial::Plaintext {
+                    value: "generation-a".into(),
+                },
+            ),
+        )
+        .await;
+        put(
+            &plane_b,
+            credential(
+                "shared-id",
+                CredentialMaterial::Plaintext {
+                    value: "generation-b".into(),
+                },
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            plane_a
+                .resolve_credential_secret("shared-id", None)
+                .await
+                .unwrap()
+                .value,
+            "Bearer generation-a",
+        );
+        assert_eq!(
+            plane_b
+                .resolve_credential_secret("shared-id", None)
+                .await
+                .unwrap()
+                .value,
+            "Bearer generation-b",
+            "a newer plane must not reuse a resolved secret cached by an older plane",
+        );
     }
 }

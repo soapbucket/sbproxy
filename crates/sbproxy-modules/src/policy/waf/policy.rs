@@ -6,6 +6,7 @@
 //! policy without a restart.
 
 use regex::Regex;
+use sbproxy_config::types::FailureMode;
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -22,28 +23,143 @@ const MAX_PARANOIA: u8 = 4;
 /// Web Application Firewall policy.
 ///
 /// Provides OWASP CRS-based request filtering, custom rules, and
-/// configurable actions on match. Fields are stored as generic values
-/// for forward compatibility with the Go implementation.
+/// configurable actions on match. The OWASP and custom-rule payloads
+/// remain generic so they can accept additional rule attributes without
+/// changing this envelope.
 ///
 /// The `paranoia` field follows the OWASP CRS convention. Level 1 is the
 /// default and runs only the lowest-false-positive rules. Levels 2-4
 /// progressively enable stricter rules at the cost of more false
 /// positives. Rules without an explicit paranoia attribute default to
 /// paranoia=1 and therefore always run.
+///
+/// Two independent axes decide what happens to a request, and they are
+/// worth keeping apart. [`Self::action_on_match`] and
+/// [`Self::test_mode`] answer "a rule fired, now what".
+/// [`Self::failure_posture()`] answers "a rule could not run, now
+/// what". A detector can reasonably be in log-only mode while it is
+/// being tuned and still need to refuse traffic it was unable to
+/// inspect.
 #[derive(Debug, Deserialize)]
 pub struct WafPolicy {
     /// OWASP Core Rule Set configuration.
     #[serde(default)]
     pub owasp_crs: Option<serde_json::Value>,
-    /// Action to take when a rule matches (e.g. "block", "log").
+    /// Action to take when a rule matches. The magic value `"log"`
+    /// means "record the match and let the request through"; anything
+    /// else (including the default) blocks.
+    ///
+    /// This is the *enforcement* axis: the WAF reached a verdict and
+    /// the verdict was "refuse". It is a different question from
+    /// [`Self::failure_posture()`], which covers the WAF being unable to
+    /// reach a verdict at all. See the note on [`Self::test_mode`] for
+    /// why this axis still has three spellings.
     #[serde(default)]
     pub action_on_match: Option<String>,
-    /// If true, log matches but do not block.
+    /// If true, log matches but do not block. Overrides
+    /// [`Self::action_on_match`] in the permissive direction.
+    ///
+    /// # Three spellings of one idea
+    ///
+    /// The enforcement axis is currently expressed three ways, and this
+    /// field is one of them:
+    ///
+    /// 1. `test_mode: true` - policy-wide, read at four sites inside
+    ///    [`Self::check_request`].
+    /// 2. `action_on_match: "log"` - policy-wide, a magic string.
+    /// 3. Per-rule [`FeedRuleAction::Log`] - carried on managed-bundle
+    ///    and feed rules.
+    ///
+    /// `sbproxy_config::types::EnforcementMode` exists to collapse all
+    /// three into one word. It is deliberately **not** wired here yet,
+    /// because a partial migration would add a fourth spelling rather
+    /// than remove two. Doing it properly means: replacing
+    /// `FeedRuleAction::Log` on the rule struct in
+    /// [`super::feed`] with the shared enum, so the per-rule and
+    /// policy-wide axes speak one vocabulary; giving the policy an
+    /// `enforcement: EnforcementMode` key that both legacy spellings
+    /// resolve into (`test_mode: true` or `action_on_match: "log"`
+    /// yields `Observe`); collapsing the four `self.test_mode` reads
+    /// into a single resolved value computed once at the top of
+    /// [`Self::check_request`]; and keeping the rule-level value as an
+    /// override of the policy-level one, which is the only ordering
+    /// that preserves today's behaviour. That work spans the feed
+    /// module and is tracked separately.
     #[serde(default)]
     pub test_mode: bool,
-    /// If true, allow requests through on WAF engine failure.
+    /// Legacy failure knob: if true, allow requests through when the
+    /// WAF cannot reach a verdict.
+    ///
+    /// Superseded by [`Self::failure_posture()`], which spells the same
+    /// decision with a word instead of a boolean whose polarity had to
+    /// be re-derived at every site. This field still parses and is
+    /// still honoured when `failure_posture` is absent, so existing
+    /// configs are unaffected. Prefer `failure_posture` in new configs;
+    /// `fail_open: true` is `failure_posture: open` and `fail_open:
+    /// false` (the default) is `failure_posture: closed`.
+    ///
+    /// Read through [`Self::failure_posture()`], never directly.
     #[serde(default)]
     pub fail_open: bool,
+    /// What the WAF does when it cannot reach a verdict on a request.
+    ///
+    /// # When this fires
+    ///
+    /// Exactly one condition reaches this knob today: a custom rule
+    /// that could not be evaluated. That covers an invalid regex under
+    /// `operator: rx`, an unknown `operator`, a rule with none of
+    /// `pattern` / `lua_script` / `js_script`, and a Lua or JavaScript
+    /// engine that failed to start or threw. Those are the cases where
+    /// the WAF has no answer about the request rather than a permissive
+    /// one.
+    ///
+    /// A rule that cannot be evaluated never stops the other rules from
+    /// running (WOR-1152), and a block from any rule still wins over
+    /// this posture. The posture only decides what happens to a request
+    /// that nothing blocked *and* that the WAF could not fully
+    /// evaluate.
+    ///
+    /// Built-in patterns, the managed OWASP CRS bundle, and feed rules
+    /// cannot reach this branch: their regexes are compiled before they
+    /// enter the corpus, so a bad one is dropped at load rather than
+    /// failing per request.
+    ///
+    /// # Postures
+    ///
+    /// - `closed` (default, and what `fail_open: false` resolves to):
+    ///   refuse the request with 403. A WAF that silently admits what
+    ///   it could not inspect is worse than no WAF, because the config
+    ///   still advertises protection.
+    /// - `open` (what `fail_open: true` resolves to): admit the
+    ///   request and claim nothing.
+    /// - `degraded`: admit the request and mark the WAF guarantee as
+    ///   not made for it. Same traffic outcome as `open`, but the
+    ///   structured log carries `guarantee_waived`, so an operator can
+    ///   alert on requests that went through uninspected.
+    /// - `observe`: **rejected at config-compile time.** See below.
+    ///
+    /// `observe` means "admit, and record the decision the control
+    /// would have taken". This branch exists precisely because the WAF
+    /// did *not* take a decision, so the only counterfactual available
+    /// is a restatement of the posture itself. `degraded` says the same
+    /// thing and says it precisely, so offering both here would be a
+    /// second spelling of one idea. The compiler rejects `observe` with
+    /// an error naming this policy rather than accepting it and
+    /// quietly treating it as `open`.
+    ///
+    /// # Upgrade note
+    ///
+    /// Before this field existed, `fail_open` was wired to a result
+    /// variant that nothing ever constructed, so a custom rule the
+    /// engine could not evaluate was logged and the request was treated
+    /// as clean, whatever `fail_open` said. A config that carries a
+    /// malformed custom rule and leaves `fail_open` at its default now
+    /// gets the refusal it always asked for. Grep the logs for
+    /// `custom rule engine error` before upgrading; the fix is to
+    /// repair the rule, and `failure_posture: open` is the escape hatch
+    /// if you need the old behaviour while you do.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_posture: Option<FailureMode>,
     /// Paranoia level (1-4). Only rules whose paranoia attribute is less
     /// than or equal to this value are evaluated. Defaults to 1 (lowest
     /// false-positive). For backward compatibility, the value can also be
@@ -94,7 +210,16 @@ pub enum WafResult {
     Clean,
     /// Attack detected - block with a message.
     Blocked(String),
-    /// WAF engine error occurred during evaluation.
+    /// The pass finished without a block, but at least one rule could
+    /// not be evaluated, so "clean" would be a claim the WAF is not in
+    /// a position to make. The string names the rules and the engine
+    /// errors they produced.
+    ///
+    /// Only [`WafPolicy::check_request`] produces this, and only from
+    /// the custom-rule loop. `Blocked` outranks it: a rule that did
+    /// fire is a stronger fact than a rule that could not run. The
+    /// caller routes this by
+    /// [`WafPolicy::failure_posture()`].
     Error(String),
 }
 
@@ -154,8 +279,20 @@ impl WafPolicy {
     /// background task spawned on [`super::feed::WAF_FEED_TASKS`].
     /// Subscriber construction errors propagate; rule-feed downloads
     /// do *not* (a flaky publisher must never break config compile).
+    ///
+    /// Rejects `failure_posture: observe`, which has no meaning at this
+    /// site. See [`Self::failure_posture()`] for the argument.
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
         let mut policy: Self = serde_json::from_value(value)?;
+        if policy.failure_posture == Some(FailureMode::Observe) {
+            anyhow::bail!(
+                "waf policy: `failure_posture: observe` is not meaningful here. \
+                 This posture applies when the WAF could not reach a verdict, so \
+                 there is no verdict whose counterfactual could be recorded. Use \
+                 `degraded` to admit the request and mark the WAF guarantee as not \
+                 made, or `closed` to refuse it."
+            );
+        }
         if let Some(feed_cfg) = policy.feed.clone() {
             if feed_cfg.enabled {
                 let sub = WafFeedSubscriber::new(feed_cfg)?;
@@ -206,6 +343,22 @@ impl WafPolicy {
         self.block_store.as_ref()
     }
 
+    /// Effective failure posture for this policy.
+    ///
+    /// The explicit `failure_posture` key wins. When it is absent the
+    /// legacy [`Self::fail_open`] boolean is converted, so a config
+    /// written before the key existed keeps its exact behaviour:
+    /// `fail_open: true` is [`FailureMode::Open`] and the default
+    /// `false` is [`FailureMode::Closed`].
+    ///
+    /// This is the only supported read path. Do not branch on
+    /// `fail_open` directly; the polarity conversion belongs in one
+    /// place.
+    pub fn failure_posture(&self) -> FailureMode {
+        self.failure_posture
+            .unwrap_or_else(|| FailureMode::from_fail_open(self.fail_open))
+    }
+
     /// Check whether OWASP CRS is enabled.
     fn owasp_enabled(&self) -> bool {
         match &self.owasp_crs {
@@ -251,6 +404,18 @@ impl WafPolicy {
     /// whose paranoia level is less than or equal to the policy's
     /// configured level are evaluated. Custom rules without a paranoia
     /// attribute default to paranoia=1 and therefore always run.
+    ///
+    /// # Which result you get
+    ///
+    /// - [`WafResult::Blocked`] as soon as any rule matches and the
+    ///   effective action is to block. Evaluation short-circuits there,
+    ///   because the request is already refused.
+    /// - [`WafResult::Error`] when the pass completed without a block
+    ///   but at least one custom rule could not be evaluated. Every
+    ///   remaining rule still ran first (WOR-1152); this reports the
+    ///   gap rather than closing the pass early on it.
+    /// - [`WafResult::Clean`] only when every applicable rule ran and
+    ///   none matched.
     pub fn check_request(
         &self,
         uri: &str,
@@ -430,6 +595,16 @@ impl WafPolicy {
         }
 
         // --- Custom rules ---
+        //
+        // Rules that blow up during evaluation are collected here
+        // rather than aborting the loop. WOR-1152 pinned that a single
+        // malformed rule must not stop the remaining rules from
+        // enforcing, and it still does not. What changed is the verdict
+        // afterwards: a pass with an unevaluated rule in it reports
+        // `Error`, not `Clean`, so the operator's failure posture gets
+        // to decide instead of the request being silently waved through
+        // as inspected.
+        let mut unevaluated: Vec<String> = Vec::new();
         for rule_value in &self.custom_rules {
             // Feed rules with the same `id` shadow inline custom rules.
             // Skip the inline rule when a feed rule of the same id
@@ -478,11 +653,32 @@ impl WafPolicy {
                     // invalid regex) must not abort evaluation of the
                     // remaining rules or fail open by short-circuiting the
                     // whole pass. Log and skip this rule so later rules
-                    // still enforce.
-                    tracing::warn!(error = %e, "WAF: custom rule engine error; skipping rule");
+                    // still enforce, but remember that this request was
+                    // not fully inspected.
+                    let rule_id = rule_value
+                        .get("id")
+                        .and_then(|id| id.as_str())
+                        .unwrap_or("unknown");
+                    tracing::warn!(
+                        rule_id = rule_id,
+                        error = %e,
+                        "WAF: custom rule engine error; skipping rule, evaluation continues"
+                    );
+                    unevaluated.push(format!("{rule_id}: {e}"));
                     continue;
                 }
             }
+        }
+
+        if !unevaluated.is_empty() {
+            // Nothing blocked, but the pass was not complete. Reporting
+            // `Clean` here would tell the caller the request was
+            // inspected and found safe, which is not what happened.
+            return WafResult::Error(format!(
+                "{} custom rule(s) could not be evaluated: {}",
+                unevaluated.len(),
+                unevaluated.join("; ")
+            ));
         }
 
         WafResult::Clean
@@ -1070,6 +1266,179 @@ mod tests {
             on.block_store().unwrap().key_kind(),
             crate::policy::waf::BlockKeyKind::Ip
         );
+    }
+
+    // --- Failure posture ---
+
+    /// The legacy boolean still parses and still decides the posture
+    /// when the new key is absent. Both polarities, plus the omitted
+    /// case, so an existing config is pinned in all three shapes.
+    #[test]
+    fn waf_legacy_fail_open_still_decides_the_posture() {
+        let omitted = WafPolicy::from_config(serde_json::json!({})).unwrap();
+        assert_eq!(omitted.failure_posture(), FailureMode::Closed);
+
+        let explicit_false =
+            WafPolicy::from_config(serde_json::json!({ "fail_open": false })).unwrap();
+        assert_eq!(explicit_false.failure_posture(), FailureMode::Closed);
+
+        let explicit_true =
+            WafPolicy::from_config(serde_json::json!({ "fail_open": true })).unwrap();
+        assert_eq!(explicit_true.failure_posture(), FailureMode::Open);
+    }
+
+    /// The explicit key wins over the legacy boolean in both
+    /// directions. Asserting only the agreeing case would not tell a
+    /// precedence bug apart from a working accessor.
+    #[test]
+    fn waf_failure_posture_overrides_legacy_fail_open() {
+        let closed_over_open = WafPolicy::from_config(serde_json::json!({
+            "fail_open": true,
+            "failure_posture": "closed",
+        }))
+        .unwrap();
+        assert_eq!(closed_over_open.failure_posture(), FailureMode::Closed);
+
+        let open_over_closed = WafPolicy::from_config(serde_json::json!({
+            "fail_open": false,
+            "failure_posture": "open",
+        }))
+        .unwrap();
+        assert_eq!(open_over_closed.failure_posture(), FailureMode::Open);
+    }
+
+    /// `degraded` parses and resolves; it is the supported way to admit
+    /// an uninspected request while marking the guarantee as not made.
+    #[test]
+    fn waf_failure_posture_accepts_degraded() {
+        let policy =
+            WafPolicy::from_config(serde_json::json!({ "failure_posture": "degraded" })).unwrap();
+        assert_eq!(policy.failure_posture(), FailureMode::Degraded);
+        assert!(policy.failure_posture().admits());
+        assert!(policy.failure_posture().guarantee_waived());
+    }
+
+    /// `observe` has no counterfactual to record at a site that exists
+    /// because no decision was reached, so config compile refuses it
+    /// rather than silently treating it as `open`. The error names the
+    /// site.
+    #[test]
+    fn waf_failure_posture_rejects_observe_at_config_compile() {
+        let err = WafPolicy::from_config(serde_json::json!({ "failure_posture": "observe" }))
+            .expect_err("observe must not compile at the waf site");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("waf policy"),
+            "error must name the site: {msg}"
+        );
+        assert!(
+            msg.contains("degraded"),
+            "error must point at the posture that does work here: {msg}"
+        );
+    }
+
+    /// A custom rule the engine cannot evaluate leaves the request
+    /// uninspected. Reporting `Clean` there would tell the caller the
+    /// WAF looked and found nothing, which is not what happened.
+    #[test]
+    fn waf_unevaluatable_custom_rule_reports_error_not_clean() {
+        let policy = WafPolicy::from_config(serde_json::json!({
+            "custom_rules": [
+                {
+                    "id": "broken-regex",
+                    "operator": "rx",
+                    "pattern": "(unclosed",
+                    "message": "never evaluated"
+                }
+            ]
+        }))
+        .unwrap();
+
+        let headers = make_header_map(&[]);
+        match policy.check_request("/api", &headers, None) {
+            WafResult::Error(msg) => {
+                assert!(msg.contains("broken-regex"), "must name the rule: {msg}");
+            }
+            _ => panic!("an unevaluatable rule must not report Clean"),
+        }
+    }
+
+    /// An unknown operator is the other engine-error shape and lands on
+    /// the same verdict.
+    #[test]
+    fn waf_unknown_operator_reports_error() {
+        let policy = WafPolicy::from_config(serde_json::json!({
+            "custom_rules": [
+                { "id": "bad-op", "operator": "sorcery", "pattern": "x" }
+            ]
+        }))
+        .unwrap();
+
+        let headers = make_header_map(&[]);
+        assert!(matches!(
+            policy.check_request("/api", &headers, None),
+            WafResult::Error(_)
+        ));
+    }
+
+    /// WOR-1152 regression pin. A malformed rule must not abort the
+    /// pass: the rules after it still run, and a block from one of them
+    /// still wins over the failure posture. Ordering matters here, so
+    /// the broken rule is deliberately first.
+    #[test]
+    fn waf_a_later_rule_still_blocks_after_an_unevaluatable_one() {
+        let policy = WafPolicy::from_config(serde_json::json!({
+            "custom_rules": [
+                { "id": "broken-regex", "operator": "rx", "pattern": "(unclosed" },
+                {
+                    "id": "still-enforcing",
+                    "operator": "contains",
+                    "pattern": "/forbidden",
+                    "action": "block",
+                    "message": "later rule still ran"
+                }
+            ]
+        }))
+        .unwrap();
+
+        let headers = make_header_map(&[]);
+        match policy.check_request("/forbidden/path", &headers, None) {
+            WafResult::Blocked(msg) => {
+                assert!(msg.contains("still-enforcing"), "{msg}");
+            }
+            _ => panic!("a malformed rule must not stop the remaining rules from enforcing"),
+        }
+    }
+
+    /// A policy with no custom rules cannot produce an engine error, so
+    /// the posture never engages and a clean request stays clean under
+    /// either legacy setting. This is the shape almost every shipped
+    /// WAF config has, and it is unchanged.
+    #[test]
+    fn waf_without_custom_rules_is_unaffected_by_the_posture() {
+        for fail_open in [false, true] {
+            let policy = WafPolicy::from_config(serde_json::json!({
+                "owasp_crs": { "enabled": true },
+                "action_on_match": "block",
+                "fail_open": fail_open,
+            }))
+            .unwrap();
+            let headers = make_header_map(&[]);
+            assert!(
+                matches!(
+                    policy.check_request("/api?q=hello", &headers, None),
+                    WafResult::Clean
+                ),
+                "fail_open={fail_open} must not change a clean request"
+            );
+            assert!(
+                matches!(
+                    policy.check_request("/api?q=union%20select%20*", &headers, None),
+                    WafResult::Blocked(_)
+                ),
+                "fail_open={fail_open} must not change a blocked request"
+            );
+        }
     }
 
     /// Same custom rule fires once policy paranoia is raised.

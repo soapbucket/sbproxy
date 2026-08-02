@@ -1,10 +1,5 @@
-if #KEYS ~= 3 then
+if #KEYS ~= 1 then
   return {'error', 'key_count'}
-end
-
-local storage_type_error = validate_storage_types()
-if storage_type_error then
-  return {'invariant', storage_type_error}
 end
 
 local reservation_prefix = ARGV[1]
@@ -22,14 +17,14 @@ end
 if state == 'settled' then
   return {
     'settled',
-    format_integer(read_required_number(reservation_prefix .. ':policy_revision')),
-    format_integer(read_required_number(reservation_prefix .. ':reserved_tokens')),
-    format_integer(read_required_number(reservation_prefix .. ':reserved_micro_usd')),
-    format_integer(read_required_number(reservation_prefix .. ':actual_tokens')),
-    format_integer(read_required_number(reservation_prefix .. ':actual_micro_usd')),
-    format_integer(read_required_number(reservation_prefix .. ':tokens_exceeded')),
-    format_integer(read_required_number(reservation_prefix .. ':micro_usd_exceeded')),
-    format_integer(read_required_number(reservation_prefix .. ':terminal_at'))
+    redis.call('HGET', governance_key, reservation_prefix .. ':policy_revision'),
+    redis.call('HGET', governance_key, reservation_prefix .. ':reserved_tokens'),
+    redis.call('HGET', governance_key, reservation_prefix .. ':reserved_micro_usd'),
+    redis.call('HGET', governance_key, reservation_prefix .. ':actual_tokens'),
+    redis.call('HGET', governance_key, reservation_prefix .. ':actual_micro_usd'),
+    redis.call('HGET', governance_key, reservation_prefix .. ':tokens_exceeded'),
+    redis.call('HGET', governance_key, reservation_prefix .. ':micro_usd_exceeded'),
+    redis.call('HGET', governance_key, reservation_prefix .. ':terminal_at')
   }
 end
 if state ~= 'active' then
@@ -38,98 +33,46 @@ end
 
 local current_window_millis = read_number('window_millis')
 if current_window_millis > 0 then
-  local _, window_reset = ensure_window(now_millis, current_window_millis)
-  if not window_reset then
-    return {'overflow', 'window_reset_at_millis'}
-  end
+  ensure_window(now_millis, current_window_millis)
 end
 
-local reserved_tokens = read_required_number(reservation_prefix .. ':reserved_tokens')
-local reserved_micro_usd = read_required_number(
-  reservation_prefix .. ':reserved_micro_usd'
-)
+local reserved_tokens = read_number(reservation_prefix .. ':reserved_tokens')
+local reserved_micro_usd = read_number(reservation_prefix .. ':reserved_micro_usd')
 local tokens_exceeded = actual_tokens > reserved_tokens and 1 or 0
 local micro_usd_exceeded = actual_micro_usd > reserved_micro_usd and 1 or 0
 
-local window_reserved_requests = read_number('window_reserved_requests')
-local window_reserved_tokens = read_number('window_reserved_tokens')
-local window_used_requests = read_number('window_used_requests')
-local window_used_tokens = read_number('window_used_tokens')
 if same_reservation_window(reservation_prefix) then
-  window_reserved_requests = checked_sub(window_reserved_requests, 1)
-  if not window_reserved_requests then
-    return {'invariant', 'window_reserved_requests'}
-  end
-  window_reserved_tokens = checked_sub(window_reserved_tokens, reserved_tokens)
-  if not window_reserved_tokens then
-    return {'invariant', 'window_reserved_tokens'}
-  end
-  window_used_requests = checked_add(window_used_requests, 1)
-  if not window_used_requests then
-    return {'overflow', 'window_used_requests'}
-  end
-  window_used_tokens = checked_add(window_used_tokens, actual_tokens)
-  if not window_used_tokens then
-    return {'overflow', 'window_used_tokens'}
-  end
+  subtract_counter('window_reserved_requests', 1)
+  subtract_counter('window_reserved_tokens', reserved_tokens)
+  write_number('window_used_requests', read_number('window_used_requests') + 1)
+  write_number('window_used_tokens', read_number('window_used_tokens') + actual_tokens)
 end
-local total_reserved_tokens = checked_sub(
-  read_number('total_reserved_tokens'),
-  reserved_tokens
+subtract_counter('total_reserved_tokens', reserved_tokens)
+subtract_counter('total_reserved_micro_usd', reserved_micro_usd)
+write_number('total_used_tokens', read_number('total_used_tokens') + actual_tokens)
+write_number(
+  'total_used_micro_usd',
+  read_number('total_used_micro_usd') + actual_micro_usd
 )
-if not total_reserved_tokens then
-  return {'invariant', 'total_reserved_tokens'}
-end
-local total_reserved_micro_usd = checked_sub(
-  read_number('total_reserved_micro_usd'),
-  reserved_micro_usd
-)
-if not total_reserved_micro_usd then
-  return {'invariant', 'total_reserved_micro_usd'}
-end
-local total_used_tokens = checked_add(
-  read_number('total_used_tokens'),
-  actual_tokens
-)
-if not total_used_tokens then
-  return {'overflow', 'total_used_tokens'}
-end
-local total_used_micro_usd = checked_add(
-  read_number('total_used_micro_usd'),
-  actual_micro_usd
-)
-if not total_used_micro_usd then
-  return {'overflow', 'total_used_micro_usd'}
-end
-
 redis.call(
   'HSET',
   governance_key,
-  'window_reserved_requests', format_integer(window_reserved_requests),
-  'window_reserved_tokens', format_integer(window_reserved_tokens),
-  'window_used_requests', format_integer(window_used_requests),
-  'window_used_tokens', format_integer(window_used_tokens),
-  'total_reserved_tokens', format_integer(total_reserved_tokens),
-  'total_reserved_micro_usd', format_integer(total_reserved_micro_usd),
-  'total_used_tokens', format_integer(total_used_tokens),
-  'total_used_micro_usd', format_integer(total_used_micro_usd),
   reservation_prefix .. ':state', 'settled',
-  reservation_prefix .. ':actual_tokens', format_integer(actual_tokens),
-  reservation_prefix .. ':actual_micro_usd', format_integer(actual_micro_usd),
-  reservation_prefix .. ':tokens_exceeded', format_integer(tokens_exceeded),
-  reservation_prefix .. ':micro_usd_exceeded', format_integer(micro_usd_exceeded),
-  reservation_prefix .. ':terminal_at', format_integer(now_millis)
+  reservation_prefix .. ':actual_tokens', tostring(actual_tokens),
+  reservation_prefix .. ':actual_micro_usd', tostring(actual_micro_usd),
+  reservation_prefix .. ':tokens_exceeded', tostring(tokens_exceeded),
+  reservation_prefix .. ':micro_usd_exceeded', tostring(micro_usd_exceeded),
+  reservation_prefix .. ':terminal_at', tostring(now_millis)
 )
-index_terminal_reservation(reservation_prefix, now_millis)
 
 return {
   'settled',
-  format_integer(read_required_number(reservation_prefix .. ':policy_revision')),
-  format_integer(reserved_tokens),
-  format_integer(reserved_micro_usd),
-  format_integer(actual_tokens),
-  format_integer(actual_micro_usd),
-  format_integer(tokens_exceeded),
-  format_integer(micro_usd_exceeded),
-  format_integer(now_millis)
+  redis.call('HGET', governance_key, reservation_prefix .. ':policy_revision'),
+  tostring(reserved_tokens),
+  tostring(reserved_micro_usd),
+  tostring(actual_tokens),
+  tostring(actual_micro_usd),
+  tostring(tokens_exceeded),
+  tostring(micro_usd_exceeded),
+  tostring(now_millis)
 }

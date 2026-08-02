@@ -195,10 +195,16 @@ fn desired_rejects_conflicting_legacy_host_policies() {
 
 #[test]
 fn desired_rejects_legacy_fields_the_managed_driver_cannot_honor() {
+    // Pinned to llama_cpp: `vllm_passthrough_supported` is false for
+    // both an unresolved (`None`, this compile-time validate pass) and
+    // a resolved (`Some(LlamaCpp)`, boot/prepare) engine, so speculative
+    // decoding of any method is rejected at both stages equally --
+    // llama.cpp has no consumer for the speculation flags at all.
     let config: ModelHostConfig = serde_yaml::from_str(
         r#"
 models:
   - model: qwen3-14b
+    engine: llama_cpp
     speculative: {}
 "#,
     )
@@ -221,6 +227,44 @@ models:
         error,
         DesiredStateError::Invalid(ref message) if message.contains("speculative")
     ));
+}
+
+#[test]
+fn desired_accepts_deferred_auto_engine_with_ngram_speculative_at_boot() {
+    // The engine is unpinned (`Auto`), so at this compile-time validate
+    // pass `resolved_engine` is `None` and `vllm_passthrough_supported`
+    // defers to `entry.engine` -- `Auto` is not excluded, so it reads as
+    // "supported for now" rather than guessing wrong on a pinned
+    // non-vLLM engine. `speculative: {}` (n-gram, the default method)
+    // needs no draft-model VRAM check, so it is accepted here rather
+    // than deferred-and-rejected. This is intentional, not a gap: were
+    // the engine to actually resolve to something other than vLLM at
+    // prepare time, `runtime_manager.rs`'s prepare path re-runs the same
+    // `validate_legacy_managed_compatibility` check with the resolved
+    // engine (runtime_manager.rs:3228) and rejects it there instead, the
+    // same two-stage pattern the other three vLLM-only passthroughs
+    // (chunked_prefill, tool_call_parser, swap_space_gib) already use.
+    let config: ModelHostConfig = serde_yaml::from_str(
+        r#"
+models:
+  - model: qwen3-14b
+    speculative: {}
+"#,
+    )
+    .unwrap();
+    compile_desired_state(
+        input(
+            None,
+            Vec::new(),
+            vec![LegacyServeInput {
+                origin: "origin-a".to_string(),
+                provider: "local".to_string(),
+                config,
+            }],
+        ),
+        &Catalog::builtin(),
+    )
+    .expect("an unpinned engine with n-gram speculative config defers to prepare, not a boot-time reject");
 }
 
 fn manager_desired(
@@ -320,8 +364,14 @@ struct FixtureRuntimeFacts {
     max_active_starts: AtomicUsize,
     fail_start: Mutex<BTreeSet<String>>,
     fail_start_once: Mutex<BTreeSet<String>>,
+    // Overrides the reason `start` fails with for an id in `fail_start` or
+    // `fail_start_once`; absent defaults to `EngineEarlyExit`.
+    fail_start_reason: Mutex<BTreeMap<String, EngineFailureReason>>,
     fail_stop: Mutex<BTreeSet<String>>,
     fail_health: Mutex<BTreeSet<String>>,
+    // id -> number of health probes to fail transiently before recovering.
+    // Each failing probe decrements the count; at zero the engine reads ready.
+    flap_health: Mutex<BTreeMap<String, u32>>,
     events: Mutex<Vec<String>>,
     next_port: AtomicU16,
     block_memory: AtomicBool,
@@ -431,8 +481,16 @@ impl PreparedDeploymentRuntime for FixturePreparedRuntime {
         self.facts.active_starts.fetch_sub(1, Ordering::SeqCst);
         let fail_once = self.facts.fail_start_once.lock().unwrap().remove(&self.id);
         if fail_once || self.facts.fail_start.lock().unwrap().contains(&self.id) {
+            let reason = self
+                .facts
+                .fail_start_reason
+                .lock()
+                .unwrap()
+                .get(&self.id)
+                .copied()
+                .unwrap_or(EngineFailureReason::EngineEarlyExit);
             return Err(RuntimeManagerError::Engine(EngineDriverError::new(
-                EngineFailureReason::EngineEarlyExit,
+                reason,
                 format!("fixture deployment {} failed to start", self.id),
                 "repair the fixture and reset it",
                 true,
@@ -460,6 +518,7 @@ impl PreparedDeploymentRuntime for FixturePreparedRuntime {
             selected_devices: Vec::new(),
             started_at_ms: 1,
             artifact_digest: "a".repeat(64),
+            engine_version: None,
             memory: sbproxy_model_host::MemoryEstimate::from_total(0, 1),
             process,
         })
@@ -496,6 +555,12 @@ impl PreparedDeploymentRuntime for FixturePreparedRuntime {
                 "repair the fixture health boundary",
                 true,
             )));
+        }
+        if let Some(remaining) = self.facts.flap_health.lock().unwrap().get_mut(&self.id) {
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Ok(EngineHealth::Unhealthy);
+            }
         }
         if running.process.has_exited().await? {
             Ok(EngineHealth::Stopped)
@@ -793,6 +858,249 @@ async fn ready_generation_detects_a_process_that_exited_after_readiness() {
     );
     assert!(status.port.is_none());
     assert!(manager.residency_reservations().await.is_empty());
+}
+
+#[tokio::test]
+async fn failed_deployment_self_heals_on_the_next_ensure_ready_call() {
+    // Regression: `Failed` used to be terminal until an operator called
+    // `reset()`. A killed engine (`kill -9`, exercised live by
+    // `scripts/certify-model-host.sh`'s recovery check) must come back on
+    // its own the next time a request needs the deployment.
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = manager(preparer.clone());
+    manager
+        .reconcile(manager_desired("self-heal", &[("a", false, 30)], 1))
+        .await
+        .unwrap();
+    let first = manager.ensure_ready("a").await.unwrap();
+    preparer.facts.processes.lock().unwrap()["a"]
+        .stopped
+        .store(true, Ordering::SeqCst);
+
+    manager
+        .ensure_ready("a")
+        .await
+        .expect_err("an exited ready process must not remain routable");
+    assert_eq!(
+        manager.status("a").await.unwrap().state,
+        sbproxy_model_host::DeploymentRuntimeState::Failed
+    );
+
+    let recovered = manager
+        .ensure_ready("a")
+        .await
+        .expect("a non-crash-loop Failed deployment must relaunch on the next request");
+    assert_ne!(
+        recovered.port, first.port,
+        "the relaunch is a brand new engine process, not the dead one"
+    );
+    assert_eq!(
+        manager.status("a").await.unwrap().state,
+        sbproxy_model_host::DeploymentRuntimeState::Ready
+    );
+    assert_eq!(
+        preparer.facts.starts.lock().unwrap().get("a").copied(),
+        Some(2),
+        "initial start plus one self-heal relaunch"
+    );
+}
+
+#[tokio::test]
+async fn admission_lets_a_non_crash_loop_failed_deployment_relaunch() {
+    // The gateway's real request path calls `admit` before `ensure_ready`
+    // (see sbproxy-core's `ManagedModelPermit`), so the self-heal in
+    // `ensure_ready` alone is unreachable from a live request unless
+    // `admit` also stops treating every `Failed` deployment as terminal.
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = manager(preparer.clone());
+    manager
+        .reconcile(manager_desired("admit-self-heal", &[("a", false, 30)], 1))
+        .await
+        .unwrap();
+    manager.ensure_ready("a").await.unwrap();
+    preparer.facts.processes.lock().unwrap()["a"]
+        .stopped
+        .store(true, Ordering::SeqCst);
+    manager.maintenance_tick(tokio::time::Instant::now()).await;
+    assert_eq!(
+        manager.status("a").await.unwrap().state,
+        sbproxy_model_host::DeploymentRuntimeState::Failed
+    );
+
+    let permit = manager
+        .admit("a", sbproxy_model_host::PriorityClass::Standard)
+        .await
+        .expect("a non-crash-loop failure must still admit new requests");
+    manager
+        .ensure_ready_for_generation(
+            "a",
+            permit.generation(),
+            permit.start_epoch(),
+            sbproxy_model_host::PriorityClass::Standard,
+        )
+        .await
+        .expect("an admitted request must relaunch the engine");
+    assert_eq!(
+        manager.status("a").await.unwrap().state,
+        sbproxy_model_host::DeploymentRuntimeState::Ready
+    );
+}
+
+#[tokio::test]
+async fn crash_looped_deployment_does_not_relaunch_on_every_request() {
+    // Once the retained failure is already `crash_loop` (the exhausted
+    // launch-retry budget `EngineSupervisor` owns in production), every
+    // later request must keep returning the cached error instead of
+    // attempting a new launch on every single call.
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    preparer
+        .facts
+        .fail_start_reason
+        .lock()
+        .unwrap()
+        .insert("a".to_string(), EngineFailureReason::CrashLoop);
+    preparer
+        .facts
+        .fail_start
+        .lock()
+        .unwrap()
+        .insert("a".to_string());
+    let manager = manager(preparer.clone());
+    manager
+        .reconcile(manager_desired("crash-loop-bound", &[("a", false, 30)], 1))
+        .await
+        .unwrap();
+
+    manager.ensure_ready("a").await.unwrap_err();
+    let starts_after_first_failure = preparer.facts.starts.lock().unwrap().get("a").copied();
+    let second = manager.ensure_ready("a").await.unwrap_err();
+    assert_eq!(
+        second.reason_code(),
+        "crash_loop",
+        "the retained crash_loop failure must reach the caller, not a generic draining error"
+    );
+    manager.ensure_ready("a").await.unwrap_err();
+    assert_eq!(
+        preparer.facts.starts.lock().unwrap().get("a").copied(),
+        starts_after_first_failure,
+        "a retained crash_loop reason must stop attempting a relaunch"
+    );
+}
+
+#[tokio::test]
+async fn failed_deployment_with_a_stuck_process_does_not_auto_relaunch() {
+    // Regression: the self-heal above must not fire while a process from
+    // a failed stop() is still owned (a SIGKILL-resistant engine, the
+    // exact scenario `failed_health_cleanup_retains_process_ownership_and_residency`
+    // encodes). Launching a second engine while the first still holds its
+    // residency/VRAM reservation would corrupt or double-consume it, so
+    // this must behave like reset() (see its `Failed if
+    // lifecycle.running.is_none()` guard): keep returning the cached
+    // error until the stuck process is cleared.
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = manager(preparer.clone());
+    manager
+        .reconcile(manager_desired("stuck-process", &[("a", false, 30)], 1))
+        .await
+        .unwrap();
+    manager.ensure_ready("a").await.unwrap();
+    preparer
+        .facts
+        .fail_health
+        .lock()
+        .unwrap()
+        .insert("a".to_string());
+    preparer
+        .facts
+        .fail_stop
+        .lock()
+        .unwrap()
+        .insert("a".to_string());
+
+    manager.maintenance_tick(tokio::time::Instant::now()).await;
+    let failed = manager.status("a").await.unwrap();
+    assert_eq!(
+        failed.state,
+        sbproxy_model_host::DeploymentRuntimeState::Failed
+    );
+    assert!(
+        failed.port.is_some(),
+        "the possibly-live process must still be owned for this regression to be meaningful"
+    );
+
+    let starts_before = preparer.facts.starts.lock().unwrap().get("a").copied();
+    let error = manager
+        .ensure_ready("a")
+        .await
+        .expect_err("a stuck process must block the self-heal, not be joined by a second engine");
+    // The retained failure is the stop() failure (`fail_stop`'s
+    // EngineInternal), not the original health-check failure: when
+    // refresh_ready_health's own cleanup stop() also fails, it overwrites
+    // the surfaced error with the cleanup failure (see its `Err(cleanup_error)
+    // => cleanup_error` arm) precisely so the "why is this process still
+    // owned" reason is what is retained, not the earlier symptom.
+    assert_eq!(error.reason_code(), "engine_internal");
+    assert_eq!(
+        preparer.facts.starts.lock().unwrap().get("a").copied(),
+        starts_before,
+        "no relaunch attempt while the old process is still owned"
+    );
+    assert!(
+        manager
+            .admit("a", sbproxy_model_host::PriorityClass::Standard)
+            .await
+            .is_err(),
+        "admit must also keep rejecting while the old process is still owned"
+    );
+
+    // Clearing the stuck process, as an operator would via `stop`, frees
+    // the deployment for the self-heal to resume.
+    preparer.facts.fail_stop.lock().unwrap().remove("a");
+    manager.stop("a").await.unwrap();
+    manager
+        .ensure_ready("a")
+        .await
+        .expect("once the stale process is cleared, requests reach the engine again");
+    assert_eq!(
+        manager.status("a").await.unwrap().state,
+        sbproxy_model_host::DeploymentRuntimeState::Ready
+    );
+}
+
+#[tokio::test]
+async fn a_transient_health_probe_miss_does_not_fail_a_ready_engine() {
+    // Regression: the readiness monitor runs from both the maintenance tick
+    // and the request path, so a single dropped or timed-out /health probe
+    // (probe races, brief scheduler stalls, observed live with SGLang) must
+    // not kill a working engine. A flap shorter than the re-probe budget
+    // recovers and the deployment stays ready and routable.
+    let preparer = FixturePreparer::new(Duration::from_millis(1));
+    let manager = manager(preparer.clone());
+    manager
+        .reconcile(manager_desired("health-flap", &[("a", false, 30)], 1))
+        .await
+        .unwrap();
+    let first = manager.ensure_ready("a").await.unwrap();
+
+    // Two consecutive misses, under the re-probe budget, then ready again.
+    preparer
+        .facts
+        .flap_health
+        .lock()
+        .unwrap()
+        .insert("a".to_string(), 2);
+
+    let recovered = manager
+        .ensure_ready("a")
+        .await
+        .expect("a transient health miss must not fail the ready engine");
+    assert_eq!(recovered.port, first.port, "the same engine keeps serving");
+    let status = manager.status("a").await.unwrap();
+    assert_eq!(
+        status.state,
+        sbproxy_model_host::DeploymentRuntimeState::Ready
+    );
+    assert_eq!(manager.residency_reservations().await.len(), 1);
 }
 
 #[tokio::test]
@@ -1702,6 +2010,9 @@ impl ModelMetadataProvider for ProductionFixtureMetadata {
             kv_heads: 2,
             head_dim: 8,
             max_context: 128,
+            hidden_size: 0,
+            expert_count: 0,
+            expert_ffn_length: 0,
         })
     }
 }
@@ -1758,8 +2069,10 @@ async fn production_preparer_classifies_artifact_ensure_io_as_infrastructure() {
     let prepared = preparer
         .prepare(DeploymentPrepareRequest {
             deployment_id: "fixture".to_string(),
+            replica_idx: 0,
             generation: 1,
             desired: desired.deployments["fixture"].clone(),
+            pinned_fit: None,
             control: desired.control.clone(),
             legacy_host_policy: desired.legacy_host_policy.clone(),
         })
@@ -1856,6 +2169,7 @@ impl EngineDriver for ProductionFixtureDriver {
             selected_devices: request.selected_devices.clone(),
             started_at_ms: 1,
             artifact_digest: request.artifact.artifact_digest.clone(),
+            engine_version: provisioned.version.clone(),
             memory: request.fit.memory.clone(),
             process: Arc::new(ManagerFixtureProcess {
                 stopped: AtomicBool::new(false),

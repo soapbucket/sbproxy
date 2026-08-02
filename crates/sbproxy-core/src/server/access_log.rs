@@ -296,6 +296,8 @@ pub(super) fn capture_headers_for_log(
     max_value_bytes: usize,
     redact_pii: bool,
     redact_pii_rules: &[String],
+    is_sensitive: impl Fn(&str) -> bool,
+    is_credential_carrier: impl Fn(&str) -> bool,
 ) -> std::collections::BTreeMap<String, String> {
     if allowlist.is_empty() {
         return std::collections::BTreeMap::new();
@@ -305,14 +307,20 @@ pub(super) fn capture_headers_for_log(
             let redactor = default_pii_redactor();
             sbproxy_observe::capture::capture_headers(
                 headers,
-                |name| allowlist.matches(name),
+                |name| {
+                    !is_credential_carrier(name)
+                        && allowlist.matches_with_sensitive(name, &is_sensitive)
+                },
                 max_value_bytes,
                 Some(|v: &str| redactor.redact(v).into_owned()),
             )
         } else if let Some(redactor) = build_scoped_pii_redactor(redact_pii_rules) {
             sbproxy_observe::capture::capture_headers(
                 headers,
-                |name| allowlist.matches(name),
+                |name| {
+                    !is_credential_carrier(name)
+                        && allowlist.matches_with_sensitive(name, &is_sensitive)
+                },
                 max_value_bytes,
                 Some(|v: &str| redactor.redact(v).into_owned()),
             )
@@ -320,7 +328,10 @@ pub(super) fn capture_headers_for_log(
             // No matching rules: fall through to no-redaction.
             sbproxy_observe::capture::capture_headers(
                 headers,
-                |name| allowlist.matches(name),
+                |name| {
+                    !is_credential_carrier(name)
+                        && allowlist.matches_with_sensitive(name, &is_sensitive)
+                },
                 max_value_bytes,
                 None::<fn(&str) -> String>,
             )
@@ -328,7 +339,10 @@ pub(super) fn capture_headers_for_log(
     } else {
         sbproxy_observe::capture::capture_headers(
             headers,
-            |name| allowlist.matches(name),
+            |name| {
+                !is_credential_carrier(name)
+                    && allowlist.matches_with_sensitive(name, &is_sensitive)
+            },
             max_value_bytes,
             None::<fn(&str) -> String>,
         )
@@ -345,18 +359,36 @@ pub(super) fn log_capture_header_warnings(cfg: &sbproxy_config::AccessLogConfig)
     let (_, resp_warnings) =
         sbproxy_config::CompiledHeaderAllowlist::compile(&cfg.capture_headers.response);
     for header in &req_warnings {
-        tracing::warn!(
-            header = %header,
-            "access_log.capture_headers.request includes a sensitive header by exact match; \
-             values will be captured (redact_secrets still strips known token shapes)",
-        );
+        if header == "dpop" {
+            tracing::warn!(
+                header = %header,
+                "access_log.capture_headers.request includes DPoP by exact match; \
+                 the non-loggable proof header will be ignored",
+            );
+        } else {
+            tracing::warn!(
+                header = %header,
+                "access_log.capture_headers.request includes a sensitive header by exact match; \
+                 configured primary credential carriers remain excluded; other exact sensitive \
+                 values are captured (redact_secrets still strips known token shapes)",
+            );
+        }
     }
     for header in &resp_warnings {
-        tracing::warn!(
-            header = %header,
-            "access_log.capture_headers.response includes a sensitive header by exact match; \
-             values will be captured (redact_secrets still strips known token shapes)",
-        );
+        if header == "dpop" {
+            tracing::warn!(
+                header = %header,
+                "access_log.capture_headers.response includes DPoP by exact match; \
+                 the non-loggable proof header will be ignored",
+            );
+        } else {
+            tracing::warn!(
+                header = %header,
+                "access_log.capture_headers.response includes a sensitive header by exact match; \
+                 configured primary credential carriers remain excluded; other exact sensitive \
+                 values are captured (redact_secrets still strips known token shapes)",
+            );
+        }
     }
 }
 
@@ -371,7 +403,7 @@ pub(super) fn emit_access_log(
     hostname: &str,
     duration_secs: f64,
 ) {
-    let pipeline = reload::current_pipeline();
+    let pipeline = &ctx.pipeline;
     let Some(cfg) = pipeline.config.access_log.as_ref() else {
         return;
     };
@@ -447,13 +479,11 @@ pub(super) fn emit_access_log(
     } else {
         Some(auth_type.clone().unwrap_or_else(|| "none".to_string()))
     };
-    // WOR-1498: the credential (API key) that injected the policy, for
-    // the log-based per-credential reconciliation. Empty string means
-    // un-credentialed; record it as absent rather than a blank column.
-    let api_key_id = match ctx.principal.api_key_id() {
-        "" => None,
-        id => Some(id.to_string()),
-    };
+    // WOR-2093: the canonical accountability id, shared with the ring
+    // entry, the inbound-key metric, and spans so one request never
+    // reports different key ids on different surfaces. Absent rather
+    // than a blank column for un-credentialed traffic.
+    let api_key_id = ctx.accountable_key_id().map(str::to_string);
     let workspace_id = ctx
         .origin_idx
         .and_then(|idx| pipeline.config.origins.get(idx))
@@ -509,6 +539,8 @@ pub(super) fn emit_access_log(
                 cfg.capture_headers.max_value_bytes,
                 cfg.capture_headers.redact_pii,
                 &cfg.capture_headers.redact_pii_rules,
+                |name| pipeline.is_sensitive_header(name),
+                |name| pipeline.is_credential_carrier(name),
             );
             let resp_headers = match session.response_written() {
                 Some(written) => capture_headers_for_log(
@@ -517,6 +549,8 @@ pub(super) fn emit_access_log(
                     cfg.capture_headers.max_value_bytes,
                     cfg.capture_headers.redact_pii,
                     &cfg.capture_headers.redact_pii_rules,
+                    |name| pipeline.is_sensitive_header(name),
+                    |name| pipeline.is_credential_carrier(name),
                 ),
                 None => std::collections::BTreeMap::new(),
             };
@@ -550,12 +584,21 @@ pub(super) fn emit_access_log(
         user_id_source: ctx.user_id_source,
         session_id: ctx.session_id.map(|u| u.to_string()),
         parent_session_id: ctx.parent_session_id.map(|u| u.to_string()),
+        // WOR-2139: the run correlation key and the trust flag that
+        // qualifies it. Both come straight off the context: the id was
+        // capped when `request_body_filter` read it out of the JSON-RPC
+        // body, and the flag is the same trust decision the A2A hop
+        // metric partitions on.
+        a2a_context_id: ctx.a2a_context_id.clone(),
+        a2a_identity_verified: ctx.a2a.as_ref().map(|a2a| a2a.identity_verified),
         properties: ctx.properties.clone(),
         workspace_id,
         tenant_id: ctx.tenant_id.to_string(),
         auth_type,
         principal_kind,
         api_key_id,
+        key_provider: ctx.native_key_provider.clone(),
+        key_mode: Some(ctx.inbound_key_mode.as_str().to_string()),
         served_from_cache: Some(ctx.served_from_cache),
         fallback_triggered: Some(ctx.fallback_triggered),
         retry_count: Some(ctx.retry_count),
@@ -742,6 +785,17 @@ pub(super) struct AccessLogContext {
     pub(super) user_id_source: Option<sbproxy_observe::UserIdSource>,
     pub(super) session_id: Option<String>,
     pub(super) parent_session_id: Option<String>,
+    /// WOR-2139: A2A `contextId` for this hop, from
+    /// `RequestContext::a2a_context_id`. The run-scoped grouping key;
+    /// `session_id` above is the caller-scoped one. `None` for traffic
+    /// that carried no A2A envelope, and for A2A hops whose origin never
+    /// buffered the request body the id lives in.
+    pub(super) a2a_context_id: Option<String>,
+    /// WOR-2139: whether the A2A envelope's identity fields came from a
+    /// trusted source, from `A2AContext::identity_verified`. `None` for
+    /// non-A2A traffic. Travels with `a2a_context_id` because an
+    /// untrusted caller picks its own run id.
+    pub(super) a2a_identity_verified: Option<bool>,
     pub(super) properties: std::collections::BTreeMap<String, String>,
     pub(super) workspace_id: String,
     /// WOR-1053: resolved tenant from `origin.tenant_id`. `__default__`
@@ -757,6 +811,10 @@ pub(super) struct AccessLogContext {
     /// WOR-1498: stable credential id (API key) that injected the
     /// policy. `None` for un-credentialed requests.
     pub(super) api_key_id: Option<String>,
+    /// Recognized native provider label; never the credential.
+    pub(super) key_provider: Option<String>,
+    /// Inbound credential mode (`none`, `minted`, or `native`).
+    pub(super) key_mode: Option<String>,
     pub(super) served_from_cache: Option<bool>,
     pub(super) fallback_triggered: Option<bool>,
     pub(super) retry_count: Option<u32>,
@@ -873,12 +931,16 @@ impl AccessLogContext {
             user_id_source: None,
             session_id: None,
             parent_session_id: None,
+            a2a_context_id: None,
+            a2a_identity_verified: None,
             properties: std::collections::BTreeMap::new(),
             workspace_id: String::new(),
             tenant_id: String::new(),
             auth_type: None,
             principal_kind: None,
             api_key_id: None,
+            key_provider: None,
+            key_mode: None,
             served_from_cache: None,
             fallback_triggered: None,
             retry_count: None,
@@ -1064,12 +1126,16 @@ pub(super) fn emit_access_log_entry(
         user_id_source: context.user_id_source,
         session_id: context.session_id,
         parent_session_id: context.parent_session_id,
+        a2a_context_id: context.a2a_context_id,
+        a2a_identity_verified: context.a2a_identity_verified,
         properties: context.properties,
         workspace_id: context.workspace_id,
         tenant_id: context.tenant_id,
         auth_type: context.auth_type,
         principal_kind: context.principal_kind,
         api_key_id: context.api_key_id,
+        key_provider: context.key_provider,
+        key_mode: context.key_mode,
         served_from_cache: context.served_from_cache,
         fallback_triggered: context.fallback_triggered,
         retry_count: context.retry_count,
@@ -1100,6 +1166,12 @@ pub(super) fn emit_access_log_entry(
         rail: context.rail,
         redeemed_token_id: context.redeemed_token_id,
         txhash: context.txhash,
+        // WOR-2100: the one-way settlement receipt correlation digest.
+        // Stamped by the settlement path, which is the only code that
+        // holds a committed receipt; there is no context slot for it yet,
+        // so a request that did not settle through the billing runtime
+        // reports None rather than an empty string.
+        settlement_receipt_digest: None,
         license_token_id: context.license_token_id,
         cap_token_id: context.cap_token_id,
         upstream_host: context.upstream_host,
@@ -1166,6 +1238,90 @@ pub(super) fn emit_access_log_entry(
     }
 }
 
+/// WOR-2139: the run correlation key survives the whole terminal
+/// stamping path, from `AccessLogContext` through serialization and
+/// redaction to the bytes an operator actually reads.
+///
+/// Driven through the file sink rather than a captured tracing
+/// subscriber because that is the shortest route to the emitted line
+/// with no subscriber machinery in the way; the two sinks share
+/// `redacted_json_line`, so the assertion covers both.
+#[cfg(test)]
+mod run_identity_tests {
+    use super::{emit_access_log_entry, AccessLogContext, HttpFields};
+
+    fn file_cfg(path: &std::path::Path) -> sbproxy_config::AccessLogConfig {
+        sbproxy_config::AccessLogConfig {
+            enabled: true,
+            sample_rate: 1.0,
+            output: sbproxy_config::AccessLogOutputConfig {
+                output_type: "file".to_string(),
+                path: Some(path.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn emit(context: AccessLogContext) -> serde_json::Value {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("access.log");
+        emit_access_log_entry(
+            &file_cfg(&path),
+            200,
+            "POST",
+            "agent.localhost",
+            "/a2a",
+            0.004,
+            "req-child".to_string(),
+            "10.0.0.1".to_string(),
+            None,
+            HttpFields::empty(),
+            context,
+        );
+        let line = std::fs::read_to_string(&path).expect("the access log line was written");
+        serde_json::from_str(line.trim()).expect("the emitted line is JSON")
+    }
+
+    #[test]
+    fn a_run_id_read_from_the_body_reaches_the_access_log() {
+        let mut context = AccessLogContext::empty();
+        context.session_id = Some("01JBX0000000000000000CAPT".to_string());
+        context.a2a_context_id = Some("run-7".to_string());
+        context.a2a_identity_verified = Some(true);
+
+        let line = emit(context);
+
+        assert_eq!(line["a2a_context_id"], "run-7");
+        assert_eq!(line["a2a_identity_verified"], true);
+        // The caller-scoped key keeps its own column rather than being
+        // displaced by the run-scoped one.
+        assert_eq!(line["session_id"], "01JBX0000000000000000CAPT");
+    }
+
+    #[test]
+    fn an_unverified_run_id_is_marked_on_the_same_line() {
+        let mut context = AccessLogContext::empty();
+        context.a2a_context_id = Some("run-7".to_string());
+        context.a2a_identity_verified = Some(false);
+
+        let line = emit(context);
+
+        assert_eq!(line["a2a_context_id"], "run-7");
+        assert_eq!(
+            line["a2a_identity_verified"], false,
+            "a run id the proxy did not authenticate must say so where it is read"
+        );
+    }
+
+    #[test]
+    fn non_a2a_traffic_carries_neither_run_column() {
+        let line = emit(AccessLogContext::empty());
+        assert!(line.get("a2a_context_id").is_none());
+        assert!(line.get("a2a_identity_verified").is_none());
+    }
+}
+
 #[cfg(test)]
 mod outcome_tests {
     use super::ai_outcome_label;
@@ -1204,5 +1360,148 @@ mod outcome_tests {
         // An unknown override degrades to `other` rather than leaking an
         // unbounded label.
         assert_eq!(ai_outcome_label(200, Some("bogus")), "other");
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::{capture_headers_for_log, log_capture_header_warnings};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    struct SharedLogGuard(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedLogGuard {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("warning capture")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLogWriter {
+        type Writer = SharedLogGuard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedLogGuard(Arc::clone(&self.0))
+        }
+    }
+
+    fn capture_header_warnings(cfg: &sbproxy_config::AccessLogConfig) -> String {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(SharedLogWriter(Arc::clone(&captured)))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            log_capture_header_warnings(cfg);
+        });
+        let bytes = captured.lock().expect("warning capture").clone();
+        String::from_utf8(bytes).expect("warning output is UTF-8")
+    }
+
+    const DPOP_PROOF: &str = concat!(
+        "eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IkVTMjU2IiwiandrIjp7Imt0eSI6IkVDIiwiY3J2",
+        "IjoiUC0yNTYiLCJ4IjoibDh0RnIzRjdrS3Rjb2J4NWVmMHlONUR1ejN0RDdmWUZQUmRaeFk1",
+        "VlFKMCIsInkiOiI0cE4tNUo3azZKbTZUdmVXZEVLd3FWRE1IWVE1bk5vVEhUY0xRa0cxZDVN",
+        "In19.",
+        "eyJqdGkiOiJmNmE4ZjMyZC00YzY1LTRjMjctYThiOS0zMDQ3ZjY4ZTI3MTUiLCJodG0iOiJH",
+        "RVQiLCJodHUiOiJodHRwczovL2FwaS5leGFtcGxlLmNvbS9yZXNvdXJjZSIsImlhdCI6MTc4",
+        "NTA5MTIwMH0.",
+        "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1",
+        "Njc4OWFiY2RlZg",
+    );
+
+    #[test]
+    fn emitted_access_log_json_never_contains_captured_dpop_proof() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("dpop", http::HeaderValue::from_static(DPOP_PROOF));
+
+        for pattern in ["*", "d*", "dpop"] {
+            let (allowlist, _) =
+                sbproxy_config::CompiledHeaderAllowlist::compile(&[pattern.to_string()]);
+            let captured = capture_headers_for_log(
+                &headers,
+                &allowlist,
+                4096,
+                false,
+                &[],
+                sbproxy_config::types::is_sensitive_header,
+                |_| false,
+            );
+            let line = sbproxy_observe::AccessLogEntry::builder()
+                .request_headers(captured)
+                .build()
+                .redacted_json_line()
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+
+            assert!(
+                value
+                    .get("request_headers")
+                    .and_then(|headers| headers.get("dpop"))
+                    .is_none(),
+                "capture pattern {pattern:?} emitted a DPoP field: {line}"
+            );
+            assert!(
+                !line.contains(DPOP_PROOF),
+                "capture pattern {pattern:?} emitted a compact DPoP proof: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_capture_cannot_override_a_primary_credential_carrier() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-opaque-credential",
+            http::HeaderValue::from_static("opaque-caller-secret"),
+        );
+        let (allowlist, _) =
+            sbproxy_config::CompiledHeaderAllowlist::compile(&["x-opaque-credential".to_string()]);
+        let captured = capture_headers_for_log(
+            &headers,
+            &allowlist,
+            4096,
+            false,
+            &[],
+            |_| false,
+            |name| name == "x-opaque-credential",
+        );
+        assert!(
+            captured.is_empty(),
+            "credential carriers must stay out of access logs even when named exactly"
+        );
+    }
+
+    #[test]
+    fn exact_sensitive_capture_warning_does_not_promise_carrier_capture() {
+        let mut cfg = sbproxy_config::AccessLogConfig::default();
+        cfg.capture_headers.request = vec!["x-sb-api".to_string()];
+        cfg.capture_headers.response = vec!["x-api-key".to_string()];
+
+        let warning = capture_header_warnings(&cfg);
+
+        assert_eq!(
+            warning
+                .matches("configured primary credential carriers remain excluded")
+                .count(),
+            2,
+            "request and response warnings must explain the hard carrier exclusion: {warning}"
+        );
+        assert!(
+            !warning.contains("values will be captured"),
+            "warning must not promise that a configured carrier is captured: {warning}"
+        );
     }
 }

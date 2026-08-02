@@ -21,6 +21,7 @@ pub use functions::{set_tls_fingerprint_matcher, TlsFingerprintMatcher};
 // --- Types ---
 
 /// A compiled CEL expression ready for evaluation.
+#[derive(Debug)]
 pub struct CelExpression {
     source: String,
     program: cel::Program,

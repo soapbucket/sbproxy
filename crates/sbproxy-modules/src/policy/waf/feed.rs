@@ -863,16 +863,16 @@ enum FetchOutcome {
 // --- Helpers ---
 
 /// Extract a Redis stream entry field as raw bytes. Stream values
-/// arrive as [`redis::Value::Data`] (RESP2 bulk-string) or
-/// [`redis::Value::Status`] (inline string); anything else is
+/// arrive as [`redis::Value::BulkString`] (RESP2 bulk-string) or
+/// [`redis::Value::SimpleString`] (inline string); anything else is
 /// treated as missing.
 fn bytes_field(
     map: &std::collections::HashMap<String, redis::Value>,
     name: &str,
 ) -> Option<Vec<u8>> {
     match map.get(name)? {
-        redis::Value::Data(b) => Some(b.clone()),
-        redis::Value::Status(s) => Some(s.as_bytes().to_vec()),
+        redis::Value::BulkString(b) => Some(b.clone()),
+        redis::Value::SimpleString(s) => Some(s.as_bytes().to_vec()),
         _ => None,
     }
 }
@@ -944,14 +944,25 @@ mod tests {
         }
     }
 
-    fn make_subscriber(tmp: &TempDir) -> (Arc<WafFeedSubscriber>, Vec<u8>, String, &'static str) {
-        // Use a deterministic env var name per test to avoid races
-        // when `cargo test` runs in parallel.
+    fn make_subscriber(
+        tmp: &TempDir,
+    ) -> (
+        Arc<WafFeedSubscriber>,
+        Vec<u8>,
+        String,
+        &'static str,
+        crate::test_env::EnvVarGuard,
+    ) {
+        // One env var name per subscriber so a leaked config cannot
+        // read another test's key. The guard serializes the mutation
+        // and restores the previous state on drop (WOR-646); it is
+        // returned to the caller because signature verification reads
+        // the key from the environment for the life of the test.
         static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let key_env: &'static str =
             Box::leak(format!("SBPROXY_FEED_TEST_KEY_{}", n).into_boxed_str());
-        std::env::set_var(key_env, "supersecretkey");
+        let env = crate::test_env::EnvVarGuard::set(&[(key_env, Some("supersecretkey"))]);
         let cache_file = tmp.path().join("cache.json");
         let config = WafFeedConfig {
             enabled: false, // disabled so new() does not spawn background tasks
@@ -972,7 +983,7 @@ mod tests {
         let raw = serde_json::to_vec(&bundle).unwrap();
         let signature = compute_signature(&raw, b"supersecretkey");
         let sub = WafFeedSubscriber::new(config).expect("subscriber");
-        (sub, raw, signature, key_env)
+        (sub, raw, signature, key_env, env)
     }
 
     #[test]
@@ -1002,7 +1013,7 @@ mod tests {
     #[test]
     fn malformed_bundle_is_rejected() {
         let tmp = TempDir::new().unwrap();
-        let (sub, _raw, _sig, _key_env) = make_subscriber(&tmp);
+        let (sub, _raw, _sig, _key_env, _env) = make_subscriber(&tmp);
         let bad = b"not json at all";
         let sig = compute_signature(bad, b"supersecretkey");
         let err = sub.verify_and_apply(bad, &sig).unwrap_err();
@@ -1012,7 +1023,7 @@ mod tests {
     #[test]
     fn well_formed_bundle_updates_rule_set() {
         let tmp = TempDir::new().unwrap();
-        let (sub, raw, sig, _key_env) = make_subscriber(&tmp);
+        let (sub, raw, sig, _key_env, _env) = make_subscriber(&tmp);
         sub.verify_and_apply(&raw, &sig).expect("apply");
         let snap = sub.current_rules();
         assert_eq!(snap.len(), 1);
@@ -1024,7 +1035,7 @@ mod tests {
     fn last_good_persists_across_reload() {
         let tmp = TempDir::new().unwrap();
         // First subscriber writes the cache.
-        let (sub, raw, sig, key_env) = make_subscriber(&tmp);
+        let (sub, raw, sig, key_env, _env) = make_subscriber(&tmp);
         sub.verify_and_apply(&raw, &sig).expect("apply");
         let cache_file = sub.config.cache_path();
         assert!(cache_file.exists(), "cache file written");
@@ -1065,7 +1076,7 @@ mod tests {
     #[test]
     fn stale_bundle_is_rejected_when_max_age_set() {
         let tmp = TempDir::new().unwrap();
-        let (sub, _raw, _sig, _key_env) = make_subscriber(&tmp);
+        let (sub, _raw, _sig, _key_env, _env) = make_subscriber(&tmp);
         // Construct a bundle with a very old timestamp.
         let old = SignedBundle {
             version: "2000-01-01T00:00:00Z".to_string(),

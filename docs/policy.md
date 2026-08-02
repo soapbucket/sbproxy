@@ -1,9 +1,65 @@
 # Policy engine
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-01*
 
 The policy engine evaluates a list of policies on every request. Each policy returns one of four verdicts: `Allow`, `Deny`, `AllowWithHeaders`, or `Confirm`. The dispatcher folds the per-policy results into a single decision and applies it before the request reaches the upstream.
 
-This page covers the `semantic_constraint` policy and the natural-language linter that supports it. The full set of built-in policies is listed in [features.md](features.md).
+This page covers the `semantic_constraint` policy. The full set of built-in policies is listed in [features.md](features.md).
+
+## Calling it
+
+Three examples carry a policy this page touches. The one used here is
+[`examples/cel-policy/`](../examples/cel-policy/), because it is the only one
+that demonstrates the *engine* described above: a policy returning `Deny` and
+the dispatcher turning that verdict into a response. The other two,
+[`ai-policy-cel`](../examples/ai-policy-cel/) and
+[`ai-content-policy-fallback`](../examples/ai-content-policy-fallback/),
+exercise the AI policy plane, which is a different evaluator documented in
+[ai-policy-cel.md](ai-policy-cel.md).
+
+That example runs one `expression` policy admitting a request only when the
+`X-Tenant` header is `acme`, with `deny_status: 403` and
+`deny_message: "tenant not allowed"`:
+
+```bash
+make run CONFIG=examples/cel-policy/sb.yml
+```
+
+A request that satisfies the expression is forwarded and the policy is
+invisible:
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' -H 'Host: cel.local' \
+  -H 'X-Tenant: acme' http://127.0.0.1:8080/get
+# 200
+```
+
+One that does not is denied by the dispatcher before the upstream is reached:
+
+```bash
+curl -sS -i -H 'Host: cel.local' http://127.0.0.1:8080/get
+```
+
+```http
+HTTP/1.1 403 Forbidden
+content-type: application/json
+content-length: 30
+
+{"error":"tenant not allowed"}
+```
+
+The configured `deny_message` becomes the value of a single `error` field in a
+JSON body; it is not returned as plain text. `deny_status` sets the status.
+A wrong header value and a missing header produce the identical response,
+because the expression evaluates to false either way rather than erroring.
+
+This is the shape every `Deny` verdict on this page takes. What differs
+between the policies is how the verdict is reached: `semantic_constraint` asks
+a judge backend, `request_validator` checks a body, `concurrent_limit` and
+`rate_limit_budget` check counters, and `expression` evaluates CEL. The
+dispatcher's handling of the result is the same.
+
+`semantic_constraint` is not demonstrated here because it requires a
+configured LLM judge backend to reach a verdict at all.
 
 ## semantic_constraint
 
@@ -36,7 +92,6 @@ origins:
 
 - `prompt_template`: a [minijinja](https://docs.rs/minijinja) template rendered against the request context. Available keys are `request.method`, `request.path`, `request.host`, and `request.query`. The rendered prompt is sent to the judge as the system message.
 - `violations_block`: when `true`, a judge `deny` verdict surfaces as the configured HTTP status (default 403). When `false`, a `deny` is logged and the request is allowed; this is the monitor mode used during rollout.
-- `policy_id`: optional UUID-shaped reference to a pinned compiled policy. Recorded on the audit event but not consulted at evaluation time in the OSS build.
 - `judge.endpoint`: upstream chat-completions URL. The judge backend speaks an OpenAI-compatible body shape and accepts either a direct verdict body (`{"verdict": "allow" | "deny", ...}`) or a `choices[0].message.content` JSON envelope.
 - `judge.api_key_env`: the name of the environment variable holding the bearer token. The proxy never stores the token in config (BYOK).
 - `judge.timeout_ms`, `judge.cache_capacity`, `judge.budget_tokens`: per-policy bounds on round-trip latency, in-memory cache size, and per-process token budget. Defaults are 2000 ms, 10000 entries, and 100000 tokens.
@@ -53,42 +108,13 @@ origins:
 
 The fail-closed contract is deliberate: a misconfigured or unreachable judge cannot silently allow traffic. The 500 body is generic; structured detail goes to logs and metrics.
 
-## NL linter (L001-L009)
+## Scope
 
-Authors who want to express a policy in plain English use the same backend through the NL compiler. The compiler runs a fixed linter before issuing the LLM compile call. Each rule catches a class of underspecified or dangerous NL input that, if fed through the compiler unchecked, produces Cedar that looks plausible but is wrong.
+`semantic_constraint` evaluates the configured prompt template directly against its judge. It does not compile natural-language rules into another policy language, store compiled policy records, or evaluate Cedar. Operators who need deterministic policy logic should use the built-in deterministic policies or a CEL expression.
 
-| Rule | What it catches |
-|---|---|
-| L001 | Resource type referenced but not declared in the workspace schema. |
-| L002 | Temporal constraint without a timezone or UTC marker. |
-| L003 | Rate constraint missing its time unit (per second, per minute, ...). |
-| L004 | Implicit deny-all or allow-all phrasing. The author must spell it out. |
-| L005 | Conflicting polarity: the same input implies both allow and deny on overlapping actions. |
-| L006 | Model name token that is not in the configured model schema. |
-| L007 | User-attribute reference whose left-hand side is not a known principal type. |
-| L008 | Monetary amount without a currency code or symbol. |
-| L009 | Bare predicate that names no principal, action, or resource. |
+## NL-to-Cedar decision
 
-A non-empty linter output blocks compilation. The author resolves the violations and re-submits.
-
-## OSS vs enterprise capability boundary
-
-OSS ships:
-
-- The `semantic_constraint` policy module.
-- The `NlLinter` rule set (L001-L009).
-- The `NlCompiler` that wraps the linter and the judge backend and emits a `CompiledPolicy` candidate with a SHA-256 `content_hash`.
-- An in-memory `CompiledPolicyStore` keyed by `policy_id`.
-- A single-provider `JudgeClient` with an LRU verdict cache and a per-process token budget tracker.
-
-OSS does not ship:
-
-- A Cedar evaluator. The compiled Cedar source is stored verbatim and used for audit replay; the OSS build does not enforce Cedar policies at the request path.
-- Multi-provider judge routing or the calibration tracker. The OSS judge is single-provider; the enterprise router adds failover, weighted blending, and a calibration delta metric.
-- A durable compiled-policy store. The in-memory store is OSS scope; the enterprise tier wraps the same struct shape with a durable backing store.
-- The hold-pending `Confirm` parking queue. The OSS dispatcher bridges `Confirm` to `AllowWithHeaders` with an `X-Policy-Confirm` header; the enterprise interceptor parks the request, posts to the configured webhook, and resumes on approval.
-
-The enterprise tier reads the same `CompiledPolicy` struct shape produced by the OSS compiler, so policies authored under OSS upgrade cleanly when the enterprise evaluator is wired in.
+SBproxy does not offer NL-to-Cedar compilation or a compiled-policy store. The inactive components had no runtime consumer and were removed in WOR-1986. `semantic_constraint` remains supported because it evaluates its configured judge directly. Reintroduce a compiler only with a concrete runtime consumer, evaluator or durable-store contract, and an explicit configuration lifecycle.
 
 ## request_validator
 
@@ -126,20 +152,60 @@ Caps in-flight requests per key. Distinct from `rate_limiting`, which throttles 
 
 Key strategies:
 
-- `origin` (default): one global counter for the route.
+- `global` (default): one counter for the policy mount.
 - `ip`: one counter per client IP.
 - `api_key`: one counter per `X-Api-Key` header (or `Authorization: Bearer` when no api-key auth is configured).
+- `route`: one counter per request path. Query strings do not create separate buckets.
+- `header:<name>`: one counter per value of the named request header.
+
+The former `key` field and its `origin` value remain accepted for schema-v1
+compatibility. New configuration should use `key_by`.
 
 ```yaml
 policies:
   - type: concurrent_limit
     max: 3
-    key: ip
+    key_by: ip
     status: 503
     error_body: '{"error":"too many concurrent requests, retry shortly"}'
 ```
 
 Runnable example: `examples/concurrent-limit/sb.yml`.
+
+## rate_limit_budget
+
+`rate_limit_budget` opts an origin into the workspace ceiling configured by the
+top-level `rate_limits:` block. Its module owns the token buckets and the full
+`Normal` → `Soft` → `Throttle` → `AutoSuspend` state machine; the proxy core
+only turns a denied decision into HTTP 429.
+
+```yaml
+rate_limits:
+  workspace_default:
+    http_rps_sustained: 100
+    http_rps_burst: 200
+    soft_threshold_rps: 80
+  escalation:
+    abuse_threshold_throttle_to_suspend: 1000
+    auto_suspend_cooldown_secs: 3600
+
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: http://backend:3000
+    policies:
+      - type: rate_limit_budget
+        headers:
+          enabled: true
+          include_retry_after: true
+          include_ratelimit_policy: true
+```
+
+`per_route_rps` is not implemented and is rejected during config compilation
+instead of being silently ignored. Use a separate `rate_limiting` policy for
+per-route RPS control. The three header switches above are all enforced on the
+429 response.
 
 ## http_framing
 
@@ -170,6 +236,8 @@ Depth, cycles, and caller and callee lists are all enforced before the upstream 
 
 Per-route enforcement for agent-to-agent calls. Source: `crates/sbproxy-modules/src/policy/a2a.rs`. The policy fires after authentication and after the resolver chain has populated `caller_agent_id`. Detection runs automatically on two header signals (`Content-Type: application/a2a+json` and `MCP-Method: agents.invoke`); `route_glob` is the operator escape hatch.
 
+Both header signals are the caller's to send or withhold, and an undetected request is allowed, so **set `route_glob` on any route you intend to govern**. Likewise the envelope these checks read is only trusted when it comes from a signed token's RFC 8693 `act` chain or from a peer in `proxy.trusted_proxies`; from anyone else it is discarded and the policy evaluates an empty envelope that trips nothing. [A2A gateway](a2a-gateway.md) covers both in full. It is worth reading before relying on the knobs below.
+
 Knobs:
 
 - `max_chain_depth`: hard ceiling on hops. Capped at 32 regardless of the configured value. Exceeding it returns 429.
@@ -179,6 +247,7 @@ Knobs:
 - `caller_denylist`: agents on this list never get past the policy. Returns 403.
 - `bill_caller_only`: true (default) bills the caller's wallet. Setting false flips to callee-billed semantics; the audit log stamps `pricing_anomaly: callee_billed` on each such transaction.
 - `route_glob`: any request whose path matches is treated as A2A traffic even when the protocol-detection headers are absent.
+- `push_target_allowlist`: hosts permitted as A2A 1.0 push-notification webhook targets even when they resolve to private address space. A2A lets a caller register a URL the upstream agent POSTs task artifacts to, so the default posture refuses private targets and non-HTTP schemes; internal callbacks are legitimate, but the operator names the host rather than getting it implicitly. Refusals return 403 with `a2a_push_target_blocked`.
 
 ```yaml
 policies:
@@ -191,9 +260,15 @@ policies:
     caller_denylist:
       - "agent:bad:actor"
     route_glob: "/agents/**"
+    push_target_allowlist:
+      - "callbacks.internal.example"
 ```
 
-Runnable example: `examples/a2a-protocol/sb.yml`.
+On detected A2A 1.0 routes the proxy buffers the request body so the push-notification target can be validated before it reaches the agent. The v0 drafts have no push-notification surface and are not buffered.
+
+Composing `prompt_injection_v2` on the same origin additionally scans the message the hop carries, with the action chosen by delegation depth. See [prompt-injection-v2.md](prompt-injection-v2.md#the-agent-boundary).
+
+Runnable examples: `examples/a2a-protocol/sb.yml` for the hop policy on its own, `examples/a2a-prompt-injection/sb.yml` for the two composed.
 
 ## See also
 

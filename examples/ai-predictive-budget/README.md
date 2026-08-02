@@ -24,3 +24,24 @@ The live fraction is also exposed to the AI policy plane as
 export OPENAI_API_KEY=sk-...
 make run CONFIG=examples/ai-predictive-budget/sb.yml
 ```
+
+## Try it
+
+```bash
+# Ordinary chat request against the $10/day workspace cap.
+curl -s -H 'Host: ai.local' -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Say hi in one word."}]}' \
+  http://127.0.0.1:8080/v1/chat/completions
+# 200 (with a valid OPENAI_API_KEY)
+
+# Malformed body: rejected before any budget check runs.
+curl -s -H 'Host: ai.local' -H 'Content-Type: application/json' \
+  -d 'not json' \
+  http://127.0.0.1:8080/v1/chat/completions
+# 400 {"error":"invalid JSON body"} - no API key needed to see this one
+```
+
+Reaching `warn_at` / `downgrade_at` / the hard cap takes real accumulated
+spend, so send enough real requests to cross 80% of the $10 cap and watch
+the response's `model` field switch to `gpt-4o-mini` past 95%, and the
+usage record gain a `budget_soft_landing` tag.

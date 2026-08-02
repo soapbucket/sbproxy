@@ -34,7 +34,7 @@
 //!   in an [`AtomicU64`] so the counter never serialises with the
 //!   selection path.
 //! - No healthy targets at all: returns `None` and the caller falls
-//!   through to the configured `lb_method`.
+//!   through to the configured `algorithm`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -175,7 +175,7 @@ mod tests {
             healthy,
             active_connections: 0,
             weight: 1,
-            metadata,
+            metadata: metadata.into(),
         }
     }
 
@@ -192,7 +192,7 @@ mod tests {
             healthy,
             active_connections: 0,
             weight: 1,
-            metadata,
+            metadata: metadata.into(),
         }
     }
 

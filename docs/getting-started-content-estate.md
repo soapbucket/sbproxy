@@ -13,7 +13,8 @@ You will put SBproxy in front of an HTML upstream and have it convert each page 
 
 ## Install
 
-One line installs the prebuilt binary on macOS or Linux. The script detects your OS and architecture, fetches the matching release binary, and drops it in `~/.local/bin`:
+One line installs the prebuilt binary on Linux amd64/arm64 or Apple Silicon
+macOS and places it in `~/.local/bin`:
 
 ```bash
 curl -fsSL https://download.sbproxy.dev | sh

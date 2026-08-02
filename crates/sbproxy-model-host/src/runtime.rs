@@ -155,6 +155,12 @@ pub trait ModelHostObserver: Send + Sync {
     ) {
         let _ = (deployment, priority, reason);
     }
+    /// Exact count of requests currently blocked on the shared
+    /// model-preparation concurrency limiter for `model`, i.e. queued
+    /// behind another in-flight cold load.
+    fn set_load_queue_depth(&self, model: &str, depth: i64) {
+        let _ = (model, depth);
+    }
 }
 
 /// A [`ModelHostObserver`] that does nothing; the runtime default.
@@ -1140,28 +1146,28 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
             .map(|(artifact, _)| vec![artifact.quant.clone()])
             .unwrap_or_else(|| self.candidate_quants(&model_ref));
         let seq_len = entry.max_context.unwrap_or(meta.max_context);
-        // WOR-1676: if the entry quantizes the KV cache, the planner
-        // spends the smaller KV term on the fit (so a card can hold a
-        // context it could not at f16 KV). `bytes_per_element()` is
-        // `None` for Auto/F16, which follows the weight quant's default.
-        let kv_bpe = entry.kv_quant.bytes_per_element();
-        let plan = plan_fit_auto_kv(
-            &*self.probe,
-            &meta,
-            &candidates,
-            seq_len,
-            DEFAULT_OVERHEAD,
-            kv_bpe,
-        )
-        .map_err(|e| RuntimeError::Fit(e.to_string()))?;
-
+        // WOR-1908: the served task decides whether a KV cache exists at
+        // all. A managed artifact carries its modality; a legacy catalog
+        // entry declares it; a raw hf: ref defaults to chat.
+        let modality = managed
+            .as_ref()
+            .map(|(artifact, _)| artifact.modality)
+            .or_else(|| {
+                model_ref
+                    .catalog_id
+                    .as_deref()
+                    .and_then(|id| self.catalog.get(id))
+                    .map(|catalog_entry| catalog_entry.modality)
+            })
+            .unwrap_or_default();
         // A GGUF source routes to llama.cpp; everything else is
         // safetensors and goes to vLLM. The signal is an explicit
         // `gguf_file` or a ref/repo that names GGUF, the same signal the
         // preflight uses. The fit-planner quant name is not reliable here:
         // a raw safetensors ref can be assigned a GGUF-style default
         // quant, and routing it to llama.cpp then fails with no file to
-        // load (there is no GGUF in a safetensors repo).
+        // load (there is no GGUF in a safetensors repo). Resolved before
+        // the fit because the KV term below depends on the engine.
         let engine_kind = managed
             .as_ref()
             .map(|(artifact, _)| artifact.engine)
@@ -1171,6 +1177,28 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
                     || model_ref.hf_repo.to_ascii_lowercase().contains("gguf");
                 entry.engine.resolve(is_gguf, self.container_runtime)
             });
+        // WOR-1676: if the entry quantizes the KV cache, the planner
+        // spends the smaller KV term on the fit (so a card can hold a
+        // context it could not at f16 KV).
+        // WOR-2069: size from what this engine will actually run, not
+        // from what was asked for; vLLM and SGLang substitute fp8 for
+        // int4, so sizing the request would book half the cache the
+        // engine allocates. `bytes_per_element` is `None` for Auto and
+        // for a no-flag engine, which follows the weight quant's default.
+        // WOR-1908: a non-decode modality overrides this to a zero KV
+        // term, so an embedder is sized by weights + overhead, never KV.
+        let effective_kv = crate::config::effective_kv_cache(entry.kv_quant, engine_kind);
+        crate::config::warn_on_kv_substitution(entry.kv_quant, effective_kv, engine_kind, name);
+        let kv_bpe = modality.kv_bytes_per_element_override(effective_kv.bytes_per_element);
+        let plan = plan_fit_auto_kv(
+            &*self.probe,
+            &meta,
+            &candidates,
+            seq_len,
+            DEFAULT_OVERHEAD,
+            kv_bpe,
+        )
+        .map_err(|e| RuntimeError::Fit(e.to_string()))?;
 
         // Admit against the VRAM budget, evicting the models the
         // residency manager chooses. WOR-1672: use the cost-minimizing
@@ -1210,6 +1238,11 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
             &entry.extra_args,
         );
         spec.args.extend(serving_flags(engine_kind, &entry));
+        // WOR-1908: a non-chat modality needs the engine's task flag
+        // (vLLM `--task embed` / `--task score`); runtime-owned, appended
+        // after the operator allowlist so config can never set it.
+        spec.args
+            .extend(crate::launch::modality_flags(engine_kind, modality));
         // WOR-1673: dynamic adapter paging needs vLLM's runtime LoRA
         // update endpoints, which are gated behind this env var.
         if entry.dynamic_lora() {
@@ -1226,6 +1259,11 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
                 crate::config::EngineKind::Vllm => {
                     crate::launch::vllm_use_local_snapshot(&mut spec.args, &ready.snapshot_path);
                 }
+                crate::config::EngineKind::SGLang => {
+                    // SGLang mirrors vLLM here: retarget `--model-path` to
+                    // the verified immutable snapshot.
+                    crate::launch::sglang_use_local_snapshot(&mut spec.args, &ready.snapshot_path);
+                }
                 crate::config::EngineKind::LlamaCpp => {
                     let local = managed_gguf.as_ref().ok_or_else(|| {
                         RuntimeError::Artifact(
@@ -1234,10 +1272,10 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
                     })?;
                     crate::launch::llama_use_local_model(&mut spec.args, local);
                 }
-                crate::config::EngineKind::Embedded => {
-                    if let Some(model) = spec.args.first_mut() {
-                        *model = ready.snapshot_path.display().to_string();
-                    }
+                crate::config::EngineKind::MistralRs => {
+                    // mistral.rs mirrors vLLM here: retarget `-m` to the
+                    // verified immutable snapshot directory (WOR-1861).
+                    crate::launch::mistralrs_use_local_model(&mut spec.args, &ready.snapshot_path);
                 }
             }
         // WOR-1656: for legacy llama.cpp, prefer a locally pre-fetched GGUF over
@@ -1269,65 +1307,63 @@ impl<L: EngineLauncher> ModelHostRuntime<L> {
         // compatibility. An explicit CUDA build fails closed because an
         // unknown PATH binary cannot prove CUDA support or source identity.
         // Misconfigured acquisition is caught at config validate/plan time.
-        // In-process engines have no binary to acquire.
-        if !engine_kind.is_in_process() {
-            let prov = self.config.engines.get(&engine_kind);
-            let on_path = crate::llama_release::resolve_on_path(engine_kind.binary_name());
-            match crate::acquire::plan_binary_acquire(engine_kind, prov, on_path) {
-                crate::acquire::BinaryAcquirePlan::OnPath(p)
-                | crate::acquire::BinaryAcquirePlan::Explicit(p) => {
-                    spec.program = p.to_string_lossy().into_owned();
-                }
-                crate::acquire::BinaryAcquirePlan::FetchRelease { tag, accel, sha256 } => {
-                    match self
-                        .acquire_llama_release(&tag, accel, sha256.as_deref())
-                        .await
-                    {
-                        Ok(p) => spec.program = p.to_string_lossy().into_owned(),
-                        Err(e) => tracing::warn!(
-                            engine = engine_kind.binary_name(),
-                            "engine release acquisition failed: {e}; falling back to PATH"
-                        ),
-                    }
-                }
-                crate::acquire::BinaryAcquirePlan::BuildCuda { tag, source_sha256 } => {
-                    let path = self
-                        .acquire_cuda_llama(&tag, &source_sha256)
-                        .await
-                        .map_err(RuntimeError::Launch)?;
-                    spec.program = path.to_string_lossy().into_owned();
-                }
-                crate::acquire::BinaryAcquirePlan::ProvisionUvx { vllm_version } => {
-                    // Fetch uv, then run vLLM through `uv tool run`. uv sets
-                    // up (and caches) the environment, and its default wheel
-                    // is CUDA-enabled, so this offloads to an NVIDIA GPU on a
-                    // box that only carries the driver. Best-effort: on
-                    // failure, fall back to spawning `vllm` from PATH.
-                    match self.acquire_uv().await {
-                        Ok(uv) => {
-                            spec = crate::launch::wrap_uvx(
-                                &spec,
-                                &uv.to_string_lossy(),
-                                vllm_version.as_deref(),
-                            );
-                            tracing::info!(
-                                engine = "vllm",
-                                "running vLLM via uvx; the first launch provisions the environment \
-                                 (this can take several minutes and a few GB)"
-                            );
-                        }
-                        Err(e) => tracing::warn!(
-                            engine = "vllm",
-                            "uv acquisition for the vLLM uvx path failed: {e}; falling back to PATH"
-                        ),
-                    }
-                }
-                crate::acquire::BinaryAcquirePlan::Blocked(reason) => {
-                    tracing::debug!(
+        let prov = self.config.engines.get(&engine_kind);
+        let on_path = crate::llama_release::resolve_on_path(engine_kind.binary_name());
+        match crate::acquire::plan_binary_acquire(engine_kind, prov, on_path) {
+            crate::acquire::BinaryAcquirePlan::OnPath(p)
+            | crate::acquire::BinaryAcquirePlan::Explicit(p) => {
+                spec.program = p.to_string_lossy().into_owned();
+            }
+            crate::acquire::BinaryAcquirePlan::FetchRelease { tag, accel, sha256 } => {
+                match self
+                    .acquire_llama_release(&tag, accel, sha256.as_deref())
+                    .await
+                {
+                    Ok(p) => spec.program = p.to_string_lossy().into_owned(),
+                    Err(e) => tracing::warn!(
                         engine = engine_kind.binary_name(),
-                        "engine binary not acquired ({reason}); using PATH"
-                    );
+                        "engine release acquisition failed: {e}; falling back to PATH"
+                    ),
                 }
+            }
+            crate::acquire::BinaryAcquirePlan::BuildCuda { tag, source_sha256 } => {
+                let path = self
+                    .acquire_cuda_llama(&tag, &source_sha256)
+                    .await
+                    .map_err(RuntimeError::Launch)?;
+                spec.program = path.to_string_lossy().into_owned();
+            }
+            crate::acquire::BinaryAcquirePlan::ProvisionUvx { vllm_version } => {
+                // Fetch uv, then run the Python-package engine (vLLM or
+                // SGLang) through `uv tool run`. uv sets up (and caches)
+                // the environment, and the default wheel is CUDA-enabled,
+                // so this offloads to an NVIDIA GPU on a box that only
+                // carries the driver. `wrap_uvx` dispatches on the engine.
+                // Best-effort: on failure, fall back to spawning from PATH.
+                match self.acquire_uv().await {
+                    Ok(uv) => {
+                        spec = crate::launch::wrap_uvx(
+                            &spec,
+                            &uv.to_string_lossy(),
+                            vllm_version.as_deref(),
+                        );
+                        tracing::info!(
+                            engine = engine_kind.binary_name(),
+                            "running the engine via uvx; the first launch provisions the \
+                             environment (this can take several minutes and a few GB)"
+                        );
+                    }
+                    Err(e) => tracing::warn!(
+                        engine = engine_kind.binary_name(),
+                        "uv acquisition for the uvx path failed: {e}; falling back to PATH"
+                    ),
+                }
+            }
+            crate::acquire::BinaryAcquirePlan::Blocked(reason) => {
+                tracing::debug!(
+                    engine = engine_kind.binary_name(),
+                    "engine binary not acquired ({reason}); using PATH"
+                );
             }
         }
 
@@ -1505,6 +1541,9 @@ mod tests {
                 kv_heads: 8,
                 head_dim: 128,
                 max_context: 40960,
+                hidden_size: 0,
+                expert_count: 0,
+                expert_ffn_length: 0,
             })
         }
     }
@@ -1564,6 +1603,19 @@ mod tests {
         serde_yaml::from_str(yaml).expect("serve config")
     }
 
+    // No `.with_artifact_manager(...)` here or on any fixture below: this
+    // whole crate is unit-tested with no network per its own crate doc,
+    // and a real ArtifactManager would need one to actually fetch
+    // weights. Any test config using this helper must therefore name a
+    // catalog entry with no `variants:` block (v1-shaped), since
+    // `acquire_managed_artifact` requires a configured artifact manager
+    // once a catalog entry has any variant. `glm-4-flash` is the one
+    // builtin entry that stays v1-shaped; every other builtin entry was
+    // pinned to a real `variants:` block. This is a fixture-only
+    // constraint: the real server (`ProductionDeploymentPreparer`, built
+    // in `sbproxy-core::server::model_host::build_production_manager`)
+    // always constructs a real ArtifactManager unconditionally, so this
+    // gate is never reachable there regardless of catalog shape.
     fn l4_runtime(cfg: ModelHostConfig) -> ModelHostRuntime<SpecPortLauncher> {
         ModelHostRuntime::new(
             cfg,
@@ -1577,13 +1629,18 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_ready_spawns_and_returns_a_port() {
-        let rt = l4_runtime(config("models:\n  - model: qwen3-14b\n"));
-        let port = rt.ensure_ready("qwen3-14b").await.expect("ready");
+        // glm-4-flash: the one builtin catalog entry still v1-shaped (no
+        // `variants:`), so resolution here never touches the managed
+        // artifact service `l4_runtime`'s fixture does not configure. See
+        // the comment on `l4_runtime` above for why this specific model
+        // is load-bearing, not an arbitrary placeholder.
+        let rt = l4_runtime(config("models:\n  - model: glm-4-flash\n"));
+        let port = rt.ensure_ready("glm-4-flash").await.expect("ready");
         assert!(port > 0);
         // Base URL points at the loopback port.
-        let url = rt.resolved_base_url("qwen3-14b").await.unwrap();
+        let url = rt.resolved_base_url("glm-4-flash").await.unwrap();
         assert_eq!(url, format!("http://127.0.0.1:{port}/v1"));
-        assert_eq!(rt.resident_models().await, vec!["qwen3-14b".to_string()]);
+        assert_eq!(rt.resident_models().await, vec!["glm-4-flash".to_string()]);
     }
 
     /// Counts observer callbacks so a test can assert the runtime emits
@@ -1684,21 +1741,21 @@ mod tests {
         // WOR-1673: a request addressing a LoRA adapter brings up (and
         // reuses) the base model's engine and resolves to its port.
         let rt = l4_runtime(config(
-            "models:\n  - model: qwen3-14b\n    lora_adapters:\n      - name: coder\n        source: hf:org/coder\n",
+            "models:\n  - model: glm-4-flash\n    lora_adapters:\n      - name: coder\n        source: hf:org/coder\n",
         ));
         let port = rt
             .ensure_ready("coder")
             .await
             .expect("adapter routes to base");
         // The engine is keyed by the base model, not the adapter.
-        assert_eq!(rt.resident_models().await, vec!["qwen3-14b".to_string()]);
+        assert_eq!(rt.resident_models().await, vec!["glm-4-flash".to_string()]);
         // Both the adapter name and the base name resolve to that engine.
         assert_eq!(
             rt.resolved_base_url("coder").await,
             Some(format!("http://127.0.0.1:{port}/v1"))
         );
         assert_eq!(
-            rt.resolved_base_url("qwen3-14b").await,
+            rt.resolved_base_url("glm-4-flash").await,
             Some(format!("http://127.0.0.1:{port}/v1"))
         );
         // A second adapter request reuses the same engine (no respawn).
@@ -1713,7 +1770,7 @@ mod tests {
         // so the load attempt fails cleanly, proving the dynamic path is
         // taken (a static config would not attempt any HTTP load).
         let rt = l4_runtime(config(
-            "models:\n  - model: qwen3-14b\n    max_loras: 1\n    lora_adapters:\n      - name: a\n        source: hf:org/a\n      - name: b\n        source: hf:org/b\n",
+            "models:\n  - model: glm-4-flash\n    max_loras: 1\n    lora_adapters:\n      - name: a\n        source: hf:org/a\n      - name: b\n        source: hf:org/b\n",
         ));
         let err = rt.ensure_ready("a").await.unwrap_err();
         assert!(
@@ -1721,7 +1778,7 @@ mod tests {
             "expected an adapter-load error, got: {err}"
         );
         // The base engine did come up (only the adapter load failed).
-        assert_eq!(rt.resident_models().await, vec!["qwen3-14b".to_string()]);
+        assert_eq!(rt.resident_models().await, vec!["glm-4-flash".to_string()]);
     }
 
     #[tokio::test]
@@ -1730,9 +1787,11 @@ mod tests {
         // fires on_adapter_loaded + updates the resident-adapter gauge,
         // and loading past the cap fires on_adapter_evicted.
         let obs = Arc::new(CountingObserver::default());
+        // glm-4-flash: see l4_runtime's comment above; no artifact
+        // manager is configured here either.
         let rt = ModelHostRuntime::new(
             config(
-                "models:\n  - model: qwen3-14b\n    max_loras: 1\n    lora_adapters:\n      - name: a\n        source: hf:org/a\n      - name: b\n        source: hf:org/b\n",
+                "models:\n  - model: glm-4-flash\n    max_loras: 1\n    lora_adapters:\n      - name: a\n        source: hf:org/a\n      - name: b\n        source: hf:org/b\n",
             ),
             Catalog::builtin(),
             Arc::new(StaticGpuProbe::new(vec![GpuDescriptor::l4()])),
@@ -1758,7 +1817,7 @@ mod tests {
     async fn ensure_failures_are_observed_by_reason() {
         // WOR-1711: an unknown model reports the unknown_model reason.
         let obs = Arc::new(CountingObserver::default());
-        let rt = l4_runtime(config("models:\n  - model: qwen3-14b\n")).with_observer(obs.clone());
+        let rt = l4_runtime(config("models:\n  - model: glm-4-flash\n")).with_observer(obs.clone());
         assert!(rt.ensure_ready("no-such-model").await.is_err());
         assert_eq!(obs.ensure_failures.load(Ordering::SeqCst), 1);
         assert_eq!(
@@ -1769,7 +1828,7 @@ mod tests {
         // A host with no GPU cannot fit or admit the model.
         let obs2 = Arc::new(CountingObserver::default());
         let rt2 = ModelHostRuntime::new(
-            config("models:\n  - model: qwen3-14b\n"),
+            config("models:\n  - model: glm-4-flash\n"),
             Catalog::builtin(),
             Arc::new(StaticGpuProbe::new(vec![])),
             Arc::new(FixtureMeta),
@@ -1777,7 +1836,7 @@ mod tests {
             true,
         )
         .with_observer(obs2.clone());
-        assert!(rt2.ensure_ready("qwen3-14b").await.is_err());
+        assert!(rt2.ensure_ready("glm-4-flash").await.is_err());
         assert_eq!(obs2.ensure_failures.load(Ordering::SeqCst), 1);
         let r = obs2.last_fail_reason.lock().unwrap().clone().unwrap();
         assert!(r == "fit" || r == "residency", "unexpected reason: {r}");
@@ -1786,47 +1845,78 @@ mod tests {
     #[tokio::test]
     async fn status_snapshot_reports_resident_models_and_vram() {
         let rt = l4_runtime(config(
-            "models:\n  - model: qwen3-14b\n    keep_alive: 30m\n",
+            "models:\n  - model: glm-4-flash\n    keep_alive: 30m\n",
         ));
         // Configured models remain visible before they are resident.
         let configured = rt.status_snapshot().await;
         assert_eq!(configured.models.len(), 1);
-        assert_eq!(configured.models[0].name, "qwen3-14b");
+        assert_eq!(configured.models[0].name, "glm-4-flash");
         assert_eq!(configured.models[0].state, crate::EngineState::Idle);
         assert!(configured.vram.budget_bytes > 0, "L4 budget reported");
         assert!(!configured.vram.devices.is_empty(), "device listed");
         assert_eq!(configured.vram.devices[0].compute_utilization, None);
         assert!(configured.vram.devices[0].memory_occupancy.is_some());
 
-        rt.ensure_ready("qwen3-14b").await.expect("ready");
+        rt.ensure_ready("glm-4-flash").await.expect("ready");
         let s = rt.status_snapshot().await;
         assert_eq!(s.models.len(), 1);
         let m = &s.models[0];
-        assert_eq!(m.name, "qwen3-14b");
+        assert_eq!(m.name, "glm-4-flash");
         assert!(m.port.is_some(), "ready model has a port");
         assert_eq!(m.keep_alive_secs, Some(1800), "30m keep_alive surfaced");
         assert!(s.vram.used_bytes > 0, "resident model uses budget");
     }
 
     #[tokio::test]
+    async fn legacy_fit_books_the_substituted_kv_cost_on_vllm() {
+        // WOR-2069 regression: this legacy `serve:` path used to size
+        // the KV term from the requested mode. vLLM serves `int4` KV as
+        // fp8, so the plan booked half the cache the engine allocates.
+        // Sized from the shared table (`effective_kv_cache`), an int4
+        // request and an fp8 request now plan identical VRAM, while f16
+        // still books its real 2-byte elements. glm-4-flash resolves to
+        // vLLM here: no GGUF signal, and the fixture has a container
+        // runtime.
+        async fn planned_bytes(kv: &str) -> u64 {
+            let rt = l4_runtime(config(&format!(
+                "models:\n  - model: glm-4-flash\n    max_context: 8192\n    kv_quant: {kv}\n"
+            )));
+            rt.ensure_ready("glm-4-flash").await.expect("ready");
+            rt.status_snapshot().await.vram.used_bytes
+        }
+        let int4 = planned_bytes("int4").await;
+        let fp8 = planned_bytes("fp8").await;
+        let f16 = planned_bytes("f16").await;
+        assert!(int4 > 0, "resident model books VRAM");
+        assert_eq!(
+            int4, fp8,
+            "vLLM serves int4 KV as fp8, so the plan must book fp8's cost, not half of it"
+        );
+        assert_ne!(
+            f16, fp8,
+            "the KV lever must still reach the fit: f16 books 2 bytes per element, fp8 books 1"
+        );
+    }
+
+    #[tokio::test]
     async fn lifecycle_emits_observer_events() {
         let obs = Arc::new(CountingObserver::default());
-        let rt = l4_runtime(config("models:\n  - model: qwen3-14b\n")).with_observer(obs.clone());
-        rt.ensure_ready("qwen3-14b").await.expect("ready");
+        let rt = l4_runtime(config("models:\n  - model: glm-4-flash\n")).with_observer(obs.clone());
+        rt.ensure_ready("glm-4-flash").await.expect("ready");
         assert_eq!(obs.ready.load(Ordering::SeqCst), 1, "engine-ready recorded");
         assert_eq!(obs.resident_last.load(Ordering::SeqCst), 1, "resident=1");
         assert!(
             obs.gpu_reports.load(Ordering::SeqCst) >= 1,
             "gpu stats reported"
         );
-        rt.unload("qwen3-14b").await;
+        rt.unload("glm-4-flash").await;
         assert_eq!(obs.evictions.load(Ordering::SeqCst), 1, "eviction recorded");
         assert_eq!(obs.resident_last.load(Ordering::SeqCst), 0, "resident=0");
     }
 
     #[tokio::test]
     async fn ensure_ready_is_idempotent() {
-        let cfg = config("models:\n  - model: qwen3-14b\n");
+        let cfg = config("models:\n  - model: glm-4-flash\n");
         let launcher_calls = Arc::new(AtomicU64::new(0));
         let calls = launcher_calls.clone();
         let rt = ModelHostRuntime::new(
@@ -1839,8 +1929,8 @@ mod tests {
             }),
             true,
         );
-        let p1 = rt.ensure_ready("qwen3-14b").await.unwrap();
-        let p2 = rt.ensure_ready("qwen3-14b").await.unwrap();
+        let p1 = rt.ensure_ready("glm-4-flash").await.unwrap();
+        let p2 = rt.ensure_ready("glm-4-flash").await.unwrap();
         assert_eq!(p1, p2);
         assert_eq!(launcher_calls.load(Ordering::SeqCst), 1, "spawned once");
     }
@@ -1858,7 +1948,7 @@ mod tests {
     async fn no_gpu_rejects_via_fit() {
         // Empty probe -> no GPU -> fit planner returns NoGpu.
         let rt = ModelHostRuntime::new(
-            config("models:\n  - model: qwen3-14b\n"),
+            config("models:\n  - model: glm-4-flash\n"),
             Catalog::builtin(),
             Arc::new(StaticGpuProbe::default()),
             Arc::new(FixtureMeta),
@@ -1866,7 +1956,7 @@ mod tests {
             false,
         );
         assert!(matches!(
-            rt.ensure_ready("qwen3-14b").await,
+            rt.ensure_ready("glm-4-flash").await,
             Err(RuntimeError::Fit(_))
         ));
     }
@@ -1963,8 +2053,15 @@ mod tests {
     async fn health_recheck_returns_live_engine_without_respawn() {
         let launches = Arc::new(AtomicU64::new(0));
         let calls = launches.clone();
+        // glm-4-flash: see l4_runtime's comment above. This test's own
+        // `let Ok(..) = .. else { skip }` pattern (for a genuinely
+        // environment-dependent loopback-bind denial) would otherwise
+        // silently swallow the "managed artifact service is not
+        // configured" error a v2-shaped catalog entry produces here too,
+        // and pass vacuously without exercising the health-recheck
+        // behavior it names.
         let rt = ModelHostRuntime::new(
-            config("models:\n  - model: qwen3-14b\n"),
+            config("models:\n  - model: glm-4-flash\n"),
             Catalog::builtin(),
             Arc::new(StaticGpuProbe::new(vec![GpuDescriptor::l4()])),
             Arc::new(FixtureMeta),
@@ -1974,12 +2071,12 @@ mod tests {
             true,
         )
         .with_health_recheck(true);
-        let Ok(p1) = rt.ensure_ready("qwen3-14b").await else {
+        let Ok(p1) = rt.ensure_ready("glm-4-flash").await else {
             eprintln!("skipping: loopback bind denied");
             return;
         };
         // Second call: the health probe passes, so no respawn.
-        let p2 = rt.ensure_ready("qwen3-14b").await.unwrap();
+        let p2 = rt.ensure_ready("glm-4-flash").await.unwrap();
         assert_eq!(p1, p2);
         assert_eq!(
             launches.load(Ordering::SeqCst),

@@ -15,6 +15,9 @@ services:
     image: soapbucket/sbproxy:latest
     command: ["serve", "-f", "/etc/sbproxy/sb.yml"]
     environment:
+      # Export this before `docker compose up`. The config refuses to run
+      # with the shipped default on a wide bind.
+      SB_ADMIN_PASSWORD: ${SB_ADMIN_PASSWORD:-change-this-before-running}
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
     volumes:

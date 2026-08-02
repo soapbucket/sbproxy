@@ -16,7 +16,7 @@
 #      side by side on stdout.
 #
 # Run:
-#   export ADMIN_PASSWORD=demo
+#   # password is demo-change-me in sb.yml (override if needed)
 #   make run CONFIG=examples/audit-log/sb.yml
 #
 # Then trigger a state-mutating admin call (the canonical audited
@@ -37,10 +37,9 @@ proxy:
     enabled: true
     port: 9090
     username: admin
-    # Resolved from the environment at config load; export it first
-    # (see the Run block above). An unset variable is left as the
-    # literal `${ADMIN_PASSWORD}`, so the login would fail loudly.
-    password: ${ADMIN_PASSWORD}
+    # Demo password for local validate/run. Change before any non-loopback bind.
+    # Export ADMIN_PASSWORD only if you override this in a fork.
+    password: demo-change-me
     # Bounded in-memory log buffer the admin /api/logs route reads
     # from; not the audit sink itself.
     max_log_entries: 1000

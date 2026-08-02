@@ -1,6 +1,6 @@
 # OpenAPI 3.0 schema validation
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-08-01*
 
 ![OpenAPI 3.0 schema validation](../../docs/assets/openapi-validation.gif)
 
@@ -12,18 +12,17 @@ The `openapi_validation` policy loads an inline OpenAPI document at startup and 
 sbproxy serve -f sb.yml
 ```
 
-The example serves a static `{"ok":true}` response for any path that passes validation, so you can exercise the policy without a real backend.
+The example forwards to the shared echo upstream, which has no `/users` route, so a request that passes validation comes back as its `404`. A `proxy` action is required: validation runs in `request_body_filter`, which never executes behind a `static` action, so a static origin would accept every body.
 
 ## Try it
 
 ```bash
-# Valid body matches the schema (name string, age in range) - 200.
+# Valid body matches the schema (name string, age in range): forwarded.
 curl -i -H 'Host: api.local' \
      -H 'Content-Type: application/json' \
      -d '{"name":"alice","age":30}' \
      http://127.0.0.1:8080/users/42
-# HTTP/1.1 200 OK
-# {"ok":true}
+# HTTP/1.1 404 Not Found  (from the upstream: the request was forwarded)
 ```
 
 ```bash
@@ -33,9 +32,7 @@ curl -i -H 'Host: api.local' \
      -d '{"age":30}' \
      http://127.0.0.1:8080/users/42
 # HTTP/1.1 400 Bad Request
-# {"error":"openapi validation failed","details":[
-#   {"path":"/","keyword":"required","message":"missing field: name"}
-# ]}
+# {"detail":"POST /users/{id} body failed schema validation at ","error":"openapi validation failed"}
 ```
 
 ```bash
@@ -44,6 +41,7 @@ curl -i -H 'Host: api.local' \
      -H 'Content-Type: application/json' \
      -d '{"name":"alice","age":"thirty"}' \
      http://127.0.0.1:8080/users/42
+# {"detail":"POST /users/{id} body failed schema validation at /age","error":"openapi validation failed"}
 ```
 
 ```bash

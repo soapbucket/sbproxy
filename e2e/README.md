@@ -61,7 +61,7 @@ e2e runs occasionally and locally, not on every PR.
 |---|---|---|
 | AI gateway (`ai_*`) | 16 | Provider routing, fallback / cascade / cost-optimized / lowest-latency, streaming, virtual keys, guardrails, budgets, context relay, model rate limits, OpenAI / Anthropic / Bedrock / Gemini direct |
 | AI surface matrix (`matrix_*`) | 2 | Every (provider × surface) cell from `provider_supports_surface` returns the expected pass / 501 verdict end-to-end |
-| Policies (`policy_*` + named) | 13 | CEL expression, WAF + OWASP CRS, CSRF, IP filter, content-shape, accept_payment + AP2, exposed_credentials, openapi_validation, object_authz BOLA / BFLA, content_digest, agent_budget, semantic_constraint |
+| Policies (`policy_*` + named) | 13 | CEL expression, WAF + OWASP CRS, CSRF, IP filter, content-shape, AP2, exposed_credentials, openapi_validation, object_authz BOLA / BFLA, content_digest, agent_budget, semantic_constraint |
 | Auth (`auth_*` + `api_key_*`, `basic_auth_*`, `bearer_*`, `jwt_*`, `oidc_*`, `forward_auth_*`, `dpop_*`, `bot_auth_*`) | 12 | API key, basic, bearer (+ DPoP-bound + mTLS-bound), JWT (JWKS + introspection), forward_auth subrequest, OIDC RP login + session cookie, Web Bot Auth signed-request verification + key-directory refresh |
 | Transforms (`transform_*`) | 5 | HTML, Markdown, JSON projection, Lua, JavaScript (QuickJS), WASM (wasmtime + WASI preview-1) |
 | Rate limiting + concurrency (`rate_*`, `concurrent_*`) | 3 | Token-bucket burst → 429 + Retry-After; per-key CEL bucketing; concurrent-limit cap |
@@ -83,7 +83,7 @@ e2e runs occasionally and locally, not on every PR.
 | Sessions (`session*`) | 1 | Encrypted cookie issue + verify + rotate |
 | Object authz (`object_authz_*`) | 1 | BOLA + BFLA enforcement + tenant isolation |
 | Listings (`listing_*`) | 1 | Listing primitive: schema + loader + three pinning modes |
-| AI crawl / 402 (`crawl_*`, `pricing_*`) | 2 | `ai_crawl_control` + peer_pricing_preflight |
+| AI crawl / 402 (`crawl_*`, `pricing_*`) | 2 | `ai_crawl_control` |
 | Storage + static actions | 2 | object_store backend (S3, GCS, Azure, local FS); static action body |
 | Observability / access log / audit | 2 | Access-log JSON emission + filter / sample; admin-mutation audit envelope |
 | Scripting (`cel*`, `lua*`, `js*`, `wasm*` non-transform) | 2 | CEL helpers under `request.*`; Lua + JS sandbox limits |
@@ -91,7 +91,7 @@ e2e runs occasionally and locally, not on every PR.
 | Trusted proxies + client IP (`trusted_*`) | 1 | Post-trust-boundary client IP resolution from X-Forwarded-For |
 | Variables + templating (`variables_*`) | 1 | `{{ variables.<name> }}` substitution + env-var interpolation |
 | Upstream retries + connect (`upstream_*`) | 1 | DNS failure, refused, unreachable, TLS handshake fail → retry behaviour |
-| HTTP basics (`http_*`, `proxy_*`) | 4 | HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket upgrade |
+| HTTP basics (`http_*`, `proxy_*`) | 4 | HTTP/1.1, HTTP/2, WebSocket upgrade |
 | Headers (`header_*`) | 1 | Vary, Cache-Control + secret-redaction passthrough |
 | Admin (`admin_*`) | 2 | Admin server bind + basic-auth + `/api/*` + `/admin/reload` |
 | Misc cross-cutting | rest | Plug-in registry, classifier sidecar lifecycle, sidecar transport, ledger + 402, vault backend, well-known projections |

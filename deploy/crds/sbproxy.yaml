@@ -24,7 +24,7 @@ spec:
             description: |-
               Desired state for a single sbproxy deployment.
 
-              The operator owns a Deployment + Service + ConfigMap triple per `SBProxy`. Spec changes drive reconciliation; status is reserved for future use.
+              The operator owns a Deployment + Service + ConfigMap triple per `SBProxy`. When `spec.clustering.enabled` is true the Deployment is replaced by a StatefulSet plus a headless Service and a shared-key Secret, so replicas form a gossip mesh with stable per-pod DNS identities. Spec changes drive reconciliation; status is reserved for future use.
             properties:
               adminAuthSecretRef:
                 description: |-
@@ -48,6 +48,36 @@ spec:
                 description: Optional admin server port the proxy exposes for `/admin/reload` and `/api/health/targets`. Defaults to 9090 when `admin_auth_secret_ref` is set; ignored otherwise. The operator never exposes the admin port through the public Service; it dials the pod IP directly via the cluster network.
                 format: int32
                 type: integer
+              clustering:
+                description: |-
+                  Optional mesh clustering for multi-replica deployments.
+
+                  When present and `enabled: true`, the operator reconciles a StatefulSet (stable per-pod identity) plus a headless Service for gossip instead of a Deployment, generates a shared cluster key Secret when none is referenced, and injects a rendered `proxy.cluster` block into the mounted `sb.yml` so the replicas form a mesh without hand-written peer configuration. Absent or `enabled: false` keeps the plain-Deployment path unchanged.
+                nullable: true
+                properties:
+                  clusterDomain:
+                    default: cluster.local
+                    description: Cluster DNS domain used when rendering the stable per-pod seed addresses (`<pod>.<headless-svc>.<ns>.svc.<domain>`). Defaults to `cluster.local`; override only on clusters with a custom domain.
+                    type: string
+                  clusterSecretRef:
+                    description: Optional name of an existing Secret in the same namespace whose `cluster-key` entry holds the shared cluster key. When unset the operator generates a `<sbproxy-name>-cluster-key` Secret once and reuses it for the lifetime of the SBProxy, so rescheduled pods always rejoin with the same key.
+                    nullable: true
+                    type: string
+                  enabled:
+                    default: false
+                    description: Turn mesh clustering on. Defaults to false.
+                    type: boolean
+                  gossipPort:
+                    default: 7946
+                    description: UDP gossip listener port carried into `proxy.cluster.gossip_port` and exposed on the headless Service. Defaults to 7946.
+                    format: int32
+                    type: integer
+                  transportPort:
+                    default: 8946
+                    description: TCP typed-state transport port carried into `proxy.cluster.transport_port` and exposed on the headless Service. Defaults to 8946.
+                    format: int32
+                    type: integer
+                type: object
               configRef:
                 description: Name of an `SBProxyConfig` in the same namespace whose `spec.config` will be mounted as the proxy's `sb.yml`. Required.
                 type: string
@@ -131,7 +161,11 @@ spec:
               The operator does not deeply validate `spec.config`. The proxy parses it on reload and rejects malformed input there. Apply-time validation is limited to "is this a non-empty string".
             properties:
               config:
-                description: The full `sb.yml` document as a YAML string. Required.
+                description: |-
+                  The full `sb.yml` document as a YAML string. Required.
+
+                  Bounded at the CRD schema level to 1 MiB so the API server rejects an oversized or malicious document at admission rather than mounting it into every proxy pod. Any real `sb.yml` is far smaller.
+                maxLength: 1048576
                 type: string
             required:
             - config

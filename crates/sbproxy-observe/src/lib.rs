@@ -8,6 +8,7 @@ pub mod access_log;
 pub mod agent_labels;
 pub mod alerting;
 pub mod audit;
+pub mod audit_ring;
 /// P0 edge capture helpers: custom properties, session IDs,
 /// and user IDs.
 pub mod capture;
@@ -19,7 +20,6 @@ pub mod events;
 /// OpenMetrics exemplar side-store used to wire trace IDs
 /// onto the request-duration and ledger histograms.
 pub mod exemplars;
-pub mod export;
 /// Test-only in-memory capture for the redaction fan-out e2e
 /// suite. Disabled by default; opted into via the
 /// `SBPROXY_TEST_FAKE_SINKS=1` environment variable.
@@ -29,12 +29,14 @@ pub mod golden_signals;
 pub mod health;
 /// Global tracing subscriber configuration (log level and format).
 pub mod logging;
+/// The `sbproxy_meter_*` families: what the attested meter reports about
+/// its own health, on both the OTLP push path and the Prometheus scrape.
+/// None of it is the billing record; the signed chain is.
+pub mod meter_metrics;
+/// The executable metric registry: every family, its writer, and its stability.
+pub mod metric_registry;
 /// Prometheus metrics registry, helpers, and per-origin recorders.
 pub mod metrics;
-/// Outbound webhook framework. Per-tenant signing (Ed25519
-/// default, HMAC-SHA256 fallback) with dual-key rotation, exponential
-/// backoff retries, and a deadletter queue.
-pub mod notify;
 pub mod otel;
 /// WOR-1046 OTLP-logs sink output. Wraps `opentelemetry_otlp::LogExporter`
 /// behind the [`sink_dispatcher::SinkOutput`] trait so the dispatcher
@@ -58,7 +60,6 @@ pub mod sink_dispatcher;
 /// In-process synthetic probe state for `/readyz`.
 pub mod synthetic;
 pub mod telemetry;
-pub mod topology;
 pub mod trace_ctx;
 /// WOR-1875 durable windowed usage rollups: hour/day spend buckets in
 /// redb feeding the windowed `/api/usage/spend` admin API, so spend
@@ -80,7 +81,6 @@ pub use clock_skew::{
     DEFAULT_NTP_SOURCE, DEFAULT_POLL_INTERVAL_SECS, SNTP_TIMEOUT, TOLERANCE_SECS,
 };
 pub use events::{EventBus, EventType, PolicySurface, PolicyVerdictEvent, ProxyEvent, VerdictTag};
-pub use export::{WebhookConfig, WebhookExporter};
 pub use health::{
     default_registry, default_registry_optional, handle_health, handle_healthz, handle_livez,
     handle_readyz, mark_process_start, ComponentReport, ComponentStatus, HealthMetadata,
@@ -93,10 +93,6 @@ pub use logging::{
     LoggingConfig, SamplingConfig, Sink, StructuredLog, SCHEMA_VERSION,
 };
 pub use metrics::{metrics, sanitize_label, ProxyMetrics};
-pub use notify::{
-    event_type_matches, verify_signature, DeadletterItem, InMemoryStore, Notifier, NotifierStore,
-    OutboundEvent, SigningKey, Subscription, VerificationKey, VerifyError,
-};
 pub use otlp_logs::{OtlpLogSink, OtlpLogSinkOptions};
 pub use request_event::{RequestEvent, UserIdSource};
 pub use request_sink::{
@@ -116,10 +112,9 @@ pub use synthetic::{
     DEFAULT_SYNTHETIC_INTERVAL_SECS, DEFAULT_SYNTHETIC_PATH, DEFAULT_SYNTHETIC_TIMEOUT_MS,
 };
 pub use telemetry::{
-    extract_from_headers, init_otlp_metrics_pipeline, init_otlp_pipeline, init_propagator,
-    inject_into_headers, inject_into_reqwest, shutdown_otlp_metrics_pipeline,
+    extract_from_headers, init_otlp_metrics_pipeline, init_propagator, inject_into_headers,
+    inject_into_reqwest, parent_span_on_remote_trace_context, shutdown_otlp_metrics_pipeline,
     shutdown_otlp_pipeline, span as pillar_span, tracing_helper, OtlpTransport, Pillar,
     TelemetryConfig,
 };
-pub use topology::{Edge, EdgeStats, TopologyTracker};
 pub use trace_ctx::w3c::TraceContext;

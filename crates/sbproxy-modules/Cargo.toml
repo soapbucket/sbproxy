@@ -58,11 +58,36 @@ llms-txt = []
 a2a-anthropic = []
 a2a-google = []
 a2a = ["a2a-anthropic", "a2a-google"]
+# WOR-2100: authoritative payment settlement.
+#
+# The billing dependency below is unconditional even though these flags
+# are not, because the closed domain types need exactly one owner. The
+# advertised rail enum, the money type, and the payment requirement are
+# shared between the crawl policy that prices a request and the crate
+# that settles it, and two definitions of "which rails exist" is how a
+# rail becomes advertisable and unsettleable.
+#
+# `payments` turns on the requirement compiler, so a priced route emits
+# one signed requirement instead of the legacy per-rail challenge.
+# `payment-mpp` adds the pinned Payment Auth codec on top.
+payments = []
+payment-mpp = ["payments", "sbproxy-billing/mpp"]
 
 [dependencies]
 sbproxy-plugin.workspace = true
+# Unconditional: see the `payments` note above. With no payment feature
+# this compiles the domain contract only, which is types and no runtime.
+sbproxy-billing.workspace = true
 sbproxy-util.workspace = true
 sbproxy-config.workspace = true
+# The metering vocabulary the receipt token is written in. Depended on for
+# the conversions in `policy/receipt_token.rs`, which match exhaustively over
+# every meter enum so that adding a variant there stops this crate compiling
+# until the signed wire format is updated deliberately.
+#
+# Acyclic and safe: sbproxy-meter depends on no workspace crate, and nothing
+# about that leaf property is affected by other crates depending on it.
+sbproxy-meter.workspace = true
 sbproxy-middleware.workspace = true
 sbproxy-extension.workspace = true
 sbproxy-ai.workspace = true
@@ -94,6 +119,7 @@ percent-encoding.workspace = true
 regex.workspace = true
 minijinja.workspace = true
 pulldown-cmark.workspace = true
+graphql-parser.workspace = true
 tracing.workspace = true
 md-5 = "0.10"
 sha2.workspace = true
@@ -107,9 +133,6 @@ hmac.workspace = true
 ed25519-dalek = "2"
 # ULID for ledger Idempotency-Key + envelope request_id.
 ulid.workspace = true
-# UUID for the CompiledPolicy identifiers in the NL policy compiler
-# pipeline (WOR-203 PR 3a).
-uuid = { workspace = true }
 # Strongly typed LedgerError variants.
 thiserror.workspace = true
 parking_lot.workspace = true
@@ -162,5 +185,7 @@ zip = { version = "0.6", default-features = false, features = ["deflate"] }
 [dev-dependencies]
 smallvec.workspace = true
 tempfile = "3"
+prost11 = { package = "prost", version = "0.11" }
+tract-onnx = "0.21"
 tokio = { workspace = true, features = ["full", "test-util"] }
 proptest.workspace = true

@@ -1,16 +1,31 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import type { ClusterNode } from "../api";
+import type { ClusterNode, DeploymentRuntimeState, NodeReplicaSnapshot } from "../api";
 import {
   clusterNodeAnchorId,
   formatAgeMs,
   formatReasonCode,
   sortClusterNodes,
 } from "../lib/cluster-health";
+import { formatBytes } from "../lib/format";
 import StatusBadge from "./StatusBadge.vue";
 
 const props = defineProps<{ nodes: readonly ClusterNode[] }>();
 const orderedNodes = computed(() => sortClusterNodes(props.nodes));
+
+function replicaStateTone(
+  state: DeploymentRuntimeState | null,
+): "ok" | "warn" | "err" | "info" | "neutral" {
+  if (state === "ready") return "ok";
+  if (state === "failed") return "err";
+  if (state === "preparing" || state === "draining") return "warn";
+  if (state === "assigned" || state === "cached") return "info";
+  return "neutral";
+}
+
+function replicaRowKey(replica: NodeReplicaSnapshot, rowIndex: number): string {
+  return `${replica.deployment}:${replica.selected_devices.join(",") || "no-device"}:${rowIndex}`;
+}
 
 function healthTone(health: ClusterNode["health"]): "ok" | "warn" | "err" {
   if (health === "healthy") return "ok";
@@ -126,6 +141,28 @@ function labelEntries(labels: Record<string, string>): [string, string][] {
                   <span><strong>{{ node.ready_artifact_count }}</strong> artifacts</span>
                   <span><strong>{{ node.replicas.length }}</strong> replicas</span>
                 </div>
+                <details v-if="node.replicas.length" class="replica-disclosure">
+                  <summary class="replica-disclosure__summary">
+                    {{ node.replicas.length }} {{ node.replicas.length === 1 ? "replica" : "replicas" }} detail
+                  </summary>
+                  <ul class="replica-list">
+                    <li
+                      v-for="(replica, replicaIndex) in node.replicas"
+                      :key="replicaRowKey(replica, replicaIndex)"
+                      class="replica-item"
+                    >
+                      <span class="sb-mono replica-item__deployment">{{ replica.deployment }}</span>
+                      <StatusBadge
+                        :label="formatReasonCode(replica.state)"
+                        :tone="replicaStateTone(replica.state)"
+                      />
+                      <span class="table-detail">
+                        {{ replica.active_requests }} active · {{ replica.queue_depth }} queued
+                      </span>
+                      <span class="table-detail">{{ formatBytes(replica.reserved_memory_bytes) }} reserved</span>
+                    </li>
+                  </ul>
+                </details>
               </td>
               <td>
                 <StatusBadge
@@ -219,8 +256,8 @@ function labelEntries(labels: Record<string, string>): [string, string][] {
 }
 
 .local-marker {
-  color: var(--sb-on-navy);
-  background: var(--sb-navy);
+  color: var(--sb-on-ink);
+  background: var(--sb-ink);
 }
 
 .data-tag {
@@ -272,6 +309,42 @@ function labelEntries(labels: Record<string, string>): [string, string][] {
 .inventory-grid strong {
   color: var(--sb-text);
   font-family: var(--sb-font-mono);
+}
+
+.replica-disclosure {
+  margin-top: var(--sb-space-2);
+}
+
+.replica-disclosure__summary {
+  color: var(--sb-text-faint);
+  font-size: 0.7rem;
+  cursor: pointer;
+  list-style-position: inside;
+}
+
+.replica-disclosure__summary:hover {
+  color: var(--sb-text-muted);
+}
+
+.replica-disclosure__summary:focus-visible {
+  outline: 3px solid var(--sb-accent-ring);
+  outline-offset: 2px;
+}
+
+.replica-list {
+  display: grid;
+  gap: var(--sb-space-2);
+  margin: var(--sb-space-2) 0 0;
+  padding: var(--sb-space-2) 0 0 var(--sb-space-3);
+  border-top: 1px solid var(--sb-border);
+  list-style: none;
+}
+
+.replica-item__deployment {
+  display: block;
+  font-size: 0.72rem;
+  color: var(--sb-text-muted);
+  overflow-wrap: anywhere;
 }
 
 @media (max-width: 760px) {

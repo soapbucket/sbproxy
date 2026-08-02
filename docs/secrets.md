@@ -1,6 +1,6 @@
 # Secret Backends
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-31*
 
 SBproxy resolves secret material through provider-specific reference schemes. The scheme names the provider type, the authority names the configured backend instance, and the path is interpreted by that provider:
 
@@ -10,6 +10,16 @@ SBproxy resolves secret material through provider-specific reference schemes. Th
 
 Backend instances are declared once, at proxy scope, under `proxy.secrets.backends:`. There is no per-tenant or per-origin backend list. A reference resolves against the backend whose `name` matches the authority segment and whose provider type matches the scheme; to keep tenants on separate stores, declare one named backend per store and reference the right name from each origin.
 
+## Backends are process-owned: changing them needs a restart
+
+The resolver is built once, at startup, and it owns live connections to whatever you configured: a Vault client, an AWS or GCP SDK client, a Kubernetes API client. Swapping that out underneath a running proxy is not something a config reload can do safely, so it does not try.
+
+A reload whose `proxy.secrets` block differs from the one the process started with is **refused**, with an error saying a restart is required. The previous config keeps serving and nothing from the candidate is applied. This includes adding a backend, removing one, renaming one, repointing a Vault address, and changing the rotation or fallback settings.
+
+Earlier versions accepted the reload and silently ignored the change. That was worse than refusing: the new backend never existed, so the first reference to it failed at handler construction with an error that named the reference rather than the real cause, and the reload that introduced it had already reported success. If you are used to that behaviour, the refusal is the fix, not a regression.
+
+Everything else in a config still hot-reloads normally. Only the `proxy.secrets` block carries this restriction, and only when it actually changes; reloading an unchanged block is a no-op. The values behind a reference are re-resolved on every reload, so rotating a secret **in** Vault or Secrets Manager needs no restart. It is only changing where SBproxy looks that does.
+
 ## Scheme Table
 
 | Scheme | Provider type | Example |
@@ -17,6 +27,7 @@ Backend instances are declared once, at proxy scope, under `proxy.secrets.backen
 | `vault://` | HashiCorp Vault KV | `vault://primary/secret/data/openai-prod?key=api_key` |
 | `awssm://` | AWS Secrets Manager | `awssm://primary/openai-prod?version=3&key=api_key` |
 | `gcpsm://` | GCP Secret Manager | `gcpsm://primary/openai-api-key?version=latest` |
+| `azurekv://` | Azure Key Vault | `azurekv://primary/openai-api-key?version=6a2b45c8f9e14e0d` |
 | `k8ssecret://` | Kubernetes Secret | `k8ssecret://primary/sbproxy-secrets/openai-key` |
 | `secretfile://` | Local YAML or JSON secret file | `secretfile://local/openai-prod?key=api_key` |
 | `secret://` | Local static secret map | `secret://local/openai-prod` |
@@ -201,6 +212,71 @@ gcpsm://primary/projects/<project>/secrets/<secret>/versions/<version>[&key=<jso
 
 The default version is `latest`. Secret payload bytes must decode as UTF-8. Use `key=<json-field>` when the payload is a JSON object and the config field needs one member.
 
+## Azure Key Vault
+
+The Azure backend reads secrets through the Key Vault `GetSecret` REST API. It supports system-assigned and user-assigned managed identity, service-principal client credentials, and the logged-in Azure CLI for local development.
+
+### Configuration
+
+```yaml
+proxy:
+  secrets:
+    backends:
+      - type: azure
+        name: primary
+        vault_url: https://acme-prod.vault.azure.net
+        cache_ttl_secs: 300
+        auth: managed_identity
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `vault_url` | string | Key Vault URL such as `https://acme-prod.vault.azure.net`. Required. The token audience follows the vault's DNS suffix, so sovereign-cloud vaults (`*.vault.azure.cn`, `*.vault.usgovcloudapi.net`) work without extra settings. |
+| `cache_ttl_secs` | integer | TTL in seconds on cached reads. Default is 300. |
+| `auth` | enum or object | `managed_identity`, `user_assigned_identity`, `service_principal`, or `azure_cli`. |
+
+### Auth Methods
+
+Managed identity is the default and the recommended choice for in-Azure deployments. On VMs and VM scale sets the backend requests tokens from the instance metadata service; on App Service, Functions, and Container Apps it uses the platform identity endpoint advertised through `IDENTITY_ENDPOINT` and `IDENTITY_HEADER`.
+
+```yaml
+auth: managed_identity
+```
+
+A user-assigned identity is selected by client id:
+
+```yaml
+auth:
+  user_assigned_identity:
+    client_id: 11111111-2222-3333-4444-555555555555
+```
+
+Service-principal auth exchanges client credentials at the Microsoft Entra token endpoint. The optional `authority` field overrides the login host for sovereign clouds; it defaults to `https://login.microsoftonline.com`.
+
+```yaml
+auth:
+  service_principal:
+    tenant_id: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+    client_id: 11111111-2222-3333-4444-555555555555
+    client_secret: ${AZURE_CLIENT_SECRET}
+```
+
+Azure CLI auth shells out to `az account get-access-token`, reusing the operator's `az login` session. Use it for local development against a real vault, not for production deployments.
+
+```yaml
+auth: azure_cli
+```
+
+### Reference Shape
+
+```text
+azurekv://primary/<secret>[?version=<id>][&key=<json-field>]
+azurekv://primary/<secret>/<version>[?key=<json-field>]
+azurekv://primary/secrets/<secret>[/<version>]
+```
+
+Without a version pin the current secret version is served; `?version=latest` spells the same thing explicitly, matching the other cloud backends. A pin is the Key Vault version id from the secret's URL, such as `?version=6a2b45c8f9e14e0d`. Secret names use letters, digits, and dashes, as Key Vault requires. The backend is read-only; add secret versions through Azure Key Vault APIs or infrastructure automation.
+
 ## Kubernetes Secrets
 
 The Kubernetes backend reads Secret objects through the standard Kubernetes API. Each backend is bound to one namespace; cross-namespace reads are rejected at URL composition.
@@ -262,7 +338,7 @@ Both `data` and `stringData` fields are honoured. `data` keys are base64-decoded
 
 ## File And Static Map Backends
 
-Use `secretfile://` for a backend-configured YAML or JSON secret file. Use `secret://` for a backend-configured static secret map. Keep `file:/path/to/secret` and `secret:<name>` for legacy configs that already use those forms.
+Use `secretfile://` for a backend-configured YAML or JSON secret file. Use `secret://` for a backend-configured static secret map. The legacy `file:/path/to/secret` form remains valid. The removed `secret:<name>` form does not; migrate it to `secret://<backend>/<name>`.
 
 Configure these backends under `proxy.secrets.backends`. Each has a `name` used in the reference. A `local` backend's `entries` values may be `${ENV}` so real secrets stay in the environment rather than the config file. A reference in an AI provider `api_key` resolves against these at startup, and an unresolved reference stops the proxy from starting rather than being sent verbatim as a bearer token.
 
@@ -317,8 +393,32 @@ Per-tenant and per-origin backend scopes (where the same reference name resolves
 
 Every backend caches successful reads for the configured TTL. A `set` on the same key invalidates the cache so a follow-up `get` sees the new value. There is no proactive watch-based invalidation today. A future watch hook can invalidate Kubernetes entries when Secret objects change.
 
+## Generating Secret Values
+
+Everything above covers referencing secrets that already exist. Some secrets you have to invent yourself: a static virtual key in a `credentials:` block, and the `pepper` and `master_key` under `key_management.crypto`. For all three, generate 32 bytes from a cryptographic random source and use the hex form:
+
+```bash
+openssl rand -hex 32
+```
+
+That prints 64 hex characters, which is the recommended size for each of these values. On Windows, `openssl` is available in Git Bash but not in plain PowerShell; the PowerShell equivalent is:
+
+```powershell
+$b = [byte[]]::new(32)
+[System.Security.Cryptography.RandomNumberGenerator]::Fill($b)
+($b | ForEach-Object ToString x2) -join ''
+```
+
+Do not derive these values from passwords, hostnames, or anything guessable, and do not reuse one value across the three roles. Generate each one once, store it in your secret manager or an environment variable, and reference it from the config (`env:NAME`, `file:PATH`, or a backend URI from the scheme table above).
+
+Two of the three have a better alternative than hand-generation:
+
+* **Virtual keys:** the dynamic key-management admin API mints keys server-side (`POST /admin/keys`) with the right shape and entropy, and returns the plaintext token exactly once. Prefer minting over inventing a static key; see [key-management.md](key-management.md). A hand-generated static key is fine for local walkthroughs, but replace placeholder values like `sk-your-virtual-key` before anything reachable beyond localhost.
+* **`pepper` and `master_key`:** if you leave them unset, sbproxy generates an ephemeral value at boot and warns. That is a fallback so a first run works, not a recommendation. Stored key hashes and encrypted credentials do not survive a restart without stable values, so set both before minting any key you intend to keep.
+
 ## Related Reading
 
 * `docs/configuration.md` for the `proxy.secrets` block and reference URI grammar.
 * `docs/multi-tenant.md` for the inheritance model and isolation guarantees.
 * `docs/migration-credentials.md` for the `virtual_keys:` to `credentials:` migration and the vault reference migration note.
+* `docs/key-management.md` for the dynamic key store the `pepper` and `master_key` protect.

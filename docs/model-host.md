@@ -1,6 +1,6 @@
 # Model host
 
-*Last modified: 2026-07-13*
+*Last modified: 2026-08-01*
 
 SBproxy can own model processes on one worker or place them across a managed
 cluster. Model-host control lives under `proxy.model_host`. Depending on its
@@ -475,10 +475,15 @@ integer returned by GET. Admin JSON integers are capped at
 `9,007,199,254,740,991`, JavaScript's largest exactly representable integer;
 larger cursors are rejected instead of being rounded by the browser.
 
-Local admin-managed state is deliberately single-node: every deployment must
-use exactly one replica, with no heterogeneous variants, required labels, or
-spread keys. Multi-replica and placement intent belongs in a signed cluster
-bundle published by the configured authority node.
+Local admin-managed state is single-node: a deployment runs any number of
+replicas on this node's devices, but carries no cross-node placement intent
+(heterogeneous variants, required labels, or spread keys). A deployment may set
+`replicas` and a fixed `tensor_parallel` degree; each replica claims its own
+disjoint device set, so `replicas` times `tensor_parallel` cannot exceed the
+node's serving devices, and a request for more is rejected with the shortfall
+named. A deployment with more than one replica must pin a variant. Cross-node
+placement belongs in a signed cluster bundle published by the configured
+authority node.
 
 ```bash
 curl -u "admin:${SB_ADMIN_PASSWORD}" \
@@ -601,9 +606,12 @@ spread keys, pull policy, warm behavior, engine, rollout policy, keep-alive,
 maximum concurrency, queue depth, and queue timeout. Add, edit, rename, and
 remove operations always build one complete replacement map.
 
-In local admin mode the form fixes replicas at one and hides heterogeneous,
-required-label, and spread controls. Those fields appear only for an authority
-node publishing signed cluster placement intent.
+The local admin API accepts a deployment's `replicas` and `tensor_parallel`
+directly, so multi-replica local deployments are configured through the
+deployments endpoint or the config file. The local admin form currently fixes
+replicas at one and hides heterogeneous, required-label, and spread controls;
+those cross-node placement fields appear only for an authority node publishing
+signed cluster placement intent.
 
 Removal requires a fresh lifecycle response. A deployment in `ready`,
 `preparing`, or `draining` state must be stopped first. If a write returns
@@ -770,6 +778,91 @@ assigned only to workers that already report the exact verified artifact.
 placement. Each worker projection is exact-variant pinned, warm, single-replica,
 and fenced to the cluster deployment generation.
 
+## Serve model settings
+
+An inline `serve:` provider hosts one or more models under `serve.models[]`.
+Each entry accepts these settings.
+
+| Setting | Purpose |
+|---|---|
+| `model` | Catalog id (`qwen3-32b`) or a raw `hf:Org/Repo[:QUANT]` reference. Required. |
+| `name` | Client-facing model id that routing, budgets, and the ledger see. Defaults to the catalog id, and is required for a raw `hf:` reference. |
+| `variant` | Exact catalog v2 artifact variant to run. Omitting it lets the worker select a compatible variant. |
+| `engine` | Engine to serve with: `auto` (default), `vllm`, `sglang`, `llama_cpp`, or `mistralrs`. |
+| `modality` | Task the model performs: `chat` (default), `embedding`, `rerank`, `speech_to_text`, `text_to_speech`, or `image`. It drives the engine's task flag (`embedding` serves `--task embed`, `rerank` serves `--task score`) and zeroes the KV-cache term in the fit. Set it to serve an embedding or rerank model from a raw `hf:` reference, which has no catalog entry to carry the modality. |
+| `max_context` | Context length to plan VRAM for and pass to the engine. |
+| `keep_alive` | Idle time before the engine unloads, as a duration like `30m` or `1h`. Omitting it keeps the engine resident until eviction. |
+| `kv_quant` | KV-cache quantization: `auto` (default), `f16`, `fp8`, `int8`, or `int4`. What each mode costs depends on the engine: vLLM and SGLang expose only fp8 KV, so `int8` and `int4` are both served as fp8 there; llama.cpp quantizes for real (`q8_0`, `q4_0`); mistral.rs takes no KV dtype flag, so a low-precision request keeps the engine default and buys nothing. The fit planner sizes the mode the engine will actually run, and when that differs from the request it logs a warning naming the requested mode, the substituted dtype, and the engine. See the table in [gpu-fit-planning.md](gpu-fit-planning.md). |
+| `enable_prefix_caching` | Enable vLLM's automatic prefix caching, reusing KV blocks across requests that share a prompt prefix. |
+| `pinned` | Keep the model resident and never evict it to make room. |
+| `gguf_file` | Exact GGUF filename to serve from a multi-file llama.cpp repo. |
+| `extra_args` | Extra engine flags appended after the runtime's own arguments, one argv element each, filtered against an allowlist. |
+| `tool_call_parser` | vLLM tool-call parser (`hermes`, `llama3_json`, `mistral`) that enables auto tool choice. |
+| `swap_space_gib` | CPU swap pool in GiB (vLLM `--swap-space`). |
+| `cpu_offload_gib` | GiB of weights kept in CPU RAM (vLLM `--cpu-offload-gb`). |
+| `reference` | Hosted model this local model displaces, used to price the dollars-saved value report. |
+
+Host-wide settings sit on the `serve:` block itself.
+
+| Setting | Purpose |
+|---|---|
+| `catalog_file` | Operator catalog file that replaces the built-in certified catalog. |
+| `cache_dir` | Directory for the content-addressed weight cache. |
+| `cache_budget_gib` | Size at which the weight cache starts evicting, in GiB. It is a garbage-collection threshold, not a limit the OS enforces: the cache can exceed it transiently, and a single artifact larger than the budget still downloads. Size the mount for the weights you intend to hold, and let this decide when old ones go. `sbproxy doctor` compares it against free space on the cache mount, and `sbproxy doctor --strict` refuses to boot a worker whose mount cannot hold it. |
+| `allow_unpinned_refs` | Permit unpinned raw `hf:` or `file:` references on a node holding the `worker` cluster role. Default `false`. A raw reference runs the engine in repo mode: external egress, a writable cache mount, and no digest verification. Fine for `sbproxy run` and a workstation, which are unaffected; a fleet worker must opt in. |
+| `eviction` | VRAM-pressure policy: `lru` (default) or `never`. |
+| `engines` | Per-engine provisioning map (`launch`, `image`, `acquire`, `shm_size_gib`). |
+| `max_concurrent_requests` | Cap on concurrently dispatched served-lane requests. |
+| `queue_timeout_ms` | How long a queued request waits for a slot before failover. Default 30000, read only when `max_concurrent_requests` is set. |
+
+## Value delivered
+
+The authenticated `GET /admin/model-host/value` endpoint reports two separate
+sources of value:
+
+- locally served completions priced against each model's configured
+  `reference`;
+- target-model input tokens and gross input cost avoided by each successful
+  context-compression lever.
+
+Compression does not count as a local or cloud completion. The request path
+records it only after the terminal provider attempt returns a billable `2xx`.
+Each `compression` row names the target `model`, closed `lever`,
+`tokens_saved`, `gross_cost_saved_micros`, and `token_count_precision`.
+`compression_totals` aggregates those rows by lever, and the top-level
+`total_compression_tokens_saved` and
+`total_compression_gross_cost_saved_micros` give the complete compression
+total.
+
+The precision value is `model_tokenizer` when the target model resolves to a
+registered tokenizer, or `heuristic` when SBproxy uses its UTF-8 byte-length
+fallback. Unknown input pricing yields zero gross cost and keeps the token
+saving. The amount is gross because dedicated summarizer spend remains in the
+normal usage stream instead of being silently netted out.
+
+```bash
+curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/admin/model-host/value" \
+  | jq '{models,compression,compression_totals,total_compression_tokens_saved}'
+```
+
+The same endpoint is available when no local model is configured. In that
+compression-only case, `models` contains a zeroed local-serving row for each
+compression target, while all local and cloud completion totals remain zero.
+Compression uses a bounded in-memory ledger unless an AI handler initializes
+the current durable compatibility path: one provider-level
+`providers[].serve` block must both contain at least one `models[].reference`
+and set `cache_dir`, which stores the process-wide ledger at
+`<cache_dir>/value-ledger.redb`. Later activation promotes the same shared
+in-memory ledger in place and merges existing totals, preserving preexisting
+value sinks and Admin readers. The first successful durable path is canonical;
+a conflicting later path emits a bounded warning and keeps using it.
+`proxy.model_host.cache.directory` does not currently activate that ledger.
+
+The ledger caps the complete lane set at 1,000 entries, including the
+deterministic `__other__` overflow lane. After 999 non-overflow model names,
+additional names combine under `__other__`.
+
 ## Artifacts and cache safety
 
 The cache root contains `blobs/sha256`, `snapshots`, `metadata`, `partials`,
@@ -812,11 +905,23 @@ sbproxy models remove qwen2.5-0.5b-instruct \
   --variant q4_k_m \
   --cache-dir /var/lib/sbproxy/models \
   --format json
+
+# Reclaim content-addressed blobs referenced by no cached artifact,
+# such as orphans left by an interrupted pull. --dry-run reports the
+# reclaimable bytes without deleting anything.
+sbproxy models prune --cache-dir /var/lib/sbproxy/models --dry-run
+sbproxy models prune --cache-dir /var/lib/sbproxy/models
 ```
 
+Because the weight store is content-addressed, two models that share a shard
+store it once, and `prune` reclaims only blobs that no cached artifact still
+references, so a shared blob survives while its last reference remains. Prune
+runs under the same collection lock as the cache-budget sweep, so it never
+races a concurrent pull.
+
 Every JSON command uses `schema_version: 1` and a stable command name such as
-`models.pull` or `models.remove`. Pull and removal results include durable job
-IDs when a mutation occurred.
+`models.pull`, `models.remove`, or `models.prune`. Pull and removal results
+include durable job IDs when a mutation occurred.
 
 ## Managed engines
 
@@ -833,53 +938,56 @@ The runtime reports one of four availability states before provisioning:
 
 llama.cpp consumes one verified GGUF path. The driver prefers an explicitly
 allowlisted path, then a compatible executable on `PATH`, then pinned
-acquisition. The built-in b9905 release assets have checked-in per-platform
+acquisition. The built-in pinned release assets have checked-in per-platform
 SHA-256 digests. Downloads use a release lock and publish under an
 asset-identity directory only after verification, so later starts reuse the
 same archive and executable. Apple Silicon uses Metal, and a CPU worker uses
 system RAM.
 
-Linux CUDA can build the pinned llama.cpp source archive on the node. The build
-requires Linux x86-64, an NVIDIA driver, `nvcc`, CMake, a C or C++ compiler, and
-`tar`. The source URL and SHA-256 are fixed, concurrent builders share one lock,
-and only an executable final binary is published. A custom source tag needs an
-explicit archive digest.
+Each pinned build also records the minimum macOS its Apple assets were built
+against. Recent llama.cpp macos-arm64 assets are built for macOS 26 and refuse
+to load on anything older, so when no `version:` is set, a macOS host reads
+its own product version and picks the newest pinned build it can run: macOS 26
+gets b9905, while macOS 14 and 15 fall back to b9415. Linux always uses the
+newest pin. A host older than every pinned build fails before any download,
+with a message naming the host version and the oldest supported minimum, and
+points at the alternatives: install llama.cpp on `PATH`, set a trusted
+`path:`, or pin `version:` and `sha256:` to a build made for that macOS. An
+explicit `version:` always wins over this selection, so only pin one on macOS
+if you know the build loads on the hosts you deploy to.
+
+llama.cpp is the engine for GGUF models on CPU and Apple Metal. On a compatible
+NVIDIA Linux host, SBproxy can also build llama.cpp from digest-pinned source
+with CUDA. The pending NVIDIA certification target uses vLLM or SGLang, so use
+one of those when following the certification procedure.
 
 ```yaml
 engines:
   llama_cpp:
     launch: binary
     version: b9905
-    acceleration: cuda
+    acceleration: auto   # Metal on Apple Silicon, CUDA when build prerequisites pass, otherwise CPU
 ```
 
-Live CUDA validation is part of the final GCP PR, so this path remains preview
+Live CUDA certification has not been recorded, so this path remains preview
 despite deterministic source-build coverage in CI.
 
-### vLLM with uv
+### vLLM in a container (default)
 
-vLLM consumes a read-only verified snapshot and requires a CUDA worker. Managed
-uv mode creates a version-pinned environment in the engine cache:
-
-```yaml
-engines:
-  vllm:
-    launch: uv
-    version: 0.10.0
-    acceleration: cuda
-```
-
-Compatibility checks report Python, torch, CUDA, and vLLM mismatches with a
-bounded remediation. A failed check does not fall back to an unrelated Python
-environment. Launch bounds `max-num-seqs` to deployment concurrency and derives
-the engine KV-cache byte limit from the admitted memory estimate.
-
-### vLLM in a container
+The most reliable way to serve a GPU model is a digest-pinned engine container.
+The image ships the whole CUDA and Python toolchain, so the host needs nothing
+beyond a container runtime and an NVIDIA driver, and there is no host build
+cascade to hit. This is the default: when the worker has a container runtime
+(Docker or Podman) and you have not configured vLLM provisioning yourself,
+SBproxy runs vLLM from a curated digest-pinned image. The smallest useful
+config names no image at all and still serves in a container.
 
 Container mode accepts only an immutable `repository@sha256:<digest>` image.
 The runtime creates a private internal network, mounts the verified artifact
 read-only, publishes the engine only on loopback, scopes the selected NVIDIA
 devices, and passes shared memory as a validated typed setting.
+
+To pin your own image instead of the curated default, set it explicitly:
 
 ```yaml
 engines:
@@ -892,8 +1000,107 @@ engines:
 ```
 
 Tagged images, `latest`, writable artifact mounts, arbitrary container argv, and
-unscoped devices are rejected. Live container certification is also deferred to
-the final GCP PR.
+unscoped devices are rejected. Live NVIDIA container certification remains
+pending.
+
+### vLLM with uv (no-docker fallback)
+
+Where a host cannot run containers, vLLM can run from a managed, version-pinned
+uv environment in the engine cache instead. This is the advanced path: it
+builds vLLM against the host, so the host itself must supply the toolchain the
+container would otherwise carry.
+
+```yaml
+engines:
+  vllm:
+    launch: uv
+    version: 0.10.0
+    acceleration: cuda
+```
+
+Before choosing this path, make sure the host provides what the vLLM wheel and
+its Triton JIT need, on top of the NVIDIA driver:
+
+- Python development headers matching the engine's Python (`Python.h`, from
+  `python3-dev` / `python3-devel`).
+- `ninja`, the build tool the compile step invokes.
+- A CUDA development toolchain, meaning `nvcc` and the CUDA headers, not just
+  the runtime driver.
+
+A box missing any of these fails the compatibility check with a bounded
+remediation rather than falling back to an unrelated Python environment. That
+missing-toolchain cascade is exactly what the container path avoids, so prefer
+the container unless you genuinely cannot run one. Launch bounds `max-num-seqs`
+to deployment concurrency and derives the engine KV-cache byte limit from the
+admitted memory estimate.
+
+### SGLang
+
+SGLang runs the same OpenAI-compatible server model as vLLM and loads the same
+safetensors weights on a CUDA worker. The real launch is `python -m
+sglang.launch_server`, so there is no single binary to install: the runtime
+provisions it from a digest-pinned container or a pinned uv environment, the
+same two paths vLLM uses and with the same container-first preference. The
+readiness probe and dispatch path are identical.
+
+```yaml
+engines:
+  sglang:
+    launch: uv
+    version: 0.4.6.post1
+    acceleration: cuda
+models:
+  - model: qwen3-32b
+    engine: sglang
+```
+
+Choose SGLang when you want RadixAttention prefix caching, higher structured-output
+throughput, or better behavior under high-concurrency agent traffic. It shares
+tensor parallelism, quantization, and context sizing with vLLM, and the runtime
+owns `--model-path`, `--host`, `--port`, and `--tp-size` so config cannot
+contradict the device placement. Its stable extra-argument allowlist is
+`--enable-torch-compile`, `--disable-radix-cache`, `--schedule-conservativeness`,
+and `--mem-fraction-static`.
+
+vLLM stays the default. SGLang is an explicit opt-in: `engine: auto` never
+resolves to it, and you name `engine: sglang` on a model or an `sglang` block
+under `engines:` to select it. It ships at preview support until it is certified
+on real NVIDIA hardware, and it targets CUDA only for now.
+
+### mistral.rs
+
+mistral.rs is the pure-Rust engine, driven as a supervised subprocess over its
+OpenAI-compatible surface (`mistralrs serve`). It is a single-binary engine
+acquired exactly like llama.cpp: an operator-installed `mistralrs` on PATH wins,
+and otherwise the runtime fetches the pinned upstream release for the host and
+verifies its sha256 against a checked-in digest. Upstream publishes a Metal
+build for Apple Silicon and, on Linux x86-64, a CPU build plus CUDA builds per
+GPU compute capability; the runtime selects the CUDA asset from the probed GPU
+and it needs an NVIDIA driver supporting CUDA 12.8 or newer. There is no
+Intel-mac or Vulkan asset, and no container or uv path.
+
+```yaml
+engines:
+  mistralrs:
+    launch: binary
+    version: v0.9.0
+models:
+  - model: qwen2.5-0.5b-instruct
+    engine: mistralrs
+```
+
+The lane serves safetensors weights; GGUF stays llama.cpp's lane. Tool calls
+are native to the server, so no parser flag is involved. The runtime owns
+`-m`, `--host`, `--port`, `--max-seq-len`, `--max-seqs`, and `--cpu`; the
+stable extra-argument allowlist is `--no-kv-cache` and `--prefix-cache-n`.
+A configured `kv_quant` is not passed through (the lane emits no KV dtype
+flag), so the fit planner books no cache saving for it.
+
+vLLM and llama.cpp stay the defaults. mistral.rs is an explicit opt-in:
+`engine: auto` never resolves to it, and the placement planner ranks it behind
+the certified lanes. Prefer it for dense and quantized models; upstream's own
+benchmarks put its MoE BF16 prefill well behind vLLM, so large MoE serving
+belongs on vLLM or SGLang.
 
 ## Admission and residency
 
@@ -928,6 +1135,15 @@ Keep-alive starts after the last request permit is released. Active or queued
 work pauses expiry. A draining deployment rejects new work and waits up to the
 configured shutdown deadline for active requests.
 
+Policy-driven eviction stops the engine process. WOR-1987 removed an unwired
+sleep/wake HTTP client and a policy-only KV tiering abstraction; neither was a
+supported model-host capability. The engine-native `swap_space_gib` and
+`cpu_offload_gib` settings remain available. A future sleep/wake implementation
+needs bounded polling for asynchronous engine transitions, retained process
+ownership and accounting when cleanup fails, a bounded host-RAM policy for
+sleeping weights, isolated container development endpoints, and end-to-end
+coverage through a fake engine.
+
 ## Status and operations
 
 The admin listener is authenticated and should remain on loopback unless TLS,
@@ -951,15 +1167,19 @@ in cache for a later restart.
 The equivalent authenticated routes are:
 
 ```text
-GET  /admin/model-host/catalog
-GET  /admin/model-host/deployments
-PUT  /admin/model-host/deployments
-GET  /admin/model-host/status
-POST /admin/model-host/load
-POST /admin/model-host/stop
-POST /admin/model-host/drain
-POST /admin/model-host/evict
-POST /admin/model-host/reset
+GET    /admin/model-host/catalog
+GET    /admin/model-host/deployments
+PUT    /admin/model-host/deployments
+GET    /admin/model-host/status
+GET    /admin/model-host/files
+DELETE /admin/model-host/artifacts/{digest}
+POST   /admin/model-host/gc
+POST   /admin/model-host/load
+POST   /admin/model-host/stop
+POST   /admin/model-host/drain
+POST   /admin/model-host/evict
+POST   /admin/model-host/reset
+GET    /admin/cluster/artifacts
 ```
 
 Load, stop, drain, evict, and reset accept

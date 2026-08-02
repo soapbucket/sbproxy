@@ -1,27 +1,23 @@
 /*
  * SBproxy admin design tokens.
  *
- * Matches the current sbproxy.dev brand: a light editorial surface with
- * a two-tier accent. The values below are the real tokens read from the
- * live sbproxy.dev stylesheet (assets/index-*.css): the paper and ink
- * scales, --navy / --navy-deep / --navy-soft, --azure / --azure-hover /
- * --azure-soft / --azure-tint, the mint and rose state hues, the
- * hairline low-alpha borders, the "ss01"/"cv11" feature settings, and
- * the Instrument Sans (body and headings) plus JetBrains Mono (code and
- * identifiers) type families.
+ * Matches the sbproxy.dev paper/ink editorial system (2026-07-12
+ * handoff): a warm paper page, white artifact panels, ink text and
+ * rules, one green accent, amber strictly for warnings, square
+ * corners, no shadows, no gradients. Values mirror the live
+ * sbproxy.dev stylesheet variables.
  *
- * Accent tiers:
- *  - Navy (#0e2a4d) is the commit / brand tier: primary buttons and the
- *    brand mark. White text sits on navy.
- *  - Azure (#2563eb) is the interaction tier only: links, focus rings,
- *    and selected or active states. It is never a primary CTA fill.
- *  - Amber survives only as a warning color (--sb-warn), never a CTA or
- *    a heading.
+ * Tiers:
+ *  - Ink (#16150F) is the commit tier: primary buttons, section
+ *    rules, and the strongest text. Paper text sits on ink.
+ *  - Green (#157A5B) is the single accent: links, focus, active nav,
+ *    and the first chart series. Its tint (#E4F1EB) marks selection.
+ *  - Amber (#B5651D) survives only as a warning color, never a CTA.
  *
- * App chrome (sidebar, cards, tables, modals, badges) reads light off
- * these variables. White paper (#ffffff) is the surface, with a subtle
- * #f7f8fa for banding and hovers. The dark code panel (--sb-code-*) is
- * retained as a deliberate accent for raw JSON and code blocks only.
+ * Chart palette: five categorical hues validated for lightness,
+ * chroma, CVD separation, and contrast on the white panel surface
+ * (green, gold, blue, clay, plum -- assign in this fixed order,
+ * never cycled).
  */
 
 :root {
@@ -34,68 +30,73 @@
   --sb-font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo,
     Consolas, "Liberation Mono", monospace;
 
-  /* Light paper surfaces (site --paper-0 / --paper-50 / --paper-100). */
-  --sb-bg: #f7f8fa;
-  --sb-bg-sunken: #eef1f5;
+  /* Paper surfaces. The page is warm paper; cards and tables are the
+     white "artifact panels" reserved for content. */
+  --sb-bg: #f6f4ee;
+  --sb-bg-sunken: #efece3;
   --sb-surface: #ffffff;
-  --sb-surface-2: #f7f8fa;
-  --sb-surface-hover: #eef1f5;
+  --sb-surface-2: #faf9f5;
+  --sb-surface-hover: #f1efe8;
 
-  /* Ink text scale (site --ink-800 / --ink-500 / --ink-400). */
-  --sb-text: #0f1f36;
-  --sb-text-muted: #4a5b73;
-  --sb-text-faint: #6b7d95;
+  /* Ink text scale. */
+  --sb-text: #16150f;
+  --sb-text-muted: #4e4a3f;
+  --sb-text-faint: #57534a;
 
-  /* Navy, the commit / brand tier (site --navy / --navy-deep /
-     --navy-soft). Primary CTAs and the brand mark. */
-  --sb-navy: #0e2a4d;
-  --sb-navy-strong: #081a33;
-  --sb-navy-soft: #1f3a60;
-  --sb-on-navy: #ffffff;
+  /* Ink, the commit tier: primary buttons and the strongest rules. */
+  --sb-ink: #16150f;
+  --sb-ink-strong: #000000;
+  --sb-ink-soft: #2e2c24;
+  --sb-on-ink: #f6f4ee;
 
-  /* Azure, the interaction tier only (site --azure / --azure-hover /
-     --azure-soft / --azure-tint). Links, focus rings, active states. */
-  --sb-accent: #2563eb;
-  --sb-accent-strong: #1d4ed8;
-  --sb-accent-tint: #eef4fe;
-  --sb-accent-tint-strong: #dbe7fe;
-  --sb-accent-ring: rgba(37, 99, 235, 0.28);
+  /* Green, the single accent: links, focus, selected states. */
+  --sb-accent: #157a5b;
+  --sb-accent-strong: #0f5f46;
+  --sb-accent-tint: #e4f1eb;
+  --sb-accent-tint-strong: #cde7dc;
+  --sb-accent-ring: rgba(21, 122, 91, 0.3);
 
-  /* Hairline rules (site --hairline / --hairline-strong /
-     --hairline-azure). */
-  --sb-border: rgba(10, 22, 40, 0.08);
-  --sb-border-strong: rgba(10, 22, 40, 0.14);
-  --sb-border-accent: rgba(37, 99, 235, 0.22);
+  /* Rules. Full-strength ink for section rules, hairlines inside. */
+  --sb-border: #e7e3d9;
+  --sb-border-strong: #d8d3c6;
+  --sb-border-ink: #16150f;
+  --sb-border-accent: rgba(21, 122, 91, 0.35);
 
-  /* State colors. Backgrounds are the site soft tints (--mint-soft,
-     --amber-tint, --rose-soft, --azure-soft); the text hues are the
-     site mint / amber / rose / azure darkened enough to read on those
-     light tints. Amber appears here as a warning only. */
-  --sb-ok: #0a7a55;
-  --sb-ok-bg: #d1fae5;
-  --sb-warn: #b45309;
-  --sb-warn-bg: #fef3c7;
-  --sb-warn-fg: #92400e;
+  /* State colors. Amber appears here as a warning only. */
+  --sb-ok: #157a5b;
+  --sb-ok-bg: #e4f1eb;
+  --sb-warn: #b5651d;
+  --sb-warn-bg: #f7ead9;
+  --sb-warn-fg: #8a4c14;
   --sb-err: #b4223f;
-  --sb-err-bg: #fce7ec;
-  --sb-info: #1d4ed8;
-  --sb-info-bg: #dbe7fe;
+  --sb-err-bg: #f8e6ea;
+  --sb-info: #31639c;
+  --sb-info-bg: #e7edf5;
 
-  /* Dark code and identifier panel (extracted syntax palette), kept as
-     an intentional accent on the light chrome. */
-  --sb-code-bg: #0e1a2c;
-  --sb-code-fg: #e2e8f0;
-  --sb-code-key: #93c5fd;
-  --sb-code-str: #fbcfe8;
-  --sb-code-val: #86efac;
-  --sb-code-num: #c4b5fd;
-  --sb-code-com: #94a3b8;
-  --sb-code-punct: #cbd5e1;
+  /* Categorical chart hues, fixed order (validated on the white
+     panel surface). Series 1 is the brand green. */
+  --sb-chart-1: #157a5b;
+  --sb-chart-2: #9c7a10;
+  --sb-chart-3: #31639c;
+  --sb-chart-4: #a64d2b;
+  --sb-chart-5: #8e4d9e;
 
-  /* Radii, modest and editorial (site uses 6-8px, pills at 999px). */
-  --sb-radius-sm: 6px;
-  --sb-radius: 8px;
-  --sb-radius-lg: 12px;
+  /* Dark code panel (site console palette), kept as the one
+     deliberate dark accent on the paper chrome. */
+  --sb-code-bg: #171512;
+  --sb-code-fg: #e9e5da;
+  --sb-code-key: #7fcba4;
+  --sb-code-str: #c9b98f;
+  --sb-code-val: #7fcba4;
+  --sb-code-num: #c9b98f;
+  --sb-code-com: #8c877b;
+  --sb-code-punct: #b5b0a3;
+
+  /* Square corners everywhere; the pill survives only for status
+     dots and scrollbar thumbs. */
+  --sb-radius-sm: 0;
+  --sb-radius: 0;
+  --sb-radius-lg: 0;
   --sb-radius-pill: 999px;
 
   /* Spacing rhythm. */
@@ -111,6 +112,7 @@
   --sb-sidebar-w: 232px;
   --sb-content-max: 1160px;
 
-  --sb-shadow: 0 1px 2px rgba(10, 22, 40, 0.06),
-    0 10px 30px rgba(10, 22, 40, 0.12);
+  /* Flat system: no shadows. Kept as a named token so components do
+     not reinvent one. */
+  --sb-shadow: none;
 }

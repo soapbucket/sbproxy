@@ -1,20 +1,28 @@
 #!/usr/bin/env python3
 """Generate VHS cassettes for sbproxy examples from their documented curls.
 
-For each example under examples/, this reads the `Test:` block in the
-sb.yml header comment, extracts up to a few command units (curl / for-loop),
-normalizes them to single lines, fixes deprecated model ids, and writes a
-tape under docs/tapes/<example>.tape with a `# CONFIG:` directive that
-scripts/record-tapes.sh understands.
+For each recorded example under examples/, this reads the `Test:` block in
+the sb.yml header comment, extracts up to a few command units (curl /
+for-loop), normalizes them to single lines, updates deprecated model ids in
+the generated command text, and writes a tape under
+docs/tapes/<example>.tape with a `# CONFIG:` directive that
+scripts/record-tapes.sh understands. Source YAML is never rewritten.
 
 Examples that need external services (redis, embedding sidecar, vault, TLS,
 mTLS, ONNX weights) are skipped: they cannot run standalone in a recording.
-The four hand-authored headline tapes are also skipped.
+Hand-authored tapes are discovered by their lack of the generated marker and
+are never overwritten. By default, the script syncs examples that already
+have a GIF or generated tape. Use `--only` to opt in a new recording, or
+`--all` to inspect every runnable example.
 
 Usage:
-  scripts/gen-example-tapes.py            # generate for all runnable examples
-  scripts/gen-example-tapes.py --list     # print the plan (generate/skip) only
+  python3 scripts/gen-example-tapes.py             # sync recorded examples
+  python3 scripts/gen-example-tapes.py --list      # print the plan only
+  python3 scripts/gen-example-tapes.py --check     # report drift without writing
+  python3 scripts/gen-example-tapes.py --only NAME # opt one example in
+  python3 scripts/gen-example-tapes.py --all       # plan every runnable example
 """
+import argparse
 import os
 import re
 import sys
@@ -22,6 +30,7 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXAMPLES = os.path.join(ROOT, "examples")
 TAPES = os.path.join(ROOT, "docs", "tapes")
+ASSETS = os.path.join(ROOT, "docs", "assets")
 
 # Hand-authored, do not overwrite.
 HEADLINE = {"ai-gateway-quickstart", "ai-routing-fallback",
@@ -32,7 +41,7 @@ EXTERNAL = re.compile(
     r"\b(redis|memcached|sidecar|classifier|vault://|onnx|\.onnx|"
     r"tls:|mtls|mutual_tls|client_cert|cert_file|key_file)\b", re.I)
 
-# Deprecated model ids -> current ones.
+# Substitutions applied only to generated tape command text.
 MODEL_FIXES = [
     (re.compile(r"claude-3-5-sonnet-latest|claude-3-5-sonnet-\d+"), "claude-haiku-4-5"),
     (re.compile(r"claude-3-5-haiku-latest|claude-3-5-haiku-\d+"), "claude-haiku-4-5"),
@@ -40,8 +49,8 @@ MODEL_FIXES = [
     (re.compile(r"gemini-2\.\d+-flash|gemini-1\.5-[a-z]+|gemini-flash-latest"), "gemini-3.5-flash"),
 ]
 
-# Shell vars the record script provides (from test/.env). A demo that needs
-# any other $VAR / ${VAR} can't run cleanly in a recording, so skip it.
+# Provider-key vars the record script may supply from its configured demo env.
+# A demo that needs any other $VAR / ${VAR} cannot run cleanly in a recording.
 ALLOWED_VARS = {"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"}
 UNDEF_VAR = re.compile(r"\$\{?([A-Z_][A-Z0-9_]*)\}?")
 
@@ -162,24 +171,19 @@ def join_cmd(lines):
     s = " ".join(parts)
     s = re.sub(r"\s+", " ", s).strip()
     # Ensure shell separators survive the line join: '...; do', '...; done'.
-    s = re.sub(r";?\s*\bdo\b", "; do", s, count=1)
-    s = re.sub(r";?\s+done\b", "; done", s)
+    #
+    # Guarded to commands that actually open a shell loop. `do` is also an
+    # ordinary English word, and it turns up inside request bodies: the
+    # ai-rag-local example asks "When do refunds arrive?", which this rewrote
+    # to "When; do refunds arrive?" and recorded a malformed question into the
+    # cassette. Only `for`, `while`, and `until` introduce a `do` that is a
+    # shell keyword.
+    if re.match(r"\s*(for|while|until)\b", s):
+        s = re.sub(r";?\s*\bdo\b", "; do", s, count=1)
+        s = re.sub(r";?\s+done\b", "; done", s)
     for pat, repl in MODEL_FIXES:
         s = pat.sub(repl, s)
     return s
-
-
-def fix_models_in_file(path):
-    with open(path) as f:
-        txt = f.read()
-    new = txt
-    for pat, repl in MODEL_FIXES:
-        new = pat.sub(repl, new)
-    if new != txt:
-        with open(path, "w") as f:
-            f.write(new)
-        return True
-    return False
 
 
 def is_ai(sb_text):
@@ -222,29 +226,78 @@ def tape_for(name, cmds, is_ai_example):
     return "\n".join(lines) + "\n"
 
 
-def main():
-    list_only = "--list" in sys.argv
-    os.makedirs(TAPES, exist_ok=True)
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--list", action="store_true", help="print the generation plan")
+    mode.add_argument("--check", action="store_true", help="report drift without writing")
+    parser.add_argument(
+        "--only",
+        action="append",
+        metavar="NAME",
+        help="process only this example (repeatable)",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="process every runnable example, including examples not recorded yet",
+    )
+    return parser.parse_args()
 
-    # Remove stale auto-generated tapes (hand-authored headline tapes lack the
-    # marker and are preserved) so examples that are now skipped don't keep a
-    # dangling tape.
-    if not list_only:
-        for fn in os.listdir(TAPES):
-            p = os.path.join(TAPES, fn)
-            if fn.endswith(".tape") and os.path.isfile(p):
-                with open(p) as f:
-                    if GEN_MARKER in f.read():
-                        os.remove(p)
 
-    gen, skip = [], []
-    for name in sorted(os.listdir(EXAMPLES)):
-        d = os.path.join(EXAMPLES, name)
-        sb = os.path.join(d, "sb.yml")
-        if not os.path.isfile(sb):
+def existing_tapes():
+    if not os.path.isdir(TAPES):
+        return {}, {}
+    generated, hand_authored = {}, {}
+    for filename in os.listdir(TAPES):
+        path = os.path.join(TAPES, filename)
+        if not filename.endswith(".tape") or not os.path.isfile(path):
             continue
-        if name in HEADLINE:
-            skip.append((name, "headline (hand-authored)"))
+        with open(path) as stream:
+            contents = stream.read()
+        if GEN_MARKER in contents:
+            generated[filename[:-5]] = contents
+        else:
+            hand_authored[filename[:-5]] = contents
+    return generated, hand_authored
+
+
+def main():
+    args = parse_args()
+    available = {
+        name
+        for name in os.listdir(EXAMPLES)
+        if os.path.isfile(os.path.join(EXAMPLES, name, "sb.yml"))
+    }
+    existing, hand_authored = existing_tapes()
+    if args.only and args.all:
+        print("error: --only and --all cannot be combined", file=sys.stderr)
+        return 2
+    if args.only:
+        selected = set(args.only)
+    elif args.all:
+        selected = set(available)
+    else:
+        # The default/check scope is the recording catalog: examples with a
+        # rendered GIF or an existing generated tape. Creating a recording for
+        # a new example is explicit through --only or --all, which avoids
+        # silently expanding the provider-calling cassette set in CI.
+        selected = set(existing) & available
+        selected.update(
+            name
+            for name in available
+            if os.path.isfile(os.path.join(ASSETS, f"{name}.gif"))
+        )
+    unknown = (selected - available) if args.only else set()
+    if unknown:
+        print(f"error: unknown example(s): {', '.join(sorted(unknown))}", file=sys.stderr)
+        return 2
+
+    desired, skip = {}, []
+    for name in sorted(selected):
+        sb = os.path.join(EXAMPLES, name, "sb.yml")
+        if name in HEADLINE or name in hand_authored:
+            skip.append((name, "hand-authored"))
             continue
         sb_text = open(sb).read()
         if EXTERNAL.search(sb_text):
@@ -255,21 +308,39 @@ def main():
         if not cmds:
             skip.append((name, "no Test: curl block"))
             continue
-        if not list_only:
-            fix_models_in_file(sb)
-        tape = tape_for(name, cmds, is_ai(sb_text))
-        if not list_only:
-            with open(os.path.join(TAPES, f"{name}.tape"), "w") as f:
-                f.write(tape)
-        gen.append(name)
+        desired[name] = tape_for(name, cmds, is_ai(sb_text))
 
-    print(f"generate: {len(gen)}")
+    stale_scope = set(existing) if not args.only else selected
+    stale = sorted((set(existing) & stale_scope) - set(desired))
+    changed = sorted(
+        name for name, contents in desired.items() if existing.get(name) != contents
+    )
+
+    if args.check:
+        for name in changed:
+            state = "missing" if name not in existing else "outdated"
+            print(f"drift: docs/tapes/{name}.tape ({state})")
+        for name in stale:
+            print(f"drift: docs/tapes/{name}.tape (stale)")
+    elif not args.list:
+        os.makedirs(TAPES, exist_ok=True)
+        for name in stale:
+            os.remove(os.path.join(TAPES, f"{name}.tape"))
+        for name, contents in desired.items():
+            with open(os.path.join(TAPES, f"{name}.tape"), "w") as stream:
+                stream.write(contents)
+
+    print(f"generate: {len(desired)}")
     print(f"skip: {len(skip)}")
     for n, why in skip:
         print(f"  skip {n}: {why}")
-    if list_only:
+    if args.list:
         print("\n(--list: no files written)")
+    if args.check:
+        print("\n(--check: no files written)")
+        return 1 if changed or stale else 0
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

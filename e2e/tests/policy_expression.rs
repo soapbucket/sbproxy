@@ -11,7 +11,7 @@
 //! The CEL request context exposes `request.method`, `request.path`,
 //! `request.host`, `request.headers`, `request.query`,
 //! `request.time` (Unix epoch seconds), `request.unix_nanos`, and
-//! `connection.remote_ip`.
+//! `request.trust_tier`, plus `connection.remote_ip`.
 
 use sbproxy_e2e::ProxyHarness;
 
@@ -141,5 +141,42 @@ origins:
     assert_eq!(
         resp.status, 200,
         "request.time must be exposed as Unix epoch seconds and pass the post-2020 gate"
+    );
+}
+
+#[test]
+fn anonymous_trust_tier_is_available_to_the_live_policy_and_metric() {
+    let yaml = r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "cel.localhost":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+    policies:
+      - type: expression
+        expression: 'request.trust_tier == "anonymous"'
+        deny_status: 403
+        deny_message: "unexpected trust tier"
+"#;
+    let harness = ProxyHarness::start_with_yaml(yaml).expect("start proxy");
+
+    let response = harness.get("/", "cel.localhost").expect("send");
+    assert_eq!(
+        response.status, 200,
+        "a request without identity evidence must reach CEL as anonymous"
+    );
+
+    let metrics = harness
+        .get("/metrics", "cel.localhost")
+        .expect("fetch metrics")
+        .text()
+        .unwrap_or_default();
+    assert!(
+        metrics.contains("sbproxy_trust_tier_requests_total{tier=\"anonymous\"}"),
+        "the live request path must record the derived tier; metrics:\n{metrics}"
     );
 }

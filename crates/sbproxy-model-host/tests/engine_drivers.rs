@@ -6,15 +6,17 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use sbproxy_model_host::{
-    build_vllm_container_plan, validate_engine_args, ArtifactCacheMetadata, ArtifactFile,
-    ArtifactFormat, BackoffPolicy, CommandExecutor, CommandOutput, ContainerRuntime,
-    CudaBuildPrerequisites, EngineAccel, EngineAvailability, EngineCapabilities, EngineCommand,
-    EngineDetection, EngineDriver, EngineDriverError, EngineFailureReason, EngineHealth,
-    EngineKind, EngineProcess, EngineProcessRunner, EngineProvisioning, EngineReadinessProbe,
-    EngineSupervisor, FileJobStore, FitPlan, KvCacheQuant, LaunchRequest, LlamaBinarySource,
-    LlamaCppDriver, OperationJob, OperationKind, OperationProgress, OperationState,
+    build_sglang_container_plan, build_vllm_container_plan, validate_engine_args,
+    ArtifactCacheMetadata, ArtifactFile, ArtifactFormat, BackoffPolicy, CommandExecutor,
+    CommandOutput, ContainerRuntime, CudaBuildPrerequisites, EngineAccel, EngineAvailability,
+    EngineCapabilities, EngineCommand, EngineDetection, EngineDriver, EngineDriverError,
+    EngineFailureReason, EngineHealth, EngineKind, EngineProcess, EngineProcessRunner,
+    EngineProvisioning, EngineReadinessProbe, EngineSupervisor, FileJobStore, FitPlan,
+    KvCacheQuant, LaunchRequest, LlamaBinarySource, LlamaCppDriver, MistralRsBinarySource,
+    MistralRsDriver, OperationJob, OperationKind, OperationProgress, OperationState,
     ProvisionRequest, ProvisionedEngine, Quant, ReadyArtifact, ResolvedArtifact, RunningEngine,
-    SupervisorClock, SupportLevel, VllmDriver, VllmHost, VllmLaunchMode, WorkerProfile,
+    SGLangDriver, SupervisorClock, SupportLevel, VllmDriver, VllmHost, VllmLaunchMode,
+    WorkerProfile,
 };
 use tempfile::tempdir;
 
@@ -58,7 +60,8 @@ impl EngineDriver for FixtureDriver {
             artifact_formats: match self.kind {
                 EngineKind::LlamaCpp => vec![ArtifactFormat::Gguf],
                 EngineKind::Vllm => vec![ArtifactFormat::Safetensors],
-                EngineKind::Embedded => Vec::new(),
+                EngineKind::SGLang => vec![ArtifactFormat::Safetensors],
+                EngineKind::MistralRs => vec![ArtifactFormat::Safetensors],
             },
             accelerators: vec![sbproxy_model_host::AcceleratorKind::Cpu],
             supports_container: self.kind == EngineKind::Vllm,
@@ -107,6 +110,7 @@ impl EngineDriver for FixtureDriver {
             selected_devices: request.selected_devices.clone(),
             started_at_ms: 1,
             artifact_digest: request.artifact.artifact_digest.clone(),
+            engine_version: provisioned.version.clone(),
             memory: request.fit.memory.clone(),
             process: Arc::new(FixtureProcess {
                 stopped: AtomicBool::new(false),
@@ -160,6 +164,7 @@ fn resolved(kind: EngineKind, format: ArtifactFormat) -> ResolvedArtifact {
         license: "apache-2.0".to_string(),
         stability: SupportLevel::Preview,
         pickle_allowed: false,
+        modality: Default::default(),
     }
 }
 
@@ -211,6 +216,7 @@ fn ready(kind: EngineKind, format: ArtifactFormat) -> ReadyArtifact {
             terminal_at_ms: Some(1),
             error: None,
         },
+        repo: None,
     }
 }
 
@@ -219,9 +225,12 @@ fn fit() -> FitPlan {
         quant_name: "fixture".to_string(),
         quant: Quant::classify("fixture"),
         estimated_vram_bytes: 1024,
-        gpu_index: 0,
+        gpu_indexes: vec![0],
         seq_len: 4096,
         memory: sbproxy_model_host::MemoryEstimate::from_total(0, 1024),
+        moe: None,
+        throughput: None,
+        gpu_memory_fraction: None,
     }
 }
 
@@ -230,6 +239,7 @@ async fn driver_contract_is_complete_and_object_safe() {
     for (kind, format) in [
         (EngineKind::LlamaCpp, ArtifactFormat::Gguf),
         (EngineKind::Vllm, ArtifactFormat::Safetensors),
+        (EngineKind::MistralRs, ArtifactFormat::Safetensors),
     ] {
         let driver: Arc<dyn EngineDriver> = Arc::new(FixtureDriver { kind });
         let provisioning = EngineProvisioning::default();
@@ -260,7 +270,9 @@ async fn driver_contract_is_complete_and_object_safe() {
                     selected_devices: Vec::new(),
                     kv_quant: KvCacheQuant::Auto,
                     extra_args: Vec::new(),
+                    engine_tuning: Default::default(),
                     max_concurrency: 1,
+                    modality: Default::default(),
                     ready_timeout: Duration::from_secs(1),
                 },
             )
@@ -420,7 +432,9 @@ async fn crash_loop_observes_backoff_retains_failure_and_requires_durable_reset(
         selected_devices: Vec::new(),
         kv_quant: KvCacheQuant::Auto,
         extra_args: Vec::new(),
+        engine_tuning: Default::default(),
         max_concurrency: 1,
+        modality: Default::default(),
         ready_timeout: Duration::from_secs(1),
     };
     let task_request = request.clone();
@@ -555,6 +569,26 @@ fn unsafe_arguments_cannot_override_runtime_owned_launch_fields() {
         (EngineKind::LlamaCpp, vec!["--api-key", "secret"]),
         (EngineKind::LlamaCpp, vec!["--device", "CUDA7"]),
         (EngineKind::LlamaCpp, vec!["--mount", "/:/host"]),
+        // WOR-1905: SGLang keeps model-path, host, port, tp-size, and
+        // mem-fraction-static runtime-owned, the same way vLLM keeps
+        // --tensor-parallel-size and --gpu-memory-utilization off.
+        (EngineKind::SGLang, vec!["--model-path", "/tmp/other"]),
+        (EngineKind::SGLang, vec!["--host", "0.0.0.0"]),
+        (EngineKind::SGLang, vec!["--port=9000"]),
+        (EngineKind::SGLang, vec!["--tp-size", "8"]),
+        (EngineKind::SGLang, vec!["--mem-fraction-static", "0.5"]),
+        (
+            EngineKind::SGLang,
+            vec!["--schedule-conservativeness", "-1"],
+        ),
+        // WOR-1861: mistral.rs keeps model, host, port, sequence length,
+        // concurrency, and device placement runtime-owned.
+        (EngineKind::MistralRs, vec!["-m", "/tmp/other"]),
+        (EngineKind::MistralRs, vec!["--host", "0.0.0.0"]),
+        (EngineKind::MistralRs, vec!["--port=9000"]),
+        (EngineKind::MistralRs, vec!["--max-seq-len", "999999"]),
+        (EngineKind::MistralRs, vec!["--max-seqs", "9999"]),
+        (EngineKind::MistralRs, vec!["--cpu"]),
     ] {
         let arguments = arguments
             .into_iter()
@@ -584,6 +618,41 @@ fn unsafe_arguments_cannot_override_runtime_owned_launch_fields() {
         .expect("allowlisted llama.cpp arguments"),
         vec!["--flash-attn", "--threads=8"]
     );
+    // WOR-1905: SGLang's stable allowlist accepts its safe tuning knobs, a
+    // non-negative float among them. `--mem-fraction-static` is not here:
+    // it is runtime-owned, derived from the fit plan (see the rejected set
+    // above), mirroring how the runtime owns vLLM's `--gpu-memory-utilization`.
+    assert_eq!(
+        validate_engine_args(
+            EngineKind::SGLang,
+            &[
+                "--enable-torch-compile".to_string(),
+                "--disable-radix-cache".to_string(),
+                "--schedule-conservativeness".to_string(),
+                "1.3".to_string(),
+            ]
+        )
+        .expect("allowlisted sglang arguments"),
+        vec![
+            "--enable-torch-compile",
+            "--disable-radix-cache",
+            "--schedule-conservativeness",
+            "1.3",
+        ]
+    );
+    // WOR-1861: mistral.rs's stable allowlist accepts its safe tuning
+    // knobs; everything runtime-owned is in the rejected set above.
+    assert_eq!(
+        validate_engine_args(
+            EngineKind::MistralRs,
+            &[
+                "--no-kv-cache".to_string(),
+                "--prefix-cache-n=32".to_string()
+            ]
+        )
+        .expect("allowlisted mistralrs arguments"),
+        vec!["--no-kv-cache", "--prefix-cache-n=32"]
+    );
 }
 
 #[test]
@@ -598,7 +667,9 @@ fn launch_request_accepts_only_verified_paths_inside_the_snapshot() {
         selected_devices: Vec::new(),
         kv_quant: KvCacheQuant::Auto,
         extra_args: vec!["--flash-attn".to_string()],
+        engine_tuning: Default::default(),
         max_concurrency: 1,
+        modality: Default::default(),
         ready_timeout: Duration::from_secs(1),
     };
     request
@@ -625,7 +696,9 @@ fn launch_request_accepts_only_verified_paths_inside_the_snapshot() {
         selected_devices: Vec::new(),
         kv_quant: KvCacheQuant::Auto,
         extra_args: Vec::new(),
+        engine_tuning: Default::default(),
         max_concurrency: 1,
+        modality: Default::default(),
         ready_timeout: Duration::from_secs(1),
     };
     request.artifact.metadata.trust = "legacy-unverified".to_string();
@@ -647,7 +720,9 @@ fn launch_request_requires_devices_that_match_the_accelerator() {
         selected_devices: Vec::new(),
         kv_quant: KvCacheQuant::Auto,
         extra_args: Vec::new(),
+        engine_tuning: Default::default(),
         max_concurrency: 1,
+        modality: Default::default(),
         ready_timeout: Duration::from_secs(1),
     };
     assert_eq!(
@@ -1101,7 +1176,9 @@ async fn llama_launch_uses_one_verified_gguf_and_runtime_owned_network_and_devic
         selected_devices: vec![2],
         kv_quant: KvCacheQuant::Int4,
         extra_args: vec!["--flash-attn".to_string()],
+        engine_tuning: Default::default(),
         max_concurrency: 1,
+        modality: Default::default(),
         ready_timeout: Duration::from_secs(1),
     };
 
@@ -1135,6 +1212,255 @@ async fn llama_launch_uses_one_verified_gguf_and_runtime_owned_network_and_devic
     assert_eq!(captured[0].environment["CUDA_VISIBLE_DEVICES"], "2");
 }
 
+type MistralRsFetchRecord = (String, String, Option<String>);
+
+#[derive(Clone)]
+struct FixtureMistralRsSource {
+    on_path: Option<PathBuf>,
+    executable: bool,
+    fetched: Result<PathBuf, String>,
+    fetches: Arc<Mutex<Vec<MistralRsFetchRecord>>>,
+}
+
+#[async_trait]
+impl MistralRsBinarySource for FixtureMistralRsSource {
+    fn resolve_on_path(&self) -> Option<PathBuf> {
+        self.on_path.clone()
+    }
+
+    fn is_executable(&self, _path: &std::path::Path) -> bool {
+        self.executable
+    }
+
+    async fn fetch_release(
+        &self,
+        _cache_dir: &std::path::Path,
+        tag: &str,
+        asset: &str,
+        sha256: Option<&str>,
+    ) -> Result<PathBuf, String> {
+        self.fetches.lock().unwrap().push((
+            tag.to_string(),
+            asset.to_string(),
+            sha256.map(str::to_string),
+        ));
+        self.fetched.clone()
+    }
+}
+
+fn mistralrs_source(on_path: Option<&str>, executable: bool) -> Arc<FixtureMistralRsSource> {
+    Arc::new(FixtureMistralRsSource {
+        on_path: on_path.map(PathBuf::from),
+        executable,
+        fetched: Ok(PathBuf::from("/engines/mistralrs")),
+        fetches: Arc::new(Mutex::new(Vec::new())),
+    })
+}
+
+fn mistralrs_worker() -> WorkerProfile {
+    WorkerProfile {
+        accelerator: sbproxy_model_host::AcceleratorKind::Cpu,
+        compute_capability: None,
+        memory_bytes: 8 * 1024 * 1024 * 1024,
+        engines: BTreeSet::from([EngineKind::MistralRs]),
+    }
+}
+
+#[test]
+fn mistralrs_detection_distinguishes_available_acquirable_and_incompatible() {
+    let runner = fixture_runner(Arc::new(Mutex::new(Vec::new())));
+    let available = MistralRsDriver::new(
+        runner.clone(),
+        mistralrs_source(Some("/usr/local/bin/mistralrs"), true),
+    );
+    assert_eq!(
+        available
+            .detect(&mistralrs_worker(), &EngineProvisioning::default())
+            .availability,
+        EngineAvailability::Available
+    );
+
+    // Off PATH on a CPU worker: the pinned release asset for this host
+    // platform (metal on macOS arm64, cpu on Linux x86-64) is acquirable
+    // and carries a built-in digest, so no digest remediation is needed.
+    let acquirable = MistralRsDriver::new(runner.clone(), mistralrs_source(None, true));
+    let detection = acquirable.detect(&mistralrs_worker(), &EngineProvisioning::default());
+    assert_eq!(detection.availability, EngineAvailability::Acquirable);
+    assert_eq!(
+        detection.version.as_deref(),
+        Some(sbproxy_model_host::DEFAULT_MISTRALRS_RELEASE_TAG)
+    );
+    assert!(
+        detection.reason.contains("digest-pinned"),
+        "{}",
+        detection.reason
+    );
+
+    // A worker profile that does not permit mistral.rs is incompatible.
+    let excluded = WorkerProfile {
+        engines: BTreeSet::from([EngineKind::Vllm]),
+        ..mistralrs_worker()
+    };
+    assert_eq!(
+        acquirable
+            .detect(&excluded, &EngineProvisioning::default())
+            .availability,
+        EngineAvailability::Incompatible
+    );
+}
+
+#[tokio::test]
+async fn mistralrs_provision_fetches_the_pinned_release_with_a_builtin_digest() {
+    let source = mistralrs_source(None, true);
+    let driver = MistralRsDriver::new(
+        fixture_runner(Arc::new(Mutex::new(Vec::new()))),
+        source.clone(),
+    );
+    let provisioned = driver
+        .provision(&ProvisionRequest {
+            artifact: resolved(EngineKind::MistralRs, ArtifactFormat::Safetensors),
+            worker: mistralrs_worker(),
+            provisioning: EngineProvisioning::default(),
+            engine_cache_dir: PathBuf::from("/engines"),
+            job_store: None,
+        })
+        .await
+        .expect("mistralrs provision");
+    assert_eq!(provisioned.kind, EngineKind::MistralRs);
+    assert_eq!(
+        provisioned.version.as_deref(),
+        Some(sbproxy_model_host::DEFAULT_MISTRALRS_RELEASE_TAG)
+    );
+    assert!(
+        provisioned.fingerprint.starts_with("sha256:"),
+        "{}",
+        provisioned.fingerprint
+    );
+
+    let fetches = source.fetches.lock().unwrap();
+    assert_eq!(fetches.len(), 1);
+    let (tag, asset, sha256) = &fetches[0];
+    assert_eq!(tag, sbproxy_model_host::DEFAULT_MISTRALRS_RELEASE_TAG);
+    assert!(asset.starts_with("mistralrs-"), "{asset}");
+    // The CPU-worker asset for every supported dev/CI host has a
+    // checked-in digest, and provisioning must pass it for verification.
+    assert_eq!(sha256.as_deref().map(str::len), Some(64));
+}
+
+#[tokio::test]
+async fn mistralrs_launch_serves_the_verified_snapshot_with_runtime_owned_flags() {
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let driver = MistralRsDriver::new(
+        fixture_runner(commands.clone()),
+        mistralrs_source(Some("/usr/local/bin/mistralrs"), true),
+    );
+    let provisioned = ProvisionedEngine {
+        kind: EngineKind::MistralRs,
+        executable: PathBuf::from("/usr/local/bin/mistralrs"),
+        version: Some("v0.9.0".to_string()),
+        fingerprint: "fixture".to_string(),
+        provisioning: EngineProvisioning::default(),
+    };
+    let request = LaunchRequest {
+        deployment: "coder".to_string(),
+        generation: 3,
+        artifact: ready(EngineKind::MistralRs, ArtifactFormat::Safetensors),
+        fit: fit(),
+        port: 18082,
+        accelerator: sbproxy_model_host::AcceleratorKind::Cuda,
+        selected_devices: vec![1],
+        kv_quant: KvCacheQuant::Auto,
+        extra_args: vec!["--no-kv-cache".to_string()],
+        engine_tuning: Default::default(),
+        max_concurrency: 4,
+        modality: Default::default(),
+        ready_timeout: Duration::from_secs(1),
+    };
+
+    let running = driver
+        .launch(&provisioned, &request)
+        .await
+        .expect("mistralrs launch");
+    assert_eq!(running.port, 18082);
+    assert_eq!(driver.health(&running).await.unwrap(), EngineHealth::Ready);
+
+    let captured = commands.lock().unwrap();
+    let arguments = &captured[0].arguments;
+    assert_eq!(arguments[0], "serve");
+    assert_eq!(flag_value(arguments, "-m"), "/verified/fixture");
+    assert_eq!(flag_value(arguments, "--host"), "127.0.0.1");
+    assert_eq!(flag_value(arguments, "--port"), "18082");
+    assert_eq!(flag_value(arguments, "--max-seq-len"), "4096");
+    assert_eq!(flag_value(arguments, "--max-seqs"), "4");
+    assert!(arguments.iter().any(|value| value == "--no-ui"));
+    assert!(arguments.iter().any(|value| value == "--no-kv-cache"));
+    assert!(!arguments.iter().any(|value| value == "--cpu"));
+    assert_eq!(captured[0].environment["CUDA_VISIBLE_DEVICES"], "1");
+    // The FlashInfer decode kernel fails live on GQA shapes (L4,
+    // status 999), so CUDA launches pin the fallback decode path.
+    assert_eq!(captured[0].environment["MISTRALRS_FLASHINFER_DECODE"], "0");
+}
+
+#[tokio::test]
+async fn mistralrs_cpu_launch_forces_cpu_without_exporting_a_cuda_device() {
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let driver = MistralRsDriver::new(
+        fixture_runner(commands.clone()),
+        mistralrs_source(Some("/usr/local/bin/mistralrs"), true),
+    );
+    let provisioned = ProvisionedEngine {
+        kind: EngineKind::MistralRs,
+        executable: PathBuf::from("/usr/local/bin/mistralrs"),
+        version: Some("v0.9.0".to_string()),
+        fingerprint: "fixture".to_string(),
+        provisioning: EngineProvisioning::default(),
+    };
+    driver
+        .launch(
+            &provisioned,
+            &LaunchRequest {
+                deployment: "cpu-coder".to_string(),
+                generation: 1,
+                artifact: ready(EngineKind::MistralRs, ArtifactFormat::Safetensors),
+                fit: fit(),
+                port: 18083,
+                accelerator: sbproxy_model_host::AcceleratorKind::Cpu,
+                selected_devices: Vec::new(),
+                kv_quant: KvCacheQuant::Auto,
+                extra_args: Vec::new(),
+                engine_tuning: Default::default(),
+                max_concurrency: 1,
+                modality: Default::default(),
+                ready_timeout: Duration::from_secs(1),
+            },
+        )
+        .await
+        .unwrap();
+
+    let captured = commands.lock().unwrap();
+    assert!(captured[0].arguments.iter().any(|value| value == "--cpu"));
+    assert!(!captured[0].environment.contains_key("CUDA_VISIBLE_DEVICES"));
+}
+
+#[tokio::test]
+async fn mistralrs_rejects_gguf_artifacts() {
+    let driver = MistralRsDriver::new(
+        fixture_runner(Arc::new(Mutex::new(Vec::new()))),
+        mistralrs_source(Some("/usr/local/bin/mistralrs"), true),
+    );
+    let error = driver
+        .provision(&ProvisionRequest {
+            artifact: resolved(EngineKind::MistralRs, ArtifactFormat::Gguf),
+            worker: mistralrs_worker(),
+            provisioning: EngineProvisioning::default(),
+            engine_cache_dir: PathBuf::from("/engines"),
+            job_store: None,
+        })
+        .await
+        .expect_err("gguf must be rejected: llama.cpp owns that lane");
+    assert_eq!(error.reason(), EngineFailureReason::EngineIncompatible);
+}
+
 #[tokio::test]
 async fn llama_metal_launch_offloads_without_exporting_a_cuda_device() {
     let commands = Arc::new(Mutex::new(Vec::new()));
@@ -1162,7 +1488,9 @@ async fn llama_metal_launch_offloads_without_exporting_a_cuda_device() {
                 selected_devices: vec![0],
                 kv_quant: KvCacheQuant::Auto,
                 extra_args: Vec::new(),
+                engine_tuning: Default::default(),
                 max_concurrency: 1,
+                modality: Default::default(),
                 ready_timeout: Duration::from_secs(1),
             },
         )
@@ -1313,6 +1641,47 @@ fn compatibility_output(compatible: bool) -> CommandOutput {
         ),
         stderr: String::new(),
     }
+}
+
+fn sglang_compatibility_output(version: &str) -> CommandOutput {
+    CommandOutput {
+        success: true,
+        stdout: format!(
+            r#"{{"python":"3.12.4","torch":"2.7.1","cuda":"12.8","sglang":"{version}","compatible":true,"reason":null}}"#
+        ),
+        stderr: String::new(),
+    }
+}
+
+#[tokio::test]
+async fn sglang_provision_records_the_probed_version() {
+    // WOR-1905/WOR-1906: the SGLang provision must thread the version the
+    // compatibility probe already reads into the provisioned engine, the
+    // same way the vLLM driver does, so admin status and the usage ledger
+    // can answer "what served this request". A regression against the bug
+    // where the container branch discarded the probe version and reported
+    // None on a live L4.
+    let driver = SGLangDriver::new(
+        vllm_runner(vec![sglang_compatibility_output("0.5.2")]),
+        vllm_host(&[("python3", "/usr/bin/python3")]),
+    );
+    let mut worker = cuda_worker();
+    worker.engines = BTreeSet::from([EngineKind::SGLang]);
+    let provisioned = driver
+        .provision(&ProvisionRequest {
+            artifact: resolved(EngineKind::SGLang, ArtifactFormat::Safetensors),
+            worker,
+            provisioning: EngineProvisioning::default(),
+            engine_cache_dir: PathBuf::from("/engines"),
+            job_store: None,
+        })
+        .await
+        .expect("SGLang provisions from the probed python environment");
+    assert_eq!(
+        provisioned.version.as_deref(),
+        Some("0.5.2"),
+        "the probed SGLang version must reach the provisioned engine"
+    );
 }
 
 #[test]
@@ -1476,11 +1845,13 @@ async fn vllm_provision_rejects_torch_cuda_mismatch_and_binary_launch_is_exact()
         selected_devices: vec![3],
         kv_quant: KvCacheQuant::Fp8,
         extra_args: vec!["--enable-prefix-caching".to_string()],
+        engine_tuning: Default::default(),
         max_concurrency: 1,
+        modality: Default::default(),
         ready_timeout: Duration::from_secs(1),
     };
     launch.fit.memory = sbproxy_model_host::MemoryEstimate {
-        device_index: 0,
+        device_indexes: vec![0],
         weight_bytes: 512,
         kv_bytes: 256,
         runtime_overhead_bytes: 128,
@@ -1509,8 +1880,8 @@ async fn vllm_provision_rejects_torch_cuda_mismatch_and_binary_launch_is_exact()
     );
     assert_eq!(flag_value(&captured[0].arguments, "--max-num-seqs"), "1");
     assert_eq!(
-        flag_value(&captured[0].arguments, "--kv-cache-memory-bytes"),
-        "256"
+        flag_value(&captured[0].arguments, "--gpu-memory-utilization"),
+        "0.9000"
     );
     assert_eq!(captured[0].environment["CUDA_VISIBLE_DEVICES"], "3");
 }
@@ -1553,7 +1924,9 @@ acquire:
                 selected_devices: vec![0],
                 kv_quant: KvCacheQuant::Auto,
                 extra_args: Vec::new(),
+                engine_tuning: Default::default(),
                 max_concurrency: 1,
+                modality: Default::default(),
                 ready_timeout: Duration::from_secs(1),
             },
         )
@@ -1580,7 +1953,9 @@ fn vllm_container_launch_is_private_read_only_and_device_scoped() {
         selected_devices: vec![1],
         kv_quant: KvCacheQuant::Auto,
         extra_args: vec!["--enable-prefix-caching".to_string()],
+        engine_tuning: Default::default(),
         max_concurrency: 1,
+        modality: Default::default(),
         ready_timeout: Duration::from_secs(1),
     };
     let image = format!("ghcr.io/vllm-project/vllm-openai@sha256:{}", "a".repeat(64));
@@ -1596,7 +1971,7 @@ fn vllm_container_launch_is_private_read_only_and_device_scoped() {
     assert!(plan
         .arguments
         .windows(2)
-        .any(|window| window == ["--gpus", "device=1"]));
+        .any(|window| window == ["--gpus", "\"device=1\""]));
     assert!(plan
         .arguments
         .iter()
@@ -1643,4 +2018,115 @@ fn vllm_container_launch_is_private_read_only_and_device_scoped() {
         )
         .is_err());
     }
+}
+
+#[test]
+fn sglang_container_plan_emits_runtime_owned_memory_fraction() {
+    // WOR-1905 regression: SGLang must launch with a runtime-owned
+    // `--mem-fraction-static` derived from the fit plan. Without it SGLang
+    // uses its ~0.88 default and OOMs on first-token decode graph capture on
+    // any card where 0.88 leaves too little headroom (reproduced live on an
+    // L4). The value is the fit fraction, mirroring vLLM's utilization flag.
+    let mut request = LaunchRequest {
+        deployment: "coder".to_string(),
+        generation: 1,
+        artifact: ready(EngineKind::SGLang, ArtifactFormat::Safetensors),
+        fit: fit(),
+        port: 18123,
+        accelerator: sbproxy_model_host::AcceleratorKind::Cuda,
+        selected_devices: vec![1],
+        kv_quant: KvCacheQuant::Auto,
+        extra_args: vec![],
+        engine_tuning: Default::default(),
+        max_concurrency: 1,
+        modality: Default::default(),
+        ready_timeout: Duration::from_secs(1),
+    };
+    request.fit.gpu_memory_fraction = Some(0.30);
+    let image = format!("lmsysorg/sglang@sha256:{}", "a".repeat(64));
+    let plan = build_sglang_container_plan(
+        ContainerRuntime::Docker,
+        PathBuf::from("/usr/bin/docker"),
+        &image,
+        4,
+        &request,
+    )
+    .expect("isolated SGLang container plan");
+    assert!(
+        plan.arguments
+            .windows(2)
+            .any(|window| window == ["--mem-fraction-static", "0.3000"]),
+        "SGLang plan must carry the fit-derived --mem-fraction-static, got {:?}",
+        plan.arguments
+    );
+
+    // No fit fraction falls back to the conservative default, never SGLang's
+    // higher built-in default.
+    request.fit.gpu_memory_fraction = None;
+    let fallback = build_sglang_container_plan(
+        ContainerRuntime::Docker,
+        PathBuf::from("/usr/bin/docker"),
+        &image,
+        4,
+        &request,
+    )
+    .expect("isolated SGLang container plan");
+    assert!(fallback
+        .arguments
+        .windows(2)
+        .any(|window| window == ["--mem-fraction-static", "0.8500"]));
+}
+
+#[test]
+fn vllm_container_plan_adds_task_flag_for_an_embedding_modality() {
+    // WOR-1908: an embedder is launched with the runtime-owned `--task
+    // embed`; a chat model gets no task flag. The flag lands before the
+    // operator allowlist, and the operator cannot set it.
+    let mut request = LaunchRequest {
+        deployment: "embedder".to_string(),
+        generation: 1,
+        artifact: ready(EngineKind::Vllm, ArtifactFormat::Safetensors),
+        fit: fit(),
+        port: 18124,
+        accelerator: sbproxy_model_host::AcceleratorKind::Cuda,
+        selected_devices: vec![0],
+        kv_quant: KvCacheQuant::Auto,
+        extra_args: vec![],
+        engine_tuning: Default::default(),
+        max_concurrency: 1,
+        modality: sbproxy_model_host::Modality::Embedding,
+        ready_timeout: Duration::from_secs(1),
+    };
+    let image = format!("ghcr.io/vllm-project/vllm-openai@sha256:{}", "a".repeat(64));
+    let embed = build_vllm_container_plan(
+        ContainerRuntime::Docker,
+        PathBuf::from("/usr/bin/docker"),
+        &image,
+        4,
+        &request,
+    )
+    .expect("embedding container plan");
+    assert!(
+        embed
+            .arguments
+            .windows(2)
+            .any(|window| window == ["--task", "embed"]),
+        "embedding launch must carry --task embed: {:?}",
+        embed.arguments
+    );
+
+    request.modality = sbproxy_model_host::Modality::Chat;
+    let chat = build_vllm_container_plan(
+        ContainerRuntime::Docker,
+        PathBuf::from("/usr/bin/docker"),
+        &image,
+        4,
+        &request,
+    )
+    .expect("chat container plan");
+    assert!(
+        !chat.arguments.iter().any(|value| value == "--task"),
+        "a chat model gets no --task flag: {:?}",
+        chat.arguments
+    );
 }

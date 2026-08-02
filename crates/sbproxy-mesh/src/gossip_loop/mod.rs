@@ -102,8 +102,8 @@ use crate::isolation::IsolationObserver;
 use crate::metrics::{
     ADDR_MAP_KIND_LEARNED, ADDR_MAP_KIND_REWRITTEN, CRYPTO_KIND_GOSSIP, DISSEM_KIND_ACK,
     MESH_ADDR_MAP_UPDATES, MESH_CRYPTO_DECRYPT_FAILED, MESH_DEAD_PEERS_GC,
-    MESH_DISSEMINATION_UPDATES_SENT, MESH_SUSPECT_TRANSITIONS, PEER_STATE_ALIVE, PEER_STATE_DEAD,
-    PEER_STATE_SUSPECT,
+    MESH_DISSEMINATION_UPDATES_SENT, MESH_PEER_COUNT, MESH_SUSPECT_TRANSITIONS, PEER_STATE_ALIVE,
+    PEER_STATE_DEAD, PEER_STATE_SUSPECT,
 };
 use crate::peer_eviction::PeerEvictor;
 
@@ -1314,6 +1314,33 @@ impl GossipLoop {
                                 addr = %addr,
                                 "GC: dead peer removed from table"
                             );
+                        }
+                        // Refresh the per-state peer gauges from the table
+                        // the sweep just settled, so mesh_peer_count tracks
+                        // membership without a write on every transition.
+                        {
+                            let (mut alive, mut suspect, mut dead) = (0i64, 0i64, 0i64);
+                            {
+                                let table = peers_proto
+                                    .read()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                for entry in table.iter() {
+                                    match entry.state {
+                                        PeerState::Alive => alive += 1,
+                                        PeerState::Suspect { .. } => suspect += 1,
+                                        PeerState::Dead => dead += 1,
+                                    }
+                                }
+                            }
+                            MESH_PEER_COUNT
+                                .with_label_values(&[PEER_STATE_ALIVE])
+                                .set(alive);
+                            MESH_PEER_COUNT
+                                .with_label_values(&[PEER_STATE_SUSPECT])
+                                .set(suspect);
+                            MESH_PEER_COUNT
+                                .with_label_values(&[PEER_STATE_DEAD])
+                                .set(dead);
                         }
                     }
                 }

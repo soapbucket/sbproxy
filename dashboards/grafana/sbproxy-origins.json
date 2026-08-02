@@ -98,7 +98,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (origin) (rate(sbproxy_requests_total[5m]))",
+          "expr": "sum by (origin) (rate(sbproxy_origin_requests_total[5m]))",
           "legendFormat": "{{origin}}",
           "datasource": {
             "type": "prometheus",
@@ -157,7 +157,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "histogram_quantile(0.95, sum by (le, origin) (rate(sbproxy_request_duration_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, origin) (rate(sbproxy_origin_request_duration_seconds_bucket[5m])))",
           "legendFormat": "P95 - {{origin}}",
           "datasource": {
             "type": "prometheus",
@@ -233,7 +233,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (origin) (rate(sbproxy_requests_total{status=~\"5..\"}[5m])) / sum by (origin) (rate(sbproxy_requests_total[5m]))",
+          "expr": "sum by (origin) (rate(sbproxy_origin_requests_total{status=~\"5..\"}[5m])) / sum by (origin) (rate(sbproxy_origin_requests_total[5m]))",
           "legendFormat": "5xx - {{origin}}",
           "datasource": {
             "type": "prometheus",
@@ -242,7 +242,7 @@
         },
         {
           "refId": "B",
-          "expr": "sum by (origin) (rate(sbproxy_requests_total{status=~\"4..\"}[5m])) / sum by (origin) (rate(sbproxy_requests_total[5m]))",
+          "expr": "sum by (origin) (rate(sbproxy_origin_requests_total{status=~\"4..\"}[5m])) / sum by (origin) (rate(sbproxy_origin_requests_total[5m]))",
           "legendFormat": "4xx - {{origin}}",
           "datasource": {
             "type": "prometheus",

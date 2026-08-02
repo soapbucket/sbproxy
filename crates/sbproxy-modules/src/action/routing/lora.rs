@@ -15,7 +15,7 @@
 //!   target advertises it: pick the lowest-index such target.
 //! - The request has a LoRA identifier but **no** healthy target
 //!   advertises it: return `None` so the caller falls back to the
-//!   configured `lb_method`. The strategy does not silently route to a
+//!   configured `algorithm`. The strategy does not silently route to a
 //!   cold target; that decision belongs to the operator's fall-back
 //!   policy.
 //!
@@ -115,7 +115,7 @@ impl RoutingStrategy for LoraStrategy {
                 return Some(idx);
             }
         }
-        // Strict no-match: defer to the configured lb_method.
+        // Strict no-match: defer to the configured algorithm.
         None
     }
 
@@ -156,7 +156,7 @@ mod tests {
             healthy,
             active_connections: 0,
             weight: 1,
-            metadata,
+            metadata: metadata.into(),
         }
     }
 
@@ -168,7 +168,7 @@ mod tests {
             healthy,
             active_connections: 0,
             weight: 1,
-            metadata: HashMap::new(),
+            metadata: HashMap::new().into(),
         }
     }
 
@@ -261,7 +261,7 @@ mod tests {
             healthy: true,
             active_connections: 0,
             weight: 1,
-            metadata: weird,
+            metadata: weird.into(),
         }];
         assert!(strat.select(&req(Some("alice-tone")), &targets).is_none());
     }
@@ -280,7 +280,7 @@ mod tests {
             healthy: true,
             active_connections: 0,
             weight: 1,
-            metadata: wrong,
+            metadata: wrong.into(),
         }];
         assert!(strat.select(&req(Some("alice-tone")), &targets).is_none());
     }

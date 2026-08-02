@@ -1,7 +1,7 @@
 # Supported providers
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-27*
 
-SBproxy ships native adapters for 66 LLM providers behind one OpenAI-compatible API. You bring your own key per provider, and the `model` field passes straight through to the upstream, so the gateway reaches 200+ models (and whatever a provider ships next) without enumerating them. Most adapters speak the OpenAI wire format and pass through unchanged. Anthropic, Bedrock, and Gemini use in-tree translators for OpenAI-shaped chat or embedding clients; SageMaker, Oracle, Watsonx, and other `Custom` formats pass through in their native shape.
+SBproxy ships native adapters for 72 LLM providers behind one OpenAI-compatible API. You bring your own key per provider, and the `model` field passes straight through to the upstream, so the gateway reaches 200+ models (and whatever a provider ships next) without enumerating them. Most adapters speak the OpenAI wire format and pass through unchanged. Anthropic, Bedrock, and Gemini use in-tree translators for OpenAI-shaped chat or embedding clients; SageMaker, Oracle, Watsonx, and other `Custom` formats pass through in their native shape.
 
 The catalog is plain YAML and you can extend it yourself: see [Extending the provider catalog](#extending-the-provider-catalog).
 
@@ -77,8 +77,14 @@ Each provider has a default base URL and auth format. Override `base_url` if you
 | `qianfan` | Baidu Qianfan (ERNIE) | OpenAI | `Authorization: Bearer` | `https://qianfan.baidubce.com/v2` |
 | `stepfun` | StepFun | OpenAI | `Authorization: Bearer` | `https://api.stepfun.com/v1` |
 | `mixedbread` | Mixedbread (embeddings only)[^embed-only] | OpenAI | `Authorization: Bearer` | `https://api.mixedbread.com/v1` |
+| `azure_foundry` | Azure AI Foundry Models | OpenAI | `api-key` | `https://{resource}.services.ai.azure.com/openai/v1` |
+| `snowflake` | Snowflake Cortex | OpenAI | `Authorization: Bearer` | `https://{account}.snowflakecomputing.com/api/v2/cortex/v1` |
+| `ai21` | AI21 Labs (Jamba) | OpenAI | `Authorization: Bearer` | `https://api.ai21.com/studio/v1` |
+| `clarifai` | Clarifai | OpenAI | `Authorization: Key` | `https://api.clarifai.com/v2/ext/openai/v1` |
+| `inception` | Inception Labs (Mercury) | OpenAI | `Authorization: Bearer` | `https://api.inceptionlabs.ai/v1` |
+| `sarvam` | Sarvam AI | OpenAI | `Authorization: Bearer` | `https://api.sarvam.ai/v1` |
 
-The `cloudflare`, `vertex`, and `runpod` defaults contain path template parameters (`{account_id}`, `{location}`, `{project_id}`, `{endpoint_id}`). Fill them in by overriding `base_url` per-origin, typically with environment-or-config interpolation (for example `base_url: https://api.runpod.ai/v2/${RUNPOD_ENDPOINT_ID}/openai/v1`). Paths left with literal placeholders will reach the upstream as-is and 404.
+The `cloudflare`, `vertex`, `runpod`, `azure_foundry`, and `snowflake` defaults contain path template parameters (`{account_id}`, `{location}`, `{project_id}`, `{endpoint_id}`, `{resource}`, `{account}`). Fill them in by overriding `base_url` per-origin, typically with environment-or-config interpolation (for example `base_url: https://api.runpod.ai/v2/${RUNPOD_ENDPOINT_ID}/openai/v1`). Paths left with literal placeholders will reach the upstream as-is and 404.
 
 [^vertex-oauth]: Vertex AI requires a short-lived OAuth2 access token rather than a static API key. Generate one with `gcloud auth print-access-token` (or your service account flow) and rotate it before expiry. SBproxy forwards the configured `api_key` verbatim as the bearer token.
 
@@ -131,7 +137,7 @@ providers:
 
 Three options, roughly in order of preference:
 
-1. **Point any provider at a custom `base_url`.** Most upstreams speak the OpenAI wire format, so a `provider_type: openai` entry with your own `base_url` reaches anything OpenAI-compatible: a self-hosted vLLM or SGLang pool, an internal gateway, or a proprietary endpoint.
+1. **Point any provider at a custom `base_url`.** Most upstreams speak the OpenAI wire format, so a `provider_type: openai` entry with your own `base_url` reaches anything OpenAI-compatible: a self-hosted vLLM or SGLang pool, an internal gateway, or a proprietary endpoint. Wire compatibility does not authorize caller-owned OpenAI credentials. Leave `accept_native_credentials_for` unset unless you intend to trust this exact endpoint with those credentials.
 2. **Add the provider to the catalog yourself.** It is plain YAML and ships uncompiled. See [Extending the provider catalog](#extending-the-provider-catalog).
 3. **Use `openrouter` as a single-key aggregator** when you want many vendors without holding a direct account with each. It is one of the native providers, no different from the rest:
 
@@ -153,6 +159,11 @@ Local and self-hosted OpenAI-compatible runtimes are first-class providers in th
 An overridden `base_url` is validated at config load to keep it from becoming an SSRF vector. Non-`http(s)` schemes (`file://`, ...) are always rejected, and by default a URL that targets a loopback, link-local, or private (RFC 1918) address is rejected too, so a stray `http://169.254.169.254/` or `http://127.0.0.1/` fails fast instead of being dispatched at request time.
 
 A local model server is the legitimate exception: it lives on `127.0.0.1` or a LAN address. Set `allow_private_base_url: true` on that provider to permit its private `base_url`. The scheme check still applies. Providers that use a registry default (no `base_url` override) are unaffected.
+
+`allow_private_base_url` controls network reachability. It does not authorize
+native credential forwarding. That requires the separate
+`accept_native_credentials_for` destination binding, and locally served or
+managed providers cannot enable it.
 
 ```yaml
 providers:
@@ -180,6 +191,11 @@ providers:
     api_key: ${INTERNAL_LLM_KEY}
     default_model: my-finetune
 ```
+
+This endpoint uses its configured `api_key`. If it is also the intended
+destination for caller-owned OpenAI keys, add
+`accept_native_credentials_for: openai` after reviewing that endpoint's trust
+boundary.
 
 ### 2. Replace the catalog at runtime with `proxy.ai_providers_file`
 

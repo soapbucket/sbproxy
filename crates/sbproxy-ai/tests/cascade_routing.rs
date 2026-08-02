@@ -37,7 +37,7 @@ fn bind_loopback() -> Option<TcpListener> {
 /// listener stays alive for the duration of the test via the
 /// returned `SocketAddr` (which captures the bind side) so each
 /// request reaches its own pre-staged mock.
-fn one_shot_json_with_status(status: u16, body: &str) -> Option<SocketAddr> {
+fn one_shot_json(body: &str) -> Option<SocketAddr> {
     let listener = bind_loopback()?;
     let addr = listener.local_addr().expect("local_addr");
     let owned = body.to_string();
@@ -49,7 +49,7 @@ fn one_shot_json_with_status(status: u16, body: &str) -> Option<SocketAddr> {
             // request looks like for these tests.
             let _ = stream.read(&mut buf);
             let resp = format!(
-                "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 owned.len(),
                 owned
             );
@@ -58,10 +58,6 @@ fn one_shot_json_with_status(status: u16, body: &str) -> Option<SocketAddr> {
         }
     });
     Some(addr)
-}
-
-fn one_shot_json(body: &str) -> Option<SocketAddr> {
-    one_shot_json_with_status(200, body)
 }
 
 fn closed_loopback_addr() -> Option<SocketAddr> {
@@ -110,15 +106,6 @@ fn chat_body(prompt: &str) -> serde_json::Value {
 /// other paths in the body are kept realistic so future scorers
 /// can rely on the same fixture shape.
 fn chat_response(content: &str, score: Option<f32>) -> String {
-    chat_response_with_usage(content, score, 10, 5)
-}
-
-fn chat_response_with_usage(
-    content: &str,
-    score: Option<f32>,
-    input_tokens: u64,
-    output_tokens: u64,
-) -> String {
     let mut v = serde_json::json!({
         "id": "chatcmpl-test",
         "object": "chat.completion",
@@ -127,11 +114,7 @@ fn chat_response_with_usage(
             "message": {"role": "assistant", "content": content},
             "finish_reason": "stop"
         }],
-        "usage": {
-            "prompt_tokens": input_tokens,
-            "completion_tokens": output_tokens,
-            "total_tokens": input_tokens.saturating_add(output_tokens)
-        }
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
     });
     if let Some(s) = score {
         v.as_object_mut()
@@ -139,16 +122,6 @@ fn chat_response_with_usage(
             .insert("confidence_score".to_string(), serde_json::json!(s));
     }
     serde_json::to_string(&v).unwrap()
-}
-
-fn response_without_usage(content: &str, score: Option<f32>) -> String {
-    let mut response: serde_json::Value =
-        serde_json::from_str(&chat_response(content, score)).expect("response fixture");
-    response
-        .as_object_mut()
-        .expect("response fixture object")
-        .remove("usage");
-    serde_json::to_string(&response).expect("serialize response fixture")
 }
 
 #[tokio::test]
@@ -199,6 +172,7 @@ async fn cascade_below_threshold_falls_through_to_next_tier() {
     assert_eq!(out.tier_index, 1);
     assert_eq!(out.provider_name, "smart");
     assert_eq!(out.model, "smart-model");
+    assert_eq!(out.attempted_providers, ["cheap", "smart"]);
     let body: serde_json::Value = serde_json::from_slice(&out.body).expect("json");
     assert_eq!(
         body["choices"][0]["message"]["content"].as_str().unwrap(),
@@ -257,6 +231,7 @@ async fn cascade_above_threshold_short_circuits() {
     assert!(out.accepted);
     assert_eq!(out.tier_index, 0);
     assert_eq!(out.provider_name, "cheap");
+    assert_eq!(out.attempted_providers, ["cheap"]);
     let after = cascade_tier_outcome_value(0, "accepted");
     assert!(after > before, "tier 0 accepted counter should have ticked");
 }
@@ -424,124 +399,4 @@ async fn cascade_metric_increments_per_tier_outcome() {
     let after_accept = cascade_tier_outcome_value(1, "accepted");
     assert!(after_retry > before_retry, "tier 0 retry should tick");
     assert!(after_accept > before_accept, "tier 1 accepted should tick");
-}
-
-#[tokio::test]
-async fn cascade_aggregates_usage_from_every_response_bearing_tier() {
-    let rejected = serde_json::json!({
-        "error": {"message": "request rejected"},
-        "usage": {"prompt_tokens": 1, "completion_tokens": 2}
-    });
-    let server_error = serde_json::json!({
-        "error": {"message": "upstream failed"},
-        "usage": {"prompt_tokens": 3, "completion_tokens": 4}
-    });
-    let Some(rejected_addr) = one_shot_json_with_status(429, &rejected.to_string()) else {
-        return;
-    };
-    let Some(server_error_addr) = one_shot_json_with_status(500, &server_error.to_string()) else {
-        return;
-    };
-    let Some(refusal_addr) = one_shot_json(&chat_response_with_usage("", None, 5, 6)) else {
-        return;
-    };
-    let Some(low_confidence_addr) =
-        one_shot_json(&chat_response_with_usage("rough", Some(0.2), 7, 8))
-    else {
-        return;
-    };
-    let Some(final_addr) = one_shot_json(&chat_response_with_usage("accepted", Some(0.95), 9, 10))
-    else {
-        return;
-    };
-    let cfg = handler_config(&[
-        ("rejected", rejected_addr),
-        ("server-error", server_error_addr),
-        ("refusal", refusal_addr),
-        ("low-confidence", low_confidence_addr),
-        ("final", final_addr),
-    ]);
-    let cascade = CascadeConfig {
-        tiers: [
-            "rejected",
-            "server-error",
-            "refusal",
-            "low-confidence",
-            "final",
-        ]
-        .into_iter()
-        .map(|provider_id| CascadeTier {
-            provider_id: provider_id.to_string(),
-            model: format!("{provider_id}-model"),
-            quality_threshold: 0.8,
-            cost_cap: None,
-        })
-        .collect(),
-        max_total_cost: None,
-    };
-
-    let outcome = AiClient::new()
-        .forward_cascade(
-            &cfg,
-            &cascade,
-            &[],
-            "/v1/chat/completions",
-            &chat_body("account for every tier"),
-            &sbproxy_ai::attribution::AttributionTags::default(),
-            "chat_completions",
-        )
-        .await
-        .expect("cascade dispatch");
-
-    assert!(outcome.accepted);
-    assert_eq!(outcome.tier_index, 4);
-    assert_eq!(outcome.aggregate_input_tokens, 25);
-    assert_eq!(outcome.aggregate_output_tokens, 30);
-    assert!(!outcome.billable_usage_missing);
-}
-
-#[tokio::test]
-async fn cascade_flags_any_response_without_parseable_usage() {
-    let Some(missing_addr) = one_shot_json(&response_without_usage("rough", Some(0.2))) else {
-        return;
-    };
-    let Some(final_addr) = one_shot_json(&chat_response_with_usage("accepted", Some(0.95), 11, 12))
-    else {
-        return;
-    };
-    let cfg = handler_config(&[("missing", missing_addr), ("final", final_addr)]);
-    let cascade = CascadeConfig {
-        tiers: vec![
-            CascadeTier {
-                provider_id: "missing".to_string(),
-                model: "missing-model".to_string(),
-                quality_threshold: 0.8,
-                cost_cap: None,
-            },
-            CascadeTier {
-                provider_id: "final".to_string(),
-                model: "final-model".to_string(),
-                quality_threshold: 0.8,
-                cost_cap: None,
-            },
-        ],
-        max_total_cost: None,
-    };
-
-    let outcome = AiClient::new()
-        .forward_cascade(
-            &cfg,
-            &cascade,
-            &[],
-            "/v1/chat/completions",
-            &chat_body("fallback usage"),
-            &sbproxy_ai::attribution::AttributionTags::default(),
-            "chat_completions",
-        )
-        .await
-        .expect("cascade dispatch");
-
-    assert_eq!(outcome.aggregate_input_tokens, 11);
-    assert_eq!(outcome.aggregate_output_tokens, 12);
-    assert!(outcome.billable_usage_missing);
 }

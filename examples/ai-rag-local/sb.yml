@@ -1,0 +1,83 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# AI gateway: gateway-performed RAG against a local deterministic fixture.
+#
+# The gateway does the retrieval itself. On each chat request it embeds
+# the last user message, queries a Qdrant-compatible vector store scoped
+# to the origin's tenant, injects the retrieved chunk as marked system
+# context, and only then dispatches to the model.
+#
+# One fixture container (`rag-fixture`, see fixture.py) stands in for
+# all three upstreams:
+#   - POST /v1/embeddings returns a fixed three-element vector
+#   - POST /collections/support-docs/points/query returns one point
+#     ("Refunds take five business days.") only when the request
+#     filter pins tenant_id == "docs"
+#   - POST /v1/chat/completions succeeds only when the request body
+#     already contains that sentence, proving the injected context
+#     reached the model
+#
+# Run:
+#   docker compose up -d --wait
+#
+# Test:
+#   curl http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.localhost' \
+#     -H 'Content-Type: application/json' \
+#     -d '{
+#       "model": "fixture-chat",
+#       "messages": [{"role": "user", "content": "When do refunds arrive?"}]
+#     }'
+#
+# Expected behaviour:
+#   The response content is "Refunds take five business days." because
+#   the gateway retrieved and injected it before the model call. With
+#   `mode: fail_closed`, any retrieval failure returns 502 with a
+#   `rag_retrieval_failed` error instead of calling the model.
+
+proxy:
+  http_bind_port: 8080
+
+  tenants:
+    - id: docs
+
+origins:
+  "ai.localhost":
+    tenant_id: docs
+
+    action:
+      type: ai_proxy
+      providers:
+        - name: fixture
+          provider_type: openai
+          base_url: http://rag-fixture:8090/v1
+          allow_private_base_url: true
+          models: [fixture-chat]
+      rag:
+        query:
+          source: last_user_message
+        embedding:
+          provider: compatible
+          base_url: http://rag-fixture:8090/v1
+          model: fixture-embedding
+          dimensions: 3
+          allow_private_url: true
+        vector_store:
+          provider: qdrant
+          base_url: http://rag-fixture:8090
+          collection: support-docs
+          content_field: content
+          distance_metric: cosine
+          allow_private_url: true
+        filters:
+          tenant_field: tenant_id
+          static_equals:
+            kind: policy
+        retrieval:
+          top_k: 3
+          min_score: 0.7
+          max_query_bytes: 8192
+          max_chunk_bytes: 16384
+          max_context_bytes: 65536
+          timeout_ms: 5000
+        on_failure:
+          mode: fail_closed

@@ -1,0 +1,37 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Tiny REST mock standing in for a real GitHub-style search API.
+#
+# `sb.yml` in this directory federates this service as an `openapi`
+# MCP server (see the `gh` entry under `federated_servers`), so the
+# `search_repos` tool it derives is a genuine end-to-end call: the
+# gateway sends a real HTTP GET here and returns the real response,
+# not a canned MCP transcript. Swap this file for your own REST API
+# (with its own OpenAPI spec) to federate something real; nothing
+# about `sb.yml`'s federation setup is specific to this mock beyond
+# the `origin` URL and the inline `spec`.
+#
+# Run:
+#   sbproxy serve -f examples/mcp-federation/upstream.yml
+#
+# Test directly (bypassing the MCP gateway):
+#   curl -s http://127.0.0.1:8091/search/repositories | jq .
+
+proxy:
+  http_bind_port: 8091
+
+origins:
+  # SBproxy matches the inbound Host header with the port stripped,
+  # so this key matches requests to http://127.0.0.1:8091 regardless
+  # of caller.
+  "127.0.0.1":
+    action:
+      type: mock
+      status: 200
+      content_type: application/json
+      body:
+        - name: sbproxy
+          full_name: soapbucket/sbproxy
+          stars: 4200
+        - name: docs
+          full_name: soapbucket/docs
+          stars: 12

@@ -1,0 +1,255 @@
+use anyhow::Result;
+
+use crate::{AggregateReport, EvalReport, Recommendation};
+
+/// Render stable pretty JSON with one trailing newline.
+pub fn render_json(report: &EvalReport) -> Result<String> {
+    let mut rendered = serde_json::to_string_pretty(report)?;
+    rendered.push('\n');
+    Ok(rendered)
+}
+
+/// Render a stable human-readable Pareto report.
+pub fn render_markdown(report: &EvalReport) -> String {
+    let mut output = String::new();
+    output.push_str("# Context Compression Evaluation\n\n");
+    output.push_str(
+        "This is a first-party smoke evaluation, not an official third-party benchmark score.\n\n",
+    );
+    output.push_str(&format!(
+        "- Profile: `{}`\n",
+        escape_inline(&report.profile)
+    ));
+    output.push_str(&format!("- Report schema: `{}`\n", report.schema_version));
+    output.push_str(&format!(
+        "- Token counter: `{}`\n",
+        escape_inline(&report.token_counter)
+    ));
+    output.push_str(&format!(
+        "- Latency mode: `{}`\n\n",
+        escape_inline(&report.latency_mode)
+    ));
+    if let Some(certification) = &report.token_prune_certification {
+        output.push_str("## Token-prune certification boundary\n\n");
+        output.push_str(
+            "The checked report uses a deterministic recorded backend with network access disabled. ",
+        );
+        output.push_str(
+            "It certifies gateway targeting, accounting, and evidence retention. In production, ",
+        );
+        output.push_str("the gateway uses the configured LLMLingua-2 sidecar.\n\n");
+        output.push_str(&format!(
+            "- Evaluation backend: `{}`\n",
+            escape_inline(&certification.evaluation_backend)
+        ));
+        output.push_str(&format!(
+            "- Production backend: `{}`\n",
+            escape_inline(&certification.production_backend)
+        ));
+        output.push_str(&format!(
+            "- Network access: `{}`\n\n",
+            yes_no(certification.network_access)
+        ));
+    }
+    output.push_str("## Verified provenance\n\n");
+    if let Some(provenance) = &report.verified_provenance {
+        output.push_str(&format!(
+            "- Manifest SHA-256: `{}`\n",
+            escape_inline(&provenance.manifest_sha256)
+        ));
+        output.push_str(
+            "- Evidence boundary: only the selected, manifest-covered inputs listed below.\n",
+        );
+        if provenance
+            .artifacts
+            .iter()
+            .all(|artifact| !artifact.contains_customer_data && !artifact.official_benchmark_score)
+        {
+            output.push_str("- No customer data; no official benchmark scores.\n");
+        }
+        output.push_str("\n| Path | Corpus | Provenance | License | Customer data | Official score | SHA-256 |\n");
+        output.push_str("|---|---|---|---|---|---|---|\n");
+        for artifact in &provenance.artifacts {
+            output.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {} |\n",
+                escape_cell(&artifact.path),
+                escape_cell(&artifact.corpus),
+                escape_cell(&artifact.provenance),
+                escape_cell(&artifact.license),
+                yes_no(artifact.contains_customer_data),
+                yes_no(artifact.official_benchmark_score),
+                escape_cell(&artifact.sha256),
+            ));
+        }
+    } else {
+        output.push_str("No verified provenance is attached to this in-memory report.\n");
+    }
+    output.push('\n');
+    output.push_str("## Ordered pipeline\n\n");
+    for (index, lever) in report.pipeline.iter().enumerate() {
+        let config = serde_json::to_string(lever)
+            .unwrap_or_else(|_| "{\"type\":\"serialization_error\"}".to_string());
+        output.push_str(&format!("{}. `{}`\n", index + 1, escape_inline(&config)));
+    }
+    if report.pipeline.is_empty() {
+        output.push_str("No levers configured.\n");
+    }
+    output.push('\n');
+    output.push_str("## Tokens versus quality and accuracy\n\n");
+    output.push_str("| Corpus | Cases | Input tokens | Output tokens | Saved | Savings | Off quality | On quality | Delta | Acceptance | Added latency (us) | Recommendation |\n");
+    output.push_str("|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---|\n");
+    push_aggregate_row(&mut output, "overall", &report.overall);
+    for (corpus, aggregate) in &report.corpora {
+        push_aggregate_row(&mut output, corpus, aggregate);
+    }
+
+    output.push_str("\n## Outcomes\n\n");
+    output.push_str("| Corpus | Applied | Skipped | Fallback | Skip rate | Reasons |\n");
+    output.push_str("|---|---:|---:|---:|---:|---|\n");
+    push_outcome_row(&mut output, "overall", &report.overall);
+    for (corpus, aggregate) in &report.corpora {
+        push_outcome_row(&mut output, corpus, aggregate);
+    }
+
+    output.push_str("\n## Case results\n\n");
+    output.push_str("| Case | Corpus | Target model | Score | Saved | Savings | Off quality | On quality | Delta | Acceptance | Outcome | Reason |\n");
+    output.push_str("|---|---|---|---|---:|---:|---:|---:|---:|---|---|---|\n");
+    for case in &report.cases {
+        output.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            escape_cell(&case.id),
+            escape_cell(&case.corpus),
+            escape_cell(&case.target_model),
+            escape_cell(&case.quality_metric),
+            case.tokens_saved,
+            percent(case.savings_ratio),
+            score(case.off.quality_score),
+            score(case.on.quality_score),
+            signed_score(case.quality_delta),
+            passed(case.acceptance_passed),
+            escape_cell(&case.outcome),
+            case.reason
+                .as_deref()
+                .map(escape_cell)
+                .unwrap_or_else(|| "-".to_string()),
+        ));
+    }
+    output.push_str("\n## Ordered lever results\n\n");
+    output.push_str("| Case | Order | Lever | Before | After | Saved | Outcome | Reason |\n");
+    output.push_str("|---|---:|---|---:|---:|---:|---|---|\n");
+    for case in &report.cases {
+        for (index, lever) in case.levers.iter().enumerate() {
+            output.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                escape_cell(&case.id),
+                index + 1,
+                escape_cell(&lever.lever),
+                lever.before_tokens,
+                lever.after_tokens,
+                lever.tokens_saved,
+                escape_cell(&lever.outcome),
+                lever
+                    .reason
+                    .as_deref()
+                    .map(escape_cell)
+                    .unwrap_or_else(|| "-".to_string()),
+            ));
+        }
+    }
+    output
+}
+
+fn push_outcome_row(output: &mut String, name: &str, report: &AggregateReport) {
+    let reasons = if report.reasons.is_empty() {
+        "none".to_string()
+    } else {
+        report
+            .reasons
+            .iter()
+            .map(|(reason, count)| format!("{}={count}", escape_cell(reason)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    output.push_str(&format!(
+        "| {} | {} | {} | {} | {} | {} |\n",
+        escape_cell(name),
+        report.applied_count,
+        report.skipped_count,
+        report.fallback_count,
+        percent(report.skip_rate),
+        reasons,
+    ));
+}
+
+fn push_aggregate_row(output: &mut String, name: &str, report: &AggregateReport) {
+    output.push_str(&format!(
+        "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+        escape_cell(name),
+        report.case_count,
+        report.input_tokens,
+        report.output_tokens,
+        report.tokens_saved,
+        percent(report.savings_ratio),
+        score(report.off_quality_score),
+        score(report.on_quality_score),
+        signed_score(report.quality_delta),
+        passed(report.acceptance_passed),
+        report
+            .added_compression_latency_micros
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "not measured".to_string()),
+        recommendation(report.recommendation),
+    ));
+}
+
+fn passed(value: bool) -> &'static str {
+    if value {
+        "pass"
+    } else {
+        "fail"
+    }
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+fn recommendation(value: Recommendation) -> &'static str {
+    match value {
+        Recommendation::Build => "build",
+        Recommendation::Borrow => "borrow",
+        Recommendation::Defer => "defer",
+    }
+}
+
+fn percent(value: f64) -> String {
+    format!("{:.2}%", value * 100.0)
+}
+
+fn score(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.3}"))
+        .unwrap_or_else(|| "not scored".to_string())
+}
+
+fn signed_score(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:+.3}"))
+        .unwrap_or_else(|| "not scored".to_string())
+}
+
+fn escape_inline(value: &str) -> String {
+    value.replace('`', "\\`").replace(['\n', '\r'], " ")
+}
+
+fn escape_cell(value: &str) -> String {
+    value
+        .replace('|', "\\|")
+        .replace(['\n', '\r'], " ")
+        .trim()
+        .to_string()
+}

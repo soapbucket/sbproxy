@@ -184,19 +184,209 @@ pub fn safe_route_headers(
     ]
 }
 
+/// Shared `{"error": {...}}` envelope for every data-plane error response.
+///
+/// `kind` (serialized as `error.type`) and `message` are the only fields
+/// every site needs; every other field is written to the JSON only when
+/// set, so a call site with just a message and a type gets exactly that,
+/// while [`managed_error_body`] below gets its full narrow shape. This
+/// centralizes the envelope construction that used to be hand-rolled with
+/// `serde_json::json!` at each AI-proxy error site.
+pub struct ErrorEnvelope<'a> {
+    kind: &'a str,
+    message: &'a str,
+    code: Option<&'a str>,
+    scope: Option<&'a str>,
+    request_id: Option<&'a str>,
+    retryable: Option<bool>,
+    reason: Option<&'a str>,
+}
+
+impl<'a> ErrorEnvelope<'a> {
+    /// Start an envelope with the two fields every error response carries.
+    pub fn new(kind: &'a str, message: &'a str) -> Self {
+        Self {
+            kind,
+            message,
+            code: None,
+            scope: None,
+            request_id: None,
+            retryable: None,
+            reason: None,
+        }
+    }
+
+    /// Sets `error.code`.
+    pub fn code(mut self, code: &'a str) -> Self {
+        self.code = Some(code);
+        self
+    }
+
+    /// Sets `error.scope`.
+    pub fn scope(mut self, scope: &'a str) -> Self {
+        self.scope = Some(scope);
+        self
+    }
+
+    /// Sets `error.request_id`.
+    pub fn request_id(mut self, request_id: &'a str) -> Self {
+        self.request_id = Some(request_id);
+        self
+    }
+
+    /// Sets `error.retryable`.
+    pub fn retryable(mut self, retryable: bool) -> Self {
+        self.retryable = Some(retryable);
+        self
+    }
+
+    /// Sets `error.sbproxy_reason`. Kept distinct from `code` for callers
+    /// (like [`managed_error_body`]) whose reason and code happen to share
+    /// a value today but are conceptually different fields.
+    pub fn reason(mut self, reason: &'a str) -> Self {
+        self.reason = Some(reason);
+        self
+    }
+
+    /// Encode as a `{"error": {...}}` JSON body.
+    pub fn to_bytes(&self) -> Bytes {
+        let mut error = serde_json::Map::new();
+        error.insert(
+            "message".to_string(),
+            serde_json::Value::String(self.message.to_string()),
+        );
+        error.insert(
+            "type".to_string(),
+            serde_json::Value::String(self.kind.to_string()),
+        );
+        if let Some(code) = self.code {
+            error.insert(
+                "code".to_string(),
+                serde_json::Value::String(code.to_string()),
+            );
+        }
+        if let Some(scope) = self.scope {
+            error.insert(
+                "scope".to_string(),
+                serde_json::Value::String(scope.to_string()),
+            );
+        }
+        if let Some(request_id) = self.request_id {
+            error.insert(
+                "request_id".to_string(),
+                serde_json::Value::String(request_id.to_string()),
+            );
+        }
+        if let Some(retryable) = self.retryable {
+            error.insert("retryable".to_string(), serde_json::Value::Bool(retryable));
+        }
+        if let Some(reason) = self.reason {
+            error.insert(
+                "sbproxy_reason".to_string(),
+                serde_json::Value::String(reason.to_string()),
+            );
+        }
+        let mut outer = serde_json::Map::new();
+        outer.insert("error".to_string(), serde_json::Value::Object(error));
+        Bytes::from(
+            serde_json::to_vec(&serde_json::Value::Object(outer)).expect("error envelope encodes"),
+        )
+    }
+}
+
 /// Stable OpenAI-style managed-model error payload.
 pub fn managed_error_body(request_id: &str, code: &'static str, retryable: bool) -> Bytes {
-    Bytes::from(
-        serde_json::to_vec(&serde_json::json!({
-            "error": {
-                "message": "managed model is temporarily unavailable",
-                "type": "managed_model_error",
-                "code": code,
-                "request_id": request_id,
-                "retryable": retryable,
-                "sbproxy_reason": code,
-            }
-        }))
-        .expect("static managed error payload"),
+    ErrorEnvelope::new(
+        "managed_model_error",
+        "managed model is temporarily unavailable",
     )
+    .code(code)
+    .request_id(request_id)
+    .retryable(retryable)
+    .reason(code)
+    .to_bytes()
+}
+
+#[cfg(test)]
+mod error_envelope_tests {
+    use super::*;
+
+    fn parsed(bytes: Bytes) -> serde_json::Value {
+        serde_json::from_slice(&bytes).expect("error envelope is valid JSON")
+    }
+
+    #[test]
+    fn a_bare_envelope_carries_only_message_and_type() {
+        let body = parsed(ErrorEnvelope::new("invalid_request_error", "bad input").to_bytes());
+        let error = &body["error"];
+        assert_eq!(error["message"], "bad input");
+        assert_eq!(error["type"], "invalid_request_error");
+        // Every optional field is genuinely absent, not null, when unset:
+        // a call site with no request_id/retryable/etc. context must not
+        // emit a misleading `"request_id": null`.
+        for field in ["code", "scope", "request_id", "retryable", "sbproxy_reason"] {
+            assert!(
+                error.get(field).is_none(),
+                "unset field {field} must be absent, not present as null"
+            );
+        }
+    }
+
+    #[test]
+    fn every_optional_field_is_present_exactly_when_set() {
+        let body = parsed(
+            ErrorEnvelope::new("guardrail_violation", "blocked")
+                .code("pii_leak")
+                .scope("governed_key")
+                .request_id("req_123")
+                .retryable(false)
+                .reason("pii_leak")
+                .to_bytes(),
+        );
+        let error = &body["error"];
+        assert_eq!(error["message"], "blocked");
+        assert_eq!(error["type"], "guardrail_violation");
+        assert_eq!(error["code"], "pii_leak");
+        assert_eq!(error["scope"], "governed_key");
+        assert_eq!(error["request_id"], "req_123");
+        assert_eq!(error["retryable"], false);
+        assert_eq!(error["sbproxy_reason"], "pii_leak");
+    }
+
+    #[test]
+    fn retryable_true_and_false_both_round_trip_as_real_booleans() {
+        // Not just "is the field present": a JSON string "false" would be
+        // truthy in some client languages, so this must be a real bool.
+        let retryable_body = parsed(
+            ErrorEnvelope::new("rate_limit_error", "slow down")
+                .retryable(true)
+                .to_bytes(),
+        );
+        assert!(retryable_body["error"]["retryable"].is_boolean());
+        assert_eq!(retryable_body["error"]["retryable"], true);
+
+        let not_retryable_body = parsed(
+            ErrorEnvelope::new("invalid_request_error", "bad input")
+                .retryable(false)
+                .to_bytes(),
+        );
+        assert_eq!(not_retryable_body["error"]["retryable"], false);
+    }
+
+    #[test]
+    fn managed_error_body_matches_its_documented_stable_shape() {
+        // managed_error_body is the one call site that populates every
+        // field; a downstream integration test
+        // (managed_replica_dispatch.rs) also pins this shape end to end.
+        let body = parsed(managed_error_body("req_abc", "no_ready_replica", true));
+        let error = &body["error"];
+        assert_eq!(error["message"], "managed model is temporarily unavailable");
+        assert_eq!(error["type"], "managed_model_error");
+        assert_eq!(error["code"], "no_ready_replica");
+        assert_eq!(error["request_id"], "req_abc");
+        assert_eq!(error["retryable"], true);
+        assert_eq!(error["sbproxy_reason"], "no_ready_replica");
+        // No `scope` on this call site: managed_error_body never sets one.
+        assert!(error.get("scope").is_none());
+    }
 }

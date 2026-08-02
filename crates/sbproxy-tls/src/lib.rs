@@ -84,6 +84,85 @@ pub struct TlsState {
     manual_cert_pem: Option<Vec<u8>>,
 }
 
+/// Earliest active ACME certificate expiry for alert evaluation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcmeCertExpiry {
+    /// Certificate hostname.
+    pub hostname: String,
+    /// Whole days remaining, rounded up so `30d 1s` does not report 30 days.
+    pub days_remaining: u32,
+}
+
+/// Cloneable, read-only ACME certificate-expiry input seam.
+///
+/// The alert loop owns this lightweight reader instead of reaching through a
+/// process global. Reads use the same persistent metadata store as renewal.
+#[derive(Clone)]
+pub struct AcmeExpiryReader {
+    cert_store: Arc<CertStore>,
+    hostnames: Arc<[String]>,
+}
+
+impl AcmeExpiryReader {
+    /// Return the certificate with the earliest parseable expiry.
+    pub fn earliest(&self) -> Option<AcmeCertExpiry> {
+        self.earliest_at(chrono::Utc::now())
+    }
+
+    fn earliest_at(&self, now: chrono::DateTime<chrono::Utc>) -> Option<AcmeCertExpiry> {
+        let mut expiries = Vec::with_capacity(self.hostnames.len());
+        for hostname in self.hostnames.iter() {
+            let meta = match self.cert_store.get_meta(hostname) {
+                Ok(Some(meta)) => meta,
+                Ok(None) => {
+                    tracing::debug!(
+                        %hostname,
+                        "ACME expiry snapshot unavailable because certificate metadata is missing"
+                    );
+                    return None;
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        %hostname,
+                        %error,
+                        "ACME expiry snapshot unavailable because certificate metadata could not be read"
+                    );
+                    return None;
+                }
+            };
+            let expires_at = match chrono::DateTime::parse_from_rfc3339(&meta.expires_at) {
+                Ok(expires_at) => expires_at.with_timezone(&chrono::Utc),
+                Err(error) => {
+                    tracing::debug!(
+                        %hostname,
+                        expires_at = %meta.expires_at,
+                        %error,
+                        "ACME expiry snapshot unavailable because certificate metadata is invalid"
+                    );
+                    return None;
+                }
+            };
+            expiries.push((hostname.clone(), expires_at));
+        }
+
+        expiries
+            .into_iter()
+            .min_by_key(|(_, expires_at)| *expires_at)
+            .map(|(hostname, expires_at)| {
+                let seconds = expires_at.signed_duration_since(now).num_seconds();
+                let days_remaining = if seconds <= 0 {
+                    0
+                } else {
+                    seconds.saturating_add(86_399) / 86_400
+                };
+                AcmeCertExpiry {
+                    hostname,
+                    days_remaining: u32::try_from(days_remaining).unwrap_or(u32::MAX),
+                }
+            })
+    }
+}
+
 /// Open the KVStore backing the ACME cert store, chosen by
 /// `acme.storage_backend` at `acme.storage_path` (WOR-1773).
 ///
@@ -120,15 +199,19 @@ fn open_cert_backend(acme: Option<&sbproxy_config::AcmeConfig>) -> Arc<dyn KVSto
             }
         }
         "redis" => {
-            // storage_path holds the redis address (host:port) for the
-            // shared cert store; connections open lazily. The distributed
-            // issuance lock (SET NX PX) makes a fleet issue a cert once
-            // instead of stampeding the CA (WOR-1774).
-            let cfg = sbproxy_platform::storage::RedisConfig {
-                addr: acme.storage_path.clone(),
-                ..Default::default()
+            // Connections open lazily. The distributed issuance lock
+            // (SET NX PX) makes a fleet issue a cert once instead of
+            // stampeding the CA (WOR-1774).
+            let cfg = match sbproxy_platform::storage::RedisConfig::from_dsn(&acme.storage_path) {
+                Ok(cfg) => cfg,
+                Err(_) => {
+                    warn!(
+                        "cert store: invalid Redis connection configuration; certs will NOT persist (in-memory fallback)"
+                    );
+                    return Arc::new(MemoryKVStore::new(0));
+                }
             };
-            info!(addr = %acme.storage_path, "cert store backend: redis (shared, cluster-safe)");
+            info!("cert store backend: redis (shared, cluster-safe)");
             Arc::new(sbproxy_platform::storage::RedisKVStore::new(cfg))
         }
         "file" => {
@@ -281,6 +364,17 @@ impl TlsState {
             ocsp_stapler,
             manual_cert_pem,
         })
+    }
+
+    /// Build a read-only expiry source when ACME is enabled.
+    pub fn acme_expiry_reader(&self) -> Option<AcmeExpiryReader> {
+        self.acme_config
+            .as_ref()
+            .is_some_and(|config| config.enabled)
+            .then(|| AcmeExpiryReader {
+                cert_store: Arc::clone(&self.cert_store),
+                hostnames: Arc::from(self.hostnames.clone()),
+            })
     }
 
     /// Spawn the OCSP refresh task for the manual fallback cert.
@@ -649,6 +743,37 @@ mod tests {
     use super::*;
     use cert_store::CertMeta;
 
+    fn acme_with_storage(backend: &str, path: &str) -> sbproxy_config::AcmeConfig {
+        sbproxy_config::AcmeConfig {
+            enabled: true,
+            email: "operator@example.com".to_string(),
+            directory_url: "https://acme.invalid/directory".to_string(),
+            challenge_types: vec!["http-01".to_string()],
+            storage_backend: backend.to_string(),
+            storage_path: path.to_string(),
+            renew_before_days: 30,
+        }
+    }
+
+    #[test]
+    fn redis_cert_backend_rejects_invalid_full_dsn_without_network_io() {
+        let sentinel = "rediss://default:sentinel-acme-password@sentinel-acme-host.invalid:6380/-1";
+        let acme = acme_with_storage("redis", sentinel);
+
+        let backend = open_cert_backend(Some(&acme));
+
+        backend
+            .put(b"certificate-key", b"certificate-value")
+            .expect("invalid Redis config must retain the in-memory fallback posture");
+        assert_eq!(
+            backend
+                .get(b"certificate-key")
+                .expect("read fallback certificate state")
+                .as_deref(),
+            Some(b"certificate-value".as_slice())
+        );
+    }
+
     // Regression: the OCSP refresh task and the maintenance handle are started
     // from the synchronous proxy-setup path, before Pingora installs a runtime.
     // A bare `tokio::spawn` there panics with "there is no reactor running",
@@ -725,5 +850,82 @@ mod tests {
             cert_needs_renewal(&m, 30),
             "bad date should trigger renewal"
         );
+    }
+
+    #[test]
+    fn acme_expiry_reader_returns_the_nearest_fixture_certificate() {
+        let store = Arc::new(CertStore::new(Arc::new(MemoryKVStore::new(0))));
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-23T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        store
+            .put_meta(
+                "later.example",
+                &meta(&(now + chrono::Duration::days(20)).to_rfc3339()),
+            )
+            .unwrap();
+        store
+            .put_meta(
+                "near.example",
+                &meta(
+                    &(now + chrono::Duration::days(6) + chrono::Duration::seconds(1)).to_rfc3339(),
+                ),
+            )
+            .unwrap();
+
+        let reader = AcmeExpiryReader {
+            cert_store: store,
+            hostnames: Arc::from(["later.example".to_string(), "near.example".to_string()]),
+        };
+        let expiry = reader.earliest_at(now).unwrap();
+        assert_eq!(expiry.hostname, "near.example");
+        assert_eq!(expiry.days_remaining, 7);
+    }
+
+    #[test]
+    fn acme_expiry_reader_rejects_a_partial_snapshot_with_invalid_metadata() {
+        let store = Arc::new(CertStore::new(Arc::new(MemoryKVStore::new(0))));
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-23T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        store
+            .put_meta(
+                "healthy.example",
+                &meta(&(now + chrono::Duration::days(90)).to_rfc3339()),
+            )
+            .unwrap();
+        store
+            .put_meta("unreadable.example", &meta("not-an-rfc3339-timestamp"))
+            .unwrap();
+
+        let reader = AcmeExpiryReader {
+            cert_store: store,
+            hostnames: Arc::from([
+                "healthy.example".to_string(),
+                "unreadable.example".to_string(),
+            ]),
+        };
+
+        assert_eq!(reader.earliest_at(now), None);
+    }
+
+    #[test]
+    fn acme_expiry_reader_rejects_a_partial_snapshot_with_missing_metadata() {
+        let store = Arc::new(CertStore::new(Arc::new(MemoryKVStore::new(0))));
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-23T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        store
+            .put_meta(
+                "healthy.example",
+                &meta(&(now + chrono::Duration::days(90)).to_rfc3339()),
+            )
+            .unwrap();
+        let reader = AcmeExpiryReader {
+            cert_store: store,
+            hostnames: Arc::from(["healthy.example".to_string(), "missing.example".to_string()]),
+        };
+
+        assert_eq!(reader.earliest_at(now), None);
     }
 }

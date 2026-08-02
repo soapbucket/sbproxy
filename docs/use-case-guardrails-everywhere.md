@@ -1,10 +1,10 @@
 # Guardrails on every prompt, local or hosted
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-28*
 
 ![One guardrail mesh blocking an injection aimed at a local model and redacting PII bound for a hosted one](assets/use-case-guardrails-everywhere.gif)
 
-You put a gateway in front of the cloud providers, wrote guardrail rules, and told the auditors your AI traffic was governed. Then a developer stood up Ollama on a spare box under a desk, and every prompt sent there now skips injection screening, PII redaction, and the access log. SBproxy was built for exactly this split: "Call any model. Serve your own. Govern both." One Apache-2.0 binary routes to 66 providers or serves weights on your own GPUs, which means the desk box and the OpenAI account can live behind the same endpoint, subject to the same rules.
+You put a gateway in front of the cloud providers, wrote guardrail rules, and told the auditors your AI traffic was governed. Then a developer stood up Ollama on a spare box under a desk, and every prompt sent there now skips injection screening, PII redaction, and the access log. SBproxy was built for exactly this split: "Call any model. Serve your own. Govern both." One Apache-2.0 binary routes to 72 providers or serves weights on your own GPUs, which means the desk box and the OpenAI account can live behind the same endpoint, subject to the same rules.
 
 ## What you will build
 
@@ -21,7 +21,8 @@ The frame worth keeping in your head is: govern the AI you call, the AI that cal
 ## Install
 
 ```bash
-# Linux / macOS, single static binary:
+# Prebuilt release executable for Linux amd64/arm64 (glibc) or Apple Silicon macOS.
+# No Rust, Python, JVM, or Node toolchain/runtime is required.
 curl -fsSL https://download.sbproxy.dev | sh
 
 # macOS via Homebrew:
@@ -103,7 +104,7 @@ This is the redactor the mesh borrows for redact-and-continue. `redact_request: 
 
 Without the `mesh` block these three detectors would run serially and block on the first flag. The mesh runs all of them, counts the flags, and fuses: at `block_threshold: 2` a prompt is rejected only when two detectors agree, so one noisy pattern cannot hard-block traffic on its own. Below the quorum, `redact_on_flag` masks the prompt with the `pii` redactor above and forwards it. `cache: true` means a repeated prompt reuses its verdict, and the latency budget stops the cascade from launching expensive detectors once 50 ms are spent. The label set also feeds the `ai.guardrails.*` namespace of the [CEL policy plane](ai-policy-cel.md) if you want to route or audit on `flagged_count` instead of blocking.
 
-One caveat to carry: `detect_common` gives you the built-in substring pattern sets, which catch the OWASP-LLM-01 vocabulary but miss obfuscation, translation, and novel phrasings. This config uses them anyway because they boot with no model download. When you outgrow them, [local-inference.md](local-inference.md) shows how to run an ONNX prompt-injection classifier on-box (sidecar or in-process, operator-supplied weights, no prompt egress), and [prompt-injection-v2.md](prompt-injection-v2.md) documents the scored detector interface behind it.
+One caveat to carry: `detect_common` gives you the built-in substring pattern sets, which catch the OWASP-LLM-01 vocabulary but miss obfuscation, translation, and novel phrasings. This config uses them anyway because they boot with no model download. When you outgrow them, set the safety guardrail to explicit `mode: classifier`; [ai-safety-classifiers](../examples/ai-safety-classifiers/) shows the local enforcing configuration. [local-inference.md](local-inference.md) covers the shared ONNX embedding runtime, while [prompt-injection-v2.md](prompt-injection-v2.md) documents the separate scored prompt-injection detector interface.
 
 ## Run it
 
@@ -111,7 +112,7 @@ Start the gateway:
 
 ```bash
 export OPENAI_API_KEY=sk-...
-sbproxy sb.yml
+sbproxy serve -f sb.yml
 ```
 
 Send an injection attempt aimed at the local model. It trips the injection detector ("ignore all previous") and the jailbreak detector ("ignore your safety"), two flags meet the quorum, and the request dies at the edge. Ollama does not need to be running for this to work; nothing is ever sent to it:

@@ -15,6 +15,27 @@
  */
 
 // In-memory CSRF token for the current session; null when unauthenticated
+// Called when the server rejects a request as unauthenticated, so the app
+// can drop to the sign-in screen instead of leaving the operator on a shell
+// where every panel quietly errors. Registered by `useAuth`; a callback
+// rather than a direct import because `useAuth` already imports this module.
+let onUnauthorized: (() => void) | null = null;
+
+/** Register the handler invoked when a request comes back 401. */
+export function setUnauthorizedHandler(handler: (() => void) | null): void {
+  onUnauthorized = handler;
+}
+
+/**
+ * Paths that legitimately answer 401 without meaning "your session died":
+ * the login attempt itself, and the session probe used to discover that
+ * there is no session yet. Firing the handler for these would fight the
+ * sign-in flow.
+ */
+function isAuthProbePath(path: string): boolean {
+  return path.startsWith("/admin/login") || path.startsWith("/admin/session");
+}
+
 // or authenticated via Basic. Set from the login / session responses.
 let csrfToken: string | null = null;
 export function setCsrfToken(token: string | null): void {
@@ -198,6 +219,12 @@ async function request(
     } catch {
       // ignore
     }
+    if (res.status === 401 && !isAuthProbePath(path)) {
+      // The session lapsed mid-use. Tell the app so it can send the
+      // operator to sign in, rather than leaving them on a console where
+      // every panel reports "Not authorized" with no way forward.
+      onUnauthorized?.();
+    }
     throw new ApiError(res.status, `${method} ${path} failed (${res.status})`, text);
   }
   return res;
@@ -260,6 +287,12 @@ async function sendRaw(
     } catch {
       // ignore
     }
+    if (res.status === 401 && !isAuthProbePath(path)) {
+      // The session lapsed mid-use. Tell the app so it can send the
+      // operator to sign in, rather than leaving them on a console where
+      // every panel reports "Not authorized" with no way forward.
+      onUnauthorized?.();
+    }
     throw new ApiError(res.status, `${method} ${path} failed (${res.status})`, text);
   }
   return await res.text();
@@ -272,6 +305,34 @@ export interface HealthComponent {
   status?: string;
   detail?: string;
   message?: string;
+}
+
+
+/** One externalized compression record, content-free. */
+export interface CompressionRecord {
+  id: string;
+  backend: string;
+  consistency: string;
+  tenant_id: string;
+  origin: string;
+  logical_version: number;
+  protected_prefix_count: number;
+  covered_history_count: number;
+  covered_input_tokens: number;
+  summary_tokens: number;
+  summarizer_provider: string;
+  summarizer_model: string;
+  writer_node: string;
+  conflict_detected: boolean;
+  created_at_unix_ms: number;
+  updated_at_unix_ms: number;
+  expires_at_unix_ms: number;
+  kind: string;
+}
+
+export interface CompressionSessionPage {
+  records: CompressionRecord[];
+  next_cursor?: string | null;
 }
 
 export interface HealthResponse {
@@ -293,6 +354,8 @@ export interface DeviceVram {
   name?: string;
   total_bytes?: number;
   free_bytes?: number;
+  compute_utilization?: number;
+  memory_occupancy?: number;
 }
 export interface LocalServing {
   ready?: boolean;
@@ -324,6 +387,9 @@ export interface ModelHostStatus {
 export interface ResidentModel {
   name?: string;
   id?: string;
+  /** Managed-runtime mirror rows key by deployment, not name. */
+  deployment?: string;
+  memory?: Record<string, unknown>;
   // EngineState serializes as a string or a small tagged object.
   state?: string | Record<string, unknown>;
   status?: string;
@@ -439,6 +505,21 @@ export interface CreatedKey {
   key: AdminKey;
 }
 
+/** Minimal, strictly-typed key listing for selectors (e.g. the playground's
+ *  virtual-key picker). `api.keys()` above stays loosely typed for the
+ *  full Keys view; this mirrors the same `GET /admin/keys` response. */
+export type AdminKeyStatus = "active" | "blocked" | "revoked";
+
+export interface AdminKeySummary {
+  key_id: string;
+  name: string | null;
+  status: AdminKeyStatus;
+}
+
+export interface AdminKeysListResponse {
+  keys: AdminKeySummary[];
+}
+
 export type KeyPolicyMutationKind = "patch" | "action";
 
 export interface KeyPolicyMutationDescriptor {
@@ -510,60 +591,37 @@ export interface EffectivePolicyPreview {
   decisions: EffectivePolicyDecisions;
 }
 
-export type KeyUsageConsistency = "approximate" | "strict";
-export type KeyUsageBackendStatus = "healthy" | "degraded" | "unavailable";
+// Governed-key usage (WOR-1845). GET /admin/keys/{id}/usage returns a
+// snapshot of the reserve/settle ledger for one key: four counter
+// dimensions plus the health of the backend that served them. `limit` and
+// `remaining` are null when the dimension has no configured cap; window
+// dimensions carry a `reset_at_millis`, lifetime dimensions do not.
+export type GovernanceConsistency = "approximate" | "strict";
+export type GovernanceBackendStatus = "healthy" | "degraded" | "unavailable";
 
-export interface KeyUsageDimension {
-  limit: number;
+export interface GovernanceCounterSnapshot {
+  limit: number | null;
   used: number;
   reserved: number;
-  remaining: number;
-  reset_at: string | null;
+  remaining: number | null;
+  reset_at_millis: number | null;
 }
 
-export interface KeyUsageDimensions {
-  requests_per_minute: KeyUsageDimension | null;
-  tokens_per_minute: KeyUsageDimension | null;
-  budget_tokens: KeyUsageDimension | null;
-  budget_micro_usd: KeyUsageDimension | null;
+export interface GovernanceBackendHealth {
+  backend: string;
+  consistency: GovernanceConsistency;
+  status: GovernanceBackendStatus;
+  checked_at_millis: number;
 }
 
-export interface KeyUsageSnapshot {
+export interface GovernanceSnapshot {
   key_id: string;
-  policy_version: {
-    revision: number;
-    digest: string;
-  };
-  consistency: KeyUsageConsistency;
-  backend: {
-    name: string;
-    status: KeyUsageBackendStatus;
-    checked_at: string;
-  };
-  dimensions: KeyUsageDimensions;
-}
-
-export interface KeyUsageBackendUnavailable {
-  error: {
-    code: "governance_backend_unavailable";
-    message: string;
-  };
-  consistency: "strict";
-  backend: {
-    name: string;
-    status: "unavailable";
-    checked_at: string;
-  };
-}
-
-export class KeyUsageUnavailableError extends ApiError {
-  readonly outage: KeyUsageBackendUnavailable;
-
-  constructor(error: ApiError, outage: KeyUsageBackendUnavailable) {
-    super(error.status, error.message, JSON.stringify(outage));
-    this.name = "KeyUsageUnavailableError";
-    this.outage = outage;
-  }
+  policy_revision: number;
+  requests_per_window: GovernanceCounterSnapshot;
+  tokens_per_window: GovernanceCounterSnapshot;
+  total_tokens: GovernanceCounterSnapshot;
+  total_micro_usd: GovernanceCounterSnapshot;
+  backend: GovernanceBackendHealth;
 }
 
 const EFFECTIVE_POLICY_DECISION_NAMES: readonly EffectivePolicyDecisionName[] = [
@@ -622,25 +680,13 @@ function responseNonNegativeSafeInteger(
   return value as number;
 }
 
-function responseIsoTimestamp(
+function responseNullableNonNegativeSafeInteger(
   object: Record<string, unknown>,
   field: string,
   label: string,
-): string {
-  const value = responseString(object, field, label);
-  if (value.length === 0 || Number.isNaN(Date.parse(value))) {
-    throw new TypeError(`${label}.${field} must be an ISO timestamp`);
-  }
-  return value;
-}
-
-function responseNullableIsoTimestamp(
-  object: Record<string, unknown>,
-  field: string,
-  label: string,
-): string | null {
+): number | null {
   if (object[field] === null) return null;
-  return responseIsoTimestamp(object, field, label);
+  return responseNonNegativeSafeInteger(object, field, label);
 }
 
 function optionalNullableResponseString(
@@ -791,128 +837,87 @@ function decodeEffectivePolicyPreview(value: unknown): EffectivePolicyPreview {
   };
 }
 
-const KEY_USAGE_DIMENSION_NAMES = [
-  "requests_per_minute",
-  "tokens_per_minute",
-  "budget_tokens",
-  "budget_micro_usd",
-] as const satisfies readonly (keyof KeyUsageDimensions)[];
+const GOVERNANCE_CONSISTENCIES: readonly GovernanceConsistency[] = [
+  "approximate",
+  "strict",
+];
+const GOVERNANCE_BACKEND_STATUSES: readonly GovernanceBackendStatus[] = [
+  "healthy",
+  "degraded",
+  "unavailable",
+];
 
-function decodeKeyUsageDimension(
+function decodeGovernanceCounterSnapshot(
   value: unknown,
   label: string,
-  lifetime: boolean,
-): KeyUsageDimension | null {
-  if (value === null) return null;
-  const dimension = responseObject(value, label);
+): GovernanceCounterSnapshot {
+  const counter = responseObject(value, label);
   return {
-    limit: responseNonNegativeSafeInteger(dimension, "limit", label),
-    used: responseNonNegativeSafeInteger(dimension, "used", label),
-    reserved: responseNonNegativeSafeInteger(dimension, "reserved", label),
-    remaining: responseNonNegativeSafeInteger(dimension, "remaining", label),
-    reset_at: lifetime
-      ? responseNullableIsoTimestamp(dimension, "reset_at", label)
-      : responseIsoTimestamp(dimension, "reset_at", label),
+    limit: responseNullableNonNegativeSafeInteger(counter, "limit", label),
+    used: responseNonNegativeSafeInteger(counter, "used", label),
+    reserved: responseNonNegativeSafeInteger(counter, "reserved", label),
+    remaining: responseNullableNonNegativeSafeInteger(counter, "remaining", label),
+    reset_at_millis: responseNullableNonNegativeSafeInteger(
+      counter,
+      "reset_at_millis",
+      label,
+    ),
   };
 }
 
-function decodeKeyUsageSnapshot(value: unknown): KeyUsageSnapshot {
-  const document = responseObject(value, "key usage");
-  const version = responseObject(document.policy_version, "key usage.policy_version");
-  const backend = responseObject(document.backend, "key usage.backend");
-  const rawDimensions = responseObject(document.dimensions, "key usage.dimensions");
-
-  const consistency = document.consistency;
-  if (consistency !== "approximate" && consistency !== "strict") {
-    throw new TypeError("key usage.consistency is not supported");
-  }
-  const backendStatus = backend.status;
-  if (
-    backendStatus !== "healthy" &&
-    backendStatus !== "degraded" &&
-    backendStatus !== "unavailable"
-  ) {
-    throw new TypeError("key usage.backend.status is not supported");
-  }
-
-  const dimensions = {} as KeyUsageDimensions;
-  for (const name of KEY_USAGE_DIMENSION_NAMES) {
-    if (!(name in rawDimensions)) {
-      throw new TypeError(`key usage.dimensions.${name} is required`);
-    }
-    dimensions[name] = decodeKeyUsageDimension(
-      rawDimensions[name],
-      `key usage.dimensions.${name}`,
-      name === "budget_tokens" || name === "budget_micro_usd",
-    );
-  }
-
-  return {
-    key_id: responseString(document, "key_id", "key usage"),
-    policy_version: {
-      revision: responseSafeInteger(version, "revision", "key usage.policy_version"),
-      digest: responseString(version, "digest", "key usage.policy_version"),
-    },
-    consistency,
-    backend: {
-      name: responseString(backend, "name", "key usage.backend"),
-      status: backendStatus,
-      checked_at: responseIsoTimestamp(backend, "checked_at", "key usage.backend"),
-    },
-    dimensions,
-  };
-}
-
-function decodeKeyUsageBackendUnavailable(
+function decodeGovernanceBackendHealth(
   value: unknown,
-): KeyUsageBackendUnavailable {
-  const document = responseObject(value, "key usage outage");
-  const error = responseObject(document.error, "key usage outage.error");
-  const backend = responseObject(document.backend, "key usage outage.backend");
-  if (error.code !== "governance_backend_unavailable") {
-    throw new TypeError("key usage outage.error.code is not supported");
+  label: string,
+): GovernanceBackendHealth {
+  const backend = responseObject(value, label);
+  const consistency = backend.consistency;
+  if (!GOVERNANCE_CONSISTENCIES.includes(consistency as GovernanceConsistency)) {
+    throw new TypeError(`${label}.consistency is not supported`);
   }
-  if (document.consistency !== "strict") {
-    throw new TypeError("key usage outage.consistency must be strict");
+  const status = backend.status;
+  if (!GOVERNANCE_BACKEND_STATUSES.includes(status as GovernanceBackendStatus)) {
+    throw new TypeError(`${label}.status is not supported`);
   }
-  if (backend.status !== "unavailable") {
-    throw new TypeError("key usage outage.backend.status must be unavailable");
-  }
-  const backendName = responseString(backend, "name", "key usage outage.backend");
-  if (
-    backendName.length === 0 ||
-    backendName.length > 64 ||
-    !/^[a-z0-9_-]+$/.test(backendName)
-  ) {
-    throw new TypeError("key usage outage.backend.name is not a bounded identifier");
-  }
-  const message = responseString(error, "message", "key usage outage.error");
-  if (message.length === 0 || message.length > 128) {
-    throw new TypeError("key usage outage.error.message is not bounded");
-  }
-
   return {
-    error: {
-      code: "governance_backend_unavailable",
-      message,
-    },
-    consistency: "strict",
-    backend: {
-      name: backendName,
-      status: "unavailable",
-      checked_at: responseIsoTimestamp(backend, "checked_at", "key usage outage.backend"),
-    },
+    backend: responseString(backend, "backend", label),
+    consistency: consistency as GovernanceConsistency,
+    status: status as GovernanceBackendStatus,
+    checked_at_millis: responseNonNegativeSafeInteger(
+      backend,
+      "checked_at_millis",
+      label,
+    ),
   };
 }
 
-function keyUsageOutage(error: ApiError): KeyUsageBackendUnavailable | null {
-  if (error.status !== 503) return null;
-  try {
-    assertSafeJsonIntegers(error.body);
-    return decodeKeyUsageBackendUnavailable(JSON.parse(error.body) as unknown);
-  } catch {
-    return null;
-  }
+/** Decode GET /admin/keys/{id}/usage's `usage` payload (a GovernanceSnapshot). */
+function decodeGovernanceSnapshot(value: unknown): GovernanceSnapshot {
+  const document = responseObject(value, "governance usage");
+  return {
+    key_id: responseString(document, "key_id", "governance usage"),
+    policy_revision: responseSafeInteger(
+      document,
+      "policy_revision",
+      "governance usage",
+    ),
+    requests_per_window: decodeGovernanceCounterSnapshot(
+      document.requests_per_window,
+      "governance usage.requests_per_window",
+    ),
+    tokens_per_window: decodeGovernanceCounterSnapshot(
+      document.tokens_per_window,
+      "governance usage.tokens_per_window",
+    ),
+    total_tokens: decodeGovernanceCounterSnapshot(
+      document.total_tokens,
+      "governance usage.total_tokens",
+    ),
+    total_micro_usd: decodeGovernanceCounterSnapshot(
+      document.total_micro_usd,
+      "governance usage.total_micro_usd",
+    ),
+    backend: decodeGovernanceBackendHealth(document.backend, "governance usage.backend"),
+  };
 }
 
 export interface KeyPolicyDraft {
@@ -1244,6 +1249,49 @@ export interface Credential {
   [k: string]: unknown;
 }
 
+/// Where one leaf of the running config came from. `local` and
+/// `authority` arrive as bare strings; a git leaf carries the resolved
+/// commit, which is the part worth showing an operator.
+export type ConfigProvenance =
+  | "local"
+  | "authority"
+  | { git: { repo: string; reference: string; commit: string } };
+
+export interface ConfigLayers {
+  base?:
+    | { kind: "local" }
+    | { kind: "git"; repo: string; reference: string; commit: string };
+  authority?: {
+    authority_id: string;
+    revision: number;
+    mode: "overlay" | "replace";
+  } | null;
+}
+
+export interface EffectiveConfigResponse {
+  // GET /admin/config/effective.
+  yaml?: string;
+  provenance?: Record<string, ConfigProvenance>;
+  layers?: ConfigLayers;
+  // True only when this node's own file is the whole configuration, which
+  // is the condition under which the editor may offer a write.
+  locally_owned?: boolean;
+  locally_owned_leaves?: number;
+  total_leaves?: number;
+  [k: string]: unknown;
+}
+
+/// Body of a 409 the write guard produced. Distinguished from a revision
+/// mismatch by `code`, because the two need different advice: one says
+/// reload and reapply, the other says this is not your config to edit.
+export interface ConfigWriteConflict {
+  code?: string;
+  error?: string;
+  conflicts?: { path: string; owner: ConfigProvenance | "suppressed" }[];
+  layers?: ConfigLayers;
+  remedy?: string;
+}
+
 export interface DriftResponse {
   // Real server shape (GET /admin/drift).
   drift?: boolean;
@@ -1467,6 +1515,36 @@ export interface ClusterStatusResponse {
   unhealthy_nodes: ClusterNodeAlert[];
 }
 
+/** Cluster-wide VRAM aggregation. Distinct from `ModelHostStatus.vram`
+ *  above, which is this node's own local view only. */
+export interface ClusterVramStatus {
+  budget_bytes: number;
+  used_bytes: number;
+  free_bytes: number;
+  devices: DeviceVram[];
+}
+
+export interface ClusterVramNode {
+  node_id: string;
+  vram: ClusterVramStatus;
+}
+
+export interface ClusterVramSummary {
+  total_bytes: number;
+  used_bytes: number;
+  free_bytes: number;
+  device_count: number;
+  node_count: number;
+}
+
+export interface ClusterVramResponse {
+  schema_version: number;
+  generated_at_unix_ms: number;
+  directory_collected_at_unix_ms: number | null;
+  cluster: ClusterVramSummary;
+  nodes: ClusterVramNode[];
+}
+
 export type ArtifactFormat = "safetensors" | "gguf" | "pickle";
 export type SupportLevel =
   | "stable"
@@ -1579,6 +1657,105 @@ export interface ModelManagementErrorResponse {
   actual_revision?: number;
 }
 
+/* ---- Artifact cache storage (WOR-1910) ---- */
+
+// One durable ready artifact in the verified weight cache, as reported by
+// GET /admin/model-host/files. `resident` marks artifacts backing a
+// currently ready replica; the server refuses to delete those.
+export interface ModelHostArtifactFile {
+  logical_model: string;
+  variant_id: string;
+  artifact_digest: string;
+  total_size_bytes: number;
+  last_accessed_ms: number;
+  resident: boolean;
+}
+
+export interface ModelHostFilesResponse {
+  schema_version: number;
+  // Absent when no model host is configured (no artifact cache is open).
+  cache_root?: string;
+  total_bytes: number;
+  artifacts: ModelHostArtifactFile[];
+  // Configured weight-cache disk budget in bytes, when the server reports
+  // it. An explicit null means no budget is configured, so cache GC has
+  // nothing to enforce. Absent on servers that do not report the budget.
+  cache_budget_bytes?: number | null;
+}
+
+// DELETE /admin/model-host/artifacts/{digest} success report. Refusals
+// (resident, configured, pinned, busy) come back as a 409 whose body
+// carries `{code, error}` like the other model-host mutation routes.
+export interface ArtifactRemovalReport {
+  artifact_digest: string;
+  removed: boolean;
+  reclaimed_bytes: number;
+  job_id?: string | null;
+}
+
+// POST /admin/model-host/gc result: deterministic cache-budget collection.
+export interface GcReport {
+  before_bytes: number;
+  after_bytes: number;
+  reclaimed_bytes: number;
+  deleted_artifacts: string[];
+  skipped_artifacts: Record<string, string>;
+  budget_unsatisfied_bytes: number;
+}
+
+/* ---- Durable operation jobs (queued / in-flight lifecycle work) ---- */
+
+export type OperationKind =
+  | "pull"
+  | "verify"
+  | "provision"
+  | "launch"
+  | "load"
+  | "drain"
+  | "stop"
+  | "rollout"
+  | "delete"
+  | "reset";
+
+export type OperationState =
+  | "queued"
+  | "downloading"
+  | "verifying"
+  | "ready"
+  | "failed"
+  | "deleting"
+  | "deleted";
+
+export interface OperationProgress {
+  completed_bytes: number;
+  total_bytes: number;
+  current_file: string | null;
+}
+
+// Mirrors sbproxy_model_host::jobs::OperationJob. `subject` is the
+// deployment id or artifact digest the operation acts on.
+export interface OperationJob {
+  id: string;
+  kind: OperationKind;
+  subject: string;
+  state: OperationState;
+  progress: OperationProgress;
+  created_at_ms: number;
+  updated_at_ms: number;
+  terminal_at_ms: number | null;
+  error: string | null;
+}
+
+export interface JobsListResponse {
+  schema_version: number;
+  jobs: OperationJob[];
+}
+
+export interface JobDetailResponse {
+  schema_version: number;
+  job: OperationJob;
+}
+
 export interface ClusterDeploymentBundleDraft {
   catalog_revision: string;
   revision: number;
@@ -1636,6 +1813,16 @@ export interface RequestLog {
   // WOR-1874 correlation + AI columns on the ring entry.
   request_id?: string;
   trace_id?: string;
+  session_id?: string;
+  parent_session_id?: string;
+  properties?: Record<string, string>;
+  cache_status?: "disabled" | "miss" | "hit" | "semantic_hit" | string;
+  retry_count?: number;
+  failover_engaged?: boolean;
+  failover_from?: string;
+  failover_to?: string;
+  load_balancer_strategy?: string;
+  load_balancer_target?: string;
   provider?: string;
   model?: string;
   tokens_in?: number;
@@ -1644,7 +1831,89 @@ export interface RequestLog {
   guardrail_category?: string;
   guardrail_action?: string;
   origin?: string;
+  // WOR-2093 key accountability columns.
+  api_key_id?: string;
+  key_mode?: "none" | "minted" | "native" | string;
+  key_provider?: string;
+  tenant_id?: string;
+  user_id?: string;
+  // WOR-2094 explainability columns.
+  error_class?: string;
+  config_revision?: string;
+  policy_version?: string;
+  policy_decisions?: string[];
+  deny_reason?: string;
   [k: string]: unknown;
+}
+
+export interface RequestFilters {
+  method?: string;
+  status?: string;
+  path?: string;
+  origin?: string;
+  sessionId?: string;
+  guardrailAction?: string;
+  guardrailCategory?: string;
+  cacheStatus?: string;
+  retried?: boolean;
+  propertyKey?: string;
+  propertyValue?: string;
+  // WOR-2093: server-side key accountability filters.
+  apiKeyId?: string;
+  keyMode?: "none" | "minted" | "native";
+}
+
+export type AlertRuleState = "inactive" | "ok" | "firing";
+export type AlertDeliveryStatus = "untested" | "healthy" | "failing";
+export type AlertHistoryEvent = "fired" | "resolved" | "test";
+
+export interface AlertRule {
+  rule: string;
+  description: string;
+  thresholds: number[];
+  minimum_samples?: number;
+  state: AlertRuleState;
+  reading?: number;
+  sample_count?: number;
+  last_evaluated_at?: string;
+}
+
+export interface AlertDeliveryHealth {
+  status: AlertDeliveryStatus;
+  last_attempt_at?: string;
+  error?: string;
+}
+
+export interface AlertChannel {
+  index: number;
+  type: "webhook" | "slack" | "pagerduty" | "log" | string;
+  target?: string;
+  routing_key_configured?: boolean;
+  health: AlertDeliveryHealth;
+}
+
+export interface AlertPayload {
+  rule: string;
+  severity: "warning" | "critical" | string;
+  message: string;
+  timestamp: string;
+  labels: Record<string, string>;
+  resolved: boolean;
+}
+
+export interface AlertHistoryEntry {
+  event: AlertHistoryEvent;
+  channel_index?: number;
+  alert: AlertPayload;
+}
+
+export interface AlertSnapshot {
+  enabled: boolean;
+  authority: "file";
+  read_only: boolean;
+  rules: AlertRule[];
+  channels: AlertChannel[];
+  history: AlertHistoryEntry[];
 }
 
 // WOR-1870: UI settings served by the admin API.
@@ -1660,6 +1929,42 @@ export interface PromptEntry {
   active?: string;
   versions?: (string | { version?: string; created_at?: string })[];
   [k: string]: unknown;
+}
+
+// WOR-2094: one normalized audit event from the bounded runtime sample.
+export interface AuditEvent {
+  timestamp: string;
+  channel: "security" | "key" | "config" | "admin" | "policy" | string;
+  kind: string;
+  actor?: string;
+  tenant_id?: string;
+  api_key_id?: string;
+  request_id?: string;
+  detail?: string;
+}
+
+export interface AuditEventFilters {
+  limit?: number;
+  channel?: string;
+  kind?: string;
+  keyId?: string;
+}
+
+// WOR-2096: one redacted content sample for one request.
+export interface CapturedMessage {
+  role: string;
+  content: string;
+}
+
+export interface ContentSample {
+  request_id: string;
+  api_key_id?: string;
+  tenant_id: string;
+  origin: string;
+  model?: string;
+  captured_at: string;
+  input_messages: CapturedMessage[];
+  output_text?: string;
 }
 
 /* ---- Endpoint helpers ---- */
@@ -1704,6 +2009,9 @@ export interface PlaygroundChatRequest {
 }
 export interface PlaygroundChatResult {
   origin?: string;
+  // Present on responses from `playgroundDispatch`: the virtual key the
+  // request was dispatched as.
+  key_id?: string;
   status?: number;
   model?: string;
   response?: Record<string, unknown>;
@@ -1712,6 +2020,14 @@ export interface PlaygroundChatResult {
   latency_ms?: number;
   debug?: { request_id?: string; config_revision?: string };
   error?: string;
+}
+/** Body for `playgroundDispatch`: same as `PlaygroundChatRequest` plus the
+ *  virtual key to impersonate through the real data-plane dispatch path. */
+export interface PlaygroundDispatchRequest {
+  key_id: string;
+  origin: string;
+  request: Record<string, unknown>;
+  debug?: boolean;
 }
 export interface CacheStatus {
   enabled: boolean;
@@ -1740,6 +2056,29 @@ export interface LoginResult {
   role: string;
   username: string;
   csrf_token: string;
+}
+
+/** A console login, as reported by `/api/admin/users`. Never carries a password. */
+export interface AdminUser {
+  username: string;
+  role: "admin" | "read_only";
+  /** The top-level admin credential, which always has the full-access role. */
+  primary: boolean;
+}
+
+export interface AdminUsersResponse {
+  users: AdminUser[];
+}
+
+/** A configured RBAC operator, as reported by `/api/operators`. Never
+ *  carries a password_hash. Config-only: managed by editing
+ *  `proxy.admin.operators` and reloading, not through this API. */
+export interface OperatorSummary {
+  username: string;
+  role: "admin" | "read_only";
+  /** Billing tenant this login is narrowed to on the meter routes.
+   *  Absent means the whole deployment. */
+  tenant?: string;
 }
 
 // Windowed spend from the durable usage rollups (WOR-1875).
@@ -1772,6 +2111,181 @@ export interface SpendWindowResponse {
   bucket_secs: number;
   buckets: SpendWindowBucket[];
   totals: SpendWindowTotals;
+  property_keys: string[];
+}
+
+/* ---- Attested metering (WOR-2131) ---- */
+
+/**
+ * Whether the meter is switched off, switched on and empty, or reporting.
+ *
+ * The distinction the whole meter view exists to make. A page of zeros
+ * cannot tell "attestation is off" from "attestation is on and has
+ * recorded nothing", and those have different next steps.
+ */
+export type MeterState = "off" | "idle" | "reporting";
+
+/** One unit total, with its provenance kept beside the count. */
+export interface MeterUnitRow {
+  /** The key the row is grouped under, per the request's `group_by`. */
+  group: string;
+  tenant: string;
+  unit: string;
+  /** `measured`, `route_weight`, or `origin_header`. */
+  source: string;
+  count: number;
+}
+
+/** One node whose units are inside the cluster and outside the total. */
+export interface MeterUncoveredNode {
+  node_id: string;
+  /** `never_reported`, `stale`, `not_live`, `unreachable`, `unreadable`. */
+  gap: string;
+  /** The last chain head this node was ever seen at, or null if never. */
+  last_known_seq: number | null;
+  last_seen_at: string | null;
+}
+
+/** Which nodes a cluster total covers, and which it does not. */
+export interface MeterCoverage {
+  complete: boolean;
+  expected: number;
+  answered: string[];
+  uncovered: MeterUncoveredNode[];
+  gathered_at: string;
+}
+
+/** One row of the per-node chain-head table. */
+export interface MeterNodeRow {
+  node_id: string;
+  covered: boolean;
+  local: boolean;
+  head_seq?: number;
+  head_hash?: string;
+  claims?: number;
+  observed_at?: string;
+  gap?: string;
+  last_known_seq?: number | null;
+  last_seen_at?: string | null;
+}
+
+/** Records the meter owed and could not write, per tenant and posture. */
+export interface MeterGapRow {
+  tenant: string;
+  /** `closed`, `open`, `degraded`, or `observe`. */
+  failure_mode: string;
+  count: number;
+}
+
+/** This node's own chain, as read from disk. */
+export interface MeterChain {
+  node_id: string;
+  present: boolean;
+  entries: number;
+  head_hash: string;
+  damaged_at_seq: number | null;
+  damage_reason: string | null;
+}
+
+/** The attestation posture this generation runs under. */
+export interface MeterAttestation {
+  configured: boolean;
+  role?: string;
+  failure_mode?: string;
+  signing_key_id?: string | null;
+  ledger_path?: string;
+}
+
+export interface MeterSummary {
+  schema_version: number;
+  state: MeterState;
+  reason: string | null;
+  group_by: string;
+  tenant: string | null;
+  gathered_at: string;
+  attestation: MeterAttestation;
+  chain: MeterChain | null;
+  /** Null when no mesh is configured: one chain, nothing to fan out over. */
+  coverage: MeterCoverage | null;
+  nodes: MeterNodeRow[];
+  totals: MeterUnitRow[];
+  claims: number;
+  gaps: {
+    total: number;
+    by_tenant: MeterGapRow[];
+    divergence_total: number;
+  };
+}
+
+/** One receipt: the chain link, then the document the link attests to. */
+export interface MeterReceipt {
+  seq: number;
+  recorded_at: string;
+  prev_hash: string;
+  entry_hash: string;
+  /** Hex Ed25519 over the entry digest, when the chain is signed. */
+  signature?: string;
+  claims: Record<string, unknown>;
+}
+
+export interface MeterReceiptPage {
+  schema_version: number;
+  state: MeterState;
+  reason: string | null;
+  node_id: string;
+  tenant: string | null;
+  since_seq: number;
+  limit: number;
+  receipts: MeterReceipt[];
+  next_since_seq: number | null;
+  damaged_at_seq?: number | null;
+  damage_reason?: string | null;
+}
+
+/** The verdict of one chain verification run. */
+export interface MeterVerifyResult {
+  schema_version: number;
+  state: MeterState;
+  /** `ok`, `broken`, `not_started`, or `unreadable`. */
+  outcome: string;
+  node_id: string;
+  entries?: number;
+  /** The first sequence number that failed, when the outcome is `broken`. */
+  broken_seq?: number | null;
+  reason?: string | null;
+  verified_at: string;
+}
+
+function requestsPath(filters: RequestFilters = {}): string {
+  const params = new URLSearchParams();
+  if (filters.method) params.set("method", filters.method);
+  if (filters.status && /^\d{3}$/.test(filters.status)) {
+    params.set("status", filters.status);
+  }
+  if (filters.path) params.set("path", filters.path);
+  if (filters.guardrailAction) {
+    params.set("guardrail_action", filters.guardrailAction);
+  }
+  if (filters.guardrailCategory) {
+    params.set("guardrail_category", filters.guardrailCategory);
+  }
+  if (filters.cacheStatus) params.set("cache_status", filters.cacheStatus);
+  if (filters.retried !== undefined) {
+    params.set("retried", String(filters.retried));
+  }
+  if (filters.propertyKey) {
+    params.set("property_key", filters.propertyKey);
+    if (filters.propertyValue) {
+      params.set("property_value", filters.propertyValue);
+    }
+  }
+  // WOR-2093: these three filter server-side now; the views still apply
+  // the same predicates client-side so live-tail rows stay consistent.
+  if (filters.sessionId) params.set("session_id", filters.sessionId);
+  if (filters.apiKeyId) params.set("api_key_id", filters.apiKeyId);
+  if (filters.keyMode) params.set("key_mode", filters.keyMode);
+  const query = params.toString();
+  return query ? `/api/requests?${query}` : "/api/requests";
 }
 
 export const api = {
@@ -1791,6 +2305,18 @@ export const api = {
   },
 
   // Overview
+  /** Compression session records: the externalized context state the AI
+   *  gateway keeps per conversation. Content is never included here; the
+   *  detail route gates summary text behind its own audited call. */
+  compressionSessions: (limit?: number, cursor?: string) => {
+    const q = new URLSearchParams();
+    if (limit) q.set("limit", String(limit));
+    if (cursor) q.set("cursor", cursor);
+    const qs = q.toString();
+    return getJson<CompressionSessionPage>(
+      `/admin/compression/sessions${qs ? `?${qs}` : ""}`,
+    );
+  },
   health: () => getJson<HealthResponse>("/health"),
   stats: () => getJson<StatsResponse>("/api/stats"),
   modelHostStatus: () => getJson<ModelHostStatus>("/admin/model-host/status"),
@@ -1813,9 +2339,28 @@ export const api = {
     sendJson<unknown>("POST", "/admin/model-host/reset", { deployment }),
   modelHostEvict: (deployment: string) =>
     sendJson<unknown>("POST", "/admin/model-host/evict", { deployment }),
+  // Artifact cache storage (WOR-1910): inventory, exact delete, cache GC.
+  modelHostFiles: () =>
+    getJson<ModelHostFilesResponse>("/admin/model-host/files"),
+  deleteModelHostArtifact: (digest: string) =>
+    sendJson<ArtifactRemovalReport>(
+      "DELETE",
+      `/admin/model-host/artifacts/${encodeURIComponent(digest)}`,
+    ),
+  modelHostGc: () => sendJson<GcReport>("POST", "/admin/model-host/gc"),
+  // Durable operation jobs (queued/in-flight lifecycle + pull/verify work).
+  modelHostJobs: () => getJson<JobsListResponse>("/admin/model-host/jobs"),
+  modelHostJob: (id: string) =>
+    getJson<JobDetailResponse>(`/admin/model-host/jobs/${encodeURIComponent(id)}`),
+  // SSE tail of one job's durable state, with `Last-Event-ID` replay across
+  // a reconnect (the browser's EventSource resends it automatically).
+  modelHostJobStreamUrl: (id: string) =>
+    `/admin/model-host/jobs/${encodeURIComponent(id)}/stream`,
 
   // Keys
   keys: () => getJson<unknown>("/admin/keys"),
+  // Typed, minimal key listing for selectors; see `AdminKeySummary` above.
+  keysList: () => getJson<AdminKeysListResponse>("/admin/keys"),
   keyPolicySchema: async () =>
     decodeKeyPolicySchema(
       await getJson<unknown>("/admin/keys/policy-schema"),
@@ -1827,17 +2372,10 @@ export const api = {
     return document.key;
   },
   keyUsage: async (id: string) => {
-    try {
-      return decodeKeyUsageSnapshot(
-        await getJson<unknown>(`/admin/keys/${encodeURIComponent(id)}/usage`),
-      );
-    } catch (error) {
-      if (error instanceof ApiError) {
-        const outage = keyUsageOutage(error);
-        if (outage) throw new KeyUsageUnavailableError(error, outage);
-      }
-      throw error;
-    }
+    const document = await getJson<{ usage: unknown }>(
+      `/admin/keys/${encodeURIComponent(id)}/usage`,
+    );
+    return decodeGovernanceSnapshot(document.usage);
   },
   createKey: (body: unknown) => sendJson<CreatedKey>("POST", "/admin/keys", body),
   patchKey: async (id: string, patch: AdminKeyPolicyPatch) => {
@@ -1890,15 +2428,66 @@ export const api = {
   targets: () => getJson<unknown>("/api/health/targets"),
 
   // Logs
-  requests: () => getJson<unknown>("/api/requests"),
+  requests: (filters: RequestFilters = {}) =>
+    getJson<RequestLog[]>(requestsPath(filters)),
   // WOR-1870: operator UI settings (trace deep-link template).
   uiSettings: () => getJson<UiSettings>("/api/ui-settings"),
   // WOR-1870: SSE live tail of the request ring. EventSource sends the
   // session cookie same-origin; the server enforces auth on connect.
   requestsStreamUrl: () => "/api/requests/stream",
 
+  // WOR-2094: unified audit sample (security/key/config/admin/policy).
+  auditEvents: (filters: AuditEventFilters = {}) => {
+    const params = new URLSearchParams();
+    if (filters.limit) params.set("limit", String(filters.limit));
+    if (filters.channel) params.set("channel", filters.channel);
+    if (filters.kind) params.set("kind", filters.kind);
+    if (filters.keyId) params.set("key_id", filters.keyId);
+    const query = params.toString();
+    return getJson<AuditEvent[]>(
+      query ? `/api/audit/events?${query}` : "/api/audit/events",
+    );
+  },
+  // WOR-2096: one request's redacted content sample (admin role only;
+  // the server audits every read).
+  requestContent: (requestId: string) =>
+    getJson<ContentSample>(
+      `/api/requests/${encodeURIComponent(requestId)}/content`,
+    ),
+
+  // File-authoritative alert runtime state and targeted channel probes.
+  alerts: () => getJson<AlertSnapshot>("/api/alerts"),
+  testAlertChannel: async (channelIndex: number): Promise<void> => {
+    await sendJson("POST", "/api/alerts/test", { channel_index: channelIndex });
+  },
+
   // Metrics
   metrics: () => getText("/metrics"),
+  // Who can sign in to this console. Passwords are never returned;
+  // accounts are managed in config, not through this route.
+  adminUsers: () => getJson<AdminUsersResponse>("/api/admin/users"),
+  // Configured RBAC operators only (excludes the top-level admin
+  // credential). password_hash is never returned.
+  operators: () => getJson<OperatorSummary[]>("/api/operators"),
+
+  // Attested metering (WOR-2131). All three are tenant-scoped server-side
+  // from the authenticated operator; passing `tenant` narrows further and
+  // is refused with 403 when it names somebody the operator may not read.
+  meterSummary: (groupBy = "tenant", tenant?: string) => {
+    const params = new URLSearchParams({ group_by: groupBy });
+    if (tenant) params.set("tenant", tenant);
+    return getJson<MeterSummary>(`/api/meter/summary?${params.toString()}`);
+  },
+  meterReceipts: (sinceSeq = 0, tenant?: string, limit?: number) => {
+    const params = new URLSearchParams({ since_seq: String(sinceSeq) });
+    if (tenant) params.set("tenant", tenant);
+    if (limit) params.set("limit", String(limit));
+    return getJson<MeterReceiptPage>(`/api/meter/receipts?${params.toString()}`);
+  },
+  // A POST because it walks the whole chain file. The connection handler's
+  // RBAC gate therefore restricts it to the admin role.
+  meterVerify: () => sendJson<MeterVerifyResult>("POST", "/api/meter/verify"),
+
   // Windowed spend history from the durable rollups (WOR-1875).
   spendWindow: (window: string, groupBy: string) =>
     getJson<SpendWindowResponse>(
@@ -1925,6 +2514,12 @@ export const api = {
     getJson<PlaygroundEndpoints>("/admin/api/playground/endpoints"),
   playgroundChat: (body: PlaygroundChatRequest) =>
     sendJson<PlaygroundChatResult>("POST", "/admin/api/playground/chat", body),
+  // Real dispatch: runs the request through the actual data-plane pipeline
+  // for a chosen virtual key (key policy, governance, routing, and
+  // guardrails all apply), rather than calling the engine/AiClient
+  // directly the way `playgroundChat` above does.
+  playgroundDispatch: (body: PlaygroundDispatchRequest) =>
+    sendJson<PlaygroundChatResult>("POST", "/admin/api/playground/dispatch", body),
 
   // Cache (WOR-1754 / WOR-1755)
   // Runtime log level (WOR-1759)
@@ -1942,6 +2537,16 @@ export const api = {
       yaml,
     ),
 
+  // What is actually running, and who owns each part of it. `config` above
+  // returns this node's own file, which on a git-sourced node is nothing
+  // but the pointer that selected the repository.
+  effectiveConfig: () =>
+    getJson<EffectiveConfigResponse>("/admin/config/effective"),
+
+  // The config JSON Schema, generated from the running binary's own types.
+  // Around 300KB, so it is fetched once per page load and not per edit.
+  configSchema: () => getJson<Record<string, unknown>>("/admin/config/schema"),
+
   // Rate-limit budget audit trail (WOR-1761) + fleet metrics (WOR-1762).
   auditRecent: (limit = 100) => getJson<AuditRow[]>(`/api/audit/recent?limit=${limit}`),
   clusterStatus: () => getJson<ClusterStatusResponse>("/admin/cluster/status"),
@@ -1954,6 +2559,7 @@ export const api = {
       draft,
     ),
   clusterMetrics: () => getJson<ClusterMetrics>("/admin/cluster/metrics"),
+  clusterVram: () => getJson<ClusterVramResponse>("/admin/cluster/vram"),
 
   // Rate-limit budget state + manual resume (WOR-1764).
   budgetSnapshot: () => getJson<WorkspaceStatus[]>("/api/rate_limits/budget"),

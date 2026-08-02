@@ -68,14 +68,37 @@ origins:
           required_components:
             - "@method"
             - "@target-uri"
+    policies:
+      - type: expression
+        expression: 'request.trust_tier == "strong"'
+        deny_status: 403
+        deny_message: "verified bot trust required"
 "#
     )
+}
+
+fn trust_tier_count(harness: &ProxyHarness, tier: &str) -> f64 {
+    let metrics = harness
+        .get("/metrics", "blog.localhost")
+        .expect("fetch metrics")
+        .text()
+        .unwrap_or_default();
+    let prefix = format!("sbproxy_trust_tier_requests_total{{tier=\"{tier}\"}} ");
+    metrics
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix(&prefix)
+                .and_then(|value| value.parse::<f64>().ok())
+        })
+        .unwrap_or(0.0)
 }
 
 #[test]
 fn missing_signature_input_returns_401() {
     let upstream = MockUpstream::start(json!({"ok": true})).expect("upstream");
     let harness = ProxyHarness::start_with_yaml(&hmac_config(&upstream.base_url())).expect("start");
+    let anonymous_before = trust_tier_count(&harness, "anonymous");
+    let suspicious_before = trust_tier_count(&harness, "suspicious");
 
     let resp = harness.get("/", "blog.localhost").expect("send");
     assert_eq!(
@@ -83,12 +106,23 @@ fn missing_signature_input_returns_401() {
         "request without Signature-Input should be rejected"
     );
     assert!(upstream.captured().is_empty());
+    assert_eq!(
+        trust_tier_count(&harness, "anonymous"),
+        anonymous_before + 1.0,
+        "missing credentials are absence of evidence, not an invalid proof"
+    );
+    assert_eq!(
+        trust_tier_count(&harness, "suspicious"),
+        suspicious_before,
+        "missing credentials must not be classified as suspicious"
+    );
 }
 
 #[test]
 fn valid_hmac_signature_returns_200() {
     let upstream = MockUpstream::start(json!({"ok": true})).expect("upstream");
     let harness = ProxyHarness::start_with_yaml(&hmac_config(&upstream.base_url())).expect("start");
+    let strong_before = trust_tier_count(&harness, "strong");
 
     let sig_header = format!("sig1=:{}:", VALID_SIG_B64);
     let resp = harness
@@ -109,6 +143,11 @@ fn valid_hmac_signature_returns_200() {
         resp.text().unwrap_or_default()
     );
     assert!(!upstream.captured().is_empty());
+    assert_eq!(
+        trust_tier_count(&harness, "strong"),
+        strong_before + 1.0,
+        "the live verifier-backed request must record Strong exactly once"
+    );
 }
 
 #[test]
@@ -118,6 +157,7 @@ fn tampered_signature_returns_401() {
     // mismatch.
     let upstream = MockUpstream::start(json!({"ok": true})).expect("upstream");
     let harness = ProxyHarness::start_with_yaml(&hmac_config(&upstream.base_url())).expect("start");
+    let suspicious_before = trust_tier_count(&harness, "suspicious");
 
     let tampered = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
     let sig_header = format!("sig1=:{}:", tampered);
@@ -133,6 +173,11 @@ fn tampered_signature_returns_401() {
         .expect("send");
     assert_eq!(resp.status, 401, "tampered signature must be rejected");
     assert!(upstream.captured().is_empty());
+    assert_eq!(
+        trust_tier_count(&harness, "suspicious"),
+        suspicious_before + 1.0,
+        "an offered proof that fails verification is suspicious"
+    );
 }
 
 #[test]

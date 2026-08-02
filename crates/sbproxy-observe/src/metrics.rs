@@ -230,8 +230,6 @@ pub struct ProxyMetrics {
     pub errors_total: IntCounterVec,
     /// Gauge `sbproxy_active_connections` of currently active connections.
     pub active_connections: IntGauge,
-    /// Counter `sbproxy_cache_hits_total` of cache hits and misses labelled by hostname.
-    pub cache_hits: IntCounterVec,
     /// Counter `sbproxy_ai_cost_usd_micros_total` of AI request cost in
     /// micro-USD, labelled by provider, model, and tenant.
     pub ai_cost_usd_micros_total: IntCounterVec,
@@ -254,6 +252,14 @@ pub struct ProxyMetrics {
     /// Counter `sbproxy_ai_cost_saved_micros_total` of micro-USD a
     /// semantic-cache hit avoided, labelled by tenant, origin, and model.
     pub ai_cost_saved_micros: IntCounterVec,
+    /// Counter `sbproxy_ai_compression_value_tokens_saved_total` of
+    /// estimated target-model input tokens avoided by successful compression,
+    /// labelled by tenant, origin, model, closed lever, and count precision.
+    pub ai_compression_value_tokens_saved: IntCounterVec,
+    /// Counter `sbproxy_ai_compression_value_cost_saved_micros_total` of gross
+    /// known-price target-model input cost avoided by successful compression,
+    /// labelled by tenant, origin, model, closed lever, and count precision.
+    pub ai_compression_value_cost_saved_micros: IntCounterVec,
 
     // --- Agent detection (WOR-592) ---
     /// Counter `sbproxy_agent_detect_total` of agent-detect scorer
@@ -264,6 +270,12 @@ pub struct ProxyMetrics {
     /// Histogram `sbproxy_agent_detect_inference_seconds` of scorer
     /// latency in seconds.
     pub agent_detect_inference_seconds: Histogram,
+    /// Counter `sbproxy_trust_tier_requests_total` of requests partitioned
+    /// by the closed trust-tier decision.
+    pub trust_tier_requests: IntCounterVec,
+    /// Counter `sbproxy_inbound_key_requests_total` of requests partitioned
+    /// by caller credential mode and its recognized provider.
+    pub inbound_key_requests: IntCounterVec,
 
     // --- Per-origin metrics (Sprint 1A) ---
     /// Total HTTP requests with origin, method, and status labels.
@@ -282,6 +294,22 @@ pub struct ProxyMetrics {
     pub cache_results: CounterVec,
     /// Circuit breaker state transitions with origin, from_state, and to_state labels.
     pub circuit_breaker_transitions: CounterVec,
+    /// Counter `sbproxy_upstream_status_retries_total` of upstream
+    /// retries triggered by a configured response status
+    /// (`retry.retry_on`), labelled by origin and the matched status.
+    /// Incremented once per scheduled retry, at decision time; matched
+    /// statuses that are skipped (method not idempotent, body not
+    /// replayable, cap reached) do not count.
+    pub upstream_status_retries: IntCounterVec,
+    /// Counter `sbproxy_upstream_timeout_retries_total` of upstream
+    /// retries whose triggering error was a timeout, labelled by
+    /// origin and the phase the deadline was hit in: `connect` (TCP
+    /// connect or TLS handshake) or `upstream` (read or write on the
+    /// established connection). Keyed on the error class, not on
+    /// which `retry_on` token enabled the retry. Incremented once per
+    /// scheduled retry, at decision time; timeouts that are not
+    /// retried do not count.
+    pub upstream_timeout_retries: IntCounterVec,
 
     // --- Cache Reserve metrics ---
     /// Counter `sbproxy_cache_reserve_hits_total` of reserve hits served
@@ -322,11 +350,6 @@ pub struct ProxyMetrics {
     /// HTTP 503 to the client and emits a structured audit event on
     /// every increment.
     pub agent_skill_digest_mismatch: IntCounterVec,
-    /// Gauge `sbproxy_dedup_cache_size` of entries currently held in the
-    /// request-deduplication cache. Published by the owner of the
-    /// `DedupCache` (see `sbproxy-transport`); lets operators spot a cache
-    /// that is growing unexpectedly under a stream of unique request hashes.
-    pub dedup_cache_size: IntGauge,
     /// Histogram `sbproxy_phase_duration_seconds` of intra-request
     /// phase durations. Labelled by `phase` (currently `auth`,
     /// `upstream_ttfb`, `response_filter`) and `origin`. Lets
@@ -389,12 +412,6 @@ impl ProxyMetrics {
         let active_connections =
             IntGauge::new("sbproxy_active_connections", "Current active connections").unwrap();
 
-        let cache_hits = IntCounterVec::new(
-            Opts::new("sbproxy_cache_hits_total", "Cache hit/miss counts"),
-            &["hostname", "result"], // "hit" or "miss"
-        )
-        .unwrap();
-
         let ai_cost_usd_micros_total = IntCounterVec::new(
             Opts::new(
                 "sbproxy_ai_cost_usd_micros_total",
@@ -455,6 +472,36 @@ impl ProxyMetrics {
         )
         .unwrap();
 
+        let ai_compression_value_tokens_saved = IntCounterVec::new(
+            Opts::new(
+                "sbproxy_ai_compression_value_tokens_saved_total",
+                "Estimated target-model input tokens avoided by successful context compression",
+            ),
+            &[
+                "tenant_id",
+                "origin",
+                "model",
+                "lever",
+                "token_count_precision",
+            ],
+        )
+        .unwrap();
+
+        let ai_compression_value_cost_saved_micros = IntCounterVec::new(
+            Opts::new(
+                "sbproxy_ai_compression_value_cost_saved_micros_total",
+                "Gross known-price target-model input cost avoided by successful context compression, in micro-USD",
+            ),
+            &[
+                "tenant_id",
+                "origin",
+                "model",
+                "lever",
+                "token_count_precision",
+            ],
+        )
+        .unwrap();
+
         // --- Agent detection (WOR-592) ---
 
         let agent_detect_total = IntCounterVec::new(
@@ -485,6 +532,23 @@ impl ProxyMetrics {
             .buckets(vec![
                 0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.002, 0.005, 0.01,
             ]),
+        )
+        .unwrap();
+
+        let trust_tier_requests = IntCounterVec::new(
+            Opts::new(
+                "sbproxy_trust_tier_requests_total",
+                "Requests partitioned by the derived trust tier",
+            ),
+            &["tier"],
+        )
+        .unwrap();
+        let inbound_key_requests = IntCounterVec::new(
+            Opts::new(
+                "sbproxy_inbound_key_requests_total",
+                "Requests partitioned by inbound credential mode and provider",
+            ),
+            &["provider", "key_mode", "tenant_id", "api_key_id"],
         )
         .unwrap();
 
@@ -558,6 +622,29 @@ impl ProxyMetrics {
                 "Circuit breaker state transitions",
             ),
             &["origin", "from_state", "to_state"],
+        )
+        .unwrap();
+
+        let upstream_status_retries = IntCounterVec::new(
+            Opts::new(
+                "sbproxy_upstream_status_retries_total",
+                "Upstream retries triggered by a configured response status",
+            ),
+            // status stays low-cardinality: only statuses an operator
+            // listed in `retry.retry_on` (validated 100..=599) appear.
+            &["origin", "status"],
+        )
+        .unwrap();
+
+        let upstream_timeout_retries = IntCounterVec::new(
+            Opts::new(
+                "sbproxy_upstream_timeout_retries_total",
+                "Upstream retries triggered by a timeout-classed failure",
+            ),
+            // phase is a closed two-value set: `connect` (TCP/TLS
+            // establishment deadline) or `upstream` (read/write
+            // deadline on the established connection).
+            &["origin", "phase"],
         )
         .unwrap();
 
@@ -640,12 +727,6 @@ impl ProxyMetrics {
         )
         .unwrap();
 
-        let dedup_cache_size = IntGauge::new(
-            "sbproxy_dedup_cache_size",
-            "Entries currently held in the request-deduplication cache",
-        )
-        .unwrap();
-
         // Phase-duration histogram. Buckets match `request_duration`
         // so cross-cut dashboards (phase vs end-to-end) align by le
         // label without bucket interpolation. `phase` label values
@@ -673,7 +754,6 @@ impl ProxyMetrics {
         registry
             .register(Box::new(active_connections.clone()))
             .unwrap();
-        registry.register(Box::new(cache_hits.clone())).unwrap();
         registry
             .register(Box::new(ai_cost_usd_micros_total.clone()))
             .unwrap();
@@ -693,6 +773,12 @@ impl ProxyMetrics {
             .register(Box::new(ai_cost_saved_micros.clone()))
             .unwrap();
         registry
+            .register(Box::new(ai_compression_value_tokens_saved.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(ai_compression_value_cost_saved_micros.clone()))
+            .unwrap();
+        registry
             .register(Box::new(agent_detect_total.clone()))
             .unwrap();
         registry
@@ -700,6 +786,12 @@ impl ProxyMetrics {
             .unwrap();
         registry
             .register(Box::new(agent_detect_inference_seconds.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(trust_tier_requests.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(inbound_key_requests.clone()))
             .unwrap();
         registry
             .register(Box::new(per_origin_requests_total.clone()))
@@ -718,6 +810,12 @@ impl ProxyMetrics {
         registry.register(Box::new(cache_results.clone())).unwrap();
         registry
             .register(Box::new(circuit_breaker_transitions.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(upstream_status_retries.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(upstream_timeout_retries.clone()))
             .unwrap();
         registry
             .register(Box::new(cache_reserve_hits.clone()))
@@ -740,9 +838,6 @@ impl ProxyMetrics {
         registry
             .register(Box::new(agent_skill_digest_mismatch.clone()))
             .unwrap();
-        registry
-            .register(Box::new(dedup_cache_size.clone()))
-            .unwrap();
         registry.register(Box::new(phase_duration.clone())).unwrap();
         registry
             .register(Box::new(boilerplate_stripped_bytes.clone()))
@@ -754,16 +849,19 @@ impl ProxyMetrics {
             request_duration,
             errors_total,
             active_connections,
-            cache_hits,
             ai_cost_usd_micros_total,
             semantic_cache_results,
             inference_requests,
             inference_duration,
             ai_tokens_saved,
             ai_cost_saved_micros,
+            ai_compression_value_tokens_saved,
+            ai_compression_value_cost_saved_micros,
             agent_detect_total,
             agent_detect_score,
             agent_detect_inference_seconds,
+            trust_tier_requests,
+            inbound_key_requests,
             per_origin_requests_total,
             per_origin_request_duration,
             per_origin_active_connections,
@@ -772,6 +870,8 @@ impl ProxyMetrics {
             policy_triggers,
             cache_results,
             circuit_breaker_transitions,
+            upstream_status_retries,
+            upstream_timeout_retries,
             cache_reserve_hits,
             cache_reserve_misses,
             cache_reserve_writes,
@@ -779,7 +879,6 @@ impl ProxyMetrics {
             synthetic_probe_failures,
             mirror_state_drift,
             agent_skill_digest_mismatch,
-            dedup_cache_size,
             phase_duration,
             boilerplate_stripped_bytes,
         }
@@ -803,7 +902,17 @@ impl ProxyMetrics {
         let mut metric_families = self.registry.gather();
         metric_families.extend(prometheus::gather());
         let mut buffer = Vec::new();
-        if encoder.encode(&metric_families, &mut buffer).is_err() {
+        if let Err(error) = encoder.encode(&metric_families, &mut buffer) {
+            // Returning an empty body here used to be silent, which made an
+            // encode failure indistinguishable from a healthy process that
+            // happens to emit nothing. The scrape succeeded, the dashboards
+            // went flat, and no signal anywhere said why. Say why.
+            tracing::error!(
+                %error,
+                families = metric_families.len(),
+                "failed to encode the Prometheus scrape; /metrics is serving an empty body"
+            );
+            record_render_failure("encode");
             return String::new();
         }
         let raw = String::from_utf8(buffer).unwrap_or_default();
@@ -818,14 +927,28 @@ impl ProxyMetrics {
     /// Sum the current values of the named metric families across all
     /// their label sets, for cluster-metric publication (WOR-1721). Each
     /// requested name maps to the total of its counter / gauge samples
-    /// (histograms contribute their sample sum); a name not present in the
-    /// registry maps to `0.0`. The mesh producer ships this compact
+    /// (histograms contribute their sample sum); a name not present in
+    /// either registry maps to `0.0`. The mesh producer ships this compact
     /// per-node snapshot so one node can report fleet totals without an
     /// external Prometheus.
+    ///
+    /// Gathers **both** registries, mirroring [`Self::render`]. Gathering only
+    /// `self.registry` is what made fleet AI tokens read zero on every node
+    /// forever: `sbproxy_ai_tokens_attributed_total` is registered by a
+    /// `register_counter_vec!` macro, so it lives on the process-global
+    /// default registry and this method could not see it. The pre-seeded
+    /// `0.0` below then supplied a plausible answer instead of an error, and
+    /// the guard test asserted only that the key was present, which the
+    /// pre-seed guarantees. Three layers, each individually reasonable,
+    /// producing a number that was always wrong.
     pub fn snapshot_named(&self, names: &[&str]) -> std::collections::HashMap<String, f64> {
         let mut out: std::collections::HashMap<String, f64> =
             names.iter().map(|n| ((*n).to_string(), 0.0)).collect();
-        for fam in self.registry.gather() {
+
+        let mut families = self.registry.gather();
+        families.extend(prometheus::gather());
+
+        for fam in families {
             let fname = fam.name();
             if !names.contains(&fname) {
                 continue;
@@ -840,10 +963,38 @@ impl ProxyMetrics {
                     total += h.sample_sum();
                 }
             }
-            out.insert(fname.to_string(), total);
+            // A family cannot appear on both registries (the metric registry
+            // declares exactly one per metric, and `metric_drift.rs` enforces
+            // it), so accumulate rather than overwrite and a future double
+            // registration shows up as a doubled value rather than a silent
+            // half.
+            *out.entry(fname.to_string()).or_insert(0.0) += total;
         }
         out
     }
+}
+
+/// Count a failure to serve `/metrics`.
+///
+/// Self-observability: if the scrape endpoint breaks, the only thing that can
+/// report it is the scrape endpoint, so this counter is the one series that
+/// has to survive its own failure mode. It lives on the proxy registry alone.
+fn record_render_failure(reason: &'static str) {
+    use prometheus::IntCounterVec;
+    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = COUNTER.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "sbproxy_metrics_render_failures_total",
+                "Failures to encode the Prometheus scrape body",
+            ),
+            &["reason"],
+        )
+        .expect("render failure counter constructs");
+        let _ = metrics().registry.register(Box::new(counter.clone()));
+        counter
+    });
+    counter.with_label_values(&[reason]).inc();
 }
 
 // --- Trace-id helper for exemplars ---
@@ -856,8 +1007,11 @@ pub fn current_trace_ids() -> (String, String) {
     use opentelemetry::trace::TraceContextExt;
 
     // Prefer the per-`tracing::Span` context when the
-    // `tracing-opentelemetry` layer is wired; fall back to the
-    // task-local context populated by `extract_from_headers`.
+    // `tracing-opentelemetry` layer is wired (seeded explicitly by
+    // `sbproxy_observe::telemetry::parent_span_on_remote_trace_context`
+    // at each span's creation site, not any ambient state); fall back
+    // to the task-local context as a last resort, though nothing in
+    // this crate populates it today.
     let cx_span = tracing_opentelemetry::OpenTelemetrySpanExt::context(&tracing::Span::current());
     let cx = if cx_span.has_active_span() {
         cx_span
@@ -1107,6 +1261,57 @@ pub fn record_agent_detect(
     }
 }
 
+/// Record one derived request trust tier.
+///
+/// The label is closed to the four trust-tier values. Unknown input is
+/// conservatively attributed to
+/// `anonymous` instead of creating attacker-controlled cardinality.
+pub fn record_trust_tier(tier: &str) {
+    let tier = match tier {
+        "suspicious" | "strong" | "named" | "anonymous" => tier,
+        _ => "anonymous",
+    };
+    metrics()
+        .trust_tier_requests
+        .with_label_values(&[tier])
+        .inc();
+}
+
+/// Record the request's inbound credential mode without exposing credential
+/// material. `key_mode` is a closed set; provider, tenant, and public key-id
+/// labels pass through bounded cardinality budgets. `None` is represented by
+/// the empty sentinel, never a made-up provider name.
+pub fn record_inbound_key_request(
+    provider: Option<&str>,
+    key_mode: &str,
+    tenant_id: &str,
+    api_key_id: Option<&str>,
+) {
+    const METRIC: &str = "sbproxy_inbound_key_requests_total";
+    let key_mode = match key_mode {
+        "none" | "minted" | "native" => key_mode,
+        _ => "none",
+    };
+    let tenant_id = sanitize_label_budget(METRIC, "tenant_id", tenant_id);
+    let provider =
+        sanitize_label_budget_tenant(METRIC, "provider", provider.unwrap_or_default(), &tenant_id);
+    let api_key_id = sanitize_label_budget_tenant(
+        METRIC,
+        "api_key_id",
+        api_key_id.unwrap_or_default(),
+        &tenant_id,
+    );
+    metrics()
+        .inbound_key_requests
+        .with_label_values(&[
+            provider.as_str(),
+            key_mode,
+            tenant_id.as_str(),
+            api_key_id.as_str(),
+        ])
+        .inc();
+}
+
 /// Attribute the tokens and cost a semantic-cache hit avoided (WOR-1225):
 /// the upstream call that did not happen. This is the value-delivered side
 /// of usage tracking, so saved cost uses the same cost table as spent cost.
@@ -1143,6 +1348,99 @@ pub fn record_cache_savings(
             .ai_cost_saved_micros
             .with_label_values(&[tenant.as_str(), origin.as_str(), model.as_str()])
             .inc_by(cost_micros);
+    }
+}
+
+/// Record per-lever value delivered by successful AI context compression.
+///
+/// `lever` and `token_count_precision` are accepted only from their closed
+/// production sets. Unknown values and records without positive token savings
+/// are not emitted. A positive token result may have zero cost when the model
+/// is unpriced or after micro-USD rounding. Tenant, origin, and
+/// model labels pass through the bounded cardinality limiter; prompt and
+/// summary content never enter this interface.
+pub fn record_compression_value(
+    tenant_id: &str,
+    origin: &str,
+    model: &str,
+    lever: &str,
+    token_count_precision: &str,
+    tokens_saved: u64,
+    gross_cost_saved_micros: u64,
+) {
+    record_compression_value_to(
+        metrics(),
+        CompressionValueObservation {
+            tenant_id,
+            origin,
+            model,
+            lever,
+            token_count_precision,
+            tokens_saved,
+            gross_cost_saved_micros,
+        },
+    );
+}
+
+struct CompressionValueObservation<'a> {
+    tenant_id: &'a str,
+    origin: &'a str,
+    model: &'a str,
+    lever: &'a str,
+    token_count_precision: &'a str,
+    tokens_saved: u64,
+    gross_cost_saved_micros: u64,
+}
+
+fn record_compression_value_to(
+    target: &ProxyMetrics,
+    observation: CompressionValueObservation<'_>,
+) {
+    const METRIC: &str = "sbproxy_ai_compression_value_tokens_saved_total";
+
+    let CompressionValueObservation {
+        tenant_id,
+        origin,
+        model,
+        lever,
+        token_count_precision,
+        tokens_saved,
+        gross_cost_saved_micros,
+    } = observation;
+    if tokens_saved == 0 {
+        return;
+    }
+    let lever = match lever {
+        "summary_buffer" => "summary_buffer",
+        "window_fit" => "window_fit",
+        "rag_select" => "rag_select",
+        "compact_serialization" => "compact_serialization",
+        _ => return,
+    };
+    let token_count_precision = match token_count_precision {
+        "model_tokenizer" => "model_tokenizer",
+        "heuristic" => "heuristic",
+        _ => return,
+    };
+    let tenant_id = sanitize_label_budget(METRIC, "tenant_id", tenant_id);
+    let origin = sanitize_label_budget_tenant(METRIC, "origin", origin, &tenant_id);
+    let model = sanitize_label_budget_tenant(METRIC, "model", model, &tenant_id);
+    let labels = [
+        tenant_id.as_str(),
+        origin.as_str(),
+        model.as_str(),
+        lever,
+        token_count_precision,
+    ];
+    target
+        .ai_compression_value_tokens_saved
+        .with_label_values(&labels)
+        .inc_by(tokens_saved);
+    if gross_cost_saved_micros > 0 {
+        target
+            .ai_compression_value_cost_saved_micros
+            .with_label_values(&labels)
+            .inc_by(gross_cost_saved_micros);
     }
 }
 
@@ -1314,6 +1612,33 @@ pub fn record_object_authz_violation(origin: &str, kind: &'static str) {
         .inc();
 }
 
+/// Count a governed key admission that bypassed reservation because the
+/// governance backend was unavailable and
+/// `key_management.governance.failure_mode` is `allow_unreserved` (WOR-1835).
+///
+/// Exposed on `sbproxy_governance_fail_open_total{key_id}` so an operator
+/// watching a degraded governance backend can see how many requests it let
+/// through unreserved. Every increment here is paired with a
+/// `security_audit` event on the same request (see
+/// `sbproxy_core::server::ai_dispatch`), since a governed limit silently
+/// stopped being enforced. `key_id` is the immutable, non-secret governed
+/// key identifier and is run through the cardinality limiter.
+pub fn record_governance_fail_open(key_id: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_governance_fail_open_total",
+            "Governed key admissions that bypassed reservation because the governance backend was unavailable and failure_mode is allow_unreserved",
+            &["key_id"],
+        )
+        .expect("governance fail-open counter registers")
+    });
+    let key_id_san = sanitize_label("key_id", key_id);
+    counter.with_label_values(&[key_id_san.as_str()]).inc();
+}
+
 /// Record drop counters returned by the capture helpers.
 /// `dimension` is `"property"`, `"session"`, or `"user"`; `reason`
 /// is one of the closed strings each helper exposes (e.g. `count`,
@@ -1367,6 +1692,32 @@ pub fn record_a2a_hop(route: &str, spec: &str, decision: &str) {
     counter
         .with_label_values(&[route.as_str(), spec, decision])
         .inc();
+}
+
+/// Record one A2A 1.0 JSON-RPC method invocation.
+///
+/// Separate from `sbproxy_a2a_hops_total` rather than another label on
+/// it: method only exists for the ratified 1.0 spec, so folding it in
+/// would leave an empty dimension on every v0 hop and multiply the
+/// existing series by a value most of them cannot carry.
+///
+/// `method` must come from the closed method enum, never from the raw
+/// wire string. The enum has eleven variants; the wire field is
+/// caller-controlled and unbounded, and would blow up cardinality.
+pub fn record_a2a_method(route: &str, method: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_a2a_methods_total",
+            "A2A 1.0 JSON-RPC methods observed by the proxy, labelled by route and method.",
+            &["route", "method"],
+        )
+        .expect("a2a methods counter registers")
+    });
+    let route = sanitize_label("route", route);
+    counter.with_label_values(&[route.as_ref(), method]).inc();
 }
 
 /// Record an A2A chain depth observation. Surfaces
@@ -1450,14 +1801,21 @@ pub fn record_channel_drop(lane: &'static str, reason: &'static str) {
             &["reason"],
         )
         .expect("channel drop counter constructs");
-        // Register on the canonical scrape registry so the metric
-        // reaches a `/metrics` endpoint.
+        // Register on the canonical scrape registry, and *only* there.
+        //
+        // This used to register on the process-global default registry as
+        // well, so that an ad-hoc `prometheus::gather()` would also see the
+        // counter. But `ProxyMetrics::render()` gathers both registries and
+        // concatenates them, so the family came out twice: two `# HELP` and
+        // two `# TYPE` lines for one name. The Prometheus text format forbids
+        // that and the parser rejects the whole scrape.
+        //
+        // The trigger makes it worse than it sounds. This counter does not
+        // exist until something drops a message on a full channel, which
+        // happens when the proxy is saturated. So `/metrics` broke at exactly
+        // the moment an operator needed it, and was fine every time anyone
+        // checked.
         let _ = metrics().registry.register(Box::new(cv.clone()));
-        // Register on the process-global default registry so ad-hoc
-        // `prometheus::gather()` calls (e.g. unit tests, scrapers
-        // that read the default registry directly) also see the
-        // counter.
-        let _ = prometheus::default_registry().register(Box::new(cv.clone()));
         cv
     });
     counter.with_label_values(&[reason]).inc();
@@ -1591,6 +1949,264 @@ pub fn record_config_reload(result: &'static str) {
         .expect("config reload counter registers")
     });
     counter.with_label_values(&[result]).inc();
+}
+
+// --- config authority (subscriber) metrics ---------------------------
+//
+// A subscriber pulls signed config bundles from an upstream authority,
+// verifies them, merges them over its local document, and applies the
+// result through the ordinary reload transaction. These five families are
+// how an operator sees that the fleet's configuration plane is alive:
+// which revision each node holds, how long since it last heard from the
+// authority, and why a node stopped taking updates.
+
+/// Publish the authority revision this node currently serves on
+/// `sbproxy_config_bundle_revision`.
+///
+/// Set once per successful apply, and again at boot when a node applies a
+/// cached bundle, so a fleet-wide `min()` shows the laggard.
+pub fn set_config_bundle_revision(revision: i64) {
+    use prometheus::{register_int_gauge, IntGauge};
+    use std::sync::OnceLock;
+    static G: OnceLock<IntGauge> = OnceLock::new();
+    let gauge = G.get_or_init(|| {
+        register_int_gauge!(
+            "sbproxy_config_bundle_revision",
+            "Authority revision of the config bundle this node currently serves",
+        )
+        .expect("config bundle revision gauge registers")
+    });
+    gauge.set(revision);
+}
+
+/// Publish the age of the config bundle this node serves on
+/// `sbproxy_config_bundle_age_seconds`.
+///
+/// Age is measured from the moment this node received and applied the
+/// bundle, not from the authority's `issued_at`. The authority's clock is
+/// not this node's clock, and a skewed pair produces a negative or absurd
+/// age exactly when an operator is trying to decide whether config
+/// distribution is stuck. Receipt time is recorded alongside the cached
+/// bundle, so the value survives a restart. `issued_at` is still enforced
+/// through the bundle's own expiry check.
+pub fn set_config_bundle_age_seconds(age_seconds: f64) {
+    use prometheus::{register_gauge, Gauge};
+    use std::sync::OnceLock;
+    static G: OnceLock<Gauge> = OnceLock::new();
+    let gauge = G.get_or_init(|| {
+        register_gauge!(
+            "sbproxy_config_bundle_age_seconds",
+            "Seconds since this node received the config bundle it currently serves",
+        )
+        .expect("config bundle age gauge registers")
+    });
+    gauge.set(age_seconds);
+}
+
+/// Count one config-bundle fetch cycle on
+/// `sbproxy_config_bundle_fetch_total{result}`.
+///
+/// `result` is a closed string:
+///
+/// | Result | Meaning |
+/// |---|---|
+/// | `ok` | Fetched, verified, merged, and applied. |
+/// | `not_modified` | The authority answered 304, or re-served the revision this node already holds. No compile and no reload. |
+/// | `unreachable` | Connect or read failure, timeout, or a status other than 200 and 304. The cached bundle keeps serving. |
+/// | `verify_failed` | Signature, schema, digest, expiry, declared-mode, or anti-replay refusal. |
+/// | `compile_failed` | The merged document did not compile, could not be constructed, or still carried an unresolved `${VAR}` reference. |
+/// | `denied_path` | The bundle named a path the subscriber owns outright. |
+/// | `reload_busy` | Another reload held the reload lock; the cycle was skipped and the next interval retries. |
+pub fn record_config_bundle_fetch(result: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_config_bundle_fetch_total",
+            "Config bundle fetch cycles, by result",
+            &["result"],
+        )
+        .expect("config bundle fetch counter registers")
+    });
+    counter.with_label_values(&[result]).inc();
+}
+
+/// Count one config bundle that applied cleanly on
+/// `sbproxy_config_bundle_applied_total`.
+///
+/// Disjoint from [`record_config_bundle_applied_degraded`] on purpose: a
+/// reload that published the pipeline while a subsystem stayed on prior
+/// state is not a clean apply, and folding the two together would make
+/// the healthy counter unusable as an alert baseline.
+pub fn record_config_bundle_applied() {
+    use prometheus::{register_int_counter, IntCounter};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounter> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter!(
+            "sbproxy_config_bundle_applied_total",
+            "Config bundles applied with every subsystem reloaded cleanly",
+        )
+        .expect("config bundle applied counter registers")
+    });
+    counter.inc();
+}
+
+/// Count one config bundle whose apply left a subsystem behind on
+/// `sbproxy_config_bundle_applied_degraded_total`.
+///
+/// The pipeline is live on the new configuration, but at least one
+/// subsystem carries prior state. Alert on any non-zero rate here.
+pub fn record_config_bundle_applied_degraded() {
+    use prometheus::{register_int_counter, IntCounter};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounter> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter!(
+            "sbproxy_config_bundle_applied_degraded_total",
+            "Config bundles applied while at least one subsystem stayed on prior state",
+        )
+        .expect("config bundle degraded counter registers")
+    });
+    counter.inc();
+}
+
+// --- config source (git) metrics --------------------------------------
+//
+// A `source:` block resolves the config document from somewhere other
+// than the local file, today a git repository. These two families make a
+// stuck source as visible as a stale bundle: the counter says whether
+// the last resolution worked and why not, and the info gauge says which
+// commit the node is actually running.
+
+/// Count one config-source resolution on
+/// `sbproxy_config_source_fetch_total{kind,result}`.
+///
+/// `kind` is the `source.kind` that was resolved (`git` or
+/// `git_overlay`). `result` is a closed string:
+///
+/// | Result | Meaning |
+/// |---|---|
+/// | `ok` | Resolved, and the resolved commit differs from the one already serving, so it was compiled and applied. |
+/// | `not_modified` | Resolved to the commit already serving. No compile and no reload. |
+/// | `unreachable` | The remote could not be reached, or `git` is not installed. The cached document keeps serving. |
+/// | `timeout` | The fetch did not finish inside `timeout_secs` and the child process was killed. |
+/// | `revision_mismatch` | `revision` pins a commit sha and the resolved `HEAD` is a different commit. |
+/// | `verify_failed` | `verify_signature` is set and the tag or commit carries no signature this host can verify. |
+/// | `invalid` | The source block, the resolved path, or the resolved document itself is unusable. |
+/// | `compile_failed` | The resolved document did not compile, could not be constructed, or left a node-local `${VAR}` unresolved. |
+/// | `reload_busy` | Another reload held the reload lock; the cycle was skipped and the next interval retries. |
+pub fn record_config_source_fetch(kind: &'static str, result: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_config_source_fetch_total",
+            "Config source resolutions, by source kind and result",
+            &["kind", "result"],
+        )
+        .expect("config source fetch counter registers")
+    });
+    counter.with_label_values(&[kind, result]).inc();
+}
+
+/// Publish the commit the config source resolved to on
+/// `sbproxy_config_source_revision_info{sha}`.
+///
+/// An info-style gauge: the value is always `1` and the commit travels
+/// as a label, which is how an operator joins "which config" onto every
+/// other series from this node. The previous label set is removed before
+/// the new one is set, so a node that has followed a branch for a year
+/// exports one series rather than a year of them.
+pub fn set_config_source_revision_info(sha: &str) {
+    use prometheus::{register_int_gauge_vec, IntGaugeVec};
+    use std::sync::{Mutex, OnceLock};
+    static G: OnceLock<IntGaugeVec> = OnceLock::new();
+    static CURRENT: Mutex<Option<String>> = Mutex::new(None);
+    let gauge = G.get_or_init(|| {
+        register_int_gauge_vec!(
+            "sbproxy_config_source_revision_info",
+            "Commit the config source resolved to; always 1, the commit is the label",
+            &["sha"],
+        )
+        .expect("config source revision gauge registers")
+    });
+    let mut current = CURRENT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if current.as_deref() == Some(sha) {
+        return;
+    }
+    if let Some(previous) = current.as_deref() {
+        let _ = gauge.remove_label_values(&[previous]);
+    }
+    gauge.with_label_values(&[sha]).set(1);
+    *current = Some(sha.to_string());
+}
+
+/// Count one config-revision announcement on
+/// `sbproxy_config_authority_announce_total{result}`.
+///
+/// An authority publishes its current revision into typed cluster state
+/// after every successful publication, so a mesh-member subscriber can pull
+/// on the hint rather than waiting out its poll interval. The announcement
+/// is an accelerator: `failed` costs propagation speed and nothing else,
+/// because polling converges on its own.
+///
+/// `result` is a closed string:
+///
+/// | Result | Meaning |
+/// |---|---|
+/// | `published` | Written into typed cluster state. |
+/// | `not_clustered` | This node has no mesh node, so there is nobody to tell. The ordinary case for a single-node authority serving subscribers over the internet. |
+/// | `failed` | The cluster write was refused or its owner was unreachable. Subscribers still converge on their poll interval. |
+pub fn record_config_authority_announce(result: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_config_authority_announce_total",
+            "Config revision announcements published to the cluster, by result",
+            &["result"],
+        )
+        .expect("config authority announce counter registers")
+    });
+    counter.with_label_values(&[result]).inc();
+}
+
+/// Count one read of the cluster's config-revision announcement on
+/// `sbproxy_config_bundle_gossip_total{outcome}`.
+///
+/// Recorded once per probe by a mesh-member subscriber while it waits out
+/// its poll interval. `hint` is the interesting series: it counts the pulls
+/// gossip brought forward, so `rate(hint)` is what the accelerator is
+/// actually buying. Every other outcome leaves the subscriber on its
+/// interval.
+///
+/// `outcome` is a closed string:
+///
+/// | Outcome | Meaning |
+/// |---|---|
+/// | `hint` | An announced revision above this node's cursor. The poll interval was cut short and a full verify-and-apply pull ran. |
+/// | `stale` | An announced revision at or below this node's cursor. No fetch. |
+/// | `absent` | Nothing announced, or the announcement passed its TTL. |
+/// | `unreadable` | The announcement could not be read or did not validate. |
+pub fn record_config_bundle_gossip(outcome: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_config_bundle_gossip_total",
+            "Cluster config-revision announcement probes, by outcome",
+            &["outcome"],
+        )
+        .expect("config bundle gossip counter registers")
+    });
+    counter.with_label_values(&[outcome]).inc();
 }
 
 /// Count a well-known projection render failure on
@@ -1816,6 +2432,38 @@ pub fn record_circuit_breaker(origin: &str, from_state: &str, to_state: &str) {
         .inc();
 }
 
+/// Increment `sbproxy_upstream_status_retries_total{origin, status}`.
+///
+/// Called once per status-triggered upstream retry, at the moment the
+/// retry is scheduled. Matched statuses that are skipped (method not
+/// idempotent, body not replayable, `max_attempts` reached) are not
+/// counted; they surface via `x-sbproxy-retry-skip-reason` instead.
+pub fn record_upstream_status_retry(origin: &str, status: u16) {
+    let origin = sanitize_label("origin", origin);
+    let status = status.to_string();
+    metrics()
+        .upstream_status_retries
+        .with_label_values(&[origin.as_str(), status.as_str()])
+        .inc();
+}
+
+/// Increment `sbproxy_upstream_timeout_retries_total{origin, phase}`.
+///
+/// Called once per timeout-triggered upstream retry, at the moment
+/// the retry is scheduled. `phase` is `connect` for TCP connect and
+/// TLS handshake deadlines, `upstream` for read and write deadlines
+/// on the established connection; no other value may be passed.
+/// Timeouts that are not retried (policy does not allow them, cap
+/// reached, response already started, body not replayable) are not
+/// counted.
+pub fn record_upstream_timeout_retry(origin: &str, phase: &str) {
+    let origin = sanitize_label("origin", origin);
+    metrics()
+        .upstream_timeout_retries
+        .with_label_values(&[origin.as_str(), phase])
+        .inc();
+}
+
 /// Increment the active (in-flight) connections gauge for an origin.
 pub fn inc_active(origin: &str) {
     let origin = sanitize_label("origin", origin);
@@ -1888,6 +2536,35 @@ pub fn record_policy_audit_emitted(verdict: &str, surface: &str, policy_id: &str
     counter
         .with_label_values(&[verdict, surface, policy_id.as_str()])
         .inc();
+}
+
+/// Count one rate-limit denial that required peer counts to reach the limit.
+///
+/// This is the observable form of mesh rate limiting's approximation. On a
+/// mesh-only cluster a node admits against its own count plus a merged view of
+/// its peers, so this counter rises exactly when the merged view changed the
+/// outcome: the local count alone would have admitted the request.
+///
+/// Read it two ways. Rising means convergence is doing work, which is the
+/// healthy state on a busy multi-node cluster. Flat at zero while several
+/// nodes serve the same limited key means dissemination is not reaching this
+/// node, and it is enforcing a per-node limit while believing otherwise.
+///
+/// A counter rather than a gauge of the divergence magnitude on purpose. Every
+/// request for every bucket would overwrite such a gauge, so it would sample
+/// whichever bucket happened to be last rather than describing the cluster.
+pub fn record_rate_limit_cluster_peer_denial() {
+    use prometheus::{register_int_counter, IntCounter};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounter> = OnceLock::new();
+    C.get_or_init(|| {
+        register_int_counter!(
+            "sbproxy_rate_limit_cluster_peer_denials_total",
+            "Rate-limit denials that needed peer counts: the local count alone would have admitted",
+        )
+        .expect("rate_limit_cluster_peer_denials counter registers")
+    })
+    .inc();
 }
 
 /// WOR-1130: increment `sbproxy_rate_limit_total{workspace, result}`.
@@ -1978,6 +2655,167 @@ pub fn record_policy_decision_latency(surface: &str, duration_secs: f64) {
         .expect("policy decision latency histogram registers")
     });
     hist.with_label_values(&[surface]).observe(duration_secs);
+}
+
+// --- WOR-2100: payment settlement observability ---
+//
+// Four label names, and every one of them is closed by construction rather
+// than by sanitization. `rail` is the settlement rail's stable spelling and
+// has four values. `operation` names the settlement or recovery step from a
+// fixed list. `outcome` is the durable transition the store committed, one
+// of `succeeded`, `terminal`, `retry_wait`, or `needs_reconciliation`.
+// `provider_class` names the kind of provider rather than the provider
+// itself: `facilitator`, `card_processor`, `lightning_node`, or `meter`.
+//
+// None of these recorders takes a payer identifier, a tenant, a quote id, a
+// challenge id, an intent id, a provider reference, a PaymentIntent id, an
+// invoice, a credential, a client secret, a macaroon, a rune, or provider
+// error text. Those values are not sanitized down to a bounded set here;
+// they are not parameters at all, which is the only form of that promise a
+// reader can check by looking at the signature.
+//
+// That is also why nothing below calls `sanitize_label`. A closed enum
+// cannot overflow a cardinality budget, and routing it through the limiter
+// would consume budget slots that an unbounded label actually needs.
+
+/// Increment `sbproxy_payment_settlement_total{rail, operation, outcome}`.
+///
+/// One observation per durable settlement transition. `outcome` is the
+/// state the store committed, never the adapter's return value, so a
+/// provider that answered "paid" while the durable record moved to
+/// `needs_reconciliation` is counted as `needs_reconciliation`. That is the
+/// point: the metric has to agree with the thing that decides access.
+pub fn record_payment_settlement(rail: &str, operation: &str, outcome: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_payment_settlement_total",
+            "Durable payment settlement transitions, by rail, operation, and committed outcome",
+            &["rail", "operation", "outcome"],
+        )
+        .expect("payment settlement counter registers")
+    });
+    counter.with_label_values(&[rail, operation, outcome]).inc();
+}
+
+/// Increment
+/// `sbproxy_payment_provider_calls_total{rail, operation, provider_class}`.
+///
+/// One observation per call that actually left the process. It exists so an
+/// operator can see that reconciliation is doing provider reads and not
+/// provider writes: `operation` is `query` for every reconciliation, and a
+/// `settle` on this family from a background sweep would be a bug with a
+/// visible signature.
+pub fn record_payment_provider_call(rail: &str, operation: &str, provider_class: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_payment_provider_calls_total",
+            "Payment provider calls that left the process, by rail, operation, and provider class",
+            &["rail", "operation", "provider_class"],
+        )
+        .expect("payment provider call counter registers")
+    });
+    counter
+        .with_label_values(&[rail, operation, provider_class])
+        .inc();
+}
+
+/// Add to `sbproxy_payment_recovery_total{operation, outcome}`.
+///
+/// The recovery worker reports its work as durable-row counts rather than
+/// as events, so this takes a delta. `count` may be zero: incrementing by
+/// zero creates the series, which makes an idle recovery queue draw a flat
+/// line instead of disappearing from the scrape.
+///
+/// There is no `rail` label here on purpose. A sweep claims rows across
+/// every rail in one batch and reports one total, so splitting it by rail
+/// would mean inventing an attribution the worker never computed.
+pub fn record_payment_recovery(operation: &str, outcome: &str, count: u64) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_payment_recovery_total",
+            "Durable rows the settlement recovery worker moved, by recovery operation and committed outcome",
+            &["operation", "outcome"],
+        )
+        .expect("payment recovery counter registers")
+    });
+    counter
+        .with_label_values(&[operation, outcome])
+        .inc_by(count);
+}
+
+/// Add to `sbproxy_payment_worker_ticks_total`.
+///
+/// A tick is one completed pass over every recovery queue. The worker
+/// counts its own ticks, so the observer hands over a delta rather than
+/// calling once per tick and hoping it never misses one.
+///
+/// A flat tick rate beside a growing `sbproxy_payment_recovery_total` is a
+/// backlog. A tick rate that stops entirely is a worker that died, which is
+/// otherwise invisible from outside because the request path keeps serving
+/// and only the recovery of stuck payments quietly stops.
+pub fn record_payment_worker_ticks(completed: u64) {
+    use prometheus::{register_int_counter, IntCounter};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounter> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter!(
+            "sbproxy_payment_worker_ticks_total",
+            "Completed settlement recovery worker ticks"
+        )
+        .expect("payment worker tick counter registers")
+    });
+    counter.inc_by(completed);
+}
+
+/// Set `sbproxy_payment_worker_drain_clean` to 1 or 0.
+///
+/// Reports the truth about shutdown rather than the intent. `0` means the
+/// configured shutdown deadline elapsed and the loop was abandoned partway
+/// through a tick. Nothing is corrupted by that, because every transition
+/// the worker performs is its own committed transaction, but the operator
+/// should be able to tell the difference between a drain and a stop.
+pub fn record_payment_worker_drain(clean: bool) {
+    use prometheus::{register_int_gauge, IntGauge};
+    use std::sync::OnceLock;
+    static G: OnceLock<IntGauge> = OnceLock::new();
+    let gauge = G.get_or_init(|| {
+        register_int_gauge!(
+            "sbproxy_payment_worker_drain_clean",
+            "1 when the settlement worker drained inside its shutdown deadline, 0 when it was abandoned mid tick"
+        )
+        .expect("payment worker drain gauge registers")
+    });
+    gauge.set(i64::from(clean));
+}
+
+/// Set `sbproxy_payment_rail_enabled{rail}` to 1 or 0.
+///
+/// Stamped once per rail at runtime assembly, after the compiled feature
+/// check and after the adapter registered. It answers the question an
+/// operator asks first when a payer reports a rail they cannot use: is this
+/// build even carrying that adapter, and did this configuration turn it on.
+pub fn record_payment_rail_enabled(rail: &str, enabled: bool) {
+    use prometheus::{register_int_gauge_vec, IntGaugeVec};
+    use std::sync::OnceLock;
+    static G: OnceLock<IntGaugeVec> = OnceLock::new();
+    let gauge = G.get_or_init(|| {
+        register_int_gauge_vec!(
+            "sbproxy_payment_rail_enabled",
+            "1 for each settlement rail this build compiled and this configuration registered, 0 otherwise",
+            &["rail"],
+        )
+        .expect("payment rail gauge registers")
+    });
+    gauge.with_label_values(&[rail]).set(i64::from(enabled));
 }
 
 // --- WOR-75: four exemplar-emitting histograms ---
@@ -2585,6 +3423,14 @@ pub fn record_cert_expiry(host: &str, seconds_until_expiry: f64) {
 /// `sbproxy_ocsp_staple_age_seconds{host}`. A stale staple (over
 /// 24 hours) signals an OCSP refresh failure that has not yet
 /// produced a hard handshake error.
+///
+/// WOR-2086: driven once a minute by the stapler's age tick
+/// (`OcspStapler::publish_staple_age`), not only at fetch time. The
+/// series is absent until the first successful fetch, which is
+/// deliberate: for a deployment that expects stapling, never-fetched
+/// is worse than old, and an absent series is what lets an alert
+/// distinguish the two. `SBProxyOcspStapleStale` in
+/// `dashboards/prometheus/alerts.yml` fires past 26 hours.
 pub fn record_ocsp_staple_age(host: &str, age_seconds: f64) {
     use prometheus::{register_gauge_vec, GaugeVec};
     use std::sync::OnceLock;
@@ -3270,7 +4116,11 @@ pub fn set_model_host_deployment_state(deployment: &str, engine: &str, state: &s
         .expect("model host deployment-state gauge registers")
     });
     let deployment = sanitize_label("deployment", deployment);
-    let engine = closed_label(engine, &["vllm", "llama_cpp", "embedded"], "unknown");
+    let engine = closed_label(
+        engine,
+        &["vllm", "sglang", "llama_cpp", "mistralrs"],
+        "unknown",
+    );
     let state = closed_label(state, STATES, "unknown");
     let previous = PREVIOUS.get_or_init(|| Mutex::new(BTreeMap::new()));
     let mut previous = previous
@@ -3323,6 +4173,89 @@ pub fn record_model_host_admission_rejection(deployment: &str, priority: &str, r
         .inc();
 }
 
+/// Count a bounded artifact acquisition failure by `ArtifactError` kind
+/// (e.g. `digest_mismatch`, `transport`, `cache_corrupt`; see
+/// `sbproxy-model-host`'s `ArtifactError::kind`).
+pub fn record_model_host_artifact_error(kind: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = COUNTER.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_model_host_artifact_errors_total",
+            "Model artifact acquisition failures by ArtifactError kind",
+            &["artifact_error_kind"],
+        )
+        .expect("model host artifact-errors counter registers")
+    });
+    // Scoped label name, not the bare "kind" other metrics in this file
+    // use: `budget_for_label` keys on label name globally, and "kind" is
+    // shared by ~20 other metrics with their own, unrelated closed
+    // enums, so a cap sized for ArtifactError's 18 variants must not
+    // apply to any of those.
+    let kind = closed_label(
+        kind,
+        &[
+            "invalid_artifact",
+            "io",
+            "transport",
+            "http_status",
+            "unexpected_response",
+            "size_mismatch",
+            "digest_mismatch",
+            "cache_corrupt",
+            "manual_artifact_missing",
+            "offline_artifact_missing",
+            "startup_artifact_not_selected",
+            "pickle_refused",
+            "pickle_unsafe",
+            "job",
+            "serialization",
+            "clock",
+            "join",
+            "removal_blocked",
+        ],
+        "unknown",
+    );
+    counter.with_label_values(&[kind]).inc();
+}
+
+/// Count a placement plan's per-node rejection by deployment and
+/// `PlacementRejectionReason`.
+pub fn record_model_host_placement_rejection(deployment: &str, reason: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = COUNTER.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_model_host_placement_rejections_total",
+            "Placement plan node rejections by deployment and reason",
+            &["deployment", "placement_reason"],
+        )
+        .expect("model host placement-rejections counter registers")
+    });
+    let deployment = sanitize_label("deployment", deployment);
+    let reason = closed_label(
+        reason,
+        &[
+            "not_worker",
+            "node_unhealthy",
+            "required_labels",
+            "missing_endpoint",
+            "no_capacity",
+            "variant_incompatible",
+            "accelerator_incompatible",
+            "insufficient_memory",
+            "engine_unavailable",
+            "artifact_not_ready",
+        ],
+        "unknown",
+    );
+    counter
+        .with_label_values(&[deployment.as_str(), reason])
+        .inc();
+}
+
 fn bounded_fraction(value: Option<f64>) -> Option<f64> {
     value
         .filter(|value| value.is_finite())
@@ -3335,6 +4268,45 @@ fn closed_label(value: &str, allowed: &[&'static str], fallback: &'static str) -
         .copied()
         .find(|candidate| *candidate == value)
         .unwrap_or(fallback)
+}
+
+// --- key policy metrics --------------------------------------------------
+//
+// `key_record_to_effective_policy` fails closed on a malformed stored key
+// record rather than lowering it into a partial or best-guess policy. This
+// counts every such rejection by its bounded reason, `invalid_budget` among
+// them, so a stored-policy corruption (or a budget value outside what the
+// gateway can represent) shows up as a rate instead of a silent 401/403.
+
+/// Count a stored key record that failed closed while lowering to an
+/// effective policy, by `StoredPolicyErrorKind` reason
+/// (`sbproxy-core`'s `key_policy` module).
+pub fn record_key_policy_stored_rejection(reason: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = COUNTER.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_key_policy_stored_rejections_total",
+            "Stored key records rejected while lowering to an effective policy, by reason",
+            &["reason"],
+        )
+        .expect("key policy stored-rejections counter registers")
+    });
+    let reason = closed_label(
+        reason,
+        &[
+            "empty_key_id",
+            "invalid_policy_revision",
+            "tenant_mismatch",
+            "invalid_principal_selector",
+            "invalid_mcp_reference",
+            "invalid_priority",
+            "invalid_budget",
+        ],
+        "unknown",
+    );
+    counter.with_label_values(&[reason]).inc();
 }
 
 // --- k8s operator metrics ----------------------------------------------
@@ -3581,6 +4553,56 @@ mod tests {
     use super::*;
     use crate::cardinality::CardinalityConfig;
 
+    /// `/metrics` must stay parseable once a channel drop has been recorded.
+    ///
+    /// `record_channel_drop` used to register its counter on the private
+    /// registry *and* the process-global default, while `render()` gathers and
+    /// concatenates both. The family therefore came out twice, with two
+    /// `# HELP` and two `# TYPE` lines for one name, which the Prometheus text
+    /// format forbids and the parser rejects outright. Not a degraded scrape:
+    /// no scrape.
+    ///
+    /// The trigger is what makes it vicious. The counter does not exist until
+    /// something drops a message on a full channel, which happens when the
+    /// proxy is saturated. So `/metrics` was intact every time anyone looked at
+    /// it and broke at precisely the moment an operator needed it to work.
+    #[test]
+    fn a_channel_drop_does_not_break_the_scrape() {
+        record_channel_drop("hooks", "channel_full");
+
+        let rendered = metrics().render();
+
+        assert!(
+            rendered.contains("sbproxy_hooks_channel_dropped_total"),
+            "the drop counter must reach the scrape at all"
+        );
+
+        let mut types: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        let mut helps: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for line in rendered.lines() {
+            if let Some(rest) = line.strip_prefix("# TYPE ") {
+                if let Some(name) = rest.split_whitespace().next() {
+                    *types.entry(name).or_default() += 1;
+                }
+            } else if let Some(rest) = line.strip_prefix("# HELP ") {
+                if let Some(name) = rest.split_whitespace().next() {
+                    *helps.entry(name).or_default() += 1;
+                }
+            }
+        }
+
+        let dupe_types: Vec<_> = types.iter().filter(|(_, n)| **n > 1).collect();
+        assert!(
+            dupe_types.is_empty(),
+            "the Prometheus text format allows one # TYPE per family; duplicates: {dupe_types:?}"
+        );
+        let dupe_helps: Vec<_> = helps.iter().filter(|(_, n)| **n > 1).collect();
+        assert!(
+            dupe_helps.is_empty(),
+            "the Prometheus text format allows one # HELP per family; duplicates: {dupe_helps:?}"
+        );
+    }
+
     // Each test creates its own ProxyMetrics to avoid global state conflicts.
     // Helper functions that call metrics() use the global instance, so those
     // tests verify the global registry path.
@@ -3603,6 +4625,12 @@ mod tests {
         m.ai_cost_saved_micros
             .with_label_values(&["acme", "o", "gpt-4o"])
             .inc_by(900);
+        m.ai_compression_value_tokens_saved
+            .with_label_values(&["acme", "o", "gpt-4o", "window_fit", "model_tokenizer"])
+            .inc_by(120);
+        m.ai_compression_value_cost_saved_micros
+            .with_label_values(&["acme", "o", "gpt-4o", "window_fit", "model_tokenizer"])
+            .inc_by(900);
         m.agent_detect_total
             .with_label_values(&["claude-code-cli", "unsigned-named"])
             .inc();
@@ -3620,6 +4648,8 @@ mod tests {
             "sbproxy_inference_duration_seconds",
             "sbproxy_ai_tokens_saved_total",
             "sbproxy_ai_cost_saved_micros_total",
+            "sbproxy_ai_compression_value_tokens_saved_total",
+            "sbproxy_ai_compression_value_cost_saved_micros_total",
             "sbproxy_agent_detect_total",
             "sbproxy_agent_detect_score",
             "sbproxy_agent_detect_inference_seconds",
@@ -3629,6 +4659,178 @@ mod tests {
                 "missing metric {expected}"
             );
         }
+    }
+
+    #[test]
+    fn compression_value_records_positive_closed_levers_only() {
+        let m = ProxyMetrics::new();
+        record_compression_value_to(
+            &m,
+            CompressionValueObservation {
+                tenant_id: "tenant-a",
+                origin: "origin-a",
+                model: "gpt-4o",
+                lever: "rag_select",
+                token_count_precision: "model_tokenizer",
+                tokens_saved: 30,
+                gross_cost_saved_micros: 300,
+            },
+        );
+        record_compression_value_to(
+            &m,
+            CompressionValueObservation {
+                tenant_id: "tenant-a",
+                origin: "origin-a",
+                model: "gpt-4o",
+                lever: "compact_serialization",
+                token_count_precision: "model_tokenizer",
+                tokens_saved: 40,
+                gross_cost_saved_micros: 400,
+            },
+        );
+        record_compression_value_to(
+            &m,
+            CompressionValueObservation {
+                tenant_id: "tenant-a",
+                origin: "origin-a",
+                model: "gpt-4o",
+                lever: "position_reorder",
+                token_count_precision: "model_tokenizer",
+                tokens_saved: 50,
+                gross_cost_saved_micros: 500,
+            },
+        );
+        record_compression_value_to(
+            &m,
+            CompressionValueObservation {
+                tenant_id: "tenant-a",
+                origin: "origin-a",
+                model: "gpt-4o",
+                lever: "window_fit",
+                token_count_precision: "model_tokenizer",
+                tokens_saved: 120,
+                gross_cost_saved_micros: 900,
+            },
+        );
+        record_compression_value_to(
+            &m,
+            CompressionValueObservation {
+                tenant_id: "tenant-a",
+                origin: "origin-a",
+                model: "gpt-4o",
+                lever: "not-a-lever",
+                token_count_precision: "model_tokenizer",
+                tokens_saved: 50,
+                gross_cost_saved_micros: 50,
+            },
+        );
+        record_compression_value_to(
+            &m,
+            CompressionValueObservation {
+                tenant_id: "tenant-a",
+                origin: "origin-a",
+                model: "gpt-4o",
+                lever: "window_fit",
+                token_count_precision: "exact",
+                tokens_saved: 50,
+                gross_cost_saved_micros: 50,
+            },
+        );
+        record_compression_value_to(
+            &m,
+            CompressionValueObservation {
+                tenant_id: "tenant-a",
+                origin: "origin-a",
+                model: "gpt-4o",
+                lever: "window_fit",
+                token_count_precision: "model_tokenizer",
+                tokens_saved: 0,
+                gross_cost_saved_micros: 0,
+            },
+        );
+        record_compression_value_to(
+            &m,
+            CompressionValueObservation {
+                tenant_id: "tenant-a",
+                origin: "origin-a",
+                model: "gpt-4o",
+                lever: "window_fit",
+                token_count_precision: "model_tokenizer",
+                tokens_saved: 0,
+                gross_cost_saved_micros: 50,
+            },
+        );
+
+        assert_eq!(
+            m.ai_compression_value_tokens_saved
+                .with_label_values(&[
+                    "tenant-a",
+                    "origin-a",
+                    "gpt-4o",
+                    "window_fit",
+                    "model_tokenizer",
+                ])
+                .get(),
+            120
+        );
+        assert_eq!(
+            m.ai_compression_value_cost_saved_micros
+                .with_label_values(&[
+                    "tenant-a",
+                    "origin-a",
+                    "gpt-4o",
+                    "window_fit",
+                    "model_tokenizer",
+                ])
+                .get(),
+            900
+        );
+        let scrape = m.render();
+        assert!(scrape.contains(
+            "sbproxy_ai_compression_value_tokens_saved_total{lever=\"window_fit\",model=\"gpt-4o\",origin=\"origin-a\",tenant_id=\"tenant-a\",token_count_precision=\"model_tokenizer\"} 120"
+        ));
+        assert!(scrape.contains(
+            "sbproxy_ai_compression_value_cost_saved_micros_total{lever=\"window_fit\",model=\"gpt-4o\",origin=\"origin-a\",tenant_id=\"tenant-a\",token_count_precision=\"model_tokenizer\"} 900"
+        ));
+        assert!(scrape.contains(
+            "sbproxy_ai_compression_value_tokens_saved_total{lever=\"rag_select\",model=\"gpt-4o\",origin=\"origin-a\",tenant_id=\"tenant-a\",token_count_precision=\"model_tokenizer\"} 30"
+        ));
+        assert!(scrape.contains(
+            "sbproxy_ai_compression_value_cost_saved_micros_total{lever=\"rag_select\",model=\"gpt-4o\",origin=\"origin-a\",tenant_id=\"tenant-a\",token_count_precision=\"model_tokenizer\"} 300"
+        ));
+        assert!(scrape.contains(
+            "sbproxy_ai_compression_value_tokens_saved_total{lever=\"compact_serialization\",model=\"gpt-4o\",origin=\"origin-a\",tenant_id=\"tenant-a\",token_count_precision=\"model_tokenizer\"} 40"
+        ));
+        assert!(scrape.contains(
+            "sbproxy_ai_compression_value_cost_saved_micros_total{lever=\"compact_serialization\",model=\"gpt-4o\",origin=\"origin-a\",tenant_id=\"tenant-a\",token_count_precision=\"model_tokenizer\"} 400"
+        ));
+        assert!(!scrape.contains("lever=\"position_reorder\""));
+        assert!(!scrape.contains("not-a-lever"));
+        assert!(!scrape.contains("token_count_precision=\"exact\""));
+    }
+
+    #[test]
+    fn heuristic_compression_value_exposes_tokens_without_fabricating_cost() {
+        let m = ProxyMetrics::new();
+        record_compression_value_to(
+            &m,
+            CompressionValueObservation {
+                tenant_id: "tenant-heuristic",
+                origin: "origin-heuristic",
+                model: "self-hosted-model",
+                lever: "window_fit",
+                token_count_precision: "heuristic",
+                tokens_saved: 80,
+                gross_cost_saved_micros: 0,
+            },
+        );
+
+        let scrape = m.render();
+        assert!(scrape.contains("token_count_precision=\"heuristic\""));
+        assert!(scrape.contains("sbproxy_ai_compression_value_tokens_saved_total"));
+        assert!(!scrape.contains(
+            "sbproxy_ai_compression_value_cost_saved_micros_total{lever=\"window_fit\",model=\"self-hosted-model\""
+        ));
     }
 
     #[test]
@@ -3657,14 +4859,6 @@ mod tests {
     }
 
     #[test]
-    fn test_dedup_cache_size_gauge() {
-        let m = ProxyMetrics::new();
-        m.dedup_cache_size.set(7);
-        let output = m.render();
-        assert!(output.contains("sbproxy_dedup_cache_size 7"));
-    }
-
-    #[test]
     fn test_request_duration_histogram() {
         let m = ProxyMetrics::new();
         m.request_duration
@@ -3686,19 +4880,6 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_hits() {
-        let m = ProxyMetrics::new();
-        m.cache_hits
-            .with_label_values(&["example.com", "hit"])
-            .inc();
-        m.cache_hits
-            .with_label_values(&["example.com", "miss"])
-            .inc_by(3);
-        let output = m.render();
-        assert!(output.contains("sbproxy_cache_hits_total"));
-    }
-
-    #[test]
     fn test_render_contains_all_metric_names() {
         let m = ProxyMetrics::new();
         // Touch each legacy metric so they appear in output.
@@ -3710,7 +4891,6 @@ mod tests {
         m.request_duration.with_label_values(&["h"]).observe(0.1);
         m.errors_total.with_label_values(&["h", "e"]).inc();
         m.active_connections.set(1);
-        m.cache_hits.with_label_values(&["h", "hit"]).inc();
         m.ai_cost_usd_micros_total
             .with_label_values(&["p", "m", "tenant-a"])
             .inc_by(42);
@@ -3743,7 +4923,6 @@ mod tests {
         assert!(output.contains("sbproxy_request_duration_seconds"));
         assert!(output.contains("sbproxy_errors_total"));
         assert!(output.contains("sbproxy_active_connections"));
-        assert!(output.contains("sbproxy_cache_hits_total"));
         assert!(output.contains("sbproxy_ai_cost_usd_micros_total"));
         assert!(output.contains("sbproxy_origin_requests_total"));
         assert!(output.contains("sbproxy_origin_request_duration_seconds"));
@@ -4065,6 +5244,49 @@ mod tests {
         let out = metrics().render();
         assert!(out.contains("sbproxy_agent_detect_score_bucket"));
         assert!(out.contains("sbproxy_agent_detect_inference_seconds_bucket"));
+    }
+
+    #[test]
+    fn record_trust_tier_stamps_the_closed_tier_label() {
+        let before = metrics()
+            .trust_tier_requests
+            .with_label_values(&["strong"])
+            .get();
+        record_trust_tier("strong");
+        let after = metrics()
+            .trust_tier_requests
+            .with_label_values(&["strong"])
+            .get();
+        assert_eq!(after, before + 1);
+    }
+
+    #[test]
+    fn record_inbound_key_request_emits_safe_tenant_and_key_dimensions() {
+        let before = metrics()
+            .inbound_key_requests
+            .with_label_values(&["openai", "native", "tenant-a", "native:tenant-a:api:openai"])
+            .get();
+        record_inbound_key_request(
+            Some("openai"),
+            "native",
+            "tenant-a",
+            Some("native:tenant-a:api:openai"),
+        );
+        let after = metrics()
+            .inbound_key_requests
+            .with_label_values(&["openai", "native", "tenant-a", "native:tenant-a:api:openai"])
+            .get();
+
+        assert_eq!(after, before + 1);
+        record_inbound_key_request(None, "none", "tenant-a", None);
+        let rendered = metrics().render();
+        assert!(rendered.contains(
+            "sbproxy_inbound_key_requests_total{api_key_id=\"native:tenant-a:api:openai\",key_mode=\"native\",provider=\"openai\",tenant_id=\"tenant-a\"}"
+        ));
+        assert!(rendered.contains(
+            "sbproxy_inbound_key_requests_total{api_key_id=\"\",key_mode=\"none\",provider=\"\",tenant_id=\"tenant-a\"}"
+        ));
+        assert!(!rendered.contains("sk-caller-owned-canary"));
     }
 
     #[test]
@@ -4703,6 +5925,66 @@ mod tests {
         assert!(out.contains(
             "sbproxy_model_host_admission_rejections_total{deployment=\"qwen3-32b\",priority=\"interactive\",reason=\"queue_full\"} 1"
         ));
+    }
+
+    #[test]
+    fn set_model_host_load_queue_depth_reflects_queue_transitions() {
+        // The gauge has to track a request joining the queue and then
+        // leaving it, not just accept a single set() call. Pinned to a
+        // model name unused by any other test in this module so the
+        // render-string assertions below are unambiguous.
+        let model = "load-queue-depth-transition-test-model";
+        set_model_host_load_queue_depth(model, 0);
+        let out = metrics().render();
+        assert!(out.contains(&format!(
+            "sbproxy_model_host_load_queue_depth{{model=\"{model}\"}} 0"
+        )));
+
+        // A second request queues behind the first cold load.
+        set_model_host_load_queue_depth(model, 1);
+        let out = metrics().render();
+        assert!(out.contains(&format!(
+            "sbproxy_model_host_load_queue_depth{{model=\"{model}\"}} 1"
+        )));
+
+        // Both requests dequeue once the load completes.
+        set_model_host_load_queue_depth(model, 0);
+        let out = metrics().render();
+        assert!(out.contains(&format!(
+            "sbproxy_model_host_load_queue_depth{{model=\"{model}\"}} 0"
+        )));
+    }
+
+    #[test]
+    fn model_host_artifact_error_and_placement_rejection_metrics_emit() {
+        record_model_host_artifact_error("digest_mismatch");
+        record_model_host_artifact_error("not_a_real_kind");
+        record_model_host_placement_rejection("qwen3-32b", "insufficient_memory");
+        let out = metrics().render();
+        assert!(out.contains(
+            "sbproxy_model_host_artifact_errors_total{artifact_error_kind=\"digest_mismatch\"} 1"
+        ));
+        assert!(out.contains(
+            "sbproxy_model_host_artifact_errors_total{artifact_error_kind=\"unknown\"} 1"
+        ));
+        assert!(out.contains(
+            "sbproxy_model_host_placement_rejections_total{deployment=\"qwen3-32b\",placement_reason=\"insufficient_memory\"} 1"
+        ));
+    }
+
+    // --- key policy metrics ---
+
+    #[test]
+    fn key_policy_stored_rejection_counts_by_reason() {
+        record_key_policy_stored_rejection("invalid_budget");
+        record_key_policy_stored_rejection("invalid_budget");
+        record_key_policy_stored_rejection("tenant_mismatch");
+        let out = metrics().render();
+        assert!(
+            out.contains("sbproxy_key_policy_stored_rejections_total{reason=\"invalid_budget\"} 2")
+        );
+        assert!(out
+            .contains("sbproxy_key_policy_stored_rejections_total{reason=\"tenant_mismatch\"} 1"));
     }
 
     // --- k8s operator metrics ---

@@ -17,9 +17,12 @@ members = [
     "crates/sbproxy-keystore",
     "crates/sbproxy-storage",
     "crates/sbproxy-mesh",
+    "crates/sbproxy-meter",
     "crates/sbproxy-middleware",
     "crates/sbproxy-extension",
     "crates/sbproxy-ai",
+    "crates/sbproxy-rag",
+    "crates/sbproxy-billing",
     "crates/sbproxy-tls",
     "crates/sbproxy-openapi",
     "crates/sbproxy-k8s-operator",
@@ -29,6 +32,7 @@ members = [
     "crates/sbproxy-classifier-client",
     "crates/sbproxy-agent-detect",
     "crates/sbproxy-model-host",
+    "crates/sbproxy-capability",
     "e2e",
 ]
 # The k8s operator pulls kube + k8s-openapi, which adds ~30-60s to a cold
@@ -53,9 +57,12 @@ default-members = [
     "crates/sbproxy-keystore",
     "crates/sbproxy-storage",
     "crates/sbproxy-mesh",
+    "crates/sbproxy-meter",
     "crates/sbproxy-middleware",
     "crates/sbproxy-extension",
     "crates/sbproxy-ai",
+    "crates/sbproxy-rag",
+    "crates/sbproxy-billing",
     "crates/sbproxy-tls",
     "crates/sbproxy-openapi",
     "crates/sbproxy-classifiers",
@@ -67,7 +74,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "1.5.0"
+version = "1.9.0"
 edition = "2021"
 rust-version = "1.82"
 authors = ["Soap Bucket LLC"]
@@ -94,15 +101,31 @@ sbproxy-vault = { path = "crates/sbproxy-vault" }
 sbproxy-keystore = { path = "crates/sbproxy-keystore" }
 sbproxy-storage = { path = "crates/sbproxy-storage" }
 sbproxy-mesh = { path = "crates/sbproxy-mesh" }
+# WOR-2123: attested consumption metering, plus the hash chain and receipt
+# signing hoisted into it by WOR-2125. It takes third-party crates but no
+# workspace crate, so an operator metering a plain REST API never compiles the
+# AI stack to do it.
+sbproxy-meter = { path = "crates/sbproxy-meter" }
 sbproxy-middleware = { path = "crates/sbproxy-middleware" }
 sbproxy-extension = { path = "crates/sbproxy-extension" }
 sbproxy-model-host = { path = "crates/sbproxy-model-host" }
 sbproxy-ai = { path = "crates/sbproxy-ai" }
+# WOR-2098: retrieval-augmented generation runtime. Providers are cargo
+# features that default off, so consumers opt into exactly the embedding
+# and vector-store adapters they compile.
+sbproxy-rag = { path = "crates/sbproxy-rag", default-features = false }
+# WOR-2100: payment settlement runtime. The default build compiles only the
+# normalized money, intent, and receipt domain. The durable store, the
+# authoritative service, the recovery worker, and every rail adapter sit
+# behind cargo features, so a binary carries exactly the settlement code it
+# opted into and no payment feature joins the binary default set.
+sbproxy-billing = { path = "crates/sbproxy-billing", default-features = false }
 sbproxy-tls = { path = "crates/sbproxy-tls" }
 sbproxy-openapi = { path = "crates/sbproxy-openapi" }
 sbproxy-classifiers = { path = "crates/sbproxy-classifiers" }
 sbproxy-classifier-client = { path = "crates/sbproxy-classifier-client" }
 sbproxy-agent-detect = { path = "crates/sbproxy-agent-detect" }
+sbproxy-capability = { path = "crates/sbproxy-capability" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -116,10 +139,18 @@ zeroize = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = { package = "yaml_serde", version = "0.10" }
+# Compact serde binary format shared by the internal mesh wire (RPC frames +
+# gossip) and the semantic-cache wire. Maintained, unlike bincode
+# (RUSTSEC-2025-0141). One declaration so both crates resolve the same copy.
+postcard = { version = "1", features = ["use-std"] }
 
 # Concurrency and data structures
 arc-swap = "1"
 dashmap = "6"
+# Bounded LRU maps (sbproxy-ai response caches, sbproxy-rag stale-context
+# cache). Same 0.16 line sbproxy-ai already pins so the lockfile keeps one
+# copy.
+lru = "0.16"
 parking_lot = "0.12"
 smallvec = { version = "1", features = ["union"] }
 compact_str = "0.8"
@@ -154,6 +185,7 @@ thiserror = "2"
 
 # HTTP
 http = "1"
+httpdate = "1"
 http-body-util = "0.1"
 hyper = { version = "1.9", features = ["client", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
@@ -176,6 +208,7 @@ percent-encoding = "2"
 regex = "1"
 minijinja = "2"
 pulldown-cmark = "0.12"
+graphql-parser = "0.4.1"
 
 # Networking
 ipnetwork = "0.20"
@@ -196,8 +229,8 @@ rquickjs = { version = "0.11", features = ["bindgen", "classes", "properties", "
 # wasmtime + wasi-common move in lockstep; bump both together. The version
 # floor is set by the cargo-deny advisory gate, which fails on any
 # unpatched RUSTSEC entry against wasmtime.
-wasmtime = { version = "44.0.1", default-features = false, features = ["cranelift", "runtime", "parallel-compilation"] }
-wasi-common = "44"
+wasmtime = { version = "46.0.2", default-features = false, features = ["cranelift", "runtime", "parallel-compilation"] }
+wasi-common = "46"
 
 # HTTP client
 reqwest = { version = "0.12", features = ["json", "stream", "blocking"] }
@@ -211,6 +244,13 @@ reqwest = { version = "0.12", features = ["json", "stream", "blocking"] }
 tonic = "0.12"
 prost = "0.13"
 tonic-build = "0.12"
+
+# Vendored `protoc` binary for deterministic protobuf generation. Pinned
+# exactly so the LND gRPC stubs generated by sbproxy-billing come from one
+# known compiler build rather than whatever is on the host PATH. It is an
+# optional build-dependency of an off-by-default feature, so a default
+# workspace build never compiles or runs it.
+protoc-bin-vendored = "=3.2.0"
 
 # Dynamic protobuf reflection for descriptor-driven REST <-> gRPC
 # transcoding (WOR-819). Parses a FileDescriptorSet at config load and
@@ -230,7 +270,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 # dep so sbproxy-modules can drive XREAD directly for feature feeds (WAF
 # rule subscription) without going through the KVStore facade.
 # `streams` enables the XREAD typed reply parser (StreamReadReply).
-redis = { version = "0.25", default-features = false, features = ["tokio-comp", "streams"] }
+redis = { version = "0.31.0", default-features = false, features = ["tokio-comp", "streams"] }
 
 # Bloom filter
 bloomfilter = "1"
@@ -239,6 +279,10 @@ bloomfilter = "1"
 sha2 = "0.11"
 hex = "0.4"
 hmac = "0.13"
+# Constant-time equality for digest, MAC, and token comparison. Promoted to a
+# workspace dependency so new crates reach for one audited implementation
+# instead of hand-rolling another byte-by-byte comparison loop.
+subtle = "2"
 
 # MCP tool-versioning compatibility oracle (mcp/compat). `semver` compares
 # declared tool versions for the version-bump linter; `serde_json_canonicalizer`
@@ -339,6 +383,31 @@ x509-parser = "0.16"
 #   codegen-units = 1
 # These would add an additional 5-15% rps per RUST_OPTIMIZATIONS.md A1.
 # ----------------------------------------------------------------------------
+# WOR-2066: the two capability guards parse every production source file in the
+# workspace with `syn` (677 files, ~17.6MB). Those guards run as tests, so they
+# build under the dev/test profiles, where an unoptimised `syn` dominated their
+# runtime and set the floor for the whole suite. Optimising just these three
+# packages leaves every other crate at dev opt-level, so incremental rebuilds
+# stay fast, and it costs one extra optimised compile of dependencies that
+# rarely change. This also speeds up proc-macro expansion across the workspace.
+[profile.dev.package.syn]
+opt-level = 3
+
+[profile.dev.package.proc-macro2]
+opt-level = 3
+
+[profile.dev.package.unicode-ident]
+opt-level = 3
+
+[profile.test.package.syn]
+opt-level = 3
+
+[profile.test.package.proc-macro2]
+opt-level = 3
+
+[profile.test.package.unicode-ident]
+opt-level = 3
+
 [profile.release]
 opt-level = 3
 strip = "symbols"

@@ -30,6 +30,24 @@ For human-facing documentation, see `docs/architecture.md`, `docs/configuration.
 - alerts.prometheus: PromQL recording and alerting rules under `deploy/alerts/`.
 - observability_stack: reference Compose stack (Prometheus, Grafana, Tempo, Loki, OTel collector, Phoenix, Langfuse) at `examples/observability-stack/`, pre-provisioned with dashboards, alerts, and seeded LLM trace projects.
 
+## AI context compression
+
+- ai_context_compression.profiles: each AI route can declare a default and named compression pipelines selected by `X-Compression`, governed key, CEL, then route default.
+- ai_context_compression.explicit_budget: `window_fit.input_budget_tokens` enforces the smaller of an explicit input target and known model capacity while preserving instructions, the current turn, contiguous history, and tool exchanges.
+- ai_context_compression.state: `summary_buffer` with omitted state defaults to a process-owned Local redb database with a 24-hour TTL; explicit Redis and mesh remain available for multi-process state and never fall back.
+- ai_context_compression.local_path: `proxy.compression_state.local_path` pins the one-process database; otherwise startup selects `/var/lib/sbproxy`, XDG state, or the platform home-state directory, while Windows requires an explicit path.
+- ai_context_compression.stateless: `rag_select`, `compact_serialization`, `position_reorder`, and `window_fit` need no state backend and do not create a Local database.
+- ai_context_compression.value: successful provider requests record per-lever target-model tokens and gross input cost saved in bounded metrics and `GET /admin/model-host/value`, with tokenizer-versus-heuristic precision.
+- ai_context_compression.eval: a deterministic off/on smoke gate covers synthetic retrieval and coding-agent shapes; external benchmark adapters are import-and-report-only.
+- ai_guardrails.default_centroids: toxicity, jailbreak, and content-safety classifier modes ship versioned MiniLM centroids with exact model, tokenizer, and artifact SHA-256 pins; operator examples extend the defaults.
+
+## RAG
+
+- ai_rag.gateway_retrieval: a per-route `rag:` block on `ai_proxy` embeds the query, runs a tenant-scoped vector search, and injects retrieved context between the original and augmented input guardrail passes (see `docs/rag.md`).
+- ai_rag.providers: five embedding adapters (openai, compatible, cohere, bedrock, vertex) and five vector stores (chroma, pinecone, qdrant, redis, weaviate) behind `rag-*` Cargo features; the released binary ships `rag-full`.
+- ai_rag.failure_policy: `on_failure.mode` is `fail_closed` (502 `rag_retrieval_failed`, default), `continue_without_context`, or `use_stale` with a bounded per-runtime cache that fails closed when expired.
+- ai_rag.metrics: `sbproxy_ai_rag_requests_total{embedding,vector_store,outcome}`, `sbproxy_ai_rag_latency_seconds{stage,provider}`, and `sbproxy_ai_rag_context_bytes`; query text and chunk content are never traced.
+
 ## Audit
 
 - admin_audit_envelope: typed `AdminAuditEvent` carrying actor, action, target, before/after diff, reason, request_id, trace_id, ip, and user_agent; emitted by every state-mutating endpoint.
@@ -47,6 +65,7 @@ For human-facing documentation, see `docs/architecture.md`, `docs/configuration.
 
 ## CI and release
 
-- doc_ci: lychee link checking and code-block syntax validation across `sbproxy-rust/docs/`; runs on every PR touching docs.
-- examples_smoke: every directory under `examples/` boots via `docker compose`, hits `/healthz`, and exercises one feature endpoint with an audit-log assertion.
+- doc_ci: lychee link checking and code-block syntax validation across `docs/`; runs on every PR touching docs.
+- examples_smoke: each Compose example with `smoke.json` boots via `docker compose`, waits for its declared health path, then evaluates its declared request cases and optional feature endpoints; audit assertions run only when `audit_check` is true.
+- ai_external_guardrails: typed external adapters for generic webhooks, Presidio, Lakera, Aporia, Azure Content Safety, Bedrock, CrowdStrike, Mistral, Pangea, and Patronus; response reads are capped and malformed responses obey the configured fail mode.
 - observability_budgets_ci: SLO burn-rate regression and cardinality budget regression run on PRs touching `sbproxy-observe/` or metric labels.

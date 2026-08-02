@@ -1,5 +1,15 @@
 # MCP sessions and a file-sink ledger
 
+> **Partially runnable.** `federated_servers[].origin` here is
+> `github.example.com`, an RFC 2606 reserved placeholder, not a running MCP
+> server, so a federated `tools/call` cannot complete end-to-end. Session
+> lifecycle (`initialize`, the `Mcp-Session-Id` header, `400`/`404` on a
+> missing or unknown id, `DELETE`) is handled by the gateway itself and
+> works as shipped; the session ledger records whatever calls you can make
+> against your own upstream. See
+> [`examples/mcp-federation`](../mcp-federation/) for the base federation
+> mechanics and its own end-to-end caveat.
+
 Turns on streamable HTTP session management and writes a session-ledger
 NDJSON artifact.
 

@@ -231,8 +231,24 @@ pub struct ModelMetadata {
     pub kv_heads: u64,
     /// Per-head dimension.
     pub head_dim: u64,
+    /// Hidden (embedding) size. Used to size MoE expert FFN tensors; `0`
+    /// when the metadata did not declare it.
+    #[serde(default)]
+    pub hidden_size: u64,
     /// Max context length the weights declare.
     pub max_context: u64,
+    /// Number of routed experts per MoE layer, or `0` for a dense model
+    /// (WOR-1866). A non-zero count means the bulk of the weights live in
+    /// per-layer expert FFN tensors that the fit planner can place on the
+    /// GPU or spill to CPU RAM.
+    #[serde(default)]
+    pub expert_count: u64,
+    /// Per-expert feed-forward (intermediate) dimension, used to size the
+    /// routed-expert tensors for MoE placement (WOR-1866). `0` for a dense
+    /// model, or when the header does not declare it (placement then falls
+    /// back to the parameter-count split).
+    #[serde(default)]
+    pub expert_ffn_length: u64,
 }
 
 impl ModelMetadata {
@@ -256,12 +272,48 @@ impl ModelMetadata {
             .get("max_position_embeddings")
             .and_then(|x| x.as_u64())
             .unwrap_or(8192);
+        // MoE shape (WOR-1866): `num_local_experts` / `num_experts` and the
+        // per-expert intermediate size. Absent on a dense model, which
+        // leaves `expert_count` at 0 and the planner in whole-model mode.
+        let expert_count = v
+            .get("num_local_experts")
+            .or_else(|| v.get("num_experts"))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+        let expert_ffn_length = v
+            .get("moe_intermediate_size")
+            .or_else(|| v.get("intermediate_size"))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+        let hidden_size = hidden.unwrap_or_else(|| head_dim.saturating_mul(attn_heads));
+        // A raw `hf:` reference's config.json rarely carries `num_parameters`,
+        // so `params` arrives as 0. Left at 0 the fit planner sees a
+        // weightless model, keeps it on one GPU, and reports absurd
+        // throughput; estimate the count from the architecture instead so
+        // tensor-parallel and fit decisions are based on the real size.
+        let params = if params > 0 {
+            params
+        } else {
+            estimate_transformer_params(
+                v,
+                layers,
+                hidden_size,
+                attn_heads,
+                kv_heads,
+                head_dim,
+                expert_count,
+                expert_ffn_length,
+            )
+        };
         Some(Self {
             params,
             layers,
             kv_heads,
             head_dim,
+            hidden_size,
             max_context,
+            expert_count,
+            expert_ffn_length,
         })
     }
 
@@ -295,6 +347,8 @@ impl ModelMetadata {
         let mut context_length = None;
         let mut key_length = None;
         let mut param_count = None;
+        let mut expert_count = None;
+        let mut expert_ffn_length = None;
 
         for _ in 0..kv_count {
             let key = r.gguf_string()?;
@@ -311,6 +365,14 @@ impl ModelMetadata {
                 _ if key.ends_with(".embedding_length") => embedding_length = scalar,
                 _ if key.ends_with(".context_length") => context_length = scalar,
                 _ if key.ends_with(".attention.key_length") => key_length = scalar,
+                // MoE shape (WOR-1866). `.expert_feed_forward_length` is the
+                // per-expert FFN dim; fall back to the dense
+                // `.feed_forward_length` when only that is present.
+                _ if key.ends_with(".expert_count") => expert_count = scalar,
+                _ if key.ends_with(".expert_feed_forward_length") => expert_ffn_length = scalar,
+                _ if key.ends_with(".feed_forward_length") => {
+                    expert_ffn_length = expert_ffn_length.or(scalar)
+                }
                 _ if key == "general.parameter_count" => param_count = scalar,
                 _ => {}
             }
@@ -325,7 +387,10 @@ impl ModelMetadata {
             layers,
             kv_heads,
             head_dim,
+            hidden_size: embedding_length.unwrap_or_else(|| head_dim.saturating_mul(heads)),
             max_context: context_length.unwrap_or(8192),
+            expert_count: expert_count.unwrap_or(0),
+            expert_ffn_length: expert_ffn_length.unwrap_or(0),
         })
     }
 
@@ -378,6 +443,35 @@ impl ModelMetadata {
             None => self.vram_estimate_bytes(quant, seq_len, overhead),
             Some(bpe) => (self.weight_bytes(quant) + self.kv_bytes_with(bpe, seq_len)) * overhead,
         }
+    }
+
+    /// Whether this is a mixture-of-experts model whose routed experts the
+    /// fit planner can place across GPU VRAM and CPU RAM (WOR-1866). A
+    /// dense model, or one missing the expert dimensions, is `false` and
+    /// keeps whole-model placement.
+    pub fn is_moe(&self) -> bool {
+        self.expert_count > 0 && self.expert_ffn_length > 0 && self.hidden_size > 0
+    }
+
+    /// Estimated weight bytes held in routed-expert FFN tensors at `quant`
+    /// (WOR-1866): the portion a MoE model can spill to CPU RAM. Each
+    /// expert holds three FFN matrices (gate, up, down) of
+    /// `hidden x expert_ffn`, so the routed-expert parameter count is
+    /// `layers x experts x 3 x hidden x expert_ffn`. Charging that share
+    /// of the params-derived weight total keeps the estimate consistent
+    /// with [`Self::weight_bytes`], clamped just below the total so the
+    /// non-expert remainder stays positive. `0` for a dense model.
+    pub fn expert_weight_bytes(&self, quant: Quant) -> f64 {
+        if !self.is_moe() || self.params == 0 {
+            return 0.0;
+        }
+        let expert_params = (self.layers as u128)
+            .saturating_mul(self.expert_count as u128)
+            .saturating_mul(3)
+            .saturating_mul(self.hidden_size as u128)
+            .saturating_mul(self.expert_ffn_length as u128);
+        let fraction = (expert_params as f64 / self.params as f64).clamp(0.0, 0.95);
+        self.weight_bytes(quant) * fraction
     }
 }
 
@@ -485,6 +579,24 @@ impl<'a> GgufReader<'a> {
     }
 }
 
+/// A mixture-of-experts placement plan (WOR-1866): how a MoE model's
+/// routed-expert tensors are split between GPU VRAM and CPU RAM so a model
+/// too large to fit whole still serves. Emitted to llama.cpp as
+/// `--n-cpu-moe`, which keeps attention, shared, and dense tensors on the
+/// GPU while the routed experts of the first `cpu_moe_layers` layers live
+/// in RAM. Prefill is mostly unaffected; decode is bounded by RAM
+/// bandwidth for the spilled experts, so tokens/sec drops accordingly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MoePlacement {
+    /// Layers whose routed-expert FFN tensors are held in CPU RAM
+    /// (llama.cpp `--n-cpu-moe`). `0` means every expert stays on the GPU.
+    pub cpu_moe_layers: u64,
+    /// Routed-expert weight bytes kept resident on the GPU.
+    pub gpu_expert_bytes: u64,
+    /// Routed-expert weight bytes spilled to CPU RAM.
+    pub ram_spilled_bytes: u64,
+}
+
 /// A chosen plan: the quant that fits and runs, with the estimate.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FitPlan {
@@ -492,44 +604,85 @@ pub struct FitPlan {
     pub quant_name: String,
     /// Its capability class.
     pub quant: Quant,
-    /// Estimated VRAM in bytes at the planned context length.
+    /// Estimated VRAM in bytes on each device at the planned context length.
     pub estimated_vram_bytes: u64,
-    /// The GPU it was fit to.
-    pub gpu_index: u32,
+    /// The GPU(s) it was fit to: one for single-GPU, the tensor-parallel group
+    /// for multi-GPU. Mirrors `memory.device_indexes`.
+    pub gpu_indexes: Vec<u32>,
     /// Context length the estimate assumed.
     pub seq_len: u64,
     /// Exact components used by admission and status.
     pub memory: MemoryEstimate,
+    /// MoE expert placement, when routed experts were spilled to CPU RAM to
+    /// fit (WOR-1866). `None` for a dense model or a MoE model that fit whole.
+    pub moe: Option<MoePlacement>,
+    /// Predicted single-stream decode throughput and safe batch ceiling for
+    /// this plan (WOR-1670), when the GPU reports memory bandwidth. Advisory:
+    /// it catches "this fits but will be slow" before an engine starts.
+    pub throughput: Option<ThroughputEstimate>,
+    /// Fraction of each device's total VRAM the engine should reserve,
+    /// emitted as vLLM/SGLang `--gpu-memory-utilization`. Derived from the
+    /// per-device byte budget and the device capacity so a fit-bounded
+    /// engine honors the same envelope the planner reserved. `None` when
+    /// the device capacity is unknown; the launcher then uses a safe
+    /// default utilization.
+    pub gpu_memory_fraction: Option<f32>,
+}
+
+impl FitPlan {
+    /// Tensor-parallel degree: the number of GPUs the plan spans.
+    pub fn tp_degree(&self) -> usize {
+        self.gpu_indexes.len().max(1)
+    }
+
+    /// The first GPU in the plan.
+    pub fn primary_gpu(&self) -> u32 {
+        self.gpu_indexes.first().copied().unwrap_or(0)
+    }
 }
 
 /// Device-specific memory requirement for one deployment generation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MemoryEstimate {
-    /// Selected worker-local device index.
-    pub device_index: u32,
-    /// Quantized model weight bytes.
+    /// Worker-local device indexes this generation occupies: one for a
+    /// single-GPU deployment, the tensor-parallel group for multi-GPU. Every
+    /// device in the set carries the same per-device requirement below, because
+    /// tensor parallelism shards weights and KV evenly across identical cards.
+    pub device_indexes: Vec<u32>,
+    /// Quantized model weight bytes, per device (full weights / tp degree).
     pub weight_bytes: u64,
-    /// KV-cache bytes at the selected context and dtype.
+    /// KV-cache bytes at the selected context and dtype, per device.
     pub kv_bytes: u64,
-    /// Framework, activation, and device-context overhead.
+    /// Framework, activation, and device-context overhead, per device.
     pub runtime_overhead_bytes: u64,
-    /// Configured headroom added after runtime overhead.
+    /// Configured headroom added after runtime overhead, per device.
     pub safety_margin_bytes: u64,
-    /// Sum of every component above.
+    /// Sum of every component above: the bytes reserved on each device in the set.
     pub total_bytes: u64,
 }
 
 impl MemoryEstimate {
-    /// Construct a compatibility estimate when only a total is known.
+    /// Construct a single-device compatibility estimate when only a total is known.
     pub fn from_total(device_index: u32, total_bytes: u64) -> Self {
         Self {
-            device_index,
+            device_indexes: vec![device_index],
             weight_bytes: total_bytes,
             kv_bytes: 0,
             runtime_overhead_bytes: 0,
             safety_margin_bytes: 0,
             total_bytes,
         }
+    }
+
+    /// The first device in the set. Reservation bookkeeping that predates
+    /// multi-device selection keys on this.
+    pub fn primary_device(&self) -> u32 {
+        self.device_indexes.first().copied().unwrap_or(0)
+    }
+
+    /// Tensor-parallel degree: the number of devices this generation spans.
+    pub fn tp_degree(&self) -> usize {
+        self.device_indexes.len().max(1)
     }
 }
 
@@ -559,6 +712,11 @@ pub enum FitError {
         /// Smallest candidate estimate in GiB.
         smallest_gib: f64,
     },
+    /// A fixed tensor-parallel degree or replica count cannot be placed on
+    /// the available devices (wrong device count, a degree that does not
+    /// divide the KV heads, or more replicas than the node can host).
+    #[error("{0}")]
+    Unsatisfiable(String),
 }
 
 /// Default framework-overhead multiplier on weights + KV.
@@ -566,11 +724,13 @@ pub const DEFAULT_OVERHEAD: f64 = 1.15;
 
 /// A rough throughput prediction for a model + quant on a GPU
 /// (WOR-1670). Decode is memory-bandwidth bound, so single-stream
-/// tokens/sec is the achievable bandwidth divided by the bytes read
-/// per generated token (the weights, at the chosen quant). A real
-/// profiled model (Vidur/Dooly) would be more accurate; this roofline
-/// estimate needs only device specs and catches "this quant fits but
-/// will be painfully slow" before an engine ever starts.
+/// seconds/token is the bytes read per generated token (the weights,
+/// at the chosen quant) over the achievable bandwidth, plus a fixed
+/// per-token host cost ([`PER_TOKEN_OVERHEAD_SECS`]) that dominates
+/// small models. A real profiled model (Vidur/Dooly) would be more
+/// accurate; this two-term estimate needs only device specs and
+/// catches "this quant fits but will be painfully slow" before an
+/// engine ever starts.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ThroughputEstimate {
     /// Estimated single-stream decode tokens/sec.
@@ -582,15 +742,133 @@ pub struct ThroughputEstimate {
     pub safe_max_batch: u64,
 }
 
+impl ThroughputEstimate {
+    /// Scale a single-device decode estimate for a tensor-parallel group of
+    /// `degree` GPUs. Each GPU holds 1/degree of the weights and streams its
+    /// shard in parallel over NVLink, so single-stream decode (a memory-bound
+    /// weight read) scales roughly linearly with the degree; `bytes_per_token`
+    /// becomes the per-device figure. A degree of 1 is a no-op. Note the
+    /// estimate ignores KV reads and interconnect latency, and the linear
+    /// scaling also divides the fixed per-token overhead across the group,
+    /// which slightly flatters a TP group; the tp=2 A100 calibration point
+    /// in [`estimate_throughput`] still lands within +/-25% of measured.
+    fn scaled_for_tp(mut self, degree: usize) -> Self {
+        let degree = degree.max(1);
+        self.decode_tokens_per_sec *= degree as f64;
+        self.bytes_per_token /= degree as u64;
+        self
+    }
+}
+
 /// Fraction of peak memory bandwidth a real engine sustains during
-/// decode. Empirically 60-80%; use a conservative midpoint.
-pub const DECODE_BANDWIDTH_EFFICIENCY: f64 = 0.7;
+/// decode. Calibrated against live A100 gateway measurements
+/// (WOR-1670): Qwen3-32B bf16 at tp=2 measured ~33 tok/s, which the
+/// old conservative 0.7 under-predicted by ~2.4x. Once the fixed
+/// per-token host cost ([`PER_TOKEN_OVERHEAD_SECS`]) is separated
+/// out, the big-model weight stream runs at roughly 85-90% of peak;
+/// use the lower edge.
+pub const DECODE_BANDWIDTH_EFFICIENCY: f64 = 0.85;
+
+/// Fixed per-token host cost in seconds: scheduler step, sampling, and
+/// kernel-launch overhead every decode step pays regardless of model
+/// size. Derived from the small-model A100 calibration point
+/// (WOR-1670): Qwen3-0.6B bf16 (~1.2e9 bytes of weights) measured
+/// ~200 tok/s on a 1555 GB/s card, so
+/// `1/200 - 1.2e9 / (1555e9 * 0.85) ~= 5.0e-3 - 0.9e-3 ~= 4.1e-3` s.
+/// Small models are dominated by this term (a pure roofline
+/// over-predicted the 0.6B by ~2x); big models barely notice it.
+pub const PER_TOKEN_OVERHEAD_SECS: f64 = 4.1e-3;
+
+/// Fixed per-device VRAM a CUDA inference engine consumes before any KV
+/// cache: the CUDA context, framework allocator, and compiled-graph buffers.
+/// The planner's `runtime_overhead_bytes` models this as a small multiplier
+/// of the working set, which under-counts it badly for small models, so the
+/// `--gpu-memory-utilization` mapping adds this fixed floor on top of the
+/// planned budget. Without it vLLM reserves the planned bytes, spends this
+/// much on its own runtime, and then has too little left for the KV cache it
+/// needs for the model's max sequence length.
+pub const ENGINE_FIXED_OVERHEAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Map a per-device byte budget to a vLLM/SGLang `--gpu-memory-utilization`
+/// fraction of the device's total VRAM. Adds [`ENGINE_FIXED_OVERHEAD_BYTES`]
+/// so the engine has room for its own runtime on top of weights and KV, then
+/// clamps to a safe serving range so a small model still reserves enough for
+/// its KV cache and a large one never over-commits the card.
+pub fn device_memory_fraction(need_bytes: u64, total_vram_bytes: u64) -> Option<f32> {
+    if total_vram_bytes == 0 {
+        return None;
+    }
+    let fraction =
+        need_bytes.saturating_add(ENGINE_FIXED_OVERHEAD_BYTES) as f64 / total_vram_bytes as f64;
+    Some(fraction.clamp(0.2, 0.95) as f32)
+}
+
+/// Estimate a transformer's parameter count from its config.json shape when
+/// the file omits `num_parameters` (common for a raw `hf:` reference). Sums
+/// the (tied) embedding table, per-layer attention (q/k/v/o with GQA), and
+/// the per-layer MLP: one dense gated FFN, or `expert_count` gated experts
+/// for a MoE. Approximate (ignores norms, biases, and the router) but well
+/// within the accuracy the fit planner needs to choose a device count.
+// The shape is already parsed by the caller; threading it in avoids a second
+// parse and keeps the estimate beside the fields it derives from.
+#[allow(clippy::too_many_arguments)]
+fn estimate_transformer_params(
+    v: &serde_json::Value,
+    layers: u64,
+    hidden: u64,
+    _attn_heads: u64,
+    kv_heads: u64,
+    head_dim: u64,
+    expert_count: u64,
+    expert_ffn_length: u64,
+) -> u64 {
+    let vocab = v.get("vocab_size").and_then(|x| x.as_u64()).unwrap_or(0);
+    let intermediate = v
+        .get("intermediate_size")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0);
+    let kv_dim = kv_heads.saturating_mul(head_dim);
+    // Attention: q_proj + o_proj (hidden x hidden each) + k_proj + v_proj
+    // (hidden x kv_dim each, smaller under grouped-query attention).
+    let attn = hidden
+        .saturating_mul(hidden)
+        .saturating_mul(2)
+        .saturating_add(hidden.saturating_mul(kv_dim).saturating_mul(2));
+    // A gated FFN is 3 matrices (gate, up, down) of hidden x ffn. A MoE layer
+    // has `expert_count` of them over the expert intermediate size; a dense
+    // layer has one over the model intermediate size.
+    let mlp = if expert_count > 0 && expert_ffn_length > 0 {
+        expert_count
+            .saturating_mul(3)
+            .saturating_mul(hidden)
+            .saturating_mul(expert_ffn_length)
+    } else {
+        3u64.saturating_mul(hidden).saturating_mul(intermediate)
+    };
+    let per_layer = attn.saturating_add(mlp);
+    vocab
+        .saturating_mul(hidden)
+        .saturating_add(layers.saturating_mul(per_layer))
+}
 
 /// Estimate decode throughput and a safe batch ceiling for a model +
 /// quant on a GPU. Returns `None` when the GPU does not report memory
-/// bandwidth. Note: for MoE models this is pessimistic, since decode
-/// reads only the active experts, not all weights; treat it as a
-/// lower bound.
+/// bandwidth.
+///
+/// Single-stream decode is modeled as two serial costs per token: the
+/// weight read at the achievable bandwidth, and a fixed host cost, so
+/// `tokens_per_sec = 1 / (bytes_per_token / (bandwidth *`
+/// [`DECODE_BANDWIDTH_EFFICIENCY`]`) + `[`PER_TOKEN_OVERHEAD_SECS`]`)`.
+/// Recomputing the two live A100 (1555 GB/s) calibration points with
+/// these constants (WOR-1670):
+///
+/// - Qwen3-0.6B bf16 (1.2e9 bytes/token):
+///   `1 / (1.2e9 / 1321.75e9 + 4.1e-3) ~= 200` tok/s; measured ~200.
+/// - Qwen3-32B bf16 (~60e9 bytes/token): `~20.2` tok/s single-card,
+///   doubled to ~40 by `scaled_for_tp(2)`; measured ~33 (+22%).
+///
+/// Note: for MoE models this is pessimistic, since decode reads only
+/// the active experts, not all weights; treat it as a lower bound.
 pub fn estimate_throughput(
     gpu: &GpuDescriptor,
     meta: &ModelMetadata,
@@ -600,7 +878,7 @@ pub fn estimate_throughput(
     let bw_gbps = gpu.mem_bandwidth_gbps?;
     let bytes_per_token = meta.weight_bytes(quant).max(1.0);
     let bw_bytes_per_sec = bw_gbps * 1e9 * DECODE_BANDWIDTH_EFFICIENCY;
-    let decode_tps = bw_bytes_per_sec / bytes_per_token;
+    let decode_tps = 1.0 / (bytes_per_token / bw_bytes_per_sec + PER_TOKEN_OVERHEAD_SECS);
 
     // KV per sequence at the planned context; how many fit in the
     // VRAM left after the weights.
@@ -696,8 +974,40 @@ pub fn plan_fit_kv_with_margin_and_concurrency(
     kv_bytes_per_element: Option<f64>,
     concurrency: u32,
 ) -> Result<FitPlan, FitError> {
+    plan_fit_sharded(
+        gpu,
+        std::slice::from_ref(&gpu.index),
+        meta,
+        candidates,
+        seq_len,
+        overhead,
+        safety_margin,
+        kv_bytes_per_element,
+        concurrency,
+    )
+}
+
+/// The fit core: place a model on a homogeneous set of `devices` at
+/// tensor-parallel degree `devices.len()`. Weights and the KV cache both shard
+/// evenly across the group, so the per-device requirement is the full estimate
+/// divided by the degree, checked against `gpu` (which the caller sets to the
+/// tightest device in the group: the one with the least free VRAM). A
+/// single-element `devices` is the ordinary single-GPU plan.
+#[allow(clippy::too_many_arguments)]
+fn plan_fit_sharded(
+    gpu: &GpuDescriptor,
+    devices: &[u32],
+    meta: &ModelMetadata,
+    candidates: &[String],
+    seq_len: u64,
+    overhead: f64,
+    safety_margin: f64,
+    kv_bytes_per_element: Option<f64>,
+    concurrency: u32,
+) -> Result<FitPlan, FitError> {
     let seq_len = seq_len.min(meta.max_context).max(1);
     let free = gpu.free_vram_bytes as f64;
+    let tp = devices.len().max(1) as f64;
 
     if concurrency == 0 {
         return Err(FitError::Incompatible {
@@ -730,12 +1040,12 @@ pub fn plan_fit_kv_with_margin_and_concurrency(
             });
             continue;
         }
-        let weight_bytes = meta.weight_bytes(quant);
+        let weight_bytes = meta.weight_bytes(quant) / tp;
         let kv_bytes_per_sequence = match kv_bytes_per_element {
             Some(bytes) => meta.kv_bytes_with(bytes, seq_len),
             None => meta.kv_bytes(quant, seq_len),
         };
-        let kv_bytes = kv_bytes_per_sequence * f64::from(concurrency);
+        let kv_bytes = kv_bytes_per_sequence * f64::from(concurrency) / tp;
         let base = weight_bytes + kv_bytes;
         let runtime_overhead = base * (overhead.max(1.0) - 1.0);
         let subtotal = base + runtime_overhead;
@@ -755,7 +1065,7 @@ pub fn plan_fit_kv_with_margin_and_concurrency(
                 .saturating_add(runtime_overhead_bytes)
                 .saturating_add(safety_margin_bytes);
             let memory = MemoryEstimate {
-                device_index: gpu.index,
+                device_indexes: devices.to_vec(),
                 weight_bytes,
                 kv_bytes,
                 runtime_overhead_bytes,
@@ -766,9 +1076,16 @@ pub fn plan_fit_kv_with_margin_and_concurrency(
                 quant_name: name.clone(),
                 quant,
                 estimated_vram_bytes: memory.total_bytes,
-                gpu_index: gpu.index,
+                gpu_indexes: devices.to_vec(),
                 seq_len,
+                gpu_memory_fraction: device_memory_fraction(
+                    memory.total_bytes,
+                    gpu.total_vram_bytes,
+                ),
                 memory,
+                moe: None,
+                throughput: estimate_throughput(gpu, meta, quant, seq_len)
+                    .map(|estimate| estimate.scaled_for_tp(devices.len())),
             });
         }
     }
@@ -844,6 +1161,7 @@ pub fn plan_fit_auto_kv_with_margin(
         safety_margin,
         kv_bytes_per_element,
         1,
+        None,
     )
 }
 
@@ -858,18 +1176,296 @@ pub fn plan_fit_auto_kv_with_margin_and_concurrency(
     safety_margin: f64,
     kv_bytes_per_element: Option<f64>,
     concurrency: u32,
+    forced_tp: Option<usize>,
 ) -> Result<FitPlan, FitError> {
-    let mut gpus = probe.probe();
+    plan_fit_over_set(
+        &probe.probe(),
+        meta,
+        candidates,
+        seq_len,
+        overhead,
+        safety_margin,
+        kv_bytes_per_element,
+        concurrency,
+        forced_tp,
+    )
+}
+
+/// Try to fit a MoE model on one GPU by spilling routed-expert FFN tensors
+/// to CPU RAM (WOR-1866).
+///
+/// For each candidate quant (capability-gated, in preference order) it
+/// keeps the non-expert weights, KV cache, and framework overhead on the
+/// GPU and spills the fewest whole expert layers needed to fit free VRAM,
+/// emitting the resulting `--n-cpu-moe` layer count. Returns the first
+/// candidate that fits, or `None` when even spilling every expert leaves
+/// the resident set too large (the caller then reports the model genuinely
+/// too big). Single-GPU only: llama.cpp's `--n-cpu-moe` is a per-process
+/// offload, so this is a last resort after tensor parallelism is exhausted.
+#[allow(clippy::too_many_arguments)]
+fn plan_moe_spill(
+    gpu: &GpuDescriptor,
+    meta: &ModelMetadata,
+    candidates: &[String],
+    seq_len: u64,
+    overhead: f64,
+    safety_margin: f64,
+    kv_bytes_per_element: Option<f64>,
+    concurrency: u32,
+) -> Option<FitPlan> {
+    if !meta.is_moe() || meta.layers == 0 {
+        return None;
+    }
+    let seq_len = seq_len.min(meta.max_context).max(1);
+    let free = gpu.free_vram_bytes as f64;
+    let overhead = overhead.max(1.0);
+    for name in candidates {
+        let quant = Quant::classify(name);
+        if quant == Quant::Fp8 && !gpu.supports_fp8 {
+            continue; // same capability gate as the dense path
+        }
+        let expert_bytes = meta.expert_weight_bytes(quant);
+        let non_expert_bytes = (meta.weight_bytes(quant) - expert_bytes).max(0.0);
+        let per_layer_expert = expert_bytes / meta.layers as f64;
+        let kv_bytes = match kv_bytes_per_element {
+            Some(b) => meta.kv_bytes_with(b, seq_len),
+            None => meta.kv_bytes(quant, seq_len),
+        } * f64::from(concurrency.max(1));
+        // Resident GPU total when `spilled` expert layers live in CPU RAM.
+        let resident = |spilled: u64| -> f64 {
+            let gpu_expert = (expert_bytes - per_layer_expert * spilled as f64).max(0.0);
+            let base = non_expert_bytes + gpu_expert + kv_bytes;
+            base * overhead * (1.0 + safety_margin)
+        };
+        // Even fully spilled must fit, or this quant is genuinely too big.
+        if resident(meta.layers) > free {
+            continue;
+        }
+        // Fewest expert layers to spill so the resident set fits.
+        let mut spill = 0u64;
+        while spill < meta.layers && resident(spill) > free {
+            spill += 1;
+        }
+        let gpu_expert_bytes = (expert_bytes - per_layer_expert * spill as f64).max(0.0);
+        let ram_spilled_bytes = (per_layer_expert * spill as f64).min(expert_bytes);
+        let gpu_weight = non_expert_bytes + gpu_expert_bytes;
+        let base = gpu_weight + kv_bytes;
+        let runtime_overhead = base * (overhead - 1.0);
+        let subtotal = base + runtime_overhead;
+        let margin = subtotal * safety_margin;
+        let total = subtotal + margin;
+        let memory = MemoryEstimate {
+            device_indexes: vec![gpu.index],
+            weight_bytes: gpu_weight as u64,
+            kv_bytes: kv_bytes as u64,
+            runtime_overhead_bytes: runtime_overhead as u64,
+            safety_margin_bytes: margin as u64,
+            total_bytes: total as u64,
+        };
+        return Some(FitPlan {
+            quant_name: name.clone(),
+            quant,
+            estimated_vram_bytes: memory.total_bytes,
+            gpu_indexes: vec![gpu.index],
+            seq_len,
+            gpu_memory_fraction: device_memory_fraction(memory.total_bytes, gpu.total_vram_bytes),
+            memory,
+            moe: Some(MoePlacement {
+                cpu_moe_layers: spill,
+                gpu_expert_bytes: gpu_expert_bytes as u64,
+                ram_spilled_bytes: ram_spilled_bytes as u64,
+            }),
+            throughput: estimate_throughput(gpu, meta, quant, seq_len),
+        });
+    }
+    None
+}
+
+/// Plan a fit across a set of GPUs, searching tensor-parallel degrees.
+///
+/// Tries tp = 1, 2, 4, 8 in order and returns the smallest degree at which a
+/// candidate quant fits, since tensor parallelism costs interconnect bandwidth
+/// and a single card is always cheaper. A tp group must be homogeneous
+/// (identical model and total VRAM) and tp must divide the model's KV heads
+/// evenly. Weights and the KV cache both shard across the group, so a model too
+/// large for any one card can fit on several. Cross-node tensor parallelism is
+/// a non-goal; every device here is on one host.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_fit_over_set(
+    gpus: &[GpuDescriptor],
+    meta: &ModelMetadata,
+    candidates: &[String],
+    seq_len: u64,
+    overhead: f64,
+    safety_margin: f64,
+    kv_bytes_per_element: Option<f64>,
+    concurrency: u32,
+    forced_tp: Option<usize>,
+) -> Result<FitPlan, FitError> {
     if gpus.is_empty() {
         return Err(FitError::NoGpu);
     }
-    gpus.sort_by_key(|g| std::cmp::Reverse(g.free_vram_bytes));
-    // Try GPUs in free-VRAM order; return the first successful fit,
-    // else the error from the most-free GPU (the most informative).
-    let mut first_err = None;
-    for gpu in &gpus {
-        match plan_fit_kv_with_margin_and_concurrency(
-            gpu,
+    // A fixed degree must be a sane, satisfiable request before searching.
+    if let Some(tp) = forced_tp {
+        if tp == 0 {
+            return Err(FitError::Unsatisfiable(
+                "tensor_parallel must be at least 1".to_string(),
+            ));
+        }
+        if tp > 1 && !meta.kv_heads.is_multiple_of(tp as u64) {
+            return Err(FitError::Unsatisfiable(format!(
+                "tensor_parallel {tp} does not divide the model's {} KV heads",
+                meta.kv_heads
+            )));
+        }
+        if gpus.len() < tp {
+            return Err(FitError::Unsatisfiable(format!(
+                "tensor_parallel {tp} needs {tp} devices, {} available",
+                gpus.len()
+            )));
+        }
+    }
+    let mut first_err: Option<FitError> = None;
+
+    let forced_slot;
+    let tp_candidates: &[usize] = match forced_tp {
+        Some(tp) => {
+            forced_slot = [tp];
+            &forced_slot
+        }
+        None => &[1usize, 2, 4, 8],
+    };
+    for &tp in tp_candidates {
+        if tp == 1 {
+            // Single GPU: try cards in free-VRAM order, the cheapest placement.
+            let mut singles: Vec<&GpuDescriptor> = gpus.iter().collect();
+            singles.sort_by_key(|g| std::cmp::Reverse(g.free_vram_bytes));
+            for gpu in singles {
+                match plan_fit_sharded(
+                    gpu,
+                    std::slice::from_ref(&gpu.index),
+                    meta,
+                    candidates,
+                    seq_len,
+                    overhead,
+                    safety_margin,
+                    kv_bytes_per_element,
+                    concurrency,
+                ) {
+                    Ok(plan) => return Ok(plan),
+                    Err(e) => {
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        // Tensor parallelism requires the KV heads to divide evenly across ranks.
+        if !meta.kv_heads.is_multiple_of(tp as u64) {
+            continue;
+        }
+        // Homogeneous classes keyed by (name, total VRAM): TP needs identical cards.
+        let mut classes: std::collections::BTreeMap<(&str, u64), Vec<&GpuDescriptor>> =
+            std::collections::BTreeMap::new();
+        for gpu in gpus {
+            classes
+                .entry((gpu.name.as_str(), gpu.total_vram_bytes))
+                .or_default()
+                .push(gpu);
+        }
+        for members in classes.values() {
+            if members.len() < tp {
+                continue;
+            }
+            // The tp emptiest identical cards; the fit is gated on the tightest.
+            let mut group: Vec<&GpuDescriptor> = members.clone();
+            group.sort_by_key(|g| std::cmp::Reverse(g.free_vram_bytes));
+            let group = &group[..tp];
+            let min_free = group.iter().map(|g| g.free_vram_bytes).min().unwrap_or(0);
+            let representative = GpuDescriptor {
+                free_vram_bytes: min_free,
+                ..group[0].clone()
+            };
+            let devices: Vec<u32> = group.iter().map(|g| g.index).collect();
+            match plan_fit_sharded(
+                &representative,
+                &devices,
+                meta,
+                candidates,
+                seq_len,
+                overhead,
+                safety_margin,
+                kv_bytes_per_element,
+                concurrency,
+            ) {
+                Ok(plan) => return Ok(plan),
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+    }
+    // WOR-1866: no whole-model placement fit. A MoE model may still serve
+    // by spilling routed experts to CPU RAM. This runs only after every
+    // tensor-parallel degree failed (and never for a forced degree), so a
+    // second GPU is always preferred over slow CPU-resident experts.
+    if forced_tp.is_none() && meta.is_moe() {
+        let mut singles: Vec<&GpuDescriptor> = gpus.iter().collect();
+        singles.sort_by_key(|gpu| std::cmp::Reverse(gpu.free_vram_bytes));
+        for gpu in singles {
+            if let Some(plan) = plan_moe_spill(
+                gpu,
+                meta,
+                candidates,
+                seq_len,
+                overhead,
+                safety_margin,
+                kv_bytes_per_element,
+                concurrency,
+            ) {
+                return Ok(plan);
+            }
+        }
+    }
+    Err(first_err.unwrap_or_else(|| match forced_tp {
+        Some(tp) => FitError::Unsatisfiable(format!(
+            "no homogeneous group of {tp} identical devices has enough free VRAM"
+        )),
+        None => FitError::NoGpu,
+    }))
+}
+
+/// Pack `replicas` replicas of one model onto disjoint device sets.
+///
+/// Each replica claims its own device set (of `tensor_parallel` size when
+/// set, else the smallest degree that fits), and no two replicas share a
+/// device, so replicas never contend for VRAM. Devices are consumed
+/// greedily replica by replica; the first replica that cannot fit on the
+/// remaining devices fails with a legible reason instead of silently
+/// dropping replicas. Returns one [`FitPlan`] per replica.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_replica_fits(
+    gpus: &[GpuDescriptor],
+    meta: &ModelMetadata,
+    candidates: &[String],
+    seq_len: u64,
+    overhead: f64,
+    safety_margin: f64,
+    kv_bytes_per_element: Option<f64>,
+    concurrency: u32,
+    replicas: u32,
+    tensor_parallel: Option<usize>,
+) -> Result<Vec<FitPlan>, FitError> {
+    let replicas = replicas.max(1) as usize;
+    let mut remaining: Vec<GpuDescriptor> = gpus.to_vec();
+    let mut plans = Vec::with_capacity(replicas);
+    for replica in 0..replicas {
+        let plan = plan_fit_over_set(
+            &remaining,
             meta,
             candidates,
             seq_len,
@@ -877,16 +1473,61 @@ pub fn plan_fit_auto_kv_with_margin_and_concurrency(
             safety_margin,
             kv_bytes_per_element,
             concurrency,
-        ) {
-            Ok(plan) => return Ok(plan),
-            Err(e) => {
-                if first_err.is_none() {
-                    first_err = Some(e);
-                }
+            tensor_parallel,
+        )
+        .map_err(|error| {
+            FitError::Unsatisfiable(format!(
+                "cannot place replica {} of {replicas}: {error} ({} device(s) still free)",
+                replica + 1,
+                remaining.len()
+            ))
+        })?;
+        let claimed: std::collections::BTreeSet<u32> = plan.gpu_indexes.iter().copied().collect();
+        remaining.retain(|gpu| !claimed.contains(&gpu.index));
+        plans.push(plan);
+    }
+    Ok(plans)
+}
+
+/// A conservative VRAM floor for a draft model absent a real size lookup:
+/// enough for a dense ~1B-parameter model at 4-bit weights plus a small
+/// KV allowance. Draft models used for speculation are chosen small on
+/// purpose, so this floor is deliberately generous rather than tight.
+const DEFAULT_DRAFT_MODEL_BYTES_FLOOR: u64 = 1_500_000_000;
+
+/// Resolve whether a requested speculative-decoding config can run
+/// alongside a base model's chosen fit plan.
+///
+/// N-gram / prompt-lookup speculation ([`crate::config::SpecMethod::Ngram`])
+/// proposes tokens from the prompt itself, with no separate model weights
+/// to load, so it always resolves once requested. Draft-model speculation
+/// ([`crate::config::SpecMethod::DraftModel`]) loads a second, smaller
+/// model onto the same device(s) as the base model, so it only resolves
+/// when the base model's fit plan left enough headroom below the device's
+/// total capacity to also hold the draft model:
+/// `draft_weight_bytes_hint`, when known (a resolved catalog entry for
+/// the draft model), or `DEFAULT_DRAFT_MODEL_BYTES_FLOOR` otherwise. A
+/// `DraftModel` request naming no `draft_model` never resolves, since
+/// there is nothing to load.
+pub fn resolve_speculative_config(
+    requested: &crate::config::SpeculativeConfig,
+    plan: &FitPlan,
+    device_total_vram_bytes: u64,
+    draft_weight_bytes_hint: Option<u64>,
+) -> Option<crate::config::SpeculativeConfig> {
+    match requested.method {
+        crate::config::SpecMethod::Ngram => Some(requested.clone()),
+        crate::config::SpecMethod::DraftModel => {
+            requested.draft_model.as_ref()?;
+            let headroom = device_total_vram_bytes.saturating_sub(plan.memory.total_bytes);
+            let needed = draft_weight_bytes_hint.unwrap_or(DEFAULT_DRAFT_MODEL_BYTES_FLOOR);
+            if headroom >= needed {
+                Some(requested.clone())
+            } else {
+                None
             }
         }
     }
-    Err(first_err.unwrap_or(FitError::NoGpu))
 }
 
 #[cfg(test)]
@@ -902,6 +1543,9 @@ mod tests {
             kv_heads: 8,
             head_dim: 128,
             max_context: 40960,
+            hidden_size: 0,
+            expert_count: 0,
+            expert_ffn_length: 0,
         }
     }
 
@@ -914,7 +1558,109 @@ mod tests {
             kv_heads: 8,
             head_dim: 128,
             max_context: 32768,
+            hidden_size: 0,
+            expert_count: 0,
+            expert_ffn_length: 0,
         }
+    }
+
+    // A ~30B-A3B-class MoE (Qwen3-30B-A3B-ish): most of the weight lives in
+    // the routed experts, so it can spill to CPU RAM to fit a small card.
+    fn meta_moe() -> ModelMetadata {
+        ModelMetadata {
+            params: 30_000_000_000,
+            layers: 48,
+            kv_heads: 4,
+            head_dim: 128,
+            hidden_size: 2048,
+            max_context: 40960,
+            expert_count: 128,
+            expert_ffn_length: 768,
+        }
+    }
+
+    #[test]
+    fn moe_model_admits_by_spilling_experts_to_ram() {
+        // WOR-1866: a 30B MoE that does not fit whole on a 12 GiB card admits
+        // with a placement plan that spills routed experts to CPU RAM, rather
+        // than being rejected as too large.
+        let mut card = GpuDescriptor::l4();
+        card.index = 0;
+        card.free_vram_bytes = 12 * GIB;
+        card.total_vram_bytes = 12 * GIB;
+        let probe = StaticGpuProbe::new(vec![card]);
+        let plan = plan_fit_auto(
+            &probe,
+            &meta_moe(),
+            &["Q4_K_M".into()],
+            4096,
+            DEFAULT_OVERHEAD,
+        )
+        .expect("a MoE model admits by spilling experts");
+        let moe = plan.moe.expect("a placement plan was emitted");
+        assert!(moe.cpu_moe_layers > 0, "some experts must spill to RAM");
+        assert!(
+            moe.cpu_moe_layers < meta_moe().layers,
+            "not every expert layer needs to spill on a 12 GiB card"
+        );
+        assert!(moe.ram_spilled_bytes > 0 && moe.gpu_expert_bytes > 0);
+        assert!(
+            plan.estimated_vram_bytes <= 12 * GIB,
+            "the resident set must fit the card, got {} bytes",
+            plan.estimated_vram_bytes
+        );
+    }
+
+    #[test]
+    fn dense_model_keeps_whole_model_placement() {
+        // A dense model that fits is untouched: no expert placement.
+        let plan = plan_fit(
+            &GpuDescriptor::l4(),
+            &meta_14b(),
+            &["Q4_K_M".into()],
+            4096,
+            DEFAULT_OVERHEAD,
+        )
+        .expect("dense model fits");
+        assert!(plan.moe.is_none(), "a dense plan carries no MoE placement");
+    }
+
+    #[test]
+    fn moe_too_large_even_fully_spilled_is_rejected() {
+        // When the non-expert remainder alone exceeds VRAM, spilling every
+        // expert still cannot fit, so the planner reports too large.
+        let mut tiny = GpuDescriptor::l4();
+        tiny.index = 0;
+        tiny.free_vram_bytes = GIB / 2;
+        tiny.total_vram_bytes = GIB / 2;
+        let probe = StaticGpuProbe::new(vec![tiny]);
+        let err = plan_fit_auto(
+            &probe,
+            &meta_moe(),
+            &["Q4_K_M".into()],
+            4096,
+            DEFAULT_OVERHEAD,
+        )
+        .unwrap_err();
+        assert!(matches!(err, FitError::TooLarge { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn fit_plan_carries_a_throughput_estimate() {
+        // WOR-1670: a plan on a bandwidth-reporting card predicts decode
+        // throughput so admission can surface tok/s before an engine starts.
+        let plan = plan_fit(
+            &GpuDescriptor::l4(),
+            &meta_14b(),
+            &["Q4_K_M".into()],
+            4096,
+            DEFAULT_OVERHEAD,
+        )
+        .expect("fits");
+        let tp = plan
+            .throughput
+            .expect("the L4 reports bandwidth, so the plan predicts throughput");
+        assert!(tp.decode_tokens_per_sec > 0.0);
     }
 
     #[test]
@@ -976,6 +1722,131 @@ mod tests {
     }
 
     #[test]
+    fn a_model_too_big_for_one_gpu_fits_across_a_homogeneous_pair() {
+        // 14B at f16 needs ~26 GiB of weights, over one 24 GiB L4, but shards
+        // across two L4s at tp=2.
+        let mut a = GpuDescriptor::l4();
+        a.index = 0;
+        let mut b = GpuDescriptor::l4();
+        b.index = 1;
+        let candidates = ["F16".to_string()];
+
+        let single = plan_fit_over_set(
+            std::slice::from_ref(&a),
+            &meta_14b(),
+            &candidates,
+            4096,
+            DEFAULT_OVERHEAD,
+            0.0,
+            None,
+            1,
+            None,
+        );
+        assert!(
+            matches!(single, Err(FitError::TooLarge { .. })),
+            "14B f16 must not fit one L4: {single:?}"
+        );
+
+        let pair = plan_fit_over_set(
+            &[a.clone(), b.clone()],
+            &meta_14b(),
+            &candidates,
+            4096,
+            DEFAULT_OVERHEAD,
+            0.0,
+            None,
+            1,
+            None,
+        )
+        .expect("14B f16 fits two L4 at tp=2");
+        assert_eq!(pair.tp_degree(), 2);
+        assert_eq!(pair.gpu_indexes, vec![0, 1]);
+        assert_eq!(pair.memory.device_indexes, vec![0, 1]);
+        // Weights shard, so each device holds roughly half.
+        assert!(pair.memory.weight_bytes < 20 * GIB);
+    }
+
+    #[test]
+    fn a_model_that_fits_one_gpu_stays_at_tp_1() {
+        // The planner prefers the smallest degree: a model that fits one card is
+        // never sharded, even with several available.
+        let mut a = GpuDescriptor::l4();
+        a.index = 0;
+        let mut b = GpuDescriptor::l4();
+        b.index = 1;
+        let plan = plan_fit_over_set(
+            &[a, b],
+            &meta_small(),
+            &["Q4_K_M".to_string()],
+            4096,
+            DEFAULT_OVERHEAD,
+            0.0,
+            None,
+            1,
+            None,
+        )
+        .expect("0.6B fits one L4");
+        assert_eq!(plan.tp_degree(), 1);
+    }
+
+    #[test]
+    fn a_heterogeneous_pair_cannot_form_a_tp_group() {
+        // Tensor parallelism needs identical cards, so a T4 + L4 pair cannot
+        // shard the 14B model and it is rejected rather than run on a mix.
+        let mut t4 = GpuDescriptor::t4();
+        t4.index = 0;
+        let mut l4 = GpuDescriptor::l4();
+        l4.index = 1;
+        let err = plan_fit_over_set(
+            &[t4, l4],
+            &meta_14b(),
+            &["F16".to_string()],
+            4096,
+            DEFAULT_OVERHEAD,
+            0.0,
+            None,
+            1,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FitError::TooLarge { .. } | FitError::Incompatible { .. }
+            ),
+            "a heterogeneous pair cannot host a tp group: {err:?}"
+        );
+    }
+
+    #[test]
+    fn tensor_parallel_degree_must_divide_the_kv_heads() {
+        // KV heads that do not divide evenly forbid every power-of-two degree,
+        // so even two identical big cards cannot admit the model.
+        let mut meta = meta_14b();
+        meta.kv_heads = 3;
+        let mut a = GpuDescriptor::l4();
+        a.index = 0;
+        let mut b = GpuDescriptor::l4();
+        b.index = 1;
+        let err = plan_fit_over_set(
+            &[a, b],
+            &meta,
+            &["F16".to_string()],
+            4096,
+            DEFAULT_OVERHEAD,
+            0.0,
+            None,
+            1,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, FitError::TooLarge { .. }),
+            "kv_heads=3 forbids every power-of-two tp, so 14B stays unservable: {err:?}"
+        );
+    }
+
+    #[test]
     fn fp8_capability_gate() {
         assert!(!fp8_supported((7, 5)), "Turing T4 has no FP8");
         assert!(!fp8_supported((8, 0)), "Ampere A100 has no FP8");
@@ -1023,6 +1894,9 @@ mod tests {
             kv_heads: 8,
             head_dim: 128,
             max_context: 131072,
+            hidden_size: 0,
+            expert_count: 0,
+            expert_ffn_length: 0,
         };
         let long = 131072;
         let candidates = ["FP8".to_string()];
@@ -1092,6 +1966,9 @@ mod tests {
             kv_heads: 8,
             head_dim: 128,
             max_context: 8192,
+            hidden_size: 0,
+            expert_count: 0,
+            expert_ffn_length: 0,
         };
         let err = plan_fit(
             &GpuDescriptor::t4(),
@@ -1110,6 +1987,41 @@ mod tests {
         let short = m.kv_bytes(Quant::F16, 4096);
         let long = m.kv_bytes(Quant::F16, 40960);
         assert!(long > short * 9.0, "KV should scale ~linearly with seq_len");
+    }
+
+    #[test]
+    fn non_decode_modality_charges_no_kv() {
+        // WOR-1908: an embedder holds no KV cache, so its fit must size on
+        // weights + overhead only. A chat model at the same shape/context
+        // reserves a positive KV term; the non-decode override zeroes it.
+        use crate::catalog::Modality;
+        let candidates = ["Q4_K_M".to_string()];
+        let chat = plan_fit_kv(
+            &GpuDescriptor::l4(),
+            &meta_14b(),
+            &candidates,
+            40960,
+            DEFAULT_OVERHEAD,
+            Modality::Chat.kv_bytes_per_element_override(None),
+        )
+        .expect("chat fits");
+        let embed = plan_fit_kv(
+            &GpuDescriptor::l4(),
+            &meta_14b(),
+            &candidates,
+            40960,
+            DEFAULT_OVERHEAD,
+            Modality::Embedding.kv_bytes_per_element_override(None),
+        )
+        .expect("embedder fits");
+        assert!(chat.memory.kv_bytes > 0, "a chat model reserves KV");
+        assert_eq!(embed.memory.kv_bytes, 0, "an embedder reserves no KV");
+        assert!(
+            embed.estimated_vram_bytes < chat.estimated_vram_bytes,
+            "dropping KV shrinks the embedder estimate ({} vs {})",
+            embed.estimated_vram_bytes,
+            chat.estimated_vram_bytes
+        );
     }
 
     #[test]
@@ -1142,14 +2054,16 @@ mod tests {
             DEFAULT_OVERHEAD,
         )
         .expect("fits on the L4");
-        assert_eq!(plan.gpu_index, 1);
+        assert_eq!(plan.gpu_indexes, vec![1]);
+        assert_eq!(plan.tp_degree(), 1);
     }
 
     #[test]
     fn throughput_decode_is_bandwidth_bound() {
         // 14B model at Q4 (~0.56 bytes/param -> ~7.84 GB/token read).
-        // L4 at 300 GB/s * 0.7 efficiency = 210 GB/s effective.
-        // decode tps ~= 210e9 / 7.84e9 ~= 26-27 tok/s.
+        // L4 at 300 GB/s * 0.85 efficiency = 255 GB/s effective, so
+        // ~30.7 ms/token of weight reads + 4.1 ms host overhead
+        // ~= 29 tok/s.
         let est = estimate_throughput(&GpuDescriptor::l4(), &meta_14b(), Quant::Int4, 4096)
             .expect("L4 reports bandwidth");
         assert!(
@@ -1168,6 +2082,62 @@ mod tests {
         assert!(q4.decode_tokens_per_sec > f16.decode_tokens_per_sec);
     }
 
+    // A synthetic NVIDIA A100 40 GiB SXM (Ampere 8.0, 1555 GB/s): the
+    // card the WOR-1670 calibration measurements were taken on.
+    fn a100() -> GpuDescriptor {
+        GpuDescriptor {
+            index: 0,
+            vendor: GpuVendor::Nvidia,
+            name: "NVIDIA A100-SXM4-40GB".to_string(),
+            total_vram_bytes: 40 * GIB,
+            free_vram_bytes: 39 * GIB,
+            compute_utilization: None,
+            memory_occupancy: memory_occupancy(40 * GIB, 39 * GIB),
+            compute_capability: Some((8, 0)),
+            supports_fp8: false,
+            mem_bandwidth_gbps: Some(1555.0),
+        }
+    }
+
+    #[test]
+    fn throughput_matches_a100_calibration_points() {
+        // WOR-1670: two single-stream decode measurements from a live A100
+        // (through the gateway) pin the estimator in both regimes. Each
+        // estimate must land within +/-35% of the measurement.
+        //
+        // Small regime: Qwen3-0.6B bf16 on one A100 measured ~200 tok/s
+        // (fixed per-token host overhead dominates the tiny weight read).
+        let small = estimate_throughput(&a100(), &meta_small(), Quant::F16, 4096)
+            .expect("the A100 reports bandwidth");
+        assert!(
+            small.decode_tokens_per_sec > 200.0 * 0.65
+                && small.decode_tokens_per_sec < 200.0 * 1.35,
+            "0.6B bf16 on one A100: got {} tok/s, measured ~200",
+            small.decode_tokens_per_sec
+        );
+
+        // Big regime: Qwen3-32B bf16 at tp=2 across two A100s measured
+        // ~33 tok/s (the weight read dominates; bandwidth efficiency rules).
+        let meta_32b = ModelMetadata {
+            params: 30_000_000_000,
+            layers: 64,
+            kv_heads: 8,
+            head_dim: 128,
+            hidden_size: 0,
+            max_context: 40960,
+            expert_count: 0,
+            expert_ffn_length: 0,
+        };
+        let big = estimate_throughput(&a100(), &meta_32b, Quant::F16, 4096)
+            .expect("the A100 reports bandwidth")
+            .scaled_for_tp(2);
+        assert!(
+            big.decode_tokens_per_sec > 33.0 * 0.65 && big.decode_tokens_per_sec < 33.0 * 1.35,
+            "32B bf16 at tp=2 on A100: got {} tok/s, measured ~33",
+            big.decode_tokens_per_sec
+        );
+    }
+
     #[test]
     fn kv_quant_shrinks_the_estimate_and_fits_more_context() {
         // A model whose f16-KV estimate exceeds free VRAM should fit
@@ -1178,6 +2148,9 @@ mod tests {
             kv_heads: 8,
             head_dim: 128,
             max_context: 131072,
+            hidden_size: 0,
+            expert_count: 0,
+            expert_ffn_length: 0,
         };
         // Long context so KV dominates.
         let seq = 131072;
@@ -1283,6 +2256,75 @@ mod tests {
         out
     }
 
+    /// A MoE GGUF header: the dense shape plus `.expert_count` and
+    /// `.expert_feed_forward_length`, so the placement planner can size the
+    /// routed experts from a golden header (WOR-1866).
+    #[allow(clippy::too_many_arguments)]
+    fn synth_moe_gguf(
+        arch: &str,
+        layers: u32,
+        heads: u32,
+        kv_heads: u32,
+        hidden: u32,
+        ctx: u32,
+        experts: u32,
+        expert_ffn: u32,
+    ) -> Vec<u8> {
+        fn push_str(out: &mut Vec<u8>, s: &str) {
+            out.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            out.extend_from_slice(s.as_bytes());
+        }
+        fn push_u32_kv(out: &mut Vec<u8>, key: &str, v: u32) {
+            push_str(out, key);
+            out.extend_from_slice(&4u32.to_le_bytes());
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(b"GGUF");
+        out.extend_from_slice(&3u32.to_le_bytes());
+        out.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+                                                    // arch string + 7 shape ints.
+        out.extend_from_slice(&8u64.to_le_bytes());
+        push_str(&mut out, "general.architecture");
+        out.extend_from_slice(&8u32.to_le_bytes());
+        push_str(&mut out, arch);
+        push_u32_kv(&mut out, &format!("{arch}.block_count"), layers);
+        push_u32_kv(&mut out, &format!("{arch}.attention.head_count"), heads);
+        push_u32_kv(
+            &mut out,
+            &format!("{arch}.attention.head_count_kv"),
+            kv_heads,
+        );
+        push_u32_kv(&mut out, &format!("{arch}.embedding_length"), hidden);
+        push_u32_kv(&mut out, &format!("{arch}.context_length"), ctx);
+        push_u32_kv(&mut out, &format!("{arch}.expert_count"), experts);
+        push_u32_kv(
+            &mut out,
+            &format!("{arch}.expert_feed_forward_length"),
+            expert_ffn,
+        );
+        out
+    }
+
+    #[test]
+    fn moe_gguf_parses_expert_shape() {
+        // A MoE GGUF header yields the expert count and expert FFN dim, and
+        // is recognized as MoE; a dense header is not.
+        let bytes = synth_moe_gguf("qwen3moe", 48, 32, 4, 2048, 40960, 128, 768);
+        let m = ModelMetadata::from_gguf(&bytes, 30_000_000_000).expect("parse moe gguf");
+        assert_eq!(m.expert_count, 128);
+        assert_eq!(m.expert_ffn_length, 768);
+        assert_eq!(m.hidden_size, 2048);
+        assert!(m.is_moe());
+        assert!(m.expert_weight_bytes(Quant::Int4) > 0.0);
+        // A dense header leaves the expert fields at zero.
+        let dense =
+            ModelMetadata::from_gguf(&synth_gguf("qwen3", 40, 40, 8, 5120, 40960), 14_000_000_000)
+                .expect("parse dense gguf");
+        assert_eq!(dense.expert_count, 0);
+        assert!(!dense.is_moe());
+    }
+
     #[test]
     fn gguf_header_parses_shape() {
         // arch qwen3, 40 layers, 40 heads, 8 kv heads, hidden 5120, ctx 40960.
@@ -1337,5 +2379,227 @@ mod tests {
         assert_eq!(m.kv_heads, 32);
         assert_eq!(m.head_dim, 128);
         assert_eq!(m.max_context, 8192); // fallback
+    }
+
+    fn indexed_l4s(count: u32) -> Vec<GpuDescriptor> {
+        (0..count)
+            .map(|index| {
+                let mut gpu = GpuDescriptor::l4();
+                gpu.index = index;
+                gpu
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_forced_degree_pins_tensor_parallel_even_when_one_card_would_do() {
+        // A 0.6B model fits one L4, but a pinned degree of two shards it
+        // across both cards instead of picking the cheapest single-card fit.
+        let gpus = indexed_l4s(2);
+        let plan = plan_fit_over_set(
+            &gpus,
+            &meta_small(),
+            &["Q4_K_M".to_string()],
+            4096,
+            DEFAULT_OVERHEAD,
+            0.0,
+            None,
+            1,
+            Some(2),
+        )
+        .expect("0.6B pins to tp=2 across two L4");
+        assert_eq!(plan.tp_degree(), 2);
+        assert_eq!(plan.gpu_indexes, vec![0, 1]);
+    }
+
+    #[test]
+    fn a_forced_degree_that_does_not_divide_kv_heads_is_unsatisfiable() {
+        let mut meta = meta_14b();
+        meta.kv_heads = 3;
+        let gpus = indexed_l4s(2);
+        let error = plan_fit_over_set(
+            &gpus,
+            &meta,
+            &["F16".to_string()],
+            4096,
+            DEFAULT_OVERHEAD,
+            0.0,
+            None,
+            1,
+            Some(2),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, FitError::Unsatisfiable(_)),
+            "tp=2 cannot divide 3 KV heads: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_forced_degree_larger_than_the_device_count_is_unsatisfiable() {
+        let gpus = indexed_l4s(1);
+        let error = plan_fit_over_set(
+            &gpus,
+            &meta_small(),
+            &["Q4_K_M".to_string()],
+            4096,
+            DEFAULT_OVERHEAD,
+            0.0,
+            None,
+            1,
+            Some(2),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, FitError::Unsatisfiable(ref message) if message.contains("needs 2 devices")),
+            "tp=2 needs two devices when only one is present",
+        );
+    }
+
+    #[test]
+    fn packing_replicas_assigns_disjoint_device_sets() {
+        // Four single-card replicas take one distinct device each.
+        let gpus = indexed_l4s(4);
+        let plans = plan_replica_fits(
+            &gpus,
+            &meta_small(),
+            &["Q4_K_M".to_string()],
+            4096,
+            DEFAULT_OVERHEAD,
+            0.0,
+            None,
+            1,
+            4,
+            Some(1),
+        )
+        .expect("four 0.6B replicas fit four L4");
+        assert_eq!(plans.len(), 4);
+        let mut devices: Vec<u32> = plans.iter().flat_map(|p| p.gpu_indexes.clone()).collect();
+        devices.sort_unstable();
+        assert_eq!(devices, vec![0, 1, 2, 3], "replicas claim distinct devices");
+
+        // Two tp=2 replicas take two disjoint pairs.
+        let pairs = plan_replica_fits(
+            &gpus,
+            &meta_14b(),
+            &["F16".to_string()],
+            4096,
+            DEFAULT_OVERHEAD,
+            0.0,
+            None,
+            1,
+            2,
+            Some(2),
+        )
+        .expect("two 14B replicas fit four L4 at tp=2");
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].tp_degree(), 2);
+        let mut paired: Vec<u32> = pairs.iter().flat_map(|p| p.gpu_indexes.clone()).collect();
+        paired.sort_unstable();
+        assert_eq!(paired, vec![0, 1, 2, 3], "the two pairs are disjoint");
+    }
+
+    #[test]
+    fn packing_more_replicas_than_devices_fails_legibly() {
+        // Four L4 at tp=2 host two replicas; a third has no devices left.
+        let gpus = indexed_l4s(4);
+        let error = plan_replica_fits(
+            &gpus,
+            &meta_14b(),
+            &["F16".to_string()],
+            4096,
+            DEFAULT_OVERHEAD,
+            0.0,
+            None,
+            1,
+            4,
+            Some(2),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, FitError::Unsatisfiable(ref message)
+                if message.contains("replica 3")),
+            "the third replica cannot be placed: {error:?}"
+        );
+    }
+
+    fn synthetic_plan(total_bytes: u64) -> FitPlan {
+        FitPlan {
+            quant_name: "FP8".to_string(),
+            quant: Quant::Fp8,
+            estimated_vram_bytes: total_bytes,
+            gpu_indexes: vec![0],
+            seq_len: 8192,
+            memory: MemoryEstimate {
+                device_indexes: vec![0],
+                weight_bytes: total_bytes,
+                kv_bytes: 0,
+                runtime_overhead_bytes: 0,
+                safety_margin_bytes: 0,
+                total_bytes,
+            },
+            moe: None,
+            throughput: None,
+            gpu_memory_fraction: None,
+        }
+    }
+
+    #[test]
+    fn ngram_speculation_always_resolves() {
+        use crate::config::{SpecMethod, SpeculativeConfig};
+        let requested = SpeculativeConfig {
+            method: SpecMethod::Ngram,
+            draft_model: None,
+            num_speculative_tokens: 5,
+        };
+        // Zero headroom: the base model plan consumes the whole device.
+        let plan = synthetic_plan(24_000_000_000);
+        let resolved = resolve_speculative_config(&requested, &plan, 24_000_000_000, None);
+        assert_eq!(resolved, Some(requested));
+    }
+
+    #[test]
+    fn draft_model_speculation_resolves_when_headroom_covers_the_hint() {
+        use crate::config::{SpecMethod, SpeculativeConfig};
+        let requested = SpeculativeConfig {
+            method: SpecMethod::DraftModel,
+            draft_model: Some("Qwen/Qwen3-0.6B".to_string()),
+            num_speculative_tokens: 4,
+        };
+        // 20 GiB base model on a 24 GiB device: 4 GiB headroom, comfortably
+        // above a 1 GiB draft-model hint.
+        let plan = synthetic_plan(20_000_000_000);
+        let resolved =
+            resolve_speculative_config(&requested, &plan, 24_000_000_000, Some(1_000_000_000));
+        assert_eq!(resolved, Some(requested));
+    }
+
+    #[test]
+    fn draft_model_speculation_is_declined_without_enough_headroom() {
+        use crate::config::{SpecMethod, SpeculativeConfig};
+        let requested = SpeculativeConfig {
+            method: SpecMethod::DraftModel,
+            draft_model: Some("Qwen/Qwen3-0.6B".to_string()),
+            num_speculative_tokens: 4,
+        };
+        // 23 GiB base model on a 24 GiB device: 1 GiB headroom, below the
+        // default 1.5 GiB floor with no hint given.
+        let plan = synthetic_plan(23_000_000_000);
+        let resolved = resolve_speculative_config(&requested, &plan, 24_000_000_000, None);
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn draft_model_speculation_with_no_named_draft_never_resolves() {
+        use crate::config::{SpecMethod, SpeculativeConfig};
+        let requested = SpeculativeConfig {
+            method: SpecMethod::DraftModel,
+            draft_model: None,
+            num_speculative_tokens: 4,
+        };
+        // Huge headroom, but there is nothing to load.
+        let plan = synthetic_plan(1_000_000_000);
+        let resolved = resolve_speculative_config(&requested, &plan, 24_000_000_000, None);
+        assert_eq!(resolved, None);
     }
 }

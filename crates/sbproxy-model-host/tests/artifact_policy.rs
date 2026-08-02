@@ -160,6 +160,7 @@ fn artifact(
         license: "apache-2.0".to_string(),
         stability: SupportLevel::Preview,
         pickle_allowed,
+        modality: Default::default(),
     }
 }
 

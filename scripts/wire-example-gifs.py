@@ -64,7 +64,9 @@ def main():
     print(f"already-wired/skipped: {len(skipped)}")
     if check:
         print("(--check: no files written)")
+        return 1 if wired else 0
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

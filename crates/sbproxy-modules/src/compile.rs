@@ -33,6 +33,32 @@ use crate::transform::{
 
 /// Compile a JSON action config into an Action enum variant.
 pub fn compile_action(config: &serde_json::Value) -> Result<Action> {
+    compile_action_for_origin_with_runtime(config, "", true)
+}
+
+/// Compile a JSON action for validation without constructing runtime clients.
+pub fn compile_action_for_validation(config: &serde_json::Value) -> Result<Action> {
+    compile_action_for_origin_with_runtime(config, "", false)
+}
+
+/// Compile an action with the stable identity of its owning origin.
+pub fn compile_action_for_origin(config: &serde_json::Value, origin_id: &str) -> Result<Action> {
+    compile_action_for_origin_with_runtime(config, origin_id, true)
+}
+
+/// Compile an origin action for validation without constructing runtime clients.
+pub fn compile_action_for_origin_for_validation(
+    config: &serde_json::Value,
+    origin_id: &str,
+) -> Result<Action> {
+    compile_action_for_origin_with_runtime(config, origin_id, false)
+}
+
+fn compile_action_for_origin_with_runtime(
+    config: &serde_json::Value,
+    origin_id: &str,
+    prepare_runtime: bool,
+) -> Result<Action> {
     let type_name = extract_type(config)?;
     match type_name.as_str() {
         "proxy" => Ok(Action::Proxy(ProxyAction::from_config(config.clone())?)),
@@ -44,11 +70,16 @@ pub fn compile_action(config: &serde_json::Value) -> Result<Action> {
         "mock" => Ok(Action::Mock(MockAction::from_config(config.clone())?)),
         "beacon" => Ok(Action::Beacon(BeaconAction::from_config(config.clone())?)),
         "load_balancer" => Ok(Action::LoadBalancer(std::sync::Arc::new(
-            LoadBalancerAction::from_config(config.clone())?,
+            LoadBalancerAction::from_config_for_origin(config.clone(), origin_id)?,
         ))),
-        "ai_proxy" => Ok(Action::AiProxy(Box::new(AiProxyAction::from_config(
-            config.clone(),
-        )?))),
+        "ai_proxy" => {
+            let action = if prepare_runtime {
+                AiProxyAction::from_config(config.clone())?
+            } else {
+                AiProxyAction::from_config_for_validation(config.clone())?
+            };
+            Ok(Action::AiProxy(Box::new(action)))
+        }
         "websocket" => Ok(Action::WebSocket(WebSocketAction::from_config(
             config.clone(),
         )?)),
@@ -211,13 +242,6 @@ pub fn compile_policy(config: &serde_json::Value) -> Result<Policy> {
         "semantic_constraint" => Ok(Policy::SemanticConstraint(
             SemanticConstraintPolicy::from_config(config.clone())?,
         )),
-        // WOR-188: outbound peer-pricing pre-flight. Stored as an
-        // `Arc<PeerPricingPreflightPolicy>` so the outbound
-        // dispatcher (a later wiring PR) can clone a cheap handle
-        // out of the compiled chain.
-        "peer_pricing_preflight" => Ok(Policy::PeerPricingPreflight(std::sync::Arc::new(
-            crate::policy::PeerPricingPreflightPolicy::from_config(config.clone())?,
-        ))),
         // WOR-506: per-`agent_id` semantic rate limit. The policy is
         // wrapped in `Arc` so the enforcer wrapper in `sbproxy-core`
         // can share the bucket state across the compiled chain
@@ -439,6 +463,146 @@ mod tests {
     }
 
     #[test]
+    fn compile_action_load_balancer_rejects_unknown_strategy_by_name() {
+        let json = serde_json::json!({
+            "type": "load_balancer",
+            "strategy": "unknown-picker",
+            "targets": [{"url": "http://one"}]
+        });
+
+        let error = compile_action(&json).expect_err("unknown strategy must fail");
+
+        assert!(
+            error.to_string().contains("unknown-picker"),
+            "error should name the invalid strategy: {error}"
+        );
+    }
+
+    #[test]
+    fn compile_action_load_balancer_accepts_registered_strategy() {
+        let json = serde_json::json!({
+            "type": "load_balancer",
+            "algorithm": "least_connections",
+            "lb_method": "plugin",
+            "strategy": "first-healthy",
+            "strategy_config": {},
+            "targets": [
+                {
+                    "url": "http://one",
+                    "metadata": {"gpu_utilization": 0.8}
+                },
+                {
+                    "url": "http://two",
+                    "metadata": {"gpu_utilization": 0.2}
+                }
+            ]
+        });
+
+        let action = compile_action(&json).expect("registered strategy should compile");
+
+        assert_eq!(action.action_type(), "load_balancer");
+        let Action::LoadBalancer(load_balancer) = action else {
+            panic!("expected load balancer action");
+        };
+        assert_eq!(
+            load_balancer.targets[0].metadata["gpu_utilization"],
+            serde_json::json!(0.8)
+        );
+    }
+
+    #[test]
+    fn compile_action_load_balancer_rejects_plugin_method_without_strategy() {
+        let json = serde_json::json!({
+            "type": "load_balancer",
+            "lb_method": "plugin",
+            "targets": [{"url": "http://one"}]
+        });
+
+        let error = compile_action(&json).expect_err("plugin method requires a strategy");
+
+        assert!(
+            error.to_string().contains("strategy"),
+            "error should explain the missing strategy: {error}"
+        );
+    }
+
+    #[test]
+    fn compile_action_load_balancer_rejects_non_object_strategy_config() {
+        let json = serde_json::json!({
+            "type": "load_balancer",
+            "strategy": "first-healthy",
+            "strategy_config": ["not", "an", "object"],
+            "targets": [{"url": "http://one"}]
+        });
+
+        let error = compile_action(&json).expect_err("strategy config must be an object");
+
+        assert!(
+            error.to_string().contains("strategy_config"),
+            "error should identify strategy_config: {error}"
+        );
+    }
+
+    #[test]
+    fn compile_action_load_balancer_rejects_more_than_64_metadata_entries() {
+        let metadata: serde_json::Map<String, serde_json::Value> = (0..65)
+            .map(|index| (format!("key-{index}"), serde_json::json!(index)))
+            .collect();
+        let json = serde_json::json!({
+            "type": "load_balancer",
+            "targets": [{
+                "url": "http://one",
+                "metadata": metadata
+            }]
+        });
+
+        let error = compile_action(&json).expect_err("metadata entry count must be bounded");
+
+        assert!(
+            error.to_string().contains("metadata"),
+            "error should identify target metadata: {error}"
+        );
+    }
+
+    #[test]
+    fn compile_action_load_balancer_rejects_metadata_keys_over_64_bytes() {
+        let json = serde_json::json!({
+            "type": "load_balancer",
+            "targets": [{
+                "url": "http://one",
+                "metadata": {
+                    "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx": true
+                }
+            }]
+        });
+
+        let error = compile_action(&json).expect_err("metadata keys must be bounded");
+
+        assert!(
+            error.to_string().contains("64 bytes"),
+            "error should explain the metadata key bound: {error}"
+        );
+    }
+
+    #[test]
+    fn compile_action_for_origin_builds_registered_strategy() {
+        let json = serde_json::json!({
+            "type": "load_balancer",
+            "strategy": "bandit",
+            "strategy_config": {"epsilon": 0.0},
+            "targets": [
+                {"url": "http://one"},
+                {"url": "http://two"}
+            ]
+        });
+
+        let action = compile_action_for_origin(&json, "origin-alpha")
+            .expect("origin-aware action should compile");
+
+        assert_eq!(action.action_type(), "load_balancer");
+    }
+
+    #[test]
     fn compile_action_unknown_type() {
         let json = serde_json::json!({"type": "unknown_thing"});
         assert!(compile_action(&json).is_err());
@@ -585,6 +749,42 @@ mod tests {
     fn compile_policy_unknown_type() {
         let json = serde_json::json!({"type": "nonexistent_policy"});
         assert!(compile_policy(&json).is_err());
+    }
+
+    #[test]
+    fn compile_policy_rejects_removed_peer_pricing_preflight() {
+        let json = serde_json::json!({"type": "peer_pricing_preflight"});
+        let err = compile_policy(&json).expect_err("removed policy must not compile");
+        assert!(err.to_string().contains("unknown policy type"));
+    }
+
+    #[test]
+    fn compile_policy_accepts_live_semantic_constraint_shape() {
+        let json = serde_json::json!({
+            "type": "semantic_constraint",
+            "prompt_template": "classify {{ request.path }}",
+            "judge": {
+                "endpoint": "http://127.0.0.1:1/",
+                "api_key_env": "SBPROXY_SC_TEST_KEY"
+            }
+        });
+        let policy = compile_policy(&json).expect("live semantic_constraint must compile");
+        assert_eq!(policy.policy_type(), "semantic_constraint");
+    }
+
+    #[test]
+    fn compile_policy_rejects_removed_semantic_constraint_policy_id() {
+        let json = serde_json::json!({
+            "type": "semantic_constraint",
+            "prompt_template": "classify {{ request.path }}",
+            "policy_id": "legacy-compiled-policy",
+            "judge": {
+                "endpoint": "http://127.0.0.1:1/",
+                "api_key_env": "SBPROXY_SC_TEST_KEY"
+            }
+        });
+        let err = compile_policy(&json).expect_err("removed policy_id must not compile");
+        assert!(err.to_string().contains("policy_id"));
     }
 
     #[test]

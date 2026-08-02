@@ -6,14 +6,16 @@ mod file;
 mod memory;
 mod redb_store;
 mod redis;
+mod redis_connection;
 mod sqlite;
 
 pub use async_kv::AsyncKVStore;
-pub use async_redis::{AsyncRedisConfig, AsyncRedisKVStore};
+pub use async_redis::{AsyncRedisConfig, AsyncRedisKVStore, RedisScanPage};
 pub use file::FileKVStore;
 pub use memory::MemoryKVStore;
 pub use redb_store::RedbKVStore;
 pub use redis::{RedisConfig, RedisKVStore};
+pub use redis_connection::{RedisTlsConfig, ValidatedRedisConnection};
 pub use sqlite::SqliteKVStore;
 
 use anyhow::Result;
@@ -21,6 +23,17 @@ use bytes::Bytes;
 
 /// Low-level key-value storage. All implementations must be thread-safe.
 pub trait KVStore: Send + Sync + 'static {
+    /// Clone the already-validated Redis connection snapshot, when this store
+    /// is Redis-backed.
+    ///
+    /// Runtime consumers use this internal seam to share one compiled DSN and
+    /// TLS identity without reopening configuration files. Other backends
+    /// retain the default `None` implementation.
+    #[doc(hidden)]
+    fn validated_redis_connection(&self) -> Option<ValidatedRedisConnection> {
+        None
+    }
+
     /// Get a value by key. Returns None if the key does not exist.
     fn get(&self, key: &[u8]) -> Result<Option<Bytes>>;
 
@@ -39,6 +52,21 @@ pub trait KVStore: Send + Sync + 'static {
     /// `not supported` error so callers can fall back.
     fn put_with_ttl(&self, _key: &[u8], _value: &[u8], _ttl_secs: u64) -> Result<()> {
         anyhow::bail!("put_with_ttl: not supported by this backend")
+    }
+
+    /// Atomically replace `expected` with `value` and set a TTL.
+    ///
+    /// The byte comparison and replacement must be one indivisible backend
+    /// operation. Unsupported backends return an error so callers never
+    /// degrade a conditional update into an unsafe unconditional write.
+    fn compare_and_swap_with_ttl(
+        &self,
+        _key: &[u8],
+        _expected: &[u8],
+        _value: &[u8],
+        _ttl_secs: u64,
+    ) -> Result<bool> {
+        anyhow::bail!("compare_and_swap_with_ttl: not supported by this backend")
     }
 
     /// Atomically increment the integer counter stored at `key` and ensure

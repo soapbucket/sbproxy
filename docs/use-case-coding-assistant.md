@@ -1,14 +1,16 @@
 # Point your coding assistant at your own GPU
 
-*Last modified: 2026-07-10*
+*Last modified: 2026-07-28*
+
+> **Compatibility form:** This walkthrough still uses provider `serve:`. Prefer `proxy.model_host` + `provider_type: managed_model` for new deployments; see [model-host.md](model-host.md) and [`examples/model-host-managed/`](../examples/model-host-managed/).
 
 ![The Anthropic wire answered by local Qwen3 weights behind the claude-sonnet-4-5 alias, the OpenAI wire answering the same, then the one-line base-URL change](assets/use-case-coding-assistant.gif)
 
 *The recording shows the gateway's Anthropic format bridge against a hosted Claude upstream. A recording of this page's config, with the model running on a local GPU, is still to come.*
 
-Your coding assistant streams your source code to somebody else's cloud, and the meter runs the whole session. Meanwhile the GPU in your workstation sits idle. SBproxy closes that gap with one Apache-2.0 binary that routes to 66 providers or serves the weights on your own hardware: "Call any model. Serve your own. Govern both." This page sets up the serving half and points Claude Code, Cline, and Continue at it.
+Your coding assistant streams your source code to somebody else's cloud, and the meter runs the whole session. Meanwhile the GPU in your workstation sits idle. SBproxy closes that gap with one Apache-2.0 binary that routes to 72 providers or serves the weights on your own hardware: "Call any model. Serve your own. Govern both." This page sets up the serving half and points Claude Code, Cline, and Continue at it.
 
-One status note up front. The managed runtime, verified artifact path, typed engines, admission, and reload transaction are implemented. Apple Metal runs the live gate before this local-runtime PR is published. NVIDIA vLLM and CUDA paths have deterministic coverage, but their live GCP certification is reserved for the final integration PR. `sbproxy doctor` reports what your current box can do; [model-host.md](model-host.md) keeps the exact boundary.
+One status note up front. The managed runtime, verified artifact path, typed engines, admission, and reload transaction are implemented. Apple Silicon Metal passed on 2026-07-11. NVIDIA vLLM, CUDA, and live GCP certification remain pending, with deterministic and local test evidence only. `sbproxy doctor` reports what your current box can do; [model-host.md](model-host.md) keeps the exact boundary.
 
 ## What you will build
 
@@ -24,7 +26,8 @@ A gateway on port 8080 that hosts Qwen3 14B on your GPU and answers to the name 
 ## Install
 
 ```bash
-# Linux / macOS, single static binary:
+# Prebuilt release executable for Linux amd64/arm64 (glibc) or Apple Silicon macOS.
+# No Rust, Python, JVM, or Node toolchain/runtime is required.
 curl -fsSL https://download.sbproxy.dev | sh
 
 # macOS via Homebrew:
@@ -95,7 +98,7 @@ $ sbproxy doctor
 `doctor` prints the visible GPUs, which engines resolve on `PATH`, the weight-cache directory, and a final verdict on whether a `serve:` provider could admit a model on this host. Fix what it names before continuing. Then start the gateway:
 
 ```bash
-sbproxy sb.yml
+sbproxy serve -f sb.yml
 ```
 
 Send the first request on the wire Claude Code speaks. Expect it to be slow once: it pays for the weight download and the engine boot.

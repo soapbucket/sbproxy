@@ -67,7 +67,7 @@ origins:
 
       - type: concurrent_limit
         max: 200
-        key: ip
+        key_by: ip
         status: 503
 
       - type: request_validator

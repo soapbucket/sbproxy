@@ -179,34 +179,18 @@ pub async fn shutdown_cache_revalidate_tasks() {
     CACHE_REVALIDATE_TASKS.wait().await;
 }
 
-/// Pending semantic-cache write produced by a cache-miss path.
+/// Pending semantic-cache write produced by a lookup that missed
+/// (WOR-2099).
 ///
-/// Tuple components: (hook, prompt key, cacheable upstream statuses,
-/// max response size in bytes, model id). When populated, the AI relay
-/// dispatches `hook.store` after the upstream response is forwarded,
-/// subject to the status and size gates.
-type PendingSemcacheMiss = (
-    std::sync::Arc<dyn crate::hooks::SemanticLookupHook>,
-    String,
-    Vec<u16>,
-    Option<usize>,
-    Option<String>,
-);
-
-/// Pending OSS embedding-cache write produced by a semantic miss
-/// (WOR-796). Tuple components: (cache handle, prompt key, the prompt's
-/// embedding vector). When populated, the AI relay stores the upstream
-/// response under this key + vector after a successful (200) response.
-/// Mutually exclusive with [`PendingSemcacheMiss`]: the OSS cache only
-/// runs when the enterprise `SemanticLookupHook` is absent.
+/// Tuple components: the compiled cache for the routed action, and the
+/// private write token that lookup produced. The token carries the derived
+/// namespace, prompt digest, normalized embedding, and generated keys, so
+/// the eventual write cannot drift from the lookup that admitted it. When
+/// populated, the buffered AI relay awaits `cache.store` once the provider
+/// response has passed the status gate and the output guardrails.
 type PendingEmbedMiss = (
     std::sync::Arc<sbproxy_ai::EmbeddingCache>,
-    String,
-    Vec<f32>,
-    // WOR-1142: per-caller cache scope (hashed tenant + credential) so
-    // the write-on-miss store records the same scope the lookup filtered
-    // on.
-    String,
+    sbproxy_ai::SemanticWriteToken,
 );
 
 /// The main proxy implementation.
@@ -753,9 +737,45 @@ fn build_request_template_context(
     tmpl
 }
 
+/// Render `ctx.principal` as the JSON shape every script engine shares.
+///
+/// One call site for the whole request path, so the Lua `ctx.principal`
+/// table, the JS `ctx.principal` object, and the CEL `principal.*`
+/// namespace can never drift apart: all three are fed from the same
+/// [`sbproxy_plugin::Principal`] on the live context.
+fn principal_context_json(principal: &sbproxy_plugin::Principal) -> serde_json::Value {
+    sbproxy_extension::js::build_principal_json(
+        Some(principal.tenant_id.as_str()),
+        (!principal.sub.is_empty()).then_some(principal.sub.as_str()),
+        Some(principal.source.as_str()),
+        principal.virtual_key.as_ref().map(|vk| vk.name.as_str()),
+        principal
+            .virtual_key
+            .as_ref()
+            .map(|vk| vk.allowed_providers.as_slice())
+            .unwrap_or(&[]),
+        principal.attrs.project.as_deref(),
+        principal.attrs.user.as_deref(),
+        principal.attrs.team.as_deref(),
+        &principal.attrs.tags,
+        &principal.attrs.metadata,
+        &principal.attrs.roles,
+        principal.attrs.claims.as_ref(),
+    )
+}
+
+/// Build the shared `ctx` table handed to every Lua / JS script surface
+/// (request modifiers, response modifiers, and the Lua/JS body
+/// transforms, which all route through here).
+///
+/// Carries `request.aipref`, `request.tls`, and `principal`, mirroring
+/// the CEL namespaces so a policy written for CEL ports across engines.
+/// Absent signals render as empty strings / `false` rather than being
+/// omitted, so a script can branch on `ctx.request.tls.ja4` or
+/// `ctx.principal.attrs.team` without probing for presence first.
 fn script_modifier_context(ctx: &RequestContext) -> serde_json::Value {
     let aipref = ctx.aipref.unwrap_or_default();
-    serde_json::json!({
+    let mut root = serde_json::json!({
         "request": {
             "aipref": {
                 "train": aipref.train,
@@ -764,7 +784,26 @@ fn script_modifier_context(ctx: &RequestContext) -> serde_json::Value {
                 "ai-input": aipref.ai_input,
             }
         }
-    })
+    });
+    // WOR-2083: the TLS fingerprint rides on the request sub-table so
+    // scripts read `ctx.request.tls.ja4` exactly like the CEL surface.
+    if let Some(request) = root.get_mut("request") {
+        let fp = ctx.tls_fingerprint.as_ref();
+        sbproxy_extension::lua::bindings::enrich_request_table_with_tls_fingerprint(
+            request,
+            fp.and_then(|f| f.ja3.as_deref()),
+            fp.and_then(|f| f.ja4.as_deref()),
+            fp.and_then(|f| f.ja4h.as_deref()),
+            fp.is_some_and(|f| f.trustworthy),
+        );
+    }
+    if let Some(map) = root.as_object_mut() {
+        map.insert(
+            "principal".to_string(),
+            principal_context_json(&ctx.principal),
+        );
+    }
+    root
 }
 
 fn insert_json_header(
@@ -936,12 +975,75 @@ fn swr_client() -> Option<&'static reqwest::Client> {
         .as_ref()
 }
 
+fn swr_cache_write_back(
+    cache_store: &dyn sbproxy_cache::CacheStore,
+    cache_key: &str,
+    stale_entry: &sbproxy_cache::CachedResponse,
+    refreshed_entry: &sbproxy_cache::CachedResponse,
+) -> anyhow::Result<bool> {
+    cache_store.compare_and_swap(cache_key, stale_entry, refreshed_entry)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SwrRevalidationRequest {
+    upstream_url: String,
+    host_header: String,
+    vary_headers: Vec<(String, String)>,
+}
+
+fn build_swr_revalidation_request(
+    pipeline: &CompiledPipeline,
+    origin_idx: usize,
+    request: &pingora_http::RequestHeader,
+    vary: &[String],
+) -> Option<SwrRevalidationRequest> {
+    let path = request.uri.path();
+    let query = request.uri.query();
+    let forward_action = pipeline
+        .forward_rules
+        .get(origin_idx)
+        .and_then(|rules| {
+            rules.iter().find(|rule| {
+                rule.matchers.iter().any(|matcher| {
+                    matcher
+                        .match_request(path, query, &request.headers)
+                        .is_some()
+                })
+            })
+        })
+        .map(|rule| &rule.action);
+    let action = forward_action.or_else(|| pipeline.actions.get(origin_idx))?;
+    let Action::Proxy(proxy) = action else {
+        return None;
+    };
+    let host_header = proxy.host_override.clone().or_else(|| {
+        url::Url::parse(&proxy.url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string))
+    })?;
+    let vary_headers = vary
+        .iter()
+        .filter(|name| !name.eq_ignore_ascii_case("host"))
+        .filter_map(|name| {
+            let lower = name.to_ascii_lowercase();
+            let value = request.headers.get(&lower)?.to_str().ok()?.to_string();
+            Some((lower, value))
+        })
+        .collect();
+
+    Some(SwrRevalidationRequest {
+        upstream_url: proxy.url.trim_end_matches('/').to_string(),
+        host_header,
+        vary_headers,
+    })
+}
+
 /// Spawn an async refresh of `cache_key` against the origin's upstream.
 ///
-/// The SWR window has just elapsed for an entry; serve the stale value
-/// to the client (caller already did this) and dispatch a background
-/// fetch that re-populates the cache when the refresh succeeds. The
-/// task is registered with [`CACHE_REVALIDATE_TASKS`] so graceful
+/// The entry is stale but still inside its SWR window. The caller has
+/// already served it to the client; this dispatches a background
+/// validation and refreshes the stored TTL on a `304 Not Modified`.
+/// The task is registered with [`CACHE_REVALIDATE_TASKS`] so graceful
 /// shutdown drains it.
 ///
 /// Failures are logged at WARN and never propagate to the client.
@@ -953,43 +1055,40 @@ fn swr_client() -> Option<&'static reqwest::Client> {
 fn spawn_swr_revalidation(
     cache_store: std::sync::Arc<dyn sbproxy_cache::CacheStore>,
     cache_key: String,
+    stale_entry: sbproxy_cache::CachedResponse,
     ttl_secs: u64,
-    action_config: serde_json::Value,
-    hostname: String,
+    revalidation_request: SwrRevalidationRequest,
     path_and_query: String,
     cacheable_status: Vec<u16>,
 ) {
-    // Extract the upstream URL from the action config. Only `proxy`
-    // actions are revalidatable; static / redirect / etc. have no
-    // upstream and we noop. The two field names (`url` and `target`)
-    // both appear in the wild, so we accept either.
-    let upstream_url = action_config
-        .get("url")
-        .or_else(|| action_config.get("target"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim_end_matches('/').to_string());
-    let Some(base) = upstream_url else {
-        tracing::debug!(
-            host = %hostname,
-            "swr: action has no proxy URL, skipping revalidation"
-        );
-        return;
-    };
-    let full_url = format!("{}{}", base, path_and_query);
+    let full_url = format!("{}{}", revalidation_request.upstream_url, path_and_query);
 
     CACHE_REVALIDATE_TASKS.spawn(async move {
-        // Build a clean GET against the upstream. We deliberately
-        // forward only the Host header; downstream callbacks /
-        // modifiers / forward rules etc. are skipped because they
-        // already ran on the synchronous request that triggered this
-        // refresh.
         let Some(client) = swr_client() else {
             // The revalidation client could not be built (logged once at
             // init). SWR is best-effort, so skip the refresh and keep
             // serving the cached entry.
             return;
         };
-        let resp = match client.get(&full_url).header("host", &hostname).send().await {
+        let mut request = client
+            .get(&full_url)
+            .header("host", &revalidation_request.host_header);
+        for (name, value) in &revalidation_request.vary_headers {
+            request = request.header(name, value);
+        }
+        if let Some(etag) = stale_entry
+            .etag()
+            .and_then(|value| reqwest::header::HeaderValue::from_str(value).ok())
+        {
+            request = request.header(reqwest::header::IF_NONE_MATCH, etag);
+        }
+        if let Some(last_modified) = stale_entry
+            .last_modified()
+            .and_then(|value| reqwest::header::HeaderValue::from_str(value).ok())
+        {
+            request = request.header(reqwest::header::IF_MODIFIED_SINCE, last_modified);
+        }
+        let resp = match request.send().await {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(
@@ -1001,6 +1100,67 @@ fn spawn_swr_revalidation(
             }
         };
         let status = resp.status().as_u16();
+        // Capture headers before consuming a successful response body.
+        // `freshen_from_not_modified` applies the stricter 304 merge
+        // rules, including preserving the stored Content-Length.
+        let mut headers: Vec<(String, String)> = Vec::with_capacity(resp.headers().len());
+        for (name, value) in resp.headers() {
+            let n = name.as_str().to_ascii_lowercase();
+            if let Ok(v) = value.to_str() {
+                headers.push((n, v.to_string()));
+            }
+        }
+        let refreshed_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        if status == 304 {
+            let refreshed = stale_entry.freshen_from_not_modified(&headers, refreshed_at, ttl_secs);
+            let _ = tokio::task::spawn_blocking(move || {
+                match swr_cache_write_back(
+                    cache_store.as_ref(),
+                    &cache_key,
+                    &stale_entry,
+                    &refreshed,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::debug!("swr: stale 304 write-back lost a generation race")
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "swr: 304 write-back to cache failed")
+                    }
+                }
+            })
+            .await;
+            return;
+        }
+
+        let connection_fields: Vec<String> = headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("connection"))
+            .flat_map(|(_, value)| value.split(','))
+            .map(|name| name.trim().to_ascii_lowercase())
+            .filter(|name| !name.is_empty())
+            .collect();
+        headers.retain(|(name, _)| {
+            !matches!(
+                name.as_str(),
+                "connection"
+                    | "transfer-encoding"
+                    | "keep-alive"
+                    | "proxy-authenticate"
+                    | "proxy-authorization"
+                    | "te"
+                    | "trailer"
+                    | "upgrade"
+                    | "x-sbproxy-cache"
+            ) && !connection_fields
+                .iter()
+                .any(|connection_name| connection_name.eq_ignore_ascii_case(name))
+        });
+
         // Apply the same cacheable_status gate the live path uses.
         // An empty list is treated as "200 only" to match the
         // response_filter default.
@@ -1017,50 +1177,57 @@ fn spawn_swr_revalidation(
             );
             return;
         }
-        // Capture headers before consuming the body. Skip hop-by-hop
-        // headers that the cache must not store.
-        let mut headers: Vec<(String, String)> = Vec::with_capacity(resp.headers().len());
-        for (name, value) in resp.headers() {
-            let n = name.as_str().to_ascii_lowercase();
-            if matches!(
-                n.as_str(),
-                "connection"
-                    | "transfer-encoding"
-                    | "keep-alive"
-                    | "proxy-authenticate"
-                    | "proxy-authorization"
-                    | "te"
-                    | "trailer"
-                    | "upgrade"
-            ) {
-                continue;
-            }
-            if let Ok(v) = value.to_str() {
-                headers.push((n, v.to_string()));
-            }
+
+        // A revalidation response is buffered before write-back. Cap it
+        // so an origin cannot make the background path consume unbounded
+        // memory. Oversized refreshes leave the stale entry untouched.
+        const MAX_SWR_CACHE_BODY_BYTES: usize = 64 * 1024 * 1024;
+        if resp
+            .content_length()
+            .is_some_and(|length| length > MAX_SWR_CACHE_BODY_BYTES as u64)
+        {
+            tracing::warn!(
+                url = %full_url,
+                cap = MAX_SWR_CACHE_BODY_BYTES,
+                "swr: refresh Content-Length exceeds cache body cap"
+            );
+            return;
         }
-        let body = match resp.bytes().await {
-            Ok(b) => b.to_vec(),
-            Err(e) => {
-                tracing::warn!(error = %e, "swr: failed to read refresh body");
+        let mut body = Vec::new();
+        let mut body_stream = resp.bytes_stream();
+        while let Some(chunk) = body_stream.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(e) => {
+                    tracing::warn!(error = %e, "swr: failed to read refresh body");
+                    return;
+                }
+            };
+            if body.len().saturating_add(chunk.len()) > MAX_SWR_CACHE_BODY_BYTES {
+                tracing::warn!(
+                    url = %full_url,
+                    cap = MAX_SWR_CACHE_BODY_BYTES,
+                    "swr: refresh body exceeds cache body cap"
+                );
                 return;
             }
-        };
+            body.extend_from_slice(&chunk);
+        }
         let entry = sbproxy_cache::CachedResponse {
+            generation: sbproxy_cache::new_cache_generation(),
             status,
             headers,
             body,
-            cached_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+            cached_at: refreshed_at,
             ttl_secs,
         };
         // Write-back goes through spawn_blocking for the same reason
         // the live path does: blocking I/O for the Redis backend.
         let _ = tokio::task::spawn_blocking(move || {
-            if let Err(e) = cache_store.put(&cache_key, &entry) {
-                tracing::warn!(error = %e, "swr: write-back to cache failed");
+            match swr_cache_write_back(cache_store.as_ref(), &cache_key, &stale_entry, &entry) {
+                Ok(true) => {}
+                Ok(false) => tracing::debug!("swr: stale write-back lost a generation race"),
+                Err(e) => tracing::warn!(error = %e, "swr: write-back to cache failed"),
             }
         })
         .await;
@@ -1105,21 +1272,7 @@ fn maybe_admit_to_reserve(
     let body = bytes::Bytes::from(entry.body.clone());
     let now = std::time::SystemTime::now();
     let expires_at = now + std::time::Duration::from_secs(entry.ttl_secs);
-    // Pull content-type from the cached headers if present so the
-    // reserve can serve it without re-walking the header list.
-    let content_type = entry
-        .headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-        .map(|(_, v)| v.clone());
-    let metadata = sbproxy_cache::ReserveMetadata {
-        created_at: now,
-        expires_at,
-        content_type,
-        vary_fingerprint: None,
-        size: entry.body.len() as u64,
-        status: entry.status,
-    };
+    let metadata = sbproxy_cache::ReserveMetadata::from_cached_response(entry, now, expires_at);
 
     tokio::spawn(async move {
         match reserve.put(&key, body, metadata).await {
@@ -1442,6 +1595,35 @@ async fn send_response(
         .write_response_body(Some(bytes::Bytes::copy_from_slice(body)), true)
         .await?;
     Ok(())
+}
+
+/// Replay one complete idempotency-cache hit with the same framing cleanup
+/// used by the early request-filter path.
+async fn send_idempotency_cache_hit(
+    session: &mut Session,
+    cached: sbproxy_middleware::idempotency::CachedResponse,
+) -> Result<u16> {
+    let status = cached.status;
+    let filtered_headers: Vec<(String, String)> = cached
+        .headers
+        .into_iter()
+        .filter(|(name, _)| {
+            let lower = name.to_ascii_lowercase();
+            lower != "content-length" && lower != "transfer-encoding" && lower != "connection"
+        })
+        .collect();
+    let mut header = pingora_http::ResponseHeader::build(status, Some(filtered_headers.len() + 1))?;
+    for (name, value) in filtered_headers {
+        let _ = header.insert_header(name, value);
+    }
+    let _ = header.insert_header("x-sbproxy-idempotency", "HIT");
+    session
+        .write_response_header(Box::new(header), false)
+        .await?;
+    session
+        .write_response_body(Some(bytes::Bytes::from(cached.body)), true)
+        .await?;
+    Ok(status)
 }
 
 /// Build a `{"error": "<message>"}` JSON body with the message
@@ -1817,6 +1999,9 @@ enum AuthResult {
         /// Origin of `sub`.
         source: Option<sbproxy_plugin::AuthSubjectSource>,
     },
+    /// Authentication passed, but the authenticated principal exhausted
+    /// an auth-provider-owned request budget.
+    RateLimited(sbproxy_modules::RateLimitInfo),
     /// Auth failed with this status code and message.
     Deny(u16, String),
     /// Auth failed with this status code, message, and provider-supplied
@@ -1836,6 +2021,71 @@ impl AuthResult {
             source: None,
         }
     }
+}
+
+fn cap_principal_from_verified_token(
+    tenant_id: sbproxy_plugin::TenantId,
+    view: &sbproxy_modules::auth::CapTokenView,
+) -> sbproxy_plugin::Principal {
+    sbproxy_plugin::Principal {
+        tenant_id,
+        sub: view.subject.clone(),
+        source: sbproxy_plugin::PrincipalSource::Cap,
+        virtual_key: None,
+        attrs: sbproxy_plugin::PrincipalAttrs::default(),
+    }
+}
+
+/// Trust-specific outcome of an authentication attempt.
+///
+/// HTTP denials are not all evidence of hostile traffic. Missing credentials,
+/// an interactive challenge, and verifier infrastructure failures remain
+/// neutral; only a proof that was actually offered and failed verification is
+/// load-bearing evidence for the `suspicious` tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthTrustOutcome {
+    Allowed,
+    Missing,
+    Challenge,
+    InvalidProof,
+    BackendFailure,
+}
+
+impl AuthTrustOutcome {
+    fn is_suspicious(self) -> bool {
+        matches!(self, Self::InvalidProof)
+    }
+}
+
+fn plugin_denial_trust_outcome(
+    provider: &dyn sbproxy_plugin::AuthProvider,
+    decision: &sbproxy_plugin::AuthDecision,
+    status: u16,
+) -> AuthTrustOutcome {
+    if status >= 500 {
+        return AuthTrustOutcome::BackendFailure;
+    }
+
+    match provider.denial_kind(decision) {
+        sbproxy_plugin::AuthDenialKind::Challenge => AuthTrustOutcome::Challenge,
+        sbproxy_plugin::AuthDenialKind::InvalidProof => AuthTrustOutcome::InvalidProof,
+    }
+}
+
+fn api_key_was_offered(
+    auth: &sbproxy_modules::auth::ApiKeyAuth,
+    headers: &http::HeaderMap,
+    query: Option<&str>,
+) -> bool {
+    if headers.contains_key(auth.header_name.as_str()) {
+        return true;
+    }
+    let Some(param_name) = auth.query_param.as_deref() else {
+        return false;
+    };
+    query.is_some_and(|query| {
+        url::form_urlencoded::parse(query.as_bytes()).any(|(name, _)| name == param_name)
+    })
 }
 
 /// WOR-892 PR1 step 3/3: OIDC Relying-Party request-time check.
@@ -1968,6 +2218,7 @@ fn read_cookie(headers: &http::HeaderMap, name: &str) -> Option<String> {
 /// the corresponding [`AuthResult`] variant; `DenyWithHeaders` is
 /// preserved end-to-end so providers can attach challenge headers
 /// (RFC 9728, OAuth 2.0 PRM, etc.) on the 4xx response.
+#[cfg(test)]
 async fn check_auth(
     auth: &Auth,
     headers: &http::HeaderMap,
@@ -1988,7 +2239,34 @@ async fn check_auth(
     // thumbprint is available (the verifier treats `None` as
     // "no TLS binding"). The DPoP wire-up does not need a
     // thumbprint and works through the `None` path unchanged.
-    check_auth_with_tls(
+    let (result, principal, _) = check_auth_with_outcome(
+        auth,
+        headers,
+        query,
+        method,
+        path,
+        tenant_id,
+        resolved_agent_id,
+    )
+    .await;
+    (result, principal)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn check_auth_with_outcome(
+    auth: &Auth,
+    headers: &http::HeaderMap,
+    query: Option<&str>,
+    method: &str,
+    path: &str,
+    tenant_id: sbproxy_plugin::TenantId,
+    resolved_agent_id: Option<&str>,
+) -> (
+    AuthResult,
+    Option<sbproxy_plugin::Principal>,
+    AuthTrustOutcome,
+) {
+    check_auth_with_tls_outcome(
         auth,
         headers,
         query,
@@ -2026,6 +2304,7 @@ fn format_htu(headers: &http::HeaderMap, path: &str) -> String {
 /// `require_mtls_bound = true` deployment fails closed (every
 /// request rejected) instead of silently allowing.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn check_auth_with_tls(
     auth: &Auth,
     headers: &http::HeaderMap,
@@ -2037,6 +2316,35 @@ async fn check_auth_with_tls(
     // WOR-1149: resolved agent id for CAP `sub` binding (see `check_auth`).
     resolved_agent_id: Option<&str>,
 ) -> (AuthResult, Option<sbproxy_plugin::Principal>) {
+    let (result, principal, _) = check_auth_with_tls_outcome(
+        auth,
+        headers,
+        query,
+        method,
+        path,
+        tenant_id,
+        tls_cert_thumbprint,
+        resolved_agent_id,
+    )
+    .await;
+    (result, principal)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn check_auth_with_tls_outcome(
+    auth: &Auth,
+    headers: &http::HeaderMap,
+    query: Option<&str>,
+    method: &str,
+    path: &str,
+    tenant_id: sbproxy_plugin::TenantId,
+    tls_cert_thumbprint: Option<&str>,
+    resolved_agent_id: Option<&str>,
+) -> (
+    AuthResult,
+    Option<sbproxy_plugin::Principal>,
+    AuthTrustOutcome,
+) {
     use sbproxy_modules::auth::dpop::DpopVerifier;
     use sbproxy_modules::auth::mtls_bound::{MtlsBoundVerifier, MtlsBoundVerifierConfig};
     // WOR-1136: the DPoP verifier owns the (jkt, jti) replay cache that
@@ -2050,8 +2358,20 @@ async fn check_auth_with_tls(
     match auth {
         Auth::ApiKey(a) => {
             match a.check_request_with_principal(headers, query, tenant_id.clone()) {
-                Some(principal) => (AuthResult::allow_anonymous(), Some(principal)),
-                None => (AuthResult::Deny(401, "unauthorized".to_string()), None),
+                Some(principal) => (
+                    AuthResult::allow_anonymous(),
+                    Some(principal),
+                    AuthTrustOutcome::Allowed,
+                ),
+                None => (
+                    AuthResult::Deny(401, "unauthorized".to_string()),
+                    None,
+                    if api_key_was_offered(a, headers, query) {
+                        AuthTrustOutcome::InvalidProof
+                    } else {
+                        AuthTrustOutcome::Missing
+                    },
+                ),
             }
         }
         Auth::BasicAuth(a) => match a.check_request_with_principal(headers, tenant_id.clone()) {
@@ -2063,9 +2383,18 @@ async fn check_auth_with_tls(
                         source: Some(sbproxy_plugin::AuthSubjectSource::Header),
                     },
                     Some(principal),
+                    AuthTrustOutcome::Allowed,
                 )
             }
-            None => (AuthResult::Deny(401, "unauthorized".to_string()), None),
+            None => (
+                AuthResult::Deny(401, "unauthorized".to_string()),
+                None,
+                if headers.contains_key(http::header::AUTHORIZATION) {
+                    AuthTrustOutcome::InvalidProof
+                } else {
+                    AuthTrustOutcome::Missing
+                },
+            ),
         },
         Auth::Bearer(a) => match a.check_request_with_token(headers, tenant_id.clone()) {
             Some((principal, token)) => {
@@ -2090,6 +2419,7 @@ async fn check_auth_with_tls(
                                     .to_string(),
                             ),
                             None,
+                            AuthTrustOutcome::BackendFailure,
                         );
                     };
                     let htu = format_htu(headers, path);
@@ -2100,15 +2430,33 @@ async fn check_auth_with_tls(
                         expected_jkt,
                         std::time::SystemTime::now(),
                     ) {
+                        let outcome = if dpop_header.is_some() {
+                            AuthTrustOutcome::InvalidProof
+                        } else {
+                            AuthTrustOutcome::Missing
+                        };
                         return (
                             AuthResult::Deny(401, format!("DPoP verification failed: {err}")),
                             None,
+                            outcome,
                         );
                     }
                 }
-                (AuthResult::allow_anonymous(), Some(principal))
+                (
+                    AuthResult::allow_anonymous(),
+                    Some(principal),
+                    AuthTrustOutcome::Allowed,
+                )
             }
-            None => (AuthResult::Deny(401, "unauthorized".to_string()), None),
+            None => (
+                AuthResult::Deny(401, "unauthorized".to_string()),
+                None,
+                if headers.contains_key(http::header::AUTHORIZATION) {
+                    AuthTrustOutcome::InvalidProof
+                } else {
+                    AuthTrustOutcome::Missing
+                },
+            ),
         },
         Auth::Jwt(a) => match a.check_request_with_claims(headers, tenant_id.clone()) {
             Some((principal, claims)) => {
@@ -2135,6 +2483,7 @@ async fn check_auth_with_tls(
                                     .to_string(),
                             ),
                             None,
+                            AuthTrustOutcome::InvalidProof,
                         );
                     };
                     let htu = format_htu(headers, path);
@@ -2145,9 +2494,15 @@ async fn check_auth_with_tls(
                         expected_jkt,
                         std::time::SystemTime::now(),
                     ) {
+                        let outcome = if dpop_header.is_some() {
+                            AuthTrustOutcome::InvalidProof
+                        } else {
+                            AuthTrustOutcome::Missing
+                        };
                         return (
                             AuthResult::Deny(401, format!("DPoP verification failed: {err}")),
                             None,
+                            outcome,
                         );
                     }
                 }
@@ -2167,6 +2522,11 @@ async fn check_auth_with_tls(
                                 format!("mTLS-bound token verification failed: {err}"),
                             ),
                             None,
+                            if tls_cert_thumbprint.is_some() {
+                                AuthTrustOutcome::InvalidProof
+                            } else {
+                                AuthTrustOutcome::Missing
+                            },
                         );
                     }
                 }
@@ -2184,9 +2544,17 @@ async fn check_auth_with_tls(
                         source: Some(sbproxy_plugin::AuthSubjectSource::Jwt),
                     }
                 };
-                (auth_result, Some(principal))
+                (auth_result, Some(principal), AuthTrustOutcome::Allowed)
             }
-            None => (AuthResult::Deny(401, "unauthorized".to_string()), None),
+            None => (
+                AuthResult::Deny(401, "unauthorized".to_string()),
+                None,
+                if headers.contains_key(http::header::AUTHORIZATION) {
+                    AuthTrustOutcome::InvalidProof
+                } else {
+                    AuthTrustOutcome::Missing
+                },
+            ),
         },
         Auth::Digest(d) => {
             if headers.get(http::header::AUTHORIZATION).is_some() {
@@ -2205,16 +2573,25 @@ async fn check_auth_with_tls(
                                 source: Some(sbproxy_plugin::AuthSubjectSource::Header),
                             },
                             Some(principal),
+                            AuthTrustOutcome::Allowed,
                         )
                     }
                     None => {
                         let nonce = sbproxy_modules::auth::DigestAuth::generate_nonce();
-                        (AuthResult::DigestChallenge(d.challenge(&nonce)), None)
+                        (
+                            AuthResult::DigestChallenge(d.challenge(&nonce)),
+                            None,
+                            AuthTrustOutcome::InvalidProof,
+                        )
                     }
                 }
             } else {
                 let nonce = sbproxy_modules::auth::DigestAuth::generate_nonce();
-                (AuthResult::DigestChallenge(d.challenge(&nonce)), None)
+                (
+                    AuthResult::DigestChallenge(d.challenge(&nonce)),
+                    None,
+                    AuthTrustOutcome::Challenge,
+                )
             }
         }
         // ForwardAuth runs as a separate async subrequest in the
@@ -2226,6 +2603,7 @@ async fn check_auth_with_tls(
         Auth::ForwardAuth(_) => (
             AuthResult::allow_anonymous(),
             Some(sbproxy_plugin::Principal::anonymous_for(tenant_id.clone())),
+            AuthTrustOutcome::Allowed,
         ),
         Auth::BotAuth(b) => {
             use sbproxy_modules::auth::BotAuthVerdict;
@@ -2251,6 +2629,7 @@ async fn check_auth_with_tls(
                     return (
                         AuthResult::Deny(500, "bot_auth: bad request".to_string()),
                         None,
+                        AuthTrustOutcome::BackendFailure,
                     );
                 }
             };
@@ -2283,15 +2662,21 @@ async fn check_auth_with_tls(
                             ..sbproxy_plugin::PrincipalAttrs::default()
                         },
                     };
-                    (AuthResult::allow_anonymous(), Some(principal))
+                    (
+                        AuthResult::allow_anonymous(),
+                        Some(principal),
+                        AuthTrustOutcome::Allowed,
+                    )
                 }
                 BotAuthVerdict::Missing => (
                     AuthResult::Deny(401, "bot_auth: signature required".to_string()),
                     None,
+                    AuthTrustOutcome::Missing,
                 ),
                 BotAuthVerdict::UnknownAgent { key_id } => (
                     AuthResult::Deny(401, format!("bot_auth: unknown agent keyid {}", key_id)),
                     None,
+                    AuthTrustOutcome::InvalidProof,
                 ),
                 BotAuthVerdict::Failed { agent_name, reason } => {
                     let agent = agent_name.unwrap_or_else(|| "<unknown>".to_string());
@@ -2299,6 +2684,7 @@ async fn check_auth_with_tls(
                     (
                         AuthResult::Deny(401, "bot_auth: verification failed".to_string()),
                         None,
+                        AuthTrustOutcome::InvalidProof,
                     )
                 }
                 BotAuthVerdict::DirectoryUnavailable { reason } => {
@@ -2312,6 +2698,7 @@ async fn check_auth_with_tls(
                     (
                         AuthResult::Deny(401, "bot_auth: directory unavailable".to_string()),
                         None,
+                        AuthTrustOutcome::BackendFailure,
                     )
                 }
             }
@@ -2345,7 +2732,11 @@ async fn check_auth_with_tls(
             let mut req = match builder.uri(target_uri.as_str()).body(bytes::Bytes::new()) {
                 Ok(r) => r,
                 Err(_) => {
-                    return (AuthResult::Deny(500, "cap: bad request".to_string()), None);
+                    return (
+                        AuthResult::Deny(500, "cap: bad request".to_string()),
+                        None,
+                        AuthTrustOutcome::BackendFailure,
+                    );
                 }
             };
             *req.headers_mut() = headers.clone();
@@ -2361,15 +2752,30 @@ async fn check_auth_with_tls(
             // the code coming from `CapError::www_auth_code()` (e.g.
             // `invalid_token`, `path_not_authorized`).
             match verifier.verify(&req, &host, path, resolved_agent_id) {
-                CapVerdict::Verified(_view) => {
-                    let principal = sbproxy_plugin::Principal {
-                        tenant_id: tenant_id.clone(),
-                        sub: String::new(),
-                        source: sbproxy_plugin::PrincipalSource::Cap,
-                        virtual_key: None,
-                        attrs: sbproxy_plugin::PrincipalAttrs::default(),
-                    };
-                    (AuthResult::allow_anonymous(), Some(principal))
+                CapVerdict::Verified(view) => {
+                    let principal = cap_principal_from_verified_token(tenant_id.clone(), &view);
+                    (
+                        AuthResult::allow_anonymous(),
+                        Some(principal),
+                        AuthTrustOutcome::Allowed,
+                    )
+                }
+                CapVerdict::RateLimited(info) => {
+                    let principal =
+                        cap_principal_from_verified_token(tenant_id.clone(), &info.token);
+                    (
+                        AuthResult::RateLimited(sbproxy_modules::RateLimitInfo {
+                            allowed: false,
+                            limit: info.limit,
+                            remaining: info.remaining,
+                            reset_secs: info.reset_secs,
+                            headers_enabled: true,
+                            include_retry_after: true,
+                            include_ratelimit_policy: false,
+                        }),
+                        Some(principal),
+                        AuthTrustOutcome::Allowed,
+                    )
                 }
                 CapVerdict::Missing => (
                     AuthResult::DenyWithHeaders(
@@ -2378,10 +2784,17 @@ async fn check_auth_with_tls(
                         vec![("WWW-Authenticate".to_string(), "License".to_string())],
                     ),
                     None,
+                    AuthTrustOutcome::Missing,
                 ),
                 CapVerdict::Invalid(err) => {
                     let status = err.http_status();
                     let code = err.www_auth_code();
+                    let trust_outcome =
+                        if matches!(&err, sbproxy_modules::auth::CapError::DirectoryUnavailable) {
+                            AuthTrustOutcome::BackendFailure
+                        } else {
+                            AuthTrustOutcome::InvalidProof
+                        };
                     (
                         AuthResult::DenyWithHeaders(
                             status,
@@ -2392,6 +2805,7 @@ async fn check_auth_with_tls(
                             )],
                         ),
                         None,
+                        trust_outcome,
                     )
                 }
             }
@@ -2399,9 +2813,21 @@ async fn check_auth_with_tls(
         Auth::Noop => (
             AuthResult::allow_anonymous(),
             Some(sbproxy_plugin::Principal::anonymous_for(tenant_id.clone())),
+            AuthTrustOutcome::Allowed,
         ),
         Auth::Oidc(cfg) => {
             let result = oidc_check(cfg.as_ref(), headers);
+            let trust_outcome = match &result {
+                AuthResult::Allow { .. } | AuthResult::RateLimited(_) => AuthTrustOutcome::Allowed,
+                AuthResult::Deny(status, _) | AuthResult::DenyWithHeaders(status, _, _)
+                    if *status >= 500 =>
+                {
+                    AuthTrustOutcome::BackendFailure
+                }
+                AuthResult::Deny(..)
+                | AuthResult::DenyWithHeaders(..)
+                | AuthResult::DigestChallenge(..) => AuthTrustOutcome::Challenge,
+            };
             // The OIDC happy path stamps the principal on `Allow`;
             // pull the sub off the AuthResult before we return so
             // the call site can copy the full principal onto ctx.
@@ -2410,7 +2836,7 @@ async fn check_auth_with_tls(
             } else {
                 None
             };
-            (result, principal)
+            (result, principal, trust_outcome)
         }
         Auth::Plugin(provider) => {
             // Build a synthetic http::Request the provider can read
@@ -2438,6 +2864,7 @@ async fn check_auth_with_tls(
                             ),
                         ),
                         None,
+                        AuthTrustOutcome::BackendFailure,
                     );
                 }
             };
@@ -2450,31 +2877,51 @@ async fn check_auth_with_tls(
             // request context lands, swap the placeholder for it.
             let mut ctx: () = ();
             match provider.authenticate(&req, &mut ctx).await {
-                Ok(sbproxy_plugin::AuthDecision::Allow { sub, source }) => {
-                    // WOR-1047 PR2: build a minimal Principal for
-                    // out-of-tree plugins so the access-log + policy
-                    // pipeline sees the same shape every built-in
-                    // provider produces. Plugins that want richer
-                    // attribution will move to the principal-only
-                    // return type in the final PR of the credentials
-                    // epic; until then `attrs` is empty.
-                    let principal = sbproxy_plugin::Principal {
-                        tenant_id: tenant_id.clone(),
-                        sub: sub.clone().unwrap_or_default(),
-                        source: sbproxy_plugin::PrincipalSource::Plugin,
-                        virtual_key: None,
-                        attrs: sbproxy_plugin::PrincipalAttrs::default(),
+                Ok(decision) => {
+                    let trust_outcome = match &decision {
+                        sbproxy_plugin::AuthDecision::Allow { .. } => AuthTrustOutcome::Allowed,
+                        sbproxy_plugin::AuthDecision::Deny { status, .. }
+                        | sbproxy_plugin::AuthDecision::DenyWithHeaders { status, .. } => {
+                            plugin_denial_trust_outcome(provider.as_ref(), &decision, *status)
+                        }
                     };
-                    (AuthResult::Allow { sub, source }, Some(principal))
+
+                    match decision {
+                        sbproxy_plugin::AuthDecision::Allow { sub, source } => {
+                            // WOR-1047 PR2: build a minimal Principal for
+                            // out-of-tree plugins so the access-log + policy
+                            // pipeline sees the same shape every built-in
+                            // provider produces. Plugins that want richer
+                            // attribution will move to the principal-only
+                            // return type in the final PR of the credentials
+                            // epic; until then `attrs` is empty.
+                            let principal = sbproxy_plugin::Principal {
+                                tenant_id: tenant_id.clone(),
+                                sub: sub.clone().unwrap_or_default(),
+                                source: sbproxy_plugin::PrincipalSource::Plugin,
+                                virtual_key: None,
+                                attrs: sbproxy_plugin::PrincipalAttrs::default(),
+                            };
+                            (
+                                AuthResult::Allow { sub, source },
+                                Some(principal),
+                                trust_outcome,
+                            )
+                        }
+                        sbproxy_plugin::AuthDecision::Deny { status, message } => {
+                            (AuthResult::Deny(status, message), None, trust_outcome)
+                        }
+                        sbproxy_plugin::AuthDecision::DenyWithHeaders {
+                            status,
+                            message,
+                            headers,
+                        } => (
+                            AuthResult::DenyWithHeaders(status, message, headers),
+                            None,
+                            trust_outcome,
+                        ),
+                    }
                 }
-                Ok(sbproxy_plugin::AuthDecision::Deny { status, message }) => {
-                    (AuthResult::Deny(status, message), None)
-                }
-                Ok(sbproxy_plugin::AuthDecision::DenyWithHeaders {
-                    status,
-                    message,
-                    headers,
-                }) => (AuthResult::DenyWithHeaders(status, message, headers), None),
                 Err(err) => {
                     tracing::warn!(
                         plugin = %provider.auth_type(),
@@ -2487,6 +2934,7 @@ async fn check_auth_with_tls(
                             format!("auth plugin {:?} error", provider.auth_type()),
                         ),
                         None,
+                        AuthTrustOutcome::BackendFailure,
                     )
                 }
             }
@@ -2501,6 +2949,9 @@ async fn check_auth_with_tls(
 /// request-scoped deadline below. The outer client-level timeout
 /// (default 30s) reads from
 /// `proxy.http_client_timeouts.forward_auth_client_secs` on first use.
+/// Redirects are disabled because this client also acquires bound outbound
+/// credentials: replaying an authorization subrequest or DPoP proof at a
+/// redirected method or URI would invalidate its security binding.
 static FORWARD_AUTH_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
 
 fn forward_auth_client() -> &'static reqwest::Client {
@@ -2512,6 +2963,7 @@ fn forward_auth_client() -> &'static reqwest::Client {
             .forward_auth_client_secs;
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(secs))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("forward-auth reqwest::Client build must succeed")
     })
@@ -2539,11 +2991,139 @@ fn bot_auth_directory_client() -> &'static reqwest::Client {
     })
 }
 
+fn is_auth_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// Return whether an HTTP authentication challenge explicitly carries the
+/// requested auth parameter and value.
+///
+/// The scanner ignores quoted strings while looking for parameter names and
+/// enforces RFC token boundaries, so values such as
+/// `error_description="invalid_token"` cannot masquerade as `error=...`.
+fn auth_challenge_has_parameter(header: &str, name: &str, expected: &str) -> bool {
+    let bytes = header.as_bytes();
+    let name = name.as_bytes();
+    let expected = expected.as_bytes();
+    let mut cursor = 0;
+
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'"' {
+            cursor += 1;
+            while cursor < bytes.len() {
+                match bytes[cursor] {
+                    b'\\' if cursor + 1 < bytes.len() => cursor += 2,
+                    b'"' => {
+                        cursor += 1;
+                        break;
+                    }
+                    _ => cursor += 1,
+                }
+            }
+            continue;
+        }
+
+        let name_end = cursor.saturating_add(name.len());
+        let has_name = name_end <= bytes.len()
+            && bytes[cursor..name_end].eq_ignore_ascii_case(name)
+            && (cursor == 0 || !is_auth_token_byte(bytes[cursor - 1]))
+            && (name_end == bytes.len() || !is_auth_token_byte(bytes[name_end]));
+        if !has_name {
+            cursor += 1;
+            continue;
+        }
+
+        let mut value_start = name_end;
+        while value_start < bytes.len() && bytes[value_start].is_ascii_whitespace() {
+            value_start += 1;
+        }
+        if bytes.get(value_start) != Some(&b'=') {
+            cursor = name_end;
+            continue;
+        }
+        value_start += 1;
+        while value_start < bytes.len() && bytes[value_start].is_ascii_whitespace() {
+            value_start += 1;
+        }
+
+        if bytes.get(value_start) == Some(&b'"') {
+            value_start += 1;
+            let mut value_end = value_start;
+            while value_end < bytes.len() && bytes[value_end] != b'"' {
+                if bytes[value_end] == b'\\' {
+                    break;
+                }
+                value_end += 1;
+            }
+            if value_end < bytes.len()
+                && bytes[value_start..value_end].eq_ignore_ascii_case(expected)
+            {
+                return true;
+            }
+        } else {
+            let mut value_end = value_start;
+            while value_end < bytes.len() && is_auth_token_byte(bytes[value_end]) {
+                value_end += 1;
+            }
+            if bytes[value_start..value_end].eq_ignore_ascii_case(expected) {
+                return true;
+            }
+        }
+
+        cursor = value_start.saturating_add(1);
+    }
+
+    false
+}
+
+fn forward_auth_denial_trust_outcome(
+    status: u16,
+    headers: &reqwest::header::HeaderMap,
+) -> AuthTrustOutcome {
+    if status >= 500 {
+        return AuthTrustOutcome::BackendFailure;
+    }
+
+    let mut challenge_present = false;
+    for value in headers.get_all(reqwest::header::WWW_AUTHENTICATE).iter() {
+        challenge_present = true;
+        if value
+            .to_str()
+            .is_ok_and(|value| auth_challenge_has_parameter(value, "error", "invalid_token"))
+        {
+            return AuthTrustOutcome::InvalidProof;
+        }
+    }
+
+    if challenge_present {
+        AuthTrustOutcome::Challenge
+    } else {
+        AuthTrustOutcome::Missing
+    }
+}
+
 /// Run forward auth by making an HTTP subrequest to the auth service.
 async fn check_forward_auth(
     fwd: &sbproxy_modules::auth::ForwardAuthProvider,
     request_headers: &http::HeaderMap,
-) -> std::result::Result<Vec<(String, String)>, (u16, String)> {
+) -> std::result::Result<Vec<(String, String)>, (u16, String, AuthTrustOutcome)> {
     let client = forward_auth_client();
     let default_request_secs = reload::current_pipeline()
         .config
@@ -2568,7 +3148,11 @@ async fn check_forward_auth(
 
     let response = req.send().await.map_err(|e| {
         warn!(error = %e, url = %fwd.url, "forward auth request failed");
-        (503u16, "auth service unavailable".to_string())
+        (
+            503u16,
+            "auth service unavailable".to_string(),
+            AuthTrustOutcome::BackendFailure,
+        )
     })?;
 
     let status = response.status().as_u16();
@@ -2585,7 +3169,8 @@ async fn check_forward_auth(
         }
         Ok(forwarded)
     } else {
-        Err((401u16, "unauthorized".to_string()))
+        let trust_outcome = forward_auth_denial_trust_outcome(status, response.headers());
+        Err((401u16, "unauthorized".to_string(), trust_outcome))
     }
 }
 
@@ -2611,6 +3196,12 @@ fn emit_auth_audit(
         Some(session.req_header().method.as_str().to_string()),
     )
     .with_tenant_id(ctx.tenant_id.to_string())
+    .with_key_context(
+        ctx.native_key_provider.clone(),
+        ctx.inbound_key_mode.as_str(),
+    )
+    // WOR-2093: a denial names the key it denied, when one resolved.
+    .with_api_key_id(ctx.accountable_key_id())
     .emit();
 }
 
@@ -2706,6 +3297,26 @@ fn emit_policy_verdict(
         // workspace id as the OSS-scope tenant proxy.
         sbproxy_observe::metrics::record_policy_audit_event_dropped(&ctx.workspace_id);
     }
+    // WOR-2094: non-allow verdicts land on the console's audit sample.
+    // Allow verdicts stay off the ring (they would flood it at request
+    // volume); the per-request policy_decisions column carries them.
+    if !matches!(verdict, sbproxy_observe::events::VerdictTag::Allow) {
+        sbproxy_observe::audit_ring::push_audit_event(
+            sbproxy_observe::audit_ring::AuditRingEvent::new(
+                "policy",
+                policy_id,
+                None,
+                Some(ctx.tenant_id.clone()),
+                None,
+                Some(ctx.request_id.clone()),
+                Some(format!(
+                    "{} verdict on {} surface ({elapsed_ms}ms)",
+                    verdict.as_label(),
+                    surface.as_label(),
+                )),
+            ),
+        );
+    }
 }
 
 /// Build a frozen `http::Request<bytes::Bytes>` snapshot of the
@@ -2715,6 +3326,20 @@ fn emit_policy_verdict(
 /// this helper materialises one from the Pingora session so the
 /// existing built-in arms can keep their `Session` view while
 /// plugin enforcers see the standard `http` types.
+///
+/// # The body is always empty
+///
+/// The snapshot carries the request line and headers only. Its body is
+/// unconditionally `bytes::Bytes::new()`, because the request filter
+/// runs before any body byte has been read.
+///
+/// This is load bearing for anyone writing an enforcer. A check gated
+/// on `req.body()` does not run, ever, and it fails silently: the
+/// enforcer returns `Allow`, its metrics stay flat, and unit tests that
+/// call the underlying check directly keep passing. The A2A 1.0
+/// push-notification SSRF check shipped that way and never fired once
+/// in production. If a policy needs the body, it belongs at the body
+/// phase; see `crate::server::a2a_body_phase` for the pattern.
 fn build_plugin_request_snapshot(session: &Session) -> Option<http::Request<bytes::Bytes>> {
     let req = session.req_header();
     let method = req.method.as_str();
@@ -2961,6 +3586,9 @@ async fn check_policies(
                     "policy enforce() returned error; treating as deny"
                 );
                 emit_policy_verdict(verdict_ctx, policy_id, surface, VerdictTag::Deny, started);
+                // WOR-2094: the ring row explains the denial too.
+                ctx.record_policy_decision(policy_id, VerdictTag::Deny.as_label());
+                ctx.deny_reason = Some(format!("{policy_id}: enforce error"));
                 return Some((500, "policy error".to_string(), "plugin"));
             }
         };
@@ -2970,7 +3598,11 @@ async fn check_policies(
             &mut confirm_state,
         );
         emit_policy_verdict(verdict_ctx, policy_id, surface, translated.verdict, started);
+        // WOR-2094: mirror every verdict onto the request context so the
+        // admin ring row can explain what applied, not just what denied.
+        ctx.record_policy_decision(policy_id, translated.verdict.as_label());
         if let Some(deny) = translated.deny {
+            ctx.deny_reason = Some(format!("{policy_id}: {}", deny.1));
             return Some(deny);
         }
     }
@@ -3016,16 +3648,17 @@ fn shared_lua_engine() -> anyhow::Result<std::sync::Arc<sbproxy_extension::lua::
 
 /// Execute a Lua request modifier script.
 ///
-/// The script must define `modify_request(req, ctx)` which receives the request
-/// data as a table with `method`, `path`, and `headers` fields, and an empty
-/// context table. It must return a table with `set_headers` (and optionally
-/// `remove_headers`) to apply to the upstream request.
+/// The script must define `modify_request(req, ctx)` which receives the
+/// request data as a table with `method`, `path`, `headers`, and `tls`
+/// fields, and a context table carrying `request.aipref`, `request.tls`,
+/// and `principal` (WOR-2083). It must return a table with `set_headers`
+/// (and optionally `remove_headers`) to apply to the upstream request.
 ///
 /// Returns a list of (header_name, header_value) pairs to set.
 fn lua_request_modifier(
     script: &str,
     req_header: &RequestHeader,
-    hostname: &str,
+    ctx: &RequestContext,
 ) -> anyhow::Result<Vec<(String, String)>> {
     let engine = shared_lua_engine()?;
 
@@ -3037,13 +3670,24 @@ fn lua_request_modifier(
         }
     }
 
-    let req_table = serde_json::json!({
+    let mut req_table = serde_json::json!({
         "method": req_header.method.as_str(),
         "path": req_header.uri.path(),
         "headers": headers_map,
-        "host": hostname,
+        "host": ctx.hostname.as_str(),
     });
-    let ctx_table = serde_json::json!({});
+    // WOR-2083: `req.tls.ja4` etc., matching the CEL `tls.*` namespace.
+    {
+        let fp = ctx.tls_fingerprint.as_ref();
+        sbproxy_extension::lua::bindings::enrich_request_table_with_tls_fingerprint(
+            &mut req_table,
+            fp.and_then(|f| f.ja3.as_deref()),
+            fp.and_then(|f| f.ja4.as_deref()),
+            fp.and_then(|f| f.ja4h.as_deref()),
+            fp.is_some_and(|f| f.trustworthy),
+        );
+    }
+    let ctx_table = script_modifier_context(ctx);
 
     // Try the Rust format first (modify_request returning {set_headers: {...}}).
     // If not found, try the Go format (match_request with req:set_header()).
@@ -3252,7 +3896,9 @@ mod callbacks;
 use callbacks::*;
 
 // --- AI proxy helpers ---
-mod ai_support;
+pub(crate) mod ai_classifier;
+
+pub(crate) mod ai_support;
 use ai_support::*;
 
 mod ai_dispatch;
@@ -3260,9 +3906,6 @@ use ai_dispatch::*;
 
 // WOR-1722: cluster-shared AI budget counters (optional Redis backend).
 pub(crate) mod budget_share;
-
-// WOR-1845: ingress-owned governed request, token, and spend reservations.
-pub(crate) mod governance_admission;
 
 // WOR-1680: process-global local model host for serve: providers.
 pub(crate) mod model_host;
@@ -3275,6 +3918,12 @@ use action_dispatch::*;
 // Dispatch-side glue for the MCP tool rollout plane (versioned
 // catalogue views, per-consumer routing, adapters, sunset).
 pub(crate) mod mcp_rollout;
+
+// WOR-2118: agent-to-agent checks that need the request body. They
+// live at the body phase because `build_plugin_request_snapshot` above
+// always hands enforcers an empty body, so the request-filter surface
+// cannot run them.
+pub(crate) mod a2a_body_phase;
 
 // The ProxyHttp trait impl lives in the `proxy_http` submodule
 //. A trait impl needs no re-import to take effect.

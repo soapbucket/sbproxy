@@ -43,19 +43,20 @@ pub mod deployment;
 pub mod deployment_store;
 pub mod desired;
 pub mod device_residency;
-#[cfg(feature = "embedded")]
-pub mod embedded;
 pub mod engine_driver;
 pub mod fit;
+pub mod foreign_cache;
 pub mod generation_store;
 pub mod hybrid;
 pub mod jobs;
-pub mod kv_tiering;
 pub mod launch;
 pub mod llama_driver;
 pub mod llama_release;
+pub mod lockfile;
 pub mod lora;
 pub mod manifest;
+pub mod mistralrs_driver;
+pub mod mistralrs_release;
 pub mod node_snapshot;
 pub mod placement;
 pub mod probe_cpu;
@@ -71,9 +72,11 @@ pub mod rollout;
 pub mod runtime;
 pub mod runtime_manager;
 pub mod scheduling;
-pub mod sleep_wake;
+pub mod sglang_driver;
 pub mod supervisor;
 pub mod supply_chain;
+#[cfg(test)]
+mod test_env;
 #[cfg(feature = "tokenizer")]
 pub mod tokenize;
 pub mod uv_release;
@@ -85,13 +88,15 @@ pub use admission::{
     AdmissionCounts, AdmissionGate, AdmissionPermit, AdmissionReason, AdmissionRejection,
     DrainReport,
 };
+#[cfg(feature = "hf-xet-transport")]
+pub use artifact::HfHubArtifactTransport;
 #[cfg(feature = "weights")]
 pub use artifact::HttpArtifactTransport;
 pub use artifact::{
     AcquisitionContext, ArtifactCacheMetadata, ArtifactCacheState, ArtifactError, ArtifactLease,
     ArtifactManager, ArtifactObserver, ArtifactTransport, CacheProtection, GcReport, NetworkPolicy,
-    PullIntent, ReadyArtifact, ResponseDisposition, SourceCredential, TransportRequest,
-    TransportResponse, UnavailableArtifactTransport,
+    PruneReport, PullIntent, ReadyArtifact, ResponseDisposition, SourceCredential,
+    TransportRequest, TransportResponse, UnavailableArtifactTransport,
 };
 pub use artifact_spec::{
     AcceleratorKind, ArtifactFile, ArtifactFormat, ArtifactVariant, ComputeCapability,
@@ -103,7 +108,7 @@ pub use capabilities::{
 };
 pub use catalog::{
     ArtifactResolveError, Catalog, CatalogDiagnostic, CatalogEntry, CatalogError, CatalogLoad,
-    ModelRef, PullPolicy, ResolveError,
+    Modality, ModelRef, PullPolicy, ResolveError,
 };
 pub use cluster_authority::{
     DeploymentAuthorityError, DeploymentBundleCursor, DeploymentSigningKey, DeploymentVerifyingKey,
@@ -142,37 +147,48 @@ pub use device_residency::{
 };
 pub use engine_driver::{
     validate_engine_args, EngineAvailability, EngineCapabilities, EngineDetection, EngineDriver,
-    EngineDriverError, EngineFailureReason, EngineHealth, LaunchRequest, ProvisionRequest,
-    ProvisionedEngine, RunningEngine,
+    EngineDriverError, EngineFailureReason, EngineHealth, EngineTuning, LaunchRequest,
+    ProvisionRequest, ProvisionedEngine, RunningEngine,
 };
 pub use fit::{
     estimate_throughput, fp8_supported, memory_occupancy, plan_fit_auto_kv_with_margin,
     plan_fit_auto_kv_with_margin_and_concurrency, plan_fit_kv_with_margin,
-    plan_fit_kv_with_margin_and_concurrency, FitError, FitPlan, GpuDescriptor, GpuProbe, GpuVendor,
-    MemoryEstimate, ModelMetadata, Quant, StaticGpuProbe, ThroughputEstimate,
+    plan_fit_kv_with_margin_and_concurrency, plan_fit_over_set, plan_replica_fits, FitError,
+    FitPlan, GpuDescriptor, GpuProbe, GpuVendor, MemoryEstimate, ModelMetadata, Quant,
+    StaticGpuProbe, ThroughputEstimate,
+};
+pub use foreign_cache::{
+    discover as discover_foreign_models, ForeignCacheSource, ForeignModelFile,
 };
 pub use generation_store::{DeploymentGenerationStoreError, FileDeploymentGenerationStore};
-pub use hybrid::{savings_micros, AliasTable, CloudPrice, LaneSplit};
+pub use hybrid::{savings_micros, CloudPrice, CompressionValue, LaneSplit, TokenCountPrecision};
 pub use jobs::{
     FileJobStore, JobError, OperationJob, OperationKind, OperationProgress, OperationState,
 };
-pub use kv_tiering::{KvTier, KvTieringPolicy, TierDecision};
-pub use launch::{
-    build_launch_spec, chunk_size_for_ttft, serving_flags, should_speculate, ProcessEngineLauncher,
-};
+pub use launch::{build_launch_spec, serving_flags, should_speculate, ProcessEngineLauncher};
 pub use llama_driver::{
     LlamaBinarySource, LlamaCppDriver, LlamaDetection, LlamaProvisioned, SystemLlamaBinarySource,
 };
 pub use llama_release::{
-    asset_url as llama_asset_url, asset_url_accel as llama_asset_url_accel, is_executable_file,
-    resolve_on_path, Platform, DEFAULT_LLAMA_RELEASE_TAG,
+    asset_url as llama_asset_url, asset_url_accel as llama_asset_url_accel,
+    default_llama_release_tag_for_host, default_release_tag_for_platform, host_macos_version,
+    is_executable_file, resolve_on_path, MacOsVersion, Platform, DEFAULT_LLAMA_RELEASE_TAG,
 };
 #[cfg(feature = "weights")]
 pub use llama_release::{ensure_llama_server, ensure_llama_server_blocking};
+pub use lockfile::{
+    diff_against_cache, read_lockfile, verify_for_serve, write_lockfile, LockDrift, LockedEngine,
+    LockedModel, Lockfile, LockfileError, LOCKFILE_NAME, LOCKFILE_SCHEMA_VERSION,
+};
 pub use lora::{AdapterRoute, LoraCache};
 pub use manifest::{
     resolve_cache_dir, resolve_cache_dir_default, validate_serve_against_manifest, SourceScheme,
     SERVICE_CACHE_DIR,
+};
+pub use mistralrs_driver::{MistralRsBinarySource, MistralRsDriver, SystemMistralRsBinarySource};
+pub use mistralrs_release::{
+    asset_url as mistralrs_asset_url, release_asset as mistralrs_release_asset,
+    DEFAULT_MISTRALRS_RELEASE_TAG,
 };
 pub use placement::{
     plan_placement, PlacementAssignment, PlacementError, PlacementNode, PlacementPlan,
@@ -184,11 +200,13 @@ pub use probe_metal::MetalGpuProbe;
 #[cfg(feature = "gpu-nvidia")]
 pub use probe_nvidia::NvmlGpuProbe;
 pub use process::{
-    CommandExecutor, CommandOutput, EngineCommand, EngineProcess, EngineProcessRunner,
-    EngineReadinessProbe, LoopbackReadinessProbe, TokioCommandExecutor,
+    capture_managed_engine_owner, reap_managed_engines_owned_by,
+    reap_managed_engines_owned_by_identity_at, reap_stale_managed_engines, CommandExecutor,
+    CommandOutput, EngineCommand, EngineProcess, EngineProcessRunner, EngineReadinessProbe,
+    LoopbackReadinessProbe, ManagedEngineOwner, TokioCommandExecutor,
 };
 pub use pull::{pull_plan, PullItem, PullMode};
-pub use report::{ModelValue, ValueReport};
+pub use report::{ModelCompressionValue, ModelValue, ValueReport};
 pub use residency::{Admission, ResidencyManager, Resident};
 pub use rollout::{
     filter_desired_state_for_assignments, plan_rollout, AssignedModelDeployment,
@@ -204,16 +222,19 @@ pub use runtime_manager::{
     DeploymentRuntimeState, DeploymentRuntimeStatus, ModelRuntimeManager,
     PreparedDeploymentRuntime, PreparedRevision, PreparedRuntimePhase, PreparedRuntimeTelemetry,
     ProductionDeploymentPreparer, ReconcilePlan, ReconcileReport, RuntimeManagerError,
+    ServingContext,
 };
 pub use scheduling::{admit, next_to_admit, PriorityClass, SchedulingDecision};
-pub use sleep_wake::{is_sleeping, sleep, wake_up, SleepLevel};
+pub use sglang_driver::{
+    build_sglang_container_plan, SGLangContainerPlan, SGLangDriver, DEFAULT_SGLANG_VERSION,
+};
 pub use supervisor::{
     BackoffPolicy, CrashLoopState, EngineLauncher, EngineState, EngineSupervisor, LaunchSpec,
     SupervisorClock, SupervisorError, TokioSupervisorClock,
 };
 pub use supply_chain::{scan_pickle, select_weight_file, SupplyChainError, WeightFormat};
 #[cfg(feature = "tokenizer")]
-pub use tokenize::{count_tokens, render_chat_template, ChatMessage};
+pub use tokenize::{count_tokens, render_chat_template, ChatMessage, TokenizerCache};
 pub use vllm_driver::{
     build_vllm_container_plan, ContainerRuntime, SystemVllmHost, VllmCompatibilityReport,
     VllmComponentStatus, VllmContainerPlan, VllmDriver, VllmHost, VllmLaunchMode,

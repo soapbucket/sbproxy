@@ -4,6 +4,8 @@
 //! performance-optimized `CompiledConfig` / `CompiledOrigin` types that
 //! the proxy runtime works with.
 
+use std::fs::File;
+use std::io::Read;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -14,18 +16,28 @@ use sbproxy_platform::messenger::redis::RedisMessengerConfig;
 use sbproxy_platform::messenger::{
     GcpPubSubMessenger, MemoryMessenger, Messenger, RedisMessenger, SqsMessenger,
 };
-use sbproxy_platform::storage::{KVStore, RedisConfig, RedisKVStore};
+use sbproxy_platform::storage::{
+    KVStore, RedisConfig, RedisKVStore, RedisTlsConfig, ValidatedRedisConnection,
+};
 use smallvec::SmallVec;
 
 use crate::snapshot::{CompiledConfig, CompiledOrigin};
-use crate::types::{ConfigFile, L2CacheConfig, MessengerSettings, RawOriginConfig};
+use crate::types::{
+    AttestationBillableConfig, AttestationConfig, AttestationLedgerConfig,
+    AttestationMeasuredConfig, AttestationOriginHeaderConfig, AttestationQueueConfig,
+    AttestationRole, AttestationRouteWeightConfig, ConfigFile, EnforcementMode, FailureMode,
+    L2CacheConfig, L2CacheParams, MessengerSettings, OriginAttestationConfig, RawOriginConfig,
+    WebBotAuthConfig, ATTESTATION_SIGN_WITH_WEB_BOT_AUTH, MAX_ATTESTATION_QUEUE_ENTRIES,
+};
+
+const MAX_REDIS_TLS_FILE_BYTES: u64 = 1_048_576;
 
 /// Extract the Redis host:port pair from a DSN like `redis://host:6379/0`.
 ///
 /// Accepts either a bare `host:port` form (as used by the raw RESP client)
 /// or a `redis://[user[:pass]@]host:port[/db]` URL. The database index is
 /// ignored since the single-connection RESP client does not issue SELECT.
-fn parse_redis_addr(dsn: &str) -> Result<String> {
+fn parse_redis_messenger_addr(dsn: &str) -> Result<String> {
     let s = dsn.trim();
     let without_scheme = s
         .strip_prefix("redis://")
@@ -56,22 +68,62 @@ fn parse_redis_addr(dsn: &str) -> Result<String> {
     }
 }
 
+fn read_redis_tls_file(path: &str, error: &'static str) -> Result<Vec<u8>> {
+    let file = File::open(path).map_err(|_| anyhow::anyhow!(error))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_REDIS_TLS_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| anyhow::anyhow!(error))?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_REDIS_TLS_FILE_BYTES {
+        return Err(anyhow::anyhow!(error));
+    }
+    Ok(bytes)
+}
+
+fn read_optional_redis_tls_file(
+    path: Option<&str>,
+    error: &'static str,
+) -> Result<Option<Vec<u8>>> {
+    path.map(|path| read_redis_tls_file(path, error))
+        .transpose()
+}
+
+/// Compile the Redis connection shared by the blocking L2 store and async
+/// compression state without opening a network connection.
+///
+/// # Errors
+///
+/// Returns a static, redacted error when the DSN, TLS field combination, file
+/// contents, or client identity is invalid.
+pub fn build_l2_redis_connection(params: &L2CacheParams) -> Result<ValidatedRedisConnection> {
+    let tls = RedisTlsConfig {
+        root_cert: read_optional_redis_tls_file(
+            params.ca_file.as_deref(),
+            "invalid Redis ca_file configuration",
+        )?,
+        client_cert: read_optional_redis_tls_file(
+            params.cert_file.as_deref(),
+            "invalid Redis cert_file configuration",
+        )?,
+        client_key: read_optional_redis_tls_file(
+            params.key_file.as_deref(),
+            "invalid Redis key_file configuration",
+        )?,
+    };
+    ValidatedRedisConnection::new(&params.dsn, tls)
+}
+
 /// Build a concrete `KVStore` for the given L2 cache config.
 ///
 /// # Errors
 ///
-/// Returns an error if the configured `driver` is not recognized, or if
-/// the `redis` driver is selected and its DSN cannot be parsed into a
-/// `host:port` address.
+/// Returns an error if the configured `driver` is not recognized or if the
+/// Redis connection and TLS configuration is invalid.
 pub fn build_l2_store(cfg: &L2CacheConfig) -> Result<Arc<dyn KVStore>> {
     match cfg.driver.as_str() {
         "redis" => {
-            let addr = parse_redis_addr(&cfg.params.dsn)
-                .with_context(|| format!("invalid redis DSN '{}'", cfg.params.dsn))?;
-            Ok(Arc::new(RedisKVStore::new(RedisConfig {
-                addr,
-                ..RedisConfig::default()
-            })))
+            let connection = build_l2_redis_connection(&cfg.params)?;
+            Ok(Arc::new(RedisKVStore::new(RedisConfig::new(connection))))
         }
         other => anyhow::bail!("unsupported l2_cache driver: '{}'", other),
     }
@@ -115,7 +167,7 @@ pub fn build_messenger(settings: &MessengerSettings) -> Result<Arc<dyn Messenger
                 .get("dsn")
                 .cloned()
                 .unwrap_or_else(|| "redis://127.0.0.1:6379".to_string());
-            let addr = parse_redis_addr(&dsn)
+            let addr = parse_redis_messenger_addr(&dsn)
                 .with_context(|| format!("invalid redis messenger DSN '{}'", dsn))?;
             Ok(Arc::new(RedisMessenger::new(RedisMessengerConfig { addr })))
         }
@@ -337,6 +389,24 @@ fn scan_yaml_hazards(yaml: &str) -> Result<Vec<String>> {
     Ok(unresolved)
 }
 
+/// Every `${VAR}` reference in `yaml` that survives interpolation on this
+/// host, as `path: ${VAR}` pairs.
+///
+/// [`compile_config`] only warns about these and leaves them as literal
+/// text, because a hand-edited config is edited by someone watching the
+/// log. An authority-supplied document has no such reader: a bundle
+/// naming a variable one subscriber does not export would take effect
+/// fleet-wide as the literal string `${VAR}`. Callers that apply a
+/// document nobody proofread use this to refuse it instead.
+///
+/// Returns an empty vector for a document that does not parse, or one
+/// carrying an unsupported YAML tag; [`compile_config`] rejects both with
+/// a better message than this scan could give.
+#[must_use]
+pub fn unresolved_env_references(yaml: &str) -> Vec<String> {
+    scan_yaml_hazards(&interpolate_env_vars(yaml)).unwrap_or_default()
+}
+
 /// Recursively walk a JSON value and replace `{{vars.X}}` and `{{env.X}}`
 /// template patterns in all string values.
 ///
@@ -520,23 +590,14 @@ fn lower_credentials_into_origin_virtual_keys(file: &mut crate::types::ConfigFil
     use serde_json::json;
 
     validate_credential_principal_selectors("proxy", &file.proxy.credentials)?;
-    validate_credential_governance_limits("proxy", &file.proxy.credentials)?;
     for tenant in &file.proxy.tenants {
         validate_credential_principal_selectors(
-            &format!("tenant `{}`", tenant.id),
-            &tenant.credentials,
-        )?;
-        validate_credential_governance_limits(
             &format!("tenant `{}`", tenant.id),
             &tenant.credentials,
         )?;
     }
     for (hostname, origin) in &file.origins {
         validate_credential_principal_selectors(
-            &format!("origin `{hostname}`"),
-            &origin.credentials,
-        )?;
-        validate_credential_governance_limits(
             &format!("origin `{hostname}`"),
             &origin.credentials,
         )?;
@@ -597,12 +658,18 @@ fn lower_credentials_into_origin_virtual_keys(file: &mut crate::types::ConfigFil
             .map(|cred| {
                 // Convert the per-credential attrs to the legacy
                 // ai_project / ai_user / tags / metadata shape.
-                let metadata: serde_json::Map<String, serde_json::Value> = cred
+                let mut metadata: serde_json::Map<String, serde_json::Value> = cred
                     .attrs
                     .metadata
                     .iter()
                     .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
                     .collect();
+                if let Some(cost_center) = &cred.attrs.cost_center {
+                    metadata.insert(
+                        "cost_center".to_string(),
+                        serde_json::Value::String(cost_center.clone()),
+                    );
+                }
                 let key = cred.key.clone().unwrap_or_default();
                 let key_id = format!(
                     "cfg:{}:{}:{}:{}:{}",
@@ -682,6 +749,9 @@ fn lower_credentials_into_origin_virtual_keys(file: &mut crate::types::ConfigFil
                 if let Some(m) = &cred.route_to_model {
                     vk["route_to_model"] = json!(m);
                 }
+                if let Some(selector) = &cred.compression_profile {
+                    vk["compression_profile"] = json!(selector);
+                }
                 if !cred.inject_tools.is_empty() {
                     vk["inject_tools"] = json!(cred.inject_tools.clone());
                 }
@@ -725,41 +795,6 @@ fn validate_credential_principal_selectors(
                      omit `principals` or use `principals: []` to match every principal",
                     credential.name
                 );
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_credential_governance_limits(
-    scope: &str,
-    credentials: &[crate::types::CredentialBlock],
-) -> Result<()> {
-    for credential in credentials {
-        if credential.kind != "ai_provider" {
-            continue;
-        }
-        let prefix = format!("credential {:?} at {scope}", credential.name);
-        if let Some(budget) = &credential.attrs.budget {
-            if let Some(value) = budget.max_tokens {
-                crate::types::validate_governance_integer(
-                    &format!("{prefix} attrs.budget.max_tokens"),
-                    value,
-                )?;
-            }
-            if let Some(value) = budget.max_cost_usd {
-                crate::types::validate_governance_usd(
-                    &format!("{prefix} attrs.budget.max_cost_usd"),
-                    value,
-                )?;
-            }
-        }
-        for (index, policy) in credential.policies.iter().enumerate() {
-            if let crate::types::CredentialPolicy::RateLimit { rpm: Some(value) } = policy {
-                crate::types::validate_governance_integer(
-                    &format!("{prefix} policies[{index}].rpm"),
-                    *value,
-                )?;
             }
         }
     }
@@ -965,6 +1000,216 @@ fn validate_custom_log_fields(fields: &[crate::CustomLogFieldConfig]) -> Result<
     Ok(())
 }
 
+/// Reject a `proxy.admin.bind` value that is not an IP address.
+///
+/// The admin server used to fall back to `127.0.0.1` when the bind
+/// string failed to parse, so `bind: 0.0.0..1` (or a hostname, which is
+/// also not accepted) looked like it worked while quietly serving
+/// somewhere else than asked. An operator who typed a wide bind and got
+/// loopback would have drawn exactly the wrong conclusion about what is
+/// exposed, so a typo fails the compile instead.
+fn validate_admin_bind(bind: Option<&str>) -> Result<()> {
+    let Some(bind) = bind else {
+        return Ok(());
+    };
+    let trimmed = bind.trim();
+    if trimmed.parse::<std::net::IpAddr>().is_err() {
+        anyhow::bail!(
+            "proxy.admin.bind is `{bind}`, which is not an IP address. Use an address \
+             literal such as `127.0.0.1`, `::1`, or `0.0.0.0` (hostnames are not \
+             resolved). Startup used to fall back to loopback on a value it could not \
+             parse, which hid the typo behind an admin server bound somewhere other \
+             than the one you asked for."
+        );
+    }
+    Ok(())
+}
+
+/// True when `entry` (an exact IP or a CIDR from `proxy.admin.allow_ips`)
+/// admits nothing but loopback peers.
+///
+/// Both `127.0.0.1` and `127.0.0.0/8` are loopback-only; `10.0.0.0/8` is
+/// not, and neither is `127.0.0.0/7`, which spans `126.0.0.0` upward. An
+/// entry that parses as neither an address nor a CIDR cannot be proven
+/// loopback-only, so it counts as reachable: the point of the check is to
+/// be sure, not to be lenient.
+///
+/// Parsed by hand rather than with a CIDR crate because `sbproxy-config`
+/// deliberately carries no network-address dependency; the runtime filter
+/// in `sbproxy-core` does the real matching.
+fn admin_allow_entry_is_loopback_only(entry: &str) -> bool {
+    let trimmed = entry.trim();
+    let (addr_part, prefix_part) = match trimmed.split_once('/') {
+        Some((addr, prefix)) => (addr, Some(prefix)),
+        None => (trimmed, None),
+    };
+    let Ok(addr) = addr_part.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    // `::ffff:127.0.0.1` is a loopback peer wearing IPv6 clothing;
+    // canonicalising first means it is judged as the v4 address it is.
+    let canonical = addr.to_canonical();
+    if !canonical.is_loopback() {
+        return false;
+    }
+    let Some(prefix) = prefix_part else {
+        return true;
+    };
+    let Ok(prefix) = prefix.parse::<u8>() else {
+        return false;
+    };
+    // The whole network has to sit inside the loopback space: 127.0.0.0/8
+    // for v4, and only the single `::1` for v6.
+    match canonical {
+        std::net::IpAddr::V4(_) => prefix >= 8,
+        std::net::IpAddr::V6(_) => prefix >= 128,
+    }
+}
+
+/// Refuse the shipped default admin credentials on an admin surface that
+/// is reachable from off the local machine.
+///
+/// `admin` / `changeme` is a published constant, so a reachable admin
+/// server carrying it is effectively unauthenticated, and the admin API
+/// mints API keys, reads and rewrites the config, and drives the model
+/// host. The surface counts as reachable when either `bind` is not a
+/// loopback address or `allow_ips` admits a peer outside loopback. The
+/// error names whichever of the two tripped.
+///
+/// Loopback-only with the defaults stays valid on purpose: that is the
+/// first-run and local-development path, where the credentials guard
+/// nothing that the local user does not already have.
+fn validate_admin_reachable_credentials(admin: &crate::types::AdminConfig) -> Result<()> {
+    if admin.password != crate::types::DEFAULT_ADMIN_PASSWORD {
+        return Ok(());
+    }
+    let mut reasons: Vec<String> = Vec::new();
+    if let Some(bind) = admin.bind.as_deref() {
+        // A bind that does not parse is already rejected by
+        // `validate_admin_bind`; treat it as reachable here so the two
+        // checks cannot disagree about what an unparseable value means.
+        let loopback = bind
+            .trim()
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|addr| addr.to_canonical().is_loopback());
+        if !loopback {
+            reasons.push(format!(
+                "proxy.admin.bind is `{bind}`, which is not a loopback address"
+            ));
+        }
+    }
+    let off_loopback: Vec<&str> = admin
+        .allow_ips
+        .iter()
+        .map(String::as_str)
+        .filter(|entry| !admin_allow_entry_is_loopback_only(entry))
+        .collect();
+    if !off_loopback.is_empty() {
+        reasons.push(format!(
+            "proxy.admin.allow_ips admits peers outside loopback ({})",
+            off_loopback.join(", ")
+        ));
+    }
+    if reasons.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "proxy.admin.password is still the shipped default `{}`, and the admin surface is \
+         reachable off loopback: {}. Set a real password (`password: ${{ADMIN_PASSWORD}}` \
+         with the variable exported, or a secret reference), or keep the admin server on \
+         loopback. The default is a published constant, so a reachable admin server using \
+         it is open to anyone who can route to the port, and the admin API mints API keys \
+         and rewrites config.",
+        crate::types::DEFAULT_ADMIN_PASSWORD,
+        reasons.join("; ")
+    );
+}
+
+/// Refuse the shipped default admin credentials on a node that publishes
+/// configuration bundles, whatever its admin server is bound to.
+///
+/// The reachability test in [`validate_admin_reachable_credentials`] is the
+/// right one for an ordinary node: loopback with the defaults is the
+/// first-run path and guards nothing the local user does not already have.
+/// A publishing node is different. Its admin API is where a fleet's
+/// configuration is authored and signed, so `admin` / `changeme` there is
+/// not "a local convenience", it is a published constant standing between
+/// anyone who reaches the port and every subscriber's running config. The
+/// blast radius is the fleet, not the box, so the bind does not enter into
+/// it.
+fn validate_publishing_node_admin_credentials(
+    admin: Option<&crate::types::AdminConfig>,
+) -> Result<()> {
+    let Some(admin) = admin.filter(|admin| admin.enabled) else {
+        // No admin server means no publish route and no status route, so
+        // there is no credential to be weak. The node can still serve the
+        // bundle listener from a config an operator publishes some other
+        // way, which is an odd but coherent deployment.
+        return Ok(());
+    };
+    if admin.password != crate::types::DEFAULT_ADMIN_PASSWORD {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "proxy.config_authority.publish is set and proxy.admin.password is still the shipped \
+         default `{}`. A publishing node's admin API validates, signs, and publishes the \
+         configuration every subscriber then applies, so the default password there is not a \
+         local-development convenience: it is a published constant guarding a fleet-wide \
+         write. Set a real password (`password: ${{ADMIN_PASSWORD}}` with the variable \
+         exported, or a secret reference) before this node publishes anything. Unlike \
+         proxy.admin on an ordinary node, binding to loopback does not make this acceptable.",
+        crate::types::DEFAULT_ADMIN_PASSWORD
+    )
+}
+
+/// Refuse a publishing node whose signing key cannot be loaded.
+///
+/// An authority that cannot sign cannot serve. Checked here rather than at
+/// the first publication so the failure lands at boot, or in `sbproxy
+/// validate`, instead of in the middle of a change window when an operator
+/// is trying to push a fix. Loads through the same constructor the running
+/// authority uses, so "readable" means readable in the way that matters:
+/// present, bounded, owner-only, and a valid Ed25519 seed.
+fn validate_publish_signing_key(
+    publish: &crate::types::ConfigAuthorityPublishConfig,
+) -> Result<()> {
+    crate::config_bundle::ConfigBundleSigner::ed25519_from_seed_file(
+        publish.key_id.as_str(),
+        &publish.signing_key_file,
+    )
+    .map(|_| ())
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "proxy.config_authority.publish.signing_key_file '{}' is not a usable signing key: \
+             {error}. Generate one with `head -c 32 /dev/urandom | base64 > {}` and \
+             `chmod 600` it, then publish the matching verifying key to subscribers with \
+             `GET /admin/config-authority/status`. An authority that cannot sign cannot serve, \
+             so this is refused at startup rather than at the first publish attempt.",
+            publish.signing_key_file,
+            publish.signing_key_file,
+        )
+    })
+}
+
+fn validate_compression_state_local_path(path: &str) -> Result<()> {
+    const MAX_PATH_BYTES: usize = 4_096;
+    let field = "proxy.compression_state.local_path";
+
+    if path.trim().is_empty() {
+        anyhow::bail!("{field} must not be empty");
+    }
+    if path.len() > MAX_PATH_BYTES {
+        anyhow::bail!("{field} must not exceed {MAX_PATH_BYTES} bytes");
+    }
+    if path.chars().any(char::is_control) {
+        anyhow::bail!("{field} must not contain control characters");
+    }
+    if !std::path::Path::new(path).is_absolute() {
+        anyhow::bail!("{field} must be an absolute path");
+    }
+    Ok(())
+}
+
 /// Compile a raw YAML config string into a `CompiledConfig`.
 ///
 /// # Errors
@@ -988,6 +1233,20 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
     // new shapes coexist (operator must pick one).
     let yaml = migrate_features_to_extensions(&yaml)?;
 
+    // WOR-1976: make every explicitly configured compatibility-only key
+    // visible at boot. Inspect the raw YAML so omitted serde-defaulted fields
+    // stay quiet; the same registry is enforced against the generated schema
+    // by the build-time reader guard.
+    if let Ok(raw_yaml) = serde_yaml::from_str::<serde_yaml::Value>(&yaml) {
+        for key in crate::key_registry::configured_config_only_keys(&raw_yaml) {
+            tracing::warn!(
+                config_key = key.path,
+                reason = key.note.unwrap_or("no live OSS consumer"),
+                "config-only key is set and does not activate runtime behavior"
+            );
+        }
+    }
+
     // Reject the legacy `virtual_keys:` YAML key with a pointer to
     // the migration guide. The credentials epic replaces it with the
     // canonical `credentials:` block; an operator with the old shape
@@ -1000,17 +1259,28 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         );
     }
 
-    // WOR-1140: parse through `serde_ignored` so a misspelled key is a
-    // hard boot error rather than a silent drop that takes the field's
-    // (often protection-disabling) default. `serde_ignored` only reports
-    // keys that a *typed* struct ignores; the schema's deliberate
-    // arbitrary-key blocks (`proxy.extensions` / origin `extensions` are
-    // `HashMap<String, Value>`, and `action` / `policies` / `transforms`
-    // / `authentication` / `variables` are opaque `serde_json::Value`
-    // handed to the module layer) accept any key, so they are not
-    // flagged. The `sbproxy serve` boot path runs `compile_config`, so
-    // this gate fires on boot and reload, not just the `validate`
-    // subcommand.
+    // WOR-1140: two layers reject misspelled keys, so a typo is a hard
+    // boot error rather than a silent drop that takes the field's
+    // (often protection-disabling) default.
+    //
+    // The first layer is `#[serde(deny_unknown_fields)]` on every
+    // struct in the config schema below the root: an unknown nested key
+    // fails the typed parse itself, including inside tagged enums
+    // (`credentials[].policies[]`, `secrets.backends[]`, ...) whose
+    // buffered content `serde_ignored` cannot see into. The root
+    // `ConfigFile` deliberately stays permissive because the archived
+    // Go v0.1.x schema was a flat single-origin file whose keys all sit
+    // at the top level; those fall through to the second layer.
+    //
+    // The second layer is this `serde_ignored` pass, which reports the
+    // top-level leftovers so they can warn (v1 compat) below. The
+    // schema's deliberate arbitrary-key blocks (`proxy.extensions` /
+    // origin `extensions` are `HashMap<String, Value>`, and `action` /
+    // `policies` / `transforms` / `authentication` / `variables` are
+    // opaque `serde_json::Value` handed to the module layer) accept any
+    // key under either layer. The `sbproxy serve` boot path runs
+    // `compile_config`, so both gates fire on boot and reload, not just
+    // the `validate` subcommand.
     let mut unknown_keys: Vec<String> = Vec::new();
     let mut config_file: ConfigFile = {
         let de = serde_yaml::Deserializer::from_str(&yaml);
@@ -1049,6 +1319,70 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         );
     }
 
+    {
+        let mut names = std::collections::HashSet::with_capacity(config_file.flags.len());
+        for flag in &config_file.flags {
+            if flag.name.trim().is_empty() {
+                anyhow::bail!("config compile: flags[].name must not be empty");
+            }
+            if !names.insert(flag.name.as_str()) {
+                anyhow::bail!(
+                    "config compile: duplicate top-level feature flag name `{}`",
+                    flag.name
+                );
+            }
+            if flag.rules.rollout_percent > 100 {
+                anyhow::bail!(
+                    "config compile: flag `{}` has rollout_percent {}; expected 0..=100",
+                    flag.name,
+                    flag.rules.rollout_percent
+                );
+            }
+        }
+    }
+
+    if config_file
+        .proxy
+        .http3
+        .as_ref()
+        .is_some_and(|http3| http3.enabled)
+    {
+        anyhow::bail!(
+            "config compile: proxy.http3.enabled=true is not supported because HTTP/3 is not \
+             served by this build. Set `enabled: false` or remove the `http3` block. Native \
+             HTTP/3 support is tracked in WOR-1969."
+        );
+    }
+
+    if let Some(key_management) = config_file.proxy.key_management.as_ref() {
+        key_management
+            .inbound
+            .validate()
+            .map_err(|error| anyhow::anyhow!("config compile: {error}"))?;
+
+        let correlation = &config_file.proxy.correlation_id;
+        if correlation.enabled
+            && key_management
+                .inbound
+                .is_credential_carrier(&correlation.header)
+        {
+            anyhow::bail!(
+                "config compile: proxy.correlation_id.header {:?} may not also be a primary \
+                 credential carrier because correlation IDs are logged, forwarded, and echoed",
+                correlation.header
+            );
+        }
+    }
+
+    if let Some(local_path) = config_file
+        .proxy
+        .compression_state
+        .as_ref()
+        .and_then(|state| state.local_path.as_deref())
+    {
+        validate_compression_state_local_path(local_path)?;
+    }
+
     // WOR-1818: report interpolation leftovers. An unset `${VAR}` stays
     // literal, which for most fields degrades into a confusing runtime
     // failure. Warn once, listing every remaining reference with its
@@ -1073,13 +1407,20 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
                     );
                 }
             }
+            validate_admin_bind(admin.bind.as_deref())?;
+            validate_admin_reachable_credentials(admin)?;
         }
-    }
-
-    if let Some(key_management) = &config_file.proxy.key_management {
-        key_management
-            .validate()
-            .context("config compile: proxy.key_management.governance")?;
+        // 0 is rejected rather than treated as "off": the admin rate
+        // limiter is a DDoS bound on an authenticated control surface
+        // and cannot be disabled through config.
+        if admin.rate_limit_per_minute == 0 || admin.rate_limit_per_minute > 100_000 {
+            anyhow::bail!(
+                "proxy.admin.rate_limit_per_minute is {}; it must be between 1 and \
+                 100000 requests per client IP per minute (the admin rate limiter \
+                 cannot be turned off)",
+                admin.rate_limit_per_minute
+            );
+        }
     }
 
     if let Some(log) = config_file
@@ -1102,6 +1443,32 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
             validate_custom_log_fields(&obs.log.custom_fields)
                 .with_context(|| format!("origin `{host}` observability.log"))?;
         }
+    }
+
+    // Config-authority participation. Validated here rather than at first
+    // fetch so `sbproxy validate` catches an unusable authority URL, an
+    // inline credential, or a `replace` subscriber that has told itself it
+    // may boot without a bundle.
+    if let Some(authority) = config_file.proxy.config_authority.as_ref() {
+        authority
+            .validate()
+            .context("config compile: proxy.config_authority")?;
+        if let Some(publish) = authority.publish.as_ref() {
+            validate_publishing_node_admin_credentials(config_file.proxy.admin.as_ref())?;
+            validate_publish_signing_key(publish)?;
+        }
+    }
+
+    // Payment settlement. Every rule here is structural or cross-field,
+    // so it holds on a machine that has none of the credentials: no
+    // secret is resolved, no SQLite file is opened, no provider object
+    // is created, and no worker starts. A configured rail whose Cargo
+    // feature is missing is caught later, at runtime assembly, where
+    // the compiled feature set is actually known.
+    if let Some(payments) = config_file.proxy.payments.as_ref() {
+        payments
+            .validate()
+            .context("config compile: proxy.payments")?;
     }
 
     if let Some(cluster) = crate::cluster::resolve_effective_cluster(&config_file.proxy)
@@ -1180,10 +1547,10 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         }
     }
 
-    // Instantiate the L2 cache backend (Redis) if configured. The store is
-    // created lazily, so this call just records the target address without
-    // opening a connection yet. Any concrete failure surfaces the first
-    // time a request tries to use it.
+    // Instantiate the L2 cache backend (Redis) if configured. DSN semantics,
+    // TLS field combinations, and local PEM material are validated here at
+    // startup. Only the network connection is lazy; reachability, TLS handshake,
+    // authentication, and database-selection failures surface on first use.
     let l2_store = match &config_file.proxy.l2_cache {
         Some(cfg) => Some(build_l2_store(cfg)?),
         None => None,
@@ -1214,13 +1581,83 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         }
     }
 
+    // WOR-2127: consumption attestation. Validated here rather than in
+    // the pipeline because `sbproxy validate` has to reject a broken
+    // block without touching the filesystem, and because a proxy that
+    // announces a metering role it cannot honour should not start.
+    if let Some(attestation) = &config_file.proxy.attestation {
+        validate_attestation(attestation, config_file.proxy.web_bot_auth.as_ref())?;
+        for origin in &origins {
+            if let Some(origin_attestation) = &origin.attestation {
+                validate_origin_attestation(&origin.hostname, attestation, origin_attestation)?;
+            }
+        }
+    } else {
+        for origin in &origins {
+            if origin.attestation.is_some() {
+                anyhow::bail!(
+                    "origin `{}` declares an `attestation:` block but `proxy.attestation` is \
+                     absent. A per-origin role has no queue, no ledger, and no billing table \
+                     behind it, so it could never produce a record.",
+                    origin.hostname,
+                );
+            }
+        }
+    }
+
+    // A clustered node whose keystore is node-local mints keys its peers may
+    // not resolve. How bad that is depends on whether a shared cache tier
+    // propagates records, so classify rather than blanket-reject.
+    if let Some(cluster) = &config_file.proxy.cluster {
+        let km = config_file.proxy.key_management.as_ref();
+        match crate::cluster::classify_clustered_keystore(
+            &cluster.seeds,
+            km.map(|k| k.enabled).unwrap_or(false),
+            km.map(|k| k.store.backend).unwrap_or_default(),
+            km.map(|k| k.cache.tier).unwrap_or_default(),
+        ) {
+            crate::cluster::ClusteredKeystoreVerdict::Fine => {}
+            crate::cluster::ClusteredKeystoreVerdict::NotDurable(message) => {
+                tracing::warn!("{message}");
+            }
+            crate::cluster::ClusteredKeystoreVerdict::Broken(message) => {
+                anyhow::bail!("config compile: {message}");
+            }
+        }
+    }
+
+    // WOR-2064: the mesh keystore stores its records on the cluster's
+    // replicated state substrate, so it needs a cluster and that
+    // cluster's replication block. Checked here so `sbproxy validate`
+    // rejects the combination without booting anything.
+    if let Some(km) = config_file.proxy.key_management.as_ref() {
+        if km.enabled && km.store.backend == crate::types::KeyStoreBackend::Mesh {
+            match &config_file.proxy.cluster {
+                None => anyhow::bail!(
+                    "config compile: proxy.key_management.store.backend is 'mesh' but \
+                     proxy.cluster is not configured. A mesh keystore on a node with no mesh is \
+                     an embedded keystore with extra steps. Configure proxy.cluster with a \
+                     replication block, or use the embedded backend."
+                ),
+                Some(cluster) if cluster.replication.is_none() => anyhow::bail!(
+                    "config compile: proxy.key_management.store.backend is 'mesh' but \
+                     proxy.cluster has no replication block. The mesh keystore stores its \
+                     records on the cluster's replicated state substrate and takes its \
+                     replication factor from proxy.cluster.replication; add that block (an \
+                     empty 'replication:' mapping uses the defaults)."
+                ),
+                Some(_) => {}
+            }
+        }
+    }
+
     Ok(CompiledConfig {
         origins,
         host_map,
         server: config_file.proxy,
         l2_store,
         messenger,
-        // The mesh node is built by the enterprise startup hook (not OSS),
+        // A pipeline lifecycle extension builds the mesh node when configured,
         // so compilation always yields `None` here.
         mesh: None,
         // Access-log emission settings ride through unchanged. `None`
@@ -1231,11 +1668,14 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         // `sbproxy-core` (which depends on the classifier crate); this
         // crate stays ignorant of the typed resolver.
         agent_classes: config_file.agent_classes,
-        // WOR-1130: top-level workspace rate-limit budget + audit sink.
+        // WOR-1130: top-level workspace rate-limit budget plus the
+        // compatibility-only audit selector.
         rate_limits: config_file.rate_limits,
         audit: config_file.audit,
         // WOR-1186: session-ledger emission config.
         session_ledger: config_file.session_ledger,
+        // WOR-1971: hand the complete top-level flag set to the binary.
+        flags: config_file.flags,
     })
 }
 
@@ -1259,24 +1699,494 @@ pub async fn compile_config_from_source(
     inline_text: &str,
     fetch_ctx: &crate::source::FetchContext,
 ) -> Result<CompiledConfig> {
-    // Pre-parse just the `source:` discriminator. We do this with a
-    // permissive lightweight type so a YAML that is mostly garbage
-    // still surfaces its source error here, rather than masking it
-    // behind a downstream schema error.
-    #[derive(serde::Deserialize)]
-    struct SourceHead {
-        #[serde(default)]
-        source: Option<crate::types::ConfigSource>,
+    compile_config_from_source_blocking(inline_text, fetch_ctx)
+}
+
+/// [`compile_config_from_source`] without the async wrapper.
+///
+/// The boot path and the reload transaction are both synchronous and run
+/// outside any tokio runtime, and the resolution itself never awaits
+/// anything: it shells out to `git` with a hard timeout and reads a
+/// file. So the production call sites use this and the async function
+/// above stays as a convenience for callers already in an async context.
+///
+/// # Errors
+///
+/// Returns an error if the top-level `source:` block cannot be parsed,
+/// if resolving a non-local config source fails, or if the resolved
+/// config fails to compile (see [`compile_config`]).
+pub fn compile_config_from_source_blocking(
+    inline_text: &str,
+    fetch_ctx: &crate::source::FetchContext,
+) -> Result<CompiledConfig> {
+    let resolved = crate::source::resolve_document(inline_text, fetch_ctx)
+        .map_err(|e| anyhow::anyhow!("config source: {e}"))?;
+    if resolved.is_remote() {
+        ensure_node_local_refs_resolved(&resolved.text)?;
     }
-    let head: SourceHead =
-        serde_yaml::from_str(inline_text).context("failed to parse top-level source: block")?;
-    let resolved = match head.source {
-        None | Some(crate::types::ConfigSource::Local) => inline_text.to_string(),
-        Some(src) => crate::source::load_from_source(&src, inline_text, fetch_ctx)
-            .await
-            .map_err(|e| anyhow::anyhow!("config source: {e}"))?,
-    };
-    compile_config(&resolved)
+    compile_config(&resolved.text)
+}
+
+/// Config paths whose value identifies *this* node and therefore must
+/// never be left as literal `${VAR}` text.
+///
+/// A shared repository carries `node_id: ${SB_NODE_ID}` and each host
+/// supplies its own value, which is the documented way one document
+/// serves a whole fleet. The failure mode without this check is quiet
+/// and bad: an unresolved reference is otherwise only a warning, so a
+/// host that forgot to export the variable would take the literal string
+/// `${SB_NODE_ID}` as its node id, join the cluster under it, and
+/// collide with every other host that forgot.
+///
+/// Scoped to `proxy.cluster` because that is the block
+/// `ClusterRestartFingerprint` covers: any change to it rejects a reload
+/// outright, so a wrong value there is not something a later reload can
+/// repair.
+pub const NODE_LOCAL_PATH_PREFIXES: &[&str] = &["proxy.cluster"];
+
+/// Refuse a resolved remote document that leaves a node-local value as
+/// literal `${VAR}` text.
+///
+/// Apply this to a document that came from a `source:` block, never to a
+/// hand-edited local file: the local file's operator is watching the log,
+/// the existing warning is enough for them, and tightening it would break
+/// configs that work today.
+///
+/// Called from both entry points that turn a resolved source into a
+/// running configuration, because they are separate paths:
+/// [`compile_config_from_source_blocking`] is what the CLI and the tests
+/// use, and the server's boot and reload paths resolve and compile in two
+/// steps so they can publish the resolved document for the
+/// config-authority merge base.
+///
+/// # Errors
+///
+/// Returns an error naming every offending path.
+pub fn ensure_node_local_refs_resolved(resolved_text: &str) -> Result<()> {
+    let unresolved = unresolved_env_references(resolved_text);
+    let offending: Vec<&String> = unresolved
+        .iter()
+        .filter(|entry| {
+            let path = entry.split(':').next().unwrap_or_default().trim();
+            NODE_LOCAL_PATH_PREFIXES
+                .iter()
+                .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}.")))
+        })
+        .collect();
+    if offending.is_empty() {
+        return Ok(());
+    }
+    let listed = offending
+        .iter()
+        .map(|entry| entry.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    anyhow::bail!(
+        "the resolved config source leaves node-local reference(s) unresolved: {listed}. These \
+         identify this node, so the literal placeholder text cannot be used as a value: export \
+         the environment variable(s) on this host, or move the value into a node-local overlay"
+    )
+}
+
+/// Validate `proxy.attestation` before anything is built from it.
+///
+/// Runs on every compile, including the one behind `sbproxy validate`,
+/// which is why it lives here and not in the pipeline: the pipeline is
+/// allowed to touch the filesystem and this is not, and an operator
+/// checking a candidate config deserves the same answer the server
+/// would give them.
+///
+/// The rule the whole block turns on is that a declared role has to be
+/// honourable. A role with no queue drops unsettled claims on restart,
+/// a role with no ledger cannot prove a gap, a role with an incomplete
+/// billing table charges by accident, and a receipt with no signing
+/// identity is a log line. Each of those fails here rather than at the
+/// moment somebody disputes an invoice.
+fn validate_attestation(
+    attestation: &AttestationConfig,
+    web_bot_auth: Option<&WebBotAuthConfig>,
+) -> Result<()> {
+    let role: AttestationRole = attestation.role;
+    let failure_mode: FailureMode = attestation.failure_mode;
+    let enforcement_mode: EnforcementMode = attestation.enforcement_mode;
+    let engaged = role.makes_claims() || role.writes_receipts();
+
+    if engaged && !failure_mode.admits() {
+        tracing::warn!(
+            failure_mode = failure_mode.as_label(),
+            "proxy.attestation.failure_mode refuses traffic when metering itself breaks. \
+             That is the right call for an operator who cannot serve unbilled traffic, and \
+             the wrong one for everybody else: a full ledger disk then takes the API down."
+        );
+    }
+    if engaged && !enforcement_mode.blocks() {
+        tracing::info!(
+            enforcement_mode = enforcement_mode.as_label(),
+            "proxy.attestation records attestation verdicts without acting on them"
+        );
+    }
+
+    match attestation.sign_with.as_deref() {
+        None if role.writes_receipts() => anyhow::bail!(
+            "proxy.attestation.role writes receipts, so proxy.attestation.sign_with is \
+             required: an unsigned receipt is a log line, not evidence. Set it to \
+             `{ATTESTATION_SIGN_WITH_WEB_BOT_AUTH}`."
+        ),
+        None => {}
+        Some(identity)
+            if identity == ATTESTATION_SIGN_WITH_WEB_BOT_AUTH && web_bot_auth.is_none() =>
+        {
+            anyhow::bail!(
+                "proxy.attestation.sign_with names `{ATTESTATION_SIGN_WITH_WEB_BOT_AUTH}`, \
+                 but that block is not configured, so there is no key to sign with"
+            )
+        }
+        Some(identity) if identity == ATTESTATION_SIGN_WITH_WEB_BOT_AUTH => {}
+        Some(other) => anyhow::bail!(
+            "proxy.attestation.sign_with `{other}` is not a signing identity this build can \
+             resolve; the only accepted value is `{ATTESTATION_SIGN_WITH_WEB_BOT_AUTH}`"
+        ),
+    }
+
+    match &attestation.queue {
+        Some(queue) => validate_attestation_queue(queue)?,
+        None if engaged => anyhow::bail!(
+            "proxy.attestation declares a role, so proxy.attestation.queue is required: a \
+             claim is written when a call starts and settled when it finishes, and with \
+             nowhere to hold the gap a restart loses every claim in flight"
+        ),
+        None => {}
+    }
+
+    match &attestation.ledger {
+        Some(ledger) => validate_attestation_ledger(ledger)?,
+        None if engaged => anyhow::bail!(
+            "proxy.attestation declares a role, so proxy.attestation.ledger is required: a \
+             signature on each record says nothing about records that were never written, \
+             and the chain is what makes a gap visible"
+        ),
+        None => {}
+    }
+
+    match &attestation.billable {
+        Some(billable) => validate_attestation_billable(billable)?,
+        None if engaged => anyhow::bail!(
+            "proxy.attestation declares a role, so proxy.attestation.billable is required, \
+             with an answer for all eight outcomes. There is no default, on purpose: an \
+             unstated billing rule still runs, it just runs as whatever the code happened \
+             to do."
+        ),
+        None => {}
+    }
+
+    validate_attestation_unit_resolvers(
+        &attestation.measured,
+        &attestation.route_weights,
+        &attestation.origin_headers,
+    )?;
+
+    if engaged
+        && attestation.measured.is_empty()
+        && attestation.route_weights.is_empty()
+        && attestation.origin_headers.is_empty()
+    {
+        // Not an error. A deployment can legitimately want the record
+        // without the arithmetic: an event per call, an outcome, and a
+        // chain that proves none went missing. It is worth saying out
+        // loud all the same, because an operator who meant to price
+        // something and mistyped the key gets a proxy that meters
+        // diligently and bills nothing, and the receipts look fine.
+        tracing::warn!(
+            "proxy.attestation declares a role but no unit resolvers, so every receipt will \
+             record an outcome with an empty units list. Declare proxy.attestation.measured, \
+             proxy.attestation.route_weights, or proxy.attestation.origin_headers to price \
+             the calls."
+        );
+    }
+
+    Ok(())
+}
+
+/// Reject unit resolver declarations that could not produce a readable
+/// invoice.
+///
+/// The cross-cutting check is the one worth having here: a unit name has
+/// to identify one invoice line, across all three lists rather than
+/// within each one. Route weights may repeat a name on purpose, because
+/// several routes priced differently are still one line, and the most
+/// specific match wins. Everything else that repeats a name produces two
+/// entries on one receipt that a buyer cannot tell apart, and worse,
+/// whose provenance differs, which defeats the reason the units are
+/// broken out by source in the first place.
+fn validate_attestation_unit_resolvers(
+    measured: &[AttestationMeasuredConfig],
+    route_weights: &[AttestationRouteWeightConfig],
+    origin_headers: &[AttestationOriginHeaderConfig],
+) -> Result<()> {
+    let mut measured_names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for (index, entry) in measured.iter().enumerate() {
+        validate_attestation_measured(index, entry)?;
+        let name: &str = entry.name.trim();
+        if !measured_names.insert(name) {
+            anyhow::bail!(
+                "proxy.attestation.measured: `{name}` is declared twice. One unit name is one \
+                 invoice line, and two quantities filling the same line would produce a receipt \
+                 nobody can read."
+            );
+        }
+    }
+
+    let mut route_names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    let mut seen_routes: std::collections::HashSet<(String, Option<String>, String)> =
+        std::collections::HashSet::new();
+
+    for entry in route_weights {
+        validate_attestation_route_weight(entry)?;
+        let name: &str = entry.name.trim();
+        let method: Option<String> = entry
+            .method
+            .as_deref()
+            .map(|method| method.trim().to_ascii_uppercase());
+        let path: &str = entry.path.trim();
+        if !seen_routes.insert((name.to_string(), method, path.to_string())) {
+            anyhow::bail!(
+                "proxy.attestation.route_weights: `{name}` prices `{path}` twice. Two weights \
+                 for one route on one invoice line have no defensible order, so pick the one \
+                 you meant."
+            );
+        }
+        if measured_names.contains(name) {
+            return Err(unit_name_claimed_twice(
+                name,
+                "a measured unit",
+                "a route weight",
+            ));
+        }
+        route_names.insert(name);
+    }
+
+    let mut header_names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for entry in origin_headers {
+        validate_attestation_origin_header(entry)?;
+        let name: &str = entry.name.trim();
+        if !header_names.insert(name) {
+            anyhow::bail!(
+                "proxy.attestation.origin_headers: `{name}` is declared twice. One unit name is \
+                 one invoice line, and two headers filling the same line would produce a \
+                 receipt nobody can read."
+            );
+        }
+        if measured_names.contains(name) {
+            return Err(unit_name_claimed_twice(
+                name,
+                "a measured unit",
+                "an origin header",
+            ));
+        }
+        if route_names.contains(name) {
+            return Err(unit_name_claimed_twice(
+                name,
+                "a route weight",
+                "an origin header",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// The error for one unit name claimed by two different resolvers.
+///
+/// Written once rather than three times so the three pairings cannot
+/// drift apart in wording; the reason is identical in every one of them.
+fn unit_name_claimed_twice(name: &str, first: &str, second: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "proxy.attestation: `{name}` is declared as both {first} and {second}. One name has to \
+         mean one thing on a receipt: a buyer reading two `{name}` lines with different \
+         provenance cannot tell which number came from where, which is the whole reason units \
+         carry a source."
+    )
+}
+
+/// Reject a measured entry that names nothing or divides by nothing.
+fn validate_attestation_measured(index: usize, entry: &AttestationMeasuredConfig) -> Result<()> {
+    let name: &str = entry.name.trim();
+    if name.is_empty() {
+        anyhow::bail!(
+            "proxy.attestation.measured[{index}].name is empty; every entry needs a non-empty \
+             `name`, because it is the invoice line the count is billed on"
+        );
+    }
+
+    if entry.per == 0 {
+        anyhow::bail!(
+            "proxy.attestation.measured[{index}].per is 0. `per` is a divisor: it says how much \
+             of the raw quantity makes one unit, so a divisor of zero cannot produce a unit \
+             count for `{name}`. Use 1 to bill one unit per observed item, or 1024 to bill \
+             kibibytes."
+        );
+    }
+
+    Ok(())
+}
+
+/// Reject a route weight that names nothing or matches nothing.
+fn validate_attestation_route_weight(entry: &AttestationRouteWeightConfig) -> Result<()> {
+    let name: &str = entry.name.trim();
+    if name.is_empty() {
+        anyhow::bail!(
+            "proxy.attestation.route_weights: every entry needs a non-empty `name`; it is the \
+             invoice line the weight is billed on"
+        );
+    }
+
+    let path: &str = entry.path.trim();
+    if !path.starts_with('/') {
+        anyhow::bail!(
+            "proxy.attestation.route_weights: `{name}` has path {path:?}, which does not start \
+             with `/` and so can never match a request path"
+        );
+    }
+    // A `*` anywhere but the documented suffix is the shape of somebody
+    // expecting glob matching. It would silently match nothing, which is
+    // a route that quietly stops being priced.
+    let stars = path.matches('*').count();
+    if stars > 1 || (stars == 1 && !path.ends_with("/*")) {
+        anyhow::bail!(
+            "proxy.attestation.route_weights: `{name}` has path {path:?}. The only wildcard is \
+             a trailing `/*`, which matches everything below that segment; anywhere else a `*` \
+             is matched literally and the route would silently go unpriced."
+        );
+    }
+
+    if let Some(method) = entry.method.as_deref() {
+        let method: &str = method.trim();
+        if method.is_empty() {
+            anyhow::bail!(
+                "proxy.attestation.route_weights: `{name}` has an empty `method`. Omit the key \
+                 to price every method."
+            );
+        }
+        if !method.bytes().all(|byte| byte.is_ascii_graphic()) {
+            anyhow::bail!(
+                "proxy.attestation.route_weights: `{name}` has method {method:?}, which is not \
+                 an HTTP method token"
+            );
+        }
+    }
+
+    // `weight` is deliberately unchecked. Zero is a real answer (metered
+    // and free) and there is no upper bound worth inventing for a number
+    // the operator is charging themselves against.
+    Ok(())
+}
+
+/// Reject an origin-header rule that names nothing or names a header
+/// that cannot exist.
+fn validate_attestation_origin_header(entry: &AttestationOriginHeaderConfig) -> Result<()> {
+    let name: &str = entry.name.trim();
+    if name.is_empty() {
+        anyhow::bail!(
+            "proxy.attestation.origin_headers: every entry needs a non-empty `name`; it is the \
+             invoice line the origin's count is billed on"
+        );
+    }
+
+    let header: &str = entry.header.trim();
+    if header.is_empty()
+        || http::header::HeaderName::from_bytes(header.to_ascii_lowercase().as_bytes()).is_err()
+    {
+        anyhow::bail!(
+            "proxy.attestation.origin_headers: `{name}` reads {header:?}, which is not a valid \
+             HTTP header name, so no response could ever carry it"
+        );
+    }
+    Ok(())
+}
+
+/// Reject a claim queue that could not hold a claim.
+fn validate_attestation_queue(queue: &AttestationQueueConfig) -> Result<()> {
+    if queue.path.trim().is_empty() {
+        anyhow::bail!("proxy.attestation.queue.path must be non-empty");
+    }
+    let max_entries: usize = queue.max_entries;
+    if max_entries == 0 {
+        anyhow::bail!(
+            "proxy.attestation.queue.max_entries must be at least 1; a queue of zero drops \
+             every claim at the moment it is made, which is silently not metering"
+        );
+    }
+    if max_entries > MAX_ATTESTATION_QUEUE_ENTRIES {
+        anyhow::bail!(
+            "proxy.attestation.queue.max_entries {max_entries} exceeds the cap of \
+             {MAX_ATTESTATION_QUEUE_ENTRIES}; past that an operator is describing a \
+             database rather than a hold buffer, and an extra zero should not be the way \
+             they find out"
+        );
+    }
+    Ok(())
+}
+
+/// Reject a ledger path that names nothing.
+fn validate_attestation_ledger(ledger: &AttestationLedgerConfig) -> Result<()> {
+    if ledger.path.trim().is_empty() {
+        anyhow::bail!("proxy.attestation.ledger.path must be non-empty");
+    }
+    Ok(())
+}
+
+/// Refuse a billing table that leaves any outcome unanswered, naming
+/// every one that is missing rather than the first.
+///
+/// Serde would reject a missing required field on its own, one field per
+/// compile. That is the wrong shape for this block: an operator who left
+/// three outcomes blank should see all three, because the point of the
+/// exercise is to make them decide, not to make them guess.
+fn validate_attestation_billable(billable: &AttestationBillableConfig) -> Result<()> {
+    let missing: Vec<&'static str> = billable.missing_outcomes();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "proxy.attestation.billable has no answer for {}. Every outcome needs one, \
+             because a billing rule left implicit is a billing rule nobody agreed to. Each \
+             takes one of yes, no, partial, collapse.",
+            missing.join(", "),
+        );
+    }
+    Ok(())
+}
+
+/// Validate one origin's attestation override against the proxy block
+/// it inherits from.
+///
+/// The check worth having is the widening one. `proxy.attestation` only
+/// has to declare a signing identity when the proxy-wide role writes
+/// receipts, so an origin that widens `claim` to `both` can reach a
+/// receipt with nothing to sign it. That hole is invisible in either
+/// block on its own, which is why this runs where both are in scope.
+fn validate_origin_attestation(
+    hostname: &str,
+    proxy: &AttestationConfig,
+    attestation: &OriginAttestationConfig,
+) -> Result<()> {
+    let role: Option<AttestationRole> = attestation.role;
+    let agreement_id: Option<&str> = attestation.agreement_id.as_deref();
+    let resolved: AttestationRole = role.unwrap_or(proxy.role);
+
+    if resolved.writes_receipts() && proxy.sign_with.is_none() {
+        anyhow::bail!(
+            "origin `{hostname}`: attestation.role writes receipts, but \
+             proxy.attestation.sign_with is unset, so nothing could sign them. An unsigned \
+             receipt is a log line, not evidence."
+        );
+    }
+    if resolved.writes_receipts() && agreement_id.is_none() {
+        tracing::warn!(
+            hostname = %hostname,
+            "origin writes receipts but names no attestation.agreement_id, so its receipts \
+             will record how much was consumed without naming the contract that prices it"
+        );
+    }
+    Ok(())
 }
 
 /// Compile a single origin from its raw config.
@@ -1292,6 +2202,12 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
         .iter()
         .filter_map(|m| m.parse::<http::Method>().ok())
         .collect();
+
+    if let Some(properties) = config.properties.as_mut() {
+        properties
+            .validate_and_normalize_rollup_keys()
+            .map_err(|message| anyhow::anyhow!("origin {hostname}: {message}"))?;
+    }
 
     // Interpolate {{vars.X}} and {{env.X}} in all JSON value fields.
     // This resolves template patterns in action URLs, error pages, etc.
@@ -1375,18 +2291,23 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
     };
 
     // Deserialize the raw `response_cache` JSON (if any) into a typed struct.
-    // Parse errors are downgraded to "no cache" with a warning so that a
-    // malformed block does not break the whole pipeline.
+    //
+    // WOR-1140: a parse failure here is a hard compile error. This block
+    // used to downgrade to "no cache" with a warning, but with
+    // `deny_unknown_fields` on `ResponseCacheConfig` a misspelled key
+    // would have turned into a silently disabled cache, which is the
+    // exact silent-drop failure mode this ticket removes. An operator
+    // who authored a `response_cache:` block gets the block they wrote
+    // or an error naming what is wrong with it.
     let response_cache: Option<crate::types::ResponseCacheConfig> = match &config.response_cache {
         Some(v) => match serde_json::from_value::<crate::types::ResponseCacheConfig>(v.clone()) {
             Ok(cfg) => Some(cfg),
             Err(e) => {
-                tracing::warn!(
-                    hostname = %hostname,
-                    error = %e,
-                    "ignoring response_cache: failed to deserialize config block"
+                anyhow::bail!(
+                    "origin '{hostname}': response_cache block failed to parse: {e}. Fix the \
+                     block (or remove it); a malformed cache config is rejected rather than \
+                     silently ignored."
                 );
-                None
             }
         },
         None => None,
@@ -1470,6 +2391,82 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
         ];
     }
 
+    // --- WOR-2136: refuse the dead tag + body-aware combination ---
+    //
+    // `action: tag` stamps the score / label headers onto the upstream
+    // request, and the upstream request is already assembled by the
+    // time the request body is read. On anything but an `ai_proxy`
+    // origin a body-aware hit therefore has nowhere to write: the
+    // combination reads as enforcing and enforces nothing. `ai_proxy`
+    // is exempt because that path reads the body before dispatch and
+    // can tag. Rejecting at compile keeps the dead combination out of
+    // running configs.
+    let origin_action_type = config
+        .action
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    for policy in &config.policies {
+        if !policy_type_is(policy, "prompt_injection_v2") {
+            continue;
+        }
+        if !policy
+            .get("enable_body_aware")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let action_key = policy.get("action").and_then(|v| v.as_str());
+        if action_key.unwrap_or("tag") == "tag" && origin_action_type != "ai_proxy" {
+            let default_note = if action_key.is_none() {
+                " (the default)"
+            } else {
+                ""
+            };
+            anyhow::bail!(
+                "origin {hostname}: prompt_injection_v2 sets `enable_body_aware: true` \
+                 with `action: tag`{default_note} on a `{origin_action_type}` origin. \
+                 A body hit cannot stamp the tag headers because the upstream request \
+                 is already assembled by the time the body is read, so this combination \
+                 enforces nothing. Use `action: block` or `action: log` for body-aware \
+                 scanning here; tagging on a body hit works only on `ai_proxy` origins, \
+                 which read the body before dispatch."
+            );
+        }
+    }
+
+    // --- WOR-2136: warn about body-reading policies on `static` ---
+    //
+    // A `static` action answers at the request phase and never
+    // forwards, so `request_body_filter` never runs and a policy that
+    // inspects the request body inspects nothing there. Warn rather
+    // than reject: the origin still serves, and the combination has
+    // shipped before as a copy-paste artifact (fixed in #861).
+    if origin_action_type == "static" {
+        for policy in &config.policies {
+            let policy_type = policy.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let reads_body = matches!(
+                policy_type,
+                "openapi_validation" | "content_digest" | "request_validator"
+            ) || (policy_type == "prompt_injection_v2"
+                && policy
+                    .get("enable_body_aware")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false));
+            if reads_body {
+                tracing::warn!(
+                    hostname = %hostname,
+                    policy = %policy_type,
+                    "policy reads the request body, but a `static` action never \
+                     forwards a request, so request_body_filter never runs and the \
+                     policy validates nothing on this origin"
+                );
+            }
+        }
+    }
+
     // --- Wave 4 / G4.5: validate and intern the Content-Signal value ---
     //
     // The closed enum is `{ai-train, search, ai-input}` per A4.1's
@@ -1521,6 +2518,21 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
                     other,
                     hostname,
                     skill.name
+                );
+            }
+        }
+    }
+
+    // WOR-2127: shape-check the per-origin attestation override. An
+    // empty `agreement_id` is worse than an absent one: it parses, it
+    // reaches a receipt, and it names no contract, so the buyer holds a
+    // signed document that cannot be priced.
+    if let Some(attestation) = &config.attestation {
+        if let Some(agreement_id) = &attestation.agreement_id {
+            if agreement_id.trim().is_empty() {
+                anyhow::bail!(
+                    "origin {hostname}: attestation.agreement_id must be non-empty when set; \
+                     omit the key to name no agreement"
                 );
             }
         }
@@ -1608,6 +2620,11 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
         outbound_credential: config.outbound_credential,
         // WOR-805: opt-in for outbound Web Bot Auth signing.
         outbound_web_bot_auth: config.outbound_web_bot_auth,
+        // WOR-2127: per-origin attestation role override + agreement id.
+        // Shape-checked above; the cross-block requirement (there has to
+        // be a `proxy.attestation` for this to mean anything) is checked
+        // in `compile_config`, which can see both.
+        attestation: config.attestation,
         // WOR-1043 PR3: origin-scope observability overrides.
         observability: config.observability,
     })
@@ -1639,6 +2656,321 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    #[test]
+    fn compile_rejects_invalid_inbound_key_config_even_when_disabled() {
+        for carrier_yaml in [
+            "headers:\n        - name: x-sb-property-credential",
+            "headers: []\n      provider_hints:\n        - provider: custom\n          header: x-sb-user-id",
+        ] {
+            let yaml = format!(
+                "proxy:\n  key_management:\n    enabled: false\n    inbound:\n      {carrier_yaml}\n"
+            );
+            let error = compile_config(&yaml)
+                .err()
+                .expect("compile must run inbound credential validation");
+            assert!(
+                format!("{error:#}").contains("may not carry a key"),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn compile_rejects_primary_carriers_that_collide_with_correlation_ids() {
+        for (correlation_yaml, inbound_yaml) in [
+            (
+                "",
+                "headers:\n        - name: X-Request-Id\n          scheme: ''\n      provider_hints: []",
+            ),
+            (
+                "  correlation_id:\n    header: X-Custom-Correlation\n",
+                "headers: []\n      provider_hints:\n        - provider: custom\n          header: x-custom-correlation",
+            ),
+        ] {
+            let yaml = format!(
+                "proxy:\n{correlation_yaml}  key_management:\n    enabled: false\n    inbound:\n      {inbound_yaml}\n"
+            );
+            let error = compile_config(&yaml)
+                .err()
+                .expect("correlation IDs must not carry credentials");
+            let message = format!("{error:#}");
+            assert!(message.contains("correlation_id"), "{message}");
+            assert!(message.contains("credential"), "{message}");
+        }
+    }
+
+    #[test]
+    fn compile_allows_reserved_match_metadata_and_disabled_correlation() {
+        let yaml = r#"
+proxy:
+  correlation_id:
+    enabled: false
+    header: X-Custom-Correlation
+  key_management:
+    enabled: false
+    inbound:
+      headers:
+        - name: X-Custom-Correlation
+          scheme: ""
+      provider_hints:
+        - provider: custom
+          header: X-Opaque-Credential
+          also_header: X-Sb-User-Id
+"#;
+        compile_config(yaml)
+            .expect("disabled correlation and non-carrier metadata must remain valid");
+    }
+
+    // --- WOR-2136: the dead tag + body-aware combination ---
+
+    #[test]
+    fn compile_rejects_tag_with_body_aware_on_a_plain_proxy_origin() {
+        let yaml = r#"
+origins:
+  "api.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    policies:
+      - type: prompt_injection_v2
+        detector: heuristic-v1
+        action: tag
+        enable_body_aware: true
+"#;
+        let error = compile_config(yaml)
+            .err()
+            .expect("tag + body-aware on a proxy origin must not compile");
+        let message = format!("{error:#}");
+        assert!(message.contains("enable_body_aware"), "{message}");
+        assert!(
+            message.contains("already assembled by the time the body is read"),
+            "{message}"
+        );
+        assert!(
+            message.contains("`action: block` or `action: log`"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn compile_rejects_the_default_tag_with_body_aware_too() {
+        // `tag` is the default action, so omitting the key is the same
+        // dead combination; the message names the default explicitly.
+        let yaml = r#"
+origins:
+  "api.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    policies:
+      - type: prompt_injection_v2
+        detector: heuristic-v1
+        enable_body_aware: true
+"#;
+        let error = compile_config(yaml)
+            .err()
+            .expect("the default action is tag, so this must not compile either");
+        assert!(format!("{error:#}").contains("(the default)"), "{error:#}");
+    }
+
+    #[test]
+    fn compile_allows_the_live_prompt_injection_combinations() {
+        // tag without body-aware: the URI + header scan can stamp.
+        // block with body-aware: a body hit rejects, which works.
+        for policy_yaml in [
+            "action: tag",
+            "action: block\n        enable_body_aware: true",
+            "action: log\n        enable_body_aware: true",
+        ] {
+            let yaml = format!(
+                r#"
+origins:
+  "api.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    policies:
+      - type: prompt_injection_v2
+        detector: heuristic-v1
+        {policy_yaml}
+"#
+            );
+            compile_config(&yaml)
+                .unwrap_or_else(|error| panic!("`{policy_yaml}` must stay compilable: {error:#}"));
+        }
+    }
+
+    #[test]
+    fn compile_allows_tag_with_body_aware_on_an_ai_proxy_origin() {
+        // The ai_proxy path reads the body before dispatch and can tag,
+        // so the combination is live there and must keep compiling.
+        let yaml = r#"
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: dummy
+    policies:
+      - type: prompt_injection_v2
+        detector: heuristic-v1
+        action: tag
+        enable_body_aware: true
+"#;
+        compile_config(yaml).expect("tag + body-aware is live on ai_proxy origins");
+    }
+
+    #[test]
+    fn a_body_reading_policy_on_a_static_origin_warns_at_compile() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // Counts compile-time warnings that name the request_body_filter
+        // gap, so the assertion cannot pass on an unrelated warning.
+        struct WarnCounter(Arc<AtomicUsize>);
+
+        impl tracing::Subscriber for WarnCounter {
+            fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+                metadata.target().starts_with("sbproxy_config")
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                struct SeenGapMessage(bool);
+                impl tracing::field::Visit for SeenGapMessage {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        if field.name() == "message"
+                            && format!("{value:?}").contains("request_body_filter never runs")
+                        {
+                            self.0 = true;
+                        }
+                    }
+                }
+                if *event.metadata().level() == tracing::Level::WARN {
+                    let mut visitor = SeenGapMessage(false);
+                    event.record(&mut visitor);
+                    if visitor.0 {
+                        self.0.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let yaml = r#"
+origins:
+  "static.local":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+    policies:
+      - type: request_validator
+        schema:
+          type: object
+"#;
+        let warnings = Arc::new(AtomicUsize::new(0));
+        let compiled =
+            tracing::subscriber::with_default(WarnCounter(Arc::clone(&warnings)), || {
+                compile_config(yaml)
+            });
+        compiled.expect("a body-reading policy on a static origin compiles; it only warns");
+        assert_eq!(
+            warnings.load(Ordering::Relaxed),
+            1,
+            "the static + body-reading combination must warn exactly once"
+        );
+    }
+
+    #[test]
+    fn top_level_feature_flags_compile_into_the_runtime_snapshot() {
+        let compiled = compile_config(
+            r#"
+flags:
+  - name: new-checkout
+    default: false
+    rules:
+      allow_list: [alice]
+      block_list: [mallory]
+      rollout_percent: 25
+"#,
+        )
+        .expect("top-level flags should compile");
+
+        assert_eq!(compiled.flags.len(), 1);
+        let flag = &compiled.flags[0];
+        assert_eq!(flag.name, "new-checkout");
+        assert!(!flag.default);
+        assert_eq!(flag.rules.allow_list, ["alice"]);
+        assert_eq!(flag.rules.block_list, ["mallory"]);
+        assert_eq!(flag.rules.rollout_percent, 25);
+    }
+
+    #[test]
+    fn duplicate_top_level_feature_flag_names_fail_compile() {
+        let error = compile_config(
+            r#"
+flags:
+  - name: new-checkout
+    default: true
+  - name: new-checkout
+    default: false
+"#,
+        )
+        .err()
+        .expect("duplicate flag names must be rejected");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("duplicate"), "{message}");
+        assert!(message.contains("new-checkout"), "{message}");
+    }
+
+    #[test]
+    fn feature_flag_rollout_percent_must_be_at_most_one_hundred() {
+        let error = compile_config(
+            r#"
+flags:
+  - name: impossible-rollout
+    rules:
+      rollout_percent: 101
+"#,
+        )
+        .err()
+        .expect("an out-of-range rollout must be rejected");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("impossible-rollout"), "{message}");
+        assert!(message.contains("0..=100"), "{message}");
+    }
+
+    #[test]
+    fn feature_flag_segments_are_rejected_until_cel_accepts_a_segment() {
+        let error = compile_config(
+            r#"
+flags:
+  - name: segment-only
+    rules:
+      segments: [beta]
+"#,
+        )
+        .err()
+        .expect("an unread segment rule must be rejected");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("segments"), "{message}");
+        assert!(message.contains("unknown field"), "{message}");
+    }
+
     fn custom_field(
         name: &str,
         value: Option<&str>,
@@ -1656,8 +2988,10 @@ mod tests {
     // WOR-1818: `${VAR:-default}` resolves with shell semantics.
     #[test]
     fn env_interpolation_supports_shell_defaults() {
-        std::env::remove_var("SBPROXY_TEST_UNSET_XYZ");
-        std::env::set_var("SBPROXY_TEST_SET_XYZ", "live");
+        let _env = crate::test_env::EnvVarGuard::set(&[
+            ("SBPROXY_TEST_UNSET_XYZ", None),
+            ("SBPROXY_TEST_SET_XYZ", Some("live")),
+        ]);
         assert_eq!(
             interpolate_env_vars("a ${SBPROXY_TEST_UNSET_XYZ:-fallback} b"),
             "a fallback b"
@@ -1703,6 +3037,442 @@ origins:
         assert!(
             msg.contains("proxy.admin.password"),
             "error must locate the tagged value: {msg}"
+        );
+    }
+
+    #[test]
+    fn admin_rate_limit_defaults_to_60() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+  admin:
+    enabled: true
+    username: admin
+    password: secret
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+        let compiled = compile_config(yaml).expect("should compile");
+        let admin = compiled.server.admin.as_ref().expect("admin block");
+        assert_eq!(admin.rate_limit_per_minute, 240);
+    }
+
+    #[test]
+    fn admin_rate_limit_out_of_range_is_rejected() {
+        for bad in ["0", "100001"] {
+            let yaml = format!(
+                r#"
+proxy:
+  http_bind_port: 8080
+  admin:
+    enabled: true
+    username: admin
+    password: secret
+    rate_limit_per_minute: {bad}
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#
+            );
+            let err = compile_config(&yaml)
+                .err()
+                .unwrap_or_else(|| panic!("rate_limit_per_minute {bad} must fail compile"));
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("rate_limit_per_minute") && msg.contains("between 1 and"),
+                "error must name the field and its range: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn admin_rate_limit_in_range_value_is_kept() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+  admin:
+    enabled: true
+    username: admin
+    password: secret
+    rate_limit_per_minute: 500
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+        let compiled = compile_config(yaml).expect("should compile");
+        let admin = compiled.server.admin.as_ref().expect("admin block");
+        assert_eq!(admin.rate_limit_per_minute, 500);
+    }
+
+    /// Build a config with an admin block whose body is `body`, so the
+    /// default-credential tests differ only in the lines under test.
+    fn admin_config_yaml(body: &str) -> String {
+        format!(
+            r#"
+proxy:
+  http_bind_port: 8080
+  admin:
+    enabled: true
+{body}
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#
+        )
+    }
+
+    #[test]
+    fn default_admin_credentials_off_loopback_bind_are_refused() {
+        let yaml =
+            admin_config_yaml("    bind: 0.0.0.0\n    username: admin\n    password: changeme");
+        let err = compile_config(&yaml)
+            .err()
+            .expect("default credentials on a wide bind must fail compile");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("proxy.admin.password") && msg.contains("shipped default"),
+            "error must name the credential: {msg}"
+        );
+        assert!(
+            msg.contains("proxy.admin.bind is `0.0.0.0`"),
+            "error must name the condition that tripped: {msg}"
+        );
+        assert!(
+            msg.contains("Set a real password"),
+            "error must say what to do: {msg}"
+        );
+    }
+
+    #[test]
+    fn default_admin_credentials_with_wide_allow_ips_are_refused() {
+        // Loopback bind, but the allowlist admits a whole private range,
+        // so the surface is reachable from other hosts on that network.
+        let yaml = admin_config_yaml(
+            "    bind: 127.0.0.1\n    password: changeme\n    allow_ips: [\"127.0.0.1\", \"10.0.0.0/8\"]",
+        );
+        let err = compile_config(&yaml)
+            .err()
+            .expect("default credentials with a wide allow_ips must fail compile");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("proxy.admin.allow_ips admits peers outside loopback (10.0.0.0/8)"),
+            "error must name the offending entry, and only that entry: {msg}"
+        );
+        assert!(
+            msg.contains("Set a real password"),
+            "error must say what to do: {msg}"
+        );
+    }
+
+    #[test]
+    fn default_admin_credentials_on_loopback_still_compile() {
+        // The local-development path. Both the implicit default bind and
+        // an explicit loopback bind (with a loopback-only allowlist) stay
+        // valid with the shipped credentials.
+        for body in [
+            "    username: admin\n    password: changeme",
+            "    bind: 127.0.0.1\n    password: changeme",
+            "    bind: \"::1\"\n    password: changeme",
+            "    password: changeme\n    allow_ips: [\"127.0.0.0/8\", \"::1\"]",
+        ] {
+            let yaml = admin_config_yaml(body);
+            compile_config(&yaml)
+                .unwrap_or_else(|e| panic!("loopback default credentials must compile: {e:#}"));
+        }
+    }
+
+    #[test]
+    fn real_admin_password_off_loopback_compiles() {
+        let yaml = admin_config_yaml(
+            "    bind: 0.0.0.0\n    username: admin\n    password: not-the-default\n    allow_ips: [\"10.0.0.0/8\"]",
+        );
+        let compiled = compile_config(&yaml)
+            .unwrap_or_else(|e| panic!("a real password off loopback must compile: {e:#}"));
+        let admin = compiled.server.admin.as_ref().expect("admin block");
+        assert_eq!(admin.bind.as_deref(), Some("0.0.0.0"));
+    }
+
+    #[test]
+    fn unparseable_admin_bind_is_refused() {
+        for bad in ["0.0.0..1", "localhost", "127.0.0.1:9090", ""] {
+            let yaml = admin_config_yaml(&format!(
+                "    bind: \"{bad}\"\n    password: not-the-default"
+            ));
+            let err = compile_config(&yaml)
+                .err()
+                .unwrap_or_else(|| panic!("bind `{bad}` must fail compile"));
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("proxy.admin.bind") && msg.contains("not an IP address"),
+                "error must name the field and the reason: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn admin_allow_entry_loopback_classification() {
+        for loopback in [
+            "127.0.0.1",
+            " 127.0.0.1 ",
+            "127.0.0.1/32",
+            "127.0.0.0/8",
+            "::1",
+            "::1/128",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(
+                admin_allow_entry_is_loopback_only(loopback),
+                "{loopback} is loopback-only"
+            );
+        }
+        for reachable in [
+            "0.0.0.0/0",
+            "10.0.0.0/8",
+            "192.168.1.50",
+            // Spans 126.0.0.0 upward, so it is not inside 127.0.0.0/8.
+            "127.0.0.0/7",
+            "::/0",
+            "not-an-address",
+        ] {
+            assert!(
+                !admin_allow_entry_is_loopback_only(reachable),
+                "{reachable} reaches beyond loopback"
+            );
+        }
+    }
+
+    #[test]
+    fn http3_enabled_is_rejected_because_it_is_not_served() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+  http3:
+    enabled: true
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+
+        let error = compile_config(yaml)
+            .err()
+            .expect("proxy.http3.enabled=true must fail config compilation");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("proxy.http3.enabled")
+                && message.contains("not served")
+                && message.contains("WOR-1969"),
+            "error must name the unsupported setting, explain that it is not served, and point \
+             to the implementation ticket: {message}"
+        );
+    }
+
+    #[test]
+    fn http3_explicitly_disabled_remains_valid() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+  http3:
+    enabled: false
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+
+        let compiled = compile_config(yaml).expect("disabled HTTP/3 config remains valid");
+        assert_eq!(
+            compiled.server.http3.as_ref().map(|config| config.enabled),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn http3_omitted_remains_valid() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+
+        let compiled = compile_config(yaml).expect("omitted HTTP/3 config remains valid");
+        assert!(compiled.server.http3.is_none());
+    }
+
+    /// Minimal `tracing::Subscriber` that records the `config_key` field
+    /// of every event, regardless of level or target. Proves the boot
+    /// warning in `compile_config` (above) actually fires as a `tracing`
+    /// event, not just that `key_registry::configured_config_only_keys`
+    /// returns the right entries in isolation.
+    struct ConfigOnlyWarningCapture {
+        keys: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl tracing::Subscriber for ConfigOnlyWarningCapture {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        /// Deliberately `sometimes`, never `always`: `tracing` caches one
+        /// `Interest` per callsite for the whole process, and the boot
+        /// warning's callsite is shared with every other `compile_config`
+        /// test running in parallel on other threads. `sometimes` forces
+        /// `tracing` to call `enabled` on the *emitting* thread for every
+        /// event, so this capture answers only for its own thread and the
+        /// cached value can never go stale in either direction.
+        fn register_callsite(
+            &self,
+            _metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+        /// Keeps the process-wide max-level hint at `TRACE` while this
+        /// subscriber is registered, so `tracing::warn!`'s static level
+        /// fast path (`LevelFilter::current()`) cannot filter the event
+        /// before interest is even consulted.
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::TRACE)
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Visitor<'a>(&'a mut Option<String>);
+            impl tracing::field::Visit for Visitor<'_> {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    if field.name() == "config_key" {
+                        *self.0 = Some(value.to_string());
+                    }
+                }
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "config_key" {
+                        *self.0 = Some(format!("{value:?}"));
+                    }
+                }
+            }
+            let mut key = None;
+            event.record(&mut Visitor(&mut key));
+            if let Some(key) = key {
+                self.keys.lock().unwrap().push(key);
+            }
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// A registered-but-silent subscriber whose only job is to keep
+    /// `tracing`'s global callsite-interest cache honest for the capture
+    /// above. It is never installed as anyone's default; it exists purely
+    /// as a second entry in the process-wide dispatcher list.
+    ///
+    /// Why this is needed (tracing-core 0.1.36):
+    ///
+    /// * `Dispatchers::rebuilder` takes a "just one dispatcher" fast path
+    ///   whenever at most one dispatcher is registered
+    ///   (`callsite.rs:544-549`), and that path computes a callsite's
+    ///   interest from *the calling thread's* default subscriber
+    ///   (`callsite.rs:561-573`). On any sibling test thread that default
+    ///   is `NoSubscriber`, whose `register_callsite` returns
+    ///   `Interest::never()` (`subscriber.rs:676-678`). The result is
+    ///   written to the one process-wide cache slot
+    ///   (`callsite.rs:505-506`), and a callsite registers exactly once
+    ///   (`callsite.rs:308-321`), so the first sibling thread to reach the
+    ///   boot warning wins and disables it for *every* thread, this test
+    ///   included. Registering a second dispatcher turns the fast path off
+    ///   and forces interest to be computed from the live dispatcher list,
+    ///   which contains the capture above.
+    /// * The pin hints `LevelFilter::OFF`, which matters for ordering:
+    ///   `MAX_LEVEL` starts at `OFF` (`metadata.rs:245`) so no thread can
+    ///   reach a callsite at all until some dispatcher raises it. Because
+    ///   the pin keeps it at `OFF`, the door stays shut until the capture
+    ///   registers, and `register_dispatch` clears `has_just_one` before
+    ///   `rebuild_interest` raises the max level (`callsite.rs:484-488`,
+    ///   `551-557`, `407-421`) -- so there is no window in which a sibling
+    ///   thread can poison the cache.
+    struct InterestPin;
+
+    impl tracing::Subscriber for InterestPin {
+        fn register_callsite(
+            &self,
+            _metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::never()
+        }
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::OFF)
+        }
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            false
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, _event: &tracing::Event<'_>) {}
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn compile_config_warns_when_an_operator_sets_a_config_only_key() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+  device_parser_file: "/etc/sbproxy/devices.yaml"
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+        // Register the pin BEFORE the capture and keep it alive for the
+        // whole test: with two dispatchers registered, `tracing` computes
+        // this callsite's interest from the dispatcher list (which holds
+        // the capture) instead of from whichever thread happens to hit the
+        // callsite first. See `InterestPin` for the file:line evidence.
+        // Dropping the pin early would re-arm the fast path, so it must
+        // outlive the `with_default` scope below (hence the explicit
+        // `drop` after it, rather than an `_`-bound temporary).
+        let pin = tracing::dispatcher::Dispatch::new(InterestPin);
+
+        let keys = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = ConfigOnlyWarningCapture { keys: keys.clone() };
+        tracing::subscriber::with_default(subscriber, || {
+            // Repair, don't rely: if some other dispatcher elsewhere in the
+            // process had already cached this callsite as `never` before the
+            // pin existed, this recomputes it. With the pin registered the
+            // rebuild reads the live dispatcher list, so the recomputed
+            // value is honest regardless of which thread runs it.
+            tracing::callsite::rebuild_interest_cache();
+            compile_config(yaml).expect("device_parser_file is config-only, not a compile error");
+        });
+        drop(pin);
+
+        assert_eq!(
+            keys.lock().unwrap().as_slice(),
+            ["proxy.device_parser_file"],
+            "compile_config must warn once for the explicitly-set config-only key"
         );
     }
 
@@ -1985,6 +3755,55 @@ origins:
         assert!(origin.allowed_methods.contains(&http::Method::POST));
     }
 
+    #[test]
+    fn compile_origin_normalizes_promoted_property_keys() {
+        let yaml = r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: http://localhost:3000
+    properties:
+      rollup_keys: [Feature, CUSTOMER-TIER]
+"#;
+        let compiled = compile_config(yaml).expect("property rollup keys should compile");
+        let properties = compiled
+            .resolve_origin("api.example.com")
+            .unwrap()
+            .properties
+            .as_ref()
+            .unwrap();
+        assert_eq!(properties.rollup_keys, ["feature", "customer-tier"]);
+    }
+
+    #[test]
+    fn compile_origin_rejects_invalid_promoted_property_keys() {
+        for rollup_keys in [
+            "[Feature, feature]",
+            "['bad.key']",
+            "[one, two, three, four, five, six]",
+        ] {
+            let yaml = format!(
+                r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: http://localhost:3000
+    properties:
+      rollup_keys: {rollup_keys}
+"#
+            );
+            let error = compile_config(&yaml)
+                .err()
+                .expect("invalid property rollup keys must fail");
+            assert!(
+                error.to_string().contains("properties.rollup_keys"),
+                "unhelpful error: {error}"
+            );
+        }
+    }
+
     /// WOR-1053 PR1: an origin with no `tenant_id:` resolves to the
     /// synthetic `__default__` tenant so existing single-tenant
     /// configs keep working unchanged.
@@ -2088,6 +3907,7 @@ proxy:
       key: ${OPENAI_API_KEY}
       attrs:
         project: shared
+        cost_center: research
         tags: [tier-shared]
 origins:
   ai.local:
@@ -2113,6 +3933,10 @@ origins:
         assert_eq!(vks[0]["project"], "shared");
         assert_eq!(vks[0]["allowed_providers"][0], "openai");
         assert_eq!(vks[0]["tags"][0], "tier-shared");
+        assert_eq!(
+            vks[0]["metadata"]["cost_center"], "research",
+            "cost_center must be lifted into the runtime metadata map"
+        );
     }
 
     /// `route_to_model` and `inject_tools` set on a credentials-block
@@ -2131,6 +3955,7 @@ proxy:
       provider: openai
       key: ${OPENAI_API_KEY}
       route_to_model: gpt-4o-mini
+      compression_profile: coding-agent
       allowed_tools: []
       inject_tools:
         - type: function
@@ -2161,6 +3986,11 @@ origins:
         assert_eq!(
             vks[0]["route_to_model"], "gpt-4o-mini",
             "route_to_model must reach the lowered VK; got: {}",
+            vks[0]
+        );
+        assert_eq!(
+            vks[0]["compression_profile"], "coding-agent",
+            "compression_profile must reach the lowered VK; got: {}",
             vks[0]
         );
         let tools = vks[0]["inject_tools"]
@@ -2536,7 +4366,8 @@ origins:
     #[test]
     fn compile_config_with_env_variables() {
         // Set a test environment variable.
-        std::env::set_var("TEST_ENV_VALUE_COMPILE", "from-env-42");
+        let _env =
+            crate::test_env::EnvVarGuard::set(&[("TEST_ENV_VALUE_COMPILE", Some("from-env-42"))]);
         let yaml = r#"
 origins:
   "envvar.test":
@@ -2560,7 +4391,6 @@ origins:
         );
         let headers = origin.request_modifiers[0].headers.as_ref().unwrap();
         assert_eq!(headers.set.get("X-Env-Test").unwrap(), "from-env-42");
-        std::env::remove_var("TEST_ENV_VALUE_COMPILE");
     }
 
     #[test]
@@ -2763,7 +4593,7 @@ origins:
     #[test]
     fn parse_kya_authentication_minimal_compiles() {
         // Minimal config: only the required `type` and `issuers` array.
-        // Defaults are filled in by the enterprise verifier at
+        // Defaults are filled in by the verifier at
         // `KyaConfig::validate` time, not by the OSS compiler.
         let yaml = r#"
 origins:
@@ -2786,7 +4616,7 @@ origins:
         // Operators may add forward-compat fields (e.g. `audit_sample_rate`)
         // that the OSS compiler does not type-check. The opaque-value
         // contract requires those fields to round-trip unchanged into
-        // the snapshot so the enterprise verifier sees them.
+        // the snapshot so the verifier sees them.
         let yaml = r#"
 origins:
   "kya-extra.test":
@@ -2808,7 +4638,7 @@ origins:
         assert_eq!(
             auth.get("audit_sample_rate").and_then(|v| v.as_u64()),
             Some(50),
-            "forward-compat fields must round-trip to the enterprise verifier"
+            "forward-compat fields must round-trip to the verifier"
         );
         assert_eq!(auth.get("fail_open").and_then(|v| v.as_bool()), Some(true));
     }
@@ -3031,12 +4861,11 @@ origins:
 
     #[test]
     fn interpolate_env_in_json_string() {
-        std::env::set_var("SBPROXY_TEST_HOST", "env-backend");
+        let _env = crate::test_env::EnvVarGuard::set(&[("SBPROXY_TEST_HOST", Some("env-backend"))]);
         let vars: HashMap<String, serde_json::Value> = HashMap::new();
         let mut val = serde_json::json!("http://{{env.SBPROXY_TEST_HOST}}:8080");
         interpolate_config_vars(&mut val, &vars);
         assert_eq!(val.as_str().unwrap(), "http://env-backend:8080");
-        std::env::remove_var("SBPROXY_TEST_HOST");
     }
 
     #[test]
@@ -3069,7 +4898,7 @@ origins:
 
     #[test]
     fn interpolate_mixed_vars_and_env() {
-        std::env::set_var("SBPROXY_MIX_PORT", "9090");
+        let _env = crate::test_env::EnvVarGuard::set(&[("SBPROXY_MIX_PORT", Some("9090"))]);
         let vars: HashMap<String, serde_json::Value> =
             [("host".to_string(), serde_json::json!("api.local"))]
                 .into_iter()
@@ -3077,7 +4906,6 @@ origins:
         let mut val = serde_json::json!("http://{{vars.host}}:{{env.SBPROXY_MIX_PORT}}/api");
         interpolate_config_vars(&mut val, &vars);
         assert_eq!(val.as_str().unwrap(), "http://api.local:9090/api");
-        std::env::remove_var("SBPROXY_MIX_PORT");
     }
 
     #[test]
@@ -3114,9 +4942,10 @@ origins:
 
     #[test]
     fn compile_config_propagates_origin_extensions() {
-        // Opaque per-origin extensions must round-trip from the raw
-        // YAML into the compiled snapshot so enterprise crates (e.g.
-        // the semantic-cache hook) can read their own keys.
+        // Opaque per-origin extensions must round-trip from the raw YAML
+        // into the compiled snapshot so an extension can read its own
+        // keys. The map stays generic: nothing in this workspace
+        // interprets it.
         let yaml = r#"
 origins:
   "api.example.com":
@@ -3124,18 +4953,18 @@ origins:
       type: proxy
       url: http://127.0.0.1:18888
     extensions:
-      semantic_cache:
+      custom_metadata:
         enabled: true
         ttl_secs: 600
 "#;
         let compiled = compile_config(yaml).expect("compile");
         let origin = compiled.resolve_origin("api.example.com").expect("origin");
-        let sc = origin
+        let custom = origin
             .extensions
-            .get("semantic_cache")
-            .expect("semantic_cache extension present after compile");
-        assert!(sc.get("enabled").unwrap().as_bool().unwrap());
-        assert_eq!(sc.get("ttl_secs").unwrap().as_u64().unwrap(), 600);
+            .get("custom_metadata")
+            .expect("custom_metadata extension present after compile");
+        assert!(custom.get("enabled").unwrap().as_bool().unwrap());
+        assert_eq!(custom.get("ttl_secs").unwrap().as_u64().unwrap(), 600);
     }
 
     #[test]
@@ -3684,6 +5513,614 @@ origins:
             Ok(_) => panic!("empty key_id must fail config load"),
             Err(e) => assert!(e.to_string().contains("key_id"), "got: {e}"),
         }
+    }
+
+    // --- WOR-2127: consumption attestation ---
+
+    /// The signing identity every attestation fixture below points at.
+    const ATTESTATION_SIGNER: &str = r#"
+  web_bot_auth:
+    key_id: sbproxy-2026
+    ed25519_seed_hex: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef""#;
+
+    /// A complete billing table, indented to sit under `attestation:`.
+    const ATTESTATION_BILLABLE: &str = r#"
+    billable:
+      delivered: yes
+      client_disconnected: partial
+      origin_4xx: no
+      origin_5xx: no
+      policy_blocked: no
+      rate_limited: no
+      cache_hit: yes
+      retry: collapse"#;
+
+    /// One static origin, so a fixture only has to say what it is
+    /// testing.
+    const ATTESTATION_ORIGIN: &str = r#"
+origins:
+  api.partner.example:
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+"#;
+
+    /// A config whose `attestation:` body is the caller's, with the
+    /// signer, queue, ledger, and billing table already in place.
+    fn attestation_yaml(body: &str) -> String {
+        format!(
+            "proxy:{ATTESTATION_SIGNER}\n  attestation:{body}\n    sign_with: proxy.web_bot_auth\
+             \n    queue:\n      path: /tmp/sbproxy-attestation/claims.q\n      max_entries: 100000\
+             \n    ledger:\n      path: /tmp/sbproxy-attestation/receipts.ndjson\
+             {ATTESTATION_BILLABLE}\n{ATTESTATION_ORIGIN}"
+        )
+    }
+
+    #[test]
+    fn attestation_valid_config_compiles() {
+        let compiled = compile_config(&attestation_yaml("\n    role: both")).expect("compile");
+        let attestation = compiled
+            .server
+            .attestation
+            .expect("the attestation block survives compilation");
+
+        assert_eq!(attestation.role, AttestationRole::Both);
+        // The whole reason this key departs from the surface-wide
+        // `closed`: billing is not a security boundary, so an unwritable
+        // ledger must not take the API down.
+        assert_eq!(attestation.failure_mode, FailureMode::Degraded);
+        assert_eq!(attestation.enforcement_mode, EnforcementMode::Block);
+        assert_eq!(
+            attestation.sign_with.as_deref(),
+            Some(ATTESTATION_SIGN_WITH_WEB_BOT_AUTH)
+        );
+        let queue = attestation.queue.expect("queue present");
+        assert_eq!(queue.max_entries, 100_000);
+        assert!(attestation.ledger.is_some());
+        assert!(attestation
+            .billable
+            .expect("billable present")
+            .missing_outcomes()
+            .is_empty());
+    }
+
+    #[test]
+    fn attestation_absent_block_still_compiles() {
+        let yaml = r#"
+origins:
+  api.partner.example:
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+"#;
+        let compiled = compile_config(yaml).expect("a config with no attestation block compiles");
+        assert!(compiled.server.attestation.is_none());
+        assert!(compiled
+            .resolve_origin("api.partner.example")
+            .expect("origin compiled")
+            .attestation
+            .is_none());
+    }
+
+    #[test]
+    fn attestation_every_failure_mode_parses() {
+        for (spelling, expected) in [
+            ("closed", FailureMode::Closed),
+            ("open", FailureMode::Open),
+            ("degraded", FailureMode::Degraded),
+            ("observe", FailureMode::Observe),
+        ] {
+            let yaml =
+                attestation_yaml(&format!("\n    role: claim\n    failure_mode: {spelling}"));
+            let compiled =
+                compile_config(&yaml).unwrap_or_else(|e| panic!("{spelling} must compile: {e}"));
+            assert_eq!(
+                compiled
+                    .server
+                    .attestation
+                    .expect("attestation present")
+                    .failure_mode,
+                expected,
+                "failure_mode: {spelling}"
+            );
+        }
+    }
+
+    #[test]
+    fn attestation_incomplete_billable_names_every_missing_outcome() {
+        let yaml = format!(
+            "proxy:{ATTESTATION_SIGNER}\n  attestation:\n    role: claim\
+             \n    sign_with: proxy.web_bot_auth\
+             \n    queue:\n      path: /tmp/sbproxy-attestation/claims.q\
+             \n    ledger:\n      path: /tmp/sbproxy-attestation/receipts.ndjson\
+             \n    billable:\n      delivered: yes\n      client_disconnected: partial\
+             \n      origin_4xx: no\n      origin_5xx: no\n      policy_blocked: no\
+             \n      rate_limited: no\n{ATTESTATION_ORIGIN}"
+        );
+
+        let error = compile_config(&yaml)
+            .err()
+            .expect("an incomplete billing table is not a table");
+        let rendered = error.to_string();
+
+        // Both, in one message. An operator who left two outcomes blank
+        // should not have to compile twice to find that out.
+        assert!(rendered.contains("cache_hit"), "{rendered}");
+        assert!(rendered.contains("retry"), "{rendered}");
+    }
+
+    #[test]
+    fn attestation_role_without_a_billing_table_fails_config_load() {
+        let yaml = format!(
+            "proxy:{ATTESTATION_SIGNER}\n  attestation:\n    role: claim\
+             \n    sign_with: proxy.web_bot_auth\
+             \n    queue:\n      path: /tmp/sbproxy-attestation/claims.q\
+             \n    ledger:\n      path: /tmp/sbproxy-attestation/receipts.ndjson\
+             \n{ATTESTATION_ORIGIN}"
+        );
+
+        let error = compile_config(&yaml)
+            .err()
+            .expect("a role with no billing table must fail");
+        assert!(
+            error.to_string().contains("billable"),
+            "the error names the key the operator has to author: {error}"
+        );
+    }
+
+    #[test]
+    fn attestation_role_without_a_queue_fails_config_load() {
+        let yaml = format!(
+            "proxy:{ATTESTATION_SIGNER}\n  attestation:\n    role: claim\
+             \n    sign_with: proxy.web_bot_auth\
+             \n    ledger:\n      path: /tmp/sbproxy-attestation/receipts.ndjson\
+             {ATTESTATION_BILLABLE}\n{ATTESTATION_ORIGIN}"
+        );
+
+        let error = compile_config(&yaml)
+            .err()
+            .expect("a role with nowhere to hold claims fails");
+        assert!(error.to_string().contains("queue"), "got: {error}");
+    }
+
+    #[test]
+    fn attestation_zero_queue_capacity_fails_config_load() {
+        let yaml =
+            attestation_yaml("\n    role: claim").replace("max_entries: 100000", "max_entries: 0");
+
+        let error = compile_config(&yaml)
+            .err()
+            .expect("a queue of zero is not a queue");
+        assert!(error.to_string().contains("max_entries"), "got: {error}");
+    }
+
+    #[test]
+    fn attestation_unknown_signing_identity_fails_config_load() {
+        let yaml = attestation_yaml("\n    role: receipt")
+            .replace("sign_with: proxy.web_bot_auth", "sign_with: proxy.mtls");
+
+        let error = compile_config(&yaml)
+            .err()
+            .expect("an unresolvable signer must fail");
+        let rendered = error.to_string();
+        assert!(rendered.contains("sign_with"), "{rendered}");
+        assert!(
+            rendered.contains(ATTESTATION_SIGN_WITH_WEB_BOT_AUTH),
+            "the error tells the operator what is on offer: {rendered}"
+        );
+    }
+
+    #[test]
+    fn attestation_receipt_role_without_a_signer_fails_config_load() {
+        let yaml = attestation_yaml("\n    role: receipt")
+            .replace("\n    sign_with: proxy.web_bot_auth", "");
+
+        let error = compile_config(&yaml)
+            .err()
+            .expect("an unsigned receipt is not evidence");
+        assert!(error.to_string().contains("sign_with"), "got: {error}");
+    }
+
+    #[test]
+    fn attestation_origin_override_survives_compilation() {
+        let override_block =
+            "      body: \"ok\"\n    attestation:\n      role: claim\n      agreement_id: acme-2026\n";
+        let yaml =
+            attestation_yaml("\n    role: both").replace("      body: \"ok\"\n", override_block);
+
+        let compiled = compile_config(&yaml).expect("a per-origin override compiles");
+        let origin = compiled
+            .resolve_origin("api.partner.example")
+            .expect("origin compiled");
+        let attestation = origin
+            .attestation
+            .as_ref()
+            .expect("the override survives compilation");
+
+        assert_eq!(attestation.role, Some(AttestationRole::Claim));
+        assert_eq!(attestation.agreement_id.as_deref(), Some("acme-2026"));
+    }
+
+    #[test]
+    fn attestation_origin_block_without_a_proxy_block_fails_config_load() {
+        let yaml = r#"
+origins:
+  api.partner.example:
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+    attestation:
+      role: claim
+      agreement_id: acme-2026
+"#;
+        let error = compile_config(yaml)
+            .err()
+            .expect("a per-origin role with nothing behind it must fail");
+        assert!(
+            error.to_string().contains("proxy.attestation"),
+            "the error points at the block the operator is missing: {error}"
+        );
+    }
+
+    #[test]
+    fn attestation_origin_widening_past_the_signer_fails_config_load() {
+        // `proxy.attestation` only has to name a signer when the
+        // proxy-wide role writes receipts. An origin that widens `claim`
+        // to `both` reaches a receipt with nothing to sign it, and that
+        // hole is invisible in either block on its own.
+        let yaml = attestation_yaml("\n    role: claim")
+            .replace("\n    sign_with: proxy.web_bot_auth", "")
+            .replace(
+                "      body: \"ok\"\n",
+                "      body: \"ok\"\n    attestation:\n      role: both\n",
+            );
+
+        let error = compile_config(&yaml)
+            .err()
+            .expect("widening past the signer must fail");
+        let rendered = error.to_string();
+        assert!(rendered.contains("sign_with"), "{rendered}");
+        assert!(rendered.contains("api.partner.example"), "{rendered}");
+    }
+
+    #[test]
+    fn attestation_empty_agreement_id_fails_config_load() {
+        let yaml = attestation_yaml("\n    role: both").replace(
+            "      body: \"ok\"\n",
+            "      body: \"ok\"\n    attestation:\n      agreement_id: \"\"\n",
+        );
+
+        let error = compile_config(&yaml)
+            .err()
+            .expect("an empty agreement names no contract");
+        assert!(error.to_string().contains("agreement_id"), "got: {error}");
+    }
+
+    // --- WOR-2128: unit resolvers ---
+
+    #[test]
+    fn attestation_resolvers_survive_compilation_in_the_operators_spelling() {
+        let compiled = compile_config(&attestation_yaml(
+            "\n    role: receipt\
+             \n    route_weights:\
+             \n      - name: search_call\
+             \n        method: POST\
+             \n        path: /v1/search\
+             \n        weight: 5\
+             \n      - name: search_call\
+             \n        path: /v1/search/*\
+             \n        weight: 1\
+             \n    origin_headers:\
+             \n      - name: result_row\
+             \n        header: X-Rows-Returned",
+        ))
+        .expect("a complete block with resolvers compiles");
+
+        let attestation = compiled
+            .server
+            .attestation
+            .expect("the attestation block survives compilation");
+
+        assert_eq!(attestation.route_weights.len(), 2);
+        assert_eq!(attestation.route_weights[0].name, "search_call");
+        assert_eq!(attestation.route_weights[0].method.as_deref(), Some("POST"));
+        assert_eq!(attestation.route_weights[0].path, "/v1/search");
+        assert_eq!(attestation.route_weights[0].weight, 5);
+        assert_eq!(
+            attestation.route_weights[1].method, None,
+            "an omitted method prices every method"
+        );
+        assert_eq!(attestation.origin_headers.len(), 1);
+        assert_eq!(
+            attestation.origin_headers[0].header, "X-Rows-Returned",
+            "the receipt quotes this back, so the operator's casing is kept"
+        );
+    }
+
+    #[test]
+    fn attestation_one_unit_name_may_not_come_from_two_provenances() {
+        // The check the units-carry-a-source design depends on. Two
+        // `search_call` lines on one receipt, one priced by config and
+        // one asserted by the origin, cannot be told apart by whoever
+        // reads it, which is exactly what the source field is for.
+        let error = compile_config(&attestation_yaml(
+            "\n    role: receipt\
+             \n    route_weights:\
+             \n      - name: search_call\
+             \n        path: /v1/search\
+             \n        weight: 5\
+             \n    origin_headers:\
+             \n      - name: search_call\
+             \n        header: X-Rows-Returned",
+        ))
+        .err()
+        .expect("a name shared across resolvers is not compilable");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("search_call"), "{rendered}");
+        assert!(rendered.contains("provenance"), "{rendered}");
+    }
+
+    #[test]
+    fn attestation_route_priced_twice_on_one_line_fails_config_load() {
+        let error = compile_config(&attestation_yaml(
+            "\n    role: receipt\
+             \n    route_weights:\
+             \n      - name: search_call\
+             \n        method: post\
+             \n        path: /v1/search\
+             \n        weight: 5\
+             \n      - name: search_call\
+             \n        method: POST\
+             \n        path: /v1/search\
+             \n        weight: 9",
+        ))
+        .err()
+        .expect("two weights for one route have no defensible order");
+
+        assert!(
+            error.to_string().contains("twice"),
+            "the method is matched case-insensitively, so these are one route: {error}"
+        );
+    }
+
+    #[test]
+    fn attestation_wildcard_outside_the_documented_suffix_fails_config_load() {
+        for path in ["/v1/*/search", "/v1/search*", "/*/x", "/v1/*/*"] {
+            let error = compile_config(&attestation_yaml(&format!(
+                "\n    role: receipt\
+                 \n    route_weights:\
+                 \n      - name: search_call\
+                 \n        path: \"{path}\"\
+                 \n        weight: 5"
+            )))
+            .err()
+            .unwrap_or_else(|| panic!("{path:?} looks like a glob and is not one"));
+
+            assert!(
+                error.to_string().contains("wildcard"),
+                "{path:?}: a `*` that matches literally leaves a route silently unpriced: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn attestation_relative_route_path_fails_config_load() {
+        let error = compile_config(&attestation_yaml(
+            "\n    role: receipt\
+             \n    route_weights:\
+             \n      - name: search_call\
+             \n        path: v1/search\
+             \n        weight: 5",
+        ))
+        .err()
+        .expect("a path that can never match a request path is a typo, not a rule");
+
+        assert!(
+            error.to_string().contains("does not start with"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn attestation_unreachable_origin_header_fails_config_load() {
+        let error = compile_config(&attestation_yaml(
+            "\n    role: receipt\
+             \n    origin_headers:\
+             \n      - name: result_row\
+             \n        header: \"X Rows Returned\"",
+        ))
+        .err()
+        .expect("a header name with spaces cannot arrive on a response");
+
+        assert!(
+            error.to_string().contains("valid HTTP header name"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn attestation_zero_weight_is_a_metered_free_route() {
+        let compiled = compile_config(&attestation_yaml(
+            "\n    role: receipt\
+             \n    route_weights:\
+             \n      - name: health_call\
+             \n        path: /healthz\
+             \n        weight: 0",
+        ))
+        .expect("metered and free is a position an operator is allowed to hold");
+
+        assert_eq!(
+            compiled
+                .server
+                .attestation
+                .expect("attestation present")
+                .route_weights[0]
+                .weight,
+            0
+        );
+    }
+
+    #[test]
+    fn attestation_role_without_resolvers_still_compiles() {
+        // Recording every call and pricing none of it is a legitimate
+        // posture: the chain still proves no call went missing. The
+        // compiler warns and does not refuse.
+        let compiled = compile_config(&attestation_yaml("\n    role: receipt"))
+            .expect("a role without unit resolvers is not an error");
+        let attestation = compiled.server.attestation.expect("attestation present");
+        assert!(attestation.measured.is_empty());
+        assert!(attestation.route_weights.is_empty());
+        assert!(attestation.origin_headers.is_empty());
+    }
+
+    // --- WOR-2145: the measured unit resolver ---
+
+    #[test]
+    fn attestation_measured_units_survive_compilation_with_per_defaulted() {
+        let compiled = compile_config(&attestation_yaml(
+            "\n    role: receipt\
+             \n    measured:\
+             \n      - name: api_call\
+             \n        quantity: requests\
+             \n      - name: egress_kib\
+             \n        quantity: bytes_out\
+             \n        per: 1024",
+        ))
+        .expect("a complete block with measured units compiles");
+
+        let attestation = compiled
+            .server
+            .attestation
+            .expect("the attestation block survives compilation");
+
+        assert_eq!(attestation.measured.len(), 2);
+        assert_eq!(attestation.measured[0].name, "api_call");
+        assert_eq!(
+            attestation.measured[0].quantity,
+            crate::types::AttestationMeasuredQuantity::Requests
+        );
+        assert_eq!(
+            attestation.measured[0].per, 1,
+            "an omitted `per` bills one unit per observed item"
+        );
+        assert_eq!(
+            attestation.measured[1].per, 1024,
+            "1024 against bytes_out is what turns bytes into kibibytes"
+        );
+    }
+
+    #[test]
+    fn attestation_every_measured_quantity_spelling_parses() {
+        use crate::types::AttestationMeasuredQuantity as Quantity;
+
+        let compiled = compile_config(&attestation_yaml(
+            "\n    role: receipt\
+             \n    measured:\
+             \n      - name: api_call\
+             \n        quantity: requests\
+             \n      - name: ingress_kib\
+             \n        quantity: bytes_in\
+             \n        per: 1024\
+             \n      - name: egress_kib\
+             \n        quantity: bytes_out\
+             \n        per: 1024\
+             \n      - name: compute_second\
+             \n        quantity: duration_ms\
+             \n        per: 1000",
+        ))
+        .expect("every quantity the meter counts is spellable in config");
+
+        let quantities: Vec<Quantity> = compiled
+            .server
+            .attestation
+            .expect("attestation present")
+            .measured
+            .iter()
+            .map(|entry| entry.quantity)
+            .collect();
+
+        assert_eq!(
+            quantities,
+            vec![
+                Quantity::Requests,
+                Quantity::BytesIn,
+                Quantity::BytesOut,
+                Quantity::DurationMs,
+            ],
+            "the config spelling and the metering spelling are the same snake_case"
+        );
+    }
+
+    #[test]
+    fn attestation_measured_divisor_of_zero_fails_config_load() {
+        // `per` reaches the request path as a divisor. Catching zero
+        // here is the difference between a config error and a panic
+        // while a response is being written.
+        let error = compile_config(&attestation_yaml(
+            "\n    role: receipt\
+             \n    measured:\
+             \n      - name: egress_kib\
+             \n        quantity: bytes_out\
+             \n        per: 0",
+        ))
+        .err()
+        .expect("a divisor of zero cannot produce a unit count");
+
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("proxy.attestation.measured[0].per"),
+            "the error names the key the operator has to fix: {rendered}"
+        );
+        assert!(rendered.contains("divisor"), "{rendered}");
+    }
+
+    #[test]
+    fn attestation_measured_without_a_name_fails_config_load() {
+        let error = compile_config(&attestation_yaml(
+            "\n    role: receipt\
+             \n    measured:\
+             \n      - name: \"\"\
+             \n        quantity: requests",
+        ))
+        .err()
+        .expect("a unit with no name has no invoice line to be billed on");
+
+        assert!(
+            error
+                .to_string()
+                .contains("proxy.attestation.measured[0].name"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn attestation_measured_name_may_not_be_claimed_by_another_resolver() {
+        // Same rule as the route-weight/origin-header collision, and
+        // for the same reason: two `api_call` lines with different
+        // provenance is a receipt nobody can read.
+        let error = compile_config(&attestation_yaml(
+            "\n    role: receipt\
+             \n    measured:\
+             \n      - name: api_call\
+             \n        quantity: requests\
+             \n    route_weights:\
+             \n      - name: api_call\
+             \n        path: /v1/search\
+             \n        weight: 5",
+        ))
+        .err()
+        .expect("a name shared across resolvers is not compilable");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("api_call"), "{rendered}");
+        assert!(rendered.contains("provenance"), "{rendered}");
     }
 
     // --- WOR-193: agent_skills schema validation ---

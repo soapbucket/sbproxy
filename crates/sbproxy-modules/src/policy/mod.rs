@@ -7,8 +7,6 @@
 
 /// A2A protocol policy module.
 pub mod a2a;
-/// `Accept-Payment` header parser.
-pub mod accept_payment;
 /// `agent_budget` semantic rate-limit primitive.
 pub mod agent_budget;
 #[cfg(feature = "agent-class")]
@@ -18,9 +16,6 @@ pub mod ai_crawl;
 pub mod aipref;
 pub mod assertion;
 pub mod bot_detection;
-/// In-memory store of pinned NL-to-Cedar compiled policies
-/// (WOR-203 PR 3a; see `adr-policy-compilation.md` NLC pillar C).
-pub mod compiled_policy_store;
 pub mod concurrent_limit;
 pub mod content_digest;
 pub mod csrf;
@@ -30,29 +25,24 @@ pub mod exposed_creds;
 pub mod expression;
 pub mod http_framing;
 pub mod ip_filter;
-pub mod match_principal;
-/// Natural-language to Cedar policy compiler (WOR-203 PR 3b;
-/// see `adr-policy-compilation.md` NLC pillar B).
-pub mod nl_compiler;
-/// Natural-language policy constraint linter (WOR-203 PR 3a;
-/// see `adr-policy-compilation.md` NLC pillar A).
-pub mod nl_linter;
 pub mod object_authz;
 pub mod openapi_validation;
 pub mod page_shield;
-/// Outbound peer-pricing pre-flight policy.
-pub mod peer_pricing_preflight;
+/// Compiles one priced route into one signed payment requirement.
+#[cfg(feature = "payments")]
+pub mod payment_requirement;
 pub mod prompt_injection_v2;
 pub mod quote_token;
 pub mod rate_limit;
 pub mod rate_limit_budget;
+pub mod rate_limit_cluster;
+pub mod receipt_token;
 pub mod request_limit;
 pub mod request_validator;
 pub mod sec_headers;
 /// `semantic_constraint` policy module (WOR-203 PR 3b; see
 /// `adr-policy-compilation.md` and `adr-judge-trait.md`).
 pub mod semantic_constraint;
-pub mod sharded_limiter;
 pub mod sri;
 pub mod threat_protection;
 pub mod waf;
@@ -60,10 +50,6 @@ pub mod waf;
 pub use a2a::{
     A2APolicy, A2APolicyConfig, A2APolicyDecision, CycleDetection, A2A_HARD_CHAIN_DEPTH_CEILING,
     DEFAULT_MAX_CHAIN_DEPTH,
-};
-pub use accept_payment::{
-    rail_tokens as accept_payment_rail_tokens, AcceptPayment,
-    ParseError as AcceptPaymentParseError, RailKind, RailPreference,
 };
 pub use agent_budget::{
     AgentBudgetDecision, AgentBudgetExceedReason, AgentBudgetGuard, AgentBudgetOnAnonymous,
@@ -82,7 +68,6 @@ pub use ai_crawl::{HttpLedger, HttpLedgerConfig};
 pub use aipref::{parse_aipref, AiprefParseError, AiprefSignal};
 pub use assertion::AssertionPolicy;
 pub use bot_detection::BotDetection;
-pub use compiled_policy_store::{CompiledPolicy, CompiledPolicyStore};
 pub use concurrent_limit::{ConcurrentLimitGuard, ConcurrentLimitPolicy};
 pub use content_digest::{
     ContentDigestPolicy, OnMissing as ContentDigestOnMissing,
@@ -95,8 +80,6 @@ pub use exposed_creds::{ExposedCredsAction, ExposedCredsPolicy, ExposedCredsResu
 pub use expression::{ExpressionPolicy, ExpressionViews};
 pub use http_framing::{FramingViolation, HttpFramingPolicy};
 pub use ip_filter::IpFilterPolicy;
-pub use nl_compiler::{NlCompileError, NlCompiler};
-pub use nl_linter::{CharRange, LintViolation, NlLinter, WorkspaceSchema};
 pub use object_authz::{
     ObjectAuthzPolicy, OwnerSource, Principal as ObjectAuthzPrincipal,
     Violation as ObjectAuthzViolation, ViolationKind as ObjectAuthzViolationKind,
@@ -105,24 +88,23 @@ pub use openapi_validation::{
     OpenApiValidationMode, OpenApiValidationPolicy, ValidationResult as OpenApiValidationResult,
 };
 pub use page_shield::{PageShieldMode, PageShieldPolicy, DEFAULT_REPORT_PATH};
-pub use peer_pricing_preflight::{
-    BlockReason as PeerPricingBlockReason, FetchResult as PeerPricingFetchResult, ManifestFetcher,
-    OnNoManifest, PeerPricingPreflightConfig, PeerPricingPreflightPolicy,
-    PreflightDecision as PeerPricingPreflightDecision,
-    DEFAULT_CACHE_TTL as PEER_PRICING_DEFAULT_CACHE_TTL,
-    NO_MANIFEST_TTL as PEER_PRICING_NO_MANIFEST_TTL,
-};
 pub use prompt_injection_v2::{
     classification_cache_stats, evaluate_body, evaluate_body_with_audit,
-    reset_classification_cache, BodyAwareAuditContext, BodyAwareConfig, BodyAwareOutcome,
-    ClassificationCacheStats, DetectionLabel, DetectionResult, Detector, PromptInjectionAction,
-    PromptInjectionV2Outcome, PromptInjectionV2Policy, HEURISTIC_DETECTOR_NAME,
+    reset_classification_cache, A2AInjectionAction, BodyAwareAuditContext, BodyAwareConfig,
+    BodyAwareOutcome, ClassificationCacheStats, DetectionLabel, DetectionResult, Detector,
+    PromptInjectionA2AConfig, PromptInjectionAction, PromptInjectionV2Outcome,
+    PromptInjectionV2Policy, DEFAULT_BLOCK_ABOVE_DELEGATION_DEPTH, HEURISTIC_DETECTOR_NAME,
 };
 pub use quote_token::{
     InMemoryNonceStore, IssuedQuote, NonceCheck, NonceContext, NonceError, NonceStore, QuoteClaims,
     QuoteTokenSigner, QuoteTokenVerifier, SignError, VerifyError, MAX_IAT_SKEW,
 };
 pub use rate_limit::{RateLimitInfo, RateLimitPolicy};
+pub use receipt_token::{
+    outcome_wire_name, receipt_content_digest, ReceiptClaims, ReceiptEvidence, ReceiptSignError,
+    ReceiptSubject, ReceiptTokenSigner, ReceiptTokenVerifier, ReceiptUnit, ReceiptVerifyError,
+    RECEIPT_JWS_TYP,
+};
 pub use request_limit::{RequestLimitPolicy, SizeValue};
 pub use request_validator::RequestValidatorPolicy;
 pub use sec_headers::{
@@ -146,8 +128,7 @@ use sbproxy_plugin::PolicyEnforcer;
 pub enum Policy {
     /// Rate limiting policy.
     RateLimit(RateLimitPolicy),
-    /// WOR-1130: workspace rate-limit budget marker (the budget
-    /// state machine lives binary-side).
+    /// WOR-1130: workspace rate-limit budget policy and state machine.
     RateLimitBudget(rate_limit_budget::RateLimitBudgetPolicy),
     /// IP allow/deny filter based on CIDR lists.
     IpFilter(IpFilterPolicy),
@@ -237,12 +218,6 @@ pub enum Policy {
     /// request and maps the verdict to a
     /// [`PolicyDecision`](sbproxy_plugin::PolicyDecision).
     SemanticConstraint(SemanticConstraintPolicy),
-    /// Outbound peer-pricing pre-flight. The variant carries
-    /// the configured policy so the config compiler can accept the
-    /// `peer_pricing_preflight` type at YAML load time; per-request
-    /// enforcement is invoked from the outbound dispatcher (a
-    /// separate code path from the inbound `PolicyEnforcer` trait).
-    PeerPricingPreflight(std::sync::Arc<PeerPricingPreflightPolicy>),
     /// `agent_budget`: per-`agent_id` semantic rate limit.
     /// Keyed on the resolver-produced agent identity, not the client
     /// IP, so a tight LLM-driven loop hits a single bucket regardless
@@ -282,7 +257,6 @@ impl Policy {
             Self::AgentClass(_) => "agent_class",
             Self::A2A(_) => "a2a",
             Self::SemanticConstraint(_) => "semantic_constraint",
-            Self::PeerPricingPreflight(_) => "peer_pricing_preflight",
             Self::AgentBudget(_) => "agent_budget",
             Self::Plugin(p) => p.policy_type(),
         }
@@ -318,9 +292,6 @@ impl std::fmt::Debug for Policy {
             Self::AgentClass(r) => f.debug_tuple("AgentClass").field(r).finish(),
             Self::A2A(r) => f.debug_tuple("A2A").field(r).finish(),
             Self::SemanticConstraint(r) => f.debug_tuple("SemanticConstraint").field(r).finish(),
-            Self::PeerPricingPreflight(r) => {
-                f.debug_tuple("PeerPricingPreflight").field(r).finish()
-            }
             Self::AgentBudget(r) => f.debug_tuple("AgentBudget").field(r).finish(),
             Self::Plugin(_) => write!(f, "Plugin(...)"),
         }

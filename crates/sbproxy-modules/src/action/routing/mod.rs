@@ -1,19 +1,15 @@
 //! Pluggable routing strategy trait + plugin registry.
 //!
-//! This is the OSS scaffold for [Fail-6](../../../../docs/roadmap.md):
-//! third-party crates (think the enterprise team's LoRA-aware,
-//! GPU-aware, and contextual-bandit routers) implement
-//! [`RoutingStrategy`] and register a factory via
-//! [`inventory::submit!`]. The proxy discovers them at link time,
-//! exactly like the auth-plugin registry in `sbproxy-plugin::registry`.
+//! Third-party crates implement [`RoutingStrategy`] and register a
+//! factory via [`inventory::submit!`]. The proxy discovers them at
+//! link time, exactly like the auth-plugin registry in
+//! `sbproxy-plugin::registry`.
 //!
-//! The trait runs *alongside* the existing built-in load-balancer
-//! algorithms (`round_robin`, `weighted`, `least_connections`,
-//! `consistent_hash`, ...). Those algorithms are not behind this trait
-//! and are not changed by the introduction of this module. A future
-//! follow-up will route through the trait first, fall back to the
-//! configured `lb_method` when [`RoutingStrategy::select`] returns
-//! `None`, and migrate the built-ins to live behind the trait.
+//! A production `load_balancer` action with `strategy` compiles the
+//! registered implementation once and invokes it before the configured
+//! `algorithm`. When [`RoutingStrategy::select`] returns `None`, the
+//! action falls back to that algorithm. The standard algorithms remain
+//! separate from this trait.
 //!
 //! # Why a hot-path trait
 //!
@@ -94,13 +90,13 @@ pub struct RoutingRequest {
     /// The hostname the request matched, before any forwarding rule
     /// rewrote it. Useful for tenant-aware strategies.
     pub hostname: String,
-    /// AI model identifier when the request is an AI proxy request.
-    /// Only set on the AI-proxy code path; plain HTTP routing leaves
-    /// this `None`.
+    /// Model identifier when present. The production load-balancer
+    /// projection fills an unset value from `X-Model` or `?model=`.
     pub model: Option<String>,
     /// LoRA / fine-tune adapter identifier when present in the request
-    /// (e.g. `?adapter=...` or `X-LoRA-Adapter`). Only set on the
-    /// AI-proxy code path.
+    /// (e.g. `?adapter=...` or `X-LoRA-Adapter`). The production
+    /// load-balancer projection performs this extraction for plain HTTP
+    /// requests as well as AI gateway requests.
     pub adapter: Option<String>,
     /// Free-form metadata bag for additional signals the strategy
     /// might want (sticky session keys, geo zone, A/B bucket, ...).
@@ -160,10 +156,20 @@ pub struct TargetState {
     /// Static weight from the target config (typically 1-100). Strategies
     /// that do not honour weights can ignore this.
     pub weight: u32,
-    /// Free-form metadata copied from the target config. Lets a strategy
+    /// Immutable free-form metadata snapshot for the target. Lets a strategy
     /// key on labels (e.g. `gpu_model`, `region`, loaded LoRA adapters)
-    /// without the trait needing a strategy-specific extension point.
-    pub metadata: HashMap<String, serde_json::Value>,
+    /// without the trait needing a strategy-specific extension point. Cloning
+    /// a target state shares this snapshot rather than cloning nested values.
+    pub metadata: Arc<HashMap<String, serde_json::Value>>,
+}
+
+/// One completed upstream attempt reported to a [`RoutingStrategy`].
+#[derive(Debug, Clone, Copy)]
+pub struct RoutingOutcome {
+    /// Whether the upstream attempt completed successfully.
+    pub success: bool,
+    /// Wall-clock duration of the upstream attempt.
+    pub latency: std::time::Duration,
 }
 
 // --- RoutingStrategy trait ---
@@ -184,7 +190,7 @@ pub struct TargetState {
 ///   slice mean the strategy can be a pure function over its own
 ///   accumulated state.
 /// - **Returning `None`** signals "fall through to the configured
-///   `lb_method`". Strategies that always have an opinion can return
+///   `algorithm`". Strategies that always have an opinion can return
 ///   `Some(0)` as a degenerate fall-back rather than `None`.
 pub trait RoutingStrategy: Send + Sync {
     /// Pick a target for this request.
@@ -198,6 +204,12 @@ pub trait RoutingStrategy: Send + Sync {
     /// Stable identifier for this strategy, matching the `name` used
     /// at registration time. Used for logging and metrics labels.
     fn name(&self) -> &str;
+
+    /// Record the outcome of an upstream attempt selected by this strategy.
+    ///
+    /// The default is intentionally a no-op so existing third-party strategy
+    /// implementations remain source-compatible.
+    fn record_outcome(&self, _target_url: &str, _outcome: RoutingOutcome) {}
 }
 
 // --- Plugin registry ---
@@ -230,18 +242,28 @@ pub fn build_routing_strategy(
     name: &str,
     config: &serde_json::Value,
 ) -> Result<Arc<dyn RoutingStrategy>> {
+    build_routing_strategy_with_name(name, config).map(|(_, strategy)| strategy)
+}
+
+pub(super) fn build_routing_strategy_with_name(
+    name: &str,
+    config: &serde_json::Value,
+) -> Result<(&'static str, Arc<dyn RoutingStrategy>)> {
     let reg = inventory::iter::<RoutingStrategyRegistration>()
         .find(|r| r.name == name)
         .ok_or_else(|| anyhow!("unknown routing strategy: {}", name))?;
-    (reg.build)(config)
+    (reg.build)(config).map(|strategy| (reg.name, strategy))
 }
 
 /// List the names of every registered routing strategy. Useful for
 /// diagnostics and the `clictl` config validator.
 pub fn list_routing_strategies() -> Vec<&'static str> {
-    inventory::iter::<RoutingStrategyRegistration>()
+    let mut names: Vec<_> = inventory::iter::<RoutingStrategyRegistration>()
         .map(|r| r.name)
-        .collect()
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
 }
 
 // --- Built-in: AlwaysFirstHealthyStrategy ---
@@ -249,13 +271,14 @@ pub fn list_routing_strategies() -> Vec<&'static str> {
 /// Reference [`RoutingStrategy`] implementation that picks the
 /// lowest-index healthy target.
 ///
-/// This is **for documentation and tests only**. Production-grade
-/// adapters ship in this same module: [`BanditStrategy`] for
+/// This is the shipped `first-healthy` strategy and also serves as the
+/// minimal registry example. Other production strategies in this module
+/// include [`BanditStrategy`] for
 /// epsilon-greedy multi-armed bandit routing, [`GpuAwareStrategy`]
 /// for telemetry-driven GPU-utilisation routing, and [`LoraStrategy`]
-/// plus [`LoraAwareStrategy`] for LoRA-adapter affinity. The existing
-/// `lb_method: round_robin` and `least_connections` algorithms remain
-/// the right defaults when no specialised signal is available.
+/// plus [`LoraAwareStrategy`] for LoRA-adapter affinity. Configured
+/// algorithms such as `round_robin` and `least_connections` remain the
+/// fallback when no specialised signal is available.
 pub struct AlwaysFirstHealthyStrategy;
 
 impl RoutingStrategy for AlwaysFirstHealthyStrategy {
@@ -302,11 +325,18 @@ mod tests {
     }
 
     #[test]
-    fn trait_is_object_safe() {
+    fn strategy_implementing_only_selection_and_name_is_object_safe() {
         // Compile-time check: if `RoutingStrategy` ever loses object
         // safety, this stops compiling. The `Box::new` keeps it from
         // being optimized away in release builds.
-        let _: Box<dyn RoutingStrategy> = Box::new(NoopStrategy);
+        let strategy: Box<dyn RoutingStrategy> = Box::new(NoopStrategy);
+        strategy.record_outcome(
+            "http://upstream",
+            RoutingOutcome {
+                success: true,
+                latency: std::time::Duration::from_millis(1),
+            },
+        );
     }
 
     #[test]
@@ -359,6 +389,22 @@ mod tests {
     }
 
     #[test]
+    fn list_routing_strategies_is_sorted_with_unique_production_builtins() {
+        let names = list_routing_strategies();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted, "registry names must be deterministic");
+
+        for builtin in ["bandit", "first-healthy", "gpu-aware", "lora", "lora-aware"] {
+            assert_eq!(
+                names.iter().filter(|name| **name == builtin).count(),
+                1,
+                "{builtin} must appear exactly once"
+            );
+        }
+    }
+
+    #[test]
     fn routing_request_debug_and_clone_preserve_metadata() {
         let mut req = RoutingRequest::new("POST", "/v1/chat", "ai.example.com");
         req.client_ip = Some("203.0.113.7".to_string());
@@ -387,18 +433,18 @@ mod tests {
 
     #[test]
     fn target_state_debug_and_clone_preserve_metadata() {
-        let mut t = TargetState {
+        let metadata = HashMap::from([("gpu_model".to_string(), serde_json::json!("a100"))]);
+        let t = TargetState {
             index: 3,
             url: "http://upstream-3.internal:8080".to_string(),
             healthy: true,
             active_connections: 17,
             weight: 50,
-            metadata: HashMap::new(),
+            metadata: Arc::new(metadata),
         };
-        t.metadata
-            .insert("gpu_model".to_string(), serde_json::json!("a100"));
 
         let cloned = t.clone();
+        assert!(Arc::ptr_eq(&t.metadata, &cloned.metadata));
         assert_eq!(cloned.index, 3);
         assert_eq!(cloned.url, "http://upstream-3.internal:8080");
         assert!(cloned.healthy);
@@ -424,7 +470,7 @@ mod tests {
                 healthy: false,
                 active_connections: 0,
                 weight: 1,
-                metadata: HashMap::new(),
+                metadata: HashMap::new().into(),
             },
             TargetState {
                 index: 1,
@@ -432,7 +478,7 @@ mod tests {
                 healthy: false,
                 active_connections: 0,
                 weight: 1,
-                metadata: HashMap::new(),
+                metadata: HashMap::new().into(),
             },
             TargetState {
                 index: 2,
@@ -440,7 +486,7 @@ mod tests {
                 healthy: true,
                 active_connections: 99,
                 weight: 1,
-                metadata: HashMap::new(),
+                metadata: HashMap::new().into(),
             },
         ];
         assert_eq!(strat.select(&req, &targets), Some(2));
@@ -456,7 +502,7 @@ mod tests {
             healthy: false,
             active_connections: 0,
             weight: 1,
-            metadata: HashMap::new(),
+            metadata: HashMap::new().into(),
         }];
         assert!(strat.select(&req, &targets).is_none());
     }

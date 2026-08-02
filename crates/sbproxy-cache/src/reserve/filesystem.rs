@@ -181,6 +181,13 @@ mod tests {
             created_at: now,
             expires_at: now + ttl,
             content_type: Some("application/json".to_string()),
+            headers: vec![
+                ("etag".to_string(), r#""filesystem-v1""#.to_string()),
+                (
+                    "last-modified".to_string(),
+                    "Sun, 06 Nov 1994 08:49:37 GMT".to_string(),
+                ),
+            ],
             vary_fingerprint: Some("vary-x".to_string()),
             size,
             status: 200,
@@ -203,6 +210,16 @@ mod tests {
         assert_eq!(got, body);
         assert_eq!(m.size, 4);
         assert_eq!(m.vary_fingerprint.as_deref(), Some("vary-x"));
+        assert_eq!(
+            m.headers,
+            vec![
+                ("etag".to_string(), r#""filesystem-v1""#.to_string()),
+                (
+                    "last-modified".to_string(),
+                    "Sun, 06 Nov 1994 08:49:37 GMT".to_string(),
+                ),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -239,6 +256,7 @@ mod tests {
                 created_at: base - Duration::from_secs(120),
                 expires_at: base - Duration::from_secs(60),
                 content_type: None,
+                headers: Vec::new(),
                 vary_fingerprint: None,
                 size: 1,
                 status: 200,

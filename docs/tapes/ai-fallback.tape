@@ -36,6 +36,6 @@ Sleep 4s
 
 Type `# The client got a clean answer. Under the hood the primary failed and the backup served it:`
 Enter
-Type `grep -o 'AI proxy: upstream request failed.*attempt=[0-9]*' /tmp/sbproxy-rec.log | head -1`
+Type `grep -o 'AI proxy: upstream request failed.*attempt=[0-9]*' "$SBPROXY_REC_LOG" | head -1`
 Enter
 Sleep 4s

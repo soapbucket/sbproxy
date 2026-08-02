@@ -1,8 +1,14 @@
 # Config stability tiers
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-28*
 
-Stability guarantees for every field in `sb.yml`. Check a field's tier before relying on it in production.
+This page defines the stability tiers and applies them to representative or
+high-impact configuration leaves. It also lists the current reviewed
+`config-only` registry. It is not an exhaustive field matrix:
+[`configuration.md`](configuration.md) is the complete field inventory.
+
+An unlisted field has no implicit stability promise. Before depending on one,
+review its Rust source and the changelog for the release you plan to run.
 
 ---
 
@@ -34,11 +40,24 @@ An `alpha` field is experimental.
 
 ### `disabled`
 
-A `disabled` field still parses but has no runtime effect today.
+A `disabled` field is retained in the schema but cannot activate runtime behavior today.
 
-- The field is accepted by the config loader so existing configs keep loading.
-- No code path acts on the value; setting it does nothing beyond an optional warning log.
-- Currently applies to the `http3` block: HTTP/3 is temporarily disabled until native QUIC support lands in Pingora.
+- An omitted block or its disabled value remains valid for config compatibility.
+- Attempting to enable unavailable behavior fails config compilation instead of being ignored.
+- Currently applies to the `http3` block. Native HTTP/3 support is tracked in WOR-1969.
+
+### `config-only`
+
+A `config-only` field remains parseable for compatibility but has no live
+consumer in the open-source runtime.
+
+- Do not use it to satisfy an operational requirement.
+- An explicitly authored config-only key emits a boot/config-validation warning
+  naming the complete schema path and the reason it has no effect.
+- The build-time config-reader guard requires an explicit registry entry and
+  an operator-facing reason for every such field.
+- The field is removed from examples that purport to demonstrate working
+  behavior. Its reference entry states the live alternative, when one exists.
 
 ---
 
@@ -48,9 +67,53 @@ A `disabled` field still parses but has no runtime effect today.
 2. A field moves from `beta` to `stable` once it has been in production use by at least one internal deployment for one full release cycle without interface changes.
 3. Stable fields are never silently removed. The process is: deprecate (the config compiler logs a structured deprecation warning at load time naming the legacy and canonical field), then remove in the next major version. A schema-level `x-deprecated` annotation is planned but not shipped.
 
+## Build-time reader coverage
+
+CI walks the generated `ConfigFile` JSON Schema and requires every key to have
+either a non-test Rust field read or a reviewed entry in
+`CONFIG_KEY_OVERRIDES`. Indirect serde consumers name their concrete runtime
+consumer. Deliberately inert fields are marked `config-only` with a reason.
+Run the same lane locally with:
+
+```bash
+scripts/check-config-readers.sh
+```
+
+Adding a key to `types.rs` without wiring it now fails with the complete dotted
+schema path. Adding a reviewed `ConfigOnly` entry makes the exception explicit
+and stale entries fail when their schema path is removed or renamed.
+
+### Current config-only compatibility fields
+
+| Field or subtree | What happens today |
+|---|---|
+| `agent_classes.hosted_feed.url`, `.bootstrap_keys` | The OSS resolver uses builtin or inline catalogs; it does not fetch or verify a hosted feed. |
+| `audit.sink` | Admin-action rows always use the in-memory ring and tracing mirror; this selector has no effect. |
+| `origins.*.agent_skills[].max_clock_skew_secs` | Reserved for signed artifact freshness headers that are not emitted yet. |
+| `origins.*.connection_pool` | Pingora's built-in upstream pool is used; these per-origin limits are not applied. |
+| `origins.*.compression.level` | Compression libraries use their runtime defaults; this parsed level is not applied. |
+| `origins.*.cors.enable` | The presence of `cors:` enables CORS; the legacy boolean value is ignored. |
+| `origins.*.credentials[].attrs.budget.reset` | Reserved reset hint; no credential reset schedule is installed. The same leaf is config-only at proxy and tenant credential scopes. |
+| `origins.*.credentials[].attrs.team` | Parsed with a warning but not copied into the virtual-key principal. The same leaf is config-only at proxy and tenant credential scopes; use live `attrs.tags` or `attrs.metadata` attribution instead. |
+| `origins.*.forward_rules[].origin.hostname`, `.workspace_id`, `.version` | Inline forward-origin metadata is accepted but not copied into the compiled child origin. |
+| `origins.*.rate_limit_headers` | Use the live rate-limit policy's `headers` block instead. |
+| `origins.*.response_modifiers[].status.text` | The status code is applied; the compatibility reason text is ignored. |
+| `origins.*.sessions.ttl_seconds` | Reserved retention hint; the in-process request ring does not expire entries from it. |
+| `origins.*.traffic_capture` | No OSS capture consumer; use `mirror` for live fire-and-forget request mirroring. |
+| `proxy.device_parser_file` | The current pure-Rust device parser does not load this catalog override. |
+| `proxy.key_management.governance.key_introspection` | The caller-only introspection route is not installed. |
+| `proxy.key_management.store.redis_source_of_truth` | Redis is authoritative whenever `store.backend: redis`; this legacy boolean changes nothing. |
+| `proxy.observability.log.level`, `.format`, `.sampling` | Process logging uses CLI/environment selection and fixed sampling defaults. Sink-local `format` remains live. |
+| `proxy.scripting.javascript.sandbox.budget_ms`, `.memory_mb`, `.stack_kb` | QuickJS engines use built-in sandbox defaults; these YAML leaves are not installed. |
+| `proxy.secrets.backend`, `.hashicorp`, `.map`, `.rotation`, `.fallback` | Legacy single-backend surface. Use named `proxy.secrets.backends` and provider URI references. |
+
 ---
 
-## Field stability reference
+## Selected field stability reference
+
+The tables below cover representative and high-impact leaves. They do not
+assign a tier to every property accepted by the configuration parser. Use the
+tier definitions above only where a field is listed explicitly.
 
 ### Top-level fields
 
@@ -68,7 +131,7 @@ A `disabled` field still parses but has no runtime effect today.
 | `tls_cert_file` | string | - | **stable** | Path to PEM cert for manual TLS. |
 | `tls_key_file` | string | - | **stable** | Path to PEM key for manual TLS. |
 | `acme` | object | - | **beta** | Automatic TLS via ACME. |
-| `http3` | object | - | **disabled** | HTTP/3 (QUIC) listener. Currently inert. |
+| `http3` | object | - | **disabled** | Reserved HTTP/3 (QUIC) listener shape. `enabled: true` is rejected. |
 
 ### `proxy.acme` - AcmeConfig
 
@@ -84,13 +147,13 @@ A `disabled` field still parses but has no runtime effect today.
 
 ### `proxy.http3` - Http3Config
 
-HTTP/3 is temporarily disabled until native QUIC support lands in Pingora. These fields still parse, but no QUIC listener starts and setting `enabled: true` only logs a warning.
+HTTP/3 is not served by this build. The block is retained for forward compatibility: omission or `enabled: false` compiles, while `enabled: true` fails config compilation with a reference to WOR-1969.
 
 | Field | Type | Default | Stability | Notes |
 |---|---|---|---|---|
-| `enabled` | boolean | false | **disabled** | Enable QUIC listener. Currently inert; no listener starts. |
-| `max_streams` | integer | 100 | **disabled** | Max concurrent QUIC streams per connection. Currently inert. |
-| `idle_timeout_secs` | integer | 30 | **disabled** | QUIC idle timeout in seconds. Currently inert. |
+| `enabled` | boolean | false | **disabled** | Must remain false until HTTP/3 is served. |
+| `max_streams` | integer | 100 | **disabled** | Reserved max concurrent QUIC streams per connection. |
+| `idle_timeout_secs` | integer | 30 | **disabled** | Reserved QUIC idle timeout in seconds. |
 
 ### Origin Config (each entry under `origins:`)
 
@@ -116,9 +179,10 @@ HTTP/3 is temporarily disabled until native QUIC support lands in Pingora. These
 | `on_response` | - | array | `[]` | **alpha** | Response event hook plugins. |
 | `bot_detection` | - | object | - | **alpha** | Bot detection config. |
 | `threat_protection` | - | object | - | **alpha** | Dynamic threat blocklist config. |
-| `rate_limit_headers` | - | object | - | **beta** | Rate limit response header config. |
-| `error_pages` | - | object | - | **beta** | Custom error page config. |
-| `traffic_capture` | - | object | - | **alpha** | Request mirroring config. |
+| `rate_limit_headers` | - | object | - | **config-only** | Use the live rate-limit policy's `headers` block. |
+| `error_pages` | - | array | - | **beta** | Custom error page entries, each matching one status or a list of statuses. |
+| `traffic_capture` | - | object | - | **config-only** | No OSS consumer; use `mirror` for request mirroring. |
+| `connection_pool` | - | object | - | **config-only** | Retained for compatibility; Pingora's built-in pool settings apply. |
 | `message_signatures` | - | object | - | **alpha** | HTTP message signing config. |
 
 ### CORS Config (`cors:`)
@@ -131,7 +195,7 @@ HTTP/3 is temporarily disabled until native QUIC support lands in Pingora. These
 | `expose_headers` | - | array | `[]` | **stable** |
 | `max_age` | - | integer | - | **stable** |
 | `allow_credentials` | - | boolean | false | **stable** |
-| `enable` | `enabled` | boolean | - | **stable** |
+| `enable` | `enabled` | boolean | - | **config-only** |
 
 ### HSTS Config (`hsts:`)
 
@@ -148,7 +212,7 @@ HTTP/3 is temporarily disabled until native QUIC support lands in Pingora. These
 | `enabled` | `enable` | boolean | true | **stable** |
 | `algorithms` | - | array | `[]` | **stable** |
 | `min_size` | - | integer | 0 | **stable** |
-| `level` | - | integer | - | **beta** |
+| `level` | - | integer | - | **config-only** |
 
 `level` is parsed but not applied: the encoders use their library
 default levels (gzip and zstd defaults, brotli quality 4).
@@ -226,4 +290,7 @@ default levels (gzip and zstd defaults, brotli quality 4).
 | Field | Type | Stability |
 |---|---|---|
 | `code` | integer | **stable** |
-| `text` | string | **stable** |
+| `text` | string | **config-only** |
+
+`text` is retained for schema-v1 compatibility. The response modifier applies
+`code`; the runtime does not emit or preserve a custom reason phrase.

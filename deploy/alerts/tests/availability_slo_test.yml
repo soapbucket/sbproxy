@@ -1,0 +1,84 @@
+# promtool unit test for the substrate availability SLO (WOR-1894).
+#
+# The regression this pins: the SLO recording rule matched on `status_class`, a
+# label sbproxy_requests_total has never carried, so it selected every series
+# and recorded exactly 1.0 through any outage. This test feeds a real 5xx burn
+# and asserts the SLI drops and the page-tier alert fires. Against the old rule
+# it fails, because the old rule cannot move off 1.0.
+
+rule_files:
+  - ../recording-rules.yml
+  - ../alerting-rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  # Half the requests return 500 for ten minutes. Availability must read ~0.5,
+  # not 1.0, and the 1h page-tier alert must fire.
+  - interval: 1m
+    input_series:
+      - series: 'sbproxy_requests_total{hostname="api.example.com", method="GET", status="200"}'
+        values: '0+50x180'
+      - series: 'sbproxy_requests_total{hostname="api.example.com", method="GET", status="500"}'
+        values: '0+50x180'
+
+    promql_expr_test:
+      # Half of all requests are 5xx, so non-5xx / total is ~0.5.
+      # `round(..., 0.001)` drops the recording rule's __name__ (so the empty
+      # label set matches) and absorbs float noise.
+      - expr: round(sbproxy:slo:substrate:availability:5m, 0.001)
+        eval_time: 30m
+        exp_samples:
+          - labels: '{}'
+            value: 0.5
+      - expr: round(sbproxy:slo:substrate:availability:1h, 0.001)
+        eval_time: 90m
+        exp_samples:
+          - labels: '{}'
+            value: 0.5
+      # The 30d error budget is deep in the red, not full. At 0.5 availability
+      # against a 0.999 target the remaining budget is (0.5-0.999)/(1-0.999),
+      # i.e. hundreds of budgets under water.
+      - expr: round(sbproxy:slo:substrate:availability:budget_remaining:30d)
+        eval_time: 120m
+        exp_samples:
+          - labels: '{}'
+            value: -499
+
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: SBPROXY-SUBSTRATE-AVAIL-1H
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              slo_id: SLO-AVAIL-INBOUND
+              runbook_id: RB-SUBSTRATE-AVAIL
+              window: 1h
+              burn_rate: "14.4"
+            exp_annotations:
+              summary: "Substrate availability burning fast (14.4x over 1h)"
+              description: |
+                Inbound 5xx ratio exceeds 14.4x of the 30d error budget over
+                the last 1h. At this rate the entire month's budget burns in
+                under 2 days. Page on-call.
+              runbook_url: "https://docs.sbproxy.dev/runbook#rb-substrate-avail"
+
+  # Control: an all-200 baseline keeps availability at 1.0 and fires nothing.
+  # This is the case the old rule got right by accident, and the case a fix
+  # must not break.
+  - interval: 1m
+    input_series:
+      - series: 'sbproxy_requests_total{hostname="api.example.com", method="GET", status="200"}'
+        values: '0+100x180'
+
+    promql_expr_test:
+      - expr: round(sbproxy:slo:substrate:availability:1h, 0.001)
+        eval_time: 90m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: SBPROXY-SUBSTRATE-AVAIL-1H
+        exp_alerts: []

@@ -85,8 +85,38 @@ impl AssertionPolicy {
         response_headers: &http::HeaderMap,
         body_size: Option<usize>,
     ) -> bool {
+        self.evaluate_with_trust_tier(
+            method,
+            path,
+            request_headers,
+            query,
+            client_ip,
+            hostname,
+            response_status,
+            response_headers,
+            body_size,
+            None,
+        )
+    }
+
+    /// Evaluate the assertion with the request trust tier available as
+    /// `request.trust_tier`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_with_trust_tier(
+        &self,
+        method: &str,
+        path: &str,
+        request_headers: &http::HeaderMap,
+        query: Option<&str>,
+        client_ip: Option<&str>,
+        hostname: &str,
+        response_status: u16,
+        response_headers: &http::HeaderMap,
+        body_size: Option<usize>,
+        trust_tier: Option<&str>,
+    ) -> bool {
         let engine = sbproxy_extension::cel::CelEngine::new();
-        let ctx = sbproxy_extension::cel::context::build_response_context(
+        let mut ctx = sbproxy_extension::cel::context::build_response_context(
             method,
             path,
             request_headers,
@@ -97,6 +127,9 @@ impl AssertionPolicy {
             response_headers,
             body_size,
         );
+        if let Some(trust_tier) = trust_tier {
+            sbproxy_extension::cel::context::populate_trust_tier_namespace(&mut ctx, trust_tier);
+        }
         match engine.compile(&self.expression) {
             Ok(expr) => engine.eval_bool(&expr, &ctx).unwrap_or(true),
             Err(e) => {
@@ -287,5 +320,27 @@ mod tests {
             None,
         );
         assert!(!result, "assertion should fail for POST returning 400");
+    }
+
+    #[test]
+    fn assertion_can_branch_on_request_trust_tier() {
+        let policy = AssertionPolicy::from_config(serde_json::json!({
+            "expression": "request.trust_tier == \"named\"",
+            "name": "named-agent"
+        }))
+        .unwrap();
+
+        assert!(policy.evaluate_with_trust_tier(
+            "GET",
+            "/",
+            &http::HeaderMap::new(),
+            None,
+            None,
+            "example.com",
+            200,
+            &http::HeaderMap::new(),
+            None,
+            Some("named"),
+        ));
     }
 }

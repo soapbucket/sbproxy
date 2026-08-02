@@ -60,11 +60,13 @@ fn startup_timeout() -> Duration {
 
 const DEFAULT_BINARY_ENV: &str = "SBPROXY_E2E_BIN";
 const NO_DEFAULT_FEATURES_BINARY_ENV: &str = "SBPROXY_E2E_NO_DEFAULT_FEATURES_BIN";
+const PAYMENTS_BINARY_ENV: &str = "SBPROXY_E2E_PAYMENTS_BIN";
 
 #[derive(Debug, Clone, Copy)]
 enum ProxyBinaryFlavor {
     Default,
     NoDefaultFeatures,
+    Payments,
 }
 
 impl ProxyBinaryFlavor {
@@ -72,6 +74,7 @@ impl ProxyBinaryFlavor {
         match self {
             Self::Default => DEFAULT_BINARY_ENV,
             Self::NoDefaultFeatures => NO_DEFAULT_FEATURES_BINARY_ENV,
+            Self::Payments => PAYMENTS_BINARY_ENV,
         }
     }
 
@@ -86,6 +89,10 @@ impl ProxyBinaryFlavor {
                 root.join("target/no-default-features/release/sbproxy"),
                 root.join("target/no-default-features/debug/sbproxy"),
             ],
+            Self::Payments => vec![
+                root.join("target/payments/release/sbproxy"),
+                root.join("target/payments/debug/sbproxy"),
+            ],
         }
     }
 
@@ -97,6 +104,9 @@ impl ProxyBinaryFlavor {
             Self::NoDefaultFeatures => {
                 "run `CARGO_TARGET_DIR=target/no-default-features cargo build -p sbproxy --no-default-features` or set SBPROXY_E2E_NO_DEFAULT_FEATURES_BIN"
             }
+            Self::Payments => {
+                "run `CARGO_TARGET_DIR=target/payments cargo build --release -p sbproxy --features payment-x402,payment-mpp,payment-stripe,payment-lightning-cln` or set SBPROXY_E2E_PAYMENTS_BIN"
+            }
         }
     }
 
@@ -104,6 +114,7 @@ impl ProxyBinaryFlavor {
         match self {
             Self::Default => "sbproxy",
             Self::NoDefaultFeatures => "no-default-features sbproxy",
+            Self::Payments => "payments-featured sbproxy",
         }
     }
 }
@@ -121,7 +132,17 @@ fn configured_binary_path(var: &str) -> Option<PathBuf> {
         if value.is_empty() {
             None
         } else {
-            Some(PathBuf::from(value))
+            let path = PathBuf::from(value);
+            // Cargo runs test binaries with the package directory as the
+            // working directory, so a relative override like
+            // "target/debug/sbproxy" (the natural spelling when invoking
+            // cargo from the workspace root) would resolve under e2e/ and
+            // miss. Anchor relative overrides to the workspace root.
+            if path.is_absolute() {
+                Some(path)
+            } else {
+                Some(workspace_root().join(path))
+            }
         }
     })
 }
@@ -155,6 +176,16 @@ pub fn proxy_binary_path() -> PathBuf {
 /// default-feature binary used by the normal suite.
 pub fn proxy_no_default_features_binary_path() -> PathBuf {
     proxy_binary_path_for(ProxyBinaryFlavor::NoDefaultFeatures)
+}
+
+/// Locate a `sbproxy` binary compiled with the payment rail features.
+///
+/// The `SBPROXY_E2E_PAYMENTS_BIN` environment variable wins when set.
+/// Otherwise this looks under `target/payments/`, which keeps the
+/// settlement e2e coverage from overwriting the default-feature binary
+/// used by the normal suite.
+pub fn proxy_payments_binary_path() -> PathBuf {
+    proxy_binary_path_for(ProxyBinaryFlavor::Payments)
 }
 
 /// One-off response shape returned by the harness's HTTP helpers.
@@ -222,6 +253,28 @@ impl ProxyHarness {
         Self::start_with_resolved_yaml(&final_yaml, port, None)
     }
 
+    /// Start the proxy with a config built from a YAML string, adding
+    /// `env` to the spawned proxy child's environment.
+    ///
+    /// The variables are scoped to the child via `Command::env`, so a
+    /// test can exercise an env-read path in the proxy without mutating
+    /// the test runner's own process environment (WOR-646).
+    pub fn start_with_yaml_and_env(yaml: &str, env: &[(&str, &str)]) -> anyhow::Result<Self> {
+        let port = pick_free_port()?;
+        let final_yaml = inject_port(yaml, port)?;
+        let owned: Vec<(&str, String)> = env
+            .iter()
+            .map(|(name, value)| (*name, (*value).to_string()))
+            .collect();
+        Self::start_with_resolved_yaml_using_binary(
+            &final_yaml,
+            port,
+            ProxyBinaryFlavor::Default,
+            None,
+            &owned,
+        )
+    }
+
     /// Start the proxy with a test-specific graceful shutdown budget.
     pub fn start_with_yaml_and_shutdown_grace(
         yaml: &str,
@@ -246,6 +299,30 @@ impl ProxyHarness {
             port,
             ProxyBinaryFlavor::NoDefaultFeatures,
             None,
+            &[],
+        )
+    }
+
+    /// Start a payments-featured proxy with extra child environment
+    /// variables.
+    ///
+    /// Settlement configs name secrets by reference
+    /// (`secret://env/NAME`), and the child resolves them against its
+    /// own environment, so the test hands the values over here instead
+    /// of mutating the test process environment. Build the binary into
+    /// `target/payments/` or set `SBPROXY_E2E_PAYMENTS_BIN`.
+    pub fn start_payments_with_yaml_and_env(
+        yaml: &str,
+        envs: &[(&str, String)],
+    ) -> anyhow::Result<Self> {
+        let port = pick_free_port()?;
+        let final_yaml = inject_port(yaml, port)?;
+        Self::start_with_resolved_yaml_using_binary(
+            &final_yaml,
+            port,
+            ProxyBinaryFlavor::Payments,
+            None,
+            envs,
         )
     }
 
@@ -269,6 +346,7 @@ impl ProxyHarness {
             port,
             ProxyBinaryFlavor::Default,
             shutdown_grace_ms,
+            &[],
         )
     }
 
@@ -277,6 +355,7 @@ impl ProxyHarness {
         port: u16,
         binary: ProxyBinaryFlavor,
         shutdown_grace_ms: Option<u64>,
+        envs: &[(&str, String)],
     ) -> anyhow::Result<Self> {
         let bin = proxy_binary_path_for(binary);
         if !bin.is_file() {
@@ -297,6 +376,11 @@ impl ProxyHarness {
 
         let stderr = NamedTempFile::new()?;
         let mut command = Command::new(&bin);
+        // Child-scoped variables: the child process gets them, the
+        // test runner's own environment stays untouched (WOR-646).
+        for (name, value) in envs {
+            command.env(name, value);
+        }
         if let Some(shutdown_grace_ms) = shutdown_grace_ms {
             command
                 .arg("--shutdown-grace-ms")
@@ -334,7 +418,7 @@ impl ProxyHarness {
     /// listing loader's "config-file parent is the Repo root"
     /// contract holds.
     pub fn start_with_workspace(yaml: &str, files: &[(&str, &str)]) -> anyhow::Result<Self> {
-        Self::start_with_workspace_and_optional_shutdown_grace(yaml, files, None)
+        Self::start_with_workspace_and_optional_shutdown_grace(yaml, files, None, &[])
     }
 
     /// Start the proxy in an isolated config workspace with a test-specific
@@ -344,13 +428,41 @@ impl ProxyHarness {
         files: &[(&str, &str)],
         shutdown_grace_ms: u64,
     ) -> anyhow::Result<Self> {
-        Self::start_with_workspace_and_optional_shutdown_grace(yaml, files, Some(shutdown_grace_ms))
+        Self::start_with_workspace_and_optional_shutdown_grace(
+            yaml,
+            files,
+            Some(shutdown_grace_ms),
+            &[],
+        )
+    }
+
+    /// Start the proxy in an isolated config workspace with a
+    /// test-specific graceful shutdown budget, adding `env` to the
+    /// spawned proxy child's environment.
+    ///
+    /// The variables are scoped to the child via `Command::env`, so a
+    /// test can exercise an env-read path in the proxy (or anything
+    /// the proxy spawns) without mutating the test runner's own
+    /// process environment (WOR-646).
+    pub fn start_with_workspace_shutdown_grace_and_env(
+        yaml: &str,
+        files: &[(&str, &str)],
+        shutdown_grace_ms: u64,
+        env: &[(&str, &str)],
+    ) -> anyhow::Result<Self> {
+        Self::start_with_workspace_and_optional_shutdown_grace(
+            yaml,
+            files,
+            Some(shutdown_grace_ms),
+            env,
+        )
     }
 
     fn start_with_workspace_and_optional_shutdown_grace(
         yaml: &str,
         files: &[(&str, &str)],
         shutdown_grace_ms: Option<u64>,
+        env: &[(&str, &str)],
     ) -> anyhow::Result<Self> {
         let port = pick_free_port()?;
         let final_yaml = inject_port(yaml, port)?;
@@ -381,6 +493,11 @@ impl ProxyHarness {
             command
                 .arg("--shutdown-grace-ms")
                 .arg(shutdown_grace_ms.to_string());
+        }
+        // Child-scoped variables: the child process gets them, the
+        // test runner's own environment stays untouched (WOR-646).
+        for (name, value) in env {
+            command.env(name, value);
         }
         let child = command
             .arg("--config")
@@ -904,6 +1021,57 @@ impl MockUpstream {
         Self::start_sequence_full(encoded, "application/json".to_string())
     }
 
+    /// Start an upstream that returns a validator-bearing `200` initially
+    /// and an empty `304` when a later request sends the matching
+    /// `If-None-Match` value.
+    pub fn start_conditional(
+        reply_json: serde_json::Value,
+        etag: String,
+        last_modified: String,
+    ) -> anyhow::Result<Self> {
+        let reply_bytes = serde_json::to_vec(&reply_json)?;
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(false)?;
+        let port = listener.local_addr()?.port();
+        let captured: Arc<Mutex<Vec<CapturedRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let shutdown = Arc::new(Mutex::new(false));
+
+        let cap_clone = captured.clone();
+        let shut_clone = shutdown.clone();
+        let etag = Arc::new(etag);
+        let last_modified = Arc::new(last_modified);
+        let body = Arc::new(reply_bytes);
+        let join = std::thread::spawn(move || {
+            listener
+                .set_nonblocking(false)
+                .expect("listener nonblocking config");
+            for incoming in listener.incoming() {
+                if *shut_clone.lock().unwrap() {
+                    break;
+                }
+                let stream = match incoming {
+                    Ok(stream) => stream,
+                    Err(_) => continue,
+                };
+                let captured = cap_clone.clone();
+                let etag = etag.clone();
+                let last_modified = last_modified.clone();
+                let body = body.clone();
+                std::thread::spawn(move || {
+                    let _ =
+                        handle_mock_conditional_conn(stream, captured, body, etag, last_modified);
+                });
+            }
+        });
+
+        Ok(Self {
+            port,
+            captured,
+            shutdown,
+            join: Some(join),
+        })
+    }
+
     /// WOR-1133: start a mock upstream that replies with a raw byte
     /// body and an explicit `Content-Type` (200). Useful for testing
     /// binary content-types (e.g. `image/png`) that the compression
@@ -1231,6 +1399,104 @@ fn handle_mock_conn(
     resp.push_str("Connection: close\r\n\r\n");
     stream.write_all(resp.as_bytes())?;
     stream.write_all(&reply_body)?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn handle_mock_conditional_conn(
+    mut stream: TcpStream,
+    captured: Arc<Mutex<Vec<CapturedRequest>>>,
+    reply_body: Arc<Vec<u8>>,
+    etag: Arc<String>,
+    last_modified: Arc<String>,
+) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let mut buf = Vec::with_capacity(8192);
+    let mut tmp = [0u8; 4096];
+    let header_end;
+    loop {
+        let n = stream.read(&mut tmp)?;
+        if n == 0 {
+            return Ok(());
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(pos) = find_header_end(&buf) {
+            header_end = pos;
+            break;
+        }
+        if buf.len() > 1 << 20 {
+            return Ok(());
+        }
+    }
+
+    let head = match std::str::from_utf8(&buf[..header_end]) {
+        Ok(head) => head,
+        Err(_) => return Ok(()),
+    };
+    let mut lines = head.split("\r\n");
+    let request_line = lines.next().unwrap_or("");
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("GET").to_string();
+    let path = parts.next().unwrap_or("/").to_string();
+    let mut headers = std::collections::HashMap::new();
+    let mut content_length = 0usize;
+    for line in lines {
+        if let Some((name, value)) = line.split_once(':') {
+            let name = name.trim().to_ascii_lowercase();
+            let value = value.trim().to_string();
+            if name == "content-length" {
+                content_length = value.parse().unwrap_or(0);
+            }
+            headers.insert(name, value);
+        }
+    }
+
+    let body_start = header_end + 4;
+    let mut request_body = if buf.len() > body_start {
+        buf[body_start..].to_vec()
+    } else {
+        Vec::new()
+    };
+    while request_body.len() < content_length {
+        let n = stream.read(&mut tmp)?;
+        if n == 0 {
+            break;
+        }
+        request_body.extend_from_slice(&tmp[..n]);
+    }
+    request_body.truncate(content_length);
+
+    let not_modified = headers
+        .get("if-none-match")
+        .is_some_and(|candidate| candidate == etag.as_str());
+    captured.lock().unwrap().push(CapturedRequest {
+        method,
+        path,
+        headers,
+        body: request_body,
+    });
+
+    if not_modified {
+        let response = format!(
+            "HTTP/1.1 304 Not Modified\r\nETag: {}\r\nLast-Modified: {}\r\n\
+             Cache-Control: public, max-age=60\r\nContent-Length: 999\r\n\
+             X-Refresh-Hop: never-store\r\nX-Sbproxy-Cache: upstream-poison\r\n\
+             Connection: close, X-Refresh-Hop\r\n\r\n",
+            etag, last_modified
+        );
+        stream.write_all(response.as_bytes())?;
+    } else {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nETag: {}\r\n\
+             Last-Modified: {}\r\nCache-Control: public, max-age=60\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            etag,
+            last_modified,
+            reply_body.len()
+        );
+        stream.write_all(response.as_bytes())?;
+        stream.write_all(&reply_body)?;
+    }
     stream.flush()?;
     Ok(())
 }

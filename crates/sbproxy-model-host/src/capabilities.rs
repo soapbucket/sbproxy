@@ -116,6 +116,9 @@ pub enum ConsumerContract {
     StatusReportsStableLifecycle,
     /// Managed replicas converge on one deterministic placement plan.
     ClusterPlacementConverges,
+    /// A configured cloud reference price values local completions as
+    /// dollars saved in the value report.
+    ReferencePriceRecordsSavings,
 }
 
 impl ConsumerContract {
@@ -148,6 +151,7 @@ impl ConsumerContract {
             Self::ExactRemovalProtectsReferences => "contract.exact_removal_protects_references",
             Self::StatusReportsStableLifecycle => "contract.status_reports_stable_lifecycle",
             Self::ClusterPlacementConverges => "contract.cluster_placement_converges",
+            Self::ReferencePriceRecordsSavings => "contract.reference_price_records_savings",
         }
     }
 
@@ -314,8 +318,39 @@ impl ConsumerContract {
             Self::ExactRemovalProtectsReferences => assert_exact_removal_protection(),
             Self::StatusReportsStableLifecycle => assert_stable_status_shape(),
             Self::ClusterPlacementConverges => assert_cluster_placement_converges(),
+            Self::ReferencePriceRecordsSavings => assert_reference_price_records_savings(),
         }
     }
+}
+
+fn assert_reference_price_records_savings() -> Result<(), String> {
+    // A serve entry with an explicit reference prices each local
+    // completion at the cloud rate it displaced and folds it into the
+    // per-model value report. This is the deterministic core the
+    // request-path value recorder and the admin value route consume.
+    let config: ModelHostConfig = serde_yaml::from_str(
+        "models:\n  - model: qwen3-32b\n    name: qwen\n    reference:\n      model: gpt-4o\n      prompt_micros_per_mtok: 3000000\n      completion_micros_per_mtok: 15000000\n",
+    )
+    .map_err(|error| error.to_string())?;
+    let entry = config.models.first().ok_or("missing serve entry")?;
+    let reference = entry
+        .reference
+        .as_ref()
+        .ok_or("reference block did not parse")?;
+    let price = reference.cloud_price();
+    let mut lane = crate::LaneSplit::default();
+    lane.record_local(1000, 500, price);
+    lane.record_local(1000, 500, price);
+    let lanes = std::collections::BTreeMap::from([(entry.effective_name()?, lane)]);
+    let report = crate::ValueReport::from_lanes(&lanes);
+    if report.total_saved_micros != 21_000
+        || report.total_local_completions != 2
+        || report.models.len() != 1
+        || report.models[0].model != "qwen"
+    {
+        return Err(format!("reference savings report was {report:?}"));
+    }
+    Ok(())
 }
 
 fn assert_cluster_placement_converges() -> Result<(), String> {
@@ -397,8 +432,10 @@ fn assert_cluster_placement_converges() -> Result<(), String> {
 fn assert_managed_driver_capabilities() -> Result<(), String> {
     let llama = crate::LlamaCppDriver::default();
     let vllm = crate::VllmDriver::default();
+    let sglang = crate::SGLangDriver::default();
     let llama_capabilities = crate::EngineDriver::capabilities(&llama);
     let vllm_capabilities = crate::EngineDriver::capabilities(&vllm);
+    let sglang_capabilities = crate::EngineDriver::capabilities(&sglang);
     if llama_capabilities.artifact_formats != [crate::ArtifactFormat::Gguf]
         || llama_capabilities.supports_container
         || llama_capabilities.supports_uv
@@ -415,6 +452,36 @@ fn assert_managed_driver_capabilities() -> Result<(), String> {
     {
         return Err(format!(
             "unexpected vLLM capabilities: {vllm_capabilities:?}"
+        ));
+    }
+    // SGLang mirrors vLLM: safetensors + CUDA, container and uv, no GGUF.
+    if sglang_capabilities.artifact_formats != [crate::ArtifactFormat::Safetensors]
+        || !sglang_capabilities
+            .accelerators
+            .contains(&crate::AcceleratorKind::Cuda)
+        || !sglang_capabilities.supports_container
+        || !sglang_capabilities.supports_uv
+    {
+        return Err(format!(
+            "unexpected SGLang capabilities: {sglang_capabilities:?}"
+        ));
+    }
+    // mistral.rs is a binary engine like llama.cpp (no container, no uv)
+    // but loads safetensors and runs on CPU, Metal, and CUDA (WOR-1861).
+    let mistralrs = crate::mistralrs_driver::MistralRsDriver::default();
+    let mistralrs_capabilities = crate::EngineDriver::capabilities(&mistralrs);
+    if mistralrs_capabilities.artifact_formats != [crate::ArtifactFormat::Safetensors]
+        || !mistralrs_capabilities
+            .accelerators
+            .contains(&crate::AcceleratorKind::Cuda)
+        || !mistralrs_capabilities
+            .accelerators
+            .contains(&crate::AcceleratorKind::Metal)
+        || mistralrs_capabilities.supports_container
+        || mistralrs_capabilities.supports_uv
+    {
+        return Err(format!(
+            "unexpected mistral.rs capabilities: {mistralrs_capabilities:?}"
         ));
     }
     Ok(())
@@ -640,11 +707,13 @@ fn assert_exact_removal_protection() -> Result<(), String> {
 fn assert_stable_status_shape() -> Result<(), String> {
     let status = crate::DeploymentRuntimeStatus {
         deployment: "coder".to_string(),
+        replica: 0,
         generation: 7,
         state: crate::DeploymentRuntimeState::Ready,
         active_requests: 1,
         queued_requests: 2,
         engine: Some(crate::EngineKind::LlamaCpp),
+        engine_version: Some("0.11.0".to_string()),
         driver_availability: Some(crate::EngineAvailability::Available),
         artifact_digest: Some("a".repeat(64)),
         selected_devices: vec![0],
@@ -655,7 +724,11 @@ fn assert_stable_status_shape() -> Result<(), String> {
         last_error: None,
     };
     let json = serde_json::to_value(status).map_err(|error| error.to_string())?;
-    if json["deployment"] != "coder" || json["state"] != "ready" || json["port"] != 41000 {
+    if json["deployment"] != "coder"
+        || json["state"] != "ready"
+        || json["port"] != 41000
+        || json["engine_version"] != "0.11.0"
+    {
         return Err(format!("unexpected lifecycle status shape: {json}"));
     }
     let reasons = [
@@ -972,6 +1045,7 @@ fn field_is_active(path: &str, config: &ModelHostConfig) -> bool {
     match path {
         "serve.catalog_file" => config.catalog_file.is_some(),
         "serve.cache_budget_gib" => config.cache_budget_gib.is_some(),
+        "serve.allow_unpinned_refs" => config.allow_unpinned_refs,
         "serve.engines" => !config.engines.is_empty(),
         "serve.queue_timeout_ms" => config.queue_timeout_ms.is_some(),
         "serve.models[].engine" => config
@@ -992,6 +1066,10 @@ fn field_is_active(path: &str, config: &ModelHostConfig) -> bool {
             .models
             .iter()
             .any(|entry| entry.kv_quant != KvCacheQuant::Auto),
+        "serve.models[].enable_prefix_caching" => config
+            .models
+            .iter()
+            .any(|entry| entry.enable_prefix_caching.is_some()),
         "serve.models[].speculative" => config
             .models
             .iter()
@@ -1019,6 +1097,7 @@ fn field_is_active(path: &str, config: &ModelHostConfig) -> bool {
             .any(|entry| entry.cpu_offload_gib.is_some()),
         "serve.models[].max_loras" => config.models.iter().any(|entry| entry.max_loras.is_some()),
         "serve.models[].gguf_file" => config.models.iter().any(|entry| entry.gguf_file.is_some()),
+        "serve.models[].modality" => config.models.iter().any(|entry| entry.modality.is_some()),
         _ => false,
     }
 }
@@ -1095,7 +1174,7 @@ const CAPABILITIES: &[CapabilityEntry] = &[
         id: "artifact.cache_budget",
         domain: CapabilityDomain::Artifact,
         status: SupportLevel::Stable,
-        summary: "Cache collection enforces LRU budgets without deleting protected artifacts.",
+        summary: "Cache collection enforces LRU budgets without deleting protected artifacts; the same protected collection runs on demand through the admin gc route.",
         evidence: &[
             "contract.cache_budget_protects_active_artifacts",
             "test.artifact_gc",
@@ -1129,7 +1208,7 @@ const CAPABILITIES: &[CapabilityEntry] = &[
         id: "engine.llama_cpp_managed",
         domain: CapabilityDomain::Engine,
         status: SupportLevel::Preview,
-        summary: "Managed llama.cpp supports digest-verified binary acquisition and Linux CUDA source builds; Apple Metal is certified while live CUDA remains deferred.",
+        summary: "Managed llama.cpp resolves an operator binary, fetches a digest-verified CPU or Metal release, or builds digest-pinned source with CUDA. Live NVIDIA certification remains deferred.",
         evidence: &[
             "test.engine_drivers",
             "test.cuda_build",
@@ -1150,6 +1229,22 @@ const CAPABILITIES: &[CapabilityEntry] = &[
         domain: CapabilityDomain::Engine,
         status: SupportLevel::Preview,
         summary: "Digest-pinned private container plans use read-only artifacts and selected devices; live NVIDIA certification remains deferred.",
+        evidence: &["test.engine_drivers"],
+        consumer: None,
+    },
+    CapabilityEntry {
+        id: "engine.sglang",
+        domain: CapabilityDomain::Engine,
+        status: SupportLevel::Preview,
+        summary: "Managed SGLang serves safetensors weights on a CUDA worker from a pinned uv environment or a digest-pinned container, mirroring vLLM and adding RadixAttention prefix caching; live NVIDIA certification remains deferred.",
+        evidence: &["test.engine_drivers"],
+        consumer: None,
+    },
+    CapabilityEntry {
+        id: "engine.mistralrs",
+        domain: CapabilityDomain::Engine,
+        status: SupportLevel::Preview,
+        summary: "Managed mistral.rs serves safetensors weights from the upstream pinned prebuilt binary (PATH-first, sha256-verified), the pure-Rust subprocess lane; an explicit opt-in that auto never selects.",
         evidence: &["test.engine_drivers"],
         consumer: None,
     },
@@ -1265,8 +1360,12 @@ const CAPABILITIES: &[CapabilityEntry] = &[
         id: "platform.nvidia_cuda",
         domain: CapabilityDomain::Platform,
         status: SupportLevel::Preview,
-        summary: "NVIDIA discovery, vLLM, and CUDA llama.cpp have deterministic coverage; live GCP certification is reserved for the final PR group.",
-        evidence: &["test.cuda_build", "test.local_admission"],
+        summary: "One NVIDIA device completed a live gateway completion, status, and stop on an L4, with the digest-pinned vLLM container. Multi-device serving stays uncertified: the lane has never had a two-GPU host to run on, so this is deliberately not promoted on single-device evidence alone.",
+        evidence: &[
+            "test.cuda_build",
+            "test.local_admission",
+            "cert.nvidia_l4_single_gpu.2026-07-30",
+        ],
         consumer: None,
     },
     CapabilityEntry {
@@ -1287,6 +1386,17 @@ const CAPABILITIES: &[CapabilityEntry] = &[
             "test.models_lifecycle_cli",
         ],
         consumer: Some(ConsumerContract::ExactRemovalProtectsReferences),
+    },
+    CapabilityEntry {
+        id: "admin.value_report",
+        domain: CapabilityDomain::Admin,
+        status: SupportLevel::Stable,
+        summary: "A configured cloud reference prices each local completion as dollars saved, recorded per model and served on the admin value route.",
+        evidence: &[
+            "contract.reference_price_records_savings",
+            "test.value_ledger",
+        ],
+        consumer: Some(ConsumerContract::ReferencePriceRecordsSavings),
     },
 ];
 
@@ -1309,10 +1419,22 @@ const CONFIG_FIELDS: &[ConfigFieldCapability] = &[
         capability_id: "artifact.cache_addressing",
         consumer: Some(ConsumerContract::CacheDirectoryChangesArtifactPath),
     },
+    // WOR-1910: the budget gained an API-triggerable executable consumer
+    // (post-pull collection plus the admin gc route), so the field is no
+    // longer config-only.
     ConfigFieldCapability {
         path: "serve.cache_budget_gib",
-        status: SupportLevel::ConfigOnly,
+        status: SupportLevel::Preview,
         capability_id: "artifact.cache_budget",
+        consumer: Some(ConsumerContract::CacheBudgetProtectsActiveArtifacts),
+    },
+    // WOR-2070: the startup gate reads this to decide whether a
+    // worker-role node may serve weights it never verified, so the field
+    // has a real consumer rather than being config-only.
+    ConfigFieldCapability {
+        path: "serve.allow_unpinned_refs",
+        status: SupportLevel::Preview,
+        capability_id: "artifact.verified_acquisition",
         consumer: None,
     },
     ConfigFieldCapability {
@@ -1388,6 +1510,12 @@ const CONFIG_FIELDS: &[ConfigFieldCapability] = &[
         consumer: None,
     },
     ConfigFieldCapability {
+        path: "serve.models[].enable_prefix_caching",
+        status: SupportLevel::Preview,
+        capability_id: "engine.typed_managed_drivers",
+        consumer: None,
+    },
+    ConfigFieldCapability {
         path: "serve.models[].speculative",
         status: SupportLevel::Preview,
         capability_id: "engine.typed_managed_drivers",
@@ -1439,6 +1567,18 @@ const CONFIG_FIELDS: &[ConfigFieldCapability] = &[
         path: "serve.models[].gguf_file",
         status: SupportLevel::Preview,
         capability_id: "artifact.legacy_download",
+        consumer: None,
+    },
+    ConfigFieldCapability {
+        path: "serve.models[].reference",
+        status: SupportLevel::Stable,
+        capability_id: "admin.value_report",
+        consumer: Some(ConsumerContract::ReferencePriceRecordsSavings),
+    },
+    ConfigFieldCapability {
+        path: "serve.models[].modality",
+        status: SupportLevel::Preview,
+        capability_id: "engine.typed_managed_drivers",
         consumer: None,
     },
 ];

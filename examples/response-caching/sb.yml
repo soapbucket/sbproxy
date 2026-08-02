@@ -26,5 +26,4 @@ origins:
 
     response_cache:
       enabled: true
-      ttl_seconds: 60
-      cache_control: true
+      ttl_secs: 60

@@ -76,6 +76,10 @@ pub struct BootstrapConfig {
     /// `MeshConfig.encryption.shared_key` after resolving any
     /// `${ENV}` placeholders.
     pub shared_key: Option<String>,
+    /// Which derivation turns [`Self::shared_key`] into the AES key.
+    /// Defaults to the historical SHA-256 scheme; see
+    /// [`crate::crypto::KeyDerivation`] for the migration path.
+    pub key_derivation: crate::crypto::KeyDerivation,
 
     // --- K4: SWIM timing knobs ---
     /// SWIM protocol period in milliseconds. One random Alive peer is
@@ -102,6 +106,12 @@ pub struct BootstrapConfig {
     /// certificate and verifies peers' on every outbound connection. `None`
     /// keeps the plaintext transport (the pre-mTLS behavior).
     pub peer_tls: Option<PeerTlsParams>,
+
+    /// WOR-1947: optional replicated durable state substrate. When set,
+    /// bootstrap opens the durable replica shard, installs it behind the
+    /// transport's replica ops, and spawns the maintenance loop. `None`
+    /// leaves the substrate off (single-owner cache semantics only).
+    pub replication: Option<ReplicationBootstrapConfig>,
 }
 
 /// Peer-mTLS material for the mesh transport, already resolved to PEM by the
@@ -119,6 +129,19 @@ pub struct PeerTlsParams {
     pub identity_authenticator: Option<Arc<crate::peer_identity::PeerIdentityAuthenticator>>,
 }
 
+/// Replicated-substrate wiring consumed by [`bootstrap`].
+#[derive(Debug, Clone)]
+pub struct ReplicationBootstrapConfig {
+    /// Replication factor, consistency levels, cadence, GC grace.
+    pub settings: crate::state::replicated::ReplicationSettings,
+    /// Shard capacity and value-size bounds.
+    pub limits: crate::state::replicated::ShardLimits,
+    /// Durable shard file. `None` runs the shard memory-only, which
+    /// keeps replication but gives up restart durability; canonical
+    /// cluster config always supplies a path via `state_dir`.
+    pub durable_path: Option<std::path::PathBuf>,
+}
+
 impl Default for BootstrapConfig {
     fn default() -> Self {
         Self {
@@ -131,6 +154,7 @@ impl Default for BootstrapConfig {
             failure_check_interval_secs: 2,
             failure_timeout_secs: 5,
             shared_key: None,
+            key_derivation: crate::crypto::KeyDerivation::default(),
             peer_tls: None,
             // K4 SWIM defaults mirror the paper's small-cluster profile.
             swim_protocol_period_ms: 1000,
@@ -140,6 +164,7 @@ impl Default for BootstrapConfig {
             // L2: 5 minutes is long enough to absorb transient partitions
             // without letting the Dead row leak forever.
             dead_peer_gc_secs: 300,
+            replication: None,
         }
     }
 }
@@ -193,6 +218,38 @@ pub async fn bootstrap(
         }
     };
 
+    // A symmetric seed list (every node ships the same seeds, which is the
+    // natural shape for static fleet config and the Kubernetes operator)
+    // includes this node's own advertised address. Keep it out of the peer
+    // set: otherwise the node enters its own ring twice, once under its
+    // node ID and once as an address alias no join message ever replaces,
+    // and consistent-hash placement (including the WOR-1947 replica sets)
+    // can count one physical node as two members.
+    let peers: Vec<String> = peers
+        .into_iter()
+        .filter(|peer| Some(peer.as_str()) != config.gossip_advertise_addr.as_deref())
+        .collect();
+
+    // Resolve DNS-name seeds and the advertised gossip address to `ip:port`
+    // form. The SWIM probe path sends UDP to a parsed `SocketAddr`, so a
+    // hostname seed (the shape the Kubernetes operator renders from a
+    // StatefulSet's stable DNS names) would otherwise never be probed and
+    // the mesh would never form. TCP transport addresses resolve at connect
+    // time and may stay symbolic; UDP gossip cannot. The self-filter above
+    // runs first on the literal strings, so a symmetric DNS seed list still
+    // drops this node's own entry before resolution.
+    let peers = resolve_gossip_addrs(peers).await;
+    let resolved_gossip_advertise = match config.gossip_advertise_addr.as_deref() {
+        Some(addr) => resolve_gossip_addr(addr).await.or_else(|| {
+            tracing::warn!(
+                addr = %addr,
+                "gossip advertise address did not resolve; advertising it unresolved"
+            );
+            Some(addr.to_string())
+        }),
+        None => None,
+    };
+
     // --- K3: derive the cluster cipher (if configured) ---
     //
     // A single `Cipher` is derived once here and shared by both the
@@ -210,9 +267,10 @@ pub async fn bootstrap(
         Some(key) => {
             tracing::info!(
                 node_id = %node_id,
+                key_derivation = config.key_derivation.as_str(),
                 "mesh: AES-256-GCM encryption enabled on gossip + transport"
             );
-            Some(Cipher::from_shared_key(key))
+            Some(Cipher::with_derivation(key, config.key_derivation))
         }
         None => {
             tracing::info!(
@@ -276,13 +334,12 @@ pub async fn bootstrap(
     let gossip_cfg = GossipLoopConfig {
         node_id: node_id.clone(),
         gossip_port: config.gossip_port,
-        gossip_advertise_addr: config.gossip_advertise_addr.clone(),
+        gossip_advertise_addr: resolved_gossip_advertise.clone(),
         transport_advertise_addr: config
             .transport_advertise_addr
             .clone()
             .or_else(|| {
-                config
-                    .gossip_advertise_addr
+                resolved_gossip_advertise
                     .as_deref()
                     .and_then(|address| replace_port(address, config.transport_port))
             })
@@ -406,6 +463,48 @@ pub async fn bootstrap(
         }
     };
 
+    // --- WOR-1947: replicated durable state substrate ---
+    //
+    // Constructed before the transport server moves into the handle so the
+    // shard can be installed behind the ReplicaApply/ReplicaFetch/SyncDigest
+    // ops. Unlike the fail-warn paths above, a durable shard that cannot
+    // open FAILS the bootstrap: silently continuing without durability
+    // would violate the substrate's restart guarantee.
+    let replica_shard = match &config.replication {
+        Some(replication) => {
+            let clock: crate::state::replicated::MeshClock = Arc::new(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_millis() as u64)
+                    .unwrap_or_default()
+            });
+            let grace_ms = replication
+                .settings
+                .tombstone_gc_grace_secs
+                .saturating_mul(1_000);
+            let shard = match &replication.durable_path {
+                Some(path) => crate::state::replicated::ReplicaShard::open(
+                    path,
+                    replication.limits,
+                    grace_ms,
+                    clock,
+                )
+                .map_err(|e| anyhow::anyhow!("open replicated state shard: {e}"))?,
+                None => crate::state::replicated::ReplicaShard::in_memory(
+                    replication.limits,
+                    grace_ms,
+                    clock,
+                ),
+            };
+            let shard = Arc::new(shard);
+            if let Some(server) = transport_server.as_ref() {
+                server.install_replica_shard(shard.clone());
+            }
+            Some(shard)
+        }
+        None => None,
+    };
+
     node = node
         .with_transport(transport_server, transport_pool, peer_addr_map)
         .with_identity_authenticator(
@@ -415,7 +514,79 @@ pub async fn bootstrap(
                 .and_then(|params| params.identity_authenticator.clone()),
         );
 
+    if let (Some(shard), Some(replication)) = (replica_shard, &config.replication) {
+        let lookup = node.peer_addr_lookup();
+        let is_isolated: crate::state::replicated::IsolationFn = match node.isolation_observer() {
+            Some(observer) => Arc::new(move || observer.is_isolated()),
+            None => Arc::new(|| false),
+        };
+        let store = Arc::new(crate::state::replicated::ReplicatedStore::new(
+            shard,
+            node.distributed_cache(),
+            node.transport_pool(),
+            Arc::new(lookup),
+            is_isolated,
+            replication.settings.clone(),
+        ));
+        crate::state::replicated::ReplicatedStore::spawn_maintenance(&store);
+        tracing::info!(
+            factor = replication.settings.replication_factor,
+            "replicated state substrate enabled"
+        );
+        node = node.with_replicated_store(store);
+    }
+
     Ok(node)
+}
+
+/// Resolve one `host:port` gossip address to `ip:port` form.
+///
+/// Addresses that already parse as socket addresses pass through untouched.
+/// Hostnames go through the system resolver, preferring IPv4 (the UDP gossip
+/// socket binds v4 by default). Returns `None` when resolution fails or
+/// yields no candidates.
+async fn resolve_gossip_addr(addr: &str) -> Option<String> {
+    if addr.parse::<std::net::SocketAddr>().is_ok() {
+        return Some(addr.to_string());
+    }
+    match tokio::net::lookup_host(addr).await {
+        Ok(mut candidates) => {
+            let mut fallback = None;
+            for candidate in candidates.by_ref() {
+                if candidate.is_ipv4() {
+                    return Some(candidate.to_string());
+                }
+                fallback.get_or_insert(candidate);
+            }
+            fallback.map(|candidate| candidate.to_string())
+        }
+        Err(error) => {
+            tracing::warn!(addr = %addr, %error, "gossip address failed to resolve");
+            None
+        }
+    }
+}
+
+/// Resolve every seed to `ip:port` form, dropping (with a warning) any that
+/// do not resolve. A dropped seed heals itself: the peer behind it resolves
+/// its own seed list when it boots and contacts this node, at which point
+/// membership gossip carries its live address.
+async fn resolve_gossip_addrs(peers: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(peers.len());
+    for peer in peers {
+        match resolve_gossip_addr(&peer).await {
+            Some(resolved) => {
+                if resolved != peer {
+                    tracing::info!(seed = %peer, resolved = %resolved, "resolved gossip seed");
+                }
+                out.push(resolved);
+            }
+            None => {
+                tracing::warn!(seed = %peer, "dropping unresolvable gossip seed");
+            }
+        }
+    }
+    out
 }
 
 fn replace_port(address: &str, port: u16) -> Option<String> {
@@ -462,6 +633,7 @@ mod tests {
             failure_check_interval_secs: 2,
             failure_timeout_secs: 5,
             shared_key: None,
+            key_derivation: crate::crypto::KeyDerivation::default(),
             // Fast SWIM cadence for the bootstrap suite so tests don't
             // wait a full real-world protocol period.
             swim_protocol_period_ms: 200,
@@ -473,6 +645,7 @@ mod tests {
             // its own coverage in `gossip_loop::tests`.
             dead_peer_gc_secs: 60,
             peer_tls: None,
+            replication: None,
         }
     }
 
@@ -487,6 +660,35 @@ mod tests {
             .expect("bootstrap ok");
         assert_eq!(node.peers(), peers.as_slice());
         assert_eq!(node.node_id(), "n1");
+    }
+
+    #[tokio::test]
+    async fn symmetric_seed_list_filters_own_advertised_address() {
+        // Every node in a static fleet ships the same seed list, so this
+        // node's own address arrives via discovery. It must not become a
+        // ring member: that alias is never replaced by a join and would
+        // let placement count one physical node twice.
+        let peers = vec![
+            "10.0.0.1:7946".to_string(),
+            "10.0.0.2:7946".to_string(),
+            "10.0.0.3:7946".to_string(),
+        ];
+        let discovery: Vec<Box<dyn Discovery>> = vec![Box::new(StaticDiscovery(peers))];
+        let mut config = test_bootstrap_config();
+        config.gossip_advertise_addr = Some("10.0.0.1:7946".to_string());
+
+        let node = bootstrap(&discovery, &config, "n1".to_string())
+            .await
+            .expect("bootstrap ok");
+        assert_eq!(
+            node.peers(),
+            ["10.0.0.2:7946".to_string(), "10.0.0.3:7946".to_string()].as_slice()
+        );
+        assert!(!node
+            .distributed_cache()
+            .member_nodes()
+            .iter()
+            .any(|member| member == "10.0.0.1:7946"));
     }
 
     #[tokio::test]
@@ -585,5 +787,37 @@ mod tests {
         // None and that the local node id is preserved on the cache itself.
         assert_eq!(cache.local_node_id(), "local");
         assert!(cache.responsible_node("any-key").is_some());
+    }
+
+    #[tokio::test]
+    async fn resolve_gossip_addr_passes_socket_addrs_through() {
+        assert_eq!(
+            resolve_gossip_addr("10.0.0.1:7946").await.as_deref(),
+            Some("10.0.0.1:7946")
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_gossip_addr_resolves_hostnames_preferring_ipv4() {
+        // `localhost` resolves everywhere; IPv4 preference makes the
+        // result deterministic on dual-stack hosts.
+        assert_eq!(
+            resolve_gossip_addr("localhost:7946").await.as_deref(),
+            Some("127.0.0.1:7946")
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_gossip_addrs_drops_unresolvable_seeds() {
+        let resolved = resolve_gossip_addrs(vec![
+            "10.0.0.1:7946".to_string(),
+            "definitely-not-a-real-host.invalid:7946".to_string(),
+            "localhost:7947".to_string(),
+        ])
+        .await;
+        assert_eq!(
+            resolved,
+            vec!["10.0.0.1:7946".to_string(), "127.0.0.1:7947".to_string()]
+        );
     }
 }

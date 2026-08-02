@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use k8s_openapi::api::core::v1::Secret;
-use kube::config::KubeConfigOptions;
+use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::{Api, Client, Config};
 use parking_lot::Mutex;
 use tokio::runtime::Runtime;
@@ -338,18 +338,31 @@ async fn build_client(auth: KubernetesAuth) -> Result<Client> {
             Ok(Client::try_from(cfg)?)
         }
         KubernetesAuth::Kubeconfig { path, context } => {
-            std::env::set_var("KUBECONFIG", &path);
-            let options = KubeConfigOptions {
-                context,
-                cluster: None,
-                user: None,
-            };
-            let cfg = Config::from_kubeconfig(&options)
-                .await
-                .context("Kubernetes Secrets: failed to load kubeconfig")?;
+            let cfg = kubeconfig_client_config(&path, context).await?;
             Ok(Client::try_from(cfg)?)
         }
     }
+}
+
+/// Load a kube `Config` from an explicit kubeconfig path.
+///
+/// Reads the file named by the config's `path` field directly and hands
+/// it to `Config::from_custom_kubeconfig`. It deliberately never reads
+/// or writes the process-global `KUBECONFIG` variable: mutating it was
+/// a race between two backends constructed concurrently with different
+/// kubeconfig paths, and could silently repoint later kube clients in
+/// unrelated components at the wrong cluster (WOR-646).
+async fn kubeconfig_client_config(path: &str, context: Option<String>) -> Result<Config> {
+    let kubeconfig = Kubeconfig::read_from(path)
+        .with_context(|| format!("Kubernetes Secrets: failed to read kubeconfig at '{path}'"))?;
+    let options = KubeConfigOptions {
+        context,
+        cluster: None,
+        user: None,
+    };
+    Config::from_custom_kubeconfig(kubeconfig, &options)
+        .await
+        .context("Kubernetes Secrets: failed to load kubeconfig")
 }
 
 #[cfg(test)]
@@ -517,5 +530,128 @@ mod tests {
             .set("k", "v")
             .expect_err("set should fail with not-implemented");
         assert!(format!("{err}").contains("not implemented"));
+    }
+
+    // --- explicit kubeconfig loading (WOR-646) ---
+
+    /// Write a minimal single-cluster kubeconfig and return its path.
+    fn write_kubeconfig(
+        directory: &std::path::Path,
+        name: &str,
+        server: &str,
+    ) -> std::path::PathBuf {
+        let path = directory.join(format!("{name}.kubeconfig"));
+        let body = format!(
+            "apiVersion: v1\n\
+             kind: Config\n\
+             clusters:\n\
+             - name: {name}\n\
+             \x20 cluster:\n\
+             \x20   server: {server}\n\
+             contexts:\n\
+             - name: {name}-context\n\
+             \x20 context:\n\
+             \x20   cluster: {name}\n\
+             \x20   user: {name}-user\n\
+             current-context: {name}-context\n\
+             users:\n\
+             - name: {name}-user\n\
+             \x20 user:\n\
+             \x20   token: {name}-token\n"
+        );
+        std::fs::write(&path, body).expect("write kubeconfig fixture");
+        path
+    }
+
+    fn current_thread_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime")
+    }
+
+    /// The explicit `path` field must win outright: the load neither
+    /// reads nor rewrites the process-global `KUBECONFIG` variable,
+    /// even when that variable points at a different cluster.
+    #[test]
+    fn kubeconfig_auth_uses_the_explicit_path_and_leaves_kubeconfig_env_alone() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let decoy = write_kubeconfig(directory.path(), "decoy", "https://decoy.invalid:6443");
+        let selected = write_kubeconfig(
+            directory.path(),
+            "selected",
+            "https://selected.invalid:6443",
+        );
+
+        let decoy_env = decoy.to_string_lossy().into_owned();
+        let _env = crate::test_env::EnvVarGuard::set(&[("KUBECONFIG", Some(decoy_env.as_str()))]);
+
+        let rt = current_thread_runtime();
+        let config = rt
+            .block_on(kubeconfig_client_config(
+                selected.to_string_lossy().as_ref(),
+                None,
+            ))
+            .expect("load the explicit kubeconfig");
+
+        assert_eq!(
+            config.cluster_url.host(),
+            Some("selected.invalid"),
+            "the explicit path must select its own cluster, not the KUBECONFIG one"
+        );
+        assert_eq!(
+            std::env::var_os("KUBECONFIG").as_deref(),
+            Some(std::ffi::OsStr::new(decoy_env.as_str())),
+            "explicit-path auth must not rewrite the process-global KUBECONFIG"
+        );
+    }
+
+    /// Two backends constructed concurrently with different kubeconfig
+    /// paths must each select their own cluster. Before WOR-646 this
+    /// raced through a shared `KUBECONFIG` write and could hand one
+    /// resolver the other's cluster and credentials.
+    #[test]
+    fn concurrent_kubeconfig_loads_cannot_cross_select_clusters() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let path_a = write_kubeconfig(
+            directory.path(),
+            "cluster-a",
+            "https://cluster-a.invalid:6443",
+        );
+        let path_b = write_kubeconfig(
+            directory.path(),
+            "cluster-b",
+            "https://cluster-b.invalid:6443",
+        );
+
+        let load_repeatedly = |path: std::path::PathBuf| {
+            std::thread::spawn(move || {
+                let rt = current_thread_runtime();
+                (0..16)
+                    .map(|_| {
+                        let config = rt
+                            .block_on(kubeconfig_client_config(
+                                path.to_string_lossy().as_ref(),
+                                None,
+                            ))
+                            .expect("load kubeconfig");
+                        config
+                            .cluster_url
+                            .host()
+                            .expect("cluster url has a host")
+                            .to_string()
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        let thread_a = load_repeatedly(path_a);
+        let thread_b = load_repeatedly(path_b);
+        for host in thread_a.join().expect("cluster-a loader") {
+            assert_eq!(host, "cluster-a.invalid");
+        }
+        for host in thread_b.join().expect("cluster-b loader") {
+            assert_eq!(host, "cluster-b.invalid");
+        }
     }
 }

@@ -11,11 +11,22 @@
 //! ## Shape
 //!
 //! Hour buckets are keyed by `{hour_start, provider, model, tenant,
-//! team, api_key_id, project}` and aggregate request counts, tokens by
+//! team, api_key_id, project, origin, agent_id}` and aggregate request
+//! counts, tokens by
 //! direction, cost in micro-USD, and a closed outcome split
 //! (`ok` / `error` / `blocked`). A compaction pass folds hourly rows
 //! past the hourly retention into day buckets under the same
 //! dimensions, and prunes day buckets past the daily retention.
+//!
+//! ## Key compatibility
+//!
+//! The key grows by additive, optional tails, never by a new table
+//! name or a migration pass. A dimension whose value is empty
+//! contributes no bytes at all, so an existing row keeps decoding and
+//! a newly written row that does not use the dimension is byte
+//! identical to what the previous version wrote. `encode_key` carries
+//! the placement rules, and the tests below pin the promise against a
+//! hardcoded byte string rather than against a re-encode.
 //!
 //! Rows carry no prompt content and no raw key material (`api_key_id`
 //! only), so the file is safe to back up and ship. Aggregation is
@@ -34,6 +45,7 @@
 //! timestamps, so retention and grouping are fully deterministic
 //! under test (no clock trait needed).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -46,11 +58,17 @@ const DAILY: TableDefinition<&[u8], &[u8]> = TableDefinition::new("usage_rollups
 
 const HOUR_SECS: u64 = 3_600;
 const DAY_SECS: u64 = 86_400;
+const PROPERTY_TAIL_MAGIC: &[u8; 4] = b"SBP1";
+const AGENT_TAIL_MAGIC: &[u8; 4] = b"SBA1";
 
 /// Attribution dimensions of one rollup bucket. Empty strings are the
 /// "unattributed" segment, mirroring the attributed metric labels.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RollupDims {
+    /// Origin hostname the request arrived on. Empty on rows written
+    /// by builds that predate the dimension; those decode as the
+    /// unattributed segment.
+    pub origin: String,
     /// Upstream provider name.
     pub provider: String,
     /// Model identifier.
@@ -63,6 +81,16 @@ pub struct RollupDims {
     pub api_key_id: String,
     /// Project from the credential's attribution tags.
     pub project: String,
+    /// Agent identity that spent this, as an agent-as-unit dimension:
+    /// the same sanitized, bounded value the `agent_id` metric label
+    /// carries, never a raw per-request identifier. Empty when the
+    /// request had no agent identity and on every row written before
+    /// the dimension existed; both decode as the unattributed segment.
+    pub agent_id: String,
+    /// Explicitly configured, redacted request properties promoted to
+    /// durable dimensions. The configured key set is bounded before
+    /// requests reach this type.
+    pub properties: BTreeMap<String, String>,
 }
 
 /// Closed outcome split for the rollup rows. Maps the wider
@@ -215,7 +243,7 @@ impl RollupAgg {
 }
 
 /// Dimension the query groups buckets by.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroupBy {
     /// One series per provider.
     Provider,
@@ -229,6 +257,13 @@ pub enum GroupBy {
     ApiKey,
     /// One series per project.
     Project,
+    /// One series per origin hostname.
+    Origin,
+    /// One series per agent identity. This is the grouping that
+    /// answers "which agent spent this".
+    Agent,
+    /// One series per value of an explicitly promoted property.
+    Property(String),
     /// A single total series.
     Total,
 }
@@ -243,12 +278,20 @@ impl GroupBy {
             "team" => Self::Team,
             "api_key" => Self::ApiKey,
             "project" => Self::Project,
+            "origin" => Self::Origin,
+            "agent" => Self::Agent,
             "total" | "" => Self::Total,
-            _ => return None,
+            _ => {
+                let key = s.strip_prefix("property:")?;
+                if !crate::capture::is_valid_property_key(key) {
+                    return None;
+                }
+                Self::Property(key.to_string())
+            }
         })
     }
 
-    fn key_of(self, dims: &RollupDims) -> String {
+    fn key_of(&self, dims: &RollupDims) -> String {
         match self {
             Self::Provider => dims.provider.clone(),
             Self::Model => dims.model.clone(),
@@ -256,6 +299,9 @@ impl GroupBy {
             Self::Team => dims.team.clone(),
             Self::ApiKey => dims.api_key_id.clone(),
             Self::Project => dims.project.clone(),
+            Self::Origin => dims.origin.clone(),
+            Self::Agent => dims.agent_id.clone(),
+            Self::Property(key) => dims.properties.get(key).cloned().unwrap_or_default(),
             Self::Total => String::new(),
         }
     }
@@ -294,6 +340,8 @@ pub struct RollupQueryResult {
     pub buckets: Vec<RollupBucket>,
     /// Totals across the window.
     pub totals: RollupTotals,
+    /// Promoted property keys present in rows in this window.
+    pub property_keys: Vec<String>,
 }
 
 /// Window totals for a query.
@@ -315,18 +363,56 @@ pub struct RollupTotals {
     pub error: u64,
 }
 
+/// Append one `u16` big-endian length-prefixed part. Over-long parts
+/// are truncated to `u16::MAX` rather than refused, matching the
+/// original encoder; nothing in this workspace produces a dimension
+/// value anywhere near that.
+fn push_len_prefixed(key: &mut Vec<u8>, part: &str) {
+    let len = u16::try_from(part.len()).unwrap_or(u16::MAX);
+    key.extend_from_slice(&len.to_be_bytes());
+    key.extend_from_slice(&part.as_bytes()[..usize::from(len).min(part.len())]);
+}
+
+/// Read one `u16` big-endian length-prefixed part at `cursor`,
+/// advancing it past the part on success. `None` when the key is
+/// truncated or the bytes are not valid UTF-8, which is how a
+/// partially written tail is rejected without publishing a fragment.
+fn read_len_prefixed(key: &[u8], cursor: &mut usize) -> Option<String> {
+    let len_bytes = key.get(*cursor..*cursor + 2)?;
+    let len = usize::from(u16::from_be_bytes([len_bytes[0], len_bytes[1]]));
+    let start = *cursor + 2;
+    let bytes = key.get(start..start + len)?;
+    *cursor = start + len;
+    std::str::from_utf8(bytes).ok().map(ToOwned::to_owned)
+}
+
 fn encode_key(bucket_start: u64, dims: &RollupDims) -> Vec<u8> {
     // Big-endian timestamp prefix so redb range scans by time work.
     let mut key = Vec::with_capacity(
-        8 + 12
+        8 + 14
             + dims.provider.len()
             + dims.model.len()
             + dims.tenant.len()
             + dims.team.len()
             + dims.api_key_id.len()
-            + dims.project.len(),
+            + dims.project.len()
+            + dims.origin.len()
+            + if dims.agent_id.is_empty() {
+                0
+            } else {
+                AGENT_TAIL_MAGIC.len() + 2 + dims.agent_id.len()
+            }
+            + dims
+                .properties
+                .iter()
+                .map(|(key, value)| 4 + key.len() + value.len())
+                .sum::<usize>()
+            + if dims.properties.is_empty() { 0 } else { 5 },
     );
     key.extend_from_slice(&bucket_start.to_be_bytes());
+    // `origin` is encoded LAST so rows written before the dimension
+    // existed still decode (the trailing slot is optional on read) and
+    // older binaries reading a newer file simply ignore the tail.
     for part in [
         &dims.provider,
         &dims.model,
@@ -334,10 +420,51 @@ fn encode_key(bucket_start: u64, dims: &RollupDims) -> Vec<u8> {
         &dims.team,
         &dims.api_key_id,
         &dims.project,
+        &dims.origin,
     ] {
-        let len = u16::try_from(part.len()).unwrap_or(u16::MAX);
-        key.extend_from_slice(&len.to_be_bytes());
-        key.extend_from_slice(&part.as_bytes()[..usize::from(len).min(part.len())]);
+        push_len_prefixed(&mut key, part);
+    }
+    // The agent dimension is a magic-prefixed tail that is omitted
+    // entirely when the agent is empty, so a rollup with no agent
+    // encodes to the byte-identical key the previous version produced.
+    // That is the whole compatibility promise: no redb migration, no
+    // `_v2` table, no rewrite of existing rows.
+    //
+    // It sits between `origin` and the property tail, and that position
+    // is forced by two constraints pulling in opposite directions.
+    //
+    // It cannot be a bare optional slot appended after `origin` the way
+    // `origin` itself was, because a row that already carries a
+    // property tail would then be misread: the decoder would take the
+    // magic bytes `SBP1` as this dimension's `u16` length prefix,
+    // consume them, and lose the properties behind them. The magic
+    // prefix is what makes the slot self-describing rather than
+    // positional, so an old property-bearing row is recognised as
+    // exactly that.
+    //
+    // And it cannot go after the property tail, because that tail
+    // validates by consuming to the end of the key, which is what stops
+    // a truncated or corrupt tail from hiding the legacy dimensions.
+    // Keeping properties terminal leaves that check untouched.
+    //
+    // So the rule for the next dimension after this one: insert it
+    // here, behind its own magic, and leave the property tail last.
+    if !dims.agent_id.is_empty() {
+        key.extend_from_slice(AGENT_TAIL_MAGIC);
+        push_len_prefixed(&mut key, &dims.agent_id);
+    }
+    // Append promoted properties after every legacy dimension. Older
+    // binaries stop decoding after origin and safely ignore this tail.
+    // Empty property maps preserve the exact historical key encoding.
+    if !dims.properties.is_empty() {
+        key.extend_from_slice(PROPERTY_TAIL_MAGIC);
+        let count = u8::try_from(dims.properties.len()).unwrap_or(u8::MAX);
+        key.push(count);
+        for (property_key, value) in dims.properties.iter().take(usize::from(count)) {
+            for part in [property_key, value] {
+                push_len_prefixed(&mut key, part);
+            }
+        }
     }
     key
 }
@@ -369,6 +496,63 @@ fn decode_key(key: &[u8]) -> Option<(u64, RollupDims)> {
         }
         *slot = String::from_utf8_lossy(&key[cursor..cursor + len]).into_owned();
         cursor += len;
+    }
+    // Optional trailing origin slot: rows written before the dimension
+    // existed end here and decode as origin = "" (unattributed).
+    if key.len() >= cursor + 2 {
+        let len = usize::from(u16::from_be_bytes([key[cursor], key[cursor + 1]]));
+        cursor += 2;
+        if key.len() >= cursor + len {
+            dims.origin = String::from_utf8_lossy(&key[cursor..cursor + len]).into_owned();
+            cursor += len;
+        }
+    }
+    // Optional agent tail. See `encode_key` for why it sits here, ahead
+    // of the property tail, and why it is magic-prefixed rather than
+    // positional. A row without one, which is every row written before
+    // the dimension existed, leaves `cursor` untouched and decodes as
+    // agent_id = "" (unattributed).
+    if key.get(cursor..cursor + AGENT_TAIL_MAGIC.len()) == Some(AGENT_TAIL_MAGIC) {
+        let mut agent_cursor = cursor + AGENT_TAIL_MAGIC.len();
+        if let Some(agent_id) = read_len_prefixed(key, &mut agent_cursor) {
+            // `encode_key` never writes an empty agent tail, and it
+            // always writes the tail either last or immediately before
+            // the property tail. Anything else is corruption: leave
+            // `cursor` where it was so the legacy dimensions still
+            // stand rather than publishing a fragment.
+            let tail_is_well_placed = agent_cursor == key.len()
+                || key.get(agent_cursor..agent_cursor + PROPERTY_TAIL_MAGIC.len())
+                    == Some(PROPERTY_TAIL_MAGIC);
+            if !agent_id.is_empty() && tail_is_well_placed {
+                dims.agent_id = agent_id;
+                cursor = agent_cursor;
+            }
+        }
+    }
+    // A corrupt or partially written property tail must not hide the
+    // legacy dimensions. Decode into a temporary map and publish it
+    // only after the complete tail validates.
+    if key.get(cursor..cursor + PROPERTY_TAIL_MAGIC.len()) == Some(PROPERTY_TAIL_MAGIC) {
+        let mut property_cursor = cursor + PROPERTY_TAIL_MAGIC.len();
+        let parsed = (|| -> Option<BTreeMap<String, String>> {
+            let count = usize::from(*key.get(property_cursor)?);
+            property_cursor += 1;
+            let mut properties = BTreeMap::new();
+            for _ in 0..count {
+                let property_key = read_len_prefixed(key, &mut property_cursor)?;
+                if !crate::capture::is_valid_property_key(&property_key) {
+                    return None;
+                }
+                let value = read_len_prefixed(key, &mut property_cursor)?;
+                if properties.insert(property_key, value).is_some() {
+                    return None;
+                }
+            }
+            (property_cursor == key.len()).then_some(properties)
+        })();
+        if let Some(properties) = parsed {
+            dims.properties = properties;
+        }
     }
     Some((ts, dims))
 }
@@ -442,8 +626,8 @@ impl RollupStore {
         let from_aligned = from_secs - (from_secs % bucket_secs);
         let lo = from_aligned.to_be_bytes().to_vec();
         let hi = to_secs.to_be_bytes().to_vec();
-        let mut grouped: std::collections::BTreeMap<(u64, String), RollupAgg> =
-            std::collections::BTreeMap::new();
+        let mut grouped: BTreeMap<(u64, String), RollupAgg> = BTreeMap::new();
+        let mut property_keys = BTreeSet::new();
         let mut totals = RollupAgg::default();
         for row in table.range(lo.as_slice()..hi.as_slice())? {
             let (k, v) = row?;
@@ -452,6 +636,7 @@ impl RollupStore {
             };
             let agg = RollupAgg::decode(v.value());
             totals.merge(&agg);
+            property_keys.extend(dims.properties.keys().cloned());
             grouped
                 .entry((ts, group_by.key_of(&dims)))
                 .or_default()
@@ -483,6 +668,7 @@ impl RollupStore {
                 blocked: totals.blocked,
                 error: totals.error,
             },
+            property_keys: property_keys.into_iter().collect(),
         })
     }
 
@@ -677,13 +863,319 @@ mod tests {
 
     fn dims(provider: &str, model: &str, team: &str) -> RollupDims {
         RollupDims {
+            origin: "ai.example".to_string(),
             provider: provider.to_string(),
             model: model.to_string(),
             tenant: "t1".to_string(),
             team: team.to_string(),
             api_key_id: "sk_1".to_string(),
             project: "p1".to_string(),
+            agent_id: String::new(),
+            properties: BTreeMap::new(),
         }
+    }
+
+    /// The exact bytes `encode_key(3600, &dims("openai", "gpt-4o",
+    /// "growth"))` produced before the agent dimension existed, written
+    /// out by hand rather than re-encoded.
+    ///
+    /// Comparing against a re-encode would pass no matter what the
+    /// encoder does, which is the one thing this assertion must not do:
+    /// the rollup tables are `_v1` and there is no migration pass, so a
+    /// key whose bytes move silently splits every existing bucket in
+    /// two and the admin spend view starts under-reporting history.
+    ///
+    /// Layout: 8-byte big-endian bucket start, then each dimension as a
+    /// `u16` big-endian length followed by its UTF-8 bytes, in the
+    /// order provider, model, tenant, team, api_key_id, project,
+    /// origin. No agent tail and no property tail, because both are
+    /// empty.
+    const LEGACY_KEY_HOUR_1: &[u8] = b"\x00\x00\x00\x00\x00\x00\x0e\x10\
+\x00\x06openai\
+\x00\x06gpt-4o\
+\x00\x02t1\
+\x00\x06growth\
+\x00\x04sk_1\
+\x00\x02p1\
+\x00\x0aai.example";
+
+    /// The property tail `encode_key` appends for
+    /// `{"feature": "assistant"}`: magic, a one-byte pair count, then
+    /// the key and value each `u16` length prefixed.
+    const FEATURE_PROPERTY_TAIL: &[u8] = b"SBP1\x01\x00\x07feature\x00\x09assistant";
+
+    /// The agent tail `encode_key` appends for `agent_id = "planner"`:
+    /// magic, then the value `u16` length prefixed. No count byte; the
+    /// dimension is single valued.
+    const PLANNER_AGENT_TAIL: &[u8] = b"SBA1\x00\x07planner";
+
+    fn concat(parts: &[&[u8]]) -> Vec<u8> {
+        parts.concat()
+    }
+
+    #[test]
+    fn key_with_no_agent_is_byte_identical_to_the_legacy_encoding() {
+        // The compatibility promise, asserted against hardcoded bytes.
+        // Every rollup written by a build without the agent dimension
+        // has to keep landing in the same bucket as the rollups written
+        // after it, or restart-durable spend history silently splits.
+        let no_agent = dims("openai", "gpt-4o", "growth");
+        assert!(no_agent.agent_id.is_empty());
+        assert_eq!(encode_key(3600, &no_agent), LEGACY_KEY_HOUR_1);
+
+        // Same promise for a row that also carries properties: the
+        // agent tail must not wedge itself between origin and the
+        // property tail when there is no agent to record.
+        let mut with_properties = no_agent.clone();
+        with_properties
+            .properties
+            .insert("feature".to_string(), "assistant".to_string());
+        assert_eq!(
+            encode_key(3600, &with_properties),
+            concat(&[LEGACY_KEY_HOUR_1, FEATURE_PROPERTY_TAIL]),
+        );
+    }
+
+    #[test]
+    fn all_four_key_shapes_decode() {
+        let base = dims("openai", "gpt-4o", "growth");
+
+        // 1. An old row with neither tail.
+        let (ts, decoded) = decode_key(LEGACY_KEY_HOUR_1).expect("legacy key decodes");
+        assert_eq!(ts, 3600);
+        assert_eq!(decoded, base);
+        assert_eq!(decoded.agent_id, "");
+        assert!(decoded.properties.is_empty());
+
+        // 2. An old row that already carries a property tail. This is
+        //    the row an unprefixed agent slot would have wrecked: the
+        //    decoder would have read `SB` as a length prefix, walked
+        //    past the magic, and dropped the properties.
+        let mut expected_properties = base.clone();
+        expected_properties
+            .properties
+            .insert("feature".to_string(), "assistant".to_string());
+        let (_, decoded) = decode_key(&concat(&[LEGACY_KEY_HOUR_1, FEATURE_PROPERTY_TAIL]))
+            .expect("legacy property key decodes");
+        assert_eq!(decoded, expected_properties);
+
+        // 3. A new row written with no agent. Byte identical to case 1,
+        //    so it decodes to the unattributed agent segment.
+        let (_, decoded) = decode_key(&encode_key(3600, &base)).expect("new key decodes");
+        assert_eq!(decoded.agent_id, "");
+
+        // 4. A new row with an agent, with and without properties.
+        let mut agent_only = base.clone();
+        agent_only.agent_id = "planner".to_string();
+        assert_eq!(
+            encode_key(3600, &agent_only),
+            concat(&[LEGACY_KEY_HOUR_1, PLANNER_AGENT_TAIL]),
+        );
+        let (_, decoded) = decode_key(&encode_key(3600, &agent_only)).expect("agent key decodes");
+        assert_eq!(decoded, agent_only);
+
+        let mut agent_and_properties = expected_properties.clone();
+        agent_and_properties.agent_id = "planner".to_string();
+        assert_eq!(
+            encode_key(3600, &agent_and_properties),
+            concat(&[LEGACY_KEY_HOUR_1, PLANNER_AGENT_TAIL, FEATURE_PROPERTY_TAIL]),
+        );
+        let (_, decoded) =
+            decode_key(&encode_key(3600, &agent_and_properties)).expect("both tails decode");
+        assert_eq!(decoded, agent_and_properties);
+    }
+
+    #[test]
+    fn agent_dimension_round_trips_through_encode_and_decode() {
+        let mut d = dims("openai", "gpt-4o", "growth");
+        d.agent_id = "research-planner".to_string();
+        let key = encode_key(3600, &d);
+        assert!(
+            key.starts_with(LEGACY_KEY_HOUR_1),
+            "the agent tail must append, never rewrite the legacy prefix"
+        );
+        let (ts, decoded) = decode_key(&key).expect("agent key decodes");
+        assert_eq!(ts, 3600);
+        assert_eq!(decoded, d);
+    }
+
+    #[test]
+    fn malformed_agent_tail_does_not_hide_legacy_dimensions_or_properties() {
+        let expected = dims("openai", "gpt-4o", "growth");
+
+        // Truncated agent tail: the length prefix claims more bytes
+        // than the key holds.
+        let truncated = concat(&[LEGACY_KEY_HOUR_1, b"SBA1\x00\x40pla"]);
+        let (_, decoded) = decode_key(&truncated).expect("legacy dimensions still decode");
+        assert_eq!(decoded, expected);
+
+        // An empty agent tail can never be produced by `encode_key`,
+        // so its presence is corruption and must not be published as a
+        // real, distinct empty-agent value.
+        let empty = concat(&[LEGACY_KEY_HOUR_1, b"SBA1\x00\x00"]);
+        let (_, decoded) = decode_key(&empty).expect("legacy dimensions still decode");
+        assert_eq!(decoded.agent_id, "");
+
+        // A well-formed agent tail followed by garbage rather than by
+        // the property tail is rejected whole, so a half-written row
+        // cannot invent an agent.
+        let trailing_garbage = concat(&[LEGACY_KEY_HOUR_1, PLANNER_AGENT_TAIL, b"\x00\x00"]);
+        let (_, decoded) = decode_key(&trailing_garbage).expect("legacy dimensions still decode");
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn group_by_agent_parses_and_groups() {
+        assert_eq!(GroupBy::parse("agent"), Some(GroupBy::Agent));
+        let mut d = dims("openai", "gpt-4o", "growth");
+        d.agent_id = "planner".to_string();
+        assert_eq!(GroupBy::Agent.key_of(&d), "planner");
+        // A row with no agent groups under the unattributed segment,
+        // the same way origin does.
+        assert_eq!(GroupBy::Agent.key_of(&dims("openai", "gpt-4o", "a")), "");
+    }
+
+    #[test]
+    fn rollups_differing_only_by_agent_land_in_different_buckets() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RollupStore::open(&dir.path().join("r.redb")).unwrap();
+        let t0 = 1_700_000_400;
+        let mut planner = dims("openai", "gpt-4o", "growth");
+        planner.agent_id = "planner".to_string();
+        let mut writer = dims("openai", "gpt-4o", "growth");
+        writer.agent_id = "writer".to_string();
+        // Same hour, same every other dimension.
+        store
+            .fold(&[usage(t0, planner, 10, 4, 100), usage(t0, writer, 3, 1, 7)])
+            .unwrap();
+
+        let result = store
+            .query(t0 - 1, t0 + HOUR_SECS, GroupBy::Agent, t0, 90 * DAY_SECS)
+            .unwrap();
+        assert_eq!(result.buckets.len(), 2, "{:?}", result.buckets);
+        let planner_cost = result
+            .buckets
+            .iter()
+            .find(|b| b.group == "planner")
+            .expect("planner series")
+            .cost_usd_micros;
+        let writer_cost = result
+            .buckets
+            .iter()
+            .find(|b| b.group == "writer")
+            .expect("writer series")
+            .cost_usd_micros;
+        assert_eq!(planner_cost, 100);
+        assert_eq!(writer_cost, 7);
+        assert_eq!(result.totals.cost_usd_micros, 107);
+    }
+
+    #[test]
+    fn decode_tolerates_keys_without_the_origin_slot() {
+        // Rows written by builds that predate the origin dimension end
+        // after the project slot; they must decode as origin = "".
+        let with_origin = dims("openai", "gpt-4o", "growth");
+        let legacy = RollupDims {
+            origin: String::new(),
+            ..with_origin.clone()
+        };
+
+        // A legacy key is exactly the modern key minus the trailing
+        // origin slot.
+        let modern_key = encode_key(3600, &with_origin);
+        let legacy_key = modern_key[..modern_key.len() - 2 - with_origin.origin.len()].to_vec();
+
+        let (ts, decoded) = decode_key(&legacy_key).expect("legacy key must decode");
+        assert_eq!(ts, 3600);
+        assert_eq!(decoded, legacy);
+        assert_eq!(decoded.origin, "");
+
+        let (_, decoded_modern) = decode_key(&modern_key).expect("modern key must decode");
+        assert_eq!(decoded_modern, with_origin);
+    }
+
+    #[test]
+    fn group_by_origin_parses_and_groups() {
+        assert_eq!(GroupBy::parse("origin"), Some(GroupBy::Origin));
+        let d = dims("openai", "gpt-4o", "growth");
+        assert_eq!(GroupBy::Origin.key_of(&d), "ai.example");
+    }
+
+    #[test]
+    fn property_dimensions_round_trip_and_keep_the_legacy_key_prefix() {
+        let legacy = dims("openai", "gpt-4o", "growth");
+        let legacy_key = encode_key(3600, &legacy);
+        let mut promoted = legacy.clone();
+        promoted
+            .properties
+            .insert("feature".to_string(), "assistant".to_string());
+        promoted
+            .properties
+            .insert("tier".to_string(), "gold".to_string());
+
+        let key = encode_key(3600, &promoted);
+        assert!(key.starts_with(&legacy_key));
+        let (ts, decoded) = decode_key(&key).expect("property key decodes");
+        assert_eq!(ts, 3600);
+        assert_eq!(decoded, promoted);
+    }
+
+    #[test]
+    fn malformed_property_tail_does_not_hide_legacy_dimensions() {
+        let expected = dims("openai", "gpt-4o", "growth");
+        let mut key = encode_key(3600, &expected);
+        key.extend_from_slice(b"SBP1\x01\x00");
+
+        let (_, decoded) = decode_key(&key).expect("legacy dimensions still decode");
+        assert_eq!(decoded, expected);
+        assert!(decoded.properties.is_empty());
+    }
+
+    #[test]
+    fn group_by_property_parses_and_groups() {
+        let mut d = dims("openai", "gpt-4o", "growth");
+        d.properties
+            .insert("feature".to_string(), "assistant".to_string());
+        let group = GroupBy::parse("property:feature").expect("property group parses");
+        assert_eq!(group, GroupBy::Property("feature".to_string()));
+        assert_eq!(group.key_of(&d), "assistant");
+        assert!(GroupBy::parse("property:").is_none());
+        assert!(GroupBy::parse("property:bad.key").is_none());
+    }
+
+    #[test]
+    fn query_groups_by_property_and_reports_available_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RollupStore::open(&dir.path().join("r.redb")).unwrap();
+        let t0 = 1_700_000_400;
+        let mut assistant = dims("openai", "gpt-4o", "growth");
+        assistant
+            .properties
+            .insert("feature".to_string(), "assistant".to_string());
+        let mut search = dims("openai", "gpt-4o", "growth");
+        search
+            .properties
+            .insert("feature".to_string(), "search".to_string());
+        search
+            .properties
+            .insert("tier".to_string(), "gold".to_string());
+        store
+            .fold(&[usage(t0, assistant, 5, 2, 7), usage(t0, search, 3, 1, 4)])
+            .unwrap();
+
+        let result = store
+            .query(
+                t0 - 1,
+                t0 + HOUR_SECS,
+                GroupBy::Property("feature".to_string()),
+                t0,
+                90 * DAY_SECS,
+            )
+            .unwrap();
+        assert_eq!(result.property_keys, ["feature", "tier"]);
+        assert_eq!(result.buckets.len(), 2);
+        assert!(result.buckets.iter().any(|b| b.group == "assistant"));
+        assert!(result.buckets.iter().any(|b| b.group == "search"));
     }
 
     fn usage(ts: u64, d: RollupDims, tin: u64, tout: u64, cost: u64) -> RollupEvent {

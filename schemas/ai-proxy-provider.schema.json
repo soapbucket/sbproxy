@@ -34,6 +34,14 @@
         "null"
       ]
     },
+    "accept_native_credentials_for": {
+      "description": "Canonical native-provider label whose caller-owned credential this exact provider destination may receive.\n\nThis is an explicit destination trust decision. It defaults to disabled and must match `provider_type` (or `name` when no type is configured). For example, `openai` permits an OpenAI-shaped native key to replace `api_key` only for this provider entry and its effective `base_url`.",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "base_url": {
       "description": "Override the upstream base URL (defaults to the provider's well-known URL).",
       "default": null,
@@ -189,13 +197,18 @@
           ]
         },
         "cache_budget_gib": {
-          "description": "Support: config_only. Disk budget in GiB for the weight cache before GC. `None` means unbounded (operator manages the disk).",
+          "description": "Support: preview. Disk budget in GiB for the weight cache before GC. `None` means unbounded (operator manages the disk). Collection runs after `models pull` and on demand through the authenticated `POST /admin/model-host/gc` route.",
           "default": null,
           "type": [
             "number",
             "null"
           ],
           "format": "double"
+        },
+        "allow_unpinned_refs": {
+          "description": "Support: preview. Permit unpinned raw `hf:` references on a node that holds the `worker` cluster role. Defaults to `false`.\n\nA raw reference runs the engine in repo mode, which gives up three protections a pinned catalog artifact gets: the container runs on the default bridge with DNS and external egress instead of an `--internal` network, the Hugging Face cache is mounted writable instead of read-only, and the launch-time trust and file-map checks are skipped because there are no local bytes to verify. No digest is ever computed for those weights, so the pull policy, offline mode, and digest-failure contract cover nothing on that path.\n\nThat trade is right for `sbproxy run <model>` on a workstation and for evaluating a model with no catalog entry yet. It is a poor fit for a long-lived fleet worker holding cluster identity, so the startup gate refuses it there unless this is set. Nodes without the worker role are unaffected either way.",
+          "default": false,
+          "type": "boolean"
         },
         "eviction": {
           "description": "What to do under VRAM pressure. Defaults to LRU eviction.",
@@ -307,8 +320,16 @@
             }
           ]
         },
+        "enable_prefix_caching": {
+          "description": "Support: preview. Enable vLLM's automatic prefix caching, reusing already-computed KV blocks across requests that share a prompt prefix. `None` leaves the engine default (off) in place.",
+          "default": null,
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "speculative": {
-          "description": "Support: preview. Speculative decoding. `None` disables it.",
+          "description": "Support: preview. Speculative decoding. The vLLM driver emits the engine's speculation flags; the managed reconcile path accepts n-gram speculation (needs no extra model) on a vLLM engine, but rejects draft-model speculation until its VRAM-headroom check (`fit::resolve_speculative_config`) is wired into a real prepare-time call site. `None` disables it.",
           "default": null,
           "anyOf": [
             {
@@ -332,7 +353,7 @@
           ]
         },
         "lora_adapters": {
-          "description": "Support: preview. LoRA adapters served over this base model.",
+          "description": "Support: preview. LoRA adapters served over this base model on the vLLM engine (WOR-1945): each becomes a `--lora-modules <name>=<source>` alongside `--enable-lora`, so a client requests the adapter by name over one resident base. An `hf:Org/Repo` source is handed to vLLM as the repo id (resolved from the Hub or the mounted cache); a local path passes through. Requires `engine: vllm`.",
           "default": [],
           "type": "array",
           "items": {
@@ -353,7 +374,7 @@
           ]
         },
         "swap_space_gib": {
-          "description": "Support: preview. CPU KV-cache tier size in GiB (WOR-1687): vLLM's `--swap-space`, the CPU pool it spills GPU KV blocks to under pressure so a longer effective context / larger batch survives beyond GPU VRAM. `None` uses the engine default.",
+          "description": "Support: preview. CPU swap pool size in GiB: vLLM's `--swap-space`. `None` uses the engine default.",
           "default": null,
           "type": [
             "integer",
@@ -363,7 +384,7 @@
           "minimum": 0.0
         },
         "cpu_offload_gib": {
-          "description": "Support: preview. GiB of model weights to keep in CPU RAM (WOR-1687): vLLM's `--cpu-offload-gb`, trading PCIe bandwidth for VRAM so a model that does not fit can still load. `None` disables offload.",
+          "description": "Support: preview. GiB of model weights to keep in CPU RAM: vLLM's `--cpu-offload-gb`, trading PCIe bandwidth for VRAM so a model that does not fit can still load. `None` disables offload.",
           "default": null,
           "type": [
             "integer",
@@ -373,7 +394,7 @@
           "minimum": 0.0
         },
         "max_loras": {
-          "description": "Support: preview. Max LoRA adapters resident on the engine at once (WOR-1673). When set below the number of configured `lora_adapters`, the engine loads adapters on demand and evicts the least-recently used past this cap (dynamic paging), rather than preloading all of them. `None` preloads every configured adapter (static), which suits a small, fixed adapter set.",
+          "description": "Support: preview. Max LoRA adapters resident on the engine at once (WOR-1945): vLLM's `--max-loras`. When set below the number of configured `lora_adapters`, the engine loads adapters on demand and evicts the least-recently used past this cap (dynamic paging), rather than preloading all of them. `None` preloads every configured adapter (static), which suits a small, fixed adapter set.",
           "default": null,
           "type": [
             "integer",
@@ -388,6 +409,28 @@
           "type": [
             "string",
             "null"
+          ]
+        },
+        "reference": {
+          "description": "The hosted model this local model displaces (WOR-1913). When set, every completion served locally is priced at what this reference would have charged and counted toward the dollars-saved value report (`GET /admin/model-host/value`). Omit it to make no savings claim: sbproxy never guesses a cloud reference price.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ReferenceModel"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "modality": {
+          "description": "The task this served model performs (WOR-1908 / WOR-1675). A catalog entry carries its own modality, but a raw `hf:Org/Repo` reference has none, so declare it here to serve an embedding or rerank model: it drives the engine's runtime-owned `--task` flag (vLLM `embed` / `score`) and zeroes the KV-cache term in the fit. Defaults to chat (autoregressive generation) when omitted. Support: preview.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Modality"
+            },
+            {
+              "type": "null"
+            }
           ]
         }
       }
@@ -410,6 +453,13 @@
           ]
         },
         {
+          "description": "Force SGLang (WOR-1905). `Auto` never resolves to this: SGLang is an explicit opt-in that stays behind vLLM as the safetensors default until it is certified on real hardware.",
+          "type": "string",
+          "enum": [
+            "sglang"
+          ]
+        },
+        {
           "description": "Force llama.cpp.",
           "type": "string",
           "enum": [
@@ -417,10 +467,10 @@
           ]
         },
         {
-          "description": "Force the in-process embedded engine (WOR-1658). `Auto` never resolves to this; the embedded engine is an explicit opt-in because it changes the deployment model (no subprocess) and is only present when the `embedded` feature is compiled.",
+          "description": "Force mistral.rs (WOR-1861). `Auto` never resolves to this: mistral.rs is an explicit opt-in that stays behind vLLM (safetensors) and llama.cpp (GGUF) until it has certification mileage, and the planner must not prefer it for large MoE prefill workloads.",
           "type": "string",
           "enum": [
-            "embedded"
+            "mistralrs"
           ]
         }
       ]
@@ -557,6 +607,80 @@
           "type": "string"
         }
       }
+    },
+    "ReferenceModel": {
+      "description": "The explicitly-configured cloud model a local model displaces (WOR-1913). Its per-million-token prices value every local completion at what the equivalent hosted API would have charged, which is the dollars-saved number that justifies the GPU. There is no default and no guessing: without a `reference:` a served model makes no savings claim.",
+      "type": "object",
+      "required": [
+        "completion_micros_per_mtok",
+        "model",
+        "prompt_micros_per_mtok"
+      ],
+      "properties": {
+        "model": {
+          "description": "The hosted model whose price this local model displaces, for display in the value report (e.g. `gpt-4o`). Not resolved against the catalog; it names the cloud API the saving is measured against.",
+          "type": "string"
+        },
+        "prompt_micros_per_mtok": {
+          "description": "Micro-USD per 1e6 prompt tokens the reference model charges.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "completion_micros_per_mtok": {
+          "description": "Micro-USD per 1e6 completion tokens the reference model charges.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "Modality": {
+      "description": "The task a served model performs (WOR-1908).\n\nA catalog is chat-only today, but the model host must be able to express an embedder, a reranker, and the other non-chat surfaces so the fit planner, engine launch, and capability negotiation branch on the actual task rather than assuming autoregressive chat. Only [`Modality::Chat`] decodes token by token and holds a KV cache; every other modality is a single forward pass. Defaults to `Chat`, so a pre-modality catalog entry parses and behaves exactly as before.",
+      "oneOf": [
+        {
+          "description": "Autoregressive chat / text generation (the default). Decodes one token at a time and accumulates a KV cache.",
+          "type": "string",
+          "enum": [
+            "chat"
+          ]
+        },
+        {
+          "description": "Text embeddings: one forward pass to a vector, no KV cache.",
+          "type": "string",
+          "enum": [
+            "embedding"
+          ]
+        },
+        {
+          "description": "Reranking / scoring: one forward pass to a relevance score.",
+          "type": "string",
+          "enum": [
+            "rerank"
+          ]
+        },
+        {
+          "description": "Speech to text (transcription).",
+          "type": "string",
+          "enum": [
+            "speech_to_text"
+          ]
+        },
+        {
+          "description": "Text to speech (synthesis).",
+          "type": "string",
+          "enum": [
+            "text_to_speech"
+          ]
+        },
+        {
+          "description": "Image generation.",
+          "type": "string",
+          "enum": [
+            "image"
+          ]
+        }
+      ]
     },
     "EvictionPolicy": {
       "description": "What to do when VRAM is needed and an idle model is resident.",

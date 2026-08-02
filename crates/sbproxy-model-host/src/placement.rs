@@ -103,6 +103,24 @@ pub enum PlacementRejectionReason {
     ArtifactNotReady,
 }
 
+impl PlacementRejectionReason {
+    /// Stable snake-case reason code shared by metrics and diagnostics.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotWorker => "not_worker",
+            Self::NodeUnhealthy => "node_unhealthy",
+            Self::RequiredLabels => "required_labels",
+            Self::MissingEndpoint => "missing_endpoint",
+            Self::NoCapacity => "no_capacity",
+            Self::VariantIncompatible => "variant_incompatible",
+            Self::AcceleratorIncompatible => "accelerator_incompatible",
+            Self::InsufficientMemory => "insufficient_memory",
+            Self::EngineUnavailable => "engine_unavailable",
+            Self::ArtifactNotReady => "artifact_not_ready",
+        }
+    }
+}
+
 /// One exact deterministic replica assignment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlacementAssignment {
@@ -349,6 +367,7 @@ fn evaluate_variant(
         entry.context_length,
         &entry.license,
         entry.allow_pickle,
+        entry.modality,
     )
     .map_err(|_| PlacementRejectionReason::VariantIncompatible)?;
     let artifact_cached = node.artifacts.iter().any(|artifact| {
@@ -458,8 +477,9 @@ fn select_engine(
     let explicit = match choice {
         EngineChoice::Auto => None,
         EngineChoice::Vllm => Some(EngineKind::Vllm),
+        EngineChoice::SGLang => Some(EngineKind::SGLang),
         EngineChoice::LlamaCpp => Some(EngineKind::LlamaCpp),
-        EngineChoice::Embedded => Some(EngineKind::Embedded),
+        EngineChoice::MistralRs => Some(EngineKind::MistralRs),
     };
     let mut engines = variant.engines.clone();
     engines.sort();

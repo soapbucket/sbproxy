@@ -1,0 +1,47 @@
+# Stack for the `ai-rag-local` example. Two containers on one bridge
+# network:
+#
+#   sbproxy      - the gateway, mounts ./sb.yml read-only on :8080
+#   rag-fixture  - python stdlib fixture on :8090 serving deterministic
+#                  embeddings, a Qdrant-compatible query endpoint, and
+#                  an OpenAI-compatible chat endpoint (see fixture.py)
+#
+# Bring up:    docker compose up -d --wait
+# Validate:    docker compose config
+# Tear down:   docker compose down -v
+
+services:
+
+  sbproxy:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.cloudbuild
+    image: sbproxy-ai-rag-local:local
+    command: ["serve", "-f", "/etc/sbproxy/sb.yml"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./sb.yml:/etc/sbproxy/sb.yml:ro
+    depends_on:
+      rag-fixture:
+        condition: service_healthy
+    networks:
+      - ragsb
+
+  rag-fixture:
+    image: python:3-slim
+    command: ["python3", "/fixture.py"]
+    volumes:
+      - ./fixture.py:/fixture.py:ro
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 2s
+    networks:
+      - ragsb
+
+networks:
+  ragsb:
+    driver: bridge

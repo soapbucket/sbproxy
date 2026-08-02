@@ -235,6 +235,7 @@ mod tests {
             outbound_credential: None,
             outbound_web_bot_auth: false,
             observability: None,
+            attestation: None,
         };
         let mut host_map = HashMap::new();
         host_map.insert(CompactString::new(hostname), 0);
@@ -250,6 +251,7 @@ mod tests {
             rate_limits: None,
             audit: None,
             session_ledger: None,
+            flags: Vec::new(),
         };
         let pipeline = crate::pipeline::CompiledPipeline::from_config(compiled)
             .expect("static origin pipeline compiles");

@@ -11,14 +11,27 @@
 #       incl. the serve: block (WOR-1686). Kept separate from the top
 #       level because origins[].action is a deliberately opaque
 #       polymorphic node (see the generator's module docs).
+#   schemas/ai-compression.schema.json <- sbproxy-ai CompressionPolicy
+#   schemas/ai-external-guardrail.schema.json <- sbproxy-ai ExternalGuardrailConfig
+#   schemas/ai-rag.schema.json <- sbproxy-ai RagRouteConfig (the rag: block
+#       of an ai_proxy action)
+#   schemas/ai-semantic-cache.schema.json <- sbproxy-ai EmbeddingCacheConfig
+#       (the semantic_cache: block of an ai_proxy action)
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+
+# shellcheck source=scripts/lib/workspace-bin.sh
+. "$(dirname "$0")/lib/workspace-bin.sh"
 
 # schema file : "cargo run" args that regenerate it
 schemas=(
     "schemas/sb-config.schema.json|-p sbproxy-config --bin generate-schema"
     "schemas/ai-proxy-provider.schema.json|-p sbproxy-ai --bin generate-ai-provider-schema"
+    "schemas/ai-compression.schema.json|-p sbproxy-ai --bin generate-ai-compression-schema"
+    "schemas/ai-external-guardrail.schema.json|-p sbproxy-ai --bin generate-ai-external-guardrail-schema"
+    "schemas/ai-rag.schema.json|-p sbproxy-ai --bin generate-ai-rag-schema"
+    "schemas/ai-semantic-cache.schema.json|-p sbproxy-ai --bin generate-ai-semantic-cache-schema"
 )
 
 GENERATED=$(mktemp)
@@ -28,8 +41,9 @@ status=0
 for entry in "${schemas[@]}"; do
     file="${entry%%|*}"
     args="${entry#*|}"
+    bin_name="${args##*--bin }"
     # shellcheck disable=SC2086
-    cargo run --quiet $args >"$GENERATED"
+    run_workspace_bin "$bin_name" $args >"$GENERATED"
     if diff -u "$file" "$GENERATED" >/dev/null; then
         echo "$file is up to date."
     else

@@ -9,9 +9,40 @@
 # Every publish-side job is guarded by
 # `if: github.repository == 'soapbucket/sbproxy'` so the workflow stays
 # inert on forks.
+#
+# Model-host certification gate (WOR-1858): `certify-model-host-*`
+# below run scripts/certify-model-host.sh and the deterministic
+# model-host DoD suite on every release tag and dispatch, and the
+# `release` / `image` publish jobs `needs` both. Before WOR-1858,
+# certify-model-host.sh was a script a human had to remember to run by
+# hand against a provisioned GPU box; nothing stopped a release from
+# shipping with zero executable hardware evidence. Arming it here means
+# a failing lane blocks the draft release and the image push, not just
+# a stale doc claim.
+#
+# certify-model-host-apple-silicon runs the real DoD checklist (cold
+# completion, warm completion, kill -9 recovery) against a real
+# `sbproxy run` + managed llama-server on the runner's own Apple
+# Silicon GPU (macos-14 runners are M-series hardware, not emulated).
+# NVIDIA single/multi-GPU certification is NOT included: no
+# GitHub-hosted runner has a GPU, and this repository has no
+# self-hosted GPU runner registered today. Per docs/model-host-capabilities.md,
+# engine.vllm_uv, engine.vllm_container, platform.nvidia_cuda, and
+# cluster.remote_dispatch stay `preview` until a GPU runner exists and
+# a lane is added here to certify them; that is tracked as a follow-up
+# to WOR-1858, not silently claimed as covered by this workflow.
 
 name: release
 
+# No `schedule:` trigger here, deliberately. The `release` and `image`
+# publish jobs are guarded by `github.repository` and `!inputs.dry_run`
+# but NOT by a tag-ref condition, so a scheduled run (which executes on
+# the default branch with empty `inputs`) would attempt to sign and
+# publish from a branch ref. Until the publish jobs gain a
+# `startsWith(github.ref, 'refs/tags/')` guard, on-demand coverage of
+# the build and certification lanes comes from `workflow_dispatch`
+# with `dry_run: true`; the nightly rot check for tag-only lanes lives
+# in e2e.yml and release-checks.yml instead.
 on:
   push:
     tags:
@@ -38,6 +69,14 @@ jobs:
   build:
     name: build / ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
+    # Linux builds run inside a rust:bookworm container so the binaries
+    # link against glibc 2.36, the floor shared by the distroless
+    # cc-debian12 Docker base and Debian-12-era hosts. Building directly
+    # on the runner links against the runner's glibc (ubuntu-24.04 =
+    # 2.39), which produced Docker images that could not start at all:
+    # "version `GLIBC_2.39' not found". The `container` value is empty
+    # for macOS, which GitHub treats as "no container".
+    container: ${{ matrix.container }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -46,9 +85,11 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             platform: linux_amd64
+            container: rust:1.97-bookworm
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             platform: linux_arm64
+            container: rust:1.97-bookworm
           - target: aarch64-apple-darwin
             runner: macos-latest
             platform: darwin_arm64
@@ -62,7 +103,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # Linux jobs take their toolchain from the pinned rust:bookworm
+      # container image; installing another one via rustup would only
+      # reintroduce drift. macOS still needs the action.
       - uses: dtolnay/rust-toolchain@stable
+        if: runner.os == 'macOS'
         with:
           targets: ${{ matrix.target }}
 
@@ -82,8 +127,11 @@ jobs:
           set -euo pipefail
           case "${RUNNER_OS}" in
             Linux)
-              sudo apt-get update
-              sudo apt-get install -y protobuf-compiler libclang-dev clang
+              # Inside the rust:bookworm container we are root and sudo
+              # does not exist; on a bare runner we are not and it does.
+              SUDO="$(command -v sudo || true)"
+              ${SUDO} apt-get update
+              ${SUDO} apt-get install -y protobuf-compiler libclang-dev clang cmake nasm
               ;;
             macOS)
               brew install protobuf
@@ -107,6 +155,24 @@ jobs:
       - name: build release binary
         run: cargo build --release --locked --target ${{ matrix.target }} --bin sbproxy --features embed-admin-ui
 
+      # Contract: linux binaries must not require a glibc newer than the
+      # distroless cc-debian12 runtime base (2.36), or the Docker image
+      # dies on startup and the tarball only runs on 2026-era distros.
+      - name: assert glibc baseline (linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/sbproxy"
+          MAX_ALLOWED="2.36"
+          NEEDED="$(objdump -T "${BIN}" | grep -o 'GLIBC_2\.[0-9]*' | sort -uV | tail -1 | cut -d_ -f2)"
+          echo "highest glibc symbol version required: ${NEEDED} (allowed: <= ${MAX_ALLOWED})"
+          HIGHEST="$(printf '%s\n%s\n' "${NEEDED}" "${MAX_ALLOWED}" | sort -V | tail -1)"
+          if [ "${HIGHEST}" != "${MAX_ALLOWED}" ]; then
+            echo "::error::binary requires GLIBC_${NEEDED} > ${MAX_ALLOWED}; it will not start on the distroless cc-debian12 image. Build inside the pinned rust:bookworm container."
+            exit 1
+          fi
+
       - name: package tarball
         shell: bash
         run: |
@@ -118,10 +184,16 @@ jobs:
           cp LICENSE NOTICE README.md SECURITY.md SUPPLY-CHAIN.md "${STAGE}/" 2>/dev/null || true
           # Pack the CONTENTS of the staging dir (binary, license, readme)
           # so the tarball extracts to a flat layout: sbproxy + LICENSE etc.
-          # at root. Matches the Go v0.1.x convention so install.sh and
-          # the Homebrew formula find the binary at the expected path.
+          # at root so install.sh and the Homebrew formula find the binary
+          # at the expected path.
           tar -czf "dist/sbproxy_${{ matrix.platform }}.tar.gz" -C "${STAGE}" .
-          (cd dist && shasum -a 256 "sbproxy_${{ matrix.platform }}.tar.gz" > "sbproxy_${{ matrix.platform }}.tar.gz.sha256")
+          # sha256sum on Linux (present in the rust:bookworm container),
+          # shasum on macOS; both emit the same "HASH  filename" shape.
+          if command -v sha256sum >/dev/null; then
+            (cd dist && sha256sum "sbproxy_${{ matrix.platform }}.tar.gz" > "sbproxy_${{ matrix.platform }}.tar.gz.sha256")
+          else
+            (cd dist && shasum -a 256 "sbproxy_${{ matrix.platform }}.tar.gz" > "sbproxy_${{ matrix.platform }}.tar.gz.sha256")
+          fi
 
       - name: upload artifact
         uses: actions/upload-artifact@v5
@@ -152,10 +224,381 @@ jobs:
           path: sbom.cyclonedx.json
           retention-days: 7
 
+  certify-model-host-deterministic:
+    name: model-host certification / deterministic gate (WOR-1858)
+    # Arms the "Deterministic gate" from docs/model-host-certification.md
+    # as a required release check. These suites need no GPU: they prove
+    # immutable artifact selection, process argv, container isolation,
+    # source-build publication, per-device capacity, bounded queue
+    # behavior, atomic rollback, status shape, and CLI contracts. They
+    # cannot prove a driver loads a model or returns tokens on real
+    # hardware; certify-model-host-apple-silicon below covers that.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: certify-model-host-deterministic
+
+      - name: install protoc and libclang
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libclang-dev clang
+
+      # The model_cluster_control / model_cluster_dispatch e2e suites
+      # spawn target/debug/sbproxy at runtime; build it before the test
+      # step below so they do not fail with "release binary missing".
+      - name: build sbproxy binary (needed by e2e harness)
+        run: cargo build -p sbproxy --locked
+
+      - name: record version metadata
+        run: |
+          set -euo pipefail
+          echo "git revision: $(git rev-parse HEAD)"
+          echo "git ref:      ${GITHUB_REF_NAME}"
+          echo "runner:       $(uname -srm)"
+
+      - name: deterministic model-host DoD suite
+        run: |
+          set -euo pipefail
+          cargo test -p sbproxy-model-host --test engine_drivers --locked
+          cargo test -p sbproxy-model-host --test cuda_build --locked
+          cargo test -p sbproxy-model-host --test runtime_reconcile --locked
+          cargo test -p sbproxy-model-host --test local_admission --locked
+          cargo test -p sbproxy-core --test model_host_reload --locked
+          cargo test -p sbproxy --test models_lifecycle_cli --locked
+          cargo test -p sbproxy-model-host --test placement --locked
+          cargo test -p sbproxy-model-host --test capability_contract --locked
+          cargo test -p sbproxy-ai --test managed_replica_routing --locked
+          cargo test -p sbproxy-core --test cluster_control_plane --locked
+          cargo test -p sbproxy-core --test model_plane_envelope --test model_plane_transport --test managed_replica_dispatch --locked
+          SBPROXY_E2E_BIN="${PWD}/target/debug/sbproxy" cargo test -p sbproxy-e2e --test model_cluster_control --locked -- --nocapture
+          SBPROXY_E2E_BIN="${PWD}/target/debug/sbproxy" cargo test -p sbproxy-e2e --test model_cluster_dispatch --locked -- --nocapture
+
+  certify-model-host-apple-silicon:
+    # Blocking since the v1.9.0 cycle. The lane's two historical failure
+    # modes are both fixed: the pinned llama-server refusing the hosted
+    # macos-14 runner (resolved by the runner-compat pin fix) and the
+    # kill -9 recovery check timing out because Failed was a terminal
+    # state (resolved by auto-relaunch on the request path). Three
+    # consecutive live runs passed on 2026-07-28 before the flip.
+    name: model-host certification / Apple Silicon (WOR-1858)
+    # Arms scripts/certify-model-host.sh as a required release check by
+    # running it for real: boots `sbproxy run` with a managed
+    # llama-server on the runner's own Apple Silicon GPU, then drives a
+    # cold completion, a warm completion, engine kill -9 recovery,
+    # gateway SIGKILL/restart ownership recovery, final SIGTERM
+    # engine/listener cleanup, and the real launchd service-uninstall
+    # lifecycle. This is the same procedure previously
+    # recorded by hand in docs/model-host-certification.md's "Apple
+    # Metal gate for this PR" section; it now runs on every release
+    # instead of relying on a human to run it before merging a PR.
+    #
+    # `sbproxy run <model>` synthesizes a config with origins
+    # "127.0.0.1" and "localhost" only (crates/sbproxy/src/main.rs
+    # prepare_run()); it does not recognize the "ai.local" hostname
+    # certify-model-host.sh defaults to for `serve:`-block deployments,
+    # so SB_HOST is pinned to 127.0.0.1 below to match.
+    runs-on: macos-14
+    # The release-profile build (fat LTO) alone can exceed 30 minutes on
+    # a cold macOS runner cache; certification needs headroom on top.
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: certify-model-host-apple-silicon
+
+      # sbproxy-classifier-proto's build script requires protoc; macOS
+      # runners do not ship it, unlike the preprovisioned Linux images.
+      - name: install protoc
+        run: brew install protobuf
+
+      - name: build release binary
+        run: cargo build --release -p sbproxy --locked
+
+      - name: record version metadata
+        run: |
+          set -euo pipefail
+          echo "git revision: $(git rev-parse HEAD)"
+          echo "git ref:      ${GITHUB_REF_NAME}"
+          sw_vers
+          uname -srm
+          sysctl -n machdep.cpu.brand_string || true
+
+      - name: boot sbproxy and certify against it
+        env:
+          MODEL: qwen2.5-0.5b-instruct
+        run: |
+          set -uo pipefail
+          # Fixed path (not mktemp) so the diagnostics step below can
+          # find the model-host's durable operation job records after
+          # a failure.
+          CACHE_DIR="/tmp/sbproxy-cert-cache"
+          mkdir -p "${CACHE_DIR}"
+          OWNERSHIP_DIR="${RUNNER_TEMP}/sbproxy-cert-ownership-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "${OWNERSHIP_DIR}"
+          chmod 700 "${OWNERSHIP_DIR}"
+          export SBPROXY_ENGINE_OWNERSHIP_DIR="${OWNERSHIP_DIR}"
+          SB_PID=""
+          SERVICE_ATTEMPTED=0
+
+          ownership_pid() {
+            python3 - "${OWNERSHIP_DIR}" <<'PY'
+          import glob, json, os, sys
+          records = sorted(glob.glob(os.path.join(sys.argv[1], "*.json")), key=os.path.getmtime)
+          if records:
+              with open(records[-1]) as handle:
+                  print(json.load(handle)["engine"]["pid"])
+          PY
+          }
+
+          wait_ready() {
+            local pid="$1" attempts="$2"
+            for _ in $(seq 1 "${attempts}"); do
+              if curl -sf -o /dev/null "http://127.0.0.1:48123/v1/models"; then
+                return 0
+              fi
+              kill -0 "${pid}" 2>/dev/null || return 1
+              sleep 2
+            done
+            return 1
+          }
+
+          wait_exit() {
+            local pid="$1" attempts="$2"
+            for _ in $(seq 1 "${attempts}"); do
+              kill -0 "${pid}" 2>/dev/null || return 0
+              sleep 1
+            done
+            return 1
+          }
+
+          start_sbproxy() {
+            local log="$1"
+            ./target/release/sbproxy run "${MODEL}" \
+              --variant q4_k_m \
+              --cache-dir "${CACHE_DIR}" \
+              --port 48123 \
+              --admin-port 48124 \
+              > "${log}" 2>&1 &
+            SB_PID=$!
+          }
+
+          cleanup() {
+            if [ "${SERVICE_ATTEMPTED}" -eq 1 ]; then
+              ./target/release/sbproxy service uninstall >/dev/null 2>&1 || true
+            fi
+            if [ -n "${SB_PID}" ] && kill -0 "${SB_PID}" 2>/dev/null; then
+              kill -TERM "${SB_PID}" 2>/dev/null || true
+              wait_exit "${SB_PID}" 15 || kill -9 "${SB_PID}" 2>/dev/null || true
+            fi
+            local engine_pid
+            engine_pid="$(ownership_pid 2>/dev/null || true)"
+            if [ -n "${engine_pid}" ] && kill -0 "${engine_pid}" 2>/dev/null; then
+              kill -TERM "${engine_pid}" 2>/dev/null || true
+              sleep 1
+              kill -9 "${engine_pid}" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+
+          start_sbproxy /tmp/sbproxy-cert-boot.log
+
+          # Wait for the HTTP port to accept connections. This only
+          # proves the process is up; certify-model-host.sh's own
+          # cold-call timeout (600s) separately absorbs the time to
+          # load the model on first request.
+          if ! wait_ready "${SB_PID}" 60; then
+            echo "sbproxy never opened :48123" >&2
+            cat /tmp/sbproxy-cert-boot.log >&2 || true
+            exit 1
+          fi
+
+          # Derive the supervised engine from sbproxy's exact durable
+          # ownership record, never from an executable-name sweep.
+          ENGINE_PID=""
+          for _ in $(seq 1 60); do
+            ENGINE_PID="$(ownership_pid 2>/dev/null || true)"
+            [ -n "${ENGINE_PID}" ] && break
+            sleep 1
+          done
+          if [ -z "${ENGINE_PID}" ]; then
+            echo "managed engine ownership record was not published" >&2
+            exit 1
+          fi
+
+          set +e
+          SB_URL="http://127.0.0.1:48123" SB_HOST=127.0.0.1 MODEL="${MODEL}" \
+            ENGINE_PID="${ENGINE_PID}" \
+            bash scripts/certify-model-host.sh
+          CERT_STATUS=$?
+          set -e
+          if [ "${CERT_STATUS}" -ne 0 ]; then
+            exit "${CERT_STATUS}"
+          fi
+
+          # SIGKILL the gateway, then start the same managed run again.
+          # The replacement must reap the exact old engine identity before
+          # it launches a new one.
+          ORPHAN_ENGINE_PID="$(ownership_pid)"
+          kill -9 "${SB_PID}"
+          wait "${SB_PID}" 2>/dev/null || true
+          SB_PID=""
+          start_sbproxy /tmp/sbproxy-cert-restart.log
+          if ! wait_ready "${SB_PID}" 90; then
+            echo "replacement sbproxy never became ready" >&2
+            cat /tmp/sbproxy-cert-restart.log >&2 || true
+            exit 1
+          fi
+          REPLACEMENT_ENGINE_PID=""
+          for _ in $(seq 1 60); do
+            REPLACEMENT_ENGINE_PID="$(ownership_pid 2>/dev/null || true)"
+            if [ -n "${REPLACEMENT_ENGINE_PID}" ] \
+              && [ "${REPLACEMENT_ENGINE_PID}" != "${ORPHAN_ENGINE_PID}" ]; then
+              break
+            fi
+            sleep 1
+          done
+          if kill -0 "${ORPHAN_ENGINE_PID}" 2>/dev/null; then
+            echo "replacement left exact orphan engine pid ${ORPHAN_ENGINE_PID} alive" >&2
+            exit 1
+          fi
+          if [ -z "${REPLACEMENT_ENGINE_PID}" ] \
+            || [ "${REPLACEMENT_ENGINE_PID}" = "${ORPHAN_ENGINE_PID}" ]; then
+            echo "replacement engine ownership was not refreshed" >&2
+            exit 1
+          fi
+
+          # Final SIGTERM must reap the replacement engine, clear its record,
+          # and release the public listener for an immediate restart.
+          kill -TERM "${SB_PID}"
+          if ! wait_exit "${SB_PID}" 60; then
+            echo "sbproxy ignored SIGTERM" >&2
+            exit 1
+          fi
+          wait "${SB_PID}" 2>/dev/null || true
+          SB_PID=""
+          if kill -0 "${REPLACEMENT_ENGINE_PID}" 2>/dev/null; then
+            echo "SIGTERM left engine pid ${REPLACEMENT_ENGINE_PID} alive" >&2
+            exit 1
+          fi
+          if find "${OWNERSHIP_DIR}" -name '*.json' -print -quit | grep -q .; then
+            echo "SIGTERM left a managed-engine ownership record behind" >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          import socket
+          sock = socket.socket()
+          sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          sock.bind(("0.0.0.0", 48123))
+          sock.close()
+          PY
+
+          # Exercise the operator-facing launchd lifecycle itself. The
+          # service starts from a sparse launchd environment, so publish
+          # the exact ownership directory through its supported env file.
+          SERVICE_ENV="${HOME}/Library/Application Support/sbproxy/service/env"
+          mkdir -p "$(dirname "${SERVICE_ENV}")"
+          printf 'SBPROXY_ENGINE_OWNERSHIP_DIR=%s\n' "${OWNERSHIP_DIR}" > "${SERVICE_ENV}"
+          chmod 600 "${SERVICE_ENV}"
+          # From this point on, neither the launchd service nor the uninstall
+          # command may inherit the direct-run override from this shell. The
+          # service env file is the only source of the ownership directory.
+          unset SBPROXY_ENGINE_OWNERSHIP_DIR
+          SERVICE_ATTEMPTED=1
+          ./target/release/sbproxy service install "${MODEL}" \
+            --variant q4_k_m \
+            --cache-dir "${CACHE_DIR}" \
+            --port 48123 \
+            --admin-port 48124 \
+            > /tmp/sbproxy-cert-service-install.log
+
+          SERVICE_READY=0
+          for _ in $(seq 1 90); do
+            if ./target/release/sbproxy service status >/dev/null 2>&1 \
+              && curl -sf -o /dev/null "http://127.0.0.1:48123/v1/models"; then
+              SERVICE_READY=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "${SERVICE_READY}" -ne 1 ]; then
+            echo "launchd service never became ready" >&2
+            cat "${HOME}/Library/Logs/sbproxy/service.err.log" >&2 || true
+            exit 1
+          fi
+          SERVICE_ENGINE_PID="$(ownership_pid)"
+          if [ -z "${SERVICE_ENGINE_PID}" ]; then
+            echo "launchd service did not publish managed-engine ownership" >&2
+            exit 1
+          fi
+
+          ./target/release/sbproxy service uninstall --format json \
+            > /tmp/sbproxy-cert-service-uninstall.json
+          SERVICE_ATTEMPTED=0
+          if ./target/release/sbproxy service status >/dev/null 2>&1; then
+            echo "service uninstall left the launchd agent running" >&2
+            exit 1
+          fi
+          if ! wait_exit "${SERVICE_ENGINE_PID}" 15; then
+            echo "service uninstall left engine pid ${SERVICE_ENGINE_PID} alive" >&2
+            exit 1
+          fi
+          if find "${OWNERSHIP_DIR}" -name '*.json' -print -quit | grep -q .; then
+            echo "service uninstall left a managed-engine ownership record behind" >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          import socket
+          sock = socket.socket()
+          sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          sock.bind(("0.0.0.0", 48123))
+          sock.close()
+          PY
+
+      # The engine's bounded stderr tail is what an engine_early_exit
+      # failure tells the operator to inspect. The model-host keeps
+      # that tail in memory only and the engine supervisor logs it into
+      # the proxy log on every failed launch attempt, so the boot log
+      # must ship in the artifact in full, alongside the durable
+      # operation job records (launch/load outcomes with reason and
+      # remediation) from the model-host cache dir.
+      - name: collect certification diagnostics
+        if: always()
+        run: |
+          set -uo pipefail
+          OUT="/tmp/sbproxy-cert-artifacts"
+          mkdir -p "${OUT}"
+          # Full proxy boot log, bounded only against pathological
+          # growth (engine stderr tails are <= 8 KiB each).
+          if [ -f /tmp/sbproxy-cert-boot.log ]; then
+            tail -c 8388608 /tmp/sbproxy-cert-boot.log > "${OUT}/sbproxy-cert-boot.log"
+          fi
+          # Durable model-host operation job records (<cache>/jobs/*.json).
+          find /tmp/sbproxy-cert-cache -type d -name jobs 2>/dev/null | while read -r dir; do
+            mkdir -p "${OUT}/jobs"
+            cp "${dir}"/*.json "${OUT}/jobs/" 2>/dev/null || true
+          done
+          ls -la "${OUT}" || true
+
+      - name: upload certification diagnostics
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: model-host-cert-apple-silicon-log
+          path: /tmp/sbproxy-cert-artifacts/
+          retention-days: 14
+
   release:
     name: publish release
     if: github.repository == 'soapbucket/sbproxy' && !inputs.dry_run
-    needs: [build, sbom]
+    needs: [build, sbom, certify-model-host-deterministic, certify-model-host-apple-silicon]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -204,17 +647,30 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Draft notes are the tagged version's CHANGELOG section, not
+          # the whole file: GitHub caps release bodies at 125k
+          # characters and the full CHANGELOG passed that at v1.9.0.
+          version="${GITHUB_REF_NAME#v}"
+          awk -v ver="$version" '
+            $0 ~ "^## \\[" ver "\\]" { on = 1; print; next }
+            on && /^## \[/ { exit }
+            on { print }
+          ' CHANGELOG.md > /tmp/release-notes.md
+          if ! [ -s /tmp/release-notes.md ]; then
+            echo "no CHANGELOG section found for ${version}" >&2
+            exit 1
+          fi
           gh release create "${GITHUB_REF_NAME}" \
             --repo "${GITHUB_REPOSITORY}" \
             --title "${GITHUB_REF_NAME}" \
-            --notes-file CHANGELOG.md \
+            --notes-file /tmp/release-notes.md \
             --draft \
             dist/*
 
   image:
     name: publish container image
     if: github.repository == 'soapbucket/sbproxy' && !inputs.dry_run
-    needs: [build, sbom]
+    needs: [build, sbom, certify-model-host-deterministic, certify-model-host-apple-silicon]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -253,12 +709,20 @@ jobs:
           mv stage/arm64/sbproxy docker-ctx/linux/arm64/sbproxy
           chmod +x docker-ctx/linux/*/sbproxy
           cp artifacts/sbom/sbom.cyclonedx.json docker-ctx/sbom.cyclonedx.json
+          # Staged empty dir: distroless has no shell, so the writable
+          # state directory must arrive via COPY from the build context.
+          mkdir -p docker-ctx/var/lib/sbproxy
           cat > docker-ctx/Dockerfile <<'EOF'
           # syntax=docker/dockerfile:1.7
           FROM gcr.io/distroless/cc-debian12:nonroot
           ARG TARGETOS
           ARG TARGETARCH
           COPY ${TARGETOS}/${TARGETARCH}/sbproxy /usr/local/bin/sbproxy
+          # /var/lib/sbproxy must exist and be writable by the nonroot
+          # runtime user (uid 65532): the documented defaults for the
+          # key_management keystore and usage rollups live there, and
+          # the base image only has a root-owned /var/lib (WOR-2087).
+          COPY --chown=65532:65532 var/lib/sbproxy /var/lib/sbproxy
           EXPOSE 8080 9090
           ENTRYPOINT ["/usr/local/bin/sbproxy"]
           EOF
@@ -304,6 +768,16 @@ jobs:
             ${{ steps.meta.outputs.dockerhub_image }}:latest
           provenance: true
           sbom: false
+
+      # The one check that would have caught the glibc-mismatch images:
+      # actually start the container we just pushed. `--version` exits 0
+      # only if the dynamic linker resolves, i.e. the binary's glibc
+      # requirement fits the distroless base.
+      - name: smoke test pushed image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm "${{ steps.meta.outputs.dockerhub_image }}@${{ steps.push.outputs.digest }}" --version
 
       - uses: sigstore/cosign-installer@v3
 

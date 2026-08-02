@@ -4,7 +4,6 @@ import {
   api,
   asList,
   ApiError,
-  KeyUsageUnavailableError,
   buildKeyPolicyPatch,
   keyPolicyDraft,
   rebaseKeyPolicyDraft,
@@ -12,14 +11,14 @@ import {
   type AdminKeyPolicyPatch,
   type EffectivePolicyDecisionName,
   type EffectivePolicyPreview,
+  type GovernanceBackendStatus,
+  type GovernanceCounterSnapshot,
+  type GovernanceSnapshot,
   type KeyPolicyDraft,
-  type KeyUsageDimension,
-  type KeyUsageDimensions,
-  type KeyUsageBackendUnavailable,
-  type KeyUsageSnapshot,
 } from "../api";
 import { useAsync } from "../composables/useAsync";
-import { formatUsd, formatTime, shortId } from "../lib/format";
+import { toast } from "../composables/useToasts";
+import { formatNumber, formatUsd, formatTime, shortId } from "../lib/format";
 import PageHeader from "../components/PageHeader.vue";
 import StatusBadge from "../components/StatusBadge.vue";
 import ErrorState from "../components/ErrorState.vue";
@@ -163,11 +162,19 @@ const createForm = reactive({
   inject_mcp: "",
   metadata: "",
   tags: "",
+  credential_id: "",
   expires_at: "",
 });
 const createBusy = ref(false);
 const createError = ref<ApiError | null>(null);
 const createdToken = ref<string | null>(null);
+// Shown beside the one-time token so an operator learns how to present it.
+// x-api-key is the default shown because it is the header the tools that
+// motivated the sweep (Anthropic SDKs, Claude Code) already send.
+const curlExample = computed(
+  () =>
+    `curl https://your-proxy/v1/messages \\\n  -H 'x-api-key: ${createdToken.value ?? ""}' \\\n  -H 'content-type: application/json' \\\n  -d '{"model":"...","messages":[]}'`,
+);
 const createdMeta = ref<AdminKey | null>(null);
 
 function resetCreate() {
@@ -195,6 +202,7 @@ function resetCreate() {
     inject_mcp: "",
     metadata: "",
     tags: "",
+    credential_id: "",
     expires_at: "",
   });
   createError.value = null;
@@ -247,6 +255,10 @@ async function submitCreate() {
     const body: Record<string, unknown> = buildPolicy(createForm);
     if (createForm.name) body.name = createForm.name;
     if (createForm.tags) body.tags = toList(createForm.tags);
+    // Binds this key to a stored upstream credential. The proxy then
+    // presents that credential instead of whatever the caller sent.
+    if (createForm.credential_id)
+      body.credential_id = createForm.credential_id.trim();
     if (createForm.expires_at) body.expires_at = createForm.expires_at;
     const created = await api.createKey(body);
     const token = created.token;
@@ -256,6 +268,7 @@ async function submitCreate() {
     if (token) {
       createdToken.value = token;
     }
+    toast.success("Key created");
     keysReq.run();
   } catch (e) {
     createError.value = e instanceof ApiError ? e : new ApiError(0, String(e));
@@ -506,6 +519,7 @@ async function submitEdit() {
       return;
     }
     await api.patchKey(keyId(baseline), patch);
+    toast.success("Key policy saved");
     closeEdit();
     void keysReq.run();
   } catch (e) {
@@ -523,79 +537,69 @@ async function submitEdit() {
   }
 }
 
-// ---- usage and reservations ----
+// ---- governed usage ----
 const usageKey = ref<AdminKey | null>(null);
-const usage = ref<KeyUsageSnapshot | null>(null);
-const usageOutage = ref<KeyUsageBackendUnavailable | null>(null);
+const usage = ref<GovernanceSnapshot | null>(null);
 const usageBusy = ref(false);
 const usageError = ref<ApiError | null>(null);
 let usageInvocation = 0;
 
+type UsageDimensionName =
+  | "requests_per_window"
+  | "tokens_per_window"
+  | "total_tokens"
+  | "total_micro_usd";
+
 interface UsageDimensionView {
-  name: keyof KeyUsageDimensions;
+  name: UsageDimensionName;
   label: string;
-  snapshot: KeyUsageDimension | null;
+  snapshot: GovernanceCounterSnapshot;
 }
 
 const usageDimensions = computed<UsageDimensionView[]>(() => {
-  const dimensions = usage.value?.dimensions;
+  if (!usage.value) return [];
   return [
     {
-      name: "requests_per_minute",
-      label: "Requests per minute",
-      snapshot: dimensions?.requests_per_minute ?? null,
+      name: "requests_per_window",
+      label: "Requests per window",
+      snapshot: usage.value.requests_per_window,
     },
     {
-      name: "tokens_per_minute",
-      label: "Tokens per minute",
-      snapshot: dimensions?.tokens_per_minute ?? null,
+      name: "tokens_per_window",
+      label: "Tokens per window",
+      snapshot: usage.value.tokens_per_window,
     },
     {
-      name: "budget_tokens",
+      name: "total_tokens",
       label: "Token budget",
-      snapshot: dimensions?.budget_tokens ?? null,
+      snapshot: usage.value.total_tokens,
     },
     {
-      name: "budget_micro_usd",
+      name: "total_micro_usd",
       label: "Monetary budget",
-      snapshot: dimensions?.budget_micro_usd ?? null,
+      snapshot: usage.value.total_micro_usd,
     },
   ];
 });
 
-const usageBackend = computed(
-  () => usage.value?.backend ?? usageOutage.value?.backend ?? null,
-);
-const usageConsistency = computed(
-  () => usage.value?.consistency ?? usageOutage.value?.consistency ?? null,
-);
 const backendUnhealthy = computed(
-  () => usageBackend.value !== null && usageBackend.value.status !== "healthy",
-);
-const strictBackendUnavailable = computed(
-  () =>
-    usageConsistency.value === "strict" &&
-    usageBackend.value?.status === "unavailable",
+  () => usage.value !== null && usage.value.backend.status !== "healthy",
 );
 
-function backendTone(
-  status: KeyUsageSnapshot["backend"]["status"],
-): "ok" | "warn" | "err" {
+function backendTone(status: GovernanceBackendStatus): "ok" | "warn" | "err" {
   if (status === "healthy") return "ok";
   if (status === "degraded") return "warn";
   return "err";
 }
 
-function formatUsageAmount(
-  value: number,
-  dimension: keyof KeyUsageDimensions,
-): string {
-  if (dimension === "budget_micro_usd") return formatUsd(value / 1_000_000);
-  return new Intl.NumberFormat().format(value);
+function formatUsageUnits(value: number, dimension: UsageDimensionName): string {
+  return dimension === "total_micro_usd" ? formatUsd(value / 1_000_000) : formatNumber(value);
 }
-
-function formatUsageReset(resetAt: string | null): string {
-  return resetAt ? formatTime(resetAt) : "Never";
+function formatUsageLimit(value: number | null, dimension: UsageDimensionName): string {
+  return value === null ? "No limit" : formatUsageUnits(value, dimension);
+}
+function formatUsageReset(resetAtMillis: number | null): string {
+  return resetAtMillis === null ? "Never" : formatTime(resetAtMillis);
 }
 
 async function loadUsage(key = usageKey.value) {
@@ -603,7 +607,6 @@ async function loadUsage(key = usageKey.value) {
   const invocation = ++usageInvocation;
   usageBusy.value = true;
   usage.value = null;
-  usageOutage.value = null;
   usageError.value = null;
   try {
     const loaded = await api.keyUsage(keyId(key));
@@ -611,12 +614,7 @@ async function loadUsage(key = usageKey.value) {
     usage.value = loaded;
   } catch (e) {
     if (invocation !== usageInvocation) return;
-    if (e instanceof KeyUsageUnavailableError) {
-      usageOutage.value = e.outage;
-      usageError.value = null;
-    } else {
-      usageError.value = e instanceof ApiError ? e : new ApiError(0, String(e));
-    }
+    usageError.value = e instanceof ApiError ? e : new ApiError(0, String(e));
   } finally {
     if (invocation === usageInvocation) usageBusy.value = false;
   }
@@ -631,14 +629,19 @@ function closeUsage() {
   usageInvocation += 1;
   usageKey.value = null;
   usage.value = null;
-  usageOutage.value = null;
   usageError.value = null;
   usageBusy.value = false;
 }
 
 // ---- row actions ----
 const rowBusy = ref<string | null>(null);
-const actionError = ref<string | null>(null);
+
+const ACTION_DONE: Record<string, string> = {
+  revoke: "Key revoked",
+  block: "Key blocked",
+  unblock: "Key unblocked",
+  rotate: "Key rotated",
+};
 
 async function doAction(
   k: AdminKey,
@@ -647,12 +650,12 @@ async function doAction(
   const id = keyId(k);
   if (action === "revoke" && !confirm(`Revoke key ${id}? This cannot be undone.`)) return;
   rowBusy.value = id + action;
-  actionError.value = null;
   try {
     await api.keyAction(id, action);
+    toast.success(ACTION_DONE[action], shortId(id));
     keysReq.run();
   } catch (e) {
-    actionError.value = e instanceof ApiError ? `${action}: ${e.hint}` : String(e);
+    toast.error(e, `${action[0].toUpperCase()}${action.slice(1)} key`);
   } finally {
     rowBusy.value = null;
   }
@@ -662,12 +665,12 @@ async function doDelete(k: AdminKey) {
   const id = keyId(k);
   if (!confirm(`Delete key ${id}? This permanently removes it.`)) return;
   rowBusy.value = id + "delete";
-  actionError.value = null;
   try {
     await api.deleteKey(id);
+    toast.success("Key deleted", shortId(id));
     keysReq.run();
   } catch (e) {
-    actionError.value = e instanceof ApiError ? `delete: ${e.hint}` : String(e);
+    toast.error(e, "Delete key");
   } finally {
     rowBusy.value = null;
   }
@@ -698,7 +701,6 @@ function statusOf(k: AdminKey): string {
     </template>
   </PageHeader>
 
-  <p class="notice" v-if="actionError">{{ actionError }}</p>
   <ErrorState
     v-if="policySchemaReq.error.value"
     :error="policySchemaReq.error.value"
@@ -832,6 +834,20 @@ function statusOf(k: AdminKey): string {
           <td>{{ budgetOf(k) !== undefined ? formatUsd(budgetOf(k)) : "n/a" }}</td>
           <td>{{ k.expires_at ? formatTime(k.expires_at) : "never" }}</td>
           <td class="actions">
+            <RouterLink
+              class="sb-btn sb-btn--sm"
+              :to="{ name: 'logs', query: { api_key_id: keyId(k) } }"
+              title="This key's requests in the log"
+            >
+              Traffic
+            </RouterLink>
+            <RouterLink
+              class="sb-btn sb-btn--sm"
+              :to="{ name: 'sessions', query: { api_key_id: keyId(k) } }"
+              title="Sessions this key has had"
+            >
+              Sessions
+            </RouterLink>
             <button
               class="sb-btn sb-btn--sm"
               :disabled="rowBusy !== null"
@@ -897,6 +913,7 @@ function statusOf(k: AdminKey): string {
     </table>
   </div>
 
+  <!-- Usage modal -->
   <ModalDialog
     v-if="usageKey"
     title="Usage and reservations"
@@ -906,97 +923,81 @@ function statusOf(k: AdminKey): string {
       Key <span class="sb-mono">{{ shortId(keyId(usageKey)) }}</span>
       <template v-if="usage">
         <span aria-hidden="true"> / </span>
-        Policy revision
-        <span class="sb-mono">{{ usage.policy_version.revision }}</span>
-        <span aria-hidden="true"> / </span>
-        digest
-        <span class="sb-mono digest">{{ usage.policy_version.digest }}</span>
+        Policy revision <span class="sb-mono">{{ usage.policy_revision }}</span>
       </template>
     </p>
 
-    <p v-if="usageBusy && !usage && !usageOutage" class="sb-faint" aria-live="polite">
-      Loading usage and active reservations...
+    <p v-if="usageBusy && !usage" class="sb-faint" aria-live="polite">
+      Loading governed usage...
     </p>
-    <template v-else-if="usage || usageOutage">
+    <template v-else-if="usage">
       <section
-        v-if="usageBackend"
         class="usage-backend"
         :class="{ 'usage-backend--unhealthy': backendUnhealthy }"
         aria-label="Governance backend"
       >
         <div>
           <span class="usage-backend__label">Consistency</span>
-          <strong>{{ usageConsistency }}</strong>
+          <strong>{{ usage.backend.consistency }}</strong>
           <span aria-hidden="true"> / </span>
           <span class="usage-backend__label">Backend</span>
-          <span class="sb-mono">{{ usageBackend.name }}</span>
+          <span class="sb-mono">{{ usage.backend.backend }}</span>
         </div>
         <div class="usage-backend__health">
           <StatusBadge
-            :label="usageBackend.status"
-            :tone="backendTone(usageBackend.status)"
+            :label="usage.backend.status"
+            :tone="backendTone(usage.backend.status)"
           />
           <span class="sb-faint">
-            checked {{ formatTime(usageBackend.checked_at) }}
+            checked {{ formatTime(usage.backend.checked_at_millis) }}
           </span>
         </div>
       </section>
 
       <section
-        v-if="backendUnhealthy && usageBackend"
+        v-if="backendUnhealthy"
         class="usage-health-alert"
-        :class="{
-          'usage-health-alert--degraded': usageBackend.status === 'degraded',
-        }"
+        :class="{ 'usage-health-alert--degraded': usage.backend.status === 'degraded' }"
         role="alert"
         aria-live="assertive"
       >
-        <strong v-if="strictBackendUnavailable">Strict limits are unavailable.</strong>
+        <strong v-if="usage.backend.consistency === 'strict'">
+          Strict limits may be unreliable.
+        </strong>
         <strong v-else>Governance backend is degraded.</strong>
-        <p v-if="strictBackendUnavailable">
-          The configured governance backend is unhealthy. Strict requests fail
-          closed until backend health recovers.
-        </p>
-        <p v-else>
+        <p>
           Reservation state may be stale or incomplete. Review backend health
           before relying on the displayed remaining allowance.
         </p>
       </section>
 
-      <div
-        v-if="usage"
-        class="usage-dimensions"
-        aria-label="Governed usage dimensions"
-      >
+      <div class="usage-dimensions" aria-label="Governed usage dimensions">
         <article
           v-for="dimension in usageDimensions"
           :key="dimension.name"
           class="usage-dimension"
         >
           <h3>{{ dimension.label }}</h3>
-          <p v-if="!dimension.snapshot" class="sb-faint usage-empty">
-            Not configured for this key.
-          </p>
-          <dl v-else>
+          <dl>
             <div>
               <dt>Limit</dt>
-              <dd>{{ formatUsageAmount(dimension.snapshot.limit, dimension.name) }}</dd>
+              <dd>{{ formatUsageLimit(dimension.snapshot.limit, dimension.name) }}</dd>
             </div>
             <div>
               <dt>Used</dt>
-              <dd>{{ formatUsageAmount(dimension.snapshot.used, dimension.name) }}</dd>
+              <dd>{{ formatUsageUnits(dimension.snapshot.used, dimension.name) }}</dd>
             </div>
             <div>
               <dt>Reserved</dt>
-              <dd>{{ formatUsageAmount(dimension.snapshot.reserved, dimension.name) }}</dd>
+              <dd>{{ formatUsageUnits(dimension.snapshot.reserved, dimension.name) }}</dd>
             </div>
             <div class="usage-remaining">
               <dt>Remaining</dt>
-              <dd>{{ formatUsageAmount(dimension.snapshot.remaining, dimension.name) }}</dd>
+              <dd>{{ formatUsageLimit(dimension.snapshot.remaining, dimension.name) }}</dd>
             </div>
             <div class="usage-reset">
               <dt>Reset</dt>
-              <dd>{{ formatUsageReset(dimension.snapshot.reset_at) }}</dd>
+              <dd>{{ formatUsageReset(dimension.snapshot.reset_at_millis) }}</dd>
             </div>
           </dl>
         </article>
@@ -1134,6 +1135,20 @@ function statusOf(k: AdminKey): string {
           <label class="sb-label">Tenant</label>
           <input class="sb-input" v-model="createForm.tenant_id" placeholder="default" />
         </div>
+        <div class="sb-field">
+          <label class="sb-label">Upstream credential</label>
+          <input
+            class="sb-input"
+            v-model="createForm.credential_id"
+            placeholder="leave blank to use the origin's own credential"
+          />
+          <p class="sb-hint">
+            Binds this key to a stored credential, so the proxy presents that
+            secret upstream instead of whatever the caller sent. The credential
+            must be active and in the same tenant. If it later becomes
+            unresolvable the request is refused rather than falling back.
+          </p>
+        </div>
         <div
           v-if="supportsPolicyField('bypass_prompt_injection')"
           class="sb-field checkbox-field"
@@ -1183,6 +1198,21 @@ function statusOf(k: AdminKey): string {
     <CopyText :value="createdToken" mono />
     <p class="sb-faint" style="margin-top: 12px" v-if="createdMeta">
       Key id: <span class="sb-mono">{{ keyId(createdMeta) }}</span>
+    </p>
+
+    <h4 class="use-head">How to present it</h4>
+    <p class="sb-faint">
+      This key is accepted in any swept header, so a tool that already sends
+      one of these needs no change beyond its base URL. Defaults are
+      <code>authorization</code> (as <code>Bearer</code>),
+      <code>x-api-key</code>, and <code>x-sb-api</code>; the list is
+      configurable under <code>key_management.inbound.headers</code>.
+    </p>
+    <CopyText :value="curlExample" mono />
+    <p class="sb-faint" style="margin-top: 8px">
+      To keep sending your own upstream credential and have SBproxy govern the
+      request without holding that secret, put this key in
+      <code>x-sb-api</code> and leave <code>authorization</code> as it is.
     </p>
     <template #footer>
       <button class="sb-btn sb-btn--primary" @click="createdToken = null">Done</button>
@@ -1489,6 +1519,12 @@ function statusOf(k: AdminKey): string {
 .policy-evidence {
   margin-top: 3px;
 }
+.edit-evidence {
+  margin-bottom: 12px;
+}
+.digest {
+  overflow-wrap: anywhere;
+}
 .usage-key-evidence {
   color: var(--sb-text-muted);
   font-size: 0.78rem;
@@ -1586,15 +1622,6 @@ function statusOf(k: AdminKey): string {
 }
 .usage-dimension .usage-reset {
   align-items: flex-start;
-}
-.usage-empty {
-  margin: 0;
-}
-.edit-evidence {
-  margin-bottom: 12px;
-}
-.digest {
-  overflow-wrap: anywhere;
 }
 .preview-panel {
   background: var(--sb-surface-2);
@@ -1748,5 +1775,10 @@ function statusOf(k: AdminKey): string {
   gap: 8px;
   color: var(--sb-text-muted);
   font-size: 0.85rem;
+}
+.use-head {
+  margin: 18px 0 6px;
+  font-size: 13px;
+  font-weight: 600;
 }
 </style>

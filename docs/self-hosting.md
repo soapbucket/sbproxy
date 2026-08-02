@@ -1,6 +1,6 @@
 # Self-hosting SBproxy
 
-*Last modified: 2026-07-10*
+*Last modified: 2026-07-28*
 
 One binary to self-host your AI gateway, and the same binary runs the
 models. OpenRouter proved that teams want unified routing, fallbacks,
@@ -27,8 +27,9 @@ curl -fsSL https://download.sbproxy.dev | sh
 brew install soapbucket/tap/sbproxy
 
 # Docker
-docker run --rm -p 8080:8080 -v "$PWD/sb.yml:/etc/sbproxy/sb.yml" \
-  soapbucket/sbproxy:latest
+docker run --rm -p 8080:8080 \
+  -v "$PWD/sb.yml:/etc/sbproxy/sb.yml:ro" \
+  soapbucket/sbproxy:latest serve -f /etc/sbproxy/sb.yml
 ```
 
 Binary downloads and the rest of the install matrix are in the
@@ -73,8 +74,8 @@ acquisition, and the current hardware evidence boundary.
 ## The model manifest
 
 Catalog v2 is the reviewable file that says which models exist, where their
-weights come from, and which digests must match. Canonical deployments in this
-PR use the built-in catalog. An operator catalog is available through the
+weights come from, and which digests must match. Canonical deployments use the
+built-in catalog. An operator catalog is available through the
 compatibility `serve.catalog_file` path; moving custom catalog selection into
 the managed admin plane is later work. See
 [`examples/model-manifest`](../examples/model-manifest). A manifest
@@ -93,13 +94,21 @@ to the first request, or `manual` to require a prior `sbproxy models pull`.
 `sbproxy doctor` answers "can this host serve models" with no config
 at all: build capabilities, visible devices, engines on PATH, container
 runtime, the model cache, and a local-runtime verdict with every
-blocker listed. For each engine it names the acquisition options viable
-here (a pinned llama.cpp release, or vLLM via uvx), and the runtime then
-acquires the engine on first use. What doctor still cannot supply is a
-host prerequisite it can only report: a GPU driver, or the
-`build-essential` and `python3-dev` that vLLM's Triton compile needs. A
-missing prerequisite is a doctor-time message, not a spawn failure at
-2am on the first request.
+blocker listed. When a container runtime is present, that is the path
+SBproxy prefers for a GPU engine: it pulls a digest-pinned image and
+runs the engine in a container, so the host needs only an NVIDIA driver
+and no Python or CUDA build toolchain. For each engine doctor names the
+acquisition options viable here (a pinned llama.cpp release, a
+digest-pinned vLLM image, or vLLM via uvx), and the runtime then
+acquires the engine on first use.
+
+The uv path is the no-docker fallback, and it is the one with host
+prerequisites doctor can only report, not supply: a GPU driver, plus the
+Python development headers (`python3-dev`), `ninja`, and CUDA development
+toolchain (`nvcc` and the CUDA headers) that vLLM's Triton compile
+needs. A missing prerequisite is a doctor-time message, not a spawn
+failure at 2am on the first request. Prefer the container path unless
+the host cannot run one.
 
 `sbproxy validate <path>` parses and validates the config offline,
 and `sbproxy plan -f sb.yml [--against baseline.yml]` diffs it: it
@@ -121,22 +130,30 @@ runs against your hardware with a one-line change.
 
 ```yaml
 proxy:
+  http_bind_port: 8080
   model_host:
     deployments:
       local-coder:
         model: qwen2.5-0.5b-instruct
         variant: q4_k_m
 
-providers:
-  - name: local
-    provider_type: managed_model
-    deployment: local-coder
-    models: [claude-sonnet-4-5]
+origins:
+  "gateway.internal":
+    action:
+      type: ai_proxy
+      providers:
+        - name: local
+          provider_type: managed_model
+          deployment: local-coder
+          models: [claude-sonnet-4-5]
 ```
 
 Check the [model host boundary](model-host.md#current-boundary) before choosing
-hardware. Apple Metal is the live gate for this PR; NVIDIA remains pending the
-final GCP integration run.
+hardware. Apple Silicon Metal and NVIDIA single-GPU CUDA both have live
+evidence recorded on 2026-07-30. Multi-GPU and live multi-node GCP
+certification remain open, with deterministic and local test evidence only.
+The [certification ledger](model-host-certification.md) has the per-lane
+detail, including one open defect on the Apple lane.
 
 ## Spill to cloud, with policy attached
 
@@ -150,15 +167,34 @@ training-sensitive prompts with the provider-level
 providers with that flag. If no provider in the chain is marked, the
 request gets a 400 rather than landing somewhere you did not approve.
 
+Runnable copy of this shape: [`examples/self-hosting/sb.yml`](../examples/self-hosting/sb.yml)
+(compatibility `serve:` plus cloud spill). Canonical managed form:
+
 ```yaml
-providers:
-  - name: local
-    provider_type: managed_model
-    deployment: local-qwen
-    models: [qwen]
-  - name: openai
-    api_key: ${OPENAI_API_KEY}
-    default_model: gpt-4o-mini
+proxy:
+  http_bind_port: 8080
+  model_host:
+    deployments:
+      local-qwen:
+        model: qwen2.5-0.5b-instruct
+        variant: q4_k_m
+
+origins:
+  "gateway.internal":
+    action:
+      type: ai_proxy
+      routing:
+        strategy: fallback_chain
+      providers:
+        - name: local
+          provider_type: managed_model
+          deployment: local-qwen
+          models: [qwen]
+          no_prompt_training: true
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          default_model: gpt-4o-mini
+          models: [gpt-4o-mini]
 ```
 
 ## Grown-up auth in front of local inference
@@ -166,10 +202,34 @@ providers:
 Ollama's own FAQ tells you to put nginx in front of it. SBproxy is that
 front, with a ledger and a policy engine behind it: virtual keys,
 per-team quotas, hierarchical budgets, and the guardrail mesh all apply
-to the local model the same way they apply to a hosted one. The usage
-ledger prices each local completion at what the equivalent hosted API
-would have charged and reports dollars saved per model per month, which
-is the number that justifies the GPU.
+to the local model the same way they apply to a hosted one.
+
+It also tells you what the GPU is worth. On the compatibility `serve:`
+path, give a served model a `reference:` block naming the hosted model it
+displaces and that model's per-million-token price, and SBproxy prices
+every completion it serves locally at what the hosted API would have
+charged. A local completion costs nothing at the API, so the whole
+displaced price is the saving:
+
+```yaml
+# Fragment: nest under origins."<host>".action (compatibility serve: path).
+# Full file: examples/self-hosting/sb.yml
+providers:
+  - name: local
+    serve:
+      models:
+        - model: qwen3-32b
+          name: qwen
+          reference:
+            model: gpt-4o
+            prompt_micros_per_mtok: 3000000
+            completion_micros_per_mtok: 15000000
+```
+
+`GET /admin/model-host/value` then reports the running total: local and
+cloud completion counts per model and the dollars each local completion
+saved. Leave `reference:` off and SBproxy makes no savings claim for that
+model; it never guesses a cloud price.
 
 ## A public endpoint with Let's Encrypt
 
@@ -217,25 +277,36 @@ stores a fleet needs are in
 
 What OpenRouter offers, the SBproxy equivalent, and what the enterprise
 tier adds on top. Honest about the gap: OpenRouter brokers a
-400-plus-model hosted marketplace; we route to 66 hosted providers plus
+400-plus-model hosted marketplace; we route to 72 hosted providers plus
 your own GPUs.
 
 | OpenRouter | SBproxy | Enterprise adds |
 |---|---|---|
-| Unified API across providers | One OpenAI/Anthropic-shaped API across 66 providers plus local engines | Same |
+| Unified API across providers | One OpenAI/Anthropic-shaped API across 72 providers plus local engines | Same |
 | Model catalog | Model manifest (source, pinning, digests, pull policy) | Curated allowlist, signed |
 | Fallback + provider routing preferences | Fallback chain, cost/latency routing, prefix-affinity, least-token-usage | GPU-aware and prefix-cache-aware routing across a node fleet |
 | Virtual keys | Virtual keys with per-key scopes | Tenants, RBAC |
-| Spend limits and accounting | Budgets, hierarchical quotas, usage ledger, dollars-saved report | Audit trail, per-tenant accounting |
+| Spend limits and accounting | Budgets, hierarchical quotas, usage ledger, dollars-saved report at `/admin/model-host/value` | Audit trail, per-tenant accounting |
 | Zero-data-retention routing | `no_prompt_training` provider flag + `x-sbproxy-disallow-prompt-training` request header | Air-gapped: guardrails, redaction, and generation all local |
 | Bring your own key | Provider keys plus a credential resolver (env, secret stores, vault) | Managed key rotation, mesh-distributed key cache |
-| 400-plus hosted-model marketplace | 66 hosted providers plus models on your GPUs | Same providers, fleet placement |
+| 400-plus hosted-model marketplace | 72 hosted providers plus models on your GPUs | Same providers, fleet placement |
+
+## Runnable examples
+
+- [`examples/self-hosting/`](../examples/self-hosting/) - local model plus
+  cloud spill in one fallback array (the serve-only quickstart this page
+  describes).
+- [`examples/self-hosting-macos/`](../examples/self-hosting-macos/) - same
+  idea with the admin UI enabled on Apple Silicon / Metal.
+- [`examples/model-host-managed/`](../examples/model-host-managed/) -
+  canonical `proxy.model_host` + `provider_type: managed_model`.
 
 ## Related
 
 - [model-host.md](model-host.md) - the reference: catalog, fit planner,
   supervisor, engine matrix.
 - [model-host-certification.md](model-host-certification.md) -
-  the hardware evidence ledger and final GCP procedure.
+  the hardware evidence ledger and GCP certification procedure.
 - [ai-gateway.md](ai-gateway.md) - the routing, guardrail, budget, and
   ledger planes local models plug into.
+- [quickstart-serve.md](quickstart-serve.md) - `sbproxy run <model>` on-ramp.

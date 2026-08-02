@@ -1369,6 +1369,7 @@ spec:
             outbound_credential: None,
             outbound_web_bot_auth: false,
             observability: None,
+            attestation: None,
         };
         let without = CompiledOrigin {
             hostname: CompactString::new("without.example.com"),
@@ -1419,6 +1420,7 @@ spec:
             outbound_credential: None,
             outbound_web_bot_auth: false,
             observability: None,
+            attestation: None,
         };
         let mut host_map = HashMap::new();
         host_map.insert(CompactString::new("with.example.com"), 0);
@@ -1435,6 +1437,7 @@ spec:
             rate_limits: None,
             audit: None,
             session_ledger: None,
+            flags: Vec::new(),
         };
         let map = render_indices(&cfg, Path::new("."));
         assert!(map.contains_key(&CompactString::new("with.example.com")));

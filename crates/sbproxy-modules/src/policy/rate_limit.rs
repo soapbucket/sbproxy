@@ -4,6 +4,7 @@
 //! optional shared L2 (Redis) fixed-window counter for cluster-wide
 //! enforcement.
 
+use crate::policy::rate_limit_cluster;
 use parking_lot::Mutex;
 use sbproxy_platform::storage::{AsyncKVStore, KVStore};
 use serde::Deserialize;
@@ -25,6 +26,10 @@ pub struct RateLimitInfo {
     pub headers_enabled: bool,
     /// Whether to include the Retry-After header on 429 responses.
     pub include_retry_after: bool,
+    /// Whether a workspace-budget response includes `RateLimit-Policy`.
+    ///
+    /// The ordinary rate limiter and DDoS policy leave this false.
+    pub include_ratelimit_policy: bool,
 }
 
 /// Rate limit policy using a token bucket algorithm.
@@ -63,7 +68,13 @@ pub struct RateLimitPolicy {
     ///
     /// - `connection.remote_ip`: per-IP buckets (default behaviour when
     ///   the field is unset).
-    /// - `request.headers["x-api-key"]`: per-API-key buckets.
+    /// - `request.key_id`: per-key buckets for a minted virtual key. Prefer
+    ///   this over the header below when `key_management` is on: the header
+    ///   holds the presented secret, so a rotation changes it and hands the
+    ///   caller a fresh budget, whereas the id is immutable. Empty string when
+    ///   no minted key resolved.
+    /// - `request.headers["x-api-key"]`: per-API-key buckets. Correct for
+    ///   static configured keys; see `request.key_id` for minted ones.
     /// - `jwt.claims.tenant_id`: per-JWT-claim buckets (the
     ///   "Volumetric Abuse Detection" pattern).
     /// - `jwt.claims.sub + ":" + jwt.claims.tenant_id`: composite keys.
@@ -109,6 +120,13 @@ pub struct RateLimitPolicy {
     /// on the success path; failures are silent (fail-warn posture).
     #[serde(skip)]
     observer: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+    /// Optional mesh cluster tier. When `Some` and no L2 store is
+    /// configured, the policy admits against this node's count plus the
+    /// merged peer view instead of a purely local token bucket. Only
+    /// consulted for windows longer than one second; see
+    /// [`Self::converges_on_mesh`].
+    #[serde(skip)]
+    cluster: Option<Arc<rate_limit_cluster::RateLimitClusterTier>>,
     /// Fixed-window length in seconds when `store` is active. Derived from
     /// the configured rate (1 s for `requests_per_second`, 60 s for
     /// `requests_per_minute`).
@@ -136,6 +154,7 @@ impl std::fmt::Debug for RateLimitPolicy {
             .field("cold_limited_attached", &self.cold_limited.lock().is_some())
             .field("store_attached", &self.store.is_some())
             .field("async_store_attached", &self.async_store.is_some())
+            .field("cluster_attached", &self.cluster.is_some())
             .field("window_secs", &self.window_secs)
             .field("key_prefix", &self.key_prefix)
             .finish()
@@ -175,11 +194,72 @@ impl Default for TokenBucket {
     }
 }
 
-// Methods live on the struct (rather than duplicating the arithmetic in
-// the test module) so the proptest exercises exactly the math used by
-// `RateLimitPolicy::allow_with_info_for`.
-#[cfg(test)]
 impl TokenBucket {
+    fn with_rate(refill_rate: f64, now: Instant) -> Self {
+        let max_tokens = refill_rate.ceil().max(1.0);
+        Self {
+            tokens: max_tokens,
+            max_tokens,
+            refill_rate,
+            last_refill: now,
+        }
+    }
+
+    fn refill_at(&mut self, now: Instant) {
+        // Callers capture time before contending on a shared bucket lock.
+        // Preserve the newest timestamp so a delayed older caller cannot make
+        // a later request earn the same refill interval twice.
+        let now = now.max(self.last_refill);
+        let elapsed = now.duration_since(self.last_refill);
+        self.refill_with_elapsed(elapsed.as_secs_f64());
+        self.last_refill = now;
+    }
+
+    fn refill_with_elapsed(&mut self, elapsed_secs: f64) {
+        self.tokens = (self.tokens + elapsed_secs * self.refill_rate).min(self.max_tokens);
+    }
+
+    fn reconfigure_at(&mut self, refill_rate: f64, now: Instant) {
+        // Earn elapsed tokens under the rate that governed that elapsed
+        // interval. Changing a grant must not mint tokens retroactively.
+        self.refill_at(now);
+        let max_tokens = refill_rate.ceil().max(1.0);
+        self.tokens = self.tokens.min(max_tokens);
+        self.max_tokens = max_tokens;
+        self.refill_rate = refill_rate;
+    }
+
+    fn try_acquire(&mut self, tokens: f64) -> bool {
+        if self.tokens >= tokens {
+            self.tokens -= tokens;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn projected_tokens_at(&self, now: Instant) -> f64 {
+        let elapsed = now.saturating_duration_since(self.last_refill);
+        (self.tokens + elapsed.as_secs_f64() * self.refill_rate).min(self.max_tokens)
+    }
+
+    fn full_refill_reset_secs_at(&self, now: Instant) -> u64 {
+        if self.refill_rate <= 0.0 {
+            return 0;
+        }
+        let deficit = self.max_tokens - self.projected_tokens_at(now);
+        (deficit / self.refill_rate).ceil() as u64
+    }
+
+    fn next_token_reset_secs_at(&self, now: Instant) -> u64 {
+        if self.refill_rate <= 0.0 {
+            return 0;
+        }
+        let deficit = (1.0 - self.projected_tokens_at(now)).max(0.0);
+        (deficit / self.refill_rate).ceil() as u64
+    }
+
+    #[cfg(test)]
     pub(crate) fn for_test(capacity: f64, refill_rate: f64) -> Self {
         Self {
             tokens: capacity,
@@ -189,30 +269,118 @@ impl TokenBucket {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn current_tokens(&self) -> f64 {
         self.tokens
     }
 
+    #[cfg(test)]
     pub(crate) fn capacity(&self) -> f64 {
         self.max_tokens
-    }
-
-    pub(crate) fn refill_with_elapsed(&mut self, dt_secs: f64) {
-        self.tokens = (self.tokens + dt_secs * self.refill_rate).min(self.max_tokens);
-    }
-
-    pub(crate) fn try_acquire(&mut self, n: f64) -> bool {
-        if self.tokens >= n {
-            self.tokens -= n;
-            true
-        } else {
-            false
-        }
     }
 }
 
 fn default_max_keys() -> usize {
     100_000
+}
+
+/// Admission result from a dynamic keyed token bucket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DynamicRateLimitInfo {
+    /// Whether the request consumed a token.
+    pub(crate) allowed: bool,
+    /// Current bucket capacity.
+    pub(crate) limit: u64,
+    /// Whole tokens available after this decision.
+    pub(crate) remaining: u64,
+    /// Seconds until the governing bucket is fully refilled.
+    pub(crate) reset_secs: u64,
+}
+
+/// Bounded token-bucket registry whose rate can change on every admission.
+#[derive(Debug)]
+pub(crate) struct DynamicKeyedTokenBuckets {
+    buckets: Mutex<lru::LruCache<String, TokenBucket>>,
+}
+
+impl Default for DynamicKeyedTokenBuckets {
+    fn default() -> Self {
+        Self::new(default_max_keys())
+    }
+}
+
+impl DynamicKeyedTokenBuckets {
+    pub(crate) fn new(max_keys: usize) -> Self {
+        let capacity = std::num::NonZeroUsize::new(max_keys.max(1))
+            .expect("dynamic bucket capacity is at least one");
+        Self {
+            buckets: Mutex::new(lru::LruCache::new(capacity)),
+        }
+    }
+
+    pub(crate) fn check(&self, key: &str, refill_rate: f64) -> DynamicRateLimitInfo {
+        self.check_at(key, refill_rate, Instant::now())
+    }
+
+    fn check_at(&self, key: &str, refill_rate: f64, now: Instant) -> DynamicRateLimitInfo {
+        if !refill_rate.is_finite() || refill_rate <= 0.0 {
+            return DynamicRateLimitInfo {
+                allowed: false,
+                limit: 0,
+                remaining: 0,
+                reset_secs: 1,
+            };
+        }
+
+        let requested_limit = refill_rate.ceil().max(1.0) as u64;
+        let mut buckets = self.buckets.lock();
+        if let Some(bucket) = buckets.get_mut(key) {
+            bucket.reconfigure_at(refill_rate, now);
+            return Self::consume(bucket, now);
+        }
+
+        if buckets.len() >= buckets.cap().get() {
+            let (evictable, reset_secs) = {
+                let (_, candidate) = buckets
+                    .peek_lru()
+                    .expect("a full dynamic bucket registry has an LRU entry");
+                (
+                    candidate.projected_tokens_at(now) >= candidate.max_tokens,
+                    candidate.full_refill_reset_secs_at(now).max(1),
+                )
+            };
+            if !evictable {
+                return DynamicRateLimitInfo {
+                    allowed: false,
+                    limit: requested_limit,
+                    remaining: 0,
+                    reset_secs,
+                };
+            }
+            buckets.pop_lru();
+        }
+
+        buckets.put(key.to_string(), TokenBucket::with_rate(refill_rate, now));
+        let bucket = buckets
+            .get_mut(key)
+            .expect("dynamic bucket was inserted immediately above");
+        Self::consume(bucket, now)
+    }
+
+    fn consume(bucket: &mut TokenBucket, now: Instant) -> DynamicRateLimitInfo {
+        let allowed = bucket.try_acquire(1.0);
+        let reset_secs = if allowed {
+            bucket.full_refill_reset_secs_at(now)
+        } else {
+            bucket.next_token_reset_secs_at(now)
+        };
+        DynamicRateLimitInfo {
+            allowed,
+            limit: bucket.max_tokens as u64,
+            remaining: bucket.tokens.floor() as u64,
+            reset_secs,
+        }
+    }
 }
 
 impl RateLimitPolicy {
@@ -322,6 +490,50 @@ impl RateLimitPolicy {
         self
     }
 
+    /// Attach the mesh cluster tier so this policy enforces an approximate
+    /// cluster-wide limit with no Redis.
+    ///
+    /// Only consulted when no L2 store is attached: a shared counter is
+    /// exact, so it always wins over an approximate merged view.
+    ///
+    /// Overshoot is bounded by `peers * rate * dissemination_cadence`. With
+    /// the default 3 second cadence, each additional node can admit about
+    /// `rate * 3` requests before this node hears about them. Pass `None` to
+    /// clear a previously attached tier.
+    ///
+    /// `origin_id` is baked into the counter-key prefix the same way
+    /// [`Self::with_store`] does it, so origins sharing one process-wide tier
+    /// cannot collide on a common client id. The prefix is set only if a
+    /// store setter has not already set it, so the setters chain in any
+    /// order.
+    pub fn with_cluster(
+        mut self,
+        cluster: Option<Arc<rate_limit_cluster::RateLimitClusterTier>>,
+        origin_id: &str,
+    ) -> Self {
+        self.cluster = cluster;
+        if self.key_prefix.is_empty() {
+            self.key_prefix = format!("sbproxy:rl:{}:", origin_id);
+        }
+        self
+    }
+
+    /// Whether this policy's window is long enough to reconcile across nodes.
+    ///
+    /// A one second window closes before a peer contribution can arrive at
+    /// any sane gossip cadence, so `requests_per_second` limits stay
+    /// per-node rather than pretending to converge.
+    pub fn converges_on_mesh(&self) -> bool {
+        self.window_secs > 1
+    }
+
+    /// Test-only accessor for the counter-key prefix, so tests can build the
+    /// same bucket string the cluster path derives.
+    #[cfg(test)]
+    pub(crate) fn debug_key_prefix(&self) -> &str {
+        &self.key_prefix
+    }
+
     /// Effective per-window limit used by the Redis-backed fixed-window path.
     fn window_limit(&self) -> u64 {
         if let Some(rpm) = self.requests_per_minute {
@@ -398,14 +610,11 @@ impl RateLimitPolicy {
             &mut template_guard
         };
 
-        let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
-        bucket.tokens = (bucket.tokens + elapsed * bucket.refill_rate).min(bucket.max_tokens);
-        bucket.last_refill = now;
+        bucket.refill_at(now);
 
         let limit = bucket.max_tokens as u64;
 
-        if bucket.tokens >= 1.0 {
-            bucket.tokens -= 1.0;
+        if bucket.try_acquire(1.0) {
             let remaining = bucket.tokens.floor() as u64;
             let deficit = bucket.max_tokens - bucket.tokens;
             let reset_secs = if bucket.refill_rate > 0.0 {
@@ -427,6 +636,7 @@ impl RateLimitPolicy {
                 reset_secs,
                 headers_enabled,
                 include_retry_after,
+                include_ratelimit_policy: false,
             }
         } else {
             let full_reset = if bucket.refill_rate > 0.0 {
@@ -444,6 +654,7 @@ impl RateLimitPolicy {
                 reset_secs: full_reset,
                 headers_enabled,
                 include_retry_after,
+                include_ratelimit_policy: false,
             }
         }
     }
@@ -471,6 +682,7 @@ impl RateLimitPolicy {
             reset_secs: until.duration_since(now).as_secs().max(1),
             headers_enabled,
             include_retry_after,
+            include_ratelimit_policy: false,
         })
     }
 
@@ -508,6 +720,14 @@ impl RateLimitPolicy {
         // migrated yet. If neither is configured, fall all the way back
         // to the local per-key token bucket.
         if self.async_store.is_none() && self.store.is_none() {
+            // No shared counter. Fall back to the mesh cluster tier when one
+            // is attached and the window is long enough to reconcile, else
+            // to the purely local token bucket.
+            if let Some(cluster) = self.cluster.as_ref() {
+                if self.converges_on_mesh() {
+                    return self.allow_with_info_cluster(client_id, cluster.as_ref());
+                }
+            }
             return self.allow_with_info_for(client_id);
         }
 
@@ -541,6 +761,7 @@ impl RateLimitPolicy {
             reset_secs: window,
             headers_enabled,
             include_retry_after,
+            include_ratelimit_policy: false,
         };
 
         let incr_result: anyhow::Result<i64> = if let Some(async_store) = self.async_store.as_ref()
@@ -591,6 +812,59 @@ impl RateLimitPolicy {
             reset_secs,
             headers_enabled,
             include_retry_after,
+            include_ratelimit_policy: false,
+        }
+    }
+
+    /// Admit against this node's count plus the merged peer view.
+    ///
+    /// The window boundary is computed exactly as the Redis path computes it,
+    /// so every node buckets a given instant into the same window and the
+    /// per-node slots merge. Local counting is immediate and authoritative
+    /// for this node; the peer view lags by at most one dissemination
+    /// cadence, which is the documented source of overshoot.
+    ///
+    /// There is no fail-open branch here because nothing can fail: both
+    /// reads are in-process. A partitioned node simply sees an empty peer
+    /// view once its last merge expires and enforces on its own count,
+    /// which over-admits rather than denying traffic.
+    fn allow_with_info_cluster(
+        &self,
+        client_id: &str,
+        cluster: &rate_limit_cluster::RateLimitClusterTier,
+    ) -> RateLimitInfo {
+        let window = if self.window_secs > 0 {
+            self.window_secs
+        } else {
+            1
+        };
+        let limit = self.window_limit();
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let window_start = now_secs - (now_secs % window);
+        let bucket = format!("{}{}:{}", self.key_prefix, client_id, window_start);
+
+        let local = cluster.increment_local(&bucket, window_start);
+        let peers = cluster.merged_peers(&bucket, window_start);
+        let count = local.saturating_add(peers);
+
+        // The merged view changed the outcome: this node alone would have
+        // admitted. Counting it is what makes the approximation observable
+        // instead of something an operator has to infer.
+        if count > limit && local <= limit {
+            sbproxy_observe::metrics::record_rate_limit_cluster_peer_denial();
+        }
+
+        RateLimitInfo {
+            allowed: count <= limit,
+            limit,
+            remaining: limit.saturating_sub(count),
+            reset_secs: window.saturating_sub(now_secs - window_start),
+            headers_enabled: self.headers_enabled(),
+            include_retry_after: self.include_retry_after(),
+            include_ratelimit_policy: false,
         }
     }
 }
@@ -598,6 +872,267 @@ impl RateLimitPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- WOR-2084: async L2 store on the hot path ---
+
+    /// Async store fake that records every `incr_with_ttl` key it sees.
+    struct RecordingAsyncStore {
+        count: std::sync::atomic::AtomicI64,
+        keys: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingAsyncStore {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                count: std::sync::atomic::AtomicI64::new(0),
+                keys: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl sbproxy_platform::storage::AsyncKVStore for RecordingAsyncStore {
+        async fn get(&self, _key: &[u8]) -> anyhow::Result<Option<bytes::Bytes>> {
+            Ok(None)
+        }
+        async fn put(&self, _key: &[u8], _value: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn put_with_ttl(
+            &self,
+            _key: &[u8],
+            _value: &[u8],
+            _ttl_secs: u64,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn incr_with_ttl(&self, key: &[u8], _ttl_secs: u64) -> anyhow::Result<i64> {
+            self.keys
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(key).into_owned());
+            Ok(self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1)
+        }
+        async fn delete(&self, _key: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Sync store fake that panics if the hot path ever reaches it, which
+    /// is exactly the spawn_blocking bridge the async handle exists to
+    /// bypass.
+    struct PanicSyncStore;
+
+    impl sbproxy_platform::storage::KVStore for PanicSyncStore {
+        fn get(&self, _key: &[u8]) -> anyhow::Result<Option<bytes::Bytes>> {
+            panic!("sync store must not be consulted when an async store is attached");
+        }
+        fn put(&self, _key: &[u8], _value: &[u8]) -> anyhow::Result<()> {
+            panic!("sync store must not be consulted when an async store is attached");
+        }
+        fn put_with_ttl(&self, _key: &[u8], _value: &[u8], _ttl_secs: u64) -> anyhow::Result<()> {
+            panic!("sync store must not be consulted when an async store is attached");
+        }
+        fn incr_with_ttl(&self, _key: &[u8], _ttl_secs: u64) -> anyhow::Result<i64> {
+            panic!("sync store must not be consulted when an async store is attached");
+        }
+        fn delete(&self, _key: &[u8]) -> anyhow::Result<()> {
+            panic!("sync store must not be consulted when an async store is attached");
+        }
+        fn scan_prefix(&self, _prefix: &[u8]) -> anyhow::Result<Vec<(bytes::Bytes, bytes::Bytes)>> {
+            panic!("sync store must not be consulted when an async store is attached");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_async_store_carries_the_hot_path_and_the_sync_store_is_never_touched() {
+        // Wired the way the pipeline compiler wires it: both handles
+        // attached, async preferred. The sync fake panics on any call,
+        // so this test fails loudly if the hot path regresses onto the
+        // spawn_blocking bridge.
+        let recorder = RecordingAsyncStore::new();
+        let policy =
+            RateLimitPolicy::from_config(serde_json::json!({ "requests_per_minute": 2.0 }))
+                .expect("valid rpm policy")
+                .with_store(
+                    Some(Arc::new(PanicSyncStore) as Arc<dyn sbproxy_platform::storage::KVStore>),
+                    "origin-a",
+                )
+                .with_async_store(
+                    Some(recorder.clone() as Arc<dyn sbproxy_platform::storage::AsyncKVStore>),
+                    "origin-a",
+                );
+
+        assert!(policy.allow_with_info_async("c1").await.allowed);
+        assert!(policy.allow_with_info_async("c1").await.allowed);
+        let third = policy.allow_with_info_async("c1").await;
+        assert!(
+            !third.allowed,
+            "the shared async counter must deny the third request under a limit of 2"
+        );
+
+        let keys = recorder.keys.lock().unwrap();
+        assert_eq!(keys.len(), 3, "every decision must hit the async store");
+        assert!(
+            keys.iter().all(|k| k.starts_with("sbproxy:rl:origin-a:")),
+            "counter keys must carry the origin-scoped prefix: {keys:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_order_does_not_change_the_counter_key_prefix() {
+        // `with_async_store` only sets the prefix when `with_store` has
+        // not already set it, and vice versa. If the derived prefixes
+        // ever diverged, an upgrade that adds the async handle would
+        // silently reset every live counter into a fresh keyspace.
+        let recorder_a = RecordingAsyncStore::new();
+        let sync_first =
+            RateLimitPolicy::from_config(serde_json::json!({ "requests_per_minute": 10.0 }))
+                .expect("valid rpm policy")
+                .with_store(
+                    Some(Arc::new(PanicSyncStore) as Arc<dyn sbproxy_platform::storage::KVStore>),
+                    "origin-a",
+                )
+                .with_async_store(
+                    Some(recorder_a.clone() as Arc<dyn sbproxy_platform::storage::AsyncKVStore>),
+                    "origin-a",
+                );
+
+        let recorder_b = RecordingAsyncStore::new();
+        let async_first =
+            RateLimitPolicy::from_config(serde_json::json!({ "requests_per_minute": 10.0 }))
+                .expect("valid rpm policy")
+                .with_async_store(
+                    Some(recorder_b.clone() as Arc<dyn sbproxy_platform::storage::AsyncKVStore>),
+                    "origin-a",
+                )
+                .with_store(
+                    Some(Arc::new(PanicSyncStore) as Arc<dyn sbproxy_platform::storage::KVStore>),
+                    "origin-a",
+                );
+
+        assert_eq!(
+            sync_first.debug_key_prefix(),
+            async_first.debug_key_prefix(),
+            "attach order must not move counters into a different keyspace"
+        );
+
+        let _ = sync_first.allow_with_info_async("c1").await;
+        let _ = async_first.allow_with_info_async("c1").await;
+        let key_a = recorder_a.keys.lock().unwrap()[0].clone();
+        let key_b = recorder_b.keys.lock().unwrap()[0].clone();
+        assert_eq!(
+            key_a, key_b,
+            "the same client in the same window must land on the same counter key"
+        );
+    }
+
+    // --- Mesh cluster tier ---
+
+    fn cluster_tier(node: &str) -> Arc<rate_limit_cluster::RateLimitClusterTier> {
+        Arc::new(rate_limit_cluster::RateLimitClusterTier::new(node))
+    }
+
+    /// The window the cluster path will bucket "now" into, for a 60s window.
+    fn current_window_start(window: u64) -> u64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        now - (now % window)
+    }
+
+    #[tokio::test]
+    async fn cluster_tier_denies_once_local_plus_peers_reaches_the_limit() {
+        let tier = cluster_tier("node-a");
+        let policy =
+            RateLimitPolicy::from_config(serde_json::json!({ "requests_per_minute": 10.0 }))
+                .expect("valid rpm policy")
+                .with_cluster(Some(tier.clone()), "test-origin");
+
+        assert!(policy.converges_on_mesh(), "a 60s window converges");
+
+        // Peers already report 8 requests in the current window. The bucket
+        // string matches what the cluster path derives, prefix included.
+        let window_start = current_window_start(60);
+        let bucket = format!("{}c1:{}", policy.debug_key_prefix(), window_start);
+        let peer = sbproxy_ai::governance_crdt::GovernanceContribution {
+            node_id: "node-b".into(),
+            generation: 1,
+            slots: vec![sbproxy_ai::governance_crdt::NodeCounterSlot {
+                key_id: bucket,
+                policy_revision: rate_limit_cluster::RATE_LIMIT_POLICY_REVISION,
+                window_start_millis: window_start * 1000,
+                usage: sbproxy_ai::governance::GovernanceUsage {
+                    requests: 8,
+                    tokens: 0,
+                    micro_usd: 0,
+                },
+            }],
+        };
+        tier.set_peer_counters(sbproxy_ai::governance_crdt::merge_contributions([peer]));
+
+        // Local 1 and 2 bring the cluster total to 9 then 10, both within the
+        // limit of 10. The third is the 11th cluster request and is denied.
+        assert!(policy.allow_with_info_async("c1").await.allowed);
+        assert!(policy.allow_with_info_async("c1").await.allowed);
+        assert!(
+            !policy.allow_with_info_async("c1").await.allowed,
+            "the cluster total must include peer counts, not just local ones"
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_tier_alone_still_enforces_its_own_limit() {
+        let tier = cluster_tier("node-a");
+        let policy =
+            RateLimitPolicy::from_config(serde_json::json!({ "requests_per_minute": 3.0 }))
+                .expect("valid rpm policy")
+                .with_cluster(Some(tier.clone()), "test-origin");
+
+        // With no peer contributions the node enforces on its own count, so a
+        // single-node mesh behaves exactly like the configured limit.
+        assert!(policy.allow_with_info_async("solo").await.allowed);
+        assert!(policy.allow_with_info_async("solo").await.allowed);
+        assert!(policy.allow_with_info_async("solo").await.allowed);
+        assert!(!policy.allow_with_info_async("solo").await.allowed);
+    }
+
+    #[tokio::test]
+    async fn per_second_limits_do_not_use_the_cluster_tier() {
+        let tier = cluster_tier("node-a");
+        let policy =
+            RateLimitPolicy::from_config(serde_json::json!({ "requests_per_second": 5.0 }))
+                .expect("valid rps policy")
+                .with_cluster(Some(tier.clone()), "test-origin");
+
+        assert!(!policy.converges_on_mesh(), "a 1s window cannot converge");
+        assert!(policy.allow_with_info_async("c1").await.allowed);
+        assert!(
+            tier.local_slots().is_empty(),
+            "a per-second limit must not publish slots it cannot reconcile"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_l2_store_takes_precedence_over_the_cluster_tier() {
+        // A shared counter is exact, so it must win over an approximate
+        // merged view. Without a store the cluster path would have counted.
+        let tier = cluster_tier("node-a");
+        let policy =
+            RateLimitPolicy::from_config(serde_json::json!({ "requests_per_minute": 10.0 }))
+                .expect("valid rpm policy")
+                .with_cluster(Some(tier.clone()), "test-origin");
+        assert!(policy.cluster.is_some());
+        assert!(policy.store.is_none() && policy.async_store.is_none());
+        // Sanity: with no store the cluster path is the one that runs.
+        let _ = policy.allow_with_info_async("c1").await;
+        assert_eq!(
+            tier.local_slots().len(),
+            1,
+            "the cluster path should have counted exactly one bucket"
+        );
+    }
     use crate::policy::Policy;
 
     #[test]
@@ -739,6 +1274,135 @@ mod tests {
         assert!(
             !policy.allow_with_info_for("legit").allowed,
             "LRU eviction must not reset an exhausted legitimate bucket"
+        );
+    }
+
+    #[test]
+    fn dynamic_keyed_buckets_isolate_keys() {
+        let buckets = DynamicKeyedTokenBuckets::new(2);
+        let now = Instant::now();
+
+        assert!(buckets.check_at("agent-a", 0.1, now).allowed);
+        assert!(!buckets.check_at("agent-a", 0.1, now).allowed);
+        assert!(buckets.check_at("agent-b", 0.1, now).allowed);
+    }
+
+    #[test]
+    fn dynamic_keyed_buckets_refill_fractional_rates() {
+        let buckets = DynamicKeyedTokenBuckets::new(1);
+        let start = Instant::now();
+
+        assert!(buckets.check_at("agent", 0.5, start).allowed);
+        assert!(
+            !buckets
+                .check_at("agent", 0.5, start + std::time::Duration::from_secs(1))
+                .allowed
+        );
+        assert!(
+            buckets
+                .check_at("agent", 0.5, start + std::time::Duration::from_secs(2))
+                .allowed
+        );
+    }
+
+    #[test]
+    fn dynamic_keyed_buckets_rate_increase_does_not_grant_tokens() {
+        let buckets = DynamicKeyedTokenBuckets::new(1);
+        let start = Instant::now();
+
+        assert!(buckets.check_at("agent", 1.0, start).allowed);
+        assert!(!buckets.check_at("agent", 2.0, start).allowed);
+        assert!(
+            buckets
+                .check_at("agent", 2.0, start + std::time::Duration::from_millis(500),)
+                .allowed
+        );
+    }
+
+    #[test]
+    fn dynamic_keyed_buckets_ignore_stale_observation_time() {
+        let buckets = DynamicKeyedTokenBuckets::new(1);
+        let start = Instant::now();
+
+        assert!(buckets.check_at("agent", 1.0, start).allowed);
+        assert!(
+            buckets
+                .check_at("agent", 1.0, start + std::time::Duration::from_secs(1))
+                .allowed
+        );
+        assert!(
+            !buckets
+                .check_at("agent", 1.0, start + std::time::Duration::from_millis(500),)
+                .allowed
+        );
+        assert!(
+            !buckets
+                .check_at(
+                    "agent",
+                    1.0,
+                    start + std::time::Duration::from_millis(1_500),
+                )
+                .allowed,
+            "a stale caller must not move the refill clock backward"
+        );
+        assert!(
+            buckets
+                .check_at("agent", 1.0, start + std::time::Duration::from_secs(2))
+                .allowed
+        );
+    }
+
+    #[test]
+    fn dynamic_keyed_buckets_lower_rate_clamps_available_tokens() {
+        let buckets = DynamicKeyedTokenBuckets::new(1);
+        let now = Instant::now();
+
+        assert!(buckets.check_at("agent", 4.0, now).allowed);
+        let lowered = buckets.check_at("agent", 1.0, now);
+        assert!(lowered.allowed);
+        assert_eq!(lowered.limit, 1);
+        assert_eq!(lowered.remaining, 0);
+        assert!(!buckets.check_at("agent", 1.0, now).allowed);
+    }
+
+    #[test]
+    fn dynamic_keyed_buckets_fail_closed_when_registry_is_saturated() {
+        let buckets = DynamicKeyedTokenBuckets::new(1);
+        let start = Instant::now();
+
+        assert!(buckets.check_at("agent-a", 0.1, start).allowed);
+        let saturated = buckets.check_at("agent-b", 0.1, start + std::time::Duration::from_secs(1));
+        assert!(!saturated.allowed);
+        assert_eq!(saturated.remaining, 0);
+        assert_eq!(saturated.reset_secs, 9);
+
+        assert!(
+            buckets
+                .check_at("agent-b", 0.1, start + std::time::Duration::from_secs(10),)
+                .allowed,
+            "a fully refilled LRU bucket may be safely reused"
+        );
+    }
+
+    #[test]
+    fn dynamic_keyed_buckets_distinguish_next_token_from_full_refill_reset() {
+        let buckets = DynamicKeyedTokenBuckets::new(1);
+        let now = Instant::now();
+
+        assert!(buckets.check_at("agent-a", 1.1, now).allowed);
+        assert!(buckets.check_at("agent-a", 1.1, now).allowed);
+        let exhausted = buckets.check_at("agent-a", 1.1, now);
+        assert!(!exhausted.allowed);
+        assert_eq!(
+            exhausted.reset_secs, 1,
+            "an exhausted known key waits only for its next token"
+        );
+
+        let saturated = buckets.check_at("agent-b", 1.1, now);
+        assert!(!saturated.allowed);
+        assert_eq!(
+            saturated.reset_secs, 2,
+            "an unseen key waits until the LRU candidate is fully reusable"
         );
     }
 

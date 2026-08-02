@@ -671,3 +671,63 @@ providers:
     supports_streaming: false
     supports_embeddings: true
     supports_chat: false
+
+  # --- Tier 15: Enterprise cloud platforms (Phase 2) ---
+  - name: azure_foundry
+    display_name: Azure AI Foundry Models
+    aliases: [foundry_models, ai_foundry]
+    default_base_url: https://{resource}.services.ai.azure.com/openai/v1
+    auth_header: api-key
+    auth_prefix: ""
+    format: openai
+    supports_streaming: true
+    supports_embeddings: true
+
+  - name: snowflake
+    display_name: Snowflake Cortex
+    aliases: [snowflake_cortex, cortex]
+    default_base_url: https://{account}.snowflakecomputing.com/api/v2/cortex/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false
+
+  # --- Tier 16: Model labs and inference platforms (Phase 2) ---
+  - name: ai21
+    display_name: AI21 Labs (Jamba)
+    aliases: [jamba]
+    default_base_url: https://api.ai21.com/studio/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false
+
+  - name: clarifai
+    display_name: Clarifai
+    default_base_url: https://api.clarifai.com/v2/ext/openai/v1
+    auth_header: Authorization
+    auth_prefix: "Key "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false
+
+  - name: inception
+    display_name: Inception Labs (Mercury)
+    aliases: [mercury]
+    default_base_url: https://api.inceptionlabs.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false
+
+  - name: sarvam
+    display_name: Sarvam AI
+    default_base_url: https://api.sarvam.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false

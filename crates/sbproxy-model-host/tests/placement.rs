@@ -73,6 +73,7 @@ fn deployment(replicas: u32) -> ModelDeployment {
         variant: None,
         heterogeneous_variants: replicas > 1,
         replicas,
+        tensor_parallel: None,
         required_labels: BTreeMap::new(),
         spread_by: Vec::new(),
         pull: PullPolicy::OnDemand,
@@ -84,6 +85,14 @@ fn deployment(replicas: u32) -> ModelDeployment {
         queue_timeout_ms: 30_000,
         engine: EngineChoice::Auto,
         rollout: RolloutPolicy::Rolling,
+        extra_args: Vec::new(),
+        chunked_prefill: None,
+        tool_call_parser: None,
+        swap_space_gib: None,
+        cpu_offload_gib: None,
+        engine_version: None,
+        engine_image: None,
+        engine_sha256: None,
     }
 }
 

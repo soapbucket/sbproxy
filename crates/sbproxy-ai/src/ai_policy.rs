@@ -23,11 +23,19 @@
 //! ```
 //!
 //! Recognized action tokens (the closed set): `allow`, `block`, `redact`,
-//! `route_to:<model>`, `set_sink_tag:<tag>`, `audit:<priority>`. The
+//! `route_to:<model>`, `compression:<selector>`, `set_sink_tag:<tag>`,
+//! `audit:<priority>`. The
 //! expression is compiled (syntax-validated) when the policy is built; an
 //! unrecognized token or a non-string/list result at evaluation time falls
 //! back to the configured `on_error` action (default `allow`, i.e.
 //! fail-open).
+//!
+//! ## Why this site does not take a failure posture
+//!
+//! Most controls in the gateway spell their failure behavior as one of
+//! four posture words (`closed`, `open`, `degraded`, `observe`). This one
+//! deliberately does not, and `AiPolicyConfig::on_error` keeps its own
+//! vocabulary. See that field's documentation for the argument.
 
 use sbproxy_extension::cel::{CelContext, CelEngine, CelExpression, CelValue};
 use serde::Deserialize;
@@ -45,6 +53,14 @@ pub enum AiPolicyAction {
     Redact,
     /// Force the request onto a specific model.
     RouteTo(String),
+    /// Select a route-local request compression pipeline.
+    Compression(crate::compression::CompressionSelector),
+    /// A recognized compression action whose selector is malformed.
+    ///
+    /// Evaluation preserves this as a typed action so the request path can
+    /// disable compression safely instead of applying the policy-wide
+    /// `on_error` fallback.
+    InvalidCompressionSelector,
     /// Tag the usage record emitted for this request.
     SetSinkTag(String),
     /// Emit an audit event at the given priority.
@@ -56,12 +72,20 @@ impl AiPolicyAction {
     pub fn parse(token: &str) -> anyhow::Result<Self> {
         let token = token.trim();
         if let Some((name, arg)) = token.split_once(':') {
+            let name = name.trim();
             let arg = arg.trim();
             if arg.is_empty() {
+                if name == "compression" {
+                    return Ok(Self::InvalidCompressionSelector);
+                }
                 anyhow::bail!("ai policy action '{name}' requires an argument (got '{token}')");
             }
-            return match name.trim() {
+            return match name {
                 "route_to" => Ok(Self::RouteTo(arg.to_string())),
+                "compression" => match crate::compression::CompressionSelector::parse(arg) {
+                    Ok(selector) => Ok(Self::Compression(selector)),
+                    Err(_) => Ok(Self::InvalidCompressionSelector),
+                },
                 "set_sink_tag" => Ok(Self::SetSinkTag(arg.to_string())),
                 "audit" => Ok(Self::Audit(arg.to_string())),
                 other => anyhow::bail!("unknown ai policy action '{other}'"),
@@ -99,6 +123,28 @@ impl AiPolicyDecision {
             _ => None,
         })
     }
+    /// The first compression selector to apply, if any.
+    pub fn compression_selector(&self) -> Option<&crate::compression::CompressionSelector> {
+        self.actions
+            .iter()
+            .find_map(|action| match action {
+                AiPolicyAction::Compression(selector) => Some(Some(selector)),
+                AiPolicyAction::InvalidCompressionSelector => Some(None),
+                _ => None,
+            })
+            .flatten()
+    }
+    /// True when the first compression action carries a malformed selector.
+    pub fn compression_selector_invalid(&self) -> bool {
+        self.actions
+            .iter()
+            .find_map(|action| match action {
+                AiPolicyAction::Compression(_) => Some(false),
+                AiPolicyAction::InvalidCompressionSelector => Some(true),
+                _ => None,
+            })
+            .unwrap_or(false)
+    }
     /// The usage-record tag to apply, if any.
     pub fn sink_tag(&self) -> Option<&str> {
         self.actions.iter().find_map(|a| match a {
@@ -131,8 +177,10 @@ pub struct AiDecisionView {
     pub api_key_id: String,
     /// Principal tier / plan tag (e.g. `free`, `pro`), when known.
     pub tier: String,
-    /// Labels of the guardrails that flagged the request.
+    /// Security verdict and non-enforcing routing labels exposed to policy.
     pub guardrail_labels: Vec<String>,
+    /// Number of enforcing security guardrails that flagged.
+    pub guardrail_flagged_count: usize,
     /// Fraction (0.0-1.0+) of the tightest active budget window consumed.
     pub budget_fraction: f64,
     /// True when a budget window is already exceeded.
@@ -147,11 +195,11 @@ impl AiDecisionView {
         let guardrails = HashMap::from([
             (
                 "flagged".to_string(),
-                CelValue::Bool(!self.guardrail_labels.is_empty()),
+                CelValue::Bool(self.guardrail_flagged_count > 0),
             ),
             (
                 "flagged_count".to_string(),
-                CelValue::Int(self.guardrail_labels.len() as i64),
+                CelValue::Int(self.guardrail_flagged_count as i64),
             ),
             (
                 "labels".to_string(),
@@ -210,6 +258,64 @@ pub struct AiPolicyConfig {
     /// Action(s) applied when the expression errors or returns an
     /// unrecognized value. Space- or comma-separated tokens. Defaults to
     /// `allow` (fail-open) so a policy bug cannot take the gateway down.
+    ///
+    /// # Why this is not a failure posture
+    ///
+    /// Other controls spell this axis with one of four shared words:
+    /// `closed`, `open`, `degraded`, `observe`. This site keeps its own
+    /// vocabulary on purpose, because it is not a posture. A posture
+    /// answers one question, "does the request proceed", and leaves the
+    /// rest of the pipeline alone. `on_error` is a whole fallback
+    /// decision: an ordered list drawn from the same closed seven-variant
+    /// action set the expression itself emits, so the fallback can route,
+    /// redact, tag, and audit, not merely admit or refuse. Real
+    /// configurations use that:
+    ///
+    /// ```yaml
+    /// on_error: redact route_to:gpt-4o-mini audit:high
+    /// ```
+    ///
+    /// Collapsing that onto four words would delete expressiveness
+    /// operators are already using, and there is no posture word for
+    /// "redact, downgrade the model, and page someone". Two of the seven
+    /// tokens happen to line up, and it is worth knowing which:
+    ///
+    /// | `on_error` | Shared posture | Meaning |
+    /// |---|---|---|
+    /// | `block` | `closed` | Reject the request |
+    /// | `allow` | `open` | Proceed unchanged, claim nothing |
+    ///
+    /// The other five have no posture spelling at all. `degraded` has no
+    /// analogue either: a policy that could not be evaluated made no
+    /// guarantee to waive, because the expression is an operator's own
+    /// rule rather than a control with an advertised outcome. Neither
+    /// does `observe`, because there is no counterfactual to record: the
+    /// expression failed, so there is no decision it would have taken.
+    ///
+    /// This is also not the unvalidated string it looks like. Every
+    /// token is parsed by `parse_action_list` at config-compile time by
+    /// [`CompiledAiPolicy::compile`], which rejects an unknown token, an
+    /// empty list, and a malformed compression selector before the
+    /// policy is ever published. A bad `on_error` is a startup failure,
+    /// not a request-time surprise.
+    ///
+    /// # Why the default is open, and why that is correct
+    ///
+    /// Every other security control in the gateway defaults closed, and
+    /// this one deliberately does not. The rule is that a control
+    /// defaults closed when it enforces a security boundary and open
+    /// only where refusing would take the gateway down over something
+    /// that is not one. This is the second case. `on_error` fires when
+    /// the operator's own CEL expression could not be evaluated: a typo
+    /// in a field path, a type error, a token the closed set does not
+    /// contain. That is a bug in a rule, not evidence that the request
+    /// is dangerous, and the guardrails, budgets, and rate limits that
+    /// do enforce boundaries have already run and are unaffected by it.
+    /// Defaulting closed here would let one malformed expression
+    /// black-hole every request on the route, which is a worse outcome
+    /// than the rule not applying. An operator who wants the strict
+    /// reading sets `on_error: block`, and one who wants the failure
+    /// visible without refusing traffic sets `on_error: allow audit:high`.
     #[serde(default = "default_on_error")]
     pub on_error: String,
 }
@@ -258,6 +364,12 @@ impl CompiledAiPolicy {
             .map_err(|e| anyhow::anyhow!("ai_policy.expression: {e}"))?;
         let on_error = parse_action_list(&cfg.on_error)
             .map_err(|e| anyhow::anyhow!("ai_policy.on_error: {e}"))?;
+        if on_error
+            .iter()
+            .any(|action| matches!(action, AiPolicyAction::InvalidCompressionSelector))
+        {
+            anyhow::bail!("ai_policy.on_error: invalid compression selector");
+        }
         Ok(Self {
             engine,
             expr,
@@ -360,6 +472,20 @@ mod tests {
             AiPolicyAction::parse("audit:high").unwrap(),
             AiPolicyAction::Audit("high".into())
         );
+        assert_eq!(
+            AiPolicyAction::parse("compression:coding-agent").unwrap(),
+            AiPolicyAction::Compression(crate::compression::CompressionSelector::Profile(
+                "coding-agent".into()
+            ))
+        );
+        assert_eq!(
+            AiPolicyAction::parse("compression:Bad Name").unwrap(),
+            AiPolicyAction::InvalidCompressionSelector
+        );
+        assert_eq!(
+            AiPolicyAction::parse("compression:").unwrap(),
+            AiPolicyAction::InvalidCompressionSelector
+        );
         assert!(AiPolicyAction::parse("nonsense").is_err());
         assert!(AiPolicyAction::parse("route_to:").is_err());
     }
@@ -374,14 +500,46 @@ mod tests {
     }
 
     #[test]
+    fn malformed_compression_selector_in_on_error_fails_to_compile() {
+        let err = CompiledAiPolicy::compile(&AiPolicyConfig {
+            expression: r#""allow""#.to_string(),
+            on_error: "compression:Upper".to_string(),
+        });
+
+        assert!(
+            err.is_err(),
+            "configured on_error selectors must be validated at config load"
+        );
+    }
+
+    #[test]
     fn block_when_two_guardrails_flag() {
         let p = policy(r#"ai.guardrails.flagged_count >= 2 ? "block" : "allow""#);
         let mut view = AiDecisionView {
             guardrail_labels: vec!["pii".into(), "injection".into()],
+            guardrail_flagged_count: 2,
             ..Default::default()
         };
         assert!(p.evaluate(&view).is_block());
         view.guardrail_labels = vec!["pii".into()];
+        view.guardrail_flagged_count = 1;
+        assert!(!p.evaluate(&view).is_block());
+    }
+
+    #[test]
+    fn routing_label_does_not_become_a_security_flag() {
+        let p = policy(
+            r#""documentation" in ai.guardrails.labels
+               && ai.guardrails.flagged_count == 0
+               && !ai.guardrails.flagged
+               ? "allow"
+               : "block""#,
+        );
+        let view = AiDecisionView {
+            guardrail_labels: vec!["documentation".into()],
+            ..Default::default()
+        };
+
         assert!(!p.evaluate(&view).is_block());
     }
 
@@ -395,6 +553,7 @@ mod tests {
         let view = AiDecisionView {
             tier: "free".into(),
             guardrail_labels: vec!["pii".into(), "toxicity".into()],
+            guardrail_flagged_count: 2,
             ..Default::default()
         };
         let d = p.evaluate(&view);
@@ -415,6 +574,35 @@ mod tests {
     }
 
     #[test]
+    fn decision_exposes_first_compression_selector() {
+        let p = policy(r#"["compression:off", "compression:coding-agent"]"#);
+        let decision = p.evaluate(&AiDecisionView::default());
+
+        assert_eq!(
+            decision.compression_selector(),
+            Some(&crate::compression::CompressionSelector::Off)
+        );
+    }
+
+    #[test]
+    fn malformed_compression_action_is_typed_safe_off_not_policy_on_error() {
+        let policy = CompiledAiPolicy::compile(&AiPolicyConfig {
+            expression: r#""compression:Bad Name""#.into(),
+            on_error: "allow".into(),
+        })
+        .unwrap();
+
+        let decision = policy.evaluate(&AiDecisionView::default());
+
+        assert!(decision.compression_selector().is_none());
+        assert!(decision.compression_selector_invalid());
+        assert_eq!(
+            decision.actions,
+            vec![AiPolicyAction::InvalidCompressionSelector]
+        );
+    }
+
+    #[test]
     fn evaluation_error_falls_back_to_on_error() {
         // `on_error` set to block; force a type error by returning an int.
         let p = CompiledAiPolicy::compile(&AiPolicyConfig {
@@ -424,6 +612,51 @@ mod tests {
         .unwrap();
         let d = p.evaluate(&AiDecisionView::default());
         assert!(d.is_block(), "non-string result uses on_error");
+    }
+
+    #[test]
+    fn on_error_keeps_its_own_vocabulary_and_its_deliberate_open_default() {
+        // The default is open on purpose, and it is the one place in the
+        // gateway where that is the right call: a bug in an operator's
+        // own expression must not black-hole every request on the route.
+        assert_eq!(default_on_error(), "allow");
+        let document = serde_json::json!({"expression": r#""allow""#});
+        let config: AiPolicyConfig = serde_json::from_value(document).unwrap();
+        assert_eq!(config.on_error, "allow");
+
+        // The two tokens that line up with the shared posture words.
+        assert_eq!(
+            parse_action_list("block").unwrap(),
+            vec![AiPolicyAction::Block]
+        );
+        assert_eq!(
+            parse_action_list("allow").unwrap(),
+            vec![AiPolicyAction::Allow]
+        );
+
+        // The multi-token fallback decision no posture word can express,
+        // which is the reason this site kept its own vocabulary.
+        let actions = parse_action_list("redact route_to:gpt-4o-mini audit:high").unwrap();
+        assert_eq!(
+            actions,
+            vec![
+                AiPolicyAction::Redact,
+                AiPolicyAction::RouteTo("gpt-4o-mini".into()),
+                AiPolicyAction::Audit("high".into()),
+            ]
+        );
+
+        // A posture word is not an action token here. It is rejected at
+        // config-compile time rather than quietly accepted and mapped to
+        // something arbitrary.
+        for posture in ["closed", "open", "degraded", "observe"] {
+            assert!(AiPolicyAction::parse(posture).is_err(), "{posture}");
+            let config = AiPolicyConfig {
+                expression: r#""allow""#.to_string(),
+                on_error: posture.to_string(),
+            };
+            assert!(CompiledAiPolicy::compile(&config).is_err(), "{posture}");
+        }
     }
 
     #[test]

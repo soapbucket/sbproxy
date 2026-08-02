@@ -1,90 +1,355 @@
-# 402 Challenge contract
-*Last modified: 2026-05-25*
+# 402 challenge contract
 
-The wire format the proxy uses when it returns `402 Payment Required`
-to an AI crawler. This document is the canonical reference for the
-challenge body shape and for the line that splits OSS-advertises from
-enterprise-settles.
+*Last modified: 2026-08-01*
 
-The behavioural policy that emits these bodies is `ai_crawl_control`;
-see [`ai-crawl-control.md`](ai-crawl-control.md) for configuration,
-agent classes, ledger, and tiered pricing.
+The exact bytes SBproxy puts on the wire when a request has to be paid
+for, and the exact bytes it accepts back. This page is the wire reference.
+The operator guide to configuring settlement is
+[payment-settlement.md](payment-settlement.md), and the policy that
+decides which requests are payable is
+[ai-crawl-control.md](ai-crawl-control.md).
 
-## Two challenge shapes
+## The flow this contract describes
 
-The OSS proxy emits one of two 402 shapes, picked per request:
+1. The route computes a price.
+2. SBproxy builds one normalized requirement from that price and
+   `proxy.payments`, and from nothing else.
+3. The client says which method it prefers.
+4. SBproxy signs the requirement, persists it as a pending intent, and
+   answers 402 with one protocol challenge.
+5. The client fulfills the challenge and retries with the protocol
+   credential.
+6. SBproxy verifies the credential locally, then performs the rail's
+   required verification and settlement inside one bounded deadline.
+7. SQLite records the settlement.
+8. Only then does the origin see the request.
 
-1. **Single-rail (default).** Returned to legacy crawlers and to any
-   request that has not opted in to multi-rail negotiation. Carries
-   the `Crawler-Payment` response header and a flat JSON body with the
-   price and currency. This is the long-standing Pay Per Crawl shape.
+Steps 6 through 8 are ordered on purpose. Nothing between the challenge
+and the committed record opens the route.
 
-2. **Multi-rail (opt-in).** Returned when the agent opts in via either
-   the `Accept-Payment` request header (a q-value list of rail names)
-   or one of the multi-rail `Accept` MIME types
-   (`application/sbproxy-multi-rail+json`, `application/x402+json`,
-   `application/mpp+json`). Carries `Content-Type:
-   application/sbproxy-multi-rail+json` and a JSON body that lists
-   one entry per advertised rail, each with its own per-rail
-   quote-token JWS.
+## Accept-Payment is a preference, never a credential
 
-The multi-rail body is the negotiation contract. It is fully defined
-in OSS so the same proxy binary can advertise rails whether or not the
-operator is running an enterprise build that can settle them.
+`Accept-Payment` is a request header listing the payment methods the
+client can use, in the client's own order of preference. It carries no
+signature, no token, no address, no amount, and no proof of anything. It
+selects which challenge is emitted. It never authorizes a request.
 
-## OSS advertises, enterprise settles
+```http
+Accept-Payment: stripe;intent=charge;q=1.0, x402;q=0.5
+```
 
-The split between what OSS does and what the enterprise build does is
-deliberate, and matches the framing the rail-Lightning example PR
-uses (see `examples/rail-lightning/README.md`).
+The grammar is a comma-separated list. Each entry is a method token,
+optionally followed by `;intent=<token>` and `;q=<quality>`.
 
-What the OSS proxy does today:
+| Parameter | Rules |
+|---|---|
+| method | Lowercased. 1 to 64 bytes of ASCII alphanumerics, `-`, `_`, or `.`. |
+| `intent` | Same token rules. Optional. |
+| `q` | Absent means `1.0`. At most three fractional digits. A value above `1.0` is invalid. |
 
-- Parses the `Accept-Payment` header (RFC-style q-values) and the
-  multi-rail `Accept` MIME types.
-- Filters the agent's preference set against the operator's per-tier
-  `rails:` override and the top-level `rails:` block.
-- Emits the multi-rail 402 body with one entry per surviving rail,
-  each carrying its own quote-token JWS (separate nonce per rail).
-- Responds 406 `no_acceptable_rail` when the preference set has no
-  overlap with the offered rails, listing the operator's offered set
-  on the response.
-- Falls back to the single-rail format for legacy crawlers that did
-  not opt in.
-- Honours the in-memory ledger (`valid_tokens:`) and the HTTPS-only
-  HTTP ledger client for accept-payment redemption.
+Parsing is per entry, never per request. A duplicate `intent`, a duplicate
+`q`, an unknown parameter, a quality above 1.0, or a malformed token drops
+that one entry and leaves the rest intact. A malformed header is never a
+reason to refuse a payable request. Entries sort by descending quality,
+and the client's own order is preserved within one quality.
 
-What the OSS proxy cannot do today:
+## Payment HTTP Authentication
 
-- Settle a real-money payment on a stablecoin or fiat rail.
-- Verify an x402 redemption token against a facilitator.
-- Capture a Stripe `payment_intent`.
-- Open or close a Lightning invoice.
+Pinned to `draft-ryan-httpauth-payment-01`. No protocol version appears on
+the wire. This release implements exactly one registered pair, `stripe`
+plus `charge`, from `draft-stripe-charge-00`.
 
-Settlement on those rails requires the enterprise build, gated behind
-cargo features:
+### The challenge
 
-| Feature              | Settles                                        |
-|----------------------|------------------------------------------------|
-| `stripe`             | Stripe fiat (cards, ACH).                      |
-| `x402`               | x402 v2 stablecoin-on-chain via a facilitator. |
-| `mpp`                | Stripe Multi-Party Payments.                   |
-| `lightning-cln`      | Core Lightning node.                           |
-| `lightning-lnd`      | LND node.                                      |
-| `lightning-phoenixd` | Phoenix self-custodial daemon.                 |
+One offered challenge means one `WWW-Authenticate` field. Two offered
+challenges means two separate fields, never one field carrying both.
 
-Each enterprise feature registers a `BillingRail` impl into the OSS
-plugin trait registry under the canonical rail name the OSS schema
-already understands (`x402`, `mpp`, `lightning`). The OSS YAML schema
-in `sb.yml` does not change across enterprise backends; only the
-settlement code does. That is the property this contract pins:
-operators write the same `sb.yml` whether they run OSS or an
-enterprise build.
+```http
+HTTP/1.1 402 Payment Required
+Cache-Control: no-store
+WWW-Authenticate: Payment id="zALONMyg62ie-ZqvHAWSvZU82ywJfV8mXk-mB2H585E", realm="api.example.com", method="stripe", intent="charge", request="eyJhbW91bnQiOiIxMDAwIiwi...", expires="2026-07-29T20:05:00Z", digest="sha-256=:ikRyUhC53NT+/Z8Oyge3CuReaSdKMQX7JetCaiz4u/Q=:", opaque="eyJpbnRlbnRfaWQiOiJzdGxfMDEiLCJwcm92aWRlciI6InN0cmlwZSJ9"
+```
 
-## Single-rail body
+Parameters appear in this order, each value double-quoted, separated by a
+comma and one space.
 
-The default 402 body for legacy crawlers. Returned with the
-`Crawler-Payment` response header and `Content-Type: application/json`.
+| Parameter | Required | Value |
+|---|---|---|
+| `id` | yes | Unpadded base64url of the challenge MAC. See "Binding" below. |
+| `realm` | yes | The protection space from `protocols.payment_auth.realm`. |
+| `method` | yes | `stripe`. |
+| `intent` | yes | `charge`. |
+| `request` | yes | Unpadded base64url of the JCS form of the charge request object. |
+| `expires` | yes | Exactly `YYYY-MM-DDTHH:MM:SSZ`, 20 bytes. No offsets, no fractional seconds, no lowercase separators. |
+| `digest` | when the request has a body | The RFC 9530 parameter over the exact request bytes. |
+| `opaque` | when routing state is carried | Unpadded base64url of the JCS form of the opaque object. |
+
+An absent optional parameter is omitted entirely and never emitted empty.
+A rendered challenge is capped at 8 KiB. Unknown parameters on a received
+challenge are ignored, as draft-01 requires, but a repeated parameter, an
+unquoted value, an empty value, or a value containing a backslash is
+rejected.
+
+The `request` object is the pinned charge request:
+
+```json
+{"amount":"1000","currency":"usd","externalId":"quote_01","methodDetails":{"metadata":{"quote_id":"quote_01"},"networkId":"profile_test_123","paymentMethodTypes":["card"]}}
+```
+
+The `opaque` object carries non-secret routing state only:
+
+```json
+{"intent_id":"stl_01","provider":"stripe"}
+```
+
+### Binding
+
+`id` is HMAC-SHA256 over exactly seven slots joined by `|`, encoded as
+unpadded base64url. An absent optional slot is an empty string, not a
+skipped separator.
+
+```text
+realm|method|intent|request|expires|digest|opaque
+```
+
+The key is `proxy.payments.challenge_binding_key`. Comparison is constant
+time. Because the realm is the first slot, changing it invalidates every
+outstanding challenge.
+
+### The credential
+
+Exactly one `Authorization` field carrying the `Payment` scheme. The token
+is unpadded base64url of UTF-8 JSON.
+
+```http
+Authorization: Payment eyJjaGFsbGVuZ2UiOnsiZGlnZXN0Ijoic2hhLTI1Nj06aWtSeVVoQzUzTlQr...
+```
+
+Decoded:
+
+```json
+{"challenge":{"digest":"sha-256=:ikRyUhC53NT+/Z8Oyge3CuReaSdKMQX7JetCaiz4u/Q=:","expires":"2026-07-29T20:05:00Z","id":"zALONMyg62ie-ZqvHAWSvZU82ywJfV8mXk-mB2H585E","intent":"charge","method":"stripe","opaque":"eyJpbnRlbnRfaWQiOiJzdGxfMDEiLCJwcm92aWRlciI6InN0cmlwZSJ9","realm":"api.example.com","request":"eyJhbW91bnQiOiIxMDAwIiwi..."},"payload":{"spt":"spt_test_123"}}
+```
+
+`challenge` echoes the eight challenge parameters. `payload` is the pinned
+Stripe charge payload: a required `spt` and an optional `externalId`.
+Unknown members are ignored at the top level and rejected inside
+`payload`.
+
+A credential is refused as malformed when the token is over 16 KiB, is not
+strict unpadded base64url, decodes to invalid UTF-8 or invalid JSON,
+repeats a JSON key, nests deeper than 16 levels, carries an `spt` that
+does not begin with `spt_` or exceeds 4 KiB, or carries an `externalId`
+that is empty or over 255 bytes. Padding characters, `+`, and `/` in
+base64url positions are refused rather than repaired. A field carrying a
+different scheme, such as `Bearer`, is skipped rather than rejected. Two
+`Payment` credentials on one request are a 400.
+
+Verification runs in a fixed order and coerces nothing: strip the scheme,
+decode, check the binding, check expiry, check the body digest, decode
+`request`, decode `opaque`. An expired challenge is not renewed and a
+mismatched digest is not recomputed.
+
+### Body digest
+
+The digest parameter is the RFC 9530 structured-field byte sequence over
+the exact request bytes:
+
+```text
+sha-256=:ikRyUhC53NT+/Z8Oyge3CuReaSdKMQX7JetCaiz4u/Q=:
+```
+
+That inner value is standard base64 with padding, and it is the one place
+in this contract that is not base64url. For the body `{"prompt":"hello"}`
+with no trailing newline, the parameter is exactly the string above.
+
+Presence is strict in both directions. A request with a body and no digest
+is refused, and a digest with no body is refused. A request with neither
+passes. The bytes are read once, capped at
+`proxy.payments.max_body_bytes`, and replayed to the origin unchanged only
+after settlement. A body over the cap is answered 413 before any challenge
+or provider work.
+
+### Errors
+
+Every failure is a Problem Details document with
+`Content-Type: application/problem+json` and exactly three members.
+
+```json
+{"type":"https://paymentauth.org/problems/verification-failed","title":"Payment verification failed","status":402}
+```
+
+| Code | Type URI suffix | Status | Title |
+|---|---|---|---|
+| `payment-required` | `/payment-required` | 402 | Payment required |
+| `payment-insufficient` | `/payment-insufficient` | 402 | Payment insufficient |
+| `payment-expired` | `/payment-expired` | 402 | Payment challenge expired |
+| `verification-failed` | `/verification-failed` | 402 | Payment verification failed |
+| `method-unsupported` | `/method-unsupported` | 400 | Payment method not supported |
+| `malformed-credential` | `/malformed-credential` | 402 | Malformed payment credential |
+| `invalid-challenge` | `/invalid-challenge` | 402 | Invalid payment challenge |
+
+The URI prefix is `https://paymentauth.org/problems/`. The `status` member
+is the status the response actually carries, which is not always the
+code's registered status: two `Payment` credentials on one request produce
+the `malformed-credential` type with `status: 400`, because the request is
+malformed rather than unpaid.
+
+Four refusals carry no problem document at all: a body over the cap (413),
+a challenge that would exceed 8 KiB (500), a Payment flow attempted over
+cleartext (421), and an internal error (500).
+
+A fresh challenge accompanies a refusal only when the status is 402. The
+400, 413, 421, and 500 answers do not re-challenge.
+
+### Cache control and the receipt
+
+Every 402 carries `Cache-Control: no-store`. A successful paid 2xx carries
+`Cache-Control: private` and one `Payment-Receipt` field. No error
+response ever carries a receipt.
+
+The receipt is the JCS form of four required members, encoded as unpadded
+base64url:
+
+```json
+{"method":"stripe","reference":"pi_test_123","status":"success","timestamp":"2026-07-29T20:00:00Z"}
+```
+
+```http
+Payment-Receipt: eyJtZXRob2QiOiJzdHJpcGUiLCJyZWZlcmVuY2UiOiJwaV90ZXN0XzEyMyIsInN0YXR1cyI6InN1Y2Nlc3MiLCJ0aW1lc3RhbXAiOiIyMDI2LTA3LTI5VDIwOjAwOjAwWiJ9
+```
+
+`reference` is the provider's own identifier, so an operator can look the
+payment up at the provider. `status` is always `success`, because a
+receipt is only ever written for a settled payment.
+
+## Direct Stripe PaymentIntent mode
+
+An alternative to Payment HTTP Authentication for clients that already
+speak Stripe. Enable it with
+`proxy.payments.rails.stripe.direct_payment_intent.enabled: true`.
+
+The challenge creates a manual-capture PaymentIntent and returns its
+one-shot client secret in the immediate response body. That value is never
+persisted, never hashed, and never logged. The client confirms the
+PaymentIntent, then retries the original request. The proxy retrieves the
+challenge-bound PaymentIntent, captures it, confirms the authoritative
+result is `succeeded`, and only then allows the origin.
+
+Automatic capture is refused by config validation. Challenge preparation
+must not take money for a resource it has not delivered.
+
+## x402 v2 `exact`
+
+Three header fields, all standard RFC 4648 base64 with padding over
+compact UTF-8 JSON. Base64url is rejected, and so is stripped padding. A
+header value is capped at 64 KiB.
+
+| Field | Direction | Carries |
+|---|---|---|
+| `PAYMENT-REQUIRED` | 402 response | The `PaymentRequired` object below |
+| `PAYMENT-SIGNATURE` | credential retry | The `PaymentPayload` object below |
+| `PAYMENT-RESPONSE` | settled 2xx only | The facilitator's exact settle response |
+
+There is no `X-` prefix on any of them, and x402 never emits
+`Payment-Receipt`.
+
+### The challenge object
+
+```json
+{
+  "x402Version": 2,
+  "resource": {"url": "https://blog.example.com/article"},
+  "accepts": [
+    {
+      "scheme": "exact",
+      "network": "eip155:84532",
+      "amount": "1000",
+      "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+      "payTo": "0x1111111111111111111111111111111111111111",
+      "maxTimeoutSeconds": 60,
+      "extra": {"name": "USDC", "version": "2"}
+    }
+  ],
+  "extensions": {
+    "sbproxy-requirement": {
+      "info": {"id": "<requirement id>", "quote": "<quote JWS>"},
+      "schema": {}
+    }
+  }
+}
+```
+
+`resource` may also carry `description`, `mimeType`, `serviceName`,
+`tags`, and `iconUrl`. An optional top-level `error` string appears when
+the 402 follows a failed attempt. Unknown top-level fields are rejected.
+
+`sbproxy-requirement` is the only SBProxy extension in the envelope, and
+it lives under `extensions` rather than as an undocumented top-level
+field. Its `schema` member is a JSON Schema Draft 2020-12 object with
+`additionalProperties: false`, requiring a string `id` matching
+`^[A-Za-z0-9_-]{16,128}$` and a string `quote` of length 1 through 4096.
+`id` is the durable requirement id and `quote` is its signed quote JWS.
+
+### The credential object
+
+```json
+{
+  "x402Version": 2,
+  "resource": {},
+  "accepted": {},
+  "payload": {},
+  "extensions": {}
+}
+```
+
+`resource`, `accepted`, and `extensions` must be exact echoes of the
+challenge. `accepted` is the one `accepts` entry the client chose.
+`payload` is the scheme's signed object and is never interpreted by the
+proxy; it is canonicalized and hashed to bind the credential to one
+intent.
+
+The echo is checked before the facilitator is contacted. A changed
+extension, a changed requirement, a duplicate header, a duplicate JSON
+key, an unknown top-level field, an oversized body, or an `x402Version`
+other than 2 all stop the request locally.
+
+### Facilitator calls
+
+Both endpoints are formed by keeping the configured API root's path,
+stripping only trailing slashes, and appending `/verify` or `/settle`.
+Nothing else is ever constructed. Both calls post identical bytes:
+
+```json
+{"x402Version":2,"paymentPayload":{},"paymentRequirements":{}}
+```
+
+The verify response is read for `isValid`, and optionally
+`invalidReason`, `payer`, and `extra`. An `isValid` that is `false` or
+absent is a refusal, and settle is never prepared or sent.
+
+The settle response is read for `success`, and optionally `errorReason`,
+`payer`, `transaction`, `network`, `amount`, and `extensions`. Settlement
+counts only when `success` is `true`, `transaction` is non-empty,
+`network` equals the accepted requirement's network exactly, `amount`
+equals the accepted amount exactly whenever the response includes it, and
+the two responses' `payer` values agree whenever both are present.
+Anything else is ambiguous and goes to reconciliation rather than to the
+origin.
+
+On success the origin is called and the exact settle response is echoed
+back as `PAYMENT-RESPONSE`.
+
+## Legacy `Crawler-Payment` compatibility
+
+Crawlers that send no payment preference still get the long-standing Pay
+Per Crawl shape, so nothing that works today stops working.
+
+```http
+HTTP/1.1 402 Payment Required
+Crawler-Payment: realm="ai-crawl" currency="USD" price="0.001"
+Content-Type: application/json
+```
 
 ```json
 {
@@ -96,14 +361,47 @@ The default 402 body for legacy crawlers. Returned with the
 }
 ```
 
-The `header` field tells the crawler which header name to set on its
-retry. The default is `crawler-payment`; operators override it via the
-policy's `header:` config field.
+`header` names the request header the crawler sets on its retry. The
+default is `crawler-payment`, overridden by the policy's `header:` field.
 
-## Multi-rail body
+### Cloudflare Pay Per Crawl interop
 
-Emitted when the agent opted in. `Content-Type:
-application/sbproxy-multi-rail+json`.
+`cloudflare_compat: true` on the `ai_crawl_control` policy speaks
+Cloudflare's header set instead. The 402 carries
+`crawler-price: <currency> <amount>`, the crawler retries with
+`crawler-exact-price` or `crawler-max-price` alongside its token, and a
+served request carries `crawler-charged: <currency> <amount>` so the
+crawler learns exactly what it paid. A `crawler-max-price` below the
+quote, or a `crawler-exact-price` that does not equal it, re-quotes with a
+fresh 402 and spends nothing.
+
+An operator running the `bot_auth` verifier can require those inbound
+price headers to be signed components by listing the header name in an
+agent's `required_components`, so a retry whose signature does not cover
+the price header is rejected before the ledger is consulted.
+
+### Always-free paths
+
+These are never charged, so a crawler can always read the site's policy
+without paying to learn it:
+
+- `/robots.txt`
+- `/sitemap.xml`
+- `/security.txt`
+- `/.well-known/security.txt`
+- `/crawlers.json`
+
+The policy's `free_paths:` list extends this built-in allowlist. A
+trailing `*` is a prefix match; anything else matches exactly. The
+built-in list always applies, so an operator cannot accidentally start
+charging for `robots.txt`.
+
+## Multi-rail negotiation body
+
+When a client opts in with `Accept-Payment` or with an `Accept` value of
+`application/sbproxy-multi-rail+json`, `application/x402+json`, or
+`application/mpp+json`, the policy answers with a body listing one entry
+per advertised rail, each carrying its own quote-token JWS.
 
 ```json
 {
@@ -111,21 +409,9 @@ application/sbproxy-multi-rail+json`.
     {
       "kind": "x402",
       "version": "2",
-      "chain": "base",
-      "facilitator": "https://facilitator-base.x402.org",
-      "asset": "USDC",
       "amount_micros": 1000,
       "currency": "USD",
-      "pay_to": "0x0000000000000000000000000000000000000000",
-      "expires_at": "2026-05-08T12:34:56Z",
-      "quote_token": "eyJhbGc..."
-    },
-    {
-      "kind": "mpp",
-      "version": "1",
-      "amount_micros": 1000,
-      "currency": "USD",
-      "expires_at": "2026-05-08T12:34:56Z",
+      "expires_at": "2026-08-01T12:34:56Z",
       "quote_token": "eyJhbGc..."
     }
   ],
@@ -134,109 +420,17 @@ application/sbproxy-multi-rail+json`.
 }
 ```
 
-Notes:
+`rails[].kind` is a closed set; an unknown kind is rejected at validate
+time. Entry order is the operator's declared preference and breaks ties
+after the client's own quality sort. Each entry gets its own nonce, so a
+quote cannot be replayed across rails.
 
-- `rails[].kind` is a closed enum: `x402`, `mpp`, `lightning`. Adding
-  a rail is a schema amendment, not a config change; unknown kinds are
-  rejected at validate time.
-- `rails[].quote_token` is a JWS. One nonce per rail per response, so
-  the agent cannot replay a quote across rails. JWKS publication and
-  token replay are covered by the
-  `examples/quote-token-replay-jwks/` example.
-- `rails[]` order is the operator's declared preference. Agents break
-  ties on this order after q-value sorting their own preference set.
-- Lightning entries appear in the body only when an enterprise
-  `lightning-*` feature has registered a `BillingRail` named
-  `lightning` into the trait registry. With the OSS-default build, a
-  per-tier `rails: [lightning, x402]` declaration parses cleanly (the
-  `Rail::Lightning` enum variant ships in OSS) and the proxy still
-  negotiates against the `lightning` token on the wire; the body just
-  carries the next surviving rail (here `x402`).
+The `application/x402+json` and `application/mpp+json` values are narrow
+opt-ins: a client sending one of them is asking for that rail's entry
+rather than for the full list.
 
-## Cloudflare Pay Per Crawl interop
-
-Set `cloudflare_compat: true` on the `ai_crawl_control` policy to speak
-Cloudflare's exact Pay Per Crawl wire contract. A crawler that already
-transacts with a Cloudflare origin works against an SBproxy origin
-unchanged, and the differentiator is that SBproxy settles on the
-operator's own rails with no Merchant-of-Record cut.
-
-In this mode the negotiation uses Cloudflare's header set instead of
-the single-rail JSON body:
-
-- The 402 response carries `crawler-price: <currency> <amount>`, for
-  example `crawler-price: USD 0.01`. A JSON body mirrors the price for
-  clients that read the body instead of the header.
-- The crawler retries with `crawler-exact-price` (commit to a precise
-  amount) or `crawler-max-price` (a cap), plus its payment token on the
-  configured header (`crawler-payment` by default). The token settles
-  through the same self-hosted ledger the single-rail path uses.
-- A `crawler-max-price` below the quote, or a `crawler-exact-price`
-  that does not equal the quote, re-quotes with a fresh 402 and does
-  not spend the token.
-- A settled request is served with `crawler-charged: <currency>
-  <amount>` so the crawler learns exactly what it paid.
-
-```yaml
-policies:
-  - type: ai_crawl_control
-    price: 0.01
-    currency: USD
-    cloudflare_compat: true
-    free_paths:
-      - "/feed/*"
-    valid_tokens:
-      - ppc-token-1
-```
-
-### Always-free paths
-
-These well-known operational endpoints are never charged, so a crawler
-can always discover the site's policy without paying to read it:
-
-- `/robots.txt`
-- `/sitemap.xml`
-- `/security.txt`
-- `/.well-known/security.txt`
-- `/crawlers.json`
-
-The per-policy `free_paths:` list extends this built-in allowlist
-(Cloudflare's Configuration-Rules equivalent). A trailing `*` is a
-prefix match (`/feed/*`); otherwise the entry matches exactly. The
-built-in allowlist always applies, so an operator cannot accidentally
-start charging for `robots.txt`.
-
-### Binding the price headers to a Web Bot Auth signature
-
-The crawler's pre-authorization headers (`crawler-max-price` and
-`crawler-exact-price`) are inbound request headers, so an operator who
-also runs the `bot_auth` verifier can require them to be signed
-components by listing the header name in that agent's
-`required_components`. A retry whose Web Bot Auth signature does not
-cover the listed price header is then rejected before the ledger is
-consulted.
-
-Binding the proxy's outbound price headers (`crawler-price`,
-`crawler-charged`) into a signature the crawler can verify is a separate
-piece of work: it needs the outbound response-signing path, which is not
-part of this contract yet.
-
-### Pluggable pricing model
-
-Pricing can be flat (`price:`) or per-path (`tiers:`). For a learned
-model (an LM-Tree-style pricing model is the motivating example), an
-embedder injects a `PricingModel` implementation through
-`AiCrawlControlPolicy::with_pricing_model`. The model is consulted
-before the static tier table; returning a price overrides the static
-resolution for that request, and returning nothing defers to the tier
-table and the flat-price fallback. The OSS build ships only the seam,
-not a model.
-
-## 406 fallback
-
-When the agent's `Accept-Payment` preference set has no overlap with
-the operator's offered rails, the proxy returns `406 Not Acceptable`
-with `Content-Type: application/json`:
+When the client's preference set has no overlap with the route's
+advertised rails, the answer is 406:
 
 ```json
 {
@@ -246,57 +440,36 @@ with `Content-Type: application/json`:
 }
 ```
 
-`supported_rails` reflects the operator's declared offered set on the
-matched tier (the per-tier `rails:` override, or the route default if
-no override is set), not the runtime-emittable subset. The agent
-retries with one of the listed rails on its `Accept-Payment` header.
+`supported_rails` is the operator's declared offered set on the matched
+tier, which is what the client should choose from on its retry.
 
-## Opt-in signals
+## Quote tokens
 
-Per A3.1, any of the following signals on the request opts the agent
-in to the multi-rail body:
+Each advertised rail carries its own `quote_token`, a JWS signed by the
+proxy under a key whose JWKS the operator publishes at
+`/.well-known/sbproxy/quote-keys.json`. The token binds the rail, the
+amount, the route, and a per-rail nonce, so a client cannot replay a quote
+across rails or reuse it after expiry.
 
-- `Accept-Payment` request header carries a q-value list of rail
-  names. Example: `Accept-Payment: lightning;q=1.0, x402;q=0.5`.
-- `Accept` request header includes
-  `application/sbproxy-multi-rail+json`,
-  `application/x402+json`, or `application/mpp+json`. The latter two
-  are narrowly opt-in: an agent that sends `Accept:
-  application/x402+json` is asking specifically for the x402 entry,
-  not for the full multi-rail body.
+The document can carry more than one key, so resolve a token by the `kid`
+in its header rather than by taking the first entry. An origin
+mid-rotation publishes two: the key it signs under now, and the
+`previous_key_id` it still verifies for the length of the rotation window.
+A multi-tenant deployment publishes one document covering every origin's
+issuer, which is a different reason for the same shape.
 
-Without any opt-in signal, the proxy emits the single-rail body so
-legacy crawlers keep working unchanged.
-
-## Quote-token JWS
-
-Each rail entry in the multi-rail body carries its own `quote_token`,
-signed by the proxy under a key whose JWKS the operator publishes at
-`/.well-known/sbproxy-quote-jwks`. The token binds the rail kind, the
-amount, the route, and a per-rail nonce so the agent cannot replay a
-quote across rails or reuse it after expiry.
-
-The `accept_payment` policy verifies the JWS on the agent's retry
-before consulting the ledger. A token whose claims do not match the
-retry context (different rail, different route, expired) is rejected
-without a ledger round-trip.
-
-The token schema is OSS. The settlement that the token underwrites is
-enterprise.
+On the retry the token is authenticated and its claims validated without
+consuming the nonce. The durable transaction that reserves the intent and
+the credential digest is what spends it, which is why the same client
+`Idempotency-Key` with the same credential can resume a retry or read a
+committed receipt, while a different credential cannot reuse the quote.
 
 ## Related
 
-- [`ai-crawl-control.md`](ai-crawl-control.md) - policy configuration,
-  agent classes, ledger, tiered pricing.
-- [`enterprise.md`](enterprise.md) - the OSS / enterprise split,
-  including the rail settlement features.
-- `examples/rail-x402-base-sepolia/` - x402 rail with a hermetic
-  mock facilitator.
-- `examples/rail-mpp-stripe-test/` - MPP rail with Stripe test
-  mode and a wiremock fallback.
-- `examples/multi-rail-accept-payment/` - x402 + MPP wired
-  together with q-value negotiation.
-- `examples/rail-lightning/` - Lightning rail negotiation contract
-  (settlement is enterprise-only).
-- `examples/quote-token-replay-jwks/` - JWKS endpoint and
-  single-use quote-token enforcement.
+- [payment-settlement.md](payment-settlement.md) - configuring rails, durable state, timeouts, reconciliation, and the exact unsupported boundaries.
+- [ai-crawl-control.md](ai-crawl-control.md) - pricing, tiers, agent classes, and the ledger.
+- `examples/rail-x402-base-sepolia/` - x402 v2 `exact` on a priced route.
+- `examples/rail-mpp-stripe-test/` - Payment HTTP Authentication settling on Stripe.
+- `examples/rail-lightning/` - CLN and LND as alternative backends.
+- `examples/multi-rail-accept-payment/` - several rails on one route.
+- `examples/quote-token-replay-jwks/` - the JWKS endpoint and single-use quote enforcement.

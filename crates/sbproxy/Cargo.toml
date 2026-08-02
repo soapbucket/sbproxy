@@ -39,14 +39,19 @@ default = [
   "llms-txt",
   "tls-fingerprint",
   "inprocess-embed",
+  "inprocess-classify",
   "gpu-nvidia",
   "gpu-apple",
   "model-weights",
+  "rag-full",
 ]
 tiered-pricing = ["sbproxy-modules/tiered-pricing"]
 # WOR-1235: in-process semantic-cache embedder (single-binary). Forwards to
 # sbproxy-core/inprocess-embed.
 inprocess-embed = ["sbproxy-core/inprocess-embed"]
+# In-process MiniLM classifier backing the `type: classifier` AI
+# guardrail. Forwards to sbproxy-core/inprocess-classify.
+inprocess-classify = ["sbproxy-core/inprocess-classify"]
 agent-class = ["sbproxy-core/agent-class"]
 http-ledger = ["sbproxy-modules/http-ledger"]
 content-negotiate = ["sbproxy-modules/content-negotiate"]
@@ -78,9 +83,53 @@ gpu-nvidia = ["sbproxy-core/gpu-nvidia"]
 # answers instead.
 gpu-apple = ["sbproxy-core/gpu-apple"]
 model-weights = ["sbproxy-core/model-weights", "sbproxy-model-host/weights"]
-# WOR-1658: in-process embedded engine (mistral.rs). Off by default; a
-# single-binary / zero-external-engine deploy opts in.
-embedded = ["sbproxy-core/embedded"]
+# WOR-2098: route-scoped RAG retrieval, forwarded to sbproxy-core. The
+# released binary ships `rag-full` (every documented embedding and
+# vector-store adapter); a narrow build can select single adapters, e.g.
+# `--no-default-features --features rag-embedding-compatible,rag-vector-qdrant`.
+rag = ["sbproxy-core/rag"]
+rag-embedding-openai = ["rag", "sbproxy-core/rag-embedding-openai"]
+rag-embedding-compatible = ["rag", "sbproxy-core/rag-embedding-compatible"]
+rag-embedding-cohere = ["rag", "sbproxy-core/rag-embedding-cohere"]
+rag-embedding-bedrock = ["rag", "sbproxy-core/rag-embedding-bedrock"]
+rag-embedding-vertex = ["rag", "sbproxy-core/rag-embedding-vertex"]
+rag-vector-chroma = ["rag", "sbproxy-core/rag-vector-chroma"]
+rag-vector-pinecone = ["rag", "sbproxy-core/rag-vector-pinecone"]
+rag-vector-qdrant = ["rag", "sbproxy-core/rag-vector-qdrant"]
+rag-vector-redis = ["rag", "sbproxy-core/rag-vector-redis"]
+rag-vector-weaviate = ["rag", "sbproxy-core/rag-vector-weaviate"]
+rag-full = [
+  "rag-embedding-openai",
+  "rag-embedding-compatible",
+  "rag-embedding-cohere",
+  "rag-embedding-bedrock",
+  "rag-embedding-vertex",
+  "rag-vector-chroma",
+  "rag-vector-pinecone",
+  "rag-vector-qdrant",
+  "rag-vector-redis",
+  "rag-vector-weaviate",
+]
+
+# WOR-2100: authoritative payment settlement.
+#
+# Deliberately absent from `default`. Every other flag above is on in the
+# released binary because it either costs nothing when unconfigured or
+# adapts to its host at runtime. These do not: turning one on means this
+# build can take money, and that has to be a decision an operator makes
+# when they build, not one they inherit.
+#
+# `payments` alone compiles the durable store, the authoritative service,
+# and the recovery worker, and advertises no rail. Each provider flag adds
+# exactly one adapter. A configured rail whose flag is missing fails
+# startup naming the flag rather than serving a challenge nobody can
+# redeem.
+payments = ["sbproxy-core/payments", "sbproxy-modules/payments"]
+payment-mpp = ["payments", "sbproxy-core/payment-mpp", "sbproxy-modules/payment-mpp"]
+payment-stripe = ["payments", "sbproxy-core/payment-stripe"]
+payment-x402 = ["payments", "sbproxy-core/payment-x402"]
+payment-lightning-cln = ["payments", "sbproxy-core/payment-lightning-cln"]
+payment-lightning-lnd = ["payments", "sbproxy-core/payment-lightning-lnd"]
 
 [dependencies]
 tracing.workspace = true

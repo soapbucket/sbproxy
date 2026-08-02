@@ -724,6 +724,8 @@ describe("useModelManagement orchestration", () => {
       deploymentId: "shared",
       desired: projection,
       runtime: null,
+      assignment: null,
+      liveReplicas: [],
     });
 
     expect(management.editor.value?.initialDeployment).toEqual(signed);
@@ -772,6 +774,8 @@ describe("useModelManagement orchestration", () => {
       deploymentId: "shared",
       desired: projection,
       runtime: null,
+      assignment: null,
+      liveReplicas: [],
     });
     const seed = management.editor.value?.initialDeployment;
     expect(seed).not.toBeNull();
@@ -1089,6 +1093,8 @@ describe("useModelManagement orchestration", () => {
       deploymentId: "projection-only",
       desired: projection,
       runtime: null,
+      assignment: null,
+      liveReplicas: [],
     });
 
     expect(publish).not.toHaveBeenCalled();

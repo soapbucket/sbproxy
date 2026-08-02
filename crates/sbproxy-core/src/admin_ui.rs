@@ -67,12 +67,37 @@ pub fn dispatch(method: &str, path: &str) -> Option<(u16, &'static str, String)>
     }
 }
 
+/// True for the bare entry paths an operator reaches by typing the admin
+/// host into a browser: `/`, `/admin`, and `/admin/`.
+///
+/// These carry no data and exist only to point at the console, so the
+/// server answers them with a redirect to [`UI_PREFIX`] rather than the
+/// generic JSON 404 they used to get.
+pub fn is_console_entry_path(path: &str) -> bool {
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    matches!(path, "/" | "/admin" | "/admin/")
+}
+
 /// Path-matching helper. `/admin/ui` (no trailing slash) and any
 /// subpath under `/admin/ui/` belong to this module. We accept the
 /// no-slash form so a single href like `<a href="/admin/ui">` does
 /// not 404 before the SPA loads.
 pub fn path_is_ours(path: &str) -> bool {
     path == UI_PREFIX || path.starts_with(&format!("{UI_PREFIX}/"))
+}
+
+/// Prefix for the Vite-built static bundle: hashed JS/CSS/font/image
+/// files, identical for every session and safe to exempt from the
+/// admin rate limiter (see `admin::path_is_exempt_from_rate_limit`).
+const ASSETS_PREFIX: &str = "/admin/ui/assets/";
+
+/// True for a request under the static asset bundle
+/// (`/admin/ui/assets/index-XXXX.js`, `...css`, fonts, images). False
+/// for the SPA shell itself (`/admin/ui`, `/admin/ui/`) and for
+/// client-side route paths (`/admin/ui/keys`), which still go through
+/// the rate limiter like any other admin request.
+pub fn is_static_asset(path: &str) -> bool {
+    path.starts_with(ASSETS_PREFIX) && path.len() > ASSETS_PREFIX.len()
 }
 
 /// Byte-body variant of [`dispatch`], used by the admin server to serve
@@ -228,6 +253,42 @@ fn content_type_for(path: &str) -> &'static str {
 }
 
 #[cfg(test)]
+mod console_entry_tests {
+    use super::*;
+
+    #[test]
+    fn bare_entry_paths_are_console_entries() {
+        // An operator typing the admin host into a browser lands on one of
+        // these, and used to get a JSON 404 with no hint the console exists.
+        for path in ["/", "/admin", "/admin/"] {
+            assert!(is_console_entry_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn query_and_fragment_do_not_defeat_the_match() {
+        assert!(is_console_entry_path("/?from=bookmark"));
+        assert!(is_console_entry_path("/admin?x=1"));
+    }
+
+    #[test]
+    fn real_api_and_ui_paths_are_not_console_entries() {
+        // Redirecting any of these would break the API or loop the SPA.
+        for path in [
+            "/admin/keys",
+            "/admin/ui",
+            "/admin/ui/",
+            "/admin/ui/keys",
+            "/health",
+            "/metrics",
+            "/adminsomething",
+        ] {
+            assert!(!is_console_entry_path(path), "{path}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -247,6 +308,25 @@ mod tests {
         // Sibling prefixes do not match.
         assert!(!path_is_ours("/admin/ui-other"));
         assert!(!path_is_ours("/admin"));
+    }
+
+    #[test]
+    fn is_static_asset_matches_only_the_assets_subpath() {
+        assert!(is_static_asset("/admin/ui/assets/index-CGvDHG5N.js"));
+        assert!(is_static_asset("/admin/ui/assets/index-f7jxlhHL.css"));
+        assert!(is_static_asset("/admin/ui/assets/favicon-abc123.woff2"));
+
+        // The SPA shell and client-side routes still count against the
+        // rate limiter; only the hashed bundle files under assets/ are
+        // exempt.
+        assert!(!is_static_asset("/admin/ui"));
+        assert!(!is_static_asset("/admin/ui/"));
+        assert!(!is_static_asset("/admin/ui/keys"));
+        assert!(!is_static_asset("/admin/ui/favicon.svg"));
+        assert!(!is_static_asset("/admin/ui/assets/"));
+        assert!(!is_static_asset("/admin/ui/assets"));
+        assert!(!is_static_asset("/admin/login"));
+        assert!(!is_static_asset("/api/health"));
     }
 
     #[test]

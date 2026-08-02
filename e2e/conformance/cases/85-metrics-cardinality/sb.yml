@@ -2,9 +2,6 @@
 proxy:
   http_bind_port: 18080
 
-telemetry:
-  bind_port: 18089
-
 origins:
   "cardinality.test":
     action:

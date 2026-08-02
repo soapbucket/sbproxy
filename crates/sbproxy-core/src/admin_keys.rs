@@ -32,13 +32,11 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use sbproxy_ai::governance::{
-    CounterSnapshot, GovernanceBackendHealth, GovernanceError, GovernanceSnapshot, SnapshotKey,
-};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::key_plane::{block_on_keystore, current_key_plane, governance_plane, KeyPlane};
+use crate::key_plane::{block_on_keystore, current_key_plane, KeyPlane};
+use sbproxy_ai::governance::{GovernanceError, GovernanceLimits, SnapshotKey};
 use sbproxy_keystore::record::{
     CredentialMaterial, CredentialRecord, KeyRecord, RecordBudget, RecordStatus,
 };
@@ -102,11 +100,10 @@ fn key_subroute(method: &str, rest: &str, body: Option<&str>) -> Resp {
                 method_not_allowed()
             }
         }
+        Some("usage") if method.eq_ignore_ascii_case("GET") => get_key_usage(id),
         Some("effective-policy/preview") if method.eq_ignore_ascii_case("POST") => {
             preview_effective_key_policy(id, body)
         }
-        Some("usage") if method.eq_ignore_ascii_case("GET") => get_key_usage(id),
-        Some("usage") => method_not_allowed(),
         Some(action) if method.eq_ignore_ascii_case("POST") => match action {
             "revoke" => set_key_status(id, RecordStatus::Revoked, body),
             "block" => set_key_status(id, RecordStatus::Blocked, body),
@@ -196,17 +193,23 @@ struct KeyMutation {
     principal_selectors: Patch<Vec<serde_json::Value>>,
     /// Pin a model for this key. JSON `null` clears the pin.
     route_to_model: Patch<String>,
+    /// Route-local compression selector. JSON `null` clears the selector.
+    compression_profile: Patch<String>,
     allowed_tools: Patch<Vec<String>>,
     inject_tools: Patch<Vec<serde_json::Value>>,
     /// Federated-MCP injection ref. JSON `null` clears it.
     inject_mcp: Patch<serde_json::Value>,
     bypass_prompt_injection: Patch<bool>,
+    allow_content_capture: Patch<bool>,
     project: Patch<String>,
     user: Patch<String>,
     tags: Patch<Vec<String>>,
     /// Free-form string metadata; replaces the record's map wholesale.
     metadata: Patch<std::collections::BTreeMap<String, String>>,
     tenant: Patch<String>,
+    /// Upstream credential this key presents. JSON `null` clears the
+    /// binding and returns the key to the origin's own resolver.
+    credential_id: Patch<String>,
     /// RFC 3339 expiry. JSON `null` clears it.
     expires_at: Patch<DateTime<Utc>>,
 }
@@ -216,27 +219,8 @@ struct KeyMutation {
 /// the required `ref` string. Runs before [`apply_key_mutation`] so a bad
 /// PATCH is a 400, never a silently-stored record the AI seam later drops.
 fn validate_key_mutation(m: &KeyMutation) -> Result<(), String> {
-    const MAX_GOVERNANCE_INTEGER: u64 = 9_007_199_254_740_991;
-
-    if let Some(revision) = m.expected_revision {
-        if revision == 0 || revision > MAX_GOVERNANCE_INTEGER {
-            return Err(format!(
-                "expected_revision must be between 1 and {MAX_GOVERNANCE_INTEGER}"
-            ));
-        }
-    }
-    for (field, value) in [
-        ("max_requests_per_minute", &m.max_requests_per_minute),
-        ("max_tokens_per_minute", &m.max_tokens_per_minute),
-        ("max_budget_tokens", &m.max_budget_tokens),
-    ] {
-        if let Patch::Value(value) = value {
-            if *value == 0 || *value > MAX_GOVERNANCE_INTEGER {
-                return Err(format!(
-                    "{field} must be between 1 and {MAX_GOVERNANCE_INTEGER}"
-                ));
-            }
-        }
+    if let Some(0) = m.expected_revision {
+        return Err("expected_revision must be at least 1".to_string());
     }
     if let Patch::Value(p) = &m.priority {
         if sbproxy_ai::identity::KeyPriority::parse(p).is_none() {
@@ -244,6 +228,11 @@ fn validate_key_mutation(m: &KeyMutation) -> Result<(), String> {
                 "priority '{p}' is not a lane; use interactive, standard, or batch"
             ));
         }
+    }
+    if let Patch::Value(selector) = &m.compression_profile {
+        sbproxy_ai::compression::CompressionSelector::parse(selector).map_err(|_| {
+            "compression_profile must be on, off, or a valid profile name".to_string()
+        })?;
     }
     if let Patch::Value(v) = &m.inject_mcp {
         let has_ref = v
@@ -268,16 +257,8 @@ fn validate_key_mutation(m: &KeyMutation) -> Result<(), String> {
         }
     }
     if let Patch::Value(value) = &m.max_budget_usd {
-        let micro_usd = *value * 1_000_000.0;
-        if !value.is_finite()
-            || *value <= 0.0
-            || !micro_usd.is_finite()
-            || micro_usd.floor() < 1.0
-            || micro_usd.floor() > MAX_GOVERNANCE_INTEGER as f64
-        {
-            return Err(format!(
-                "max_budget_usd must represent between 1 and {MAX_GOVERNANCE_INTEGER} integer micro-USD"
-            ));
+        if !value.is_finite() || *value < 0.0 {
+            return Err("max_budget_usd must be a finite non-negative number".to_string());
         }
     }
     for (field, is_null) in [
@@ -305,6 +286,10 @@ fn validate_key_mutation(m: &KeyMutation) -> Result<(), String> {
         (
             "bypass_prompt_injection",
             matches!(&m.bypass_prompt_injection, Patch::Null),
+        ),
+        (
+            "allow_content_capture",
+            matches!(&m.allow_content_capture, Patch::Null),
         ),
     ] {
         if is_null {
@@ -355,18 +340,79 @@ fn apply_key_mutation(rec: &mut KeyRecord, m: &KeyMutation) {
     apply_replacement(&mut rec.require_pii_redaction, &m.require_pii_redaction);
     apply_replacement(&mut rec.principal_selectors, &m.principal_selectors);
     apply_nullable(&mut rec.route_to_model, &m.route_to_model);
+    apply_nullable(&mut rec.compression_profile, &m.compression_profile);
     apply_nullable(&mut rec.allowed_tools, &m.allowed_tools);
     apply_replacement(&mut rec.inject_tools, &m.inject_tools);
     apply_nullable(&mut rec.inject_mcp, &m.inject_mcp);
     if let Patch::Value(value) = &m.bypass_prompt_injection {
         rec.bypass_prompt_injection = *value;
     }
+    if let Patch::Value(value) = &m.allow_content_capture {
+        rec.allow_content_capture = *value;
+    }
     apply_nullable(&mut rec.project, &m.project);
     apply_nullable(&mut rec.user, &m.user);
     apply_replacement(&mut rec.tags, &m.tags);
     apply_replacement(&mut rec.metadata, &m.metadata);
     apply_nullable(&mut rec.tenant_id, &m.tenant);
+    apply_nullable(&mut rec.credential_id, &m.credential_id);
     apply_nullable(&mut rec.expires_at, &m.expires_at);
+}
+
+/// Reject a `credential_id` binding that names a credential which does not
+/// exist, is not active, or belongs to another tenant.
+///
+/// Checked here AND again at resolution time in
+/// [`crate::key_plane::KeyPlane::resolve_credential_secret`], because either
+/// record's tenant can be patched after the binding was made. One check is not
+/// enough.
+///
+/// `key_tenant` is the tenant the key will have once the mutation applies.
+fn validate_credential_binding(
+    plane: &KeyPlane,
+    m: &KeyMutation,
+    key_tenant: Option<&str>,
+) -> Result<(), Resp> {
+    let Patch::Value(credential_id) = &m.credential_id else {
+        return Ok(());
+    };
+    // An older node in the fleet drops `credential_id` when it replicates the
+    // record, resolves the key without a binding, and dispatches on the
+    // origin's shared credential. Refuse to create such a record until every
+    // node has declared it understands the field.
+    match block_on_keystore(async {
+        crate::key_capability::check_fleet_capability(crate::key_capability::CAP_CREDENTIAL_BINDING)
+            .await
+    }) {
+        crate::key_capability::FleetCapability::Satisfied => {}
+        crate::key_capability::FleetCapability::Missing(nodes) => {
+            return Err(conflict(&format!(
+                "credential binding needs every node upgraded; these have not declared \
+                 support: {}",
+                nodes.join(", ")
+            )));
+        }
+        crate::key_capability::FleetCapability::Unknown(reason) => {
+            return Err(conflict(&format!(
+                "cannot confirm every node supports credential binding: {reason}"
+            )));
+        }
+    }
+    match load_credential(plane, credential_id) {
+        Ok(Some(cred)) => {
+            if !cred.is_usable() {
+                return Err(bad_request(
+                    "credential_id names a credential that is not active",
+                ));
+            }
+            if cred.tenant_id.is_some() && cred.tenant_id.as_deref() != key_tenant {
+                return Err(bad_request("credential_id belongs to a different tenant"));
+            }
+            Ok(())
+        }
+        Ok(None) => Err(bad_request("credential_id names an unknown credential")),
+        Err(e) => Err(internal_error(&e)),
+    }
 }
 
 fn create_key(body: Option<&str>) -> Resp {
@@ -383,6 +429,13 @@ fn create_key(body: Option<&str>) -> Resp {
     }
     if m.expected_revision.is_some() {
         return bad_request("expected_revision is only valid for key mutation");
+    }
+    let new_tenant = match &m.tenant {
+        Patch::Value(t) => Some(t.as_str()),
+        _ => None,
+    };
+    if let Err(resp) = validate_credential_binding(&plane, &m, new_tenant) {
+        return resp;
     }
     let minted = plane.crypto().mint_key();
     let now = Utc::now();
@@ -428,193 +481,6 @@ fn get_key(id: &str) -> Resp {
         Ok(Some(rec)) => ok(json!({ "key": KeyView::from(&rec) })),
         Ok(None) => not_found("key not found"),
         Err(e) => internal_error(&e),
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct KeyUsageView {
-    key_id: String,
-    policy_version: sbproxy_ai::effective_key_policy::PolicyVersion,
-    consistency: sbproxy_ai::governance::GovernanceConsistency,
-    backend: KeyUsageBackendView,
-    dimensions: KeyUsageDimensionsView,
-}
-
-#[derive(Debug, Serialize)]
-struct KeyUsageBackendView {
-    name: String,
-    status: sbproxy_ai::governance::GovernanceBackendStatus,
-    checked_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Serialize)]
-struct KeyUsageUnavailableView {
-    error: KeyUsageUnavailableErrorView,
-    consistency: sbproxy_ai::governance::GovernanceConsistency,
-    backend: KeyUsageBackendView,
-}
-
-#[derive(Debug, Serialize)]
-struct KeyUsageUnavailableErrorView {
-    code: &'static str,
-    message: &'static str,
-}
-
-#[derive(Debug, Serialize)]
-struct KeyUsageDimensionsView {
-    requests_per_minute: Option<KeyUsageDimensionView>,
-    tokens_per_minute: Option<KeyUsageDimensionView>,
-    budget_tokens: Option<KeyUsageDimensionView>,
-    budget_micro_usd: Option<KeyUsageDimensionView>,
-}
-
-#[derive(Debug, Serialize)]
-struct KeyUsageDimensionView {
-    limit: u64,
-    used: u64,
-    reserved: u64,
-    remaining: u64,
-    reset_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum UsageReset {
-    FixedWindow,
-    Lifetime,
-}
-
-fn get_key_usage(id: &str) -> Resp {
-    let key_plane = match plane_or_err() {
-        Ok(plane) => plane,
-        Err(response) => return response,
-    };
-    let record = match load_key(&key_plane, id) {
-        Ok(Some(record)) => record,
-        Ok(None) => return not_found("key not found"),
-        Err(_) => return internal_error("key usage record lookup failed"),
-    };
-
-    // Tenantless keys inherit the request origin at dispatch. Admin usage has
-    // no caller origin, so use the same explicit default origin as policy
-    // preview while deriving limits and the displayed policy version.
-    let policy_origin = record.tenant_id.as_deref().unwrap_or("__default__");
-    let policy = match crate::key_policy::key_record_to_effective_policy(&record, policy_origin) {
-        Ok(policy) => policy,
-        Err(error) => {
-            tracing::warn!(
-                reason = error.safe_reason(),
-                "admin key usage: stored policy rejected"
-            );
-            return internal_error("stored key policy is invalid");
-        }
-    };
-    let policy_version = match policy.policy_version() {
-        Ok(version) => version,
-        Err(_) => return internal_error("effective policy serialization failed"),
-    };
-    let limits = match crate::server::governance_admission::limits_for_policy(&policy) {
-        Ok(limits) => limits,
-        Err(_) => return internal_error("effective policy governance limits are invalid"),
-    };
-
-    let governance = governance_plane();
-    let store = governance.store();
-    let expected_key_id = policy.key_id.clone();
-    let snapshot_key = SnapshotKey {
-        key_id: expected_key_id.clone(),
-        policy_revision: policy.policy_revision,
-        limits,
-    };
-    let snapshot = match block_on_keystore(async move { store.snapshot(snapshot_key).await }) {
-        Ok(snapshot) => snapshot,
-        Err(error) => return governance_snapshot_error(error),
-    };
-    let view = match key_usage_view(snapshot, &expected_key_id, policy_version) {
-        Ok(view) => view,
-        Err(reason) => return internal_error(reason),
-    };
-    match serde_json::to_value(view) {
-        Ok(value) => ok(value),
-        Err(_) => internal_error("key usage response serialization failed"),
-    }
-}
-
-fn key_usage_view(
-    snapshot: GovernanceSnapshot,
-    expected_key_id: &str,
-    policy_version: sbproxy_ai::effective_key_policy::PolicyVersion,
-) -> Result<KeyUsageView, &'static str> {
-    if snapshot.key_id != expected_key_id || snapshot.policy_revision != policy_version.revision {
-        return Err("governance snapshot identity mismatch");
-    }
-    let GovernanceBackendHealth {
-        backend,
-        consistency,
-        status,
-        checked_at_millis,
-    } = snapshot.backend;
-    Ok(KeyUsageView {
-        key_id: snapshot.key_id,
-        policy_version,
-        consistency,
-        backend: KeyUsageBackendView {
-            name: backend,
-            status,
-            checked_at: millis_to_datetime(checked_at_millis)?,
-        },
-        dimensions: KeyUsageDimensionsView {
-            requests_per_minute: usage_dimension(
-                snapshot.requests_per_window,
-                UsageReset::FixedWindow,
-            )?,
-            tokens_per_minute: usage_dimension(
-                snapshot.tokens_per_window,
-                UsageReset::FixedWindow,
-            )?,
-            budget_tokens: usage_dimension(snapshot.total_tokens, UsageReset::Lifetime)?,
-            budget_micro_usd: usage_dimension(snapshot.total_micro_usd, UsageReset::Lifetime)?,
-        },
-    })
-}
-
-fn usage_dimension(
-    snapshot: CounterSnapshot,
-    reset: UsageReset,
-) -> Result<Option<KeyUsageDimensionView>, &'static str> {
-    let Some(limit) = snapshot.limit else {
-        return Ok(None);
-    };
-    let remaining = snapshot
-        .remaining
-        .ok_or("configured governance dimension has no remaining value")?;
-    let reset_at = match (reset, snapshot.reset_at_millis) {
-        (UsageReset::FixedWindow, Some(value)) => Some(millis_to_datetime(value)?),
-        (UsageReset::FixedWindow, None) => {
-            return Err("configured rate dimension has no reset time");
-        }
-        (UsageReset::Lifetime, None) => None,
-        (UsageReset::Lifetime, Some(_)) => {
-            return Err("configured lifetime dimension has a reset time");
-        }
-    };
-    Ok(Some(KeyUsageDimensionView {
-        limit,
-        used: snapshot.used,
-        reserved: snapshot.reserved,
-        remaining,
-        reset_at,
-    }))
-}
-
-fn millis_to_datetime(value: u64) -> Result<DateTime<Utc>, &'static str> {
-    let value = i64::try_from(value).map_err(|_| "governance timestamp exceeds ISO range")?;
-    DateTime::<Utc>::from_timestamp_millis(value).ok_or("governance timestamp is outside ISO range")
-}
-
-fn governance_snapshot_error(error: GovernanceError) -> Resp {
-    match error {
-        GovernanceError::BackendUnavailable { backend } => service_unavailable(backend),
-        _ => internal_error("governance snapshot failed"),
     }
 }
 
@@ -1208,13 +1074,12 @@ fn policy_preview_limits(record: &KeyRecord) -> Result<PolicyPreviewLimits, &'st
 
 fn policy_preview_usd_to_micro_usd(value: f64) -> Result<u64, &'static str> {
     const MICRO_USD_PER_USD: f64 = 1_000_000.0;
-    const MAX_GOVERNANCE_INTEGER: u64 = 9_007_199_254_740_991;
 
-    if !value.is_finite() || value <= 0.0 {
-        return Err("stored max_budget_usd is not a finite positive number");
+    if !value.is_finite() || value < 0.0 {
+        return Err("stored max_budget_usd is not a finite non-negative number");
     }
-    let rounded = (value * MICRO_USD_PER_USD).floor();
-    if !rounded.is_finite() || rounded < 1.0 || rounded > MAX_GOVERNANCE_INTEGER as f64 {
+    let rounded = (value * MICRO_USD_PER_USD).round();
+    if !rounded.is_finite() || rounded < 0.0 || rounded >= u64::MAX as f64 {
         return Err("stored max_budget_usd cannot be represented as integer micro-USD");
     }
     Ok(rounded as u64)
@@ -1262,6 +1127,63 @@ fn preview_counter(limit: Option<u64>, current: u64, requested: u64) -> PreviewC
     }
 }
 
+fn get_key_usage(id: &str) -> Resp {
+    let plane = match plane_or_err() {
+        Ok(plane) => plane,
+        Err(response) => return response,
+    };
+    let record = match load_key(&plane, id) {
+        Ok(Some(record)) => record,
+        Ok(None) => return not_found("key not found"),
+        Err(error) => return internal_error(&error),
+    };
+    let limits = match governance_limits(&record) {
+        Ok(limits) => limits,
+        Err(error) => return internal_error(error),
+    };
+    let snapshot_key = SnapshotKey {
+        key_id: record.key_id,
+        policy_revision: record.policy_revision,
+        limits,
+    };
+    let store = plane.governance_store();
+    match block_on_keystore(async move { store.snapshot(snapshot_key).await }) {
+        Ok(snapshot) => ok(json!({ "usage": snapshot })),
+        Err(GovernanceError::BackendUnavailable { .. }) => governance_backend_unavailable(),
+        Err(error) => internal_error(&format!("governance snapshot: {error}")),
+    }
+}
+
+fn governance_limits(record: &KeyRecord) -> Result<GovernanceLimits, &'static str> {
+    let total_micro_usd = record
+        .budget
+        .as_ref()
+        .and_then(|budget| budget.max_cost_usd)
+        .map(usd_to_micro_usd)
+        .transpose()?;
+
+    Ok(GovernanceLimits {
+        requests_per_window: record.max_requests_per_minute,
+        tokens_per_window: record.max_tokens_per_minute,
+        total_tokens: record.budget.as_ref().and_then(|budget| budget.max_tokens),
+        total_micro_usd,
+        window_millis: 60_000,
+    })
+}
+
+fn usd_to_micro_usd(value: f64) -> Result<u64, &'static str> {
+    const MICRO_USD_PER_USD: f64 = 1_000_000.0;
+
+    if !value.is_finite() || value < 0.0 {
+        return Err("stored max_budget_usd is not a finite non-negative number");
+    }
+    let rounded = (value * MICRO_USD_PER_USD).round();
+    if !rounded.is_finite() || rounded < 0.0 || rounded >= u64::MAX as f64 {
+        return Err("stored max_budget_usd cannot be represented as integer micro-USD");
+    }
+    Ok(rounded as u64)
+}
+
 fn update_key(id: &str, body: Option<&str>) -> Resp {
     let plane = match plane_or_err() {
         Ok(p) => p,
@@ -1283,6 +1205,16 @@ fn update_key(id: &str, body: Option<&str>) -> Resp {
         Ok(None) => return not_found("key not found"),
         Err(e) => return internal_error(&e),
     };
+    // The tenant the key will have AFTER this mutation: an explicit value
+    // wins, otherwise the one already stored.
+    let effective_tenant = match &m.tenant {
+        Patch::Value(t) => Some(t.clone()),
+        Patch::Null => None,
+        Patch::Missing => rec.tenant_id.clone(),
+    };
+    if let Err(resp) = validate_credential_binding(&plane, &m, effective_tenant.as_deref()) {
+        return resp;
+    }
     if rec.policy_revision != expected_revision {
         return revision_conflict(id, expected_revision, rec.policy_revision);
     }
@@ -1345,6 +1277,7 @@ fn set_key_status(id: &str, status: RecordStatus, body: Option<&str>) -> Resp {
     if rec.status == RecordStatus::Revoked {
         return terminal_key(id, rec.policy_revision);
     }
+    let prior_status = rec.status;
     rec.status = status;
     rec.updated_at = Utc::now();
     let rec = match store_key_if_revision(&plane, rec, expected_revision) {
@@ -1352,7 +1285,13 @@ fn set_key_status(id: &str, status: RecordStatus, body: Option<&str>) -> Resp {
         Err(response) => return response,
     };
     invalidate(&plane, id);
-    audit_mutation(status_verb(status), "key", id);
+    audit_mutation_scoped(
+        status_verb(status),
+        "key",
+        id,
+        rec.tenant_id.as_deref(),
+        Some((prior_status, status)),
+    );
     ok(json!({ "key": KeyView::from(&rec) }))
 }
 
@@ -1436,6 +1375,12 @@ struct CredentialCreate {
     /// A plaintext secret to envelope-encrypt at rest (needs a master key).
     secret: Option<String>,
     tenant: Option<String>,
+    /// Upstream header this credential is written to. Defaults to
+    /// `authorization`.
+    header: Option<String>,
+    /// Scheme prefix on the header value. Defaults to `Bearer `. Send an empty
+    /// string for raw-value headers such as `x-api-key`.
+    scheme: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1460,6 +1405,19 @@ fn create_credential(body: Option<&str>) -> Resp {
     let id =
         c.id.clone()
             .unwrap_or_else(sbproxy_keystore::crypto::random_id);
+    // Reject a header the proxy could never legally set on an upstream
+    // request, at the boundary rather than at dispatch time.
+    let credential_header = c
+        .header
+        .as_deref()
+        .map(|h| h.trim().to_ascii_lowercase())
+        .unwrap_or_else(sbproxy_keystore::record::default_cred_header);
+    if http::header::HeaderName::from_bytes(credential_header.as_bytes()).is_err() {
+        return bad_request("header is not a valid HTTP header name");
+    }
+    if sbproxy_config::types::credential_header_is_reserved(&credential_header) {
+        return bad_request("header may not be used to carry a credential");
+    }
     let material = match build_material(&plane, &id, c.vault_ref.as_deref(), c.secret.as_deref()) {
         Ok(m) => m,
         Err(e) => return bad_request(&e),
@@ -1470,6 +1428,10 @@ fn create_credential(body: Option<&str>) -> Resp {
         name: c.name.unwrap_or_else(|| id.clone()),
         provider: c.provider,
         kind: c.kind.unwrap_or_else(|| "ai_provider".to_string()),
+        header: credential_header,
+        scheme: c
+            .scheme
+            .unwrap_or_else(sbproxy_keystore::record::default_cred_scheme),
         material,
         status: RecordStatus::Active,
         tenant_id: c.tenant,
@@ -1559,6 +1521,29 @@ fn delete_credential(id: &str) -> Resp {
         Ok(p) => p,
         Err(e) => return e,
     };
+    // Refuse while keys still bind this credential. Deleting it would leave
+    // those keys resolving to nothing, and since a bound key fails closed
+    // rather than falling back, every request on them would start returning
+    // 503 with no obvious cause. Name the keys so the operator can unbind
+    // them (PATCH with `"credential_id": null`) and retry.
+    let bound = {
+        let store = plane.cache().store().clone();
+        match block_on_keystore(async move { store.list_keys().await }) {
+            Ok(keys) => keys
+                .into_iter()
+                .filter(|k| k.credential_id.as_deref() == Some(id))
+                .map(|k| k.key_id)
+                .collect::<Vec<_>>(),
+            Err(e) => return internal_error(&format!("list keys: {e:#}")),
+        }
+    };
+    if !bound.is_empty() {
+        return conflict(&format!(
+            "credential is bound by {} key(s): {}. Clear credential_id on them first.",
+            bound.len(),
+            bound.join(", ")
+        ));
+    }
     let store = plane.cache().store().clone();
     let owned = id.to_string();
     if let Err(e) = block_on_keystore(async move { store.delete_credential(&owned).await }) {
@@ -1579,13 +1564,20 @@ fn set_credential_status(id: &str, status: RecordStatus) -> Resp {
         Ok(None) => return not_found("credential not found"),
         Err(e) => return internal_error(&e),
     };
+    let prior_status = rec.status;
     rec.status = status;
     rec.updated_at = Utc::now();
     if let Err(e) = store_credential(&plane, rec.clone()) {
         return internal_error(&e);
     }
     invalidate(&plane, id);
-    audit_mutation(status_verb(status), "credential", id);
+    audit_mutation_scoped(
+        status_verb(status),
+        "credential",
+        id,
+        rec.tenant_id.as_deref(),
+        Some((prior_status, status)),
+    );
     ok(json!({ "credential": CredentialView::from(&rec) }))
 }
 
@@ -1642,10 +1634,13 @@ struct KeyView {
     principal_selectors: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     route_to_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compression_profile: Option<String>,
     inject_tools: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     inject_mcp: Option<serde_json::Value>,
     bypass_prompt_injection: bool,
+    allow_content_capture: bool,
     project: Option<String>,
     user: Option<String>,
     tags: Vec<String>,
@@ -1679,9 +1674,11 @@ impl From<&KeyRecord> for KeyView {
             require_pii_redaction: r.require_pii_redaction.clone(),
             principal_selectors: r.principal_selectors.clone(),
             route_to_model: r.route_to_model.clone(),
+            compression_profile: r.compression_profile.clone(),
             inject_tools: r.inject_tools.clone(),
             inject_mcp: r.inject_mcp.clone(),
             bypass_prompt_injection: r.bypass_prompt_injection,
+            allow_content_capture: r.allow_content_capture,
             project: r.project.clone(),
             user: r.user.clone(),
             tags: r.tags.clone(),
@@ -1710,6 +1707,10 @@ struct CredentialView {
     name: String,
     provider: Option<String>,
     kind: String,
+    /// Upstream header this credential is presented in. Not a secret.
+    header: String,
+    /// Scheme prefix on the header value. Not a secret.
+    scheme: String,
     status: RecordStatus,
     tenant_id: Option<String>,
     /// How the secret is held, without revealing it.
@@ -1733,6 +1734,8 @@ impl From<&CredentialRecord> for CredentialView {
             name: r.name.clone(),
             provider: r.provider.clone(),
             kind: r.kind.clone(),
+            header: r.header.clone(),
+            scheme: r.scheme.clone(),
             status: r.status,
             tenant_id: r.tenant_id.clone(),
             storage,
@@ -1806,6 +1809,10 @@ fn invalidate(plane: &KeyPlane, id: &str) {
     let cache = plane.cache().clone();
     let owned = id.to_string();
     block_on_keystore(async move { cache.invalidate(&owned).await });
+    // A credential's resolved secret is cached separately from its record, so
+    // a rotation has to drop both on the same signal or the old secret keeps
+    // going upstream until the TTL lapses.
+    plane.invalidate_resolved_credential(id);
 }
 
 fn status_verb(status: RecordStatus) -> &'static str {
@@ -1818,8 +1825,46 @@ fn status_verb(status: RecordStatus) -> &'static str {
 
 /// Emit an audit record for a key/credential mutation. Wired to the audit sink
 /// in WOR-1557; here it stamps the structured event onto the tracing pipeline.
+///
+/// WOR-2094: names the acting operator (from the admin dispatch
+/// thread-local) so the trail answers who changed what, not just that
+/// something changed.
 fn audit_mutation(op: &str, kind: &str, id: &str) {
-    sbproxy_observe::KeyAuditEntry::new(op, kind, id).emit();
+    audit_mutation_scoped(op, kind, id, None, None);
+}
+
+/// [`audit_mutation`] with tenant scope and a secret-free status diff
+/// for mutations where both are cheaply at hand (WOR-2094).
+fn audit_mutation_scoped(
+    op: &str,
+    kind: &str,
+    id: &str,
+    tenant_id: Option<&str>,
+    status_diff: Option<(RecordStatus, RecordStatus)>,
+) {
+    let mut entry = sbproxy_observe::KeyAuditEntry::new(op, kind, id);
+    if let Some(actor) = crate::admin::current_admin_actor() {
+        entry = entry.with_actor(actor);
+    }
+    if let Some(tenant_id) = tenant_id {
+        entry = entry.with_tenant_id(tenant_id);
+    }
+    if let Some((before, after)) = status_diff {
+        entry = entry.with_diff(
+            Some(json!({ "status": status_label(before) })),
+            Some(json!({ "status": status_label(after) })),
+        );
+    }
+    entry.emit();
+}
+
+/// Closed status vocabulary for the audit diff; never a secret.
+fn status_label(status: RecordStatus) -> &'static str {
+    match status {
+        RecordStatus::Active => "active",
+        RecordStatus::Blocked => "blocked",
+        RecordStatus::Revoked => "revoked",
+    }
 }
 
 fn parse_body<T: for<'de> Deserialize<'de> + Default>(body: Option<&str>) -> Result<T, Resp> {
@@ -1841,6 +1886,11 @@ fn created(value: serde_json::Value) -> Resp {
 
 fn bad_request(msg: &str) -> Resp {
     (400, "application/json", json!({ "error": msg }).to_string())
+}
+
+/// A mutation refused because it would break something still in use.
+fn conflict(msg: &str) -> Resp {
+    (409, "application/json", json!({ "error": msg }).to_string())
 }
 
 fn revision_conflict(key_id: &str, expected_revision: u64, current_revision: u64) -> Resp {
@@ -1893,27 +1943,12 @@ fn method_not_allowed() -> Resp {
     )
 }
 
-fn service_unavailable(backend: &'static str) -> Resp {
-    let backend = match backend {
-        "redis" => "redis",
-        _ => "unknown",
-    };
-    let view = KeyUsageUnavailableView {
-        error: KeyUsageUnavailableErrorView {
-            code: "governance_backend_unavailable",
-            message: "governance backend unavailable",
-        },
-        consistency: sbproxy_ai::governance::GovernanceConsistency::Strict,
-        backend: KeyUsageBackendView {
-            name: backend.to_string(),
-            status: sbproxy_ai::governance::GovernanceBackendStatus::Unavailable,
-            checked_at: Utc::now(),
-        },
-    };
-    match serde_json::to_string(&view) {
-        Ok(body) => (503, "application/json", body),
-        Err(_) => internal_error("key usage outage response serialization failed"),
-    }
+fn governance_backend_unavailable() -> Resp {
+    (
+        503,
+        "application/json",
+        r#"{"error":"governance backend unavailable"}"#.to_string(),
+    )
 }
 
 fn internal_error(msg: &str) -> Resp {
@@ -1928,8 +1963,137 @@ fn internal_error(msg: &str) -> Resp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use parking_lot::Mutex;
+    use sbproxy_ai::governance::{
+        CounterSnapshot, GovernanceBackendHealth, GovernanceBackendStatus, GovernanceConsistency,
+        GovernanceError, GovernanceSnapshot, GovernanceStore, Release, ReleaseRequest, Reservation,
+        ReserveRequest, SettleRequest, Settlement, SnapshotKey,
+    };
     use sbproxy_keystore::crypto::KeyCrypto;
     use sbproxy_keystore::{KeyStore, MemoryKeyStore, TtlCache, TtlCacheConfig};
+
+    struct RecordingGovernanceStore {
+        snapshots: Mutex<Vec<SnapshotKey>>,
+        unavailable: bool,
+    }
+
+    impl RecordingGovernanceStore {
+        fn healthy() -> Self {
+            Self {
+                snapshots: Mutex::new(Vec::new()),
+                unavailable: false,
+            }
+        }
+
+        fn unavailable() -> Self {
+            Self {
+                snapshots: Mutex::new(Vec::new()),
+                unavailable: true,
+            }
+        }
+
+        fn snapshot_requests(&self) -> Vec<SnapshotKey> {
+            self.snapshots.lock().clone()
+        }
+
+        fn backend_health(&self) -> GovernanceBackendHealth {
+            GovernanceBackendHealth {
+                backend: "redis".to_string(),
+                consistency: GovernanceConsistency::Strict,
+                status: if self.unavailable {
+                    GovernanceBackendStatus::Unavailable
+                } else {
+                    GovernanceBackendStatus::Healthy
+                },
+                checked_at_millis: 1_700_000_000_000,
+            }
+        }
+    }
+
+    fn counter(
+        limit: Option<u64>,
+        used: u64,
+        reserved: u64,
+        reset_at_millis: Option<u64>,
+    ) -> CounterSnapshot {
+        CounterSnapshot {
+            limit,
+            used,
+            reserved,
+            remaining: limit.map(|value| value.saturating_sub(used.saturating_add(reserved))),
+            reset_at_millis,
+        }
+    }
+
+    #[async_trait]
+    impl GovernanceStore for RecordingGovernanceStore {
+        async fn reserve(&self, _request: ReserveRequest) -> Result<Reservation, GovernanceError> {
+            Err(GovernanceError::BackendUnavailable { backend: "redis" })
+        }
+
+        async fn settle(&self, _request: SettleRequest) -> Result<Settlement, GovernanceError> {
+            Err(GovernanceError::BackendUnavailable { backend: "redis" })
+        }
+
+        async fn release(&self, _request: ReleaseRequest) -> Result<Release, GovernanceError> {
+            Err(GovernanceError::BackendUnavailable { backend: "redis" })
+        }
+
+        async fn snapshot(&self, key: SnapshotKey) -> Result<GovernanceSnapshot, GovernanceError> {
+            self.snapshots.lock().push(key.clone());
+            if self.unavailable {
+                return Err(GovernanceError::BackendUnavailable { backend: "redis" });
+            }
+
+            Ok(GovernanceSnapshot {
+                key_id: key.key_id,
+                policy_revision: key.policy_revision,
+                requests_per_window: counter(
+                    key.limits.requests_per_window,
+                    2,
+                    1,
+                    Some(1_700_000_040_000),
+                ),
+                tokens_per_window: counter(
+                    key.limits.tokens_per_window,
+                    100,
+                    20,
+                    Some(1_700_000_040_000),
+                ),
+                total_tokens: counter(key.limits.total_tokens, 200, 40, None),
+                total_micro_usd: counter(key.limits.total_micro_usd, 3_000_000, 500_000, None),
+                backend: self.backend_health(),
+            })
+        }
+
+        async fn health(&self) -> GovernanceBackendHealth {
+            self.backend_health()
+        }
+    }
+
+    fn install_test_plane_with_governance(
+        store: Arc<MemoryKeyStore>,
+        governance_store: Arc<dyn GovernanceStore>,
+    ) {
+        let crypto = KeyCrypto::new(b"pepper".to_vec(), b"master".to_vec());
+        let store: Arc<dyn KeyStore> = store;
+        let cache = Arc::new(TtlCache::new(store, TtlCacheConfig::default()));
+        // `governance_store` here is a test double (`RecordingGovernanceStore`),
+        // never the concrete `InMemoryGovernanceStore`, so there is no
+        // approximate store to hand off for dissemination.
+        let plane = Arc::new(crate::key_plane::KeyPlane::from_parts_with_governance(
+            crypto,
+            cache,
+            false,
+            false,
+            None,
+            sbproxy_config::KeyGovernanceConfig::default(),
+            governance_store,
+            None,
+        ));
+        crate::key_plane::install_key_plane(plane);
+    }
 
     fn install_test_plane_with_store(store: Arc<MemoryKeyStore>) {
         let crypto = KeyCrypto::new(b"pepper".to_vec(), b"master".to_vec());
@@ -1950,6 +2114,190 @@ mod tests {
     }
 
     #[test]
+    fn a_credential_carries_its_own_upstream_presentation() {
+        let _g = crate::key_plane::test_plane_guard();
+        install_test_plane();
+        let resp = dispatch(
+            "POST",
+            "/admin/credentials",
+            Some(r#"{"id":"anthropic","secret":"s","header":"X-Api-Key","scheme":""}"#),
+        )
+        .unwrap();
+        assert_eq!(resp.0, 201, "{}", resp.2);
+        let v = parse(&resp);
+        // Normalised to lowercase, because that is how it is written upstream.
+        assert_eq!(v["credential"]["header"], "x-api-key");
+        assert_eq!(v["credential"]["scheme"], "");
+    }
+
+    #[test]
+    fn a_credential_defaults_to_bearer_authorization() {
+        let _g = crate::key_plane::test_plane_guard();
+        install_test_plane();
+        let resp = dispatch(
+            "POST",
+            "/admin/credentials",
+            Some(r#"{"id":"openai","secret":"s"}"#),
+        )
+        .unwrap();
+        assert_eq!(resp.0, 201, "{}", resp.2);
+        let v = parse(&resp);
+        assert_eq!(v["credential"]["header"], "authorization");
+        assert_eq!(v["credential"]["scheme"], "Bearer ");
+    }
+
+    #[test]
+    fn a_credential_header_that_cannot_be_set_upstream_is_rejected() {
+        let _g = crate::key_plane::test_plane_guard();
+        install_test_plane();
+        for bad in ["not a header", "host", "content-length"] {
+            let body = format!(r#"{{"id":"c","secret":"s","header":"{bad}"}}"#);
+            let resp = dispatch("POST", "/admin/credentials", Some(&body)).unwrap();
+            assert_eq!(resp.0, 400, "{bad} must be rejected: {}", resp.2);
+        }
+    }
+
+    #[test]
+    fn hop_by_hop_credential_headers_are_rejected_at_admin_creation() {
+        let _g = crate::key_plane::test_plane_guard();
+        install_test_plane();
+        for (index, header) in ["keep-alive", "proxy-connection", "te", "trailer"]
+            .into_iter()
+            .enumerate()
+        {
+            let body = format!(r#"{{"id":"hop-{index}","secret":"s","header":"{header}"}}"#);
+            let resp = dispatch("POST", "/admin/credentials", Some(&body)).unwrap();
+            assert_eq!(
+                resp.0, 400,
+                "{header} must be rejected before storage: {}",
+                resp.2
+            );
+        }
+    }
+
+    #[test]
+    fn a_credential_header_cannot_claim_realtime_protocol_or_proxy_owned_metadata() {
+        let _g = crate::key_plane::test_plane_guard();
+        install_test_plane();
+        for bad in [
+            "OpenAI-Beta",
+            "SEC-WebSocket-Key",
+            "Upgrade",
+            "TraceParent",
+            "TRACESTATE",
+            "Signature-Input",
+            "Signature",
+            "Signature-Agent",
+        ] {
+            let body = format!(r#"{{"id":"c","secret":"s","header":"{bad}"}}"#);
+            let resp = dispatch("POST", "/admin/credentials", Some(&body)).unwrap();
+            assert_eq!(resp.0, 400, "{bad} must be rejected: {}", resp.2);
+        }
+    }
+
+    #[test]
+    fn binding_a_key_to_a_missing_credential_is_rejected() {
+        let _g = crate::key_plane::test_plane_guard();
+        install_test_plane();
+        let resp = create_key(Some(r#"{"credential_id":"does-not-exist"}"#));
+        assert_eq!(resp.0, 400, "{}", resp.2);
+        assert!(resp.2.contains("unknown credential"), "{}", resp.2);
+    }
+
+    #[test]
+    fn binding_across_tenants_is_rejected_but_within_one_is_accepted() {
+        let _g = crate::key_plane::test_plane_guard();
+        install_test_plane();
+        assert_eq!(
+            dispatch(
+                "POST",
+                "/admin/credentials",
+                Some(r#"{"id":"cred-a","secret":"s","tenant":"tenant-a"}"#),
+            )
+            .unwrap()
+            .0,
+            201
+        );
+
+        let wrong = create_key(Some(r#"{"credential_id":"cred-a","tenant":"tenant-b"}"#));
+        assert_eq!(wrong.0, 400, "{}", wrong.2);
+        assert!(wrong.2.contains("different tenant"), "{}", wrong.2);
+
+        let right = create_key(Some(r#"{"credential_id":"cred-a","tenant":"tenant-a"}"#));
+        assert_eq!(right.0, 201, "{}", right.2);
+    }
+
+    #[test]
+    fn binding_to_a_revoked_credential_is_rejected() {
+        let _g = crate::key_plane::test_plane_guard();
+        install_test_plane();
+        assert_eq!(
+            dispatch(
+                "POST",
+                "/admin/credentials",
+                Some(r#"{"id":"cred-r","secret":"s"}"#),
+            )
+            .unwrap()
+            .0,
+            201
+        );
+        assert_eq!(
+            dispatch("POST", "/admin/credentials/cred-r/revoke", None)
+                .unwrap()
+                .0,
+            200
+        );
+        let resp = create_key(Some(r#"{"credential_id":"cred-r"}"#));
+        assert_eq!(resp.0, 400, "{}", resp.2);
+        assert!(resp.2.contains("not active"), "{}", resp.2);
+    }
+
+    #[test]
+    fn deleting_a_bound_credential_is_refused_and_names_the_keys() {
+        let _g = crate::key_plane::test_plane_guard();
+        install_test_plane();
+        assert_eq!(
+            dispatch(
+                "POST",
+                "/admin/credentials",
+                Some(r#"{"id":"cred-b","secret":"s"}"#),
+            )
+            .unwrap()
+            .0,
+            201
+        );
+        let created = create_key(Some(r#"{"credential_id":"cred-b"}"#));
+        assert_eq!(created.0, 201, "{}", created.2);
+        let key_id = parse(&created)["key"]["key_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let refused = dispatch("DELETE", "/admin/credentials/cred-b", None).unwrap();
+        assert_eq!(refused.0, 409, "{}", refused.2);
+        assert!(
+            refused.2.contains(&key_id),
+            "the refusal must name the bound key so an operator can act: {}",
+            refused.2
+        );
+
+        // Unbind, then the delete goes through.
+        let unbound = dispatch(
+            "PATCH",
+            &format!("/admin/keys/{key_id}"),
+            Some(r#"{"expected_revision":1,"credential_id":null}"#),
+        )
+        .unwrap();
+        assert_eq!(unbound.0, 200, "{}", unbound.2);
+        assert_eq!(
+            dispatch("DELETE", "/admin/credentials/cred-b", None)
+                .unwrap()
+                .0,
+            200
+        );
+    }
+
+    #[test]
     fn key_lifecycle_via_dispatch() {
         let _g = crate::key_plane::test_plane_guard();
         install_test_plane();
@@ -1964,7 +2312,15 @@ mod tests {
         assert_eq!(resp.0, 201);
         let v = parse(&resp);
         let token = v["token"].as_str().unwrap().to_string();
-        assert!(token.starts_with("sk-"));
+        // The minted shape is self-identifying, so the sweep can accept or
+        // reject a header value without a store lookup. Assert the whole
+        // contract, not just the prefix.
+        assert!(token.starts_with(sbproxy_keystore::crypto::TOKEN_PREFIX));
+        assert_eq!(token.len(), sbproxy_keystore::crypto::TOKEN_LEN);
+        assert!(
+            sbproxy_keystore::crypto::parse_minted_token(&token).is_some(),
+            "a minted token must round-trip through the strict parser"
+        );
         let key_id = v["key"]["key_id"].as_str().unwrap().to_string();
         assert_eq!(v["key"]["policy_revision"], 1);
         assert!(
@@ -2152,190 +2508,6 @@ mod tests {
     }
 
     #[test]
-    fn governed_key_usage_via_dispatch_has_exact_secret_free_contract() {
-        let _g = crate::key_plane::test_plane_guard();
-        install_test_plane();
-
-        let created = dispatch(
-            "POST",
-            "/admin/keys",
-            Some(
-                r#"{"name":"governed","tenant":"tenant-a",
-                    "max_requests_per_minute":60,"max_tokens_per_minute":50000,
-                    "max_budget_tokens":1000000,"max_budget_usd":25.0}"#,
-            ),
-        )
-        .unwrap();
-        assert_eq!(created.0, 201, "create failed: {}", created.2);
-        let created_json = parse(&created);
-        let key_id = created_json["key"]["key_id"].as_str().unwrap();
-        let token = created_json["token"].as_str().unwrap();
-
-        let usage = dispatch("GET", &format!("/admin/keys/{key_id}/usage"), None).unwrap();
-        assert_eq!(usage.0, 200, "usage failed: {}", usage.2);
-        let value = parse(&usage);
-        assert_eq!(
-            value
-                .as_object()
-                .unwrap()
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>(),
-            [
-                "backend",
-                "consistency",
-                "dimensions",
-                "key_id",
-                "policy_version"
-            ]
-        );
-        assert_eq!(value["key_id"], key_id);
-        assert_eq!(value["policy_version"]["revision"], 1);
-        assert!(value["policy_version"]["digest"]
-            .as_str()
-            .is_some_and(|digest| digest.starts_with("sha256:")));
-        assert_eq!(value["consistency"], "approximate");
-        assert_eq!(value["backend"]["name"], "memory");
-        assert_eq!(value["backend"]["status"], "healthy");
-        DateTime::parse_from_rfc3339(value["backend"]["checked_at"].as_str().unwrap())
-            .expect("backend check time is ISO 8601");
-
-        for (name, limit, reset) in [
-            ("requests_per_minute", 60, true),
-            ("tokens_per_minute", 50_000, true),
-            ("budget_tokens", 1_000_000, false),
-            ("budget_micro_usd", 25_000_000, false),
-        ] {
-            let dimension = &value["dimensions"][name];
-            assert_eq!(dimension["limit"], limit, "{name}");
-            assert_eq!(dimension["used"], 0, "{name}");
-            assert_eq!(dimension["reserved"], 0, "{name}");
-            assert_eq!(dimension["remaining"], limit, "{name}");
-            if reset {
-                DateTime::parse_from_rfc3339(dimension["reset_at"].as_str().unwrap())
-                    .expect("rate reset is ISO 8601");
-            } else {
-                assert!(dimension["reset_at"].is_null(), "{name}");
-            }
-        }
-        assert!(!usage.2.contains(token));
-        assert!(!usage.2.contains("secret_hash"));
-
-        assert_eq!(
-            dispatch("POST", &format!("/admin/keys/{key_id}/usage"), None)
-                .unwrap()
-                .0,
-            405
-        );
-    }
-
-    #[test]
-    fn key_usage_view_preserves_integer_counters_and_unconfigured_dimensions() {
-        let view = key_usage_view(
-            GovernanceSnapshot {
-                key_id: "key-public-id".to_string(),
-                policy_revision: 7,
-                requests_per_window: CounterSnapshot {
-                    limit: Some(10),
-                    used: 3,
-                    reserved: 2,
-                    remaining: Some(5),
-                    reset_at_millis: Some(1_700_000_060_000),
-                },
-                tokens_per_window: CounterSnapshot {
-                    limit: None,
-                    used: 0,
-                    reserved: 0,
-                    remaining: None,
-                    reset_at_millis: Some(1_700_000_060_000),
-                },
-                total_tokens: CounterSnapshot {
-                    limit: Some(100),
-                    used: 20,
-                    reserved: 10,
-                    remaining: Some(70),
-                    reset_at_millis: None,
-                },
-                total_micro_usd: CounterSnapshot {
-                    limit: None,
-                    used: 0,
-                    reserved: 0,
-                    remaining: None,
-                    reset_at_millis: None,
-                },
-                backend: GovernanceBackendHealth {
-                    backend: "memory".to_string(),
-                    consistency: sbproxy_ai::governance::GovernanceConsistency::Approximate,
-                    status: sbproxy_ai::governance::GovernanceBackendStatus::Degraded,
-                    checked_at_millis: 1_700_000_000_000,
-                },
-            },
-            "key-public-id",
-            sbproxy_ai::effective_key_policy::PolicyVersion {
-                revision: 7,
-                digest: "sha256:policy".to_string(),
-            },
-        )
-        .unwrap();
-        let value = serde_json::to_value(view).unwrap();
-
-        assert_eq!(value["backend"]["status"], "degraded");
-        assert_eq!(value["dimensions"]["requests_per_minute"]["used"], 3);
-        assert_eq!(value["dimensions"]["requests_per_minute"]["reserved"], 2);
-        assert_eq!(value["dimensions"]["requests_per_minute"]["remaining"], 5);
-        assert!(value["dimensions"]["tokens_per_minute"].is_null());
-        assert_eq!(value["dimensions"]["budget_tokens"]["used"], 20);
-        assert_eq!(value["dimensions"]["budget_tokens"]["reserved"], 10);
-        assert!(value["dimensions"]["budget_tokens"]["reset_at"].is_null());
-        assert!(value["dimensions"]["budget_micro_usd"].is_null());
-    }
-
-    #[test]
-    fn unavailable_governance_snapshot_is_a_bounded_503() {
-        let response =
-            governance_snapshot_error(GovernanceError::BackendUnavailable { backend: "redis" });
-
-        assert_eq!(response.0, 503);
-        let value = parse(&response);
-        assert_eq!(
-            value
-                .as_object()
-                .unwrap()
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>(),
-            ["backend", "consistency", "error"]
-        );
-        assert_eq!(value["consistency"], "strict");
-        assert_eq!(value["backend"]["name"], "redis");
-        assert_eq!(value["backend"]["status"], "unavailable");
-        DateTime::parse_from_rfc3339(value["backend"]["checked_at"].as_str().unwrap())
-            .expect("backend check time is ISO 8601");
-        assert_eq!(
-            value["error"],
-            json!({
-                "code": "governance_backend_unavailable",
-                "message": "governance backend unavailable",
-            })
-        );
-        assert!(!response.2.contains("url"));
-        assert!(!response.2.contains("password"));
-    }
-
-    #[test]
-    fn unavailable_governance_snapshot_bounds_an_unexpected_backend_label() {
-        let response = governance_snapshot_error(GovernanceError::BackendUnavailable {
-            backend: "redis://admin:password@private.example:6379/0",
-        });
-        let value = parse(&response);
-
-        assert_eq!(value["backend"]["name"], "unknown");
-        assert!(!response.2.contains("admin"));
-        assert!(!response.2.contains("password"));
-        assert!(!response.2.contains("private.example"));
-    }
-
-    #[test]
     fn tenantless_key_digest_is_origin_scoped_to_policy_preview() {
         let _g = crate::key_plane::test_plane_guard();
         install_test_plane();
@@ -2421,6 +2593,7 @@ mod tests {
             "/admin/keys",
             Some(
                 r#"{"name":"lanes","priority":"interactive","max_tokens_per_minute":50000,
+                    "compression_profile":"coding-agent",
                     "inject_mcp":{"ref":"toolhub"},"metadata":{"owner":"platform"}}"#,
             ),
         )
@@ -2431,6 +2604,7 @@ mod tests {
         assert_eq!(v["key"]["priority"], "interactive");
         assert_eq!(v["key"]["max_tokens_per_minute"], 50000);
         assert_eq!(v["key"]["inject_mcp"]["ref"], "toolhub");
+        assert_eq!(v["key"]["compression_profile"], "coding-agent");
         assert_eq!(v["key"]["metadata"]["owner"], "platform");
 
         // Unknown lane and a ref-less inject_mcp are 400s, not stored.
@@ -2439,6 +2613,16 @@ mod tests {
                 "PATCH",
                 &format!("/admin/keys/{key_id}"),
                 Some(r#"{"expected_revision":1,"priority":"urgent"}"#)
+            )
+            .unwrap()
+            .0,
+            400
+        );
+        assert_eq!(
+            dispatch(
+                "PATCH",
+                &format!("/admin/keys/{key_id}"),
+                Some(r#"{"expected_revision":1,"compression_profile":"Bad Name"}"#)
             )
             .unwrap()
             .0,
@@ -2459,13 +2643,17 @@ mod tests {
         let resp = dispatch(
             "PATCH",
             &format!("/admin/keys/{key_id}"),
-            Some(r#"{"expected_revision":1,"priority":null,"inject_mcp":null}"#),
+            Some(
+                r#"{"expected_revision":1,"priority":null,"compression_profile":null,
+                    "inject_mcp":null}"#,
+            ),
         )
         .unwrap();
         assert_eq!(resp.0, 200);
         let v = parse(&resp);
         assert_eq!(v["key"]["policy_revision"], 2);
         assert!(v["key"]["priority"].is_null());
+        assert!(v["key"]["compression_profile"].is_null());
         assert!(v["key"]["inject_mcp"].is_null());
     }
 
@@ -2486,7 +2674,8 @@ mod tests {
                     "allowed_tools":["search"],
                     "require_pii_redaction":["email"],
                     "principal_selectors":[{"team":"platform"}],
-                    "route_to_model":"gpt-4.1","inject_tools":[{"name":"search"}],
+                    "route_to_model":"gpt-4.1","compression_profile":"coding-agent",
+                    "inject_tools":[{"name":"search"}],
                     "inject_mcp":{"ref":"toolhub"},"bypass_prompt_injection":true,
                     "project":"search","user":"alice","tags":["prod"],
                     "metadata":{"owner":"platform"},"tenant":"tenant-a",
@@ -2500,6 +2689,7 @@ mod tests {
         assert_eq!(created["key"]["policy_revision"], 1);
         assert_eq!(created["key"]["blocked_providers"], json!(["vertex"]));
         assert_eq!(created["key"]["allowed_tools"], json!(["search"]));
+        assert_eq!(created["key"]["compression_profile"], "coding-agent");
 
         // Absent fields stay unchanged while a concrete value replaces one.
         let resp = dispatch(
@@ -2540,7 +2730,8 @@ mod tests {
                     "priority":null,"max_budget_tokens":null,"max_budget_usd":null,
                     "allowed_models":[],"blocked_models":[],"allowed_providers":[],
                     "blocked_providers":[],"allowed_tools":null,"require_pii_redaction":[],
-                    "principal_selectors":[],"route_to_model":null,"inject_tools":[],
+                    "principal_selectors":[],"route_to_model":null,
+                    "compression_profile":null,"inject_tools":[],
                     "inject_mcp":null,"bypass_prompt_injection":false,
                     "project":null,"user":null,"tags":[],"metadata":{},
                     "tenant":null,"expires_at":null}"#,
@@ -2557,6 +2748,7 @@ mod tests {
             "priority",
             "budget",
             "route_to_model",
+            "compression_profile",
             "allowed_tools",
             "inject_mcp",
             "project",
@@ -3025,35 +3217,157 @@ mod tests {
     }
 
     #[test]
-    fn key_mutations_reject_zero_and_non_exact_governance_limits_before_write() {
+    fn key_usage_returns_integer_limits_counters_and_safe_backend_health() {
         let _g = crate::key_plane::test_plane_guard();
-        install_test_plane();
+        let key_store = Arc::new(MemoryKeyStore::new());
+        let governance = Arc::new(RecordingGovernanceStore::healthy());
+        install_test_plane_with_governance(key_store, governance.clone());
 
-        for body in [
-            r#"{"max_requests_per_minute":0}"#,
-            r#"{"max_tokens_per_minute":9007199254740992}"#,
-            r#"{"max_budget_tokens":0}"#,
-            r#"{"max_budget_usd":0}"#,
-            r#"{"max_budget_usd":0.0000001}"#,
-            r#"{"max_budget_usd":10000000000}"#,
-        ] {
-            let response = dispatch("POST", "/admin/keys", Some(body)).unwrap();
-            assert_eq!(response.0, 400, "body was accepted: {body}");
-            assert!(dispatch("GET", "/admin/keys", None)
-                .unwrap()
-                .2
-                .contains("\"keys\":[]"));
-        }
-
-        let valid = dispatch(
+        let created = dispatch(
             "POST",
             "/admin/keys",
             Some(
-                r#"{"max_requests_per_minute":1,"max_tokens_per_minute":1,
-                    "max_budget_tokens":1,"max_budget_usd":0.000001}"#,
+                r#"{"name":"must-not-appear","max_requests_per_minute":60,
+                    "max_tokens_per_minute":50000,"max_budget_tokens":1000000,
+                    "max_budget_usd":25.1234564,
+                    "metadata":{"redis_url":"redis://operator:top-secret@redis.internal",
+                    "node_id":"node-secret","artifact":"artifact-secret"}}"#,
             ),
         )
         .unwrap();
-        assert_eq!(valid.0, 201, "minimum positive limits failed: {}", valid.2);
+        assert_eq!(created.0, 201, "create failed: {}", created.2);
+        let created_json = parse(&created);
+        let key_id = created_json["key"]["key_id"].as_str().unwrap().to_string();
+        let token = created_json["token"].as_str().unwrap().to_string();
+
+        let response = dispatch("GET", &format!("/admin/keys/{key_id}/usage"), None).unwrap();
+        assert_eq!(response.0, 200, "usage failed: {}", response.2);
+        let usage = &parse(&response)["usage"];
+        assert_eq!(usage["key_id"], key_id);
+        assert_eq!(usage["policy_revision"], 1);
+        assert_eq!(
+            usage["requests_per_window"],
+            json!({
+                "limit": 60,
+                "used": 2,
+                "reserved": 1,
+                "remaining": 57,
+                "reset_at_millis": 1_700_000_040_000_u64,
+            })
+        );
+        assert_eq!(usage["tokens_per_window"]["limit"], 50_000);
+        assert_eq!(usage["tokens_per_window"]["used"], 100);
+        assert_eq!(usage["tokens_per_window"]["reserved"], 20);
+        assert_eq!(usage["tokens_per_window"]["remaining"], 49_880);
+        assert_eq!(usage["total_tokens"]["limit"], 1_000_000);
+        assert_eq!(usage["total_tokens"]["reset_at_millis"], json!(null));
+        assert_eq!(usage["total_micro_usd"]["limit"], 25_123_456);
+        assert_eq!(usage["total_micro_usd"]["used"], 3_000_000);
+        assert_eq!(usage["total_micro_usd"]["reserved"], 500_000);
+        assert_eq!(usage["total_micro_usd"]["remaining"], 21_623_456);
+        assert_eq!(usage["backend"]["backend"], "redis");
+        assert_eq!(usage["backend"]["consistency"], "strict");
+        assert_eq!(usage["backend"]["status"], "healthy");
+        assert_eq!(usage["backend"]["checked_at_millis"], 1_700_000_000_000_u64);
+
+        let snapshots = governance.snapshot_requests();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].key_id, key_id);
+        assert_eq!(snapshots[0].policy_revision, 1);
+        assert_eq!(snapshots[0].limits.window_millis, 60_000);
+        assert_eq!(snapshots[0].limits.total_micro_usd, Some(25_123_456));
+
+        for forbidden in [
+            token.as_str(),
+            "must-not-appear",
+            "top-secret",
+            "redis.internal",
+            "node-secret",
+            "artifact-secret",
+            "secret_hash",
+        ] {
+            assert!(
+                !response.2.contains(forbidden),
+                "usage response leaked {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn key_usage_returns_not_found_without_calling_governance_storage() {
+        let _g = crate::key_plane::test_plane_guard();
+        let key_store = Arc::new(MemoryKeyStore::new());
+        let governance = Arc::new(RecordingGovernanceStore::unavailable());
+        install_test_plane_with_governance(key_store, governance.clone());
+
+        let missing = dispatch("GET", "/admin/keys/missing/usage", None).unwrap();
+        assert_eq!(missing.0, 404);
+        assert_eq!(parse(&missing), json!({ "error": "key not found" }));
+        assert!(governance.snapshot_requests().is_empty());
+    }
+
+    #[test]
+    fn key_usage_returns_generic_secret_free_service_unavailable_for_backend_errors() {
+        let _g = crate::key_plane::test_plane_guard();
+        let key_store = Arc::new(MemoryKeyStore::new());
+        let governance = Arc::new(RecordingGovernanceStore::unavailable());
+        install_test_plane_with_governance(key_store, governance.clone());
+
+        let created = dispatch(
+            "POST",
+            "/admin/keys",
+            Some(r#"{"name":"unavailable-key","max_requests_per_minute":5}"#),
+        )
+        .unwrap();
+        let key_id = parse(&created)["key"]["key_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let response = dispatch("GET", &format!("/admin/keys/{key_id}/usage"), None).unwrap();
+        assert_eq!(response.0, 503);
+        assert_eq!(
+            parse(&response),
+            json!({ "error": "governance backend unavailable" })
+        );
+        for forbidden in ["redis", "unavailable-key", &key_id] {
+            assert!(
+                !response.2.contains(forbidden),
+                "backend error leaked {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn key_usage_rejects_malformed_legacy_monetary_limits_before_snapshot() {
+        let _g = crate::key_plane::test_plane_guard();
+        let key_store = Arc::new(MemoryKeyStore::new());
+        let governance = Arc::new(RecordingGovernanceStore::healthy());
+        install_test_plane_with_governance(key_store.clone(), governance.clone());
+
+        for (index, value) in [-1.0, f64::NAN, f64::INFINITY, f64::MAX]
+            .into_iter()
+            .enumerate()
+        {
+            let key_id = format!("legacy-{index}");
+            let mut record =
+                KeyRecord::new(key_id.clone(), "hash-must-not-leak".to_string(), Utc::now());
+            record.budget = Some(RecordBudget {
+                max_tokens: Some(100),
+                max_cost_usd: Some(value),
+            });
+            let store = key_store.clone();
+            block_on_keystore(async move { store.put_key(record).await }).unwrap();
+
+            let response = dispatch("GET", &format!("/admin/keys/{key_id}/usage"), None).unwrap();
+            assert_eq!(response.0, 500, "value {value:?}: {}", response.2);
+            assert_eq!(parse(&response), json!({ "error": "internal error" }));
+            assert!(!response.2.contains("hash-must-not-leak"));
+            assert!(!response.2.contains(&key_id));
+        }
+
+        assert!(
+            governance.snapshot_requests().is_empty(),
+            "malformed monetary policies must not reach governance storage"
+        );
     }
 }

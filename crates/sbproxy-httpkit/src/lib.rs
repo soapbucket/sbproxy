@@ -1,15 +1,15 @@
-//! sbproxy-httpkit: shared `BytesMut` buffer pool for response body
-//! buffering on the proxy hot path.
+//! Shared HTTP primitives for sbproxy.
 //!
 //! The crate is the public-API entrypoint for plugin authors who need
 //! to recycle response-body buffers without paying repeated heap
-//! allocation, and is intentionally narrow: today it exposes only
-//! [`bufferpool::BufferPool`]. Broader HTTP request/response helpers
-//! (header parsing, body limits, compression) live in `sbproxy-core`,
-//! `sbproxy-middleware`, and `sbproxy-transport`; they are not
-//! re-exported here to keep the public surface stable.
+//! allocation. It also exposes bounded outbound clients that give
+//! integrations consistent timeout, connection-pool, redirect, and
+//! user-agent settings.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod bufferpool;
+pub mod outbound;
+
+pub use outbound::{default_outbound, token_bearing_outbound, OutboundClientBuilder};

@@ -127,7 +127,7 @@ variable "serve_models" {
 variable "cache_budget_gib" {
   type        = number
   default     = 20
-  description = "VRAM budget for the resident model set (L4 has 24GB)."
+  description = "Disk budget in GiB for the weight cache before it evicts (LRU). A disk limit on the resident weight files, not a VRAM limit."
 }
 
 variable "repo_url" {

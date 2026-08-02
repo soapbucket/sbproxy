@@ -19,6 +19,7 @@
 //! vault://primary/secret/data/openai-prod?key=api_key
 //! awssm://primary/prod/openai-keys?version=3&key=api_key
 //! gcpsm://primary/projects/acme/secrets/openai-key?version=latest
+//! azurekv://primary/openai-key?version=abc123def456
 //! k8ssecret://primary/sbproxy-secrets/openai-key
 //! secretfile://local/openai-prod?key=api_key
 //! secret://local/openai-prod
@@ -32,10 +33,12 @@
 //!
 //! ## Backward compatibility
 //!
-//! `${ENV_VAR}`, `file:/path/to/secret`, and `secret:<name>` shapes
-//! ship a sibling parser; the resolver tries each in turn. Reserved
-//! URI schemes such as `https://` and `file://` are not treated as
-//! secret references and pass through as literals.
+//! `${ENV_VAR}` and `file:/path/to/secret` shapes ship sibling
+//! parsers; the resolver tries each in turn. The removed
+//! `secret:<name>` form is rejected in favor of
+//! `secret://<backend>/<name>`. Reserved URI schemes such as
+//! `https://` and `file://` are not treated as secret references and
+//! pass through as literals.
 //!
 //! ## Multi-tenant resolution
 //!
@@ -90,6 +93,8 @@ pub enum VaultProviderType {
     AwsSecretsManager,
     /// GCP Secret Manager, selected by `gcpsm://`.
     GcpSecretManager,
+    /// Azure Key Vault, selected by `azurekv://`.
+    AzureKeyVault,
     /// Kubernetes Secret objects, selected by `k8ssecret://`.
     KubernetesSecret,
     /// Local file-backed secret store, selected by `secretfile://`.
@@ -105,6 +110,7 @@ impl VaultProviderType {
             "vault" => Some(Self::HashiCorp),
             "awssm" => Some(Self::AwsSecretsManager),
             "gcpsm" => Some(Self::GcpSecretManager),
+            "azurekv" => Some(Self::AzureKeyVault),
             "k8ssecret" => Some(Self::KubernetesSecret),
             "secretfile" => Some(Self::SecretFile),
             "secret" => Some(Self::LocalSecret),
@@ -118,6 +124,7 @@ impl VaultProviderType {
             Self::HashiCorp => "vault",
             Self::AwsSecretsManager => "awssm",
             Self::GcpSecretManager => "gcpsm",
+            Self::AzureKeyVault => "azurekv",
             Self::KubernetesSecret => "k8ssecret",
             Self::SecretFile => "secretfile",
             Self::LocalSecret => "secret",
@@ -130,6 +137,7 @@ impl VaultProviderType {
             Self::HashiCorp => "hashicorp",
             Self::AwsSecretsManager => "aws_secrets_manager",
             Self::GcpSecretManager => "gcp_secret_manager",
+            Self::AzureKeyVault => "azure_key_vault",
             Self::KubernetesSecret => "kubernetes_secret",
             Self::SecretFile => "file",
             Self::LocalSecret => "local",
@@ -497,6 +505,17 @@ mod tests {
         assert_eq!(r.backend, "primary");
         assert_eq!(r.path, "projects/acme/secrets/openai-key");
         assert_eq!(r.version.as_deref(), Some("latest"));
+    }
+
+    /// Azure Key Vault references carry the secret name with an
+    /// optional version pin in the query block.
+    #[test]
+    fn parses_azure_style_reference() {
+        let r = VaultRef::parse("azurekv://primary/openai-key?version=abc123def456").unwrap();
+        assert_eq!(r.provider_type, VaultProviderType::AzureKeyVault);
+        assert_eq!(r.backend, "primary");
+        assert_eq!(r.path, "openai-key");
+        assert_eq!(r.version.as_deref(), Some("abc123def456"));
     }
 
     /// Kubernetes Secret references keep the provider path opaque.

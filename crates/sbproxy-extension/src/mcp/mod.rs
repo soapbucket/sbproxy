@@ -19,9 +19,11 @@
 //! - [`access_control`] - Principal-aware tool ACLs and per-tool quotas.
 //! - [`schema_drift`] / [`cassette_drift`] - CI drift detection (drift CLI).
 //! - [`egress`] - Deterministic allowlist for gateway-originated traffic.
+//! - [`auth`] - Run-as-user upstream credential minting (WOR-1792).
 //! - [`stdio`] - Supervised local stdio MCP transport.
 
 pub mod access_control;
+pub mod auth;
 pub mod cassette_drift;
 pub mod codemode_ts;
 pub mod compat;
@@ -29,6 +31,7 @@ pub mod discovery;
 pub mod egress;
 pub mod federation;
 pub mod openapi_convert;
+pub mod quarantine;
 pub mod rest_to_mcp;
 /// Tool rollout plane: multiple live versions of one tool with
 /// per-consumer resolution (call `_meta`, session requirements,
@@ -57,7 +60,7 @@ pub use cassette_drift::{
     tools_from_value, CassetteContract, CassetteDriftChange, CassetteDriftEvent, CassetteDriftKind,
     CassetteDriftReport, CassetteFieldContract, CassetteToolContract, CASSETTE_DRIFT_EVENT_TYPE,
 };
-pub use egress::{EgressDenied, EgressMode, EgressPolicy};
+pub use egress::{EgressDenied, EgressMode, EgressPolicy, SystemHostResolver};
 pub use federation::{
     FederatedTool, FederationIoSettings, McpCallOutcome, McpFederation, McpServerConfig,
     NamespaceMode, OpenApiBacking, SerializedToolEntry, SerializedTools, ToolVersioningGate,

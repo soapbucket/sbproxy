@@ -1,69 +1,62 @@
 # Model pinning
 
-*Last modified: 2026-05-09*
+*Last modified: 2026-07-27*
 
-SBproxy ships a small registry of "known" classifier models in
-`crates/sbproxy-classifiers/src/known_models.rs`. Each entry pins a
-specific upstream URL plus the SHA-256 hash of the file at that URL on
-the day the entry was added. Detectors reference an entry by name, so
-operators do not have to copy the URL and hash into every config.
+SBproxy keeps its trusted classifier registry in
+`crates/sbproxy-classifiers/src/known_models.rs`. Every merged entry
+identifies an immutable upstream artifact pair and carries both SHA-256
+digests. Detectors can reference an entry by name instead of repeating
+the pins in every configuration.
 
-This page is the procedure note for pinning hashes on a fresh entry,
-and the reasoning behind the assertion test that fails the build when
-an entry is committed without a hash.
+## Trust requirements
 
-## Why hashes are pinned in source
+A registry candidate must have:
 
-- A model rotation is a code change with a code review attached, not a
-  YAML edit any operator can land. The registry is the single source
-  of truth for what "the production model" means.
-- `cargo deny` and supply-chain audits pick up the registry the same
-  way they pick up `Cargo.toml` pins.
-- Detectors that load a known model use the SHA pair to verify the
-  download out of caution against tampering or a compromised mirror.
-  An empty hash flags the entry as "unpinned" and disables that
-  verification, which is the same posture as supplying the URL
-  directly in policy config without `model_sha256`.
+- An immutable upstream revision, never a moving `resolve/main` URL.
+- Clear model-weight and tokenizer provenance.
+- An Apache-2.0 or MIT license (or an explicitly reviewed equivalent).
+- A verified label/output contract for its intended detector.
+- Measured artifact sizes within that detector's default budgets.
+- SHA-256 digests computed from the exact downloadable bytes.
 
-## Computing the SHA on first download
+Empty, placeholder, or deferred digests are not allowed in
+`KNOWN_MODELS`. If the review environment cannot fetch and verify a
+candidate, leave it out of the trusted registry until someone can.
+Local prompt-injection auto-selection likewise requires a complete pin
+pair; it never trusts files merely because they are present.
 
-Some entries land with empty `model_sha256` and `tokenizer_sha256`
-values. The build sandbox has no outbound network access, so we will
-not commit a hash we have not verified. The follow-up procedure to
-populate those values is:
+## Adding or rotating an entry
 
-1. Run the proxy locally with the relevant detector enabled. On first
-   request, the detector fetches the file and stores it under the
-   classifier cache directory (`SBPROXY_CACHE_DIR` if set, otherwise
-   the OS default returned by the `dirs` crate).
-2. Run `sha256sum <cache-path>/model.onnx` and
-   `sha256sum <cache-path>/tokenizer.json`. Use lowercase hex for the
-   value you paste back.
-3. Cross-check the hash against the upstream model card. Hugging Face
-   exposes a "Files and versions" tab that lists the SHA for each
-   blob; the values must match exactly.
-4. Paste the lowercase hex strings into the matching `KnownModel`
-   entry in `known_models.rs` and update `revision_pinned_at` to
-   today's date in `YYYY-MM-DD` form.
-5. Re-enable the assertion test by removing the `#[ignore]` attribute
-   on `no_known_model_has_unpinned_sha256` in the same module.
-6. Open the follow-up PR. The review must include the upstream model
-   card URL and the LICENSE the model ships under.
+1. Select the exact upstream commit or immutable revision and review
+   its model card, license, tokenizer, label order, and export
+   provenance.
+2. Download the model and tokenizer on a connected host with redirects
+   visible in the command output. Confirm the final artifact belongs to
+   the reviewed immutable revision.
+3. Measure both files. Do not rely on a filename or model-card estimate.
+4. Compute lowercase digests:
 
-## Assertion test
+   ```bash
+   sha256sum model.onnx tokenizer.json
+   ```
 
-The `no_known_model_has_unpinned_sha256` test in
-`crates/sbproxy-classifiers/src/known_models.rs` walks every entry in
-`KNOWN_MODELS` and fails if either `model_sha256` or
-`tokenizer_sha256` is:
+   On macOS, use `shasum -a 256` when `sha256sum` is unavailable.
+5. Cross-check any upstream-published digest. A mismatch blocks the
+   entry; do not choose whichever value makes a download pass.
+6. Add the immutable URLs, both digests, SPDX license identifier, and
+   current `revision_pinned_at` date to the `KnownModel` entry.
+7. Run the registry assertion test and the relevant detector load test.
+8. Include the model card, license, immutable revision, measured sizes,
+   digests, and label verification evidence in the PR.
 
-- the empty string,
-- the literal 64-character hex zero placeholder
-  (`0000...`, which operators sometimes paste while shadowing local
-  builds),
+## Assertion gate
+
+`no_known_model_has_unpinned_sha256` runs in the normal test suite. It
+walks every `KNOWN_MODELS` entry and rejects:
+
+- an empty digest,
+- a literal 64-character all-zero placeholder,
 - or the lowercase hex form of a 32-byte zero buffer.
 
-The test is marked `#[ignore]` while the registry still ships an
-unpinned entry; the follow-up that pastes the computed hashes also
-drops the `#[ignore]`, at which point any future PR that
-re-introduces an empty hash trips the gate at CI time.
+The test is intentionally not ignored. A new model without verified
+pins must fail CI instead of silently weakening artifact verification.

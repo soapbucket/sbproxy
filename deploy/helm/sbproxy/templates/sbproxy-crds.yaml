@@ -88,6 +88,36 @@ spec:
                       type: string
                       default: authorization
                       description: Key inside the Secret whose value is the full basic-auth header (e.g. `Basic YWRtaW46c2VjcmV0`).
+                clustering:
+                  description: |-
+                    Optional mesh clustering for multi-replica deployments.
+
+                    When present and `enabled: true`, the operator reconciles a StatefulSet (stable per-pod identity) plus a headless Service for gossip instead of a Deployment, generates a shared cluster key Secret when none is referenced, and injects a rendered `proxy.cluster` block into the mounted `sb.yml` so the replicas form a mesh without hand-written peer configuration. Absent or `enabled: false` keeps the plain-Deployment path unchanged.
+                  nullable: true
+                  properties:
+                    clusterDomain:
+                      default: cluster.local
+                      description: Cluster DNS domain used when rendering the stable per-pod seed addresses (`<pod>.<headless-svc>.<ns>.svc.<domain>`). Defaults to `cluster.local`; override only on clusters with a custom domain.
+                      type: string
+                    clusterSecretRef:
+                      description: Optional name of an existing Secret in the same namespace whose `cluster-key` entry holds the shared cluster key. When unset the operator generates a `<sbproxy-name>-cluster-key` Secret once and reuses it for the lifetime of the SBProxy, so rescheduled pods always rejoin with the same key.
+                      nullable: true
+                      type: string
+                    enabled:
+                      default: false
+                      description: Turn mesh clustering on. Defaults to false.
+                      type: boolean
+                    gossipPort:
+                      default: 7946
+                      description: UDP gossip listener port carried into `proxy.cluster.gossip_port` and exposed on the headless Service. Defaults to 7946.
+                      format: int32
+                      type: integer
+                    transportPort:
+                      default: 8946
+                      description: TCP typed-state transport port carried into `proxy.cluster.transport_port` and exposed on the headless Service. Defaults to 8946.
+                      format: int32
+                      type: integer
+                  type: object
             status:
               type: object
               nullable: true

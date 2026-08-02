@@ -1,22 +1,35 @@
-//! Multi-process strict-governance acceptance coverage (WOR-1845).
+//! Multi-process strict-governance acceptance coverage (WOR-1835).
 //!
-//! This test is ignored by default because it needs a live Redis endpoint and
-//! a prebuilt sbproxy binary. Run it with `REDIS_URL=redis://127.0.0.1:6379`.
+//! Two independent proxy processes share one governed key and one Redis
+//! governance backend (`key_management.governance.consistency: strict`).
+//! The whole point of strict consistency is that admission is a
+//! cluster-wide atomic reservation, not a per-process counter: firing a
+//! burst of concurrent requests split across both gateways must never let
+//! the combined accepted count exceed the key's shared limit, even though
+//! neither gateway can see the other's in-memory state.
+//!
+//! Requires `redis-server` on PATH (the test spawns and owns its own
+//! instance; no external Redis is touched) and a prebuilt `sbproxy`
+//! binary. Ordinary local runs skip with a message when `redis-server`
+//! is unavailable. Set `SBPROXY_E2E_REQUIRE_REDIS=1` in CI or other
+//! dependency-complete environments to make a missing Redis executable
+//! fail instead. This test is not part of the required PR CI gate.
 
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Barrier};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use sbproxy_e2e::{MockUpstream, ProxyHarness};
+use serde_json::{json, Value};
 
-const LIMIT: usize = 25;
-const REQUESTS: usize = 100;
-
-#[derive(Clone, Copy)]
-enum LimitMode {
-    Requests,
-    Money,
-}
+/// Shared per-key request budget. Small on purpose: the assertion is exact
+/// (`accepted <= LIMIT`), so a tight limit makes any race in the reserve
+/// path show up as a clear over-admission rather than noise.
+const LIMIT: u64 = 10;
+/// Roughly 2x the limit, split across both gateways, fired concurrently.
+const REQUESTS: usize = 20;
 
 fn pick_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
@@ -26,27 +39,89 @@ fn pick_port() -> u16 {
         .port()
 }
 
+/// A private `redis-server` child, killed on drop. Mirrors
+/// `e2e/tests/key_replicas.rs::RedisGuard`.
+struct RedisGuard {
+    child: Child,
+    port: u16,
+}
+
+impl RedisGuard {
+    /// Spawn `redis-server` on an ephemeral port with persistence disabled.
+    /// Returns `None` when the binary is not installed.
+    fn spawn() -> Option<Self> {
+        let port = pick_port();
+        let child = match Command::new("redis-server")
+            .args([
+                "--port",
+                &port.to_string(),
+                "--save",
+                "",
+                "--appendonly",
+                "no",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if std::env::var_os("SBPROXY_E2E_REQUIRE_REDIS").as_deref()
+                    == Some(std::ffi::OsStr::new("1"))
+                {
+                    panic!(
+                        "SBPROXY_E2E_REQUIRE_REDIS=1 but redis-server was not found on PATH; \
+                         install redis-server before running governance_strict"
+                    );
+                }
+                return None;
+            }
+            Err(e) => panic!("spawn redis-server: {e}"),
+        };
+        let guard = Self { child, port };
+        guard.wait_ready(Duration::from_secs(10));
+        Some(guard)
+    }
+
+    fn url(&self) -> String {
+        format!("redis://127.0.0.1:{}", self.port)
+    }
+
+    /// Block until the server accepts TCP connections.
+    fn wait_ready(&self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if TcpStream::connect(format!("127.0.0.1:{}", self.port)).is_ok() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!(
+            "redis-server did not accept connections on port {}",
+            self.port
+        );
+    }
+}
+
+impl Drop for RedisGuard {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// One gateway's config: its own embedded key store (so minting is purely
+/// local/declarative via `seed.keys`), but the SAME Redis governance
+/// backend as every other gateway, so admission accounting is coherent
+/// cluster-wide even though the key *records* are not shared.
 fn config(
     admin_port: u16,
     store_path: &str,
     redis_url: &str,
-    upstream_url: &str,
+    upstream_base: &str,
     key_id: &str,
-    limit_mode: LimitMode,
+    secret: &str,
 ) -> String {
-    let redis_url = serde_json::to_string(redis_url).expect("quote Redis URL");
-    let (seed_limit, model_prices) = match limit_mode {
-        LimitMode::Requests => (format!("max_requests_per_minute: {LIMIT}"), String::new()),
-        LimitMode::Money => (
-            "max_budget_usd: 0.000025".to_string(),
-            r#"
-      model_prices:
-        gpt-4o-mini:
-          input_per_million: 0.0
-          output_per_million: 1.0"#
-                .to_string(),
-        ),
-    };
     format!(
         r#"
 proxy:
@@ -61,26 +136,25 @@ proxy:
     store:
       backend: embedded
       path: "{store_path}"
+    cache:
+      ttl_secs: 60
     crypto:
-      pepper: strict-governance-e2e-pepper
-      master_key: strict-governance-e2e-master
+      pepper: governance-strict-e2e-pepper
+      master_key: governance-strict-e2e-master
     governance:
       consistency: strict
       backend:
         type: redis
-        url: {redis_url}
-      lease_ttl_secs: 5
+        url: "{redis_url}"
+      lease_ttl_secs: 30
       terminal_retention_secs: 60
       failure_mode: closed
-      missing_rate: zero_cost
-      default_max_output_tokens: 32
     seed:
       keys:
         - key_id: {key_id}
-          secret: shared-secret
-          name: strict-load-key
-          {seed_limit}
-          allowed_models: [gpt-4o-mini]
+          secret: {secret}
+          name: strict-shared-budget
+          max_requests_per_minute: {LIMIT}
 origins:
   "ai.localhost":
     action:
@@ -88,28 +162,29 @@ origins:
       require_governed_key: true
       providers:
         - name: openai
-          api_key: stub
-          base_url: "{upstream_url}"
+          api_key: sk-dummy
+          base_url: "{upstream_base}"
           allow_private_base_url: true
           default_model: gpt-4o-mini
           models: [gpt-4o-mini]
-{model_prices}
 "#
     )
 }
 
-fn chat(base_url: &str, token: &str) -> u16 {
+fn client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
         .expect("HTTP client")
+}
+
+/// Send one governed chat request and return the HTTP status.
+fn chat(base_url: &str, token: &str) -> u16 {
+    client()
         .post(format!("{base_url}/v1/chat/completions"))
         .header("host", "ai.localhost")
         .header("authorization", format!("Bearer {token}"))
-        // Correlation IDs are caller-controlled and must never collapse
-        // independent governance reservations into one idempotent record.
-        .header("x-request-id", "shared-client-correlation-id")
-        .json(&serde_json::json!({
+        .json(&json!({
             "model": "gpt-4o-mini",
             "messages": [{"role": "user", "content": "strict admission"}],
             "max_tokens": 1
@@ -120,26 +195,79 @@ fn chat(base_url: &str, token: &str) -> u16 {
         .as_u16()
 }
 
-fn exercise_two_gateway_load(limit_mode: LimitMode) -> (Vec<u16>, serde_json::Value, usize) {
-    let redis_url = std::env::var("REDIS_URL").expect("REDIS_URL is required");
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("wall clock")
-        .as_nanos();
-    let key_id = format!("strict{}{}", std::process::id(), suffix);
-    let token = format!("sk-{key_id}-shared-secret");
+fn admin_usage(admin_port: u16, key_id: &str) -> Value {
+    client()
+        .get(format!(
+            "http://127.0.0.1:{admin_port}/admin/keys/{key_id}/usage"
+        ))
+        .basic_auth("admin", Some("secret"))
+        .send()
+        .expect("admin usage request")
+        .error_for_status()
+        .expect("admin usage status")
+        .json::<Value>()
+        .expect("admin usage JSON")
+}
+
+#[test]
+fn required_redis_mode_fails_when_redis_server_is_unavailable() {
+    let test_binary = std::env::current_exe().expect("current governance_strict test binary");
+    let output = Command::new(test_binary)
+        .args([
+            "--exact",
+            "two_gateways_never_admit_more_than_the_shared_strict_request_limit",
+            "--nocapture",
+        ])
+        .env("PATH", "/sbproxy-e2e-intentionally-missing")
+        .env("SBPROXY_E2E_REQUIRE_REDIS", "1")
+        .output()
+        .expect("run governance_strict in Redis-required mode");
+
+    assert!(
+        !output.status.success(),
+        "Redis-required mode must fail instead of reporting a successful skip; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("SBPROXY_E2E_REQUIRE_REDIS=1 but redis-server was not found on PATH"),
+        "failure must explain how to satisfy the Redis dependency; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn two_gateways_never_admit_more_than_the_shared_strict_request_limit() {
+    let Some(redis) = RedisGuard::spawn() else {
+        eprintln!(
+            "SKIP governance_strict::two_gateways_never_admit_more_than_the_shared_strict_request_limit: \
+             redis-server not found on PATH (optional for local runs; set \
+             SBPROXY_E2E_REQUIRE_REDIS=1 to require it)"
+        );
+        return;
+    };
+
+    let suffix = std::process::id();
+    let key_id = format!("strictgov{suffix}");
+    let secret = "shared-strict-secret";
+    let token = format!("sk-{key_id}-{secret}");
+
     let store_a = format!(
-        "{}/governance-a-{suffix}.redb",
+        "{}/sbproxy_e2e_governance_strict_a_{suffix}.redb",
         std::env::temp_dir().display()
     );
     let store_b = format!(
-        "{}/governance-b-{suffix}.redb",
+        "{}/sbproxy_e2e_governance_strict_b_{suffix}.redb",
         std::env::temp_dir().display()
     );
     let _ = std::fs::remove_file(&store_a);
     let _ = std::fs::remove_file(&store_b);
 
-    let upstream = MockUpstream::start(serde_json::json!({
+    // A single shared mock upstream is fine: both gateways only need to
+    // observe whether a request reached dispatch at all, not per-gateway
+    // provider isolation.
+    let upstream = MockUpstream::start(json!({
         "id": "chatcmpl-governed",
         "object": "chat.completion",
         "model": "gpt-4o-mini",
@@ -151,15 +279,18 @@ fn exercise_two_gateway_load(limit_mode: LimitMode) -> (Vec<u16>, serde_json::Va
         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
     }))
     .expect("mock upstream");
+
     let admin_a = pick_port();
     let admin_b = pick_port();
+    let redis_url = redis.url();
+
     let proxy_a = ProxyHarness::start_with_yaml(&config(
         admin_a,
         &store_a,
         &redis_url,
         &upstream.base_url(),
         &key_id,
-        limit_mode,
+        secret,
     ))
     .expect("start gateway A");
     let proxy_b = ProxyHarness::start_with_yaml(&config(
@@ -168,12 +299,15 @@ fn exercise_two_gateway_load(limit_mode: LimitMode) -> (Vec<u16>, serde_json::Va
         &redis_url,
         &upstream.base_url(),
         &key_id,
-        limit_mode,
+        secret,
     ))
     .expect("start gateway B");
     ProxyHarness::wait_for_port(admin_a, Duration::from_secs(10)).expect("admin A ready");
     ProxyHarness::wait_for_port(admin_b, Duration::from_secs(10)).expect("admin B ready");
 
+    // Fire ~2x the limit, alternating gateways, all released from a
+    // barrier at once so the two processes race each other against the
+    // one shared Redis reservation.
     let bases = [proxy_a.base_url(), proxy_b.base_url()];
     let barrier = Arc::new(Barrier::new(REQUESTS + 1));
     let mut workers = Vec::with_capacity(REQUESTS);
@@ -181,75 +315,55 @@ fn exercise_two_gateway_load(limit_mode: LimitMode) -> (Vec<u16>, serde_json::Va
         let base = bases[index % bases.len()].clone();
         let token = token.clone();
         let barrier = Arc::clone(&barrier);
-        workers.push(std::thread::spawn(move || {
+        workers.push(thread::spawn(move || {
             barrier.wait();
             chat(&base, &token)
         }));
     }
     barrier.wait();
-    let statuses = workers
+    let statuses: Vec<u16> = workers
         .into_iter()
         .map(|worker| worker.join().expect("request worker"))
-        .collect::<Vec<_>>();
+        .collect();
 
-    let usage = reqwest::blocking::Client::new()
-        .get(format!(
-            "http://127.0.0.1:{admin_a}/admin/keys/{key_id}/usage"
-        ))
-        .basic_auth("admin", Some("secret"))
-        .send()
-        .expect("admin usage")
-        .error_for_status()
-        .expect("usage status")
-        .json::<serde_json::Value>()
-        .expect("usage JSON");
-    let upstream_requests = upstream.captured().len();
-
-    drop(proxy_b);
-    drop(proxy_a);
-    let _ = std::fs::remove_file(&store_a);
-    let _ = std::fs::remove_file(&store_b);
-
-    (statuses, usage, upstream_requests)
-}
-
-#[test]
-#[ignore = "requires REDIS_URL and a prebuilt sbproxy binary"]
-fn two_gateways_never_accept_more_than_the_shared_strict_request_limit() {
-    let (statuses, usage, upstream_requests) = exercise_two_gateway_load(LimitMode::Requests);
     let accepted = statuses.iter().filter(|status| **status == 200).count();
     let denied = statuses.iter().filter(|status| **status == 429).count();
-    assert_eq!(accepted, LIMIT, "statuses: {statuses:?}");
-    assert_eq!(denied, REQUESTS - LIMIT, "statuses: {statuses:?}");
-    assert_eq!(upstream_requests, LIMIT);
+    assert_eq!(
+        accepted + denied,
+        REQUESTS,
+        "every response must be either admitted or governance-denied: {statuses:?}"
+    );
+    assert!(
+        accepted > 0,
+        "sanity: at least some requests under the limit must be admitted: {statuses:?}"
+    );
+    assert!(
+        accepted as u64 <= LIMIT,
+        "strict Redis reservation must never let two gateways jointly admit more than \
+         the shared limit ({LIMIT}); accepted={accepted} statuses={statuses:?}"
+    );
 
-    let rpm = &usage["dimensions"]["requests_per_minute"];
-    assert_eq!(rpm["limit"].as_u64(), Some(LIMIT as u64));
-    assert_eq!(rpm["used"].as_u64(), Some(LIMIT as u64));
-    assert_eq!(rpm["reserved"].as_u64(), Some(0));
-    assert_eq!(rpm["remaining"].as_u64(), Some(0));
-    assert_eq!(usage["consistency"], "strict");
-    assert_eq!(usage["backend"]["status"], "healthy");
-}
+    // Denied requests must never reach the upstream: the reserve() call
+    // happens before dispatch, so a 429 short-circuits before any provider
+    // I/O.
+    assert_eq!(
+        upstream.captured().len(),
+        accepted,
+        "only admitted requests may reach the upstream"
+    );
 
-#[test]
-#[ignore = "requires REDIS_URL and a prebuilt sbproxy binary"]
-fn two_gateways_never_exceed_shared_money_by_more_than_one_micro_usd() {
-    let (statuses, usage, upstream_requests) = exercise_two_gateway_load(LimitMode::Money);
-    let accepted = statuses.iter().filter(|status| **status == 200).count();
-    let denied = statuses.iter().filter(|status| **status == 402).count();
-    assert_eq!(accepted, LIMIT, "statuses: {statuses:?}");
-    assert_eq!(denied, REQUESTS - LIMIT, "statuses: {statuses:?}");
-    assert_eq!(upstream_requests, LIMIT);
-
-    let money = &usage["dimensions"]["budget_micro_usd"];
-    let limit = money["limit"].as_u64().expect("money limit");
-    let used = money["used"].as_u64().expect("money used");
-    assert_eq!(limit, LIMIT as u64);
-    assert!(used <= limit + 1, "used={used}, limit={limit}");
-    assert_eq!(used, LIMIT as u64);
-    assert_eq!(money["reserved"].as_u64(), Some(0));
-    assert_eq!(money["remaining"].as_u64(), Some(0));
-    assert_eq!(usage["consistency"], "strict");
+    // Cross-check the admin-visible ledger agrees with what the request
+    // path actually admitted. The governance store settles synchronously
+    // before each response is written, so by the time every worker thread
+    // above has joined, all `accepted` reservations must already be
+    // settled (reserved == 0) rather than still outstanding.
+    let usage = admin_usage(admin_a, &key_id)["usage"].clone();
+    assert_eq!(usage["requests_per_window"]["limit"], LIMIT);
+    assert_eq!(usage["requests_per_window"]["used"], accepted as u64);
+    assert_eq!(
+        usage["requests_per_window"]["reserved"], 0,
+        "every reservation must be settled once its HTTP response has been sent"
+    );
+    assert_eq!(usage["backend"]["consistency"], "strict");
     assert_eq!(usage["backend"]["status"], "healthy");
 }

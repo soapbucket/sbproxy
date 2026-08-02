@@ -53,6 +53,28 @@ impl KVStore for MemoryKVStore {
         Ok(())
     }
 
+    fn put_with_ttl(&self, key: &[u8], value: &[u8], _ttl_secs: u64) -> Result<()> {
+        self.put(key, value)
+    }
+
+    fn compare_and_swap_with_ttl(
+        &self,
+        key: &[u8],
+        expected: &[u8],
+        value: &[u8],
+        _ttl_secs: u64,
+    ) -> Result<bool> {
+        let mut data = self.data.lock();
+        if data
+            .get(key)
+            .is_none_or(|current| current.as_ref() != expected)
+        {
+            return Ok(false);
+        }
+        data.insert(key.to_vec(), Bytes::copy_from_slice(value));
+        Ok(true)
+    }
+
     fn delete(&self, key: &[u8]) -> Result<()> {
         let mut data = self.data.lock();
         data.remove(key);

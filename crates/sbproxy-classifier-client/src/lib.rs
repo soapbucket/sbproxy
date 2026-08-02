@@ -21,9 +21,14 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use sbproxy_classifier_proto::{
-    ClassifyRequest, ClassifyResponse, EmbedRequest, InferenceServiceClient, VersionRequest,
-    VersionResponse,
+    compress_request, ClassifyRequest, CompressRequest, CompressResponse, EmbedRequest,
+    InferenceServiceClient, VersionRequest, VersionResponse,
 };
+
+/// Classification response types, re-exported so callers of
+/// [`ClassifierClient::classify`] can name them without depending on the
+/// proto crate directly.
+pub use sbproxy_classifier_proto::{ClassifyResponse, Label};
 use tokio::net::UnixStream;
 use tonic::transport::{Channel, Endpoint};
 use tower::service_fn;
@@ -52,8 +57,36 @@ pub enum ClassifierClientError {
     #[error("classifier call timed out after {0:?}")]
     Timeout(Duration),
     /// The sidecar returned a gRPC error status.
-    #[error("classifier rpc failed: {0}")]
-    Rpc(String),
+    #[error("classifier rpc failed ({code:?}): {message}")]
+    Rpc {
+        /// Structured gRPC status code returned by the sidecar.
+        code: tonic::Code,
+        /// Status message returned by the sidecar.
+        message: String,
+    },
+    /// The sidecar returned a structurally invalid response (see
+    /// `validate_classify_response` / `validate_compress_response`).
+    #[error("classifier protocol error: {0}")]
+    Protocol(String),
+    /// The caller supplied an invalid compression request.
+    #[error("invalid classifier request: {0}")]
+    InvalidRequest(String),
+}
+
+fn rpc_error(status: tonic::Status) -> ClassifierClientError {
+    ClassifierClientError::Rpc {
+        code: status.code(),
+        message: status.message().to_string(),
+    }
+}
+
+/// Target mode for extractive token compression.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CompressionTarget {
+    /// Retain this fraction of source tokens.
+    RetainRatio(f64),
+    /// Retain at most this many source tokens.
+    TargetTokens(u32),
 }
 
 /// A connected, cheaply-cloneable client to a classifier sidecar.
@@ -190,6 +223,15 @@ impl ClassifierClient {
     }
 
     /// Classify `text` with the named model (empty = the sidecar's default).
+    ///
+    /// The response is validated before it is returned: it carries at least
+    /// one label, every label has a non-empty name unique within the
+    /// response, and every score is finite and within `0.0..=1.0`. A
+    /// response that fails any of these checks surfaces as
+    /// [`ClassifierClientError::Protocol`], so a malformed sidecar verdict
+    /// flows through the caller's fail policy instead of masquerading as a
+    /// clean result. The returned labels are ordered highest score first
+    /// regardless of the order the sidecar sent them in.
     pub async fn classify(
         &self,
         model: &str,
@@ -203,11 +245,14 @@ impl ClassifierClient {
         // Clone the inner client so this method takes `&self`: tonic clients
         // require `&mut self`, and the channel clone shares the connection.
         let mut client = self.inner.clone();
-        match tokio::time::timeout(self.timeout, client.classify(request)).await {
-            Ok(Ok(resp)) => Ok(resp.into_inner()),
-            Ok(Err(status)) => Err(ClassifierClientError::Rpc(status.to_string())),
-            Err(_) => Err(ClassifierClientError::Timeout(self.timeout)),
-        }
+        let mut response = match tokio::time::timeout(self.timeout, client.classify(request)).await
+        {
+            Ok(Ok(resp)) => resp.into_inner(),
+            Ok(Err(status)) => return Err(rpc_error(status)),
+            Err(_) => return Err(ClassifierClientError::Timeout(self.timeout)),
+        };
+        validate_classify_response(&mut response)?;
+        Ok(response)
     }
 
     /// Embed `inputs` with the named model (empty = the sidecar's default).
@@ -232,9 +277,56 @@ impl ClassifierClient {
                 .into_iter()
                 .map(|e| e.values)
                 .collect()),
-            Ok(Err(status)) => Err(ClassifierClientError::Rpc(status.to_string())),
+            Ok(Err(status)) => Err(rpc_error(status)),
             Err(_) => Err(ClassifierClientError::Timeout(self.timeout)),
         }
+    }
+
+    /// Compress `text` extractively with the named token-classification model.
+    pub async fn compress(
+        &self,
+        model: &str,
+        text: &str,
+        target: CompressionTarget,
+    ) -> Result<CompressResponse, ClassifierClientError> {
+        if text.is_empty() {
+            return Err(ClassifierClientError::InvalidRequest(
+                "compression text is empty".to_string(),
+            ));
+        }
+        let target = match target {
+            CompressionTarget::RetainRatio(ratio)
+                if ratio.is_finite() && ratio > 0.0 && ratio <= 1.0 =>
+            {
+                compress_request::Target::RetainRatio(ratio)
+            }
+            CompressionTarget::RetainRatio(_) => {
+                return Err(ClassifierClientError::InvalidRequest(
+                    "retain ratio must be finite and in (0, 1]".to_string(),
+                ))
+            }
+            CompressionTarget::TargetTokens(tokens) if tokens > 0 => {
+                compress_request::Target::TargetTokens(tokens)
+            }
+            CompressionTarget::TargetTokens(_) => {
+                return Err(ClassifierClientError::InvalidRequest(
+                    "target token count must be greater than zero".to_string(),
+                ))
+            }
+        };
+        let request = CompressRequest {
+            model: model.to_string(),
+            text: text.to_string(),
+            target: Some(target),
+        };
+        let mut client = self.inner.clone();
+        let response = match tokio::time::timeout(self.timeout, client.compress(request)).await {
+            Ok(Ok(response)) => response.into_inner(),
+            Ok(Err(status)) => return Err(rpc_error(status)),
+            Err(_) => return Err(ClassifierClientError::Timeout(self.timeout)),
+        };
+        validate_compress_response(text, &response)?;
+        Ok(response)
     }
 
     /// Probe the sidecar's version + served model ids (startup capability check).
@@ -242,17 +334,110 @@ impl ClassifierClient {
         let mut client = self.inner.clone();
         match tokio::time::timeout(self.timeout, client.version(VersionRequest {})).await {
             Ok(Ok(resp)) => Ok(resp.into_inner()),
-            Ok(Err(status)) => Err(ClassifierClientError::Rpc(status.to_string())),
+            Ok(Err(status)) => Err(rpc_error(status)),
             Err(_) => Err(ClassifierClientError::Timeout(self.timeout)),
         }
     }
+}
+
+/// Validate (and normalize) a classification response before it reaches an
+/// adapter (WOR-2161).
+///
+/// The proto cannot express these invariants, so the client enforces them
+/// centrally, mirroring [`validate_compress_response`]:
+///
+/// * at least one label is present;
+/// * every label name is non-empty;
+/// * every score is finite and within `0.0..=1.0`.
+///
+/// Duplicates: two labels whose names collide ASCII-case-insensitively are
+/// rejected. Adapters match label names case-insensitively (the sidecar
+/// detector's `injection_label`), so a duplicate pair such as `Injection`
+/// 0.9 / `INJECTION` 0.1 makes the verdict ambiguous; guessing which score
+/// the sidecar meant is how a bypass hides, so the response fails loud
+/// instead.
+///
+/// Ordering: the proto documents labels as "highest score first" but this
+/// client does not trust the sidecar to honor that. After validation the
+/// labels are re-sorted descending by score (stable, so equal scores keep
+/// the sidecar's relative order), turning the documented ordering into an
+/// enforced invariant callers may rely on.
+fn validate_classify_response(
+    response: &mut ClassifyResponse,
+) -> Result<(), ClassifierClientError> {
+    if response.labels.is_empty() {
+        return Err(ClassifierClientError::Protocol(
+            "classification response contains no labels".to_string(),
+        ));
+    }
+    let mut seen = std::collections::HashSet::with_capacity(response.labels.len());
+    for label in &response.labels {
+        if label.name.is_empty() {
+            return Err(ClassifierClientError::Protocol(
+                "classification response contains a label with an empty name".to_string(),
+            ));
+        }
+        if !label.score.is_finite() || !(0.0..=1.0).contains(&label.score) {
+            return Err(ClassifierClientError::Protocol(format!(
+                "classification response label {:?} has invalid score {}: \
+                 must be finite and in [0.0, 1.0]",
+                label.name, label.score
+            )));
+        }
+        if !seen.insert(label.name.to_ascii_lowercase()) {
+            return Err(ClassifierClientError::Protocol(format!(
+                "classification response contains duplicate label {:?} \
+                 (names are compared case-insensitively)",
+                label.name
+            )));
+        }
+    }
+    // total_cmp is safe here: every score was just checked finite.
+    response.labels.sort_by(|a, b| b.score.total_cmp(&a.score));
+    Ok(())
+}
+
+fn validate_compress_response(
+    source: &str,
+    response: &CompressResponse,
+) -> Result<(), ClassifierClientError> {
+    if response.text.is_empty() {
+        return Err(ClassifierClientError::Protocol(
+            "compression response text is empty".to_string(),
+        ));
+    }
+    if response.original_tokens == 0 {
+        return Err(ClassifierClientError::Protocol(
+            "compression response original_tokens is zero".to_string(),
+        ));
+    }
+    if response.compressed_tokens == 0 || response.compressed_tokens > response.original_tokens {
+        return Err(ClassifierClientError::Protocol(format!(
+            "invalid compression token counts: original={}, compressed={}",
+            response.original_tokens, response.compressed_tokens
+        )));
+    }
+    if !is_char_subsequence(&response.text, source) {
+        return Err(ClassifierClientError::Protocol(
+            "compression response is not an extractive subsequence of the request".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_char_subsequence(candidate: &str, source: &str) -> bool {
+    let mut source_chars = source.chars();
+    candidate
+        .chars()
+        .all(|wanted| source_chars.by_ref().any(|found| found == wanted))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use sbproxy_classifier_proto::{
-        EmbedRequest, EmbedResponse, Embedding, InferenceService, InferenceServiceServer, Label,
+        compress_request, ClassifyRequest, CompressRequest, CompressResponse, EmbedRequest,
+        EmbedResponse, Embedding, InferenceService, InferenceServiceServer, Label,
         ModelInfoRequest, ModelInfoResponse,
     };
     use tonic::{Request, Response, Status};
@@ -268,11 +453,68 @@ mod tests {
             req: Request<ClassifyRequest>,
         ) -> Result<Response<ClassifyResponse>, Status> {
             let model = req.into_inner().model;
-            Ok(Response::new(ClassifyResponse {
-                labels: vec![Label {
+            // Malformed-response fixtures keyed by model name, mirroring the
+            // compress stubs below: each one is structurally valid protobuf
+            // that the client must reject as a protocol error (WOR-2161).
+            let labels = match model.as_str() {
+                "empty-labels" => vec![],
+                "empty-name" => vec![Label {
+                    name: String::new(),
+                    score: 0.5,
+                }],
+                "nan-score" => vec![Label {
+                    name: "injection".to_string(),
+                    score: f64::NAN,
+                }],
+                "inf-score" => vec![Label {
+                    name: "injection".to_string(),
+                    score: f64::INFINITY,
+                }],
+                "negative-score" => vec![Label {
+                    name: "injection".to_string(),
+                    score: -0.25,
+                }],
+                "overrange-score" => vec![Label {
+                    name: "injection".to_string(),
+                    score: 1.5,
+                }],
+                "duplicate-labels" => vec![
+                    Label {
+                        name: "Injection".to_string(),
+                        score: 0.9,
+                    },
+                    Label {
+                        name: "INJECTION".to_string(),
+                        score: 0.1,
+                    },
+                ],
+                "unsorted-labels" => vec![
+                    Label {
+                        name: "benign".to_string(),
+                        score: 0.25,
+                    },
+                    Label {
+                        name: "injection".to_string(),
+                        score: 0.75,
+                    },
+                ],
+                "boundary-scores" => vec![
+                    Label {
+                        name: "injection".to_string(),
+                        score: 1.0,
+                    },
+                    Label {
+                        name: "benign".to_string(),
+                        score: 0.0,
+                    },
+                ],
+                _ => vec![Label {
                     name: format!("stub:{model}"),
                     score: 0.99,
                 }],
+            };
+            Ok(Response::new(ClassifyResponse {
+                labels,
                 latency_us: 1,
             }))
         }
@@ -289,6 +531,54 @@ mod tests {
                         values: vec![1.0, 0.0],
                     })
                     .collect(),
+                latency_us: 1,
+            }))
+        }
+        async fn compress(
+            &self,
+            req: Request<CompressRequest>,
+        ) -> Result<Response<CompressResponse>, Status> {
+            let req = req.into_inner();
+            if req.model == "resource-exhausted" {
+                return Err(Status::resource_exhausted("compression queue is full"));
+            }
+            if req.model == "empty-result" {
+                return Ok(Response::new(CompressResponse {
+                    text: String::new(),
+                    original_tokens: 3,
+                    compressed_tokens: 0,
+                    latency_us: 1,
+                }));
+            }
+            if req.model == "invented-result" {
+                return Ok(Response::new(CompressResponse {
+                    text: "words not in source".to_string(),
+                    original_tokens: 3,
+                    compressed_tokens: 2,
+                    latency_us: 1,
+                }));
+            }
+            if req.model == "bad-counts" {
+                return Ok(Response::new(CompressResponse {
+                    text: req.text,
+                    original_tokens: 2,
+                    compressed_tokens: 3,
+                    latency_us: 1,
+                }));
+            }
+            let text = match req.target {
+                Some(compress_request::Target::RetainRatio(0.5)) => "alpha gamma".to_string(),
+                Some(compress_request::Target::TargetTokens(2)) => "alpha beta".to_string(),
+                Some(compress_request::Target::RetainRatio(_))
+                | Some(compress_request::Target::TargetTokens(_)) => {
+                    return Err(Status::invalid_argument("unexpected target"))
+                }
+                None => return Err(Status::invalid_argument("missing target")),
+            };
+            Ok(Response::new(CompressResponse {
+                text,
+                original_tokens: 3,
+                compressed_tokens: 2,
                 latency_us: 1,
             }))
         }
@@ -358,6 +648,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn classify_rejects_malformed_sidecar_responses() {
+        let Some(endpoint) = spawn_stub().await else {
+            return;
+        };
+        let client =
+            ClassifierClient::connect(&endpoint, Duration::from_secs(2), Duration::from_secs(2))
+                .await
+                .expect("connect");
+
+        for model in [
+            "empty-labels",
+            "empty-name",
+            "nan-score",
+            "inf-score",
+            "negative-score",
+            "overrange-score",
+            "duplicate-labels",
+        ] {
+            let error = client
+                .classify(model, "ignore previous")
+                .await
+                .expect_err("malformed response must fail");
+            assert!(
+                matches!(error, ClassifierClientError::Protocol(_)),
+                "unexpected error for {model}: {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn classify_sorts_labels_highest_score_first() {
+        // The proto documents this ordering but the client enforces it, so
+        // a sidecar that returns labels unsorted still yields the invariant.
+        let Some(endpoint) = spawn_stub().await else {
+            return;
+        };
+        let client =
+            ClassifierClient::connect(&endpoint, Duration::from_secs(2), Duration::from_secs(2))
+                .await
+                .expect("connect");
+
+        let resp = client
+            .classify("unsorted-labels", "ignore previous")
+            .await
+            .expect("valid response");
+        assert_eq!(resp.labels.len(), 2);
+        assert_eq!(resp.labels[0].name, "injection");
+        assert_eq!(resp.labels[0].score, 0.75);
+        assert_eq!(resp.labels[1].name, "benign");
+    }
+
+    #[tokio::test]
+    async fn classify_accepts_boundary_scores() {
+        // 0.0 and 1.0 are valid scores; the range check is inclusive.
+        let Some(endpoint) = spawn_stub().await else {
+            return;
+        };
+        let client =
+            ClassifierClient::connect(&endpoint, Duration::from_secs(2), Duration::from_secs(2))
+                .await
+                .expect("connect");
+
+        let resp = client
+            .classify("boundary-scores", "ignore previous")
+            .await
+            .expect("boundary scores are valid");
+        assert_eq!(resp.labels[0].score, 1.0);
+        assert_eq!(resp.labels[1].score, 0.0);
+    }
+
+    #[tokio::test]
     async fn embed_round_trips_against_a_stub() {
         let Some(endpoint) = spawn_stub().await else {
             return;
@@ -375,6 +736,139 @@ mod tests {
             .unwrap();
         assert_eq!(vecs.len(), 2);
         assert_eq!(vecs[0], vec![1.0, 0.0]);
+    }
+
+    #[tokio::test]
+    async fn compress_ratio_round_trips_against_a_stub() {
+        let Some(endpoint) = spawn_stub().await else {
+            return;
+        };
+        let client =
+            ClassifierClient::connect(&endpoint, Duration::from_secs(2), Duration::from_secs(2))
+                .await
+                .expect("connect");
+
+        let response = client
+            .compress(
+                "llmlingua-2",
+                "alpha beta gamma",
+                CompressionTarget::RetainRatio(0.5),
+            )
+            .await
+            .expect("compress");
+
+        assert_eq!(response.text, "alpha gamma");
+        assert_eq!(response.original_tokens, 3);
+        assert_eq!(response.compressed_tokens, 2);
+    }
+
+    #[tokio::test]
+    async fn compress_target_tokens_round_trips_against_a_stub() {
+        let Some(endpoint) = spawn_stub().await else {
+            return;
+        };
+        let client =
+            ClassifierClient::connect(&endpoint, Duration::from_secs(2), Duration::from_secs(2))
+                .await
+                .expect("connect");
+
+        let response = client
+            .compress(
+                "llmlingua-2",
+                "alpha beta gamma",
+                CompressionTarget::TargetTokens(2),
+            )
+            .await
+            .expect("compress");
+
+        assert_eq!(response.text, "alpha beta");
+        assert_eq!(response.original_tokens, 3);
+        assert_eq!(response.compressed_tokens, 2);
+    }
+
+    #[tokio::test]
+    async fn compress_rejects_malformed_sidecar_responses() {
+        let Some(endpoint) = spawn_stub().await else {
+            return;
+        };
+        let client =
+            ClassifierClient::connect(&endpoint, Duration::from_secs(2), Duration::from_secs(2))
+                .await
+                .expect("connect");
+
+        for model in ["empty-result", "invented-result", "bad-counts"] {
+            let error = client
+                .compress(
+                    model,
+                    "alpha beta gamma",
+                    CompressionTarget::TargetTokens(2),
+                )
+                .await
+                .expect_err("malformed response must fail");
+            assert!(
+                matches!(error, ClassifierClientError::Protocol(_)),
+                "unexpected error for {model}: {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compress_preserves_resource_exhausted_status_code() {
+        let Some(endpoint) = spawn_stub().await else {
+            return;
+        };
+        let client =
+            ClassifierClient::connect(&endpoint, Duration::from_secs(2), Duration::from_secs(2))
+                .await
+                .expect("connect");
+
+        let error = client
+            .compress(
+                "resource-exhausted",
+                "alpha beta gamma",
+                CompressionTarget::TargetTokens(2),
+            )
+            .await
+            .expect_err("stub exhaustion must reach the caller");
+
+        let ClassifierClientError::Rpc { code, message } = error else {
+            panic!("unexpected error: {error:?}");
+        };
+        assert_eq!(code, tonic::Code::ResourceExhausted);
+        assert_eq!(message, "compression queue is full");
+    }
+
+    #[tokio::test]
+    async fn compress_rejects_invalid_requests_before_the_rpc() {
+        let Some(endpoint) = spawn_stub().await else {
+            return;
+        };
+        let client =
+            ClassifierClient::connect(&endpoint, Duration::from_secs(2), Duration::from_secs(2))
+                .await
+                .expect("connect");
+
+        for target in [
+            CompressionTarget::RetainRatio(0.0),
+            CompressionTarget::RetainRatio(f64::NAN),
+            CompressionTarget::RetainRatio(1.1),
+            CompressionTarget::TargetTokens(0),
+        ] {
+            let error = client
+                .compress("llmlingua-2", "alpha beta", target)
+                .await
+                .expect_err("invalid request must fail");
+            assert!(
+                matches!(error, ClassifierClientError::InvalidRequest(_)),
+                "unexpected error for {target:?}: {error:?}"
+            );
+        }
+
+        let error = client
+            .compress("llmlingua-2", "", CompressionTarget::TargetTokens(1))
+            .await
+            .expect_err("empty text must fail");
+        assert!(matches!(error, ClassifierClientError::InvalidRequest(_)));
     }
 
     #[tokio::test]
@@ -475,7 +969,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                ClassifierClientError::Timeout(_) | ClassifierClientError::Rpc(_)
+                ClassifierClientError::Timeout(_) | ClassifierClientError::Rpc { .. }
             ),
             "expected Timeout or Rpc, got {err:?}"
         );

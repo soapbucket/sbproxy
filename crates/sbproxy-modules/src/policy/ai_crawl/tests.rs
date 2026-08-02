@@ -483,10 +483,68 @@ fn ledger_happy_path_passes_request() {
 }
 
 #[test]
+fn cap_pricing_exemption_skips_ledger_and_402() {
+    let policy = AiCrawlControlPolicy::from_config(serde_json::json!({
+        "price": 0.001,
+        "valid_tokens": [],
+    }))
+    .unwrap()
+    .with_ledger(Arc::new(AlwaysTransient));
+    let headers = payment_headers("GPTBot/1.0", "crawler-payment", "must-not-redeem");
+
+    assert_eq!(
+        policy.check_with_pricing_exemption("GET", "x.com", "/article", &headers, None, true),
+        AiCrawlDecision::Allow
+    );
+}
+
+#[test]
+fn cap_pricing_exemption_does_not_bypass_content_signals() {
+    let policy = AiCrawlControlPolicy::from_config(serde_json::json!({
+        "price": 0.001,
+        "valid_tokens": [],
+        "crawler_user_agents": ["ClaudeBot"],
+        "content_signals": { "ai_train": false },
+    }))
+    .unwrap();
+    let headers = ua_headers("ClaudeBot/1.0");
+
+    assert!(matches!(
+        policy.check_with_pricing_exemption("GET", "x.com", "/article", &headers, None, true),
+        AiCrawlDecision::SignalBlocked { .. }
+    ));
+}
+
+#[test]
 fn money_from_units_rounds_to_micros() {
     let m = Money::from_units(0.001234567, "USD");
     assert_eq!(m.amount_micros, 1235);
     assert_eq!(m.currency, "USD");
+}
+
+#[cfg(not(feature = "http-ledger"))]
+#[test]
+fn ledger_yaml_block_fails_closed_without_http_ledger_feature() {
+    let err = AiCrawlControlPolicy::from_config(serde_json::json!({
+        "price": 0.001,
+        "ledger": {
+            "url": "https://ledger.internal",
+            "key_id": "k1",
+            "key_hex": "00",
+        }
+    }))
+    .expect_err("ledger config must not silently fall back without HTTP support");
+
+    assert_eq!(
+        err.to_string(),
+        "ai_crawl_control: `ledger:` requires the `http-ledger` feature; enable it or remove the `ledger:` block"
+    );
+
+    AiCrawlControlPolicy::from_config(serde_json::json!({
+        "price": 0.001,
+        "valid_tokens": ["dev-token"],
+    }))
+    .expect("config without a ledger block remains valid");
 }
 
 #[cfg(feature = "http-ledger")]
@@ -546,7 +604,7 @@ fn ledger_yaml_block_rejects_plain_http() {
 #[cfg(feature = "http-ledger")]
 #[test]
 fn ledger_yaml_block_resolves_secret_ref_env() {
-    std::env::set_var("SBPROXY_TEST_LEDGER_HMAC", "deadbeef");
+    let _env = crate::test_env::EnvVarGuard::set(&[("SBPROXY_TEST_LEDGER_HMAC", Some("deadbeef"))]);
     let policy = AiCrawlControlPolicy::from_config(serde_json::json!({
         "price": 0.001,
         "ledger": {
@@ -558,7 +616,27 @@ fn ledger_yaml_block_resolves_secret_ref_env() {
     .expect("policy compiles with secret_ref.env");
     let dbg = format!("{:?}", policy);
     assert!(dbg.contains("ledger.internal"), "{dbg}");
-    std::env::remove_var("SBPROXY_TEST_LEDGER_HMAC");
+}
+
+#[cfg(feature = "http-ledger")]
+#[test]
+fn ledger_trust_root_rejects_malformed_pem_at_config_load() {
+    let err = AiCrawlControlPolicy::from_config(serde_json::json!({
+        "price": 0.001,
+        "ledger": {
+            "url": "https://ledger.internal",
+            "key_id": "k1",
+            "key_hex": "00",
+            "trust_roots": ["not a PEM certificate"],
+        }
+    }))
+    .expect_err("malformed private root must fail config load");
+
+    assert!(
+        err.to_string()
+            .starts_with("ai_crawl_control.ledger.trust_roots[0]: invalid PEM bundle:"),
+        "actionable trust-root error: {err}"
+    );
 }
 
 // --- G3.4 / G3.5 multi-rail challenge tests ---
@@ -921,10 +999,10 @@ fn jwks_endpoint_publishes_active_kid() {
 
 #[test]
 fn quote_token_yaml_resolves_secret_ref_secret_via_env_fallback() {
-    std::env::set_var(
+    let _env = crate::test_env::EnvVarGuard::set(&[(
         "SBPROXY_TEST_QUOTE_SEED",
-        "0001020304050607080910111213141516171819202122232425262728293031",
-    );
+        Some("0001020304050607080910111213141516171819202122232425262728293031"),
+    )]);
     let policy = AiCrawlControlPolicy::from_config(serde_json::json!({
         "price": 0.001,
         "rails": {
@@ -944,21 +1022,56 @@ fn quote_token_yaml_resolves_secret_ref_secret_via_env_fallback() {
 
     let jwks = policy.quote_token_jwks().expect("jwks");
     assert_eq!(jwks["keys"][0]["kid"], "quote-kid");
-    std::env::remove_var("SBPROXY_TEST_QUOTE_SEED");
 }
 
 #[test]
-fn quote_token_yaml_without_rails_is_a_config_error() {
+fn quote_token_yaml_without_rails_publishes_a_key_and_no_paywall() {
+    // This used to be a config error, which left a seller who wants signed
+    // receipts and no 402 challenge with no way to configure a signing key
+    // at all. The key and the paywall are separate decisions now.
+    let policy = AiCrawlControlPolicy::from_config(serde_json::json!({
+        "price": 0.001,
+        "valid_tokens": [],
+        "quote_token": {
+            "key_id": "receipts-only-kid",
+            "seed_hex": "0001020304050607080910111213141516171819202122232425262728293031",
+        }
+    }))
+    .expect("quote_token without rails compiles");
+
+    // The key is published, which is what a buyer fetches to check a
+    // receipt.
+    let jwks = policy.quote_token_jwks().expect("jwks");
+    assert_eq!(jwks["keys"][0]["kid"], "receipts-only-kid");
+
+    // And no multi-rail challenge is offered, not even to an agent that
+    // asked for one. Answering with a 406 listing zero supported rails
+    // would be worse than the single-rail body every other unconfigured
+    // origin sends.
+    let headers = multi_rail_headers("GPTBot/1.0", Some("x402;q=1, mpp;q=0.9"), Some("text/html"));
+    match policy.check("GET", "x.com", "/articles/foo", &headers, None) {
+        AiCrawlDecision::Charge { challenge, .. } => {
+            assert!(challenge.contains("Crawler-Payment"), "{challenge}");
+        }
+        other => panic!("expected the single-rail Charge, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_authored_but_empty_rails_block_is_still_a_config_error() {
+    // An absent `rails:` block is a position (no paywall). A `rails:` block
+    // that names no rail is a typo, and it keeps failing closed.
     let err = AiCrawlControlPolicy::from_config(serde_json::json!({
         "price": 0.001,
         "valid_tokens": [],
+        "rails": {},
         "quote_token": {
             "key_id": "test-kid",
             "seed_hex": "0001020304050607080910111213141516171819202122232425262728293031",
         }
     }))
-    .expect_err("quote_token without rails should fail");
-    assert!(err.to_string().contains("rails"), "{err}");
+    .expect_err("an empty rails block should fail");
+    assert!(err.to_string().contains("at least one rail"), "{err}");
 }
 
 #[test]
@@ -1325,4 +1438,314 @@ fn pricing_model_none_defers_to_tiers() {
     .with_pricing_model(Arc::new(DeferModel));
     // Model returns None, so the static tier price applies.
     assert_eq!(policy.resolve_price("/x").amount_micros, 7000);
+}
+
+// --- WOR-2135: the quote-token rotation window ---
+//
+// The procedure these tests execute is the one
+// `examples/quote-token-replay-jwks/README.md` gives an operator: add the
+// new key alongside the old one, bump `key_id`, hot-reload, then remove
+// the old key once the longest plausible TTL has passed. Before
+// `previous_key_id` existed the schema could not express "alongside", so
+// the reload retired the only trusted kid and every quote still in flight
+// stopped verifying at once.
+
+/// Key id an operator rotates away from.
+const KID_JULY: &str = "quote-2026-07";
+
+/// Key id an operator rotates to.
+const KID_AUGUST: &str = "quote-2026-08";
+
+/// The 32-byte seed behind the July key.
+const SEED_JULY: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+/// The 32-byte seed behind the August key.
+const SEED_AUGUST: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+/// One `ai_crawl_control` config with an x402 rail and a quote-token
+/// block. `previous` carries `(previous_key_id, previous_seed_hex)` when
+/// the config is mid-rotation.
+fn rotation_config(
+    key_id: &str,
+    seed_hex: &str,
+    previous: Option<(&str, &str)>,
+) -> serde_json::Value {
+    let mut quote_token = serde_json::json!({
+        "key_id": key_id,
+        "seed_hex": seed_hex,
+        "issuer": "https://api.example.com",
+        "default_ttl_seconds": 300,
+    });
+    if let Some((previous_key_id, previous_seed_hex)) = previous {
+        quote_token["previous_key_id"] = serde_json::json!(previous_key_id);
+        quote_token["previous_seed_hex"] = serde_json::json!(previous_seed_hex);
+    }
+    serde_json::json!({
+        "price": 0.001,
+        "valid_tokens": [],
+        "rails": {
+            "x402": {
+                "chain": "base",
+                "facilitator": "https://facilitator-base.x402.org",
+                "asset": "USDC",
+                "pay_to": "0xabc",
+            }
+        },
+        "quote_token": quote_token,
+    })
+}
+
+fn rotation_policy(
+    key_id: &str,
+    seed_hex: &str,
+    previous: Option<(&str, &str)>,
+) -> AiCrawlControlPolicy {
+    AiCrawlControlPolicy::from_config(rotation_config(key_id, seed_hex, previous))
+        .expect("rotation config compiles")
+}
+
+/// The config as it looks between the reload and the end of the window:
+/// August signs, July still verifies.
+fn mid_rotation_policy() -> AiCrawlControlPolicy {
+    rotation_policy(KID_AUGUST, SEED_AUGUST, Some((KID_JULY, SEED_JULY)))
+}
+
+/// Provoke a multi-rail 402 and hand back the first rail's quote token.
+/// A real issued quote rather than a hand-built one, because what the
+/// rotation has to protect is the tokens the policy actually emitted.
+fn issue_quote_token(policy: &AiCrawlControlPolicy) -> String {
+    let headers = multi_rail_headers("GPTBot/1.0", Some("x402"), Some("text/html"));
+    let AiCrawlDecision::MultiRail { body, .. } =
+        policy.check("GET", "x.com", "/article", &headers, None)
+    else {
+        panic!("expected a multi-rail 402");
+    };
+    let parsed: MultiRailChallenge = serde_json::from_str(&body).expect("body parses");
+    parsed.rails[0].quote_token().to_string()
+}
+
+/// Sign a quote directly under an arbitrary key, to mint a token under the
+/// retired kid without keeping a pre-rotation policy alive.
+fn sign_quote_under(key_id: &str, seed_hex: &str) -> String {
+    let signer = crate::policy::quote_token::QuoteTokenSigner::from_seed_bytes(
+        &seed_bytes(seed_hex),
+        key_id,
+        "https://api.example.com",
+        std::time::Duration::from_secs(300),
+    );
+    let price = Money {
+        amount_micros: 1000,
+        currency: "USD".to_string(),
+    };
+    signer
+        .issue(
+            "agent-rotation",
+            "/article",
+            ContentShape::Html,
+            price,
+            "x402",
+            None,
+            None,
+        )
+        .expect("sign")
+        .token
+}
+
+fn seed_bytes(seed_hex: &str) -> [u8; 32] {
+    let raw = hex::decode(seed_hex).expect("seed hex");
+    raw.as_slice().try_into().expect("32-byte seed")
+}
+
+/// Build a verifier trusting exactly the keys a JWKS document publishes.
+///
+/// This is the buyer's view of the key plane. A third party holding a
+/// token has the served document and nothing else, so a kid missing from
+/// it is a token nobody can check, whatever the proxy still knows
+/// internally.
+fn verifier_from_jwks(jwks: &serde_json::Value) -> crate::policy::quote_token::QuoteTokenVerifier {
+    use base64::Engine as _;
+
+    let mut keys = HashMap::new();
+    for entry in jwks["keys"].as_array().expect("keys array") {
+        let kid = entry["kid"].as_str().expect("kid").to_string();
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(entry["x"].as_str().expect("x"))
+            .expect("x is base64url");
+        let bytes: [u8; 32] = raw.as_slice().try_into().expect("32-byte public key");
+        let key = VerifyingKey::from_bytes(&bytes).expect("valid ed25519 key");
+        keys.insert(kid, key);
+    }
+    let store: Arc<dyn crate::policy::quote_token::NonceStore> =
+        Arc::new(crate::policy::quote_token::InMemoryNonceStore::new());
+    crate::policy::quote_token::QuoteTokenVerifier::with_keys(keys, store)
+}
+
+/// The `kid` in a compact JWS protected header.
+fn decode_token_kid(token: &str) -> String {
+    use base64::Engine as _;
+
+    let header_b64 = token.split('.').next().expect("header segment");
+    let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(header_b64)
+        .expect("header b64");
+    let header: serde_json::Value = serde_json::from_slice(&header).expect("header decode");
+    header["kid"].as_str().expect("kid").to_string()
+}
+
+/// The kids a policy publishes, sorted so the assertion does not depend on
+/// map iteration order.
+fn published_kids(policy: &AiCrawlControlPolicy) -> Vec<String> {
+    let jwks = policy.quote_token_jwks().expect("jwks");
+    let mut kids: Vec<String> = jwks["keys"]
+        .as_array()
+        .expect("keys array")
+        .iter()
+        .map(|entry| entry["kid"].as_str().expect("kid").to_string())
+        .collect();
+    kids.sort();
+    kids
+}
+
+#[test]
+fn a_rotation_window_config_compiles_and_publishes_both_kids() {
+    let policy = mid_rotation_policy();
+    assert_eq!(
+        published_kids(&policy),
+        [KID_JULY, KID_AUGUST],
+        "the active key and the previous key are both published"
+    );
+}
+
+#[test]
+fn a_token_signed_under_the_previous_kid_verifies() {
+    let policy = mid_rotation_policy();
+    let token = sign_quote_under(KID_JULY, SEED_JULY);
+    verifier_from_jwks(&policy.quote_token_jwks().expect("jwks"))
+        .verify_claims(&token, "/article", ContentShape::Html)
+        .expect("the previous key still verifies");
+}
+
+#[test]
+fn a_token_signed_under_the_current_kid_verifies() {
+    // Opening a window is additive. It must not disturb the key that is
+    // doing the signing.
+    let policy = mid_rotation_policy();
+    let token = issue_quote_token(&policy);
+    let claims = verifier_from_jwks(&policy.quote_token_jwks().expect("jwks"))
+        .verify_claims(&token, "/article", ContentShape::Html)
+        .expect("the active key verifies");
+    assert_eq!(claims.route, "/article");
+}
+
+#[test]
+fn signing_always_uses_the_current_kid() {
+    // A previous key that could sign would leave a retired key minting new
+    // obligations after the operator believed it was out of service.
+    let policy = mid_rotation_policy();
+    for _ in 0..3 {
+        let kid = decode_token_kid(&issue_quote_token(&policy));
+        assert_eq!(kid, KID_AUGUST, "the JWS header names the active key");
+    }
+}
+
+#[test]
+fn the_readme_rotation_procedure_keeps_an_in_flight_quote_verifiable() {
+    use crate::policy::quote_token::VerifyError;
+
+    // Step 0: the config before the rotation. One key, no window open.
+    let before = rotation_policy(KID_JULY, SEED_JULY, None);
+
+    // An agent takes a quote under it. The default TTL is 300 seconds, so
+    // in production there are five minutes of these outstanding at any
+    // moment. This is the token the procedure exists to protect.
+    let in_flight = issue_quote_token(&before);
+    assert_eq!(decode_token_kid(&in_flight), KID_JULY);
+
+    // Step 1: add the new key alongside the old one, bump key_id, and
+    // hot-reload. Compiling the second config is the reload.
+    let after_reload = mid_rotation_policy();
+
+    // The claim the README makes: a token issued before the reload still
+    // verifies after it.
+    let claims = verifier_from_jwks(&after_reload.quote_token_jwks().expect("jwks"))
+        .verify_claims(&in_flight, "/article", ContentShape::Html)
+        .expect("a quote issued before the rotation survives the reload");
+    assert_eq!(claims.route, "/article");
+
+    // Everything issued from here carries the new kid.
+    assert_eq!(
+        decode_token_kid(&issue_quote_token(&after_reload)),
+        KID_AUGUST
+    );
+
+    // Step 2: the window has outlived the longest plausible TTL, so the
+    // old key is removed. The pre-rotation token stops verifying now,
+    // which is precisely the failure step 1 deferred. Without the window
+    // it landed at reload time instead, on every quote issued in the
+    // preceding five minutes.
+    let after_window = rotation_policy(KID_AUGUST, SEED_AUGUST, None);
+    let err = verifier_from_jwks(&after_window.quote_token_jwks().expect("jwks"))
+        .verify_claims(&in_flight, "/article", ContentShape::Html)
+        .expect_err("the retired kid is gone once the window closes");
+    assert!(matches!(err, VerifyError::UnknownKey(_)), "{err:?}");
+}
+
+#[test]
+fn a_previous_key_id_without_key_material_is_a_config_error() {
+    let mut config = rotation_config(KID_AUGUST, SEED_AUGUST, None);
+    config["quote_token"]["previous_key_id"] = serde_json::json!(KID_JULY);
+    let err = AiCrawlControlPolicy::from_config(config)
+        .expect_err("a kid with no key behind it must fail closed");
+    let message = err.to_string();
+    assert!(
+        message.contains("ai_crawl_control.quote_token.previous_key_id"),
+        "names the config key: {message}"
+    );
+    assert!(
+        message.contains(KID_JULY),
+        "names the key the operator wrote: {message}"
+    );
+}
+
+#[test]
+fn previous_key_material_without_a_previous_key_id_is_a_config_error() {
+    let mut config = rotation_config(KID_AUGUST, SEED_AUGUST, None);
+    config["quote_token"]["previous_seed_hex"] = serde_json::json!(SEED_JULY);
+    let err = AiCrawlControlPolicy::from_config(config)
+        .expect_err("a key nothing can select must fail closed");
+    let message = err.to_string();
+    assert!(
+        message.contains("ai_crawl_control.quote_token.previous_seed_hex"),
+        "names the config key: {message}"
+    );
+    assert!(
+        message.contains("previous_key_id"),
+        "names what is missing: {message}"
+    );
+}
+
+#[test]
+fn a_previous_key_id_equal_to_key_id_is_a_config_error() {
+    // Same id, different seed. The JWKS is keyed by kid, so the two
+    // entries would collapse into one and the older key would be gone.
+    let config = rotation_config(KID_AUGUST, SEED_AUGUST, Some((KID_AUGUST, SEED_JULY)));
+    let err = AiCrawlControlPolicy::from_config(config)
+        .expect_err("reusing the active kid is not a rotation");
+    let message = err.to_string();
+    assert!(
+        message.contains("ai_crawl_control.quote_token.previous_key_id"),
+        "names the config key: {message}"
+    );
+    assert!(
+        message.contains("not a rotation"),
+        "says why it is refused: {message}"
+    );
+}
+
+#[test]
+fn a_steady_state_config_publishes_one_kid() {
+    // The window is opt-in. A config that names no previous key behaves
+    // exactly as it did before rotation was expressible.
+    let policy = rotation_policy(KID_AUGUST, SEED_AUGUST, None);
+    assert_eq!(published_kids(&policy), [KID_AUGUST]);
 }

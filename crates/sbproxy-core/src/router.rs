@@ -194,6 +194,7 @@ mod tests {
                 outbound_credential: None,
                 outbound_web_bot_auth: false,
                 observability: None,
+                attestation: None,
             });
         }
         CompiledConfig {
@@ -208,6 +209,7 @@ mod tests {
             rate_limits: None,
             audit: None,
             session_ledger: None,
+            flags: Vec::new(),
         }
     }
 

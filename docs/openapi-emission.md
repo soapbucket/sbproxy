@@ -1,5 +1,5 @@
 # OpenAPI Emission
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-01*
 
 SBproxy documents and governs your API. It does not just proxy it.
 
@@ -157,7 +157,89 @@ You ship the gateway and you ship the spec, in one motion.
 
 ## Example
 
-A runnable example is at [`examples/openapi-emission/`](../examples/openapi-emission/sb.yml).
+The runnable configuration is
+[`examples/openapi-emission/`](../examples/openapi-emission/sb.yml). It sets
+`expose_openapi: true` on `api.localhost` and declares four forward rules
+covering each matcher shape. Start it:
+
+```bash
+make run CONFIG=examples/openapi-emission/sb.yml
+```
+
+Read the per-host surface:
+
+```bash
+curl -sS -H 'Host: api.localhost' \
+  http://127.0.0.1:8080/.well-known/openapi.json | jq
+```
+
+The document opens with a fixed envelope that states its own coverage limits:
+
+```json
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "SoapBucket Gateway",
+    "version": "1.0.0",
+    "description": "Routes exposed by this SoapBucket gateway, derived from its live configuration. Coverage is bounded by what the gateway config knows: path templates, methods, declared parameters, auth schemes, and known response codes. Upstream request/response bodies are not described here unless declared explicitly."
+  },
+  "paths": { }
+}
+```
+
+The four rules in that config produce five path entries:
+
+```
+/users/{id:[0-9]+}/posts/{post_id}
+/api/
+/health
+/static/{*rest}
+/__regex__/^_v(?P<version>[0-9]+)_items
+```
+
+Each is worth reading against the matcher that produced it. The template
+matcher keeps its inline segment constraint in the key itself, so the path is
+`/users/{id:[0-9]+}/posts/{post_id}` rather than a cleaned
+`/users/{id}/posts/{post_id}`. Generators that expect a bare `{id}` will need
+to strip that.
+
+The regex matcher cannot be expressed as an OpenAPI path at all, so it is
+emitted under a synthetic `/__regex__/...` key with the separators rewritten,
+and the real pattern is carried alongside in an extension:
+
+```json
+"x-sbproxy-regex-path": "^/v(?P<version>[0-9]+)/items"
+```
+
+Read `x-sbproxy-regex-path`, not the path key, for anything that matters.
+Prefix matchers carry `x-sbproxy-prefix-match` for the same reason.
+
+The declared `parameters` pass through verbatim, and are repeated per method
+rather than hoisted to the path item:
+
+```json
+{
+  "name": "id",
+  "in": "path",
+  "required": true,
+  "description": "Numeric user identifier.",
+  "schema": {"type": "integer", "format": "int64"}
+}
+```
+
+`allowed_methods: ["GET", "POST"]` on the origin is why every path carries
+exactly those two operations, each with its own `operationId` built from the
+host, the method, and the rule's `id`. Responses are the generic `200` and
+`default` pair: the gateway describes the routes it exposes, not the bodies
+the upstream returns.
+
+The admin surface serves the same document for every host and requires basic
+auth. Without credentials it answers `401`:
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:9090/api/openapi.json
+# 401
+```
 
 ## See also
 

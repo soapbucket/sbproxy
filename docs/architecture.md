@@ -1,6 +1,6 @@
 # SBproxy architecture and deployment guide
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-29*
 
 This document covers the internal architecture of SBproxy, the request lifecycle, the plugin
 system, the AI gateway, caching, events, and common deployment topologies.
@@ -9,10 +9,10 @@ system, the AI gateway, caching, events, and common deployment topologies.
 
 ## 1. Overview
 
-SBproxy is a single static binary with no required external runtime dependencies. It is
-written in Rust and ships as a self-contained executable. There is no JVM, no Python
-interpreter, no Node.js runtime, and no shared library requirement beyond libc (or none at
-all when built with `musl` or `--target *-unknown-linux-musl`).
+Public release archives contain a prebuilt SBproxy executable. Linux release artifacts
+are linked against glibc. Running them does not require a Rust or C toolchain, a JVM, a
+Python interpreter, or a Node.js runtime. Source builds can target `musl` with
+`--target *-unknown-linux-musl` when a musl-linked executable is required.
 
 The proxy is built on Cloudflare's [Pingora](https://github.com/cloudflare/pingora)
 framework. Pingora supplies the tokio runtime, listener management, HTTP/1.1, HTTP/2
@@ -68,7 +68,7 @@ sbproxy/
                                           encoding, format_convert, normalize,
                                           payload_limit, replace_strings,
                                           html_to_markdown, sse_chunking, noop
-    sbproxy-ai/           - AI gateway: 66 native providers, routing,
+    sbproxy-ai/           - AI gateway: 72 native providers, routing,
                               guardrails, budget enforcement, virtual keys,
                               semantic cache, usage ledger.
     sbproxy-extension/    - Scripting and extension runtimes:
@@ -346,11 +346,15 @@ OpenAI-compatible API surface and routes requests to any supported LLM provider.
     |
     v
 +------------------+
+| Compression      |  Resolves X-Compression, governed key, CEL, then route
+| policy           |  default. Pins one default or named runtime before any
+|                  |  semantic-cache lookup and transforms messages safely.
++------------------+
+    |
+    v
++------------------+
 | Router           |  Selects provider and model based on routing strategy
 |                  |  (16 strategies; see the table below).
-|                  |  Optional context compression: with
-|                  |  resilience.llm_aware.context_compress on, history is
-|                  |  trimmed to the model's window before dispatch.
 +------------------+
     |
     v
@@ -382,6 +386,35 @@ OpenAI-compatible API surface and routes requests to any supported LLM provider.
   Client
 ```
 
+### Compression runtime boundary
+
+Each compiled AI origin owns an immutable default compression pipeline, an
+immutable `off` pipeline, and immutable named pipelines. Request dispatch pins
+one of them with precedence header, governed key, CEL, then route default. The
+selector is resolved before either semantic-cache implementation can read or
+arm write-back state. Routes with named profiles, an explicit-budget default,
+or a marked-context lever, and requests with an explicit selector, bypass
+caches that cannot partition by compression behavior. This keeps a cache hit
+from crossing profile boundaries. The legacy default-only compatibility
+pipeline retains its old cache scope.
+
+`window_fit` is stateless. Explicit-budget fitting preserves the leading
+instruction prefix, newest protocol unit, contiguous recent suffix, and tool
+call/result groups. `query_select` ranks marked text sentences against the
+marked query without external state. `token_prune` uses a shared lazy client to
+an OSS classifier sidecar, validates its extractive result, and fails open at
+the lever boundary. `summary_buffer` defaults to a process-owned Local redb
+store and accepts explicit Redis or mesh state. Redis serializes updates across
+processes; mesh uses the replicated substrate's eventual last-writer-wins
+contract. Admin deletion and purge operate on the same selected store. There is
+no OmniRoute runtime, import, or migration seam.
+
+Compression produces pending per-lever value after it changes the message list.
+The response phase commits that value only for a billable terminal provider
+success, then updates bounded metrics and the process-wide Admin value ledger.
+Logs and metrics carry closed selectors, outcomes, numeric counts, and timing;
+they never include message or summary content.
+
 ### Provider registry
 
 Providers do not use the `inventory` mechanism and there is no per-provider trait to
@@ -393,7 +426,7 @@ their own YAML; the registry is held behind an `ArcSwap` and rebuilt on hot relo
 Request serialization and response normalization are handled by the shared client plus
 the format translators (Anthropic, Gemini, Bedrock).
 
-66 native providers ship in-tree alongside a native Anthropic
+72 native providers ship in-tree alongside a native Anthropic
 translator. The `model` field passes straight through to the upstream,
 so the gateway reaches 200+ models without enumerating them.
 Direct adapters include OpenAI, Anthropic, Google Gemini, Azure
@@ -418,7 +451,7 @@ adapters (Hugging Face TGI, LM Studio, llama.cpp).
 | `prefix_affinity`   | Hash the prompt prefix to a provider so shared-prefix sessions land on the same upstream cache. |
 | `sticky`            | Pin a session key to one provider. Falls back to round robin without a session key. |
 | `race`              | Fan out to every healthy provider in parallel; first non-error response wins, the rest are cancelled. |
-| `peak_ewma`         | Power-of-two-choices over observed latency: sample two eligible providers, route to the recently faster one. |
+| `peak_ewma`         | Power-of-two-choices over time-decayed peak latency and in-flight load: sample two eligible providers, route to the lower effective cost. |
 | `cascade`           | Tiered dispatch from cheapest to most expensive (provider, model) pairs; a response below the tier's quality threshold retries on the next tier. |
 | `cost_quality`      | Score the prompt's difficulty and route simple prompts to a cheap model, hard prompts to a frontier model, on a `cost_threshold` dial. |
 | `outcome_aware`     | Route on realized cost-per-success; see [ai-outcome-aware-routing.md](ai-outcome-aware-routing.md). |
@@ -435,15 +468,15 @@ The per-guardrail streaming policy table is in
 
 ### Streaming cache recorder hook
 
-`StreamCacheRecorderHook` (in `sbproxy-core/src/hooks.rs`) is the OSS-side seam that lets
-an enterprise build record streaming AI responses for later replay. It mirrors the shape
+`StreamCacheRecorderHook` (in `sbproxy-core/src/hooks.rs`) is an optional seam for
+recording streaming AI responses. It mirrors the shape
 of `SemanticLookupHook` and `StreamSafetyHook`: a trait, a per-session context type
 (`StreamCacheCtx`), and a unit slot on the `Hooks` bundle that defaults to `None`.
 
-The hook lives in OSS because the emit point is on the SSE forwarding hot path. Threading
-chunks across a crate boundary at runtime would be expensive; landing the trait in
-`sbproxy-core` keeps the per-chunk fan-out cheap and lets the enterprise impl plug in
-through `EnterpriseStartupHook::on_startup` exactly like every other slot.
+The hook lives in the core crate because the emit point is on the SSE forwarding hot path.
+Threading chunks across a crate boundary at runtime would be expensive; landing the trait
+in `sbproxy-core` keeps the per-chunk fan-out cheap and lets an implementation plug in
+through `PipelineLifecycleHook::on_startup` exactly like every other slot.
 
 When the slot is wired, `relay_ai_stream` calls `start_session` once at stream start,
 forwards a copy of every chunk into the returned channel, and emits exactly one terminal
@@ -453,12 +486,12 @@ error, mid-stream abort). A `StreamCacheGuard` RAII wrapper owns this terminal-e
 invariant: `guard.finish()` sends `complete: true`, and the guard's `Drop` impl sends
 `complete: false` if `finish` was never called.
 
-What stays out of OSS: caching policy decisions (deterministic tool calls only, image
-data by reference only), replay pacing (`as_fast_as_possible` vs `natural`), eviction,
-and persistence. The OSS proxy passes the AI handler's `semantic_cache.streaming` config
-block through verbatim as a `serde_json::Value` so the enterprise recorder reads
-whatever shape it expects without OSS validating those fields. The enterprise crate
-fills the slot from its `EnterpriseStartupHook::on_startup` implementation.
+Caching policy decisions (deterministic tool calls only, image data by reference only),
+replay pacing (`as_fast_as_possible` vs `natural`), eviction, and persistence are chosen
+by the recorder implementation. The proxy passes the AI handler's
+`semantic_cache.streaming` config block through verbatim as a `serde_json::Value` so a
+recorder can read the shape it expects without core validation. A pipeline lifecycle
+extension fills the slot from `PipelineLifecycleHook::on_startup`.
 
 ### MCP federation
 
@@ -478,9 +511,8 @@ narrow, purpose-built channels:
 Every policy decision emits a `PolicyVerdictEvent` (type defined in
 `sbproxy-observe::events`) onto a bounded `tokio::sync::mpsc` channel in
 `sbproxy-core::policy_bus` (capacity 10,000). The hot path finishes as soon as the event
-is enqueued; a downstream consumer drains it asynchronously. In OSS the consumer writes
-JSON lines to stderr; the enterprise build replaces it with a NATS-backed audit-chain
-consumer. On overflow the dispatcher drops the event, increments
+is enqueued; a downstream consumer drains it asynchronously. The default consumer writes
+JSON lines to stderr. On overflow the dispatcher drops the event, increments
 `sbproxy_policy_audit_events_dropped_total{tenant}`, and continues; the hot path never
 blocks on the bus.
 

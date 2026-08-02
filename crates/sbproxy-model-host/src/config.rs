@@ -38,34 +38,57 @@ pub enum EngineKind {
     /// subprocess over its OpenAI-compatible HTTP surface.
     #[default]
     Vllm,
+    /// SGLang (WOR-1905), driven as a supervised subprocess over its
+    /// OpenAI-compatible HTTP surface, exactly like vLLM. The real launch
+    /// is `python -m sglang.launch_server`; the sentinel binary name is
+    /// never resolved on `PATH`. It loads the same safetensors weights as
+    /// vLLM on a CUDA worker and leads on RadixAttention prefix caching and
+    /// high-concurrency throughput, so it is an explicit opt-in alternative.
+    #[serde(rename = "sglang")]
+    SGLang,
     /// llama.cpp `llama-server`, the low-VRAM / GGUF / edge path.
     LlamaCpp,
-    /// In-process engine (WOR-1658): no subprocess, no external binary.
-    /// The model runs inside the gateway behind the `embedded` cargo
-    /// feature (candle backend), serving over a loopback HTTP port like
-    /// the others so the runtime routes to it unchanged. A build without
-    /// the `embedded` feature accepts the config but fails the launch
-    /// with a clear "rebuild with --features embedded" error.
-    Embedded,
+    /// mistral.rs (WOR-1861), driven as a supervised subprocess over its
+    /// OpenAI-compatible HTTP surface via the upstream prebuilt `mistralrs`
+    /// binary (pinned tag + sha256, PATH-first), exactly like llama.cpp.
+    /// The pure-Rust lane without the `embedded` feature's build tax.
+    /// Deliberately last in declaration order: placement sorts candidate
+    /// engines by this ordinal, and mistral.rs stays an explicit opt-in
+    /// behind the certified lanes (its MoE BF16 prefill measured 7 to 9x
+    /// behind vLLM upstream; dense and quantized models are its lane).
+    #[serde(rename = "mistralrs")]
+    MistralRs,
 }
 
 impl EngineKind {
-    /// The binary name looked up on `PATH` for this engine. For
-    /// [`EngineKind::Embedded`] this is a sentinel, not a real
-    /// executable: the embedded engine runs in-process and never spawns
-    /// a subprocess, so the name is never resolved on `PATH`.
+    /// The binary name looked up on `PATH` for this engine.
     pub fn binary_name(self) -> &'static str {
         match self {
             EngineKind::Vllm => "vllm",
+            // A sentinel: SGLang is launched as `python -m
+            // sglang.launch_server`, so this name is never resolved on
+            // `PATH`. The managed driver owns the real invocation.
+            EngineKind::SGLang => "sglang",
             EngineKind::LlamaCpp => "llama-server",
-            EngineKind::Embedded => "embedded",
+            // The v0.9 unified CLI: upstream's installer and release
+            // tarballs both ship a single `mistralrs` binary.
+            EngineKind::MistralRs => "mistralrs",
         }
     }
 
-    /// Whether this engine runs in-process (no subprocess spawn). Only
-    /// [`EngineKind::Embedded`] does; the launcher dispatches on it.
-    pub fn is_in_process(self) -> bool {
-        matches!(self, EngineKind::Embedded)
+    /// The model id this engine's OpenAI surface accepts in request
+    /// bodies for a managed deployment (WOR-1861). vLLM and SGLang are
+    /// launched with `--served-model-name <deployment>`, so the
+    /// deployment id is the served name; llama.cpp ignores the field.
+    /// mistral.rs has no served-name flag: it registers the model under
+    /// the id it loaded (the snapshot path) and accepts `default` as the
+    /// alias for the loaded model, so the deployment id would be
+    /// rejected with a 404-shaped error.
+    pub fn request_model_id(self, deployment: &str) -> &str {
+        match self {
+            EngineKind::Vllm | EngineKind::SGLang | EngineKind::LlamaCpp => deployment,
+            EngineKind::MistralRs => "default",
+        }
     }
 }
 
@@ -84,13 +107,20 @@ pub enum EngineChoice {
     Auto,
     /// Force vLLM.
     Vllm,
+    /// Force SGLang (WOR-1905). `Auto` never resolves to this: SGLang is
+    /// an explicit opt-in that stays behind vLLM as the safetensors
+    /// default until it is certified on real hardware.
+    #[serde(rename = "sglang")]
+    SGLang,
     /// Force llama.cpp.
     LlamaCpp,
-    /// Force the in-process embedded engine (WOR-1658). `Auto` never
-    /// resolves to this; the embedded engine is an explicit opt-in
-    /// because it changes the deployment model (no subprocess) and is
-    /// only present when the `embedded` feature is compiled.
-    Embedded,
+    /// Force mistral.rs (WOR-1861). `Auto` never resolves to this:
+    /// mistral.rs is an explicit opt-in that stays behind vLLM
+    /// (safetensors) and llama.cpp (GGUF) until it has certification
+    /// mileage, and the planner must not prefer it for large MoE
+    /// prefill workloads.
+    #[serde(rename = "mistralrs")]
+    MistralRs,
 }
 
 impl EngineChoice {
@@ -107,8 +137,9 @@ impl EngineChoice {
     pub fn resolve(self, is_gguf: bool, _container_runtime: bool) -> EngineKind {
         match self {
             EngineChoice::Vllm => EngineKind::Vllm,
+            EngineChoice::SGLang => EngineKind::SGLang,
             EngineChoice::LlamaCpp => EngineKind::LlamaCpp,
-            EngineChoice::Embedded => EngineKind::Embedded,
+            EngineChoice::MistralRs => EngineKind::MistralRs,
             EngineChoice::Auto if is_gguf => EngineKind::LlamaCpp,
             EngineChoice::Auto => EngineKind::Vllm,
         }
@@ -119,8 +150,9 @@ impl EngineChoice {
     pub fn resolve_reason(self, is_gguf: bool, _container_runtime: bool) -> &'static str {
         match self {
             EngineChoice::Vllm => "engine: vllm (forced)",
+            EngineChoice::SGLang => "engine: sglang (forced, opt-in)",
             EngineChoice::LlamaCpp => "engine: llama_cpp (forced)",
-            EngineChoice::Embedded => "engine: embedded (forced, in-process)",
+            EngineChoice::MistralRs => "engine: mistralrs (forced, opt-in)",
             EngineChoice::Auto if is_gguf => "auto -> llama_cpp (GGUF weights)",
             EngineChoice::Auto => "auto -> vllm (safetensors)",
         }
@@ -314,8 +346,13 @@ pub enum KvCacheQuant {
 }
 
 impl KvCacheQuant {
-    /// Bytes per KV element for this mode, or `None` for `Auto` (the
-    /// caller uses the weight quant's default instead).
+    /// Bytes per KV element for this mode *as requested*, or `None` for
+    /// `Auto` (the caller uses the weight quant's default instead).
+    ///
+    /// This is the ideal, not what any particular engine delivers. No
+    /// engine accepts every mode, so the fit planner must size from
+    /// [`effective_kv_cache`] instead; sizing from this value is how
+    /// WOR-2069 under-estimated int4 KV on vLLM by a factor of two.
     pub fn bytes_per_element(self) -> Option<f64> {
         match self {
             KvCacheQuant::Auto => None,
@@ -331,6 +368,136 @@ impl KvCacheQuant {
     pub fn needs_fp8(self) -> bool {
         matches!(self, KvCacheQuant::Fp8)
     }
+}
+
+/// What an engine will actually do with a requested [`KvCacheQuant`].
+///
+/// Both halves come from one table ([`effective_kv_cache`]) on purpose.
+/// The engine drivers read [`flag_value`](Self::flag_value) to build
+/// argv and the fit planner reads
+/// [`bytes_per_element`](Self::bytes_per_element) to size the cache, so
+/// keeping them in separate `match` arms is how the two silently
+/// disagreed: the planner sized int4 at 0.5 bytes while every CUDA
+/// driver substituted fp8 at 1.0, halving the KV estimate that derives
+/// `--gpu-memory-utilization` (WOR-2069). Deriving both from the same
+/// row makes that class of drift impossible rather than merely fixed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EffectiveKvCache {
+    /// The dtype string to pass this engine, or `None` to pass no flag
+    /// and take the engine's own default.
+    pub flag_value: Option<&'static str>,
+    /// Bytes per KV element the engine will really use, or `None` when
+    /// it follows the weight quant's default.
+    pub bytes_per_element: Option<f64>,
+    /// The mode the engine actually runs, which differs from the request
+    /// when the engine has no kernel for it.
+    pub effective: KvCacheQuant,
+}
+
+impl EffectiveKvCache {
+    /// Whether the engine substituted something other than what was
+    /// asked for, so a caller can say so rather than silently serving a
+    /// different cache than the operator configured.
+    pub fn is_substituted(self, requested: KvCacheQuant) -> bool {
+        self.effective != requested
+    }
+}
+
+/// Resolve a requested KV mode against what `engine` can actually run.
+///
+/// The substitutions are real engine limitations, not policy:
+///
+/// - **vLLM and SGLang** expose only fp8 KV variants, so `int8` and
+///   `int4` both land on fp8 at 1.0 bytes per element. An `int4` request
+///   therefore saves nothing on either, and sizing it at 0.5 would leave
+///   the engine half the cache it needs.
+/// - **llama.cpp** quantizes the K and V caches for real, so `int8` maps
+///   to `q8_0` and `int4` to `q4_0` and the savings are genuine.
+/// - **mistral.rs** is driven without a KV dtype flag (the subprocess
+///   lane passes no cache-quant argument), so requested low-precision
+///   modes report `Auto`, follow the weight quant's default, and never
+///   book a saving the engine will not deliver.
+pub fn effective_kv_cache(kv: KvCacheQuant, engine: EngineKind) -> EffectiveKvCache {
+    // No flag, engine default. Shared by `Auto` everywhere and by the
+    // low-precision modes on mistral.rs.
+    const DEFAULT: EffectiveKvCache = EffectiveKvCache {
+        flag_value: None,
+        bytes_per_element: None,
+        effective: KvCacheQuant::Auto,
+    };
+    // f16 is every engine's default, so it is requested by passing no
+    // flag; the planner still books the concrete 2.0.
+    const F16: EffectiveKvCache = EffectiveKvCache {
+        flag_value: None,
+        bytes_per_element: Some(2.0),
+        effective: KvCacheQuant::F16,
+    };
+
+    match (kv, engine) {
+        (KvCacheQuant::Auto, _) => DEFAULT,
+        (KvCacheQuant::F16, _) => F16,
+
+        // vLLM: one fp8 KV dtype, whatever low-precision mode was asked for.
+        (KvCacheQuant::Fp8 | KvCacheQuant::Int8 | KvCacheQuant::Int4, EngineKind::Vllm) => {
+            EffectiveKvCache {
+                flag_value: Some("fp8"),
+                bytes_per_element: Some(1.0),
+                effective: KvCacheQuant::Fp8,
+            }
+        }
+        // SGLang: same, under its own spelling.
+        (KvCacheQuant::Fp8 | KvCacheQuant::Int8 | KvCacheQuant::Int4, EngineKind::SGLang) => {
+            EffectiveKvCache {
+                flag_value: Some("fp8_e5m2"),
+                bytes_per_element: Some(1.0),
+                effective: KvCacheQuant::Fp8,
+            }
+        }
+
+        // llama.cpp quantizes K and V for real.
+        (KvCacheQuant::Fp8 | KvCacheQuant::Int8, EngineKind::LlamaCpp) => EffectiveKvCache {
+            flag_value: Some("q8_0"),
+            bytes_per_element: Some(1.0),
+            // fp8 and int8 are both 8-bit; llama.cpp's is the integer one.
+            effective: KvCacheQuant::Int8,
+        },
+        (KvCacheQuant::Int4, EngineKind::LlamaCpp) => EffectiveKvCache {
+            flag_value: Some("q4_0"),
+            bytes_per_element: Some(0.5),
+            effective: KvCacheQuant::Int4,
+        },
+
+        // mistral.rs is launched without a KV dtype flag, so requested
+        // low-precision modes fall back to the engine default and the
+        // planner books no saving.
+        (_, EngineKind::MistralRs) => DEFAULT,
+    }
+}
+
+/// Say so when an engine cannot run the KV mode that was configured.
+///
+/// The fit planner sizes the substitute, so nothing is mis-planned, but
+/// an operator who wrote `kv_quant: int4` expecting to halve their cache
+/// is getting fp8 on vLLM and SGLang and would otherwise have no way to
+/// find that out (WOR-2069). Lives next to [`effective_kv_cache`] so
+/// every plan-time call site emits the same warning.
+pub(crate) fn warn_on_kv_substitution(
+    requested: KvCacheQuant,
+    effective: EffectiveKvCache,
+    engine: EngineKind,
+    model: &str,
+) {
+    if !effective.is_substituted(requested) {
+        return;
+    }
+    tracing::warn!(
+        model = %model,
+        engine = ?engine,
+        requested = ?requested,
+        effective = ?effective.effective,
+        "engine has no kernel for the configured kv_quant; serving the nearest mode it supports \
+         and sizing the fit for that"
+    );
 }
 
 /// How a model does speculative decoding (WOR-1674). Speculation
@@ -396,6 +563,35 @@ pub struct LoraAdapter {
     pub source: String,
 }
 
+/// The explicitly-configured cloud model a local model displaces
+/// (WOR-1913). Its per-million-token prices value every local completion
+/// at what the equivalent hosted API would have charged, which is the
+/// dollars-saved number that justifies the GPU. There is no default and
+/// no guessing: without a `reference:` a served model makes no savings
+/// claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub struct ReferenceModel {
+    /// The hosted model whose price this local model displaces, for
+    /// display in the value report (e.g. `gpt-4o`). Not resolved against
+    /// the catalog; it names the cloud API the saving is measured against.
+    pub model: String,
+    /// Micro-USD per 1e6 prompt tokens the reference model charges.
+    pub prompt_micros_per_mtok: u64,
+    /// Micro-USD per 1e6 completion tokens the reference model charges.
+    pub completion_micros_per_mtok: u64,
+}
+
+impl ReferenceModel {
+    /// The cloud reference price used to value a displaced completion.
+    pub fn cloud_price(&self) -> crate::hybrid::CloudPrice {
+        crate::hybrid::CloudPrice {
+            prompt_micros_per_mtok: self.prompt_micros_per_mtok,
+            completion_micros_per_mtok: self.completion_micros_per_mtok,
+        }
+    }
+}
+
 /// One model an operator wants the gateway to serve locally.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ServeEntry {
@@ -440,7 +636,18 @@ pub struct ServeEntry {
     #[serde(default)]
     pub kv_quant: KvCacheQuant,
     /// Support: preview.
-    /// Speculative decoding. `None` disables it.
+    /// Enable vLLM's automatic prefix caching, reusing already-computed
+    /// KV blocks across requests that share a prompt prefix. `None`
+    /// leaves the engine default (off) in place.
+    #[serde(default)]
+    pub enable_prefix_caching: Option<bool>,
+    /// Support: preview.
+    /// Speculative decoding. The vLLM driver emits the engine's speculation
+    /// flags; the managed reconcile path accepts n-gram speculation
+    /// (needs no extra model) on a vLLM engine, but rejects draft-model
+    /// speculation until its VRAM-headroom check
+    /// (`fit::resolve_speculative_config`) is wired into a real
+    /// prepare-time call site. `None` disables it.
     #[serde(default)]
     pub speculative: Option<SpeculativeConfig>,
     /// Support: preview.
@@ -448,7 +655,12 @@ pub struct ServeEntry {
     #[serde(default)]
     pub chunked_prefill: Option<ChunkedPrefill>,
     /// Support: preview.
-    /// LoRA adapters served over this base model.
+    /// LoRA adapters served over this base model on the vLLM engine
+    /// (WOR-1945): each becomes a `--lora-modules <name>=<source>`
+    /// alongside `--enable-lora`, so a client requests the adapter by
+    /// name over one resident base. An `hf:Org/Repo` source is handed to
+    /// vLLM as the repo id (resolved from the Hub or the mounted cache);
+    /// a local path passes through. Requires `engine: vllm`.
     #[serde(default)]
     pub lora_adapters: Vec<LoraAdapter>,
     /// Support: preview.
@@ -468,20 +680,19 @@ pub struct ServeEntry {
     #[serde(default)]
     pub tool_call_parser: Option<String>,
     /// Support: preview.
-    /// CPU KV-cache tier size in GiB (WOR-1687): vLLM's `--swap-space`,
-    /// the CPU pool it spills GPU KV blocks to under pressure so a
-    /// longer effective context / larger batch survives beyond GPU
-    /// VRAM. `None` uses the engine default.
+    /// CPU swap pool size in GiB: vLLM's `--swap-space`. `None` uses the
+    /// engine default.
     #[serde(default)]
     pub swap_space_gib: Option<u64>,
     /// Support: preview.
-    /// GiB of model weights to keep in CPU RAM (WOR-1687): vLLM's
+    /// GiB of model weights to keep in CPU RAM: vLLM's
     /// `--cpu-offload-gb`, trading PCIe bandwidth for VRAM so a model
     /// that does not fit can still load. `None` disables offload.
     #[serde(default)]
     pub cpu_offload_gib: Option<u64>,
     /// Support: preview.
-    /// Max LoRA adapters resident on the engine at once (WOR-1673).
+    /// Max LoRA adapters resident on the engine at once (WOR-1945):
+    /// vLLM's `--max-loras`.
     /// When set below the number of configured `lora_adapters`, the
     /// engine loads adapters on demand and evicts the least-recently
     /// used past this cap (dynamic paging), rather than preloading all
@@ -500,6 +711,22 @@ pub struct ServeEntry {
     /// default (fine only for a single-file repo).
     #[serde(default)]
     pub gguf_file: Option<String>,
+    /// The hosted model this local model displaces (WOR-1913). When set,
+    /// every completion served locally is priced at what this reference
+    /// would have charged and counted toward the dollars-saved value
+    /// report (`GET /admin/model-host/value`). Omit it to make no savings
+    /// claim: sbproxy never guesses a cloud reference price.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<ReferenceModel>,
+    /// The task this served model performs (WOR-1908 / WOR-1675). A catalog
+    /// entry carries its own modality, but a raw `hf:Org/Repo` reference has
+    /// none, so declare it here to serve an embedding or rerank model:
+    /// it drives the engine's runtime-owned `--task` flag (vLLM `embed` /
+    /// `score`) and zeroes the KV-cache term in the fit. Defaults to chat
+    /// (autoregressive generation) when omitted.
+    /// Support: preview.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modality: Option<crate::catalog::Modality>,
 }
 
 /// The `serve:` block: the local models plus host-wide policy.
@@ -519,11 +746,33 @@ pub struct ModelHostConfig {
     /// the platform default (`$HF_HOME` / `~/.cache/sbproxy/models`).
     #[serde(default)]
     pub cache_dir: Option<String>,
-    /// Support: config_only.
+    /// Support: preview.
     /// Disk budget in GiB for the weight cache before GC. `None`
-    /// means unbounded (operator manages the disk).
+    /// means unbounded (operator manages the disk). Collection runs
+    /// after `models pull` and on demand through the authenticated
+    /// `POST /admin/model-host/gc` route.
     #[serde(default)]
     pub cache_budget_gib: Option<f64>,
+    /// Support: preview.
+    /// Permit unpinned raw `hf:` references on a node that holds the
+    /// `worker` cluster role. Defaults to `false`.
+    ///
+    /// A raw reference runs the engine in repo mode, which gives up three
+    /// protections a pinned catalog artifact gets: the container runs on
+    /// the default bridge with DNS and external egress instead of an
+    /// `--internal` network, the Hugging Face cache is mounted writable
+    /// instead of read-only, and the launch-time trust and file-map checks
+    /// are skipped because there are no local bytes to verify. No digest
+    /// is ever computed for those weights, so the pull policy, offline
+    /// mode, and digest-failure contract cover nothing on that path.
+    ///
+    /// That trade is right for `sbproxy run <model>` on a workstation and
+    /// for evaluating a model with no catalog entry yet. It is a poor fit
+    /// for a long-lived fleet worker holding cluster identity, so the
+    /// startup gate refuses it there unless this is set. Nodes without the
+    /// worker role are unaffected either way.
+    #[serde(default)]
+    pub allow_unpinned_refs: bool,
     /// What to do under VRAM pressure. Defaults to LRU eviction.
     #[serde(default)]
     pub eviction: EvictionPolicy,
@@ -720,7 +969,9 @@ impl ModelHostConfig {
                         "engine {kind:?} acquire.version must be pinned, not `latest`"
                     ));
                 }
-                if *kind == EngineKind::LlamaCpp {
+                // The tag-shape rule is engine-agnostic (ASCII, bounded,
+                // never `latest`); both binary-release engines use it.
+                if matches!(*kind, EngineKind::LlamaCpp | EngineKind::MistralRs) {
                     if let Some(version) = acq.version.as_deref() {
                         crate::llama_release::validate_pinned_tag(version).map_err(|reason| {
                             format!("engine {kind:?} acquire.version is invalid: {reason}")
@@ -728,12 +979,15 @@ impl ModelHostConfig {
                     }
                 }
                 // `uvx` provisions a Python package via `uv tool run`, which
-                // is the vLLM path; a binary engine (llama.cpp) uses a
-                // release or an explicit path instead.
-                if acq.source == AcquireSource::Uvx && *kind != EngineKind::Vllm {
+                // is the vLLM and SGLang path (both are Python packages); a
+                // binary engine (llama.cpp) uses a release or an explicit
+                // path instead.
+                if acq.source == AcquireSource::Uvx
+                    && !matches!(*kind, EngineKind::Vllm | EngineKind::SGLang)
+                {
                     return Err(format!(
-                        "engine {kind:?} acquire.source: uvx is only for vllm (a Python package); \
-                         use release or path for a binary engine"
+                        "engine {kind:?} acquire.source: uvx is only for vllm or sglang (Python \
+                         packages); use release or path for a binary engine"
                     ));
                 }
                 if acq.source == AcquireSource::SourceBuild
@@ -760,6 +1014,8 @@ pub struct EngineEnv {
     pub vllm_on_path: bool,
     /// The `llama-server` binary is on `PATH`.
     pub llama_server_on_path: bool,
+    /// The `mistralrs` binary is on `PATH` (WOR-1861).
+    pub mistralrs_on_path: bool,
     /// A container runtime (docker/podman) is available.
     pub container_runtime: bool,
     /// vLLM can be acquired here via `uvx` (sbproxy fetches `uv` and runs
@@ -779,6 +1035,7 @@ impl EngineEnv {
         Self {
             vllm_on_path: resolve_on_path("vllm").is_some(),
             llama_server_on_path: resolve_on_path("llama-server").is_some(),
+            mistralrs_on_path: resolve_on_path("mistralrs").is_some(),
             container_runtime: resolve_on_path("docker").is_some()
                 || resolve_on_path("podman").is_some(),
             // sbproxy fetches uv itself, so uvx is viable wherever vLLM's
@@ -833,17 +1090,27 @@ impl EngineDoctor {
                     }),
                 )
             }
-            EngineKind::Embedded => {
-                // The in-process engine needs no binary; it needs the
-                // `embedded` feature compiled into this build (WOR-1658).
-                let compiled = cfg!(feature = "embedded");
+            EngineKind::SGLang => {
+                // SGLang mirrors vLLM here: a Python-package engine with no
+                // single binary on PATH. It runs from a container or the
+                // uvx path on a Linux host (the same acquisition surface as
+                // vLLM, so the `vllm_uvx` Linux signal applies to it too).
+                let ok = env.container_runtime || env.vllm_uvx;
                 (
-                    compiled,
-                    (!compiled).then(|| {
-                        "engine: embedded needs a build with --features embedded".to_string()
+                    ok,
+                    (!ok).then(|| {
+                        "SGLang needs a container runtime or a Linux host for the uvx path"
+                            .to_string()
                     }),
                 )
             }
+            EngineKind::MistralRs => (
+                // PATH is the boot-time signal; the doctor's engine row
+                // ORs in prebuilt-release acquirability, mirroring
+                // llama.cpp's split between this preflight and doctor.
+                env.mistralrs_on_path,
+                (!env.mistralrs_on_path).then(|| "mistralrs not found on PATH".to_string()),
+            ),
         };
         Self {
             model: entry
@@ -906,18 +1173,43 @@ models:
     #[test]
     fn engine_binary_names() {
         assert_eq!(EngineKind::Vllm.binary_name(), "vllm");
+        assert_eq!(EngineKind::SGLang.binary_name(), "sglang");
         assert_eq!(EngineKind::LlamaCpp.binary_name(), "llama-server");
-        assert_eq!(EngineKind::Embedded.binary_name(), "embedded");
+        assert_eq!(EngineKind::MistralRs.binary_name(), "mistralrs");
+        // The outbound request model id: vLLM/SGLang serve under the
+        // deployment id (--served-model-name); mistral.rs only accepts
+        // its loaded id or the `default` alias (WOR-1861).
+        assert_eq!(EngineKind::Vllm.request_model_id("dep-1"), "dep-1");
+        assert_eq!(EngineKind::MistralRs.request_model_id("dep-1"), "default");
     }
 
     #[test]
     fn unknown_engine_is_rejected() {
+        // `sglang` is now a valid allowlisted engine (WOR-1905), so the
+        // rejection test uses a genuinely-unknown engine name.
         let r: Result<ModelHostConfig, _> =
-            serde_yaml::from_str("models:\n  - model: x\n    engine: sglang\n");
+            serde_yaml::from_str("models:\n  - model: x\n    engine: tensorrt\n");
         assert!(
             r.is_err(),
-            "engine is an allowlisted enum; sglang must reject"
+            "engine is an allowlisted enum; an unknown engine must reject"
         );
+    }
+
+    #[test]
+    fn sglang_engine_parses() {
+        // WOR-1905: `engine: sglang` parses to the forced SGLang choice.
+        // The variant is `SGLang` but renamed to `sglang` for config, since
+        // snake_case would otherwise produce `s_g_lang`.
+        let cfg: ModelHostConfig =
+            serde_yaml::from_str("models:\n  - model: qwen3-8b\n    engine: sglang\n")
+                .expect("sglang parses");
+        assert_eq!(cfg.models[0].engine, EngineChoice::SGLang);
+        // SGLang is a forced choice: Auto never resolves to it.
+        assert_eq!(
+            EngineChoice::SGLang.resolve(false, true),
+            EngineKind::SGLang
+        );
+        assert_eq!(EngineChoice::Auto.resolve(false, true), EngineKind::Vllm);
     }
 
     #[test]
@@ -939,44 +1231,6 @@ models:
         let s = &static_cfg.models[0];
         assert!(!s.dynamic_lora());
         assert_eq!(s.lora_capacity(), 2);
-    }
-
-    #[test]
-    fn embedded_engine_resolves_and_is_in_process() {
-        // WOR-1658: `engine: embedded` parses, is a forced choice (Auto
-        // never picks it), and marks the in-process launch path.
-        let cfg: ModelHostConfig =
-            serde_yaml::from_str("models:\n  - model: qwen3-0.6b\n    engine: embedded\n")
-                .expect("embedded parses");
-        assert_eq!(cfg.models[0].engine, EngineChoice::Embedded);
-        assert_eq!(
-            EngineChoice::Embedded.resolve(false, true),
-            EngineKind::Embedded
-        );
-        assert!(EngineKind::Embedded.is_in_process());
-        assert!(!EngineKind::Vllm.is_in_process());
-        assert!(!EngineKind::LlamaCpp.is_in_process());
-    }
-
-    #[test]
-    fn embedded_doctor_gated_on_feature() {
-        // The plan-time doctor reports an embedded model as runnable only
-        // when the `embedded` feature is compiled; otherwise it blocks
-        // with a clear rebuild hint (WOR-1658).
-        let cfg: ModelHostConfig =
-            serde_yaml::from_str("models:\n  - model: qwen3-0.6b\n    engine: embedded\n").unwrap();
-        let env = EngineEnv::default();
-        let doc = EngineDoctor::for_entry(&cfg.models[0], false, &env);
-        if cfg!(feature = "embedded") {
-            assert!(doc.runnable);
-        } else {
-            assert!(!doc.runnable);
-            assert!(doc
-                .blocker
-                .as_deref()
-                .unwrap()
-                .contains("--features embedded"));
-        }
     }
 
     #[test]
@@ -1038,6 +1292,7 @@ models:
             max_context: None,
             extra_args: vec![],
             kv_quant: KvCacheQuant::Auto,
+            enable_prefix_caching: None,
             speculative: None,
             chunked_prefill: None,
             lora_adapters: vec![],
@@ -1047,6 +1302,8 @@ models:
             cpu_offload_gib: None,
             max_loras: None,
             gguf_file: None,
+            reference: None,
+            modality: None,
         };
         let json = serde_json::to_value(&e).expect("serialize");
         let obj = json.as_object().expect("object");
@@ -1086,8 +1343,9 @@ models:
         // among a fixed set and can never inject an executable path.
         for (kind, expect) in [
             (EngineKind::Vllm, "vllm"),
+            (EngineKind::SGLang, "sglang"),
             (EngineKind::LlamaCpp, "llama-server"),
-            (EngineKind::Embedded, "embedded"),
+            (EngineKind::MistralRs, "mistralrs"),
         ] {
             assert_eq!(kind.binary_name(), expect);
         }
@@ -1286,6 +1544,7 @@ models:
         let env = EngineEnv {
             vllm_on_path: false,
             llama_server_on_path: true,
+            mistralrs_on_path: false,
             container_runtime: false,
             vllm_uvx: false,
             gpu_present: true,
@@ -1305,5 +1564,160 @@ models:
         assert_eq!(d2.resolved, EngineKind::Vllm);
         assert!(!d2.runnable);
         assert!(d2.blocker.is_some());
+    }
+}
+
+/// The KV-cache contract (WOR-2069): what the fit planner books and what
+/// the engine actually runs must agree, for every mode on every engine.
+#[cfg(test)]
+mod kv_cache_contract {
+    use super::*;
+
+    /// Every engine kind, so adding one forces a decision here.
+    const ENGINES: [EngineKind; 4] = [
+        EngineKind::Vllm,
+        EngineKind::SGLang,
+        EngineKind::LlamaCpp,
+        EngineKind::MistralRs,
+    ];
+
+    const MODES: [KvCacheQuant; 5] = [
+        KvCacheQuant::Auto,
+        KvCacheQuant::F16,
+        KvCacheQuant::Fp8,
+        KvCacheQuant::Int8,
+        KvCacheQuant::Int4,
+    ];
+
+    #[test]
+    fn the_contract_covers_every_mode_and_engine() {
+        // Both matches have no wildcard arm, deliberately. Adding a
+        // KvCacheQuant variant or an EngineKind fails compilation right
+        // here, forcing the new row into MODES / ENGINES above so every
+        // contract test in this module sweeps it. Do not "fix" a build
+        // break in this test with a `_` arm.
+        for mode in MODES {
+            match mode {
+                KvCacheQuant::Auto => {}
+                KvCacheQuant::F16 => {}
+                KvCacheQuant::Fp8 => {}
+                KvCacheQuant::Int8 => {}
+                KvCacheQuant::Int4 => {}
+            }
+        }
+        for engine in ENGINES {
+            match engine {
+                EngineKind::Vllm => {}
+                EngineKind::SGLang => {}
+                EngineKind::LlamaCpp => {}
+                EngineKind::MistralRs => {}
+            }
+        }
+    }
+
+    /// Bytes per element each dtype string really costs. This is the
+    /// independent half of the check: if the table ever claims a saving
+    /// the dtype does not deliver, this map disagrees and the test fails.
+    fn bytes_for_dtype(dtype: &str) -> f64 {
+        match dtype {
+            // vLLM and SGLang spellings of 8-bit float KV.
+            "fp8" | "fp8_e5m2" => 1.0,
+            // llama.cpp block quants.
+            "q8_0" => 1.0,
+            "q4_0" => 0.5,
+            other => panic!("unknown KV dtype {other}: add its real cost to this test"),
+        }
+    }
+
+    #[test]
+    fn planned_bytes_always_match_the_dtype_the_engine_is_given() {
+        for engine in ENGINES {
+            for mode in MODES {
+                let effective = effective_kv_cache(mode, engine);
+                match (effective.flag_value, effective.bytes_per_element) {
+                    // A flag is passed: the booked cost must be that
+                    // dtype's real cost. This is the assertion that
+                    // WOR-2069 violated, int4 on vLLM booking 0.5 while
+                    // the engine was handed fp8 at 1.0.
+                    (Some(dtype), Some(bytes)) => assert_eq!(
+                        bytes,
+                        bytes_for_dtype(dtype),
+                        "{engine:?} + {mode:?}: planned {bytes} bytes/element but the engine \
+                         is launched with --kv-cache-dtype {dtype}"
+                    ),
+                    // No flag means the engine default. Only f16 may book
+                    // a concrete cost there, because f16 is the default.
+                    (None, Some(bytes)) => assert_eq!(
+                        bytes, 2.0,
+                        "{engine:?} + {mode:?}: no dtype flag is passed, so the engine runs its \
+                         f16 default, but the plan books {bytes} bytes/element"
+                    ),
+                    (None, None) => {}
+                    (Some(dtype), None) => panic!(
+                        "{engine:?} + {mode:?}: launched with {dtype} but the plan books no cost"
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_plan_never_books_a_saving_the_engine_will_not_deliver() {
+        // The direction that matters. Over-booking wastes VRAM; under-
+        // booking hands the engine less cache than it allocates, and the
+        // shortfall surfaces at first-token graph capture.
+        for engine in ENGINES {
+            for mode in MODES {
+                let requested = mode.bytes_per_element();
+                let effective = effective_kv_cache(mode, engine).bytes_per_element;
+                if let (Some(requested), Some(effective)) = (requested, effective) {
+                    assert!(
+                        effective >= requested,
+                        "{engine:?} + {mode:?}: plan books {effective} bytes/element against a \
+                         request of {requested}, which under-sizes the cache"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cuda_engines_substitute_fp8_for_the_integer_modes() {
+        // The specific WOR-2069 regression, pinned per engine.
+        for engine in [EngineKind::Vllm, EngineKind::SGLang] {
+            for mode in [KvCacheQuant::Int8, KvCacheQuant::Int4] {
+                let effective = effective_kv_cache(mode, engine);
+                assert_eq!(
+                    effective.bytes_per_element,
+                    Some(1.0),
+                    "{engine:?} has no integer KV kernel, so {mode:?} costs fp8's 1.0"
+                );
+                assert_eq!(effective.effective, KvCacheQuant::Fp8);
+                assert!(
+                    effective.is_substituted(mode),
+                    "{engine:?} + {mode:?} is a substitution and must be reported as one"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn llama_cpp_delivers_real_four_bit_kv() {
+        // The saving is genuine here, so it must not be flattened along
+        // with the CUDA engines.
+        let effective = effective_kv_cache(KvCacheQuant::Int4, EngineKind::LlamaCpp);
+        assert_eq!(effective.flag_value, Some("q4_0"));
+        assert_eq!(effective.bytes_per_element, Some(0.5));
+        assert!(!effective.is_substituted(KvCacheQuant::Int4));
+    }
+
+    #[test]
+    fn auto_defers_to_the_weight_quant_on_every_engine() {
+        for engine in ENGINES {
+            let effective = effective_kv_cache(KvCacheQuant::Auto, engine);
+            assert_eq!(effective.flag_value, None, "{engine:?}");
+            assert_eq!(effective.bytes_per_element, None, "{engine:?}");
+            assert!(!effective.is_substituted(KvCacheQuant::Auto), "{engine:?}");
+        }
     }
 }

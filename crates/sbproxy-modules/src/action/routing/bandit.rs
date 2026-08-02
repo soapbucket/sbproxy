@@ -2,12 +2,12 @@
 //! Epsilon-greedy multi-armed bandit routing strategy.
 //!
 //! Treats each target as an arm of a bandit and learns which one delivers
-//! the best success rate over time. The hot-path selection is cheap: a
+//! the best reward over time. The hot-path selection is cheap: a
 //! single hash-map lookup per target plus one float comparison per
 //! candidate. Statistics are kept in a process-local
 //! [`std::sync::Mutex`]-guarded map keyed by target URL, so the state
-//! survives reload of the load-balancer action as long as the URL is
-//! stable.
+//! can survive reload of the load-balancer action when the compiler
+//! provides a stable state namespace.
 //!
 //! # Selection rule
 //!
@@ -17,7 +17,7 @@
 //!   (`0.05` by default). This is a UCB-style optimism bump that keeps
 //!   unseen arms ahead of any arm with observed losses, so every target
 //!   gets at least one trial before exploitation kicks in.
-//! - **Seen arm**: empirical success rate `successes / total`.
+//! - **Seen arm**: empirical mean reward `reward_sum / total`.
 //!
 //! With probability `epsilon` (default `0.1`) the strategy picks a
 //! healthy target uniformly at random instead, which is the exploration
@@ -27,27 +27,34 @@
 //! # Recording outcomes
 //!
 //! The proxy's request-finalize path calls
-//! [`BanditStrategy::record_outcome`] after the response is settled.
-//! "Success" is whatever the operator wants (typically 2xx without
-//! upstream timeout). Outcomes update a `(successes, total)` pair in the
-//! interior map; the counters never decay, which is intentional. If
-//! operators want a sliding window they can wrap the strategy or reset
-//! by reloading the config.
+//! [`RoutingStrategy::record_outcome`] after the response is settled.
+//! A failure receives no reward. A successful attempt receives
+//! `1 / (1 + latency_seconds)`, so faster successful arms win. Outcomes
+//! update a bounded `(reward_sum, total)` pair in the interior map.
 //!
 //! # Fall-back semantics
 //!
 //! Returns `None` when no healthy target exists, so the caller falls
-//! through to the configured `lb_method`. Otherwise always returns
+//! through to the configured `algorithm`. Otherwise always returns
 //! `Some`.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::Result;
 use rand::Rng;
 use serde::Deserialize;
 
-use super::{RoutingRequest, RoutingStrategy, RoutingStrategyRegistration, TargetState};
+use super::{
+    RoutingOutcome, RoutingRequest, RoutingStrategy, RoutingStrategyRegistration, TargetState,
+};
+
+/// Maximum number of reload-stable bandit state namespaces held per process.
+const MAX_STATE_NAMESPACES: usize = 256;
+/// Maximum number of target arms retained in one bandit state namespace.
+pub(crate) const MAX_TARGETS_PER_NAMESPACE: usize = 256;
+static NAMESPACE_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// Default value for the `epsilon` config field (`0.1`).
 fn default_epsilon() -> f64 {
@@ -78,18 +85,77 @@ struct BanditConfig {
     /// trial before exploitation. Defaults to `0.05`.
     #[serde(default = "default_unseen_bonus")]
     unseen_bonus: f64,
+    /// Optional process-local key used to retain feedback across reloads.
+    /// The load-balancer compiler supplies this for production actions.
+    #[serde(default)]
+    state_namespace: Option<String>,
 }
 
-/// Per-target observation counters.
-///
-/// `total` is `successes + failures`, kept as one number so the
-/// success-rate computation is a single division.
+/// Per-target reward observations.
 #[derive(Debug, Default, Clone, Copy)]
 struct ArmStats {
-    /// Count of recorded successful outcomes.
-    successes: u64,
-    /// Count of all recorded outcomes (successes plus failures).
+    /// Sum of bounded rewards for recorded outcomes.
+    reward_sum: f64,
+    /// Count of recorded outcomes.
     total: u64,
+}
+
+/// Bounded process-local state retained across compatible config reloads.
+struct BanditStateRegistry {
+    /// Namespace insertion order, with the oldest entry at the front.
+    order: VecDeque<String>,
+    /// Mutable arm statistics held by each namespace.
+    states: HashMap<String, Arc<Mutex<HashMap<String, ArmStats>>>>,
+}
+
+impl BanditStateRegistry {
+    fn state_for_namespace(&mut self, namespace: String) -> Arc<Mutex<HashMap<String, ArmStats>>> {
+        if let Some(state) = self.states.get(&namespace) {
+            return Arc::clone(state);
+        }
+
+        if self.states.len() >= MAX_STATE_NAMESPACES {
+            let inactive_position = self.order.iter().position(|candidate| {
+                self.states
+                    .get(candidate)
+                    .is_some_and(|state| Arc::strong_count(state) == 1)
+            });
+            if let Some(position) = inactive_position {
+                if let Some(inactive) = self.order.remove(position) {
+                    self.states.remove(&inactive);
+                }
+            } else {
+                if !NAMESPACE_FALLBACK_WARNED.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        namespace_limit = MAX_STATE_NAMESPACES,
+                        "bandit state registry is full with live namespaces; using action-local bounded state"
+                    );
+                }
+                return Arc::new(Mutex::new(HashMap::new()));
+            }
+        }
+
+        let state = Arc::new(Mutex::new(HashMap::new()));
+        self.order.push_back(namespace.clone());
+        self.states.insert(namespace, Arc::clone(&state));
+        state
+    }
+}
+
+/// Process-wide registry used only when a compiled action provides a namespace.
+static BANDIT_STATE_REGISTRY: LazyLock<Mutex<BanditStateRegistry>> = LazyLock::new(|| {
+    Mutex::new(BanditStateRegistry {
+        order: VecDeque::new(),
+        states: HashMap::new(),
+    })
+});
+
+fn state_for_namespace(namespace: String) -> Arc<Mutex<HashMap<String, ArmStats>>> {
+    let mut registry = match BANDIT_STATE_REGISTRY.lock() {
+        Ok(registry) => registry,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    registry.state_for_namespace(namespace)
 }
 
 /// Epsilon-greedy multi-armed bandit routing strategy.
@@ -103,10 +169,10 @@ pub struct BanditStrategy {
     epsilon: f64,
     /// Optimism bonus added to the score of any unseen arm.
     unseen_bonus: f64,
-    /// Per-target observation counters keyed by upstream URL. The mutex
+    /// Per-target reward observations keyed by upstream URL. The mutex
     /// is held only for the duration of a single hash-map operation so
     /// contention on the hot path is dominated by the read in `select`.
-    stats: Mutex<HashMap<String, ArmStats>>,
+    stats: Arc<Mutex<HashMap<String, ArmStats>>>,
 }
 
 impl BanditStrategy {
@@ -125,7 +191,10 @@ impl BanditStrategy {
             name: config.name.unwrap_or_else(|| "bandit".to_string()),
             epsilon: config.epsilon.clamp(0.0, 1.0),
             unseen_bonus: config.unseen_bonus.max(0.0),
-            stats: Mutex::new(HashMap::new()),
+            stats: config
+                .state_namespace
+                .map(state_for_namespace)
+                .unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new()))),
         }))
     }
 
@@ -137,18 +206,18 @@ impl BanditStrategy {
         match stats {
             None => 1.0 + self.unseen_bonus,
             Some(s) if s.total == 0 => 1.0 + self.unseen_bonus,
-            Some(s) => s.successes as f64 / s.total as f64,
+            Some(s) => {
+                let score = s.reward_sum / s.total as f64;
+                if score.is_finite() {
+                    score.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                }
+            }
         }
     }
 
-    /// Record the outcome of a request that the strategy routed to
-    /// `target_url`. Callers invoke this after the response resolves;
-    /// `success` is operator-defined (typically a 2xx response without
-    /// upstream timeout).
-    ///
-    /// Unknown URLs are added to the map on first record, which is the
-    /// expected path on the very first request to a new arm.
-    pub fn record_outcome(&self, target_url: &str, success: bool) {
+    fn record(&self, target_url: &str, outcome: RoutingOutcome) {
         let mut guard = match self.stats.lock() {
             Ok(g) => g,
             // A poisoned mutex means a previous holder panicked while
@@ -157,18 +226,32 @@ impl BanditStrategy {
             // invariant can have been left half-updated.
             Err(poisoned) => poisoned.into_inner(),
         };
-        let entry = guard.entry(target_url.to_string()).or_default();
-        if success {
-            entry.successes += 1;
+        if !guard.contains_key(target_url) && guard.len() >= MAX_TARGETS_PER_NAMESPACE {
+            return;
         }
-        entry.total += 1;
+        let entry = guard.entry(target_url.to_string()).or_default();
+        if entry.total == u64::MAX {
+            return;
+        }
+        let reward = if outcome.success {
+            let reward = 1.0 / (1.0 + outcome.latency.as_secs_f64());
+            if reward.is_finite() {
+                reward.clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        entry.reward_sum += reward;
+        entry.total = entry.total.saturating_add(1);
     }
 }
 
 impl RoutingStrategy for BanditStrategy {
     fn select(&self, _request: &RoutingRequest, targets: &[TargetState]) -> Option<usize> {
         // Build the healthy candidate list. No healthy target means we
-        // fall through to the configured lb_method.
+        // fall through to the configured algorithm.
         let healthy: Vec<usize> = targets
             .iter()
             .enumerate()
@@ -209,6 +292,10 @@ impl RoutingStrategy for BanditStrategy {
     fn name(&self) -> &str {
         &self.name
     }
+
+    fn record_outcome(&self, target_url: &str, outcome: RoutingOutcome) {
+        self.record(target_url, outcome);
+    }
 }
 
 inventory::submit! {
@@ -223,8 +310,9 @@ inventory::submit! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::action::routing::build_routing_strategy;
+    use crate::action::routing::{build_routing_strategy, RoutingOutcome};
     use std::collections::HashMap;
+    use std::time::Duration;
 
     /// Build a minimal `TargetState` slot.
     fn target(index: usize, healthy: bool) -> TargetState {
@@ -234,12 +322,19 @@ mod tests {
             healthy,
             active_connections: 0,
             weight: 1,
-            metadata: HashMap::new(),
+            metadata: HashMap::new().into(),
         }
     }
 
     fn req() -> RoutingRequest {
         RoutingRequest::new("POST", "/v1/chat", "ai.example.com")
+    }
+
+    fn outcome(success: bool) -> RoutingOutcome {
+        RoutingOutcome {
+            success,
+            latency: Duration::from_millis(10),
+        }
     }
 
     /// Build a strategy with a deterministic epsilon for tests.
@@ -248,8 +343,16 @@ mod tests {
             name: "bandit".to_string(),
             epsilon,
             unseen_bonus: 0.05,
-            stats: Mutex::new(HashMap::new()),
+            stats: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    fn build_with_namespace(namespace: &str) -> Arc<dyn RoutingStrategy> {
+        BanditStrategy::from_config(&serde_json::json!({
+            "epsilon": 0.0,
+            "state_namespace": namespace,
+        }))
+        .expect("bandit config should build")
     }
 
     #[test]
@@ -275,7 +378,7 @@ mod tests {
         // 0/10 success; arm 1 is unseen and must be tried first.
         let strat = build_with_epsilon(0.0);
         for _ in 0..10 {
-            strat.record_outcome("http://upstream-0", false);
+            strat.record_outcome("http://upstream-0", outcome(false));
         }
         let targets = vec![target(0, true), target(1, true)];
         assert_eq!(strat.select(&req(), &targets), Some(1));
@@ -286,13 +389,13 @@ mod tests {
         let strat = build_with_epsilon(0.0);
         // Arm 0: 9/10 success rate.
         for _ in 0..9 {
-            strat.record_outcome("http://upstream-0", true);
+            strat.record_outcome("http://upstream-0", outcome(true));
         }
-        strat.record_outcome("http://upstream-0", false);
+        strat.record_outcome("http://upstream-0", outcome(false));
         // Arm 1: 1/10 success rate.
-        strat.record_outcome("http://upstream-1", true);
+        strat.record_outcome("http://upstream-1", outcome(true));
         for _ in 0..9 {
-            strat.record_outcome("http://upstream-1", false);
+            strat.record_outcome("http://upstream-1", outcome(false));
         }
         let targets = vec![target(0, true), target(1, true)];
         for _ in 0..20 {
@@ -330,7 +433,7 @@ mod tests {
         let targets = vec![target(0, true), target(1, true)];
         assert_eq!(strat.select(&req(), &targets), Some(0));
         for _ in 0..5 {
-            strat.record_outcome("http://upstream-0", false);
+            strat.record_outcome("http://upstream-0", outcome(false));
         }
         assert_eq!(strat.select(&req(), &targets), Some(1));
     }
@@ -340,7 +443,7 @@ mod tests {
         let strat = build_with_epsilon(0.0);
         // Arm 0 has perfect history but is unhealthy: must be skipped.
         for _ in 0..10 {
-            strat.record_outcome("http://upstream-0", true);
+            strat.record_outcome("http://upstream-0", outcome(true));
         }
         let targets = vec![target(0, false), target(1, true)];
         assert_eq!(strat.select(&req(), &targets), Some(1));
@@ -366,5 +469,144 @@ mod tests {
         // epsilon = 2.0 clamps to 1.0; building succeeds.
         let _ = BanditStrategy::from_config(&serde_json::json!({ "epsilon": 2.0 }))
             .expect("config should build");
+    }
+
+    #[test]
+    fn successful_faster_arm_wins_after_both_arms_are_sampled() {
+        let strategy = build_with_epsilon(0.0);
+        let targets = vec![
+            TargetState {
+                index: 0,
+                url: "http://slow".to_string(),
+                healthy: true,
+                active_connections: 0,
+                weight: 1,
+                metadata: HashMap::new().into(),
+            },
+            TargetState {
+                index: 1,
+                url: "http://fast".to_string(),
+                healthy: true,
+                active_connections: 0,
+                weight: 1,
+                metadata: HashMap::new().into(),
+            },
+        ];
+
+        strategy.record_outcome(
+            "http://slow",
+            RoutingOutcome {
+                success: true,
+                latency: Duration::from_millis(500),
+            },
+        );
+        strategy.record_outcome(
+            "http://fast",
+            RoutingOutcome {
+                success: true,
+                latency: Duration::from_millis(10),
+            },
+        );
+
+        assert_eq!(strategy.select(&req(), &targets), Some(1));
+    }
+
+    #[test]
+    fn failed_arm_loses_to_sampled_successful_arm() {
+        let strategy = build_with_epsilon(0.0);
+        let targets = vec![target(0, true), target(1, true)];
+
+        strategy.record_outcome("http://upstream-0", outcome(false));
+        strategy.record_outcome("http://upstream-1", outcome(true));
+
+        assert_eq!(strategy.select(&req(), &targets), Some(1));
+    }
+
+    #[test]
+    fn maximum_duration_outcome_keeps_scores_finite() {
+        let strategy = build_with_epsilon(0.0);
+        let targets = vec![target(0, true), target(1, true)];
+
+        strategy.record_outcome(
+            "http://upstream-0",
+            RoutingOutcome {
+                success: true,
+                latency: Duration::MAX,
+            },
+        );
+        strategy.record_outcome("http://upstream-1", outcome(true));
+
+        assert_eq!(strategy.select(&req(), &targets), Some(1));
+    }
+
+    #[test]
+    fn matching_namespace_reuses_history_and_distinct_namespace_does_not() {
+        let first = build_with_namespace("bandit-reload-stability-first");
+        let reloaded = build_with_namespace("bandit-reload-stability-first");
+        let independent = build_with_namespace("bandit-reload-stability-independent");
+        let targets = vec![target(0, true), target(1, true)];
+
+        first.record_outcome("http://upstream-0", outcome(false));
+
+        assert_eq!(reloaded.select(&req(), &targets), Some(1));
+        assert_eq!(independent.select(&req(), &targets), Some(0));
+    }
+
+    #[test]
+    fn namespace_pressure_evicts_the_oldest_inactive_state() {
+        let mut registry = BanditStateRegistry {
+            order: VecDeque::new(),
+            states: HashMap::new(),
+        };
+        let active = registry.state_for_namespace("active".to_string());
+        for index in 1..MAX_STATE_NAMESPACES {
+            drop(registry.state_for_namespace(format!("inactive-{index}")));
+        }
+
+        let inserted = registry.state_for_namespace("replacement".to_string());
+
+        assert!(
+            registry.states.contains_key("active"),
+            "a live action must retain its reload namespace"
+        );
+        assert!(
+            !registry.states.contains_key("inactive-1"),
+            "the oldest inactive namespace should be evicted first"
+        );
+        assert!(registry.states.contains_key("replacement"));
+        assert_eq!(Arc::strong_count(&active), 2);
+        assert_eq!(Arc::strong_count(&inserted), 2);
+    }
+
+    #[test]
+    fn fully_active_namespace_registry_uses_a_bounded_local_fallback() {
+        let mut registry = BanditStateRegistry {
+            order: VecDeque::new(),
+            states: HashMap::new(),
+        };
+        let active: Vec<_> = (0..MAX_STATE_NAMESPACES)
+            .map(|index| registry.state_for_namespace(format!("active-{index}")))
+            .collect();
+
+        let fallback = registry.state_for_namespace("overflow".to_string());
+        fallback
+            .lock()
+            .unwrap()
+            .insert("http://observed".to_string(), ArmStats::default());
+
+        assert_eq!(registry.states.len(), MAX_STATE_NAMESPACES);
+        assert!(
+            registry.states.contains_key("active-0"),
+            "pressure must not evict state still held by an action"
+        );
+        assert!(
+            !registry.states.contains_key("overflow"),
+            "overflow state must stay local instead of growing the registry"
+        );
+        assert!(
+            fallback.lock().unwrap().contains_key("http://observed"),
+            "the bounded fallback must retain observations for its live action"
+        );
+        assert_eq!(active.len(), MAX_STATE_NAMESPACES);
     }
 }

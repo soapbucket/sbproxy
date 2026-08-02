@@ -1,5 +1,6 @@
 # Troubleshooting
-*Last modified: 2026-07-13*
+
+*Last modified: 2026-07-29*
 
 When something breaks, this is the first place to look. Each section is one failure: the symptom, the likely cause, and the fix. For *why* these things happen, see [architecture.md](architecture.md); for what the proxy does on its own while a dependency is down, see [degradation.md](degradation.md); for the dashboard-to-action triage flow, see [operator-runbook.md](operator-runbook.md).
 
@@ -21,7 +22,7 @@ Jump by symptom:
 | No traces in the backend | [Traces never arrive at the collector](#traces-never-arrive-at-the-collector) |
 | Admin port dead or 401/403 | [The admin server is unreachable or rejects you](#the-admin-server-is-unreachable-or-rejects-you) |
 | Dashboards empty | [Grafana dashboards show no data](#grafana-dashboards-show-no-data) |
-| Cluster limits or shared cache misbehaving | [Redis went down and cluster behavior changed](#redis-went-down-and-cluster-behavior-changed) |
+| Cluster limits or shared cache misbehaving | [Redis shared state is degraded](#redis-shared-state-is-degraded) |
 | TLS errors | [TLS handshake fails](#tls-handshake-fails) |
 | Cert expiring, renewal not happening | [ACME renewal is failing](#acme-renewal-is-failing) |
 | No HTTP/3 | [HTTP/3 requests fall back to HTTP/2](#http3-requests-fall-back-to-http2) |
@@ -50,7 +51,7 @@ Check:
 The `Host` header on the request does not match any configured origin.
 
 Check:
-- Run `sbproxy validate --config sb.yml` to confirm the config parses.
+- Run `sbproxy validate sb.yml` to confirm the config parses.
 - Confirm the request's `Host` header matches the origin name exactly, including any port suffix.
 - SBproxy uses a bloom filter for fast hostname lookup. If you just added an origin via hot reload, wait a second and retry.
 - These 404s land in `sbproxy_requests_total` under the client-supplied hostname (the cardinality limiter collapses excess values into `__other__`) and in the access log with `error_class: "not_found"`, so a flood of them is visible: it is usually a DNS record pointing at the proxy for a hostname you never configured, or scanning traffic.
@@ -80,7 +81,7 @@ Check:
 Usually one of: file watcher debounce, ConfigMap symlink swap, or a validation failure.
 
 Check:
-- A config with a validation error gets logged and rejected. The old config keeps running. Run `sbproxy validate --config sb.yml` to see the error.
+- A config with a validation error gets logged and rejected. The old config keeps running. Run `sbproxy validate sb.yml` to see the error.
 - The file watcher reacts to in-place writes. Saves that replace the file by atomic rename (many editors, `sed -i`, and Kubernetes ConfigMap symlink swaps) may not be detected. After a ConfigMap update, send `SIGHUP` or restart the pod to force the reload.
 - The `agent_classes`, `agent_detect`, and `tls_fingerprint` installers are applied at startup and re-applied on every hot reload; each swaps its live state atomically, so changes to those blocks take effect without a restart.
 - Watch `sbproxy_config_reload_total{result}`: a rising `failure` count or a stalled `success` cadence is the reload path telling you it is stuck.
@@ -99,7 +100,7 @@ Check:
 
 Check in order:
 1. Confirm the provider API key is set correctly. Check the `api_key` field or the environment variable it references.
-2. Run `sbproxy validate --config sb.yml` to confirm the provider block parses correctly.
+2. Run `sbproxy validate sb.yml` to confirm the provider block parses correctly.
 3. Check the structured log for `provider` and `status_code` fields on the failed request.
 4. If using a fallback chain, check that at least one provider in the chain has available capacity. The log will show which provider was attempted last.
 5. If the error is "context window exceeded," the requested model does not support the token count in the prompt. Add a model with a larger context window to the provider list.
@@ -120,7 +121,7 @@ SBproxy adds well under 1 ms of overhead under normal load. If you see more, the
 1. Check `upstream_ttfb_ms` in the structured log. If it's high, the upstream is slow, not SBproxy.
 2. If `upstream_ttfb_ms` is low but total latency is high, suspect DNS. Resolved addresses are cached and refreshed in the background by a refreshing resolver, so a request that lands right after a hostname goes stale pays the resolver round trip.
 3. Turn on OpenTelemetry tracing (`telemetry` block) to get a per-span breakdown across the phase pipeline.
-4. If you have Lua or JavaScript configured, cap runaway scripts with the per-engine sandbox budgets: `proxy.scripting.lua.sandbox.max_execution_ms` and `proxy.scripting.javascript.sandbox.budget_ms`.
+4. If you have Lua configured, cap runaway scripts with `proxy.scripting.lua.sandbox.max_execution_ms`. JavaScript uses its built-in 100 ms budget; the parsed `proxy.scripting.javascript` tuning block is not installed yet.
 5. The `sbproxy_phase_duration_seconds{phase}` histogram (and the matching `auth_ms` / `upstream_ttfb_ms` / `response_filter_ms` access-log fields) splits end-to-end latency into auth, upstream wait, and response transforms, so you can see which phase grew without tracing.
 
 ## No access-log lines appear
@@ -176,15 +177,96 @@ Check:
 - Send some traffic. Counters that have never incremented emit no series, and a fresh proxy with zero requests renders empty panels that look broken but are not.
 - Alert panels need the recording rules: `dashboards/prometheus/alerts.yml` references series computed by `dashboards/prometheus/recording-rules.yml`, so load both files.
 
-## Redis went down and cluster behavior changed
+## Redis shared state is degraded
 
-With `proxy.l2_cache_settings` on Redis, an outage does not stop traffic, but shared state degrades to per-node until it reconnects.
+With `proxy.l2_cache_settings` on Redis, a runtime connection failure does not
+stop general traffic. A response-cache lookup failure bypasses the cache and
+does not write that request's upstream response to an outage cache. A shared
+rate-limit operation failure admits the request fail-open instead of switching
+to a local bucket. `summary_buffer` also fails open for the primary AI request,
+but it does not create worker-local summary state. Other L2 consumers retain
+their feature-specific failure posture.
 
 Check:
-- Expected during the outage: rate-limit counters go node-local (a multi-replica fleet lets slightly more traffic through a global limit), and response-cache entries written meanwhile stay local. This is the designed fallback behavior; see [degradation.md](degradation.md).
-- There is no dedicated Redis metric family; confirm the outage in the logs, where failed Redis operations surface as errors on the rate-limit and cache paths.
-- Reconnection is automatic: the client connects lazily and re-establishes the connection on the next operation once Redis is back. There is nothing to restart; fix Redis and the proxy re-attaches.
-- Alert on this when running clustered, since the visible symptom (limits slightly leaky, cache hit rate down) is easy to miss.
+
+- Run `sbproxy validate sb.yml` with the required secret environment
+  already set. Do not print the expanded DSN. Validation catches malformed or
+  unsupported schemes, query strings, fragments, bad database syntax, missing
+  certificate/key partners, unreadable PEM files, and a mismatched client key.
+- Remember that validation does not contact Redis. The first L2 operation
+  performs TLS, `AUTH`, and `SELECT`, so trust, credential, server-side database,
+  and reachability failures appear only when traffic uses shared state.
+- Check that the SBproxy process can read `ca_file`, `cert_file`, and `key_file`.
+  `openssl x509 -in <file> -noout -subject -issuer` safely checks certificate
+  parsing. Let `sbproxy validate` check that the client certificate and key
+  match, rather than dumping either file.
+- Test Redis without putting the password or DSN on the command line. Set
+  `REDISCLI_AUTH` in the command environment and pass the host, port, CA, client
+  certificate, client key, username, and database as separate `redis-cli`
+  options. Run `PING` or `DBSIZE`; do not run `KEYS`, `SCAN`, or `GET` during a
+  privacy-sensitive incident.
+- Expected during an outage: failed response-cache lookups fetch from the
+  upstream and do not arm cache write-back for that request. Failed shared
+  rate-limit increments admit the request without consulting a local bucket.
+  See [degradation.md](degradation.md).
+- Reconnection is automatic. Broken connections leave the pool, and a later
+  operation opens a new connection. Fix Redis or the trust/authentication
+  configuration, then send a new cache miss or shared-state operation. SBproxy
+  does not need a restart when the configured connection material is unchanged.
+
+The runtime error reason points at the next check without exposing the Redis
+response:
+
+| Reason | Check |
+|---|---|
+| `pool_timeout` | Pool saturation or an operation holding a slot too long |
+| `connect_timeout` | Reachability and time spent in TCP, TLS, `AUTH`, or `SELECT` setup |
+| `command_timeout` | Redis command latency and server load |
+| `tls` | CA trust, server name, client certificate, and client key |
+| `auth` | ACL username and password; percent-encoding of reserved URL characters |
+| `transport` | Listener, network, reset, or dropped connection |
+| `server` | Redis application errors, including a server-side `SELECT` rejection |
+| `protocol` | Invalid or unexpected Redis protocol data |
+
+The platform health events named `redis store health failed`,
+`redis store health remains failed`, and `redis store health recovered` are
+transition-based. The first failure from an unknown or healthy state is
+`WARN`, repeated platform health failures are `DEBUG`, and the first successful
+operation after failure is `INFO`. Safe platform events look like this:
+
+```text
+WARN operation="get" reason="tls" redis store health failed
+INFO operation="get" redis store health recovered
+```
+
+That `WARN` to `DEBUG` to `INFO` sequence applies only to the platform health
+events. Response-cache lookup, write, and invalidation call sites and the shared
+rate-limit increment call site can emit a separate `WARN` for every failed
+operation. Repeated consumer warnings do not mean that the platform transition
+suppression failed.
+
+The three Redis L2 metric families use only closed labels:
+
+```bash
+curl -fsS http://127.0.0.1:8080/metrics |
+  grep -E '^(# (HELP|TYPE) sbproxy_redis_kv_|sbproxy_redis_kv_)'
+```
+
+- `sbproxy_redis_kv_connections_total{result}` uses `success` or `error`.
+- `sbproxy_redis_kv_operation_duration_seconds{operation}` uses `get`, `set`,
+  `set_ttl`, `delete`, `increment`, `lock`, `unlock`, or `scan`.
+- `sbproxy_redis_kv_operation_errors_total{operation,reason}` uses the operation
+  values above and `pool_timeout`, `connect_timeout`, `command_timeout`, `tls`,
+  `auth`, `transport`, `server`, or `protocol`.
+
+No Redis metric or platform transition log includes the endpoint, tenant, application
+key, username, database, credential, certificate path, or free-form server
+error. Consumer warnings have their own fixed message text and are not governed
+by the platform transition cadence. Correlate them with the closed-label
+metrics; do not paste a DSN, expanded configuration, credential, cache key, or
+cache value into a diagnostic command or incident ticket. Alert on connection
+errors or operation errors when running more than one replica because the
+application can continue while shared-state guarantees are degraded.
 
 ## TLS handshake fails
 
@@ -206,10 +288,10 @@ Check:
 
 ## HTTP/3 requests fall back to HTTP/2
 
-Cause: HTTP/3 is currently disabled until native QUIC support lands in Pingora. The proxy does not start a QUIC listener and does not advertise `Alt-Svc`, so HTTP/2 is the highest version served. Clients that try HTTP/3 fall back to HTTP/2, which is expected.
+Cause: HTTP/3 is not served by this build. The proxy does not start a QUIC listener and does not advertise `Alt-Svc`, so HTTP/2 is the highest version served. Clients that try HTTP/3 fall back to HTTP/2, which is expected.
 
 Check:
-- The `proxy.http3` block still parses, but it is inert. Setting `enabled: true` only logs a warning and starts no listener, so the absence of an `Alt-Svc: h3` header on responses is expected.
+- Config compilation rejects `proxy.http3.enabled: true` and references WOR-1969. Remove the block or set `enabled: false`.
 - If you need a UDP/QUIC path today, terminate HTTP/3 at an upstream edge or CDN and forward HTTP/2 to SBproxy.
 
 ## A local model will not serve
@@ -243,7 +325,7 @@ Check:
 
 Provider-level `serve:` blocks use the same runtime through compatibility
 lowering. New configurations should use `proxy.model_host`. Live NVIDIA
-remediation is verified in the final GCP integration PR; see
+certification has not been recorded; see
 [model-host-certification.md](model-host-certification.md) before treating a
 simulated device test as hardware evidence.
 
@@ -389,7 +471,7 @@ make build                          # -> target/debug/sbproxy
 # Release build (required by the e2e harness)
 cargo build --release -p sbproxy    # -> target/release/sbproxy
 # Validate a config offline before serving
-sbproxy validate --config ./sb.yml
+sbproxy validate ./sb.yml
 # Diff a proposed config against a baseline (exit 0 no-op / 2 changes / 3 errors)
 sbproxy plan -f ./sb.yml --against ./last-good.yml
 # Run

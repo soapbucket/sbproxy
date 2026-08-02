@@ -5,12 +5,47 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use crate::budget::BudgetConfig;
+use crate::compression::{CompressionPolicy, CompressionSelector};
 use crate::guardrails::GuardrailsConfig;
 use crate::identity::VirtualKeyConfig;
 use crate::ids::ModelId;
 use crate::provider::ProviderConfig;
 use crate::ratelimit::{ModelRateConfig, SurfaceRateConfig};
+use crate::reasoning::ReasoningPolicy;
 use crate::routing::RoutingStrategy;
+
+fn value_ledger_for_sink(
+    ledger: std::sync::Arc<crate::value_ledger::ValueLedger>,
+    path: &std::path::Path,
+) -> std::sync::Arc<crate::value_ledger::ValueLedger> {
+    if !path.as_os_str().is_empty() {
+        if let Err(error) = ledger.promote_to_redb(path) {
+            // This helper runs inside usage_sinks_built, so each handler emits
+            // at most one warning for a failed or conflicting promotion.
+            tracing::warn!(
+                error = %error,
+                requested_path = %path.display(),
+                fallback = "existing_backend",
+                "value ledger: durable promotion failed; keeping existing backend"
+            );
+        }
+    }
+    ledger
+}
+
+struct CachedQuotaPoolStore {
+    kind: &'static str,
+    store: std::sync::Arc<dyn crate::quota_pool::QuotaPoolStore>,
+}
+
+impl std::fmt::Debug for CachedQuotaPoolStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CachedQuotaPoolStore")
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
+}
 
 /// AI gateway handler configuration.
 #[derive(Debug, Deserialize)]
@@ -65,10 +100,23 @@ pub struct AiHandlerConfig {
     /// upstreams.
     #[serde(default)]
     pub resilience: Option<AiResilienceConfig>,
-    /// Optional shadow / side-by-side eval. The primary response is
-    /// served unchanged; a copy of every request goes to the shadow
-    /// provider concurrently and metrics (TTFT, tokens, cost,
-    /// finish_reason) are logged.
+    /// Optional ordered context-compression policy.
+    ///
+    /// When present this block is authoritative, including an empty lever
+    /// list. When absent, the legacy `resilience.llm_aware.context_compress`
+    /// setting is adapted by [`Self::effective_compression_policy`].
+    #[serde(default)]
+    pub compression: Option<CompressionPolicy>,
+    /// Optional concise-reasoning policy applied after per-provider model mapping.
+    ///
+    /// The default is [`ReasoningPolicy::Off`], which preserves existing
+    /// request behavior.
+    #[serde(default)]
+    pub reasoning: ReasoningPolicy,
+    /// Optional shadow / side-by-side eval for sampled non-streaming
+    /// requests. The primary response is served unchanged; an admitted
+    /// copy goes to the shadow provider in a bounded background task.
+    /// Streaming requests are intentionally skipped.
     #[serde(default)]
     pub shadow: Option<AiShadowConfig>,
     /// Optional pattern-aware PII redaction applied at the request
@@ -88,15 +136,28 @@ pub struct AiHandlerConfig {
     /// `pii` configured and a trace backend inside your trust boundary.
     #[serde(default)]
     pub trace_content: bool,
-    /// Opaque semantic-cache configuration block. The OSS proxy
-    /// stores this verbatim and surfaces it through the stream cache
-    /// recorder hook so the enterprise implementation can read its
-    /// `streaming` sub-block (`enabled`, `replay_pacing`, ...) without
-    /// the OSS pipeline having to validate or interpret any of those
-    /// fields. Shape contract lives in the enterprise crate; OSS only
-    /// passes the value through.
+    /// WOR-2096: retain a redacted sample of this origin's prompt and
+    /// response text in a bounded in-memory store so an operator can
+    /// inspect one request's content from the admin console. Off by
+    /// default, and gated twice: capture happens only when this flag is
+    /// on AND the governed key's policy sets `allow_content_capture`.
+    /// The same redaction stack as `trace_content` applies (secret
+    /// redactor, then the origin's `pii` redactor, then the payload
+    /// cap). Nothing is durable: the store clears on restart, and the
+    /// production-grade content path remains OTLP `trace_content`.
     #[serde(default)]
-    pub semantic_cache: Option<serde_json::Value>,
+    pub capture_content: bool,
+    /// Typed semantic-cache configuration for this action.
+    ///
+    /// Parsed and bounds-checked at config load rather than carried as an
+    /// opaque value: WOR-2099 gave this block a backend selector, and a
+    /// misspelled or out-of-range field has to fail the load instead of
+    /// silently disabling the cache on first request. The compiled
+    /// runtime is built from this by
+    /// `sbproxy_core::semantic_cache_runtime`, which owns backend
+    /// selection per origin and forward rule.
+    #[serde(default)]
+    pub semantic_cache: Option<crate::semantic_cache::EmbeddingCacheConfig>,
     /// WOR-800: per-origin versioned prompt store. Named prompts, each
     /// with one or more numbered versions and optional reusable
     /// `partials:` fragments, referenced from a request body as
@@ -139,11 +200,26 @@ pub struct AiHandlerConfig {
     /// runtime. `None` uses only `model_prices` + the built-in catalog.
     #[serde(default)]
     pub rate_card: Option<String>,
-    /// Immutable per-origin model price table. It is initialized at config
-    /// load when possible and lazily for directly-deserialized test or plugin
-    /// configs, so governed admission never consults another origin's table.
+    /// WOR-1880: optional fair-share quota pool across providers.
+    /// When set, each provider attempt reserves against the pool before
+    /// dispatch; a deny advances to the next candidate when alternatives
+    /// exist. Process-local only unless a future atomic backend lands.
+    #[serde(default)]
+    pub quota_pool: Option<crate::quota_pool::QuotaPoolConfig>,
+    /// Optional route-scoped retrieval augmentation.
+    #[serde(default)]
+    pub rag: Option<crate::rag_config::RagRouteConfig>,
+    /// Lazy-compiled guardrail pipeline, owned by this reload-managed
+    /// handler config. Keeping the cache here makes its lifetime follow
+    /// the published config: a reload cannot reuse a pipeline by recycled
+    /// memory address, and dropping the old config releases its pipeline
+    /// once in-flight requests finish.
+    ///
+    /// Compilation failures are cached as strings so every request fails
+    /// closed consistently without retrying deterministic bad config.
     #[serde(skip)]
-    price_table: OnceLock<crate::budget::PriceTable>,
+    pub(crate) guardrails_pipeline:
+        OnceLock<Result<std::sync::Arc<crate::guardrails::GuardrailPipeline>, String>>,
     /// Lazy-built compiled redactor cached on the per-origin
     /// config. Built on first use so config-load does not pay the
     /// regex-compile cost for origins that never serve a request.
@@ -152,15 +228,6 @@ pub struct AiHandlerConfig {
     /// the same way (skip redaction).
     #[serde(skip)]
     pub(crate) pii_redactor: OnceLock<Option<sbproxy_security::pii::PiiRedactor>>,
-    /// Lazy-built OSS embedding semantic cache (WOR-796), parsed from
-    /// the `semantic_cache` block on first use. `None` inside the
-    /// OnceLock means the cache is disabled or misconfigured; the
-    /// request path treats both as "no semantic layer". Held in an
-    /// `Arc` so the instance (and its entries) persist across requests
-    /// for the lifetime of this per-origin config.
-    #[serde(skip)]
-    pub(crate) embedding_cache:
-        OnceLock<Option<std::sync::Arc<crate::semantic_cache::EmbeddingCache>>>,
     /// Lazily-built provider router (WOR-798), held in an `Arc` so its
     /// per-provider latency / token / connection state persists across
     /// requests for the lifetime of this per-origin config (rebuilt only
@@ -180,6 +247,9 @@ pub struct AiHandlerConfig {
     #[serde(skip)]
     pub(crate) ai_policy_compiled:
         OnceLock<Option<std::sync::Arc<crate::ai_policy::CompiledAiPolicy>>>,
+    /// Lazy-built fair-share pool store (WOR-1880, WOR-1993).
+    #[serde(skip)]
+    quota_pool_store: OnceLock<std::sync::Arc<CachedQuotaPoolStore>>,
 }
 
 fn default_usage_parser() -> String {
@@ -187,16 +257,46 @@ fn default_usage_parser() -> String {
 }
 
 impl AiHandlerConfig {
-    /// Resolve the configured, rate-card, or built-in model price for this
-    /// origin. Unknown models return `None`; the governance missing-rate
-    /// policy decides whether that means zero cost or a closed admission.
-    pub fn governance_model_price(&self, model: &str) -> Option<crate::budget::ModelPrice> {
-        self.price_table
-            .get_or_init(|| {
-                crate::budget::build_price_table(&self.model_prices, self.rate_card.as_deref())
-            })
-            .resolve_model(model)
-            .map(|(price, _)| price)
+    /// Eagerly construct enforcing safety classifiers before publication.
+    ///
+    /// The shipped centroids are meaningful only for their pinned embedding
+    /// model and tokenizer bytes. Startup and reload call this after the
+    /// concrete classifier factory is installed, so an unavailable or
+    /// mismatched artifact rejects the candidate pipeline. Routing-only
+    /// `type: classifier` entries keep their established inert-on-error
+    /// behavior.
+    pub fn preflight_default_safety_centroids(&self) -> anyhow::Result<()> {
+        let Some(config) = self.guardrails.as_ref() else {
+            return Ok(());
+        };
+        if crate::guardrails::uses_default_safety_centroids(config) {
+            self.guardrail_pipeline()?;
+        }
+        Ok(())
+    }
+
+    /// Return this handler's compiled guardrail pipeline, building it once.
+    ///
+    /// The returned `Arc` lets in-flight requests finish against the old
+    /// pipeline during a config reload. The owning cache lives on this
+    /// handler rather than in process-global address-keyed state, so the old
+    /// generation is released when both the old config and those requests
+    /// are gone. A compile error remains an error and must fail the request
+    /// closed.
+    pub fn guardrail_pipeline(
+        &self,
+    ) -> anyhow::Result<Option<std::sync::Arc<crate::guardrails::GuardrailPipeline>>> {
+        let Some(config) = self.guardrails.as_ref() else {
+            return Ok(None);
+        };
+        match self.guardrails_pipeline.get_or_init(|| {
+            crate::guardrails::compile_pipeline(config)
+                .map(std::sync::Arc::new)
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(pipeline) => Ok(Some(std::sync::Arc::clone(pipeline))),
+            Err(error) => Err(anyhow::anyhow!("{error}")),
+        }
     }
 
     /// Return the compiled PII redactor for this handler, building
@@ -223,41 +323,56 @@ impl AiHandlerConfig {
             .as_ref()
     }
 
-    /// Return the OSS embedding semantic cache for this handler,
-    /// building it on first call (WOR-796). `None` when the
-    /// `semantic_cache` block is absent, disabled, missing the
-    /// `embedding` provider sub-block, or fails to parse. The cache is
-    /// opt-in, so the common path returns `None` with no cost beyond
-    /// the one-time parse.
-    pub fn embedding_cache(
-        &self,
-    ) -> Option<&std::sync::Arc<crate::semantic_cache::EmbeddingCache>> {
-        self.embedding_cache
-            .get_or_init(|| {
-                let value = self.semantic_cache.as_ref()?;
-                let cfg: crate::semantic_cache::EmbeddingCacheConfig =
-                    match serde_json::from_value(value.clone()) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "AI handler: semantic_cache block did not parse as an embedding \
-                                 cache config; semantic caching disabled"
-                            );
-                            return None;
-                        }
-                    };
-                crate::semantic_cache::EmbeddingCache::from_config(&cfg).map(std::sync::Arc::new)
-            })
-            .as_ref()
-    }
-
     /// Return the shared usage sinks for this handler, building them once.
     /// Empty when none are configured. Sinks are best-effort and never fail a
     /// request.
     pub fn usage_sinks(&self) -> &[std::sync::Arc<dyn crate::usage_sink::UsageSink>] {
         self.usage_sinks_built
-            .get_or_init(|| crate::usage_sink::build_sinks(&self.usage_sinks))
+            .get_or_init(|| {
+                let mut sinks = crate::usage_sink::build_sinks(&self.usage_sinks);
+                // WOR-1913: a served model that declares a `reference:` cloud
+                // price gets a value recorder that prices each local completion
+                // it serves at that reference, so the admin value route and the
+                // dollars-saved doc claim are backed by a real per-completion
+                // tally. No reference configured means no recorder, never a
+                // guessed saving.
+                let mut references = std::collections::BTreeMap::new();
+                let mut ledger_dir: Option<String> = None;
+                for provider in &self.providers {
+                    if let Some(serve) = &provider.serve {
+                        let serve_references =
+                            crate::value_ledger::ValueSink::references_from_serve(serve);
+                        if !serve_references.is_empty() && ledger_dir.is_none() {
+                            ledger_dir.clone_from(&serve.cache_dir);
+                        }
+                        references.extend(serve_references);
+                    }
+                }
+                if !references.is_empty() {
+                    // Persist under the serve cache dir when one is configured
+                    // so the tally survives a restart; an unset cache dir keeps
+                    // an in-memory tally for the life of the process.
+                    let path = ledger_dir
+                        .map(|dir| std::path::Path::new(&dir).join("value-ledger.redb"))
+                        .unwrap_or_default();
+                    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    // Every handler obtains the one stable process facade.
+                    // A configured cache path promotes that facade in place,
+                    // preserving compression and earlier ValueSink references.
+                    // On promotion failure the sink remains active against the
+                    // existing memory or durable backend.
+                    let ledger = value_ledger_for_sink(
+                        crate::value_ledger::value_ledger_or_init_memory(),
+                        &path,
+                    );
+                    sinks.push(std::sync::Arc::new(crate::value_ledger::ValueSink::new(
+                        ledger, references,
+                    )));
+                }
+                sinks
+            })
             .as_slice()
     }
 
@@ -295,6 +410,70 @@ impl AiHandlerConfig {
                 ))
             })
             .clone()
+    }
+
+    /// Return the enforcing fair-share quota store for this handler.
+    ///
+    /// Local pools need no runtime backend. Approximate and strong pools bind
+    /// to the installed governance store only when its consistency guarantee
+    /// matches the configured pool.
+    pub fn quota_pool_store(
+        &self,
+        governance: Option<(
+            std::sync::Arc<dyn crate::governance::GovernanceStore>,
+            crate::governance::GovernanceConsistency,
+        )>,
+    ) -> Result<
+        Option<std::sync::Arc<dyn crate::quota_pool::QuotaPoolStore>>,
+        crate::quota_pool::PoolError,
+    > {
+        let Some(config) = self.quota_pool.as_ref() else {
+            return Ok(None);
+        };
+        if let Some(cached) = self.quota_pool_store.get() {
+            return Ok(Some(std::sync::Arc::clone(&cached.store)));
+        }
+
+        let cached = match config.consistency {
+            crate::quota_pool::QuotaPoolConsistency::Local => {
+                let store = crate::quota_pool::LocalQuotaPool::new(vec![config.clone()])
+                    .map_err(|_| crate::quota_pool::PoolError::InvalidState)?;
+                CachedQuotaPoolStore {
+                    kind: "local",
+                    store: std::sync::Arc::new(store),
+                }
+            }
+            crate::quota_pool::QuotaPoolConsistency::Approximate => {
+                let (store, consistency) =
+                    governance.ok_or(crate::quota_pool::PoolError::InvalidState)?;
+                if consistency != crate::governance::GovernanceConsistency::Approximate {
+                    return Err(crate::quota_pool::PoolError::InvalidState);
+                }
+                let store = crate::quota_pool::SharedQuotaPool::new(vec![config.clone()], store)
+                    .map_err(|_| crate::quota_pool::PoolError::InvalidState)?;
+                CachedQuotaPoolStore {
+                    kind: "approximate",
+                    store: std::sync::Arc::new(store),
+                }
+            }
+            crate::quota_pool::QuotaPoolConsistency::Strong => {
+                let (store, consistency) =
+                    governance.ok_or(crate::quota_pool::PoolError::InvalidState)?;
+                if consistency != crate::governance::GovernanceConsistency::Strict {
+                    return Err(crate::quota_pool::PoolError::InvalidState);
+                }
+                let store = crate::quota_pool::SharedQuotaPool::new(vec![config.clone()], store)
+                    .map_err(|_| crate::quota_pool::PoolError::InvalidState)?;
+                CachedQuotaPoolStore {
+                    kind: "strong",
+                    store: std::sync::Arc::new(store),
+                }
+            }
+        };
+        let cached = self
+            .quota_pool_store
+            .get_or_init(|| std::sync::Arc::new(cached));
+        Ok(Some(std::sync::Arc::clone(&cached.store)))
     }
 
     /// Apply PII redaction to a parsed request body. Returns whether
@@ -497,17 +676,18 @@ fn default_health_healthy() -> u32 {
     2
 }
 
-/// Shadow / side-by-side eval: send the same request to a second
-/// provider concurrently and log metadata. The shadow response is
-/// drained and discarded; the primary's response goes to the client
-/// unchanged.
+/// Shadow / side-by-side eval: send the same request to a second provider
+/// concurrently and log metadata. V1 is restricted to non-streaming chat
+/// evaluation surfaces (`chat/completions`, normalized `messages`, and
+/// normalized `responses`). The shadow response is drained and discarded;
+/// the primary's response goes to the client unchanged.
 ///
-/// Shadow tasks are supervised by a bounded queue. When the in-flight
-/// queue fills up the new request is dropped (a counter ticks) instead
-/// of being silently spawned, and each task has a hard wall-clock
-/// timeout that, when exceeded, drops the future and ticks a separate
-/// timeout counter. See `sbproxy_ai::client::AiClient` for the
-/// supervisor implementation.
+/// Shadow tasks are supervised by bounded task and memory admission. When
+/// either capacity fills up the new request is dropped (a counter ticks)
+/// instead of being silently spawned, and each task has a hard wall-clock
+/// timeout that, when exceeded, drops the future and ticks a separate timeout
+/// counter. See `sbproxy_ai::client::AiClient` for the supervisor
+/// implementation.
 #[derive(Debug, Deserialize, Clone)]
 pub struct AiShadowConfig {
     /// Provider name to shadow against. Must also appear in the
@@ -559,7 +739,8 @@ fn deserialize_routing<'de, D>(deserializer: D) -> Result<RoutingStrategy, D::Er
 where
     D: serde::Deserializer<'de>,
 {
-    use crate::routing::{CascadeConfig, CascadeTier};
+    use crate::routing::{CascadeConfig, CascadeTier, PeakEwmaConfig};
+    use crate::routing_state::PrefixAffinityConfig;
     use serde::de::Error;
 
     // Step 1: capture the raw input. Cascade carries a struct
@@ -608,6 +789,21 @@ where
         }));
     }
 
+    if strategy_name == "peak_ewma" {
+        let config: PeakEwmaConfig = serde_json::from_value(serde_json::Value::Object(obj.clone()))
+            .map_err(Error::custom)?;
+        return Ok(RoutingStrategy::PeakEwma(config));
+    }
+
+    if strategy_name == "prefix_affinity" {
+        let mut fields = obj.clone();
+        fields.remove("strategy");
+        let config: PrefixAffinityConfig =
+            serde_json::from_value(serde_json::Value::Object(fields)).map_err(Error::custom)?;
+        config.validate().map_err(Error::custom)?;
+        return Ok(RoutingStrategy::PrefixAffinity(config));
+    }
+
     // WOR-797: cost/quality routing carries cheap_provider /
     // frontier_provider / cost_threshold alongside the discriminator.
     // `learned` is accepted as an alias.
@@ -629,6 +825,18 @@ impl AiHandlerConfig {
     /// Build from a generic JSON value.
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
         let mut config: Self = serde_json::from_value(value)?;
+        if let Some(rag) = config.rag.as_ref() {
+            rag.validate()
+                .map_err(|error| anyhow::anyhow!("ai rag: {error}"))?;
+        }
+        config
+            .reasoning
+            .validate()
+            .map_err(|error| anyhow::anyhow!("ai reasoning: {error}"))?;
+        if let Some(guardrails) = &config.guardrails {
+            crate::guardrails::validate_pipeline_config(guardrails)
+                .map_err(|error| anyhow::anyhow!("ai guardrails: {error}"))?;
+        }
         // WOR-1044 PR4: reversible PII and semantic caching cannot
         // safely co-exist on the same origin. The semantic cache
         // keys responses on a similarity hash of the prompt; two
@@ -656,10 +864,27 @@ impl AiHandlerConfig {
         // WOR-603: validate each provider's base_url at config load so an
         // SSRF target (file://, link-local metadata, loopback, ...) fails
         // fast here rather than being dispatched at request time.
+        let mut provider_names = std::collections::HashSet::new();
+        for provider in &config.providers {
+            if !provider_names.insert(provider.name.as_str()) {
+                anyhow::bail!(
+                    "ai provider name {:?} is configured more than once",
+                    provider.name
+                );
+            }
+        }
         for provider in &config.providers {
             provider.validate_managed_model().map_err(|error| {
                 anyhow::anyhow!("ai provider {:?} managed model: {error}", provider.name)
             })?;
+            provider
+                .validate_native_credential_binding()
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "ai provider {:?} native credential binding: {error}",
+                        provider.name
+                    )
+                })?;
             provider
                 .validate_base_url()
                 .map_err(|e| anyhow::anyhow!("ai provider {:?} base_url: {e}", provider.name))?;
@@ -699,6 +924,11 @@ impl AiHandlerConfig {
                     ));
                 }
             }
+        }
+        // WOR-1880: reject strong consistency / invalid pool shapes at load.
+        if let Some(pool) = &config.quota_pool {
+            crate::quota_pool::validate_quota_pool_config(pool)
+                .map_err(|error| anyhow::anyhow!("ai quota_pool: {error}"))?;
         }
         // WOR-1683: on a served provider the serve-entry name IS the
         // model id every plane sees, so an empty `models:` list derives
@@ -789,20 +1019,58 @@ impl AiHandlerConfig {
                 }
             }
         }
+        if let Some(compression) = &mut config.compression {
+            compression.apply_state_defaults();
+            compression.validate(&config.providers)?;
+        }
+        for (index, key) in config.virtual_keys.iter().enumerate() {
+            let Some(raw_selector) = key.compression_profile.as_deref() else {
+                continue;
+            };
+            let selector = CompressionSelector::parse(raw_selector).map_err(|_| {
+                anyhow::anyhow!(
+                    "ai virtual_keys[{index}].compression_profile must be on, off, or a valid profile name"
+                )
+            })?;
+            if let CompressionSelector::Profile(name) = selector {
+                let declared = config
+                    .compression
+                    .as_ref()
+                    .is_some_and(|policy| policy.profiles.contains_key(&name));
+                if !declared {
+                    anyhow::bail!(
+                        "ai virtual_keys[{index}].compression_profile selects an undeclared profile"
+                    );
+                }
+            }
+        }
         // WOR-1707: install the operator price table (config prices +
         // external rate card) into the process-global consulted by cost
         // estimation. Runs on every config (re)load so prices update
         // with the config; a missing/bad rate card warns and is skipped.
-        crate::budget::validate_governance_price_sources(
+        crate::budget::set_price_table(crate::budget::build_price_table(
             &config.model_prices,
             config.rate_card.as_deref(),
-        )
-        .map_err(anyhow::Error::msg)?;
-        let price_table =
-            crate::budget::build_price_table(&config.model_prices, config.rate_card.as_deref());
-        crate::budget::set_price_table(price_table.clone());
-        let _ = config.price_table.set(price_table);
+        ));
         Ok(config)
+    }
+
+    /// Resolve explicit compression or synthesize the legacy window-fit policy.
+    ///
+    /// An explicit block always wins, including an explicit empty lever list.
+    /// The explicit path is borrowed and does not allocate on request handling.
+    pub fn effective_compression_policy(&self) -> Option<std::borrow::Cow<'_, CompressionPolicy>> {
+        if let Some(policy) = self.compression.as_ref() {
+            return Some(std::borrow::Cow::Borrowed(policy));
+        }
+        let legacy = self
+            .resilience
+            .as_ref()
+            .and_then(|resilience| resilience.llm_aware.as_ref())
+            .filter(|legacy| legacy.context_compress)?;
+        Some(std::borrow::Cow::Owned(
+            CompressionPolicy::legacy_window_fit(legacy.completion_reserve_tokens),
+        ))
     }
 
     /// Number of provider attempts allowed for one client request.
@@ -907,6 +1175,77 @@ impl AiSurface {
             AiSurface::Unknown => "unknown",
         }
     }
+
+    /// The OpenTelemetry GenAI `gen_ai.operation.name` for this surface
+    /// (WOR-2085).
+    ///
+    /// [`Self::label`] is the metrics/tracing *surface* identifier and
+    /// stays exactly as it is; this mapping exists because the OTel
+    /// convention names the operation differently: a chat completion is
+    /// `chat`, not `chat_completions`, and every image or audio shape
+    /// collapses onto one operation name. Before this mapping the
+    /// request span stamped the surface label into
+    /// `gen_ai.operation.name`, which happened to be right for
+    /// embeddings and `images/generations` and wrong for everything
+    /// else, chat included.
+    ///
+    /// Control-plane surfaces (models, files, batches, fine-tuning,
+    /// assistants, threads, moderations, reranking, unknown) are
+    /// deliberately left on their surface label: they are not GenAI
+    /// generation operations, the convention has no name for them, and
+    /// relabelling them `chat` would be the exact misreporting this
+    /// mapping removes.
+    pub fn operation_name(&self) -> &'static str {
+        match self {
+            // Chat-shaped generation, whatever the inbound dialect:
+            // OpenAI chat completions, Anthropic Messages, OpenAI
+            // Responses, and the realtime session all produce chat
+            // turns.
+            AiSurface::ChatCompletions
+            | AiSurface::Messages
+            | AiSurface::Responses
+            | AiSurface::Realtime => crate::tracing_spans::OP_CHAT,
+            AiSurface::Embeddings => crate::tracing_spans::OP_EMBEDDINGS,
+            AiSurface::ImageGeneration | AiSurface::ImageEdits | AiSurface::ImageVariations => {
+                crate::tracing_spans::OP_IMAGE_GENERATION
+            }
+            AiSurface::AudioTranscription | AiSurface::AudioSpeech => {
+                crate::tracing_spans::OP_AUDIO
+            }
+            // Not generation operations; see the doc comment.
+            AiSurface::Models
+            | AiSurface::Assistants
+            | AiSurface::Threads
+            | AiSurface::Batches
+            | AiSurface::FineTuning
+            | AiSurface::Files
+            | AiSurface::Moderations
+            | AiSurface::Reranking
+            | AiSurface::Unknown => self.label(),
+        }
+    }
+
+    /// Whether v1 shadow evaluation may replay this request surface.
+    ///
+    /// Only chat evaluation surfaces are safe to copy. Mutating and non-chat
+    /// APIs must never enter the shadow transport.
+    pub fn supports_shadow_eval(&self) -> bool {
+        matches!(
+            self,
+            AiSurface::ChatCompletions | AiSurface::Messages | AiSurface::Responses
+        )
+    }
+
+    /// Whether a route reasoning policy may transform this request surface.
+    ///
+    /// Only prompt-completion surfaces carry the canonical message body and
+    /// completion semantics required by provider reasoning controls.
+    pub fn supports_reasoning_policy(&self) -> bool {
+        matches!(
+            self,
+            AiSurface::ChatCompletions | AiSurface::Messages | AiSurface::Responses
+        )
+    }
 }
 
 /// Extract the surface-specific input-text field from a parsed JSON
@@ -1009,146 +1348,7 @@ pub fn classify_surface(_method: &str, path: &str) -> AiSurface {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn governed_prices_are_isolated_per_origin() {
-        let first = AiHandlerConfig::from_config(serde_json::json!({
-            "providers": [],
-            "model_prices": {
-                "shared-local-model": {
-                    "input_per_million": 1.0,
-                    "output_per_million": 2.0
-                }
-            }
-        }))
-        .expect("first origin config");
-        let second = AiHandlerConfig::from_config(serde_json::json!({
-            "providers": [],
-            "model_prices": {
-                "shared-local-model": {
-                    "input_per_million": 10.0,
-                    "output_per_million": 20.0
-                }
-            }
-        }))
-        .expect("second origin config");
-
-        let first_price = first
-            .governance_model_price("shared-local-model")
-            .expect("first origin price");
-        let second_price = second
-            .governance_model_price("shared-local-model")
-            .expect("second origin price");
-
-        assert_eq!(first_price.input_per_million, 1.0);
-        assert_eq!(first_price.output_per_million, 2.0);
-        assert_eq!(second_price.input_per_million, 10.0);
-        assert_eq!(second_price.output_per_million, 20.0);
-    }
-
-    #[test]
-    fn governed_price_layers_inline_over_rate_card_over_catalog() {
-        let rate_card = tempfile::NamedTempFile::new().expect("temporary rate card");
-        std::fs::write(
-            rate_card.path(),
-            r#"{
-                "operator-only": {
-                    "input_cost_per_token": 0.000003,
-                    "output_cost_per_token": 0.000004
-                },
-                "rate-only": {
-                    "input_cost_per_token": 0.000007,
-                    "output_cost_per_token": 0.000008
-                }
-            }"#,
-        )
-        .expect("write rate card");
-        let config: AiHandlerConfig = serde_json::from_value(serde_json::json!({
-            "providers": [],
-            "rate_card": rate_card.path().to_string_lossy(),
-            "model_prices": {
-                "operator-only": {
-                    "input_per_million": 5.0,
-                    "output_per_million": 6.0
-                }
-            }
-        }))
-        .expect("origin config");
-
-        let inline = config
-            .governance_model_price("operator-only")
-            .expect("inline price");
-        let rate = config
-            .governance_model_price("rate-only")
-            .expect("rate card price");
-        let catalog = config
-            .governance_model_price("gpt-4o-mini")
-            .expect("catalog price");
-
-        assert_eq!(inline.input_per_million, 5.0);
-        assert_eq!(inline.output_per_million, 6.0);
-        assert_eq!(rate.input_per_million, 7.0);
-        assert_eq!(rate.output_per_million, 8.0);
-        assert_eq!(catalog.input_per_million, 0.15);
-        assert_eq!(catalog.output_per_million, 0.60);
-    }
-
-    #[test]
-    fn invalid_inline_governance_price_fails_handler_config() {
-        for field in [
-            "input_per_million",
-            "output_per_million",
-            "cache_read_per_million",
-            "cache_write_per_million",
-        ] {
-            let mut price = serde_json::json!({
-                "input_per_million": 1.0,
-                "output_per_million": 2.0
-            });
-            price[field] = serde_json::json!(-1.0);
-            let result = AiHandlerConfig::from_config(serde_json::json!({
-                "providers": [],
-                "model_prices": {"invalid-local-model": price}
-            }));
-            let error = result.expect_err("negative governance price must fail config load");
-            let message = error.to_string();
-            assert!(
-                message.contains("invalid-local-model"),
-                "unexpected error: {message}"
-            );
-            assert!(message.contains(field), "unexpected error: {message}");
-        }
-    }
-
-    #[test]
-    fn invalid_rate_card_governance_price_fails_handler_config() {
-        let rate_card = tempfile::NamedTempFile::new().expect("temporary rate card");
-        std::fs::write(
-            rate_card.path(),
-            r#"{
-                "invalid-rate-model": {
-                    "input_cost_per_token": -0.000001,
-                    "output_cost_per_token": 0.000002
-                }
-            }"#,
-        )
-        .expect("write rate card");
-
-        let result = AiHandlerConfig::from_config(serde_json::json!({
-            "providers": [],
-            "rate_card": rate_card.path().to_string_lossy()
-        }));
-        let error = result.expect_err("negative rate-card price must fail config load");
-        let message = error.to_string();
-        assert!(
-            message.contains("invalid-rate-model"),
-            "unexpected error: {message}"
-        );
-        assert!(
-            message.contains("input_cost_per_token"),
-            "unexpected error: {message}"
-        );
-    }
+    use crate::reasoning::ReasoningPolicy;
 
     #[test]
     fn usage_sinks_parse_and_build_from_config() {
@@ -1169,6 +1369,36 @@ mod tests {
     }
 
     #[test]
+    fn value_sink_initialization_keeps_the_winning_facade_on_path_conflict() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let winning_path = dir.path().join("winning.redb");
+        let conflicting_path = dir.path().join("conflicting.redb");
+        let ledger =
+            std::sync::Arc::new(crate::value_ledger::ValueLedger::open("").expect("memory ledger"));
+        ledger
+            .promote_to_redb(&winning_path)
+            .expect("winning promotion");
+
+        let selected = value_ledger_for_sink(ledger.clone(), &conflicting_path);
+        assert!(std::sync::Arc::ptr_eq(&ledger, &selected));
+        selected.record_compression(
+            "handler-fallback",
+            crate::compression::LeverKind::WindowFit,
+            23,
+            0,
+            sbproxy_model_host::TokenCountPrecision::Heuristic,
+        );
+        drop(selected);
+        drop(ledger);
+
+        let report = crate::value_ledger::ValueLedger::open(&winning_path)
+            .expect("reopen winning ledger")
+            .report();
+        assert_eq!(report.total_compression_tokens_saved, 23);
+        assert!(!conflicting_path.exists());
+    }
+
+    #[test]
     fn model_allowed_no_lists() {
         let config = AiHandlerConfig {
             providers: Vec::new(),
@@ -1184,22 +1414,27 @@ mod tests {
             per_surface_rate_limits: HashMap::new(),
             max_concurrent: None,
             resilience: None,
+            compression: None,
+            reasoning: ReasoningPolicy::Off,
             shadow: None,
             pii: None,
             trace_content: false,
+            capture_content: false,
             semantic_cache: None,
             prompts: None,
             usage_parser: "auto".to_string(),
             pii_redactor: OnceLock::new(),
-            embedding_cache: OnceLock::new(),
             router: OnceLock::new(),
             usage_sinks: vec![],
             usage_sinks_built: OnceLock::new(),
             ai_policy: None,
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
-            price_table: OnceLock::new(),
+            quota_pool: None,
+            rag: None,
+            guardrails_pipeline: OnceLock::new(),
             ai_policy_compiled: OnceLock::new(),
+            quota_pool_store: OnceLock::new(),
         };
         assert!(config.is_model_allowed("gpt-4"));
         assert!(config.is_model_allowed("anything"));
@@ -1221,22 +1456,27 @@ mod tests {
             per_surface_rate_limits: HashMap::new(),
             max_concurrent: None,
             resilience: None,
+            compression: None,
+            reasoning: ReasoningPolicy::Off,
             shadow: None,
             pii: None,
             trace_content: false,
+            capture_content: false,
             semantic_cache: None,
             prompts: None,
             usage_parser: "auto".to_string(),
             pii_redactor: OnceLock::new(),
-            embedding_cache: OnceLock::new(),
             router: OnceLock::new(),
             usage_sinks: vec![],
             usage_sinks_built: OnceLock::new(),
             ai_policy: None,
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
-            price_table: OnceLock::new(),
+            quota_pool: None,
+            rag: None,
+            guardrails_pipeline: OnceLock::new(),
             ai_policy_compiled: OnceLock::new(),
+            quota_pool_store: OnceLock::new(),
         };
         assert!(!config.is_model_allowed("gpt-4"));
         assert!(config.is_model_allowed("gpt-3.5-turbo"));
@@ -1258,22 +1498,27 @@ mod tests {
             per_surface_rate_limits: HashMap::new(),
             max_concurrent: None,
             resilience: None,
+            compression: None,
+            reasoning: ReasoningPolicy::Off,
             shadow: None,
             pii: None,
             trace_content: false,
+            capture_content: false,
             semantic_cache: None,
             prompts: None,
             usage_parser: "auto".to_string(),
             pii_redactor: OnceLock::new(),
-            embedding_cache: OnceLock::new(),
             router: OnceLock::new(),
             usage_sinks: vec![],
             usage_sinks_built: OnceLock::new(),
             ai_policy: None,
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
-            price_table: OnceLock::new(),
+            quota_pool: None,
+            rag: None,
+            guardrails_pipeline: OnceLock::new(),
             ai_policy_compiled: OnceLock::new(),
+            quota_pool_store: OnceLock::new(),
         };
         assert!(config.is_model_allowed("gpt-4"));
         assert!(config.is_model_allowed("gpt-3.5-turbo"));
@@ -1296,22 +1541,27 @@ mod tests {
             per_surface_rate_limits: HashMap::new(),
             max_concurrent: None,
             resilience: None,
+            compression: None,
+            reasoning: ReasoningPolicy::Off,
             shadow: None,
             pii: None,
             trace_content: false,
+            capture_content: false,
             semantic_cache: None,
             prompts: None,
             usage_parser: "auto".to_string(),
             pii_redactor: OnceLock::new(),
-            embedding_cache: OnceLock::new(),
             router: OnceLock::new(),
             usage_sinks: vec![],
             usage_sinks_built: OnceLock::new(),
             ai_policy: None,
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
-            price_table: OnceLock::new(),
+            quota_pool: None,
+            rag: None,
+            guardrails_pipeline: OnceLock::new(),
             ai_policy_compiled: OnceLock::new(),
+            quota_pool_store: OnceLock::new(),
         };
         // Block list wins
         assert!(!config.is_model_allowed("gpt-4"));
@@ -1384,6 +1634,414 @@ mod tests {
         assert!(config.blocked_models.is_empty());
         assert!(config.max_body_size.is_none());
         assert!(!config.require_governed_key);
+        assert!(config.quota_pool.is_none());
+        assert_eq!(config.reasoning, ReasoningPolicy::Off);
+    }
+
+    #[test]
+    fn reasoning_policy_accepts_closed_config_shapes() {
+        for (value, expected) in [
+            (serde_json::json!("off"), ReasoningPolicy::Off),
+            (serde_json::json!("concise"), ReasoningPolicy::Concise),
+            (
+                serde_json::json!({"budget": 2048}),
+                ReasoningPolicy::Budget(2048),
+            ),
+        ] {
+            let config = AiHandlerConfig::from_config(serde_json::json!({
+                "providers": [{"name": "openai"}],
+                "reasoning": value,
+            }))
+            .expect("valid reasoning policy");
+            assert_eq!(config.reasoning, expected);
+        }
+    }
+
+    #[test]
+    fn reasoning_policy_rejects_zero_budget() {
+        let error = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai"}],
+            "reasoning": {"budget": 0},
+        }))
+        .expect_err("zero reasoning budget must fail validation")
+        .to_string();
+
+        assert!(
+            error.contains("reasoning budget must be greater than zero"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn from_config_rejects_invalid_guardrail_placement_before_serving() {
+        let json = serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "guardrails": {
+                "input": [{
+                    "type": "regex",
+                    "patterns": ["secret"],
+                    "action": "block"
+                }],
+                "output": [{
+                    "type": "classifier",
+                    "backend": {
+                        "kind": "embedding",
+                        "model_path": "/unused/model.onnx",
+                        "tokenizer_path": "/unused/tokenizer.json"
+                    },
+                    "classes": {
+                        "documentation": ["write the readme"]
+                    }
+                }]
+            }
+        });
+
+        let error = AiHandlerConfig::from_config(json)
+            .expect_err("an input-only classifier under output must fail config compilation")
+            .to_string();
+        assert!(
+            error.contains("classifier") && error.contains("input-only"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn from_config_rejects_malformed_classifier_before_serving() {
+        let json = serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "guardrails": {
+                "input": [
+                    {
+                        "type": "regex",
+                        "patterns": ["secret"],
+                        "action": "block"
+                    },
+                    {
+                        "type": "classifier",
+                        "backend": {
+                            "kind": "embedding",
+                            "model_path": "/unused/model.onnx",
+                            "tokenizer_path": "/unused/tokenizer.json"
+                        },
+                        "classes": {}
+                    }
+                ]
+            }
+        });
+
+        let error = AiHandlerConfig::from_config(json)
+            .expect_err("a malformed classifier must fail config compilation")
+            .to_string();
+        assert!(
+            error.contains("classifier") && error.contains("classes"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn from_config_rejects_unknown_classifier_fields_before_serving() {
+        let json = serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "guardrails": {
+                "input": [{
+                    "type": "classifier",
+                    "backend": {
+                        "kind": "embedding",
+                        "model_path": "/unused/model.onnx",
+                        "tokenizer_path": "/unused/tokenizer.json",
+                        "min_socre": 0.30
+                    },
+                    "classes": {
+                        "documentation": ["write the readme"]
+                    }
+                }]
+            }
+        });
+
+        let error = AiHandlerConfig::from_config(json)
+            .expect_err("unknown classifier fields must fail config compilation")
+            .to_string();
+        assert!(
+            error.contains("unknown field") && error.contains("min_socre"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn from_config_rejects_overlong_classifier_examples_before_serving() {
+        let json = serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "guardrails": {
+                "input": [{
+                    "type": "classifier",
+                    "backend": {
+                        "kind": "embedding",
+                        "model_path": "/unused/model.onnx",
+                        "tokenizer_path": "/unused/tokenizer.json"
+                    },
+                    "classes": {
+                        "documentation": ["five!"]
+                    },
+                    "max_chars": 4
+                }]
+            }
+        });
+
+        let error = AiHandlerConfig::from_config(json)
+            .expect_err("overlong examples must fail config compilation")
+            .to_string();
+        assert!(
+            error.contains("documentation") && error.contains("max_chars"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn from_config_validates_classifier_without_loading_artifacts() {
+        let json = serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "guardrails": {
+                "input": [{
+                    "type": "classifier",
+                    "backend": {
+                        "kind": "embedding",
+                        "model_path": "/not-loaded-during-validation/model.onnx",
+                        "tokenizer_path": "/not-loaded-during-validation/tokenizer.json"
+                    },
+                    "classes": {
+                        "documentation": ["write the readme"]
+                    }
+                }]
+            }
+        });
+
+        AiHandlerConfig::from_config(json)
+            .expect("config compilation validates structure without opening model artifacts");
+    }
+
+    #[test]
+    fn guardrail_pipeline_lifetime_tracks_reload_managed_handler_config() {
+        fn config(pattern: &str) -> AiHandlerConfig {
+            AiHandlerConfig::from_config(serde_json::json!({
+                "providers": [{"name": "openai", "api_key": "sk-test"}],
+                "guardrails": {
+                    "input": [{
+                        "type": "regex",
+                        "patterns": [pattern],
+                        "action": "block"
+                    }]
+                }
+            }))
+            .expect("valid handler config")
+        }
+
+        let old_config = config("old-secret");
+        let old_pipeline = old_config
+            .guardrail_pipeline()
+            .expect("old pipeline compiles")
+            .expect("old pipeline configured");
+        let old_pipeline_again = old_config
+            .guardrail_pipeline()
+            .expect("cached old pipeline")
+            .expect("old pipeline configured");
+        assert!(
+            std::sync::Arc::ptr_eq(&old_pipeline, &old_pipeline_again),
+            "one handler config should compile its pipeline only once"
+        );
+        assert!(old_pipeline.check_input_text("old-secret").is_some());
+        drop(old_pipeline_again);
+        assert_eq!(
+            std::sync::Arc::strong_count(&old_pipeline),
+            2,
+            "the handler config and in-flight request should be the only owners"
+        );
+
+        let new_config = config("new-secret");
+        let new_pipeline = new_config
+            .guardrail_pipeline()
+            .expect("replacement pipeline compiles")
+            .expect("replacement pipeline configured");
+        assert!(new_pipeline.check_input_text("old-secret").is_none());
+        assert!(new_pipeline.check_input_text("new-secret").is_some());
+
+        drop(old_config);
+        assert_eq!(
+            std::sync::Arc::strong_count(&old_pipeline),
+            1,
+            "publishing a replacement config must release the old compiled pipeline"
+        );
+    }
+
+    #[test]
+    fn guardrail_pipeline_runtime_compilation_error_remains_fail_closed() {
+        // Production publication goes through `from_config` and rejects this
+        // first. Deserializing directly exercises the request path's final
+        // defense against a future validation/compiler mismatch.
+        let config: AiHandlerConfig = serde_json::from_value(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "guardrails": {
+                "input": [{
+                    "type": "regex",
+                    "patterns": ["("],
+                    "action": "block"
+                }]
+            }
+        }))
+        .expect("raw handler shape");
+
+        let first = config
+            .guardrail_pipeline()
+            .expect_err("invalid guardrail compilation must be an error")
+            .to_string();
+        let second = config
+            .guardrail_pipeline()
+            .expect_err("cached invalid guardrail compilation must remain an error")
+            .to_string();
+        assert!(first.contains("invalid regex pattern"), "{first}");
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn from_config_accepts_strong_quota_pool_for_runtime_backend_binding() {
+        let json = serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "quota_pool": {
+                "name": "shared",
+                "total_limit": 100,
+                "weights": {"virtual-key-a": 1},
+                "policy": "hard",
+                "consistency": "strong"
+            }
+        });
+        let config = AiHandlerConfig::from_config(json)
+            .expect("backend-independent config validation accepts strong consistency");
+        assert_eq!(
+            config.quota_pool.as_ref().expect("quota pool").consistency,
+            crate::quota_pool::QuotaPoolConsistency::Strong
+        );
+    }
+
+    fn handler_with_quota_consistency(consistency: &str) -> AiHandlerConfig {
+        AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "quota_pool": {
+                "name": "shared",
+                "total_limit": 10,
+                "weights": {"virtual-key-a": 1},
+                "policy": "burst",
+                "consistency": consistency
+            }
+        }))
+        .expect("valid handler quota config")
+    }
+
+    #[tokio::test]
+    async fn local_quota_pool_builds_without_a_governance_backend() {
+        let config = handler_with_quota_consistency("local");
+        let store = config
+            .quota_pool_store(None)
+            .expect("local store builds")
+            .expect("quota configured");
+
+        let reservation = store
+            .reserve("shared", "virtual-key-a", 1, "local-request:0")
+            .await
+            .expect("local pool admits configured member");
+        store
+            .reconcile(reservation, crate::quota_pool::PoolUsage { units: 1 })
+            .await
+            .expect("local reservation settles");
+    }
+
+    #[tokio::test]
+    async fn approximate_quota_pool_requires_a_matching_governance_backend() {
+        let missing = handler_with_quota_consistency("approximate");
+        assert!(matches!(
+            missing.quota_pool_store(None),
+            Err(crate::quota_pool::PoolError::InvalidState)
+        ));
+
+        let mismatched = handler_with_quota_consistency("approximate");
+        let governance: std::sync::Arc<dyn crate::governance::GovernanceStore> =
+            std::sync::Arc::new(
+                crate::governance::InMemoryGovernanceStore::new(Default::default())
+                    .expect("memory governance"),
+            );
+        assert!(matches!(
+            mismatched.quota_pool_store(Some((
+                governance,
+                crate::governance::GovernanceConsistency::Strict,
+            ))),
+            Err(crate::quota_pool::PoolError::InvalidState)
+        ));
+
+        let matching = handler_with_quota_consistency("approximate");
+        let governance: std::sync::Arc<dyn crate::governance::GovernanceStore> =
+            std::sync::Arc::new(
+                crate::governance::InMemoryGovernanceStore::new(Default::default())
+                    .expect("memory governance"),
+            );
+        let store = matching
+            .quota_pool_store(Some((
+                governance,
+                crate::governance::GovernanceConsistency::Approximate,
+            )))
+            .expect("matching approximate backend")
+            .expect("quota configured");
+        assert!(store
+            .reserve("shared", "virtual-key-a", 1, "approximate-request:0")
+            .await
+            .is_ok());
+    }
+
+    #[test]
+    fn strong_quota_pool_treats_a_missing_or_mismatched_backend_as_invalid_state() {
+        let missing = handler_with_quota_consistency("strong");
+        assert!(matches!(
+            missing.quota_pool_store(None),
+            Err(crate::quota_pool::PoolError::InvalidState)
+        ));
+
+        let mismatched = handler_with_quota_consistency("strong");
+        let governance: std::sync::Arc<dyn crate::governance::GovernanceStore> =
+            std::sync::Arc::new(
+                crate::governance::InMemoryGovernanceStore::new(Default::default())
+                    .expect("memory governance"),
+            );
+        assert!(matches!(
+            mismatched.quota_pool_store(Some((
+                governance,
+                crate::governance::GovernanceConsistency::Approximate,
+            ))),
+            Err(crate::quota_pool::PoolError::InvalidState)
+        ));
+    }
+
+    #[test]
+    fn prefix_affinity_object_parses_and_rejects_zero_bounds() {
+        let config = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "routing": {
+                "strategy": "prefix_affinity",
+                "ttl_secs": 45,
+                "max_prefixes_per_provider": 64
+            }
+        }))
+        .expect("bounded prefix config");
+        let RoutingStrategy::PrefixAffinity(prefix) = config.routing else {
+            panic!("expected prefix affinity");
+        };
+        assert_eq!(prefix.ttl_secs, 45);
+        assert_eq!(prefix.max_prefixes_per_provider, 64);
+
+        let invalid = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "routing": {
+                "strategy": "prefix_affinity",
+                "ttl_secs": 0
+            }
+        }));
+        assert!(invalid.is_err(), "zero TTL must fail config loading");
     }
 
     #[test]
@@ -1484,6 +2142,44 @@ mod tests {
     }
 
     #[test]
+    fn from_config_rejects_duplicate_provider_destination_names() {
+        let err = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "primary", "base_url": "https://one.example/v1"},
+                {"name": "primary", "base_url": "https://two.example/v1"}
+            ]
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("configured more than once"), "{err}");
+    }
+
+    #[test]
+    fn from_config_validates_native_credential_destination_binding() {
+        let err = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "primary",
+                "provider_type": "openai",
+                "base_url": "https://8.8.8.8/v1",
+                "accept_native_credentials_for": "anthropic"
+            }]
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("native credential binding"), "{err}");
+
+        assert!(AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "primary",
+                "provider_type": "openai",
+                "base_url": "https://8.8.8.8/v1",
+                "accept_native_credentials_for": "openai"
+            }]
+        }))
+        .is_ok());
+    }
+
+    #[test]
     fn from_config_rejects_serve_with_base_url() {
         // WOR-1680: a served provider is hosted locally and must not
         // also carry a base_url; `plan` rejects it with a clear message.
@@ -1566,6 +2262,47 @@ mod tests {
             "allowed_models": ["some-future-model"]
         });
         assert!(AiHandlerConfig::from_config(json).is_ok());
+    }
+
+    // --- Peak EWMA routing deserialization ---
+
+    #[test]
+    fn peak_ewma_flat_form_uses_default_half_life() {
+        let config = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "x"}],
+            "routing": "peak_ewma"
+        }))
+        .expect("flat peak_ewma parses");
+
+        let RoutingStrategy::PeakEwma(config) = config.routing else {
+            panic!("expected peak_ewma");
+        };
+        assert_eq!(config.half_life_secs, 10);
+    }
+
+    #[test]
+    fn peak_ewma_object_form_parses_half_life() {
+        let config = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "x"}],
+            "routing": {"strategy": "peak_ewma", "half_life": "30s"}
+        }))
+        .expect("configured peak_ewma parses");
+
+        let RoutingStrategy::PeakEwma(config) = config.routing else {
+            panic!("expected peak_ewma");
+        };
+        assert_eq!(config.half_life_secs, 30);
+    }
+
+    #[test]
+    fn peak_ewma_rejects_zero_half_life() {
+        let error = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "x"}],
+            "routing": {"strategy": "peak_ewma", "half_life": 0}
+        }))
+        .expect_err("zero half-life must fail");
+
+        assert!(error.to_string().contains("half_life"));
     }
 
     // --- Cascade routing deserialization ---
@@ -2068,5 +2805,43 @@ mod tests {
         assert_eq!(AiSurface::FineTuning.label(), "fine_tuning");
         assert_eq!(AiSurface::AudioTranscription.label(), "audio_transcription");
         assert_eq!(AiSurface::Unknown.label(), "unknown");
+    }
+
+    #[test]
+    fn reasoning_policy_is_limited_to_prompt_completion_surfaces() {
+        let all_surfaces = [
+            AiSurface::ChatCompletions,
+            AiSurface::Models,
+            AiSurface::Embeddings,
+            AiSurface::Assistants,
+            AiSurface::Threads,
+            AiSurface::Batches,
+            AiSurface::FineTuning,
+            AiSurface::Files,
+            AiSurface::Realtime,
+            AiSurface::ImageGeneration,
+            AiSurface::ImageEdits,
+            AiSurface::ImageVariations,
+            AiSurface::AudioTranscription,
+            AiSurface::AudioSpeech,
+            AiSurface::Moderations,
+            AiSurface::Reranking,
+            AiSurface::Messages,
+            AiSurface::Responses,
+            AiSurface::Unknown,
+        ];
+
+        for surface in all_surfaces {
+            let expected = matches!(
+                surface,
+                AiSurface::ChatCompletions | AiSurface::Messages | AiSurface::Responses
+            );
+            assert_eq!(
+                surface.supports_reasoning_policy(),
+                expected,
+                "{} eligibility",
+                surface.label()
+            );
+        }
     }
 }

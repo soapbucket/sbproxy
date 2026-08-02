@@ -1,25 +1,26 @@
 //! Guardrail mesh: collect every verdict, then fuse.
 //!
 //! The serial pipeline ([`super::GuardrailPipeline::check_input`]) blocks on
-//! the first guardrail that flags. The mesh instead runs the guardrails as a
-//! cascade, collects the full verdict set, and fuses it into one decision
-//! under a configurable rule. That unlocks three things the serial chain
-//! cannot do:
+//! the first security guardrail that flags. The mesh instead runs the
+//! guardrails as a cascade, collects security verdicts and routing labels,
+//! and fuses the security verdicts under a configurable rule. That unlocks
+//! three things the serial chain cannot do:
 //!
 //! - **Fusion**: block only when at least N guardrails agree, instead of
-//!   any-one-blocks. The full label set also feeds the CEL policy plane
-//!   ([`crate::ai_policy`]) so a rule can reason over `flagged_count`.
+//!   any-one-blocks. The full label set and separate security count feed the
+//!   CEL policy plane ([`crate::ai_policy`]).
 //! - **Redact-and-continue**: a flagged-but-not-blocked request can have its
 //!   prompt masked and proceed, rather than only pass or block.
 //! - **Latency-SLO cascade + verdict cache**: cheap detectors (regex, PII,
-//!   schema) run first, and once a wall-clock budget is spent the remaining
-//!   expensive classifiers are skipped; a content-addressed cache lets a
-//!   repeated prompt skip re-running the detectors entirely.
+//!   schema) run first, and once a wall-clock budget is spent optional
+//!   expensive classifiers are skipped; enforcing safety classifiers always
+//!   run. A content-addressed cache lets a repeated prompt skip re-running the
+//!   detectors entirely.
 //!
 //! Default off: with no `mesh` block the dispatch path keeps using the
 //! serial, block-on-any check.
 
-use super::{Guardrail, GuardrailBlock, GuardrailPipeline};
+use super::{CachedMeshDecision, Guardrail, GuardrailFinding, GuardrailPipeline};
 use crate::types::Message;
 use serde::Deserialize;
 use std::time::Instant;
@@ -36,23 +37,24 @@ fn default_cache_capacity() -> usize {
 /// `GuardrailsConfig.mesh`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GuardrailMeshConfig {
-    /// Block when at least this many guardrails flag. `1` (the default)
-    /// reproduces the serial block-on-any behavior; `2` blocks only on a
-    /// quorum; `0` never blocks on the count (use with `redact_on_flag`).
+    /// Block when at least this many security guardrails flag. `1` (the
+    /// default) reproduces the serial block-on-any-security-verdict behavior;
+    /// `2` blocks only on a quorum; `0` never blocks on the count.
+    /// Non-enforcing classifier routing labels never contribute.
     #[serde(default = "default_block_threshold")]
     pub block_threshold: usize,
-    /// When a request is flagged but the count is below `block_threshold`,
-    /// mask the prompt and continue instead of passing it through
-    /// untouched.
+    /// When a security guardrail flags but the count is below
+    /// `block_threshold`, mask the prompt and continue instead of passing it
+    /// through untouched. Routing labels do not trigger redaction.
     #[serde(default)]
     pub redact_on_flag: bool,
-    /// Wall-clock budget for running the detectors. Once exceeded, the
-    /// cascade stops launching further (expensive) detectors. `None` runs
-    /// them all.
+    /// Wall-clock budget for running optional detectors. Once exceeded, the
+    /// cascade skips remaining optional work but still runs enforcing safety
+    /// classifiers. `None` runs every detector.
     #[serde(default)]
     pub latency_budget_ms: Option<u64>,
-    /// Cache verdicts by content + guardrail-set hash so a repeated prompt
-    /// skips re-running the detectors.
+    /// Cache verdicts by prompt text, role/content structure, and role-aware
+    /// classifier scope so a repeated prompt skips re-running the detectors.
     #[serde(default)]
     pub cache: bool,
     /// Capacity of the verdict cache.
@@ -79,23 +81,28 @@ pub struct MeshDecision {
     pub block: bool,
     /// Mask the prompt and continue.
     pub redact: bool,
-    /// Names of the guardrails that flagged.
+    /// All labels exposed to the AI policy plane. This is the union of
+    /// `routing_labels` and `security_labels`.
     pub labels: Vec<String>,
-    /// Human-readable reasons, parallel to `labels`.
+    /// Non-enforcing classifier labels.
+    pub routing_labels: Vec<String>,
+    /// Enforcing security guardrail verdicts.
+    pub security_labels: Vec<String>,
+    /// Human-readable reasons, parallel to `security_labels`.
     pub reasons: Vec<String>,
 }
 
 impl MeshDecision {
-    /// Number of guardrails that flagged.
+    /// Number of security guardrails that flagged.
     pub fn flagged_count(&self) -> usize {
-        self.labels.len()
+        self.security_labels.len()
     }
 }
 
 /// Relative execution cost of a guardrail, so the cascade runs the cheap
 /// detectors before the expensive classifiers. `0` is cheap (regex / PII /
 /// schema / context-poisoning rules), `1` is an ONNX or multi-token
-/// classifier.
+/// classifier, including the embedding-backed [`Guardrail::Classifier`].
 fn cost_rank(g: &Guardrail) -> u8 {
     match g {
         Guardrail::Regex(_)
@@ -106,7 +113,9 @@ fn cost_rank(g: &Guardrail) -> u8 {
         | Guardrail::Jailbreak(_)
         | Guardrail::ContentSafety(_)
         | Guardrail::Injection(_)
-        | Guardrail::AgentAlignment(_) => 1,
+        | Guardrail::AgentAlignment(_)
+        | Guardrail::Classifier(_)
+        | Guardrail::SafetyClassifier(_) => 1,
     }
 }
 
@@ -119,15 +128,30 @@ fn cost_rank(g: &Guardrail) -> u8 {
 /// one pipeline. A SHA-256 (not the previous fixed-key `DefaultHasher`
 /// 64-bit hash) makes a crafted collision, where a benign prompt inherits
 /// a blocked prompt's cached verdict, infeasible.
-fn cache_key(content: &str) -> [u8; 32] {
+fn cache_key(pipeline: &GuardrailPipeline, messages: &[Message], content: &str) -> [u8; 32] {
     use sha2::{Digest, Sha256};
+
+    fn update_field(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+
     let mut h = Sha256::new();
-    h.update(content.as_bytes());
+    h.update(b"sbproxy-guardrail-mesh-v2");
+    update_field(&mut h, content.as_bytes());
+    for guard in &pipeline.input {
+        update_field(&mut h, guard.cache_scope_tag().as_bytes());
+    }
+    for message in messages {
+        update_field(&mut h, message.role.as_bytes());
+        let encoded = serde_json::to_vec(&message.content).unwrap_or_default();
+        update_field(&mut h, &encoded);
+    }
     h.finalize().into()
 }
 
-/// Flagged labels + reasons cached for a given prompt.
-type CacheEntry = (Vec<String>, Vec<String>);
+/// Separated labels and verdicts cached for a given structured prompt.
+type CacheEntry = CachedMeshDecision;
 
 /// The guardrail mesh runtime.
 #[derive(Debug, Clone)]
@@ -170,39 +194,82 @@ impl GuardrailMesh {
         messages: &[Message],
         content: &str,
     ) -> MeshDecision {
-        let key = cache_key(content);
-        let (labels, reasons) = match self.cache_lookup(pipeline, &key) {
+        let key = cache_key(pipeline, messages, content);
+        let cached = match self.cache_lookup(pipeline, &key) {
             Some(hit) => hit,
             None => {
                 let collected = self.collect_cascade(pipeline, messages, content);
-                let labels: Vec<String> = collected.iter().map(|b| b.name.clone()).collect();
-                let reasons: Vec<String> = collected.iter().map(|b| b.reason.clone()).collect();
-                self.cache_store(pipeline, key, &(labels.clone(), reasons.clone()));
-                (labels, reasons)
+                let fail_closed = collected
+                    .iter()
+                    .any(|finding| matches!(finding, GuardrailFinding::SecurityBackendFailure(_)));
+                let cacheable = !collected.iter().any(|finding| {
+                    matches!(
+                        finding,
+                        GuardrailFinding::SecurityBackendFailure(_)
+                            | GuardrailFinding::RoutingBackendFailure
+                    )
+                });
+                let mut labels = Vec::new();
+                let mut routing_labels = Vec::new();
+                let mut security_labels = Vec::new();
+                let mut reasons = Vec::new();
+                for finding in collected {
+                    match finding {
+                        GuardrailFinding::Security(block) => {
+                            labels.push(block.name.clone());
+                            security_labels.push(block.name);
+                            reasons.push(block.reason);
+                        }
+                        GuardrailFinding::Routing(label) => {
+                            labels.push(label.name.clone());
+                            routing_labels.push(label.name);
+                        }
+                        GuardrailFinding::SecurityBackendFailure(block) => {
+                            labels.push(block.name.clone());
+                            security_labels.push(block.name);
+                            reasons.push(block.reason);
+                        }
+                        GuardrailFinding::RoutingBackendFailure => {}
+                    }
+                }
+                let entry = CachedMeshDecision {
+                    labels,
+                    routing_labels,
+                    security_labels,
+                    reasons,
+                    fail_closed,
+                };
+                if cacheable {
+                    self.cache_store(pipeline, key, &entry);
+                }
+                entry
             }
         };
 
-        let flagged = labels.len();
+        let flagged = cached.security_labels.len();
         let threshold = self.config.block_threshold;
-        let block = threshold > 0 && flagged >= threshold;
+        let block = cached.fail_closed || (threshold > 0 && flagged >= threshold);
         let redact = !block && self.config.redact_on_flag && flagged > 0;
 
         MeshDecision {
             block,
             redact,
-            labels,
-            reasons,
+            labels: cached.labels,
+            routing_labels: cached.routing_labels,
+            security_labels: cached.security_labels,
+            reasons: cached.reasons,
         }
     }
 
-    /// Run every input guardrail, cheap-first, collecting all verdicts.
-    /// Stops launching further detectors once the latency budget is spent.
+    /// Run input guardrails cheap-first, collecting all verdicts. Optional
+    /// detectors are skipped once the latency budget is spent; enforcing
+    /// safety classifiers are never skipped.
     fn collect_cascade(
         &self,
         pipeline: &GuardrailPipeline,
         messages: &[Message],
         content: &str,
-    ) -> Vec<GuardrailBlock> {
+    ) -> Vec<GuardrailFinding> {
         // Cheap detectors first so a tight latency budget still gets their
         // verdicts.
         let mut order: Vec<usize> = (0..pipeline.input.len()).collect();
@@ -213,16 +280,18 @@ impl GuardrailMesh {
         let mut out = Vec::new();
         for idx in order {
             if let Some(ms) = budget {
-                if start.elapsed().as_millis() as u64 >= ms {
-                    break;
+                if start.elapsed().as_millis() as u64 >= ms
+                    && !matches!(pipeline.input[idx], Guardrail::SafetyClassifier(_))
+                {
+                    continue;
                 }
             }
             // WOR-1692: reuse the text already extracted for the cache
             // key instead of re-extracting per guard. This also makes the
             // detector-visible text provably identical to the cache-key
             // text.
-            if let Some(block) = pipeline.input[idx].check_with_text(content, messages) {
-                out.push(block);
+            if let Some(finding) = pipeline.input[idx].finding_with_text(content, messages) {
+                out.push(finding);
             }
         }
         out
@@ -232,13 +301,127 @@ impl GuardrailMesh {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::guardrails::{InjectionGuardrail, RegexAction, RegexGuardrail};
+    use crate::guardrails::{
+        ClassifierBackendConfig, ClassifierConfig, ClassifierGuardrail, ClassifierScope,
+        ClassifierVerdict, EmbeddingBackendConfig, Guardrail, InjectionGuardrail, RegexAction,
+        RegexGuardrail, SafetyClassifierGuardrail, SafetyGuardrailKind, TextClassifier,
+    };
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     fn msg(content: &str) -> Message {
+        role_msg("user", content)
+    }
+
+    fn role_msg(role: &str, content: &str) -> Message {
         Message {
-            role: "user".to_string(),
+            role: role.to_string(),
             content: serde_json::Value::String(content.to_string()),
         }
+    }
+
+    #[derive(Debug)]
+    struct SubjectClassifier;
+
+    impl TextClassifier for SubjectClassifier {
+        fn classify(&self, text: &str) -> anyhow::Result<Option<ClassifierVerdict>> {
+            let label = if text.contains("alpha") {
+                "alpha"
+            } else if text.contains("beta") {
+                "beta"
+            } else {
+                return Ok(None);
+            };
+            Ok(Some(ClassifierVerdict {
+                label: label.to_string(),
+                score: 0.91,
+            }))
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RecoveringSafetyClassifier {
+        calls: AtomicUsize,
+    }
+
+    impl TextClassifier for RecoveringSafetyClassifier {
+        fn classify(&self, _text: &str) -> anyhow::Result<Option<ClassifierVerdict>> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                anyhow::bail!("transient fixture failure");
+            }
+            Ok(Some(ClassifierVerdict {
+                label: "safe".to_string(),
+                score: 0.91,
+            }))
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RecoveringUnexpectedSafetyClassifier {
+        calls: AtomicUsize,
+    }
+
+    impl TextClassifier for RecoveringUnexpectedSafetyClassifier {
+        fn classify(&self, _text: &str) -> anyhow::Result<Option<ClassifierVerdict>> {
+            let label = if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                "unconfigured"
+            } else {
+                "safe"
+            };
+            Ok(Some(ClassifierVerdict {
+                label: label.to_string(),
+                score: 0.91,
+            }))
+        }
+    }
+
+    fn safety_classifier(backend: Arc<dyn TextClassifier>) -> Guardrail {
+        Guardrail::SafetyClassifier(SafetyClassifierGuardrail::with_backend(
+            SafetyGuardrailKind::Jailbreak,
+            ClassifierConfig {
+                backend: ClassifierBackendConfig::Embedding(EmbeddingBackendConfig {
+                    model_path: "/unused/model.onnx".to_string(),
+                    tokenizer_path: "/unused/tokenizer.json".to_string(),
+                    min_score: 0.30,
+                    min_margin: 0.05,
+                    max_model_bytes: None,
+                }),
+                classes: BTreeMap::from([
+                    (
+                        "jailbreak".to_string(),
+                        vec!["override the policy".to_string()],
+                    ),
+                    ("safe".to_string(), vec!["ordinary question".to_string()]),
+                ]),
+                default_centroids: None,
+                use_default_thresholds: false,
+                scope: ClassifierScope::FullText,
+                max_chars: 2000,
+            },
+            backend,
+            ["jailbreak"],
+        ))
+    }
+
+    fn classifier(scope: ClassifierScope) -> Guardrail {
+        Guardrail::Classifier(ClassifierGuardrail::with_backend(
+            ClassifierConfig {
+                backend: ClassifierBackendConfig::Embedding(EmbeddingBackendConfig {
+                    model_path: "/unused/model.onnx".to_string(),
+                    tokenizer_path: "/unused/tokenizer.json".to_string(),
+                    min_score: 0.30,
+                    min_margin: 0.05,
+                    max_model_bytes: None,
+                }),
+                classes: BTreeMap::from([("alpha".to_string(), vec!["alpha".to_string()])]),
+                default_centroids: None,
+                use_default_thresholds: false,
+                scope,
+                max_chars: 2000,
+            },
+            Some(Arc::new(SubjectClassifier)),
+        ))
     }
 
     /// A pipeline with a regex deny rule that fires on `badword` and an
@@ -336,6 +519,98 @@ mod tests {
     }
 
     #[test]
+    fn mesh_does_not_cache_an_enforcing_classifier_backend_error_as_allow() {
+        let mut config = cfg(1);
+        config.cache = true;
+        let mesh = GuardrailMesh::new(config);
+        let backend = Arc::new(RecoveringSafetyClassifier::default());
+        let mut pipeline = GuardrailPipeline::default();
+        pipeline.input.push(safety_classifier(backend.clone()));
+
+        let first = eval(&mesh, &pipeline, "same prompt");
+        let second = eval(&mesh, &pipeline, "same prompt");
+
+        assert!(first.block, "backend failure must fail closed");
+        assert!(
+            !second.block,
+            "the transient failure must not be served from the verdict cache"
+        );
+        assert_eq!(
+            backend.calls.load(Ordering::SeqCst),
+            2,
+            "the second evaluation must retry the backend"
+        );
+    }
+
+    #[test]
+    fn exhausted_budget_still_runs_enforcing_classifier_without_caching_partial_allow() {
+        let mut config = cfg(1);
+        config.latency_budget_ms = Some(0);
+        config.cache = true;
+        let mesh = GuardrailMesh::new(config);
+        let backend = Arc::new(RecoveringSafetyClassifier::default());
+        let mut pipeline = GuardrailPipeline::default();
+        pipeline.input.push(safety_classifier(backend.clone()));
+
+        let first = eval(&mesh, &pipeline, "same prompt");
+        let second = eval(&mesh, &pipeline, "same prompt");
+
+        assert!(first.block, "the first backend failure must fail closed");
+        assert!(
+            !second.block,
+            "the enforcing classifier must run again after its transient failure"
+        );
+        assert_eq!(
+            backend.calls.load(Ordering::SeqCst),
+            2,
+            "an exhausted optional budget must not skip an enforcing classifier"
+        );
+    }
+
+    #[test]
+    fn enforcing_classifier_backend_error_blocks_regardless_of_mesh_quorum() {
+        let mesh = GuardrailMesh::new(cfg(2));
+        let backend = Arc::new(RecoveringSafetyClassifier::default());
+        let mut pipeline = GuardrailPipeline::default();
+        pipeline.input.push(safety_classifier(backend));
+
+        let decision = eval(&mesh, &pipeline, "same prompt");
+
+        assert!(
+            decision.block,
+            "an enforcing backend failure must fail closed even below the configured quorum"
+        );
+        assert_eq!(decision.security_labels, ["jailbreak"]);
+    }
+
+    #[test]
+    fn mesh_fails_closed_and_does_not_cache_an_unexpected_classifier_label() {
+        let mut config = cfg(2);
+        config.cache = true;
+        let mesh = GuardrailMesh::new(config);
+        let backend = Arc::new(RecoveringUnexpectedSafetyClassifier::default());
+        let mut pipeline = GuardrailPipeline::default();
+        pipeline.input.push(safety_classifier(backend.clone()));
+
+        let first = eval(&mesh, &pipeline, "same prompt");
+        let second = eval(&mesh, &pipeline, "same prompt");
+
+        assert!(
+            first.block,
+            "a malformed enforcing verdict must fail closed below quorum"
+        );
+        assert!(
+            !second.block,
+            "the malformed verdict must not become a cached decision"
+        );
+        assert_eq!(
+            backend.calls.load(Ordering::SeqCst),
+            2,
+            "the backend must be retried after a malformed verdict"
+        );
+    }
+
+    #[test]
     fn cache_does_not_bleed_across_pipelines_with_same_guard_types() {
         // WOR-1694: two pipelines with the same guard *type* (regex) but
         // different patterns must not share verdicts. The old global cache
@@ -370,5 +645,91 @@ mod tests {
             "differently-configured pipeline must not inherit the cached block"
         );
         assert!(b.labels.is_empty());
+    }
+
+    #[test]
+    fn classifier_labels_do_not_count_as_security_flags() {
+        let mut p = GuardrailPipeline::default();
+        p.input.push(classifier(ClassifierScope::LastUserMessage));
+        let mesh = GuardrailMesh::new(cfg(1));
+
+        let decision = eval(&mesh, &p, "alpha");
+
+        assert_eq!(decision.labels, vec!["alpha"]);
+        assert_eq!(
+            decision.flagged_count(),
+            0,
+            "a routing label is not a security verdict"
+        );
+        assert!(
+            !decision.block,
+            "routing labels must never meet block quorum"
+        );
+        assert!(
+            !decision.redact,
+            "routing labels must not trigger redaction"
+        );
+    }
+
+    #[test]
+    fn serial_pipeline_collects_classifier_label_without_blocking() {
+        let mut p = GuardrailPipeline::default();
+        p.input.push(classifier(ClassifierScope::LastUserMessage));
+        let messages = [msg("alpha")];
+
+        assert!(
+            p.check_input(&messages).is_none(),
+            "a routing classifier is never an enforcing guardrail"
+        );
+        assert_eq!(
+            p.classify_input(&messages)
+                .into_iter()
+                .map(|label| label.name)
+                .collect::<Vec<_>>(),
+            vec!["alpha"]
+        );
+    }
+
+    #[test]
+    fn classifier_labels_do_not_inflate_a_security_quorum() {
+        let mut p = GuardrailPipeline::default();
+        p.input.push(Guardrail::Regex(RegexGuardrail {
+            patterns: vec![regex::Regex::new("badword").unwrap()],
+            action: RegexAction::Block,
+        }));
+        p.input.push(classifier(ClassifierScope::LastUserMessage));
+        let mesh = GuardrailMesh::new(cfg(2));
+
+        let decision = eval(&mesh, &p, "alpha badword");
+
+        assert_eq!(decision.flagged_count(), 1);
+        assert!(
+            !decision.block,
+            "one security verdict plus one routing label is not a quorum of two"
+        );
+        assert!(decision.labels.contains(&"alpha".to_string()));
+        assert!(decision.labels.contains(&"regex".to_string()));
+    }
+
+    #[test]
+    fn cached_classifier_verdict_respects_message_roles() {
+        let mut config = cfg(1);
+        config.cache = true;
+        let mesh = GuardrailMesh::new(config);
+        let mut p = GuardrailPipeline::default();
+        p.input.push(classifier(ClassifierScope::LastUserMessage));
+
+        let first_messages = vec![role_msg("system", "alpha"), role_msg("user", "beta")];
+        let second_messages = vec![role_msg("user", "alpha"), role_msg("assistant", "beta")];
+        let flattened = "alpha\nbeta";
+        let first = mesh.evaluate_input(&p, &first_messages, flattened);
+        let second = mesh.evaluate_input(&p, &second_messages, flattened);
+
+        assert_eq!(first.labels, vec!["beta"]);
+        assert_eq!(
+            second.labels,
+            vec!["alpha"],
+            "identical flattened text with different roles must not share a cached verdict"
+        );
     }
 }

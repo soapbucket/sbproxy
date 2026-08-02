@@ -1,0 +1,574 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CompressionPolicy",
+  "description": "Ordered context-compression policy for one AI handler.",
+  "type": "object",
+  "properties": {
+    "state": {
+      "description": "Shared-state backend used by stateful levers.",
+      "default": null,
+      "anyOf": [
+        {
+          "$ref": "#/definitions/CompressionStateConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "allow_admin_content_inspection": {
+      "description": "Permit audited Admin-only summary-content inspection.",
+      "default": false,
+      "type": "boolean"
+    },
+    "levers": {
+      "description": "Compression levers executed in declaration order.",
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/CompressionLeverConfig"
+      }
+    },
+    "profiles": {
+      "description": "Route-local named pipelines available to governed policy and requests.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/CompressionProfile"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "CompressionStateConfig": {
+      "description": "External state selected for stateful compression levers.",
+      "type": "object",
+      "required": [
+        "backend",
+        "ttl"
+      ],
+      "properties": {
+        "backend": {
+          "description": "Existing process-wide state subsystem to reuse.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CompressionStateBackend"
+            }
+          ]
+        },
+        "ttl": {
+          "description": "Record lifetime, in seconds after deserialization.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/DurationSchema"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "CompressionStateBackend": {
+      "description": "State backends safe to select from public compression configuration.",
+      "oneOf": [
+        {
+          "description": "Durable lease-serialized state in the process-owned embedded database.",
+          "type": "string",
+          "enum": [
+            "local"
+          ]
+        },
+        {
+          "description": "Strict Redis lease, fence, and compare-and-set storage.",
+          "type": "string",
+          "enum": [
+            "redis"
+          ]
+        },
+        {
+          "description": "Replicated mesh storage over the cluster replication substrate. Requires `proxy.cluster.replication`; conditional writes converge through causal last-writer-wins merging.",
+          "type": "string",
+          "enum": [
+            "mesh"
+          ]
+        }
+      ]
+    },
+    "DurationSchema": {
+      "anyOf": [
+        {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        {
+          "type": "string"
+        }
+      ]
+    },
+    "CompressionLeverConfig": {
+      "description": "One configured compression lever.",
+      "oneOf": [
+        {
+          "description": "Stateful running-summary compaction.",
+          "type": "object",
+          "required": [
+            "min_tokens",
+            "retain_recent_messages",
+            "summarizer",
+            "target_summary_tokens",
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "summary_buffer"
+              ]
+            },
+            "min_tokens": {
+              "description": "Minimum request input tokens before summary buffering is eligible.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "retain_recent_messages": {
+              "description": "Number of most recent messages retained byte-for-byte.",
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            },
+            "target_summary_tokens": {
+              "description": "Maximum tokens requested from the dedicated summarizer.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "summarizer": {
+              "description": "Dedicated provider and model used for internal summaries.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SummarizerConfig"
+                }
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Deterministic compatibility trimming to the target model window.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "window_fit"
+              ]
+            },
+            "completion_reserve_tokens": {
+              "description": "Completion capacity excluded from the input-message budget.",
+              "default": 1024,
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "input_budget_tokens": {
+              "description": "Optional hard input-message budget before the target model limit.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 1.0
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Sidecar-backed LLMLingua-2 token pruning over marked text chunks.",
+          "type": "object",
+          "required": [
+            "endpoint",
+            "min_tokens",
+            "model",
+            "target",
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "token_prune"
+              ]
+            },
+            "min_tokens": {
+              "description": "Minimum target-model tokens across marked text bodies before pruning.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 1.0
+            },
+            "endpoint": {
+              "description": "Classifier gRPC URI or absolute `unix://` socket path.",
+              "type": "string",
+              "minLength": 1
+            },
+            "model": {
+              "description": "Sidecar token-classification model id.",
+              "type": "string",
+              "maxLength": 256,
+              "minLength": 1
+            },
+            "timeout_ms": {
+              "description": "Per-RPC timeout in milliseconds.",
+              "default": 250,
+              "type": "integer",
+              "format": "uint64",
+              "maximum": 60000.0,
+              "minimum": 1.0
+            },
+            "max_chunks": {
+              "description": "Maximum marked chunks sent to the sidecar in one request.",
+              "default": 64,
+              "type": "integer",
+              "format": "uint",
+              "maximum": 256.0,
+              "minimum": 1.0
+            },
+            "target": {
+              "description": "Compression target interpreted by the sidecar and rechecked by the gateway.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TokenPruneTarget"
+                }
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Query-aware sentence selection from marked text chunks.",
+          "type": "object",
+          "oneOf": [
+            {
+              "required": [
+                "max_sentences"
+              ]
+            },
+            {
+              "required": [
+                "target_tokens"
+              ]
+            }
+          ],
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "query_select"
+              ]
+            },
+            "max_sentences": {
+              "type": "integer",
+              "format": "uint",
+              "maximum": 4096.0,
+              "minimum": 1.0
+            },
+            "target_tokens": {
+              "type": "integer",
+              "format": "uint64",
+              "maximum": 1000000.0,
+              "minimum": 1.0
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Retrieval-aware selection of marked context chunks.",
+          "type": "object",
+          "required": [
+            "max_chunks",
+            "min_tokens",
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "rag_select"
+              ]
+            },
+            "min_tokens": {
+              "description": "Minimum marked-context tokens before selection is eligible.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 1.0
+            },
+            "ranking": {
+              "description": "Ranking source used to compare marked chunks.",
+              "default": "auto",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/RetrievalRanking"
+                }
+              ]
+            },
+            "max_chunks": {
+              "description": "Maximum number of marked chunks retained.",
+              "type": "integer",
+              "format": "uint",
+              "minimum": 1.0
+            },
+            "min_relevance_percent": {
+              "description": "Minimum accepted relevance percentage, from 0 through 100.",
+              "default": 0,
+              "type": "integer",
+              "format": "uint8",
+              "maximum": 100.0,
+              "minimum": 0.0
+            },
+            "drop_empty": {
+              "description": "Drop marked chunks whose selected content is empty.",
+              "default": false,
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Deterministic compact serialization of supported structured content.",
+          "type": "object",
+          "required": [
+            "min_tokens",
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "compact_serialization"
+              ]
+            },
+            "min_tokens": {
+              "description": "Minimum marked-context tokens before serialization is eligible.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 1.0
+            },
+            "tabular": {
+              "description": "Optional tabular compaction rules.",
+              "default": {
+                "enabled": false,
+                "min_rows": 8
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TabularSerializationConfig"
+                }
+              ],
+              "if": {
+                "required": [
+                  "enabled"
+                ],
+                "properties": {
+                  "enabled": {
+                    "const": true
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "min_rows": {
+                    "minimum": 2.0
+                  }
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Reorder marked context to mitigate lost-in-the-middle effects.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "position_reorder"
+              ]
+            },
+            "ranking": {
+              "description": "Ranking source used to order marked chunks.",
+              "default": "auto",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/RetrievalRanking"
+                }
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "SummarizerConfig": {
+      "description": "Dedicated internal summarizer selection and timeout.",
+      "type": "object",
+      "required": [
+        "model",
+        "provider",
+        "timeout"
+      ],
+      "properties": {
+        "provider": {
+          "description": "Provider name from the same AI handler.",
+          "type": "string"
+        },
+        "model": {
+          "description": "Model sent to the selected provider.",
+          "type": "string"
+        },
+        "timeout": {
+          "description": "Hard request timeout, in seconds after deserialization.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/DurationSchema"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "TokenPruneTarget": {
+      "description": "Exactly one explicit token-pruning target mode.",
+      "oneOf": [
+        {
+          "description": "Retain a percentage of pruning-tokenizer tokens in each marked chunk.",
+          "type": "object",
+          "required": [
+            "mode",
+            "retain_percent"
+          ],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "retain_ratio"
+              ]
+            },
+            "retain_percent": {
+              "description": "Percentage retained, from 1 through 99.",
+              "type": "integer",
+              "format": "uint8",
+              "maximum": 99.0,
+              "minimum": 1.0
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Retain marked bodies within one target-model token budget.",
+          "type": "object",
+          "required": [
+            "mode",
+            "target_tokens"
+          ],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "target_tokens"
+              ]
+            },
+            "target_tokens": {
+              "description": "Aggregate target-model token budget for marked bodies.",
+              "type": "integer",
+              "format": "uint32",
+              "maximum": 1000000.0,
+              "minimum": 1.0
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "RetrievalRanking": {
+      "description": "Ranking source used by retrieval-aware compression levers.",
+      "oneOf": [
+        {
+          "description": "Select supplied scores when complete, otherwise use lexical ranking.",
+          "type": "string",
+          "enum": [
+            "auto"
+          ]
+        },
+        {
+          "description": "Require caller-supplied relevance scores.",
+          "type": "string",
+          "enum": [
+            "supplied"
+          ]
+        },
+        {
+          "description": "Rank marked context with deterministic lexical relevance.",
+          "type": "string",
+          "enum": [
+            "lexical"
+          ]
+        }
+      ]
+    },
+    "TabularSerializationConfig": {
+      "description": "Tabular serialization eligibility controls.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Enable tabular serialization of supported row collections.",
+          "default": false,
+          "type": "boolean"
+        },
+        "min_rows": {
+          "description": "Minimum row count required when tabular serialization is enabled.",
+          "default": 8,
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "CompressionProfile": {
+      "description": "One reusable route-local compression pipeline.",
+      "type": "object",
+      "properties": {
+        "state": {
+          "description": "Shared-state backend used by stateful levers in this profile.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CompressionStateConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "levers": {
+          "description": "Compression levers executed in declaration order.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/CompressionLeverConfig"
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -37,7 +37,9 @@ pub struct StoredPolicyError {
 
 impl StoredPolicyError {
     fn new(kind: StoredPolicyErrorKind) -> Self {
-        Self { kind }
+        let error = Self { kind };
+        sbproxy_observe::metrics::record_key_policy_stored_rejection(error.safe_reason());
+        error
     }
 
     /// Bounded error category suitable for tests and programmatic handling.
@@ -151,12 +153,14 @@ pub fn key_record_to_effective_policy(
         allowed_providers: record.allowed_providers.clone(),
         blocked_providers: record.blocked_providers.clone(),
         route_to_model: record.route_to_model.clone(),
+        compression_profile: record.compression_profile.clone(),
         principal_selectors,
         require_pii_redaction: record.require_pii_redaction.clone(),
         allowed_tools: record.allowed_tools.clone(),
         inject_tools: record.inject_tools.clone(),
         inject_mcp,
         bypass_prompt_injection: record.bypass_prompt_injection,
+        allow_content_capture: record.allow_content_capture,
         max_requests_per_minute: record.max_requests_per_minute,
         max_tokens_per_minute: record.max_tokens_per_minute,
         budget: record.budget.as_ref().map(|budget| KeyBudgetPolicy {

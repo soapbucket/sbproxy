@@ -1,6 +1,6 @@
 # SBproxy dynamic key management
 
-*Last modified: 2026-07-14*
+*Last modified: 2026-08-01*
 
 A virtual key is a live, governed resource, not a line of YAML. With the
 `key_management:` block enabled, you mint, revoke, and rotate inbound keys at
@@ -30,7 +30,9 @@ proxy:
   key_management:
     enabled: true
     store:
-      backend: embedded              # embedded | redis | secrets_manager
+      backend: embedded              # embedded | redis | secrets_manager | mesh
+      # node-local: see "Clustered deployments" below before using this
+      # on more than one node
       path: /var/lib/sbproxy/keystore.redb
     cache:
       ttl_secs: 60                   # how long a resolved key stays cached
@@ -40,18 +42,23 @@ proxy:
     crypto:
       pepper: env:SBPROXY_KEY_PEPPER       # HMAC key for inbound hashing
       master_key: env:SBPROXY_KEY_MASTER   # envelope key for upstream creds
-    failure_mode_allow: false        # fail closed when the store is down
+    inbound:
+      headers:                             # one minted token resolves; conflicts deny
+        - {name: authorization, scheme: "Bearer "}
+        - {name: x-api-key,     scheme: ""}
+        - {name: x-sb-api,      scheme: ""}
+      require: false                       # 401 when no minted key resolved
+      native_key_policy:
+        allowed_providers: [openai, anthropic]
+        max_requests_per_minute: 600
+        max_tokens_per_minute: 200000
+        max_budget_tokens: 10000000
+        max_budget_usd: 250.00
+        allowed_models: [gpt-5, claude-sonnet-4]
+        blocked_models: []
+        require_pii_redaction: [email]
+    failure_posture: closed          # closed | degraded | open
     allow_api_override: false        # config records win on reload
-    governance:
-      consistency: approximate       # approximate | strict
-      # backend:                     # required only for strict
-      #   type: redis
-      #   url: redis://redis:6379/4
-      lease_ttl_secs: 120
-      terminal_retention_secs: 300
-      failure_mode: closed            # closed | allow_unreserved
-      missing_rate: zero_cost         # zero_cost | require_rate
-      default_max_output_tokens: 4096
     oidc_claim_map:
       claim_field: virtual_key       # JWT/OIDC claim that names the record
     seed:
@@ -61,6 +68,246 @@ proxy:
 
 When `enabled` is false (the default) the block is inert and inbound auth keeps
 using the compiled `credentials:` blocks.
+
+In Docker, mount a volume at `/var/lib/sbproxy` so the keystore survives
+container replacement (`-v sbproxy-state:/var/lib/sbproxy`). Images up to
+v1.9.0 ship without that directory and the nonroot runtime user cannot create
+it, so on those versions the mount is required: without it the key plane
+fails to install at boot with `create keystore directory '/var/lib/sbproxy'`.
+A bind mount to a host directory works too.
+
+## Which header carries the key
+
+A minted key is presented in whatever header the calling tool already sends.
+An Anthropic SDK sends `x-api-key`, Azure OpenAI sends `api-key`, and an
+internal tool sends whatever its author picked. Rather than ask you to rewrite
+those tools, SBproxy sweeps a configured list of headers for a token.
+
+The list is route-level, not per-key, and it has to be: to know which header
+holds the key you would have to have resolved the key already. The default
+covers the three common shapes and you can add your own.
+
+A minted token looks like `sbp_<16 hex>_<64 hex>`, a fixed 85 characters over a
+fixed alphabet. SBproxy recognizes that shape before store access, then looks
+up the public key id and verifies the secret. Shape recognition alone never
+authenticates a request. A caller presenting their own `sk-proj-...` or
+`sk-ant-...` provider key enters the native-key policy described below and,
+when allowed, passes through to the upstream that owns it.
+
+The configured carrier list is also the lookup surface for legacy stored
+`sk-<id>-<secret>` keys and exact `credentials: {type: ai_provider}` values on
+AI routes. Resolution order is canonical `sbp_...`, stored legacy key, a
+verified OIDC/JWT claim mapped to a stored record, exact configured credential,
+then provider-native policy. The winning governed carrier is removed before
+dispatch, so that presented value does not accompany the operator's provider
+credential upstream.
+
+### Two ways to use it
+
+**Substitution.** The tool already sends `x-api-key`. Point it at SBproxy,
+give it a minted key instead of the provider key, and bind that key to a stored
+credential. The upstream sees its own real key in `x-api-key`; the tool never
+holds it.
+
+```
+client  ->  x-api-key: sbp_0a1b..._9f8e...     (minted, governed)
+upstream <- x-api-key: <the real provider key>  (from the bound credential)
+```
+
+**Sidecar.** The tool keeps sending its own credential, and the minted key
+rides alongside in `x-sb-api`. SBproxy governs the request without storing or
+managing the caller-owned upstream secret; it still receives and forwards that
+secret on the proxied request.
+
+```
+client  ->  authorization: Bearer <the tool's own key>
+            x-sb-api: sbp_0a1b..._9f8e...
+upstream <- authorization: Bearer <the tool's own key>   (untouched)
+```
+
+Both fall out of one rule: the key's header is consumed, and a bound
+credential, if any, is written to its own header.
+
+### Attributing native provider keys
+
+A request that carries no minted key but does carry a recognizable provider
+credential is attributed to and governed as that provider. The rules live under
+`inbound.provider_hints`, ship with defaults for the common shapes (`sk-ant-`
+is Anthropic, `sk-or-` is OpenRouter, a bare `sk-` bearer is OpenAI,
+`x-goog-api-key` is Gemini, `api-key` is Azure), and are ordered: the first
+match wins, so specific prefixes belong before loose ones.
+
+Primary credential carriers are security-sensitive protocol fields, so SBproxy
+validates them even when `key_management.enabled` is currently `false`.
+Carriers cannot reuse hop-by-hop, framing, WebSocket, tracing, signature,
+correlation, budget identity, A2A envelope, access-log identity, or
+capture-envelope headers. This includes `x-user-id`, `x-end-user`,
+`x-sbproxy-tag`, `x-sb-user-id`, the session headers, and the `x-a2a-*` and
+`x-sb-property-*` namespaces.
+`provider_hints[].also_header` is match metadata rather than a credential
+carrier, so it may still name protocol metadata such as a provider version
+header.
+
+Recognized native credentials require an explicit
+`inbound.native_key_policy.allowed_providers` allowlist. If the policy is
+absent or the recognized provider is not listed, SBproxy returns 403 before
+dispatch. A credential matching no hint remains unattributed and follows the
+origin's ordinary auth behavior.
+
+The same block is lowered to a secret-free KeyRecord-shaped default. Every
+traffic type gets provider admission, audit attribution, a stable
+tenant/origin/provider identity, and automatic
+`max_requests_per_minute` enforcement. AI routes additionally apply provider
+and model policy, token/cost budget preflight, and PII requirements wherever
+the request shape can be interpreted. JSON POST and PUT/PATCH bodies can be
+inspected and redacted. Multipart and Realtime cannot safely satisfy required
+PII redaction and fail closed when a credential requires it; bodyless or
+otherwise uninterpretable methods fail closed when model policy requires a
+model. Multipart and non-POST responses do not yet settle token/cost counters,
+so those fields are admission signals rather than strict usage ceilings on
+those surfaces.
+
+Limits are bucketed by tenant, origin, and recognized provider. The native
+policy identity is built from those labels and contains no credential bytes.
+
+On a generic proxy route, an allowed caller-owned credential passes upstream
+unchanged, even when that origin also configures `outbound_credential`: native
+mode represents an explicit caller-owned identity, so the origin credential
+must not replace it. SBproxy receives and forwards the caller-owned secret, but
+does not store, manage, or substitute it. An AI provider must opt in as an
+exact credential destination. Set `accept_native_credentials_for` to the
+canonical hint label, and make it match the provider's wire type:
+
+```yaml
+action:
+  type: ai_proxy
+  providers:
+    - name: openai-primary
+      provider_type: openai
+      accept_native_credentials_for: openai
+      base_url: https://api.openai.com/v1
+      api_key: ${OPENAI_API_KEY} # used when the caller is not in native mode
+```
+
+The opt-in belongs to this provider entry and its effective `base_url`.
+`provider_type` selects the wire format; it does not grant a destination access
+to caller credentials. Without the opt-in, a custom endpoint that speaks the
+OpenAI protocol receives only its operator credential. If the native
+credential cannot be re-resolved or no opted-in provider exists, the request
+fails before an upstream call. Minted `sbp_...` keys take precedence and never
+enter native-key policy resolution.
+
+Confidence cascade and race routing are unavailable for native credentials.
+Cascade returns 503 and race returns 403 before request-body processing, cache
+or idempotency lookup, managed-model preparation, streaming dispatch, or the
+first upstream attempt. Sequential fallback can use another provider only when
+that provider entry has its own matching `accept_native_credentials_for`
+binding.
+For the same reason, configured shadow copies are suppressed for native
+traffic: the primary response proceeds normally, while neither the caller
+credential nor an operator credential is sent to the shadow target.
+
+The companion metric
+`sbproxy_inbound_key_requests_total{provider,key_mode,tenant_id,api_key_id}`
+uses the closed `key_mode` values `none`, `minted`, and `native`. An unresolved
+provider or key id is the empty label value. Native `api_key_id` is the stable,
+secret-free tenant/origin/provider policy-bucket id. Access logs, request
+events, and security audit records carry the same `key_provider` and
+`key_mode` fields. No raw provider key is stored in those records or metric
+labels.
+
+One canonical key id spans every per-request surface: the admin request
+ring (`GET /api/requests?api_key_id=`), the access log, the metric label,
+usage events, and the `sbproxy.key_id` span attribute all report the same
+id for the same request, so "what did this key do" has one answer
+everywhere. Key and credential lifecycle changes are audited with the
+acting operator and a status diff, queryable at `GET /api/audit/events`;
+see [admin-api-reference.md](admin-api-reference.md).
+
+A key policy may set `allow_content_capture: true` to consent to the
+origin's opt-in console content sampling. Consent alone captures nothing:
+the AI origin must also set `capture_content: true`, and every retained
+sample is redacted before storage. See the console content samples
+section of [ai-gateway.md](ai-gateway.md).
+
+### Requiring a key
+
+`require: true` refuses a request that carried no minted key, with a 401. It is
+off by default, so turning the sweep on changes nothing for an existing route.
+Reach for it on an origin that has no other auth provider, where the default is
+to admit unauthenticated traffic.
+
+A resolved minted key satisfies auth on its own and skips the origin's
+configured provider, so an origin with a JWT provider accepts either a valid
+JWT or a valid minted key. That is what makes minted keys work in parallel with
+credentials you already issue.
+
+### Rate limiting a minted key
+
+Bucket on `request.key_id`, not on the header:
+
+```yaml
+policies:
+  - type: rate_limit
+    key: request.key_id
+    requests_per_minute: 600
+```
+
+The header carries the presented secret, so bucketing on it means the bucket
+changes when you rotate the key and the caller gets a fresh budget. The key id
+does not change. `request.key_id` is the secret-free native policy-bucket id for
+admitted native traffic and an empty string when no key policy resolved, so the
+expression still evaluates on unauthenticated traffic.
+
+`concurrent_limit` with `key_by: api_key` already does this for you: it uses the
+resolved key id when there is one and falls back to the header otherwise.
+
+## Binding a key to an upstream credential
+
+A key can name a stored credential with `credential_id`. That credential is
+then the only upstream identity the key can reach an origin with.
+
+The credential carries its own presentation, because how a secret must be sent
+is a property of the upstream rather than of the caller:
+
+```bash
+curl -X POST localhost:9090/admin/credentials \
+  -d '{"id":"anthropic-prod","secret":"sk-ant-...","header":"x-api-key","scheme":""}'
+
+curl -X POST localhost:9090/admin/keys \
+  -d '{"name":"research-team","credential_id":"anthropic-prod"}'
+```
+
+`header` defaults to `authorization` and `scheme` to `Bearer `. Set `scheme` to
+an empty string for raw-value headers.
+
+**A bound credential fails closed.** If it is missing, revoked, or cannot be
+resolved, the request is refused with a 503. It never falls back to the
+origin's own `outbound_credential`, because that would hand the key an upstream
+identity it was never bound to. Deleting a credential that keys still bind is
+refused with a 409 naming those keys; clear `credential_id` on them first.
+
+A key and the credential it binds must belong to the same tenant. That is
+checked when you set the binding and again on every request, because either
+record's tenant can change afterwards.
+
+**Credential bindings need a fully upgraded fleet.** A node on an older build
+drops `credential_id` when the record replicates to it, resolves the key
+without a binding, and dispatches on the origin's shared credential. You cannot
+make an already-running binary refuse a field it ignores, so minting a bound
+key is refused unless every node is known to understand it.
+
+Each node republishes what it understands into cluster state, and the gate
+reads one record per member before allowing a binding. A member with no record
+refuses the mint and is named in the error, whether it is on an older build or
+just unreachable: neither can be told apart from the case the gate exists to
+prevent. A single-node deployment has no peers and is unaffected.
+
+The records carry a two-minute expiry and are republished at half that, so a
+node that is replaced by an older build drops out of the set on its own and the
+fleet starts refusing again without anyone intervening. Pin your image tag when
+you roll out.
+
 
 ## Store backends
 
@@ -79,6 +326,155 @@ vault, which reads external secrets you do not own.
   from `token_env`), `aws` (default credential chain), or `local` (in-memory, for
   dev and tests). Only writable managers are supported; read-only backends are
   not offered here.
+- `mesh`: the cluster's own replicated state substrate is the system of record,
+  so a key minted on one node resolves on its peers with no Redis and no
+  external secrets manager. Requires `proxy.cluster` with a `replication`
+  block. See [The mesh backend](#the-mesh-backend) for the guarantees and the
+  full configuration.
+
+### The mesh backend
+
+`backend: mesh` puts the keystore on the same quorum-replicated, durable
+substrate the cluster already runs for its own state
+([mesh-replication.md](mesh-replication.md)). Every record is written to
+`replication.factor` nodes and acknowledged only after a majority committed it
+to disk, so the fleet needs no external store at all.
+
+The consistency levels are pinned by the backend and are not configurable:
+writes and reads run at quorum, and revocation is written at one
+acknowledgement. The only knobs that apply come from the cluster's existing
+`replication` block, which the keystore shares with every other consumer of
+the substrate.
+
+```yaml
+proxy:
+  cluster:
+    cluster_id: prod
+    node_id: gw-1
+    seeds: ["gw-2:7946"]                 # the peers this node joins
+    state_dir: /var/lib/sbproxy/cluster  # durable identity + replica shard
+    security:
+      mode: mtls
+      shared_key: env:SBPROXY_CLUSTER_GOSSIP_KEY
+      cert_file: /var/lib/sbproxy/cluster/node.pem
+      key_file: /var/lib/sbproxy/cluster/node-key.pem
+      ca_file: /var/lib/sbproxy/cluster/ca.pem
+      server_name: sbproxy-mesh
+    replication:
+      factor: 2                          # copies per key record
+      anti_entropy_interval_secs: 30     # repair cadence after partitions
+      tombstone_gc_grace_secs: 86400     # also the rejoin quarantine bound
+  key_management:
+    enabled: true
+    store:
+      backend: mesh                      # no url, no path: the cluster is the store
+    cache:
+      ttl_secs: 60                       # per-node resolution cache (see below)
+    crypto:
+      pepper: env:SBPROXY_KEY_PEPPER
+      master_key: env:SBPROXY_KEY_MASTER
+```
+
+Each component earns its place:
+
+- `proxy.cluster` is required. Selecting `backend: mesh` on a node with no
+  cluster fails at config validation, because a mesh keystore on a node with
+  no mesh is an embedded keystore with extra steps.
+- `proxy.cluster.replication` is where the keystore's records physically live:
+  the durable replica shard under `state_dir`. The `factor` is how many nodes
+  hold each record; `anti_entropy_interval_secs` bounds how long a healed
+  partition takes to reconverge; `tombstone_gc_grace_secs` doubles as the
+  rejoin quarantine window described below. There are no keystore-specific
+  consistency knobs on purpose.
+- `store.backend: mesh` is the whole store surface. No URL, no file path, no
+  credentials to a third system.
+- `cache.ttl_secs` is the per-node resolution cache every backend has. For
+  this backend it is also half of the revocation propagation bound, so
+  shortening it tightens cluster-wide denial.
+- `crypto.pepper` and `crypto.master_key` matter more here than on a
+  single-node store: every node verifies hashes and opens envelopes minted by
+  every other node, so all nodes must be configured with the same values.
+
+What the backend guarantees, stated exactly:
+
+| Guarantee | `mesh` backend |
+|---|---|
+| Acknowledged mint survives any minority failure | Yes. Writes are quorum-acknowledged and durable on a majority before success is reported. |
+| Revocation visible cluster-wide | Eventual: bounded by `anti_entropy_interval_secs` plus `cache.ttl_secs`. Redis is bounded by `cache.ttl_secs` alone, because its pub/sub invalidation pushes to every node. |
+| Revisioned policy CAS | Write-then-verify: the backend reads at quorum, writes, reads back, and reports success only if its exact write won. Never a false success; a false conflict is possible and the caller retries. |
+| Mint from a partitioned minority | No. A minority cannot reach a write quorum, so the mint fails. |
+| Revoke from a partitioned minority | Yes. Revocation is written at one acknowledgement, and anti-entropy carries it across the heal. |
+
+If you need synchronous cluster-wide denial, the mesh backend is the wrong
+tool: use the `redis` backend, whose invalidation channel drops the record
+from every node's cache the moment it changes.
+
+One security rule is enforced at mint time: a credential whose material is
+raw plaintext is refused, with an error naming the credential, because the
+substrate would copy the secret onto every replica's disk. Hand the API or the
+seed a `secret` (sealed into an AEAD envelope under the master key) or a
+`vault_ref`; both replicate safely. Key records are unaffected, since they
+only ever store an HMAC of the secret.
+
+Three operational behaviors to know:
+
+- **A failed mint must not be assumed not-to-have-happened.** A mint that
+  errored below quorum may still have landed on some replicas, and
+  anti-entropy will propagate that record later. It is inert litter, because
+  the caller never received the token, but it exists: reconcile by listing
+  (`GET /admin/keys`), which fails loudly rather than returning a partial
+  fleet view.
+- **Revocation is terminal, and the substrate enforces it.** A revoked record
+  can never merge back to a usable one, not even against a stale replica
+  pushing a higher-version copy. Rotating a compromised key id means minting a
+  new id; there is no un-revocation.
+- **A node returning from a long absence holds authentication until it
+  catches up.** A node offline longer than `tombstone_gc_grace_secs` rejoins
+  with a quarantined (wiped) shard and refuses keystore reads until its first
+  complete anti-entropy round finishes; with the default `closed` failure
+  posture that is a 503, not a false allow or a false deny. The admin health
+  registry reports the same state through the `keystore` component on
+  `/readyz`.
+
+### Clustered deployments
+
+A key minted on one node is resolvable on every node only when the store itself
+is shared, which `redis`, `secrets_manager`, and `mesh` are. The `embedded`
+backend is a redb file on local disk, so a key minted on node A is written only
+to node A and node B cannot resolve it.
+
+A shared `cache.tier` changes how bad that is, though it does not make the store
+shared. Both the `mesh` and `redis` tiers propagate records to peers, so a key
+minted on node A is readable on node B for as long as it stays cached. What you
+do not get is durability: once the entry expires or a node restarts, the peer
+falls back to its own store and cannot resolve the key. A revocation may also
+fail to deny on a peer that never cached the record.
+
+So a node declaring `proxy.cluster.seeds` with `key_management.enabled: true` and
+`store.backend: embedded` gets one of two outcomes at boot:
+
+- **With `cache.tier: mesh` or `redis`, it warns.** Cross-node resolution works
+  while cached, so this is a usable development topology, but it is not a durable
+  cluster-wide keystore and the log says so.
+- **With `cache.tier: none`, it fails to start.** Nothing propagates records, so a
+  minted key is invisible to peers from the moment it is created. Minting keys
+  that silently do not work elsewhere is worse than not starting.
+
+For a durable cluster-wide keystore, set `store.backend` to `redis`,
+`secrets_manager`, or `mesh`. A single node with no seeds keeps the embedded
+default and needs no change. The `mesh` backend has the reverse requirement,
+checked at config validation: selecting it without `proxy.cluster` (or without
+its `replication` block) refuses to start, because there is no substrate for
+the records to live on.
+
+One gap worth knowing: the check fires on nodes that declare seeds. A node others
+join, which has no seeds of its own, is not itself classified, though every node
+that joins it is, so the misconfiguration still surfaces.
+
+A bulk credential purge on any node is cluster-wide. It fans out to every peer
+rather than clearing only the local cache, so peers do not keep serving stale
+resolved credentials until their TTL expires. A peer that cannot be reached is
+logged, because the purge did not fully take.
 
 ### Atomic policy mutation support
 
@@ -91,135 +487,23 @@ revision as one atomic operation.
 | `embedded` | Supported in one redb write transaction. The guarantee is local to that store file. |
 | `redis` | Supported in one server-side Redis operation. The revision update and cache-invalidation publication advance together. |
 | `secrets_manager` | Not supported by the common secrets-manager interface. `PATCH`, block, unblock, revoke, and rotate fail closed with `409` instead of performing a racy read-then-write. |
+| `mesh` | Supported as write-then-verify, not an atomic primitive: read at quorum, write, read back, and report success only if this node's write won the deterministic merge. Never a false success; a concurrent loser sees `409` and retries. |
 
 Creation and deletion are separate operations. In particular,
 `DELETE /admin/keys/{id}` is not guarded by `policy_revision`; coordinate
 destructive deletion separately from policy editing.
 
-This compare-and-swap protects the key policy document. Runtime RPM, TPM, and
-budget consistency are selected separately under `key_management.governance`.
+This compare-and-swap protects the key policy document, not the runtime usage
+counters. RPM, TPM, and budget accounting for a governed key run through a
+separate ledger with its own consistency guarantee, approximate by default or
+strict against Redis; see
+[Governed admission: strict and approximate](#governed-admission-strict-and-approximate).
+Authenticated caller introspection is separate rollout work and is not
+documented as available here.
 
 ![a key minted on node A, read immediately from node B, then revoked with both replicas seeing it, no reload](assets/ai-dynamic-keys-cluster.gif)
 
 Two replicas share a Redis store with a mesh cache in front ([config](../examples/ai-dynamic-keys-cluster/)).
-
-## Governed accounting consistency
-
-Dynamic-key rate and budget fields use one reservation lifecycle at the
-ingress gateway. Choose its consistency explicitly:
-
-| Mode | Guarantee | Backend |
-|---|---|---|
-| `approximate` | Exact inside one process. Multiple gateways can each admit from their local view, so a fleet can oversubscribe a key. This is the compatibility default. | None. Configuring a backend in this mode is rejected. |
-| `strict` | Atomic admission across every gateway that uses the same Redis database. Used plus active reservations cannot exceed a configured key limit beyond the one-micro-USD rounding unit. | An explicit `backend: { type: redis, url: ... }` is required. Missing or unsupported strict backends fail config validation. |
-
-The strict client supports a standard Redis endpoint, including a managed
-primary/HA endpoint such as non-cluster-mode GCP Memorystore. Redis Cluster
-endpoints that require `MOVED`/`ASK` redirection are not supported in this
-release; do not point governance at a cluster-mode endpoint.
-
-The governance backend is independent of `key_management.store`. The key store
-holds policy records; the governance backend owns reservations and usage. A
-deployment may point both at the same Redis service, but strict mode still
-requires its own explicit backend declaration:
-
-```yaml
-proxy:
-  key_management:
-    governance:
-      consistency: strict
-      backend:
-        type: redis
-        url: redis://redis:6379/4
-      lease_ttl_secs: 120
-      terminal_retention_secs: 300
-      failure_mode: closed
-      missing_rate: require_rate
-      default_max_output_tokens: 4096
-```
-
-| Field | Default | Meaning |
-|---|---|---|
-| `consistency` | `approximate` | Process-local approximate accounting or cluster-wide strict accounting. |
-| `backend` | unset | Tagged shared backend. Only `type: redis` is supported, and only with `strict`. |
-| `lease_ttl_secs` | `120` | Maximum time a reservation can remain stranded without renewal. Must be positive. |
-| `terminal_retention_secs` | `300` | How long settled, released, and expired outcomes remain available for idempotent retries. Must be at least the lease TTL and the 60-second rate window. |
-| `failure_mode` | `closed` | Strict-backend outage behavior: reject, or explicitly admit without a reservation. |
-| `missing_rate` | `zero_cost` | Behavior for a model with no configured, rate-card, or built-in token price. |
-| `default_max_output_tokens` | `4096` | Conservative output reservation when the request omits `max_tokens`. |
-
-### Reservation lifecycle and failure behavior
-
-The ingress gateway resolves the effective key policy, estimates the maximum
-tokens and cost, and atomically reserves RPM, TPM, lifetime tokens, and lifetime
-spend before choosing a provider or managed replica. It renews an active lease
-before half the TTL elapses while provider work or a stream is still running.
-Completion replaces the reservation with actual usage once. A refusal with no
-billable work releases it once. Repeated settle or release calls return the
-retained terminal outcome without changing counters.
-
-If a gateway crashes, renewal stops and Redis reclaims the reservation after
-`lease_ttl_secs`. A healthy long stream remains admitted because ingress keeps
-renewing its lease. Workers never receive the governance-store handle and never
-charge the caller. Local, peer, unmanaged, external, fallback, streaming, and
-cancellation paths all settle or release at the ingress boundary, so forwarding
-to a worker cannot double-charge a key.
-
-The prompt hold is deliberately conservative: it is at least the larger of the
-recognized-model tokenizer estimate and the complete encoded request-body byte
-length. Native-format pass-through also includes the original wire length. This
-covers tools, response schemas, top-level instructions, multimodal parts, and
-future prompt-bearing fields without trusting a partial schema parser. Choice
-count and the maximum number of billable fallback, race, or cascade attempts
-multiply the hold. This can reject a request earlier than an exact tokenizer
-would, but cannot weaken the configured hard cap.
-
-With `failure_mode: closed`, an unavailable strict backend rejects admission
-with `503` and `governance_backend_unavailable`. This is the production-safe
-default. `allow_unreserved` admits the request without silently switching to
-approximate counters. It marks backend health unavailable and emits one bounded
-audit event identifying the public key, policy version, and request, plus a
-bounded outage metric without key-cardinality labels. Neither records the bearer
-token or prompt. Use it only as an explicit outage
-policy.
-
-Rate-window denials return `429`. Lifetime token or monetary denials return
-`402`. RPM and TPM use fixed 60-second windows aligned to Unix epoch boundaries.
-Their usage snapshots include the next reset time. `max_budget_tokens` and
-`max_budget_usd` remain lifetime limits, so their reset is `null`.
-
-Monetary accounting uses the AI origin's `model_prices`, optional rate card, or
-built-in model catalog for hosted and self-hosted routes. The gateway converts
-USD to integer micro-USD and rounds up once per request; the documented rounding
-unit is one micro-USD. Floating-point values never enter Redis. With
-`missing_rate: zero_cost`, an unpriced model settles zero micro-USD while RPM,
-TPM, and token budgets still apply. With `missing_rate: require_rate`, an
-unpriced model is rejected before dispatch.
-
-Config compilation rejects governed integer limits outside `1` through
-`9,007,199,254,740,991`. USD limits must be finite, positive, represent at
-least one whole micro-USD, and remain in that exact range after conversion.
-These checks apply both to `key_management.seed.keys` and to `ai_provider`
-credential RPM and budget fields at proxy, tenant, and origin scope.
-
-For a heterogeneous fallback or cascade, admission and final aggregate-token
-settlement use the component-wise greatest eligible rate. The result is a
-conservative upper charge, never an underestimate of configured spend. Split
-per-attempt exact-cost attribution is a separate billing enhancement and is not
-part of this hard-cap contract.
-
-### Migrating advisory distributed counters
-
-Existing mesh CRDT counters and the older Redis shared-budget writer remain
-legacy, advisory data sources for deployments that expose their metrics. They
-are not strict admission mechanisms. The governed reservation path does not
-read or increment them for enforcement, so it cannot stack those post-flight
-charges on top of the ingress settlement.
-
-For a multi-gateway key that must not oversubscribe, configure
-`consistency: strict` with Redis. Leaving the default `approximate` is an
-explicit choice to accept process-local enforcement. A Redis key store or mesh
-cache alone does not upgrade governed limits to strict consistency.
 
 ## The policy cache
 
@@ -240,11 +524,13 @@ request -> L1 in-memory cache -> L2 tier (redis/mesh, optional) -> store
 The mesh tier makes the L2 a gossip cluster instead of Redis: a SWIM membership
 protocol feeds a consistent-hash ring, and reads and writes route to the replica
 that owns a key, so the resolution order is L1, then the mesh cache, then the
-store. A durable shared store still sits behind it as the source of truth (Redis,
-or a secrets manager for a Redis-free fleet); the mesh keeps the policy cache
-coherent. Its CRDT spend and rate counters are advisory and do not replace the
-strict Redis governance backend. Bootstrap it with a `cache.mesh:` block of seed
-peers plus gossip and transport ports:
+store. A durable shared store still sits behind it as the source of truth
+(Redis, a secrets manager, or the mesh store backend for a fully self-contained
+fleet); the mesh tier keeps the cache coherent.
+Governed-key spend and rate counters are separate from this cache tier: see
+[Governed admission: strict and approximate](#governed-admission-strict-and-approximate)
+for how approximate mode merges each node's settled usage. Bootstrap the mesh
+tier with a `cache.mesh:` block of seed peers plus gossip and transport ports:
 
 ```yaml
 cache:
@@ -285,11 +571,69 @@ Set `pepper` and `master_key` to a stable secret in production. Both accept
 leave them unset, sbproxy generates an ephemeral value and warns: stored hashes
 and encrypted credentials will not survive a restart.
 
-By default the plane fails closed. If the store cannot be reached, a request
-carrying a virtual key is denied. Set `failure_mode_allow: true` only if you have
-weighed an outage of the store against an outage of your gateway.
-This key-record lookup switch is separate from
-`governance.failure_mode`, which controls strict reservation-backend outages.
+Generate each value as 32 bytes of cryptographic randomness, hex-encoded
+(`openssl rand -hex 32`), and never reuse one value for both roles. See
+[Generating secret values](secrets.md#generating-secret-values) for the full
+guidance, including the PowerShell equivalent for Windows machines without
+`openssl`.
+
+### What happens when the store is down
+
+`failure_posture` decides it. The default is `closed`: if the store cannot be
+reached, a request carrying a virtual key is denied with `503`.
+
+```yaml
+proxy:
+  key_management:
+    enabled: true
+    failure_posture: closed        # closed | degraded | open
+```
+
+| Posture | The request | What is left behind |
+|---|---|---|
+| `closed` (default) | Denied with `503` | The denial itself, at `WARN` |
+| `degraded` | Falls through to the origin's own configured auth | `WARN` with `failure_posture=degraded` and `guarantee_waived=true` |
+| `open` | Falls through to the origin's own configured auth | `WARN` with `failure_posture=open` and `guarantee_waived=false` |
+
+Both admitting postures do the same thing to the request. Neither is a blanket
+admit: the request falls through to whatever auth the origin already has, so an
+origin with a `credentials:` block still authenticates it. What they change is
+the record. A key-store outage means the request runs with no per-key policy,
+no budget, and no attribution, and `degraded` is the posture that says so out
+loud, in a field you can alert on. `open` admits the same request and claims
+nothing about what was lost.
+
+Pick `degraded` over `open` unless you have a specific reason to suppress the
+signal. Pick either only if you have weighed an outage of the store against an
+outage of your gateway.
+
+`observe` is rejected at config-compile time here. It means "record the verdict
+the control would have reached", and a store that could not be read reached no
+verdict. Setting it fails startup with a message naming the key rather than
+quietly picking one of the other three for you.
+
+Try it against a store that is not there:
+
+```bash
+$ sbproxy run --config sb.yml            # store path points at a dead volume
+$ curl -si -H "Authorization: Bearer sk-abc123-secret" http://localhost:8080/v1/models \
+    | head -1
+HTTP/1.1 503 Service Unavailable         # failure_posture: closed
+```
+
+Flip the posture to `degraded`, restart, and the same call falls through to the
+origin's configured auth instead, leaving this in the log:
+
+```
+WARN key store unavailable; falling through to configured auth with no per-key
+     policy, budget, or attribution failure_posture="degraded" guarantee_waived=true
+```
+
+The older boolean `failure_mode_allow` still parses and still means what it
+always meant. It is used only when `failure_posture` is absent: `false` resolves
+to `closed`, and `true` resolves to `degraded`. Nothing in the runtime reads the
+boolean directly any more, so an existing config keeps its exact behavior and a
+new one gets a knob that can say which kind of "allow" it means.
 
 ## Key identity and policy revisions
 
@@ -344,7 +688,7 @@ The plaintext token appears once at mint; list calls only ever show the key_id (
 | `GET /admin/keys` | List keys (no secrets) |
 | `GET /admin/keys/policy-schema` | Fetch the server-driven field, editor, clear, and enforcement contract |
 | `GET /admin/keys/{id}` | Fetch one key |
-| `GET /admin/keys/{id}/usage` | Fetch current limits, usage, reservations, reset times, consistency, and backend health |
+| `GET /admin/keys/{id}/usage` | Fetch governed usage (used, reserved, remaining) and governance backend health |
 | `POST /admin/keys/{id}/effective-policy/preview` | Evaluate a bounded sample without dispatching or changing counters |
 | `PATCH /admin/keys/{id}` | Update policy with required `expected_revision` |
 | `DELETE /admin/keys/{id}` | Delete a key |
@@ -361,11 +705,11 @@ The plaintext token appears once at mint; list calls only ever show the key_id (
 
 The PATCH body is flat. Do not wrap fields under `policy` or `budget`.
 
-- `expected_revision` is required and must be between `1` and
-  `9,007,199,254,740,991`.
+- `expected_revision` is required and must be at least `1`.
 - An absent field is unchanged.
-- JSON `null` clears a nullable field such as `name`, `route_to_model`, a limit,
-  a budget cap, attribution, `inject_mcp`, or `expires_at`.
+- JSON `null` clears a nullable field such as `name`, `route_to_model`,
+  `compression_profile`, a limit, a budget cap, attribution, `inject_mcp`, or
+  `expires_at`.
 - A list or map is replaced in full. Use `[]` or `{}` to clear it. The API
   rejects `null` for non-nullable collections such as model/provider lists,
   `tags`, `metadata`, and injected tools. `allowed_tools` is the exception:
@@ -379,11 +723,11 @@ field leaves it unchanged.
 | PATCH field | Replacement value | Clear or reset value | Read response |
 |---|---|---|---|
 | `name` | string | `null` | `name` |
-| `max_requests_per_minute` | integer from 1 to 9,007,199,254,740,991 | `null` | same field |
-| `max_tokens_per_minute` | integer from 1 to 9,007,199,254,740,991 | `null` | same field |
+| `max_requests_per_minute` | non-negative integer | `null` | same field |
+| `max_tokens_per_minute` | non-negative integer | `null` | same field |
 | `priority` | `interactive`, `standard`, or `batch` | `null` | same field |
-| `max_budget_tokens` | integer from 1 to 9,007,199,254,740,991 | `null` | `budget.max_tokens` |
-| `max_budget_usd` | finite positive value representing 1 to 9,007,199,254,740,991 whole micro-USD | `null` | `budget.max_cost_usd` |
+| `max_budget_tokens` | non-negative integer | `null` | `budget.max_tokens` |
+| `max_budget_usd` | finite non-negative number | `null` | `budget.max_cost_usd` |
 | `allowed_models` | string list | `[]` | same field |
 | `blocked_models` | string list | `[]` | same field |
 | `allowed_providers` | string list | `[]` | same field |
@@ -391,6 +735,7 @@ field leaves it unchanged.
 | `require_pii_redaction` | string list | `[]` | same field |
 | `principal_selectors` | selector object list | `[]` | same field |
 | `route_to_model` | string | `null` | same field |
+| `compression_profile` | `on`, `off`, or a valid profile name | `null` | same field |
 | `allowed_tools` | string list | `null` for unrestricted; `[]` denies all | same field |
 | `inject_tools` | tool object list | `[]` | same field |
 | `inject_mcp` | object with a non-empty `ref` | `null` | same field |
@@ -460,7 +805,8 @@ curl -s -u admin:change-me -X PATCH \
   http://127.0.0.1:9090/admin/keys/ab12cd34 \
   -H 'Content-Type: application/json' \
   -d '{"expected_revision":3,"max_requests_per_minute":60,
-       "max_budget_usd":50,"name":"ci-runner"}'
+       "max_budget_usd":50,"compression_profile":"compact",
+       "name":"ci-runner"}'
 ```
 
 A stale write returns `409` without exposing record contents:
@@ -523,61 +869,6 @@ resource kind, and public record id. The event does not contain a plaintext
 secret or verifier hash. Route that tracing target to a protected audit sink and
 apply normal operational-log access controls. See [Audit log](audit-log.md).
 
-### Usage and backend health
-
-Read one key's current reservation state with:
-
-```bash
-curl -s -u admin:change-me \
-  http://127.0.0.1:9090/admin/keys/ab12cd34/usage | jq .
-```
-
-The response includes the effective policy revision and digest, `approximate`
-or `strict` consistency, secret-free backend name and health, and four possible
-dimensions: `requests_per_minute`, `tokens_per_minute`, `budget_tokens`, and
-`budget_micro_usd`. An unconfigured dimension is `null`; otherwise it includes
-`limit`, `used`, `reserved`, `remaining`, and `reset_at`:
-
-```json
-{
-  "key_id": "ab12cd34",
-  "policy_version": { "revision": 4, "digest": "sha256:..." },
-  "consistency": "strict",
-  "backend": {
-    "name": "redis",
-    "status": "healthy",
-    "checked_at": "2026-07-14T18:30:00Z"
-  },
-  "dimensions": {
-    "requests_per_minute": {
-      "limit": 60,
-      "used": 12,
-      "reserved": 3,
-      "remaining": 45,
-      "reset_at": "2026-07-14T18:31:00Z"
-    },
-    "tokens_per_minute": null,
-    "budget_tokens": {
-      "limit": 100000,
-      "used": 25000,
-      "reserved": 5000,
-      "remaining": 70000,
-      "reset_at": null
-    },
-    "budget_micro_usd": null
-  }
-}
-```
-
-The endpoint never returns a bearer token, verifier hash, Redis URL, worker
-identity, or private model endpoint. The Keys page renders the same snapshot and
-calls out degraded or unavailable strict backends.
-
-When the strict backend cannot serve the snapshot, the endpoint returns 503
-with `error.code: governance_backend_unavailable`, `consistency: strict`, and a
-sanitized backend object whose status is `unavailable`. The checked timestamp
-remains visible, but the Redis URL and connection error are never returned.
-
 ## Live policy
 
 A key is not just an auth token; it carries its own policy. Everything below
@@ -590,13 +881,20 @@ accounting are different guarantees; see
   `allowed_providers`, and `blocked_providers`. Empty allow-lists mean "all".
   A matching block takes precedence over an allow.
 - **Rate and budget:** `max_requests_per_minute` and `max_tokens_per_minute`
-  cap fixed one-minute windows. `max_budget_tokens` and `max_budget_usd` are the
-  flat mutation fields for lifetime caps. Read responses return those caps in
-  the key's `budget.max_tokens` and `budget.max_cost_usd` fields. Admission
-  reserves a conservative ceiling before routing and ingress settles actual
-  usage once across local, peer, unmanaged, external, fallback, streaming,
-  cancellation, and failure paths. See
-  [Governed accounting consistency](#governed-accounting-consistency).
+  cap the key's one-minute windows (requests admitted, then tokens actually
+  consumed by responses). `max_budget_tokens` and `max_budget_usd` are the flat
+  mutation fields for lifetime caps. Read responses return those caps in the
+  key's `budget.max_tokens` and `budget.max_cost_usd` fields.
+
+  Stored-key token and cost settlement currently applies only to standard JSON
+  POST inference surfaces when the provider response reports parseable usage.
+  Multipart and non-POST requests can still dispatch, but they do not settle
+  `max_tokens_per_minute`, `max_budget_tokens`, or `max_budget_usd` counters, so
+  do not treat these caps as a hard ceiling on multipart or non-POST traffic.
+  For standard JSON POST traffic, a governed key reserves against these caps
+  before the request dispatches; see
+  [Governed admission: strict and approximate](#governed-admission-strict-and-approximate)
+  for what "cluster-aware" means under each consistency tier.
 - **Scheduling lane:** `priority` (`interactive`, `standard`, or `batch`)
   places the key's requests in a lane on the locally served model's admission
   queue. Unset means standard. See the model host doc for how lanes queue and
@@ -613,6 +911,16 @@ accounting are different guarantees; see
   gateway, for example `{"ref": "toolhub"}`) attaches that gateway's tools to
   the key's requests. Together these make a key a fixed "model plus tools"
   surface.
+- **Context compression:** `compression_profile` selects the AI route's default
+  pipeline with `on`, disables compression with `off`, or selects one named
+  route-local profile. Header `X-Compression` overrides the governed key, CEL
+  is consulted only when the key has no selector, and an absent selector uses
+  the route default. SBproxy strips the request header before upstream
+  dispatch. The Admin API validates selector syntax but cannot prove which AI
+  origin a dynamic key will reach. A syntactically valid profile that is not
+  declared on the eventual route safely resolves to `off` and records
+  `invalid_operator`. Static configured credentials are route-bound, so an
+  undeclared profile is a configuration error at load time.
 - **Principal gate:** `principal_selectors` restricts which inbound identities
   may present the key, matched by `virtual_key`, `team`, `project`, `user`,
   `role`, or `claim`. Empty means any principal.
@@ -638,6 +946,93 @@ This field does not control the key-owned definitions in `inject_tools` or
 allowlist** for a list. An empty allowlist intentionally denies every
 caller-supplied tool.
 
+### Governed admission: strict and approximate
+
+A governed key with at least one of `max_requests_per_minute`,
+`max_tokens_per_minute`, `max_budget_tokens`, or `max_budget_usd` set reserves
+against a dedicated governance ledger before the request dispatches, and
+settles the reservation once the provider's response reports usage. A request
+that would exceed a limit is denied before it reaches an upstream.
+`key_management.governance:` picks the consistency guarantee behind that
+ledger:
+
+```yaml
+proxy:
+  key_management:
+    governance:
+      consistency: approximate      # approximate | strict
+      # backend:                    # required only when consistency is strict
+      #   type: redis
+      #   url: rediss://governance.internal:6379/2
+      lease_ttl_secs: 120
+      terminal_retention_secs: 300
+      failure_posture: closed     # closed | degraded | open
+      missing_rate: zero_cost     # zero_cost | require_rate
+```
+
+- **`approximate`** (the default) counts requests, tokens, and cost locally on
+  each gateway process. In a cluster, each node periodically publishes its own
+  settled usage and merges every live peer's usage back in, so a governed
+  key's admission check weighs the rest of the fleet's spend, not just this
+  node's own counters. That merged view catches up on a short interval rather
+  than updating instantly, so treat it as cluster-aware within a bounded
+  staleness window, not an exact global total. Only settled usage
+  disseminates; an open reservation stays local until it settles or expires.
+  No external database is required, but the cross-node view only exists when
+  clustering itself is active; an unclustered node in approximate mode counts
+  only its own traffic.
+- **`strict`** reserves and settles against a dedicated Redis backend instead.
+  Every gateway targets the same hash-tagged key, and the reserve, settle, and
+  release operations run as atomic Redis-side scripts, so two nodes cannot
+  both admit a request only one of them has budget for. Set
+  `governance.backend` to `{type: redis, url: ...}` (`redis://` or
+  `rediss://`). `consistency: strict` without a `backend` fails config
+  validation at load and reload rather than silently falling back to per-node
+  enforcement, and a `backend` set under `consistency: approximate` fails
+  validation the same way. This backend is independent of
+  `key_management.store` and `cache.tier: redis`; configure a strict
+  governance URL separately even if you already point those at Redis.
+
+`failure_posture` (default `closed`) decides what happens when a governance
+backend outage stops a reserve call from completing. It takes the same three
+values the key store's posture takes, and they mean the same things here:
+
+| Posture | The request | What is left behind |
+|---|---|---|
+| `closed` (default) | Denied with `503` | The denial, at `WARN` |
+| `degraded` | Admitted with no reservation | `WARN`, a `security_audit` event, and `sbproxy_governance_fail_open_total{key_id}` |
+| `open` | Admitted with no reservation | `WARN` only |
+
+`degraded` is the audited escape hatch: it admits the request without a
+reservation, and every time it fires the decision is logged, recorded on the
+`security_audit` channel, and counted, so running off the default posture is a
+choice you can see in the numbers rather than a silent one. `open` admits the
+same request and records neither the audit event nor the counter. That is the
+only difference between them, and it is the reason to prefer `degraded`.
+
+`observe` is rejected at config-compile time here too: a reserve call that never
+reached its backend produced no verdict to record.
+
+The older `failure_mode: closed | allow_unreserved` still parses and is used
+only when `failure_posture` is absent. `closed` resolves to `closed` and
+`allow_unreserved` resolves to `degraded`, which is what `allow_unreserved`
+always did: the audit event and the fail-open counter have fired on that path
+since it shipped. An existing config keeps its exact behavior.
+
+A settle call that cannot reach the backend after a reservation already
+succeeded is unaffected by either key. It stays best-effort, and the
+reservation's own drop-time repair reconciles it later.
+
+`missing_rate` (default `zero_cost`) governs a key that carries a
+`total_micro_usd` limit when the resolved model has no configured rate.
+`zero_cost` treats the request as free at reserve time and still settles the
+key's cost limit from actually billed usage. `require_rate` denies the request
+instead, so a monetary limit is never left silently unenforced against a model
+whose spend cannot be pre-accounted.
+
+See [Dependency degradation matrix](degradation.md) for current outage
+behavior per backend.
+
 Set policy fields at mint time or with `PATCH /admin/keys/{id}`. Admin writes
 and seed records both use flat `max_budget_tokens`, `max_budget_usd`, and
 `tenant` fields. Read responses expose `budget` and `tenant_id`. Seed records
@@ -650,7 +1045,8 @@ curl -s -u admin:change-me -X PATCH http://127.0.0.1:9090/admin/keys/ab12cd34 \
   -d '{"expected_revision":3,"allowed_models":["gpt-4o-mini"],
        "blocked_providers":["unapproved-provider"],"allowed_tools":[],
        "max_requests_per_minute":60,"max_budget_usd":50,
-       "route_to_model":"gpt-4o-mini","require_pii_redaction":["email"],
+       "route_to_model":"gpt-4o-mini","compression_profile":"compact",
+       "require_pii_redaction":["email"],
        "tags":["team:payments"]}'
 ```
 
@@ -700,8 +1096,9 @@ token whose mapped claim names a revoked, blocked, or expired record is denied
 with 403 on the next request, and a claim naming a record that does not exist
 is denied with 401. A token that carries no mapped claim at all is simply
 unmapped; it authenticates on its own terms with no per-key policy. When the
-store is unreachable this path fails closed unless `failure_mode_allow` is set,
-matching the bearer path.
+store is unreachable this path reads the same `failure_posture` every other
+inbound-key path reads, so it fails closed by default and falls through under
+`degraded` or `open`, matching the bearer path.
 
 ## Migrating from static credentials
 
@@ -750,6 +1147,7 @@ proxy:
           blocked_providers: [unapproved-provider]
           allowed_tools: []          # explicit empty list denies all caller tools
           route_to_model: gpt-4o-mini
+          compression_profile: compact
           bypass_prompt_injection: false
           project: payments
           tenant: acme
@@ -764,3 +1162,9 @@ proxy:
 ```
 
 See the runnable `examples/ai-dynamic-keys/` config for the full setup.
+
+The secret-free `EffectiveKeyPolicy` schema is version 2. Version 2 carries
+`compression_profile` through configured keys, dynamic records, cache tiers,
+and effective-policy preview. Readers still accept a version 1 policy that
+lacks the field and treat it as unset, so rolling upgrades do not invent a
+selector for an older record.

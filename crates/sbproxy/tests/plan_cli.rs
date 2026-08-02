@@ -255,6 +255,10 @@ fn plan_missing_secret_exits_three_with_finding() {
         Some(3),
         "expected exit 3 for missing-vault-key; stderr:\n{stderr}\nstdout:\n{stdout}"
     );
+    assert!(
+        stderr.contains("proxy.secrets.backend") && stderr.contains("proxy.secrets.map.*"),
+        "config-only compatibility warnings must remain visible on stderr:\n{stderr}"
+    );
 
     let json: serde_json::Value = serde_json::from_str(&stdout).expect("plan stdout is valid JSON");
     let findings = json["findings"]

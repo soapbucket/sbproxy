@@ -23,6 +23,9 @@
 use anyhow::{anyhow, Context, Result};
 use sbproxy_ai::prompts::{NamedPrompt, PromptStore, RuntimePromptOverlay};
 use sbproxy_platform::storage::{KVStore, RedbKVStore};
+use sbproxy_security::sealed_record::{
+    OpenOutcome, SealKey, SealKeyRing, SealScheme, SealedEnvelope,
+};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -32,11 +35,127 @@ use std::sync::Arc;
 /// just prompts in the future.
 const KEY_PREFIX: &str = "prompts:";
 
+/// The prompt store's envelope: magic `SBPP`, short for SBproxy Prompt
+/// Persistence.
+///
+/// Deliberately its own [`HkdfPurpose`], not a reuse of the response
+/// cache's. An operator may point both surfaces at one secret, and
+/// purpose separation is what keeps one derived key from opening the
+/// other's records.
+///
+/// [`HkdfPurpose`]: sbproxy_security::HkdfPurpose
+const SBPP_SCHEME: SealScheme = SealScheme::new(
+    *b"SBPP",
+    1,
+    sbproxy_security::HkdfPurpose::PromptPersistenceAtRest,
+    b"sbproxy.prompt-persistence.key-id.v1",
+);
+
+/// Build a prompt-persistence key ring from resolved key material.
+///
+/// `active` seals and opens; each entry of `previous` opens only.
+/// Material shorter than 16 bytes is refused rather than stretched,
+/// matching the response-cache rule: a short passphrase silently
+/// accepted is how a store ends up encrypted with something guessable.
+pub fn prompt_key_ring(active: Vec<u8>, previous: Vec<Vec<u8>>) -> Result<PromptSealer> {
+    let active = SealKey::new(SBPP_SCHEME, active)?;
+    let previous = previous
+        .into_iter()
+        .map(|material| SealKey::new(SBPP_SCHEME, material))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(PromptSealer {
+        ring: SealKeyRing::new(SBPP_SCHEME, active, previous)?,
+    })
+}
+
+/// The active key plus any retired keys kept only to open older records.
+#[derive(Debug)]
+pub struct PromptSealer {
+    ring: SealKeyRing,
+}
+
+impl PromptSealer {
+    /// The active key's id, safe to log.
+    pub fn active_key_id(&self) -> String {
+        self.ring.active_key_id()
+    }
+
+    /// How many retired keys can still open records.
+    pub fn retired_key_count(&self) -> usize {
+        self.ring.retired_key_count()
+    }
+}
+
+/// Associated data binding a sealed record to the exact key it was stored
+/// under.
+///
+/// Without this a sealed value could be copied from one
+/// `prompts:<host>:<name>` slot to another and would still open, silently
+/// serving one host's prompt as another's. The envelope header is
+/// prepended by the sealing helper, so salt, nonce, and key fingerprint
+/// are authenticated as well; this is only the tail.
+fn seal_aad(store_key: &[u8]) -> Vec<u8> {
+    store_key.to_vec()
+}
+
+/// Seal one serialized record under the sealer's active key.
+fn seal_record(sealer: &PromptSealer, store_key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
+    sealer
+        .ring
+        .seal(plaintext, &seal_aad(store_key))
+        .context("seal prompt record")
+}
+
+/// Return the plaintext bytes for a stored value.
+///
+/// A value that is not an `SBPP` envelope is returned unchanged, so a
+/// file written before encryption was enabled keeps hydrating. Enabling
+/// encryption therefore does not orphan existing prompts; each one reseals
+/// the next time it is written. JSON values always begin with `{`, which
+/// the magic cannot collide with.
+///
+/// A value that *is* sealed must open. Returning it verbatim on failure
+/// would hand undecryptable ciphertext to `serde_json` and report a
+/// confusing parse error instead of the real one.
+fn open_record(sealer: Option<&PromptSealer>, store_key: &[u8], stored: &[u8]) -> Result<Vec<u8>> {
+    // Probe the magic before demanding a sealer, so an unsealed file
+    // still hydrates when no key is configured.
+    if !stored.starts_with(&SBPP_SCHEME.magic()) {
+        return Ok(stored.to_vec());
+    }
+    let sealer = sealer.ok_or_else(|| {
+        anyhow!(
+            "prompt record is sealed but no prompt-persistence encryption key is configured; \
+             restore the key under admin.prompt_persistence_encryption"
+        )
+    })?;
+    let envelope = SealedEnvelope::parse(SBPP_SCHEME, stored, |v| v == SBPP_SCHEME.version())
+        .ok_or_else(|| {
+            anyhow!("sealed prompt record is truncated or declares an unsupported envelope version")
+        })?;
+    match sealer.ring.open(&envelope, &seal_aad(store_key)) {
+        OpenOutcome::Opened(plaintext) => Ok(plaintext),
+        OpenOutcome::NoMatchingKey => Err(anyhow!(
+            "sealed prompt record was written under key {}, which is not the active key and is \
+             not listed in previous_keys",
+            envelope.fingerprint_hex()
+        )),
+        OpenOutcome::AuthFailed => Err(anyhow!(
+            "sealed prompt record under key {} failed authentication; it is corrupt, or it was \
+             moved here from another key",
+            envelope.fingerprint_hex()
+        )),
+    }
+}
+
 /// Persistence handle the admin mutators call after a successful
 /// in-memory add or pin. Cheap to clone (it is just an `Arc`).
 #[derive(Clone)]
 pub struct PromptPersistence {
     store: Arc<dyn KVStore>,
+    /// `None` stores records as plaintext JSON, which is the historical
+    /// behaviour and the default.
+    sealer: Option<Arc<PromptSealer>>,
 }
 
 impl std::fmt::Debug for PromptPersistence {
@@ -53,22 +172,38 @@ impl PromptPersistence {
     /// On a fresh file the overlay stays empty; an existing file's
     /// prompts are loaded back into the same `RuntimePromptOverlay`
     /// shape PR3's admin routes mutate.
-    pub fn open(path: &Path) -> Result<Self> {
+    /// `sealer` seals record values at rest. `None` keeps the historical
+    /// plaintext-JSON behaviour. A sealer must be built from key material
+    /// already resolved by the caller, so an unresolvable reference fails
+    /// before this point rather than degrading to plaintext.
+    pub fn open(path: &Path, sealer: Option<Arc<PromptSealer>>) -> Result<Self> {
         let path_str = path
             .to_str()
             .ok_or_else(|| anyhow!("prompt persistence path is not valid UTF-8"))?;
         let store: Arc<dyn KVStore> =
             Arc::new(RedbKVStore::new(path_str).context("open prompt persistence redb file")?);
-        let overlay = hydrate(&*store).context("hydrate runtime overlay from redb")?;
+        let overlay =
+            hydrate(&*store, sealer.as_deref()).context("hydrate runtime overlay from redb")?;
         sbproxy_ai::prompts::install_runtime_overlay(overlay);
-        Ok(Self { store })
+        Ok(Self { store, sealer })
     }
 
     /// Construct directly from an existing KV store. Used by unit
     /// tests so they can swap in an in-memory store without touching
     /// disk; the production caller uses [`Self::open`].
     pub fn from_store(store: Arc<dyn KVStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            sealer: None,
+        }
+    }
+
+    /// [`Self::from_store`] with at-rest sealing enabled.
+    pub fn from_store_sealed(store: Arc<dyn KVStore>, sealer: Arc<PromptSealer>) -> Self {
+        Self {
+            store,
+            sealer: Some(sealer),
+        }
     }
 
     /// Persist one named prompt at `prompts:<host>:<name>`. Called
@@ -78,8 +213,12 @@ impl PromptPersistence {
     pub fn write_named_prompt(&self, host: &str, name: &str, named: &NamedPrompt) -> Result<()> {
         let key = build_key(host, name);
         let bytes = serde_json::to_vec(named).context("serialize NamedPrompt")?;
+        let stored = match self.sealer.as_deref() {
+            Some(sealer) => seal_record(sealer, key.as_bytes(), &bytes)?,
+            None => bytes,
+        };
         self.store
-            .put(key.as_bytes(), &bytes)
+            .put(key.as_bytes(), &stored)
             .context("redb put named prompt")?;
         Ok(())
     }
@@ -88,7 +227,7 @@ impl PromptPersistence {
 /// Scan every `prompts:` key and rebuild a [`RuntimePromptOverlay`].
 /// Errors on the first malformed key or undeserializable value so a
 /// silently-corrupted redb file does not boot with a partial overlay.
-fn hydrate(store: &dyn KVStore) -> Result<RuntimePromptOverlay> {
+fn hydrate(store: &dyn KVStore, sealer: Option<&PromptSealer>) -> Result<RuntimePromptOverlay> {
     let entries = store
         .scan_prefix(KEY_PREFIX.as_bytes())
         .context("scan prompts prefix")?;
@@ -96,7 +235,9 @@ fn hydrate(store: &dyn KVStore) -> Result<RuntimePromptOverlay> {
     for (key, value) in entries {
         let key_str = std::str::from_utf8(&key).context("prompt persistence key is not UTF-8")?;
         let (host, name) = parse_key(key_str)?;
-        let named: NamedPrompt = serde_json::from_slice(&value)
+        let plaintext = open_record(sealer, &key, &value)
+            .with_context(|| format!("open prompt record at key {key_str:?}"))?;
+        let named: NamedPrompt = serde_json::from_slice(&plaintext)
             .with_context(|| format!("deserialize NamedPrompt at key {key_str:?}"))?;
         let entry = by_host.entry(host.to_string()).or_default();
         entry.templates.insert(name.to_string(), named);
@@ -238,7 +379,7 @@ mod tests {
             .unwrap();
 
         // Hydrate from the same store and check the overlay.
-        let overlay = hydrate(&*store).unwrap();
+        let overlay = hydrate(&*store, None).unwrap();
         let store_for_host = overlay.by_host.get("example.com").expect("host present");
         let prompt = store_for_host.templates.get("greet").expect("name present");
         assert_eq!(prompt.default_version.as_deref(), Some("2"));
@@ -259,7 +400,7 @@ mod tests {
         p.write_named_prompt("example.com", "greet", &named_v(&[("1", "v1")], None))
             .unwrap();
 
-        let overlay = hydrate(&*store).unwrap();
+        let overlay = hydrate(&*store, None).unwrap();
         // Only the prompts:* key contributes; the unrelated key is
         // silently ignored.
         assert_eq!(overlay.by_host.len(), 1);
@@ -276,7 +417,7 @@ mod tests {
         store
             .put(b"prompts:example.com:greet", b"{not json")
             .unwrap();
-        let err = hydrate(&*store).unwrap_err();
+        let err = hydrate(&*store, None).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("deserialize NamedPrompt"),
@@ -298,7 +439,7 @@ mod tests {
             &named_v(&[("1", "a"), ("2", "b")], Some("2")),
         )
         .unwrap();
-        let overlay = hydrate(&*store).unwrap();
+        let overlay = hydrate(&*store, None).unwrap();
         let prompt = overlay
             .by_host
             .get("example.com")
@@ -308,5 +449,167 @@ mod tests {
             .unwrap();
         assert_eq!(prompt.default_version.as_deref(), Some("2"));
         assert_eq!(prompt.versions.len(), 2);
+    }
+
+    // --- at-rest sealing ------------------------------------------------
+
+    /// A sealer whose active key is `byte` repeated, with `previous`
+    /// as its retired keys.
+    fn ring(byte: u8, previous: &[u8]) -> PromptSealer {
+        prompt_key_ring(
+            vec![byte; 32],
+            previous.iter().map(|b| vec![*b; 32]).collect(),
+        )
+        .expect("32 bytes is enough material")
+    }
+
+    fn sealer(byte: u8) -> Arc<PromptSealer> {
+        Arc::new(ring(byte, &[]))
+    }
+
+    #[test]
+    fn key_material_refuses_short_input_and_scrubs_it() {
+        let err = prompt_key_ring(b"short".to_vec(), Vec::new()).unwrap_err();
+        assert!(
+            err.to_string().contains("at least"),
+            "a short key must be refused rather than stretched: {err}"
+        );
+    }
+
+    #[test]
+    fn sealed_records_round_trip_and_hide_the_template() {
+        let _guard = overlay_lock();
+        reset_overlay();
+        let store = Arc::new(MemStore::default());
+        let sealer = sealer(1);
+        let persistence = PromptPersistence::from_store_sealed(store.clone(), sealer.clone());
+
+        persistence
+            .write_named_prompt(
+                "api.test",
+                "greet",
+                &named_v(&[("1", "hello world")], Some("1")),
+            )
+            .expect("write sealed");
+
+        // What landed in the store is sealed, and the template is not in it.
+        let stored = store
+            .get(build_key("api.test", "greet").as_bytes())
+            .expect("get")
+            .expect("present");
+        assert!(
+            stored.starts_with(&SBPP_SCHEME.magic()),
+            "value must carry the seal envelope"
+        );
+        assert!(
+            !String::from_utf8_lossy(&stored).contains("hello world"),
+            "the template must not be readable in the stored bytes"
+        );
+
+        // And it hydrates back through the same sealer.
+        let overlay = hydrate(&*store, Some(&sealer)).expect("hydrate sealed");
+        let prompt = overlay
+            .by_host
+            .get("api.test")
+            .and_then(|s| s.templates.get("greet"))
+            .expect("prompt hydrated");
+        assert_eq!(
+            prompt.versions.get("1").map(|v| v.template.as_str()),
+            Some("hello world")
+        );
+    }
+
+    #[test]
+    fn a_sealed_record_moved_to_another_key_fails_to_open() {
+        let sealer = sealer(2);
+        let plaintext = br#"{"versions":{}}"#;
+        let sealed =
+            seal_record(&sealer, build_key("a.test", "greet").as_bytes(), plaintext).expect("seal");
+
+        // Same key material, different store key: the AAD no longer matches,
+        // so one host's prompt cannot be served as another's.
+        let err = open_record(
+            Some(&sealer),
+            build_key("b.test", "greet").as_bytes(),
+            &sealed,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("failed authentication"),
+            "moving a record between keys must fail the AEAD: {err}"
+        );
+
+        // Sanity: it does open under its own key.
+        let opened = open_record(
+            Some(&sealer),
+            build_key("a.test", "greet").as_bytes(),
+            &sealed,
+        )
+        .expect("opens under its own key");
+        assert_eq!(opened, plaintext);
+    }
+
+    #[test]
+    fn a_record_sealed_under_a_retired_key_still_opens_after_rotation() {
+        let old = sealer(3);
+        let store_key = build_key("api.test", "greet");
+        let sealed = seal_record(&old, store_key.as_bytes(), br#"{"versions":{}}"#).expect("seal");
+
+        // Rotate: the old key moves into previous_keys and a new key becomes
+        // active.
+        let rotated = ring(4, &[3]);
+        let opened = open_record(Some(&rotated), store_key.as_bytes(), &sealed)
+            .expect("a retired key must still open its records");
+        assert_eq!(opened, br#"{"versions":{}}"#);
+
+        // Drop the retired key and the record is no longer openable, which is
+        // what retiring a key is supposed to mean.
+        let without = ring(4, &[]);
+        let err = open_record(Some(&without), store_key.as_bytes(), &sealed).unwrap_err();
+        assert!(
+            err.to_string().contains("not the active key"),
+            "the error must name the missing key: {err}"
+        );
+    }
+
+    #[test]
+    fn plaintext_records_written_before_encryption_still_hydrate() {
+        let _guard = overlay_lock();
+        reset_overlay();
+        // A file written by a build with no encryption configured.
+        let store = Arc::new(MemStore::default());
+        let plain = PromptPersistence::from_store(store.clone());
+        plain
+            .write_named_prompt("api.test", "greet", &named_v(&[("1", "legacy")], Some("1")))
+            .expect("write plaintext");
+
+        // Turning encryption on must not orphan it.
+        let overlay = hydrate(&*store, Some(&sealer(5))).expect("hydrate mixed file");
+        let prompt = overlay
+            .by_host
+            .get("api.test")
+            .and_then(|s| s.templates.get("greet"))
+            .expect("legacy prompt still hydrates");
+        assert_eq!(
+            prompt.versions.get("1").map(|v| v.template.as_str()),
+            Some("legacy")
+        );
+    }
+
+    #[test]
+    fn a_sealed_record_with_no_key_configured_is_an_error_not_a_parse_failure() {
+        let sealed = seal_record(
+            &sealer(6),
+            build_key("api.test", "greet").as_bytes(),
+            br#"{"versions":{}}"#,
+        )
+        .expect("seal");
+        let err =
+            open_record(None, build_key("api.test", "greet").as_bytes(), &sealed).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("no prompt-persistence encryption key"),
+            "losing the key must say so plainly: {err}"
+        );
     }
 }

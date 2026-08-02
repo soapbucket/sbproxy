@@ -70,6 +70,17 @@ struct Cli {
     #[arg(long = "check", action = ArgAction::SetTrue, global = true)]
     check: bool,
 
+    /// Refuse to serve unless the model stack matches
+    /// `sbproxy-models.lock` (WOR-1864). Before any listener starts,
+    /// the lockfile next to the config is diffed against the verified
+    /// weight cache and every configured serve/deployment entry must
+    /// resolve to a locked artifact digest. Drift (or a missing
+    /// lockfile) prints the per-model drift lines and exits 2 without
+    /// serving. Honored by `serve` and the bare run form; other
+    /// subcommands ignore it.
+    #[arg(long = "locked", action = ArgAction::SetTrue, global = true)]
+    locked: bool,
+
     #[command(flatten)]
     globals: GlobalArgs,
 
@@ -169,20 +180,29 @@ enum Cmd {
     Projections(ProjectionsCmd),
     /// AI gateway tools (usage ledger verification, ...).
     Ai(AiCmd),
+    /// Admin-account maintenance (password hashing, ...).
+    Admin(AdminCliCmd),
     /// Serve a certified catalog model in one command, with no YAML.
     /// Resolves an immutable artifact, generates local admin auth, warms
     /// the managed deployment, then advertises its OpenAI-compatible endpoint.
     Run(RunArgs),
     /// Discover, cache, remove, and operate managed local models.
     Models(ModelsCmd),
-    /// Freshness: is any of it out of date. `sbproxy update` checks the
-    /// engine release feed and the cached models; `--self` also checks
-    /// the sbproxy binary. Reports only (a dry run); nothing is mutated.
+    /// Update the engines and cached models (add `--self` for the
+    /// binary). `sbproxy update` checks the engine release feed and the
+    /// cached models, then fetches, verifies, and swaps what is out of
+    /// date, with confirmation. `--check` reports only. A pinned or
+    /// `path`/`brew`/`apt`-managed artifact is reported, never replaced,
+    /// unless a run explicitly targets it.
     Update(UpdateArgs),
     /// Diagnose what this binary can do on the current host: compiled
     /// capability features, visible GPUs, inference engines on PATH,
     /// and whether a `serve:` provider could admit a model here.
     Doctor(DoctorArgs),
+    /// Install, remove, or check a per-user launchd agent that keeps a
+    /// certified catalog model running in the background (macOS only).
+    /// Reuses the same secure config generation as `sbproxy run`.
+    Service(ServiceCmd),
     /// Print a shell-completion script to stdout for the requested
     /// shell. Pipe into the shell's completion sink.
     Completions {
@@ -208,6 +228,12 @@ struct ValidateArgs {
     /// emits a single structured object for CI consumption.
     #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
+    /// Do not resolve a `source:` block. Validates the pointer file
+    /// alone, which is what you want on a machine with no network or no
+    /// credential for the repository, and a lie about a git-sourced
+    /// config anywhere else.
+    #[arg(long = "no-fetch")]
+    no_fetch: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -215,6 +241,11 @@ struct PlanArgs {
     /// Proposed config file. Required.
     #[arg(short = 'f', long = "config")]
     config: Option<PathBuf>,
+    /// Do not resolve a `source:` block on either side of the diff.
+    /// Without it, a git-sourced config is planned against the document
+    /// the repository actually serves.
+    #[arg(long = "no-fetch")]
+    no_fetch: bool,
     /// Baseline config file. Default: empty baseline (every origin
     /// in the proposed config surfaces as `added`).
     #[arg(long = "against")]
@@ -230,7 +261,7 @@ struct PlanArgs {
     out: Option<PathBuf>,
 }
 
-#[derive(clap::Args, Debug)]
+#[derive(clap::Args)]
 struct ApplyArgs {
     /// Proposed config file. Mutually exclusive with `-p`.
     #[arg(short = 'f', long = "config", conflicts_with = "plan_file")]
@@ -240,6 +271,35 @@ struct ApplyArgs {
     /// `baseline_revision` drifted. Mutually exclusive with `-f`.
     #[arg(short = 'p', long = "plan", conflicts_with = "config")]
     plan_file: Option<PathBuf>,
+    /// Admin API base URL of the proxy to apply to. Defaults to
+    /// `http://127.0.0.1:9090`.
+    #[arg(long = "admin-url", env = "SB_ADMIN_URL")]
+    admin_url: Option<String>,
+    /// Admin Basic Auth username. Defaults to `admin`.
+    #[arg(long = "username", env = "SB_ADMIN_USERNAME")]
+    username: Option<String>,
+    /// Admin Basic Auth password. Never printed.
+    #[arg(long = "password", env = "SB_ADMIN_PASSWORD")]
+    password: Option<String>,
+    /// Validate the config and stop. Contacts no proxy and changes
+    /// nothing. Use this in CI, where there is no running proxy to
+    /// apply to.
+    #[arg(long = "validate-only")]
+    validate_only: bool,
+}
+
+impl std::fmt::Debug for ApplyArgs {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ApplyArgs")
+            .field("config", &self.config)
+            .field("plan_file", &self.plan_file)
+            .field("admin_url", &self.admin_url)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("validate_only", &self.validate_only)
+            .finish()
+    }
 }
 
 #[derive(clap::Args, Debug)]
@@ -258,6 +318,218 @@ enum ConfigSub {
     /// interpolation, with secret values masked. Shows what this box
     /// will actually do.
     Print(ConfigPrintArgs),
+    /// Operate a config authority: generate its signing key, publish a
+    /// configuration to the fleet, watch the rollout, roll back, and
+    /// manage subscriber credentials.
+    Authority(ConfigAuthorityCmd),
+    /// Preview the configuration this node's authority would apply next,
+    /// without applying it.
+    Pull(ConfigPullArgs),
+}
+
+impl ConfigCmd {
+    /// Whether this subcommand reports through `plan`'s exit-code
+    /// convention, where 2 means "changes present" and is not an error.
+    ///
+    /// The older `config` subcommands exit 2 on a CLI error. The two that
+    /// print a plan-style diff cannot, or a diff would be
+    /// indistinguishable from a broken invocation, so their CLI-error code
+    /// is 1 like `plan`'s.
+    fn uses_plan_exit_codes(&self) -> bool {
+        matches!(self.sub, ConfigSub::Authority(_) | ConfigSub::Pull(_))
+    }
+}
+
+#[derive(clap::Args, Debug)]
+struct ConfigAuthorityCmd {
+    #[command(subcommand)]
+    sub: ConfigAuthoritySub,
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigAuthoritySub {
+    /// Generate an Ed25519 signing key and the verifying-key file
+    /// subscribers install, then print what to copy where. Local: writes
+    /// files, contacts nothing.
+    Init(AuthorityInitArgs),
+    /// Validate a payload locally, then publish it. Prints the revision
+    /// and digest the authority assigned.
+    Publish(AuthorityPublishArgs),
+    /// Show the current revision, the signing key id, and the revision
+    /// each subscriber was last seen holding.
+    Status(AuthorityStatusArgs),
+    /// Republish the previous revision's payload under a new revision
+    /// number.
+    Rollback(AuthorityRollbackArgs),
+    /// Register, list, and revoke subscriber credentials.
+    Subscriber(AuthoritySubscriberCmd),
+}
+
+/// `sbproxy config authority init`: generate this authority's key material.
+#[derive(clap::Args, Debug)]
+struct AuthorityInitArgs {
+    /// Directory to write the key material into. Created when absent,
+    /// owner-only.
+    #[arg(long = "dir")]
+    directory: PathBuf,
+    /// Key id stamped into every bundle and keyed in the verifying-key
+    /// file. Defaults to a name derived from the new public key, so a
+    /// rotation never collides with the key it replaces.
+    #[arg(long = "key-id")]
+    key_id: Option<String>,
+    /// Authority id shown in the printed config snippet. Does not affect
+    /// the generated key material.
+    #[arg(long = "authority-id", default_value = "control-plane")]
+    authority_id: String,
+    /// Replace an existing signing key. The new verifying key is added to
+    /// the existing map rather than replacing it, so subscribers that
+    /// still trust the old key keep verifying while they are updated.
+    #[arg(long = "force", action = ArgAction::SetTrue)]
+    force: bool,
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+/// `sbproxy config authority publish`: validate a payload, then publish it.
+#[derive(clap::Args, Debug)]
+struct AuthorityPublishArgs {
+    /// The payload to publish: the document subscribers apply, not this
+    /// node's own config file.
+    #[arg(short = 'f', long = "config")]
+    config: Option<PathBuf>,
+    /// How subscribers apply it. Must match the `mode` each subscriber is
+    /// configured for, or they refuse the bundle rather than guess.
+    #[arg(long = "mode", value_enum, default_value_t = BundleModeArg::Overlay)]
+    mode: BundleModeArg,
+    /// Run every validation the authority runs and stop. Contacts no
+    /// authority and publishes nothing. For CI.
+    #[arg(long = "validate-only", action = ArgAction::SetTrue)]
+    validate_only: bool,
+    /// Admin endpoint and Basic Auth credentials of the authority.
+    #[command(flatten)]
+    admin: ModelsAdminArgs,
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+/// `sbproxy config authority status`: what is published, and who has it.
+#[derive(clap::Args, Debug)]
+struct AuthorityStatusArgs {
+    /// Admin endpoint and Basic Auth credentials of the authority.
+    #[command(flatten)]
+    admin: ModelsAdminArgs,
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+/// `sbproxy config authority rollback`: republish the previous revision.
+#[derive(clap::Args, Debug)]
+struct AuthorityRollbackArgs {
+    /// Admin endpoint and Basic Auth credentials of the authority.
+    #[command(flatten)]
+    admin: ModelsAdminArgs,
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+#[derive(clap::Args, Debug)]
+struct AuthoritySubscriberCmd {
+    #[command(subcommand)]
+    sub: AuthoritySubscriberSub,
+}
+
+#[derive(Subcommand, Debug)]
+enum AuthoritySubscriberSub {
+    /// Register a subscriber and mint its credential. The credential is
+    /// printed here, once, and is not recoverable afterwards.
+    Add(AuthoritySubscriberAddArgs),
+    /// List registered subscribers and the revision each last took.
+    List(AuthoritySubscriberListArgs),
+    /// Revoke one credential, or every credential one subscriber holds.
+    Revoke(AuthoritySubscriberRevokeArgs),
+}
+
+/// `sbproxy config authority subscriber add`.
+#[derive(clap::Args, Debug)]
+struct AuthoritySubscriberAddArgs {
+    /// Subscriber id, matching the `subscriber_id` that node sets under
+    /// `proxy.config_authority.upstream`.
+    subscriber_id: String,
+    /// Admin endpoint and Basic Auth credentials of the authority.
+    #[command(flatten)]
+    admin: ModelsAdminArgs,
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+/// `sbproxy config authority subscriber list`.
+#[derive(clap::Args, Debug)]
+struct AuthoritySubscriberListArgs {
+    /// Admin endpoint and Basic Auth credentials of the authority.
+    #[command(flatten)]
+    admin: ModelsAdminArgs,
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+/// `sbproxy config authority subscriber revoke`.
+#[derive(clap::Args, Debug)]
+struct AuthoritySubscriberRevokeArgs {
+    /// Revoke exactly this credential, leaving any other credential the
+    /// same subscriber holds alive. This is the half of a rotation that
+    /// retires the old credential.
+    #[arg(long = "credential-id", conflicts_with = "subscriber_id")]
+    credential_id: Option<String>,
+    /// Revoke every credential this subscriber holds. The node stops
+    /// receiving updates; it keeps serving what it already applied.
+    #[arg(long = "subscriber-id")]
+    subscriber_id: Option<String>,
+    /// Admin endpoint and Basic Auth credentials of the authority.
+    #[command(flatten)]
+    admin: ModelsAdminArgs,
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+/// `sbproxy config pull`: preview what the next poll would apply.
+#[derive(clap::Args, Debug)]
+struct ConfigPullArgs {
+    /// This node's config file, which is the merge base. Defaults to
+    /// `-f/--config` or `SB_CONFIG_FILE`.
+    config_path: Option<PathBuf>,
+    /// Required. Fetch, verify, and merge, then print the diff. Applies
+    /// nothing, writes no cache, advances no cursor, reloads nothing.
+    #[arg(long = "dry-run", action = ArgAction::SetTrue)]
+    dry_run: bool,
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+/// How a published bundle declares subscribers should apply it.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum BundleModeArg {
+    /// Merge over each subscriber's local document.
+    Overlay,
+    /// Become the whole document on each subscriber.
+    Replace,
+}
+
+impl BundleModeArg {
+    /// The wire value the `?mode=` query parameter takes.
+    fn as_str(self) -> &'static str {
+        match self {
+            BundleModeArg::Overlay => "overlay",
+            BundleModeArg::Replace => "replace",
+        }
+    }
 }
 
 #[derive(clap::Args, Debug)]
@@ -451,6 +723,86 @@ struct AiCmd {
 enum AiSub {
     /// Verifiable usage ledger commands.
     Ledger(LedgerCmd),
+    /// Versioned prompt tools.
+    Prompt(Box<PromptCmd>),
+}
+
+#[derive(clap::Args, Debug)]
+struct PromptCmd {
+    #[command(subcommand)]
+    sub: PromptSub,
+}
+
+#[derive(Subcommand, Debug)]
+enum PromptSub {
+    /// Compile a shorter static system prompt against an evaluation set.
+    Optimize(PromptOptimizeArgs),
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum PromptEvalMetricArg {
+    ExactMatch,
+    Contains,
+    JsonExact,
+}
+
+impl From<PromptEvalMetricArg> for sbproxy_ai::prompt_optimizer::PromptEvalMetric {
+    fn from(value: PromptEvalMetricArg) -> Self {
+        match value {
+            PromptEvalMetricArg::ExactMatch => Self::ExactMatch,
+            PromptEvalMetricArg::Contains => Self::Contains,
+            PromptEvalMetricArg::JsonExact => Self::JsonExact,
+        }
+    }
+}
+
+#[derive(clap::Args, Debug)]
+struct PromptOptimizeArgs {
+    /// UTF-8 file containing the source system prompt.
+    #[arg(long)]
+    prompt: PathBuf,
+    /// Customer-owned JSONL evaluation set.
+    #[arg(long = "eval-set")]
+    eval_set: PathBuf,
+    /// OpenAI-compatible base URL or full chat-completions endpoint.
+    #[arg(long)]
+    endpoint: String,
+    /// Optional HTTP Host header when the endpoint uses a separate dial address.
+    #[arg(long = "host-header")]
+    host_header: Option<String>,
+    /// Environment variable containing the endpoint API key.
+    #[arg(long = "api-key-env")]
+    api_key_env: Option<String>,
+    /// Model used to evaluate the source and candidate prompts.
+    #[arg(long = "task-model")]
+    task_model: String,
+    /// Model used once to propose shorter instructions. Defaults to task model.
+    #[arg(long = "optimizer-model")]
+    optimizer_model: Option<String>,
+    /// Deterministic evaluation metric.
+    #[arg(long, value_enum, default_value_t = PromptEvalMetricArg::ExactMatch)]
+    metric: PromptEvalMetricArg,
+    /// Maximum accepted aggregate quality drop.
+    #[arg(long = "noise-tolerance", default_value_t = 0.02)]
+    noise_tolerance: f64,
+    /// Maximum candidate instructions evaluated.
+    #[arg(long = "max-candidates", default_value_t = 8)]
+    max_candidates: usize,
+    /// Hard cap on all model requests in this run.
+    #[arg(long = "max-requests", default_value_t = 256)]
+    max_requests: usize,
+    /// Per-request timeout in seconds.
+    #[arg(long = "timeout-secs", default_value_t = 60)]
+    timeout_secs: u64,
+    /// Prompt-store name written into the artifact.
+    #[arg(long)]
+    name: String,
+    /// Prompt version label written into the artifact.
+    #[arg(long = "prompt-version")]
+    prompt_version: String,
+    /// JSON artifact output path.
+    #[arg(long)]
+    output: PathBuf,
 }
 
 #[derive(clap::Args, Debug)]
@@ -479,6 +831,32 @@ struct LedgerVerifyArgs {
     /// single structured object for CI consumption.
     #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
+}
+
+#[derive(clap::Args, Debug)]
+struct AdminCliCmd {
+    #[command(subcommand)]
+    sub: AdminSub,
+}
+
+#[derive(Subcommand, Debug)]
+enum AdminSub {
+    /// Hash a password with the same HMAC-SHA256-plus-pepper primitive
+    /// `proxy.admin.operators[].password_hash` is verified against, for
+    /// pasting the result into config.
+    HashPassword(HashPasswordArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct HashPasswordArgs {
+    /// Password to hash. Prefer `--password-stdin`: a literal value here
+    /// stays in the shell history.
+    #[arg(long = "password")]
+    password: Option<String>,
+    /// Read the password from stdin (first line, trailing newline
+    /// trimmed) instead of `--password`.
+    #[arg(long = "password-stdin", action = ArgAction::SetTrue)]
+    password_stdin: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -562,6 +940,28 @@ enum ModelsSub {
     Ps(ModelsPsArgs),
     /// Drain and stop one deployment on a running local gateway.
     Stop(ModelsStopArgs),
+    /// Write a lockfile pinning the exactly resolved serving stack.
+    Lock(ModelsLockArgs),
+    /// Check the verified local cache against the lockfile.
+    VerifyLock(ModelsVerifyLockArgs),
+    /// Reclaim content-addressed blobs referenced by no cached artifact.
+    Prune(ModelsPruneArgs),
+}
+
+/// `sbproxy models prune`: reclaim unreferenced weight blobs.
+#[derive(clap::Args, Debug, Default)]
+struct ModelsPruneArgs {
+    /// Cache directory to prune. Defaults to the configured
+    /// `proxy.model_host.cache.directory` (or legacy `serve.cache_dir`)
+    /// when `-f/--config` is given, then the platform default.
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
+    /// Report what would be reclaimed without deleting anything.
+    #[arg(long)]
+    dry_run: bool,
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -569,8 +969,11 @@ enum ModelEngineArg {
     #[default]
     Auto,
     Vllm,
+    #[value(name = "sglang")]
+    SGLang,
     LlamaCpp,
-    Embedded,
+    #[value(name = "mistralrs")]
+    MistralRs,
 }
 
 impl From<ModelEngineArg> for sbproxy_model_host::EngineChoice {
@@ -578,8 +981,9 @@ impl From<ModelEngineArg> for sbproxy_model_host::EngineChoice {
         match value {
             ModelEngineArg::Auto => Self::Auto,
             ModelEngineArg::Vllm => Self::Vllm,
+            ModelEngineArg::SGLang => Self::SGLang,
             ModelEngineArg::LlamaCpp => Self::LlamaCpp,
-            ModelEngineArg::Embedded => Self::Embedded,
+            ModelEngineArg::MistralRs => Self::MistralRs,
         }
     }
 }
@@ -712,20 +1116,53 @@ struct ModelsStopArgs {
 }
 
 #[derive(clap::Args, Debug)]
+struct ModelsLockArgs {
+    /// Lockfile path to write. Defaults to `sbproxy-models.lock` next
+    /// to the config given with -f/--config.
+    #[arg(long = "out")]
+    out: Option<PathBuf>,
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+#[derive(clap::Args, Debug)]
+struct ModelsVerifyLockArgs {
+    /// Lockfile path to check. Defaults to `sbproxy-models.lock` next
+    /// to the config (or in the current directory without -f/--config).
+    #[arg(long = "lockfile")]
+    lockfile: Option<PathBuf>,
+    /// Content-addressed artifact cache directory.
+    #[arg(long = "cache-dir")]
+    cache_dir: Option<PathBuf>,
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+#[derive(clap::Args, Debug)]
 struct UpdateArgs {
-    /// Check the sbproxy binary against the release channel.
+    /// Include the sbproxy binary. It is only replaced when `--self` is
+    /// given, since replacing the running binary is an explicit choice.
     #[arg(long = "self")]
     self_: bool,
-    /// Check the inference engines (default when no target flag is set).
+    /// Include the inference engines (default when no target flag is set).
+    /// Passing `--engines` explicitly targets them, so a pinned engine may
+    /// be moved.
     #[arg(long = "engines")]
     engines: bool,
-    /// Check the cached models (default when no target flag is set).
+    /// Include the cached models (default when no target flag is set).
+    /// Passing `--models` explicitly targets them.
     #[arg(long = "models")]
     models: bool,
+    /// Assume yes to every confirmation prompt (for non-interactive runs).
+    #[arg(long = "yes", short = 'y')]
+    yes: bool,
     /// Weight cache directory to check for pulled models.
     #[arg(long = "cache-dir")]
     cache_dir: Option<PathBuf>,
-    /// Output format. `text` (default) or `json`.
+    /// Output format. `text` (default) or `json`. `json` is always the
+    /// freshness report (the acting path prints progress on the text path).
     #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
 }
@@ -741,6 +1178,78 @@ struct DoctorArgs {
     /// emits a single structured object for tooling.
     #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
+    /// Run the managed-worker startup gate and exit 3 if any check
+    /// fails. Checks driver presence, visible accelerators, per-entry
+    /// CUDA compatibility, the shared memory an engine asked for, the
+    /// weight-cache mount against `serve.cache_budget_gib`, and
+    /// model-plane identity material. Intended for a VM bootstrap or a
+    /// container entrypoint that should refuse to come up rather than
+    /// fail at the first customer request.
+    #[arg(long = "strict")]
+    strict: bool,
+}
+
+#[derive(clap::Args, Debug)]
+struct ServiceCmd {
+    #[command(subcommand)]
+    sub: ServiceSub,
+}
+
+#[derive(Subcommand, Debug)]
+enum ServiceSub {
+    /// Generate a secure config, write a launchd agent, and load it.
+    Install(ServiceInstallArgs),
+    /// Unload the launchd agent and remove its plist.
+    Uninstall(ServiceUninstallArgs),
+    /// Report whether the agent is registered with launchd and running.
+    Status(ServiceStatusArgs),
+    /// Internal launchd bootstrap that loads the declarative environment.
+    #[command(hide = true)]
+    Launch(ServiceLaunchArgs),
+}
+
+/// `sbproxy service install`: the exact same model/engine/accel/port/
+/// variant surface as `sbproxy run` (flattened), so the two commands
+/// resolve identically. The difference is what happens to the result:
+/// `run` serves it in this process; `install` persists it and wraps it
+/// in a launchd agent instead.
+#[derive(clap::Args, Debug)]
+struct ServiceInstallArgs {
+    #[command(flatten)]
+    run: RunArgs,
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+#[derive(clap::Args, Debug)]
+struct ServiceUninstallArgs {
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+#[derive(clap::Args, Debug)]
+struct ServiceStatusArgs {
+    /// Output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+#[derive(clap::Args, Debug)]
+struct ServiceLaunchArgs {
+    /// Strict KEY=value environment file loaded before the proxy starts.
+    #[arg(long = "environment", value_name = "PATH")]
+    environment: PathBuf,
+    /// Stable lock shared with transactional service uninstall.
+    #[arg(long = "lifecycle-lock", value_name = "PATH")]
+    lifecycle_lock: PathBuf,
+    /// Durable registry of exact service process generations.
+    #[arg(long = "uninstall-state", value_name = "PATH")]
+    uninstall_state: PathBuf,
+    /// Persisted proxy configuration to serve.
+    #[arg(value_name = "CONFIG")]
+    config: PathBuf,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, Default)]
@@ -811,6 +1320,17 @@ fn main() {
     // true uptime rather than time-since-first-health-hit.
     sbproxy_observe::mark_process_start();
 
+    // Point the attested meter's self-observation at the `sbproxy_meter_*`
+    // families before any config is compiled. The meter reports through a
+    // seam rather than owning a metrics dependency (it must stay compilable
+    // by an operator who wants the hash chain and nothing else), so nothing
+    // is recorded until somebody installs the receiving end. Doing it here
+    // means the first metered request of a deployment is counted, which is
+    // usually the one somebody is watching. The return value is discarded
+    // because a second install is refused rather than accepted, and this is
+    // the only caller.
+    let _ = sbproxy_observe::meter_metrics::install();
+
     let cli = Cli::parse();
 
     // --- --version / -V / `version` short-circuit ---
@@ -837,7 +1357,29 @@ fn main() {
     let log_filter = resolve_log_filter(&cli.globals);
     let log_format = cli.globals.log_format.unwrap_or_default();
     let runtime_telemetry = runtime_telemetry_config_for_cli(&cli);
-    init_tracing(log_filter, log_format, runtime_telemetry.as_ref());
+    if let Some(config) = runtime_telemetry.as_ref() {
+        if let Err(err) = config.validate_export_metrics() {
+            eprintln!("Fatal: {err}");
+            std::process::exit(1);
+        }
+        if let Err(err) = config.validate_propagation() {
+            eprintln!("Fatal: {err}");
+            std::process::exit(1);
+        }
+    }
+    let log_to_stderr = cli.check || !matches!(&cli.cmd, None | Some(Cmd::Serve(_)));
+    init_tracing(
+        log_filter,
+        log_format,
+        runtime_telemetry.as_ref(),
+        log_to_stderr,
+    );
+
+    // Resolve secret references in the alert channels and hand the finished set
+    // to the boot-time dispatcher in sbproxy-core (WOR-1884). Done here, in the
+    // binary, because secret resolution owns the vault backends and core does
+    // not depend on them, mirroring how OTLP header secrets resolve above.
+    install_alerting_channels_for_cli(&cli);
 
     // Resolve the graceful-shutdown grace period from the CLI flags / env
     // the operator set (`--grace-time` / `SB_GRACE_TIME`, and
@@ -878,11 +1420,14 @@ fn main() {
         let args = ValidateArgs {
             config_path: path,
             format: OutputFormat::Text,
+            no_fetch: false,
         };
         run_subcommand("validate", 2, handle_validate_subcommand(&args));
     }
 
     let global_config_path = cli.globals.config.clone();
+    // The global `--check` flag doubles as the update dry-run selector.
+    let global_check = cli.check;
     match cli.cmd {
         Some(Cmd::Validate(args)) => {
             run_subcommand("validate", 2, handle_validate_subcommand(&args));
@@ -894,7 +1439,16 @@ fn main() {
             run_subcommand("apply", 1, handle_apply_subcommand(&args));
         }
         Some(Cmd::Config(cmd)) => {
-            run_subcommand("config", 2, handle_config_subcommand(&cmd));
+            // `config authority` and `config pull` print plan-style
+            // diffs, where exit 2 means "changes present" rather than an
+            // error, so their CLI-error code is 1. The older `config`
+            // subcommands keep the 2 they have always used.
+            let err_code = if cmd.uses_plan_exit_codes() { 1 } else { 2 };
+            run_subcommand(
+                "config",
+                err_code,
+                handle_config_subcommand(&cmd, global_config_path.as_deref()),
+            );
         }
         Some(Cmd::Cluster(cmd)) => {
             run_subcommand("cluster", 2, handle_cluster_subcommand(&cmd));
@@ -904,6 +1458,13 @@ fn main() {
         }
         Some(Cmd::Ai(cmd)) => {
             run_subcommand("ai", 2, handle_ai_subcommand(&cmd));
+        }
+        Some(Cmd::Admin(cmd)) => {
+            run_subcommand(
+                "admin",
+                2,
+                handle_admin_subcommand(&cmd, global_config_path.as_deref()),
+            );
         }
         Some(Cmd::Run(args)) => {
             let code = handle_run_subcommand(&args, grace);
@@ -919,10 +1480,17 @@ fn main() {
             );
         }
         Some(Cmd::Update(args)) => {
-            run_subcommand("update", 2, handle_update_subcommand(&args));
+            run_subcommand(
+                "update",
+                2,
+                handle_update_subcommand(&args, global_config_path.as_deref(), global_check),
+            );
         }
         Some(Cmd::Doctor(args)) => {
             run_subcommand("doctor", 2, handle_doctor_subcommand(&args));
+        }
+        Some(Cmd::Service(cmd)) => {
+            run_subcommand("service", 2, handle_service_subcommand(&cmd));
         }
         Some(Cmd::Completions { shell }) => {
             print_completions(shell);
@@ -930,6 +1498,12 @@ fn main() {
         Some(Cmd::Version) => unreachable!("handled by short-circuit above"),
         Some(Cmd::Serve(_)) | None => {
             let path = pick_run_path(&cli);
+            // WOR-1864: `--locked` gates boot on the model lockfile.
+            // The check runs before `run_proxy` (and therefore before
+            // any listener binds); drift or a missing lockfile exits 2.
+            if cli.locked {
+                enforce_locked_serve_or_exit(path.as_deref());
+            }
             run_proxy(path.as_deref(), grace);
         }
     }
@@ -1260,6 +1834,53 @@ fn install_secret_resolver(path: &std::path::Path) {
                     }
                 }
             }
+            sbproxy_config::SecretBackendConfig::Azure {
+                name,
+                vault_url,
+                cache_ttl_secs,
+                auth,
+            } => {
+                let auth = match auth {
+                    sbproxy_config::AzureBackendAuth::ManagedIdentity => {
+                        sbproxy_vault::AzureKeyVaultAuth::ManagedIdentity
+                    }
+                    sbproxy_config::AzureBackendAuth::UserAssignedIdentity { client_id } => {
+                        sbproxy_vault::AzureKeyVaultAuth::UserAssignedIdentity {
+                            client_id: client_id.clone(),
+                        }
+                    }
+                    sbproxy_config::AzureBackendAuth::ServicePrincipal {
+                        tenant_id,
+                        client_id,
+                        client_secret,
+                        authority,
+                    } => sbproxy_vault::AzureKeyVaultAuth::ServicePrincipal {
+                        tenant_id: tenant_id.clone(),
+                        client_id: client_id.clone(),
+                        client_secret: env_interp(client_secret),
+                        authority: authority.clone(),
+                    },
+                    sbproxy_config::AzureBackendAuth::AzureCli => {
+                        sbproxy_vault::AzureKeyVaultAuth::AzureCli
+                    }
+                };
+                let cfg = sbproxy_vault::AzureKeyVaultConfig {
+                    vault_url: vault_url.clone(),
+                    auth,
+                    cache_ttl_secs: *cache_ttl_secs,
+                };
+                match sbproxy_vault::AzureKeyVaultBackend::new(cfg) {
+                    Ok(b) => manager.register_backend(
+                        sbproxy_vault::VaultProviderType::AzureKeyVault,
+                        name.clone(),
+                        Box::new(b),
+                    ),
+                    Err(e) => {
+                        eprintln!("Fatal: secret backend '{name}': {e:#}");
+                        std::process::exit(1);
+                    }
+                }
+            }
             sbproxy_config::SecretBackendConfig::K8s {
                 name,
                 namespace,
@@ -1446,17 +2067,99 @@ fn runtime_telemetry_config(
     }
 }
 
+/// Resolve secret references in `proxy.alerting.channels` and install the
+/// finished channel set for sbproxy-core's boot-time alert dispatcher (WOR-1884).
+///
+/// Runs only on the serve path. Follows the WOR-1767 fail-loud convention: a
+/// recognized secret reference in `url` / `routing_key` that cannot be resolved
+/// aborts startup rather than reaching PagerDuty or a webhook verbatim.
+fn install_alerting_channels_for_cli(cli: &Cli) {
+    if cli.check || !matches!(cli.cmd, None | Some(Cmd::Serve(_))) {
+        return;
+    }
+    let Some(path) = pick_run_path(cli) else {
+        return;
+    };
+    let Ok(yaml) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(compiled) = sbproxy_config::compile_config(&yaml) else {
+        return;
+    };
+    let Some(alerting) = compiled.server.alerting.as_ref() else {
+        return;
+    };
+    // Install the process resolver when any channel carries a provider-URI
+    // secret reference; the same idempotent installer telemetry headers use.
+    let has_reference = alerting.channels.iter().any(|c| {
+        [c.url.as_deref(), c.routing_key.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(sbproxy_vault::looks_like_secret_reference_uri)
+    });
+    if has_reference {
+        install_secret_resolver(&path);
+    }
+
+    let channels = alerting
+        .channels
+        .iter()
+        .map(map_alert_channel)
+        .collect::<Vec<_>>();
+    sbproxy_observe::alerting::install_channels(channels);
+}
+
+/// Map a config alert channel to the observe dispatcher shape, resolving any
+/// secret references in `url` / `routing_key`.
+fn map_alert_channel(
+    channel: &sbproxy_config::AlertChannelConfig,
+) -> sbproxy_observe::alerting::AlertChannelConfig {
+    sbproxy_observe::alerting::AlertChannelConfig {
+        channel_type: channel.channel_type.clone(),
+        url: channel.url.as_deref().map(resolve_alerting_secret),
+        headers: channel
+            .headers
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        secret: None,
+        routing_key: channel.routing_key.as_deref().map(resolve_alerting_secret),
+    }
+}
+
+/// Resolve a single alert-channel secret value, aborting on a reference that
+/// cannot be resolved. Mirrors [`resolve_telemetry_headers`].
+fn resolve_alerting_secret(value: &str) -> String {
+    let resolver = sbproxy_vault::process_resolver();
+    let resolved = match resolver.as_deref() {
+        Some(r) => r.resolve(value),
+        None => sbproxy_vault::SecretResolver::new().resolve(value),
+    };
+    match resolved {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Fatal: alerting channel secret: {e:#}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn init_tracing(
     log_filter: String,
     format: LogFormat,
     telemetry: Option<&sbproxy_observe::TelemetryConfig>,
+    log_to_stderr: bool,
 ) {
     let logging = sbproxy_observe::LoggingConfig {
         level: log_filter,
         format: format.as_str().to_string(),
         sampling: sbproxy_observe::SamplingConfig::default(),
     };
-    logging.init_with_resolved_filter_and_telemetry(telemetry);
+    if log_to_stderr {
+        logging.init_with_resolved_filter_and_telemetry_to_stderr(telemetry);
+    } else {
+        logging.init_with_resolved_filter_and_telemetry(telemetry);
+    }
 }
 
 /// Honour `SB_DISABLE_SB_FLAGS=1|true|yes|on` (case-insensitive).
@@ -1525,15 +2228,48 @@ fn handle_validate_subcommand(args: &ValidateArgs) -> anyhow::Result<i32> {
     let outcome = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("failed to read config '{path_str}': {e}"))
         .and_then(|yaml| {
+            // Validate what would actually boot. A `source:` block means
+            // the file on disk is a pointer, and compiling the pointer
+            // would report a config valid without ever looking at the
+            // document that serves traffic.
+            let yaml = resolve_source_for_cli(&yaml, args.no_fetch, &path_str)?;
             let compiled = sbproxy_config::compile_config(&yaml)
                 .map_err(|e| anyhow::anyhow!("config '{path_str}' did not compile:\n{e:#}"))?;
-            let pipeline = sbproxy_core::pipeline::CompiledPipeline::from_config(compiled)
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "config '{path_str}' compiled, but a module failed to construct \
-                         (this would fail at boot):\n{e:#}"
-                    )
+            // Boot-time telemetry validation (export_metrics/enabled
+            // consistency, supported propagation values) should reject
+            // here too, not just at `sbproxy serve`. Probe with only
+            // the fields those two checks read, not the full
+            // runtime_telemetry_config mapping: that function also
+            // resolves header secret references and hard-exits the
+            // process on an unresolved one, which `validate` must
+            // never do.
+            if let Some(telemetry) = compiled
+                .server
+                .observability
+                .as_ref()
+                .and_then(|observability| observability.telemetry.as_ref())
+            {
+                let probe = sbproxy_observe::TelemetryConfig {
+                    enabled: telemetry.enabled,
+                    export_metrics: telemetry.export_metrics,
+                    propagation: telemetry.propagation.clone(),
+                    ..sbproxy_observe::TelemetryConfig::default()
+                };
+                probe.validate_export_metrics().map_err(|e| {
+                    anyhow::anyhow!("config '{path_str}': {e} (this would fail at boot)")
                 })?;
+                probe.validate_propagation().map_err(|e| {
+                    anyhow::anyhow!("config '{path_str}': {e} (this would fail at boot)")
+                })?;
+            }
+            let pipeline =
+                sbproxy_core::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "config '{path_str}' compiled, but a module failed to construct \
+                         (this would fail at boot):\n{e:#}"
+                        )
+                    })?;
             let config_dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
             sbproxy_core::model_runtime::validate_model_runtime(&pipeline, config_dir).map_err(
                 |e| {
@@ -1571,6 +2307,35 @@ fn handle_validate_subcommand(args: &ValidateArgs) -> anyhow::Result<i32> {
     }
 }
 
+/// Resolve a `source:` block for a CLI subcommand that is about to
+/// validate or diff a config document.
+///
+/// With `--no-fetch`, the pointer file stands and a remote source is
+/// reported on stderr rather than silently ignored. Silence is what the
+/// old behaviour was, and it is why `validate` used to pass on a config
+/// whose real content nobody had looked at.
+///
+/// # Errors
+///
+/// Returns an error when the `source:` block is malformed or cannot be
+/// resolved.
+fn resolve_source_for_cli(yaml: &str, no_fetch: bool, path_str: &str) -> anyhow::Result<String> {
+    if !no_fetch {
+        return Ok(sbproxy_core::config_source::resolve(yaml)?.text);
+    }
+    let declares_remote_source = sbproxy_config::source::parse_source_head(yaml)
+        .map_err(|e| anyhow::anyhow!("config '{path_str}': {e}"))?
+        .is_some();
+    if declares_remote_source {
+        eprintln!(
+            "note: '{path_str}' declares a `source:` block and --no-fetch was passed, so only \
+             the pointer file was checked. The document this proxy would actually serve was not \
+             looked at."
+        );
+    }
+    Ok(yaml.to_string())
+}
+
 // --- `doctor` handler ---
 
 /// Print the host-capability diagnostics report. It exits 0 once the
@@ -1586,6 +2351,7 @@ fn handle_doctor_subcommand(args: &DoctorArgs) -> anyhow::Result<i32> {
         .clone()
         .or_else(|| std::env::var_os("SB_CONFIG_FILE").map(PathBuf::from));
     let mut exit = 0;
+    let mut plane = None;
     if let Some(path) = config_path {
         match std::fs::read_to_string(&path) {
             Ok(yaml) => {
@@ -1601,17 +2367,294 @@ fn handle_doctor_subcommand(args: &DoctorArgs) -> anyhow::Result<i32> {
                         exit = 2;
                     }
                 }
+                plane = extract_model_plane_identity(&yaml, config_dir);
+                // The canonical `proxy.model_host` form, which the inline
+                // `serve:` extraction above does not see.
+                if let Some((demand, budget)) = extract_control_plane_demand(&yaml) {
+                    report = report.with_control_plane_demand(demand, budget);
+                }
             }
             Err(e) => {
                 eprintln!("doctor: could not read config '{}': {e}", path.display());
             }
         }
     }
+    // The strict gate is evaluated (and reported) whenever asked for,
+    // even with no config: "nothing was configured to check" is itself
+    // the answer a bootstrap needs, and every check reports `skip`
+    // rather than a misleading pass.
+    let strict_checks = if args.strict {
+        report.strict_checks(plane.as_ref())
+    } else {
+        Vec::new()
+    };
+    if args.strict {
+        exit = report.strict_exit_code(&strict_checks);
+    }
+    // WOR-1863: weights other local tools already cached (Ollama, LM
+    // Studio, the HF hub), discovered read-only and summarized per
+    // source alongside sbproxy's own model cache.
+    let foreign = foreign_cache_summaries();
     match args.format {
-        OutputFormat::Text => print!("{}", report.render_text()),
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+        OutputFormat::Text => {
+            let mut text = report.render_text();
+            insert_after_model_cache_block(&mut text, &render_foreign_caches_text(&foreign));
+            print!("{text}");
+            if args.strict {
+                print!("{}", render_strict_checks_text(&strict_checks));
+            }
+        }
+        OutputFormat::Json => {
+            // `DoctorReport` lives in sbproxy-core; attach the foreign
+            // summary as an extra top-level field rather than widening
+            // that struct.
+            let mut value = serde_json::to_value(&report)?;
+            if let serde_json::Value::Object(object) = &mut value {
+                object.insert(
+                    "foreign_model_caches".to_string(),
+                    serde_json::to_value(&foreign)?,
+                );
+                if args.strict {
+                    object.insert(
+                        "strict_checks".to_string(),
+                        serde_json::to_value(&strict_checks)?,
+                    );
+                }
+            }
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        }
     }
     Ok(exit)
+}
+
+/// Render the `startup gate` block `doctor --strict` appends, one line
+/// per named check, in the same two-space style as the rest of the
+/// report. The trailing verdict line is what an operator reads first.
+fn render_strict_checks_text(checks: &[sbproxy_core::doctor::StrictCheck]) -> String {
+    let mut out = String::from("\nstartup gate\n");
+    for check in checks {
+        out.push_str(&format!(
+            "  {:<22} {:<5} {}\n",
+            check.check, check.status, check.detail
+        ));
+    }
+    let failed = checks.iter().filter(|c| c.failed()).count();
+    out.push_str(&match failed {
+        0 => "  verdict: pass (no startup blocker on this host)\n".to_string(),
+        1 => "  verdict: FAIL (1 startup blocker)\n".to_string(),
+        n => format!("  verdict: FAIL ({n} startup blockers)\n"),
+    });
+    out
+}
+
+/// Read what the canonical `proxy.model_host` block demands of the host,
+/// for the strict gate.
+///
+/// `extract_serve_and_catalog` only sees the inline provider-level
+/// `serve:` form. `proxy.model_host` is the form the examples and the
+/// self-host docs lead with, so a gate blind to it would report six
+/// `skip`s for a worker config that cannot run here. Parses only the
+/// engine and cache policy, and tolerates a config it cannot fully
+/// understand: an unparseable block yields no demand rather than a
+/// spurious blocker.
+fn extract_control_plane_demand(
+    yaml: &str,
+) -> Option<(sbproxy_core::doctor::ServeDemand, Option<f64>)> {
+    use sbproxy_config::model_host::{
+        ManagedEngineAcceleration, ManagedEngineKind, ModelHostControlConfig,
+    };
+
+    let root: serde_yaml::Value = serde_yaml::from_str(yaml).ok()?;
+    let block = root.get("proxy")?.get("model_host")?;
+    let control: ModelHostControlConfig = serde_yaml::from_value(block.clone()).ok()?;
+
+    let mut demand = sbproxy_core::doctor::ServeDemand::default();
+    for (kind, engine) in &control.engines {
+        // vLLM and SGLang have no non-NVIDIA backend sbproxy can launch,
+        // so naming either is a CUDA demand whatever `acceleration` says.
+        let cuda_engine = matches!(kind, ManagedEngineKind::Vllm | ManagedEngineKind::SGLang);
+        let cuda_accel = engine.acceleration == ManagedEngineAcceleration::Cuda;
+        if cuda_engine || cuda_accel {
+            demand.requires_cuda = true;
+            demand
+                .cuda_engines
+                .push(format!("proxy.model_host.engines.{kind:?}").to_lowercase());
+        }
+        if let Some(gib) = engine.shm_size_gib {
+            let bytes = gib.saturating_mul(1024 * 1024 * 1024);
+            demand.required_shm_bytes = Some(demand.required_shm_bytes.unwrap_or(0).max(bytes));
+        }
+    }
+    Some((demand, control.cache.budget_gib))
+}
+
+/// Read the model-plane identity material `proxy.cluster` names, for the
+/// strict gate's `model_plane_identity` check.
+///
+/// Parses the same YAML the proxy boots from, but only the security
+/// block: this is deliberately not `compile_config`, because a bootstrap
+/// wants the identity verdict even for a config whose origins reference
+/// a secret backend that is not reachable yet. Relative paths resolve
+/// against the config's own directory, matching how the proxy loads them.
+/// `None` means no cluster block, which the check reports as `skip`.
+fn extract_model_plane_identity(
+    yaml: &str,
+    config_dir: &std::path::Path,
+) -> Option<sbproxy_core::doctor::ModelPlaneIdentity> {
+    let root: serde_yaml::Value = serde_yaml::from_str(yaml).ok()?;
+    let cluster = root.get("proxy")?.get("cluster")?;
+    let security = cluster.get("security");
+    let mode = security
+        .and_then(|s| s.get("mode"))
+        .and_then(serde_yaml::Value::as_str)
+        .unwrap_or("shared_key");
+    let mtls = mode == "mtls";
+    let worker_role = cluster
+        .get("roles")
+        .and_then(serde_yaml::Value::as_sequence)
+        .is_some_and(|roles| {
+            roles
+                .iter()
+                .filter_map(serde_yaml::Value::as_str)
+                .any(|role| role == "worker")
+        });
+
+    let resolve = |value: &str| -> PathBuf {
+        let path = PathBuf::from(value);
+        if path.is_absolute() {
+            path
+        } else {
+            config_dir.join(path)
+        }
+    };
+    let read = |key: &str| -> Option<String> {
+        security?
+            .get(key)
+            .and_then(serde_yaml::Value::as_str)
+            .map(str::to_string)
+    };
+
+    let mut files = Vec::new();
+    let mut missing_keys = Vec::new();
+    for key in ["cert_file", "key_file", "ca_file"] {
+        match read(key) {
+            Some(value) => files.push((key, resolve(&value))),
+            // Only mTLS makes the three files mandatory; shared-key mode
+            // legitimately omits all of them.
+            None if mtls => missing_keys.push(key),
+            None => {}
+        }
+    }
+    // Interpolated references (`env:`, `file:`, a vault URI) are resolved
+    // by the secret layer at boot, not here, so treat a non-literal
+    // shared key as present and let the boot path own that failure.
+    let shared_key_present = if mtls {
+        None
+    } else {
+        Some(read("shared_key").is_some_and(|value| !value.trim().is_empty()))
+    };
+
+    Some(sbproxy_core::doctor::ModelPlaneIdentity {
+        worker_role,
+        mtls,
+        files,
+        missing_keys,
+        shared_key_present,
+    })
+}
+
+/// Per-source rollup of the read-only foreign model-cache scan
+/// (WOR-1863): weights Ollama, LM Studio, or the Hugging Face hub
+/// already have on disk under the current user's home directory.
+#[derive(Debug, serde::Serialize)]
+struct ForeignCacheSummary {
+    /// Which foreign cache the files came from.
+    source: sbproxy_model_host::ForeignCacheSource,
+    /// Number of weight files found for this source.
+    files: usize,
+    /// Combined on-disk size of those files in bytes.
+    total_bytes: u64,
+}
+
+/// Scan the foreign model caches under the current home directory and
+/// roll the findings up per source, in a stable order. Read-only and
+/// silent about absent directories; no resolvable home directory
+/// yields an empty list.
+fn foreign_cache_summaries() -> Vec<ForeignCacheSummary> {
+    let Some(home) = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+    else {
+        return Vec::new();
+    };
+    let mut summaries: Vec<ForeignCacheSummary> = Vec::new();
+    for file in sbproxy_model_host::discover_foreign_models(&home) {
+        match summaries.iter_mut().find(|s| s.source == file.source) {
+            Some(summary) => {
+                summary.files += 1;
+                summary.total_bytes += file.size_bytes;
+            }
+            None => summaries.push(ForeignCacheSummary {
+                source: file.source,
+                files: 1,
+                total_bytes: file.size_bytes,
+            }),
+        }
+    }
+    summaries
+}
+
+/// Render the `foreign model caches` doctor block, mirroring the
+/// report's section formatting: one line per source found, or a
+/// single `none found` line.
+fn render_foreign_caches_text(summaries: &[ForeignCacheSummary]) -> String {
+    let mut out = String::from("\nforeign model caches\n");
+    if summaries.is_empty() {
+        out.push_str("  none found\n");
+        return out;
+    }
+    for summary in summaries {
+        let plural = if summary.files == 1 { "" } else { "s" };
+        out.push_str(&format!(
+            "  {:<14}{} file{plural}, {}\n",
+            summary.source.label(),
+            summary.files,
+            format_cache_size(summary.total_bytes)
+        ));
+    }
+    out
+}
+
+/// Human-readable byte size for the foreign-caches block: GiB for
+/// anything large, MiB below one GiB, raw bytes below one MiB.
+fn format_cache_size(bytes: u64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= GIB {
+        format!("{:.1} GiB", b / GIB)
+    } else if b >= MIB {
+        format!("{:.0} MiB", b / MIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Insert `block` into the rendered doctor text directly after the
+/// `model cache` section, falling back to appending at the end if
+/// that section marker ever moves.
+fn insert_after_model_cache_block(text: &mut String, block: &str) {
+    const MARKER: &str = "\nmodel cache\n";
+    let insert_at = text.find(MARKER).and_then(|start| {
+        let body = start + MARKER.len();
+        // The section body ends where the blank line before the next
+        // section header begins.
+        text[body..].find("\n\n").map(|i| body + i + 1)
+    });
+    match insert_at {
+        Some(at) => text.insert_str(at, block),
+        None => text.push_str(block),
+    }
 }
 
 /// Extract the merged `serve:` block (across every `ai_proxy` provider)
@@ -1902,11 +2945,20 @@ fn parse_run_engine(value: &str) -> anyhow::Result<sbproxy_model_host::EngineCho
     match value {
         "auto" => Ok(sbproxy_model_host::EngineChoice::Auto),
         "vllm" => Ok(sbproxy_model_host::EngineChoice::Vllm),
+        "sglang" => Ok(sbproxy_model_host::EngineChoice::SGLang),
         "llama_cpp" => Ok(sbproxy_model_host::EngineChoice::LlamaCpp),
+        "mistralrs" => Ok(sbproxy_model_host::EngineChoice::MistralRs),
         "embedded" => {
-            anyhow::bail!("embedded is not a managed process engine; use auto, vllm, or llama_cpp")
+            anyhow::bail!(
+                "embedded is not a managed process engine; use auto, vllm, sglang, llama_cpp, \
+                 or mistralrs"
+            )
         }
-        other => anyhow::bail!("unknown engine '{other}'; use auto, vllm, or llama_cpp"),
+        other => {
+            anyhow::bail!(
+                "unknown engine '{other}'; use auto, vllm, sglang, llama_cpp, or mistralrs"
+            )
+        }
     }
 }
 
@@ -1987,14 +3039,33 @@ fn prepare_run(args: &RunArgs) -> anyhow::Result<PreparedRun> {
             "version": sbproxy_model_host::DEFAULT_VLLM_VERSION,
             "acceleration": acceleration,
         }),
-        sbproxy_model_host::EngineKind::LlamaCpp => serde_json::json!({
-            "launch": "binary",
-            "version": sbproxy_model_host::DEFAULT_LLAMA_RELEASE_TAG,
+        sbproxy_model_host::EngineKind::SGLang => serde_json::json!({
+            "launch": "uv",
+            "version": sbproxy_model_host::DEFAULT_SGLANG_VERSION,
             "acceleration": acceleration,
         }),
-        sbproxy_model_host::EngineKind::Embedded => {
-            anyhow::bail!("catalog resolved the unsupported embedded managed engine")
+        sbproxy_model_host::EngineKind::LlamaCpp => {
+            // The generated config pins the engine release explicitly, so
+            // the pin must be one this host's macOS can load: recent
+            // llama.cpp macos-arm64 assets link against macOS 26 and die
+            // at dyld link time on older hosts. The host-aware default
+            // picks the newest pinned build the OS supports, and fails
+            // here, loudly, when none fits.
+            let tag = sbproxy_model_host::default_llama_release_tag_for_host()
+                .map_err(|reason| anyhow::anyhow!("select llama.cpp release: {reason}"))?;
+            serde_json::json!({
+                "launch": "binary",
+                "version": tag,
+                "acceleration": acceleration,
+            })
         }
+        sbproxy_model_host::EngineKind::MistralRs => serde_json::json!({
+            // Binary engine like llama.cpp: PATH-first with the pinned
+            // upstream prebuilt release as the fallback (WOR-1861).
+            "launch": "binary",
+            "version": sbproxy_model_host::mistralrs_release::DEFAULT_MISTRALRS_RELEASE_TAG,
+            "acceleration": acceleration,
+        }),
     };
     let action = serde_json::json!({
         "type": "ai_proxy",
@@ -2073,6 +3144,1306 @@ fn write_private_run_config(path: &std::path::Path, yaml: &[u8]) -> anyhow::Resu
     Ok(())
 }
 
+// --- `service` handler: launchd agent install/uninstall/status (macOS) ---
+//
+// `sbproxy-platform` (storage/messenger/circuit-breaker/DNS/health) has no
+// precedent for OS service integration and nothing in its dependency graph
+// is CLI-shaped, so this lives next to `prepare_run`/`RunArgs` in the
+// binary crate instead, alongside the other host-integration code already
+// here (`atomic_replace_binary`, `raise_fd_limit`, `tighten_directory_permissions`).
+
+/// launchd label for the single per-user sbproxy agent. One agent per
+/// host: a second `service install` replaces it rather than adding a
+/// second one, mirroring how `sbproxy run` serves one model at a time.
+const SERVICE_LABEL: &str = "dev.sbproxy.agent";
+
+/// Seconds launchd waits for the agent to exit after SIGTERM before it
+/// escalates to SIGKILL.
+///
+/// launchd's default is 20 seconds, which is far shorter than the proxy's
+/// full drain. The drain has TWO phases of the same length: Pingora sleeps
+/// the whole `grace_period_seconds`, then waits up to
+/// `graceful_shutdown_timeout_seconds` for service runtimes to exit, and
+/// the server sets both to the 30-second default grace
+/// (`SBPROXY_SHUTDOWN_GRACE_MS`), so a shutdown after traffic takes about
+/// 60 seconds end to end. The previous value of 45 only budgeted one
+/// phase, so launchd SIGKILLed a draining agent mid-shutdown, skipping
+/// every Rust destructor including the engine reap (WOR-2167). 90 leaves
+/// the full two-phase drain room to finish; raise it alongside any
+/// increase to the default grace.
+///
+/// Durable managed-engine ownership separately covers a forced gateway
+/// death; this timeout preserves the preferred graceful path so a normal
+/// `service uninstall` can drain before verifying and clearing ownership.
+const SERVICE_EXIT_TIMEOUT_SECS: u32 = 90;
+
+/// The proxy's default shutdown grace in seconds. The full drain is two
+/// phases of this length (grace sleep, then runtime exit wait; see
+/// `crates/sbproxy-core/src/server/lifecycle.rs`, which sets both Pingora
+/// fields from the same value), and [`SERVICE_EXIT_TIMEOUT_SECS`] has to
+/// exceed the sum. Kept next to it so the relationship is checked at
+/// compile time rather than in a test that someone has to remember to run.
+const DEFAULT_SHUTDOWN_GRACE_SECS: u32 = 30;
+const _: () = assert!(
+    SERVICE_EXIT_TIMEOUT_SECS > 2 * DEFAULT_SHUTDOWN_GRACE_SECS,
+    "launchd would SIGKILL the agent before its two-phase shutdown drain could finish"
+);
+
+/// Filesystem locations the `service` subcommands read and write,
+/// resolved from `$HOME` once so every handler agrees on the same
+/// paths. The config lives under Application Support: unlike
+/// `PrivateRunDirectory`'s config, it must outlive the process that
+/// wrote it, since launchd rereads it on every future load. The plist
+/// lives in the standard per-user launchd agent directory. The two log
+/// paths are where launchd redirects the child's stdout/stderr.
+struct ServicePaths {
+    config: PathBuf,
+    plist: PathBuf,
+    stdout_log: PathBuf,
+    stderr_log: PathBuf,
+    env_file: PathBuf,
+    uninstall_state: PathBuf,
+    lifecycle_lock: PathBuf,
+}
+
+fn service_paths() -> anyhow::Result<ServicePaths> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("$HOME is not set"))?;
+    let service_dir = home.join("Library/Application Support/sbproxy/service");
+    Ok(ServicePaths {
+        config: service_dir.join("sb.yml"),
+        plist: home
+            .join("Library/LaunchAgents")
+            .join(format!("{SERVICE_LABEL}.plist")),
+        stdout_log: home.join("Library/Logs/sbproxy/service.log"),
+        stderr_log: home.join("Library/Logs/sbproxy/service.err.log"),
+        env_file: service_dir.join("env"),
+        uninstall_state: service_dir.join("uninstall-state.json"),
+        lifecycle_lock: service_dir.join("lifecycle.lock"),
+    })
+}
+
+const SERVICE_ENGINE_OWNERSHIP_ENV: &str = "SBPROXY_ENGINE_OWNERSHIP_DIR";
+const MAX_SERVICE_ENVIRONMENT_BYTES: usize = 1024 * 1024;
+const MAX_SERVICE_PLIST_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Default)]
+struct ServiceEnvironment {
+    variables: BTreeMap<String, String>,
+}
+
+/// Header written into a freshly created service environment file.
+///
+/// A launchd agent inherits almost nothing from the shell that installed
+/// it, so a `HF_TOKEN` exported in a terminal is invisible to the agent
+/// and a gated model fails to pull with no obvious cause. This file is
+/// where those values live. It is created once and never rewritten, so
+/// reinstalling to change model or port does not discard the operator's
+/// token.
+const SERVICE_ENV_TEMPLATE: &str = "\
+# sbproxy launchd agent environment.
+#
+# Read as data before the agent starts, so anything set here is visible
+# to the served process. Use one KEY=value per line. Values are literal:
+# do not use export, quotes, shell expansion, commands, or inline comments.
+# `sbproxy service install` creates this file once and never overwrites it,
+# so a token set here survives a reinstall.
+#
+# Hugging Face token required to pull a gated model:
+# HF_TOKEN=hf_...
+# Raise or lower the agent's log level:
+# RUST_LOG=info
+# Optional absolute directory for durable managed-engine ownership:
+# SBPROXY_ENGINE_OWNERSHIP_DIR=/absolute/path
+";
+
+fn read_service_environment(path: &std::path::Path) -> anyhow::Result<ServiceEnvironment> {
+    use std::io::Read as _;
+
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ServiceEnvironment::default());
+        }
+        Err(error) => {
+            return Err(anyhow::anyhow!("read '{}': {error}", path.display()));
+        }
+    };
+    let length = file
+        .metadata()
+        .map_err(|error| anyhow::anyhow!("inspect '{}': {error}", path.display()))?
+        .len();
+    if length > MAX_SERVICE_ENVIRONMENT_BYTES as u64 {
+        anyhow::bail!(
+            "read '{}': service environment exceeds maximum size of {} bytes",
+            path.display(),
+            MAX_SERVICE_ENVIRONMENT_BYTES
+        );
+    }
+    let mut bytes = Vec::with_capacity(length as usize);
+    file.take((MAX_SERVICE_ENVIRONMENT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| anyhow::anyhow!("read '{}': {error}", path.display()))?;
+    if bytes.len() > MAX_SERVICE_ENVIRONMENT_BYTES {
+        anyhow::bail!(
+            "read '{}': service environment exceeds maximum size of {} bytes",
+            path.display(),
+            MAX_SERVICE_ENVIRONMENT_BYTES
+        );
+    }
+    let contents = String::from_utf8(bytes)
+        .map_err(|error| anyhow::anyhow!("read '{}': {error}", path.display()))?;
+    parse_service_environment(path, &contents)
+}
+
+fn parse_service_environment(
+    path: &std::path::Path,
+    contents: &str,
+) -> anyhow::Result<ServiceEnvironment> {
+    let mut variables = BTreeMap::new();
+    for (index, line) in contents.lines().enumerate() {
+        let line_number = index + 1;
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            anyhow::bail!(
+                "parse '{}', line {line_number}: expected KEY=value; shell syntax is not supported",
+                path.display()
+            );
+        };
+        let key_is_valid = !key.is_empty()
+            && key
+                .bytes()
+                .next()
+                .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+            && key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+        if !key_is_valid {
+            anyhow::bail!(
+                "parse '{}', line {line_number}: invalid environment key '{key}'; \
+                 use strict KEY=value syntax without export",
+                path.display()
+            );
+        }
+        if value.trim() != value {
+            anyhow::bail!(
+                "parse '{}', line {line_number}: leading or trailing value whitespace is ambiguous",
+                path.display()
+            );
+        }
+        let quoted = value.starts_with('\'')
+            || value.starts_with('"')
+            || value.ends_with('\'')
+            || value.ends_with('"');
+        let shell_syntax = quoted
+            || value.contains('$')
+            || value.contains('`')
+            || value.contains('\\')
+            || value.contains(';')
+            || value.contains("&&")
+            || value.contains("||")
+            || value.contains("<(")
+            || value.contains(">(")
+            || value.contains(" #")
+            || value.starts_with('~');
+        if shell_syntax {
+            anyhow::bail!(
+                "parse '{}', line {line_number}: shell syntax is not supported; \
+                 provide the literal value without quotes, expansion, commands, or comments",
+                path.display()
+            );
+        }
+        if variables
+            .insert(key.to_string(), value.to_string())
+            .is_some()
+        {
+            anyhow::bail!(
+                "parse '{}', line {line_number}: duplicate environment key '{key}'",
+                path.display()
+            );
+        }
+    }
+    Ok(ServiceEnvironment { variables })
+}
+
+/// Create the environment file if it is absent, leaving an existing one
+/// untouched. Mode 0600: it is the documented home for a Hugging Face
+/// token.
+fn ensure_service_env_file(path: &std::path::Path) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    if path.exists() {
+        return Ok(());
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| anyhow::anyhow!("create '{}': {error}", path.display()))?;
+    file.write_all(SERVICE_ENV_TEMPLATE.as_bytes())
+        .map_err(|error| anyhow::anyhow!("write '{}': {error}", path.display()))?;
+    Ok(())
+}
+
+const LEGACY_SERVICE_UNINSTALL_STATE_SCHEMA_VERSION: u32 = 1;
+const SERVICE_UNINSTALL_STATE_SCHEMA_VERSION: u32 = 2;
+const MAX_SERVICE_OWNER_GENERATIONS: usize = 4_096;
+const MAX_SERVICE_UNINSTALL_STATE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SERVICE_UNLOAD_ATTEMPTS: usize = 8;
+const MAX_SERVICE_UNLOAD_NO_PROGRESS: usize = 2;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ServiceUninstallState {
+    schema_version: u32,
+    ownership_directory: PathBuf,
+    owners: Vec<sbproxy_model_host::ManagedEngineOwner>,
+    #[serde(default)]
+    bootstrap_registered_owners: Vec<sbproxy_model_host::ManagedEngineOwner>,
+}
+
+#[derive(Debug)]
+struct ServiceLifecycleLock {
+    _file: std::fs::File,
+}
+
+#[cfg(unix)]
+fn acquire_service_lifecycle_lock(path: &std::path::Path) -> anyhow::Result<ServiceLifecycleLock> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("'{}' has no parent", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| anyhow::anyhow!("create '{}': {error}", parent.display()))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).mode(0o600);
+    #[cfg(target_os = "macos")]
+    options.custom_flags(0x0000_0100); // O_NOFOLLOW
+    #[cfg(target_os = "linux")]
+    options.custom_flags(0x0002_0000); // O_NOFOLLOW
+    let file = options
+        .open(path)
+        .map_err(|error| anyhow::anyhow!("open lifecycle lock '{}': {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| anyhow::anyhow!("inspect lifecycle lock '{}': {error}", path.display()))?;
+    let parent_metadata = std::fs::metadata(parent)
+        .map_err(|error| anyhow::anyhow!("inspect '{}': {error}", parent.display()))?;
+    if !metadata.file_type().is_file() || metadata.uid() != parent_metadata.uid() {
+        anyhow::bail!(
+            "lifecycle lock '{}' must be a regular file owned by the service directory owner",
+            path.display()
+        );
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| anyhow::anyhow!("secure lifecycle lock '{}': {error}", path.display()))?;
+    fs2::FileExt::lock_exclusive(&file)
+        .map_err(|error| anyhow::anyhow!("lock lifecycle '{}': {error}", path.display()))?;
+    file.sync_all()
+        .map_err(|error| anyhow::anyhow!("sync lifecycle lock '{}': {error}", path.display()))?;
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| anyhow::anyhow!("sync '{}': {error}", parent.display()))?;
+    Ok(ServiceLifecycleLock { _file: file })
+}
+
+#[cfg(not(unix))]
+fn acquire_service_lifecycle_lock(path: &std::path::Path) -> anyhow::Result<ServiceLifecycleLock> {
+    anyhow::bail!(
+        "service lifecycle lock '{}' is only supported on Unix",
+        path.display()
+    )
+}
+
+fn append_service_owner(
+    state: &mut ServiceUninstallState,
+    owner: &sbproxy_model_host::ManagedEngineOwner,
+) -> anyhow::Result<bool> {
+    if service_owner_list_contains(&state.owners, owner) {
+        return Ok(false);
+    }
+    if state.owners.len() >= MAX_SERVICE_OWNER_GENERATIONS {
+        anyhow::bail!(
+            "service owner generation limit ({MAX_SERVICE_OWNER_GENERATIONS}) reached; \
+             uninstall and inspect the durable lifecycle state before restarting"
+        );
+    }
+    state.owners.push(owner.clone());
+    Ok(true)
+}
+
+fn service_owner_list_contains(
+    owners: &[sbproxy_model_host::ManagedEngineOwner],
+    owner: &sbproxy_model_host::ManagedEngineOwner,
+) -> bool {
+    owners
+        .iter()
+        .any(|candidate| candidate.same_process_generation(owner))
+}
+
+fn register_bootstrap_service_owner(
+    state: &mut ServiceUninstallState,
+    owner: &sbproxy_model_host::ManagedEngineOwner,
+) -> anyhow::Result<bool> {
+    let owner_is_new = !service_owner_list_contains(&state.owners, owner);
+    let registration_is_new =
+        !service_owner_list_contains(&state.bootstrap_registered_owners, owner);
+    if owner_is_new && state.owners.len() >= MAX_SERVICE_OWNER_GENERATIONS {
+        anyhow::bail!(
+            "service owner generation limit ({MAX_SERVICE_OWNER_GENERATIONS}) reached; \
+             uninstall and inspect the durable lifecycle state before restarting"
+        );
+    }
+    if registration_is_new
+        && state.bootstrap_registered_owners.len() >= MAX_SERVICE_OWNER_GENERATIONS
+    {
+        anyhow::bail!(
+            "bootstrap-registered service owner generation limit \
+             ({MAX_SERVICE_OWNER_GENERATIONS}) reached; uninstall and inspect the durable \
+             lifecycle state before restarting"
+        );
+    }
+    if owner_is_new {
+        state.owners.push(owner.clone());
+    }
+    if registration_is_new {
+        state.bootstrap_registered_owners.push(owner.clone());
+    }
+    Ok(owner_is_new || registration_is_new)
+}
+
+fn register_service_owner_locked(
+    _lock: &ServiceLifecycleLock,
+    state_path: &std::path::Path,
+    ownership_directory: &std::path::Path,
+    owner: &sbproxy_model_host::ManagedEngineOwner,
+) -> anyhow::Result<()> {
+    if !ownership_directory.is_absolute() {
+        anyhow::bail!(
+            "managed-engine ownership directory '{}' must be absolute",
+            ownership_directory.display()
+        );
+    }
+    let existing = read_service_uninstall_state(state_path)?;
+    let mut state = existing.unwrap_or_else(|| ServiceUninstallState {
+        schema_version: SERVICE_UNINSTALL_STATE_SCHEMA_VERSION,
+        ownership_directory: ownership_directory.to_path_buf(),
+        owners: Vec::new(),
+        bootstrap_registered_owners: Vec::new(),
+    });
+    if state.ownership_directory != ownership_directory {
+        anyhow::bail!(
+            "service lifecycle state '{}' uses ownership directory '{}', not '{}'; \
+             uninstall the prior service generation before changing directories",
+            state_path.display(),
+            state.ownership_directory.display(),
+            ownership_directory.display()
+        );
+    }
+    if register_bootstrap_service_owner(&mut state, owner)? {
+        persist_service_uninstall_state(state_path, &state)?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchdJobStatus {
+    NotLoaded,
+    Loaded { pid: Option<u32> },
+}
+
+trait LaunchdController {
+    fn status(&mut self) -> anyhow::Result<LaunchdJobStatus>;
+    fn unload(&mut self, plist: &std::path::Path) -> anyhow::Result<()>;
+}
+
+struct SystemLaunchdController;
+
+fn classify_launchctl_list_status(
+    success: bool,
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> anyhow::Result<LaunchdJobStatus> {
+    if success {
+        return Ok(LaunchdJobStatus::Loaded {
+            pid: parse_launchctl_list_pid(stdout),
+        });
+    }
+
+    let normalized_stderr = stderr.to_ascii_lowercase();
+    let service_is_missing = normalized_stderr.contains("could not find service")
+        || normalized_stderr.contains("could not find specified service")
+        || normalized_stderr.contains("service cannot be found");
+    if service_is_missing {
+        return Ok(LaunchdJobStatus::NotLoaded);
+    }
+
+    let status = exit_code.map_or_else(
+        || "terminated by signal".to_string(),
+        |code| format!("exit code {code}"),
+    );
+    let detail = stderr.trim();
+    anyhow::bail!(
+        "launchctl list '{SERVICE_LABEL}' failed ({status}): {}",
+        if detail.is_empty() {
+            "no error output"
+        } else {
+            detail
+        }
+    );
+}
+
+impl LaunchdController for SystemLaunchdController {
+    fn status(&mut self) -> anyhow::Result<LaunchdJobStatus> {
+        let output = std::process::Command::new("launchctl")
+            .arg("list")
+            .arg(SERVICE_LABEL)
+            .output()
+            .map_err(|error| anyhow::anyhow!("launchctl list: {error}"))?;
+        classify_launchctl_list_status(
+            output.status.success(),
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        )
+    }
+
+    fn unload(&mut self, plist: &std::path::Path) -> anyhow::Result<()> {
+        let output = std::process::Command::new("launchctl")
+            .arg("unload")
+            .arg(plist)
+            .output()
+            .map_err(|error| anyhow::anyhow!("launchctl unload: {error}"))?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "launchctl unload '{}' failed: {}",
+                plist.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+}
+
+trait ServiceEngineCleanup {
+    fn capture_owner(&mut self, pid: u32)
+        -> anyhow::Result<sbproxy_model_host::ManagedEngineOwner>;
+    fn reap_owner(
+        &mut self,
+        directory: &std::path::Path,
+        owner: &sbproxy_model_host::ManagedEngineOwner,
+    ) -> anyhow::Result<usize>;
+}
+
+struct SystemServiceEngineCleanup;
+
+impl ServiceEngineCleanup for SystemServiceEngineCleanup {
+    fn capture_owner(
+        &mut self,
+        pid: u32,
+    ) -> anyhow::Result<sbproxy_model_host::ManagedEngineOwner> {
+        sbproxy_model_host::capture_managed_engine_owner(pid).ok_or_else(|| {
+            anyhow::anyhow!(
+                "capture exact launchd owner pid {pid}: process identity is no longer available"
+            )
+        })
+    }
+
+    fn reap_owner(
+        &mut self,
+        directory: &std::path::Path,
+        owner: &sbproxy_model_host::ManagedEngineOwner,
+    ) -> anyhow::Result<usize> {
+        sbproxy_model_host::reap_managed_engines_owned_by_identity_at(
+            directory,
+            owner,
+            std::time::Duration::from_secs(u64::from(SERVICE_EXIT_TIMEOUT_SECS)),
+            std::time::Duration::from_secs(5),
+        )
+        .map_err(|error| anyhow::anyhow!("reap managed engines after service unload: {error}"))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ServiceUninstallOutcome {
+    removed: bool,
+    engines_reaped: usize,
+}
+
+fn service_engine_ownership_directory(paths: &ServicePaths) -> anyhow::Result<PathBuf> {
+    let environment = read_service_environment(&paths.env_file)?;
+    service_engine_ownership_directory_from_environment(
+        &environment,
+        &paths.env_file,
+        &paths.config,
+    )
+}
+
+fn service_engine_ownership_directory_from_environment(
+    environment: &ServiceEnvironment,
+    env_file: &std::path::Path,
+    config: &std::path::Path,
+) -> anyhow::Result<PathBuf> {
+    if let Some(value) = environment.variables.get(SERVICE_ENGINE_OWNERSHIP_ENV) {
+        if value.is_empty() {
+            anyhow::bail!(
+                "{SERVICE_ENGINE_OWNERSHIP_ENV} in '{}' is empty",
+                env_file.display()
+            );
+        }
+        let directory = PathBuf::from(value);
+        if !directory.is_absolute() {
+            anyhow::bail!(
+                "{SERVICE_ENGINE_OWNERSHIP_ENV} in '{}' must be absolute",
+                env_file.display()
+            );
+        }
+        return Ok(directory);
+    }
+    config
+        .parent()
+        .and_then(std::path::Path::parent)
+        .map(|application_dir| application_dir.join("managed-engines"))
+        .ok_or_else(|| anyhow::anyhow!("resolve default managed-engine ownership directory"))
+}
+
+fn read_service_uninstall_state(
+    path: &std::path::Path,
+) -> anyhow::Result<Option<ServiceUninstallState>> {
+    use std::io::Read as _;
+
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(anyhow::anyhow!("read '{}': {error}", path.display()));
+        }
+    };
+    let length = file
+        .metadata()
+        .map_err(|error| anyhow::anyhow!("inspect '{}': {error}", path.display()))?
+        .len();
+    if length > MAX_SERVICE_UNINSTALL_STATE_BYTES as u64 {
+        anyhow::bail!(
+            "read '{}': lifecycle state exceeds maximum size of {} bytes",
+            path.display(),
+            MAX_SERVICE_UNINSTALL_STATE_BYTES
+        );
+    }
+    let mut bytes = Vec::with_capacity(length as usize);
+    let mut limited = file.take((MAX_SERVICE_UNINSTALL_STATE_BYTES + 1) as u64);
+    limited
+        .read_to_end(&mut bytes)
+        .map_err(|error| anyhow::anyhow!("read '{}': {error}", path.display()))?;
+    if bytes.len() > MAX_SERVICE_UNINSTALL_STATE_BYTES {
+        anyhow::bail!(
+            "read '{}': lifecycle state exceeds maximum size of {} bytes",
+            path.display(),
+            MAX_SERVICE_UNINSTALL_STATE_BYTES
+        );
+    }
+    let mut state: ServiceUninstallState = serde_json::from_slice(&bytes)
+        .map_err(|error| anyhow::anyhow!("parse '{}': {error}", path.display()))?;
+    match state.schema_version {
+        LEGACY_SERVICE_UNINSTALL_STATE_SCHEMA_VERSION => {
+            // Schema 1 mixed bootstrap registrations with owners observed by
+            // uninstall, so none of its entries can prove registration.
+            state.bootstrap_registered_owners.clear();
+            state.schema_version = SERVICE_UNINSTALL_STATE_SCHEMA_VERSION;
+        }
+        SERVICE_UNINSTALL_STATE_SCHEMA_VERSION => {}
+        _ => anyhow::bail!("validate '{}': unsupported or unsafe state", path.display()),
+    }
+    if !state.ownership_directory.is_absolute()
+        || state.owners.len() > MAX_SERVICE_OWNER_GENERATIONS
+        || state.bootstrap_registered_owners.len() > MAX_SERVICE_OWNER_GENERATIONS
+        || !state
+            .bootstrap_registered_owners
+            .iter()
+            .all(|owner| service_owner_list_contains(&state.owners, owner))
+    {
+        anyhow::bail!("validate '{}': unsupported or unsafe state", path.display());
+    }
+    Ok(Some(state))
+}
+
+fn persist_service_uninstall_state(
+    path: &std::path::Path,
+    state: &ServiceUninstallState,
+) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("'{}' has no parent", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| anyhow::anyhow!("create '{}': {error}", parent.display()))?;
+    let temporary = parent.join(format!(
+        ".uninstall-state-{}-{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let bytes = serde_json::to_vec_pretty(state)
+        .map_err(|error| anyhow::anyhow!("encode uninstall state: {error}"))?;
+    if bytes.len() + 1 > MAX_SERVICE_UNINSTALL_STATE_BYTES {
+        anyhow::bail!(
+            "persist '{}': lifecycle state exceeds maximum size of {} bytes",
+            path.display(),
+            MAX_SERVICE_UNINSTALL_STATE_BYTES
+        );
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&temporary)
+        .map_err(|error| anyhow::anyhow!("create '{}': {error}", temporary.display()))?;
+    let result = (|| -> std::io::Result<()> {
+        file.write_all(&bytes)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)?;
+        std::fs::File::open(parent)?.sync_all()
+    })();
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(anyhow::anyhow!("persist '{}': {error}", path.display()));
+    }
+    Ok(())
+}
+
+fn remove_service_file(path: &std::path::Path) -> anyhow::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            if let Some(parent) = path.parent() {
+                std::fs::File::open(parent)
+                    .and_then(|directory| directory.sync_all())
+                    .map_err(|error| anyhow::anyhow!("sync '{}': {error}", parent.display()))?;
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(anyhow::anyhow!("remove '{}': {error}", path.display())),
+    }
+}
+
+fn service_plist_uses_registered_bootstrap(paths: &ServicePaths) -> anyhow::Result<bool> {
+    use std::io::Read as _;
+
+    let file = match std::fs::File::open(&paths.plist) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "read service plist '{}': {error}",
+                paths.plist.display()
+            ));
+        }
+    };
+    let length = file
+        .metadata()
+        .map_err(|error| anyhow::anyhow!("inspect '{}': {error}", paths.plist.display()))?
+        .len();
+    if length > MAX_SERVICE_PLIST_BYTES as u64 {
+        anyhow::bail!(
+            "read '{}': service plist exceeds maximum size of {} bytes",
+            paths.plist.display(),
+            MAX_SERVICE_PLIST_BYTES
+        );
+    }
+    let mut bytes = Vec::with_capacity(length as usize);
+    file.take((MAX_SERVICE_PLIST_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| anyhow::anyhow!("read '{}': {error}", paths.plist.display()))?;
+    if bytes.len() > MAX_SERVICE_PLIST_BYTES {
+        anyhow::bail!(
+            "read '{}': service plist exceeds maximum size of {} bytes",
+            paths.plist.display(),
+            MAX_SERVICE_PLIST_BYTES
+        );
+    }
+    let plist = String::from_utf8(bytes)
+        .map_err(|error| anyhow::anyhow!("read '{}': {error}", paths.plist.display()))?;
+    Ok([
+        "<string>service</string>",
+        "<string>launch</string>",
+        "<string>--environment</string>",
+        "<string>--lifecycle-lock</string>",
+        "<string>--uninstall-state</string>",
+        &format!(
+            "<string>{}</string>",
+            xml_escape(&paths.lifecycle_lock.to_string_lossy())
+        ),
+        &format!(
+            "<string>{}</string>",
+            xml_escape(&paths.uninstall_state.to_string_lossy())
+        ),
+    ]
+    .into_iter()
+    .all(|marker| plist.contains(marker)))
+}
+
+fn perform_service_uninstall(
+    paths: &ServicePaths,
+    launchd: &mut dyn LaunchdController,
+    cleanup: &mut dyn ServiceEngineCleanup,
+) -> anyhow::Result<ServiceUninstallOutcome> {
+    // A launchd replacement must register under this same lock before it
+    // can exec the gateway. Holding it through unload makes the registry
+    // and launchd transition one cooperative transaction.
+    let _lifecycle_lock = acquire_service_lifecycle_lock(&paths.lifecycle_lock)?;
+    let removed = paths.plist.exists();
+    let mut state = read_service_uninstall_state(&paths.uninstall_state)?;
+    let mut status = launchd.status()?;
+
+    if matches!(status, LaunchdJobStatus::Loaded { .. })
+        && !service_plist_uses_registered_bootstrap(paths)?
+    {
+        anyhow::bail!(
+            "launchd job '{SERVICE_LABEL}' uses a legacy plist without exact generation \
+             registration; unloading it cannot close the KeepAlive replacement race. \
+             Reinstall the intended model with this sbproxy version (`sbproxy service install \
+             <model>`), wait for `sbproxy service status` to report running, then retry uninstall. \
+             The existing plist and lifecycle state were retained."
+        );
+    }
+
+    if state.is_none() && status == LaunchdJobStatus::NotLoaded {
+        remove_service_file(&paths.plist)?;
+        return Ok(ServiceUninstallOutcome {
+            removed,
+            engines_reaped: 0,
+        });
+    }
+
+    // The plist on disk can be newer than the generation launchd is still
+    // running. Prove the exact initially observed process completed this
+    // version's bootstrap registration before trusting the cooperative lock.
+    // Owners recorded only by an older uninstall attempt do not carry that
+    // provenance and cannot authorize unload.
+    let mut initially_registered_owner = match status {
+        LaunchdJobStatus::Loaded { pid: Some(pid) } => {
+            let owner = cleanup.capture_owner(pid)?;
+            let was_bootstrap_registered = state.as_ref().is_some_and(|state| {
+                service_owner_list_contains(&state.bootstrap_registered_owners, &owner)
+            });
+            if !was_bootstrap_registered {
+                anyhow::bail!(
+                    "launchd job '{SERVICE_LABEL}' generation pid {pid} was not registered by \
+                     the service bootstrap; refusing to unload because the plist on disk cannot \
+                     prove which generation launchd is running. Reinstall the intended model \
+                     with this sbproxy version (`sbproxy service install <model>`), wait for \
+                     `sbproxy service status` to report running, then retry uninstall. The \
+                     existing plist and lifecycle state were retained."
+                );
+            }
+            Some((pid, owner))
+        }
+        LaunchdJobStatus::NotLoaded | LaunchdJobStatus::Loaded { pid: None } => None,
+    };
+
+    if state.is_none() {
+        state = Some(ServiceUninstallState {
+            schema_version: SERVICE_UNINSTALL_STATE_SCHEMA_VERSION,
+            ownership_directory: service_engine_ownership_directory(paths)?,
+            owners: Vec::new(),
+            bootstrap_registered_owners: Vec::new(),
+        });
+    }
+    let state = state.as_mut().expect("uninstall state initialized");
+    // Persist the transaction before touching launchd. In particular, a
+    // loaded job without a PID cannot be tied to an exact owner yet and
+    // must leave both retry handles intact.
+    persist_service_uninstall_state(&paths.uninstall_state, state)?;
+
+    let mut unload_attempts = 0usize;
+    let mut no_progress = 0usize;
+    let mut prior_owner: Option<sbproxy_model_host::ManagedEngineOwner> = None;
+    loop {
+        let pid = match status {
+            LaunchdJobStatus::NotLoaded => break,
+            LaunchdJobStatus::Loaded { pid: Some(pid) } => pid,
+            LaunchdJobStatus::Loaded { pid: None } => {
+                anyhow::bail!(
+                    "launchd job '{SERVICE_LABEL}' is loaded but has no PID; \
+                     exact managed-engine ownership cannot be captured yet"
+                );
+            }
+        };
+
+        let owner = if let Some((registered_pid, owner)) = initially_registered_owner.take() {
+            debug_assert_eq!(registered_pid, pid);
+            owner
+        } else {
+            cleanup.capture_owner(pid)?
+        };
+        let owner_was_added = append_service_owner(state, &owner)?;
+        if owner_was_added {
+            persist_service_uninstall_state(&paths.uninstall_state, state)?;
+        }
+        if prior_owner
+            .as_ref()
+            .is_some_and(|prior| prior.same_process_generation(&owner))
+            && !owner_was_added
+        {
+            no_progress += 1;
+            if no_progress >= MAX_SERVICE_UNLOAD_NO_PROGRESS {
+                anyhow::bail!(
+                    "launchd unload made no progress after {no_progress} repeated observations \
+                     of pid {pid}; retry handles were retained"
+                );
+            }
+        } else {
+            no_progress = 0;
+        }
+        prior_owner = Some(owner);
+        if unload_attempts >= MAX_SERVICE_UNLOAD_ATTEMPTS {
+            anyhow::bail!(
+                "launchd job '{SERVICE_LABEL}' remained loaded after \
+                 {MAX_SERVICE_UNLOAD_ATTEMPTS} unload attempts; retry handles were retained"
+            );
+        }
+        unload_attempts += 1;
+
+        match launchd.unload(&paths.plist) {
+            Ok(()) => {
+                // KeepAlive can replace the process generation between the
+                // first status call and unload. Re-query until launchd
+                // confirms the job is gone, capturing and durably recording
+                // every replacement generation it reports.
+                status = launchd.status()?;
+            }
+            Err(unload_error) => {
+                status = launchd.status()?;
+                match status {
+                    LaunchdJobStatus::NotLoaded => break,
+                    LaunchdJobStatus::Loaded {
+                        pid: Some(replacement_pid),
+                    } => {
+                        let replacement_owner = cleanup.capture_owner(replacement_pid)?;
+                        if append_service_owner(state, &replacement_owner)? {
+                            persist_service_uninstall_state(&paths.uninstall_state, state)?;
+                        }
+                        return Err(unload_error);
+                    }
+                    LaunchdJobStatus::Loaded { pid: None } => {
+                        return Err(anyhow::anyhow!(
+                            "launchd job '{SERVICE_LABEL}' remains loaded without a PID: \
+                             {unload_error:#}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut engines_reaped = 0;
+    for owner in &state.owners {
+        engines_reaped += cleanup.reap_owner(&state.ownership_directory, owner)?;
+    }
+    // The plist remains the retry handle until every exact owner has exited
+    // and every one of its durable engine records has been resolved.
+    remove_service_file(&paths.plist)?;
+    remove_service_file(&paths.uninstall_state)?;
+    // Keep lifecycle_lock permanently. Unlinking a cooperative lock path can
+    // split future lockers across different inodes while one still holds the
+    // old file descriptor.
+    Ok(ServiceUninstallOutcome {
+        removed,
+        engines_reaped,
+    })
+}
+
+/// Escape the five XML predefined entities. Every value interpolated
+/// into [`render_service_plist`] is a filesystem path, but escaping is
+/// cheap and a wrong plist silently fails to load rather than erroring
+/// loudly, so this is not worth skipping.
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// Render the launchd property list that runs `binary serve <config>`
+/// at load and restarts it if it exits. Pure string building: no
+/// filesystem or `launchctl` access, so it is covered by a plain unit
+/// test.
+///
+/// The hidden `service launch` bootstrap reads the strict environment file
+/// as data and then execs `binary serve <config>`. This keeps credentials
+/// out of the world-readable plist, prevents shell evaluation, and leaves
+/// launchd supervising the proxy at the same PID.
+fn render_service_plist(binary: &std::path::Path, paths: &ServicePaths) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>{label}</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>{binary}</string>
+		<string>service</string>
+		<string>launch</string>
+		<string>--environment</string>
+		<string>{env_file}</string>
+		<string>--lifecycle-lock</string>
+		<string>{lifecycle_lock}</string>
+		<string>--uninstall-state</string>
+		<string>{uninstall_state}</string>
+		<string>{config}</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ExitTimeOut</key>
+	<integer>{exit_timeout}</integer>
+	<key>StandardOutPath</key>
+	<string>{stdout}</string>
+	<key>StandardErrorPath</key>
+	<string>{stderr}</string>
+</dict>
+</plist>
+"#,
+        label = SERVICE_LABEL,
+        exit_timeout = SERVICE_EXIT_TIMEOUT_SECS,
+        binary = xml_escape(&binary.to_string_lossy()),
+        config = xml_escape(&paths.config.to_string_lossy()),
+        stdout = xml_escape(&paths.stdout_log.to_string_lossy()),
+        stderr = xml_escape(&paths.stderr_log.to_string_lossy()),
+        env_file = xml_escape(&paths.env_file.to_string_lossy()),
+        lifecycle_lock = xml_escape(&paths.lifecycle_lock.to_string_lossy()),
+        uninstall_state = xml_escape(&paths.uninstall_state.to_string_lossy()),
+    )
+}
+
+fn handle_service_subcommand(cmd: &ServiceCmd) -> anyhow::Result<i32> {
+    match &cmd.sub {
+        ServiceSub::Install(args) => handle_service_install(args),
+        ServiceSub::Uninstall(args) => handle_service_uninstall(args),
+        ServiceSub::Status(args) => handle_service_status(args),
+        ServiceSub::Launch(args) => handle_service_launch(args),
+    }
+}
+
+fn handle_service_launch(args: &ServiceLaunchArgs) -> anyhow::Result<i32> {
+    if args.lifecycle_lock.parent() != args.uninstall_state.parent() {
+        anyhow::bail!(
+            "service lifecycle lock '{}' and state '{}' must share a directory",
+            args.lifecycle_lock.display(),
+            args.uninstall_state.display()
+        );
+    }
+    let lifecycle_lock = acquire_service_lifecycle_lock(&args.lifecycle_lock)?;
+    let environment = read_service_environment(&args.environment)?;
+    let ownership_directory = service_engine_ownership_directory_from_environment(
+        &environment,
+        &args.environment,
+        &args.config,
+    )?;
+    let owner = sbproxy_model_host::capture_managed_engine_owner(std::process::id())
+        .ok_or_else(|| anyhow::anyhow!("capture exact service bootstrap process identity"))?;
+    register_service_owner_locked(
+        &lifecycle_lock,
+        &args.uninstall_state,
+        &ownership_directory,
+        &owner,
+    )?;
+
+    let binary = std::env::current_exe()
+        .map_err(|error| anyhow::anyhow!("resolve current executable: {error}"))?;
+    let mut command = std::process::Command::new(binary);
+    command.arg("serve").arg(&args.config);
+    // An inherited caller value must not mask the declarative file or its
+    // documented default. Always pass the resolved absolute path so process
+    // recovery and uninstall cannot diverge if launchd omits HOME.
+    command.env_remove(SERVICE_ENGINE_OWNERSHIP_ENV);
+    command.envs(environment.variables);
+    command.env(SERVICE_ENGINE_OWNERSHIP_ENV, &ownership_directory);
+    // Registration is durable before this release. If uninstall owns the
+    // lock, this bootstrap cannot reach exec; if it already registered,
+    // uninstall will reap its exact generation even if launchd hides it.
+    drop(lifecycle_lock);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        let error = command.exec();
+        Err(anyhow::anyhow!(
+            "exec service proxy for '{}': {error}",
+            args.config.display()
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = command;
+        anyhow::bail!("launchd services are macOS-only")
+    }
+}
+
+/// `sbproxy service install <model>`: resolve the same secure config
+/// `sbproxy run` would generate (loopback bind, admin enabled with a
+/// random local password), persist it, and register a launchd agent
+/// that serves it in the background. `--dry-run` (inherited from the
+/// flattened `RunArgs`) prints the plist and config without installing.
+fn handle_service_install(args: &ServiceInstallArgs) -> anyhow::Result<i32> {
+    use zeroize::Zeroize;
+
+    if !cfg!(target_os = "macos") {
+        anyhow::bail!("launchd services are macOS-only; use `sbproxy run` or `sbproxy serve`");
+    }
+
+    let mut prepared = prepare_run(&args.run)?;
+    let paths = service_paths()?;
+
+    if args.run.dry_run {
+        let _ = read_service_environment(&paths.env_file)?;
+        let binary = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("sbproxy"));
+        println!(
+            "# would install launchd agent '{}' for {}:{} at {}\n{}\n{}",
+            SERVICE_LABEL,
+            prepared.artifact.logical_model,
+            prepared.artifact.variant_id,
+            paths.plist.display(),
+            render_service_plist(&binary, &paths),
+            prepared.yaml,
+        );
+        prepared.admin_password.zeroize();
+        prepared.yaml.zeroize();
+        return Ok(0);
+    }
+
+    for dir in [
+        paths.config.parent(),
+        paths.plist.parent(),
+        paths.stdout_log.parent(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        std::fs::create_dir_all(dir)
+            .map_err(|error| anyhow::anyhow!("create '{}': {error}", dir.display()))?;
+    }
+
+    // The config must persist for launchd to reread on every future load,
+    // unlike `PrivateRunDirectory`'s, which is removed on drop. A prior
+    // install's config is replaced outright: `write_private_run_config`
+    // insists on creating a new file, and the old admin password embedded
+    // in it is going away with the plist that referenced it.
+    if paths.config.exists() {
+        std::fs::remove_file(&paths.config).map_err(|error| {
+            anyhow::anyhow!("remove stale '{}': {error}", paths.config.display())
+        })?;
+    }
+    if let Err(error) = write_private_run_config(&paths.config, prepared.yaml.as_bytes()) {
+        prepared.admin_password.zeroize();
+        prepared.yaml.zeroize();
+        return Err(error);
+    }
+    prepared.yaml.zeroize();
+
+    // Created once, never rewritten: reinstalling to change the model or
+    // the port must not throw away a token the operator put here.
+    ensure_service_env_file(&paths.env_file)?;
+    let _ = read_service_environment(&paths.env_file)?;
+
+    let binary = std::env::current_exe()
+        .map_err(|error| anyhow::anyhow!("resolve current executable: {error}"))?;
+    let plist = render_service_plist(&binary, &paths);
+    std::fs::write(&paths.plist, plist)
+        .map_err(|error| anyhow::anyhow!("write '{}': {error}", paths.plist.display()))?;
+
+    // Clear out a prior load of the same label first: `launchctl load` on
+    // an already-loaded label is a silent no-op, so a second install (a
+    // new port, model, or password) would never take effect without
+    // this. Absence is the common case and not an error.
+    let _ = std::process::Command::new("launchctl")
+        .arg("unload")
+        .arg(&paths.plist)
+        .output();
+    let output = std::process::Command::new("launchctl")
+        .arg("load")
+        .arg("-w")
+        .arg(&paths.plist)
+        .output()
+        .map_err(|error| anyhow::anyhow!("launchctl load: {error}"))?;
+    prepared.admin_password.zeroize();
+    if !output.status.success() {
+        anyhow::bail!(
+            "launchctl load '{}' failed: {}",
+            paths.plist.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    match args.format {
+        OutputFormat::Text => println!(
+            "Installed {} as launchd agent '{}'.\nConfig: {}\nPlist:  {}\nLogs:   {}\nEnv:    {}\n",
+            prepared.name,
+            SERVICE_LABEL,
+            paths.config.display(),
+            paths.plist.display(),
+            paths.stdout_log.display(),
+            paths.env_file.display(),
+        ),
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&cli_command_envelope(
+                "service.install",
+                serde_json::json!({
+                    "label": SERVICE_LABEL,
+                    "model": prepared.name,
+                    "config_path": paths.config.to_string_lossy(),
+                    "plist_path": paths.plist.to_string_lossy(),
+                    "stdout_log": paths.stdout_log.to_string_lossy(),
+                    "stderr_log": paths.stderr_log.to_string_lossy(),
+                    "env_file": paths.env_file.to_string_lossy(),
+                }),
+            ))?
+        ),
+    }
+    Ok(0)
+}
+
+/// `sbproxy service uninstall`: unload the agent and remove its plist.
+/// Idempotent: uninstalling an agent that was never installed reports
+/// nothing removed rather than failing, since the end state either way
+/// is what the operator asked for.
+fn handle_service_uninstall(args: &ServiceUninstallArgs) -> anyhow::Result<i32> {
+    if !cfg!(target_os = "macos") {
+        anyhow::bail!("launchd services are macOS-only");
+    }
+
+    let paths = service_paths()?;
+    let outcome = perform_service_uninstall(
+        &paths,
+        &mut SystemLaunchdController,
+        &mut SystemServiceEngineCleanup,
+    )?;
+
+    match args.format {
+        OutputFormat::Text => {
+            if outcome.removed {
+                println!(
+                    "Uninstalled launchd agent '{SERVICE_LABEL}' (reaped {} managed engine(s)).",
+                    outcome.engines_reaped
+                );
+            } else {
+                println!(
+                    "No launchd agent '{SERVICE_LABEL}' was installed (reaped {} managed engine(s) from a prior retry, if any).",
+                    outcome.engines_reaped
+                );
+            }
+        }
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&cli_command_envelope(
+                "service.uninstall",
+                serde_json::json!({
+                    "label": SERVICE_LABEL,
+                    "removed": outcome.removed,
+                    "engines_reaped": outcome.engines_reaped,
+                }),
+            ))?
+        ),
+    }
+    Ok(0)
+}
+
+/// `sbproxy service status`: ask `launchctl list` whether the agent is
+/// registered, and whether it currently has a PID. Exit 0 when running,
+/// 1 otherwise (registered-but-stopped and never-installed alike), so a
+/// caller can `sbproxy service status || restart-it` without parsing
+/// output.
+fn handle_service_status(args: &ServiceStatusArgs) -> anyhow::Result<i32> {
+    if !cfg!(target_os = "macos") {
+        anyhow::bail!("launchd services are macOS-only");
+    }
+
+    let mut launchd = SystemLaunchdController;
+    let (registered, pid) = match launchd.status()? {
+        LaunchdJobStatus::NotLoaded => (false, None),
+        LaunchdJobStatus::Loaded { pid } => (true, pid),
+    };
+    let running = pid.is_some();
+    // Report the paths a running agent is actually using, so recovering
+    // an agent installed months ago does not start with a hunt for its
+    // logs or its token file.
+    let paths = service_paths()?;
+
+    match args.format {
+        OutputFormat::Text => {
+            if !registered {
+                println!("{SERVICE_LABEL}: not installed");
+            } else {
+                if let Some(pid) = pid {
+                    println!("{SERVICE_LABEL}: running (pid {pid})");
+                } else {
+                    println!("{SERVICE_LABEL}: registered, not running");
+                }
+                println!("Config: {}", paths.config.display());
+                println!("Logs:   {}", paths.stdout_log.display());
+                println!(
+                    "Env:    {}{}",
+                    paths.env_file.display(),
+                    if paths.env_file.exists() {
+                        ""
+                    } else {
+                        " (absent)"
+                    }
+                );
+            }
+        }
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&cli_command_envelope(
+                "service.status",
+                serde_json::json!({
+                    "label": SERVICE_LABEL,
+                    "registered": registered,
+                    "running": running,
+                    "pid": pid,
+                    "config_path": paths.config.to_string_lossy(),
+                    "stdout_log": paths.stdout_log.to_string_lossy(),
+                    "stderr_log": paths.stderr_log.to_string_lossy(),
+                    "env_file": paths.env_file.to_string_lossy(),
+                    "env_file_present": paths.env_file.exists(),
+                }),
+            ))?
+        ),
+    }
+    Ok(if running { 0 } else { 1 })
+}
+
+/// Extract the `"PID" = <n>;` value from `launchctl list <label>`'s
+/// stdout. Absent means the agent is loaded but not currently running.
+fn parse_launchctl_list_pid(text: &str) -> Option<u32> {
+    text.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("\"PID\" = ")?;
+        rest.trim_end_matches(';').parse::<u32>().ok()
+    })
+}
+
 // --- `models` handler (WOR-1803) ---
 
 fn handle_models_subcommand(
@@ -2081,13 +4452,16 @@ fn handle_models_subcommand(
 ) -> anyhow::Result<i32> {
     match &cmd.sub {
         // `sbproxy models` with no subcommand lists.
-        None => handle_models_list(&ModelsListArgs::default()),
-        Some(ModelsSub::List(a)) => handle_models_list(a),
-        Some(ModelsSub::Show(a)) => handle_models_show(a),
+        None => handle_models_list(&ModelsListArgs::default(), config_path),
+        Some(ModelsSub::List(a)) => handle_models_list(a, config_path),
+        Some(ModelsSub::Show(a)) => handle_models_show(a, config_path),
         Some(ModelsSub::Pull(a)) => handle_models_pull(a, config_path),
         Some(ModelsSub::Remove(a)) => handle_models_remove(a, config_path),
         Some(ModelsSub::Ps(a)) => handle_models_ps(a),
         Some(ModelsSub::Stop(a)) => handle_models_stop(a),
+        Some(ModelsSub::Prune(a)) => handle_models_prune(a, config_path),
+        Some(ModelsSub::Lock(a)) => handle_models_lock(a, config_path),
+        Some(ModelsSub::VerifyLock(a)) => handle_models_verify_lock(a, config_path),
     }
 }
 
@@ -2202,8 +4576,9 @@ struct ModelsPullOutput {
 fn engine_kind_name(engine: sbproxy_model_host::EngineKind) -> &'static str {
     match engine {
         sbproxy_model_host::EngineKind::Vllm => "vllm",
+        sbproxy_model_host::EngineKind::SGLang => "sglang",
         sbproxy_model_host::EngineKind::LlamaCpp => "llama_cpp",
-        sbproxy_model_host::EngineKind::Embedded => "embedded",
+        sbproxy_model_host::EngineKind::MistralRs => "mistralrs",
     }
 }
 
@@ -2246,7 +4621,11 @@ fn managed_engine_choice(
     match engine {
         sbproxy_config::ManagedEngineChoice::Auto => sbproxy_model_host::EngineChoice::Auto,
         sbproxy_config::ManagedEngineChoice::Vllm => sbproxy_model_host::EngineChoice::Vllm,
+        sbproxy_config::ManagedEngineChoice::SGLang => sbproxy_model_host::EngineChoice::SGLang,
         sbproxy_config::ManagedEngineChoice::LlamaCpp => sbproxy_model_host::EngineChoice::LlamaCpp,
+        sbproxy_config::ManagedEngineChoice::MistralRs => {
+            sbproxy_model_host::EngineChoice::MistralRs
+        }
     }
 }
 
@@ -2605,7 +4984,9 @@ fn admin_request_json(
     Ok(value)
 }
 
-fn models_command_envelope(command: &'static str, value: serde_json::Value) -> serde_json::Value {
+/// Wrap one subcommand's JSON result in the shared `{command,
+/// schema_version, ...}` envelope every `--format json` surface prints.
+fn cli_command_envelope(command: &'static str, value: serde_json::Value) -> serde_json::Value {
     let mut object = match value {
         serde_json::Value::Object(object) => object,
         value => serde_json::Map::from_iter([("result".to_string(), value)]),
@@ -2613,6 +4994,27 @@ fn models_command_envelope(command: &'static str, value: serde_json::Value) -> s
     object.insert("command".to_string(), serde_json::json!(command));
     object.insert("schema_version".to_string(), serde_json::json!(1));
     serde_json::Value::Object(object)
+}
+
+/// Render the worker-local device set for `models ps`: a single index for a
+/// single-GPU deployment, or the tensor-parallel group with its degree for a
+/// multi-GPU one ("0,1 tp2"). Empty (CPU or unplaced) renders "-".
+fn format_device_set(value: Option<&serde_json::Value>) -> String {
+    let indexes: Vec<String> = value
+        .and_then(serde_json::Value::as_array)
+        .map(|devices| {
+            devices
+                .iter()
+                .filter_map(serde_json::Value::as_u64)
+                .map(|index| index.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    match indexes.len() {
+        0 => "-".to_string(),
+        1 => indexes[0].clone(),
+        degree => format!("{} tp{degree}", indexes.join(",")),
+    }
 }
 
 fn handle_models_ps(args: &ModelsPsArgs) -> anyhow::Result<i32> {
@@ -2626,7 +5028,7 @@ fn handle_models_ps(args: &ModelsPsArgs) -> anyhow::Result<i32> {
     match args.format {
         OutputFormat::Json => println!(
             "{}",
-            serde_json::to_string_pretty(&models_command_envelope("models.ps", status))?
+            serde_json::to_string_pretty(&cli_command_envelope("models.ps", status))?
         ),
         OutputFormat::Text => {
             let deployments = status
@@ -2635,12 +5037,12 @@ fn handle_models_ps(args: &ModelsPsArgs) -> anyhow::Result<i32> {
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
             println!(
-                "{:<24} {:<12} {:<8} {:<8} {:<8} REASON",
-                "DEPLOYMENT", "STATE", "PORT", "ACTIVE", "QUEUED"
+                "{:<24} {:<12} {:<8} {:<8} {:<8} {:<14} REASON",
+                "DEPLOYMENT", "STATE", "PORT", "ACTIVE", "QUEUED", "DEVICES"
             );
             for deployment in deployments {
                 println!(
-                    "{:<24} {:<12} {:<8} {:<8} {:<8} {}",
+                    "{:<24} {:<12} {:<8} {:<8} {:<8} {:<14} {}",
                     deployment
                         .get("deployment")
                         .and_then(serde_json::Value::as_str)
@@ -2662,6 +5064,7 @@ fn handle_models_ps(args: &ModelsPsArgs) -> anyhow::Result<i32> {
                         .get("queued_requests")
                         .and_then(serde_json::Value::as_u64)
                         .unwrap_or(0),
+                    format_device_set(deployment.get("selected_devices")),
                     deployment
                         .get("reason_code")
                         .and_then(serde_json::Value::as_str)
@@ -2684,11 +5087,419 @@ fn handle_models_stop(args: &ModelsStopArgs) -> anyhow::Result<i32> {
     match args.format {
         OutputFormat::Json => println!(
             "{}",
-            serde_json::to_string_pretty(&models_command_envelope("models.stop", stopped))?
+            serde_json::to_string_pretty(&cli_command_envelope("models.stop", stopped))?
         ),
-        OutputFormat::Text => println!("{} stopped", args.deployment),
+        OutputFormat::Text => {
+            let state = stopped
+                .get("state")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("stopped");
+            println!("{} {state}", args.deployment);
+        }
     }
     Ok(0)
+}
+
+// --- `models lock` / `models verify-lock` handlers (WOR-1864) ---
+
+/// Default lockfile location: next to the active config, or the
+/// current directory when no config was given.
+fn default_lockfile_path(config_path: Option<&std::path::Path>) -> PathBuf {
+    match config_path.and_then(std::path::Path::parent) {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join(sbproxy_model_host::LOCKFILE_NAME),
+        _ => PathBuf::from(sbproxy_model_host::LOCKFILE_NAME),
+    }
+}
+
+/// The engine version/image pin for a resolved artifact, when the
+/// config pins one: a per-deployment pin (WOR-1906) on a matching
+/// canonical deployment wins over the legacy node-wide `engines:`
+/// provisioning for the selected engine. Unpinned engines lock the
+/// kind alone.
+fn locked_engine_pin(
+    artifact: &sbproxy_model_host::ResolvedArtifact,
+    serve: Option<&sbproxy_model_host::ModelHostConfig>,
+    canonical: Option<&sbproxy_config::ModelHostControlConfig>,
+) -> (Option<String>, Option<String>) {
+    if let Some(deployment) = canonical.and_then(|canonical| {
+        canonical
+            .deployments
+            .values()
+            .filter(|deployment| {
+                deployment.model == artifact.logical_model
+                    && (deployment.engine_version.is_some() || deployment.engine_image.is_some())
+            })
+            // Prefer the deployment pinning the exact selected variant.
+            .max_by_key(|deployment| {
+                deployment.variant.as_deref() == Some(artifact.variant_id.as_str())
+            })
+    }) {
+        return (
+            deployment.engine_version.clone(),
+            deployment.engine_image.clone(),
+        );
+    }
+    if let Some(provisioning) = serve.and_then(|serve| serve.engines.get(&artifact.engine)) {
+        let version = provisioning
+            .acquire
+            .as_ref()
+            .and_then(|acquire| acquire.version.clone());
+        if version.is_some() || provisioning.image.is_some() {
+            return (version, provisioning.image.clone());
+        }
+    }
+    (None, None)
+}
+
+/// Resolve `selections` on this host's worker profile into the exact
+/// locked identities `models lock` writes and the `--locked` boot
+/// check pins against. Two selections resolving to the same artifact
+/// collapse into one entry.
+fn resolve_locked_models(
+    selections: Vec<PullSelection>,
+    catalog: &sbproxy_model_host::Catalog,
+    serve: Option<&sbproxy_model_host::ModelHostConfig>,
+    canonical: Option<&sbproxy_config::ModelHostControlConfig>,
+) -> anyhow::Result<Vec<sbproxy_model_host::LockedModel>> {
+    let report = sbproxy_core::doctor::DoctorReport::collect();
+    let worker = sbproxy_model_host::WorkerProfile::from_descriptors(&report.gpus)
+        .map_err(|error| anyhow::anyhow!("resolve lock worker: {error}"))?;
+    let mut models: Vec<sbproxy_model_host::LockedModel> = Vec::with_capacity(selections.len());
+    for selection in selections {
+        let model = &selection.model;
+        let entry = catalog
+            .get(model)
+            .ok_or_else(|| anyhow::anyhow!("model '{model}' is not in the catalog"))?;
+        if entry.variants.is_empty() {
+            anyhow::bail!(
+                "model '{model}' has no exact catalog v2 variant; migrate its files, sizes, digests, and revision before locking"
+            );
+        }
+        let artifact = catalog.resolve_artifact(
+            &sbproxy_model_host::ResolveArtifactRequest {
+                model: selection.model.clone(),
+                variant: selection.variant.clone(),
+                engine: selection.engine,
+                replicas: selection.replicas,
+                heterogeneous_variants: selection.heterogeneous_variants,
+            },
+            &worker,
+        )?;
+        // Two selections resolving to the same artifact lock one entry.
+        if models
+            .iter()
+            .any(|locked| locked.artifact_digest == artifact.artifact_digest)
+        {
+            continue;
+        }
+        let (version, image) = locked_engine_pin(&artifact, serve, canonical);
+        let locked =
+            sbproxy_model_host::LockedModel::from(&artifact).with_engine_pin(version, image);
+        models.push(locked);
+    }
+    Ok(models)
+}
+
+#[derive(serde::Serialize)]
+struct ModelsLockRow {
+    name: String,
+    variant: String,
+    engine: String,
+    artifact_digest: String,
+}
+
+#[derive(serde::Serialize)]
+struct ModelsLockOutput {
+    schema_version: u32,
+    command: &'static str,
+    path: PathBuf,
+    catalog_revision: String,
+    models: Vec<ModelsLockRow>,
+}
+
+fn handle_models_lock(
+    args: &ModelsLockArgs,
+    config_path: Option<&std::path::Path>,
+) -> anyhow::Result<i32> {
+    let Some(config_path) = config_path else {
+        anyhow::bail!(
+            "models lock requires -f/--config: the lockfile pins that config's serve entries"
+        );
+    };
+    let yaml = std::fs::read_to_string(config_path)
+        .map_err(|error| anyhow::anyhow!("read config '{}': {error}", config_path.display()))?;
+    let config_dir = config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let compiled = sbproxy_config::compile_config(&yaml)?;
+    let canonical = compiled.server.model_host.clone();
+    let legacy = extract_serve_and_catalog(&yaml, config_dir)?;
+    if canonical.is_none() && legacy.is_none() {
+        anyhow::bail!(
+            "config '{}' has no proxy.model_host or local serve block",
+            config_path.display()
+        );
+    }
+    let (serve, catalog) = match legacy {
+        Some((serve, catalog)) => (Some(serve), catalog),
+        None => (None, sbproxy_model_host::Catalog::builtin()),
+    };
+    let selections = configured_pull_selections(serve.as_ref(), canonical.as_ref());
+    if selections.is_empty() {
+        anyhow::bail!(
+            "config '{}' has no serve entries to lock",
+            config_path.display()
+        );
+    }
+
+    let models = resolve_locked_models(selections, &catalog, serve.as_ref(), canonical.as_ref())?;
+    let generated_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let lockfile = sbproxy_model_host::Lockfile::new(
+        generated_at_ms,
+        catalog.catalog_revision.clone(),
+        models,
+    );
+    let path = args
+        .out
+        .clone()
+        .unwrap_or_else(|| default_lockfile_path(Some(config_path)));
+    sbproxy_model_host::write_lockfile(&path, &lockfile)
+        .map_err(|error| anyhow::anyhow!("write lockfile '{}': {error}", path.display()))?;
+
+    let output = ModelsLockOutput {
+        schema_version: 1,
+        command: "models.lock",
+        path: path.clone(),
+        catalog_revision: lockfile.catalog_revision.clone(),
+        models: lockfile
+            .models
+            .iter()
+            .map(|locked| ModelsLockRow {
+                name: locked.name.clone(),
+                variant: locked.variant_id.clone(),
+                engine: engine_kind_name(locked.engine.kind).to_string(),
+                artifact_digest: locked.artifact_digest.clone(),
+            })
+            .collect(),
+    };
+    match args.format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&output)?),
+        OutputFormat::Text => {
+            for row in &output.models {
+                println!(
+                    "{}:{} locked (sha256:{}, engine {})",
+                    row.name, row.variant, row.artifact_digest, row.engine
+                );
+            }
+            println!(
+                "wrote {} ({} models, catalog {})",
+                path.display(),
+                output.models.len(),
+                output.catalog_revision
+            );
+        }
+    }
+    Ok(0)
+}
+
+#[derive(serde::Serialize)]
+struct ModelsVerifyLockRow {
+    name: String,
+    variant: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct ModelsVerifyLockOutput {
+    schema_version: u32,
+    command: &'static str,
+    lockfile: PathBuf,
+    drift: usize,
+    models: Vec<ModelsVerifyLockRow>,
+}
+
+fn handle_models_verify_lock(
+    args: &ModelsVerifyLockArgs,
+    config_path: Option<&std::path::Path>,
+) -> anyhow::Result<i32> {
+    let path = args
+        .lockfile
+        .clone()
+        .unwrap_or_else(|| default_lockfile_path(config_path));
+    let lockfile = sbproxy_model_host::read_lockfile(&path)
+        .map_err(|error| anyhow::anyhow!("read lockfile '{}': {error}", path.display()))?;
+    let root = model_cache_root(args.cache_dir.as_deref());
+    let manager = sbproxy_model_host::ArtifactManager::new(root, models_pull_transport()?)?;
+    let cached = manager.cached_artifacts()?;
+    let drifts = sbproxy_model_host::diff_against_cache(&lockfile, &cached);
+
+    let rows: Vec<ModelsVerifyLockRow> = lockfile
+        .models
+        .iter()
+        .map(|locked| {
+            let drift = drifts.iter().find(|drift| {
+                drift.name() == locked.name && drift.variant_id() == locked.variant_id
+            });
+            let (status, detail) = match drift {
+                None => ("ok".to_string(), None),
+                Some(drift) => (
+                    match drift {
+                        sbproxy_model_host::LockDrift::Missing { .. } => "missing".to_string(),
+                        sbproxy_model_host::LockDrift::DigestMismatch { .. } => {
+                            "digest_mismatch".to_string()
+                        }
+                        // Only the serve-time check produces this
+                        // variant; verify-lock diffs the cache alone.
+                        sbproxy_model_host::LockDrift::Unlocked { .. } => "unlocked".to_string(),
+                    },
+                    Some(drift.to_string()),
+                ),
+            };
+            ModelsVerifyLockRow {
+                name: locked.name.clone(),
+                variant: locked.variant_id.clone(),
+                status,
+                detail,
+            }
+        })
+        .collect();
+    let output = ModelsVerifyLockOutput {
+        schema_version: 1,
+        command: "models.verify-lock",
+        lockfile: path.clone(),
+        drift: drifts.len(),
+        models: rows,
+    };
+    match args.format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&output)?),
+        OutputFormat::Text => {
+            for locked in &lockfile.models {
+                match drifts.iter().find(|drift| {
+                    drift.name() == locked.name && drift.variant_id() == locked.variant_id
+                }) {
+                    None => println!(
+                        "{}:{} ok (sha256:{})",
+                        locked.name, locked.variant_id, locked.artifact_digest
+                    ),
+                    Some(drift) => {
+                        println!("{}:{} drift: {drift}", locked.name, locked.variant_id)
+                    }
+                }
+            }
+            if drifts.is_empty() {
+                println!(
+                    "{}: {} models match the verified cache",
+                    path.display(),
+                    lockfile.models.len()
+                );
+            } else {
+                println!(
+                    "{}: {} of {} models drifted",
+                    path.display(),
+                    drifts.len(),
+                    lockfile.models.len()
+                );
+            }
+        }
+    }
+    Ok(if drifts.is_empty() { 0 } else { 2 })
+}
+
+// --- `--locked` serve-time lockfile enforcement (WOR-1864) ---
+
+/// Read the lockfile for the `--locked` boot check. A missing file is
+/// the distinct operator error `no lockfile at <path>; run sbproxy
+/// models lock` (exit 2 at the call site), never a silent pass. An
+/// unreadable or invalid file surfaces the underlying read error.
+fn read_serve_lockfile(path: &std::path::Path) -> anyhow::Result<sbproxy_model_host::Lockfile> {
+    if !path.exists() {
+        anyhow::bail!("no lockfile at {}; run sbproxy models lock", path.display());
+    }
+    sbproxy_model_host::read_lockfile(path)
+        .map_err(|error| anyhow::anyhow!("read lockfile '{}': {error}", path.display()))
+}
+
+/// Resolve every configured serve/deployment entry in `config_path`
+/// for the `--locked` boot check, plus the cache directory the serve
+/// path would use (canonical `model_host.cache.directory` first, then
+/// the legacy serve `cache_dir`, mirroring the boot-time resolution).
+/// A config with no `proxy.model_host` and no `serve:` block yields
+/// an empty model set: the check then only diffs the lockfile against
+/// the cache.
+fn locked_models_for_config(
+    config_path: &std::path::Path,
+) -> anyhow::Result<(Vec<sbproxy_model_host::LockedModel>, Option<String>)> {
+    let yaml = std::fs::read_to_string(config_path)
+        .map_err(|error| anyhow::anyhow!("read config '{}': {error}", config_path.display()))?;
+    let config_dir = config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let compiled = sbproxy_config::compile_config(&yaml)?;
+    let canonical = compiled.server.model_host.clone();
+    let legacy = extract_serve_and_catalog(&yaml, config_dir)?;
+    let (serve, catalog) = match legacy {
+        Some((serve, catalog)) => (Some(serve), catalog),
+        None => (None, sbproxy_model_host::Catalog::builtin()),
+    };
+    let cache_dir = canonical
+        .as_ref()
+        .and_then(|control| control.cache.directory.clone())
+        .or_else(|| serve.as_ref().and_then(|serve| serve.cache_dir.clone()));
+    let selections = configured_pull_selections(serve.as_ref(), canonical.as_ref());
+    if selections.is_empty() {
+        return Ok((Vec::new(), cache_dir));
+    }
+    let models = resolve_locked_models(selections, &catalog, serve.as_ref(), canonical.as_ref())?;
+    Ok((models, cache_dir))
+}
+
+/// The `--locked` pre-boot check (WOR-1864): read `sbproxy-models.lock`
+/// next to the config, diff it against the verified weight cache, and
+/// pin every configured serve/deployment entry's resolved artifact
+/// digest to the lock. Any drift prints the same per-model drift lines
+/// `models verify-lock` prints and returns the refusal as an `Err`;
+/// the caller exits 2 before any listener starts. A clean lock logs
+/// one info line and returns `Ok`.
+fn enforce_locked_serve(config_path: &std::path::Path) -> anyhow::Result<()> {
+    let lockfile_path = default_lockfile_path(Some(config_path));
+    let lockfile = read_serve_lockfile(&lockfile_path)?;
+    let (configured, cache_dir) = locked_models_for_config(config_path)?;
+    let root = sbproxy_model_host::resolve_cache_dir_default(cache_dir.as_deref());
+    let manager = sbproxy_model_host::ArtifactManager::new(root, models_pull_transport()?)?;
+    let cached = manager.cached_artifacts()?;
+    let drifts = sbproxy_model_host::lockfile::verify_for_serve(&lockfile, &cached, &configured);
+    if drifts.is_empty() {
+        tracing::info!(
+            lockfile = %lockfile_path.display(),
+            models = lockfile.models.len(),
+            "lockfile clean; serving the locked model stack"
+        );
+        return Ok(());
+    }
+    for drift in &drifts {
+        println!("{}:{} drift: {drift}", drift.name(), drift.variant_id());
+    }
+    anyhow::bail!("refusing to serve: lockfile drift")
+}
+
+/// Apply `--locked` before boot: run [`enforce_locked_serve`] and exit
+/// 2 on any failure (drift, missing lockfile, or an unresolvable
+/// config), so listeners never start against a drifted stack. Returns
+/// only when the lock is clean.
+fn enforce_locked_serve_or_exit(config_path: Option<&std::path::Path>) {
+    let Some(config_path) = config_path else {
+        eprintln!("--locked requires a config path (positional or -f/--config)");
+        std::process::exit(2);
+    };
+    if let Err(error) = enforce_locked_serve(config_path) {
+        eprintln!("{error:#}");
+        std::process::exit(2);
+    }
 }
 
 fn configured_artifact_protection(
@@ -2707,8 +5518,14 @@ fn configured_artifact_protection(
             let engine = match deployment.engine {
                 sbproxy_config::ManagedEngineChoice::Auto => sbproxy_model_host::EngineChoice::Auto,
                 sbproxy_config::ManagedEngineChoice::Vllm => sbproxy_model_host::EngineChoice::Vllm,
+                sbproxy_config::ManagedEngineChoice::SGLang => {
+                    sbproxy_model_host::EngineChoice::SGLang
+                }
                 sbproxy_config::ManagedEngineChoice::LlamaCpp => {
                     sbproxy_model_host::EngineChoice::LlamaCpp
+                }
+                sbproxy_config::ManagedEngineChoice::MistralRs => {
+                    sbproxy_model_host::EngineChoice::MistralRs
                 }
             };
             let artifact = catalog.resolve_artifact(
@@ -2755,6 +5572,46 @@ fn configured_artifact_protection(
         }
     }
     Ok(protection)
+}
+
+fn handle_models_prune(
+    args: &ModelsPruneArgs,
+    config_path: Option<&std::path::Path>,
+) -> anyhow::Result<i32> {
+    let configured = configured_model_cache_dir(config_path);
+    let root = model_cache_root(args.cache_dir.as_deref().or(configured.as_deref()));
+    // Prune is local-only: it never fetches, so no transport is wired.
+    let manager = sbproxy_model_host::ArtifactManager::new(
+        root,
+        std::sync::Arc::new(sbproxy_model_host::UnavailableArtifactTransport),
+    )?;
+    let report = manager.prune(args.dry_run)?;
+    let output = cli_command_envelope(
+        "models.prune",
+        serde_json::json!({
+            "dry_run": report.dry_run,
+            "orphan_blobs": report.orphan_blobs,
+            "reclaimed_bytes": report.reclaimed_bytes,
+            "before_bytes": report.before_bytes,
+        }),
+    );
+    match args.format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&output)?),
+        OutputFormat::Text => {
+            let verb = if report.dry_run {
+                "would reclaim"
+            } else {
+                "reclaimed"
+            };
+            println!(
+                "{verb} {} across {} unreferenced blob(s) ({} cached before prune)",
+                format_cache_size(report.reclaimed_bytes),
+                report.orphan_blobs,
+                format_cache_size(report.before_bytes),
+            );
+        }
+    }
+    Ok(0)
 }
 
 fn handle_models_remove(
@@ -2812,7 +5669,7 @@ fn handle_models_remove(
         .build()
         .map_err(|error| anyhow::anyhow!("build models remove runtime: {error}"))?;
     let removed = executor.block_on(manager.remove(&artifact.artifact_digest, &protection))?;
-    let output = models_command_envelope(
+    let output = cli_command_envelope(
         "models.remove",
         serde_json::json!({
             "model": args.model,
@@ -2847,6 +5704,32 @@ fn model_cache_root(cache_dir: Option<&std::path::Path>) -> PathBuf {
 }
 
 /// Whether any weights for `entry` are present in the cache dir.
+/// Cache directory configured in `config_path`, mirroring the pull path's
+/// resolution order: the canonical `proxy.model_host.cache.directory`
+/// first, then the legacy provider `serve.cache_dir`. `None` without a
+/// config or when neither is set, which lets the platform default apply.
+/// Read-only status commands (`models list`, `models show`) use this so
+/// they inspect the same cache the pull and serve paths write; without it
+/// a `-f` invocation silently reads the platform default cache instead.
+fn configured_model_cache_dir(config_path: Option<&std::path::Path>) -> Option<PathBuf> {
+    let config_path = config_path?;
+    let yaml = std::fs::read_to_string(config_path).ok()?;
+    let config_dir = config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let canonical = sbproxy_config::compile_config(&yaml)
+        .ok()
+        .and_then(|compiled| compiled.server.model_host)
+        .and_then(|control| control.cache.directory.map(PathBuf::from));
+    if canonical.is_some() {
+        return canonical;
+    }
+    extract_serve_and_catalog(&yaml, config_dir)
+        .ok()
+        .flatten()
+        .and_then(|(serve, _)| serve.cache_dir.map(PathBuf::from))
+}
+
 fn model_is_cached(
     root: &std::path::Path,
     model: &str,
@@ -2879,6 +5762,7 @@ struct ModelRow {
     params: String,
     license: String,
     family: String,
+    modality: String,
     quants: Vec<String>,
     selected_variant: Option<String>,
     format: Option<String>,
@@ -2890,17 +5774,23 @@ struct ModelRow {
     fit: String,
     estimated_vram_gib: Option<f64>,
     /// cached (weights present in the cache dir) or not-pulled. Resident
-    /// / serving state needs a running gateway and is not shown here.
+    /// / serving state needs a running gateway and is not shown here. A
+    /// not-pulled model whose declared files all have a size-matching
+    /// candidate in one foreign cache (Ollama, LM Studio, the HF hub)
+    /// carries an appended `importable from <source>` marker; the size
+    /// match is a cheap list-time heuristic, and the real digest
+    /// verification happens at import (WOR-1863).
     status: String,
 }
 
-/// Build the model rows from a catalog, the host report, and the cache
-/// dir. Pure over its inputs (the report/probe is passed in), so it is
-/// unit-testable.
+/// Build the model rows from a catalog, the host report, the cache
+/// dir, and one foreign-cache scan. Pure over its inputs (the
+/// report/probe and the scan are passed in), so it is unit-testable.
 fn build_model_rows(
     catalog: &sbproxy_model_host::Catalog,
     report: &sbproxy_core::doctor::DoctorReport,
     cache_root: &std::path::Path,
+    foreign: &[sbproxy_model_host::ForeignModelFile],
 ) -> Vec<ModelRow> {
     // One serve entry per catalog id, so the doctor resolves engine +
     // fit per model against the detected GPU.
@@ -2940,6 +5830,7 @@ fn build_model_rows(
                 params: entry.params.clone(),
                 license: entry.license.clone(),
                 family: entry.family.clone(),
+                modality: entry.modality.label().to_string(),
                 quants: entry.quants.clone(),
                 selected_variant: resolved
                     .as_ref()
@@ -2967,6 +5858,8 @@ fn build_model_rows(
                     "preview-incomplete".to_string()
                 } else if model_is_cached(cache_root, id, entry) {
                     "cached".to_string()
+                } else if let Some(source) = foreign_import_source(resolved.as_ref(), foreign) {
+                    format!("not-pulled, importable from {}", source.label())
                 } else {
                     "not-pulled".to_string()
                 },
@@ -2975,16 +5868,61 @@ fn build_model_rows(
         .collect()
 }
 
-fn handle_models_list(args: &ModelsListArgs) -> anyhow::Result<i32> {
+/// The single foreign cache whose files could seed every declared file
+/// of the resolved artifact, judged by exact byte-size match only
+/// (WOR-1863). List time never hashes: the size match is a cheap
+/// heuristic that only decides whether to show the marker, and the
+/// real verification happens at import, where each candidate is
+/// stream-hashed with SHA-256 and the staged bytes are re-verified by
+/// the cache's promote path. Sources are tried in the scan's stable
+/// order, and a model whose files are only covered by a mix of sources
+/// shows no marker.
+fn foreign_import_source(
+    resolved: Option<&sbproxy_model_host::ResolvedArtifact>,
+    foreign: &[sbproxy_model_host::ForeignModelFile],
+) -> Option<sbproxy_model_host::ForeignCacheSource> {
+    let artifact = resolved?;
+    if artifact.files.is_empty() || foreign.is_empty() {
+        return None;
+    }
+    let mut sources: Vec<_> = foreign.iter().map(|file| file.source).collect();
+    sources.sort();
+    sources.dedup();
+    sources.into_iter().find(|source| {
+        artifact.files.iter().all(|file| {
+            foreign
+                .iter()
+                .any(|c| c.source == *source && c.size_bytes == file.size_bytes)
+        })
+    })
+}
+
+/// Raw foreign-cache scan for `models list` (WOR-1863): the weight
+/// files Ollama, LM Studio, or the Hugging Face hub already hold under
+/// the current home directory. Read-only; no resolvable home directory
+/// yields an empty list.
+fn foreign_model_files() -> Vec<sbproxy_model_host::ForeignModelFile> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(|home| sbproxy_model_host::discover_foreign_models(&PathBuf::from(home)))
+        .unwrap_or_default()
+}
+
+fn handle_models_list(
+    args: &ModelsListArgs,
+    config_path: Option<&std::path::Path>,
+) -> anyhow::Result<i32> {
     let catalog = load_models_catalog(args.catalog_file.as_deref())?;
-    let root = model_cache_root(args.cache_dir.as_deref());
+    let configured = configured_model_cache_dir(config_path);
+    let root = model_cache_root(args.cache_dir.as_deref().or(configured.as_deref()));
     let report = sbproxy_core::doctor::DoctorReport::collect();
-    let rows = build_model_rows(&catalog, &report, &root);
+    let foreign = foreign_model_files();
+    let rows = build_model_rows(&catalog, &report, &root, &foreign);
 
     match args.format {
         OutputFormat::Json => println!(
             "{}",
-            serde_json::to_string_pretty(&models_command_envelope(
+            serde_json::to_string_pretty(&cli_command_envelope(
                 "models.list",
                 serde_json::json!({ "models": rows }),
             ))?
@@ -3040,6 +5978,7 @@ struct ModelDetail {
     params: String,
     license: String,
     family: String,
+    modality: String,
     context_length: u64,
     allow_pickle: bool,
     variants: Vec<sbproxy_model_host::ArtifactVariant>,
@@ -3051,8 +5990,9 @@ fn engine_choice_name(engine: sbproxy_model_host::EngineChoice) -> &'static str 
     match engine {
         sbproxy_model_host::EngineChoice::Auto => "auto",
         sbproxy_model_host::EngineChoice::Vllm => "vllm",
+        sbproxy_model_host::EngineChoice::SGLang => "sglang",
         sbproxy_model_host::EngineChoice::LlamaCpp => "llama_cpp",
-        sbproxy_model_host::EngineChoice::Embedded => "embedded",
+        sbproxy_model_host::EngineChoice::MistralRs => "mistralrs",
     }
 }
 
@@ -3064,9 +6004,13 @@ fn pull_policy_name(policy: sbproxy_model_host::PullPolicy) -> &'static str {
     }
 }
 
-fn handle_models_show(args: &ModelsShowArgs) -> anyhow::Result<i32> {
+fn handle_models_show(
+    args: &ModelsShowArgs,
+    config_path: Option<&std::path::Path>,
+) -> anyhow::Result<i32> {
     let catalog = load_models_catalog(args.catalog_file.as_deref())?;
-    let root = model_cache_root(args.cache_dir.as_deref());
+    let configured = configured_model_cache_dir(config_path);
+    let root = model_cache_root(args.cache_dir.as_deref().or(configured.as_deref()));
     let Some(entry) = catalog.get(&args.id) else {
         eprintln!("sbproxy models show: '{}' is not in the catalog", args.id);
         return Ok(2);
@@ -3087,6 +6031,7 @@ fn handle_models_show(args: &ModelsShowArgs) -> anyhow::Result<i32> {
         params: entry.params.clone(),
         license: entry.license.clone(),
         family: entry.family.clone(),
+        modality: entry.modality.label().to_string(),
         context_length: entry.context_length,
         allow_pickle: entry.allow_pickle,
         variants: entry.variants.clone(),
@@ -3096,7 +6041,7 @@ fn handle_models_show(args: &ModelsShowArgs) -> anyhow::Result<i32> {
     match args.format {
         OutputFormat::Json => println!(
             "{}",
-            serde_json::to_string_pretty(&models_command_envelope(
+            serde_json::to_string_pretty(&cli_command_envelope(
                 "models.show",
                 serde_json::to_value(&detail)?,
             ))?
@@ -3110,6 +6055,7 @@ fn handle_models_show(args: &ModelsShowArgs) -> anyhow::Result<i32> {
             println!("  params:       {}", detail.params);
             println!("  license:      {}", detail.license);
             println!("  family:       {}", detail.family);
+            println!("  modality:     {}", detail.modality);
             println!("  context:      {}", detail.context_length);
             println!("  quants:       {}", detail.quants.join(", "));
             println!("  engine:       {}", detail.engine);
@@ -3159,6 +6105,7 @@ fn handle_models_show(args: &ModelsShowArgs) -> anyhow::Result<i32> {
 
 const SBPROXY_RELEASE_REPO: &str = "soapbucket/sbproxy";
 const LLAMA_RELEASE_REPO: &str = "ggml-org/llama.cpp";
+const MISTRALRS_RELEASE_REPO: &str = "EricLBuehler/mistral.rs";
 
 #[derive(serde::Serialize)]
 struct SelfFreshness {
@@ -3196,9 +6143,15 @@ struct UpdateReport {
     note: String,
 }
 
-fn handle_update_subcommand(args: &UpdateArgs) -> anyhow::Result<i32> {
-    // `update` = engines + models. `--self` adds the binary check; only
-    // `--engines` / `--models` narrow (so `update --self` still reports
+fn handle_update_subcommand(
+    args: &UpdateArgs,
+    config_path: Option<&std::path::Path>,
+    check: bool,
+) -> anyhow::Result<i32> {
+    let update_cfg = load_update_config(config_path)?;
+
+    // `update` = engines + models. `--self` adds the binary; only
+    // `--engines` / `--models` narrow (so `update --self` still includes
     // engines + models).
     let narrowed = args.engines || args.models;
     let self_ = args.self_.then(check_self_freshness);
@@ -3209,21 +6162,641 @@ fn handle_update_subcommand(args: &UpdateArgs) -> anyhow::Result<i32> {
         None
     };
 
+    // The acting path runs only on a `text`, non-`--check`, non-`auto`
+    // run. `--check` and a background `update.auto` run report only, and
+    // JSON is always the machine-readable freshness report (the acting
+    // path prints progress on the human path).
+    let is_json = matches!(args.format, OutputFormat::Json);
+    let will_act = !check && !update_cfg.auto && !is_json;
+    let note = if update_cfg.auto {
+        "report only: update.auto is on, so this run reports and never \
+         swaps. Run `sbproxy update` with auto off (or override the config) \
+         to apply, and target an artifact to move a pinned one."
+            .to_string()
+    } else if check {
+        "dry run (--check): reports only. Drop --check to apply, with \
+         confirmation. A pinned or externally-managed artifact is never \
+         replaced without an explicit targeted run."
+            .to_string()
+    } else if is_json {
+        "freshness report only (json). Run `sbproxy update` on a terminal \
+         to fetch, verify, and swap what is out of date, with confirmation."
+            .to_string()
+    } else {
+        format!(
+            "channel {}: applying with confirmation. A pinned or \
+             externally-managed artifact is reported, never replaced, unless \
+             you target it (e.g. `sbproxy update --engines`).",
+            channel_label(update_cfg.channel)
+        )
+    };
+
     let report = UpdateReport {
         self_,
         engines,
         models,
-        note: "dry run: `sbproxy update` reports only. Applying an update \
-               (engine swap, self-update, model re-pull) is not wired yet; \
-               a pinned artifact is never mutated without an explicit run."
-            .to_string(),
+        note,
     };
 
-    match args.format {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
-        OutputFormat::Text => print_update_report(&report),
+    if is_json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(0);
     }
-    Ok(0)
+
+    print_update_report(&report);
+    if !will_act {
+        return Ok(0);
+    }
+
+    let applier = RealUpdateApplier;
+    apply_updates(
+        &report,
+        &UpdatePlanContext {
+            channel: update_cfg.channel,
+            targeted_self: args.self_,
+            targeted_engines: args.engines,
+            targeted_models: args.models,
+            assume_yes: args.yes,
+            cache_dir: args.cache_dir.clone(),
+        },
+        &applier,
+    )
+}
+
+/// Load the `update:` block from a config file, or the defaults when no
+/// `-f/--config` was given (or the file omits an `update:` block).
+fn load_update_config(
+    config_path: Option<&std::path::Path>,
+) -> anyhow::Result<sbproxy_config::UpdateConfig> {
+    match config_path {
+        Some(path) => {
+            let yaml = std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("read config '{}': {e}", path.display()))?;
+            let cfg: sbproxy_config::ConfigFile = serde_yaml::from_str(&yaml)
+                .map_err(|e| anyhow::anyhow!("parse config '{}': {e}", path.display()))?;
+            Ok(cfg.update)
+        }
+        None => Ok(sbproxy_config::UpdateConfig::default()),
+    }
+}
+
+/// Short label for an update channel, for the report note.
+fn channel_label(channel: sbproxy_config::UpdateChannel) -> &'static str {
+    match channel {
+        sbproxy_config::UpdateChannel::Stable => "stable",
+        sbproxy_config::UpdateChannel::Latest => "latest",
+        sbproxy_config::UpdateChannel::Pinned => "pinned",
+    }
+}
+
+// --- `update` acting half: pinning gate + swap planners + apply seam ---
+
+/// How an updatable artifact is currently obtained, which decides whether
+/// `sbproxy update` is allowed to replace it (WOR-1804).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PinState {
+    /// Installed and owned by an external tool: a binary already on
+    /// `PATH`, or a `brew` / `apt` package. Reported, never overwritten.
+    ExternallyManaged,
+    /// Pinned to an explicit version or digest. A blanket run holds it;
+    /// only a run that explicitly targets this artifact may move it.
+    Pinned,
+    /// Tracks a moving reference on the configured channel. Swap-eligible.
+    Tracking,
+}
+
+/// The outcome of the pinning gate: whether a swap may proceed, and why
+/// not when it may not. Pure; drives both the report and the acting path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwapDecision {
+    /// A newer artifact exists and may be fetched and swapped in.
+    Eligible,
+    /// Already current; nothing to do.
+    UpToDate,
+    /// Owned by an external package manager; report only, never touch.
+    ManagedElsewhere,
+    /// Pinned and this run did not explicitly target it; hold.
+    PinnedHold,
+    /// A background / `update.auto` run only reports; it never swaps.
+    AutoReportOnly,
+}
+
+/// Decide whether `sbproxy update` may replace one artifact. Pure:
+/// pinning and external management always win over an available update,
+/// an `auto` (background) run never swaps, and the `pinned` channel
+/// freezes everything a targeted run did not name.
+fn decide_swap(
+    pin: PinState,
+    update_available: bool,
+    channel: sbproxy_config::UpdateChannel,
+    targeted: bool,
+    auto: bool,
+) -> SwapDecision {
+    if auto {
+        return SwapDecision::AutoReportOnly;
+    }
+    if pin == PinState::ExternallyManaged {
+        return SwapDecision::ManagedElsewhere;
+    }
+    let frozen = pin == PinState::Pinned || channel == sbproxy_config::UpdateChannel::Pinned;
+    if frozen && !targeted {
+        return SwapDecision::PinnedHold;
+    }
+    if !update_available {
+        return SwapDecision::UpToDate;
+    }
+    SwapDecision::Eligible
+}
+
+/// Classify how the running `sbproxy` binary was installed, from its
+/// path. Homebrew and distro package prefixes are externally managed (the
+/// package manager owns the file); anything else (a `curl | sh` install
+/// into `~/.local/bin`, `/usr/local/bin`, a container, or a dev build) is
+/// treated as channel-tracking and swap-eligible.
+fn classify_self_install(exe: &std::path::Path) -> PinState {
+    let text = exe.to_string_lossy();
+    // Homebrew (Intel + Apple Silicon) and Linuxbrew formula prefixes.
+    let brew =
+        text.contains("/Cellar/") || text.contains("/homebrew/") || text.contains("/linuxbrew/");
+    // apt / dpkg install the binary into the distro-owned /usr (or /bin)
+    // tree. /usr/local is operator-owned by the FHS, so it stays
+    // swap-eligible.
+    let distro = (text.starts_with("/usr/bin/") || text.starts_with("/bin/"))
+        && !text.starts_with("/usr/local/");
+    if brew || distro {
+        PinState::ExternallyManaged
+    } else {
+        PinState::Tracking
+    }
+}
+
+/// Classify how an engine binary is obtained on this host. A binary on
+/// `PATH` is operator-installed (brew / apt / manual) and never
+/// overwritten; otherwise the managed runtime falls back to the pinned
+/// prebuilt release it fetches into the cache.
+fn engine_pin_state(program: &str) -> PinState {
+    if sbproxy_model_host::resolve_on_path(program).is_some() {
+        PinState::ExternallyManaged
+    } else {
+        PinState::Pinned
+    }
+}
+
+/// The PATH program name for an engine key.
+fn engine_program(engine: &str) -> &'static str {
+    match engine {
+        "vllm" => "vllm",
+        _ => "llama-server",
+    }
+}
+
+/// Classify a cached model from its freshness `tracking` label: a pinned
+/// revision is held, a moving ref is swap-eligible (a re-pull chases the
+/// upstream head).
+fn model_pin_state(tracking: &str) -> PinState {
+    if tracking == "moving-ref" {
+        PinState::Tracking
+    } else {
+        PinState::Pinned
+    }
+}
+
+/// A planned engine prebuilt swap: which engine, the target release tag,
+/// the expected sha256 when a digest is known for the tag, and the cache
+/// root the binary is published under. The applier seam fetches, verifies,
+/// and atomically publishes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EngineSwapPlan {
+    engine: String,
+    program: String,
+    tag: String,
+    expected_sha256: Option<String>,
+    cache_dir: PathBuf,
+}
+
+/// Plan an engine swap from a freshness row and a pinning decision, or
+/// `None` when nothing should move. Only `llama_cpp` publishes a
+/// single-binary prebuilt release the runtime manages; vLLM does not.
+fn plan_engine_swap(
+    freshness: &EngineFreshness,
+    cache_dir: &std::path::Path,
+    decision: SwapDecision,
+) -> Option<EngineSwapPlan> {
+    if decision != SwapDecision::Eligible || freshness.engine != "llama_cpp" {
+        return None;
+    }
+    let tag = freshness.latest_release.clone()?;
+    Some(EngineSwapPlan {
+        engine: freshness.engine.to_string(),
+        program: engine_program(freshness.engine).to_string(),
+        // A vendored digest exists only for the default pinned tag; a
+        // newer tag has no built-in digest, so it is fetched unverified
+        // unless the operator supplies `engines.llama_cpp.acquire.sha256`.
+        expected_sha256: None,
+        tag,
+        cache_dir: cache_dir.to_path_buf(),
+    })
+}
+
+/// A planned binary self-update: the target version and the path of the
+/// binary to replace. The release asset URL + digest are resolved by the
+/// applier seam at apply time (they come from the GitHub release feed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelfUpdatePlan {
+    target_version: String,
+    dest: PathBuf,
+}
+
+/// Plan a self-update from the binary's freshness row and a pinning
+/// decision, or `None` when the binary should not move.
+fn plan_self_update(
+    freshness: &SelfFreshness,
+    dest: &std::path::Path,
+    decision: SwapDecision,
+) -> Option<SelfUpdatePlan> {
+    if decision != SwapDecision::Eligible {
+        return None;
+    }
+    let target_version = freshness.latest.clone()?;
+    Some(SelfUpdatePlan {
+        target_version,
+        dest: dest.to_path_buf(),
+    })
+}
+
+/// A planned model re-pull: the catalog id, HF repo, and revision to
+/// re-fetch through the existing weight manager.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelRepullPlan {
+    id: String,
+    hf_repo: String,
+    revision: String,
+}
+
+/// Plan a model re-pull from its freshness row and a pinning decision.
+fn plan_model_repull(
+    freshness: &ModelFreshness,
+    decision: SwapDecision,
+) -> Option<ModelRepullPlan> {
+    if decision != SwapDecision::Eligible {
+        return None;
+    }
+    Some(ModelRepullPlan {
+        id: freshness.id.clone(),
+        hf_repo: freshness.hf_repo.clone(),
+        revision: freshness.revision.clone(),
+    })
+}
+
+/// The release-archive base name for a host, matching the naming
+/// `scripts/install.sh` uses: `sbproxy_<os>_<arch>.tar.gz` with `os` in
+/// {linux, darwin} and `arch` in {amd64, arm64}. `Err` when the host is
+/// one no prebuilt binary is published for (Intel macOS).
+fn self_update_asset_name(os: &str, arch: &str) -> anyhow::Result<String> {
+    let os_tag = match os {
+        "linux" => "linux",
+        "macos" => "darwin",
+        other => anyhow::bail!("no prebuilt sbproxy binary for os '{other}'"),
+    };
+    let arch_tag = match arch {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => anyhow::bail!("no prebuilt sbproxy binary for arch '{other}'"),
+    };
+    if os_tag == "darwin" && arch_tag == "amd64" {
+        anyhow::bail!(
+            "no prebuilt sbproxy binary for darwin/amd64 (Intel Mac); build from source or run under Docker"
+        );
+    }
+    Ok(format!("sbproxy_{os_tag}_{arch_tag}.tar.gz"))
+}
+
+/// The side-effecting half of `sbproxy update`: fetch, verify, and swap.
+/// Split from the pure planners so the decision logic is unit-tested with
+/// no network, and the real network + filesystem work is exercised only
+/// on a live run (mirroring how the freshness report shipped ahead of the
+/// acting half).
+trait UpdateApplier {
+    /// Fetch, verify, and publish an engine prebuilt swap. Returns the
+    /// path to the newly published binary.
+    fn apply_engine_swap(&self, plan: &EngineSwapPlan) -> anyhow::Result<PathBuf>;
+    /// Fetch, verify, and atomically replace the running binary.
+    fn apply_self_update(&self, plan: &SelfUpdatePlan) -> anyhow::Result<()>;
+    /// Re-pull a model's weights through the existing weight manager.
+    fn apply_model_repull(&self, plan: &ModelRepullPlan) -> anyhow::Result<()>;
+}
+
+/// The production applier: real network fetches, sha256 verification, and
+/// atomic filesystem swaps.
+struct RealUpdateApplier;
+
+impl UpdateApplier for RealUpdateApplier {
+    fn apply_engine_swap(&self, plan: &EngineSwapPlan) -> anyhow::Result<PathBuf> {
+        #[cfg(feature = "model-weights")]
+        {
+            let path = sbproxy_model_host::ensure_llama_server_blocking(
+                &plan.cache_dir,
+                &plan.tag,
+                sbproxy_model_host::EngineAccel::Auto,
+                plan.expected_sha256.as_deref(),
+            )
+            .map_err(|e| anyhow::anyhow!("acquire {} {}: {e}", plan.engine, plan.tag))?;
+            Ok(path)
+        }
+        #[cfg(not(feature = "model-weights"))]
+        {
+            let _ = plan;
+            anyhow::bail!(
+                "this build has no model-weights feature; rebuild with it to fetch engine prebuilts"
+            )
+        }
+    }
+
+    fn apply_self_update(&self, plan: &SelfUpdatePlan) -> anyhow::Result<()> {
+        let asset = self_update_asset_name(std::env::consts::OS, std::env::consts::ARCH)?;
+        let base = format!(
+            "https://github.com/{SBPROXY_RELEASE_REPO}/releases/download/{}",
+            plan.target_version
+        );
+        let archive_url = format!("{base}/{asset}");
+        let sha_url = format!("{archive_url}.sha256");
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(300))
+            .build()?;
+        // Stage under the destination directory so the final rename is a
+        // same-filesystem atomic move.
+        let dir = plan
+            .dest
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("binary path has no parent directory"))?;
+        let staging = dir.join(format!(".sbproxy-update-{}", std::process::id()));
+        std::fs::create_dir_all(&staging)
+            .map_err(|e| anyhow::anyhow!("create {}: {e}", staging.display()))?;
+        let result = self_update_into(&client, &archive_url, &sha_url, &staging, &plan.dest);
+        let _ = std::fs::remove_dir_all(&staging);
+        result
+    }
+
+    fn apply_model_repull(&self, plan: &ModelRepullPlan) -> anyhow::Result<()> {
+        // Re-pull the exact catalog artifact for this model id through the
+        // existing weight manager (the same path as `sbproxy models pull
+        // <id>`), which re-resolves, fetches, and verifies it.
+        let pull = ModelsPullArgs {
+            models: vec![plan.id.clone()],
+            all: false,
+            variant: None,
+            engine: ModelEngineArg::Auto,
+            catalog_file: None,
+            cache_dir: None,
+            offline: false,
+            format: OutputFormat::Text,
+        };
+        let code = handle_models_pull(&pull, None)?;
+        if code != 0 {
+            anyhow::bail!("re-pull of {} exited {code}", plan.id);
+        }
+        Ok(())
+    }
+}
+
+/// Download the release archive + its published sha256, verify, extract
+/// the `sbproxy` binary, and atomically replace `dest`.
+fn self_update_into(
+    client: &reqwest::blocking::Client,
+    archive_url: &str,
+    sha_url: &str,
+    staging: &std::path::Path,
+    dest: &std::path::Path,
+) -> anyhow::Result<()> {
+    let bytes = client
+        .get(archive_url)
+        .send()
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| anyhow::anyhow!("download {archive_url}: {e}"))?
+        .bytes()
+        .map_err(|e| anyhow::anyhow!("read {archive_url}: {e}"))?;
+    let archive_path = staging.join("sbproxy.tar.gz");
+    std::fs::write(&archive_path, &bytes)
+        .map_err(|e| anyhow::anyhow!("write {}: {e}", archive_path.display()))?;
+
+    // Fetch + verify the published checksum. Every release publishes it;
+    // its absence is a hard failure (the same posture as install.sh).
+    let sha_text = client
+        .get(sha_url)
+        .send()
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| anyhow::anyhow!("fetch checksum {sha_url}: {e}"))?
+        .text()
+        .map_err(|e| anyhow::anyhow!("read checksum {sha_url}: {e}"))?;
+    let expected = sha_text
+        .split_whitespace()
+        .next()
+        .map(|s| s.to_ascii_lowercase())
+        .filter(|s| s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()))
+        .ok_or_else(|| anyhow::anyhow!("published checksum is malformed: '{sha_text}'"))?;
+    sbproxy_model_host::weights::verify_sha256(&archive_path, &expected)
+        .map_err(|e| anyhow::anyhow!("checksum verify failed: {e}"))?;
+
+    // Extract (shell out to `tar`, as the engine release path does).
+    let status = std::process::Command::new("tar")
+        .arg("-xzf")
+        .arg(&archive_path)
+        .arg("-C")
+        .arg(staging)
+        .status()
+        .map_err(|e| anyhow::anyhow!("tar: {e}"))?;
+    if !status.success() {
+        anyhow::bail!("tar extract of {} failed", archive_path.display());
+    }
+    let staged_binary = staging.join("sbproxy");
+    if !staged_binary.is_file() {
+        anyhow::bail!("sbproxy binary not found in the extracted release");
+    }
+    atomic_replace_binary(&staged_binary, dest)
+}
+
+/// Atomically replace `dest` with `src`: copy `src` to a temp file in the
+/// destination directory, mark it executable, then rename over `dest`. On
+/// unix a running binary can be replaced while it executes; on Windows a
+/// rename over the running image fails, so a Windows self-update needs the
+/// rename-self-aside dance this build does not implement.
+fn atomic_replace_binary(src: &std::path::Path, dest: &std::path::Path) -> anyhow::Result<()> {
+    let dir = dest
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("binary path has no parent directory"))?;
+    let tmp = dir.join(format!(".sbproxy-new-{}", std::process::id()));
+    std::fs::copy(src, &tmp).map_err(|e| anyhow::anyhow!("stage new binary: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| anyhow::anyhow!("chmod staged binary: {e}"))?;
+    }
+    std::fs::rename(&tmp, dest).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::anyhow!("replace {}: {e}", dest.display())
+    })?;
+    Ok(())
+}
+
+/// Inputs to the acting half that the freshness report does not carry.
+struct UpdatePlanContext {
+    channel: sbproxy_config::UpdateChannel,
+    targeted_self: bool,
+    targeted_engines: bool,
+    targeted_models: bool,
+    assume_yes: bool,
+    cache_dir: Option<PathBuf>,
+}
+
+/// Drive the acting half: for each artifact in the report run the pinning
+/// gate, and when eligible confirm + apply through the seam. Never mutates
+/// a pinned or externally-managed artifact without an explicit targeted
+/// run. Returns exit code 1 when any apply failed.
+fn apply_updates(
+    report: &UpdateReport,
+    ctx: &UpdatePlanContext,
+    applier: &dyn UpdateApplier,
+) -> anyhow::Result<i32> {
+    println!("\napplying updates");
+    let mut applied = 0u32;
+    let mut failures = 0u32;
+
+    if let Some(freshness) = &report.self_ {
+        match std::env::current_exe() {
+            Ok(exe) => {
+                let decision = decide_swap(
+                    classify_self_install(&exe),
+                    freshness.update_available,
+                    ctx.channel,
+                    ctx.targeted_self,
+                    false,
+                );
+                report_decision("sbproxy", decision);
+                if let Some(plan) = plan_self_update(freshness, &exe, decision) {
+                    if confirm_swap(
+                        &format!("replace this binary with sbproxy {}", plan.target_version),
+                        ctx.assume_yes,
+                    ) {
+                        match applier.apply_self_update(&plan) {
+                            Ok(()) => {
+                                applied += 1;
+                                println!("  sbproxy -> {}", plan.target_version);
+                            }
+                            Err(e) => {
+                                failures += 1;
+                                eprintln!("  sbproxy self-update failed: {e}");
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => eprintln!("  sbproxy: cannot locate the running binary: {e}; skipping"),
+        }
+    }
+
+    if let Some(engines) = &report.engines {
+        let cache = model_cache_root(ctx.cache_dir.as_deref());
+        for engine in engines {
+            let decision = decide_swap(
+                engine_pin_state(engine_program(engine.engine)),
+                engine.update_available,
+                ctx.channel,
+                ctx.targeted_engines,
+                false,
+            );
+            report_decision(engine.engine, decision);
+            if let Some(plan) = plan_engine_swap(engine, &cache, decision) {
+                if confirm_swap(
+                    &format!("fetch and swap {} to {}", plan.engine, plan.tag),
+                    ctx.assume_yes,
+                ) {
+                    match applier.apply_engine_swap(&plan) {
+                        Ok(path) => {
+                            applied += 1;
+                            println!("  {} -> {} ({})", plan.engine, plan.tag, path.display());
+                        }
+                        Err(err) => {
+                            failures += 1;
+                            eprintln!("  {} swap failed: {err}", plan.engine);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(models) = &report.models {
+        for model in models {
+            let pin = model_pin_state(model.tracking);
+            // A moving-ref model is treated as potentially behind upstream
+            // (the freshness classifies moving vs pinned; the upstream-head
+            // comparison is a seam), so it is offered for re-pull.
+            let update_available = pin == PinState::Tracking;
+            let decision = decide_swap(
+                pin,
+                update_available,
+                ctx.channel,
+                ctx.targeted_models,
+                false,
+            );
+            report_decision(&model.id, decision);
+            if let Some(plan) = plan_model_repull(model, decision) {
+                if confirm_swap(
+                    &format!("re-pull {} ({}@{})", plan.id, plan.hf_repo, plan.revision),
+                    ctx.assume_yes,
+                ) {
+                    match applier.apply_model_repull(&plan) {
+                        Ok(()) => {
+                            applied += 1;
+                            println!("  re-pulled {}", plan.id);
+                        }
+                        Err(err) => {
+                            failures += 1;
+                            eprintln!("  {} re-pull failed: {err}", plan.id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    println!("\n{applied} applied, {failures} failed");
+    Ok(if failures > 0 { 1 } else { 0 })
+}
+
+/// Print a one-line reason for the pinning gate's non-eligible verdicts,
+/// so a report-and-hold outcome is visible in the acting output.
+fn report_decision(name: &str, decision: SwapDecision) {
+    match decision {
+        SwapDecision::Eligible => {}
+        SwapDecision::UpToDate => println!("  {name}: up to date"),
+        SwapDecision::ManagedElsewhere => {
+            println!("  {name}: managed elsewhere (PATH / brew / apt); skipping")
+        }
+        SwapDecision::PinnedHold => {
+            println!("  {name}: pinned; target it explicitly to move it, or set update.channel")
+        }
+        SwapDecision::AutoReportOnly => println!("  {name}: report only (update.auto)"),
+    }
+}
+
+/// Interactive yes/no confirmation. Returns true immediately when
+/// `assume_yes` (`--yes`) is set; otherwise prompts on stderr and reads a
+/// line from stdin. A non-tty / EOF answer is treated as "no".
+fn confirm_swap(action: &str, assume_yes: bool) -> bool {
+    use std::io::Write;
+    if assume_yes {
+        return true;
+    }
+    eprint!("  {action}? [y/N] ");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim(), "y" | "Y" | "yes" | "Yes")
 }
 
 fn check_self_freshness() -> SelfFreshness {
@@ -3241,7 +6814,13 @@ fn check_self_freshness() -> SelfFreshness {
 }
 
 fn check_engines_freshness() -> Vec<EngineFreshness> {
-    let pinned = sbproxy_model_host::DEFAULT_LLAMA_RELEASE_TAG.to_string();
+    // The effective default pin is host-aware on macOS: an older host
+    // reports the newest pinned build its OS can load. When even that
+    // fails (host older than every pin), report the newest pin so the
+    // freshness table still renders; acquisition surfaces the real error.
+    let pinned = sbproxy_model_host::default_llama_release_tag_for_host()
+        .unwrap_or(sbproxy_model_host::DEFAULT_LLAMA_RELEASE_TAG)
+        .to_string();
     let llama_latest = github_latest_release(LLAMA_RELEASE_REPO);
     let llama_update = llama_latest
         .as_deref()
@@ -3262,6 +6841,18 @@ fn check_engines_freshness() -> Vec<EngineFreshness> {
             pinned_release: None,
             latest_release: None,
             update_available: false,
+        },
+        {
+            let pinned = sbproxy_model_host::mistralrs_release::DEFAULT_MISTRALRS_RELEASE_TAG;
+            let latest = github_latest_release(MISTRALRS_RELEASE_REPO);
+            let update = latest.as_deref().map(|l| l != pinned).unwrap_or(false);
+            EngineFreshness {
+                engine: "mistralrs",
+                installed: engine_version("mistralrs"),
+                pinned_release: Some(pinned.to_string()),
+                latest_release: latest,
+                update_available: update,
+            }
         },
     ]
 }
@@ -3476,11 +7067,32 @@ fn handle_projections_render(args: &RenderArgs) -> anyhow::Result<()> {
 
 // --- `config` handler ---
 
-fn handle_config_subcommand(cmd: &ConfigCmd) -> anyhow::Result<i32> {
+/// Dispatch `sbproxy config <sub>`.
+///
+/// `global_config` is `-f/--config` (or `SB_CONFIG_FILE`) as parsed at the
+/// top level. It is threaded in because `-f` is a global flag, so a
+/// subcommand that documents "defaults to `-f/--config`" cannot see it from
+/// its own args struct.
+fn handle_config_subcommand(
+    cmd: &ConfigCmd,
+    global_config: Option<&std::path::Path>,
+) -> anyhow::Result<i32> {
     match &cmd.sub {
         ConfigSub::Migrate(args) => handle_config_migrate(args),
         ConfigSub::ImportLitellm(args) => handle_config_import_litellm(args),
-        ConfigSub::Print(args) => handle_config_print(args),
+        ConfigSub::Print(args) => handle_config_print(args, global_config),
+        ConfigSub::Authority(cmd) => match &cmd.sub {
+            ConfigAuthoritySub::Init(args) => handle_authority_init(args),
+            ConfigAuthoritySub::Publish(args) => handle_authority_publish(args),
+            ConfigAuthoritySub::Status(args) => handle_authority_status(args),
+            ConfigAuthoritySub::Rollback(args) => handle_authority_rollback(args),
+            ConfigAuthoritySub::Subscriber(cmd) => match &cmd.sub {
+                AuthoritySubscriberSub::Add(args) => handle_authority_subscriber_add(args),
+                AuthoritySubscriberSub::List(args) => handle_authority_subscriber_list(args),
+                AuthoritySubscriberSub::Revoke(args) => handle_authority_subscriber_revoke(args),
+            },
+        },
+        ConfigSub::Pull(args) => handle_config_pull(args, global_config),
     }
 }
 
@@ -3775,14 +7387,11 @@ fn parse_cluster_labels(labels: &[String]) -> anyhow::Result<BTreeMap<String, St
 /// `sbproxy config print`: the effective config after built-in defaults +
 /// the file + `${ENV}` interpolation, with secret values masked. Makes
 /// it obvious what a box will actually do (WOR-1805).
-fn handle_config_print(args: &ConfigPrintArgs) -> anyhow::Result<i32> {
-    let path = args
-        .config_path
-        .clone()
-        .or_else(|| std::env::var_os("SB_CONFIG_FILE").map(PathBuf::from))
-        .ok_or_else(|| {
-            anyhow::anyhow!("no config file: pass a path or set -f/--config / SB_CONFIG_FILE")
-        })?;
+fn handle_config_print(
+    args: &ConfigPrintArgs,
+    global_config: Option<&std::path::Path>,
+) -> anyhow::Result<i32> {
+    let path = resolve_config_path(args.config_path.as_deref(), global_config)?;
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| anyhow::anyhow!("read config '{}': {e}", path.display()))?;
     // Apply the same `${ENV}` interpolation the compiler does, so an
@@ -3800,6 +7409,1142 @@ fn handle_config_print(args: &ConfigPrintArgs) -> anyhow::Result<i32> {
         print!("{}", serde_yaml::to_string(&value)?);
     }
     Ok(0)
+}
+
+// --- `config authority` + `config pull` handlers ---
+//
+// Every command here that changes what the fleet sees goes over the admin
+// API and reports what the server returned. None of them reaches for an
+// in-process primitive: `sbproxy apply` used to do that, compiling the
+// config into the short-lived CLI process, swapping that process's own
+// pipeline, and printing success without ever contacting the proxy, so its
+// exit code meant nothing. `config pull --dry-run` is the one local command,
+// and it is local because it applies nothing at all.
+
+/// File the generated Ed25519 signing seed is written to, inside `--dir`.
+const AUTHORITY_SIGNING_KEY_FILE: &str = "authority-signing.key";
+
+/// File the verifying-key map subscribers install is written to.
+const AUTHORITY_VERIFYING_KEYS_FILE: &str = "authority-keys.json";
+
+/// Resolve the config path for a subcommand that takes it positionally.
+///
+/// Priority: the positional path, then the global `-f/--config`, then
+/// `SB_CONFIG_FILE`. Matches the order `serve` resolves its own path in.
+fn resolve_config_path(
+    positional: Option<&std::path::Path>,
+    global_config: Option<&std::path::Path>,
+) -> anyhow::Result<PathBuf> {
+    positional
+        .or(global_config)
+        .map(std::path::Path::to_path_buf)
+        .or_else(|| std::env::var_os("SB_CONFIG_FILE").map(PathBuf::from))
+        .ok_or_else(|| {
+            anyhow::anyhow!("no config file: pass a path or set -f/--config / SB_CONFIG_FILE")
+        })
+}
+
+/// Body for one admin request that carries one.
+enum AdminRequestBody {
+    /// A JSON document, sent as `application/json`.
+    Json(serde_json::Value),
+    /// A verbatim YAML document, sent as `application/yaml`.
+    ///
+    /// The publish route takes the payload as the request body rather than
+    /// wrapped in a JSON field, so the bytes that get signed are the bytes
+    /// the operator wrote.
+    Yaml(String),
+}
+
+/// What one admin request produced.
+enum AdminOutcome {
+    /// The admin API answered. Carries the status and the decoded body
+    /// (`Null` when the answer was not JSON).
+    Answered {
+        /// HTTP status the admin API returned.
+        status: reqwest::StatusCode,
+        /// Decoded response body.
+        body: serde_json::Value,
+    },
+    /// Nothing answered at the admin URL, so nothing happened. Carries the
+    /// transport reason for the operator-facing line.
+    Unreachable(String),
+}
+
+/// Send one admin request, returning the status alongside the body.
+///
+/// `admin_request_json` collapses every non-2xx into an error, which is
+/// right for the commands whose only useful answer is the happy path. These
+/// commands have to tell an authority that refused (exit 4) apart from one
+/// that never answered (exit 7): an exit code that conflates the two is
+/// exactly the defect that made `apply`'s old exit code worthless.
+fn admin_request_parts(
+    args: &ModelsAdminArgs,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<AdminRequestBody>,
+) -> anyhow::Result<AdminOutcome> {
+    use zeroize::Zeroize;
+
+    let base_url = args.admin_url.as_deref().unwrap_or(DEFAULT_ADMIN_URL);
+    let username = args.username.as_deref().unwrap_or("admin");
+    let mut password = args.password.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "admin password is required via --password or SB_ADMIN_PASSWORD. A publishing node \
+             refuses the shipped default password, so an authority always has a real one"
+        )
+    })?;
+    let url = format!("{}{}", base_url.trim_end_matches('/'), path);
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(3))
+        // Publishing runs the full boot-equivalent validation on the
+        // server, so the read budget matches `apply`'s rather than the
+        // 30s the read-only model-host routes use.
+        .timeout(std::time::Duration::from_secs(60))
+        .build()?;
+    let mut request = client
+        .request(method, &url)
+        .basic_auth(username, Some(password.as_str()));
+    match body {
+        Some(AdminRequestBody::Json(value)) => request = request.json(&value),
+        Some(AdminRequestBody::Yaml(document)) => {
+            request = request
+                .header(reqwest::header::CONTENT_TYPE, "application/yaml")
+                .body(document);
+        }
+        None => {}
+    }
+    let request = request.build();
+    // Cleared as soon as the Authorization header exists, matching
+    // `admin_request_json` and `apply_to_running_proxy`.
+    password.zeroize();
+    let response = match client.execute(request?) {
+        Ok(response) => response,
+        Err(error) => return Ok(AdminOutcome::Unreachable(error.to_string())),
+    };
+    let status = response.status();
+    let body = response.json().unwrap_or(serde_json::Value::Null);
+    Ok(AdminOutcome::Answered { status, body })
+}
+
+/// Report an admin API that refused, and return the documented exit code 4.
+fn report_admin_refusal(
+    command: &str,
+    status: reqwest::StatusCode,
+    body: &serde_json::Value,
+) -> i32 {
+    let error = body
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("the admin API gave no reason");
+    let code = body
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    eprintln!("{command}: the authority refused (HTTP {status}, {code}): {error}");
+    eprintln!("{command}: nothing changed on the authority.");
+    4
+}
+
+/// Report an unreachable admin API, and return the documented exit code 7.
+///
+/// Deliberately never followed by a local fallback. A command that cannot
+/// reach the authority has not published, rolled back, or revoked anything,
+/// and saying otherwise is worse than saying nothing.
+fn report_admin_unreachable(command: &str, args: &ModelsAdminArgs, reason: &str) -> i32 {
+    let base_url = args.admin_url.as_deref().unwrap_or(DEFAULT_ADMIN_URL);
+    eprintln!("{command}: could not reach the admin API at {base_url}: {reason}");
+    eprintln!(
+        "{command}: nothing was changed. Point --admin-url (or SB_ADMIN_URL) at the running \
+         authority's admin listener."
+    );
+    7
+}
+
+/// Name a generated key after its own public key: `authority-` plus the
+/// first twelve alphanumeric characters of the base64 public material,
+/// lowercased.
+///
+/// Derived rather than dated because rotation is additive: an operator
+/// generating a second key wants a second name, and two keys made in the
+/// same month would collide on a date-shaped default. Derived from the
+/// public half and never from the seed, because the seed's entropy must not
+/// show up in a value the verifying-key file publishes.
+fn derived_key_id(verifying_material_base64: &str) -> String {
+    let suffix: String = verifying_material_base64
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(12)
+        .map(|character| character.to_ascii_lowercase())
+        .collect();
+    format!("authority-{suffix}")
+}
+
+/// Set a directory this command just created to owner-only.
+///
+/// Best effort: a failure is reported and does not abort, because the
+/// signing key inside it carries its own mode and its own refusal to load
+/// when that mode is wrong.
+#[cfg(unix)]
+fn tighten_directory_permissions(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)) {
+        eprintln!(
+            "config authority init: warning: could not set '{}' to owner-only (0700): {error}",
+            path.display()
+        );
+    }
+}
+
+/// Windows has no mode bits to set, so this is a no-op there rather than a
+/// false assurance.
+#[cfg(not(unix))]
+fn tighten_directory_permissions(_path: &std::path::Path) {}
+
+/// Warn when the directory holding a signing key can be reached by another
+/// account on the box.
+///
+/// A warning and not a refusal: the key file itself is owner-only and
+/// `ConfigBundleSigner` refuses to load one that is not, so a loose
+/// directory mode is a risk to whatever else lives there rather than to the
+/// key. Worth saying out loud all the same, because an operator who ran
+/// `chmod 755` on a parent path has no other prompt to notice.
+#[cfg(unix)]
+fn warn_if_directory_is_reachable_by_others(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+    let mode = metadata.permissions().mode();
+    if mode & 0o077 != 0 {
+        eprintln!(
+            "config authority init: warning: '{}' is mode {:o}, so other accounts on this host \
+             can reach it. Run `chmod 700 {}`.",
+            path.display(),
+            mode & 0o777,
+            path.display(),
+        );
+    }
+}
+
+/// Windows has no mode bits to check.
+#[cfg(not(unix))]
+fn warn_if_directory_is_reachable_by_others(_path: &std::path::Path) {}
+
+/// Write private key material with owner-only permissions.
+///
+/// The mode is requested in the open and set again afterwards: the first
+/// covers a file this call creates, so it is never briefly world-readable,
+/// and the second covers `--force` over a file that already exists with a
+/// looser mode. Getting either wrong would also mean an authority that
+/// cannot start, since the loader refuses a group-readable signing key.
+fn write_owner_only(path: &std::path::Path, contents: &str) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| anyhow::anyhow!("write '{}': {error}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(
+            |error| {
+                anyhow::anyhow!(
+                    "set owner-only permissions on '{}': {error}",
+                    path.display()
+                )
+            },
+        )?;
+    }
+    file.write_all(contents.as_bytes())
+        .and_then(|()| file.write_all(b"\n"))
+        .and_then(|()| file.sync_all())
+        .map_err(|error| anyhow::anyhow!("write '{}': {error}", path.display()))?;
+    Ok(())
+}
+
+/// Fold one signer's verifying-key entry into the map at `path`, keeping
+/// whatever is already there.
+///
+/// Rotation is additive: subscribers trust the old key and the new one at
+/// once, then drop the old entry a window later. Replacing the file
+/// wholesale would withdraw the old key's trust at the same instant the new
+/// key starts signing, which is the window rotation exists to avoid.
+fn merge_verifying_keys(path: &std::path::Path, entry: &str) -> anyhow::Result<String> {
+    let mut merged = match std::fs::read_to_string(path) {
+        Ok(existing) => serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+            &existing,
+        )
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "'{}' exists but is not a verifying-key object ({error}). Move it aside or fix \
+                 it, rather than having this overwrite keys subscribers may still be trusting",
+                path.display()
+            )
+        })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::Map::new(),
+        Err(error) => {
+            return Err(anyhow::anyhow!("read '{}': {error}", path.display()));
+        }
+    };
+    let generated: serde_json::Map<String, serde_json::Value> = serde_json::from_str(entry)
+        .map_err(|error| anyhow::anyhow!("decode the generated verifying-key entry: {error}"))?;
+    merged.extend(generated);
+    serde_json::to_string_pretty(&serde_json::Value::Object(merged))
+        .map_err(|error| anyhow::anyhow!("encode the verifying-key file: {error}"))
+}
+
+/// `sbproxy config authority init`: generate the authority's key pair, write
+/// the signing key owner-only, write the verifying-key file subscribers
+/// install, and print what to copy where.
+///
+/// Local by definition: a signing key that travelled over a network to get
+/// to its own authority is a signing key that has been somewhere else.
+///
+/// Exit codes: 0 generated, 1 CLI or IO error, 3 refused because a signing
+/// key already exists and `--force` was not given.
+fn handle_authority_init(args: &AuthorityInitArgs) -> anyhow::Result<i32> {
+    use rand::RngCore as _;
+    use sbproxy_config::config_bundle::{
+        encode_signing_key_seed, ConfigBundleSigner, ED25519_KEY_BYTES,
+    };
+    use zeroize::Zeroize as _;
+
+    let directory = args.directory.as_path();
+    let created = !directory.exists();
+    std::fs::create_dir_all(directory).map_err(|error| {
+        anyhow::anyhow!(
+            "create authority directory '{}': {error}",
+            directory.display()
+        )
+    })?;
+    if created {
+        tighten_directory_permissions(directory);
+    }
+    warn_if_directory_is_reachable_by_others(directory);
+
+    let key_path = directory.join(AUTHORITY_SIGNING_KEY_FILE);
+    let keys_path = directory.join(AUTHORITY_VERIFYING_KEYS_FILE);
+    if key_path.exists() && !args.force {
+        eprintln!(
+            "config authority init: '{}' already exists. Overwriting a signing key means every \
+             bundle it signed stops verifying for any subscriber that has not installed the new \
+             verifying key yet, so this refuses rather than guess.",
+            key_path.display()
+        );
+        eprintln!(
+            "config authority init: pass --force to rotate (the new verifying key is added to \
+             '{}' alongside the old one), or point --dir somewhere else.",
+            keys_path.display()
+        );
+        return Ok(3);
+    }
+
+    let mut seed = [0u8; ED25519_KEY_BYTES];
+    rand::rngs::OsRng.fill_bytes(&mut seed);
+    // The key id we want names the key's own public half, and the signer is
+    // what computes that, so the pair is built twice: once to learn the
+    // public key, once under the name that describes it. Cheap, and it
+    // keeps the id derivation out of the crypto crate.
+    let key_id = match args.key_id.as_deref() {
+        Some(key_id) => key_id.to_string(),
+        None => {
+            let probe = ConfigBundleSigner::ed25519_from_seed_bytes("authority-pending", &seed)
+                .map_err(|error| anyhow::anyhow!("derive the authority key id: {error}"))?;
+            derived_key_id(&probe.verifying_material_base64())
+        }
+    };
+    let signer = ConfigBundleSigner::ed25519_from_seed_bytes(&key_id, &seed).map_err(|error| {
+        anyhow::anyhow!("build a signer for key id {key_id:?}: {error}. Key ids accept letters, digits, and . - _ :")
+    })?;
+    let verifying_material = signer.verifying_material_base64();
+    let entry = signer
+        .verifying_key_file_json()
+        .map_err(|error| anyhow::anyhow!("render the verifying-key entry: {error}"))?;
+    let keys_body = merge_verifying_keys(&keys_path, &entry)?;
+
+    let mut signing_body = encode_signing_key_seed(&seed);
+    seed.zeroize();
+    let write_result = write_owner_only(&key_path, &signing_body);
+    // Cleared whether or not the write succeeded: the failure path is
+    // exactly where a copy of a signing key should not linger.
+    signing_body.zeroize();
+    write_result?;
+    std::fs::write(&keys_path, &keys_body)
+        .map_err(|error| anyhow::anyhow!("write '{}': {error}", keys_path.display()))?;
+
+    match args.format {
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "command": "config.authority.init",
+                "directory": directory,
+                "authority_id": args.authority_id,
+                "key_id": key_id,
+                "algorithm": "ed25519",
+                "signing_key_file": key_path,
+                "verifying_keys_file": keys_path,
+                // The public half, safe to publish. The seed appears in no
+                // output, in either format.
+                "verifying_material": verifying_material,
+                "rotated": args.force,
+            }))?
+        ),
+        OutputFormat::Text => {
+            println!(
+                "config authority init: wrote {} (owner-only) and {}",
+                key_path.display(),
+                keys_path.display()
+            );
+            println!("config authority init: key id {key_id}");
+            println!();
+            println!("On the authority, under proxy.config_authority.publish:");
+            println!("  authority_id: {}", args.authority_id);
+            println!("  key_id: {key_id}");
+            println!("  signing_key_file: {}", key_path.display());
+            println!("  store_dir: {}", directory.join("store").display());
+            println!();
+            println!("On every subscriber, under proxy.config_authority.upstream:");
+            println!("  verifying_keys_file: <this node's copy of authority-keys.json>");
+            println!();
+            println!(
+                "Copy {AUTHORITY_VERIFYING_KEYS_FILE} to each subscriber. Never copy \
+                 {AUTHORITY_SIGNING_KEY_FILE} anywhere: it is the key that mints configuration \
+                 for the whole fleet."
+            );
+            println!(
+                "Then register each subscriber with `sbproxy config authority subscriber add \
+                 <subscriber-id>`."
+            );
+        }
+    }
+    Ok(0)
+}
+
+/// `sbproxy config authority publish`: validate the payload the way the
+/// authority will, then publish it over the admin API.
+///
+/// The local validation is the same function the server route runs, so a
+/// payload that would be refused is refused here, before a revision number
+/// is spent on it.
+///
+/// Exit codes: 0 published (or validated under `--validate-only`), 1 CLI or
+/// IO error, 3 the payload was refused locally and nothing was sent, 4 the
+/// authority refused it, 7 the authority was unreachable.
+fn handle_authority_publish(args: &AuthorityPublishArgs) -> anyhow::Result<i32> {
+    let path = args.config.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "missing -f / --config: publish takes the payload document subscribers should apply, \
+             not this node's own config file"
+        )
+    })?;
+    let yaml = std::fs::read_to_string(path)
+        .map_err(|error| anyhow::anyhow!("read payload '{}': {error}", path.display()))?;
+    // Relative model-host paths in a payload resolve on each subscriber,
+    // not here, so the directory holding the payload is the best available
+    // stand-in. That axis of the check is advisory; the rest is not.
+    let validation_dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let unresolved =
+        match sbproxy_core::config_authority::validate_publish_payload(&yaml, validation_dir) {
+            Ok(unresolved) => unresolved,
+            Err(error) => {
+                eprintln!("config authority publish: {error}");
+                eprintln!(
+                    "config authority publish: nothing was published and no revision was \
+                     consumed. Fix the payload and run it again."
+                );
+                return Ok(3);
+            }
+        };
+    if !unresolved.is_empty() {
+        eprintln!(
+            "config authority publish: warning: the payload carries ${{VAR}} reference(s) this \
+             host cannot resolve: {}",
+            unresolved.join(", ")
+        );
+        eprintln!(
+            "config authority publish: warning: a subscriber that cannot resolve them either \
+             refuses the bundle rather than applying the literal text."
+        );
+    }
+    if args.validate_only {
+        println!(
+            "config authority publish: {} passes every check the authority runs. Nothing was \
+             published (--validate-only).",
+            path.display()
+        );
+        return Ok(0);
+    }
+
+    let route = format!(
+        "{}?mode={}",
+        sbproxy_core::config_authority::PUBLISH_PATH,
+        args.mode.as_str()
+    );
+    let outcome = admin_request_parts(
+        &args.admin,
+        reqwest::Method::POST,
+        &route,
+        Some(AdminRequestBody::Yaml(yaml)),
+    )?;
+    let body = match outcome {
+        AdminOutcome::Unreachable(reason) => {
+            return Ok(report_admin_unreachable(
+                "config authority publish",
+                &args.admin,
+                &reason,
+            ));
+        }
+        AdminOutcome::Answered { status, body } if !status.is_success() => {
+            return Ok(report_admin_refusal(
+                "config authority publish",
+                status,
+                &body,
+            ));
+        }
+        AdminOutcome::Answered { body, .. } => body,
+    };
+    match args.format {
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&cli_command_envelope("config.authority.publish", body))?
+        ),
+        OutputFormat::Text => {
+            println!(
+                "config authority publish: published revision {} (mode {}, key {}, digest {})",
+                json_u64(&body, "revision"),
+                body.get("mode")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(args.mode.as_str()),
+                body.get("key_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown"),
+                body.get("content_digest")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown"),
+            );
+            println!(
+                "config authority publish: subscribers take it on their next poll. Watch the \
+                 rollout with `sbproxy config authority status`."
+            );
+        }
+    }
+    Ok(0)
+}
+
+/// `sbproxy config authority status`: what is published, under which key,
+/// and which subscribers have taken it.
+///
+/// Read-only, and the document it prints carries no secret: subscriber
+/// records name a credential id, never the credential, and the verifying
+/// material is the public half of the signing key by construction.
+///
+/// Exit codes: 0 reported, 1 CLI or IO error, 4 the authority refused, 7 the
+/// authority was unreachable.
+fn handle_authority_status(args: &AuthorityStatusArgs) -> anyhow::Result<i32> {
+    let body = match admin_request_parts(
+        &args.admin,
+        reqwest::Method::GET,
+        sbproxy_core::config_authority::STATUS_PATH,
+        None,
+    )? {
+        AdminOutcome::Unreachable(reason) => {
+            return Ok(report_admin_unreachable(
+                "config authority status",
+                &args.admin,
+                &reason,
+            ));
+        }
+        AdminOutcome::Answered { status, body } if !status.is_success() => {
+            return Ok(report_admin_refusal(
+                "config authority status",
+                status,
+                &body,
+            ));
+        }
+        AdminOutcome::Answered { body, .. } => body,
+    };
+    match args.format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&body)?),
+        OutputFormat::Text => {
+            let current_revision = json_u64(&body, "current_revision");
+            println!(
+                "authority {} key {} ({})",
+                body.get("authority_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown"),
+                body.get("key_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown"),
+                body.get("algorithm")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown"),
+            );
+            if current_revision == 0 {
+                println!("revision: none published yet");
+            } else {
+                println!(
+                    "revision: {current_revision} (digest {}, previous {}, highest reserved {})",
+                    body.get("current_content_digest")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown"),
+                    body.get("previous_revision")
+                        .and_then(serde_json::Value::as_u64)
+                        .map_or_else(|| "none".to_string(), |revision| revision.to_string()),
+                    json_u64(&body, "high_water_revision"),
+                );
+            }
+            println!(
+                "subscribers: {} registered, {} live",
+                json_u64(&body, "subscriber_count"),
+                json_u64(&body, "live_subscriber_count"),
+            );
+            if let Some(subscribers) = body
+                .get("subscribers")
+                .and_then(serde_json::Value::as_array)
+            {
+                for subscriber in subscribers {
+                    let last_seen = json_u64(subscriber, "last_seen_revision");
+                    let state = if subscriber
+                        .get("revoked")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        "revoked"
+                    } else if subscriber
+                        .get("up_to_date")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        "current"
+                    } else if last_seen == 0 {
+                        "never fetched"
+                    } else {
+                        "behind"
+                    };
+                    println!(
+                        "{}\tcredential={}\tlast_seen_revision={last_seen}\t{state}",
+                        subscriber
+                            .get("subscriber_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown"),
+                        subscriber
+                            .get("credential_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown"),
+                    );
+                }
+            }
+        }
+    }
+    Ok(0)
+}
+
+/// `sbproxy config authority rollback`: republish the previous revision's
+/// payload.
+///
+/// The new revision number is above the one it replaces, because a
+/// subscriber's anti-replay cursor refuses anything that is not. A rollback
+/// that re-served the old number would reach only the nodes that had not yet
+/// taken the revision being undone, which is the opposite of what an
+/// operator wants at that moment.
+///
+/// Exit codes: 0 rolled back, 1 CLI or IO error, 4 the authority refused
+/// (typically no previous revision to return to), 7 unreachable.
+fn handle_authority_rollback(args: &AuthorityRollbackArgs) -> anyhow::Result<i32> {
+    let body = match admin_request_parts(
+        &args.admin,
+        reqwest::Method::POST,
+        sbproxy_core::config_authority::ROLLBACK_PATH,
+        None,
+    )? {
+        AdminOutcome::Unreachable(reason) => {
+            return Ok(report_admin_unreachable(
+                "config authority rollback",
+                &args.admin,
+                &reason,
+            ));
+        }
+        AdminOutcome::Answered { status, body } if !status.is_success() => {
+            return Ok(report_admin_refusal(
+                "config authority rollback",
+                status,
+                &body,
+            ));
+        }
+        AdminOutcome::Answered { body, .. } => body,
+    };
+    match args.format {
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&cli_command_envelope("config.authority.rollback", body))?
+        ),
+        OutputFormat::Text => {
+            println!(
+                "config authority rollback: republished revision {}'s payload as revision {}, \
+                 replacing revision {}",
+                json_u64(&body, "restored_from_revision"),
+                json_u64(&body, "revision"),
+                json_u64(&body, "replaced_revision"),
+            );
+            println!(
+                "config authority rollback: the number moves forward because a subscriber refuses \
+                 a revision that is not greater than the one it applied. Subscribers take it on \
+                 their next poll."
+            );
+        }
+    }
+    Ok(0)
+}
+
+/// `sbproxy config authority subscriber add`: register a subscriber and mint
+/// its credential.
+///
+/// The authority stores only a SHA-256 fingerprint of the credential, so the
+/// clear token printed here is the only copy that will ever exist. Text mode
+/// prints it alone on stdout, the way `cluster token create` does, so
+/// `export SB_CONFIG_AUTHORITY_TOKEN="$(...)"` works; the note saying it is
+/// shown once goes to stderr so it cannot end up inside that variable.
+///
+/// Exit codes: 0 registered, 1 CLI or IO error, 4 the authority refused, 7
+/// unreachable.
+fn handle_authority_subscriber_add(args: &AuthoritySubscriberAddArgs) -> anyhow::Result<i32> {
+    let body = match admin_request_parts(
+        &args.admin,
+        reqwest::Method::POST,
+        sbproxy_core::config_authority::SUBSCRIBERS_PATH,
+        Some(AdminRequestBody::Json(serde_json::json!({
+            "subscriber_id": args.subscriber_id,
+        }))),
+    )? {
+        AdminOutcome::Unreachable(reason) => {
+            return Ok(report_admin_unreachable(
+                "config authority subscriber add",
+                &args.admin,
+                &reason,
+            ));
+        }
+        AdminOutcome::Answered { status, body } if !status.is_success() => {
+            return Ok(report_admin_refusal(
+                "config authority subscriber add",
+                status,
+                &body,
+            ));
+        }
+        AdminOutcome::Answered { body, .. } => body,
+    };
+    let credential = body
+        .get("credential")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "the authority registered the subscriber but returned no credential; register \
+                 again once you know why, since this one cannot be recovered"
+            )
+        })?;
+    match args.format {
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&cli_command_envelope(
+                "config.authority.subscriber.add",
+                body.clone()
+            ))?
+        ),
+        OutputFormat::Text => println!("{credential}"),
+    }
+    eprintln!(
+        "config authority subscriber add: registered {} (credential id {}).",
+        args.subscriber_id,
+        body.get("credential_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown"),
+    );
+    eprintln!(
+        "config authority subscriber add: the credential above is shown once and never again. \
+         The authority keeps only a SHA-256 fingerprint of it."
+    );
+    eprintln!(
+        "config authority subscriber add: give it to that node as \
+         proxy.config_authority.upstream.credential, by secret reference (env:NAME, file:/path, \
+         secret://backend/name) rather than inline."
+    );
+    Ok(0)
+}
+
+/// `sbproxy config authority subscriber list`: the roster and each node's
+/// last-seen revision.
+///
+/// Exit codes: as `config authority status`.
+fn handle_authority_subscriber_list(args: &AuthoritySubscriberListArgs) -> anyhow::Result<i32> {
+    let body = match admin_request_parts(
+        &args.admin,
+        reqwest::Method::GET,
+        sbproxy_core::config_authority::SUBSCRIBERS_PATH,
+        None,
+    )? {
+        AdminOutcome::Unreachable(reason) => {
+            return Ok(report_admin_unreachable(
+                "config authority subscriber list",
+                &args.admin,
+                &reason,
+            ));
+        }
+        AdminOutcome::Answered { status, body } if !status.is_success() => {
+            return Ok(report_admin_refusal(
+                "config authority subscriber list",
+                status,
+                &body,
+            ));
+        }
+        AdminOutcome::Answered { body, .. } => body,
+    };
+    match args.format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&body)?),
+        OutputFormat::Text => {
+            println!(
+                "{} subscriber(s) registered, {} live",
+                json_u64(&body, "subscriber_count"),
+                json_u64(&body, "live_subscriber_count"),
+            );
+            if let Some(subscribers) = body
+                .get("subscribers")
+                .and_then(serde_json::Value::as_array)
+            {
+                for subscriber in subscribers {
+                    println!(
+                        "{}\tcredential={}\tlast_seen_revision={}\trevoked={}",
+                        subscriber
+                            .get("subscriber_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown"),
+                        subscriber
+                            .get("credential_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown"),
+                        json_u64(subscriber, "last_seen_revision"),
+                        subscriber
+                            .get("revoked")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false),
+                    );
+                }
+            }
+        }
+    }
+    Ok(0)
+}
+
+/// `sbproxy config authority subscriber revoke`: retire one credential, or
+/// every credential one node holds.
+///
+/// Exit codes: 0 the authority answered, 1 CLI or IO error (including
+/// naming neither selector), 4 the authority refused, 7 unreachable. A
+/// selector that matches nothing is a successful answer reporting
+/// `revoked: false`, not an error: the operator's goal (that credential
+/// cannot fetch) holds either way.
+fn handle_authority_subscriber_revoke(args: &AuthoritySubscriberRevokeArgs) -> anyhow::Result<i32> {
+    let selector = match (args.credential_id.as_deref(), args.subscriber_id.as_deref()) {
+        (Some(credential_id), _) => serde_json::json!({"credential_id": credential_id}),
+        (None, Some(subscriber_id)) => serde_json::json!({"subscriber_id": subscriber_id}),
+        (None, None) => {
+            anyhow::bail!(
+                "name what to revoke: --credential-id <id> for one credential, or \
+                 --subscriber-id <id> for every credential that node holds"
+            )
+        }
+    };
+    let body = match admin_request_parts(
+        &args.admin,
+        reqwest::Method::POST,
+        sbproxy_core::config_authority::SUBSCRIBER_REVOKE_PATH,
+        Some(AdminRequestBody::Json(selector)),
+    )? {
+        AdminOutcome::Unreachable(reason) => {
+            return Ok(report_admin_unreachable(
+                "config authority subscriber revoke",
+                &args.admin,
+                &reason,
+            ));
+        }
+        AdminOutcome::Answered { status, body } if !status.is_success() => {
+            return Ok(report_admin_refusal(
+                "config authority subscriber revoke",
+                status,
+                &body,
+            ));
+        }
+        AdminOutcome::Answered { body, .. } => body,
+    };
+    match args.format {
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&cli_command_envelope(
+                "config.authority.subscriber.revoke",
+                body
+            ))?
+        ),
+        OutputFormat::Text => {
+            // The route answers `true`/`false` for a credential and a count
+            // for a subscriber, so both shapes get read.
+            let revoked = body.get("revoked");
+            let described = match revoked {
+                Some(serde_json::Value::Bool(true)) => "revoked".to_string(),
+                Some(serde_json::Value::Bool(false)) => {
+                    "already revoked or not known to this authority".to_string()
+                }
+                Some(serde_json::Value::Number(count)) => {
+                    format!("{count} credential(s) revoked")
+                }
+                _ => "the authority gave no revocation count".to_string(),
+            };
+            println!(
+                "config authority subscriber revoke: {}: {described}",
+                args.credential_id
+                    .as_deref()
+                    .or(args.subscriber_id.as_deref())
+                    .unwrap_or("unknown"),
+            );
+            println!(
+                "config authority subscriber revoke: a revoked node keeps serving what it \
+                 already applied; it stops receiving updates."
+            );
+        }
+    }
+    Ok(0)
+}
+
+/// One line naming what an operator can do about a bundle the subscriber
+/// refused.
+fn pull_refusal_hint(result: sbproxy_core::config_subscriber::CycleResult) -> &'static str {
+    use sbproxy_core::config_subscriber::CycleResult;
+
+    match result {
+        CycleResult::VerifyFailed => {
+            "the signature, schema, digest, expiry, declared mode, or replay cursor rejected it. \
+             Check that verifying_keys_file holds the authority's current key and that `mode` \
+             here matches the mode the bundle was published under."
+        }
+        CycleResult::CompileFailed => {
+            "the merged document could not be produced or carries an unresolved ${VAR}. Export \
+             the variables this node is expected to provide, or fix the payload."
+        }
+        CycleResult::DeniedPath => {
+            "the bundle names a path every subscriber owns outright (listeners, TLS, admin, \
+             secrets, cluster, model_host, config_authority, source). The whole bundle is \
+             refused, not the offending keys."
+        }
+        // Not reachable from `evaluate`, which neither fetches nor reloads.
+        // Named anyway so a new variant cannot be added without deciding
+        // what it means here.
+        CycleResult::Applied
+        | CycleResult::NotModified
+        | CycleResult::Unreachable
+        | CycleResult::ReloadBusy => "see the log line above for the reason.",
+    }
+}
+
+/// Diff the merged authority document against the local one.
+///
+/// The baseline is this node's file and the proposal is the merged document,
+/// which is exactly the change one poll cycle would make. A boot-time
+/// construction failure folds in as an error finding, the same channel
+/// `plan` and `apply` use, so it reaches exit 3 rather than being reported
+/// as a clean diff.
+fn merged_plan_report(
+    local_yaml: &str,
+    merged_yaml: &str,
+) -> anyhow::Result<sbproxy_config::PlanReport> {
+    let baseline = serde_yaml::from_str::<sbproxy_config::ConfigFile>(local_yaml)
+        .map_err(|error| anyhow::anyhow!("parse the local document as ConfigFile: {error}"))?;
+    let compiled = sbproxy_config::compile_config(merged_yaml)
+        .map_err(|error| anyhow::anyhow!("the merged document does not compile:\n{error:#}"))?;
+    let construction_error =
+        sbproxy_core::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+            .err()
+            .map(|error| format!("{error:#}"));
+    let proposed = serde_yaml::from_str::<sbproxy_config::ConfigFile>(merged_yaml)
+        .map_err(|error| anyhow::anyhow!("parse the merged document as ConfigFile: {error}"))?;
+    let mut report = sbproxy_config::plan(&baseline, &proposed);
+    if let Some(message) = construction_error.as_deref() {
+        push_construction_finding(&mut report, message);
+    }
+    Ok(report)
+}
+
+/// `sbproxy config pull --dry-run`: run a real poll cycle up to the point of
+/// applying, and print the diff it would have applied.
+///
+/// The one command in this group that is deliberately local, because it
+/// applies nothing. `ConfigSubscriber::fetch` is the only transport and
+/// `ConfigSubscriber::evaluate` is pure (verify, mode check, cursor probe on
+/// a clone, merge, unresolved-`${VAR}` screen), so the interesting half of a
+/// cycle runs here with the bundle cache, the replay cursor, and the running
+/// pipeline all untouched. Applying is the running proxy's own poll loop's
+/// job: a short-lived CLI process cannot swap a server's pipeline, and
+/// pretending otherwise is the defect that made `apply`'s exit code
+/// worthless before #764.
+///
+/// Exit codes: 0 nothing to apply, 1 CLI or IO error, 2 changes present, 3
+/// the bundle or the merged document was refused, 7 the authority was
+/// unreachable.
+fn handle_config_pull(
+    args: &ConfigPullArgs,
+    global_config: Option<&std::path::Path>,
+) -> anyhow::Result<i32> {
+    if !args.dry_run {
+        anyhow::bail!(
+            "config pull requires --dry-run. There is no local apply: a node takes its \
+             authority's bundles through its own poll loop, and a short-lived CLI process cannot \
+             swap a running proxy's pipeline. Use --dry-run to preview what the next poll would \
+             apply."
+        );
+    }
+    let path = resolve_config_path(args.config_path.as_deref(), global_config)?;
+    let local_yaml = std::fs::read_to_string(&path)
+        .map_err(|error| anyhow::anyhow!("read config '{}': {error}", path.display()))?;
+    let compiled = sbproxy_config::compile_config(&local_yaml).map_err(|error| {
+        anyhow::anyhow!("config '{}' did not compile:\n{error:#}", path.display())
+    })?;
+    let upstream = compiled
+        .server
+        .config_authority
+        .as_ref()
+        .and_then(|authority| authority.upstream.as_ref())
+        .cloned()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "'{}' sets no proxy.config_authority.upstream, so there is no authority to pull \
+                 from. A node that publishes rather than subscribes uses `config authority \
+                 status` instead.",
+                path.display()
+            )
+        })?;
+    // Secret references in the credential resolve through the process
+    // resolver, exactly as they do at boot, so `secret://` works here and
+    // not only in the server.
+    install_secret_resolver(&path);
+    let path_str = path.to_string_lossy().into_owned();
+    let subscriber = sbproxy_core::config_subscriber::ConfigSubscriber::new(&path_str, &upstream)?;
+    if !subscriber.has_keys() {
+        eprintln!(
+            "config pull: warning: no verifying key set loaded from {}, so no bundle can be \
+             verified and none would be applied.",
+            upstream.verifying_keys_file
+        );
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let fetched = runtime.block_on(subscriber.fetch());
+    let signed = match fetched {
+        sbproxy_core::config_subscriber::FetchResult::Unreachable(reason) => {
+            eprintln!(
+                "config pull: the authority at {} could not be reached: {reason}",
+                upstream.url
+            );
+            eprintln!(
+                "config pull: nothing was applied. A running node in this state keeps serving \
+                 the configuration it already applied."
+            );
+            return Ok(7);
+        }
+        sbproxy_core::config_subscriber::FetchResult::NotModified => {
+            println!(
+                "config pull: the authority is serving revision {}, which this node already \
+                 holds. No changes, and nothing was applied.",
+                subscriber.revision()
+            );
+            return Ok(0);
+        }
+        sbproxy_core::config_subscriber::FetchResult::Bundle(signed) => signed,
+    };
+    // Mirrors the poll loop, which short-circuits before evaluating: an
+    // authority that does not implement `If-None-Match` re-serves the
+    // applied revision every interval, and that is a no-op rather than a
+    // change.
+    if subscriber.holds_revision(&signed.bundle) {
+        println!(
+            "config pull: the authority re-served revision {}, which this node already holds. No \
+             changes, and nothing was applied.",
+            signed.bundle.revision
+        );
+        return Ok(0);
+    }
+    let now_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    let candidate = match subscriber.evaluate(&signed, &local_yaml, now_unix_ms) {
+        Ok(candidate) => candidate,
+        Err(result) => {
+            eprintln!(
+                "config pull: revision {} was refused ({}): {}",
+                signed.bundle.revision,
+                result.as_str(),
+                pull_refusal_hint(result),
+            );
+            eprintln!(
+                "config pull: nothing was applied. The bundle cache, the replay cursor, and the \
+                 running configuration are all untouched."
+            );
+            return Ok(3);
+        }
+    };
+    let report = match merged_plan_report(&local_yaml, candidate.merged_yaml()) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!(
+                "config pull: revision {} verified, but the merged document would be refused: \
+                 {error:#}",
+                candidate.revision()
+            );
+            eprintln!("config pull: nothing was applied.");
+            return Ok(3);
+        }
+    };
+    match args.format {
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "command": "config.pull",
+                // Load-bearing, not decoration: this command never applies
+                // anything, and a consumer should not have to infer that.
+                "applied": false,
+                "dry_run": true,
+                "authority_url": upstream.url,
+                "mode": upstream.mode,
+                "offered_revision": candidate.revision(),
+                "applied_revision": subscriber.revision(),
+                "plan": report,
+            }))?
+        ),
+        OutputFormat::Text => {
+            println!(
+                "config pull: authority offers revision {}; this node has applied {}. Dry run: \
+                 nothing is applied.",
+                candidate.revision(),
+                subscriber.revision(),
+            );
+            print!("{}", sbproxy_config::render_text(&report));
+            println!(
+                "config pull: nothing was applied. The bundle cache, the replay cursor, and the \
+                 running configuration are all untouched. The proxy's own poll loop is what \
+                 applies a bundle."
+            );
+        }
+    }
+    Ok(plan_exit_code(&report))
 }
 
 /// `${VAR}` interpolation matching the config compiler: a set variable
@@ -3924,7 +8669,102 @@ fn handle_ai_subcommand(cmd: &AiCmd) -> anyhow::Result<i32> {
         AiSub::Ledger(ledger) => match &ledger.sub {
             LedgerSub::Verify(args) => handle_ledger_verify(args),
         },
+        AiSub::Prompt(prompt) => match &prompt.sub {
+            PromptSub::Optimize(args) => handle_prompt_optimize(args),
+        },
     }
+}
+
+fn handle_prompt_optimize(args: &PromptOptimizeArgs) -> anyhow::Result<i32> {
+    const MAX_PROMPT_BYTES: usize = 1024 * 1024;
+    const MAX_EVAL_SET_BYTES: usize = 16 * 1024 * 1024;
+
+    let prompt_bytes = read_bounded_cli_file(&args.prompt, MAX_PROMPT_BYTES, "system prompt")?;
+    let prompt = std::str::from_utf8(&prompt_bytes)
+        .map_err(|error| anyhow::anyhow!("system prompt must be UTF-8: {error}"))?;
+    let eval_bytes = read_bounded_cli_file(&args.eval_set, MAX_EVAL_SET_BYTES, "eval set")?;
+    let cases = sbproxy_ai::prompt_optimizer::parse_prompt_eval_jsonl(&eval_bytes)?;
+    let api_key = match args.api_key_env.as_deref() {
+        Some(name) => {
+            if name.trim().is_empty() || name.contains('=') {
+                anyhow::bail!("--api-key-env must name one environment variable");
+            }
+            Some(
+                std::env::var(name)
+                    .map_err(|_| anyhow::anyhow!("environment variable {name:?} is not set"))?,
+            )
+        }
+        None => None,
+    };
+    let mut client = sbproxy_ai::prompt_optimizer::OpenAiPromptOptimizationClient::new(
+        &args.endpoint,
+        api_key,
+        std::time::Duration::from_secs(args.timeout_secs),
+    )?;
+    if let Some(host) = args.host_header.as_deref() {
+        client = client.with_host_header(host)?;
+    }
+    let config = sbproxy_ai::prompt_optimizer::PromptOptimizationConfig {
+        name: args.name.clone(),
+        version: args.prompt_version.clone(),
+        task_model: args.task_model.clone(),
+        optimizer_model: args
+            .optimizer_model
+            .clone()
+            .unwrap_or_else(|| args.task_model.clone()),
+        metric: args.metric.into(),
+        noise_tolerance: args.noise_tolerance,
+        max_candidates: args.max_candidates,
+        max_requests: args.max_requests,
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| anyhow::anyhow!("build prompt optimizer runtime: {error}"))?;
+    let artifact = runtime.block_on(sbproxy_ai::prompt_optimizer::optimize_prompt(
+        &client, prompt, &cases, &config,
+    ))?;
+    let mut output = serde_json::to_vec_pretty(&artifact)
+        .map_err(|error| anyhow::anyhow!("serialize prompt artifact: {error}"))?;
+    output.push(b'\n');
+    std::fs::write(&args.output, output).map_err(|error| {
+        anyhow::anyhow!("write prompt artifact {}: {error}", args.output.display())
+    })?;
+    println!(
+        "prompt optimize: wrote {} ({} -> {} tokens, quality {:.4} -> {:.4})",
+        args.output.display(),
+        artifact.original_tokens,
+        artifact.optimized_tokens,
+        artifact.baseline_score,
+        artifact.optimized_score
+    );
+    Ok(0)
+}
+
+fn read_bounded_cli_file(
+    path: &std::path::Path,
+    maximum: usize,
+    label: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|error| anyhow::anyhow!("read {label} {}: {error}", path.display()))?;
+    if metadata.len() > maximum as u64 {
+        anyhow::bail!(
+            "{label} {} exceeds the {} byte limit",
+            path.display(),
+            maximum
+        );
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|error| anyhow::anyhow!("read {label} {}: {error}", path.display()))?;
+    if bytes.len() > maximum {
+        anyhow::bail!(
+            "{label} {} exceeds the {} byte limit",
+            path.display(),
+            maximum
+        );
+    }
+    Ok(bytes)
 }
 
 fn handle_ledger_verify(args: &LedgerVerifyArgs) -> anyhow::Result<i32> {
@@ -3970,6 +8810,74 @@ fn handle_ledger_verify(args: &LedgerVerifyArgs) -> anyhow::Result<i32> {
     }
 
     Ok(if result.ok { 0 } else { 1 })
+}
+
+fn handle_admin_subcommand(
+    cmd: &AdminCliCmd,
+    global_config_path: Option<&std::path::Path>,
+) -> anyhow::Result<i32> {
+    match &cmd.sub {
+        AdminSub::HashPassword(args) => handle_admin_hash_password(args, global_config_path),
+    }
+}
+
+/// `sbproxy admin hash-password`: print the `password_hash` value to paste
+/// into `proxy.admin.operators[].password_hash`.
+///
+/// Resolves the pepper the same way the running server does: from
+/// `key_management.crypto.pepper` in `-f/--config` when set, else the
+/// fixed default, so the printed hash verifies against a server booted
+/// from the same config.
+fn handle_admin_hash_password(
+    args: &HashPasswordArgs,
+    global_config_path: Option<&std::path::Path>,
+) -> anyhow::Result<i32> {
+    handle_admin_hash_password_to(args, global_config_path, &mut std::io::stdout())
+}
+
+/// The testable core of `handle_admin_hash_password`: writes the hash to
+/// `out` instead of stdout, so tests can assert on it without capturing the
+/// process's real stdout.
+fn handle_admin_hash_password_to(
+    args: &HashPasswordArgs,
+    global_config_path: Option<&std::path::Path>,
+    out: &mut impl std::io::Write,
+) -> anyhow::Result<i32> {
+    let password = match (args.password.as_deref(), args.password_stdin) {
+        (Some(_), true) => {
+            anyhow::bail!("pass either --password or --password-stdin, not both")
+        }
+        (Some(p), false) => p.to_string(),
+        (None, true) => {
+            let mut line = String::new();
+            std::io::stdin()
+                .read_line(&mut line)
+                .map_err(|e| anyhow::anyhow!("failed to read password from stdin: {e}"))?;
+            line.trim_end_matches(['\n', '\r']).to_string()
+        }
+        (None, false) => anyhow::bail!(
+            "missing password\n\nusage: sbproxy admin hash-password --password-stdin\n   or: sbproxy admin hash-password --password <value>"
+        ),
+    };
+
+    let key_management = global_config_path
+        .map(|path| -> anyhow::Result<_> {
+            let yaml = std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("failed to read config '{}': {e}", path.display()))?;
+            let compiled = sbproxy_config::compile_config(&yaml)
+                .map_err(|e| anyhow::anyhow!("config did not compile: {e:#}"))?;
+            Ok(compiled.server.key_management)
+        })
+        .transpose()?
+        .flatten();
+    let pepper = sbproxy_core::key_plane::resolve_admin_operator_pepper(key_management.as_ref())
+        .map_err(|e| anyhow::anyhow!("resolve admin operator pepper: {e}"))?;
+    writeln!(
+        out,
+        "{}",
+        sbproxy_core::key_plane::hash_admin_operator_password(&password, &pepper)
+    )?;
+    Ok(0)
 }
 
 fn handle_config_import_litellm(args: &ImportLitellmArgs) -> anyhow::Result<i32> {
@@ -4061,9 +8969,25 @@ fn lookup_projection<'a>(
 fn load_and_validate(
     path: &std::path::Path,
 ) -> anyhow::Result<(sbproxy_config::ConfigFile, Option<String>)> {
+    load_and_validate_with(path, false)
+}
+
+/// [`load_and_validate`] with control over whether a `source:` block is
+/// resolved.
+///
+/// `plan` exposes the choice as `--no-fetch`; `apply` always resolves,
+/// because the document it is about to push is the resolved one.
+fn load_and_validate_with(
+    path: &std::path::Path,
+    no_fetch: bool,
+) -> anyhow::Result<(sbproxy_config::ConfigFile, Option<String>)> {
     let path_str = path.to_string_lossy();
     let yaml = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("failed to read config '{path_str}': {e}"))?;
+    // Diff and validate the document that would boot, not the pointer at
+    // it. Both sides of a plan go through here, so an `--against`
+    // baseline that is itself git-sourced resolves too.
+    let yaml = resolve_source_for_cli(&yaml, no_fetch, &path_str)?;
     let compiled = sbproxy_config::compile_config(&yaml)
         .map_err(|e| anyhow::anyhow!("config '{path_str}' did not compile:\n{e:#}"))?;
     // WOR-1815: run the boot-time module constructors too, so `plan`
@@ -4072,9 +8996,10 @@ fn load_and_validate(
     // can fold it into their findings report: `plan` renders it next
     // to the other semantic findings and exits 3, the same channel
     // the validate-rule findings use.
-    let construction_error = sbproxy_core::pipeline::CompiledPipeline::from_config(compiled)
-        .err()
-        .map(|e| format!("{e:#}"));
+    let construction_error =
+        sbproxy_core::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+            .err()
+            .map(|e| format!("{e:#}"));
     let config = serde_yaml::from_str::<sbproxy_config::ConfigFile>(&yaml)
         .map_err(|e| anyhow::anyhow!("failed to parse '{path_str}' as ConfigFile: {e}"))?;
     Ok((config, construction_error))
@@ -4115,11 +9040,11 @@ fn load_plan_inputs(
         .config
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("missing -f / --config"))?;
-    let (proposed, construction_error) = load_and_validate(config)?;
+    let (proposed, construction_error) = load_and_validate_with(config, args.no_fetch)?;
     // The baseline is the operator's current state; only the proposed
     // side's construction result gates the plan.
     let baseline = match args.against.as_deref() {
-        Some(p) => load_and_validate(p)?.0,
+        Some(p) => load_and_validate_with(p, args.no_fetch)?.0,
         None => empty_config_file(),
     };
     Ok((baseline, proposed, construction_error))
@@ -4249,10 +9174,13 @@ fn acquire_apply_lock(yaml_path: &std::path::Path) -> anyhow::Result<std::fs::Fi
 }
 
 /// Run the `sbproxy apply` subcommand. Loads + validates the proposed
-/// YAML, runs plan-time semantic validation, and calls into the
-/// existing `reload_from_config_path` primitive (the same call the
-/// file watcher and SIGHUP handler use). Refuses to apply when any
-/// `Severity::Error` finding is present.
+/// YAML, runs plan-time semantic validation, then pushes the config to a
+/// running proxy over the admin API and reports what the server did with
+/// it. Refuses to apply when any `Severity::Error` finding is present.
+///
+/// Exit codes: 0 applied, 3 validation refused, 4 the proxy refused it,
+/// 6 another apply holds the lock, 7 no proxy reachable, 8 applied but
+/// degraded.
 ///
 /// Two flows are supported:
 ///
@@ -4267,21 +9195,114 @@ fn acquire_apply_lock(yaml_path: &std::path::Path) -> anyhow::Result<std::fs::Fi
 /// Both flows take an exclusive `flock(2)` on
 /// `<yaml_path>.applylock` so two operators running `apply` against
 /// the same on-host config cannot race each other.
+/// Default admin endpoint, matching `AdminConfig`'s own defaults.
+const DEFAULT_ADMIN_URL: &str = "http://127.0.0.1:9090";
+
+/// Push `yaml` to a running proxy over the admin API and report what the
+/// server did with it.
+///
+/// This is the whole point of `apply`. It used to call the in-process
+/// reload, which compiled the config into the short-lived CLI process,
+/// swapped that process's own pipeline, printed success, and exited
+/// without ever contacting the proxy. A running server picked the change
+/// up only if its file watcher happened to notice the file, so the exit
+/// code said nothing about whether the config was accepted or even seen.
+///
+/// `PUT /admin/config` is used rather than `POST /admin/reload` because
+/// apply is given a file, not a promise that the file is the one the
+/// proxy booted with. The server validates, persists, and swaps.
+fn apply_to_running_proxy(args: &ApplyArgs, yaml: &str) -> anyhow::Result<i32> {
+    use zeroize::Zeroize;
+
+    let base_url = args.admin_url.as_deref().unwrap_or(DEFAULT_ADMIN_URL);
+    let username = args.username.as_deref().unwrap_or("admin");
+    let mut password = args.password.clone().unwrap_or_default();
+
+    let url = format!("{}/admin/config", base_url.trim_end_matches('/'));
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(60))
+        .build()?;
+    let request = client
+        .put(&url)
+        .basic_auth(username, Some(password.as_str()))
+        .header(reqwest::header::CONTENT_TYPE, "application/yaml")
+        .body(yaml.to_string())
+        .build();
+    password.zeroize();
+
+    let response = match client.execute(request?) {
+        Ok(response) => response,
+        Err(error) => {
+            // Never fall back to something local that looks like success.
+            eprintln!(
+                "apply: could not reach the admin API at {base_url}: {error}\n\
+                 apply: nothing was applied. Point --admin-url at the running \
+                 proxy, or pass --validate-only to check the config without \
+                 applying it."
+            );
+            return Ok(7);
+        }
+    };
+
+    let status = response.status();
+    let body: serde_json::Value = response.json().unwrap_or(serde_json::Value::Null);
+    if !status.is_success() {
+        let reason = body
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("admin request failed");
+        eprintln!("apply: the proxy refused the config (HTTP {status}): {reason}");
+        return Ok(4);
+    }
+
+    let revision = body
+        .get("config_revision")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    // `fully_applied` is absent on older proxies; absence is not failure.
+    let fully_applied = body
+        .get("fully_applied")
+        .and_then(serde_json::Value::as_bool);
+    let degraded: Vec<&str> = body
+        .get("degraded")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| items.iter().filter_map(serde_json::Value::as_str).collect())
+        .unwrap_or_default();
+
+    if fully_applied == Some(false) || !degraded.is_empty() {
+        let named = if degraded.is_empty() {
+            "one or more subsystems".to_string()
+        } else {
+            degraded.join(", ")
+        };
+        println!("apply: applied to {base_url}, config revision {revision}");
+        eprintln!(
+            "apply: warning: the config loaded but {named} did not take effect and \
+             kept stale state. The proxy is serving the new config otherwise."
+        );
+        return Ok(8);
+    }
+
+    println!("apply: applied to {base_url}, config revision {revision}");
+    Ok(0)
+}
+
 fn handle_apply_subcommand(args: &ApplyArgs) -> anyhow::Result<i32> {
     if let Some(plan_path) = args.plan_file.as_deref() {
-        return handle_apply_from_plan_file(plan_path);
+        return handle_apply_from_plan_file(args, plan_path);
     }
     let yaml_path = args
         .config
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("missing -f / --config or -p / --plan"))?;
-    handle_apply_from_yaml(yaml_path)
+    handle_apply_from_yaml(args, yaml_path)
 }
 
 /// `apply -f <yaml>` flow. Acquires the apply-lock, validates, and
-/// calls `reload_from_config_path`. Refuses on validation errors
-/// (exit 3) or lock contention (exit 6).
-fn handle_apply_from_yaml(yaml_path: &std::path::Path) -> anyhow::Result<i32> {
+/// pushes the config to a running proxy over the admin API. Refuses on
+/// validation errors (exit 3) or lock contention (exit 6).
+fn handle_apply_from_yaml(args: &ApplyArgs, yaml_path: &std::path::Path) -> anyhow::Result<i32> {
     let _lock = match acquire_apply_lock(yaml_path) {
         Ok(f) => f,
         Err(e) => {
@@ -4304,17 +9325,23 @@ fn handle_apply_from_yaml(yaml_path: &std::path::Path) -> anyhow::Result<i32> {
     }
 
     let yaml_path_str = yaml_path.to_string_lossy().into_owned();
-    sbproxy_core::server::reload_from_config_path(&yaml_path_str)
-        .map_err(|e| anyhow::anyhow!("reload failed: {e:#}"))?;
-    println!("apply: reloaded config from {yaml_path_str}");
-    Ok(0)
+    if args.validate_only {
+        println!("apply: {yaml_path_str} is valid. Nothing was applied (--validate-only).");
+        return Ok(0);
+    }
+    let yaml = std::fs::read_to_string(yaml_path)
+        .map_err(|e| anyhow::anyhow!("read {yaml_path_str}: {e}"))?;
+    apply_to_running_proxy(args, &yaml)
 }
 
 /// `apply -p <plan-file>` flow. Reads the plan-file, locates the
 /// proposed YAML by reading the path the operator supplied via the
 /// `SB_APPLY_CONFIG` env var, recomputes the plan, and rejects with
 /// exit 5 if the baseline_revision drifted.
-fn handle_apply_from_plan_file(plan_path: &std::path::Path) -> anyhow::Result<i32> {
+fn handle_apply_from_plan_file(
+    args: &ApplyArgs,
+    plan_path: &std::path::Path,
+) -> anyhow::Result<i32> {
     let plan_path_str = plan_path.to_string_lossy().into_owned();
     let plan_file = sbproxy_config::PlanFile::read_from_path(plan_path)
         .map_err(|e| anyhow::anyhow!("failed to read plan-file '{plan_path_str}': {e}"))?;
@@ -4371,16 +9398,26 @@ fn handle_apply_from_plan_file(plan_path: &std::path::Path) -> anyhow::Result<i3
         return Ok(3);
     }
 
-    sbproxy_core::server::reload_from_config_path(&yaml_path)
-        .map_err(|e| anyhow::anyhow!("reload failed: {e:#}"))?;
-    println!("apply: reloaded config from {yaml_path} (via plan-file {plan_path_str})");
-    Ok(0)
+    if args.validate_only {
+        println!(
+            "apply: {yaml_path} is valid (via plan-file {plan_path_str}). \
+             Nothing was applied (--validate-only)."
+        );
+        return Ok(0);
+    }
+    let yaml = std::fs::read_to_string(&yaml_path)
+        .map_err(|e| anyhow::anyhow!("read {yaml_path}: {e}"))?;
+    println!("apply: applying {yaml_path} (via plan-file {plan_path_str})");
+    apply_to_running_proxy(args, &yaml)
 }
+
+#[cfg(test)]
+mod test_env;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use crate::test_env::EnvVarGuard;
 
     fn pull_catalog() -> sbproxy_model_host::Catalog {
         sbproxy_model_host::Catalog::from_yaml(
@@ -4557,6 +9594,117 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_demand_reads_the_canonical_model_host_block() {
+        // Regression: the strict gate originally only saw the inline
+        // provider-level `serve:` form, so a `proxy.model_host` worker
+        // config reported six skips and a pass on a host with no GPU.
+        let config = "proxy:\n  model_host:\n    cache:\n      budget_gib: 40\n    engines:\n      vllm:\n        launch: container\n        image: vllm/vllm-openai:v0.10.0\n        shm_size_gib: 8\n";
+        let (demand, budget) =
+            extract_control_plane_demand(config).expect("proxy.model_host parses");
+
+        assert!(demand.requires_cuda, "a vLLM engine is a CUDA demand");
+        assert_eq!(demand.cuda_engines, vec!["proxy.model_host.engines.vllm"]);
+        assert_eq!(demand.required_shm_bytes, Some(8 * 1024 * 1024 * 1024));
+        assert_eq!(budget, Some(40.0));
+    }
+
+    #[test]
+    fn control_plane_demand_is_absent_without_the_block() {
+        let config = "origins:\n  api.local:\n    upstream: https://test.sbproxy.dev\n";
+        assert!(extract_control_plane_demand(config).is_none());
+    }
+
+    #[test]
+    fn control_plane_demand_treats_portable_llama_cpp_as_no_cuda_demand() {
+        // llama.cpp runs on Metal and CPU, so only an explicit
+        // `acceleration: cuda` makes it a CUDA demand.
+        let portable = "proxy:\n  model_host:\n    engines:\n      llama_cpp:\n        launch: binary\n        version: b9905\n        acceleration: auto\n";
+        let (demand, _) = extract_control_plane_demand(portable).expect("parses");
+        assert!(
+            !demand.requires_cuda,
+            "auto acceleration is not a CUDA demand"
+        );
+
+        let pinned = "proxy:\n  model_host:\n    engines:\n      llama_cpp:\n        launch: binary\n        acceleration: cuda\n";
+        let (demand, _) = extract_control_plane_demand(pinned).expect("parses");
+        assert!(demand.requires_cuda);
+    }
+
+    #[test]
+    fn model_plane_identity_is_absent_without_a_cluster_block() {
+        // A single-box config has no model plane, and the strict gate has
+        // to be able to report that rather than inventing a failure.
+        let config =
+            "origins:\n  ai.local:\n    action:\n      providers:\n        - name: local\n";
+        assert!(
+            extract_model_plane_identity(config, std::path::Path::new(".")).is_none(),
+            "no proxy.cluster block means no model-plane identity to check"
+        );
+    }
+
+    #[test]
+    fn model_plane_identity_lists_mtls_files_and_missing_keys() {
+        let config = "proxy:\n  cluster:\n    cluster_id: fleet\n    roles: [worker]\n    security:\n      mode: mtls\n      cert_file: tls/worker.crt\n      key_file: /abs/worker.key\n";
+        let plane = extract_model_plane_identity(config, std::path::Path::new("/etc/sbproxy"))
+            .expect("cluster block parses");
+
+        assert!(plane.worker_role, "roles: [worker] is the worker role");
+        assert!(plane.mtls);
+        // A relative path resolves against the config's own directory,
+        // matching how the proxy loads it.
+        assert_eq!(
+            plane.files[0].1,
+            std::path::Path::new("/etc/sbproxy/tls/worker.crt")
+        );
+        // An absolute path is left alone.
+        assert_eq!(plane.files[1].1, std::path::Path::new("/abs/worker.key"));
+        // mTLS makes the unset CA a violation, not a shrug.
+        assert_eq!(plane.missing_keys, vec!["ca_file"]);
+        assert_eq!(plane.shared_key_present, None);
+    }
+
+    #[test]
+    fn model_plane_identity_flags_shared_key_mode_with_no_key() {
+        let missing = "proxy:\n  cluster:\n    cluster_id: fleet\n    roles: [gateway]\n    security:\n      mode: shared_key\n";
+        let plane = extract_model_plane_identity(missing, std::path::Path::new("."))
+            .expect("cluster block parses");
+        assert!(!plane.worker_role);
+        assert!(!plane.mtls);
+        assert_eq!(plane.shared_key_present, Some(false));
+        // Shared-key mode does not owe the three mTLS files.
+        assert!(plane.missing_keys.is_empty());
+
+        let present = "proxy:\n  cluster:\n    cluster_id: fleet\n    security:\n      mode: shared_key\n      shared_key: env:SB_MESH_KEY\n";
+        let plane = extract_model_plane_identity(present, std::path::Path::new("."))
+            .expect("cluster block parses");
+        assert_eq!(plane.shared_key_present, Some(true));
+    }
+
+    #[test]
+    fn strict_text_block_names_every_check_and_the_verdict() {
+        use sbproxy_core::doctor::StrictCheck;
+        let text = render_strict_checks_text(&[
+            StrictCheck {
+                check: "driver",
+                status: "pass",
+                detail: "NVIDIA driver 550.54.15 present".to_string(),
+            },
+            StrictCheck {
+                check: "cache_mount",
+                status: "fail",
+                detail: "not enough space".to_string(),
+            },
+        ]);
+        assert!(text.contains("startup gate"));
+        assert!(text.contains("driver"));
+        assert!(text.contains("cache_mount"));
+        assert!(
+            text.contains("verdict: FAIL (1 startup blocker)"),
+            "the verdict line is what an operator reads first: {text}"
+        );
+    }
+
+    #[test]
     fn run_name_defaults_to_catalog_id_and_rejects_raw_refs() {
         // A plain catalog id is its own name.
         assert_eq!(resolve_run_name("qwen3-14b", None).unwrap(), "qwen3-14b");
@@ -4603,6 +9751,1077 @@ mod tests {
     }
 
     #[test]
+    fn service_install_cli_surface_flattens_run_args() {
+        let cli = Cli::try_parse_from([
+            "sbproxy",
+            "service",
+            "install",
+            "qwen3-14b",
+            "--port",
+            "9000",
+            "--format",
+            "json",
+        ])
+        .unwrap();
+        let Some(Cmd::Service(ServiceCmd {
+            sub: ServiceSub::Install(args),
+        })) = cli.cmd
+        else {
+            panic!("service install parsed to the wrong command");
+        };
+        assert_eq!(args.run.model, "qwen3-14b");
+        assert_eq!(args.run.port, 9000);
+        assert!(matches!(args.format, OutputFormat::Json));
+    }
+
+    #[test]
+    fn service_install_reuses_run_config_generation() {
+        // `service install` flattens `RunArgs` and calls the exact same
+        // `prepare_run` as `sbproxy run`, so the launchd-installed
+        // service gets the same loopback-bind, admin-enabled, random-
+        // password config as a foreground `run`.
+        let args = ServiceInstallArgs {
+            run: RunArgs {
+                model: "qwen2.5-0.5b-instruct".to_string(),
+                name: Some("service-test".to_string()),
+                port: 8080,
+                engine: "auto".to_string(),
+                accel: "auto".to_string(),
+                cache_dir: None,
+                variant: Some("q4_k_m".to_string()),
+                admin_port: Some(9092),
+                dry_run: false,
+            },
+            format: OutputFormat::Text,
+        };
+        let prepared = prepare_run(&args.run).expect("prepare canonical service config");
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&prepared.yaml).unwrap();
+        assert_eq!(prepared.name, "service-test");
+        assert_eq!(yaml["proxy"]["admin"]["enabled"], true);
+        assert_eq!(yaml["proxy"]["admin"]["bind"], "127.0.0.1");
+        assert_eq!(yaml["proxy"]["admin"]["port"], 9092);
+        assert_eq!(prepared.admin_password.len(), 64);
+        assert!(!prepared.yaml.contains("serve:"));
+    }
+
+    /// The service paths a plist test renders against, with an overridable
+    /// home so the shell-quoting case can use an awkward one.
+    fn service_paths_fixture(home: &str) -> ServicePaths {
+        ServicePaths {
+            config: PathBuf::from(format!(
+                "{home}/Library/Application Support/sbproxy/service/sb.yml"
+            )),
+            plist: PathBuf::from(format!("{home}/Library/LaunchAgents/{SERVICE_LABEL}.plist")),
+            stdout_log: PathBuf::from(format!("{home}/Library/Logs/sbproxy/service.log")),
+            stderr_log: PathBuf::from(format!("{home}/Library/Logs/sbproxy/service.err.log")),
+            env_file: PathBuf::from(format!(
+                "{home}/Library/Application Support/sbproxy/service/env"
+            )),
+            uninstall_state: PathBuf::from(format!(
+                "{home}/Library/Application Support/sbproxy/service/uninstall-state.json"
+            )),
+            lifecycle_lock: PathBuf::from(format!(
+                "{home}/Library/Application Support/sbproxy/service/lifecycle.lock"
+            )),
+        }
+    }
+
+    #[test]
+    fn service_plist_contains_program_arguments_and_bootstrap() {
+        let paths = service_paths_fixture("/Users/test");
+        let plist = render_service_plist(std::path::Path::new("/usr/local/bin/sbproxy"), &paths);
+        assert!(plist.contains("<key>ProgramArguments</key>"));
+        assert!(plist.contains("<string>service</string>"));
+        assert!(plist.contains("<string>launch</string>"));
+        assert!(plist.contains("/usr/local/bin/sbproxy"));
+        assert!(plist.contains(&format!("<string>{SERVICE_LABEL}</string>")));
+        assert!(plist.contains("/Users/test/Library/Application Support/sbproxy/service/sb.yml"));
+    }
+
+    #[test]
+    fn service_plist_bootstraps_with_the_declarative_environment_file() {
+        let paths = service_paths_fixture("/Users/test");
+        let plist = render_service_plist(std::path::Path::new("/usr/local/bin/sbproxy"), &paths);
+
+        assert!(plist.contains("<string>service</string>"), "{plist}");
+        assert!(plist.contains("<string>launch</string>"), "{plist}");
+        assert!(plist.contains("<string>--environment</string>"), "{plist}");
+        assert!(
+            plist.contains("<string>--lifecycle-lock</string>"),
+            "{plist}"
+        );
+        assert!(
+            plist.contains("<string>--uninstall-state</string>"),
+            "{plist}"
+        );
+        assert!(
+            plist.contains("/Users/test/Library/Application Support/sbproxy/service/env"),
+            "the plist does not reference the environment file: {plist}"
+        );
+        assert!(
+            plist
+                .contains("/Users/test/Library/Application Support/sbproxy/service/lifecycle.lock"),
+            "the plist does not pass the cooperative lifecycle lock: {plist}"
+        );
+        assert!(
+            !plist.contains("/bin/sh") && !plist.contains("set -a;"),
+            "launchd must not interpret the declarative environment as shell code: {plist}"
+        );
+    }
+
+    #[test]
+    fn service_plist_xml_escapes_a_home_directory_containing_an_apostrophe() {
+        let paths = service_paths_fixture("/Users/o'brien");
+        let plist = render_service_plist(std::path::Path::new("/usr/local/bin/sbproxy"), &paths);
+
+        assert!(
+            plist.contains("/Users/o&apos;brien/Library/Application Support/sbproxy/service/env"),
+            "the direct ProgramArguments value must be valid XML: {plist}"
+        );
+        assert!(
+            !plist.contains(r"\&apos;"),
+            "direct ProgramArguments must not contain shell-quoting artifacts: {plist}"
+        );
+    }
+
+    #[test]
+    fn service_plist_gives_the_drain_longer_than_launchd_would() {
+        // launchd's default ExitTimeOut (20s) is shorter than the proxy's
+        // default shutdown grace (30s), so an agent still draining
+        // in-flight requests at 20 seconds would be SIGKILLed part-way
+        // through, skipping every destructor on the shutdown path.
+        let paths = service_paths_fixture("/Users/test");
+        let plist = render_service_plist(std::path::Path::new("/usr/local/bin/sbproxy"), &paths);
+        assert!(
+            plist.contains("<key>ExitTimeOut</key>"),
+            "the plist must set ExitTimeOut or launchd kills the drain early: {plist}"
+        );
+        // The ordering against the default shutdown grace is a compile-time
+        // assertion next to the constant itself, so it cannot drift.
+        assert!(
+            plist.contains(&format!("<integer>{SERVICE_EXIT_TIMEOUT_SECS}</integer>")),
+            "{plist}"
+        );
+    }
+
+    /// A unique scratch path for the env-file tests. Mirrors
+    /// `temp_config`'s pid-plus-counter convention rather than adding a
+    /// dev-dependency this crate does not otherwise carry.
+    fn temp_env_path(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "sbproxy-service-env-{tag}-{}-{n}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn service_env_file_is_created_once_and_never_overwritten() {
+        let env_file = temp_env_path("once");
+        let _ = std::fs::remove_file(&env_file);
+
+        ensure_service_env_file(&env_file).expect("create");
+        let template = std::fs::read_to_string(&env_file).expect("read");
+        assert!(
+            template.contains("HF_TOKEN"),
+            "the template must name the variable a gated model needs: {template}"
+        );
+
+        // An operator's token has to survive a reinstall that changes the
+        // model or the port.
+        std::fs::write(&env_file, "HF_TOKEN=hf_operator_secret\n").expect("write");
+        ensure_service_env_file(&env_file).expect("second call is a no-op");
+        assert_eq!(
+            std::fs::read_to_string(&env_file).expect("read"),
+            "HF_TOKEN=hf_operator_secret\n",
+            "reinstalling must not discard the operator's environment file"
+        );
+        let _ = std::fs::remove_file(&env_file);
+    }
+
+    #[test]
+    fn service_env_template_examples_are_valid_when_uncommented() {
+        let examples = SERVICE_ENV_TEMPLATE
+            .lines()
+            .filter_map(|line| line.strip_prefix("# "))
+            .filter(|line| {
+                line.starts_with("HF_TOKEN=")
+                    || line.starts_with("RUST_LOG=")
+                    || line.starts_with("SBPROXY_ENGINE_OWNERSHIP_DIR=")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let environment = parse_service_environment(std::path::Path::new("service-env"), &examples)
+            .expect("every commented assignment should work when uncommented");
+
+        assert_eq!(
+            environment.variables.get("HF_TOKEN").map(String::as_str),
+            Some("hf_...")
+        );
+        assert_eq!(
+            environment
+                .variables
+                .get(SERVICE_ENGINE_OWNERSHIP_ENV)
+                .map(String::as_str),
+            Some("/absolute/path")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_env_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let env_file = temp_env_path("mode");
+        let _ = std::fs::remove_file(&env_file);
+        ensure_service_env_file(&env_file).expect("create");
+        let mode = std::fs::metadata(&env_file)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the documented home for a Hugging Face token must not be group or world readable"
+        );
+        let _ = std::fs::remove_file(&env_file);
+    }
+
+    #[test]
+    fn launchctl_list_pid_parses_running_and_missing() {
+        let running = "{\n\t\"LimitLoadToSessionType\" = \"Aqua\";\n\t\"Label\" = \"dev.sbproxy.agent\";\n\t\"OnDemand\" = false;\n\t\"LastExitStatus\" = 0;\n\t\"PID\" = 4321;\n};\n";
+        assert_eq!(parse_launchctl_list_pid(running), Some(4321));
+        let loaded_not_running =
+            "{\n\t\"Label\" = \"dev.sbproxy.agent\";\n\t\"LastExitStatus\" = 0;\n};\n";
+        assert_eq!(parse_launchctl_list_pid(loaded_not_running), None);
+    }
+
+    #[test]
+    fn launchctl_list_classifies_only_known_missing_service_as_not_loaded() {
+        let status = classify_launchctl_list_status(
+            false,
+            Some(113),
+            "",
+            "Could not find service \"dev.sbproxy.agent\" in domain for user gui: 501",
+        )
+        .expect("known launchd absence");
+
+        assert_eq!(status, LaunchdJobStatus::NotLoaded);
+    }
+
+    #[test]
+    fn launchctl_list_propagates_real_status_errors() {
+        let error = classify_launchctl_list_status(
+            false,
+            Some(1),
+            "",
+            "Operation not permitted while contacting launchd",
+        )
+        .expect_err("permission errors must not look like an absent service");
+
+        let message = error.to_string();
+        assert!(message.contains("exit code 1"), "{message}");
+        assert!(message.contains("Operation not permitted"), "{message}");
+    }
+
+    fn service_temp_paths(tag: &str) -> ServicePaths {
+        let root = temp_env_path(tag);
+        let service = root.join("service");
+        std::fs::create_dir_all(&service).unwrap();
+        ServicePaths {
+            config: service.join("sb.yml"),
+            plist: root.join("dev.sbproxy.agent.plist"),
+            stdout_log: root.join("service.log"),
+            stderr_log: root.join("service.err.log"),
+            env_file: service.join("env"),
+            uninstall_state: service.join("uninstall-state.json"),
+            lifecycle_lock: service.join("lifecycle.lock"),
+        }
+    }
+
+    fn write_registered_service_plist(paths: &ServicePaths) {
+        std::fs::write(
+            &paths.plist,
+            render_service_plist(std::path::Path::new("/usr/local/bin/sbproxy"), paths),
+        )
+        .unwrap();
+    }
+
+    struct FakeLaunchd {
+        statuses: std::collections::VecDeque<LaunchdJobStatus>,
+        unload_fails: bool,
+        unload_calls: usize,
+    }
+
+    impl LaunchdController for FakeLaunchd {
+        fn status(&mut self) -> anyhow::Result<LaunchdJobStatus> {
+            self.statuses
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("unexpected fake launchd status call"))
+        }
+
+        fn unload(&mut self, _plist: &std::path::Path) -> anyhow::Result<()> {
+            self.unload_calls += 1;
+            if self.unload_fails {
+                anyhow::bail!("injected launchctl unload failure");
+            }
+            Ok(())
+        }
+    }
+
+    struct FakeServiceEngineCleanup {
+        owner: sbproxy_model_host::ManagedEngineOwner,
+        owners_by_pid: std::collections::HashMap<u32, sbproxy_model_host::ManagedEngineOwner>,
+        fail_reap: bool,
+        capture_calls: usize,
+        captured_pids: Vec<u32>,
+        reaped_directories: Vec<PathBuf>,
+        reaped_owners: Vec<sbproxy_model_host::ManagedEngineOwner>,
+    }
+
+    impl ServiceEngineCleanup for FakeServiceEngineCleanup {
+        fn capture_owner(
+            &mut self,
+            pid: u32,
+        ) -> anyhow::Result<sbproxy_model_host::ManagedEngineOwner> {
+            self.capture_calls += 1;
+            self.captured_pids.push(pid);
+            Ok(self.owners_by_pid.get(&pid).unwrap_or(&self.owner).clone())
+        }
+
+        fn reap_owner(
+            &mut self,
+            directory: &std::path::Path,
+            owner: &sbproxy_model_host::ManagedEngineOwner,
+        ) -> anyhow::Result<usize> {
+            self.reaped_directories.push(directory.to_path_buf());
+            self.reaped_owners.push(owner.clone());
+            if self.fail_reap {
+                anyhow::bail!("injected exact-owner reap failure");
+            }
+            Ok(1)
+        }
+    }
+
+    fn fake_service_cleanup(fail_reap: bool) -> FakeServiceEngineCleanup {
+        FakeServiceEngineCleanup {
+            owner: sbproxy_model_host::capture_managed_engine_owner(std::process::id())
+                .expect("capture test process identity"),
+            owners_by_pid: std::collections::HashMap::new(),
+            fail_reap,
+            capture_calls: 0,
+            captured_pids: Vec::new(),
+            reaped_directories: Vec::new(),
+            reaped_owners: Vec::new(),
+        }
+    }
+
+    fn fake_managed_engine_owner(
+        pid: u32,
+        start_fingerprint: u64,
+    ) -> sbproxy_model_host::ManagedEngineOwner {
+        fake_managed_engine_owner_with_executable(pid, start_fingerprint, None)
+    }
+
+    fn fake_managed_engine_owner_with_executable(
+        pid: u32,
+        start_fingerprint: u64,
+        executable: Option<&str>,
+    ) -> sbproxy_model_host::ManagedEngineOwner {
+        serde_json::from_value(serde_json::json!({
+            "pid": pid,
+            "start_fingerprint": start_fingerprint,
+            "executable": executable,
+        }))
+        .expect("construct a distinct opaque owner token")
+    }
+
+    fn register_test_service_owner(
+        paths: &ServicePaths,
+        owner: &sbproxy_model_host::ManagedEngineOwner,
+    ) {
+        let ownership_directory =
+            service_engine_ownership_directory(paths).expect("resolve test ownership directory");
+        let lifecycle_lock =
+            acquire_service_lifecycle_lock(&paths.lifecycle_lock).expect("lock lifecycle");
+        register_service_owner_locked(
+            &lifecycle_lock,
+            &paths.uninstall_state,
+            &ownership_directory,
+            owner,
+        )
+        .expect("register test bootstrap generation");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_launch_registration_persists_exact_owner_before_exec() {
+        let paths = service_temp_paths("launch-registration");
+        let ownership_directory = paths.config.parent().unwrap().join("managed-engines");
+        let owner = fake_managed_engine_owner(5101, 61);
+        let lifecycle_lock =
+            acquire_service_lifecycle_lock(&paths.lifecycle_lock).expect("lock lifecycle");
+
+        register_service_owner_locked(
+            &lifecycle_lock,
+            &paths.uninstall_state,
+            &ownership_directory,
+            &owner,
+        )
+        .expect("register exact bootstrap generation");
+
+        let state = read_service_uninstall_state(&paths.uninstall_state)
+            .unwrap()
+            .expect("durable lifecycle state");
+        assert_eq!(state.ownership_directory, ownership_directory);
+        assert_eq!(state.owners, vec![owner.clone()]);
+        assert_eq!(state.bootstrap_registered_owners, vec![owner]);
+        assert!(paths.lifecycle_lock.exists());
+        drop(lifecycle_lock);
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_launch_registration_rejects_owner_generation_overflow() {
+        let paths = service_temp_paths("owner-overflow");
+        let ownership_directory = paths.config.parent().unwrap().join("managed-engines");
+        let owners = (0..MAX_SERVICE_OWNER_GENERATIONS)
+            .map(|index| fake_managed_engine_owner(20_000 + index as u32, 10_000 + index as u64))
+            .collect::<Vec<_>>();
+        persist_service_uninstall_state(
+            &paths.uninstall_state,
+            &ServiceUninstallState {
+                schema_version: SERVICE_UNINSTALL_STATE_SCHEMA_VERSION,
+                ownership_directory: ownership_directory.clone(),
+                owners: owners.clone(),
+                bootstrap_registered_owners: Vec::new(),
+            },
+        )
+        .unwrap();
+        let lifecycle_lock =
+            acquire_service_lifecycle_lock(&paths.lifecycle_lock).expect("lock lifecycle");
+
+        let error = register_service_owner_locked(
+            &lifecycle_lock,
+            &paths.uninstall_state,
+            &ownership_directory,
+            &fake_managed_engine_owner(99_999, 99_999),
+        )
+        .expect_err("the lifecycle registry must have a hard owner cap");
+
+        assert!(
+            error.to_string().contains("owner generation limit"),
+            "{error:#}"
+        );
+        let state = read_service_uninstall_state(&paths.uninstall_state)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.owners, owners);
+        assert!(state.bootstrap_registered_owners.is_empty());
+        drop(lifecycle_lock);
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn service_uninstall_state_rejects_oversized_file_before_read() {
+        let paths = service_temp_paths("oversized-state");
+        let file = std::fs::File::create(&paths.uninstall_state).unwrap();
+        file.set_len((MAX_SERVICE_UNINSTALL_STATE_BYTES + 1) as u64)
+            .unwrap();
+
+        let error = read_service_uninstall_state(&paths.uninstall_state)
+            .expect_err("oversized lifecycle state must be rejected before allocation");
+
+        assert!(error.to_string().contains("maximum size"), "{error:#}");
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn service_lifecycle_lock_does_not_follow_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let paths = service_temp_paths("lock-symlink");
+        let target = paths.config.parent().unwrap().join("lock-target");
+        std::fs::write(&target, "do not lock through this path").unwrap();
+        symlink(&target, &paths.lifecycle_lock).unwrap();
+
+        let error = acquire_service_lifecycle_lock(&paths.lifecycle_lock)
+            .expect_err("a lifecycle lock symlink must fail closed");
+
+        assert!(error.to_string().contains("lifecycle lock"), "{error:#}");
+        assert_eq!(
+            std::fs::read_to_string(target).unwrap(),
+            "do not lock through this path"
+        );
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn service_uninstall_uses_the_service_env_ownership_directory() {
+        let paths = service_temp_paths("ownership-env");
+        let service_directory = paths.env_file.parent().unwrap().join("from-service-env");
+        std::fs::write(
+            &paths.env_file,
+            format!(
+                "SBPROXY_ENGINE_OWNERSHIP_DIR={}\n",
+                service_directory.display()
+            ),
+        )
+        .unwrap();
+        let caller_shell = paths.env_file.parent().unwrap().join("from-caller-shell");
+        let caller_shell = caller_shell.display().to_string();
+        let _env =
+            EnvVarGuard::set(&[("SBPROXY_ENGINE_OWNERSHIP_DIR", Some(caller_shell.as_str()))]);
+
+        let selected = service_engine_ownership_directory(&paths).unwrap();
+
+        assert_eq!(selected, service_directory);
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn service_environment_rejects_duplicate_assignments() {
+        let paths = service_temp_paths("duplicate-environment");
+        std::fs::write(
+            &paths.env_file,
+            "SBPROXY_ENGINE_OWNERSHIP_DIR=/first\n\
+             SBPROXY_ENGINE_OWNERSHIP_DIR=/second\n",
+        )
+        .unwrap();
+
+        let error = service_engine_ownership_directory(&paths)
+            .expect_err("duplicate keys could select different startup and cleanup values");
+
+        assert!(error.to_string().contains("duplicate"), "{error:#}");
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn service_environment_rejects_shell_syntax() {
+        let paths = service_temp_paths("shell-environment");
+        std::fs::write(
+            &paths.env_file,
+            "HF_TOKEN=$(cat /tmp/token)\n\
+             SBPROXY_ENGINE_OWNERSHIP_DIR=/managed-engines\n",
+        )
+        .unwrap();
+
+        let error = service_engine_ownership_directory(&paths)
+            .expect_err("the service environment is declarative, not a shell program");
+
+        assert!(error.to_string().contains("shell syntax"), "{error:#}");
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn service_environment_rejects_an_oversized_file_before_reading_it() {
+        let paths = service_temp_paths("oversized-environment");
+        let file = std::fs::File::create(&paths.env_file).unwrap();
+        file.set_len((MAX_SERVICE_ENVIRONMENT_BYTES + 1) as u64)
+            .unwrap();
+
+        let error = read_service_environment(&paths.env_file)
+            .expect_err("service bootstrap must bound environment-file allocation");
+
+        assert!(error.to_string().contains("maximum size"), "{error:#}");
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn service_uninstall_accepts_an_already_unloaded_job_without_calling_unload() {
+        let paths = service_temp_paths("already-unloaded");
+        std::fs::write(&paths.plist, "plist").unwrap();
+        let mut launchd = FakeLaunchd {
+            statuses: [LaunchdJobStatus::NotLoaded].into(),
+            unload_fails: false,
+            unload_calls: 0,
+        };
+        let mut cleanup = fake_service_cleanup(false);
+
+        let outcome = perform_service_uninstall(&paths, &mut launchd, &mut cleanup).unwrap();
+
+        assert!(outcome.removed);
+        assert_eq!(outcome.engines_reaped, 0);
+        assert_eq!(launchd.unload_calls, 0);
+        assert_eq!(cleanup.capture_calls, 0);
+        assert!(!paths.plist.exists());
+        assert!(!paths.uninstall_state.exists());
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_uninstall_fails_closed_for_a_loaded_legacy_plist() {
+        let paths = service_temp_paths("loaded-legacy-plist");
+        std::fs::write(
+            &paths.plist,
+            "<string>/bin/sh</string><string>-c</string><string>exec sbproxy serve</string>",
+        )
+        .unwrap();
+        let mut launchd = FakeLaunchd {
+            statuses: [LaunchdJobStatus::Loaded {
+                pid: Some(std::process::id()),
+            }]
+            .into(),
+            unload_fails: false,
+            unload_calls: 0,
+        };
+        let mut cleanup = fake_service_cleanup(false);
+
+        let error = perform_service_uninstall(&paths, &mut launchd, &mut cleanup)
+            .expect_err("a legacy KeepAlive job has no complete owner-generation registry");
+
+        assert!(error.to_string().contains("legacy plist"), "{error:#}");
+        assert!(error.to_string().contains("service install"), "{error:#}");
+        assert_eq!(launchd.unload_calls, 0);
+        assert_eq!(cleanup.capture_calls, 0);
+        assert!(paths.plist.exists(), "legacy retry handle must remain");
+        assert!(!paths.uninstall_state.exists());
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn service_uninstall_fails_closed_when_loaded_generation_has_no_registry() {
+        let paths = service_temp_paths("loaded-without-registry");
+        write_registered_service_plist(&paths);
+        let mut launchd = FakeLaunchd {
+            statuses: [
+                LaunchdJobStatus::Loaded {
+                    pid: Some(std::process::id()),
+                },
+                LaunchdJobStatus::NotLoaded,
+            ]
+            .into(),
+            unload_fails: false,
+            unload_calls: 0,
+        };
+        let mut cleanup = fake_service_cleanup(false);
+
+        let error = perform_service_uninstall(&paths, &mut launchd, &mut cleanup)
+            .expect_err("a plist marker cannot prove the running generation registered");
+
+        assert!(error.to_string().contains("not registered"), "{error:#}");
+        assert_eq!(launchd.unload_calls, 0);
+        assert_eq!(cleanup.capture_calls, 1);
+        assert!(paths.plist.exists(), "the retry handle must remain");
+        assert!(
+            !paths.uninstall_state.exists(),
+            "uninstall must not invent registration state"
+        );
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn service_uninstall_fails_closed_when_registry_has_only_an_unrelated_owner() {
+        let paths = service_temp_paths("loaded-with-unrelated-registry");
+        write_registered_service_plist(&paths);
+        let ownership_directory = paths
+            .config
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("managed-engines");
+        let unrelated_owner = fake_managed_engine_owner(91_001, 91_001);
+        persist_service_uninstall_state(
+            &paths.uninstall_state,
+            &ServiceUninstallState {
+                schema_version: SERVICE_UNINSTALL_STATE_SCHEMA_VERSION,
+                ownership_directory,
+                owners: vec![unrelated_owner.clone()],
+                bootstrap_registered_owners: Vec::new(),
+            },
+        )
+        .unwrap();
+        let state_before = std::fs::read(&paths.uninstall_state).unwrap();
+        let mut launchd = FakeLaunchd {
+            statuses: [
+                LaunchdJobStatus::Loaded {
+                    pid: Some(std::process::id()),
+                },
+                LaunchdJobStatus::NotLoaded,
+            ]
+            .into(),
+            unload_fails: false,
+            unload_calls: 0,
+        };
+        let mut cleanup = fake_service_cleanup(false);
+
+        let error = perform_service_uninstall(&paths, &mut launchd, &mut cleanup)
+            .expect_err("an unrelated owner cannot authorize unloading this generation");
+
+        assert!(error.to_string().contains("not registered"), "{error:#}");
+        assert_eq!(launchd.unload_calls, 0);
+        assert_eq!(cleanup.capture_calls, 1);
+        assert!(paths.plist.exists(), "the retry handle must remain");
+        assert_eq!(
+            std::fs::read(&paths.uninstall_state).unwrap(),
+            state_before,
+            "an untrusted observation must not mutate lifecycle state"
+        );
+        let state = read_service_uninstall_state(&paths.uninstall_state)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.owners, vec![unrelated_owner]);
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn service_uninstall_does_not_trust_an_owner_recorded_only_by_uninstall() {
+        let paths = service_temp_paths("loaded-with-unregistered-observation");
+        write_registered_service_plist(&paths);
+        let ownership_directory = paths
+            .config
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("managed-engines");
+        let mut cleanup = fake_service_cleanup(false);
+        persist_service_uninstall_state(
+            &paths.uninstall_state,
+            &ServiceUninstallState {
+                schema_version: SERVICE_UNINSTALL_STATE_SCHEMA_VERSION,
+                ownership_directory,
+                owners: vec![cleanup.owner.clone()],
+                bootstrap_registered_owners: Vec::new(),
+            },
+        )
+        .unwrap();
+        let state_before = std::fs::read(&paths.uninstall_state).unwrap();
+        let mut launchd = FakeLaunchd {
+            statuses: [LaunchdJobStatus::Loaded {
+                pid: Some(std::process::id()),
+            }]
+            .into(),
+            unload_fails: false,
+            unload_calls: 0,
+        };
+
+        let error = perform_service_uninstall(&paths, &mut launchd, &mut cleanup)
+            .expect_err("an uninstall observation does not prove bootstrap registration");
+
+        assert!(error.to_string().contains("not registered"), "{error:#}");
+        assert_eq!(launchd.unload_calls, 0);
+        assert_eq!(cleanup.capture_calls, 1);
+        assert_eq!(
+            std::fs::read(&paths.uninstall_state).unwrap(),
+            state_before,
+            "uninstall must preserve the provenance-bearing registry"
+        );
+        assert!(paths.plist.exists());
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn service_uninstall_matches_registration_by_process_generation() {
+        let paths = service_temp_paths("registration-survives-binary-replacement");
+        write_registered_service_plist(&paths);
+        let pid = 92_001;
+        let registered_owner =
+            fake_managed_engine_owner_with_executable(pid, 92_001, Some("/usr/local/bin/sbproxy"));
+        let recaptured_owner = fake_managed_engine_owner_with_executable(
+            pid,
+            92_001,
+            Some("/usr/local/bin/sbproxy (deleted)"),
+        );
+        register_test_service_owner(&paths, &registered_owner);
+        let mut launchd = FakeLaunchd {
+            statuses: [
+                LaunchdJobStatus::Loaded { pid: Some(pid) },
+                LaunchdJobStatus::NotLoaded,
+            ]
+            .into(),
+            unload_fails: false,
+            unload_calls: 0,
+        };
+        let mut cleanup = fake_service_cleanup(false);
+        cleanup.owners_by_pid.insert(pid, recaptured_owner);
+
+        let outcome = perform_service_uninstall(&paths, &mut launchd, &mut cleanup)
+            .expect("an executable audit-path change must not change process identity");
+
+        assert_eq!(launchd.unload_calls, 1);
+        assert_eq!(outcome.engines_reaped, 1);
+        assert_eq!(cleanup.reaped_owners, vec![registered_owner]);
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn service_uninstall_retains_exact_retry_state_and_plist_until_reap_succeeds() {
+        let paths = service_temp_paths("transaction");
+        write_registered_service_plist(&paths);
+        let ownership_directory = paths
+            .env_file
+            .parent()
+            .unwrap()
+            .join("service-only-ownership");
+        std::fs::write(
+            &paths.env_file,
+            format!(
+                "SBPROXY_ENGINE_OWNERSHIP_DIR={}\n",
+                ownership_directory.display()
+            ),
+        )
+        .unwrap();
+        let mut first_launchd = FakeLaunchd {
+            statuses: [
+                LaunchdJobStatus::Loaded {
+                    pid: Some(std::process::id()),
+                },
+                LaunchdJobStatus::NotLoaded,
+            ]
+            .into(),
+            unload_fails: false,
+            unload_calls: 0,
+        };
+        let mut failing_cleanup = fake_service_cleanup(true);
+        register_test_service_owner(&paths, &failing_cleanup.owner);
+
+        let error = perform_service_uninstall(&paths, &mut first_launchd, &mut failing_cleanup)
+            .expect_err("reap failure must leave a retry transaction");
+
+        assert!(error.to_string().contains("exact-owner reap failure"));
+        assert!(paths.plist.exists(), "plist is the durable retry handle");
+        assert!(paths.uninstall_state.exists());
+        let state = read_service_uninstall_state(&paths.uninstall_state)
+            .unwrap()
+            .expect("retry state");
+        assert_eq!(state.ownership_directory, ownership_directory);
+        assert_eq!(state.owners, vec![failing_cleanup.owner.clone()]);
+
+        let mut retry_launchd = FakeLaunchd {
+            statuses: [LaunchdJobStatus::NotLoaded].into(),
+            unload_fails: false,
+            unload_calls: 0,
+        };
+        let mut succeeding_cleanup = fake_service_cleanup(false);
+        let outcome =
+            perform_service_uninstall(&paths, &mut retry_launchd, &mut succeeding_cleanup)
+                .expect("retry exact persisted owner");
+
+        assert_eq!(outcome.engines_reaped, 1);
+        assert_eq!(succeeding_cleanup.capture_calls, 0);
+        assert_eq!(
+            succeeding_cleanup.reaped_directories,
+            vec![ownership_directory]
+        );
+        assert!(!paths.plist.exists());
+        assert!(!paths.uninstall_state.exists());
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn service_uninstall_accepts_unload_failure_when_launchd_reports_not_loaded() {
+        let paths = service_temp_paths("unload-race");
+        write_registered_service_plist(&paths);
+        let mut launchd = FakeLaunchd {
+            statuses: [
+                LaunchdJobStatus::Loaded {
+                    pid: Some(std::process::id()),
+                },
+                LaunchdJobStatus::NotLoaded,
+            ]
+            .into(),
+            unload_fails: true,
+            unload_calls: 0,
+        };
+        let mut cleanup = fake_service_cleanup(false);
+        register_test_service_owner(&paths, &cleanup.owner);
+
+        let outcome = perform_service_uninstall(&paths, &mut launchd, &mut cleanup)
+            .expect("a concurrently unloaded job already reached the requested state");
+
+        assert_eq!(outcome.engines_reaped, 1);
+        assert_eq!(launchd.unload_calls, 1);
+        assert!(!paths.plist.exists());
+        assert!(!paths.uninstall_state.exists());
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn service_uninstall_keeps_transaction_when_unload_fails_and_job_is_still_loaded() {
+        let paths = service_temp_paths("unload-failure");
+        write_registered_service_plist(&paths);
+        let running = LaunchdJobStatus::Loaded {
+            pid: Some(std::process::id()),
+        };
+        let mut launchd = FakeLaunchd {
+            statuses: [running, running].into(),
+            unload_fails: true,
+            unload_calls: 0,
+        };
+        let mut cleanup = fake_service_cleanup(false);
+        register_test_service_owner(&paths, &cleanup.owner);
+
+        let error = perform_service_uninstall(&paths, &mut launchd, &mut cleanup)
+            .expect_err("a still-loaded job must preserve its transaction");
+
+        assert!(error.to_string().contains("unload failure"));
+        assert!(paths.plist.exists());
+        assert!(paths.uninstall_state.exists());
+        assert!(cleanup.reaped_directories.is_empty());
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn service_uninstall_records_every_keepalive_generation_before_cleanup() {
+        let paths = service_temp_paths("keepalive-generations");
+        write_registered_service_plist(&paths);
+        let first_pid = 4101;
+        let replacement_pid = 4102;
+        let first_owner = fake_managed_engine_owner(first_pid, 51);
+        let replacement_owner = fake_managed_engine_owner(replacement_pid, 52);
+        let mut launchd = FakeLaunchd {
+            statuses: [
+                LaunchdJobStatus::Loaded {
+                    pid: Some(first_pid),
+                },
+                LaunchdJobStatus::Loaded {
+                    pid: Some(replacement_pid),
+                },
+                LaunchdJobStatus::NotLoaded,
+            ]
+            .into(),
+            unload_fails: false,
+            unload_calls: 0,
+        };
+        let mut cleanup = fake_service_cleanup(false);
+        cleanup.owners_by_pid.insert(first_pid, first_owner.clone());
+        cleanup
+            .owners_by_pid
+            .insert(replacement_pid, replacement_owner.clone());
+        register_test_service_owner(&paths, &first_owner);
+
+        let outcome = perform_service_uninstall(&paths, &mut launchd, &mut cleanup)
+            .expect("every observed KeepAlive generation is captured");
+
+        assert_eq!(launchd.unload_calls, 2);
+        assert_eq!(cleanup.captured_pids, vec![first_pid, replacement_pid]);
+        assert_eq!(cleanup.reaped_owners, vec![first_owner, replacement_owner]);
+        assert_eq!(outcome.engines_reaped, 2);
+        assert!(!paths.plist.exists());
+        assert!(!paths.uninstall_state.exists());
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_uninstall_reaps_pre_registered_replacement_when_unload_hides_it() {
+        let paths = service_temp_paths("pre-registered-replacement");
+        write_registered_service_plist(&paths);
+        let ownership_directory = paths.config.parent().unwrap().join("managed-engines");
+        let first_pid = 6101;
+        let first_owner = fake_managed_engine_owner(first_pid, 71);
+        let replacement_owner = fake_managed_engine_owner(6102, 72);
+        {
+            let lifecycle_lock =
+                acquire_service_lifecycle_lock(&paths.lifecycle_lock).expect("lock lifecycle");
+            register_service_owner_locked(
+                &lifecycle_lock,
+                &paths.uninstall_state,
+                &ownership_directory,
+                &first_owner,
+            )
+            .unwrap();
+            register_service_owner_locked(
+                &lifecycle_lock,
+                &paths.uninstall_state,
+                &ownership_directory,
+                &replacement_owner,
+            )
+            .unwrap();
+        }
+        let mut launchd = FakeLaunchd {
+            statuses: [
+                LaunchdJobStatus::Loaded {
+                    pid: Some(first_pid),
+                },
+                LaunchdJobStatus::NotLoaded,
+            ]
+            .into(),
+            unload_fails: false,
+            unload_calls: 0,
+        };
+        let mut cleanup = fake_service_cleanup(false);
+        cleanup.owners_by_pid.insert(first_pid, first_owner.clone());
+
+        let outcome = perform_service_uninstall(&paths, &mut launchd, &mut cleanup)
+            .expect("the registry covers a replacement hidden by unload");
+
+        assert_eq!(launchd.unload_calls, 1);
+        assert_eq!(cleanup.captured_pids, vec![first_pid]);
+        assert_eq!(cleanup.reaped_owners, vec![first_owner, replacement_owner]);
+        assert_eq!(outcome.engines_reaped, 2);
+        assert!(!paths.plist.exists());
+        assert!(!paths.uninstall_state.exists());
+        assert!(
+            paths.lifecycle_lock.exists(),
+            "never unlink a cooperative lock path"
+        );
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_uninstall_bounds_same_pid_no_progress_and_retains_handles() {
+        let paths = service_temp_paths("bounded-no-progress");
+        write_registered_service_plist(&paths);
+        let pid = 7101;
+        let running = LaunchdJobStatus::Loaded { pid: Some(pid) };
+        let mut launchd = FakeLaunchd {
+            statuses: vec![running; MAX_SERVICE_UNLOAD_ATTEMPTS + 2].into(),
+            unload_fails: false,
+            unload_calls: 0,
+        };
+        let mut cleanup = fake_service_cleanup(false);
+        let owner = fake_managed_engine_owner(pid, 81);
+        cleanup.owners_by_pid.insert(pid, owner.clone());
+        register_test_service_owner(&paths, &owner);
+
+        let error = perform_service_uninstall(&paths, &mut launchd, &mut cleanup)
+            .expect_err("a launchd job that never changes must fail in bounded time");
+
+        assert!(error.to_string().contains("no progress"), "{error:#}");
+        assert!(launchd.unload_calls <= MAX_SERVICE_UNLOAD_ATTEMPTS);
+        assert!(paths.plist.exists());
+        assert!(paths.uninstall_state.exists());
+        assert!(paths.lifecycle_lock.exists());
+        assert!(cleanup.reaped_owners.is_empty());
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn service_uninstall_preserves_retry_handles_when_loaded_job_has_no_pid() {
+        let paths = service_temp_paths("loaded-without-pid");
+        write_registered_service_plist(&paths);
+        let mut launchd = FakeLaunchd {
+            statuses: [LaunchdJobStatus::Loaded { pid: None }].into(),
+            unload_fails: false,
+            unload_calls: 0,
+        };
+        let mut cleanup = fake_service_cleanup(false);
+
+        let error = perform_service_uninstall(&paths, &mut launchd, &mut cleanup)
+            .expect_err("an ownerless loaded generation cannot be cleaned exactly");
+
+        assert!(error.to_string().contains("has no PID"), "{error:#}");
+        assert_eq!(launchd.unload_calls, 0);
+        assert!(cleanup.captured_pids.is_empty());
+        assert!(cleanup.reaped_owners.is_empty());
+        assert!(paths.plist.exists());
+        assert!(
+            paths.uninstall_state.exists(),
+            "the durable retry transaction must survive"
+        );
+        let _ = std::fs::remove_dir_all(paths.config.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
     fn update_version_newer_compares_semver() {
         assert!(version_is_newer("1.4.0", "v1.5.0"));
         assert!(version_is_newer("1.4.0", "1.4.1"));
@@ -4622,6 +10841,241 @@ mod tests {
         assert!(!is_moving_ref(&"a".repeat(40)));
         // A 39-char near-sha is treated as a branch (moving).
         assert!(is_moving_ref(&"a".repeat(39)));
+    }
+
+    #[test]
+    fn update_pinned_never_swaps_moving_ref_is_eligible() {
+        use sbproxy_config::UpdateChannel::Stable;
+        // A moving-ref artifact on the stable channel with an available
+        // update is swap-eligible.
+        assert_eq!(
+            decide_swap(PinState::Tracking, true, Stable, false, false),
+            SwapDecision::Eligible
+        );
+        // The same artifact with nothing newer is up to date.
+        assert_eq!(
+            decide_swap(PinState::Tracking, false, Stable, false, false),
+            SwapDecision::UpToDate
+        );
+        // A pinned artifact holds on a blanket run, even with an update
+        // available, and is never swapped.
+        assert_eq!(
+            decide_swap(PinState::Pinned, true, Stable, false, false),
+            SwapDecision::PinnedHold
+        );
+        // An explicit targeted run may move the pin.
+        assert_eq!(
+            decide_swap(PinState::Pinned, true, Stable, true, false),
+            SwapDecision::Eligible
+        );
+        // Externally managed (PATH / brew / apt) is never touched, even
+        // when targeted.
+        assert_eq!(
+            decide_swap(PinState::ExternallyManaged, true, Stable, true, false),
+            SwapDecision::ManagedElsewhere
+        );
+    }
+
+    #[test]
+    fn update_pinned_channel_freezes_untargeted_tracking() {
+        use sbproxy_config::UpdateChannel::{Pinned, Stable};
+        // The `pinned` channel holds even a moving-ref artifact on a
+        // blanket run...
+        assert_eq!(
+            decide_swap(PinState::Tracking, true, Pinned, false, false),
+            SwapDecision::PinnedHold
+        );
+        // ...but a targeted run may still move it.
+        assert_eq!(
+            decide_swap(PinState::Tracking, true, Pinned, true, false),
+            SwapDecision::Eligible
+        );
+        // On the stable channel the same untargeted moving-ref is eligible.
+        assert_eq!(
+            decide_swap(PinState::Tracking, true, Stable, false, false),
+            SwapDecision::Eligible
+        );
+    }
+
+    #[test]
+    fn update_auto_run_only_reports() {
+        use sbproxy_config::UpdateChannel::Stable;
+        // A background / auto run never swaps anything, even an eligible
+        // tracking artifact on a targeted run.
+        assert_eq!(
+            decide_swap(PinState::Tracking, true, Stable, true, true),
+            SwapDecision::AutoReportOnly
+        );
+    }
+
+    #[test]
+    fn update_classify_self_install() {
+        use std::path::Path;
+        // Homebrew and Linuxbrew formula prefixes are externally managed.
+        assert_eq!(
+            classify_self_install(Path::new("/opt/homebrew/Cellar/sbproxy/1.4.0/bin/sbproxy")),
+            PinState::ExternallyManaged
+        );
+        assert_eq!(
+            classify_self_install(Path::new("/home/linuxbrew/.linuxbrew/bin/sbproxy")),
+            PinState::ExternallyManaged
+        );
+        // A distro (apt) path under /usr/bin is externally managed.
+        assert_eq!(
+            classify_self_install(Path::new("/usr/bin/sbproxy")),
+            PinState::ExternallyManaged
+        );
+        // A curl-installed / operator-owned path is channel-tracking.
+        assert_eq!(
+            classify_self_install(Path::new("/home/rick/.local/bin/sbproxy")),
+            PinState::Tracking
+        );
+        assert_eq!(
+            classify_self_install(Path::new("/usr/local/bin/sbproxy")),
+            PinState::Tracking
+        );
+    }
+
+    #[test]
+    fn update_engine_swap_plan_only_for_llama_and_eligible() {
+        let llama = EngineFreshness {
+            engine: "llama_cpp",
+            installed: None,
+            pinned_release: Some("b9905".to_string()),
+            latest_release: Some("b9999".to_string()),
+            update_available: true,
+        };
+        let dir = std::path::Path::new("/cache");
+        // Eligible llama_cpp yields a plan targeting the latest tag.
+        let plan = plan_engine_swap(&llama, dir, SwapDecision::Eligible).unwrap();
+        assert_eq!(plan.engine, "llama_cpp");
+        assert_eq!(plan.program, "llama-server");
+        assert_eq!(plan.tag, "b9999");
+        // A newer tag carries no vendored digest.
+        assert_eq!(plan.expected_sha256, None);
+        // A non-eligible decision produces no plan.
+        assert!(plan_engine_swap(&llama, dir, SwapDecision::PinnedHold).is_none());
+        // vLLM has no single-binary prebuilt swap.
+        let vllm = EngineFreshness {
+            engine: "vllm",
+            installed: None,
+            pinned_release: None,
+            latest_release: None,
+            update_available: false,
+        };
+        assert!(plan_engine_swap(&vllm, dir, SwapDecision::Eligible).is_none());
+    }
+
+    #[test]
+    fn update_self_update_asset_name_matches_installer() {
+        assert_eq!(
+            self_update_asset_name("linux", "x86_64").unwrap(),
+            "sbproxy_linux_amd64.tar.gz"
+        );
+        assert_eq!(
+            self_update_asset_name("linux", "aarch64").unwrap(),
+            "sbproxy_linux_arm64.tar.gz"
+        );
+        assert_eq!(
+            self_update_asset_name("macos", "aarch64").unwrap(),
+            "sbproxy_darwin_arm64.tar.gz"
+        );
+        // Intel macOS and unknown hosts have no published binary.
+        assert!(self_update_asset_name("macos", "x86_64").is_err());
+        assert!(self_update_asset_name("freebsd", "x86_64").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_atomic_replace_binary_swaps_contents_and_is_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "sbproxy-update-replace-{}-{}",
+            std::process::id(),
+            random_local_password(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("sbproxy");
+        std::fs::write(&dest, b"old-binary").unwrap();
+        let src = dir.join("staged");
+        std::fs::write(&src, b"new-binary").unwrap();
+
+        atomic_replace_binary(&src, &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new-binary");
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode();
+        assert!(mode & 0o111 != 0, "replacement is executable");
+        // The temp file is renamed away, not left behind.
+        assert!(!dir
+            .join(format!(".sbproxy-new-{}", std::process::id()))
+            .exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn update_acting_swaps_eligible_and_holds_pinned_via_seam() {
+        use sbproxy_config::UpdateChannel::Stable;
+        use std::cell::RefCell;
+
+        #[derive(Default)]
+        struct FakeApplier {
+            engine_swaps: RefCell<Vec<String>>,
+            self_updates: RefCell<Vec<String>>,
+            model_repulls: RefCell<Vec<String>>,
+        }
+        impl UpdateApplier for FakeApplier {
+            fn apply_engine_swap(&self, plan: &EngineSwapPlan) -> anyhow::Result<PathBuf> {
+                self.engine_swaps.borrow_mut().push(plan.engine.clone());
+                Ok(PathBuf::from("/fake/llama-server"))
+            }
+            fn apply_self_update(&self, plan: &SelfUpdatePlan) -> anyhow::Result<()> {
+                self.self_updates
+                    .borrow_mut()
+                    .push(plan.target_version.clone());
+                Ok(())
+            }
+            fn apply_model_repull(&self, plan: &ModelRepullPlan) -> anyhow::Result<()> {
+                self.model_repulls.borrow_mut().push(plan.id.clone());
+                Ok(())
+            }
+        }
+
+        // A report with one moving-ref model and one pinned model. Only
+        // the moving-ref one, on a targeted run, reaches the seam. This
+        // path touches neither PATH nor the running-binary path (self and
+        // engines are absent), so it is host-independent.
+        let report = UpdateReport {
+            self_: None,
+            engines: None,
+            models: Some(vec![
+                ModelFreshness {
+                    id: "moving".to_string(),
+                    hf_repo: "Org/Moving".to_string(),
+                    revision: "main".to_string(),
+                    tracking: "moving-ref",
+                },
+                ModelFreshness {
+                    id: "pinned".to_string(),
+                    hf_repo: "Org/Pinned".to_string(),
+                    revision: "v1.0".to_string(),
+                    tracking: "pinned",
+                },
+            ]),
+            note: String::new(),
+        };
+        let ctx = UpdatePlanContext {
+            channel: Stable,
+            targeted_self: false,
+            targeted_engines: false,
+            targeted_models: true,
+            assume_yes: true,
+            cache_dir: None,
+        };
+        let fake = FakeApplier::default();
+        let code = apply_updates(&report, &ctx, &fake).unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(*fake.model_repulls.borrow(), vec!["moving".to_string()]);
+        assert!(fake.self_updates.borrow().is_empty());
+        assert!(fake.engine_swaps.borrow().is_empty());
     }
 
     #[test]
@@ -4666,7 +11120,8 @@ mod tests {
         let report = sbproxy_core::doctor::DoctorReport::collect();
         // A cache root that does not exist -> everything reads not-pulled.
         let root = std::env::temp_dir().join("sbproxy-models-test-nonexistent");
-        let rows = build_model_rows(&catalog, &report, &root);
+        // An empty foreign scan -> no importable markers appear.
+        let rows = build_model_rows(&catalog, &report, &root, &[]);
         assert_eq!(rows.len(), catalog.len());
         for r in &rows {
             // Catalog ids resolve, so the fit is a real verdict, never empty.
@@ -4679,6 +11134,64 @@ mod tests {
                 r.status
             );
         }
+    }
+
+    #[test]
+    fn models_list_importable_marker_requires_full_size_coverage_from_one_source() {
+        use sbproxy_model_host::{ForeignCacheSource, ForeignModelFile};
+        let artifact = sbproxy_model_host::ResolvedArtifact {
+            catalog_revision: "list-fixture".to_string(),
+            logical_model: "fixture".to_string(),
+            variant_id: "exact".to_string(),
+            artifact_digest: "a".repeat(64),
+            format: sbproxy_model_host::ArtifactFormat::Gguf,
+            quant: "q4".to_string(),
+            engine: sbproxy_model_host::EngineKind::LlamaCpp,
+            source: "hf:Fixture/List".to_string(),
+            revision: "main".to_string(),
+            files: vec![
+                sbproxy_model_host::ArtifactFile {
+                    path: "a.gguf".to_string(),
+                    sha256: "b".repeat(64),
+                    size_bytes: 10,
+                },
+                sbproxy_model_host::ArtifactFile {
+                    path: "b.gguf".to_string(),
+                    sha256: "c".repeat(64),
+                    size_bytes: 20,
+                },
+            ],
+            context_length: 4096,
+            license: "apache-2.0".to_string(),
+            stability: sbproxy_model_host::SupportLevel::Preview,
+            pickle_allowed: false,
+            modality: Default::default(),
+        };
+        let candidate = |source, size_bytes: u64| ForeignModelFile {
+            source,
+            path: std::path::PathBuf::from("/scan/fixture"),
+            repo_or_name: "fixture".to_string(),
+            size_bytes,
+            format_hint: None,
+        };
+        // Every declared file size-covered by one source -> that source.
+        let full = vec![
+            candidate(ForeignCacheSource::Ollama, 10),
+            candidate(ForeignCacheSource::Ollama, 20),
+        ];
+        assert_eq!(
+            foreign_import_source(Some(&artifact), &full),
+            Some(ForeignCacheSource::Ollama)
+        );
+        // Partial coverage, coverage split across sources, or no
+        // resolved artifact -> no marker.
+        assert_eq!(foreign_import_source(Some(&artifact), &full[..1]), None);
+        let split = vec![
+            candidate(ForeignCacheSource::Ollama, 10),
+            candidate(ForeignCacheSource::LmStudio, 20),
+        ];
+        assert_eq!(foreign_import_source(Some(&artifact), &split), None);
+        assert_eq!(foreign_import_source(None, &full), None);
     }
 
     #[test]
@@ -4743,10 +11256,6 @@ mod tests {
         assert_eq!(parse_open_files_soft_limit(""), None);
     }
 
-    // env::set_var / env::remove_var aren't safe to interleave across
-    // threads. Serialize the env-var tests through this lock.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
     /// Parse `argv` with clap and return the resulting `Cli`. Each
     /// test owns its argv slice so clap's `try_get_matches_from` does
     /// not consume the process's real `std::env::args`.
@@ -4768,33 +11277,27 @@ mod tests {
 
     #[test]
     fn log_filter_cli_wins_over_env() {
-        let _g = ENV_LOCK.lock().unwrap();
-        env::set_var("RUST_LOG", "trace");
+        let _env = EnvVarGuard::set(&[("RUST_LOG", Some("trace"))]);
         let got = resolve_log_filter(&globals_with_log(Some("debug"), None));
-        env::remove_var("RUST_LOG");
         assert_eq!(got, "debug");
     }
 
     #[test]
     fn log_filter_falls_through_to_rust_log() {
-        let _g = ENV_LOCK.lock().unwrap();
-        env::set_var("RUST_LOG", "sbproxy=trace");
+        let _env = EnvVarGuard::set(&[("RUST_LOG", Some("sbproxy=trace"))]);
         let got = resolve_log_filter(&globals_with_log(None, None));
-        env::remove_var("RUST_LOG");
         assert_eq!(got, "sbproxy=trace");
     }
 
     #[test]
     fn log_filter_default_info() {
-        let _g = ENV_LOCK.lock().unwrap();
-        env::remove_var("RUST_LOG");
+        let _env = EnvVarGuard::set(&[("RUST_LOG", None)]);
         assert_eq!(resolve_log_filter(&globals_with_log(None, None)), "info");
     }
 
     #[test]
     fn request_log_level_cli_appends_access_log_target() {
-        let _g = ENV_LOCK.lock().unwrap();
-        env::remove_var("RUST_LOG");
+        let _env = EnvVarGuard::set(&[("RUST_LOG", None)]);
         let got = resolve_log_filter(&globals_with_log(Some("warn"), Some("debug")));
         assert_eq!(got, "warn,access_log=debug");
     }
@@ -4805,8 +11308,7 @@ mod tests {
         // absent. Drive that path by populating `GlobalArgs` the way
         // clap would: with the env value already folded into the
         // `request_log_level` field.
-        let _g = ENV_LOCK.lock().unwrap();
-        env::remove_var("RUST_LOG");
+        let _env = EnvVarGuard::set(&[("RUST_LOG", None)]);
         let got = resolve_log_filter(&globals_with_log(None, Some("trace")));
         assert_eq!(got, "info,access_log=trace");
     }
@@ -4815,46 +11317,36 @@ mod tests {
 
     #[test]
     fn clap_cli_log_level_wins_over_sb_log_level() {
-        let _g = ENV_LOCK.lock().unwrap();
-        env::set_var("SB_LOG_LEVEL", "warn");
+        let _env = EnvVarGuard::set(&[("SB_LOG_LEVEL", Some("warn"))]);
         let cli = parse(&["sbproxy", "--log-level", "debug", "/tmp/sb.yml"]);
-        env::remove_var("SB_LOG_LEVEL");
         assert_eq!(cli.globals.log_level.as_deref(), Some("debug"));
     }
 
     #[test]
     fn clap_sb_log_level_env_fills_the_gap() {
-        let _g = ENV_LOCK.lock().unwrap();
-        env::set_var("SB_LOG_LEVEL", "warn");
+        let _env = EnvVarGuard::set(&[("SB_LOG_LEVEL", Some("warn"))]);
         let cli = parse(&["sbproxy", "/tmp/sb.yml"]);
-        env::remove_var("SB_LOG_LEVEL");
         assert_eq!(cli.globals.log_level.as_deref(), Some("warn"));
     }
 
     #[test]
     fn clap_shutdown_grace_cli_wins_over_env() {
-        let _g = ENV_LOCK.lock().unwrap();
-        env::set_var("SBPROXY_SHUTDOWN_GRACE_MS", "5000");
+        let _env = EnvVarGuard::set(&[("SBPROXY_SHUTDOWN_GRACE_MS", Some("5000"))]);
         let cli = parse(&["sbproxy", "--shutdown-grace-ms", "12000", "/tmp/sb.yml"]);
-        env::remove_var("SBPROXY_SHUTDOWN_GRACE_MS");
         assert_eq!(cli.globals.shutdown_grace_ms, Some(12_000));
     }
 
     #[test]
     fn clap_shutdown_grace_env_only() {
-        let _g = ENV_LOCK.lock().unwrap();
-        env::set_var("SBPROXY_SHUTDOWN_GRACE_MS", "45000");
+        let _env = EnvVarGuard::set(&[("SBPROXY_SHUTDOWN_GRACE_MS", Some("45000"))]);
         let cli = parse(&["sbproxy", "/tmp/sb.yml"]);
-        env::remove_var("SBPROXY_SHUTDOWN_GRACE_MS");
         assert_eq!(cli.globals.shutdown_grace_ms, Some(45_000));
     }
 
     #[test]
     fn clap_grace_time_cli_wins_over_env() {
-        let _g = ENV_LOCK.lock().unwrap();
-        env::set_var("SB_GRACE_TIME", "30");
+        let _env = EnvVarGuard::set(&[("SB_GRACE_TIME", Some("30"))]);
         let cli = parse(&["sbproxy", "--grace-time", "5", "/tmp/sb.yml"]);
-        env::remove_var("SB_GRACE_TIME");
         assert_eq!(cli.globals.grace_time, Some(5));
     }
 
@@ -4864,6 +11356,310 @@ mod tests {
     #[test]
     fn shutdown_grace_default_is_30_seconds() {
         assert_eq!(DEFAULT_SHUTDOWN_GRACE_MS, 30_000);
+    }
+
+    // --- apply talks to a running proxy ---
+
+    fn apply_args_pointing_at(url: &str) -> ApplyArgs {
+        ApplyArgs {
+            config: None,
+            plan_file: None,
+            admin_url: Some(url.to_string()),
+            username: None,
+            password: Some("test-password".to_string()),
+            validate_only: false,
+        }
+    }
+
+    /// The behaviour this whole change exists for. Apply used to compile
+    /// the config into its own process, swap that process's pipeline, and
+    /// print success without contacting anything. An unreachable proxy
+    /// must now be a distinct non-zero exit, not a local no-op wearing a
+    /// success message.
+    #[test]
+    fn apply_reports_an_unreachable_proxy_rather_than_succeeding_locally() {
+        // Bind and immediately drop, so the port is almost certainly
+        // closed but is a real address rather than a routing black hole.
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
+            probe.local_addr().expect("probe addr").port()
+        };
+        let args = apply_args_pointing_at(&format!("http://127.0.0.1:{port}"));
+
+        let code = apply_to_running_proxy(&args, "proxy:\n  http_bind_port: 0\n")
+            .expect("unreachable proxy is a reported exit code, not an Err");
+
+        assert_eq!(
+            code, 7,
+            "an unreachable admin API must exit 7 so a deploy script can tell \
+             the difference between applied and never delivered"
+        );
+    }
+
+    /// A trailing slash on the admin URL must not produce a double slash
+    /// in the request path.
+    #[test]
+    fn apply_admin_url_trailing_slash_is_normalised() {
+        let base = "http://127.0.0.1:9090/";
+        assert_eq!(
+            format!("{}/admin/config", base.trim_end_matches('/')),
+            "http://127.0.0.1:9090/admin/config"
+        );
+    }
+
+    /// The password must never reach a log line through Debug.
+    #[test]
+    fn apply_args_debug_redacts_the_password() {
+        let args = apply_args_pointing_at("http://127.0.0.1:9090");
+        let rendered = format!("{args:?}");
+        assert!(
+            !rendered.contains("test-password"),
+            "ApplyArgs Debug leaked the admin password: {rendered}"
+        );
+        assert!(
+            rendered.contains("<redacted>"),
+            "expected a redaction marker"
+        );
+    }
+
+    // --- config authority ---
+
+    /// Every config-authority command carries an admin password, so every one
+    /// of their args structs has to redact it. They flatten `ModelsAdminArgs`
+    /// rather than declaring the three flags again precisely so its
+    /// hand-written `Debug` covers them, and this is what keeps a future
+    /// command from declaring its own field and losing the redaction.
+    #[test]
+    fn config_authority_args_debug_redacts_the_password() {
+        let admin = ModelsAdminArgs {
+            admin_url: Some("http://127.0.0.1:9090".to_string()),
+            username: Some("admin".to_string()),
+            password: Some("test-password".to_string()),
+        };
+        let rendered = [
+            format!(
+                "{:?}",
+                AuthorityPublishArgs {
+                    config: Some(PathBuf::from("payload.yml")),
+                    mode: BundleModeArg::Overlay,
+                    validate_only: false,
+                    admin: admin.clone(),
+                    format: OutputFormat::Text,
+                }
+            ),
+            format!(
+                "{:?}",
+                AuthorityStatusArgs {
+                    admin: admin.clone(),
+                    format: OutputFormat::Text,
+                }
+            ),
+            format!(
+                "{:?}",
+                AuthorityRollbackArgs {
+                    admin: admin.clone(),
+                    format: OutputFormat::Text,
+                }
+            ),
+            format!(
+                "{:?}",
+                AuthoritySubscriberAddArgs {
+                    subscriber_id: "edge-01".to_string(),
+                    admin: admin.clone(),
+                    format: OutputFormat::Text,
+                }
+            ),
+            format!(
+                "{:?}",
+                AuthoritySubscriberListArgs {
+                    admin: admin.clone(),
+                    format: OutputFormat::Text,
+                }
+            ),
+            format!(
+                "{:?}",
+                AuthoritySubscriberRevokeArgs {
+                    credential_id: Some("0lJ8kQ2vTn5mAqRt".to_string()),
+                    subscriber_id: None,
+                    admin,
+                    format: OutputFormat::Text,
+                }
+            ),
+        ];
+        for rendered in rendered {
+            assert!(
+                !rendered.contains("test-password"),
+                "a config-authority args Debug leaked the admin password: {rendered}"
+            );
+            assert!(
+                rendered.contains("<redacted>"),
+                "expected a redaction marker: {rendered}"
+            );
+        }
+    }
+
+    /// The whole surface parses, including the two nested subcommand levels
+    /// and the flags that pick the wire behaviour.
+    #[test]
+    fn config_authority_cli_surface_parses() {
+        let cli = Cli::try_parse_from([
+            "sbproxy",
+            "config",
+            "authority",
+            "publish",
+            "-f",
+            "payload.yml",
+            "--mode",
+            "replace",
+            "--format",
+            "json",
+        ])
+        .expect("publish parses");
+        let Some(Cmd::Config(ConfigCmd {
+            sub:
+                ConfigSub::Authority(ConfigAuthorityCmd {
+                    sub: ConfigAuthoritySub::Publish(args),
+                }),
+        })) = cli.cmd
+        else {
+            panic!("config authority publish parsed to the wrong command");
+        };
+        assert_eq!(args.config, Some(PathBuf::from("payload.yml")));
+        assert_eq!(args.mode, BundleModeArg::Replace);
+        assert_eq!(args.mode.as_str(), "replace");
+
+        let cli = Cli::try_parse_from([
+            "sbproxy",
+            "config",
+            "authority",
+            "subscriber",
+            "add",
+            "edge-01",
+        ])
+        .expect("subscriber add parses");
+        let Some(Cmd::Config(ConfigCmd {
+            sub:
+                ConfigSub::Authority(ConfigAuthorityCmd {
+                    sub:
+                        ConfigAuthoritySub::Subscriber(AuthoritySubscriberCmd {
+                            sub: AuthoritySubscriberSub::Add(args),
+                        }),
+                }),
+        })) = cli.cmd
+        else {
+            panic!("subscriber add parsed to the wrong command");
+        };
+        assert_eq!(args.subscriber_id, "edge-01");
+
+        // The two selectors are mutually exclusive: revoking one credential
+        // and revoking every credential a node holds are different acts.
+        assert!(Cli::try_parse_from([
+            "sbproxy",
+            "config",
+            "authority",
+            "subscriber",
+            "revoke",
+            "--credential-id",
+            "one",
+            "--subscriber-id",
+            "edge-01",
+        ])
+        .is_err());
+    }
+
+    /// `config authority` and `config pull` report through `plan`'s exit
+    /// codes, where 2 is "changes present". Their CLI-error code therefore
+    /// has to be 1, or a diff would be indistinguishable from a broken
+    /// invocation.
+    #[test]
+    fn config_subcommands_that_print_a_diff_use_plans_error_code() {
+        let plan_style = [
+            vec!["sbproxy", "config", "pull", "sb.yml", "--dry-run"],
+            vec!["sbproxy", "config", "authority", "status"],
+        ];
+        for argv in plan_style {
+            let cli = Cli::try_parse_from(&argv).expect("parses");
+            let Some(Cmd::Config(cmd)) = cli.cmd else {
+                panic!("{argv:?} parsed to the wrong command");
+            };
+            assert!(cmd.uses_plan_exit_codes(), "{argv:?}");
+        }
+        let cli = Cli::try_parse_from(["sbproxy", "config", "print", "sb.yml"]).expect("parses");
+        let Some(Cmd::Config(cmd)) = cli.cmd else {
+            panic!("config print parsed to the wrong command");
+        };
+        assert!(
+            !cmd.uses_plan_exit_codes(),
+            "the older config subcommands keep the exit 2 they have always used for errors"
+        );
+    }
+
+    /// A generated key id names its own public half, so two keys never
+    /// collide in a verifying-key file during an additive rotation.
+    #[test]
+    fn derived_key_ids_are_readable_valid_and_key_specific() {
+        let first = derived_key_id("3p8Q0mB1yV4kX7wR2tL6nS9cF5jH0dA8gZ2eK4uY1oM=");
+        let second = derived_key_id("9kL2xP7bT4mV1nQ8wR5tY6sF3jH0dA8gZ2eK4uY1oM=");
+        assert_ne!(first, second);
+        assert!(first.starts_with("authority-"), "{first}");
+        // Only characters a bundle identifier accepts: the base64 alphabet's
+        // `+` and `/` would be refused by the signer.
+        assert!(
+            first
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-'),
+            "{first}"
+        );
+        assert_eq!(first.len(), "authority-".len() + 12);
+    }
+
+    /// A rotation adds a key rather than replacing the file, because the old
+    /// key has to keep verifying while subscribers are updated.
+    #[test]
+    fn merging_verifying_keys_keeps_the_entries_already_there() {
+        let path = temp_config(
+            "{\n  \"authority-old\": {\"algorithm\": \"ed25519\", \"key\": \"AAA=\"}\n}\n",
+        );
+        let merged = merge_verifying_keys(
+            &path,
+            "{\n  \"authority-new\": {\"algorithm\": \"ed25519\", \"key\": \"BBB=\"}\n}\n",
+        )
+        .expect("merge");
+        let merged: serde_json::Value = serde_json::from_str(&merged).expect("merged JSON");
+        assert_eq!(merged["authority-old"]["key"], "AAA=");
+        assert_eq!(merged["authority-new"]["key"], "BBB=");
+
+        // A file that is not a key map is a refusal, not something to
+        // overwrite: subscribers may be trusting whatever is in it.
+        let garbage = temp_config("not json at all\n");
+        assert!(merge_verifying_keys(&garbage, "{}").is_err());
+
+        // A missing file is the first-run case, not an error.
+        let absent = path.with_extension("absent");
+        assert!(merge_verifying_keys(&absent, "{}").is_ok());
+    }
+
+    /// A refused bundle has to be named in terms an operator can act on, so
+    /// every `CycleResult` gets a hint rather than a bare label.
+    #[test]
+    fn every_pull_refusal_has_a_hint() {
+        use sbproxy_core::config_subscriber::CycleResult;
+
+        for result in [
+            CycleResult::Applied,
+            CycleResult::NotModified,
+            CycleResult::Unreachable,
+            CycleResult::VerifyFailed,
+            CycleResult::CompileFailed,
+            CycleResult::DeniedPath,
+            CycleResult::ReloadBusy,
+        ] {
+            assert!(
+                !pull_refusal_hint(result).is_empty(),
+                "{} has no hint",
+                result.as_str()
+            );
+        }
     }
 
     // --- run-path resolution ---
@@ -5184,6 +11980,22 @@ mod tests {
     }
 
     #[test]
+    fn update_accepts_global_check_and_local_yes() {
+        // `--check` is the global flag; it is accepted after the `update`
+        // subcommand and selects the dry-run report. `--yes` / `-y` is
+        // local to `update`.
+        let cli = parse(&["sbproxy", "update", "--check", "-y", "--engines"]);
+        assert!(cli.check, "global --check is accepted after `update`");
+        match cli.cmd {
+            Some(Cmd::Update(args)) => {
+                assert!(args.yes);
+                assert!(args.engines);
+            }
+            other => panic!("expected Update, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parses_completions_subcommand() {
         let cli = parse(&["sbproxy", "completions", "zsh"]);
         match cli.cmd {
@@ -5242,17 +12054,14 @@ mod tests {
 
     #[test]
     fn log_format_env_fallback_works() {
-        let _g = ENV_LOCK.lock().unwrap();
-        env::set_var("SB_LOG_FORMAT", "json");
+        let _env = EnvVarGuard::set(&[("SB_LOG_FORMAT", Some("json"))]);
         let cli = Cli::try_parse_from(["sbproxy", "cfg.yml"]).expect("env fallback should parse");
         assert_eq!(cli.globals.log_format, Some(LogFormat::Json));
-        env::remove_var("SB_LOG_FORMAT");
     }
 
     #[test]
     fn log_format_unset_yields_compact_default() {
-        let _g = ENV_LOCK.lock().unwrap();
-        env::remove_var("SB_LOG_FORMAT");
+        let _env = EnvVarGuard::set(&[("SB_LOG_FORMAT", None)]);
         let cli = Cli::try_parse_from(["sbproxy", "cfg.yml"]).expect("parse should succeed");
         assert_eq!(cli.globals.log_format, None);
         // The defaulting happens at init_tracing's call site; verify the
@@ -5318,6 +12127,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn runtime_telemetry_config_rejects_unsupported_propagation_at_boot_validation() {
+        let raw = sbproxy_config::ObservabilityTelemetryConfig {
+            enabled: true,
+            propagation: Some("b3".to_string()),
+            ..sbproxy_config::ObservabilityTelemetryConfig::default()
+        };
+
+        let mapped = runtime_telemetry_config(&raw);
+        let error = mapped
+            .validate_propagation()
+            .expect_err("b3 propagation is not wired");
+        let message = error.to_string();
+        assert!(message.contains("b3"), "{message}");
+        assert!(message.contains("w3c"), "{message}");
+    }
+
     /// The version line is load-bearing: the marketing site `Hero.vue`
     /// and the Homebrew formula assert on the exact shape. This pins
     /// the format string so any drift is caught at test time.
@@ -5345,22 +12171,20 @@ mod tests {
 
     #[test]
     fn env_disable_sb_flags_accepts_truthy_values() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let env = EnvVarGuard::set(&[("SB_DISABLE_SB_FLAGS", None)]);
         for v in ["1", "true", "TRUE", "yes", "on", "YES", " On "] {
-            env::set_var("SB_DISABLE_SB_FLAGS", v);
+            env.update("SB_DISABLE_SB_FLAGS", v);
             assert!(env_disable_sb_flags(), "expected truthy for {v}");
         }
-        env::remove_var("SB_DISABLE_SB_FLAGS");
     }
 
     #[test]
     fn env_disable_sb_flags_rejects_other_values() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let env = EnvVarGuard::set(&[("SB_DISABLE_SB_FLAGS", None)]);
         for v in ["0", "false", "no", "off", ""] {
-            env::set_var("SB_DISABLE_SB_FLAGS", v);
+            env.update("SB_DISABLE_SB_FLAGS", v);
             assert!(!env_disable_sb_flags(), "expected falsy for '{v}'");
         }
-        env::remove_var("SB_DISABLE_SB_FLAGS");
     }
 
     // --- validate handler (regression coverage from the legacy parser tests) ---
@@ -5377,6 +12201,67 @@ mod tests {
         path
     }
 
+    #[test]
+    fn serve_locked_flag_parses_on_serve_and_bare_run_forms() {
+        let serve = Cli::try_parse_from(["sbproxy", "serve", "sb.yml", "--locked"]).unwrap();
+        assert!(serve.locked);
+        assert!(matches!(serve.cmd, Some(Cmd::Serve(_))));
+
+        let bare = Cli::try_parse_from(["sbproxy", "--locked", "sb.yml"]).unwrap();
+        assert!(bare.locked);
+        assert!(bare.cmd.is_none());
+        assert_eq!(bare.config_path, Some(PathBuf::from("sb.yml")));
+
+        // Without the flag, the run form parses exactly as before.
+        let unlocked = Cli::try_parse_from(["sbproxy", "serve", "sb.yml"]).unwrap();
+        assert!(!unlocked.locked);
+    }
+
+    #[test]
+    fn read_serve_lockfile_missing_file_is_a_distinct_error() {
+        let path = std::env::temp_dir().join(format!(
+            "sbproxy-locked-test-{}-missing/sbproxy-models.lock",
+            std::process::id()
+        ));
+        let error = read_serve_lockfile(&path).expect_err("a missing lockfile must not pass");
+        let message = error.to_string();
+        assert!(message.contains("no lockfile at"), "got: {message}");
+        assert!(
+            message.contains("run sbproxy models lock"),
+            "got: {message}"
+        );
+    }
+
+    #[test]
+    fn read_serve_lockfile_reads_back_a_written_lockfile() {
+        let marker = temp_config("");
+        let path = marker.with_extension("lock");
+        let lockfile = sbproxy_model_host::Lockfile::new(1, "cli-fixture".to_string(), Vec::new());
+        sbproxy_model_host::write_lockfile(&path, &lockfile).unwrap();
+        let read = read_serve_lockfile(&path).expect("written lockfile must read back");
+        assert_eq!(read, lockfile);
+        let _ = std::fs::remove_file(marker);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn enforce_locked_serve_refuses_when_no_lockfile_exists() {
+        // A config directory without sbproxy-models.lock refuses before
+        // touching the config, the cache, or any listener. The config
+        // lives in its own directory so a stray lockfile in the shared
+        // temp dir cannot turn the refusal into a pass.
+        let dir = std::env::temp_dir().join(format!("sbproxy-locked-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("sb.yml");
+        std::fs::write(&config, MINIMAL_VALID).unwrap();
+        let error = enforce_locked_serve(&config).expect_err("no lockfile must refuse to serve");
+        assert!(
+            error.to_string().contains("no lockfile at"),
+            "got: {error:#}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     const MINIMAL_VALID: &str = "proxy:\n  http_bind_port: 8080\norigins:\n  \"x.local\":\n    action:\n      type: proxy\n      url: https://test.sbproxy.dev\n";
 
     fn validate_args(path: &std::path::Path, json: bool) -> ValidateArgs {
@@ -5387,6 +12272,7 @@ mod tests {
             } else {
                 OutputFormat::Text
             },
+            no_fetch: false,
         }
     }
 
@@ -5416,6 +12302,32 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_unsupported_propagation_that_boot_rejects() {
+        let path = temp_config(
+            "proxy:\n  http_bind_port: 8080\n  observability:\n    telemetry:\n      propagation: b3\norigins:\n  \"x.local\":\n    action:\n      type: proxy\n      url: https://test.sbproxy.dev\n",
+        );
+        let err = handle_validate_subcommand(&validate_args(&path, false))
+            .expect_err("propagation: b3 must fail validate the same way it fails boot");
+        let message = format!("{err:#}");
+        assert!(message.contains("b3"), "{message}");
+        assert!(message.contains("w3c"), "{message}");
+        assert_eq!(
+            handle_validate_subcommand(&validate_args(&path, true)).unwrap(),
+            2
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn validate_rejects_export_metrics_without_enabled_that_boot_rejects() {
+        let path = temp_config(
+            "proxy:\n  http_bind_port: 8080\n  observability:\n    telemetry:\n      export_metrics: true\norigins:\n  \"x.local\":\n    action:\n      type: proxy\n      url: https://test.sbproxy.dev\n",
+        );
+        assert!(handle_validate_subcommand(&validate_args(&path, false)).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn validate_rejects_model_host_semantics_that_boot_rejects() {
         let path = temp_config(
             "proxy:\n  http_bind_port: 8080\n  model_host:\n    max_parallel_prepares: 0\norigins:\n  x.local:\n    action:\n      type: static\n      status_code: 200\n      content_type: text/plain\n      body: ok\n",
@@ -5429,22 +12341,98 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_multi_replica_single_node_deployments() {
+    fn validate_accepts_multi_replica_single_node_deployments() {
+        // A single node may run several replicas; the device budget is enforced
+        // at reconcile, so config validation accepts a multi-replica deployment
+        // with a pinned variant.
         let path = temp_config(
             "proxy:\n  http_bind_port: 8080\n  model_host:\n    deployments:\n      coder:\n        model: qwen2.5-0.5b-instruct\n        variant: q4_k_m\n        replicas: 2\norigins:\n  x.local:\n    action:\n      type: static\n      status_code: 200\n      content_type: text/plain\n      body: ok\n",
         );
-        assert!(handle_validate_subcommand(&validate_args(&path, false)).is_err());
+        assert_eq!(
+            handle_validate_subcommand(&validate_args(&path, false)).unwrap(),
+            0
+        );
         assert_eq!(
             handle_validate_subcommand(&validate_args(&path, true)).unwrap(),
-            2
+            0
         );
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
+    fn validate_gates_mesh_compression_on_cluster_replication() {
+        fn mesh_compression_config(replication_block: &str) -> String {
+            format!(
+                r#"proxy:
+  cluster:
+    cluster_id: compression-test
+    node_id: gateway-a
+    roles: [gateway]
+    seeds: ["127.0.0.1:17946"]
+    gossip_port: 17946
+    transport_port: 18946
+    advertise_addr: "127.0.0.1:17946"
+    transport_advertise_addr: "127.0.0.1:18946"
+    state_dir: ./state/compression-test
+{replication_block}    security:
+      mode: shared_key
+      development: true
+      shared_key: validation-only-secret
+origins:
+  ai.local:
+    action:
+      type: ai_proxy
+      providers:
+        - name: primary
+          api_key: test-key
+          models: [gpt-4o]
+        - name: summarizer
+          api_key: test-key
+          models: [gpt-4o-mini]
+      compression:
+        state: {{ backend: mesh, ttl: 1h }}
+        levers:
+          - type: summary_buffer
+            min_tokens: 100
+            retain_recent_messages: 2
+            target_summary_tokens: 20
+            summarizer:
+              provider: summarizer
+              model: gpt-4o-mini
+              timeout: 2s
+"#
+            )
+        }
+
+        // A cluster without a replication block cannot host mesh
+        // compression state; boot and validation fail loud.
+        let rejected = temp_config(&mesh_compression_config(""));
+        assert!(handle_validate_subcommand(&validate_args(&rejected, false)).is_err());
+        assert_eq!(
+            handle_validate_subcommand(&validate_args(&rejected, true)).unwrap(),
+            2
+        );
+        let _ = std::fs::remove_file(&rejected);
+
+        // With cluster replication configured, backend: mesh validates.
+        let accepted = temp_config(&mesh_compression_config(
+            "    replication:\n      factor: 2\n",
+        ));
+        assert_eq!(
+            handle_validate_subcommand(&validate_args(&accepted, false)).unwrap(),
+            0
+        );
+        assert_eq!(
+            handle_validate_subcommand(&validate_args(&accepted, true)).unwrap(),
+            0
+        );
+        let _ = std::fs::remove_file(&accepted);
+    }
+
+    #[test]
     fn validate_rejects_unsupported_legacy_managed_fields() {
         let path = temp_config(
-            "origins:\n  ai.local:\n    action:\n      type: ai_proxy\n      providers:\n        - name: local\n          serve:\n            models:\n              - model: qwen3-14b\n                speculative: {}\n",
+            "origins:\n  ai.local:\n    action:\n      type: ai_proxy\n      providers:\n        - name: local\n          serve:\n            models:\n              - model: qwen3-14b\n                engine: llama_cpp\n                speculative: {}\n",
         );
         assert!(handle_validate_subcommand(&validate_args(&path, false)).is_err());
         assert_eq!(
@@ -5459,6 +12447,7 @@ mod tests {
         let args = ValidateArgs {
             config_path: None,
             format: OutputFormat::Json,
+            no_fetch: false,
         };
         assert!(handle_validate_subcommand(&args).is_err());
     }
@@ -5502,6 +12491,7 @@ mod tests {
         let path = temp_config(MINIMAL_VALID);
         let args = PlanArgs {
             config: Some(path.clone()),
+            no_fetch: false,
             against: None,
             format: OutputFormat::Text,
             out: None,
@@ -5510,6 +12500,7 @@ mod tests {
         // Plan against itself: no changes -> exit 0.
         let args = PlanArgs {
             config: Some(path.clone()),
+            no_fetch: false,
             against: Some(path.clone()),
             format: OutputFormat::Text,
             out: None,
@@ -5522,10 +12513,203 @@ mod tests {
     fn handle_plan_missing_config_is_usage_error() {
         let args = PlanArgs {
             config: None,
+            no_fetch: false,
             against: None,
             format: OutputFormat::Text,
             out: None,
         };
         assert!(handle_plan_subcommand(&args).is_err());
+    }
+
+    // --- admin hash-password handler ---
+
+    #[test]
+    fn hash_password_with_no_config_uses_the_default_pepper() {
+        let args = HashPasswordArgs {
+            password: Some("hunter2".to_string()),
+            password_stdin: false,
+        };
+        let mut out = Vec::new();
+        let code = handle_admin_hash_password_to(&args, None, &mut out).unwrap();
+        assert_eq!(code, 0);
+        let printed = String::from_utf8(out).unwrap().trim().to_string();
+        let expected = sbproxy_core::key_plane::hash_admin_operator_password(
+            "hunter2",
+            &sbproxy_core::key_plane::default_admin_operator_pepper(),
+        );
+        assert_eq!(printed, expected);
+    }
+
+    #[test]
+    fn hash_password_prefers_a_pinned_key_management_pepper() {
+        let path = temp_config(
+            "proxy:\n  http_bind_port: 8080\n  key_management:\n    crypto:\n      pepper: pinned-pepper\norigins:\n  \"x.local\":\n    action:\n      type: proxy\n      url: https://test.sbproxy.dev\n",
+        );
+        let args = HashPasswordArgs {
+            password: Some("hunter2".to_string()),
+            password_stdin: false,
+        };
+        let mut out = Vec::new();
+        let code = handle_admin_hash_password_to(&args, Some(&path), &mut out).unwrap();
+        assert_eq!(code, 0);
+        let printed = String::from_utf8(out).unwrap().trim().to_string();
+        let expected =
+            sbproxy_core::key_plane::hash_admin_operator_password("hunter2", b"pinned-pepper");
+        assert_eq!(printed, expected);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn hash_password_requires_exactly_one_input_source() {
+        let neither = HashPasswordArgs {
+            password: None,
+            password_stdin: false,
+        };
+        assert!(handle_admin_hash_password_to(&neither, None, &mut Vec::new()).is_err());
+
+        let both = HashPasswordArgs {
+            password: Some("x".to_string()),
+            password_stdin: true,
+        };
+        assert!(handle_admin_hash_password_to(&both, None, &mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn prompt_optimize_cli_parses_nested_contract() {
+        let cli = Cli::try_parse_from([
+            "sbproxy",
+            "ai",
+            "prompt",
+            "optimize",
+            "--prompt",
+            "system.txt",
+            "--eval-set",
+            "eval.jsonl",
+            "--endpoint",
+            "http://127.0.0.1:8080/v1",
+            "--host-header",
+            "ai.local",
+            "--task-model",
+            "task",
+            "--name",
+            "answer",
+            "--prompt-version",
+            "2",
+            "--output",
+            "artifact.json",
+        ])
+        .expect("prompt optimizer CLI parses");
+        let Some(Cmd::Ai(AiCmd {
+            sub: AiSub::Prompt(prompt),
+        })) = cli.cmd
+        else {
+            panic!("expected ai prompt optimize");
+        };
+        let PromptCmd {
+            sub: PromptSub::Optimize(args),
+        } = *prompt;
+        assert_eq!(args.metric, PromptEvalMetricArg::ExactMatch);
+        assert_eq!(args.max_candidates, 8);
+        assert_eq!(args.max_requests, 256);
+        assert_eq!(args.timeout_secs, 60);
+        assert_eq!(args.host_header.as_deref(), Some("ai.local"));
+        assert_eq!(args.prompt_version, "2");
+    }
+
+    #[test]
+    fn prompt_optimize_handler_writes_admin_ready_static_artifact() {
+        use std::io::{Read as _, Write as _};
+
+        fn read_request(stream: &mut std::net::TcpStream) {
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let mut scratch = [0u8; 4096];
+            let header_end = loop {
+                let read = stream.read(&mut scratch).unwrap();
+                assert!(read > 0);
+                bytes.extend_from_slice(&scratch[..read]);
+                if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let headers = std::str::from_utf8(&bytes[..header_end]).unwrap();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(str::trim)
+                        .map(str::to_string)
+                })
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            while bytes.len() < header_end + content_length {
+                let read = stream.read(&mut scratch).unwrap();
+                assert!(read > 0);
+                bytes.extend_from_slice(&scratch[..read]);
+            }
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for content in ["alpha", r#"["Return only the requested word."]"#, "alpha"] {
+                let (mut stream, _) = listener.accept().unwrap();
+                read_request(&mut stream);
+                let body = serde_json::json!({
+                    "choices": [{"message": {"content": content}}]
+                })
+                .to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+
+        let prompt = temp_config(
+            "You are a careful assistant. Return exactly the requested word and no other text.",
+        );
+        let eval_set = temp_config(r#"{"id":"one","input":"Say alpha","expected":"alpha"}"#);
+        let output = temp_config("{}");
+        let args = PromptOptimizeArgs {
+            prompt: prompt.clone(),
+            eval_set: eval_set.clone(),
+            endpoint: format!("http://{address}/v1"),
+            host_header: None,
+            api_key_env: None,
+            task_model: "task-model".to_string(),
+            optimizer_model: None,
+            metric: PromptEvalMetricArg::ExactMatch,
+            noise_tolerance: 0.0,
+            max_candidates: 1,
+            max_requests: 3,
+            timeout_secs: 5,
+            name: "concise-answer".to_string(),
+            prompt_version: "2".to_string(),
+            output: output.clone(),
+        };
+
+        assert_eq!(handle_prompt_optimize(&args).unwrap(), 0);
+        server.join().unwrap();
+        let artifact: sbproxy_ai::prompt_optimizer::OptimizedPromptArtifact =
+            serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+        assert_eq!(artifact.name, "concise-answer");
+        assert_eq!(artifact.prompt_version.version, "2");
+        assert_eq!(
+            artifact.prompt_version.template,
+            "Return only the requested word."
+        );
+        assert!(artifact.prompt_version.variables.is_empty());
+        assert!(artifact.optimized_tokens < artifact.original_tokens);
+
+        for path in [prompt, eval_set, output] {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }

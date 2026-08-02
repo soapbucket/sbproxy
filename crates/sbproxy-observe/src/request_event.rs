@@ -62,12 +62,25 @@ pub struct RequestEvent {
 
     /// Set when this request is a retry, replay, or sub-call inside an
     /// agent pattern. The portal reconstructs trees client-side.
+    ///
+    /// Reserved contract field: the OSS proxy never sets it today
+    /// because no agent-pattern source exists on the request context.
+    /// Session linkage (`session_id` / `parent_session_id`) is the
+    /// live hierarchy mechanism.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub parent_request_id: Option<Ulid>,
 
     /// Tenant key. Required in multi-tenant deployments; defaults to
     /// `"default"` in OSS single-tenant deployments.
     pub workspace_id: String,
+
+    /// Origin-scoped tenant label from the proxy config
+    /// (`__default__` when the origin declares none). Distinct from
+    /// `workspace_id`, which is the capture-envelope workspace: the
+    /// access log carries both, and this event now matches it so the
+    /// collector can partition by either dimension.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tenant_id: Option<String>,
 
     /// Origin hostname (matches `crate::events::ProxyEvent::hostname`).
     pub hostname: String,
@@ -114,6 +127,14 @@ pub struct RequestEvent {
     /// un-credentialed traffic.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub api_key_id: Option<String>,
+
+    /// Recognized native provider label. Never contains credential material.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub key_provider: Option<String>,
+
+    /// Inbound credential mode (`none`, `minted`, or `native`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub key_mode: Option<String>,
 
     /// Custom properties. Lowercased keys, allowlist-checked,
     /// length-capped, redaction-applied. Empty map serializes as absent.
@@ -193,6 +214,7 @@ impl RequestEvent {
             request_id,
             parent_request_id: None,
             workspace_id,
+            tenant_id: None,
             hostname,
             timestamp_ms: now_millis(),
             latency_ms: None,
@@ -202,6 +224,8 @@ impl RequestEvent {
             user_id: None,
             user_id_source: None,
             api_key_id: None,
+            key_provider: None,
+            key_mode: None,
             properties: BTreeMap::new(),
             provider: None,
             model: None,
@@ -240,6 +264,7 @@ mod tests {
             request_id: Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
             parent_request_id: Some(Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAW").unwrap()),
             workspace_id: "ws_test".to_string(),
+            tenant_id: Some("tenant-test".to_string()),
             hostname: "api.example.com".to_string(),
             timestamp_ms: 1_700_000_000_000,
             latency_ms: Some(120),
@@ -249,6 +274,8 @@ mod tests {
             user_id: Some("user_42".to_string()),
             user_id_source: Some(UserIdSource::Header),
             api_key_id: Some("sk_deadbeef0001".to_string()),
+            key_provider: Some("openai".to_string()),
+            key_mode: Some("native".to_string()),
             properties: props,
             provider: Some("openai".to_string()),
             model: Some("gpt-4o".to_string()),
@@ -294,6 +321,8 @@ mod tests {
         assert_eq!(decoded.session_id, original.session_id);
         assert_eq!(decoded.user_id, original.user_id);
         assert_eq!(decoded.user_id_source, original.user_id_source);
+        assert_eq!(decoded.key_provider, original.key_provider);
+        assert_eq!(decoded.key_mode, original.key_mode);
         assert_eq!(decoded.properties, original.properties);
         assert_eq!(decoded.cost_usd_micros, original.cost_usd_micros);
         assert_eq!(decoded.tokens_cached, original.tokens_cached);

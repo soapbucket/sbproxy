@@ -107,7 +107,7 @@ defineProps<{
   grid-template-columns: minmax(0, 1.25fr) minmax(320px, 0.75fr);
   gap: var(--sb-space-6);
   margin: var(--sb-space-5) 0;
-  border-left: 4px solid var(--sb-navy);
+  border-left: 4px solid var(--sb-ink);
 }
 
 .ownership-copy,

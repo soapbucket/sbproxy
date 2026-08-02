@@ -4,18 +4,56 @@
 //! Model-host status admin API (WOR-1665).
 //!
 //! `GET /admin/model-host/status` reports what the local model host is
-//! running right now: resident models with their engine state, bound
-//! port, VRAM estimate, and configured `keep_alive`, plus the residency
-//! budget and per-device VRAM. Read-only; it sits behind the admin
-//! server's shared auth gate like every other `/admin/*` route.
+//! running right now: resident models with their engine state, served
+//! engine version (WOR-1906), bound port, VRAM estimate, and configured
+//! `keep_alive`, plus the residency budget and per-device VRAM.
+//! Read-only; it sits behind the admin server's shared auth gate like
+//! every other `/admin/*` route.
 //!
-//! This is the "what is running now" half of WOR-1665. The
-//! "value-delivered / dollars-saved" half needs a per-completion lane +
-//! savings recorder on the request path (none exists yet), so it is a
-//! separate slice.
+//! `GET /admin/model-host/value` reports per-model local and cloud completion
+//! counts, the micro-USD each local completion saved versus its configured
+//! cloud reference price, and per-lever target token estimates and gross input cost
+//! avoided by successful context compression. It reads the request-path value
+//! recorder's ledger (`sbproxy_ai::value_ledger`); before any eligible value is
+//! recorded the report is empty. Read-only, same auth gate.
+//!
+//! `GET /admin/model-host/files` reports the verified artifact cache
+//! (WOR-1910): the cache root, exact total bytes, and per-artifact
+//! durable ready metadata including whether the artifact currently backs
+//! a ready deployment replica. Read-only, same auth gate.
+//!
+//! `DELETE /admin/model-host/artifacts/{digest}` removes one exact
+//! verified artifact (WOR-1910) through the same protected
+//! `ArtifactManager::remove` path `sbproxy models remove` uses, so
+//! configured, resident, pinned, leased, and locked artifacts fail
+//! closed with a 409 and a stable reason. `POST /admin/model-host/gc`
+//! runs the same protected LRU collection as the post-pull sweep down to
+//! the configured cache budget and returns the collection report; with
+//! no budget configured it answers 409, because there is no target to
+//! collect toward. Both mutate the cache and sit behind the shared
+//! admin auth gate.
+//!
+//! `GET /admin/model-host/jobs` lists durable operation jobs (queued,
+//! in-flight, and retained terminal history) from the same `FileJobStore`
+//! the artifact cache writes pull/verify operations into.
+//! `GET /admin/model-host/jobs/{id}` reads one job by ID. Both answer an
+//! honest empty list / 404 when no production model host is configured
+//! yet, mirroring `files`. `GET /admin/model-host/jobs/{id}/stream`
+//! (handled in `admin::handle_admin_connection`, not here, because it
+//! must own the socket) tails one job's durable state as
+//! `text/event-stream`, with `Last-Event-ID` replay across a reconnect.
+//!
+//! `POST /admin/model-host/load` and `POST /admin/model-host/evict`
+//! (aliased at `/stop` and `/drain`) enqueue a durable job for the
+//! requested deployment and answer `202` with a `job_id` and `poll_url`
+//! immediately, rather than blocking the admin request on the engine
+//! work; the job settles to `ready` or `failed` in the background. When
+//! no production model host is configured (no durable job store is open)
+//! they fall back to blocking on the lifecycle call directly and
+//! answering its outcome, exactly as before.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +73,10 @@ trait ModelManagementRuntime {
 
     fn management_snapshot(&self) -> Result<ModelManagementSnapshot, AdminDeploymentRevisionError>;
 
+    /// Serving devices on this node, the ceiling on a deployment's
+    /// `replicas * tensor_parallel`.
+    fn serving_device_count(&self) -> usize;
+
     fn apply_admin_deployment_revision(
         &self,
         expected_revision: Option<u64>,
@@ -45,6 +87,10 @@ trait ModelManagementRuntime {
 impl ModelManagementRuntime for ProductionModelRuntime {
     fn active_catalog(&self) -> Arc<sbproxy_model_host::Catalog> {
         ProductionModelRuntime::active_catalog(self)
+    }
+
+    fn serving_device_count(&self) -> usize {
+        self.active_manager().serving_device_count()
     }
 
     fn management_snapshot(&self) -> Result<ModelManagementSnapshot, AdminDeploymentRevisionError> {
@@ -160,6 +206,8 @@ struct StrictModelDeployment {
     heterogeneous_variants: bool,
     #[serde(default = "one_replica")]
     replicas: u32,
+    #[serde(default)]
+    tensor_parallel: Option<u32>,
     #[serde(default, deserialize_with = "deserialize_unique_btree_map")]
     required_labels: BTreeMap<String, String>,
     #[serde(default)]
@@ -168,6 +216,10 @@ struct StrictModelDeployment {
     pull: sbproxy_model_host::PullPolicy,
     #[serde(default)]
     warm: bool,
+    // Deliberately no default: admin-managed deployments must state
+    // cold_start explicitly (docs/ai-gateway.md, docs/configuration.md),
+    // because the safe omission behavior depends on the security profile
+    // and only the file_managed authority resolves that profile.
     cold_start: sbproxy_model_host::ColdStartPolicy,
     #[serde(default)]
     keep_alive_secs: Option<u64>,
@@ -190,6 +242,7 @@ impl From<StrictModelDeployment> for sbproxy_model_host::ModelDeployment {
             variant: deployment.variant,
             heterogeneous_variants: deployment.heterogeneous_variants,
             replicas: deployment.replicas,
+            tensor_parallel: deployment.tensor_parallel,
             required_labels: deployment.required_labels,
             spread_by: deployment.spread_by,
             pull: deployment.pull,
@@ -201,6 +254,16 @@ impl From<StrictModelDeployment> for sbproxy_model_host::ModelDeployment {
             queue_timeout_ms: deployment.queue_timeout_ms,
             engine: deployment.engine,
             rollout: deployment.rollout,
+            // The admin API does not expose engine tuning; it is set through the
+            // config-file managed deployments or the legacy serve block.
+            extra_args: Vec::new(),
+            chunked_prefill: None,
+            tool_call_parser: None,
+            swap_space_gib: None,
+            cpu_offload_gib: None,
+            engine_version: None,
+            engine_image: None,
+            engine_sha256: None,
         }
     }
 }
@@ -421,7 +484,8 @@ fn deployments_put_response(runtime: &impl ModelManagementRuntime, body: Option<
     if let Err(error) = draft.validate() {
         return error_response(400, "invalid_desired", error.to_string());
     }
-    if let Err(error) = validate_local_admin_deployments(&draft.deployments) {
+    let serving_device_count = runtime.serving_device_count();
+    if let Err(error) = validate_local_admin_deployments(&draft.deployments, serving_device_count) {
         return error_response(400, "invalid_desired", error);
     }
     for (deployment_id, deployment) in &draft.deployments {
@@ -502,14 +566,23 @@ fn deployments_put_response(runtime: &impl ModelManagementRuntime, body: Option<
 
 fn validate_local_admin_deployments(
     deployments: &BTreeMap<String, sbproxy_model_host::ModelDeployment>,
+    serving_device_count: usize,
 ) -> Result<(), String> {
     if deployments.len() > 1_024 {
         return Err("admin deployment state may contain at most 1024 deployments".to_string());
     }
     for (id, deployment) in deployments {
-        if deployment.replicas != 1 {
+        if deployment.replicas == 0 {
+            return Err(format!("deployment {id:?} must use at least one replica"));
+        }
+        // Each replica claims its own device set, so replicas times the
+        // tensor-parallel degree cannot exceed the node's serving devices.
+        let degree = deployment.tensor_parallel.unwrap_or(1).max(1) as usize;
+        let needed = deployment.replicas as usize * degree;
+        if serving_device_count > 0 && needed > serving_device_count {
             return Err(format!(
-                "deployment {id:?} must use exactly one replica in local admin mode"
+                "deployment {id:?} requests {} replicas at tensor_parallel {degree}, needing {needed} devices, but the node serves {serving_device_count}",
+                deployment.replicas
             ));
         }
         if deployment.heterogeneous_variants
@@ -679,6 +752,45 @@ pub fn dispatch(method: &str, path: &str, body: Option<&str>) -> Option<Resp> {
         let runtime = crate::server::model_host::model_runtime_manager();
         return dispatch_with_runtime(runtime.as_ref(), method, path_only, body);
     }
+    // WOR-1910: exact protected artifact removal, mirroring the
+    // `sbproxy models remove` path.
+    if let Some(digest) = path_only.strip_prefix("/admin/model-host/artifacts/") {
+        if !method.eq_ignore_ascii_case("DELETE") {
+            return Some((
+                405,
+                JSON,
+                r#"{"error":"method not allowed; use DELETE"}"#.to_string(),
+            ));
+        }
+        return Some(remove_artifact_response(digest));
+    }
+    // Durable operation job list/detail. `/{id}/stream` is intercepted
+    // earlier, in `admin::handle_admin_connection`, because it must own
+    // the socket to stream `text/event-stream`; it never reaches here.
+    if let Some(rest) = path_only.strip_prefix("/admin/model-host/jobs") {
+        if rest.is_empty() {
+            if !method.eq_ignore_ascii_case("GET") {
+                return Some((
+                    405,
+                    JSON,
+                    r#"{"error":"method not allowed; use GET"}"#.to_string(),
+                ));
+            }
+            return Some(jobs_list_response());
+        }
+        if let Some(job_id) = rest.strip_prefix('/') {
+            if !job_id.is_empty() && !job_id.contains('/') {
+                if !method.eq_ignore_ascii_case("GET") {
+                    return Some((
+                        405,
+                        JSON,
+                        r#"{"error":"method not allowed; use GET"}"#.to_string(),
+                    ));
+                }
+                return Some(job_detail_response(job_id));
+            }
+        }
+    }
     match path_only {
         "/admin/model-host/status" => {
             if !method.eq_ignore_ascii_case("GET") {
@@ -689,6 +801,42 @@ pub fn dispatch(method: &str, path: &str, body: Option<&str>) -> Option<Resp> {
                 ));
             }
             Some(status_response())
+        }
+        // WOR-1913: value-delivered / dollars-saved report for locally
+        // served completions priced against their configured cloud
+        // reference.
+        "/admin/model-host/value" => {
+            if !method.eq_ignore_ascii_case("GET") {
+                return Some((
+                    405,
+                    JSON,
+                    r#"{"error":"method not allowed; use GET"}"#.to_string(),
+                ));
+            }
+            Some(value_response())
+        }
+        // WOR-1910: verified artifact cache inventory and disk usage.
+        "/admin/model-host/files" => {
+            if !method.eq_ignore_ascii_case("GET") {
+                return Some((
+                    405,
+                    JSON,
+                    r#"{"error":"method not allowed; use GET"}"#.to_string(),
+                ));
+            }
+            Some(files_response())
+        }
+        // WOR-1910: on-demand protected LRU collection down to the
+        // configured cache budget.
+        "/admin/model-host/gc" => {
+            if !method.eq_ignore_ascii_case("POST") {
+                return Some((
+                    405,
+                    JSON,
+                    r#"{"error":"method not allowed; use POST"}"#.to_string(),
+                ));
+            }
+            Some(gc_response())
         }
         // WOR-1765: load (spawn/ready) and evict (unload to free VRAM) a
         // model on demand. keep_alive stays config-driven.
@@ -762,58 +910,185 @@ fn model_from_body(body: Option<&str>) -> Result<String, Resp> {
 }
 
 fn load_response(body: Option<&str>) -> Resp {
-    let runtime = crate::server::model_host::model_runtime_manager();
+    load_response_with(crate::server::model_host::model_runtime_manager(), body)
+}
+
+fn load_response_with(runtime: Arc<ProductionModelRuntime>, body: Option<&str>) -> Resp {
     let model = match model_from_body(body) {
         Ok(m) => m,
         Err(resp) => return resp,
     };
-    // Blocking-pool thread (spawn_blocking dispatcher); block on the async
-    // load, matching status_response.
-    let result = tokio::runtime::Handle::current().block_on(async {
-        let running = runtime.ensure_ready(&model).await?;
-        let status = runtime.status(&model).await;
-        Ok::<_, sbproxy_model_host::RuntimeManagerError>((running, status))
-    });
-    match result {
-        Ok((running, status)) => (
-            200,
-            JSON,
-            serde_json::json!({
-                "deployment": model,
-                "state": "ready",
-                "port": running.port,
-                "job_id": status.and_then(|status| status.job_id),
-            })
-            .to_string(),
-        ),
-        Err(error) => runtime_error_response("load", error),
-    }
+    let Some(store) = runtime.job_store() else {
+        // No production model host is configured, so no durable job store
+        // is open; fall back to the pre-existing contract and block on the
+        // load directly. Blocking-pool thread (spawn_blocking dispatcher);
+        // block on the async load, matching status_response.
+        let result = tokio::runtime::Handle::current().block_on(async {
+            let running = runtime.ensure_ready(&model).await?;
+            let status = runtime.status(&model).await;
+            Ok::<_, sbproxy_model_host::RuntimeManagerError>((running, status))
+        });
+        return match result {
+            Ok((running, status)) => (
+                200,
+                JSON,
+                serde_json::json!({
+                    "deployment": model,
+                    "state": "ready",
+                    "port": running.port,
+                    "job_id": status.and_then(|status| status.job_id),
+                })
+                .to_string(),
+            ),
+            Err(error) => runtime_error_response("load", error),
+        };
+    };
+    enqueue_lifecycle_job(
+        runtime,
+        store,
+        sbproxy_model_host::OperationKind::Load,
+        model,
+    )
 }
 
 fn evict_response(body: Option<&str>) -> Resp {
-    let runtime = crate::server::model_host::model_runtime_manager();
+    evict_response_with(crate::server::model_host::model_runtime_manager(), body)
+}
+
+fn evict_response_with(runtime: Arc<ProductionModelRuntime>, body: Option<&str>) -> Resp {
     let model = match model_from_body(body) {
         Ok(m) => m,
         Err(resp) => return resp,
     };
-    let result = tokio::runtime::Handle::current().block_on(async {
-        let report = runtime.drain(&model).await?;
-        let status = runtime.status(&model).await;
-        Ok::<_, sbproxy_model_host::RuntimeManagerError>((report, status))
-    });
-    match result {
-        Ok((report, status)) => (
-            200,
-            JSON,
-            serde_json::json!({
-                "deployment": model,
-                "state": "stopped",
-                "drain": report,
-                "job_id": status.and_then(|status| status.job_id),
-            })
-            .to_string(),
+    let Some(store) = runtime.job_store() else {
+        // No production model host is configured; fall back to the
+        // pre-existing contract and block on the drain directly.
+        let result = tokio::runtime::Handle::current().block_on(async {
+            let report = runtime.drain(&model).await?;
+            let status = runtime.status(&model).await;
+            Ok::<_, sbproxy_model_host::RuntimeManagerError>((report, status))
+        });
+        return match result {
+            Ok((report, status)) => (
+                200,
+                JSON,
+                serde_json::json!({
+                    "deployment": model,
+                    "state": "stopped",
+                    "drain": report,
+                    "job_id": status.and_then(|status| status.job_id),
+                })
+                .to_string(),
+            ),
+            Err(error) => runtime_error_response("stop", error),
+        };
+    };
+    enqueue_lifecycle_job(
+        runtime,
+        store,
+        sbproxy_model_host::OperationKind::Drain,
+        model,
+    )
+}
+
+#[derive(Debug, Serialize)]
+struct LifecycleJobResponse {
+    schema_version: u32,
+    deployment: String,
+    state: &'static str,
+    job_id: String,
+    poll_url: String,
+}
+
+/// Enqueue a durable operation job for a load/evict lifecycle route and
+/// answer `202` immediately with a poll link, rather than blocking the
+/// admin request on the underlying engine work. The actual `ensure_ready`
+/// / `drain` call runs on the same Tokio runtime in the background and
+/// settles the job to `ready` or `failed`.
+fn enqueue_lifecycle_job(
+    runtime: Arc<ProductionModelRuntime>,
+    store: sbproxy_model_host::FileJobStore,
+    kind: sbproxy_model_host::OperationKind,
+    deployment: String,
+) -> Resp {
+    let job = match store.create(kind, deployment.clone()) {
+        Ok(job) => job,
+        Err(error) => {
+            tracing::error!(%error, "create lifecycle operation job");
+            return (
+                502,
+                JSON,
+                r#"{"error":"operation job store unavailable; inspect server logs"}"#.to_string(),
+            );
+        }
+    };
+    job_event_log().publish(&job);
+    let job_id = job.id.clone();
+    tokio::runtime::Handle::current().spawn(run_lifecycle_job(
+        runtime,
+        store,
+        kind,
+        deployment.clone(),
+        job_id.clone(),
+    ));
+    json_response(
+        202,
+        &LifecycleJobResponse {
+            schema_version: MANAGEMENT_SCHEMA_VERSION,
+            deployment,
+            state: "queued",
+            poll_url: format!("/admin/model-host/jobs/{job_id}"),
+            job_id,
+        },
+    )
+}
+
+/// Background half of [`enqueue_lifecycle_job`]: run the actual lifecycle
+/// call and settle the durable job to its terminal state. The redacted
+/// `reason_code` (never the raw error, which can carry a private path) is
+/// what a failed job's `error` field carries.
+async fn run_lifecycle_job(
+    runtime: Arc<ProductionModelRuntime>,
+    store: sbproxy_model_host::FileJobStore,
+    kind: sbproxy_model_host::OperationKind,
+    deployment: String,
+    job_id: String,
+) {
+    let operation = match kind {
+        sbproxy_model_host::OperationKind::Drain => "stop",
+        _ => "load",
+    };
+    let outcome = match kind {
+        sbproxy_model_host::OperationKind::Drain => {
+            runtime.drain(&deployment).await.map(|_report| ())
+        }
+        _ => runtime.ensure_ready(&deployment).await.map(|_running| ()),
+    };
+    let transition = match outcome {
+        Ok(()) => store.transition(
+            &job_id,
+            sbproxy_model_host::OperationState::Ready,
+            sbproxy_model_host::OperationProgress::default(),
+            None,
         ),
-        Err(error) => runtime_error_response("stop", error),
+        Err(error) => {
+            let message = format!(
+                "{operation} failed ({}); inspect server logs",
+                error.reason_code()
+            );
+            store.transition(
+                &job_id,
+                sbproxy_model_host::OperationState::Failed,
+                sbproxy_model_host::OperationProgress::default(),
+                Some(message.as_str()),
+            )
+        }
+    };
+    match transition {
+        Ok(job) => {
+            job_event_log().publish(&job);
+        }
+        Err(error) => tracing::error!(%error, job_id, "settle lifecycle operation job"),
     }
 }
 
@@ -838,6 +1113,209 @@ fn reset_response(body: Option<&str>) -> Resp {
         ),
         Err(error) => runtime_error_response("reset", error),
     }
+}
+
+#[derive(Debug, Serialize)]
+struct JobsListResponse {
+    schema_version: u32,
+    jobs: Vec<sbproxy_model_host::OperationJob>,
+}
+
+#[derive(Debug, Serialize)]
+struct JobDetailResponse {
+    schema_version: u32,
+    job: sbproxy_model_host::OperationJob,
+}
+
+fn unknown_job_response(job_id: &str) -> Resp {
+    json_response(
+        404,
+        &serde_json::json!({
+            "error": "operation job was not found",
+            "job_id": job_id,
+        }),
+    )
+}
+
+/// Build `GET /admin/model-host/jobs`: every active job plus retained
+/// terminal history from the durable `FileJobStore`. With no production
+/// model host configured (no durable job store open) this answers an
+/// honest empty list, mirroring `files_response`.
+fn jobs_list_response() -> Resp {
+    jobs_list_response_with(crate::server::model_host::model_runtime_manager())
+}
+
+fn jobs_list_response_with(runtime: Arc<ProductionModelRuntime>) -> Resp {
+    let Some(store) = runtime.job_store() else {
+        return json_response(
+            200,
+            &JobsListResponse {
+                schema_version: MANAGEMENT_SCHEMA_VERSION,
+                jobs: Vec::new(),
+            },
+        );
+    };
+    match store.list() {
+        Ok(jobs) => json_response(
+            200,
+            &JobsListResponse {
+                schema_version: MANAGEMENT_SCHEMA_VERSION,
+                jobs,
+            },
+        ),
+        Err(error) => {
+            tracing::error!(%error, "list operation jobs");
+            (
+                502,
+                JSON,
+                r#"{"error":"operation job list unavailable; inspect server logs"}"#.to_string(),
+            )
+        }
+    }
+}
+
+/// Build `GET /admin/model-host/jobs/{id}`: one job by ID. A malformed ID
+/// (not a ULID) is a `400`, matching how the artifact-digest route rejects
+/// a malformed digest; a well-formed but absent ID is a `404`.
+fn job_detail_response(job_id: &str) -> Resp {
+    job_detail_response_with(crate::server::model_host::model_runtime_manager(), job_id)
+}
+
+fn job_detail_response_with(runtime: Arc<ProductionModelRuntime>, job_id: &str) -> Resp {
+    // Job IDs are a path segment used to address job files, so format is
+    // rejected up front, the same as `is_artifact_digest`.
+    if job_id.parse::<ulid::Ulid>().is_err() {
+        return json_response(
+            400,
+            &serde_json::json!({
+                "error": "operation job ID must be a ULID",
+                "job_id": job_id,
+            }),
+        );
+    }
+    let Some(store) = runtime.job_store() else {
+        return unknown_job_response(job_id);
+    };
+    match store.get(job_id) {
+        Ok(Some(job)) => json_response(
+            200,
+            &JobDetailResponse {
+                schema_version: MANAGEMENT_SCHEMA_VERSION,
+                job,
+            },
+        ),
+        Ok(None) => unknown_job_response(job_id),
+        Err(error) => {
+            tracing::error!(%error, "read operation job");
+            (
+                502,
+                JSON,
+                r#"{"error":"operation job read failed; inspect server logs"}"#.to_string(),
+            )
+        }
+    }
+}
+
+/// One durable job snapshot plus the monotonic sequence number an SSE
+/// client resumes after via `Last-Event-ID`. Sequence numbers are
+/// process-local and reset on restart, same as `AdminState::log_events`.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct JobEvent {
+    pub(crate) sequence: u64,
+    pub(crate) job: sbproxy_model_host::OperationJob,
+}
+
+/// Retained replay events per job. Bounded so a long-lived process cannot
+/// grow this without limit; durable truth stays in `FileJobStore`, this
+/// only smooths over a client's brief disconnect.
+const JOB_EVENT_HISTORY_PER_JOB: usize = 64;
+/// Distinct jobs tracked for replay before the oldest is evicted.
+const JOB_EVENT_TRACKED_JOBS: usize = 512;
+
+#[derive(Debug, Default)]
+struct JobEventLogState {
+    next_sequence: u64,
+    order: VecDeque<String>,
+    by_job: BTreeMap<String, VecDeque<JobEvent>>,
+}
+
+/// In-memory replay buffer plus live broadcast tail backing
+/// `GET /admin/model-host/jobs/{id}/stream`. Never the source of truth
+/// (that is `FileJobStore`); a restart drops it same as `log_events`.
+#[derive(Debug)]
+pub(crate) struct JobEventLog {
+    state: Mutex<JobEventLogState>,
+    live: tokio::sync::broadcast::Sender<JobEvent>,
+}
+
+impl JobEventLog {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(JobEventLogState::default()),
+            live: tokio::sync::broadcast::channel(256).0,
+        }
+    }
+
+    /// Publish one job snapshot: append it to that job's bounded replay
+    /// history and fan it out to live SSE subscribers. Returns the
+    /// sequence number assigned to this event, for callers (tests, mainly)
+    /// that need to name it in a later `Last-Event-ID`.
+    pub(crate) fn publish(&self, job: &sbproxy_model_host::OperationJob) -> u64 {
+        let event = {
+            let mut state = self.state.lock().expect("job event log lock");
+            let sequence = state.next_sequence;
+            state.next_sequence += 1;
+            let event = JobEvent {
+                sequence,
+                job: job.clone(),
+            };
+            if !state.by_job.contains_key(&job.id) {
+                state.order.push_back(job.id.clone());
+                if state.order.len() > JOB_EVENT_TRACKED_JOBS {
+                    if let Some(oldest) = state.order.pop_front() {
+                        state.by_job.remove(&oldest);
+                    }
+                }
+            }
+            let history = state.by_job.entry(job.id.clone()).or_default();
+            history.push_back(event.clone());
+            if history.len() > JOB_EVENT_HISTORY_PER_JOB {
+                history.pop_front();
+            }
+            event
+        };
+        let sequence = event.sequence;
+        let _ = self.live.send(event);
+        sequence
+    }
+
+    /// Retained events for `job_id` with a sequence strictly greater than
+    /// `after` (`None` replays the full retained history).
+    pub(crate) fn replay(&self, job_id: &str, after: Option<u64>) -> Vec<JobEvent> {
+        let state = self.state.lock().expect("job event log lock");
+        state
+            .by_job
+            .get(job_id)
+            .map(|history| {
+                history
+                    .iter()
+                    .filter(|event| after.is_none_or(|after| event.sequence > after))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn subscribe(&self) -> tokio::sync::broadcast::Receiver<JobEvent> {
+        self.live.subscribe()
+    }
+}
+
+/// Process-wide job-progress event log backing the SSE stream. Lazily
+/// built on first use, matching `model_runtime_manager`'s `OnceLock`.
+pub(crate) fn job_event_log() -> &'static JobEventLog {
+    static LOG: OnceLock<JobEventLog> = OnceLock::new();
+    LOG.get_or_init(JobEventLog::new)
 }
 
 fn runtime_serving_summary(
@@ -936,6 +1414,337 @@ fn status_response() -> Resp {
     }
 }
 
+fn value_response() -> Resp {
+    // The ledger is populated by the request-path local-serving and
+    // compression value recorders in sbproxy-ai. Before either records an
+    // eligible success, the ledger is unset and the report is honestly empty.
+    let report = sbproxy_ai::value_ledger::value_ledger()
+        .map(|ledger| ledger.report())
+        .unwrap_or_default();
+    match serde_json::to_string(&report) {
+        Ok(body) => (200, JSON, body),
+        Err(e) => (
+            500,
+            JSON,
+            format!(r#"{{"error":"serialize value report: {e}"}}"#),
+        ),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct FilesResponse {
+    schema_version: u32,
+    // Absent when no model host is configured: no artifact cache is open
+    // then, and reporting a made-up root would invent data.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_root: Option<String>,
+    total_bytes: u64,
+    artifacts: Vec<FilesArtifactEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct FilesArtifactEntry {
+    logical_model: String,
+    variant_id: String,
+    artifact_digest: String,
+    total_size_bytes: u64,
+    last_accessed_ms: u64,
+    resident: bool,
+}
+
+/// Build `GET /admin/model-host/files` (WOR-1910): the verified artifact
+/// cache root, exact total bytes, and per-artifact durable ready metadata.
+/// Reads the same lightweight inventory the CLI lists through
+/// `ArtifactManager::cached_artifacts`, plus the current runtime statuses
+/// to mark artifacts backing a ready replica as `resident`; it never
+/// touches artifact bytes. Read-only; the admin server's shared auth gate
+/// authenticates the caller before dispatch, like every other `/admin/*`
+/// route.
+fn files_response() -> Resp {
+    let runtime = crate::server::model_host::model_runtime_manager();
+    let (Some(cache_root), Some(artifacts)) =
+        (runtime.artifact_cache_root(), runtime.cached_artifacts())
+    else {
+        // No model host is configured, so no artifact cache is open. The
+        // honest answer is an empty inventory, mirroring how the status
+        // route reports an empty deployment list.
+        return json_response(
+            200,
+            &FilesResponse {
+                schema_version: MANAGEMENT_SCHEMA_VERSION,
+                cache_root: None,
+                total_bytes: 0,
+                artifacts: Vec::new(),
+            },
+        );
+    };
+    let artifacts = match artifacts {
+        Ok(artifacts) => artifacts,
+        Err(error) => {
+            tracing::error!(%error, "list model artifact cache inventory");
+            return (
+                502,
+                JSON,
+                r#"{"error":"artifact inventory unavailable; inspect server logs"}"#.to_string(),
+            );
+        }
+    };
+    // The admin dispatcher runs under `spawn_blocking`, so we are on a
+    // blocking-pool thread and may block on the async status snapshot.
+    let statuses = tokio::runtime::Handle::current().block_on(async { runtime.statuses().await });
+    let resident_digests = statuses
+        .iter()
+        .filter(|status| status.state == sbproxy_model_host::DeploymentRuntimeState::Ready)
+        .filter_map(|status| status.artifact_digest.as_deref())
+        .collect::<BTreeSet<_>>();
+    // Same exact-JSON-integer bound the catalog route enforces: never
+    // emit a number JavaScript would silently round.
+    let bound = sbproxy_model_host::MAX_SAFE_JSON_INTEGER;
+    let mut total_bytes: u64 = 0;
+    let mut entries = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts {
+        let accessed_in_bounds = artifact.last_accessed_ms <= bound;
+        let next_total = total_bytes
+            .checked_add(artifact.total_size_bytes)
+            .filter(|total| accessed_in_bounds && *total <= bound);
+        let Some(next_total) = next_total else {
+            tracing::error!("model artifact cache metadata exceeds exact admin JSON bounds");
+            return (
+                500,
+                JSON,
+                r#"{"error":"artifact inventory metadata unavailable"}"#.to_string(),
+            );
+        };
+        total_bytes = next_total;
+        let resident = resident_digests.contains(artifact.artifact_digest.as_str());
+        entries.push(FilesArtifactEntry {
+            logical_model: artifact.logical_model,
+            variant_id: artifact.variant_id,
+            artifact_digest: artifact.artifact_digest,
+            total_size_bytes: artifact.total_size_bytes,
+            last_accessed_ms: artifact.last_accessed_ms,
+            resident,
+        });
+    }
+    json_response(
+        200,
+        &FilesResponse {
+            schema_version: MANAGEMENT_SCHEMA_VERSION,
+            cache_root: Some(cache_root.display().to_string()),
+            total_bytes,
+            artifacts: entries,
+        },
+    )
+}
+
+/// Whether a path segment is a canonical lowercase SHA-256 artifact digest.
+fn is_artifact_digest(candidate: &str) -> bool {
+    candidate.len() == 64
+        && candidate
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Open the verified artifact cache for an admin mutation the same way
+/// `sbproxy models remove` does: over the committed cache root with the
+/// network transport disabled, so removal and collection can never
+/// download bytes. Cross-process safety comes from the cache's own
+/// exclusive mutation, lease, and artifact file locks.
+fn open_admin_artifact_manager(
+    cache_root: std::path::PathBuf,
+) -> Result<sbproxy_model_host::ArtifactManager, sbproxy_model_host::ArtifactError> {
+    sbproxy_model_host::ArtifactManager::new(
+        cache_root,
+        Arc::new(sbproxy_model_host::UnavailableArtifactTransport),
+    )
+}
+
+fn unknown_artifact_response(digest: &str) -> Resp {
+    json_response(
+        404,
+        &serde_json::json!({
+            "error": "artifact is not in the verified cache",
+            "artifact_digest": digest,
+        }),
+    )
+}
+
+/// Build `DELETE /admin/model-host/artifacts/{digest}` (WOR-1910): one
+/// exact, protected artifact removal. Reuses the same
+/// `ArtifactManager::remove` path as `sbproxy models remove`, with the
+/// protection sets assembled from live runtime truth, so API and CLI
+/// removals obey identical configured, resident, pinned, leased, and
+/// locked rules. 200 returns the removal report, 409 carries the stable
+/// protection reason, and an uncached digest is 404.
+fn remove_artifact_response(digest: &str) -> Resp {
+    if !is_artifact_digest(digest) {
+        return (
+            400,
+            JSON,
+            r#"{"error":"invalid artifact digest; expected 64 lowercase hex characters"}"#
+                .to_string(),
+        );
+    }
+    let runtime = crate::server::model_host::model_runtime_manager();
+    let Some(cache_root) = runtime.artifact_cache_root() else {
+        // No model host is configured, so no artifact cache is open and
+        // no digest can be cached: the honest answer is 404.
+        return unknown_artifact_response(digest);
+    };
+    // Blocking-pool thread (spawn_blocking dispatcher); block on the
+    // async protection snapshot and removal, matching load_response.
+    let protection = match tokio::runtime::Handle::current()
+        .block_on(runtime.artifact_cache_protection())
+    {
+        Ok(protection) => protection,
+        Err(error) => {
+            tracing::error!(%error, "assemble artifact removal protection");
+            return (
+                502,
+                JSON,
+                r#"{"error":"artifact protection unavailable; inspect server logs"}"#.to_string(),
+            );
+        }
+    };
+    let manager = match open_admin_artifact_manager(cache_root) {
+        Ok(manager) => manager,
+        Err(error) => {
+            tracing::error!(%error, "open artifact cache for admin removal");
+            return (
+                502,
+                JSON,
+                r#"{"error":"artifact cache unavailable; inspect server logs"}"#.to_string(),
+            );
+        }
+    };
+    match tokio::runtime::Handle::current().block_on(manager.remove(digest, &protection)) {
+        Ok(report) if report.removed => {
+            tracing::info!(
+                target: "sbproxy::admin::audit",
+                action = "model_artifact_remove",
+                artifact_digest = %report.artifact_digest,
+                reclaimed_bytes = report.reclaimed_bytes,
+                job_id = ?report.job_id,
+                "admin artifact removal committed"
+            );
+            json_response(200, &report)
+        }
+        Ok(_) => unknown_artifact_response(digest),
+        Err(sbproxy_model_host::ArtifactError::RemovalBlocked { reason, .. }) => json_response(
+            409,
+            &serde_json::json!({
+                "error": format!("artifact removal refused: {reason}"),
+                "reason": reason,
+            }),
+        ),
+        Err(error) => {
+            tracing::error!(%error, "admin artifact removal failed");
+            (
+                502,
+                JSON,
+                r#"{"error":"artifact removal failed; inspect server logs"}"#.to_string(),
+            )
+        }
+    }
+}
+
+/// Build `POST /admin/model-host/gc` (WOR-1910): protected LRU collection
+/// down to the configured cache budget (`proxy.model_host.cache.budget_gib`
+/// or the legacy `serve.cache_budget_gib`). Runs the same
+/// `ArtifactManager::enforce_budget` path as the post-pull sweep with the
+/// protection sets assembled from live runtime truth, and returns the
+/// collection report. Without a configured budget the honest answer is
+/// 409: there is no target to collect toward.
+fn gc_response() -> Resp {
+    let runtime = crate::server::model_host::model_runtime_manager();
+    let desired = runtime.current_desired();
+    let budget_gib = desired.control.cache.budget_gib.or_else(|| {
+        desired
+            .legacy_host_policy
+            .as_ref()
+            .and_then(|policy| policy.cache_budget_gib)
+    });
+    let Some(budget_gib) = budget_gib else {
+        return (
+            409,
+            JSON,
+            r#"{"error":"no cache budget configured"}"#.to_string(),
+        );
+    };
+    if !budget_gib.is_finite() || budget_gib < 0.0 {
+        return (
+            409,
+            JSON,
+            r#"{"error":"configured cache budget is out of range"}"#.to_string(),
+        );
+    }
+    let budget_bytes = (budget_gib * 1024.0 * 1024.0 * 1024.0).floor();
+    if budget_bytes > u64::MAX as f64 {
+        return (
+            409,
+            JSON,
+            r#"{"error":"configured cache budget is out of range"}"#.to_string(),
+        );
+    }
+    let Some(cache_root) = runtime.artifact_cache_root() else {
+        // A budget without a committed cache root means no artifact cache
+        // is open, so there is nothing to collect.
+        return (
+            409,
+            JSON,
+            r#"{"error":"no artifact cache is open"}"#.to_string(),
+        );
+    };
+    // Blocking-pool thread (spawn_blocking dispatcher); block on the
+    // async protection snapshot, matching load_response.
+    let protection = match tokio::runtime::Handle::current()
+        .block_on(runtime.artifact_cache_protection())
+    {
+        Ok(protection) => protection,
+        Err(error) => {
+            tracing::error!(%error, "assemble cache collection protection");
+            return (
+                502,
+                JSON,
+                r#"{"error":"artifact protection unavailable; inspect server logs"}"#.to_string(),
+            );
+        }
+    };
+    let manager = match open_admin_artifact_manager(cache_root) {
+        Ok(manager) => manager,
+        Err(error) => {
+            tracing::error!(%error, "open artifact cache for admin collection");
+            return (
+                502,
+                JSON,
+                r#"{"error":"artifact cache unavailable; inspect server logs"}"#.to_string(),
+            );
+        }
+    };
+    match manager.enforce_budget(budget_bytes as u64, &protection) {
+        Ok(report) => {
+            tracing::info!(
+                target: "sbproxy::admin::audit",
+                action = "model_cache_gc",
+                budget_bytes = budget_bytes as u64,
+                reclaimed_bytes = report.reclaimed_bytes,
+                deleted_artifacts = report.deleted_artifacts.len(),
+                budget_unsatisfied_bytes = report.budget_unsatisfied_bytes,
+                "admin cache collection completed"
+            );
+            json_response(200, &report)
+        }
+        Err(error) => {
+            tracing::error!(%error, "admin cache collection failed");
+            (
+                502,
+                JSON,
+                r#"{"error":"cache collection failed; inspect server logs"}"#.to_string(),
+            )
+        }
+    }
+}
+
 fn runtime_error_response(operation: &str, error: sbproxy_model_host::RuntimeManagerError) -> Resp {
     let status = match &error {
         sbproxy_model_host::RuntimeManagerError::UnknownDeployment(_) => 404,
@@ -975,6 +1784,7 @@ mod tests {
     struct FakeManagementRuntime {
         catalog: Arc<Catalog>,
         snapshot: ModelManagementSnapshot,
+        serving_device_count: usize,
         apply_result:
             Mutex<Option<Result<AdminDeploymentRevisionResult, AdminDeploymentRevisionError>>>,
         applied: Mutex<Vec<AppliedRevision>>,
@@ -989,6 +1799,10 @@ mod tests {
             &self,
         ) -> Result<ModelManagementSnapshot, AdminDeploymentRevisionError> {
             Ok(self.snapshot.clone())
+        }
+
+        fn serving_device_count(&self) -> usize {
+            self.serving_device_count
         }
 
         fn apply_admin_deployment_revision(
@@ -1026,6 +1840,7 @@ mod tests {
             variant: Some("q4_k_m".to_string()),
             heterogeneous_variants: false,
             replicas: 1,
+            tensor_parallel: None,
             required_labels: BTreeMap::new(),
             spread_by: Vec::new(),
             pull: PullPolicy::OnDemand,
@@ -1037,6 +1852,14 @@ mod tests {
             queue_timeout_ms: 30_000,
             engine: sbproxy_model_host::EngineChoice::Auto,
             rollout: RolloutPolicy::Rolling,
+            extra_args: Vec::new(),
+            chunked_prefill: None,
+            tool_call_parser: None,
+            swap_space_gib: None,
+            cpu_offload_gib: None,
+            engine_version: None,
+            engine_image: None,
+            engine_sha256: None,
         }
     }
 
@@ -1047,6 +1870,7 @@ mod tests {
         FakeManagementRuntime {
             catalog: Arc::new(Catalog::builtin()),
             snapshot: management_snapshot(authority),
+            serving_device_count: 1,
             apply_result: Mutex::new(Some(apply_result)),
             applied: Mutex::new(Vec::new()),
         }
@@ -1359,7 +2183,7 @@ models:
     }
 
     #[test]
-    fn deployment_put_rejects_invalid_multi_replica_variant_policy() {
+    fn deployment_put_rejects_multi_replica_without_a_pinned_variant() {
         let runtime = fake_runtime(
             sbproxy_config::ModelHostAuthority::AdminManaged,
             Err(AdminDeploymentRevisionError::Store("unused".to_string())),
@@ -1391,9 +2215,85 @@ models:
     }
 
     #[test]
+    fn deployment_put_rejects_more_replicas_than_serving_devices() {
+        // The node serves one device (fake default), so two replicas cannot fit
+        // even with a pinned variant.
+        let runtime = fake_runtime(
+            sbproxy_config::ModelHostAuthority::AdminManaged,
+            Err(AdminDeploymentRevisionError::Store("unused".to_string())),
+        );
+        let body = r#"{
+            "expected_revision": null,
+            "deployments": {
+                "local-qwen": {
+                    "model": "qwen2.5-0.5b-instruct",
+                    "variant": "q4_k_m",
+                    "cold_start": "wait",
+                    "replicas": 2
+                }
+            }
+        }"#;
+
+        let (status, _, response_body) =
+            dispatch_with_runtime(&runtime, "PUT", "/admin/model-host/deployments", Some(body))
+                .expect("deployments route");
+        let response: serde_json::Value =
+            serde_json::from_str(&response_body).expect("error response");
+
+        assert_eq!(status, 400, "{response_body}");
+        assert_eq!(response["code"], "invalid_desired");
+        assert!(
+            response["error"]
+                .as_str()
+                .is_some_and(|message| message.contains("device")),
+            "the rejection names the device shortfall: {response_body}"
+        );
+        assert!(runtime
+            .applied
+            .lock()
+            .expect("applied revisions lock")
+            .is_empty());
+    }
+
+    #[test]
+    fn deployment_put_accepts_replicas_within_serving_devices() {
+        // A four-GPU node accepts two replicas at tensor_parallel 2.
+        let mut runtime = fake_runtime(
+            sbproxy_config::ModelHostAuthority::AdminManaged,
+            Ok(AdminDeploymentRevisionResult {
+                revision: 8,
+                content_digest: "e".repeat(64),
+                plan: ReconcilePlan::default(),
+            }),
+        );
+        runtime.serving_device_count = 4;
+        let body = r#"{
+            "expected_revision": null,
+            "deployments": {
+                "local-qwen": {
+                    "model": "qwen2.5-0.5b-instruct",
+                    "variant": "q4_k_m",
+                    "cold_start": "wait",
+                    "replicas": 2,
+                    "tensor_parallel": 2
+                }
+            }
+        }"#;
+
+        let (status, _, response_body) =
+            dispatch_with_runtime(&runtime, "PUT", "/admin/model-host/deployments", Some(body))
+                .expect("deployments route");
+
+        assert_eq!(status, 200, "{response_body}");
+        let applied = runtime.applied.lock().expect("applied revisions lock");
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].1["local-qwen"].replicas, 2);
+        assert_eq!(applied[0].1["local-qwen"].tensor_parallel, Some(2));
+    }
+
+    #[test]
     fn deployment_put_rejects_cluster_only_and_unbounded_local_intent() {
         let cases = [
-            ("replicas", serde_json::json!(2)),
             ("heterogeneous_variants", serde_json::json!(true)),
             ("required_labels", serde_json::json!({"pool": "gpu"})),
             ("spread_by", serde_json::json!(["zone"])),
@@ -1614,11 +2514,13 @@ models:
     ) -> sbproxy_model_host::DeploymentRuntimeStatus {
         sbproxy_model_host::DeploymentRuntimeStatus {
             deployment: "local".to_string(),
+            replica: 0,
             generation: 1,
             state,
             active_requests: 0,
             queued_requests: 0,
             engine: Some(sbproxy_model_host::EngineKind::LlamaCpp),
+            engine_version: Some("0.11.0".to_string()),
             driver_availability: Some(sbproxy_model_host::EngineAvailability::Available),
             artifact_digest: Some("a".repeat(64)),
             selected_devices: vec![0],
@@ -1710,6 +2612,122 @@ models:
         assert!(body.contains("\"runtime_revision\""));
     }
 
+    #[test]
+    fn value_route_returns_a_report_shape_without_a_ledger() {
+        // With no value recorder wired the ledger is unset, so the route
+        // answers 200 with an empty-but-well-formed report rather than
+        // erroring.
+        let (code, ct, body) =
+            dispatch("GET", "/admin/model-host/value", None).expect("value route");
+        assert_eq!(code, 200);
+        assert_eq!(ct, JSON);
+        let report: serde_json::Value = serde_json::from_str(&body).expect("value report json");
+        assert_eq!(report["total_saved_micros"], 0);
+        assert_eq!(report["total_local_completions"], 0);
+        assert_eq!(report["total_compression_tokens_saved"], 0);
+        assert_eq!(report["total_compression_gross_cost_saved_micros"], 0);
+        assert!(report["models"].is_array());
+        assert!(report["compression"].is_array());
+        assert!(report["compression_totals"].is_object());
+    }
+
+    #[test]
+    fn value_route_rejects_non_get() {
+        let (code, _, _) = dispatch("POST", "/admin/model-host/value", None).unwrap();
+        assert_eq!(code, 405);
+    }
+
+    #[test]
+    fn files_route_rejects_non_get() {
+        let (code, _, _) = dispatch("POST", "/admin/model-host/files", None).unwrap();
+        assert_eq!(code, 405);
+    }
+
+    #[test]
+    fn files_route_reports_an_empty_inventory_without_a_model_host() {
+        // With no model host configured there is no open artifact cache,
+        // so the route answers 200 with an empty inventory and omits
+        // cache_root rather than erroring or inventing a path.
+        let (code, ct, body) =
+            dispatch("GET", "/admin/model-host/files", None).expect("files route");
+        assert_eq!(code, 200);
+        assert_eq!(ct, JSON);
+        let report: serde_json::Value = serde_json::from_str(&body).expect("files json");
+        assert_eq!(report["schema_version"], 1);
+        assert_eq!(report["total_bytes"], 0);
+        assert_eq!(report["artifacts"], serde_json::json!([]));
+        assert!(report.get("cache_root").is_none());
+    }
+
+    #[test]
+    fn artifact_delete_rejects_non_delete_methods() {
+        let digest = "a".repeat(64);
+        let (code, _, _) = dispatch(
+            "GET",
+            &format!("/admin/model-host/artifacts/{digest}"),
+            None,
+        )
+        .expect("artifacts route");
+        assert_eq!(code, 405);
+        let (code, _, _) = dispatch(
+            "POST",
+            &format!("/admin/model-host/artifacts/{digest}"),
+            None,
+        )
+        .expect("artifacts route");
+        assert_eq!(code, 405);
+    }
+
+    #[test]
+    fn artifact_delete_rejects_a_malformed_digest() {
+        // The digest is a path segment used to address cache files, so
+        // anything but exact lowercase SHA-256 hex is rejected up front.
+        for digest in ["not-a-digest", "..", "ABCDEF", ""] {
+            let (code, _, _) = dispatch(
+                "DELETE",
+                &format!("/admin/model-host/artifacts/{digest}"),
+                None,
+            )
+            .expect("artifacts route");
+            assert_eq!(code, 400, "{digest:?}");
+        }
+    }
+
+    #[test]
+    fn artifact_delete_returns_not_found_for_an_unknown_digest() {
+        // With no model host configured there is no open artifact cache,
+        // so no digest is cached and the removal is an honest 404.
+        let digest = "b".repeat(64);
+        let (code, ct, body) = dispatch(
+            "DELETE",
+            &format!("/admin/model-host/artifacts/{digest}"),
+            None,
+        )
+        .expect("artifacts route");
+        assert_eq!(code, 404);
+        assert_eq!(ct, JSON);
+        let response: serde_json::Value = serde_json::from_str(&body).expect("error json");
+        assert_eq!(response["artifact_digest"], digest);
+        assert_eq!(response["error"], "artifact is not in the verified cache");
+    }
+
+    #[test]
+    fn gc_rejects_non_post() {
+        let (code, _, _) = dispatch("GET", "/admin/model-host/gc", None).expect("gc route");
+        assert_eq!(code, 405);
+    }
+
+    #[test]
+    fn gc_without_a_configured_budget_is_a_conflict() {
+        // The empty runtime has no cache budget in canonical or legacy
+        // form, so on-demand collection has no target and answers 409.
+        let (code, ct, body) = dispatch("POST", "/admin/model-host/gc", None).expect("gc route");
+        assert_eq!(code, 409);
+        assert_eq!(ct, JSON);
+        let response: serde_json::Value = serde_json::from_str(&body).expect("error json");
+        assert_eq!(response["error"], "no cache budget configured");
+    }
+
     #[tokio::test]
     async fn lifecycle_routes_return_stable_unknown_deployment_reason() {
         for path in [
@@ -1733,5 +2751,215 @@ models:
             assert_eq!(ct, JSON);
             assert!(body.contains("\"reason_code\":\"unknown_deployment\""));
         }
+    }
+
+    #[test]
+    fn jobs_list_route_reports_jobs_from_the_durable_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(crate::server::model_host::test_runtime_with_job_store(
+            directory.path(),
+        ));
+        let store = runtime
+            .job_store()
+            .expect("fixture runtime has a job store");
+        let job = store
+            .create(
+                sbproxy_model_host::OperationKind::Pull,
+                "fixture-job-subject".to_string(),
+            )
+            .expect("create fixture job");
+
+        let (status, ct, body) = jobs_list_response_with(runtime);
+        assert_eq!(status, 200);
+        assert_eq!(ct, JSON);
+        let response: serde_json::Value = serde_json::from_str(&body).expect("jobs list json");
+        assert_eq!(response["schema_version"], 1);
+        let jobs = response["jobs"].as_array().expect("jobs array");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0]["id"], job.id);
+        assert_eq!(jobs[0]["subject"], "fixture-job-subject");
+        assert_eq!(jobs[0]["state"], "queued");
+    }
+
+    #[test]
+    fn job_detail_route_returns_the_matching_job() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(crate::server::model_host::test_runtime_with_job_store(
+            directory.path(),
+        ));
+        let store = runtime
+            .job_store()
+            .expect("fixture runtime has a job store");
+        let job = store
+            .create(
+                sbproxy_model_host::OperationKind::Pull,
+                "fixture-job-subject".to_string(),
+            )
+            .expect("create fixture job");
+
+        let (status, ct, body) = job_detail_response_with(runtime, &job.id);
+        assert_eq!(status, 200);
+        assert_eq!(ct, JSON);
+        let response: serde_json::Value = serde_json::from_str(&body).expect("job detail json");
+        assert_eq!(response["schema_version"], 1);
+        assert_eq!(response["job"]["id"], job.id);
+        assert_eq!(response["job"]["subject"], "fixture-job-subject");
+    }
+
+    #[test]
+    fn job_detail_route_answers_not_found_for_an_unknown_id() {
+        // No production model host is configured for the process-global
+        // runtime `dispatch` reads, so there is no durable job store open;
+        // a well-formed ID is an honest 404, mirroring
+        // `artifact_delete_returns_not_found_for_an_unknown_digest`.
+        let job_id = ulid::Ulid::new().to_string();
+        let (code, ct, body) = dispatch("GET", &format!("/admin/model-host/jobs/{job_id}"), None)
+            .expect("job detail route");
+        assert_eq!(code, 404);
+        assert_eq!(ct, JSON);
+        let response: serde_json::Value = serde_json::from_str(&body).expect("error json");
+        assert_eq!(response["job_id"], job_id);
+    }
+
+    #[test]
+    fn job_detail_route_rejects_a_malformed_id() {
+        let (code, _, _) =
+            dispatch("GET", "/admin/model-host/jobs/not-a-ulid", None).expect("job detail route");
+        assert_eq!(code, 400);
+    }
+
+    #[test]
+    fn jobs_list_route_rejects_non_get() {
+        let (code, _, _) =
+            dispatch("POST", "/admin/model-host/jobs", None).expect("jobs list route");
+        assert_eq!(code, 405);
+    }
+
+    #[test]
+    fn jobs_list_route_reports_an_empty_list_without_a_model_host() {
+        // Mirrors `files_route_reports_an_empty_inventory_without_a_model_host`:
+        // no production model host means no durable job store is open, so
+        // the honest answer is an empty list rather than an error.
+        let (code, ct, body) =
+            dispatch("GET", "/admin/model-host/jobs", None).expect("jobs list route");
+        assert_eq!(code, 200);
+        assert_eq!(ct, JSON);
+        let response: serde_json::Value = serde_json::from_str(&body).expect("jobs list json");
+        assert_eq!(response["schema_version"], 1);
+        assert_eq!(response["jobs"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn load_route_enqueues_a_durable_job_and_answers_202() {
+        // `enqueue_lifecycle_job` only spawns the background lifecycle call
+        // (never blocks on it), so this can run directly on the test's
+        // Tokio runtime without the `spawn_blocking` wrapper the
+        // no-job-store fallback below needs.
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(crate::server::model_host::test_runtime_with_job_store(
+            directory.path(),
+        ));
+
+        let (status, ct, body) =
+            load_response_with(runtime, Some(r#"{"deployment":"fixture-deployment"}"#));
+        assert_eq!(status, 202, "{body}");
+        assert_eq!(ct, JSON);
+        let response: serde_json::Value = serde_json::from_str(&body).expect("load response json");
+        assert_eq!(response["schema_version"], 1);
+        assert_eq!(response["deployment"], "fixture-deployment");
+        assert_eq!(response["state"], "queued");
+        let job_id = response["job_id"].as_str().expect("job_id present");
+        assert!(!job_id.is_empty());
+        assert_eq!(
+            response["poll_url"],
+            format!("/admin/model-host/jobs/{job_id}")
+        );
+    }
+
+    #[tokio::test]
+    async fn evict_route_enqueues_a_durable_job_and_answers_202() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(crate::server::model_host::test_runtime_with_job_store(
+            directory.path(),
+        ));
+
+        let (status, ct, body) =
+            evict_response_with(runtime, Some(r#"{"deployment":"fixture-deployment"}"#));
+        assert_eq!(status, 202, "{body}");
+        assert_eq!(ct, JSON);
+        let response: serde_json::Value = serde_json::from_str(&body).expect("evict response json");
+        assert_eq!(response["schema_version"], 1);
+        assert_eq!(response["deployment"], "fixture-deployment");
+        assert_eq!(response["state"], "queued");
+        let job_id = response["job_id"].as_str().expect("job_id present");
+        assert!(!job_id.is_empty());
+        assert_eq!(
+            response["poll_url"],
+            format!("/admin/model-host/jobs/{job_id}")
+        );
+    }
+
+    #[tokio::test]
+    async fn load_and_evict_without_a_model_host_keep_the_synchronous_contract() {
+        // No production model host is configured for the process-global
+        // runtime `dispatch` reads, so there is no durable job store open;
+        // both routes fall back to their pre-existing synchronous 404 for
+        // an unknown deployment rather than enqueueing an unpollable job.
+        // Pinned alongside `lifecycle_routes_return_stable_unknown_deployment_reason`
+        // so the two contracts (job-store-backed vs. fallback) cannot
+        // silently drift apart. The fallback path blocks on the runtime
+        // handle, so (like that test) it runs on a blocking-pool thread.
+        let (load_status, _, _) = tokio::task::spawn_blocking(|| {
+            dispatch(
+                "POST",
+                "/admin/model-host/load",
+                Some(r#"{"deployment":"definitely-missing"}"#),
+            )
+            .expect("load route")
+        })
+        .await
+        .unwrap();
+        assert_eq!(load_status, 404);
+        let (evict_status, _, _) = tokio::task::spawn_blocking(|| {
+            dispatch(
+                "POST",
+                "/admin/model-host/evict",
+                Some(r#"{"deployment":"definitely-missing"}"#),
+            )
+            .expect("evict route")
+        })
+        .await
+        .unwrap();
+        assert_eq!(evict_status, 404);
+    }
+
+    #[test]
+    fn minimal_deployment_body_is_model_plus_explicit_cold_start() {
+        // Pins the documented admin PUT contract from both sides so drift
+        // surfaces at the PR gate rather than in the tag-time e2e:
+        // cold_start is the one field that must be explicit (the safe
+        // omission behavior depends on the security profile, which only
+        // the file_managed authority resolves), and every other field
+        // defaults.
+        let without_cold_start = r#"{
+            "expected_revision": null,
+            "deployments": { "m": { "model": "hf:org/model" } }
+        }"#;
+        let error = serde_json::from_str::<DeploymentPutRequest>(without_cold_start)
+            .expect_err("cold_start must be explicit for admin-managed deployments");
+        assert!(
+            error.to_string().contains("cold_start"),
+            "rejection must name the missing field: {error}"
+        );
+
+        let minimal = r#"{
+            "expected_revision": null,
+            "deployments": { "m": { "model": "hf:org/model", "cold_start": "wait" } }
+        }"#;
+        let request: DeploymentPutRequest =
+            serde_json::from_str(minimal).expect("model plus cold_start must deserialize");
+        let deployment = request.deployments.get("m").expect("deployment entry");
+        assert_eq!(deployment.replicas, 1);
+        assert!(!deployment.warm);
     }
 }

@@ -269,7 +269,7 @@
     {
       "id": 4,
       "title": "Web Bot Auth Verification Mix",
-      "description": "Splits agent-classified traffic into three buckets: `verified` (a catalog-resolved agent — Web Bot Auth signature carried a known keyid), `anonymous` (signed but no resolved keyid, draft-rescorla-anonymous-webbotauth-00), and `unknown` (looks automated but does not match the catalog). `human` is excluded.",
+      "description": "Splits agent-classified traffic into three buckets: `verified` (a catalog-resolved agent \u2014 Web Bot Auth signature carried a known keyid), `anonymous` (signed but no resolved keyid, draft-rescorla-anonymous-webbotauth-00), and `unknown` (looks automated but does not match the catalog). `human` is excluded.",
       "type": "timeseries",
       "gridPos": {
         "h": 9,
@@ -466,60 +466,6 @@
           "refId": "A",
           "expr": "sum by (policy_type, action) (rate(sbproxy_policy_triggers_total{policy_type=~\"ai_crawl.*|pay_per_crawl\"}[5m]))",
           "legendFormat": "{{policy_type}} / {{action}}",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          }
-        }
-      ]
-    },
-    {
-      "id": 7,
-      "title": "Bot Request Latency (P95) by Agent Class",
-      "description": "95th-percentile latency of bot-class requests, broken out by agent_class. Useful for spotting when a specific bot class is being slowed down by tarpit or upstream pressure. `human` is excluded.",
-      "type": "timeseries",
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 25
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "s",
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "lineWidth": 2,
-            "fillOpacity": 10,
-            "spanNulls": false,
-            "drawStyle": "line",
-            "pointSize": 5,
-            "showPoints": "auto"
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "histogram_quantile(0.95, sum by (le, agent_class) (rate(sbproxy_request_duration_seconds_bucket{hostname=~\"$hostname\", agent_class!=\"human\", agent_class!=\"\"}[5m])))",
-          "legendFormat": "p95 - {{agent_class}}",
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"

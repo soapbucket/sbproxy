@@ -1,0 +1,88 @@
+# Regenerate docs/llms-full.txt on main (WOR-2119).
+#
+# `docs/llms-full.txt` is the whole docs corpus flattened into one 2 MB
+# file. It is generated output, and it used to be regenerated and
+# committed by every branch that touched a doc. Two such branches always
+# conflicted on it, and the conflict was never interesting: the fix was
+# always "take either side, run the generator again". PR #833 paid that
+# tax three times in one afternoon.
+#
+# So branches no longer carry the file. This workflow owns it: after a
+# merge to main changes any source the generator reads, it regenerates
+# and commits the result on its own. The PR-side gate in docs-ci.yml
+# rejects a branch that hand-carries the file, which is what keeps the
+# conflicts from coming back.
+#
+# The push uses the default GITHUB_TOKEN, and GitHub deliberately does
+# not start new workflow runs from pushes made with it. That is what
+# stops this workflow from retriggering itself; do not swap in a PAT
+# without adding a loop guard.
+
+name: llms-full-refresh
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      # Exactly the inputs scripts/regen-llms-full.sh reads. Keep this
+      # list in step with the script; a source that is missing here
+      # leaves the corpus stale until some other doc changes.
+      - 'docs/**.md'
+      - 'README.md'
+      - 'MIGRATION.md'
+      - 'CHANGELOG.md'
+      - 'scripts/regen-llms-full.sh'
+      - '.github/workflows/llms-full-refresh.yml'
+
+# Committing back to main needs write access. Nothing else here does.
+permissions:
+  contents: write
+
+# One refresh at a time. Merges can land in bursts, and two concurrent
+# runs would race on the same file and the same branch tip. Do not
+# cancel a run in progress: it may already have pushed, and the queued
+# run regenerates from the newer tree anyway.
+concurrency:
+  group: llms-full-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The generator only reads the working tree, but the commit
+          # below needs a real branch to push to rather than the
+          # detached HEAD checkout gives a push event by default.
+          ref: main
+
+      - name: regenerate the corpus
+        run: ./scripts/regen-llms-full.sh
+
+      - name: commit when the corpus moved
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- docs/llms-full.txt; then
+            echo "docs/llms-full.txt is already current for this tree"
+            exit 0
+          fi
+          # Only ever commit the generated file. If the generator ever
+          # starts touching something else, stop and let a human look
+          # rather than pushing an unreviewed change to main.
+          changed=$(git diff --name-only)
+          if [ "$changed" != "docs/llms-full.txt" ]; then
+            echo "::error::regen touched unexpected paths:"
+            echo "$changed"
+            exit 1
+          fi
+          git config user.name 'sbproxy-docs-bot'
+          git config user.email 'noreply@soapbucket.com'
+          git add docs/llms-full.txt
+          git commit -m 'chore(docs): regenerate llms-full.txt
+
+          Generated from the docs corpus by scripts/regen-llms-full.sh.
+          Committed here rather than on a branch so concurrent PRs stop
+          conflicting on a 2 MB generated file (WOR-2119).'
+          git push origin main

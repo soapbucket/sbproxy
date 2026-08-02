@@ -4,9 +4,9 @@
 //! cache hits, and budget utilization for every AI provider and model.
 
 use prometheus::{
-    register_counter, register_counter_vec, register_gauge, register_gauge_vec,
-    register_histogram_vec, Counter, CounterVec, Gauge, GaugeVec, HistogramOpts, HistogramVec,
-    Opts,
+    register_counter, register_counter_vec, register_gauge, register_gauge_vec, register_histogram,
+    register_histogram_vec, Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramOpts,
+    HistogramVec, Opts,
 };
 use std::sync::LazyLock;
 
@@ -198,6 +198,21 @@ static AI_FAILOVERS: LazyLock<CounterVec> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// Route reasoning-policy outcomes for each provider attempt.
+///
+/// `provider` is bounded by configured provider names and `outcome` comes
+/// from [`crate::reasoning::ReasoningOutcome`]'s closed label set.
+static AI_REASONING_POLICY_ATTEMPTS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_reasoning_policy_attempts_total",
+            "AI provider attempts by concise-reasoning policy outcome"
+        ),
+        &["provider", "outcome"]
+    )
+    .unwrap()
+});
+
 /// WOR-798: every provider selection by the AI router. `strategy`
 /// is the active `RoutingStrategy` variant name (snake_case); the
 /// `provider` label is the picked provider's configured name.
@@ -215,6 +230,75 @@ static AI_LB_DECISIONS: LazyLock<CounterVec> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// AI routing decisions that intentionally use a fallback path.
+///
+/// `strategy` comes from the closed routing enum. `reason` is normalized by
+/// [`record_routing_fallback`] so request data cannot create new series.
+static AI_ROUTING_FALLBACKS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_routing_fallbacks_total",
+            "AI routing selections that used an explicit fallback path"
+        ),
+        &["strategy", "reason"]
+    )
+    .unwrap()
+});
+
+/// Prefix-affinity selections by observed-cache outcome.
+static AI_PREFIX_AFFINITY_DECISIONS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_prefix_affinity_decisions_total",
+            "Prefix-affinity selections by cache-location outcome"
+        ),
+        &["outcome"]
+    )
+    .unwrap()
+});
+
+/// Bounded prefix-table evictions by cause.
+static AI_PREFIX_AFFINITY_EVICTIONS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_prefix_affinity_evictions_total",
+            "Entries evicted from the bounded prefix-affinity table"
+        ),
+        &["reason"]
+    )
+    .unwrap()
+});
+
+/// Distributed quota-pool admissions allowed during backend unavailability.
+///
+/// Pool names are operator-declared config values. Virtual-key identities are
+/// deliberately excluded from this family.
+static AI_QUOTA_POOL_FAIL_OPEN: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_quota_pool_fail_open_total",
+            "Quota-pool admissions allowed while the shared backend was unavailable"
+        ),
+        &["pool"]
+    )
+    .unwrap()
+});
+
+/// Soft-policy quota-pool admissions beyond a member's entitlement.
+///
+/// Pool names are operator-declared config values. Caller identities are
+/// deliberately excluded from this family.
+static AI_QUOTA_POOL_OVERSHARE: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_quota_pool_overshare_total",
+            "Soft quota-pool admissions beyond a member entitlement"
+        ),
+        &["pool"]
+    )
+    .unwrap()
+});
+
 static AI_GUARDRAIL_BLOCKS: LazyLock<CounterVec> = LazyLock::new(|| {
     register_counter_vec!(
         Opts::new(
@@ -222,6 +306,28 @@ static AI_GUARDRAIL_BLOCKS: LazyLock<CounterVec> = LazyLock::new(|| {
             "Guardrail block events"
         ),
         &["category"] // "pii", "injection", "toxicity", "jailbreak", etc.
+    )
+    .unwrap()
+});
+
+static AI_SAFETY_GUARDRAIL_VERDICTS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_safety_guardrail_verdicts_total",
+            "Built-in safety guardrail evaluations by class, backend, and verdict"
+        ),
+        &["guardrail", "class", "backend", "verdict"]
+    )
+    .unwrap()
+});
+
+static AI_EXTERNAL_GUARDRAIL_VERDICTS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_external_guardrail_verdicts_total",
+            "External guardrail evaluations by provider, phase, and outcome"
+        ),
+        &["provider", "phase", "outcome"]
     )
     .unwrap()
 });
@@ -381,10 +487,13 @@ static AI_SHADOW_INFLIGHT: LazyLock<Gauge> = LazyLock::new(|| {
     .unwrap()
 });
 
-static AI_SHADOW_DROPPED: LazyLock<Counter> = LazyLock::new(|| {
-    register_counter!(
-        "sbproxy_ai_shadow_dropped_total",
-        "Shadow requests dropped because the supervisor queue was full"
+static AI_SHADOW_DROPPED: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_shadow_dropped_total",
+            "Shadow requests skipped or dropped before dispatch"
+        ),
+        &["reason"]
     )
     .unwrap()
 });
@@ -409,10 +518,44 @@ pub fn dec_shadow_inflight() {
     AI_SHADOW_INFLIGHT.dec();
 }
 
-/// Record one shadow request that the supervisor refused to spawn
-/// because the in-flight queue was at capacity.
-pub fn record_shadow_dropped() {
-    AI_SHADOW_DROPPED.inc();
+/// Closed, low-cardinality reasons why a configured shadow request
+/// did not reach the shadow provider. Deliberate sampling is excluded:
+/// sampling out is expected behavior, not a failed dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShadowDropReason {
+    /// Streaming requests are intentionally unsupported by shadow dispatch.
+    Streaming,
+    /// The configured shadow provider was absent from the handler provider list.
+    ProviderNotFound,
+    /// Credential-scoped provider policy disallowed the shadow provider.
+    ProviderNotAllowed,
+    /// The request opted out of prompt training and the shadow provider did not.
+    PromptTrainingDisallowed,
+    /// Purpose-scoped egress is active and shadow transport cannot honor it.
+    EgressDenied,
+    /// The bounded shadow supervisor had no free admission slots.
+    Saturated,
+}
+
+impl ShadowDropReason {
+    /// Stable Prometheus label value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Streaming => "streaming",
+            Self::ProviderNotFound => "provider_not_found",
+            Self::ProviderNotAllowed => "provider_not_allowed",
+            Self::PromptTrainingDisallowed => "prompt_training_disallowed",
+            Self::EgressDenied => "egress_denied",
+            Self::Saturated => "saturated",
+        }
+    }
+}
+
+/// Record one configured shadow request that could not be dispatched.
+pub fn record_shadow_dropped(reason: ShadowDropReason) {
+    AI_SHADOW_DROPPED
+        .with_label_values(&[reason.as_str()])
+        .inc();
 }
 
 /// Record one shadow task that exceeded its wall-clock supervisor
@@ -465,10 +608,12 @@ pub fn shadow_inflight_value() -> f64 {
     AI_SHADOW_INFLIGHT.get()
 }
 
-/// Read the cumulative shadow-dropped counter value. Tests use this
-/// to assert that an overflow tick happened.
-pub fn shadow_dropped_value() -> f64 {
-    AI_SHADOW_DROPPED.get()
+/// Read the cumulative shadow-dropped counter value for one closed
+/// reason. Tests use this to assert that the expected path ticked.
+pub fn shadow_dropped_value(reason: ShadowDropReason) -> f64 {
+    AI_SHADOW_DROPPED
+        .with_label_values(&[reason.as_str()])
+        .get()
 }
 
 /// Read the cumulative shadow-timeout counter value. Tests use this
@@ -481,9 +626,9 @@ pub fn shadow_timeout_value() -> f64 {
 //
 // Operators alert on any non-zero rate of this counter to detect a
 // rejected client. `axis` is the bucket that tripped (`rpm`, `tpm`,
-// `rpd`, `tpd`, `concurrent`). `key_hash` is the hashed virtual key
-// the rejection was charged to; the limiter never receives the raw
-// key. `model` is the upstream model name.
+// `rpd`, `tpd`, `concurrent`). The legacy `key_hash` label contains the
+// immutable, secret-free resolved policy/key id; the limiter never receives
+// raw credential text. `model` is the upstream model name.
 static AI_RATELIMIT_REJECTED: LazyLock<CounterVec> = LazyLock::new(|| {
     register_counter_vec!(
         Opts::new(
@@ -602,6 +747,13 @@ pub fn record_failover(from: &str, to: &str, reason: &str) {
     AI_FAILOVERS.with_label_values(&[from, to, reason]).inc();
 }
 
+/// Record one closed reasoning-policy outcome for a provider attempt.
+pub fn record_reasoning_policy_attempt(provider: &str, outcome: &'static str) {
+    AI_REASONING_POLICY_ATTEMPTS
+        .with_label_values(&[provider, outcome])
+        .inc();
+}
+
 /// WOR-798: record one AI router selection. `strategy` is the
 /// active `RoutingStrategy` variant rendered as a snake_case name
 /// (`round_robin`, `peak_ewma`, `least_token_usage`, ...). `provider`
@@ -612,11 +764,56 @@ pub fn record_lb_decision(strategy: &str, provider: &str) {
         .inc();
 }
 
+/// Record an intentional routing fallback.
+///
+/// Reasons are a closed vocabulary shared by the outcome-aware and
+/// prefix-affinity strategies.
+pub fn record_routing_fallback(strategy: &str, reason: &str) {
+    let reason = match reason {
+        "warmup" | "missing_signal" | "no_holder" | "no_feedback" => reason,
+        _ => "unknown",
+    };
+    AI_ROUTING_FALLBACKS
+        .with_label_values(&[strategy, reason])
+        .inc();
+}
+
+/// Record whether prefix affinity found a live holder or used a fallback.
+pub fn record_prefix_affinity_decision(outcome: &str) {
+    let outcome = match outcome {
+        "hit" | "miss" | "missing_signal" => outcome,
+        _ => "unknown",
+    };
+    AI_PREFIX_AFFINITY_DECISIONS
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+/// Record removal from the bounded prefix table.
+pub fn record_prefix_affinity_eviction(reason: &str) {
+    let reason = match reason {
+        "ttl" | "capacity" => reason,
+        _ => "unknown",
+    };
+    AI_PREFIX_AFFINITY_EVICTIONS
+        .with_label_values(&[reason])
+        .inc();
+}
+
+/// Record an admission that bypassed a failed shared quota backend.
+pub fn record_quota_pool_fail_open(pool: &str) {
+    AI_QUOTA_POOL_FAIL_OPEN.with_label_values(&[pool]).inc();
+}
+
+/// Record a soft-policy admission beyond a member's weighted entitlement.
+pub fn record_quota_pool_overshare(pool: &str) {
+    AI_QUOTA_POOL_OVERSHARE.with_label_values(&[pool]).inc();
+}
+
 /// Record a streaming time-to-first-token observation, in seconds.
 ///
-/// Call sites: the streaming relay's first-token hook, after the
-/// per-request `StreamTracker::record_first_token` has captured the
-/// instant. Convert with `tracker.ttft_ms().map(|ms| ms / 1000.0)`.
+/// The streaming relay calls this from its first-token hook using the
+/// elapsed time captured directly for that request.
 pub fn record_ttft(provider: &str, model: &str, ttft_seconds: f64) {
     AI_TTFT
         .with_label_values(&[provider, model])
@@ -664,6 +861,91 @@ pub fn record_provider_error(provider: &str, error_kind: &str) {
 /// Record a guardrail block.
 pub fn record_guardrail_block(category: &str) {
     AI_GUARDRAIL_BLOCKS.with_label_values(&[category]).inc();
+}
+
+/// Record one built-in safety guardrail evaluation.
+///
+/// Every label is normalized to a closed vocabulary before it reaches
+/// Prometheus. Classifier implementations and configuration can therefore
+/// never turn model-produced labels into unbounded metric cardinality.
+pub fn record_safety_guardrail_verdict(guardrail: &str, class: &str, backend: &str, verdict: &str) {
+    let guardrail = match guardrail {
+        "toxicity" | "jailbreak" | "content_safety" => guardrail,
+        _ => "unknown",
+    };
+    let class = match class {
+        "toxic" | "jailbreak" | "violence" | "self_harm" | "sexual" | "hate_speech" | "illegal"
+        | "safe" | "none" | "error" | "unknown" => class,
+        _ => "unknown",
+    };
+    let backend = match backend {
+        "keyword" | "classifier" => backend,
+        _ => "unknown",
+    };
+    let verdict = match verdict {
+        "allow" | "block" => verdict,
+        _ => "unknown",
+    };
+    AI_SAFETY_GUARDRAIL_VERDICTS
+        .with_label_values(&[guardrail, class, backend, verdict])
+        .inc();
+}
+
+/// Record an external guardrail result with a bounded label vocabulary.
+pub fn record_external_guardrail_verdict(provider: &str, phase: &str, outcome: &str) {
+    let (provider, phase, outcome) = normalize_external_guardrail_labels(provider, phase, outcome);
+    AI_EXTERNAL_GUARDRAIL_VERDICTS
+        .with_label_values(&[provider, phase, outcome])
+        .inc();
+}
+
+fn normalize_external_guardrail_labels<'a>(
+    provider: &'a str,
+    phase: &'a str,
+    outcome: &'a str,
+) -> (&'a str, &'a str, &'a str) {
+    let provider = match provider {
+        "generic"
+        | "presidio"
+        | "lakera"
+        | "aporia"
+        | "azure_content_safety"
+        | "bedrock"
+        | "crowdstrike"
+        | "mistral"
+        | "pangea"
+        | "patronus" => provider,
+        _ => "unknown",
+    };
+    let phase = match phase {
+        "input" | "output" => phase,
+        _ => "unknown",
+    };
+    let outcome = match outcome {
+        "allow" | "block" | "fail_open" | "fail_closed" => outcome,
+        _ => "unknown",
+    };
+    (provider, phase, outcome)
+}
+
+#[cfg(test)]
+pub(crate) fn external_guardrail_verdict_value(provider: &str, phase: &str, outcome: &str) -> f64 {
+    let (provider, phase, outcome) = normalize_external_guardrail_labels(provider, phase, outcome);
+    AI_EXTERNAL_GUARDRAIL_VERDICTS
+        .with_label_values(&[provider, phase, outcome])
+        .get()
+}
+
+#[cfg(test)]
+pub(crate) fn safety_guardrail_verdict_value(
+    guardrail: &str,
+    class: &str,
+    backend: &str,
+    verdict: &str,
+) -> f64 {
+    AI_SAFETY_GUARDRAIL_VERDICTS
+        .with_label_values(&[guardrail, class, backend, verdict])
+        .get()
 }
 
 // --- Context-poisoning guardrail metrics ---
@@ -736,23 +1018,23 @@ pub fn set_budget_utilization(scope: &str, ratio: f64) {
 /// Record an AI gateway rate-limit rejection.
 ///
 /// `axis` is the stable label returned by
-/// [`crate::ratelimit::RejectReason::axis_label`]; `key_hash` is the
-/// hashed virtual-key identifier (never the raw key); `tenant` is the
+/// [`crate::ratelimit::RejectReason::axis_label`]; `key_id` is the immutable,
+/// secret-free resolved policy/key identifier; `tenant` is the
 /// originating tenant (empty for the tenant-blind entry point); `model`
 /// is the upstream model name. Surface this via the
 /// `sbproxy_ai_ratelimit_rejected_total` counter; operators alert when
 /// any axis fires.
-pub fn record_ratelimit_rejected(axis: &str, key_hash: &str, tenant: &str, model: &str) {
+pub fn record_ratelimit_rejected(axis: &str, key_id: &str, tenant: &str, model: &str) {
     AI_RATELIMIT_REJECTED
-        .with_label_values(&[axis, key_hash, tenant, model])
+        .with_label_values(&[axis, key_id, tenant, model])
         .inc();
 }
 
 /// Read the cumulative value of the rate-limit rejection counter for
-/// one `(axis, key_hash, tenant, model)` tuple. Used by tests.
-pub fn ratelimit_rejected_value(axis: &str, key_hash: &str, tenant: &str, model: &str) -> f64 {
+/// one `(axis, key_id, tenant, model)` tuple. Used by tests.
+pub fn ratelimit_rejected_value(axis: &str, key_id: &str, tenant: &str, model: &str) -> f64 {
     AI_RATELIMIT_REJECTED
-        .with_label_values(&[axis, key_hash, tenant, model])
+        .with_label_values(&[axis, key_id, tenant, model])
         .get()
 }
 
@@ -777,14 +1059,13 @@ pub fn record_token_estimate_error(model: &str, estimated: u64, actual: u64) {
 // detectors that the gateway can flag deterministically without
 // any guess about what the caller intended:
 //
-// * `duplicate_request`: response_dedup.rs already detects an
-//   exact-context resend; tag the spend wasted.
+// * `duplicate_request`: an exact-context resend reported by the serving
+//   path; tag the spend wasted.
 // * `abandoned_stream`: the client cancelled or the upstream
 //   stream closed with zero output tokens after the prompt was
 //   already sent.
-// * `validation_failed`: a guardrail or structured-output
-//   validator rejected AFTER the upstream call completed; the
-//   spend already happened.
+// * `validation_failed`: a guardrail rejected AFTER the upstream call
+//   completed; the spend already happened.
 // * `context_bloat`: input tokens significantly above the
 //   route's rolling median (the gateway emits the counter; the
 //   classifier-cum-roller lives outside this module and reports
@@ -792,7 +1073,8 @@ pub fn record_token_estimate_error(model: &str, estimated: u64, actual: u64) {
 //
 // These are observational counters + an estimated-wasted-USD
 // gauge. Enforcement (budget caps, denial gates) lives in
-// `budget.rs` / `hierarchical_budget.rs`, not here.
+// `budget.rs`, not here. There is no separate hierarchical
+// budget tracker; scopes are flat `BudgetScope` limits.
 
 /// Wasted-token counter, partitioned by waste class + bounded
 /// attribution labels. The same cardinality contract as
@@ -855,9 +1137,8 @@ fn label_or_empty(value: Option<&str>) -> &str {
 /// auditable instead of letting a typo create a new time series.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WasteKind {
-    /// The request's full context matched a recent prior request
-    /// per `response_dedup.rs`; the gateway served the cached
-    /// reply but the upstream call still happened (or would have).
+    /// The request's full context matched a recent prior request; the
+    /// upstream call still happened (or would have).
     DuplicateRequest,
     /// The client cancelled or the upstream stream closed with
     /// zero output tokens after the prompt was sent.
@@ -973,6 +1254,10 @@ static AI_TOKENS_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
             "AI tokens consumed, partitioned by attribution tag (WOR-1086)"
         ),
         &[
+            // Origin (config hostname) the request arrived on; bounded
+            // by the config, so it is cardinality-safe. Enables the
+            // admin UI's per-origin spend and token views.
+            "origin",
             "provider",
             "model",
             "surface", // classified AI surface (WOR-1095): chat_completions, embeddings, image_generation, audio_speech, realtime, ...
@@ -990,6 +1275,13 @@ static AI_TOKENS_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
             // PromQL: `sum by (tenant_id, model) (...)`.
             "tenant_id",
             "api_key_id",
+            // WOR-2140: which agent spent it. Appended last because the
+            // metric registry treats a family's label list as positional
+            // and append-only. Empty unless the gateway resolved a
+            // VERIFIED agent identity, so the distinct values are the
+            // operator's agent roster rather than whatever a caller
+            // decided to call itself. See `record_ai_request_attributed`.
+            "agent_id",
         ]
     )
     .unwrap()
@@ -1005,6 +1297,8 @@ static AI_COST_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
             "AI cost in USD, partitioned by attribution tag (WOR-1086)"
         ),
         &[
+            // See AI_TOKENS_ATTRIBUTED: config-bounded origin hostname.
+            "origin",
             "provider",
             "model",
             "surface", // classified AI surface (WOR-1095)
@@ -1016,6 +1310,10 @@ static AI_COST_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
             // See AI_TOKENS_ATTRIBUTED (WOR-1493/WOR-1494).
             "tenant_id",
             "api_key_id",
+            // See AI_TOKENS_ATTRIBUTED (WOR-2140). Appended last, and
+            // in the same position relative to the shared labels, so
+            // `sum by (agent_id)` reads the same on tokens and cost.
+            "agent_id",
         ]
     )
     .unwrap()
@@ -1037,6 +1335,8 @@ static AI_OUTCOMES_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
             "AI requests partitioned by attribution + outcome (WOR-1496)"
         ),
         &[
+            // See AI_TOKENS_ATTRIBUTED: config-bounded origin hostname.
+            "origin",
             "provider",
             "model",
             "surface",
@@ -1054,6 +1354,7 @@ static AI_OUTCOMES_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
 /// into that set before calling so the label cardinality stays bounded.
 #[allow(clippy::too_many_arguments)]
 pub fn record_ai_outcome_attributed(
+    origin: &str,
     provider: &str,
     model: &str,
     surface: &str,
@@ -1062,7 +1363,9 @@ pub fn record_ai_outcome_attributed(
     outcome: &str,
 ) {
     AI_OUTCOMES_ATTRIBUTED
-        .with_label_values(&[provider, model, surface, tenant_id, api_key_id, outcome])
+        .with_label_values(&[
+            origin, provider, model, surface, tenant_id, api_key_id, outcome,
+        ])
         .inc();
 }
 
@@ -1075,9 +1378,35 @@ pub fn record_ai_outcome_attributed(
 ///
 /// The OSS access log + OTel span pick up the high-cardinality
 /// dimensions (customer, trace_id, okr) elsewhere; the ledger's
-/// Allocate-layer join works off the span's trace_id.
+/// Allocate-layer join works off the span's trace_id, which is also the
+/// workflow key (see [`crate::attribution::AttributionTags::trace_id`]).
+///
+/// # Agent attribution (WOR-2140)
+///
+/// `agent_id` comes off `tags` and rides as the last label on both
+/// counters, so `sum by (agent_id) (rate(sbproxy_ai_cost_dollars_attributed_total[5m]))`
+/// answers "what is each agent costing me per minute" with no join.
+///
+/// Two things are load bearing about which agent ids get here.
+///
+/// The caller cannot pick one. `agent_id` is not settable from an
+/// `SB-Attr-*` header, and the dispatch path fills it only from an
+/// identity the proxy verified. An agent that merely asserts its own
+/// name lands in the empty bucket, which reads as "spend we could not
+/// attribute to a verified agent" rather than as somebody else's bill.
+/// That is also what keeps the label's distinct values bounded by the
+/// operator's agent roster instead of by traffic.
+///
+/// The run and workflow ids never get here at all. A `contextId`, a task
+/// id, and a `trace_id` each take one value per occurrence, so as labels
+/// they mint a time series per run and the series count grows with
+/// traffic. The run and task ids belong on the span and in the usage
+/// ledger, the workflow id on the access log, and that is where they
+/// are. `sbproxy-observe`'s metric-registry guard fails the build if one
+/// of them reaches a label list here.
 #[allow(clippy::too_many_arguments)]
 pub fn record_ai_request_attributed(
+    origin: &str,
     provider: &str,
     model: &str,
     surface: &str,
@@ -1096,6 +1425,11 @@ pub fn record_ai_request_attributed(
     let team = label_or_empty(tags.team.as_deref());
     let agent_type = label_or_empty(tags.agent_type.as_deref());
     let environment = label_or_empty(tags.environment.as_deref());
+    // WOR-2140. Empty when no verified agent identity resolved, which is
+    // the same convention every other optional dimension here uses: the
+    // spend is still counted, in a bucket that says it is not attributed
+    // to an agent rather than one that names the wrong one.
+    let agent_id = label_or_empty(tags.agent_id.as_deref());
 
     let record_token_kind = |direction: &'static str, n: u64| {
         if n == 0 {
@@ -1103,6 +1437,7 @@ pub fn record_ai_request_attributed(
         }
         AI_TOKENS_ATTRIBUTED
             .with_label_values(&[
+                origin,
                 provider,
                 model,
                 surface,
@@ -1114,6 +1449,7 @@ pub fn record_ai_request_attributed(
                 environment,
                 tenant_id,
                 api_key_id,
+                agent_id,
             ])
             .inc_by(n as f64);
     };
@@ -1126,6 +1462,7 @@ pub fn record_ai_request_attributed(
     if cost > 0.0 {
         AI_COST_ATTRIBUTED
             .with_label_values(&[
+                origin,
                 provider,
                 model,
                 surface,
@@ -1136,6 +1473,7 @@ pub fn record_ai_request_attributed(
                 environment,
                 tenant_id,
                 api_key_id,
+                agent_id,
             ])
             .inc_by(cost);
     }
@@ -1267,6 +1605,171 @@ pub fn record_stream_guardrail_decode_fallback() {
     STREAM_GUARDRAIL_DECODE_FALLBACK.inc();
 }
 
+// --- RAG retrieval metrics (WOR-2098) ---
+
+/// AI requests that consulted a RAG retrieval runtime, by embedding
+/// provider, vector store, and closed outcome.
+///
+/// `embedding` and `vector_store` are the runtime's configured provider
+/// kind labels (bounded by the closed provider sets the `rag` config
+/// accepts); `outcome` is one of `retrieved`, `no_match`, `stale`,
+/// `continued`, or `error`, normalized by [`record_rag_request`] so
+/// request data cannot create new series.
+static AI_RAG_REQUESTS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_rag_requests_total",
+            "AI requests that ran RAG retrieval, by embedding provider, vector store, and outcome"
+        ),
+        &["embedding", "vector_store", "outcome"]
+    )
+    .unwrap()
+});
+
+/// RAG retrieval latency in seconds, by stage and provider.
+///
+/// `stage` is one of `embedding`, `search`, or `total`; an unknown stage
+/// is dropped rather than remapped so a typo cannot misattribute time.
+/// `provider` is the provider kind label that served the stage (the
+/// embedding provider for `embedding` and `total`, the vector store for
+/// `search`). Buckets span local sub-10ms lookups through slow remote
+/// stores.
+static AI_RAG_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        HistogramOpts::new(
+            "sbproxy_ai_rag_latency_seconds",
+            "RAG retrieval latency in seconds, by stage and provider"
+        )
+        .buckets(vec![
+            0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0
+        ]),
+        &["stage", "provider"]
+    )
+    .unwrap()
+});
+
+/// Bytes of rendered retrieval context injected into the request body.
+///
+/// Observed once per retrieval that produced a context (zero-byte
+/// observations are recorded too, so a run of empty renders is visible).
+/// Buckets span a one-sentence snippet through the configured context
+/// ceiling.
+static AI_RAG_CONTEXT_BYTES: LazyLock<Histogram> = LazyLock::new(|| {
+    register_histogram!(HistogramOpts::new(
+        "sbproxy_ai_rag_context_bytes",
+        "Bytes of rendered RAG context injected into the request body"
+    )
+    .buckets(vec![
+        256.0, 1024.0, 4096.0, 16384.0, 65536.0, 262144.0, 1048576.0
+    ]))
+    .unwrap()
+});
+
+/// Record one RAG retrieval attempt against the request counter.
+///
+/// `outcome` must come from the closed set `retrieved | no_match |
+/// stale | continued | error`; any other value is folded into `error`
+/// so a future outcome variant cannot mint an unbounded label.
+pub fn record_rag_request(embedding: &str, vector_store: &str, outcome: &str) {
+    let outcome = match outcome {
+        "retrieved" | "no_match" | "stale" | "continued" | "error" => outcome,
+        _ => "error",
+    };
+    AI_RAG_REQUESTS
+        .with_label_values(&[embedding, vector_store, outcome])
+        .inc();
+}
+
+/// Record one RAG retrieval latency observation, in seconds.
+///
+/// `stage` must be `embedding`, `search`, or `total`; unknown stages
+/// and non-finite or negative durations are dropped so the histogram
+/// only sees meaningful, correctly attributed samples.
+pub fn record_rag_latency(stage: &str, provider: &str, seconds: f64) {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return;
+    }
+    let stage = match stage {
+        "embedding" | "search" | "total" => stage,
+        _ => return,
+    };
+    AI_RAG_LATENCY
+        .with_label_values(&[stage, provider])
+        .observe(seconds);
+}
+
+/// Record the rendered RAG context size, in bytes, for one retrieval.
+pub fn record_rag_context_bytes(bytes: usize) {
+    AI_RAG_CONTEXT_BYTES.observe(bytes as f64);
+}
+
+// --- Model directory metrics ---
+
+/// Directory nodes excluded from model routing, by
+/// [`crate::model_directory::ModelDirectoryExclusionReason`]. Counted once
+/// per excluded node per `ModelDirectory::refresh`, so a steady
+/// exclusion shows up as a steady rate rather than a one-shot event.
+static AI_MODEL_DIRECTORY_EXCLUSIONS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_model_directory_exclusions_total",
+            "Directory nodes excluded from model routing, by exclusion reason"
+        ),
+        &["exclusion_reason"]
+    )
+    .unwrap()
+});
+
+/// Record one directory node classified out of eligible routing on a
+/// `refresh`, by its bounded exclusion reason.
+pub fn record_model_directory_exclusion(reason: &'static str) {
+    AI_MODEL_DIRECTORY_EXCLUSIONS
+        .with_label_values(&[reason])
+        .inc();
+}
+
+#[cfg(test)]
+pub(crate) fn model_directory_exclusion_value(reason: &str) -> f64 {
+    AI_MODEL_DIRECTORY_EXCLUSIONS
+        .with_label_values(&[reason])
+        .get()
+}
+
+// --- Managed-replica routing metrics ---
+
+/// Managed-replica candidates excluded before rendezvous ranking, by the
+/// [`crate::managed_replica::ReplicaSelectionTrace`] stage that dropped
+/// them (`generation`, `health`, `endpoint`, `state`, `adapter`).
+static AI_REPLICA_SELECTION_EXCLUDED: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_replica_selection_excluded_total",
+            "Managed-replica candidates excluded before rendezvous ranking, by stage"
+        ),
+        &["stage"]
+    )
+    .unwrap()
+});
+
+/// Record `count` candidates excluded at one `ReplicaSelectionTrace`
+/// stage for a single routing decision. A no-op for `count == 0` so a
+/// clean routing decision does not touch every stage's series.
+pub fn record_replica_selection_excluded(stage: &'static str, count: usize) {
+    if count == 0 {
+        return;
+    }
+    AI_REPLICA_SELECTION_EXCLUDED
+        .with_label_values(&[stage])
+        .inc_by(count as f64);
+}
+
+#[cfg(test)]
+pub(crate) fn replica_selection_excluded_value(stage: &str) -> f64 {
+    AI_REPLICA_SELECTION_EXCLUDED
+        .with_label_values(&[stage])
+        .get()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1304,6 +1807,138 @@ mod tests {
         assert!(families
             .iter()
             .any(|f| f.name() == "sbproxy_ai_stream_guardrail_decode_fallback_total"));
+    }
+
+    /// WOR-2098: the three RAG families register and carry the expected
+    /// label names.
+    #[test]
+    fn rag_metrics_families_register_with_expected_labels() {
+        record_rag_request("openai_compatible", "qdrant", "retrieved");
+        record_rag_latency("embedding", "openai_compatible", 0.012);
+        record_rag_latency("search", "qdrant", 0.004);
+        record_rag_latency("total", "openai_compatible", 0.02);
+        record_rag_context_bytes(1536);
+
+        let families = prometheus::gather();
+        let requests = families
+            .iter()
+            .find(|f| f.name() == "sbproxy_ai_rag_requests_total")
+            .expect("rag request counter registered");
+        let request_labels: Vec<&str> = requests
+            .get_metric()
+            .iter()
+            .flat_map(|m| m.get_label().iter().map(|l| l.name()))
+            .collect();
+        for required in &["embedding", "vector_store", "outcome"] {
+            assert!(
+                request_labels.contains(required),
+                "expected label '{required}' on sbproxy_ai_rag_requests_total"
+            );
+        }
+
+        let latency = families
+            .iter()
+            .find(|f| f.name() == "sbproxy_ai_rag_latency_seconds")
+            .expect("rag latency histogram registered");
+        let latency_labels: Vec<&str> = latency
+            .get_metric()
+            .iter()
+            .flat_map(|m| m.get_label().iter().map(|l| l.name()))
+            .collect();
+        for required in &["stage", "provider"] {
+            assert!(
+                latency_labels.contains(required),
+                "expected label '{required}' on sbproxy_ai_rag_latency_seconds"
+            );
+        }
+        for stage in ["embedding", "search", "total"] {
+            assert!(
+                latency.get_metric().iter().any(|m| {
+                    m.get_label()
+                        .iter()
+                        .any(|l| l.name() == "stage" && l.value() == stage)
+                }),
+                "expected a '{stage}' stage row on sbproxy_ai_rag_latency_seconds"
+            );
+        }
+
+        let context = families
+            .iter()
+            .find(|f| f.name() == "sbproxy_ai_rag_context_bytes")
+            .expect("rag context-bytes histogram registered");
+        let samples: u64 = context
+            .get_metric()
+            .iter()
+            .map(|m| m.get_histogram().get_sample_count())
+            .sum();
+        assert!(samples >= 1, "expected at least one context observation");
+    }
+
+    /// WOR-2098: an outcome outside the closed vocabulary is folded into
+    /// `error` instead of minting a new series.
+    #[test]
+    fn rag_metrics_outcome_labels_are_closed() {
+        let outcome_value = |outcome: &str| {
+            AI_RAG_REQUESTS
+                .with_label_values(&["closed-set-embed", "closed-set-store", outcome])
+                .get()
+        };
+        let before = outcome_value("error");
+        record_rag_request(
+            "closed-set-embed",
+            "closed-set-store",
+            "operator-controlled",
+        );
+        assert_eq!(outcome_value("error"), before + 1.0);
+
+        let families = prometheus::gather();
+        let requests = families
+            .iter()
+            .find(|f| f.name() == "sbproxy_ai_rag_requests_total")
+            .expect("rag request counter registered");
+        assert!(
+            !requests.get_metric().iter().any(|m| {
+                m.get_label()
+                    .iter()
+                    .any(|l| l.name() == "outcome" && l.value() == "operator-controlled")
+            }),
+            "an out-of-set outcome must never appear as its own series"
+        );
+    }
+
+    /// WOR-2098: unknown stages plus non-finite and negative durations
+    /// are dropped, keeping the stage vocabulary closed.
+    #[test]
+    fn rag_metrics_latency_drops_unknown_stage_and_bad_values() {
+        let sample_count = || -> u64 {
+            let families = prometheus::gather();
+            families
+                .iter()
+                .find(|f| f.name() == "sbproxy_ai_rag_latency_seconds")
+                .map(|f| {
+                    f.get_metric()
+                        .iter()
+                        .filter(|m| {
+                            m.get_label().iter().any(|l| {
+                                l.name() == "provider" && l.value() == "stage-guard-provider"
+                            })
+                        })
+                        .map(|m| m.get_histogram().get_sample_count())
+                        .sum()
+                })
+                .unwrap_or(0)
+        };
+        let before = sample_count();
+        record_rag_latency("prefetch", "stage-guard-provider", 0.1);
+        record_rag_latency("total", "stage-guard-provider", f64::NAN);
+        record_rag_latency("total", "stage-guard-provider", -0.5);
+        assert_eq!(
+            sample_count(),
+            before,
+            "unknown stages and invalid durations must not be observed"
+        );
+        record_rag_latency("total", "stage-guard-provider", 0.1);
+        assert_eq!(sample_count(), before + 1);
     }
 
     #[test]
@@ -1391,6 +2026,7 @@ mod tests {
     #[test]
     fn test_record_ai_outcome_attributed() {
         record_ai_outcome_attributed(
+            "test.origin",
             "openai",
             "gpt-4o",
             "chat_completions",
@@ -1589,6 +2225,79 @@ mod tests {
     }
 
     #[test]
+    fn routing_depth_counters_register_bounded_labels_and_increment() {
+        record_routing_fallback("outcome_aware", "warmup");
+        record_routing_fallback("outcome_aware", "operator-controlled");
+        record_prefix_affinity_decision("hit");
+        record_prefix_affinity_decision("operator-controlled");
+        record_prefix_affinity_eviction("ttl");
+        record_prefix_affinity_eviction("operator-controlled");
+        record_quota_pool_fail_open("shared-upstream");
+        record_quota_pool_overshare("shared-upstream");
+
+        let families = prometheus::gather();
+        let expected = [
+            (
+                "sbproxy_ai_routing_fallbacks_total",
+                vec![("strategy", "outcome_aware"), ("reason", "warmup")],
+            ),
+            (
+                "sbproxy_ai_prefix_affinity_decisions_total",
+                vec![("outcome", "hit")],
+            ),
+            (
+                "sbproxy_ai_prefix_affinity_evictions_total",
+                vec![("reason", "ttl")],
+            ),
+            (
+                "sbproxy_ai_quota_pool_fail_open_total",
+                vec![("pool", "shared-upstream")],
+            ),
+            (
+                "sbproxy_ai_quota_pool_overshare_total",
+                vec![("pool", "shared-upstream")],
+            ),
+        ];
+
+        for (name, labels) in expected {
+            let family = families
+                .iter()
+                .find(|family| family.name() == name)
+                .unwrap_or_else(|| panic!("{name} must be registered"));
+            assert!(
+                family.get_metric().iter().any(|metric| {
+                    labels.iter().all(|(label_name, label_value)| {
+                        metric.get_label().iter().any(|label| {
+                            label.name() == *label_name && label.value() == *label_value
+                        })
+                    }) && metric.get_counter().value() >= 1.0
+                }),
+                "{name} must contain the expected incremented label set"
+            );
+        }
+
+        for (name, label_name) in [
+            ("sbproxy_ai_routing_fallbacks_total", "reason"),
+            ("sbproxy_ai_prefix_affinity_decisions_total", "outcome"),
+            ("sbproxy_ai_prefix_affinity_evictions_total", "reason"),
+        ] {
+            let family = families
+                .iter()
+                .find(|family| family.name() == name)
+                .expect("metric family registered above");
+            assert!(
+                family.get_metric().iter().any(|metric| {
+                    metric
+                        .get_label()
+                        .iter()
+                        .any(|label| label.name() == label_name && label.value() == "unknown")
+                }),
+                "{name} must normalize unexpected label values"
+            );
+        }
+    }
+
+    #[test]
     fn test_record_guardrail_block() {
         record_guardrail_block("pii");
         record_guardrail_block("injection");
@@ -1597,6 +2306,14 @@ mod tests {
             .iter()
             .find(|f| f.name() == "sbproxy_ai_guardrail_blocks_total");
         assert!(blocks.is_some());
+    }
+
+    #[test]
+    fn safety_guardrail_verdict_labels_are_closed() {
+        let before = safety_guardrail_verdict_value("jailbreak", "unknown", "unknown", "unknown");
+        record_safety_guardrail_verdict("jailbreak", "operator-value", "remote", "deny");
+        let after = safety_guardrail_verdict_value("jailbreak", "unknown", "unknown", "unknown");
+        assert_eq!(after, before + 1.0);
     }
 
     #[test]
@@ -1762,6 +2479,7 @@ mod tests {
             ..Default::default()
         };
         record_ai_request_attributed(
+            "test.origin",
             "openai",
             "gpt-4o",
             "chat_completions",
@@ -1798,6 +2516,142 @@ mod tests {
         assert!(families
             .iter()
             .any(|f| f.name() == "sbproxy_ai_cost_dollars_attributed_total"));
+    }
+
+    /// WOR-2140: the agent that spent it reaches both attributed
+    /// counters as `agent_id`, and nothing run-scoped reaches either.
+    ///
+    /// The second half is the part worth a test rather than a comment.
+    /// `agent_id` is safe as a label because it names a member of the
+    /// operator's agent roster; a run, task, context, or workflow id is
+    /// not, because it takes a fresh value per occurrence and would mint
+    /// one dead time series per run forever. Those ids are on the span
+    /// and in the usage ledger instead. `sbproxy-observe` fails the build
+    /// if one appears in the registry's declared label list, but the
+    /// registry is a hand-maintained table; this asserts against the
+    /// labels the process actually emitted.
+    #[test]
+    fn attributed_spend_carries_the_agent_and_no_run_scoped_id() {
+        use crate::attribution::AttributionTags;
+        // Unique provider + model so the assertions are isolated from
+        // the shared process-wide Prometheus registry.
+        let provider = "agent-attr-test-provider";
+        let model = "agent-attr-test-model";
+        let tags = AttributionTags {
+            project: Some("growth-q3".to_string()),
+            team: Some("platform".to_string()),
+            // The workflow key. It must reach the span and the access
+            // log, and it must NOT reach a label here.
+            trace_id: Some("wf-01J6FQ7X0000000000000000".to_string()),
+            agent_id: Some("billing-orchestrator".to_string()),
+            ..Default::default()
+        };
+        record_ai_request_attributed(
+            "test.origin",
+            provider,
+            model,
+            "chat_completions",
+            "acme-tenant",
+            "sk_deadbeef0003",
+            &tags,
+            100,
+            50,
+            0,
+            0,
+            0,
+            0.25,
+        );
+
+        let families = prometheus::gather();
+        for family in [
+            "sbproxy_ai_tokens_attributed_total",
+            "sbproxy_ai_cost_dollars_attributed_total",
+        ] {
+            let f = families
+                .iter()
+                .find(|f| f.name() == family)
+                .unwrap_or_else(|| panic!("{family} must be registered"));
+            let ours: Vec<_> = f
+                .get_metric()
+                .iter()
+                .filter(|m| {
+                    m.get_label()
+                        .iter()
+                        .any(|l| l.name() == "provider" && l.value() == provider)
+                })
+                .collect();
+            assert!(!ours.is_empty(), "{family} recorded no cell for {provider}");
+            for m in &ours {
+                let labels = m.get_label();
+                assert!(
+                    labels
+                        .iter()
+                        .any(|l| l.name() == "agent_id" && l.value() == "billing-orchestrator"),
+                    "{family} must carry the spending agent, got {labels:?}"
+                );
+                for forbidden in [
+                    "trace_id",
+                    "run_id",
+                    "task_id",
+                    "session_id",
+                    "context_id",
+                    "request_id",
+                    "a2a_context_id",
+                ] {
+                    assert!(
+                        !labels.iter().any(|l| l.name() == forbidden),
+                        "{family} must not carry the run-scoped label {forbidden:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Spend the gateway could not tie to a verified agent still counts,
+    /// under an empty `agent_id`. Dropping the row would hide the spend;
+    /// inventing a value for it would attribute somebody's bill to an
+    /// agent that did not make the call.
+    #[test]
+    fn unattributed_spend_lands_under_an_empty_agent_id() {
+        use crate::attribution::AttributionTags;
+        let provider = "no-agent-test-provider";
+        let model = "no-agent-test-model";
+        record_ai_request_attributed(
+            "test.origin",
+            provider,
+            model,
+            "chat_completions",
+            "acme-tenant",
+            "sk_deadbeef0004",
+            &AttributionTags::default(),
+            10,
+            5,
+            0,
+            0,
+            0,
+            0.5,
+        );
+        let families = prometheus::gather();
+        let f = families
+            .iter()
+            .find(|f| f.name() == "sbproxy_ai_cost_dollars_attributed_total")
+            .expect("cost counter registered");
+        let ours = f
+            .get_metric()
+            .iter()
+            .find(|m| {
+                m.get_label()
+                    .iter()
+                    .any(|l| l.name() == "provider" && l.value() == provider)
+            })
+            .expect("the unattributed cell was recorded");
+        assert!(
+            ours.get_label()
+                .iter()
+                .any(|l| l.name() == "agent_id" && l.value().is_empty()),
+            "an unresolved agent must record as empty, not be dropped"
+        );
+        assert!(ours.get_counter().value() >= 0.5);
     }
 
     /// WOR-1095: realtime / audio surfaces land in the attributed
@@ -1866,6 +2720,7 @@ mod tests {
         let provider = "zero-kinds-test-provider";
         let model = "zero-kinds-test-model";
         record_ai_request_attributed(
+            "test.origin",
             provider,
             model,
             "chat_completions",
@@ -1901,5 +2756,24 @@ mod tests {
             !has_cache_for_our_labels,
             "zero cache_read tokens should not land in the metric for this test's labels"
         );
+    }
+
+    #[test]
+    fn model_directory_exclusion_counts_by_reason() {
+        let before = model_directory_exclusion_value("membership_dead");
+        record_model_directory_exclusion("membership_dead");
+        record_model_directory_exclusion("membership_dead");
+        assert!((model_directory_exclusion_value("membership_dead") - before - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn replica_selection_excluded_counts_by_stage_and_skips_zero() {
+        let before = replica_selection_excluded_value("health");
+        // A clean routing decision (0 excluded) must not touch the series.
+        record_replica_selection_excluded("health", 0);
+        assert!((replica_selection_excluded_value("health") - before).abs() < 1e-9);
+
+        record_replica_selection_excluded("health", 3);
+        assert!((replica_selection_excluded_value("health") - before - 3.0).abs() < 1e-9);
     }
 }

@@ -1,20 +1,95 @@
 # yaml-language-server: $schema=../../schemas/sb-config.schema.json
-# 32 - multi-rail-accept-payment
+# multi-rail-accept-payment - three ways to pay for one route.
 #
-# Both x402 and MPP rails configured at once. The example demonstrates
-# the `Accept-Payment` header negotiation: q-value semantics,
-# first-match-wins per A3.1, the multi-rail body shape, and the 406
-# fallback when no rail matches.
+# The route advertises x402, Payment HTTP Authentication, and Stripe
+# directly. All three are priced in USD, which is not a coincidence: one
+# challenge cannot mix currencies, because the proxy performs no
+# conversion, and a mixed-currency route is refused at load by name.
 #
-# Run:
-#   cd examples/multi-rail-accept-payment
+# `Accept-Payment` decides which challenge comes back. It is a preference
+# list of methods and intents, and nothing else: no token, no signature,
+# no address, no amount. It never authorizes a request.
+#
+# Note that `mpp` and `stripe` both settle on rails.stripe. Payment HTTP
+# Authentication is a credential transport, not a network that moves
+# funds, so there is no separate rail block for it.
+#
+# Validate it without holding any of its secrets:
+#   sbproxy validate -f examples/multi-rail-accept-payment/sb.yml
+#
+# Serve it:
+#   export SBPROXY_PAYMENT_BINDING_KEY="$(openssl rand -hex 32)"
+#   export SBPROXY_PAYMENT_RECOVERY_KEY="$(openssl rand -hex 32)"
+#   export STRIPE_SECRET_KEY=sk_test_...
 #   docker compose up -d --wait
 #
-# Tear down:
-#   docker compose down -v
+# Probe with a preference order:
+#   curl -is -H 'Host: blog.test.sbproxy.dev' \
+#        -H 'User-Agent: GPTBot/1.0' \
+#        -H 'Accept-Payment: x402;q=1.0, stripe;intent=charge;q=0.5' \
+#        http://127.0.0.1:8080/article
 
 proxy:
   http_bind_port: 8080
+
+  payments:
+    state_path: /var/lib/sbproxy/payments.sqlite3
+    challenge_binding_key: secret://env/SBPROXY_PAYMENT_BINDING_KEY
+    authorization_timeout_ms: 2000
+    max_body_bytes: 1048576
+
+    # Required because rails.stripe is enabled below.
+    recovery_encryption:
+      key_id: payments-2026-08
+      key: secret://env/SBPROXY_PAYMENT_RECOVERY_KEY
+      max_age_hours: 23
+
+    worker:
+      reconcile_interval_ms: 1000
+      max_reconcile_batch: 32
+      shutdown_timeout_ms: 5000
+
+    protocols:
+      payment_auth:
+        draft: draft-ryan-httpauth-payment-01
+        realm: blog.test.sbproxy.dev
+        method: stripe
+        intent: charge
+
+    rails:
+      x402:
+        scheme: exact
+        network: "eip155:84532"
+        asset: "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
+        quote_currency: USD
+        asset_decimals: 6
+        pay_to: "0x1111111111111111111111111111111111111111"
+        max_timeout_seconds: 60
+        extra:
+          name: USDC
+          version: "2"
+        facilitators:
+          - facilitator_url: https://facilitator.x402.test.sbproxy.dev/api
+        verify_timeout_ms: 700
+        settle_timeout_ms: 1200
+        breaker:
+          failure_threshold: 3
+          open_ms: 5000
+          half_open_max: 1
+
+      stripe:
+        api_key: secret://env/STRIPE_SECRET_KEY
+        api_version: 2026-06-24.dahlia
+        account_context: platform
+        business_network_id: profile_test_example
+        # Same currency as the x402 rail above. Changing either one alone
+        # is a load error on any route that advertises both.
+        quote_currency: USD
+        currency_decimals: 2
+        payment_method_types: [card]
+        direct_payment_intent:
+          enabled: true
+          capture_method: manual
 
 origins:
   "blog.test.sbproxy.dev":
@@ -24,9 +99,6 @@ origins:
 
     policies:
       - type: ai_crawl_control
-        # Default fallback price. Each rail in the multi-rail body
-        # quotes this same price (the rail negotiation is over how
-        # the agent settles, not how much it pays).
         price: 0.001
         currency: USD
         header: crawler-payment
@@ -40,9 +112,12 @@ origins:
           - PerplexityBot
           - Google-Extended
 
-        # Single tier; both rails inherit this price. We intentionally
-        # do not vary price per rail so the test cases focus on the
-        # negotiation shape, not the price-resolution path.
+        free_paths:
+          - /robots.txt
+          - /health
+
+        # One price for every rail. The negotiation is over how the
+        # client pays, not how much.
         tiers:
           - route_pattern: /article*
             price:
@@ -50,21 +125,3 @@ origins:
               currency: USD
             content_shape: html
             paywall_position: top_of_page
-
-        # Wave 3 multi-rail block. Both rails configured.
-        rails:
-          x402:
-            chain: base
-            facilitator: http://mock-x402-facilitator:80
-            asset: USDC
-            pay_to: "0x0000000000000000000000000000000000000000"
-            version: "2"
-          mpp:
-            version: "1"
-
-        quote_token:
-          key_id: multi-rail-demo-2026
-          # Demo seed only. Production deployments use `secret_ref:`.
-          seed_hex: "3333333333333333333333333333333333333333333333333333333333333333"
-          issuer: "https://blog.test.sbproxy.dev"
-          default_ttl_seconds: 300

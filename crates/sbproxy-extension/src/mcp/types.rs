@@ -47,6 +47,47 @@ pub fn negotiate_protocol_version(requested: Option<&str>) -> &'static str {
     }
 }
 
+// --- SEP-414 request metadata: trace context ---
+
+/// `params._meta` key carrying the W3C `traceparent` of the trace the
+/// request belongs to.
+///
+/// SEP-414 (Standards Track, Final) reserves this name,
+/// [`META_TRACESTATE`], and [`META_BAGGAGE`] inside `params._meta`
+/// **unprefixed**, as an explicit documented exception to MCP's rule
+/// that `_meta` keys carry a DNS-style prefix. The SEP states the
+/// reason for the exception itself: "If we don't document this shared
+/// concern, differing interpretations could materialize, such as
+/// namespacing traceparent like `io.modelcontextprotocol.traceparent`,
+/// which will break traces and log correlation."
+///
+/// So the key goes on the wire bare. Do not invent a prefix for it.
+pub const META_TRACEPARENT: &str = "traceparent";
+
+/// `params._meta` key carrying the W3C `tracestate` of the trace the
+/// request belongs to. Reserved unprefixed by SEP-414; see
+/// [`META_TRACEPARENT`] for the reasoning behind the exception.
+pub const META_TRACESTATE: &str = "tracestate";
+
+/// `params._meta` key carrying W3C Baggage. Reserved unprefixed by
+/// SEP-414; see [`META_TRACEPARENT`] for the reasoning behind the
+/// exception.
+///
+/// The gateway emits no baggage today: only the W3C TraceContext
+/// propagator is wired, and it produces `traceparent` and
+/// `tracestate`. The name is reserved here so that if a composite
+/// propagator is ever installed, its baggage output is recognised as
+/// belonging in `_meta` bare rather than being prefixed or dropped.
+pub const META_BAGGAGE: &str = "baggage";
+
+/// Every `_meta` key SEP-414 reserves unprefixed.
+///
+/// A propagator's output is filtered against this set before it is
+/// merged into `params._meta`. A key SEP-414 does not reserve has no
+/// exception from MCP's prefixing rule, so writing it bare would be
+/// exactly the namespace collision the reservation exists to prevent.
+pub const SEP_414_RESERVED_META_KEYS: &[&str] = &[META_TRACEPARENT, META_TRACESTATE, META_BAGGAGE];
+
 // --- JSON-RPC 2.0 ---
 
 /// JSON-RPC 2.0 request envelope used by all MCP methods.
@@ -334,5 +375,35 @@ mod protocol_version_tests {
         assert!(SUPPORTED_PROTOCOL_VERSIONS
             .iter()
             .all(|v| is_supported_protocol_version(v)));
+    }
+}
+
+#[cfg(test)]
+mod sep_414_meta_tests {
+    use super::*;
+
+    /// The whole point of SEP-414 is that these three names are bare.
+    /// Pinning the literals here means a rename of the constant cannot
+    /// quietly change what goes on the wire, and a prefix cannot creep
+    /// in without this test failing.
+    #[test]
+    fn reserved_meta_keys_are_unprefixed() {
+        assert_eq!(META_TRACEPARENT, "traceparent");
+        assert_eq!(META_TRACESTATE, "tracestate");
+        assert_eq!(META_BAGGAGE, "baggage");
+        for key in SEP_414_RESERVED_META_KEYS {
+            assert!(
+                !key.contains('.'),
+                "SEP-414 reserves {key} unprefixed; a dotted name breaks trace correlation"
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_set_covers_every_named_key() {
+        assert_eq!(
+            SEP_414_RESERVED_META_KEYS,
+            [META_TRACEPARENT, META_TRACESTATE, META_BAGGAGE].as_slice()
+        );
     }
 }

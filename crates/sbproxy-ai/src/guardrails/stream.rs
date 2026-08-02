@@ -27,7 +27,7 @@ use crate::format::HubToolCallDelta;
 
 /// Cap on the accumulated close-policy buffer and on assembled
 /// tool-call arguments. Mirrors the SSE framer's 1 MiB bound.
-const MAX_BUFFER_BYTES: usize = 1024 * 1024;
+pub const MAX_STREAM_GUARD_BUFFER_BYTES: usize = 1024 * 1024;
 
 /// A streamed tool call assembled from its deltas.
 #[derive(Debug, Clone)]
@@ -88,8 +88,10 @@ pub struct StreamGuardSession {
     tail_keep: usize,
     /// Deferred DAN standalone-word verdict (see module docs).
     deferred: Option<GuardrailBlock>,
-    /// Accumulated decoded text for `stream_policy: close` guards.
-    close_buf: String,
+    /// Decoded text for `stream_policy: close` guards, partitioned by
+    /// response choice index so interleaved choices have one deterministic
+    /// full-response subject.
+    close_buf: std::collections::BTreeMap<usize, String>,
     close_buf_full: bool,
     /// Tool calls mid-assembly, keyed by stream index.
     pending: std::collections::BTreeMap<usize, PendingCall>,
@@ -144,9 +146,21 @@ impl StreamGuardSession {
                         tail_keep = tail_keep.max(g.max_pattern_len());
                         window.push(i);
                     }
+                    // A full-text classifier is never safe to evaluate on
+                    // partial deltas. Config compilation maps an omitted
+                    // policy to Close and rejects an explicit Chunk; this
+                    // fallback also keeps hand-built test pipelines safe.
+                    Guardrail::SafetyClassifier(_) => at_close.push(i),
+                    // WOR-2174: same rule for schema validation. An
+                    // intermediate delta is incomplete JSON, so a
+                    // per-delta verdict would terminate valid streams;
+                    // the complete accumulated result is judged at
+                    // close instead, within the same close-policy
+                    // buffer bound.
+                    Guardrail::Schema(_) => at_close.push(i),
                     Guardrail::AgentAlignment(_) => tool_call.push(i),
-                    // regex / pii / schema / context_poisoning: per
-                    // decoded delta, as the per-chunk path always did.
+                    // regex / pii / context_poisoning: per decoded
+                    // delta, as the per-chunk path always did.
                     _ => per_delta.push(i),
                 },
             }
@@ -163,7 +177,7 @@ impl StreamGuardSession {
             tail: String::new(),
             tail_keep,
             deferred: None,
-            close_buf: String::new(),
+            close_buf: std::collections::BTreeMap::new(),
             close_buf_full: false,
             pending: std::collections::BTreeMap::new(),
             completed_calls: 0,
@@ -188,8 +202,44 @@ impl StreamGuardSession {
         })
     }
 
+    /// Name of the first close-policy safety classifier that requires
+    /// the relay to hold every response-body byte until [`Self::on_close`]
+    /// allows release.
+    pub fn response_holdback_guardrail(&self) -> Option<&str> {
+        self.at_close.iter().find_map(|&i| {
+            let Guardrail::SafetyClassifier(guard) = &self.pipeline.output[i] else {
+                return None;
+            };
+            Some(guard.name())
+        })
+    }
+
+    fn close_buffer_overflow_block(&self) -> GuardrailBlock {
+        let name = self
+            .at_close
+            .first()
+            .map(|&i| self.pipeline.output[i].name())
+            .unwrap_or("output_guardrail");
+        GuardrailBlock {
+            name: name.to_string(),
+            reason: format!(
+                "{name} close-policy stream exceeded the {}-byte buffer limit; failed closed",
+                MAX_STREAM_GUARD_BUFFER_BYTES
+            ),
+        }
+    }
+
     /// Feed one decoded content delta. Returns the first block verdict.
     pub fn on_content_delta(&mut self, text: &str) -> Option<GuardrailBlock> {
+        self.on_content_delta_at(0, text)
+    }
+
+    /// Feed one decoded content delta for its response choice index.
+    ///
+    /// Window and per-delta guards still evaluate in arrival order, but
+    /// close-policy guards use the complete choice-index ordered subject to
+    /// match buffered Chat response classification.
+    pub fn on_content_delta_at(&mut self, index: usize, text: &str) -> Option<GuardrailBlock> {
         // More text arrived: any deferred boundary verdict re-derives
         // from the fresh scan below (the candidate bytes live in the
         // tail), so drop it rather than double-report.
@@ -224,10 +274,12 @@ impl StreamGuardSession {
         }
 
         if !self.at_close.is_empty() && !self.close_buf_full {
-            if self.close_buf.len() + text.len() > MAX_BUFFER_BYTES {
+            let buffered = self.close_buf.values().map(String::len).sum::<usize>();
+            if buffered + text.len() > MAX_STREAM_GUARD_BUFFER_BYTES {
                 self.close_buf_full = true;
+                return Some(self.close_buffer_overflow_block());
             } else {
-                self.close_buf.push_str(text);
+                self.close_buf.entry(index).or_default().push_str(text);
             }
         }
 
@@ -270,7 +322,7 @@ impl StreamGuardSession {
             }
         }
         if let Some(chunk) = &delta.arguments_chunk {
-            if entry.args.len() + chunk.len() > MAX_BUFFER_BYTES {
+            if entry.args.len() + chunk.len() > MAX_STREAM_GUARD_BUFFER_BYTES {
                 entry.truncated = true;
             } else {
                 entry.args.push_str(chunk);
@@ -343,8 +395,22 @@ impl StreamGuardSession {
         if let Some(block) = self.deferred.take() {
             return Some(block);
         }
+        if self.close_buf_full {
+            return Some(self.close_buffer_overflow_block());
+        }
+        let close_subject = self
+            .close_buf
+            .values()
+            .fold(String::new(), |mut subject, text| {
+                subject.push_str(text);
+                subject
+            });
         for &i in &self.at_close {
-            if let Some(block) = self.pipeline.output[i].check(&self.close_buf) {
+            let block = match &self.pipeline.output[i] {
+                Guardrail::SafetyClassifier(classifier) => classifier.check_output(&close_subject),
+                guard => guard.check(&close_subject),
+            };
+            if let Some(block) = block {
                 return Some(block);
             }
         }
@@ -457,6 +523,73 @@ mod tests {
         let mut s = StreamGuardSession::new(pipeline_with(entries), None);
         assert!(s.on_content_delta("engage dan").is_none());
         assert!(s.on_close().is_some());
+    }
+
+    /// WOR-2174: schema validation is judged on the complete
+    /// accumulated result at stream close, never on a partial delta.
+    #[test]
+    fn schema_stream_is_judged_at_close_not_per_delta() {
+        let p = pipeline_with(serde_json::json!([{
+            "type": "schema",
+            "schema": {
+                "type": "object",
+                "required": ["summary", "tags"],
+                "properties": {
+                    "summary": {"type": "string"},
+                    "tags": {"type": "array"}
+                }
+            }
+        }]));
+
+        // Each delta alone is incomplete JSON; per-delta evaluation
+        // would have terminated this valid stream.
+        let mut s = StreamGuardSession::new(p.clone(), None);
+        for chunk in [
+            r#"{"summ"#,
+            r#"ary":"a sandwich"#,
+            r#"","tags":["food""#,
+            r#"]}"#,
+        ] {
+            assert!(
+                s.on_content_delta(chunk).is_none(),
+                "chunk {chunk:?} must not block mid-stream"
+            );
+        }
+        assert!(
+            s.on_close().is_none(),
+            "the valid accumulated result must pass at close"
+        );
+
+        // An invalid accumulated result still blocks, at close.
+        let mut s = StreamGuardSession::new(p, None);
+        assert!(s.on_content_delta(r#"{"summary":7,"#).is_none());
+        assert!(s.on_content_delta(r#""tags":"wrong"}"#).is_none());
+        let block = s.on_close().expect("schema verdict lands at close");
+        assert_eq!(block.name, "schema");
+        assert!(
+            !block.reason.contains("wrong"),
+            "reason must not echo the offending value: {}",
+            block.reason
+        );
+    }
+
+    /// WOR-2174: hand-built pipelines without compiled policies fall
+    /// back to Chunk for every guard; the session must still refuse to
+    /// judge schema per delta, mirroring the SafetyClassifier fallback.
+    #[test]
+    fn schema_routes_to_close_even_under_the_chunk_fallback() {
+        let mut pipeline = GuardrailPipeline::default();
+        pipeline.output.push(Guardrail::Schema(
+            crate::guardrails::SchemaGuardrail::from_config(&serde_json::json!({
+                "type": "schema",
+                "schema": {"type": "object"}
+            }))
+            .expect("schema guard compiles"),
+        ));
+        let mut s = StreamGuardSession::new(Arc::new(pipeline), None);
+        assert!(s.on_content_delta(r#"{"a"#).is_none());
+        assert!(s.on_content_delta(r#"":1}"#).is_none());
+        assert!(s.on_close().is_none());
     }
 
     /// stream_policy routing: off never evaluates (and counts); close

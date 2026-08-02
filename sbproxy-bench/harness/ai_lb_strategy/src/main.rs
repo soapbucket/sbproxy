@@ -4,8 +4,8 @@
 //! In-process driver that feeds a synthetic skewed workload
 //! through the live [`sbproxy_ai::routing::Router`] for each
 //! declared strategy, then prints a P50 / P95 / P99 / P99.9 / max
-//! comparison table plus a Jain fairness index and (for
-//! `prefix_affinity`) a KV-cache hit rate.
+//! comparison table plus a Jain fairness index and a simulated
+//! KV-cache hit rate.
 //!
 //! ## What "skewed" means
 //!
@@ -20,29 +20,28 @@
 //! 2. **Prompt-prefix Zipf.** A vocabulary of
 //!    `--prefix-vocabulary` distinct prefixes is sampled with Zipf
 //!    parameter `--prefix-zipf-s` (default 1.1). Rewards
-//!    `prefix_affinity` when the same prefix repeats; degenerates
-//!    to round-robin when prefixes never repeat.
+//!    `prefix_affinity` when the same normalized prefix repeats;
+//!    exercises its least-token-load miss path otherwise.
 //! 3. **Tenant token-burst Zipf.** `--tenants` distinct tenants
 //!    sampled with Zipf `--tenant-zipf-s` (default 1.0). The hot
-//!    tenant emits a disproportionate share of tokens; rewards
-//!    `least_token_usage` (it spreads the hot tenant across
+//!    tenant appears more often and has a larger per-request token
+//!    burst, but does not alter prompt-prefix identity. This rewards
+//!    `least_token_usage` (it spreads the hot tenant's tokens across
 //!    providers) and `least_connections`.
 //!
 //! ## What the simulated latency model assumes
 //!
 //! ```text
 //! observed_ms = base_ms * provider_factor
-//!             - kv_cache_bonus_ms if prefix was seen on this provider
-//!                                  in the last K requests
+//!             - kv_cache_bonus_ms if normalized prefix was seen
+//!                                  on this provider in the last K requests
 //!             + queue_term_ms (in-flight count * per_req_overhead)
 //!             + lognormal noise (mu=0, sigma=0.3)
 //! ```
 //!
 //! The lognormal noise gives the heavy tail that makes P99 the
-//! right comparison metric. The KV-cache bonus is what lets
-//! `prefix_affinity` show its value in simulation; without it the
-//! strategy is indistinguishable from round-robin on a synthetic
-//! workload.
+//! right comparison metric. The KV-cache bonus makes the value of
+//! learned prefix ownership visible in the synthetic workload.
 //!
 //! These assumptions are documented in `docs/ai-lb-benchmark.md`
 //! so a reader can challenge them.
@@ -62,7 +61,7 @@ use rand_distr::{LogNormal, WeightedAliasIndex};
 use sbproxy_ai::ids::ProviderName;
 use sbproxy_ai::provider::ProviderConfig;
 use sbproxy_ai::routing::{Router, RoutingStrategy};
-use sha2::{Digest, Sha256};
+use sbproxy_ai::{normalize_prefix, PrefixAffinityConfig, PrefixDigest};
 
 /// All strategies the bench exercises. Listed in the order they
 /// appear in the printed results table.
@@ -72,9 +71,15 @@ fn strategies() -> Vec<(&'static str, RoutingStrategy)> {
         ("random", RoutingStrategy::Random),
         ("least_connections", RoutingStrategy::LeastConnections),
         ("lowest_latency", RoutingStrategy::LowestLatency),
-        ("peak_ewma", RoutingStrategy::PeakEwma),
+        (
+            "peak_ewma",
+            RoutingStrategy::PeakEwma(sbproxy_ai::PeakEwmaConfig::default()),
+        ),
         ("least_token_usage", RoutingStrategy::LeastTokenUsage),
-        ("prefix_affinity", RoutingStrategy::PrefixAffinity),
+        (
+            "prefix_affinity",
+            RoutingStrategy::PrefixAffinity(PrefixAffinityConfig::default()),
+        ),
     ]
 }
 
@@ -110,9 +115,7 @@ struct Cli {
     queue_overhead_ms: f64,
 
     /// Latency bonus (ms) when the chosen provider has seen this
-    /// prefix in its last `prefix_window` requests. The whole reason
-    /// `prefix_affinity` exists; under-stating this defeats the
-    /// strategy in simulation.
+    /// normalized prefix in its last `prefix_window` requests.
     #[arg(long, default_value_t = 80.0)]
     kv_cache_bonus_ms: f64,
 
@@ -157,8 +160,7 @@ struct Cli {
 
 /// Per-request workload sample.
 struct Sample {
-    prefix_id: u64,
-    tenant_id: u64,
+    prefix: PrefixDigest,
     tokens: u64,
 }
 
@@ -170,8 +172,13 @@ fn main() -> Result<()> {
     }
     let cli = Cli::parse();
     println!(
-        "ai-lb-strategy-bench: providers={} total_requests={} prefix_zipf_s={} tenant_zipf_s={} slow_provider_multiplier={}x",
-        cli.providers, cli.total_requests, cli.prefix_zipf_s, cli.tenant_zipf_s, cli.slow_provider_multiplier
+        "ai-lb-strategy-bench: providers={} total_requests={} prefix_zipf_s={} tenant_zipf_s={} slow_provider_multiplier={}x seed=0x{:016x}",
+        cli.providers,
+        cli.total_requests,
+        cli.prefix_zipf_s,
+        cli.tenant_zipf_s,
+        cli.slow_provider_multiplier,
+        cli.seed
     );
     println!();
 
@@ -196,6 +203,7 @@ fn build_providers(n: usize) -> Vec<ProviderConfig> {
         .map(|i| ProviderConfig {
             name: ProviderName::from(format!("p{i}")),
             provider_type: None,
+            deployment: None,
             api_key: None,
             base_url: None,
             models: Vec::new(),
@@ -212,6 +220,7 @@ fn build_providers(n: usize) -> Vec<ProviderConfig> {
             disable_forwarded_host_header: false,
             allow_private_base_url: false,
             no_prompt_training: false,
+            serve: None,
         })
         .collect()
 }
@@ -234,14 +243,26 @@ fn generate_workload(cli: &Cli) -> Vec<Sample> {
             let factor = LogNormal::new(0.0, 0.25)
                 .expect("valid lognormal")
                 .sample(&mut rng);
-            let tokens = ((cli.mean_tokens as f64) * factor).max(1.0) as u64;
+            let tokens = ((cli.mean_tokens as f64)
+                * tenant_token_multiplier(tenant_id as usize, cli.tenants)
+                * factor)
+                .max(1.0) as u64;
             Sample {
-                prefix_id,
-                tenant_id,
+                prefix: normalized_prefix(prefix_id),
                 tokens,
             }
         })
         .collect()
+}
+
+/// Stable per-request token burst by tenant rank.
+///
+/// The multiplier averages to `1.0` for a uniform tenant mix, ranges from
+/// roughly `0.5x` for the coldest tenant to `1.5x` for the hottest, and is
+/// independent of prompt-prefix identity.
+fn tenant_token_multiplier(tenant_id: usize, tenants: usize) -> f64 {
+    let rank = tenants.saturating_sub(tenant_id);
+    0.5 + (rank as f64 / (tenants.saturating_add(1) as f64))
 }
 
 /// Zipf weights for an alias index. Index `i` (1-based) gets weight
@@ -278,24 +299,24 @@ fn run_strategy(
     // model "in-flight" as just the most recent K requests landing
     // on that provider.
     let mut in_flight = vec![0u32; providers.len()];
-    // Sliding window of (prefix_id, request_index) seen on each
-    // provider. A bounded VecDeque per provider is more accurate
-    // but a single tail check is cheaper and matches the cache
-    // semantics for a per-request bench.
-    let mut prefix_seen: Vec<Vec<u64>> =
-        (0..providers.len()).map(|_| Vec::with_capacity(cli.prefix_window)).collect();
+    // Sliding window of normalized prefix identities seen on each provider.
+    // A bounded VecDeque per provider is more accurate, but a short Vec keeps
+    // the synthetic cache model easy to inspect.
+    let mut prefix_seen: Vec<Vec<PrefixDigest>> = (0..providers.len())
+        .map(|_| Vec::with_capacity(cli.prefix_window))
+        .collect();
     let mut kv_cache_hits: u64 = 0;
     let mut decision_overhead_ns: u64 = 0;
 
     let noise = LogNormal::new(0.0, cli.noise_sigma)?;
     let mut rng = SmallRng::seed_from_u64(cli.seed ^ 0xDEAD_BEEF);
+    let observes_prefix_holders = matches!(&strategy, RoutingStrategy::PrefixAffinity(_));
 
     for sample in workload {
-        let prefix_bytes = prefix_key_bytes(sample.prefix_id, sample.tenant_id);
         let decision_start = Instant::now();
-        let pick = match strategy {
-            RoutingStrategy::PrefixAffinity => {
-                router.select_with_prefix(providers, &prefix_bytes)
+        let pick = match &strategy {
+            RoutingStrategy::PrefixAffinity(_) => {
+                router.select_with_prefix(providers, Some(sample.prefix))
             }
             _ => router.select(providers),
         };
@@ -317,7 +338,7 @@ fn run_strategy(
         };
         let base = cli.base_latency_ms * provider_factor;
         let queue = cli.queue_overhead_ms * (in_flight[pick] as f64);
-        let cache_bonus = if prefix_seen[pick].contains(&sample.prefix_id) {
+        let cache_bonus = if prefix_seen[pick].contains(&sample.prefix) {
             kv_cache_hits += 1;
             cli.kv_cache_bonus_ms
         } else {
@@ -331,8 +352,15 @@ fn run_strategy(
         per_provider_count[pick] += 1;
         per_provider_tokens[pick] += sample.tokens;
 
-        // Update prefix window (keep last K).
-        prefix_seen[pick].push(sample.prefix_id);
+        // Every simulated response is accepted. Mirror the serving path by
+        // teaching prefix affinity which provider now holds this normalized
+        // prefix only after that acceptance.
+        if observes_prefix_holders {
+            router.record_prefix(pick, sample.prefix);
+        }
+
+        // Update the provider's simulated KV-cache window (keep last K).
+        prefix_seen[pick].push(sample.prefix);
         if prefix_seen[pick].len() > cli.prefix_window {
             prefix_seen[pick].remove(0);
         }
@@ -363,23 +391,45 @@ fn run_strategy(
     })
 }
 
-/// Build a stable prefix key from (prefix_id, tenant_id). The
-/// router hashes this to a provider index; mirror what
-/// `extract_prefix_key` in the real dispatcher would produce.
-fn prefix_key_bytes(prefix_id: u64, tenant_id: u64) -> Vec<u8> {
-    let mut h = Sha256::new();
-    h.update(b"prompt:");
-    h.update(prefix_id.to_le_bytes());
-    h.update(b":");
-    h.update(tenant_id.to_le_bytes());
-    h.finalize().to_vec()
+/// Build the same normalized prefix identity used by the serving path.
+///
+/// The system message is deliberately constant so tenant token skew cannot
+/// multiply the sampled prefix vocabulary. The later turn proves the
+/// production normalizer does not let conversation growth change the
+/// affinity identity.
+fn normalized_prefix(prefix_id: u64) -> PrefixDigest {
+    let body = serde_json::json!({
+        "messages": [
+            {
+                "role": "system",
+                "content": "synthetic shared system prompt"
+            },
+            {
+                "role": "user",
+                "content": format!("synthetic prompt prefix {prefix_id}")
+            },
+            {
+                "role": "assistant",
+                "content": "later conversation content is ignored"
+            }
+        ]
+    });
+    normalize_prefix(&body, "model:synthetic-benchmark").expect("benchmark chat prefix")
 }
 
 /// Print one row per strategy, padding so columns line up.
 fn print_results(rows: &[RunResult]) {
     println!(
         "{:<20} {:>10} {:>10} {:>10} {:>10} {:>10}  {:>8} {:>10} {:>9}",
-        "strategy", "p50_ms", "p95_ms", "p99_ms", "p99.9_ms", "max_ms", "fairness", "kv_hit_%", "decide_ns"
+        "strategy",
+        "p50_ms",
+        "p95_ms",
+        "p99_ms",
+        "p99.9_ms",
+        "max_ms",
+        "fairness",
+        "kv_hit_%",
+        "decide_ns"
     );
     println!("{}", "-".repeat(110));
     for r in rows {
@@ -390,11 +440,7 @@ fn print_results(rows: &[RunResult]) {
             100.0 * (r.kv_cache_hits as f64) / (total as f64)
         };
         let fairness = jain_fairness(&r.requests_per_provider);
-        let mean_decision_ns = if total == 0 {
-            0
-        } else {
-            r.decision_overhead_ns / total
-        };
+        let mean_decision_ns = r.decision_overhead_ns.checked_div(total).unwrap_or(0);
         println!(
             "{:<20} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2}  {:>8.3} {:>9.1}% {:>9}",
             r.label,
@@ -454,6 +500,25 @@ fn jain_fairness(counts: &[u64]) -> f64 {
 mod tests {
     use super::*;
 
+    fn test_cli(tenant_zipf_s: f64) -> Cli {
+        Cli {
+            providers: 4,
+            total_requests: 128,
+            slow_provider_multiplier: 5.0,
+            base_latency_ms: 200.0,
+            queue_overhead_ms: 5.0,
+            kv_cache_bonus_ms: 80.0,
+            prefix_window: 64,
+            prefix_vocabulary: 16,
+            prefix_zipf_s: 1.1,
+            tenants: 10,
+            tenant_zipf_s,
+            mean_tokens: 1_000,
+            noise_sigma: 0.3,
+            seed: 0x5BA0_F0DE_0123_4567,
+        }
+    }
+
     #[test]
     fn jain_perfect_is_one() {
         assert!((jain_fairness(&[10, 10, 10, 10]) - 1.0).abs() < 1e-9);
@@ -469,7 +534,11 @@ mod tests {
     fn zipf_weights_decrease() {
         let w = zipf_weights(5, 1.1);
         for i in 0..4 {
-            assert!(w[i] > w[i + 1], "weight at index {i} should exceed {}", i + 1);
+            assert!(
+                w[i] > w[i + 1],
+                "weight at index {i} should exceed {}",
+                i + 1
+            );
         }
     }
 
@@ -480,14 +549,36 @@ mod tests {
     }
 
     #[test]
-    fn prefix_key_is_deterministic_for_same_pair() {
-        assert_eq!(prefix_key_bytes(42, 7), prefix_key_bytes(42, 7));
+    fn prefix_stream_is_independent_of_tenant_skew() {
+        let uniform = generate_workload(&test_cli(0.0));
+        let skewed = generate_workload(&test_cli(2.0));
+
+        assert_eq!(
+            uniform
+                .iter()
+                .map(|sample| sample.prefix)
+                .collect::<Vec<_>>(),
+            skewed
+                .iter()
+                .map(|sample| sample.prefix)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
-    fn prefix_key_differs_when_either_field_differs() {
-        let a = prefix_key_bytes(1, 0);
-        assert_ne!(a, prefix_key_bytes(2, 0));
-        assert_ne!(a, prefix_key_bytes(1, 1));
+    fn tenant_skew_changes_the_token_workload() {
+        let uniform = generate_workload(&test_cli(0.0));
+        let skewed = generate_workload(&test_cli(2.0));
+
+        assert_ne!(
+            uniform
+                .iter()
+                .map(|sample| sample.tokens)
+                .collect::<Vec<_>>(),
+            skewed
+                .iter()
+                .map(|sample| sample.tokens)
+                .collect::<Vec<_>>()
+        );
     }
 }

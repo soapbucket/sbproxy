@@ -18,14 +18,23 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use bytes::Bytes;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
 use crate::crypto::Cipher;
+use crate::metrics::{
+    MESH_TRANSPORT_RPC_DURATION, MESH_TRANSPORT_RPC_ERRORS, TRANSPORT_RPC_KIND_CONNECT,
+    TRANSPORT_RPC_KIND_DECODE, TRANSPORT_RPC_KIND_DECRYPT, TRANSPORT_RPC_KIND_ENCODE,
+    TRANSPORT_RPC_KIND_IO, TRANSPORT_RPC_KIND_REMOTE, TRANSPORT_RPC_KIND_TLS,
+};
+use crate::state::register::VersionedLwwMergeOutcome;
 
-use super::frame::{read_frame, write_frame, CacheOp, CacheResult, Request, Response};
+use super::frame::{
+    read_frame, write_frame, CacheOp, CacheResult, CacheSnapshot, Request, Response,
+};
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -97,6 +106,22 @@ impl AsyncWrite for MeshConn {
             MeshConn::Plain(s) => Pin::new(s).poll_shutdown(cx),
             MeshConn::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
         }
+    }
+}
+
+/// Bounded `op` label for [`MESH_TRANSPORT_RPC_DURATION`], derived from
+/// the [`CacheOp`] variant.
+fn cache_op_label(op: &CacheOp) -> &'static str {
+    match op {
+        CacheOp::Get { .. } => "get",
+        CacheOp::Put { .. } => "put",
+        CacheOp::Delete { .. } => "delete",
+        CacheOp::PurgePrefix { .. } => "purge_prefix",
+        CacheOp::MergeVersioned { .. } => "merge_versioned",
+        CacheOp::ReplicaApply { .. } => "replica_apply",
+        CacheOp::ReplicaFetch { .. } => "replica_fetch",
+        CacheOp::SyncDigest { .. } => "sync_digest",
+        CacheOp::SnapshotPrefix { .. } => "snapshot_prefix",
     }
 }
 
@@ -178,7 +203,12 @@ impl PeerClient {
     pub async fn get(&self, key: String) -> anyhow::Result<Option<Bytes>> {
         match self.send_request(CacheOp::Get { key }).await? {
             CacheResult::Value(v) => Ok(v),
-            CacheResult::Error(e) => Err(anyhow::anyhow!("remote error: {}", e)),
+            CacheResult::Error(e) => {
+                MESH_TRANSPORT_RPC_ERRORS
+                    .with_label_values(&[TRANSPORT_RPC_KIND_REMOTE])
+                    .inc();
+                Err(anyhow::anyhow!("remote error: {}", e))
+            }
             other => Err(anyhow::anyhow!("unexpected cache result: {:?}", other)),
         }
     }
@@ -213,8 +243,153 @@ impl PeerClient {
             .await?
         {
             CacheResult::Acked => Ok(()),
-            CacheResult::Error(e) => Err(anyhow::anyhow!("remote error: {}", e)),
+            CacheResult::Error(e) => {
+                MESH_TRANSPORT_RPC_ERRORS
+                    .with_label_values(&[TRANSPORT_RPC_KIND_REMOTE])
+                    .inc();
+                Err(anyhow::anyhow!("remote error: {}", e))
+            }
             other => Err(anyhow::anyhow!("unexpected cache result: {:?}", other)),
+        }
+    }
+
+    /// Atomically merge one versioned LWW candidate on the remote owner.
+    pub async fn merge_versioned(
+        &self,
+        key: String,
+        value: Bytes,
+        ttl_secs: u64,
+    ) -> anyhow::Result<VersionedLwwMergeOutcome> {
+        match self
+            .send_request(CacheOp::MergeVersioned {
+                key,
+                value,
+                ttl_secs,
+            })
+            .await?
+        {
+            CacheResult::VersionedMerged(outcome) => Ok(outcome),
+            CacheResult::Error(error) => {
+                MESH_TRANSPORT_RPC_ERRORS
+                    .with_label_values(&[TRANSPORT_RPC_KIND_REMOTE])
+                    .inc();
+                Err(anyhow::anyhow!("remote error: {error}"))
+            }
+            other => Err(anyhow::anyhow!("unexpected cache result: {other:?}")),
+        }
+    }
+
+    /// Apply a replicated-record candidate on the remote peer's durable
+    /// replica shard (WOR-1947). The peer persists the winning record
+    /// before replying, so an `Ok` outcome means the record is durable
+    /// there, not merely resident in memory.
+    pub async fn replica_apply(
+        &self,
+        key: String,
+        value: Bytes,
+        ttl_secs: u64,
+    ) -> anyhow::Result<VersionedLwwMergeOutcome> {
+        match self
+            .send_request(CacheOp::ReplicaApply {
+                key,
+                value,
+                ttl_secs,
+            })
+            .await?
+        {
+            CacheResult::VersionedMerged(outcome) => Ok(outcome),
+            CacheResult::Error(error) => {
+                MESH_TRANSPORT_RPC_ERRORS
+                    .with_label_values(&[TRANSPORT_RPC_KIND_REMOTE])
+                    .inc();
+                Err(anyhow::anyhow!("remote error: {error}"))
+            }
+            other => Err(anyhow::anyhow!("unexpected cache result: {other:?}")),
+        }
+    }
+
+    /// Fetch the full stored replica record (register plus expiry) for
+    /// `key` from the remote peer's replica shard. `Ok(None)` means the
+    /// peer holds no record for the key.
+    pub async fn replica_fetch(&self, key: String) -> anyhow::Result<Option<Bytes>> {
+        match self.send_request(CacheOp::ReplicaFetch { key }).await? {
+            CacheResult::Value(value) => Ok(value),
+            CacheResult::Error(error) => {
+                MESH_TRANSPORT_RPC_ERRORS
+                    .with_label_values(&[TRANSPORT_RPC_KIND_REMOTE])
+                    .inc();
+                Err(anyhow::anyhow!("remote error: {error}"))
+            }
+            other => Err(anyhow::anyhow!("unexpected cache result: {other:?}")),
+        }
+    }
+
+    /// Request one bounded digest page of the remote peer's replica shard
+    /// for anti-entropy comparison.
+    pub async fn sync_digest(
+        &self,
+        prefix: String,
+        page_token: Option<String>,
+        limit: u32,
+    ) -> anyhow::Result<crate::transport::frame::DigestPage> {
+        match self
+            .send_request(CacheOp::SyncDigest {
+                prefix,
+                page_token,
+                limit,
+            })
+            .await?
+        {
+            CacheResult::DigestPage(page) => Ok(page),
+            CacheResult::Error(error) => {
+                MESH_TRANSPORT_RPC_ERRORS
+                    .with_label_values(&[TRANSPORT_RPC_KIND_REMOTE])
+                    .inc();
+                Err(anyhow::anyhow!("remote error: {error}"))
+            }
+            other => Err(anyhow::anyhow!("unexpected cache result: {other:?}")),
+        }
+    }
+
+    /// Read one bounded lexicographic page of `prefix` from the remote
+    /// peer's local shard.
+    ///
+    /// The request carries no routing key: the caller has already resolved
+    /// the consistent-hash owner and dialled it. `maximum` must be in
+    /// `1..=4096` and `prefix` must be non-empty and at most
+    /// [`crate::transport::frame::MAX_ROUTED_SNAPSHOT_PREFIX_BYTES`] bytes;
+    /// the peer answers an out-of-bounds request with a fixed non-secret
+    /// error that never echoes the prefix.
+    ///
+    /// Only [`CacheResult::Snapshot`] is accepted. Every other result,
+    /// including a remote error, is a transport-level failure for this call.
+    ///
+    /// A caller must verify the authenticated `semantic_cache_snapshot_v1`
+    /// fleet capability before sending this operation. Postcard enum
+    /// variants are not self-describing, so an older peer would decode the
+    /// appended discriminant as garbage rather than as an unknown operation.
+    pub async fn snapshot_prefix(
+        &self,
+        prefix: String,
+        maximum: u32,
+    ) -> anyhow::Result<CacheSnapshot> {
+        match self
+            .send_request(CacheOp::SnapshotPrefix { prefix, maximum })
+            .await?
+        {
+            CacheResult::Snapshot(snapshot) => Ok(snapshot),
+            CacheResult::Error(error) => {
+                MESH_TRANSPORT_RPC_ERRORS
+                    .with_label_values(&[TRANSPORT_RPC_KIND_REMOTE])
+                    .inc();
+                Err(anyhow::anyhow!("remote error: {error}"))
+            }
+            CacheResult::Value(_) => Err(anyhow::anyhow!(
+                "unexpected cache result for snapshot_prefix"
+            )),
+            other => Err(anyhow::anyhow!(
+                "unexpected cache result for snapshot_prefix: {other:?}"
+            )),
         }
     }
 
@@ -224,7 +399,12 @@ impl PeerClient {
     pub async fn delete(&self, key: String) -> anyhow::Result<()> {
         match self.send_request(CacheOp::Delete { key }).await? {
             CacheResult::Acked => Ok(()),
-            CacheResult::Error(e) => Err(anyhow::anyhow!("remote error: {}", e)),
+            CacheResult::Error(e) => {
+                MESH_TRANSPORT_RPC_ERRORS
+                    .with_label_values(&[TRANSPORT_RPC_KIND_REMOTE])
+                    .inc();
+                Err(anyhow::anyhow!("remote error: {}", e))
+            }
             other => Err(anyhow::anyhow!("unexpected cache result: {:?}", other)),
         }
     }
@@ -245,7 +425,12 @@ impl PeerClient {
     pub async fn purge_prefix(&self, prefix: String) -> anyhow::Result<u64> {
         match self.send_request(CacheOp::PurgePrefix { prefix }).await? {
             CacheResult::Purged(n) => Ok(n),
-            CacheResult::Error(e) => Err(anyhow::anyhow!("remote error: {}", e)),
+            CacheResult::Error(e) => {
+                MESH_TRANSPORT_RPC_ERRORS
+                    .with_label_values(&[TRANSPORT_RPC_KIND_REMOTE])
+                    .inc();
+                Err(anyhow::anyhow!("remote error: {}", e))
+            }
             other => Err(anyhow::anyhow!("unexpected cache result: {:?}", other)),
         }
     }
@@ -257,13 +442,18 @@ impl PeerClient {
     /// Any transport error clears `inner.stream` so the next call starts by
     /// reconnecting.
     async fn send_request(&self, op: CacheOp) -> anyhow::Result<CacheResult> {
+        let started = Instant::now();
+        let op_label = cache_op_label(&op);
         let mut guard = self.inner.lock().await;
 
         // --- Ensure we're connected ---
         if guard.stream.is_none() {
-            let tcp = TcpStream::connect(&self.addr)
-                .await
-                .map_err(|e| anyhow::anyhow!("connect to {} failed: {}", self.addr, e))?;
+            let tcp = TcpStream::connect(&self.addr).await.map_err(|e| {
+                MESH_TRANSPORT_RPC_ERRORS
+                    .with_label_values(&[TRANSPORT_RPC_KIND_CONNECT])
+                    .inc();
+                anyhow::anyhow!("connect to {} failed: {}", self.addr, e)
+            })?;
             // Small perf win on the wire side: coalescing is almost never
             // beneficial for a request/response RPC.
             let _ = tcp.set_nodelay(true);
@@ -273,6 +463,9 @@ impl PeerClient {
                         .connect(t.server_name.clone(), tcp)
                         .await
                         .map_err(|e| {
+                            MESH_TRANSPORT_RPC_ERRORS
+                                .with_label_values(&[TRANSPORT_RPC_KIND_TLS])
+                                .inc();
                             anyhow::anyhow!("TLS handshake to {} failed: {}", self.addr, e)
                         })?,
                 )),
@@ -284,8 +477,12 @@ impl PeerClient {
         let request_id = guard.next_id;
         guard.next_id = guard.next_id.wrapping_add(1);
         let req = Request { request_id, op };
-        let plaintext = crate::transport::wire::encode(&req)
-            .map_err(|e| anyhow::anyhow!("request serialize failed: {}", e))?;
+        let plaintext = crate::transport::wire::encode(&req).map_err(|e| {
+            MESH_TRANSPORT_RPC_ERRORS
+                .with_label_values(&[TRANSPORT_RPC_KIND_ENCODE])
+                .inc();
+            anyhow::anyhow!("request serialize failed: {}", e)
+        })?;
 
         // K3: seal the request body when encryption is configured. The
         // server's matching `read_frame + open` step mirrors this.
@@ -314,6 +511,9 @@ impl PeerClient {
         let resp_bytes = match io_result {
             Ok(b) => b,
             Err(e) => {
+                MESH_TRANSPORT_RPC_ERRORS
+                    .with_label_values(&[TRANSPORT_RPC_KIND_IO])
+                    .inc();
                 guard.stream = None;
                 return Err(e);
             }
@@ -326,6 +526,9 @@ impl PeerClient {
             Some(c) => match c.open(&resp_bytes) {
                 Some(pt) => pt,
                 None => {
+                    MESH_TRANSPORT_RPC_ERRORS
+                        .with_label_values(&[TRANSPORT_RPC_KIND_DECRYPT])
+                        .inc();
                     guard.stream = None;
                     return Err(anyhow::anyhow!(
                         "response from {} failed AEAD decrypt",
@@ -336,8 +539,12 @@ impl PeerClient {
             None => resp_bytes,
         };
 
-        let resp: Response = crate::transport::wire::decode(&resp_plain)
-            .map_err(|e| anyhow::anyhow!("response deserialize failed: {}", e))?;
+        let resp: Response = crate::transport::wire::decode(&resp_plain).map_err(|e| {
+            MESH_TRANSPORT_RPC_ERRORS
+                .with_label_values(&[TRANSPORT_RPC_KIND_DECODE])
+                .inc();
+            anyhow::anyhow!("response deserialize failed: {}", e)
+        })?;
         if resp.request_id != request_id {
             // Pipelined implementations would fix this up via a pending
             // map. In the serial MVP a mismatch is a bug; tear the
@@ -349,6 +556,9 @@ impl PeerClient {
                 resp.request_id
             ));
         }
+        MESH_TRANSPORT_RPC_DURATION
+            .with_label_values(&[op_label])
+            .observe(started.elapsed().as_secs_f64());
         Ok(resp.result)
     }
 }
@@ -483,6 +693,7 @@ impl TransportClientPool {
 mod tests {
     use super::*;
     use crate::state::distributed_cache::DistributedCache;
+    use crate::state::register::{VersionedLwwMergeOutcome, VersionedLwwRegister};
     use crate::transport::server::TransportServer;
 
     async fn spawn_server() -> (TransportServer, Arc<DistributedCache<Bytes>>, u16) {
@@ -547,6 +758,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sequential_rpcs_avoid_delayed_ack_stalls() {
+        // WOR-1949 regression guard. A healthy loopback RPC costs well under
+        // a millisecond; the delayed-ACK/Nagle write-write-read stall costs
+        // ~40ms per RPC. The 20ms mean threshold sits far above any
+        // plausible loaded-runner jitter for a loopback roundtrip and far
+        // below the 40ms failure signature.
+        use std::time::{Duration, Instant};
+
+        let (server, cache, port) = spawn_server().await;
+        cache.put_local("hot", Bytes::from_static(b"value"));
+        let client = PeerClient::new(format!("127.0.0.1:{port}"));
+
+        // First call connects; keep it out of the timed window.
+        client.get("hot".to_string()).await.expect("warmup get");
+
+        const N: u32 = 30;
+        let started = Instant::now();
+        for _ in 0..N {
+            client.get("hot".to_string()).await.expect("get");
+        }
+        let mean = started.elapsed() / N;
+        assert!(
+            mean < Duration::from_millis(20),
+            "mean loopback RPC took {mean:?}; smells like the delayed-ACK/Nagle stall"
+        );
+
+        server.shutdown();
+    }
+
+    #[tokio::test]
     async fn client_purge_prefix_returns_remote_count() {
         let (server, cache, port) = spawn_server().await;
         cache.put_local("p:1", Bytes::from_static(b"a"));
@@ -576,6 +817,100 @@ mod tests {
         assert_eq!(cache.get_local("y"), None);
 
         server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn client_versioned_merge_runs_atomically_on_remote_owner() {
+        let (server, cache, port) = spawn_server().await;
+        let client = PeerClient::new(format!("127.0.0.1:{port}"));
+        let candidate = |value: &str, version: u64| {
+            Bytes::from(
+                serde_json::to_vec(&VersionedLwwRegister::live(
+                    value.to_string(),
+                    "node-a",
+                    version * 100,
+                    version,
+                    version.checked_sub(1),
+                ))
+                .unwrap(),
+            )
+        };
+
+        assert_eq!(
+            client
+                .merge_versioned("state:one".to_string(), candidate("new", 2), 60)
+                .await
+                .unwrap(),
+            VersionedLwwMergeOutcome::Replaced
+        );
+        assert_eq!(
+            client
+                .merge_versioned("state:one".to_string(), candidate("stale", 1), 60)
+                .await
+                .unwrap(),
+            VersionedLwwMergeOutcome::StaleRejected
+        );
+        let stored: VersionedLwwRegister =
+            serde_json::from_slice(&cache.get_local("state:one").unwrap()).unwrap();
+        assert_eq!(stored.value(), Some("new"));
+
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn client_snapshot_prefix_maps_only_snapshot_result() {
+        let (server, cache, port) = spawn_server().await;
+        cache.put_local("member:b", Bytes::from_static(b"two"));
+        cache.put_local("member:a", Bytes::from_static(b"one"));
+        cache.put_local("other:a", Bytes::from_static(b"skip"));
+
+        let client = PeerClient::new(format!("127.0.0.1:{port}"));
+        let snapshot = client
+            .snapshot_prefix("member:".to_string(), 16)
+            .await
+            .expect("snapshot");
+        assert_eq!(
+            snapshot.entries,
+            vec![
+                ("member:a".to_string(), Bytes::from_static(b"one")),
+                ("member:b".to_string(), Bytes::from_static(b"two")),
+            ]
+        );
+        assert!(!snapshot.truncated);
+
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn client_snapshot_prefix_rejects_an_unexpected_result() {
+        // The server answers an out-of-bounds request with `CacheResult::Error`,
+        // which is not a snapshot. The client must surface that as an error
+        // rather than inventing an empty page.
+        let (server, _cache, port) = spawn_server().await;
+        let client = PeerClient::new(format!("127.0.0.1:{port}"));
+
+        let err = client
+            .snapshot_prefix("member:".to_string(), 0)
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("remote error"), "{message}");
+        assert!(!message.contains("member:"), "{message}");
+
+        server.shutdown();
+    }
+
+    #[test]
+    fn snapshot_prefix_uses_the_closed_transport_operation_label() {
+        // The transport duration metric labels on `op`, so the label set has
+        // to stay a fixed closed vocabulary.
+        assert_eq!(
+            cache_op_label(&CacheOp::SnapshotPrefix {
+                prefix: "member:".to_string(),
+                maximum: 16,
+            }),
+            "snapshot_prefix"
+        );
     }
 
     #[tokio::test]

@@ -9,7 +9,7 @@
 #   sbproxy examples/use-case-own-openrouter/sb.yml
 #
 # Mint a key for a team (the plaintext token comes back exactly once):
-#   TOKEN=$(curl -s -u admin:admin -X POST http://127.0.0.1:9090/admin/keys \
+#   TOKEN=$(curl -s -u "admin:$SB_ADMIN_PASSWORD" -X POST http://127.0.0.1:9090/admin/keys \
 #     -d '{"name":"team-payments"}' | jq -r .token)
 #
 # One endpoint, the model field picks the vendor:
@@ -30,7 +30,11 @@ proxy:
     enabled: true
     port: 9090
     username: admin
-    password: admin   # demo credentials; change both before any real use
+    # A reference, not a literal. This surface binds wide for Docker
+    # networking (see below), and a bound-wide admin API with a guessable
+    # password is the whole admin API handed to anyone who can route to
+    # the port. The compose file passes this through from your shell.
+    password: ${SB_ADMIN_PASSWORD:-change-this-before-running}
     # The docker-compose file publishes this port, and Docker connections
     # arrive from the bridge network rather than loopback, so bind wide but
     # admit only loopback and private-range clients. Tighten the list and add

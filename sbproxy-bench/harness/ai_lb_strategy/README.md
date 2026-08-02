@@ -2,8 +2,9 @@
 
 Compares the AI router's load-balancing strategies on a synthetic,
 skewed workload, printing P50 / P95 / P99 / P99.9 latency per
-strategy plus a Jain fairness index and a KV-cache hit rate for
-prefix affinity.
+strategy plus a Jain fairness index and a simulated KV-cache hit rate.
+The prefix-affinity path uses the production chat-prefix normalizer and
+records successful selections as observed cache holders.
 
 ## Why standalone Cargo
 
@@ -45,8 +46,8 @@ One row per strategy:
 
 ```text
 strategy                p50_ms     p95_ms     p99_ms   p99.9_ms     max_ms  fairness   kv_hit_%  decide_ns
-round_robin             ...        ...        ...      ...         ...       0.999       2.1%        20
-prefix_affinity         ...        ...        ...      ...         ...       0.870      48.6%        70
+round_robin             ...        ...        ...      ...         ...       ...         ...%       ...
+prefix_affinity         ...        ...        ...      ...         ...       ...         ...%       ...
 ...
 ```
 
@@ -62,26 +63,30 @@ Three orthogonal skews layered into the workload. All default on.
    the slow one) and rewards `peak_ewma` and `least_connections`.
 2. **Prompt-prefix Zipf.** A vocabulary of distinct prefixes
    sampled with Zipf 1.1. Rewards `prefix_affinity` because the
-   same prefix repeats often enough to land on the same provider
-   twice.
-3. **Tenant token-burst Zipf.** One hot tenant out of N. Rewards
-   `least_token_usage` because it spreads the hot tenant across
-   providers.
+   same normalized prefix repeats often enough to reuse an observed
+   holder. The synthetic system message is constant, so tenant identity
+   does not multiply this vocabulary.
+3. **Tenant token-burst Zipf.** One hot tenant out of N appears more
+   often and emits a larger per-request token burst. This affects only
+   the token workload and rewards `least_token_usage` because it spreads
+   the hot tenant's tokens across providers.
 
 ## What the latency model assumes
 
 ```text
 observed_ms = base_ms * provider_factor
-            - kv_cache_bonus_ms  if prefix was seen on this provider
-                                  in the last K requests
+            - kv_cache_bonus_ms  if normalized prefix was seen on this provider
+                                  in its last K requests
             + queue_term_ms       (in-flight count * per-req overhead)
             + lognormal noise     (mu=0, sigma=0.3)
 ```
 
 The lognormal noise creates the heavy tail that makes P99 the right
 comparison metric. The KV-cache bonus is what lets `prefix_affinity`
-demonstrate value in simulation; without it the strategy is
-indistinguishable from round-robin.
+demonstrate value in simulation. The first accepted request for a prefix
+records the selected provider as a holder. Later matching requests use the
+live router's observed-holder selection, while misses use its recent-token
+load fallback.
 
 These assumptions are documented in `docs/ai-lb-benchmark.md` so a
 reader can challenge them.

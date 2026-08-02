@@ -14,3 +14,21 @@ fuzz/Cargo.lock
 examples/*/certs/
 
 .claude/
+
+# curl cookie jars from running the examples/docs commands; never commit
+cookies.txt
+
+# scripts/capture-admin-screenshots.mjs resolves puppeteer from the
+# workspace root, so a capture run installs it here.
+node_modules/
+
+# scripts/certify-selfhost.sh writes per-lane logs and captured host
+# metadata here. The evidence is retained with the certification record
+# in docs/model-host-certification.md, not in git: the logs are large,
+# machine-specific, and can carry generated admin passwords.
+.cert-evidence/
+
+# Python bytecode from scripts/tests. Regenerated on every run and
+# tagged with the interpreter version, so it churns per machine.
+__pycache__/
+*.pyc

@@ -1,14 +1,32 @@
 //! Routing strategies for selecting AI providers.
 
+mod peak_ewma;
+
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
-use dashmap::DashMap;
 use sbproxy_platform::circuitbreaker::CircuitBreaker;
 use sbproxy_platform::outlier::{OutlierDetector, OutlierDetectorConfig};
-use serde::Deserialize;
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer};
 
 use crate::provider::ProviderConfig;
+use crate::provider_ratelimit::{ProviderQuotaSnapshot, ProviderRateLimitTracker};
+use crate::routing_state::{PrefixAffinityConfig, PrefixDigest, ReplicaRoutingState};
+
+/// Explicit reason a policy-filtered selection fell back to round-robin.
+///
+/// Silent strategy degradation is forbidden: every round-robin fallback
+/// under an allow/block filter must record one of these reasons and be
+/// covered by a regression test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilteredSelectionFallback {
+    /// Strategy needs a request signal (prefix, session, ...) that the
+    /// basic filtered `select` path does not have, so round-robin on the
+    /// narrowed candidate set is intentional.
+    RoundRobinMissingSignal,
+}
 
 /// Return whether a provider name satisfies a credential's provider policy.
 /// A block entry always wins, including when the same name is allowed.
@@ -22,8 +40,7 @@ pub fn provider_allowed_by_policy(
 }
 
 /// Strategy for selecting a provider.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone)]
 pub enum RoutingStrategy {
     /// Rotate through providers in order, one request at a time.
     RoundRobin,
@@ -50,21 +67,20 @@ pub enum RoutingStrategy {
     /// not pre-declare a token cap. Untried providers (zero
     /// observed tokens) sort lowest and are explored first.
     LeastTokenUsage,
-    /// WOR-798: prefix-affinity routing for self-hosted LLM pools
-    /// (vLLM, SGLang) that keep a per-worker KV cache of recently-
-    /// processed prompt prefixes. Hash a stable prefix of the
-    /// request body (the first N bytes of the JSON-serialised
-    /// payload, captured at dispatch time) to an enabled-provider
-    /// index, so two requests sharing the same prefix land on the
-    /// same upstream and reuse its KV cache rather than warming a
-    /// cold one. The hash is deterministic, modular over the
-    /// eligible-providers count, and stable across reloads as long
-    /// as the provider list does not reorder.
+    /// Prefix-affinity routing for self-hosted LLM pools (vLLM, SGLang)
+    /// whose workers retain prompt KV caches.
     ///
-    /// Falls back to round-robin when the dispatcher cannot extract
-    /// a prefix (e.g. the surface has no body, or it is an opaque
-    /// upgrade request).
-    PrefixAffinity,
+    /// The dispatcher normalizes the model namespace, leading
+    /// system/developer instructions, and first user message into a bounded
+    /// digest. An accepted response records its provider as an observed holder
+    /// for that digest. Later requests prefer a live observed holder;
+    /// deterministic holder ties preserve replica-state order. A miss or
+    /// missing prefix chooses the provider with the lowest recent token load,
+    /// rotating exact load ties.
+    ///
+    /// Holder and load state are bounded and process-local. They are learned
+    /// from accepted traffic and are not shared across gateway processes.
+    PrefixAffinity(PrefixAffinityConfig),
     /// Pin a session key to the same provider across requests.
     Sticky,
     /// Send the request concurrently to every eligible provider and
@@ -72,15 +88,8 @@ pub enum RoutingStrategy {
     /// Trades doubled spend for halved latency on the chat-first-token
     /// path; useful when every millisecond of TTFT matters.
     Race,
-    /// Power-of-Two-Choices over observed latency (Helicone-style):
-    /// sample two eligible providers and route to the one with the
-    /// lower recently-observed latency. Cuts tail latency under skewed
-    /// load versus always picking the single lowest-latency provider
-    /// (which herds). An untried provider is explored first; with a
-    /// single eligible provider it is returned directly. The signal is
-    /// the most recent observed latency; an EWMA-decay refinement is a
-    /// follow-up.
-    PeakEwma,
+    /// Power-of-Two-Choices over time-decayed latency and in-flight load.
+    PeakEwma(PeakEwmaConfig),
     /// Try a sequence of (provider, model) tiers from cheapest to
     /// most expensive. Each tier's response is graded against a
     /// quality threshold; if the response falls below threshold,
@@ -99,9 +108,138 @@ pub enum RoutingStrategy {
     /// Closed-loop outcome-aware routing (WOR-1541): score candidates by
     /// the realized cost-per-success fed back from completed requests
     /// ([`crate::routing_feedback`]), demoting providers whose refusal or
-    /// error rate is climbing. Falls back to round-robin while providers
-    /// are still warming up.
+    /// error rate is climbing. During warm-up it deterministically blends
+    /// learned picks with an independent round-robin fallback cursor according
+    /// to the least-observed candidate's confidence. A fresh process starts
+    /// with pure round-robin and reaches fully learned selection at five
+    /// samples per candidate.
     OutcomeAware,
+    /// Prefer the provider with the lowest request-quota pressure
+    /// (`1 - remaining/limit`) from fresh header-derived snapshots.
+    /// Unknown or stale signals are advisory only and sort after known
+    /// fresh observations; ties keep enabled-list order.
+    Headroom,
+    /// Prefer the provider whose quota window resets soonest among
+    /// candidates waiting for positive capacity. Providers that already
+    /// report remaining capacity sort first. Unknown/stale signals sort
+    /// last and never invent a reset time.
+    ResetAware,
+}
+
+/// Default half-life for Peak EWMA latency decay.
+pub const DEFAULT_PEAK_EWMA_HALF_LIFE_SECS: u64 = 10;
+
+/// Configuration for [`RoutingStrategy::PeakEwma`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeakEwmaConfig {
+    /// Seconds of decay before an idle provider re-enters at neutral cost.
+    pub half_life_secs: u64,
+}
+
+impl Default for PeakEwmaConfig {
+    fn default() -> Self {
+        Self {
+            half_life_secs: DEFAULT_PEAK_EWMA_HALF_LIFE_SECS,
+        }
+    }
+}
+
+impl PeakEwmaConfig {
+    /// Configured half-life as a duration.
+    pub fn half_life(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.half_life_secs)
+    }
+}
+
+impl<'de> Deserialize<'de> for PeakEwmaConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            #[serde(
+                default = "default_peak_ewma_half_life_secs",
+                rename = "half_life",
+                deserialize_with = "sbproxy_config::duration::deserialize_secs"
+            )]
+            half_life_secs: u64,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        if wire.half_life_secs == 0 {
+            return Err(D::Error::custom(
+                "peak_ewma routing half_life must be greater than zero",
+            ));
+        }
+        Ok(Self {
+            half_life_secs: wire.half_life_secs,
+        })
+    }
+}
+
+fn default_peak_ewma_half_life_secs() -> u64 {
+    DEFAULT_PEAK_EWMA_HALF_LIFE_SECS
+}
+
+impl<'de> Deserialize<'de> for RoutingStrategy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if value.as_str() == Some("peak_ewma") {
+            return Ok(Self::PeakEwma(PeakEwmaConfig::default()));
+        }
+        if value.as_str() == Some("prefix_affinity") {
+            return Ok(Self::PrefixAffinity(PrefixAffinityConfig::default()));
+        }
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Wire {
+            RoundRobin,
+            Weighted,
+            FallbackChain,
+            Random,
+            LowestLatency,
+            LeastConnections,
+            CostOptimized,
+            TokenRate,
+            LeastTokenUsage,
+            PrefixAffinity(PrefixAffinityConfig),
+            Sticky,
+            Race,
+            PeakEwma(PeakEwmaConfig),
+            Cascade(CascadeConfig),
+            CostQuality(crate::cost_quality::CostQualityConfig),
+            OutcomeAware,
+            Headroom,
+            ResetAware,
+        }
+
+        let wire = serde_json::from_value::<Wire>(value).map_err(D::Error::custom)?;
+        Ok(match wire {
+            Wire::RoundRobin => Self::RoundRobin,
+            Wire::Weighted => Self::Weighted,
+            Wire::FallbackChain => Self::FallbackChain,
+            Wire::Random => Self::Random,
+            Wire::LowestLatency => Self::LowestLatency,
+            Wire::LeastConnections => Self::LeastConnections,
+            Wire::CostOptimized => Self::CostOptimized,
+            Wire::TokenRate => Self::TokenRate,
+            Wire::LeastTokenUsage => Self::LeastTokenUsage,
+            Wire::PrefixAffinity(config) => Self::PrefixAffinity(config),
+            Wire::Sticky => Self::Sticky,
+            Wire::Race => Self::Race,
+            Wire::PeakEwma(config) => Self::PeakEwma(config),
+            Wire::Cascade(config) => Self::Cascade(config),
+            Wire::CostQuality(config) => Self::CostQuality(config),
+            Wire::OutcomeAware => Self::OutcomeAware,
+            Wire::Headroom => Self::Headroom,
+            Wire::ResetAware => Self::ResetAware,
+        })
+    }
 }
 
 /// Configuration for the [`RoutingStrategy::Cascade`] variant.
@@ -149,21 +287,41 @@ pub struct CascadeTier {
     pub cost_cap: Option<u64>,
 }
 
+/// Cap on the sticky session-affinity map (WOR-1693). Session keys are
+/// client-chosen, so without a bound the map gains one entry per unique
+/// key for the life of the process. 100,000 matches the cap
+/// [`crate::ratelimit::ModelRateLimiter`] uses for its entity buckets.
+/// Overflow evicts the least-recently-used session, whose only effect is
+/// that the evicted session re-pins on its next request, the same as
+/// after a restart.
+const MAX_STICKY_SESSIONS: usize = 100_000;
+
 /// Router that selects a provider for each request.
 pub struct Router {
     strategy: RoutingStrategy,
     counter: AtomicU64,
+    /// Round-robin cursor for outcome-aware warm-up traffic. Kept separate
+    /// from the confidence schedule so learned slots cannot starve whichever
+    /// providers occupy the same schedule positions.
+    outcome_fallback_counter: AtomicU64,
     // --- Per-provider state (sized at creation time) ---
     /// Observed p50 latency in microseconds per provider.
     latencies: Vec<AtomicU64>,
+    /// Time-decayed, peak-sensitive latency state for Peak EWMA routing.
+    peak_ewma: Option<peak_ewma::PeakEwmaEstimator>,
     /// In-flight request count per provider.
     connections: Vec<AtomicU32>,
     /// Tokens used in the current minute per provider.
     tokens_used: Vec<AtomicU64>,
+    /// Bounded prefix locations and lazy recent-token load shared by
+    /// prefix-affinity and least-token-usage routing.
+    replica_state: ReplicaRoutingState,
     /// Token-per-minute limits per provider.
     token_limits: Vec<u64>,
-    /// Session affinity map (session key -> provider index).
-    sticky_map: DashMap<String, usize>,
+    /// Session affinity map (session key -> provider index), bounded to
+    /// [`MAX_STICKY_SESSIONS`] entries so client-chosen keys cannot grow
+    /// it without limit (WOR-1693).
+    sticky_map: parking_lot::Mutex<lru::LruCache<String, usize>>,
     /// Per-provider circuit breakers. Empty when no resilience policy
     /// is configured; populated when the AI handler config carries a
     /// `resilience.circuit_breaker` block.
@@ -176,6 +334,25 @@ pub struct Router {
     /// healthy, `2` = unhealthy. Updated by background probe tasks
     /// when an `health_check` config is present.
     health: Vec<AtomicU8>,
+    /// Header-derived quota snapshots for headroom / reset-aware scoring.
+    quota: ProviderRateLimitTracker,
+    /// Last explicit round-robin fallback under policy-filtered selection.
+    last_filtered_fallback: parking_lot::Mutex<Option<FilteredSelectionFallback>>,
+}
+
+/// Cancellation-safe accounting for one provider attempt.
+#[must_use = "dropping the guard releases the provider's in-flight slot"]
+pub struct ProviderInFlightGuard<'a> {
+    router: &'a Router,
+    provider_idx: Option<usize>,
+}
+
+impl Drop for ProviderInFlightGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(provider_idx) = self.provider_idx {
+            self.router.record_disconnect(provider_idx);
+        }
+    }
 }
 
 impl std::fmt::Debug for Router {
@@ -195,19 +372,68 @@ impl Router {
         let tokens_used = (0..num_providers).map(|_| AtomicU64::new(0)).collect();
         let token_limits = vec![0; num_providers];
         let health = (0..num_providers).map(|_| AtomicU8::new(0)).collect();
+        let prefix_config = match &strategy {
+            RoutingStrategy::PrefixAffinity(config) => *config,
+            _ => PrefixAffinityConfig::default(),
+        };
+        let replica_state = ReplicaRoutingState::new(num_providers, prefix_config)
+            .expect("routing strategy configuration must be validated before Router construction");
+        let peak_ewma = match &strategy {
+            RoutingStrategy::PeakEwma(config) => Some(peak_ewma::PeakEwmaEstimator::new(
+                num_providers,
+                config.half_life(),
+            )),
+            _ => None,
+        };
 
         Self {
             strategy,
             counter: AtomicU64::new(0),
+            outcome_fallback_counter: AtomicU64::new(0),
             latencies,
+            peak_ewma,
             connections,
             tokens_used,
+            replica_state,
             token_limits,
-            sticky_map: DashMap::new(),
+            sticky_map: parking_lot::Mutex::new(lru::LruCache::new(
+                NonZeroUsize::new(MAX_STICKY_SESSIONS).expect("cap is nonzero"),
+            )),
             breakers: Vec::new(),
             outlier: None,
             health,
+            quota: ProviderRateLimitTracker::new(0.1),
+            last_filtered_fallback: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// Update quota snapshots from an upstream provider response.
+    /// Call before retry/reselect so headroom and reset-aware strategies
+    /// see the latest headers (including 429 paths).
+    pub fn update_quota_from_headers(
+        &self,
+        provider: &str,
+        headers: &[(String, String)],
+        status: u16,
+    ) {
+        self.quota
+            .update_from_headers_with_status(provider, headers, status);
+    }
+
+    /// Advisory quota snapshot for a provider. Unknown when never observed.
+    pub fn quota_snapshot(&self, provider: &str) -> ProviderQuotaSnapshot {
+        self.quota.snapshot(provider)
+    }
+
+    /// Last explicit round-robin fallback recorded by policy-filtered
+    /// selection, if any. Cleared on the next filtered pick that does
+    /// not fall back.
+    pub fn last_filtered_fallback(&self) -> Option<FilteredSelectionFallback> {
+        *self.last_filtered_fallback.lock()
+    }
+
+    fn record_filtered_fallback(&self, reason: Option<FilteredSelectionFallback>) {
+        *self.last_filtered_fallback.lock() = reason;
     }
 
     /// Attach circuit breakers and an outlier detector built from the
@@ -313,6 +539,9 @@ impl Router {
     pub fn record_latency(&self, provider_idx: usize, latency_us: u64) {
         if let Some(slot) = self.latencies.get(provider_idx) {
             slot.store(latency_us, Ordering::Relaxed);
+            if let Some(estimator) = &self.peak_ewma {
+                estimator.observe(provider_idx, latency_us);
+            }
         }
     }
 
@@ -323,10 +552,27 @@ impl Router {
         }
     }
 
+    /// Track one provider attempt until the returned guard is dropped.
+    ///
+    /// The guard balances success, failure, early-return, and future
+    /// cancellation paths. An unknown provider index produces an inert guard.
+    pub fn track_in_flight(&self, provider_idx: usize) -> ProviderInFlightGuard<'_> {
+        let provider_idx = self.connections.get(provider_idx).map(|slot| {
+            slot.fetch_add(1, Ordering::Relaxed);
+            provider_idx
+        });
+        ProviderInFlightGuard {
+            router: self,
+            provider_idx,
+        }
+    }
+
     /// Decrement the in-flight connection count for a provider.
     pub fn record_disconnect(&self, provider_idx: usize) {
         if let Some(slot) = self.connections.get(provider_idx) {
-            slot.fetch_sub(1, Ordering::Relaxed);
+            let _ = slot.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(1))
+            });
         }
     }
 
@@ -335,6 +581,7 @@ impl Router {
         if let Some(slot) = self.tokens_used.get(provider_idx) {
             slot.fetch_add(tokens, Ordering::Relaxed);
         }
+        self.replica_state.record_tokens(provider_idx, tokens);
     }
 
     /// WOR-798: record tokens consumed against a provider looked up by
@@ -365,6 +612,7 @@ impl Router {
         for slot in &self.tokens_used {
             slot.store(0, Ordering::Relaxed);
         }
+        self.replica_state.reset_tokens();
     }
 
     /// Select a provider using sticky (session affinity) routing.
@@ -381,22 +629,25 @@ impl Router {
             return None;
         }
 
-        // Check cache first
-        if let Some(cached) = self.sticky_map.get(session_key) {
-            let idx = *cached;
+        // Check cache first. `get` also marks the entry
+        // most-recently-used, so active sessions survive LRU eviction
+        // while idle ones age out (WOR-1693).
+        let mut sticky = self.sticky_map.lock();
+        if let Some(&idx) = sticky.get(session_key) {
             // Verify the cached provider is still enabled
             if providers.get(idx).is_some_and(|p| p.enabled) {
                 return Some(idx);
             }
             // Cached provider is gone or disabled, remove stale entry
-            drop(cached);
-            self.sticky_map.remove(session_key);
+            sticky.pop(session_key);
         }
 
-        // Fall back to round robin for new sessions
+        // Fall back to round robin for new sessions. At capacity, `put`
+        // evicts the least-recently-used session; that session re-pins
+        // on its next request, the same as after a restart.
         let counter = self.counter.fetch_add(1, Ordering::Relaxed);
         let selected = enabled[counter as usize % enabled.len()].0;
-        self.sticky_map.insert(session_key.to_string(), selected);
+        sticky.put(session_key.to_string(), selected);
         Some(selected)
     }
 
@@ -440,16 +691,16 @@ impl Router {
     }
 
     /// Pick an enabled provider permitted by the credential policy.
-    /// Empty allow and block lists preserve unrestricted selection.
+    ///
+    /// Policy and resilience filters are intersected. Unlike [`Self::select`],
+    /// this strict dispatch path does not revive the narrowed set when every
+    /// permitted provider is unhealthy, ejected, or breaker-blocked.
     pub fn select_with_policy(
         &self,
         providers: &[ProviderConfig],
         allowed: &[String],
         blocked: &[String],
     ) -> Option<usize> {
-        if allowed.is_empty() && blocked.is_empty() {
-            return self.select(providers);
-        }
         let picked = self.select_inner_filtered(providers, &|p| {
             provider_allowed_by_policy(p.name.as_str(), allowed, blocked)
         });
@@ -461,11 +712,15 @@ impl Router {
         picked
     }
 
-    /// `select_inner` with an additional predicate. Mirrors the
-    /// resilience-filter fallback: when the additional filter rejects
-    /// every otherwise-enabled provider, the router returns `None`
-    /// instead of falling back, because the operator's
-    /// `allowed_providers` block is a hard policy gate, not a hint.
+    /// `select_inner` with an additional predicate. The predicate and
+    /// resilience filters are both hard gates: an empty intersection returns
+    /// `None` instead of reviving a provider that either gate rejected.
+    ///
+    /// Candidate ranking reuses the same strategy dispatch as
+    /// [`Self::select_inner`] on the narrowed set. Round-robin fallback
+    /// is recorded explicitly via [`FilteredSelectionFallback`] when a
+    /// strategy lacks a required request signal (e.g. PrefixAffinity
+    /// without a prefix).
     fn select_inner_filtered(
         &self,
         providers: &[ProviderConfig],
@@ -477,35 +732,16 @@ impl Router {
             .filter(|(_, p)| p.enabled && extra(p))
             .collect();
         if enabled.is_empty() {
+            self.record_filtered_fallback(None);
             return None;
         }
-        // From here, reuse the same strategy dispatch as
-        // `select_inner`. We do not reapply the resilience filter on
-        // top of `extra` because the explicit allowlist already
-        // narrows the set; resilience ejection on a narrowed set
-        // produces too many false-deny outcomes in practice.
-        match self.strategy {
-            RoutingStrategy::RoundRobin => {
-                let idx = self.counter.fetch_add(1, Ordering::Relaxed);
-                Some(enabled[idx as usize % enabled.len()].0)
-            }
-            RoutingStrategy::FallbackChain => {
-                let mut sorted = enabled.clone();
-                sorted.sort_by_key(|(_, p)| p.priority.unwrap_or(u32::MAX));
-                Some(sorted[0].0)
-            }
-            // Outcome-aware routing works on the narrowed set directly:
-            // realized cost-per-success is provider-keyed, so the allowlist
-            // simply restricts the candidate pool.
-            RoutingStrategy::OutcomeAware => self.select_outcome_aware(&enabled),
-            // For other non-trivial strategies fall back to the unfiltered
-            // dispatch on the narrowed set. The shape of the strategy
-            // body matches `select_inner` so behaviour stays consistent.
-            _ => {
-                let idx = self.counter.fetch_add(1, Ordering::Relaxed);
-                Some(enabled[idx as usize % enabled.len()].0)
-            }
-        }
+        let candidates = enabled.iter().map(|(idx, _)| *idx).collect::<Vec<_>>();
+        let eligible = self.eligible_candidate_indices(providers, &candidates);
+        let eligible = eligible
+            .into_iter()
+            .filter_map(|idx| providers.get(idx).map(|provider| (idx, provider)))
+            .collect::<Vec<_>>();
+        self.select_from_candidates(&eligible, true)
     }
 
     fn select_inner(&self, providers: &[ProviderConfig]) -> Option<usize> {
@@ -532,21 +768,53 @@ impl Router {
             eligible
         };
 
+        self.select_from_candidates(&enabled, false)
+    }
+
+    /// Shared strategy dispatch over an already-narrowed candidate list.
+    /// When `record_fallback` is true, intentional round-robin fallbacks
+    /// (missing prefix/session signal) are recorded for tests and ops.
+    fn select_from_candidates(
+        &self,
+        enabled: &[(usize, &ProviderConfig)],
+        record_fallback: bool,
+    ) -> Option<usize> {
+        if enabled.is_empty() {
+            if record_fallback {
+                self.record_filtered_fallback(None);
+            }
+            return None;
+        }
+
+        let clear_fallback = || {
+            if record_fallback {
+                self.record_filtered_fallback(None);
+            }
+        };
+        let mark_missing_signal = || {
+            if record_fallback {
+                self.record_filtered_fallback(Some(
+                    FilteredSelectionFallback::RoundRobinMissingSignal,
+                ));
+            }
+        };
+
         match self.strategy {
             RoutingStrategy::RoundRobin => {
+                clear_fallback();
                 let idx = self.counter.fetch_add(1, Ordering::Relaxed);
                 Some(enabled[idx as usize % enabled.len()].0)
             }
             RoutingStrategy::Weighted => {
+                clear_fallback();
                 let total: u32 = enabled.iter().map(|(_, p)| p.weight).sum();
                 if total == 0 {
                     return Some(enabled[0].0);
                 }
                 let counter = self.counter.fetch_add(1, Ordering::Relaxed);
-                // LCG-derived pseudo-random selection for weighted distribution
                 let mut target =
                     (counter.wrapping_mul(6364136223846793005).wrapping_add(1)) % total as u64;
-                for &(idx, provider) in &enabled {
+                for &(idx, provider) in enabled {
                     if target < provider.weight as u64 {
                         return Some(idx);
                     }
@@ -555,12 +823,13 @@ impl Router {
                 Some(enabled[0].0)
             }
             RoutingStrategy::FallbackChain => {
-                // Priority order: lowest priority number is first choice
-                let mut sorted = enabled.clone();
+                clear_fallback();
+                let mut sorted = enabled.to_vec();
                 sorted.sort_by_key(|(_, p)| p.priority.unwrap_or(u32::MAX));
                 Some(sorted[0].0)
             }
             RoutingStrategy::Random => {
+                clear_fallback();
                 let idx = self.counter.fetch_add(1, Ordering::Relaxed);
                 let hash = idx
                     .wrapping_mul(6364136223846793005)
@@ -568,13 +837,12 @@ impl Router {
                 Some(enabled[hash as usize % enabled.len()].0)
             }
             RoutingStrategy::LowestLatency => {
-                // Select provider with lowest observed latency.
-                // If no latency data recorded yet, fall back to round robin.
+                clear_fallback();
                 let mut best_idx = None;
                 let mut best_latency = u64::MAX;
                 let mut has_data = false;
 
-                for &(idx, _) in &enabled {
+                for &(idx, _) in enabled {
                     let latency = self
                         .latencies
                         .get(idx)
@@ -591,17 +859,13 @@ impl Router {
                 if has_data {
                     best_idx.or(Some(enabled[0].0))
                 } else {
-                    // No latency data yet, use round robin
+                    mark_missing_signal();
                     let counter = self.counter.fetch_add(1, Ordering::Relaxed);
                     Some(enabled[counter as usize % enabled.len()].0)
                 }
             }
-            RoutingStrategy::PeakEwma => {
-                // Power-of-Two-Choices over observed latency: sample two
-                // distinct eligible providers and route to the lower
-                // latency. An untried provider (latency 0) sorts lowest,
-                // so the pair naturally explores it once. With a single
-                // eligible provider, return it.
+            RoutingStrategy::PeakEwma(_) => {
+                clear_fallback();
                 if enabled.len() == 1 {
                     return Some(enabled[0].0);
                 }
@@ -613,19 +877,25 @@ impl Router {
                 if b == a {
                     b = (a + 1) % enabled.len();
                 }
-                let lat = |i: usize| {
-                    self.latencies
-                        .get(enabled[i].0)
-                        .map_or(0, |l| l.load(Ordering::Relaxed))
+                let cost = |pool_idx: usize| {
+                    let provider_idx = enabled[pool_idx].0;
+                    let in_flight = self
+                        .connections
+                        .get(provider_idx)
+                        .map_or(0, |value| value.load(Ordering::Relaxed));
+                    self.peak_ewma
+                        .as_ref()
+                        .and_then(|estimator| estimator.score(provider_idx, in_flight))
+                        .unwrap_or(f64::INFINITY)
                 };
-                Some(enabled[if lat(a) <= lat(b) { a } else { b }].0)
+                Some(enabled[if cost(a) <= cost(b) { a } else { b }].0)
             }
             RoutingStrategy::LeastConnections => {
-                // Select provider with fewest in-flight requests
+                clear_fallback();
                 let mut best_idx = enabled[0].0;
                 let mut best_conns = u32::MAX;
 
-                for &(idx, _) in &enabled {
+                for &(idx, _) in enabled {
                     let conns = self
                         .connections
                         .get(idx)
@@ -639,19 +909,16 @@ impl Router {
                 Some(best_idx)
             }
             RoutingStrategy::CostOptimized => {
-                // Favor providers with lower weight (cheaper) when utilization is similar.
-                // Score = connections * 1000 + weight, pick the lowest score.
+                clear_fallback();
                 let mut best_idx = enabled[0].0;
                 let mut best_score = u64::MAX;
 
-                for &(idx, provider) in &enabled {
+                for &(idx, provider) in enabled {
                     let conns = self
                         .connections
                         .get(idx)
                         .map_or(0, |c| c.load(Ordering::Relaxed))
                         as u64;
-                    // Scale connections heavily so utilization dominates,
-                    // but weight breaks ties in favor of cheaper providers.
                     let score = conns * 1000 + provider.weight as u64;
                     if score < best_score {
                         best_score = score;
@@ -662,11 +929,11 @@ impl Router {
                 Some(best_idx)
             }
             RoutingStrategy::TokenRate => {
-                // Select provider with the most remaining token-per-minute capacity
+                clear_fallback();
                 let mut best_idx = enabled[0].0;
                 let mut best_remaining: i64 = i64::MIN;
 
-                for &(idx, _) in &enabled {
+                for &(idx, _) in enabled {
                     let limit = self.token_limits.get(idx).copied().unwrap_or(0);
                     let used = self
                         .tokens_used
@@ -681,62 +948,32 @@ impl Router {
 
                 Some(best_idx)
             }
-            RoutingStrategy::PrefixAffinity => {
-                // Basic `select` API has no prefix in hand (the
-                // dispatcher routes through `select_with_prefix` when
-                // it has the request body). Fall back to round-robin
-                // so a callsite that has not been threaded with the
-                // prefix-aware API still gets a deterministic answer.
+            RoutingStrategy::PrefixAffinity(_) => {
+                // Basic select API has no prefix; intentional RR fallback.
+                mark_missing_signal();
                 let counter = self.counter.fetch_add(1, Ordering::Relaxed);
                 Some(enabled[counter as usize % enabled.len()].0)
             }
             RoutingStrategy::LeastTokenUsage => {
-                // WOR-798: select the eligible provider with the
-                // smallest tokens_used in the current minute window.
-                // An untried provider has tokens_used = 0 and sorts
-                // first, so an empty pool naturally explores every
-                // upstream before settling. Ties are broken by the
-                // first match in enabled order, which gives stable
-                // routing under no load.
-                let mut best_idx = enabled[0].0;
-                let mut best_used = u64::MAX;
-                for &(idx, _) in &enabled {
-                    let used = self
-                        .tokens_used
-                        .get(idx)
-                        .map_or(0, |t| t.load(Ordering::Relaxed));
-                    if used < best_used {
-                        best_used = used;
-                        best_idx = idx;
-                    }
-                }
-                Some(best_idx)
+                clear_fallback();
+                let candidates = enabled.iter().map(|(idx, _)| *idx).collect::<Vec<_>>();
+                let tie_cursor = self.counter.fetch_add(1, Ordering::Relaxed);
+                self.replica_state.least_loaded(&candidates, tie_cursor)
             }
             RoutingStrategy::Sticky => {
-                // Sticky without a session key falls back to round robin.
-                // Callers should use select_sticky() instead for session affinity.
+                // Sticky without a session key: intentional RR fallback.
+                mark_missing_signal();
                 let counter = self.counter.fetch_add(1, Ordering::Relaxed);
                 Some(enabled[counter as usize % enabled.len()].0)
             }
             RoutingStrategy::Race => {
-                // Pick the first eligible provider for the basic
-                // `select` API. The fan-out is performed by the AI
-                // client when it sees `RoutingStrategy::Race`; this
-                // path is the fallback when only one provider is
-                // eligible.
+                clear_fallback();
                 Some(enabled[0].0)
             }
             RoutingStrategy::Cascade(ref cfg) => {
-                // The cascade dispatcher walks `cfg.tiers` itself
-                // (via `cascade_config()`); the basic `select` API
-                // just hands back the first tier's provider so
-                // callers that do not engage the cascade path still
-                // get a deterministic provider. If the first tier's
-                // provider name doesn't match any configured
-                // provider, fall through to the first enabled one
-                // so we never return None for misconfigured cascades.
+                clear_fallback();
                 if let Some(first) = cfg.tiers.first() {
-                    for &(idx, p) in &enabled {
+                    for &(idx, p) in enabled {
                         if p.name == first.provider_id {
                             return Some(idx);
                         }
@@ -745,44 +982,117 @@ impl Router {
                 Some(enabled[0].0)
             }
             RoutingStrategy::CostQuality(ref cfg) => {
-                // The cost/quality dispatcher scores the prompt and picks
-                // the cheap or frontier provider itself (via
-                // `cost_quality_config()`); `select` hands back the cheap
-                // provider as a deterministic fallback for callers that do
-                // not engage that path.
-                for &(idx, p) in &enabled {
+                clear_fallback();
+                for &(idx, p) in enabled {
                     if p.name == cfg.cheap_provider {
                         return Some(idx);
                     }
                 }
                 Some(enabled[0].0)
             }
-            RoutingStrategy::OutcomeAware => self.select_outcome_aware(&enabled),
+            RoutingStrategy::OutcomeAware => {
+                clear_fallback();
+                self.select_outcome_aware(enabled)
+            }
+            RoutingStrategy::Headroom => {
+                clear_fallback();
+                self.select_headroom(enabled)
+            }
+            RoutingStrategy::ResetAware => {
+                clear_fallback();
+                self.select_reset_aware(enabled)
+            }
         }
     }
 
+    /// Prefer lowest known-fresh request pressure; ties keep enabled order.
+    /// Unknown/stale candidates sort after known observations.
+    fn select_headroom(&self, enabled: &[(usize, &ProviderConfig)]) -> Option<usize> {
+        if enabled.is_empty() {
+            return None;
+        }
+        let mut best_idx = enabled[0].0;
+        // (tier, pressure_millis, stable_pos): lower is better.
+        // tier 0 = known pressure, 1 = unknown/stale
+        let mut best_key = (2u8, u64::MAX, 0usize);
+        for (pos, &(idx, p)) in enabled.iter().enumerate() {
+            let snap = self.quota.snapshot(&p.name);
+            let key = match snap.request_pressure() {
+                Some(pressure) => {
+                    let millis = (pressure.clamp(0.0, 1.0) * 1_000_000.0) as u64;
+                    (0u8, millis, pos)
+                }
+                None => (1u8, 0u64, pos),
+            };
+            if pos == 0 || key < best_key {
+                best_key = key;
+                best_idx = idx;
+            }
+        }
+        Some(best_idx)
+    }
+
+    /// Prefer providers with positive capacity now; otherwise the earliest
+    /// reset among exhausted candidates. Unknown/stale sort last.
+    fn select_reset_aware(&self, enabled: &[(usize, &ProviderConfig)]) -> Option<usize> {
+        if enabled.is_empty() {
+            return None;
+        }
+        let now = std::time::Instant::now();
+        let mut best_idx = enabled[0].0;
+        let mut best_key: (u8, u128, usize) = (2, u128::MAX, 0);
+        // tier 0 = has positive capacity now
+        // tier 1 = exhausted with known reset (rank by earliest reset)
+        // tier 2 = unknown/stale / no reset
+        for (pos, &(idx, p)) in enabled.iter().enumerate() {
+            let snap = self.quota.snapshot(&p.name);
+            let key = if snap.has_positive_capacity() {
+                (0u8, 0u128, pos)
+            } else if snap.quality == crate::provider_ratelimit::QuotaSignalQuality::KnownFresh {
+                match snap.reset_at {
+                    Some(reset) => {
+                        let nanos = reset.saturating_duration_since(now).as_nanos();
+                        (1u8, nanos, pos)
+                    }
+                    None => (2u8, u128::MAX, pos),
+                }
+            } else {
+                (2u8, u128::MAX, pos)
+            };
+            if pos == 0 || key < best_key {
+                best_key = key;
+                best_idx = idx;
+            }
+        }
+        Some(best_idx)
+    }
+
     /// Pick the enabled provider with the best realized cost-per-success
-    /// from the global feedback store. Falls back to round-robin while
-    /// providers warm up (the store explores under-sampled candidates
-    /// first), so a fresh deployment behaves exactly like round-robin
-    /// until it has data.
+    /// from the global feedback store.
+    ///
+    /// During warm-up, learned selections are blended with round-robin in
+    /// exact proportion to the least-observed candidate's confidence. The
+    /// fallback has its own cursor, so learned schedule positions cannot
+    /// starve providers of exploration. A fresh process still begins with
+    /// pure round-robin.
     fn select_outcome_aware(&self, enabled: &[(usize, &ProviderConfig)]) -> Option<usize> {
         if enabled.is_empty() {
             return None;
         }
         let names: Vec<&str> = enabled.iter().map(|(_, p)| p.name.as_str()).collect();
         let store = crate::routing_feedback::FeedbackStore::global();
-        // While any candidate is still warming up, round-robin so every
-        // provider earns an estimate (and a fresh deployment behaves like
-        // round-robin until it has data).
-        if store.needs_exploration(&names) {
-            let idx = self.counter.fetch_add(1, Ordering::Relaxed);
-            return Some(enabled[idx as usize % enabled.len()].0);
+        let cursor = self.counter.fetch_add(1, Ordering::Relaxed);
+        let (learned_slots, total_slots) = store.confidence(&names);
+        if learned_slots > 0 && cursor % total_slots < learned_slots {
+            if let Some(pos) = store.best_among(&names) {
+                return Some(enabled[pos].0);
+            }
         }
-        match store.best_among(&names) {
-            Some(pos) => Some(enabled[pos].0),
-            None => Some(enabled[0].0),
-        }
+        crate::ai_metrics::record_routing_fallback("outcome_aware", "warmup");
+        let fallback_cursor = self
+            .outcome_fallback_counter
+            .fetch_add(1, Ordering::Relaxed);
+        Some(enabled[fallback_cursor as usize % enabled.len()].0)
     }
 
     /// Returns true when the configured strategy is `Race`. The AI
@@ -791,95 +1101,105 @@ impl Router {
         matches!(self.strategy, RoutingStrategy::Race)
     }
 
-    /// WOR-798: returns true when the configured strategy wants the
-    /// dispatcher to route through [`Self::select_with_prefix`]
-    /// (i.e. it benefits from a stable prompt prefix). The
-    /// dispatcher checks this before doing the prefix-extraction
-    /// work; non-prefix strategies skip the extraction entirely.
+    /// Return whether the dispatcher should normalize the request and use a
+    /// prefix-aware selection method. Non-prefix strategies can skip that
+    /// request-body work.
     pub fn is_prefix_affinity(&self) -> bool {
-        matches!(self.strategy, RoutingStrategy::PrefixAffinity)
+        matches!(self.strategy, RoutingStrategy::PrefixAffinity(_))
     }
 
-    /// WOR-798: prefix-aware provider selection. `prefix_key` is a
-    /// stable, request-derived byte slice (e.g. the first N bytes of
-    /// the request body) that hashes deterministically to one
-    /// enabled provider so two requests sharing the prefix land on
-    /// the same upstream and reuse its KV cache.
-    ///
-    /// Uses FxHash for speed (the rule is "same prefix -> same
-    /// provider", not "cryptographic identity"); ineligible
-    /// providers are filtered out the same way [`Self::select`] does
-    /// so the affinity respects circuit-breaker / outlier ejection.
-    /// With a single eligible provider, returns it directly. With an
-    /// empty `prefix_key`, falls back to the same round-robin that
-    /// the basic [`Self::select`] uses for this strategy, so callers
-    /// that get a None-prefix request still progress.
+    /// Select a live holder for a normalized prefix, falling back to the
+    /// lowest recent-token load when no holder is known.
     pub fn select_with_prefix(
         &self,
         providers: &[ProviderConfig],
-        prefix_key: &[u8],
+        prefix: Option<PrefixDigest>,
     ) -> Option<usize> {
-        self.select_with_prefix_policy(providers, prefix_key, &[], &[])
+        self.select_with_prefix_policy(providers, prefix, &[], &[])
     }
 
     /// Prefix-aware selection constrained by a credential provider policy.
-    /// Policy filtering is applied before affinity hashing, and an empty
+    /// Policy filtering is applied before state lookup, and an empty
     /// policy-filtered set fails closed instead of falling back.
     pub fn select_with_prefix_policy(
         &self,
         providers: &[ProviderConfig],
-        prefix_key: &[u8],
+        prefix: Option<PrefixDigest>,
         allowed: &[String],
         blocked: &[String],
     ) -> Option<usize> {
-        let enabled: Vec<(usize, &ProviderConfig)> = providers
+        let candidates = providers
             .iter()
             .enumerate()
             .filter(|(_, p)| {
                 p.enabled && provider_allowed_by_policy(p.name.as_str(), allowed, blocked)
             })
-            .collect();
-        if enabled.is_empty() {
+            .map(|(idx, _)| idx)
+            .collect::<Vec<_>>();
+        self.select_with_prefix_candidates(providers, prefix, &candidates)
+    }
+
+    /// Prefix-aware selection constrained to the dispatcher's exact final
+    /// candidate indices.
+    ///
+    /// Disabled, unhealthy, breaker-blocked, and ejected candidates are
+    /// removed without all-ineligible revival. A known prefix holder wins when
+    /// it remains live; holder ties keep the deterministic ordering maintained
+    /// by the bounded replica state. Otherwise the least recent-token load
+    /// among the remaining candidates wins.
+    pub fn select_with_prefix_candidates(
+        &self,
+        providers: &[ProviderConfig],
+        prefix: Option<PrefixDigest>,
+        candidate_indices: &[usize],
+    ) -> Option<usize> {
+        let eligible = self.eligible_candidate_indices(providers, candidate_indices);
+        if eligible.is_empty() {
             return None;
         }
-        let eligible: Vec<(usize, &ProviderConfig)> = enabled
-            .iter()
-            .filter(|(idx, p)| self.provider_eligible(*idx, p.name.as_str()))
-            .cloned()
-            .collect();
-        let pool = if eligible.is_empty() {
-            enabled
-        } else {
-            eligible
+        let picked = match prefix {
+            Some(prefix) => {
+                if let Some(holder) = self.replica_state.select_holder(&prefix, &eligible) {
+                    crate::ai_metrics::record_prefix_affinity_decision("hit");
+                    holder
+                } else {
+                    crate::ai_metrics::record_prefix_affinity_decision("miss");
+                    crate::ai_metrics::record_routing_fallback("prefix_affinity", "no_holder");
+                    let tie_cursor = self.counter.fetch_add(1, Ordering::Relaxed);
+                    self.replica_state.least_loaded(&eligible, tie_cursor)?
+                }
+            }
+            None => {
+                crate::ai_metrics::record_prefix_affinity_decision("missing_signal");
+                crate::ai_metrics::record_routing_fallback("prefix_affinity", "missing_signal");
+                let tie_cursor = self.counter.fetch_add(1, Ordering::Relaxed);
+                self.replica_state.least_loaded(&eligible, tie_cursor)?
+            }
         };
-        if pool.len() == 1 || prefix_key.is_empty() {
-            // Sole-provider case OR no prefix in hand: fall through
-            // to a deterministic pick. Sole-provider always returns
-            // that provider; empty prefix uses round-robin so two
-            // body-less requests do not herd onto one upstream.
-            let pool_idx = if prefix_key.is_empty() {
-                let counter = self.counter.fetch_add(1, Ordering::Relaxed);
-                counter as usize % pool.len()
-            } else {
-                0
-            };
-            crate::ai_metrics::record_lb_decision(self.strategy_name(), &pool[pool_idx].1.name);
-            return Some(pool[pool_idx].0);
-        }
-        // Deterministic hash of the prefix mod the eligible-pool
-        // size. FNV-1a 64-bit; small, no_std, and stable across
-        // releases. The pool's order matches `providers` (filtered),
-        // so the result is stable as long as the provider list
-        // does not reorder.
-        let mut hash: u64 = 0xcbf29ce484222325;
-        for byte in prefix_key {
-            hash ^= *byte as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        let picked_pool_idx = (hash % pool.len() as u64) as usize;
-        let picked = pool[picked_pool_idx].0;
-        crate::ai_metrics::record_lb_decision(self.strategy_name(), &pool[picked_pool_idx].1.name);
+        let provider = providers.get(picked)?;
+        crate::ai_metrics::record_lb_decision(self.strategy_name(), &provider.name);
         Some(picked)
+    }
+
+    /// Record that an accepted response populated one provider's prefix cache.
+    pub fn record_prefix(&self, provider_idx: usize, prefix: PrefixDigest) {
+        self.replica_state.record_prefix(provider_idx, prefix);
+    }
+
+    /// Record prefix ownership after looking up a provider by stable name.
+    pub fn record_prefix_for_provider(
+        &self,
+        providers: &[ProviderConfig],
+        provider_name: &str,
+        prefix: PrefixDigest,
+    ) {
+        if let Some((provider_idx, _)) = providers
+            .iter()
+            .enumerate()
+            .find(|(_, provider)| provider.name == provider_name)
+        {
+            self.record_prefix(provider_idx, prefix);
+        }
     }
 
     /// WOR-798: snake_case name of the active strategy, used as the
@@ -896,13 +1216,15 @@ impl Router {
             RoutingStrategy::CostOptimized => "cost_optimized",
             RoutingStrategy::TokenRate => "token_rate",
             RoutingStrategy::LeastTokenUsage => "least_token_usage",
-            RoutingStrategy::PrefixAffinity => "prefix_affinity",
+            RoutingStrategy::PrefixAffinity(_) => "prefix_affinity",
             RoutingStrategy::Sticky => "sticky",
             RoutingStrategy::Race => "race",
-            RoutingStrategy::PeakEwma => "peak_ewma",
+            RoutingStrategy::PeakEwma(_) => "peak_ewma",
             RoutingStrategy::Cascade(_) => "cascade",
             RoutingStrategy::CostQuality(_) => "cost_quality",
             RoutingStrategy::OutcomeAware => "outcome_aware",
+            RoutingStrategy::Headroom => "headroom",
+            RoutingStrategy::ResetAware => "reset_aware",
         }
     }
 
@@ -936,6 +1258,53 @@ impl Router {
         }
     }
 
+    /// Return the resilience-eligible subset of an exact candidate list.
+    ///
+    /// Input order is preserved. Disabled, unknown, unhealthy,
+    /// breaker-blocked, and ejected entries are omitted. If every supplied
+    /// candidate is omitted, the result stays empty; this strict API never
+    /// revives the all-ineligible set.
+    pub fn eligible_candidate_indices(
+        &self,
+        providers: &[ProviderConfig],
+        candidate_indices: &[usize],
+    ) -> Vec<usize> {
+        candidate_indices
+            .iter()
+            .copied()
+            .filter(|idx| {
+                providers.get(*idx).is_some_and(|provider| {
+                    provider.enabled && self.provider_eligible(*idx, provider.name.as_str())
+                })
+            })
+            .collect()
+    }
+
+    /// Select with the configured strategy from an exact candidate list.
+    ///
+    /// The supplied order is retained for strategy tie-breaking. Resilience
+    /// filtering is strict, so an all-ineligible set returns `None` without
+    /// reviving candidates. Successful selections record the same normal
+    /// load-balancer decision metric as [`Self::select`].
+    pub fn select_with_candidates(
+        &self,
+        providers: &[ProviderConfig],
+        candidate_indices: &[usize],
+    ) -> Option<usize> {
+        let eligible = self.eligible_candidate_indices(providers, candidate_indices);
+        let eligible = eligible
+            .into_iter()
+            .filter_map(|idx| providers.get(idx).map(|provider| (idx, provider)))
+            .collect::<Vec<_>>();
+        let picked = self.select_from_candidates(&eligible, true);
+        if let Some(idx) = picked {
+            if let Some(provider) = providers.get(idx) {
+                crate::ai_metrics::record_lb_decision(self.strategy_name(), &provider.name);
+            }
+        }
+        picked
+    }
+
     /// Return every eligible provider index. Used by the race
     /// strategy and the shadow request orchestration.
     pub fn eligible_indices(&self, providers: &[ProviderConfig]) -> Vec<usize> {
@@ -964,6 +1333,7 @@ mod tests {
             provider_type: None,
             deployment: None,
             api_key: None,
+            accept_native_credentials_for: None,
             base_url: None,
             models: Vec::new(),
             default_model: None,
@@ -981,6 +1351,19 @@ mod tests {
             no_prompt_training: false,
             serve: None,
         }
+    }
+
+    fn normalized_prefix(label: &str) -> PrefixDigest {
+        crate::routing_state::normalize_prefix(
+            &serde_json::json!({
+                "messages": [
+                    {"role": "system", "content": "Be concise."},
+                    {"role": "user", "content": label}
+                ]
+            }),
+            "model:test",
+        )
+        .expect("test request has a prefix")
     }
 
     // --- RoundRobin Tests ---
@@ -1134,11 +1517,18 @@ mod tests {
 
         let json = serde_json::json!("prefix_affinity");
         let strategy: RoutingStrategy = serde_json::from_value(json).unwrap();
-        assert!(matches!(strategy, RoutingStrategy::PrefixAffinity));
+        assert!(matches!(strategy, RoutingStrategy::PrefixAffinity(_)));
 
         let json = serde_json::json!("sticky");
         let strategy: RoutingStrategy = serde_json::from_value(json).unwrap();
         assert!(matches!(strategy, RoutingStrategy::Sticky));
+
+        let json = serde_json::json!("peak_ewma");
+        let strategy: RoutingStrategy = serde_json::from_value(json).unwrap();
+        let RoutingStrategy::PeakEwma(config) = strategy else {
+            panic!("expected peak_ewma");
+        };
+        assert_eq!(config.half_life_secs, 10);
     }
 
     // --- WOR-798: LeastTokenUsage + record_tokens_for_provider ---
@@ -1223,65 +1613,82 @@ mod tests {
     // --- WOR-798 PrefixAffinity ---
 
     #[test]
-    fn prefix_affinity_same_prefix_same_provider() {
+    fn prefix_affinity_routes_a_continuation_to_its_observed_holder() {
         let providers = vec![
             make_provider("a", 1, None, true),
             make_provider("b", 1, None, true),
-            make_provider("c", 1, None, true),
-            make_provider("d", 1, None, true),
         ];
-        let router = Router::new(RoutingStrategy::PrefixAffinity, providers.len());
-        // Same prefix repeats to the same provider; routing is
-        // deterministic across calls so vLLM/SGLang upstream keeps
-        // its KV cache warm for that prefix.
-        let prefix = b"You are a helpful assistant. The user asks: ";
-        let first = router.select_with_prefix(&providers, prefix);
-        for _ in 0..50 {
-            assert_eq!(router.select_with_prefix(&providers, prefix), first);
-        }
-    }
+        let router = Router::new(
+            RoutingStrategy::PrefixAffinity(PrefixAffinityConfig::default()),
+            providers.len(),
+        );
+        let first_turn = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "Be concise."},
+                {"role": "user", "content": "Summarize this."}
+            ]
+        });
+        let continuation = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "Be concise."},
+                {"role": "user", "content": "Summarize this."},
+                {"role": "assistant", "content": "Summary."},
+                {"role": "user", "content": "Shorter."}
+            ]
+        });
+        let first_prefix =
+            crate::routing_state::normalize_prefix(&first_turn, "model:test").expect("prefix");
+        let continued_prefix =
+            crate::routing_state::normalize_prefix(&continuation, "model:test").expect("prefix");
+        assert_eq!(continued_prefix, first_prefix);
 
-    #[test]
-    fn prefix_affinity_different_prefixes_distribute() {
-        let providers = vec![
-            make_provider("a", 1, None, true),
-            make_provider("b", 1, None, true),
-            make_provider("c", 1, None, true),
-            make_provider("d", 1, None, true),
-        ];
-        let router = Router::new(RoutingStrategy::PrefixAffinity, providers.len());
-        // 100 prefix variations should hit more than one provider
-        // (with a 4-way pool and FNV-1a we expect ~uniform).
-        let mut counts = [0u32; 4];
-        for i in 0..100u32 {
-            let key = format!("prompt-variant-{i:03}");
-            let idx = router
-                .select_with_prefix(&providers, key.as_bytes())
-                .expect("select");
-            counts[idx] += 1;
-        }
-        // At least 3 of the 4 providers must have been hit; with FNV-1a
-        // we'd be very unlucky to get a perfect 0 for any single bucket.
-        let nonzero = counts.iter().filter(|c| **c > 0).count();
-        assert!(
-            nonzero >= 3,
-            "expected prefix-affinity to spread across at least 3 providers; counts={counts:?}"
+        let first = router
+            .select_with_prefix(&providers, Some(first_prefix))
+            .expect("least-load fallback");
+        router.record_prefix(first, first_prefix);
+        router.record_tokens(first, 1_000);
+
+        assert_eq!(
+            router.select_with_prefix(&providers, Some(continued_prefix)),
+            Some(first),
+            "the live holder must win even when the other replica is less loaded"
         );
     }
 
     #[test]
-    fn prefix_affinity_empty_prefix_uses_round_robin() {
+    fn prefix_affinity_miss_uses_recent_token_load() {
+        let providers = vec![
+            make_provider("a", 1, None, true),
+            make_provider("b", 1, None, true),
+        ];
+        let router = Router::new(
+            RoutingStrategy::PrefixAffinity(PrefixAffinityConfig::default()),
+            providers.len(),
+        );
+        router.record_tokens(0, 500);
+
+        assert_eq!(
+            router.select_with_prefix(&providers, Some(normalized_prefix("new conversation"))),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn prefix_affinity_missing_signal_rotates_exact_load_ties() {
         let providers = vec![
             make_provider("a", 1, None, true),
             make_provider("b", 1, None, true),
             make_provider("c", 1, None, true),
         ];
-        let router = Router::new(RoutingStrategy::PrefixAffinity, providers.len());
-        // Empty prefix means "no prefix in hand" — fall back to a
-        // round-robin so body-less requests do not herd onto provider 0.
+        let router = Router::new(
+            RoutingStrategy::PrefixAffinity(PrefixAffinityConfig::default()),
+            providers.len(),
+        );
         let mut counts = [0u32; 3];
         for _ in 0..30 {
-            let idx = router.select_with_prefix(&providers, b"").expect("select");
+            let idx = router
+                .select_with_prefix(&providers, None)
+                .expect("least-load fallback");
             counts[idx] += 1;
         }
         assert_eq!(counts, [10, 10, 10]);
@@ -1290,12 +1697,15 @@ mod tests {
     #[test]
     fn prefix_affinity_single_provider_always_returns_it() {
         let providers = vec![make_provider("only", 1, None, true)];
-        let router = Router::new(RoutingStrategy::PrefixAffinity, providers.len());
+        let router = Router::new(
+            RoutingStrategy::PrefixAffinity(PrefixAffinityConfig::default()),
+            providers.len(),
+        );
         assert_eq!(
-            router.select_with_prefix(&providers, b"any-prefix"),
+            router.select_with_prefix(&providers, Some(normalized_prefix("any prefix"))),
             Some(0)
         );
-        assert_eq!(router.select_with_prefix(&providers, b""), Some(0));
+        assert_eq!(router.select_with_prefix(&providers, None), Some(0));
     }
 
     #[test]
@@ -1305,16 +1715,17 @@ mod tests {
             make_provider("b", 1, None, true),
             make_provider("c", 1, None, true),
         ];
-        let router = Router::new(RoutingStrategy::PrefixAffinity, providers.len());
-        // Any prefix that hashes into the pool must land on b or c,
-        // never a (which is disabled).
-        for i in 0..20u32 {
-            let key = format!("variant-{i}");
-            let idx = router
-                .select_with_prefix(&providers, key.as_bytes())
-                .expect("select");
-            assert_ne!(idx, 0, "disabled provider a must not be picked");
-        }
+        let router = Router::new(
+            RoutingStrategy::PrefixAffinity(PrefixAffinityConfig::default()),
+            providers.len(),
+        );
+        let prefix = normalized_prefix("holder becomes disabled");
+        router.record_prefix(0, prefix);
+
+        let idx = router
+            .select_with_prefix(&providers, Some(prefix))
+            .expect("eligible fallback");
+        assert_ne!(idx, 0, "disabled holder must not be picked");
     }
 
     #[test]
@@ -1328,7 +1739,10 @@ mod tests {
             make_provider("b", 1, None, true),
             make_provider("c", 1, None, true),
         ];
-        let router = Router::new(RoutingStrategy::PrefixAffinity, providers.len());
+        let router = Router::new(
+            RoutingStrategy::PrefixAffinity(PrefixAffinityConfig::default()),
+            providers.len(),
+        );
         let mut counts = [0u32; 3];
         for _ in 0..30 {
             counts[router.select(&providers).unwrap()] += 1;
@@ -1338,7 +1752,11 @@ mod tests {
 
     #[test]
     fn is_prefix_affinity_only_true_for_that_variant() {
-        assert!(Router::new(RoutingStrategy::PrefixAffinity, 1).is_prefix_affinity());
+        assert!(Router::new(
+            RoutingStrategy::PrefixAffinity(PrefixAffinityConfig::default()),
+            1
+        )
+        .is_prefix_affinity());
         assert!(!Router::new(RoutingStrategy::RoundRobin, 1).is_prefix_affinity());
         assert!(!Router::new(RoutingStrategy::LeastTokenUsage, 1).is_prefix_affinity());
     }
@@ -1354,7 +1772,7 @@ mod tests {
             "round_robin"
         );
         assert_eq!(
-            Router::new(RoutingStrategy::PeakEwma, 1).strategy_name(),
+            Router::new(RoutingStrategy::PeakEwma(PeakEwmaConfig::default()), 1).strategy_name(),
             "peak_ewma"
         );
         assert_eq!(
@@ -1362,7 +1780,11 @@ mod tests {
             "least_token_usage"
         );
         assert_eq!(
-            Router::new(RoutingStrategy::PrefixAffinity, 1).strategy_name(),
+            Router::new(
+                RoutingStrategy::PrefixAffinity(PrefixAffinityConfig::default()),
+                1
+            )
+            .strategy_name(),
             "prefix_affinity"
         );
         assert_eq!(
@@ -1531,6 +1953,96 @@ mod tests {
     }
 
     #[test]
+    fn outcome_aware_fallback_visits_every_provider_across_complete_schedules() {
+        use crate::routing_feedback::{FeedbackStore, Outcome};
+
+        for confidence in 1..=4u64 {
+            let providers = (0..5)
+                .map(|index| {
+                    make_provider(&format!("oa_blend_{confidence}_{index}"), 1, None, true)
+                })
+                .collect::<Vec<_>>();
+            let store = FeedbackStore::global();
+            for provider in &providers {
+                for _ in 0..confidence {
+                    store.record(&Outcome {
+                        provider: &provider.name,
+                        success: true,
+                        refused: false,
+                        cost_usd: if provider.name.ends_with("_4") {
+                            0.001
+                        } else {
+                            0.100
+                        },
+                        latency_ms: 100,
+                    });
+                }
+            }
+
+            let router = Router::new(RoutingStrategy::OutcomeAware, providers.len());
+            let mut counts = [0u64; 5];
+            // Five complete five-slot confidence schedules provide a whole
+            // number of fallback turns for every provider at every partial
+            // confidence. Each provider must receive an equal share of those
+            // fallback turns, independent of where the learned winner sits.
+            for _ in 0..25 {
+                counts[router.select(&providers).expect("provider")] += 1;
+            }
+
+            let fallback_per_provider = 5 - confidence;
+            assert_eq!(
+                counts[..4],
+                [fallback_per_provider; 4],
+                "{confidence}/5 confidence must still give every non-winner an equal fallback share"
+            );
+            assert_eq!(
+                counts[4],
+                fallback_per_provider + 5 * confidence,
+                "{confidence}/5 confidence must add learned picks without consuming the winner's \
+                 fallback share"
+            );
+        }
+    }
+
+    #[test]
+    fn outcome_feedback_survives_router_rebuild_for_hot_reload() {
+        use crate::routing_feedback::{FeedbackStore, Outcome};
+
+        let providers = vec![
+            make_provider("oa_reload_expensive", 1, None, true),
+            make_provider("oa_reload_efficient", 1, None, true),
+        ];
+        let store = FeedbackStore::global();
+        for _ in 0..5 {
+            store.record(&Outcome {
+                provider: "oa_reload_expensive",
+                success: true,
+                refused: false,
+                cost_usd: 0.100,
+                latency_ms: 100,
+            });
+            store.record(&Outcome {
+                provider: "oa_reload_efficient",
+                success: true,
+                refused: false,
+                cost_usd: 0.001,
+                latency_ms: 100,
+            });
+        }
+
+        let before_reload = Router::new(RoutingStrategy::OutcomeAware, providers.len());
+        assert_eq!(before_reload.select(&providers), Some(1));
+        drop(before_reload);
+
+        let after_reload = Router::new(RoutingStrategy::OutcomeAware, providers.len());
+        assert_eq!(
+            after_reload.select(&providers),
+            Some(1),
+            "replacing a handler/router must not replace process-wide feedback"
+        );
+    }
+
+    #[test]
     fn outcome_aware_deserializes_from_snake_case() {
         let s: RoutingStrategy =
             serde_json::from_value(serde_json::json!("outcome_aware")).unwrap();
@@ -1549,7 +2061,10 @@ mod tests {
             make_provider("slow", 1, None, true),
             make_provider("fast", 1, None, true),
         ];
-        let router = Router::new(RoutingStrategy::PeakEwma, providers.len());
+        let router = Router::new(
+            RoutingStrategy::PeakEwma(PeakEwmaConfig::default()),
+            providers.len(),
+        );
         router.record_latency(0, 5000);
         router.record_latency(1, 1000);
         // With two eligible providers, P2C samples both, so it always
@@ -1562,14 +2077,60 @@ mod tests {
     #[test]
     fn peak_ewma_single_provider_returns_it() {
         let providers = vec![make_provider("only", 1, None, true)];
-        let router = Router::new(RoutingStrategy::PeakEwma, providers.len());
+        let router = Router::new(
+            RoutingStrategy::PeakEwma(PeakEwmaConfig::default()),
+            providers.len(),
+        );
         assert_eq!(router.select(&providers).unwrap(), 0);
+    }
+
+    #[test]
+    fn peak_ewma_in_flight_load_breaks_equal_latency_tie() {
+        let providers = vec![
+            make_provider("queued", 1, None, true),
+            make_provider("idle", 1, None, true),
+        ];
+        let router = Router::new(
+            RoutingStrategy::PeakEwma(PeakEwmaConfig::default()),
+            providers.len(),
+        );
+        router.record_latency(0, 1_000);
+        router.record_latency(1, 1_000);
+        router.record_connect(0);
+
+        for _ in 0..10 {
+            assert_eq!(router.select(&providers), Some(1));
+        }
+
+        router.record_disconnect(0);
+        let selections = (0..10)
+            .map(|_| router.select(&providers).expect("provider"))
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(selections, std::collections::HashSet::from([0, 1]));
+    }
+
+    #[test]
+    fn in_flight_guard_balances_on_drop_and_ignores_unknown_provider() {
+        let router = Router::new(RoutingStrategy::LeastConnections, 2);
+        assert_eq!(router.connections[0].load(Ordering::Relaxed), 0);
+
+        {
+            let _guard = router.track_in_flight(0);
+            assert_eq!(router.connections[0].load(Ordering::Relaxed), 1);
+        }
+        assert_eq!(router.connections[0].load(Ordering::Relaxed), 0);
+
+        {
+            let _guard = router.track_in_flight(99);
+        }
+        assert_eq!(router.connections[0].load(Ordering::Relaxed), 0);
+        assert_eq!(router.connections[1].load(Ordering::Relaxed), 0);
     }
 
     #[test]
     fn peak_ewma_deserializes_from_snake_case() {
         let s: RoutingStrategy = serde_json::from_value(serde_json::json!("peak_ewma")).unwrap();
-        assert!(matches!(s, RoutingStrategy::PeakEwma));
+        assert!(matches!(s, RoutingStrategy::PeakEwma(_)));
     }
 
     // --- LeastConnections Tests ---
@@ -1808,6 +2369,29 @@ mod tests {
         assert!(router.select_sticky(&providers, "user-1").is_none());
     }
 
+    #[test]
+    fn sticky_map_is_bounded_under_unique_session_keys() {
+        // WOR-1693: session keys are client-chosen and unique in the
+        // worst case, so pinning far more sessions than the cap must not
+        // grow the map without bound.
+        let providers = vec![
+            make_provider("a", 1, None, true),
+            make_provider("b", 1, None, true),
+        ];
+        let router = Router::new(RoutingStrategy::Sticky, providers.len());
+        let total = MAX_STICKY_SESSIONS + 100;
+        for i in 0..total {
+            router.select_sticky(&providers, &format!("session-{i}"));
+        }
+        assert_eq!(router.sticky_map.lock().len(), MAX_STICKY_SESSIONS);
+        // The most recent session kept its pin; the oldest aged out and
+        // re-pins on its next request instead of failing.
+        let newest = format!("session-{}", total - 1);
+        assert!(router.sticky_map.lock().contains(&newest));
+        assert!(!router.sticky_map.lock().contains("session-0"));
+        assert!(router.select_sticky(&providers, "session-0").is_some());
+    }
+
     // --- record_latency Tests ---
 
     #[test]
@@ -1925,8 +2509,91 @@ mod tests {
     }
 
     #[test]
+    fn select_with_policy_returns_none_when_every_permitted_provider_is_unhealthy() {
+        let router = Router::new(RoutingStrategy::RoundRobin, 2);
+        let providers = vec![
+            make_provider("permitted-but-unhealthy", 1, None, true),
+            make_provider("healthy-but-not-permitted", 1, None, true),
+        ];
+        router.set_provider_health(0, false);
+        let allowed = vec!["permitted-but-unhealthy".to_string()];
+
+        assert_eq!(router.select_with_policy(&providers, &allowed, &[]), None);
+    }
+
+    #[test]
+    fn eligible_candidate_indices_preserve_exact_order_without_reviving() {
+        let router = Router::new(RoutingStrategy::RoundRobin, 3);
+        let mut providers = vec![
+            make_provider("healthy", 1, None, true),
+            make_provider("disabled", 1, None, true),
+            make_provider("unhealthy", 1, None, true),
+        ];
+        providers[1].enabled = false;
+        router.set_provider_health(2, false);
+
+        assert_eq!(
+            router.eligible_candidate_indices(&providers, &[2, 0, 1]),
+            vec![0]
+        );
+
+        router.set_provider_health(0, false);
+        assert!(
+            router
+                .eligible_candidate_indices(&providers, &[2, 0, 1])
+                .is_empty(),
+            "an all-ineligible exact set must stay empty"
+        );
+    }
+
+    #[test]
+    fn select_with_candidates_uses_strategy_strictly_and_records_decision() {
+        let router = Router::new(RoutingStrategy::LeastConnections, 3);
+        let providers = vec![
+            make_provider("healthy-outside-exact-set", 1, None, true),
+            make_provider("strict-candidate-idle", 1, None, true),
+            make_provider("strict-candidate-busy", 1, None, true),
+        ];
+        router.record_connect(2);
+
+        let picked = router
+            .select_with_candidates(&providers, &[2, 1])
+            .expect("one exact candidate is healthy");
+        assert_eq!(picked, 1, "least_connections must rank the exact set");
+
+        let recorded = prometheus::gather()
+            .into_iter()
+            .find(|family| family.name() == "sbproxy_ai_lb_decisions_total")
+            .and_then(|family| {
+                family.get_metric().iter().find_map(|metric| {
+                    let labels = metric
+                        .get_label()
+                        .iter()
+                        .map(|label| (label.name(), label.value()))
+                        .collect::<std::collections::HashMap<_, _>>();
+                    (labels.get("strategy") == Some(&"least_connections")
+                        && labels.get("provider") == Some(&"strict-candidate-idle"))
+                    .then(|| metric.get_counter().value())
+                })
+            })
+            .unwrap_or(0.0);
+        assert_eq!(recorded, 1.0);
+
+        router.set_provider_health(1, false);
+        router.set_provider_health(2, false);
+        assert_eq!(
+            router.select_with_candidates(&providers, &[2, 1]),
+            None,
+            "the healthy provider outside the exact set must not be revived"
+        );
+    }
+
+    #[test]
     fn prefix_affinity_policy_never_selects_a_blocked_provider() {
-        let router = Router::new(RoutingStrategy::PrefixAffinity, 3);
+        let router = Router::new(
+            RoutingStrategy::PrefixAffinity(PrefixAffinityConfig::default()),
+            3,
+        );
         let providers = vec![
             make_provider("a", 1, None, true),
             make_provider("b", 1, None, true),
@@ -1935,11 +2602,159 @@ mod tests {
         let allowed = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let blocked = vec!["b".to_string(), "c".to_string()];
 
-        for prefix in [b"one".as_slice(), b"two", b"three", b"four"] {
+        for label in ["one", "two", "three", "four"] {
             let pick = router
-                .select_with_prefix_policy(&providers, prefix, &allowed, &blocked)
+                .select_with_prefix_policy(
+                    &providers,
+                    Some(normalized_prefix(label)),
+                    &allowed,
+                    &blocked,
+                )
                 .expect("a remains eligible");
             assert_eq!(providers[pick].name, "a");
         }
+    }
+
+    #[test]
+    fn prefix_candidates_do_not_revive_an_all_unhealthy_candidate_set() {
+        let router = Router::new(
+            RoutingStrategy::PrefixAffinity(PrefixAffinityConfig::default()),
+            2,
+        );
+        let providers = vec![
+            make_provider("outside-final-candidates", 1, None, true),
+            make_provider("candidate-but-unhealthy", 1, None, true),
+        ];
+        router.set_provider_health(1, false);
+
+        assert_eq!(
+            router.select_with_prefix_candidates(
+                &providers,
+                Some(normalized_prefix("strict candidate")),
+                &[1],
+            ),
+            None
+        );
+    }
+
+    // --- WOR-1881: headroom / reset-aware / explicit filtered fallback ---
+
+    #[test]
+    fn headroom_prefers_lower_pressure_then_stable_order() {
+        let providers = vec![
+            make_provider("high-pressure", 1, None, true),
+            make_provider("low-pressure", 1, None, true),
+            make_provider("also-low", 1, None, true),
+        ];
+        let router = Router::new(RoutingStrategy::Headroom, providers.len());
+        router.update_quota_from_headers(
+            "high-pressure",
+            &[
+                ("x-ratelimit-limit-requests".into(), "100".into()),
+                ("x-ratelimit-remaining-requests".into(), "10".into()),
+            ],
+            200,
+        );
+        router.update_quota_from_headers(
+            "low-pressure",
+            &[
+                ("x-ratelimit-limit-requests".into(), "100".into()),
+                ("x-ratelimit-remaining-requests".into(), "80".into()),
+            ],
+            200,
+        );
+        router.update_quota_from_headers(
+            "also-low",
+            &[
+                ("x-ratelimit-limit-requests".into(), "100".into()),
+                ("x-ratelimit-remaining-requests".into(), "80".into()),
+            ],
+            200,
+        );
+        // Same pressure on low-pressure and also-low: stable enabled order wins.
+        assert_eq!(router.select(&providers), Some(1));
+    }
+
+    #[test]
+    fn reset_aware_prefers_earliest_positive_capacity_reset() {
+        let providers = vec![
+            make_provider("later", 1, None, true),
+            make_provider("sooner", 1, None, true),
+        ];
+        let router = Router::new(RoutingStrategy::ResetAware, providers.len());
+        router.update_quota_from_headers(
+            "later",
+            &[
+                ("x-ratelimit-remaining-requests".into(), "0".into()),
+                ("retry-after".into(), "60".into()),
+            ],
+            429,
+        );
+        router.update_quota_from_headers(
+            "sooner",
+            &[
+                ("x-ratelimit-remaining-requests".into(), "0".into()),
+                ("retry-after".into(), "5".into()),
+            ],
+            429,
+        );
+        assert_eq!(router.select(&providers), Some(1));
+    }
+
+    #[test]
+    fn policy_filtered_least_connections_does_not_silently_round_robin() {
+        // Unification lock: a non-trivial strategy under an allowlist must
+        // keep its ranking on the narrowed set, not silently become RR.
+        let providers = vec![
+            make_provider("busy", 1, None, true),
+            make_provider("idle", 1, None, true),
+            make_provider("other", 1, None, true),
+        ];
+        let router = Router::new(RoutingStrategy::LeastConnections, providers.len());
+        for _ in 0..5 {
+            router.record_connect(0);
+        }
+        let allowed = vec!["busy".to_string(), "idle".to_string()];
+        for _ in 0..6 {
+            let pick = router
+                .select_with_allowed(&providers, &allowed)
+                .expect("eligible");
+            assert_eq!(
+                providers[pick].name, "idle",
+                "policy-filtered least_connections must prefer idle, not round-robin"
+            );
+        }
+    }
+
+    #[test]
+    fn policy_filtered_prefix_affinity_explicitly_falls_back_to_round_robin() {
+        // Explicit fallback lock: PrefixAffinity via select_with_policy has
+        // no prefix in hand, so round-robin is intentional and documented.
+        let providers = vec![
+            make_provider("a", 1, None, true),
+            make_provider("b", 1, None, true),
+            make_provider("c", 1, None, true),
+        ];
+        let router = Router::new(
+            RoutingStrategy::PrefixAffinity(PrefixAffinityConfig::default()),
+            providers.len(),
+        );
+        let allowed = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let mut counts = [0u32; 3];
+        for _ in 0..30 {
+            let pick = router
+                .select_with_allowed(&providers, &allowed)
+                .expect("eligible");
+            counts[pick] += 1;
+        }
+        assert_eq!(
+            counts,
+            [10, 10, 10],
+            "PrefixAffinity without a prefix must explicitly round-robin on the filtered set"
+        );
+        assert_eq!(
+            router.last_filtered_fallback(),
+            Some(FilteredSelectionFallback::RoundRobinMissingSignal)
+        );
     }
 }

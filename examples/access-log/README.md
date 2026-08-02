@@ -36,31 +36,43 @@ fields and nothing more:
 
 ```json
 {
-  "timestamp": "2026-06-04T01:23:45Z",
-  "request_id": "01H...",
+  "timestamp": "2026-08-01T14:56:33.863503+00:00",
+  "request_id": "019fbdd3ab8272e2a87d91f409911437",
   "origin": "api.local",
   "method": "GET",
   "path": "/anything",
+  "protocol": "HTTP/1.1",
+  "host": "api.local",
+  "user_agent": "curl/8.18.0",
   "status": 200,
-  "latency_ms": 12.3,
-  "upstream_ttfb_ms": 11.0,
+  "response_content_type": "application/json; charset=utf-8",
+  "latency_ms": 196.17337500000002,
+  "upstream_ttfb_ms": 195.80141700000001,
+  "response_filter_ms": 0.060958,
   "bytes_in": 0,
-  "bytes_out": 456,
+  "bytes_out": 2596,
   "client_ip": "127.0.0.1",
-  "request_headers": {
-    "user-agent": "curl/8.x"
-  },
+  "trace_id": "a242bdd5b2a948b683f9020924010054",
+  "envelope_request_id": "01KYYX7AWCH1C2E5GFP6BCJEGC",
+  "session_id": "01KYYX7AWCXXJ74WD2AAZV6EHT",
+  "tenant_id": "__default__",
+  "principal_kind": "none",
+  "key_mode": "none",
+  "served_from_cache": false,
+  "fallback_triggered": false,
+  "retry_count": 0,
+  "request_headers": {"user-agent": "curl/8.18.0"},
   "response_headers": {
-    "content-length": "456",
-    "content-type": "application/json"
+    "content-length": "2596",
+    "content-type": "application/json; charset=utf-8"
   }
 }
 ```
 
-The 500 from `/status/500` adds `upstream_status: 500` because the
-upstream's status was passed through unchanged. A retry chain or a
-`response_modifier` that rewrote the status would surface both
-fields with different values.
+The 500 from `/status/500` adds `error_class: "upstream_5xx"`. It does
+not add `upstream_status`: that field only appears when the status the
+client sees differs from the one the upstream sent, which is what a
+retry chain, a fallback, or a `response_modifier` produces.
 
 ## Tuning
 

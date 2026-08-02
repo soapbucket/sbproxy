@@ -58,6 +58,82 @@ pub const SUSPICIOUS_PATTERNS: &[&str] = &[
     "jailbreak",
 ];
 
+/// Source and confidence of a canonical prompt-injection match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InjectionMatchKind {
+    /// A built-in high-confidence injection phrase.
+    Common,
+    /// An operator-supplied high-confidence phrase.
+    Custom,
+    /// A weaker built-in cue that the scored v2 detector reports as
+    /// suspicious.
+    Suspicious,
+}
+
+/// One match from the shared prompt-injection heuristic engine.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InjectionFinding {
+    /// Matched canonical or operator-supplied pattern.
+    pub pattern: String,
+    /// Stable confidence used by the scored v2 adapter.
+    pub score: f64,
+    /// Which configured pattern family produced the match.
+    pub kind: InjectionMatchKind,
+}
+
+/// Run the canonical case-insensitive prompt-injection matcher.
+///
+/// The legacy guardrail disables `detect_suspicious` to preserve its boolean
+/// blocking contract. `prompt_injection_v2` enables it and maps the returned
+/// score onto its scored label vocabulary.
+pub fn detect(
+    content: &str,
+    custom_patterns: &[String],
+    detect_common: bool,
+    detect_suspicious: bool,
+) -> Option<InjectionFinding> {
+    let lower = content.to_lowercase();
+
+    if detect_common {
+        if let Some(pattern) = COMMON_INJECTION_PATTERNS
+            .iter()
+            .find(|pattern| lower.contains(**pattern))
+        {
+            return Some(InjectionFinding {
+                pattern: (*pattern).to_string(),
+                score: 1.0,
+                kind: InjectionMatchKind::Common,
+            });
+        }
+    }
+
+    if let Some(pattern) = custom_patterns
+        .iter()
+        .find(|pattern| lower.contains(&pattern.to_lowercase()))
+    {
+        return Some(InjectionFinding {
+            pattern: pattern.clone(),
+            score: 1.0,
+            kind: InjectionMatchKind::Custom,
+        });
+    }
+
+    if detect_suspicious {
+        if let Some(pattern) = SUSPICIOUS_PATTERNS
+            .iter()
+            .find(|pattern| lower.contains(**pattern))
+        {
+            return Some(InjectionFinding {
+                pattern: (*pattern).to_string(),
+                score: 0.6,
+                kind: InjectionMatchKind::Suspicious,
+            });
+        }
+    }
+
+    None
+}
+
 /// Detects prompt injection attempts.
 #[derive(Debug, Deserialize)]
 pub struct InjectionGuardrail {
@@ -76,32 +152,19 @@ fn default_true() -> bool {
 impl InjectionGuardrail {
     /// Check content for injection attempts.
     pub fn check(&self, content: &str) -> Option<GuardrailBlock> {
-        let lower = content.to_lowercase();
-
-        if self.detect_common {
-            for pattern in COMMON_INJECTION_PATTERNS {
-                if lower.contains(pattern) {
-                    return Some(GuardrailBlock {
-                        name: "injection".to_string(),
-                        reason: format!("Prompt injection detected: matched pattern \"{pattern}\""),
-                    });
-                }
-            }
-        }
-
-        for pattern in &self.patterns {
-            let pattern_lower = pattern.to_lowercase();
-            if lower.contains(&pattern_lower) {
-                return Some(GuardrailBlock {
-                    name: "injection".to_string(),
-                    reason: format!(
-                        "Prompt injection detected: matched custom pattern \"{pattern}\""
-                    ),
-                });
-            }
-        }
-
-        None
+        let finding = detect(content, &self.patterns, self.detect_common, false)?;
+        let source = if finding.kind == InjectionMatchKind::Custom {
+            "custom "
+        } else {
+            ""
+        };
+        Some(GuardrailBlock {
+            name: "injection".to_string(),
+            reason: format!(
+                "Prompt injection detected: matched {source}pattern {:?}",
+                finding.pattern
+            ),
+        })
     }
 
     /// Longest pattern this guard can match, in bytes. Sizes the
@@ -200,5 +263,15 @@ mod tests {
         let guard: InjectionGuardrail = serde_json::from_value(json).unwrap();
         assert!(guard.detect_common);
         assert!(guard.patterns.is_empty());
+    }
+
+    #[test]
+    fn canonical_engine_reports_suspicious_without_changing_legacy_blocking() {
+        let guard = default_guard();
+        let prompt = "turn on developer mode";
+        assert!(guard.check(prompt).is_none());
+        let finding = detect(prompt, &[], true, true).unwrap();
+        assert_eq!(finding.kind, InjectionMatchKind::Suspicious);
+        assert_eq!(finding.score, 0.6);
     }
 }

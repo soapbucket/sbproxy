@@ -14,21 +14,20 @@ use sha2::{Digest, Sha256};
 use crate::governance::{
     CounterSnapshot, GovernanceBackendHealth, GovernanceBackendStatus, GovernanceConsistency,
     GovernanceDenial, GovernanceDimension, GovernanceError, GovernanceLimits, GovernanceSnapshot,
-    GovernanceStore, GovernanceUsage, Release, ReleaseRequest, RenewRequest, Reservation,
+    GovernanceStore, GovernanceUsage, Release, ReleaseRequest, Reservation,
     ReservationTerminalState, ReserveRequest, SettleRequest, Settlement, SnapshotKey,
 };
 
 const LUA_MAX_EXACT_INTEGER: u64 = 9_007_199_254_740_991;
 const COMMON_LUA: &str = include_str!("governance_redis/common.lua");
 const RESERVE_LUA: &str = include_str!("governance_redis/reserve.lua");
-const RENEW_LUA: &str = include_str!("governance_redis/renew.lua");
 const SETTLE_LUA: &str = include_str!("governance_redis/settle.lua");
 const RELEASE_LUA: &str = include_str!("governance_redis/release.lua");
 const SNAPSHOT_LUA: &str = include_str!("governance_redis/snapshot.lua");
 const HEALTH_LUA: &str = r#"
 local value = redis.call('TIME')
 local now = (tonumber(value[1]) * 1000) + math.floor(tonumber(value[2]) / 1000)
-return {'ok', string.format('%.0f', now)}
+return {'ok', tostring(now)}
 "#;
 
 /// Connection-independent settings for strict Redis governance.
@@ -99,25 +98,14 @@ pub fn redis_governance_key(key_prefix: &str, key_id: &str) -> String {
     )
 }
 
-/// Derive the state hash and both expiry indexes used by one atomic
-/// governance operation. Suffixes follow the closing hash-tag brace, so all
-/// three keys map to the same Redis Cluster slot.
-fn redis_governance_operation_keys(key_prefix: &str, key_id: &str) -> Vec<String> {
-    let governance_key = redis_governance_key(key_prefix, key_id);
-    vec![
-        governance_key.clone(),
-        format!("{governance_key}:active-expiry"),
-        format!("{governance_key}:terminal-expiry"),
-    ]
-}
-
 #[async_trait]
 impl GovernanceStore for RedisGovernanceStore {
     async fn reserve(&self, request: ReserveRequest) -> Result<Reservation, GovernanceError> {
         validate_reserve_request(&request)?;
+        let redis_key = redis_governance_key(&self.config.key_prefix, &request.key_id);
         let reservation_prefix = reservation_prefix(&request.reservation_id);
         let fingerprint = request_fingerprint(&request)?;
-        let keys = redis_governance_operation_keys(&self.config.key_prefix, &request.key_id);
+        let keys = vec![redis_key.clone()];
         let args = vec![
             reservation_prefix,
             fingerprint,
@@ -159,53 +147,6 @@ impl GovernanceStore for RedisGovernanceStore {
                 reservation_id: request.reservation_id,
                 state: response_terminal_state(&response, 1)?,
             }),
-            Some("overflow") => Err(GovernanceError::ArithmeticOverflow {
-                field: response_error_field(&response, 1)?,
-            }),
-            Some("invariant") => Err(GovernanceError::InternalInvariant {
-                field: response_error_field(&response, 1)?,
-            }),
-            _ => Err(protocol_error()),
-        }
-    }
-
-    async fn renew(&self, request: RenewRequest) -> Result<Reservation, GovernanceError> {
-        validate_reservation_id(&request.reservation_id)?;
-        validate_key_id(&request.key_id)?;
-        let keys = redis_governance_operation_keys(&self.config.key_prefix, &request.key_id);
-        let args = vec![
-            reservation_prefix(&request.reservation_id),
-            self.config.reservation_ttl_millis.to_string(),
-            self.config.terminal_retention_millis.to_string(),
-        ];
-        let response = self.invoke(RENEW_LUA, &keys, &args).await?;
-        match response.first().map(String::as_str) {
-            Some("reserved") => Ok(Reservation {
-                reservation_id: request.reservation_id,
-                key_id: request.key_id,
-                policy_revision: response_u64(&response, 4, "renew_policy_revision")?,
-                reserved: GovernanceUsage {
-                    requests: 1,
-                    tokens: response_u64(&response, 5, "renew_reserved_tokens")?,
-                    micro_usd: response_u64(&response, 6, "renew_reserved_micro_usd")?,
-                },
-                created_at_millis: response_u64(&response, 1, "renew_created_at")?,
-                expires_at_millis: response_u64(&response, 2, "renew_expires_at")?,
-                window_reset_at_millis: response_u64(&response, 3, "renew_window_reset")?,
-            }),
-            Some("terminal") => Err(GovernanceError::TerminalConflict {
-                reservation_id: request.reservation_id,
-                state: response_terminal_state(&response, 1)?,
-            }),
-            Some("not_found") => Err(GovernanceError::ReservationNotFound {
-                reservation_id: request.reservation_id,
-            }),
-            Some("overflow") => Err(GovernanceError::ArithmeticOverflow {
-                field: response_error_field(&response, 1)?,
-            }),
-            Some("invariant") => Err(GovernanceError::InternalInvariant {
-                field: response_error_field(&response, 1)?,
-            }),
             _ => Err(protocol_error()),
         }
     }
@@ -215,7 +156,10 @@ impl GovernanceStore for RedisGovernanceStore {
         validate_key_id(&request.key_id)?;
         validate_lua_integer(request.actual_tokens, "actual_tokens")?;
         validate_lua_integer(request.actual_micro_usd, "actual_micro_usd")?;
-        let keys = redis_governance_operation_keys(&self.config.key_prefix, &request.key_id);
+        let keys = vec![redis_governance_key(
+            &self.config.key_prefix,
+            &request.key_id,
+        )];
         let args = vec![
             reservation_prefix(&request.reservation_id),
             request.actual_tokens.to_string(),
@@ -254,12 +198,6 @@ impl GovernanceStore for RedisGovernanceStore {
             Some("not_found") => Err(GovernanceError::ReservationNotFound {
                 reservation_id: request.reservation_id,
             }),
-            Some("overflow") => Err(GovernanceError::ArithmeticOverflow {
-                field: response_error_field(&response, 1)?,
-            }),
-            Some("invariant") => Err(GovernanceError::InternalInvariant {
-                field: response_error_field(&response, 1)?,
-            }),
             _ => Err(protocol_error()),
         }
     }
@@ -267,7 +205,10 @@ impl GovernanceStore for RedisGovernanceStore {
     async fn release(&self, request: ReleaseRequest) -> Result<Release, GovernanceError> {
         validate_reservation_id(&request.reservation_id)?;
         validate_key_id(&request.key_id)?;
-        let keys = redis_governance_operation_keys(&self.config.key_prefix, &request.key_id);
+        let keys = vec![redis_governance_key(
+            &self.config.key_prefix,
+            &request.key_id,
+        )];
         let args = vec![
             reservation_prefix(&request.reservation_id),
             self.config.terminal_retention_millis.to_string(),
@@ -293,37 +234,21 @@ impl GovernanceStore for RedisGovernanceStore {
             Some("not_found") => Err(GovernanceError::ReservationNotFound {
                 reservation_id: request.reservation_id,
             }),
-            Some("overflow") => Err(GovernanceError::ArithmeticOverflow {
-                field: response_error_field(&response, 1)?,
-            }),
-            Some("invariant") => Err(GovernanceError::InternalInvariant {
-                field: response_error_field(&response, 1)?,
-            }),
             _ => Err(protocol_error()),
         }
     }
 
     async fn snapshot(&self, key: SnapshotKey) -> Result<GovernanceSnapshot, GovernanceError> {
         validate_snapshot_key(&key)?;
-        let keys = redis_governance_operation_keys(&self.config.key_prefix, &key.key_id);
+        let redis_key = redis_governance_key(&self.config.key_prefix, &key.key_id);
+        let keys = vec![redis_key];
         let args = vec![
             key.limits.window_millis.to_string(),
             self.config.terminal_retention_millis.to_string(),
         ];
         let response = self.invoke(SNAPSHOT_LUA, &keys, &args).await?;
-        match response.first().map(String::as_str) {
-            Some("snapshot") => {}
-            Some("overflow") => {
-                return Err(GovernanceError::ArithmeticOverflow {
-                    field: response_error_field(&response, 1)?,
-                });
-            }
-            Some("invariant") => {
-                return Err(GovernanceError::InternalInvariant {
-                    field: response_error_field(&response, 1)?,
-                });
-            }
-            _ => return Err(protocol_error()),
+        if response.first().map(String::as_str) != Some("snapshot") {
+            return Err(protocol_error());
         }
         let checked_at_millis = response_u64(&response, 1, "snapshot_checked_at")?;
         let reset_at_millis = response_u64(&response, 2, "snapshot_window_reset")?;
@@ -388,11 +313,8 @@ impl GovernanceStore for RedisGovernanceStore {
 }
 
 fn validate_config(config: &RedisGovernanceConfig) -> Result<(), GovernanceError> {
-    if config.key_prefix.trim().trim_end_matches(':').is_empty() {
-        return Err(invalid(
-            "key_prefix",
-            "must contain a non-separator character",
-        ));
+    if config.key_prefix.trim().is_empty() {
+        return Err(invalid("key_prefix", "must not be empty"));
     }
     if config.key_prefix.contains('{') || config.key_prefix.contains('}') {
         return Err(invalid(
@@ -528,27 +450,6 @@ fn response_terminal_state(
         "settled" => Ok(ReservationTerminalState::Settled),
         "released" => Ok(ReservationTerminalState::Released),
         "expired" => Ok(ReservationTerminalState::Expired),
-        _ => Err(protocol_error()),
-    }
-}
-
-fn response_error_field(
-    response: &[String],
-    index: usize,
-) -> Result<&'static str, GovernanceError> {
-    match response_field(response, index)? {
-        "used_and_reserved" => Ok("used_and_reserved"),
-        "prospective_usage" => Ok("prospective_usage"),
-        "expires_at_millis" => Ok("expires_at_millis"),
-        "window_reset_at_millis" => Ok("window_reset_at_millis"),
-        "window_reserved_requests" => Ok("window_reserved_requests"),
-        "window_reserved_tokens" => Ok("window_reserved_tokens"),
-        "window_used_requests" => Ok("window_used_requests"),
-        "window_used_tokens" => Ok("window_used_tokens"),
-        "total_reserved_tokens" => Ok("total_reserved_tokens"),
-        "total_reserved_micro_usd" => Ok("total_reserved_micro_usd"),
-        "total_used_tokens" => Ok("total_used_tokens"),
-        "total_used_micro_usd" => Ok("total_used_micro_usd"),
         _ => Err(protocol_error()),
     }
 }

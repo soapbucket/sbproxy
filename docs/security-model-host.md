@@ -1,6 +1,6 @@
 # Model host security
 
-*Last modified: 2026-07-13*
+*Last modified: 2026-07-28*
 
 The model host starts inference processes beside a gateway that may hold cloud
 provider credentials. Treat write access to `sb.yml`, the deployment revision
@@ -116,11 +116,11 @@ removing from the cache used by a running file-managed gateway.
 
 ## Engine supply chain
 
-### llama.cpp binary and source build
+### llama.cpp binary
 
 The driver can use a trusted explicit path, a compatible `PATH` executable, or a
-pinned release. Built-in b9905 prebuilt assets and the Linux CUDA source archive
-have checked-in SHA-256 digests. A custom release may carry an expected digest.
+pinned release. Built-in b9905 prebuilt assets have checked-in per-platform
+SHA-256 digests. A custom release may carry an expected digest.
 Acquirers share an identity-scoped lock, stage away from the ready path, verify
 the archive, and publish only a complete executable directory.
 
@@ -138,9 +138,9 @@ source remain part of the operator's network and mirror policy.
 ### vLLM container
 
 Container launch requires `repository@sha256:<64 hex>`. Tags and `latest` are
-rejected. The runtime:
+rejected. For a pinned artifact, the runtime:
 
-- creates an internal private network;
+- creates an internal private network with no egress;
 - publishes the engine port on loopback only;
 - mounts the verified artifact snapshot read-only;
 - scopes the selected NVIDIA devices;
@@ -149,6 +149,28 @@ rejected. The runtime:
 
 The container runtime daemon is a privileged trust boundary. Anyone who can
 control its socket may already have host-level authority.
+
+#### Unpinned raw `hf:` references are weaker, on purpose
+
+A serve entry naming a raw `hf:` reference instead of a catalog artifact runs
+in repo mode, where sbproxy has no verified local bytes because the engine
+downloads the weights itself. Three of the protections above do not apply:
+
+- the container runs on the default bridge, **with DNS and external egress**,
+  because it has to reach Hugging Face;
+- the Hugging Face cache is mounted **writable**, not read-only;
+- the launch-time trust-state gate and file-map cross-check are skipped, since
+  there is nothing local to check. No digest is ever computed for these
+  weights, so the pull policy, offline mode, and digest-failure contract cover
+  nothing on this path.
+
+This is the intended trade for `sbproxy run <model>` on a workstation and for
+evaluating a model that has no catalog entry yet. It is a poor fit for a
+long-lived fleet worker holding cluster identity. A `proxy.model_host` managed
+deployment already refuses raw references; the legacy provider-level `serve:`
+form still accepts them. Prefer a catalog entry with real per-file digests on
+anything you would call production, and treat repo mode as a development
+affordance.
 
 ## Process lifecycle
 
@@ -304,10 +326,12 @@ contract:
 - strict distributed budget reservation and lease recovery across gateways;
 - complete server-derived key introspection for every managed route decision.
 
-Live NVIDIA and multi-node validation runs on GCP in the final PR group. Until
-that evidence is recorded, NVIDIA uv, container, and CUDA source-build paths
-remain preview even though their deterministic process and isolation contracts
-run in CI.
+The NVIDIA container path has live single-GPU evidence recorded on 2026-07-30:
+a digest-pinned vLLM container served through the gateway on an L4 and released
+the device on stop. Multi-GPU and multi-node GCP certification have not been
+recorded, so `platform.nvidia_cuda` stays preview rather than being promoted on
+single-device evidence. The managed uv path has no live evidence either way;
+the container path is the certified one.
 
 ## Related
 

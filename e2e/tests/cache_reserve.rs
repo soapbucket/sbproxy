@@ -33,6 +33,7 @@ fn metadata_for(body_len: u64, ttl: Duration) -> ReserveMetadata {
         created_at: now,
         expires_at: now + ttl,
         content_type: Some("application/json".to_string()),
+        headers: Vec::new(),
         vary_fingerprint: None,
         size: body_len,
         status: 200,
@@ -119,6 +120,7 @@ async fn reserve_hit_returns_body_and_promotes_to_hot() {
 
     // Promotion: write into hot.
     let cached = CachedResponse {
+        generation: 0,
         status: got_meta.status,
         headers: vec![],
         body: got_body.to_vec(),
@@ -151,6 +153,7 @@ async fn evicted_hot_entry_is_admitted_and_recovered_from_reserve() {
     // Hot put + admission to reserve.
     let body = Bytes::from_static(b"will-survive-eviction");
     let cached = CachedResponse {
+        generation: 0,
         status: 200,
         headers: vec![("content-type".to_string(), "text/plain".to_string())],
         body: body.to_vec(),
@@ -168,6 +171,7 @@ async fn evicted_hot_entry_is_admitted_and_recovered_from_reserve() {
         created_at: SystemTime::now(),
         expires_at: SystemTime::now() + Duration::from_secs(cached.ttl_secs),
         content_type: Some("text/plain".to_string()),
+        headers: cached.headers.clone(),
         vary_fingerprint: None,
         size: cached.body.len() as u64,
         status: cached.status,
@@ -272,6 +276,7 @@ async fn expired_reserve_metadata_reads_as_miss() {
         created_at: now - Duration::from_secs(120),
         expires_at: now - Duration::from_secs(60),
         content_type: None,
+        headers: Vec::new(),
         vary_fingerprint: None,
         size: body.len() as u64,
         status: 200,
@@ -327,6 +332,7 @@ async fn evict_expired_sweeps_stale_entries() {
                 created_at: base - Duration::from_secs(120),
                 expires_at: base - Duration::from_secs(60),
                 content_type: None,
+                headers: Vec::new(),
                 vary_fingerprint: None,
                 size: 1,
                 status: 200,

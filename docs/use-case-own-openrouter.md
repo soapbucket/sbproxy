@@ -1,10 +1,10 @@
 # API keys everywhere, accounting nowhere: stand up your own OpenRouter
 
-*Last modified: 2026-07-06*
+*Last modified: 2026-07-28*
 
 ![Minting a virtual key, calling OpenAI and Anthropic through one governed endpoint, reading the spend ledger, and tripping a budget cap](assets/use-case-own-openrouter.gif)
 
-Somewhere in your company there is an OpenAI key in a CI secret, an Anthropic key in a notebook, and a third key nobody remembers minting. Every tool points at a different provider, and when the invoice lands there is no way to say which team spent what. SBproxy's pitch is "Call any model. Serve your own. Govern both.": one Apache-2.0 binary that puts a single OpenAI-compatible endpoint in front of 66 providers, or serves the weights on your own GPUs, with keys, budgets, and accounting under your control. This guide builds the hosted-gateway half of that sentence. In about twenty minutes you get your own OpenRouter, running on a box you own.
+Somewhere in your company there is an OpenAI key in a CI secret, an Anthropic key in a notebook, and a third key nobody remembers minting. Every tool points at a different provider, and when the invoice lands there is no way to say which team spent what. SBproxy's pitch is "Call any model. Serve your own. Govern both.": one Apache-2.0 binary that puts a single OpenAI-compatible endpoint in front of 72 providers, or serves the weights on your own GPUs, with keys, budgets, and accounting under your control. This guide builds the hosted-gateway half of that sentence. In about twenty minutes you get your own OpenRouter, running on a box you own.
 
 ## What you will build
 
@@ -12,14 +12,15 @@ One endpoint on port 8080 that speaks the OpenAI API in front of OpenAI and Anth
 
 ## Prerequisites
 
-- An OpenAI key (`OPENAI_API_KEY`) and an Anthropic key (`ANTHROPIC_API_KEY`). These are the demo pair; any of the 66 providers configures the same way.
+- An OpenAI key (`OPENAI_API_KEY`) and an Anthropic key (`ANTHROPIC_API_KEY`). These are the demo pair; any of the 72 providers configures the same way.
 - `curl` for requests and `jq` for reading JSON.
 - No Rust toolchain. The published binary is all you need.
 
 ## Install
 
 ```bash
-# Linux / macOS, single static binary:
+# Prebuilt release executable for Linux amd64/arm64 (glibc) or Apple Silicon macOS.
+# No Rust, Python, JVM, or Node toolchain/runtime is required.
 curl -fsSL https://download.sbproxy.dev | sh
 
 # macOS via Homebrew:
@@ -106,7 +107,7 @@ Export your provider keys and start the gateway (or run `docker compose up` from
 ```bash
 export OPENAI_API_KEY=sk-...
 export ANTHROPIC_API_KEY=sk-ant-...
-sbproxy sb.yml
+sbproxy serve -f sb.yml
 ```
 
 Mint a key for your first team. The plaintext token comes back exactly once; after this response the gateway holds only the hash.

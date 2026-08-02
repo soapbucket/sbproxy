@@ -70,6 +70,13 @@ pub struct ModelDeployment {
     /// Desired replica count.
     #[serde(default = "one_replica")]
     pub replicas: u32,
+    /// Fixed tensor-parallel degree per replica: the exact number of
+    /// devices each replica spans. `None` lets the fit planner pick the
+    /// smallest degree that fits. When set, N replicas need N disjoint
+    /// device sets of this size, so `replicas * tensor_parallel` must not
+    /// exceed the node's device count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tensor_parallel: Option<u32>,
     /// Node labels required by placement.
     #[serde(default)]
     pub required_labels: BTreeMap<String, String>,
@@ -103,6 +110,38 @@ pub struct ModelDeployment {
     /// Replica replacement policy.
     #[serde(default)]
     pub rollout: RolloutPolicy,
+    /// Extra engine command-line arguments appended after the runtime's own,
+    /// validated against the resolved engine.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_args: Vec<String>,
+    /// Chunked-prefill settings (vLLM). `None` uses the engine default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunked_prefill: Option<crate::ChunkedPrefill>,
+    /// vLLM tool-call parser enabling auto tool-choice. `None` leaves tool
+    /// calling off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_parser: Option<String>,
+    /// CPU swap pool size in GiB (vLLM `--swap-space`). `None` uses the
+    /// engine default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_space_gib: Option<u64>,
+    /// GiB of model weights to keep in CPU RAM (vLLM `--cpu-offload-gb`).
+    /// `None` disables offload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_offload_gib: Option<u64>,
+    /// Per-deployment engine version pin, overriding the node-wide engine
+    /// policy so one model can run a different backend version than another.
+    /// Never `latest`. `None` inherits the node policy or the built-in default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_version: Option<String>,
+    /// Per-deployment engine container image, overriding the node policy.
+    /// Must be tag- or digest-pinned. `None` inherits the node policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_image: Option<String>,
+    /// Expected SHA-256 for the pinned engine binary or image digest.
+    /// `None` inherits the node policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_sha256: Option<String>,
 }
 
 const fn one_replica() -> u32 {

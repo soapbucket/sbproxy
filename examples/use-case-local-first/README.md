@@ -2,6 +2,8 @@
 
 *Last modified: 2026-07-06*
 
+![Local first, spill to cloud](../../docs/assets/use-case-local-first.gif)
+
 One provider array with two lanes: a `serve:` entry that runs qwen3-14b
 on this box, and a hosted provider behind it that catches overflow and
 anything the card cannot take. Prompts flagged with

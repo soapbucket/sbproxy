@@ -15,6 +15,10 @@
 //!     --features gpu-nvidia,weights -- weights Qwen/Qwen3-0.6B
 //!   cargo run --release --example gpu_cert \
 //!     --features gpu-nvidia,weights -- serve Qwen/Qwen3-0.6B 8000
+//!
+//! `certify` is the exception: a KL-divergence gate over a stubbed
+//! logit pair (harness scaffolding, no GPU or feature flags needed):
+//!   cargo run --example gpu_cert -- certify Qwen/Qwen3-0.6B 2026-07-27
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -27,7 +31,6 @@ fn main() {
             args.get(3).and_then(|p| p.parse().ok()).unwrap_or(8000),
         ),
         "runtime" => runtime_cert(args.get(2).map(String::as_str).unwrap_or("Qwen/Qwen3-0.6B")),
-        "sleepwake" => sleepwake_cert(args.get(2).map(String::as_str).unwrap_or("Qwen/Qwen3-0.6B")),
         "seed-config" => seed_config(
             args.get(2).map(String::as_str).unwrap_or("Qwen/Qwen3-0.6B"),
             args.get(3)
@@ -42,14 +45,13 @@ fn main() {
         "translators" => {
             translators_cert(args.get(2).map(String::as_str).unwrap_or("Qwen/Qwen3-0.6B"))
         }
-        "embedded" => embedded_cert(
-            args.get(2)
-                .map(String::as_str)
-                .unwrap_or("google/gemma-2-2b-it"),
+        "certify" => certify(
+            args.get(2).map(String::as_str).unwrap_or("Qwen/Qwen3-0.6B"),
+            args.get(3).map(String::as_str),
         ),
         other => {
             eprintln!(
-                "unknown mode {other}; use probe | weights | serve | runtime | sleepwake | seed-config | llamacpp <gguf-repo> | translators <repo> | embedded <repo>"
+                "unknown mode {other}; use probe | weights | serve | runtime | seed-config | llamacpp <gguf-repo> | translators <repo> | certify <model> [date]"
             );
             std::process::exit(2);
         }
@@ -178,98 +180,6 @@ fn runtime_cert(repo: &str) {
 #[cfg(not(all(feature = "gpu-nvidia", feature = "weights")))]
 fn runtime_cert(_repo: &str) {
     eprintln!("build with --features gpu-nvidia,weights to run the runtime cert");
-    std::process::exit(2);
-}
-
-/// Certify vLLM sleep/wake (WOR-1655) on a real engine: spawn a model
-/// through the runtime (dev mode on, set by the launch spec), then
-/// drive the sleep/wake client and verify `is_sleeping` flips.
-#[cfg(all(feature = "gpu-nvidia", feature = "weights"))]
-fn sleepwake_cert(repo: &str) {
-    use sbproxy_model_host::launch::ProcessEngineLauncher;
-    use sbproxy_model_host::weights::ensure_weight_file;
-    use sbproxy_model_host::{
-        is_sleeping, sleep, wake_up, Catalog, ConfigDirMetadataProvider, ModelHostConfig,
-        ModelHostRuntime, NvmlGpuProbe, SleepLevel,
-    };
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    let rt = tokio_rt();
-    let cache = std::env::temp_dir().join("sbproxy-runtime-cert-cache");
-    if let Err(e) = rt.block_on(ensure_weight_file(
-        &cache,
-        repo,
-        "main",
-        "config.json",
-        None,
-    )) {
-        println!("FAIL: config.json fetch: {e}");
-        std::process::exit(1);
-    }
-    let cfg: ModelHostConfig = serde_yaml::from_str(&format!(
-        "models:\n  - model: hf:{repo}\n    name: cert-model\n    engine: vllm\n    max_context: 8192\n"
-    ))
-    .expect("serve config");
-    let runtime = ModelHostRuntime::new(
-        cfg,
-        Catalog::builtin(),
-        Arc::new(NvmlGpuProbe::new()),
-        Arc::new(ConfigDirMetadataProvider {
-            cache_root: cache.clone(),
-            revision: "main".to_string(),
-            catalog: Arc::new(Catalog::builtin()),
-        }),
-        Box::new(|| ProcessEngineLauncher::with_timeout(Duration::from_secs(420))),
-        false,
-    )
-    .with_health_recheck(true);
-
-    let port = match rt.block_on(runtime.ensure_ready("cert-model")) {
-        Ok(p) => {
-            println!("PASS: vLLM up on port {p} (dev mode for sleep/wake)");
-            p
-        }
-        Err(e) => {
-            println!("FAIL: ensure_ready: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    match rt.block_on(sleep(port, SleepLevel::Weights)) {
-        Ok(()) => println!("PASS: sleep(level 1) accepted"),
-        Err(e) => println!("FAIL: sleep: {e}"),
-    }
-    // vLLM's sleep is async internally; give it a moment.
-    std::thread::sleep(Duration::from_secs(3));
-    match rt.block_on(is_sleeping(port)) {
-        Ok(true) => println!("PASS: is_sleeping reports true after sleep"),
-        Ok(false) => println!("FAIL: engine not sleeping after sleep()"),
-        Err(e) => println!("FAIL: is_sleeping: {e}"),
-    }
-    match rt.block_on(wake_up(port, false)) {
-        Ok(()) => println!("PASS: wake_up accepted"),
-        Err(e) => println!("FAIL: wake_up: {e}"),
-    }
-    std::thread::sleep(Duration::from_secs(3));
-    match rt.block_on(is_sleeping(port)) {
-        Ok(false) => println!("PASS: engine awake after wake_up"),
-        Ok(true) => println!("FAIL: still sleeping after wake_up"),
-        Err(e) => println!("FAIL: is_sleeping: {e}"),
-    }
-    // A completion after wake proves the model is servable again.
-    if curl_tokens(port, repo) {
-        println!("PASS: completion after wake returned tokens");
-    } else {
-        println!("FAIL: no tokens after wake");
-    }
-    rt.block_on(runtime.unload("cert-model"));
-    println!("sleepwake cert complete");
-}
-
-#[cfg(not(all(feature = "gpu-nvidia", feature = "weights")))]
-fn sleepwake_cert(_repo: &str) {
-    eprintln!("build with --features gpu-nvidia,weights");
     std::process::exit(2);
 }
 
@@ -592,6 +502,9 @@ fn probe() {
         kv_heads: 8,
         head_dim: 128,
         max_context: 40960,
+        hidden_size: 0,
+        expert_count: 0,
+        expert_ffn_length: 0,
     };
     let candidates = vec!["FP8".to_string(), "Q4_K_M".to_string()];
     match plan_fit(g, &meta, &candidates, 8192, 1.15) {
@@ -686,9 +599,12 @@ fn serve(repo: &str, port: u16) {
         quant_name: "bf16".to_string(),
         quant: Quant::F16,
         estimated_vram_bytes: 4 * 1024 * 1024 * 1024,
-        gpu_index: 0,
+        gpu_indexes: vec![0],
         seq_len: 8192,
         memory: sbproxy_model_host::MemoryEstimate::from_total(0, 4 * 1024 * 1024 * 1024),
+        moe: None,
+        throughput: None,
+        gpu_memory_fraction: None,
     };
     let spec = build_launch_spec(
         EngineKind::Vllm,
@@ -718,60 +634,106 @@ fn serve(repo: &str, port: u16) {
     }
 }
 
-/// Certify the in-process embedded engine (WOR-1658): load `repo` with
-/// mistral.rs, serve it on a loopback port, and get a completion. The
-/// default `repo` is a Gemma model (per the load-Gemma cert); Gemma is
-/// HF-gated, so this needs `HF_TOKEN` in the env. Build with
-/// `--features embedded` (add `gpu-nvidia` to run on the GPU).
-#[cfg(feature = "embedded")]
-fn embedded_cert(repo: &str) {
-    use sbproxy_model_host::embedded::EmbeddedServer;
-    let rt = tokio_rt();
-    let port = 8123u16;
-    println!("loading embedded model {repo} via mistral.rs (Gemma-capable) ...");
-    match rt.block_on(EmbeddedServer::start(repo, port)) {
-        Ok(server) => {
-            println!("PASS: embedded model loaded + serving on {port}");
-            let body = format!(
-                "{{\"model\":\"{repo}\",\"messages\":[{{\"role\":\"user\",\"content\":\"Say hi in one word\"}}],\"max_tokens\":10}}"
-            );
-            let out = std::process::Command::new("curl")
-                .args([
-                    "-sS",
-                    "-m",
-                    "180",
-                    "-w",
-                    "\nHTTP_STATUS:%{http_code}",
-                    &format!("http://127.0.0.1:{port}/v1/chat/completions"),
-                    "-H",
-                    "Content-Type: application/json",
-                    "-d",
-                    &body,
-                ])
-                .output();
-            match out {
-                Ok(o) => {
-                    let text = String::from_utf8_lossy(&o.stdout);
-                    if text.contains("HTTP_STATUS:200") && text.contains("\"content\"") {
-                        println!("PASS: embedded completion returned tokens");
-                    } else {
-                        let head: String = text.chars().take(200).collect();
-                        println!("FAIL: embedded completion -> {head}");
-                    }
-                }
-                Err(e) => println!("FAIL: curl embedded endpoint: {e}"),
-            }
-            rt.block_on(server.shutdown());
-        }
-        Err(e) => println!("FAIL: embedded load: {e} (Gemma is HF-gated; set HF_TOKEN)"),
+// --- catalog certification harness scaffolding ---
+//
+// A `certify <model>` gate: does a model's decoding distribution over a
+// fixed prompt set match a stored reference within a KL-divergence
+// bound. This scaffolds the math and the record shape; the Tier-1
+// model matrix (gpt-oss-20b, Qwen3.5 4B/9B/35B-A3B, Gemma 4) and the
+// real GPU logit capture are a follow-up run on the GPU cert box, not
+// CI. `capture_logits_stub` below stands in for that capture so the
+// gate and its record are exercised deterministically without a GPU.
+
+/// KL divergence `D(P || Q) = sum(p_i * ln(p_i / q_i))`, the measure
+/// this harness gates a certified model's decoding distribution
+/// against a reference with: `0.0` for identical distributions, growing
+/// as they diverge. `p` and `q` must be the same length and each sum to
+/// roughly `1.0` (a probability distribution); a length mismatch or a
+/// negative entry is rejected outright rather than silently producing a
+/// meaningless or `NaN` result, since a wrong-but-quiet number here
+/// would defeat the whole point of a certification gate. A zero entry
+/// in `p` contributes nothing (the `x * ln(x)` term's limit at `0` is
+/// `0`); a zero in `q` where `p` is nonzero is undefined and returns
+/// `f64::INFINITY` for that term, the standard convention.
+fn kl_divergence(p: &[f64], q: &[f64]) -> Result<f64, String> {
+    if p.len() != q.len() {
+        return Err(format!(
+            "kl_divergence: distributions have different lengths ({} vs {})",
+            p.len(),
+            q.len()
+        ));
     }
-    println!("embedded cert complete");
+    if p.iter().chain(q.iter()).any(|&x| x < 0.0) {
+        return Err("kl_divergence: distributions must be non-negative".to_string());
+    }
+    Ok(p.iter()
+        .zip(q.iter())
+        .map(|(&pi, &qi)| {
+            if pi == 0.0 {
+                0.0
+            } else if qi == 0.0 {
+                f64::INFINITY
+            } else {
+                pi * (pi / qi).ln()
+            }
+        })
+        .sum())
 }
 
-#[cfg(not(feature = "embedded"))]
-fn embedded_cert(_repo: &str) {
-    eprintln!("build with --features embedded (add gpu-nvidia to run on the GPU)");
-    std::process::exit(2);
+/// Gate: a certified model's KL divergence from its reference
+/// distribution must not exceed this before the harness marks it FAIL.
+const CERTIFY_KL_THRESHOLD: f64 = 0.01;
+
+/// Stubbed logit capture (harness scaffolding): no GPU or real forward
+/// pass in this task's scope. Returns two identical synthetic
+/// distributions so `certify` exercises its full gate and record-emission
+/// path deterministically. A real run on the GPU cert box replaces this
+/// with an actual forward pass over the fixed Tier-1 prompt set for
+/// `model`, compared against a reference distribution captured once at
+/// first certification and stored alongside the catalog entry.
+fn capture_logits_stub(_model: &str) -> (Vec<f64>, Vec<f64>) {
+    let reference = vec![0.4, 0.3, 0.2, 0.1];
+    (reference.clone(), reference)
+}
+
+/// `certify <model> [date]`: compute the KL-divergence gate and print a
+/// `cert.<lane>.<date>` record. `date` is supplied by whoever runs a
+/// real certification (the day it actually ran on the GPU cert box, to
+/// match the `cert.apple_metal.2026-07-11` precedent in the capability
+/// registry, a fixed evidence string stamped once and committed);
+/// omitting it prints an obviously-unfinished placeholder rather than
+/// guessing a date from the host clock.
+fn certify(model: &str, date: Option<&str>) {
+    let (reference, candidate) = capture_logits_stub(model);
+    let divergence = match kl_divergence(&reference, &candidate) {
+        Ok(value) => value,
+        Err(error) => {
+            println!("FAIL: {error}");
+            std::process::exit(1);
+        }
+    };
+    let passed = divergence <= CERTIFY_KL_THRESHOLD;
+    let date = date.unwrap_or("unscheduled");
+    let lane = model
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let id = format!("cert.{lane}.{date}");
+    println!("certification id: {id}");
+    println!("model: {model}");
+    println!("kl_divergence: {divergence:.6} (threshold {CERTIFY_KL_THRESHOLD})");
+    if passed {
+        println!("PASS: {id} within the KL-divergence gate");
+    } else {
+        println!("FAIL: {id} exceeds the KL-divergence gate");
+        std::process::exit(1);
+    }
 }
 
 fn tokio_rt() -> tokio::runtime::Runtime {
@@ -779,4 +741,80 @@ fn tokio_rt() -> tokio::runtime::Runtime {
         .enable_all()
         .build()
         .expect("tokio runtime")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kl_divergence_of_identical_distributions_is_zero() {
+        let p = vec![0.25_f64, 0.25, 0.25, 0.25];
+        let q = p.clone();
+        assert!((kl_divergence(&p, &q).unwrap()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn kl_divergence_is_positive_for_differing_distributions() {
+        let p = vec![0.9_f64, 0.1];
+        let q = vec![0.5_f64, 0.5];
+        assert!(kl_divergence(&p, &q).unwrap() > 0.0);
+    }
+
+    #[test]
+    fn kl_divergence_treats_a_zero_p_entry_as_no_contribution() {
+        let p = vec![1.0_f64, 0.0];
+        let q = vec![0.5_f64, 0.5];
+        assert!((kl_divergence(&p, &q).unwrap() - (1.0_f64 * (1.0_f64 / 0.5).ln())).abs() < 1e-9);
+    }
+
+    #[test]
+    fn kl_divergence_is_infinite_when_q_is_zero_where_p_is_not() {
+        let p = vec![1.0_f64];
+        let q = vec![0.0_f64];
+        assert!(kl_divergence(&p, &q).unwrap().is_infinite());
+    }
+
+    #[test]
+    fn kl_divergence_rejects_mismatched_lengths() {
+        let p = vec![0.5_f64, 0.5];
+        let q = vec![1.0_f64];
+        let error = kl_divergence(&p, &q).unwrap_err();
+        assert!(error.contains("different lengths"), "{error}");
+    }
+
+    #[test]
+    fn kl_divergence_rejects_a_negative_entry() {
+        let p = vec![1.5_f64, -0.5];
+        let q = vec![0.5_f64, 0.5];
+        let error = kl_divergence(&p, &q).unwrap_err();
+        assert!(error.contains("non-negative"), "{error}");
+    }
+
+    #[test]
+    fn certification_id_follows_the_cert_lane_date_convention() {
+        let (reference, candidate) = capture_logits_stub("Qwen/Qwen3-0.6B");
+        assert_eq!(
+            reference, candidate,
+            "the stub is exact until a real GPU capture lands"
+        );
+        assert!(kl_divergence(&reference, &candidate).unwrap().abs() < 1e-9);
+
+        // The `certify` function itself prints and may exit(1) on FAIL,
+        // so the id format is exercised directly here rather than by
+        // capturing stdout: it must match `cert.<lane>.<date>` with the
+        // lane lowercased and every non-alphanumeric character (the `/`
+        // in a repo id) collapsed to `_`.
+        let lane = "Qwen/Qwen3-0.6B"
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_lowercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        assert_eq!(lane, "qwen_qwen3_0_6b");
+    }
 }

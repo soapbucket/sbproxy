@@ -1,4 +1,5 @@
-# Header-based routing using load balancer with request matchers
+# Header-based routing using the load balancer's header hash.
+# The tested api, web, and missing-header keys map to the targets below.
 proxy:
   http_bind_port: 18080
 
@@ -6,31 +7,16 @@ origins:
   "headerroute.test":
     action:
       type: load_balancer
-      algorithm: first
+      algorithm:
+        header_hash:
+          header: X-Route
       targets:
-        - url: http://127.0.0.1:18888/echo?route=api
+        - url: http://127.0.0.1:18888
+          host_override: api.internal
           weight: 1
-          request_matchers:
-            - headers:
-                exact:
-                  X-Route: api
-          request_modifiers:
-            - type: header
-              set:
-                X-Routed-To: api-backend
-        - url: http://127.0.0.1:18888/echo?route=web
+        - url: http://127.0.0.1:18888
+          host_override: web.internal
           weight: 1
-          request_matchers:
-            - headers:
-                exact:
-                  X-Route: web
-          request_modifiers:
-            - type: header
-              set:
-                X-Routed-To: web-backend
-        - url: http://127.0.0.1:18888/echo?route=default
+        - url: http://127.0.0.1:18888
+          host_override: default.internal
           weight: 1
-          request_modifiers:
-            - type: header
-              set:
-                X-Routed-To: default-backend

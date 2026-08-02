@@ -8,7 +8,10 @@
 //! ## Sandbox
 //!
 //! Every script runs under three independently enforced limits, all
-//! configurable from `sb.yml` via `proxy.scripting.javascript.sandbox`:
+//! supplied when the engine is constructed. The
+//! `proxy.scripting.javascript.sandbox` YAML shape remains parseable
+//! for compatibility, but the OSS boot path does not pass it to
+//! [`JsEngine`]:
 //!
 //! * **CPU time budget** (`budget_ms`, default 100 ms): a watchdog
 //!   timer flips an atomic flag after the budget elapses. The
@@ -144,13 +147,14 @@ impl JsEngine {
         })
     }
 
-    /// Create a new sandboxed JS engine with operator-provided sandbox limits.
+    /// Create a new sandboxed JS engine with caller-provided sandbox limits.
     ///
-    /// This is the path through which `proxy.scripting.javascript.sandbox`
-    /// from sb.yml reaches the engine. The supplied [`JsSandboxConfig`]
-    /// is applied to the QuickJS runtime up front and then retained
-    /// for the lifetime of the engine so the CPU-budget watchdog can
-    /// read it on every script invocation.
+    /// Programmatic callers can deserialize the compatibility YAML
+    /// shape and pass it here explicitly, but the OSS boot path does
+    /// not wire `proxy.scripting.javascript.sandbox` into the engine.
+    /// The supplied [`JsSandboxConfig`] is applied to the QuickJS
+    /// runtime up front and retained for the lifetime of the engine so
+    /// the CPU-budget watchdog can read it on every script invocation.
     pub fn with_sandbox(sandbox: JsSandboxConfig) -> Result<Self> {
         let runtime = Runtime::new()?;
         runtime.set_memory_limit(sandbox.memory_mb.saturating_mul(1024 * 1024));
@@ -1422,11 +1426,10 @@ mod tests {
         assert!(err.is_interrupt(), "got {err:?}");
     }
 
-    /// Operator override: a JsSandboxConfig deserialised from the
-    /// YAML shape used in `proxy.scripting.javascript.sandbox`
-    /// reaches the engine unchanged and is honored at runtime.
+    /// A programmatic caller can deserialize `JsSandboxConfig` from
+    /// YAML and pass it to the engine explicitly.
     #[test]
-    fn operator_yaml_override_reaches_engine() {
+    fn programmatic_yaml_config_is_honored_by_engine() {
         let yaml = r#"
 budget_ms: 60
 memory_mb: 4

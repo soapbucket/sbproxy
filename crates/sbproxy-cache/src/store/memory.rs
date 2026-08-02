@@ -5,6 +5,7 @@
 //! (P13/P14). DashMap shards internally so reads/writes on different keys
 //! scale linearly with cores. See sbproxy-bench/docs/RUST_OPTIMIZATIONS.md A3.
 
+use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 
 use anyhow::Result;
@@ -91,6 +92,21 @@ impl CacheStore for MemoryCacheStore {
         Ok(())
     }
 
+    fn compare_and_swap(
+        &self,
+        key: &str,
+        expected: &CachedResponse,
+        replacement: &CachedResponse,
+    ) -> Result<bool> {
+        match self.data.entry(key.to_string()) {
+            Entry::Occupied(mut entry) if entry.get() == expected => {
+                entry.insert(replacement.clone());
+                Ok(true)
+            }
+            Entry::Occupied(_) | Entry::Vacant(_) => Ok(false),
+        }
+    }
+
     fn delete(&self, key: &str) -> Result<()> {
         self.data.remove(key);
         Ok(())
@@ -119,8 +135,16 @@ mod tests {
 
     fn make_entry(ttl_secs: u64) -> CachedResponse {
         CachedResponse {
+            generation: 0,
             status: 200,
-            headers: vec![("content-type".into(), "text/plain".into())],
+            headers: vec![
+                ("content-type".into(), "text/plain".into()),
+                ("etag".into(), r#""memory-v1""#.into()),
+                (
+                    "last-modified".into(),
+                    "Sun, 06 Nov 1994 08:49:37 GMT".into(),
+                ),
+            ],
             body: b"hello".to_vec(),
             cached_at: now_secs(),
             ttl_secs,
@@ -140,6 +164,8 @@ mod tests {
         let got = store.get("k1").unwrap().unwrap();
         assert_eq!(got.status, 200);
         assert_eq!(got.body, b"hello");
+        assert_eq!(got.etag(), Some(r#""memory-v1""#));
+        assert_eq!(got.last_modified(), Some("Sun, 06 Nov 1994 08:49:37 GMT"));
 
         // Delete.
         store.delete("k1").unwrap();
@@ -159,6 +185,7 @@ mod tests {
 
         // Entry that expired 10 seconds ago.
         let entry = CachedResponse {
+            generation: 0,
             status: 200,
             headers: vec![],
             body: vec![],
@@ -211,6 +238,7 @@ mod tests {
     fn test_get_including_expired_returns_stale() {
         let store = MemoryCacheStore::new(0);
         let stale = CachedResponse {
+            generation: 0,
             status: 200,
             headers: vec![],
             body: b"stale".to_vec(),
@@ -237,6 +265,7 @@ mod tests {
 
         // Overwriting existing key should not evict.
         let updated = CachedResponse {
+            generation: 0,
             status: 404,
             headers: vec![],
             body: b"not found".to_vec(),
@@ -247,5 +276,31 @@ mod tests {
 
         assert_eq!(store.data.len(), 2);
         assert_eq!(store.data.get("k1").unwrap().status, 404);
+    }
+
+    #[test]
+    fn compare_and_swap_does_not_overwrite_or_resurrect_newer_state() {
+        let store = MemoryCacheStore::new(0);
+        let mut stale = make_entry(300);
+        stale.generation = 1;
+        let mut refreshed = make_entry(300);
+        refreshed.generation = 2;
+        refreshed.body = b"background refresh".to_vec();
+        store.put("key", &stale).unwrap();
+
+        let mut foreground = make_entry(300);
+        foreground.generation = 3;
+        foreground.body = b"foreground replacement".to_vec();
+        store.put("key", &foreground).unwrap();
+        assert!(!store.compare_and_swap("key", &stale, &refreshed).unwrap());
+        assert_eq!(
+            store.get("key").unwrap().expect("foreground value").body,
+            b"foreground replacement"
+        );
+
+        store.put("key", &stale).unwrap();
+        store.delete("key").unwrap();
+        assert!(!store.compare_and_swap("key", &stale, &refreshed).unwrap());
+        assert!(store.get("key").unwrap().is_none());
     }
 }

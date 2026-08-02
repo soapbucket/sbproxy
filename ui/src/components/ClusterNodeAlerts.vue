@@ -133,7 +133,7 @@ function rosterHref(nodeId: string): string {
   place-items: center;
   min-width: 30px;
   height: 30px;
-  color: var(--sb-on-navy);
+  color: var(--sb-on-ink);
   background: var(--sb-err);
   border-radius: 50%;
   font-size: 0.78rem;

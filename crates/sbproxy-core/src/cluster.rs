@@ -679,8 +679,21 @@ impl ClusterOwner {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(current) = installed.as_ref() {
             if current.restart_fingerprint != fingerprint {
+                // Name the fields. A generic message was tolerable when
+                // reloads were hand-driven; a config arriving from a
+                // shared git repository makes this the most likely
+                // first-day failure, and "something changed" is not
+                // something an operator can act on.
+                let detail = ClusterRestartFingerprint::describe_change(
+                    current.restart_fingerprint.as_ref(),
+                    fingerprint.as_ref(),
+                );
                 anyhow::bail!(
-                    "cluster identity, roles, labels, discovery, listeners, endpoints, or peer security changed; restart sbproxy to apply the new process-owned cluster configuration"
+                    "process-owned cluster configuration changed and cannot be applied to a \
+                     running process ({detail}); restart sbproxy to adopt it. If this document \
+                     comes from a shared source, node-local values belong in `${{VAR}}` \
+                     references this host exports, or in a node-local overlay, not in the \
+                     shared document"
                 );
             }
             current.settings.update(settings);
@@ -1252,7 +1265,19 @@ impl ClusterBootstrap for SystemClusterBootstrap {
             transport_advertise_addr: config.transport_advertise_addr.clone(),
             dead_peer_gc_secs: config.dead_peer_gc_secs,
             shared_key,
+            key_derivation: match config.key_derivation {
+                sbproxy_config::MeshKeyDerivation::Sha256 => {
+                    sbproxy_mesh::crypto::KeyDerivation::Sha256
+                }
+                sbproxy_config::MeshKeyDerivation::Hkdf => {
+                    sbproxy_mesh::crypto::KeyDerivation::Hkdf
+                }
+            },
             peer_tls,
+            replication: config
+                .replication
+                .as_ref()
+                .map(|replication| lower_replication(replication, config.state_dir.as_deref())),
             ..Default::default()
         };
         let node_id = identity.node_id.clone();
@@ -1270,7 +1295,47 @@ impl ClusterBootstrap for SystemClusterBootstrap {
                 anyhow::bail!("canonical cluster typed-state transport failed to bind");
             }
         }
+        // WOR-2064: install the keystore revocation fence on the replica
+        // shard as soon as the substrate exists, before any key plane
+        // binds to it, so records the transport applies in the boot
+        // window are already fenced. Harmless when the mesh keystore
+        // backend is not configured: the fence only matches its own key
+        // namespace.
+        if let Some(replicated) = node.replicated_store() {
+            crate::mesh_keystore::install_revocation_fence(&replicated.shard());
+        }
         ClusterHandle::distributed(identity, Arc::new(node)).map_err(anyhow::Error::from)
+    }
+}
+
+/// Lower the public replication block into the mesh bootstrap wiring.
+/// The durable shard lives beside the node's other durable identity
+/// state; canonical validation guarantees `state_dir` is present.
+fn lower_replication(
+    replication: &sbproxy_config::cluster::ClusterReplicationConfig,
+    state_dir: Option<&str>,
+) -> sbproxy_mesh::bootstrap::ReplicationBootstrapConfig {
+    use sbproxy_config::cluster::ClusterConsistencyLevel;
+    use sbproxy_mesh::state::replicated::Consistency;
+
+    let lower_level = |level: ClusterConsistencyLevel| match level {
+        ClusterConsistencyLevel::One => Consistency::One,
+        ClusterConsistencyLevel::Quorum => Consistency::Quorum,
+        ClusterConsistencyLevel::All => Consistency::All,
+    };
+    sbproxy_mesh::bootstrap::ReplicationBootstrapConfig {
+        settings: sbproxy_mesh::state::replicated::ReplicationSettings {
+            replication_factor: replication.factor,
+            write_consistency: lower_level(replication.write_consistency),
+            read_consistency: lower_level(replication.read_consistency),
+            anti_entropy_interval_secs: replication.anti_entropy_interval_secs,
+            tombstone_gc_grace_secs: replication.tombstone_gc_grace_secs,
+        },
+        limits: sbproxy_mesh::state::replicated::ShardLimits {
+            max_entries: replication.max_entries,
+            max_value_bytes: replication.max_value_bytes,
+        },
+        durable_path: state_dir.map(|dir| std::path::Path::new(dir).join("replicated-state.redb")),
     }
 }
 
@@ -1421,7 +1486,7 @@ fn cluster_runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
-fn block_on_cluster<F>(future: F) -> F::Output
+pub(crate) fn block_on_cluster<F>(future: F) -> F::Output
 where
     F: std::future::Future + Send,
     F::Output: Send,
@@ -1515,6 +1580,212 @@ fn start_cluster_metrics(handle: &ClusterHandle) {
         sbproxy_mesh::cluster_metrics::ClusterMetrics::new(),
     ));
     cluster_runtime().spawn(crate::cluster_metrics::run_loop(handle.clone(), 15));
+    cluster_runtime().spawn(run_capability_announcer());
+}
+
+/// Republish this node's capability set for as long as the process lives.
+///
+/// The gate that guards credential bindings reads one of these per member and
+/// treats a member with no record as a node that cannot honour the field. A
+/// node therefore has to keep saying so: if this loop stops, the record expires
+/// and the fleet correctly starts refusing new bindings rather than assuming
+/// the node is still fine.
+///
+/// The generation is a monotonic tick rather than a timestamp, because cluster
+/// state fences on generation and a clock that moves backwards would make a
+/// republish look stale.
+///
+/// The counter itself lives in `key_capability` as one process-wide atomic, so
+/// this loop and an immediate preflight publication share it. Two publishers
+/// with two private counters could otherwise write different payloads at the
+/// same generation, which cluster state rejects as a conflict.
+async fn run_capability_announcer() {
+    let period = crate::key_capability::CAPABILITY_TTL / 2;
+    loop {
+        crate::key_capability::announce_local_capabilities().await;
+        tokio::time::sleep(period).await;
+    }
+}
+
+/// Start the cross-node governance-counter dissemination loop, once, for a
+/// clustered node running the in-memory (approximate) governance store.
+///
+/// This is deliberately not part of `start_cluster_metrics`. That function
+/// runs from `reconcile_process_cluster`, which `server::lifecycle` calls
+/// *before* lifecycle activates the prepared approximate store, on
+/// both the boot path (`server::lifecycle::run`) and the config-reload path
+/// (`server::lifecycle::reload_from_config_yaml`). A governance check made
+/// inside `start_cluster_metrics` would always observe `current_key_plane()`
+/// as not-yet-updated for this cycle and never spawn. Instead,
+/// `server::lifecycle` calls this function itself, immediately after
+/// key-plane activation on both paths, once both the process cluster handle and
+/// the key plane are guaranteed installed.
+///
+/// Idempotent: guarded by its own atomic, separate from
+/// `start_cluster_metrics`'s `STARTED` gate, so it does not consume that
+/// gate's one-shot attempt. If the predicate is not satisfied yet (for
+/// example clustering came up before approximate governance was
+/// configured), the gate stays open so a later reload that does satisfy it
+/// can still start the loop; once started, it never spawns a second time.
+pub(crate) fn start_governance_dissemination() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.load(Ordering::SeqCst) {
+        return;
+    }
+    let Some(handle) = current_cluster_handle() else {
+        return;
+    };
+    let clustered = handle.mesh_node().is_some();
+    if !should_disseminate_governance(clustered, current_approximate_governance_store().is_some()) {
+        return;
+    }
+    if STARTED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    cluster_runtime().spawn(crate::governance_cluster::run_loop(
+        handle.clone(),
+        current_approximate_governance_store,
+        15,
+    ));
+}
+
+/// Start cross-node dissemination of rate-limit counters on a clustered node.
+///
+/// Separate from [`start_governance_dissemination`] because the cadence
+/// differs: governance guards spend on a long window, while a rate limit is a
+/// promise about a 60 second window and needs several exchanges inside one to
+/// keep the overshoot bound tight.
+///
+/// Unlike governance this has no approximate-store predicate. The tier is
+/// process-owned and always present, so the only gate is whether this node is
+/// clustered at all. Idempotent behind its own atomic.
+pub(crate) fn start_rate_limit_dissemination() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.load(Ordering::SeqCst) {
+        return;
+    }
+    let Some(handle) = current_cluster_handle() else {
+        return;
+    };
+    if handle.mesh_node().is_none() {
+        return;
+    }
+    let Some(tier) = crate::rate_limit_cluster::tier_if_clustered() else {
+        return;
+    };
+    if STARTED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    cluster_runtime().spawn(crate::rate_limit_cluster::run_loop(
+        handle.clone(),
+        tier,
+        crate::rate_limit_cluster::DEFAULT_RATE_LIMIT_CADENCE_SECS,
+    ));
+}
+
+/// Start publication of this node's receipt-chain segment on a clustered
+/// node.
+///
+/// Without this the mesh-wide meter has a reader and no writer. Every peer's
+/// gather finds no record under this node's id and reports it as
+/// [`sbproxy_meter::coverage::CoverageGap::NeverReported`], so a clustered
+/// deployment's coverage view says the whole fleet has never reported and
+/// the cluster total is permanently partial.
+///
+/// Publishing is the only thing the loop does. Gathering is a request rather
+/// than a background job, so the coverage block on an answer describes the
+/// moment somebody asked rather than the last time a timer fired. See
+/// [`crate::meter_cluster::run_loop`], which states the same split from the
+/// other side.
+///
+/// # Cadence
+///
+/// Fifteen seconds, matching [`crate::governance_cluster::run_loop`] rather
+/// than the faster cadence [`crate::cluster::start_rate_limit_dissemination`]
+/// uses. A rate limit is a promise about a 60 second window and needs several
+/// exchanges inside one to keep the overshoot bound tight. A chain head is a
+/// durable fact on a disk, so a peer reading one fifteen seconds late is
+/// reading a true number that is fifteen seconds old, and the gather labels
+/// records past their age bound stale rather than quietly summing them.
+///
+/// # Why there is no attestation predicate
+///
+/// The segment closure reads the current pipeline on every tick rather than
+/// capturing one, so a reload that replaces the meter cannot leave this loop
+/// republishing a segment from a runtime that no longer exists. A process
+/// with attestation switched off therefore returns `None` every tick and
+/// publishes nothing, which is the whole guard. A boot-time attestation check
+/// here would do worse than duplicate that: it would latch a node that later
+/// reloads attestation on into permanent silence, because the starter only
+/// gets one successful attempt.
+///
+/// # State
+///
+/// This shares the one process-wide [`crate::meter_cluster::ClusterMeterView`]
+/// with the admin gather rather than building its own. Publishing touches none
+/// of the memory that type holds, so a second view would work today, and that
+/// is exactly what makes it worth avoiding: the type documents itself as one
+/// per process because its last-known-heads table never evicts, and a second
+/// instance would sit there being harmless until somebody taught the publish
+/// path to remember a head, at which point the two would disagree about which
+/// nodes had ever reported.
+///
+/// Idempotent behind its own atomic, like its two siblings, so calling it
+/// again from a later reload is a no-op rather than a second publisher.
+pub(crate) fn start_meter_dissemination() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.load(Ordering::SeqCst) {
+        return;
+    }
+    let Some(handle) = current_cluster_handle() else {
+        return;
+    };
+    if handle.mesh_node().is_none() {
+        return;
+    }
+    if STARTED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    cluster_runtime().spawn(crate::meter_cluster::run_loop(
+        handle.clone(),
+        crate::admin_meter::cluster_view().clone(),
+        || {
+            crate::reload::current_pipeline_full()
+                .attestation
+                .as_ref()
+                .and_then(|attestation| attestation.chain.as_ref())
+                .and_then(|chain| chain.segment())
+        },
+        15,
+    ));
+}
+
+fn current_approximate_governance_store(
+) -> Option<Arc<sbproxy_ai::governance::InMemoryGovernanceStore>> {
+    crate::key_plane::current_key_plane().and_then(|plane| plane.approximate_store())
+}
+
+/// Dissemination runs only for a clustered node in approximate mode.
+///
+/// `clustered` is true once this node has an active mesh node (the same
+/// gate `start_cluster_metrics` uses); `approximate_store_present` is true
+/// only when the installed key plane holds a concrete in-memory governance
+/// store (approximate consistency). Strict (Redis) governance owns its own
+/// cross-node coherence and must never get a dissemination loop.
+pub(crate) fn should_disseminate_governance(
+    clustered: bool,
+    approximate_store_present: bool,
+) -> bool {
+    clustered && approximate_store_present
 }
 
 #[cfg(test)]
@@ -1617,5 +1888,13 @@ cluster:
         for secret in ["certificate-secret", "private-key-secret", "ca-secret"] {
             assert!(!debug.contains(secret));
         }
+    }
+
+    #[test]
+    fn should_disseminate_governance_requires_both_clustered_and_approximate() {
+        assert!(should_disseminate_governance(true, true));
+        assert!(!should_disseminate_governance(false, true));
+        assert!(!should_disseminate_governance(true, false));
+        assert!(!should_disseminate_governance(false, false));
     }
 }

@@ -1,6 +1,6 @@
 # Sidecar deployment
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-01*
 
 SBproxy is north-south first: most operators run it as a
 top-of-rack gateway in front of an LLM provider or an internal
@@ -220,6 +220,76 @@ The knobs, in order:
 * `ip_filter` bounds where the workload can connect. The
   shipped `0.0.0.0/0` whitelist admits everything; narrow it to
   the provider CIDRs you have authorised before production.
+
+## Calling it
+
+Run the example directly, without a pod, to see both the footprint and the
+back-pressure contract:
+
+```bash
+make run CONFIG=examples/sidecar/sb.yml
+```
+
+It binds `15001`, the same port the pod spec above redirects to. A request
+under the budget is forwarded and carries the rate-limit headers:
+
+```bash
+curl -sS -i -H 'Host: app.local' http://127.0.0.1:15001/get
+```
+
+```http
+HTTP/1.1 200 OK
+x-ratelimit-limit: 100
+x-ratelimit-remaining: 99
+x-ratelimit-reset: 1
+```
+
+`x-ratelimit-limit` reports `100`, which is `burst`, not the
+`requests_per_minute: 3000` steady state. That is the number an agent loop
+should size its concurrency against: `requests_per_minute` sets the refill
+rate, and `burst` sets how much can be spent at once.
+
+Push past the burst and the sidecar sheds load rather than queuing it:
+
+```bash
+seq 1 300 | xargs -P 40 -I{} \
+  curl -s -o /dev/null -w '%{http_code}\n' \
+    -H 'Host: app.local' http://127.0.0.1:15001/get \
+  | sort | uniq -c
+# 143 200
+# 157 429
+```
+
+The exact split depends on how fast the requests land, since the bucket
+refills while the run proceeds. A rejected request looks like this:
+
+```http
+HTTP/1.1 429 Too Many Requests
+content-type: application/json
+X-RateLimit-Limit: 100
+X-RateLimit-Remaining: 0
+X-RateLimit-Reset: 2
+Retry-After: 2
+
+{"error":"rate limited"}
+```
+
+`Retry-After` is present because the config sets
+`headers.include_retry_after: true`, and it agrees with `X-RateLimit-Reset`.
+That is the whole point of the `headers` block in a sidecar: the caller is
+your own workload, so telling it exactly how long to wait converts a retry
+storm into a scheduled backoff.
+
+Resident set for that idle process measured 77.5 MB here, inside the 80 MB
+target in the table above:
+
+```bash
+ps -o rss= -p $(pgrep -f 'sbproxy serve') | awk '{printf "%.1f MB\n", $1/1024}'
+# 77.5 MB
+```
+
+Measure this on your own build before trusting it. The figure moves with the
+feature set compiled in, and a debug binary is not what you ship.
 
 ## Service-mesh integration
 

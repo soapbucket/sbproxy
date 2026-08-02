@@ -7,15 +7,24 @@
 //! Also supports blue-green and canary deployment modes, and priority-based
 //! routing via the `X-Priority` request header.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
+use arc_swap::ArcSwap;
 use sbproxy_platform::circuitbreaker::CircuitBreaker;
 use sbproxy_platform::outlier::{OutlierDetector, OutlierDetectorConfig};
 use serde::Deserialize;
 
+use super::routing::build_routing_strategy_with_name;
 use super::ForwardingHeaderControls;
+use super::{RoutingOutcome, RoutingRequest, RoutingStrategy, TargetState};
+
+const MAX_TARGET_METADATA_ENTRIES: usize = 64;
+const MAX_TARGET_METADATA_KEY_BYTES: usize = 64;
+const MAX_TARGET_METADATA_SERIALIZED_BYTES: usize = 16 * 1024;
+const MAX_TARGET_METADATA_NESTING_DEPTH: usize = 8;
 
 // --- Configuration types ---
 
@@ -69,7 +78,24 @@ pub struct LoadBalancerAction {
     /// `upstream_peer`, which routes traffic to a different healthy
     /// target via outlier / breaker / health filtering.
     pub retry: Option<crate::action::RetryConfig>,
+    strategy_name: Option<&'static str>,
+    strategy: Option<Arc<dyn RoutingStrategy>>,
     state: LoadBalancerState,
+}
+
+/// One load-balancer target choice and the method that produced it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetSelection {
+    /// Parsed upstream hostname.
+    pub host: String,
+    /// Parsed upstream port.
+    pub port: u16,
+    /// Whether the upstream URL uses TLS.
+    pub tls: bool,
+    /// Position in [`LoadBalancerAction::targets`].
+    pub target_index: usize,
+    /// Registered strategy name or built-in algorithm name.
+    pub selection_method: String,
 }
 
 impl std::fmt::Debug for LoadBalancerAction {
@@ -85,6 +111,7 @@ impl std::fmt::Debug for LoadBalancerAction {
                 &self.circuit_breakers.as_ref().map(|v| v.len()),
             )
             .field("retry", &self.retry.is_some())
+            .field("strategy", &self.strategy_name)
             .field("state", &self.state)
             .finish()
     }
@@ -232,6 +259,9 @@ pub struct Target {
     /// Set this when the target expects a different `Host`.
     #[serde(default)]
     pub host_override: Option<String>,
+    /// Strategy-specific static routing signals.
+    #[serde(default)]
+    pub metadata: HashMap<String, serde_json::Value>,
     /// Per-target opt-out flags for the standard proxy forwarding headers.
     #[serde(flatten, default)]
     pub forwarding: ForwardingHeaderControls,
@@ -243,6 +273,44 @@ fn default_priority() -> u8 {
 
 fn default_weight() -> u32 {
     1
+}
+
+fn validate_target_metadata(metadata: &HashMap<String, serde_json::Value>) -> Result<()> {
+    anyhow::ensure!(
+        metadata.len() <= MAX_TARGET_METADATA_ENTRIES,
+        "target metadata cannot contain more than {MAX_TARGET_METADATA_ENTRIES} entries"
+    );
+    anyhow::ensure!(
+        metadata
+            .keys()
+            .all(|key| key.len() <= MAX_TARGET_METADATA_KEY_BYTES),
+        "target metadata keys cannot exceed {MAX_TARGET_METADATA_KEY_BYTES} bytes"
+    );
+    let serialized_size = serde_json::to_vec(metadata)?.len();
+    anyhow::ensure!(
+        serialized_size <= MAX_TARGET_METADATA_SERIALIZED_BYTES,
+        "target metadata serialized size cannot exceed {MAX_TARGET_METADATA_SERIALIZED_BYTES} bytes"
+    );
+
+    let mut pending: Vec<(&serde_json::Value, usize)> =
+        metadata.values().map(|value| (value, 1)).collect();
+    while let Some((value, depth)) = pending.pop() {
+        anyhow::ensure!(
+            depth <= MAX_TARGET_METADATA_NESTING_DEPTH,
+            "target metadata nesting depth cannot exceed {MAX_TARGET_METADATA_NESTING_DEPTH}"
+        );
+        match value {
+            serde_json::Value::Array(values) => {
+                pending.extend(values.iter().map(|value| (value, depth + 1)));
+            }
+            serde_json::Value::Object(values) => {
+                pending.extend(values.values().map(|value| (value, depth + 1)));
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
 }
 
 /// Load balancing algorithm.
@@ -295,6 +363,8 @@ struct LoadBalancerState {
     /// Per-target health: `0` = unknown (treated as healthy), `1` =
     /// healthy, `2` = unhealthy. Vec indexed by target index.
     health: Vec<AtomicU8>,
+    /// Immutable metadata snapshots swapped atomically by target index.
+    metadata: Vec<ArcSwap<HashMap<String, serde_json::Value>>>,
 }
 
 impl std::fmt::Debug for LoadBalancerState {
@@ -305,6 +375,7 @@ impl std::fmt::Debug for LoadBalancerState {
                 &self.round_robin_counter.load(Ordering::Relaxed),
             )
             .field("connections_len", &self.connections.len())
+            .field("metadata_len", &self.metadata.len())
             .finish()
     }
 }
@@ -314,6 +385,11 @@ impl std::fmt::Debug for LoadBalancerState {
 impl LoadBalancerAction {
     /// Build a LoadBalancerAction from a generic JSON config value.
     pub fn from_config(value: serde_json::Value) -> Result<Self> {
+        Self::from_config_for_origin(value, "")
+    }
+
+    /// Build a load balancer with a stable identity for strategy state.
+    pub fn from_config_for_origin(value: serde_json::Value, origin_id: &str) -> Result<Self> {
         #[derive(Deserialize)]
         struct Config {
             targets: Vec<Target>,
@@ -327,6 +403,12 @@ impl LoadBalancerAction {
             circuit_breaker: Option<CircuitBreakerConfig>,
             #[serde(default)]
             retry: Option<crate::action::RetryConfig>,
+            #[serde(default)]
+            strategy: Option<String>,
+            #[serde(default)]
+            strategy_config: Option<serde_json::Value>,
+            #[serde(default)]
+            lb_method: Option<String>,
         }
         fn default_algo() -> Algorithm {
             Algorithm::RoundRobin
@@ -362,7 +444,62 @@ impl LoadBalancerAction {
             !config.targets.is_empty(),
             "load balancer requires at least one target"
         );
+        for target in &config.targets {
+            validate_target_metadata(&target.metadata)?;
+        }
+        anyhow::ensure!(
+            config.lb_method.as_deref() != Some("plugin") || config.strategy.is_some(),
+            "lb_method: plugin requires strategy"
+        );
+        anyhow::ensure!(
+            config
+                .strategy_config
+                .as_ref()
+                .is_none_or(serde_json::Value::is_object),
+            "strategy_config must be an object"
+        );
+        if config.strategy.as_deref() == Some("bandit") {
+            anyhow::ensure!(
+                config.targets.len() <= super::routing::bandit::MAX_TARGETS_PER_NAMESPACE,
+                "bandit strategy supports at most {} targets",
+                super::routing::bandit::MAX_TARGETS_PER_NAMESPACE
+            );
+        }
         let num_targets = config.targets.len();
+        let metadata = config
+            .targets
+            .iter()
+            .map(|target| ArcSwap::from_pointee(target.metadata.clone()))
+            .collect();
+        let (strategy_name, strategy) = match config.strategy.as_deref() {
+            Some(name) => {
+                let mut strategy_config = config
+                    .strategy_config
+                    .unwrap_or_else(|| serde_json::json!({}));
+                if name == "bandit" {
+                    let object = strategy_config
+                        .as_object_mut()
+                        .expect("strategy config was normalized to an object");
+                    let target_urls: Vec<&str> = config
+                        .targets
+                        .iter()
+                        .map(|target| target.url.as_str())
+                        .collect();
+                    let namespace = format!(
+                        "{origin_id}:{name}:{}",
+                        serde_json::to_string(&target_urls)?
+                    );
+                    object.insert(
+                        "state_namespace".to_string(),
+                        serde_json::Value::String(namespace),
+                    );
+                }
+                let (registered_name, strategy) =
+                    build_routing_strategy_with_name(name, &strategy_config)?;
+                (Some(registered_name), Some(strategy))
+            }
+            None => (None, None),
+        };
 
         // Build the outlier detector when the user has configured it.
         // The detector is shared across requests via Arc so the
@@ -402,12 +539,40 @@ impl LoadBalancerAction {
             outlier_detector,
             circuit_breakers,
             retry: config.retry,
+            strategy_name,
+            strategy,
             state: LoadBalancerState {
                 round_robin_counter: AtomicU64::new(0),
                 connections: (0..num_targets).map(|_| AtomicU32::new(0)).collect(),
                 health: (0..num_targets).map(|_| AtomicU8::new(0)).collect(),
+                metadata,
             },
         })
+    }
+
+    /// Atomically replace one target's bounded strategy metadata snapshot.
+    pub fn update_target_metadata(
+        &self,
+        target_index: usize,
+        metadata: HashMap<String, serde_json::Value>,
+    ) -> Result<()> {
+        validate_target_metadata(&metadata)?;
+        let slot = self.state.metadata.get(target_index).ok_or_else(|| {
+            anyhow::anyhow!("target metadata index {target_index} is out of range")
+        })?;
+        slot.store(Arc::new(metadata));
+        Ok(())
+    }
+
+    /// Return the current immutable strategy metadata snapshot for a target.
+    pub fn target_metadata_snapshot(
+        &self,
+        target_index: usize,
+    ) -> Option<Arc<HashMap<String, serde_json::Value>>> {
+        self.state
+            .metadata
+            .get(target_index)
+            .map(ArcSwap::load_full)
     }
 
     /// Returns `true` when the breaker for the target at `idx` would
@@ -427,7 +592,15 @@ impl LoadBalancerAction {
     pub fn record_breaker_success(&self, idx: usize) {
         if let Some(brs) = &self.circuit_breakers {
             if let Some(b) = brs.get(idx) {
-                b.record_success();
+                if let Some((from, to)) = b.record_success() {
+                    if let Some(target) = self.targets.get(idx) {
+                        sbproxy_observe::metrics::record_circuit_breaker(
+                            &target.url,
+                            from.as_str(),
+                            to.as_str(),
+                        );
+                    }
+                }
             }
         }
     }
@@ -439,7 +612,15 @@ impl LoadBalancerAction {
     pub fn record_breaker_failure(&self, idx: usize) {
         if let Some(brs) = &self.circuit_breakers {
             if let Some(b) = brs.get(idx) {
-                b.record_failure();
+                if let Some((from, to)) = b.record_failure() {
+                    if let Some(target) = self.targets.get(idx) {
+                        sbproxy_observe::metrics::record_circuit_breaker(
+                            &target.url,
+                            from.as_str(),
+                            to.as_str(),
+                        );
+                    }
+                }
             }
         }
     }
@@ -525,19 +706,50 @@ impl LoadBalancerAction {
         }
     }
 
-    /// Select a target based on the configured algorithm.
-    /// Returns (host, port, tls, target_index).
-    ///
-    /// When `deployment_mode` is `BlueGreen`, only targets in the active group are used.
-    /// When `deployment_mode` is `Canary`, `weight`% of requests go to canary targets.
-    /// Priority-based routing pre-sorts active targets by `priority` ascending (1 = highest),
-    /// then by any `X-Priority` header value.
+    /// Select a target through the compatibility request projection.
     pub fn select_target(
         &self,
         client_ip: Option<&str>,
         uri: &str,
         headers: &http::HeaderMap,
     ) -> Result<(String, u16, bool, usize)> {
+        let hostname = headers
+            .get(http::header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        let mut request = RoutingRequest::new("GET", uri, hostname);
+        request.headers = headers.clone();
+        request.client_ip = client_ip.map(str::to_string);
+        let selection = self.select_target_for_request(request)?;
+        Ok((
+            selection.host,
+            selection.port,
+            selection.tls,
+            selection.target_index,
+        ))
+    }
+
+    /// Select a target through the configured strategy, then the algorithm.
+    ///
+    /// Deployment, backup, priority, health, breaker, and outlier filters
+    /// run before the strategy projection. A strategy can therefore choose
+    /// only from the same final eligible slice used by the fallback
+    /// algorithm.
+    pub fn select_target_for_request(
+        &self,
+        mut request: RoutingRequest,
+    ) -> Result<TargetSelection> {
+        enrich_routing_request(&mut request);
+        let client_ip = request.client_ip.as_deref();
+        // Registry strategies receive the full path plus query above. Legacy
+        // URI hashing used Pingora's path-only projection, so keep a separate
+        // fallback key when no strategy selects a target.
+        let fallback_uri = request
+            .path
+            .split_once('?')
+            .map_or(request.path.as_str(), |(path, _)| path);
+        let headers = &request.headers;
+
         // --- Outlier / active-health / circuit-breaker filter ---
         // Skip a target if any of:
         //   * the outlier detector has currently ejected it,
@@ -635,16 +847,16 @@ impl LoadBalancerAction {
         // back to the unfiltered list when every active target is
         // ejected (better to send traffic to a flaky upstream than to
         // 502 the client).
-        let active_targets: Vec<(usize, &Target)> = {
+        let (active_targets, has_strictly_eligible_targets): (Vec<(usize, &Target)>, bool) = {
             let kept: Vec<(usize, &Target)> = active_targets
                 .iter()
                 .filter(|(idx, _)| !is_ejected(*idx))
                 .cloned()
                 .collect();
             if kept.is_empty() {
-                active_targets
+                (active_targets, false)
             } else {
-                kept
+                (kept, true)
             }
         };
 
@@ -680,7 +892,109 @@ impl LoadBalancerAction {
 
         let active_targets = priority_filtered;
 
-        let idx = match &self.algorithm {
+        let strategy_selection = self
+            .strategy
+            .as_ref()
+            .filter(|_| has_strictly_eligible_targets)
+            .and_then(|strategy| {
+                let projection: Vec<TargetState> = active_targets
+                    .iter()
+                    .map(|(index, target)| TargetState {
+                        index: *index,
+                        url: target.url.clone(),
+                        healthy: true,
+                        active_connections: self
+                            .state
+                            .connections
+                            .get(*index)
+                            .map(|count| u64::from(count.load(Ordering::Relaxed)))
+                            .unwrap_or_default(),
+                        weight: target.weight,
+                        metadata: self
+                            .target_metadata_snapshot(*index)
+                            .expect("metadata state is parallel to configured targets"),
+                    })
+                    .collect();
+                strategy
+                    .select(&request, &projection)
+                    .and_then(|slice_index| active_targets.get(slice_index))
+                    .map(|(index, _)| {
+                        (
+                            *index,
+                            self.strategy_name
+                                .expect("compiled strategy must retain its registry name")
+                                .to_string(),
+                        )
+                    })
+            });
+
+        let (idx, selection_method) = match strategy_selection {
+            Some(selection) => selection,
+            None => (
+                self.select_with_algorithm(&active_targets, client_ip, fallback_uri, headers),
+                algorithm_name(&self.algorithm).to_string(),
+            ),
+        };
+
+        let target = &self.targets[idx];
+        let parsed = url::Url::parse(&target.url)?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("missing host in target URL"))?
+            .to_string();
+        let tls = parsed.scheme() == "https";
+        let port = parsed.port().unwrap_or(if tls { 443 } else { 80 });
+        Ok(TargetSelection {
+            host,
+            port,
+            tls,
+            target_index: idx,
+            selection_method,
+        })
+    }
+
+    /// Report one completed target attempt to the configured strategy.
+    pub fn record_strategy_outcome(&self, target_index: usize, outcome: RoutingOutcome) {
+        if let (Some(strategy), Some(target)) =
+            (self.strategy.as_ref(), self.targets.get(target_index))
+        {
+            strategy.record_outcome(&target.url, outcome);
+        }
+    }
+
+    /// Record that a connection to a target was established.
+    pub fn record_connect(&self, target_idx: usize) {
+        if target_idx < self.state.connections.len() {
+            self.state.connections[target_idx].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Record that a connection to a target was closed.
+    pub fn record_disconnect(&self, target_idx: usize) {
+        if target_idx < self.state.connections.len() {
+            self.state.connections[target_idx].fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Get the current connection count for a target.
+    pub fn connection_count(&self, target_idx: usize) -> u32 {
+        if target_idx < self.state.connections.len() {
+            self.state.connections[target_idx].load(Ordering::Relaxed)
+        } else {
+            0
+        }
+    }
+
+    // --- Private helpers ---
+
+    fn select_with_algorithm(
+        &self,
+        active_targets: &[(usize, &Target)],
+        client_ip: Option<&str>,
+        uri: &str,
+        headers: &http::HeaderMap,
+    ) -> usize {
+        match &self.algorithm {
             Algorithm::RoundRobin => {
                 let counter = self
                     .state
@@ -688,8 +1002,8 @@ impl LoadBalancerAction {
                     .fetch_add(1, Ordering::Relaxed);
                 active_targets[counter as usize % active_targets.len()].0
             }
-            Algorithm::WeightedRandom => self.select_weighted_random(&active_targets),
-            Algorithm::LeastConnections => self.select_least_connections(&active_targets),
+            Algorithm::WeightedRandom => self.select_weighted_random(active_targets),
+            Algorithm::LeastConnections => self.select_least_connections(active_targets),
             Algorithm::IpHash => {
                 let ip = client_ip.unwrap_or("0.0.0.0");
                 let hash = fnv1a_hash(ip.as_bytes());
@@ -712,44 +1026,8 @@ impl LoadBalancerAction {
                 let hash = fnv1a_hash(cookie_val.as_bytes());
                 active_targets[hash % active_targets.len()].0
             }
-        };
-
-        let target = &self.targets[idx];
-        let parsed = url::Url::parse(&target.url)?;
-        let host = parsed
-            .host_str()
-            .ok_or_else(|| anyhow::anyhow!("missing host in target URL"))?
-            .to_string();
-        let tls = parsed.scheme() == "https";
-        let port = parsed.port().unwrap_or(if tls { 443 } else { 80 });
-        Ok((host, port, tls, idx))
-    }
-
-    /// Record that a connection to a target was established.
-    pub fn record_connect(&self, target_idx: usize) {
-        if target_idx < self.state.connections.len() {
-            self.state.connections[target_idx].fetch_add(1, Ordering::Relaxed);
         }
     }
-
-    /// Record that a connection to a target was closed.
-    pub fn record_disconnect(&self, target_idx: usize) {
-        if target_idx < self.state.connections.len() {
-            self.state.connections[target_idx].fetch_sub(1, Ordering::Relaxed);
-        }
-    }
-
-    /// Get the current connection count for a target.
-    #[cfg(test)]
-    pub fn connection_count(&self, target_idx: usize) -> u32 {
-        if target_idx < self.state.connections.len() {
-            self.state.connections[target_idx].load(Ordering::Relaxed)
-        } else {
-            0
-        }
-    }
-
-    // --- Private helpers ---
 
     fn select_weighted_random(&self, active_targets: &[(usize, &Target)]) -> usize {
         let total_weight: u32 = active_targets.iter().map(|(_, t)| t.weight).sum();
@@ -967,6 +1245,46 @@ fn fnv1a_hash(data: &[u8]) -> usize {
     hash as usize
 }
 
+fn algorithm_name(algorithm: &Algorithm) -> &'static str {
+    match algorithm {
+        Algorithm::RoundRobin => "round_robin",
+        Algorithm::WeightedRandom => "weighted_random",
+        Algorithm::LeastConnections => "least_connections",
+        Algorithm::IpHash => "ip_hash",
+        Algorithm::UriHash => "uri_hash",
+        Algorithm::HeaderHash { .. } => "header_hash",
+        Algorithm::CookieHash { .. } => "cookie_hash",
+    }
+}
+
+const MAX_ROUTING_HINT_BYTES: usize = 256;
+
+fn enrich_routing_request(request: &mut RoutingRequest) {
+    if request.model.is_none() {
+        request.model = bounded_header(&request.headers, "x-model")
+            .or_else(|| bounded_query_value(&request.path, "model"));
+    }
+    if request.adapter.is_none() {
+        request.adapter = bounded_header(&request.headers, "x-lora-adapter")
+            .or_else(|| bounded_query_value(&request.path, "adapter"));
+    }
+}
+
+fn bounded_header(headers: &http::HeaderMap, name: &str) -> Option<String> {
+    bounded_routing_hint(headers.get(name)?.to_str().ok()?)
+}
+
+fn bounded_query_value(path: &str, name: &str) -> Option<String> {
+    let query = path.split_once('?')?.1;
+    url::form_urlencoded::parse(query.as_bytes())
+        .find(|(key, _)| key == name)
+        .and_then(|(_, value)| bounded_routing_hint(&value))
+}
+
+fn bounded_routing_hint(value: &str) -> Option<String> {
+    (!value.is_empty() && value.len() <= MAX_ROUTING_HINT_BYTES).then(|| value.to_string())
+}
+
 /// Extract a named cookie value from the Cookie header.
 fn extract_cookie(headers: &http::HeaderMap, cookie_name: &str) -> String {
     headers
@@ -991,6 +1309,118 @@ fn extract_cookie(headers: &http::HeaderMap, cookie_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::action::routing::RoutingStrategyRegistration;
+
+    struct StrictConfigStrategy;
+
+    impl RoutingStrategy for StrictConfigStrategy {
+        fn select(&self, _request: &RoutingRequest, targets: &[TargetState]) -> Option<usize> {
+            (!targets.is_empty()).then_some(0)
+        }
+
+        fn name(&self) -> &str {
+            "strict-config-test"
+        }
+    }
+
+    fn build_strict_config_strategy(
+        value: &serde_json::Value,
+    ) -> anyhow::Result<Arc<dyn RoutingStrategy>> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct StrictConfig {
+            enabled: bool,
+        }
+
+        let config: StrictConfig = serde_json::from_value(value.clone())?;
+        anyhow::ensure!(config.enabled, "strict test strategy must be enabled");
+        Ok(Arc::new(StrictConfigStrategy))
+    }
+
+    inventory::submit! {
+        RoutingStrategyRegistration {
+            name: "strict-config-test",
+            build: build_strict_config_strategy,
+        }
+    }
+
+    struct DeferringStrategy;
+
+    impl RoutingStrategy for DeferringStrategy {
+        fn select(&self, _request: &RoutingRequest, _targets: &[TargetState]) -> Option<usize> {
+            None
+        }
+
+        fn name(&self) -> &str {
+            "deferring-test"
+        }
+    }
+
+    struct PathCapturingDeferringStrategy {
+        paths: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl RoutingStrategy for PathCapturingDeferringStrategy {
+        fn select(&self, request: &RoutingRequest, _targets: &[TargetState]) -> Option<usize> {
+            self.paths
+                .lock()
+                .expect("path capture lock")
+                .push(request.path.clone());
+            None
+        }
+
+        fn name(&self) -> &str {
+            "path-capturing-deferring-test"
+        }
+    }
+
+    struct OutOfRangeStrategy;
+
+    impl RoutingStrategy for OutOfRangeStrategy {
+        fn select(&self, _request: &RoutingRequest, targets: &[TargetState]) -> Option<usize> {
+            Some(targets.len())
+        }
+
+        fn name(&self) -> &str {
+            "out-of-range-test"
+        }
+    }
+
+    struct ProjectionGuardStrategy {
+        forbidden_url: &'static str,
+        saw_forbidden: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl RoutingStrategy for ProjectionGuardStrategy {
+        fn select(&self, _request: &RoutingRequest, targets: &[TargetState]) -> Option<usize> {
+            if targets
+                .iter()
+                .any(|target| target.url == self.forbidden_url)
+            {
+                self.saw_forbidden.store(true, Ordering::Relaxed);
+            }
+            Some(0)
+        }
+
+        fn name(&self) -> &str {
+            "projection-guard-test"
+        }
+    }
+
+    struct InvocationTrackingStrategy {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl RoutingStrategy for InvocationTrackingStrategy {
+        fn select(&self, _request: &RoutingRequest, _targets: &[TargetState]) -> Option<usize> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Some(0)
+        }
+
+        fn name(&self) -> &str {
+            "invocation-tracking-test"
+        }
+    }
 
     fn make_lb(json: serde_json::Value) -> LoadBalancerAction {
         LoadBalancerAction::from_config(json).unwrap()
@@ -1221,6 +1651,72 @@ mod tests {
     }
 
     #[test]
+    fn target_metadata_rejects_oversized_and_deep_values() {
+        let oversized = LoadBalancerAction::from_config(serde_json::json!({
+            "targets": [{
+                "url": "http://a:8080",
+                "metadata": {"payload": "x".repeat(17 * 1024)}
+            }]
+        }))
+        .expect_err("oversized metadata must be rejected");
+        assert!(
+            oversized.to_string().contains("serialized size"),
+            "unexpected error: {oversized}"
+        );
+
+        let mut nested = serde_json::json!("leaf");
+        for _ in 0..9 {
+            nested = serde_json::json!([nested]);
+        }
+        let too_deep = LoadBalancerAction::from_config(serde_json::json!({
+            "targets": [{
+                "url": "http://a:8080",
+                "metadata": {"nested": nested}
+            }]
+        }))
+        .expect_err("deeply nested metadata must be rejected");
+        assert!(
+            too_deep.to_string().contains("nesting depth"),
+            "unexpected error: {too_deep}"
+        );
+    }
+
+    #[test]
+    fn third_party_strategy_receives_exact_user_config() {
+        let lb = LoadBalancerAction::from_config_for_origin(
+            serde_json::json!({
+                "targets": [{"url": "http://a:8080"}],
+                "strategy": "strict-config-test",
+                "strategy_config": {"enabled": true}
+            }),
+            "workspace-a/origin-a",
+        )
+        .expect("internal routing context must not enter a third-party config");
+
+        let selection = lb
+            .select_target_for_request(RoutingRequest::new("GET", "/", "example.com"))
+            .expect("strict strategy selection");
+        assert_eq!(selection.selection_method, "strict-config-test");
+    }
+
+    #[test]
+    fn bandit_rejects_a_257_target_pool_at_compile_time() {
+        let targets: Vec<serde_json::Value> = (0..257)
+            .map(|index| serde_json::json!({"url": format!("http://target-{index}:8080")}))
+            .collect();
+        let error = LoadBalancerAction::from_config(serde_json::json!({
+            "targets": targets,
+            "strategy": "bandit"
+        }))
+        .expect_err("a bandit pool above the retained arm bound must be rejected");
+
+        assert!(
+            error.to_string().contains("at most 256 targets"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn from_config_missing_targets_fails() {
         let result = LoadBalancerAction::from_config(serde_json::json!({}));
         assert!(result.is_err());
@@ -1335,6 +1831,65 @@ mod tests {
         }
     }
 
+    #[test]
+    fn uri_hash_fallback_ignores_query_without_strategy() {
+        let lb = make_lb(serde_json::json!({
+            "targets": [
+                {"url": "http://a:8080"},
+                {"url": "http://b:8080"},
+                {"url": "http://c:8080"},
+                {"url": "http://d:8080"},
+                {"url": "http://e:8080"}
+            ],
+            "algorithm": "uri_hash"
+        }));
+
+        let first = lb
+            .select_target_for_request(RoutingRequest::new("GET", "/resource?a=1", "example.com"))
+            .expect("first URI hash selection");
+        let second = lb
+            .select_target_for_request(RoutingRequest::new("GET", "/resource?a=2", "example.com"))
+            .expect("second URI hash selection");
+
+        assert_eq!(first.target_index, second.target_index);
+        assert_eq!(first.selection_method, "uri_hash");
+        assert_eq!(second.selection_method, "uri_hash");
+    }
+
+    #[test]
+    fn uri_hash_fallback_ignores_query_after_strategy_deferral() {
+        let paths = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut lb = make_lb(serde_json::json!({
+            "targets": [
+                {"url": "http://a:8080"},
+                {"url": "http://b:8080"},
+                {"url": "http://c:8080"},
+                {"url": "http://d:8080"},
+                {"url": "http://e:8080"}
+            ],
+            "algorithm": "uri_hash"
+        }));
+        lb.strategy_name = Some("path-capturing-deferring-test");
+        lb.strategy = Some(Arc::new(PathCapturingDeferringStrategy {
+            paths: Arc::clone(&paths),
+        }));
+
+        let first = lb
+            .select_target_for_request(RoutingRequest::new("GET", "/resource?a=1", "example.com"))
+            .expect("first deferred URI hash selection");
+        let second = lb
+            .select_target_for_request(RoutingRequest::new("GET", "/resource?a=2", "example.com"))
+            .expect("second deferred URI hash selection");
+
+        assert_eq!(first.target_index, second.target_index);
+        assert_eq!(first.selection_method, "uri_hash");
+        assert_eq!(second.selection_method, "uri_hash");
+        assert_eq!(
+            *paths.lock().expect("path capture lock"),
+            vec!["/resource?a=1", "/resource?a=2"]
+        );
+    }
+
     // --- least_connections tests ---
 
     #[test]
@@ -1381,6 +1936,384 @@ mod tests {
 
         lb.record_disconnect(0);
         assert_eq!(lb.connection_count(0), 1);
+    }
+
+    #[test]
+    fn first_healthy_strategy_selects_first_eligible_target() {
+        let lb = make_lb(serde_json::json!({
+            "targets": [
+                {"url": "http://first:8080"},
+                {"url": "http://second:8080"}
+            ],
+            "algorithm": "least_connections",
+            "strategy": "first-healthy"
+        }));
+        lb.record_connect(0);
+
+        let selection = lb
+            .select_target_for_request(RoutingRequest::new("GET", "/", "example.com"))
+            .expect("strategy selection should succeed");
+
+        assert_eq!(selection.target_index, 0);
+        assert_eq!(selection.selection_method, "first-healthy");
+    }
+
+    #[test]
+    fn omitted_strategy_preserves_round_robin_default() {
+        let lb = make_lb(serde_json::json!({
+            "targets": [
+                {"url": "http://first:8080"},
+                {"url": "http://second:8080"}
+            ]
+        }));
+
+        let first = lb
+            .select_target_for_request(RoutingRequest::new("GET", "/", "example.com"))
+            .expect("first selection should succeed");
+        let second = lb
+            .select_target_for_request(RoutingRequest::new("GET", "/", "example.com"))
+            .expect("second selection should succeed");
+
+        assert_eq!(first.target_index, 0);
+        assert_eq!(second.target_index, 1);
+        assert_eq!(first.selection_method, "round_robin");
+        assert_eq!(second.selection_method, "round_robin");
+    }
+
+    #[test]
+    fn gpu_aware_strategy_uses_eligible_target_metadata() {
+        let lb = make_lb(serde_json::json!({
+            "targets": [
+                {
+                    "url": "http://busy:8080",
+                    "metadata": {"gpu_utilization": 0.8}
+                },
+                {
+                    "url": "http://idle:8080",
+                    "metadata": {"gpu_utilization": 0.2}
+                }
+            ],
+            "strategy": "gpu-aware"
+        }));
+
+        let selection = lb
+            .select_target_for_request(RoutingRequest::new("POST", "/v1/chat", "ai.example.com"))
+            .expect("GPU-aware selection should succeed");
+
+        assert_eq!(selection.target_index, 1);
+        assert_eq!(selection.selection_method, "gpu-aware");
+    }
+
+    #[test]
+    fn target_metadata_can_be_updated_without_rebuilding_the_action() {
+        let lb = make_lb(serde_json::json!({
+            "targets": [
+                {
+                    "url": "http://busy:8080",
+                    "metadata": {"gpu_utilization": 0.8}
+                },
+                {
+                    "url": "http://idle:8080",
+                    "metadata": {"gpu_utilization": 0.2}
+                }
+            ],
+            "strategy": "gpu-aware"
+        }));
+        let before = lb
+            .target_metadata_snapshot(0)
+            .expect("configured target metadata snapshot");
+        assert_eq!(
+            lb.select_target_for_request(RoutingRequest::new("POST", "/v1/chat", "ai.example.com"))
+                .expect("initial GPU-aware selection")
+                .target_index,
+            1
+        );
+
+        lb.update_target_metadata(
+            0,
+            HashMap::from([("gpu_utilization".to_string(), serde_json::json!(0.05))]),
+        )
+        .expect("bounded metadata update");
+
+        let after = lb
+            .target_metadata_snapshot(0)
+            .expect("updated target metadata snapshot");
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert_eq!(after.get("gpu_utilization"), Some(&serde_json::json!(0.05)));
+        assert_eq!(
+            lb.select_target_for_request(RoutingRequest::new("POST", "/v1/chat", "ai.example.com"))
+                .expect("selection with updated metadata")
+                .target_index,
+            0
+        );
+
+        let invalid = HashMap::from([(
+            "payload".to_string(),
+            serde_json::json!("x".repeat(17 * 1024)),
+        )]);
+        assert!(lb.update_target_metadata(0, invalid).is_err());
+        assert!(Arc::ptr_eq(
+            &after,
+            &lb.target_metadata_snapshot(0)
+                .expect("rejected updates must preserve the current snapshot")
+        ));
+    }
+
+    #[test]
+    fn selection_method_uses_closed_registry_name() {
+        let lb = make_lb(serde_json::json!({
+            "targets": [{"url": "http://first:8080"}],
+            "strategy": "bandit",
+            "strategy_config": {
+                "name": "tenant-controlled-label",
+                "epsilon": 0.0
+            }
+        }));
+
+        let selection = lb
+            .select_target_for_request(RoutingRequest::new("GET", "/", "example.com"))
+            .expect("bandit selection should succeed");
+
+        assert_eq!(selection.selection_method, "bandit");
+    }
+
+    #[test]
+    fn lora_aware_strategy_reads_adapter_header_and_selects_warm_target() {
+        let lb = make_lb(serde_json::json!({
+            "targets": [
+                {
+                    "url": "http://cold:8080",
+                    "metadata": {"loaded_adapters": []}
+                },
+                {
+                    "url": "http://warm:8080",
+                    "metadata": {"loaded_adapters": ["support"]}
+                }
+            ],
+            "strategy": "lora-aware"
+        }));
+        let mut request = RoutingRequest::new("POST", "/v1/chat", "ai.example.com");
+        request
+            .headers
+            .insert("x-lora-adapter", "support".parse().unwrap());
+
+        let selection = lb
+            .select_target_for_request(request)
+            .expect("LoRA-aware selection should succeed");
+
+        assert_eq!(selection.target_index, 1);
+        assert_eq!(selection.selection_method, "lora-aware");
+    }
+
+    #[test]
+    fn deferring_strategy_falls_back_to_configured_algorithm() {
+        let mut lb = make_lb(serde_json::json!({
+            "targets": [
+                {"url": "http://busy:8080"},
+                {"url": "http://idle:8080"}
+            ],
+            "algorithm": "least_connections"
+        }));
+        lb.strategy_name = Some("deferring-test");
+        lb.strategy = Some(Arc::new(DeferringStrategy));
+        lb.record_connect(0);
+
+        let selection = lb
+            .select_target_for_request(RoutingRequest::new("GET", "/", "example.com"))
+            .expect("algorithm fallback should succeed");
+
+        assert_eq!(selection.target_index, 1);
+        assert_eq!(selection.selection_method, "least_connections");
+    }
+
+    #[test]
+    fn out_of_range_strategy_result_falls_back_without_panicking() {
+        let mut lb = make_lb(serde_json::json!({
+            "targets": [
+                {"url": "http://busy:8080"},
+                {"url": "http://idle:8080"}
+            ],
+            "algorithm": "least_connections"
+        }));
+        lb.strategy_name = Some("out-of-range-test");
+        lb.strategy = Some(Arc::new(OutOfRangeStrategy));
+        lb.record_connect(0);
+
+        let selection = lb
+            .select_target_for_request(RoutingRequest::new("GET", "/", "example.com"))
+            .expect("invalid strategy result should use algorithm fallback");
+
+        assert_eq!(selection.target_index, 1);
+        assert_eq!(selection.selection_method, "least_connections");
+    }
+
+    #[test]
+    fn filtered_targets_never_appear_in_strategy_projection() {
+        let saw_filtered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut lb = make_lb(serde_json::json!({
+            "targets": [
+                {"url": "http://backup:8080", "backup": true},
+                {"url": "http://eligible:8080"}
+            ]
+        }));
+        lb.strategy_name = Some("projection-guard-test");
+        lb.strategy = Some(Arc::new(ProjectionGuardStrategy {
+            forbidden_url: "http://backup:8080",
+            saw_forbidden: Arc::clone(&saw_filtered),
+        }));
+
+        let selection = lb
+            .select_target_for_request(RoutingRequest::new("GET", "/", "example.com"))
+            .expect("eligible target selection should succeed");
+
+        assert_eq!(selection.target_index, 1);
+        assert!(
+            !saw_filtered.load(Ordering::Relaxed),
+            "backup target must be removed before strategy projection"
+        );
+    }
+
+    #[test]
+    fn strategy_is_skipped_when_strict_eligibility_filter_rejects_every_target() {
+        #[derive(Debug, Clone, Copy)]
+        enum Rejection {
+            Health,
+            Breaker,
+            Outlier,
+        }
+
+        for rejection in [Rejection::Health, Rejection::Breaker, Rejection::Outlier] {
+            let mut config = serde_json::json!({
+                "targets": [
+                    {"url": "http://first:8080"},
+                    {"url": "http://second:8080"}
+                ]
+            });
+            match rejection {
+                Rejection::Health => {}
+                Rejection::Breaker => {
+                    config["circuit_breaker"] = serde_json::json!({
+                        "failure_threshold": 1,
+                        "success_threshold": 1,
+                        "open_duration_secs": 60
+                    });
+                }
+                Rejection::Outlier => {
+                    config["outlier_detection"] = serde_json::json!({
+                        "threshold": 0.0,
+                        "window_secs": 60,
+                        "min_requests": 1,
+                        "ejection_duration_secs": 60
+                    });
+                }
+            }
+
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut lb = make_lb(config);
+            lb.strategy_name = Some("invocation-tracking-test");
+            lb.strategy = Some(Arc::new(InvocationTrackingStrategy {
+                calls: Arc::clone(&calls),
+            }));
+            match rejection {
+                Rejection::Health => {
+                    lb.set_target_health(0, false);
+                    lb.set_target_health(1, false);
+                }
+                Rejection::Breaker => {
+                    lb.record_breaker_failure(0);
+                    lb.record_breaker_failure(1);
+                }
+                Rejection::Outlier => {
+                    lb.record_target_failure(0);
+                    lb.record_target_failure(1);
+                }
+            }
+
+            let selection = lb
+                .select_target_for_request(RoutingRequest::new("GET", "/", "example.com"))
+                .expect("legacy algorithm fallback should select a target");
+
+            assert_eq!(
+                selection.selection_method, "round_robin",
+                "{rejection:?} must preserve legacy algorithm fallback"
+            );
+            assert_eq!(
+                calls.load(Ordering::Relaxed),
+                0,
+                "strategy must not see a pool rejected by {rejection:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stable_origin_namespace_reuses_bandit_outcomes_after_recompile() {
+        let config = serde_json::json!({
+            "targets": [
+                {"url": "http://first:8080"},
+                {"url": "http://second:8080"}
+            ],
+            "strategy": "bandit",
+            "strategy_config": {"epsilon": 0.0}
+        });
+        let first =
+            LoadBalancerAction::from_config_for_origin(config.clone(), "task2-reload-persistence")
+                .expect("first action should compile");
+        let request = || RoutingRequest::new("GET", "/", "example.com");
+        let initial = first
+            .select_target_for_request(request())
+            .expect("initial selection should succeed");
+        assert_eq!(initial.target_index, 0);
+        first.record_strategy_outcome(
+            initial.target_index,
+            RoutingOutcome {
+                success: false,
+                latency: std::time::Duration::from_millis(10),
+            },
+        );
+
+        let recompiled =
+            LoadBalancerAction::from_config_for_origin(config.clone(), "task2-reload-persistence")
+                .expect("recompiled action should compile");
+        let next = recompiled
+            .select_target_for_request(request())
+            .expect("selection after reload should succeed");
+
+        assert_eq!(
+            next.target_index, 1,
+            "recompiled action should reuse feedback for the stable namespace"
+        );
+
+        let other_origin = LoadBalancerAction::from_config_for_origin(config, "task2-other-origin")
+            .expect("distinct origin should compile");
+        assert_eq!(
+            other_origin
+                .select_target_for_request(request())
+                .expect("distinct-origin selection should succeed")
+                .target_index,
+            0,
+            "a distinct origin must not inherit another origin's feedback"
+        );
+
+        let changed_pool = LoadBalancerAction::from_config_for_origin(
+            serde_json::json!({
+                "targets": [
+                    {"url": "http://first:8080"},
+                    {"url": "http://replacement:8080"}
+                ],
+                "strategy": "bandit",
+                "strategy_config": {"epsilon": 0.0}
+            }),
+            "task2-reload-persistence",
+        )
+        .expect("changed target pool should compile");
+        assert_eq!(
+            changed_pool
+                .select_target_for_request(request())
+                .expect("changed-pool selection should succeed")
+                .target_index,
+            0,
+            "a changed target pool must start with a fresh namespace"
+        );
     }
 
     // --- weighted distribution tests ---
@@ -1748,6 +2681,7 @@ mod tests {
                 zone: Some("us-east-1a".into()),
                 health_check: None,
                 host_override: None,
+                metadata: HashMap::new(),
                 forwarding: Default::default(),
             },
             Target {
@@ -1759,6 +2693,7 @@ mod tests {
                 zone: Some("us-west-2a".into()),
                 health_check: None,
                 host_override: None,
+                metadata: HashMap::new(),
                 forwarding: Default::default(),
             },
             Target {
@@ -1770,6 +2705,7 @@ mod tests {
                 zone: Some("us-east-1a".into()),
                 health_check: None,
                 host_override: None,
+                metadata: HashMap::new(),
                 forwarding: Default::default(),
             },
         ];
@@ -1789,6 +2725,7 @@ mod tests {
                 zone: Some("eu-west-1a".into()),
                 health_check: None,
                 host_override: None,
+                metadata: HashMap::new(),
                 forwarding: Default::default(),
             },
             Target {
@@ -1800,6 +2737,7 @@ mod tests {
                 zone: Some("eu-central-1a".into()),
                 health_check: None,
                 host_override: None,
+                metadata: HashMap::new(),
                 forwarding: Default::default(),
             },
         ];
@@ -1824,6 +2762,7 @@ mod tests {
                 zone: None,
                 health_check: None,
                 host_override: None,
+                metadata: HashMap::new(),
                 forwarding: Default::default(),
             },
             Target {
@@ -1835,6 +2774,7 @@ mod tests {
                 zone: Some("us-east-1a".into()),
                 health_check: None,
                 host_override: None,
+                metadata: HashMap::new(),
                 forwarding: Default::default(),
             },
         ];

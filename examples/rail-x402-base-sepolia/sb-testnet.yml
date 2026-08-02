@@ -1,42 +1,84 @@
-# sb-testnet.yml: Base Sepolia override for the rail-x402-base-sepolia
-# example.
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# rail-x402-base-sepolia - the same route pointed at a real facilitator.
 #
-# Identical to sb.yml except:
+# This file is manual. CI never runs it, nothing here spends funds on your
+# behalf, and no credential is committed. Four fields have to be replaced
+# with values your facilitator publishes before it settles anything:
 #
-# 1. The x402 facilitator URL points at the LF-stewarded Base Sepolia
-#    endpoint (https://, not the local mock).
-# 2. The merchant `pay_to` address is sourced from the
-#    `MERCHANT_ADDRESS` environment variable interpolation; the demo
-#    address in sb.yml never holds real funds.
-# 3. The quote-token signing key reads from `secret_ref.env` rather
-#    than the inline seed_hex so production keys never land in YAML.
+#   rails.x402.facilitators[0].facilitator_url - the facilitator's
+#       complete API root over HTTPS. The adapter appends exactly
+#       `/verify` or `/settle` and nothing else.
+#   rails.x402.network  - CAIP-2 identifier for the chain you settle on.
+#   rails.x402.asset    - the asset contract on that network.
+#   rails.x402.pay_to   - your own receive address on that network.
 #
-# To run:
+# Validate it without holding any of its secrets:
+#   sbproxy validate -f examples/rail-x402-base-sepolia/sb-testnet.yml
 #
-#   1. Create `.env.testnet` next to docker-compose.yml (see the
-#      README's "Swapping in the Base Sepolia facilitator" section):
-#        MERCHANT_ADDRESS=0xYOUR_BASE_SEPOLIA_ADDRESS
-#        SBPROXY_QUOTE_TOKEN_SEED_HEX=<output of: openssl rand -hex 32>
-#   2. docker compose --env-file .env.testnet up -d --wait
+# Serve it:
+#   export SBPROXY_PAYMENT_BINDING_KEY="$(openssl rand -hex 32)"
+#   sbproxy serve -f examples/rail-x402-base-sepolia/sb-testnet.yml
 #
-# Then point the proxy at this file by mounting it as
-# /etc/sbproxy/sb.yml inside the container (override
-# `volumes:` in docker-compose.yml or use an override file).
+# You also need a client that can produce an x402 `exact` payload for the
+# scheme your facilitator verifies. See docs/402-challenge.md for the
+# exact envelope the proxy accepts.
 
 proxy:
   http_bind_port: 8080
+
+  payments:
+    state_path: /var/lib/sbproxy/payments.sqlite3
+    # `env:NAME` reads the exported variable at startup with no other
+    # configuration; a `secret://<backend>/<name>` URI would need a
+    # backend under proxy.secrets.backends before the proxy boots.
+    challenge_binding_key: env:SBPROXY_PAYMENT_BINDING_KEY
+    authorization_timeout_ms: 2000
+    max_body_bytes: 1048576
+
+    worker:
+      reconcile_interval_ms: 1000
+      max_reconcile_batch: 32
+      shutdown_timeout_ms: 5000
+
+    rails:
+      x402:
+        scheme: exact
+        # REPLACE: the chain you settle on, as a CAIP-2 identifier.
+        network: "eip155:84532"
+        # REPLACE: the asset contract on that network.
+        asset: "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
+        quote_currency: USD
+        asset_decimals: 6
+        # REPLACE: your own receive address. The placeholder below
+        # receives nothing and belongs to nobody.
+        pay_to: "0x1111111111111111111111111111111111111111"
+        max_timeout_seconds: 60
+        extra:
+          name: USDC
+          version: "2"
+        # REPLACE: the API root your facilitator publishes. HTTPS only,
+        # no query, no fragment, no `/verify` or `/settle` suffix.
+        facilitators:
+          - facilitator_url: https://facilitator.example/api
+        verify_timeout_ms: 700
+        settle_timeout_ms: 1200
+        breaker:
+          failure_threshold: 3
+          open_ms: 5000
+          half_open_max: 1
 
 origins:
   "blog.test.sbproxy.dev":
     action:
       type: proxy
-      url: http://mock-origin:80
+      url: https://test.sbproxy.dev
 
     policies:
       - type: ai_crawl_control
         price: 0.001
         currency: USD
         header: crawler-payment
+
         crawler_user_agents:
           - GPTBot
           - ChatGPT-User
@@ -46,6 +88,10 @@ origins:
           - PerplexityBot
           - Google-Extended
 
+        free_paths:
+          - /robots.txt
+          - /health
+
         tiers:
           - route_pattern: /article*
             price:
@@ -53,25 +99,3 @@ origins:
               currency: USD
             content_shape: html
             paywall_position: top_of_page
-
-        rails:
-          x402:
-            chain: base-sepolia
-            # LF-stewarded Base Sepolia facilitator. The proxy talks
-            # to this URL only when the agent posts a redemption; the
-            # 402 emission path itself does not contact the
-            # facilitator.
-            facilitator: https://facilitator.base-sepolia.x402.org
-            asset: USDC
-            pay_to: "${MERCHANT_ADDRESS}"
-            version: "2"
-
-        quote_token:
-          key_id: x402-base-sepolia-prod-2026
-          # Production key sourced from env. The variable holds a
-          # 64-char hex string (32 raw bytes). Use `openssl rand
-          # -hex 32` to mint a fresh seed.
-          secret_ref:
-            env: SBPROXY_QUOTE_TOKEN_SEED_HEX
-          issuer: "https://blog.test.sbproxy.dev"
-          default_ttl_seconds: 300

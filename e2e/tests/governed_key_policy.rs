@@ -21,6 +21,7 @@ const STRICT_A_HOST: &str = "strict-a.localhost";
 const STRICT_B_HOST: &str = "strict-b.localhost";
 const COMPAT_HOST: &str = "compat.localhost";
 const SELECTOR_HOST: &str = "selector.localhost";
+const COMPRESSION_CEL_HOST: &str = "compression-cel.localhost";
 const JWT_SECRET: &str = "governed-key-policy-jwt-secret";
 
 struct TestWorld {
@@ -157,6 +158,35 @@ origins:
           allow_private_base_url: true
           default_model: gpt-client
           models: [gpt-allowed, gpt-blocked, gpt-route]
+      compression:
+        levers:
+          - type: window_fit
+            completion_reserve_tokens: 0
+            input_budget_tokens: 360
+        profiles:
+          compact:
+            levers:
+              - type: window_fit
+                completion_reserve_tokens: 0
+                input_budget_tokens: 96
+          phase1:
+            levers:
+              - type: rag_select
+                min_tokens: 1
+                ranking: supplied
+                max_chunks: 1
+                min_relevance_percent: 0
+                drop_empty: false
+              - type: compact_serialization
+                min_tokens: 1
+                tabular:
+                  enabled: true
+                  min_rows: 8
+              - type: position_reorder
+                ranking: supplied
+              - type: window_fit
+                completion_reserve_tokens: 0
+                input_budget_tokens: 96
     policies:
       - type: prompt_injection_v2
         action: block
@@ -218,6 +248,42 @@ origins:
       type: jwt
       secret: {JWT_SECRET}
       algorithms: [HS256]
+  "{COMPRESSION_CEL_HOST}":
+    tenant_id: tenant-a
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          provider_type: openai
+          api_key: sk-openai
+          base_url: "{openai_base}"
+          allow_private_base_url: true
+          default_model: gpt-client
+          models: [gpt-client]
+      compression:
+        levers: []
+        profiles:
+          phase1:
+            levers:
+              - type: rag_select
+                min_tokens: 1
+                ranking: supplied
+                max_chunks: 1
+                min_relevance_percent: 0
+                drop_empty: false
+              - type: compact_serialization
+                min_tokens: 1
+                tabular:
+                  enabled: true
+                  min_rows: 8
+              - type: position_reorder
+                ranking: supplied
+              - type: window_fit
+                completion_reserve_tokens: 0
+                input_budget_tokens: 96
+      ai_policy:
+        expression: 'ai.tokens.input_est > 96 ? ["compression:phase1"] : ["compression:off"]'
+        on_error: allow
 "#,
         store_path = store_path.display(),
         usage_path = usage_path.display(),
@@ -844,6 +910,171 @@ fn dynamic_record_enforces_model_provider_route_and_caller_tool_policy() {
 }
 
 #[test]
+fn dynamic_compression_profile_changes_context_and_header_overrides_it() {
+    let world = start_world();
+    let disabled = mint(
+        &world,
+        json!({"name": "complete-context", "compression_profile": "off"}),
+    );
+    let route_default = mint(
+        &world,
+        json!({"name": "default-context", "compression_profile": "on"}),
+    );
+    let compact = mint(
+        &world,
+        json!({"name": "compact-context", "compression_profile": "compact"}),
+    );
+    let phase1 = mint(
+        &world,
+        json!({"name": "phase1-context", "compression_profile": "phase1"}),
+    );
+    let messages = (0..10)
+        .map(|index| {
+            json!({
+                "role": if index % 2 == 0 { "user" } else { "assistant" },
+                "content": format!("turn {index}: {}", "historical context ".repeat(40))
+            })
+        })
+        .chain(std::iter::once(json!({
+            "role": "user",
+            "content": "answer using the newest surviving context"
+        })))
+        .collect::<Vec<_>>();
+    let body = json!({"model": "gpt-client", "messages": messages});
+    let marked_content = concat!(
+        "unmarked prefix\n",
+        "<sbproxy-retrieval>\n",
+        "<sbproxy-query>\nwhich deployment evidence matters\n</sbproxy-query>\n",
+        "<sbproxy-chunk id=\"distractor\" score=\"0.1\" format=\"text\">\n",
+        "unrelated archive material repeated repeated repeated\n",
+        "</sbproxy-chunk>\n",
+        "<sbproxy-chunk id=\"required\" score=\"0.9\" format=\"text\">\n",
+        "required deployment evidence survives\n",
+        "</sbproxy-chunk>\n",
+        "</sbproxy-retrieval>\n",
+        "unmarked suffix"
+    );
+    let marked_body = json!({
+        "model": "gpt-client",
+        "messages": [{"role": "user", "content": marked_content}]
+    });
+
+    let before = capture_counts(&world);
+    assert_status(
+        &chat(&world, POLICY_HOST, Some(&disabled.token), &body),
+        200,
+        "a governed off selector must dispatch",
+    );
+    let disabled_body = capture_json(&only_new_capture(&world, before));
+    assert_eq!(
+        disabled_body["messages"], body["messages"],
+        "the governed off selector must preserve the complete caller context"
+    );
+
+    let before = capture_counts(&world);
+    assert_status(
+        &chat(&world, POLICY_HOST, Some(&route_default.token), &body),
+        200,
+        "a governed on selector must dispatch through the route default",
+    );
+    let default_body = capture_json(&only_new_capture(&world, before));
+
+    let before = capture_counts(&world);
+    assert_status(
+        &chat(&world, POLICY_HOST, Some(&compact.token), &body),
+        200,
+        "a governed compression profile must dispatch",
+    );
+    let compact_capture = only_new_capture(&world, before);
+    let compact_body = capture_json(&compact_capture);
+    assert!(
+        compact_body["messages"].as_array().unwrap().len()
+            < body["messages"].as_array().unwrap().len(),
+        "the governed compact profile must reduce the forwarded context"
+    );
+    assert_eq!(
+        compact_body["messages"].as_array().unwrap().last(),
+        body["messages"].as_array().unwrap().last(),
+        "window fitting must preserve the newest message"
+    );
+    assert!(
+        default_body["messages"].as_array().unwrap().len()
+            > compact_body["messages"].as_array().unwrap().len(),
+        "on and the named compact profile must forward visibly different context"
+    );
+    assert!(
+        default_body["messages"].as_array().unwrap().len()
+            < body["messages"].as_array().unwrap().len(),
+        "the route default must be distinct from off"
+    );
+
+    let before = capture_counts(&world);
+    assert_status(
+        &chat(&world, POLICY_HOST, Some(&phase1.token), &marked_body),
+        200,
+        "a governed Phase 1 profile must dispatch",
+    );
+    let phase1_capture = only_new_capture(&world, before);
+    let phase1_body = capture_json(&phase1_capture);
+    assert_ne!(
+        phase1_body["messages"][0]["content"], marked_body["messages"][0]["content"],
+        "the governed Phase 1 profile must change explicitly marked context"
+    );
+    assert!(
+        phase1_body["messages"][0]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("required deployment evidence survives")),
+        "the governed Phase 1 profile must retain required evidence"
+    );
+
+    let authorization = format!("Bearer {}", phase1.token);
+    let before = capture_counts(&world);
+    let response = world
+        .proxy
+        .post_json(
+            "/v1/chat/completions",
+            POLICY_HOST,
+            &marked_body,
+            &[
+                ("authorization", authorization.as_str()),
+                ("x-compression", "off"),
+            ],
+        )
+        .expect("header override request");
+    assert_status(
+        &response,
+        200,
+        "the header must override the governed compression profile",
+    );
+    let uncompressed_capture = only_new_capture(&world, before);
+    assert_eq!(
+        capture_json(&uncompressed_capture)["messages"],
+        marked_body["messages"],
+        "x-compression: off must preserve the complete caller context"
+    );
+    assert!(
+        !uncompressed_capture.headers.contains_key("x-compression"),
+        "the internal selection header must never reach the provider"
+    );
+
+    let before = capture_counts(&world);
+    assert_status(
+        &chat(&world, COMPRESSION_CEL_HOST, None, &body),
+        200,
+        "CEL must select a profile from the pre-compression token estimate",
+    );
+    let cel_capture = only_new_capture(&world, before);
+    assert!(
+        capture_json(&cel_capture)["messages"]
+            .as_array()
+            .unwrap()
+            .len()
+            < body["messages"].as_array().unwrap().len(),
+        "the live CEL-selected profile must reduce the forwarded context"
+    );
+}
+
+#[test]
 fn dynamic_record_enforces_prompt_rates_budget_and_safe_attribution() {
     let world = start_world();
     let injection =
@@ -1032,13 +1263,17 @@ fn dynamic_record_enforces_prompt_rates_budget_and_safe_attribution() {
         "one record budget must not consume another record's bucket",
     );
 
+    // Keep enough room for the prompt-cost reservation introduced by
+    // governed-key monetary preflight. The mock provider records 1,000 input
+    // and 1,000 output tokens, so its settled charge still exhausts this cap
+    // before the second request.
     let cost_budget_a = mint(
         &world,
-        json!({"name": "cost-budget-a", "max_budget_usd": 0.000001}),
+        json!({"name": "cost-budget-a", "max_budget_usd": 0.0001}),
     );
     let cost_budget_b = mint(
         &world,
-        json!({"name": "cost-budget-b", "max_budget_usd": 0.000001}),
+        json!({"name": "cost-budget-b", "max_budget_usd": 0.0001}),
     );
     assert_status(
         &chat(
@@ -1178,26 +1413,6 @@ fn governed_key_requirement_is_origin_scoped_and_tenant_safe() {
         "strict credential denials must happen before dispatch"
     );
 
-    let realtime = http_client()
-        .get(format!("{}/v1/realtime", world.proxy.base_url()))
-        .header("host", STRICT_A_HOST)
-        .header("connection", "upgrade")
-        .header("upgrade", "websocket")
-        .header("sec-websocket-version", "13")
-        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
-        .send()
-        .expect("governed realtime upgrade attempt");
-    assert_eq!(
-        realtime.status().as_u16(),
-        501,
-        "governed realtime must fail closed until it shares common admission"
-    );
-    assert_eq!(
-        total_captures(&world),
-        before,
-        "realtime rejection must not reach an upstream credential"
-    );
-
     assert_status(
         &chat(&world, COMPAT_HOST, None, &body),
         200,
@@ -1205,24 +1420,6 @@ fn governed_key_requirement_is_origin_scoped_and_tenant_safe() {
     );
 
     let lifecycle = mint(&world, json!({"name": "lifecycle"}));
-    let before_method_mutation = total_captures(&world);
-    let method_mutation = http_client()
-        .patch(format!("{}/v1/assistants/asst-1", world.proxy.base_url()))
-        .header("host", STRICT_A_HOST)
-        .header("authorization", format!("Bearer {}", lifecycle.token))
-        .json(&json!({"model": "gpt-client"}))
-        .send()
-        .expect("governed method-aware mutation");
-    assert_eq!(
-        method_mutation.status().as_u16(),
-        501,
-        "governed non-POST mutations must fail closed until they run the full policy pipeline"
-    );
-    assert_eq!(
-        total_captures(&world),
-        before_method_mutation,
-        "method-aware rejection must happen before provider dispatch"
-    );
     assert_status(
         &chat(&world, STRICT_A_HOST, Some(&lifecycle.token), &body),
         200,

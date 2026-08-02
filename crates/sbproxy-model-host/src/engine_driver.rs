@@ -13,8 +13,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AcceleratorKind, ArtifactFormat, EngineKind, EngineProcess, EngineProvisioning, FileJobStore,
-    FitPlan, ReadyArtifact, ResolvedArtifact, WorkerProfile,
+    AcceleratorKind, ArtifactFormat, ChunkedPrefill, EngineKind, EngineProcess, EngineProvisioning,
+    FileJobStore, FitPlan, ReadyArtifact, ResolvedArtifact, WorkerProfile,
 };
 
 /// Whether an engine can run on the detected worker.
@@ -89,6 +89,36 @@ pub struct ProvisionedEngine {
     pub provisioning: EngineProvisioning,
 }
 
+/// Runtime-owned engine tuning knobs sourced from the served-model config
+/// and emitted by the driver after the operator allowlist, so operators
+/// cannot set them directly (the flags are not on the `extra_args`
+/// allowlist). These are vLLM passthroughs today; a non-vLLM driver
+/// ignores them and the desired-state validator rejects a non-vLLM model
+/// that sets them. `Default` leaves every knob unset.
+#[derive(Debug, Clone, Default)]
+pub struct EngineTuning {
+    /// Chunked prefill: `--enable-chunked-prefill` plus
+    /// `--max-num-batched-tokens` from the explicit chunk size or, when
+    /// only `target_ttft_ms` is set, from the driver's conservative TTFT
+    /// auto-tune (WOR-1678). Neither set leaves the engine default.
+    pub chunked_prefill: Option<ChunkedPrefill>,
+    /// vLLM auto tool-choice parser: `--enable-auto-tool-choice
+    /// --tool-call-parser <name>`.
+    pub tool_call_parser: Option<String>,
+    /// CPU swap pool in GiB: `--swap-space`.
+    pub swap_space_gib: Option<u64>,
+    /// Weights kept in CPU RAM in GiB: `--cpu-offload-gb`.
+    pub cpu_offload_gib: Option<u64>,
+    /// LoRA adapters served over the base model (WOR-1945): each becomes a
+    /// vLLM `--lora-modules <name>=<path>` alongside `--enable-lora`, so a
+    /// client can request the adapter by name over one resident base.
+    /// Empty leaves LoRA off.
+    pub lora_adapters: Vec<crate::config::LoraAdapter>,
+    /// vLLM adapter-slot capacity (`--max-loras`): the maximum adapters
+    /// resident at once. Ignored when `lora_adapters` is empty.
+    pub max_loras: usize,
+}
+
 /// Typed launch input that can only be constructed from verified local bytes.
 #[derive(Debug, Clone)]
 pub struct LaunchRequest {
@@ -110,8 +140,15 @@ pub struct LaunchRequest {
     pub kv_quant: crate::KvCacheQuant,
     /// Additional allowlisted engine arguments.
     pub extra_args: Vec<String>,
+    /// Runtime-owned engine tuning knobs (chunked prefill, tool-call
+    /// parser, CPU KV swap, weight offload) emitted after the operator
+    /// allowlist.
+    pub engine_tuning: EngineTuning,
     /// Maximum concurrent sequences accounted for by admission and KV memory.
     pub max_concurrency: u32,
+    /// The task the served model performs (WOR-1908). Drives the engine's
+    /// runtime-owned `--task` flag; defaults to chat.
+    pub modality: crate::catalog::Modality,
     /// Maximum wait for the engine's readiness endpoint.
     pub ready_timeout: Duration,
 }
@@ -135,6 +172,9 @@ pub struct RunningEngine {
     pub started_at_ms: u64,
     /// Canonical digest of the verified artifact snapshot.
     pub artifact_digest: String,
+    /// Resolved engine version this process runs, when the provisioner
+    /// discovered or pinned one. Answers "what served this request".
+    pub engine_version: Option<String>,
     /// Device-specific memory reserved for this generation.
     pub memory: crate::MemoryEstimate,
     /// Opaque process handle owned by the low-level process boundary.
@@ -437,7 +477,12 @@ impl LaunchRequest {
                 false,
             ));
         }
-        if self.artifact.metadata.trust != "verified" {
+        // A repo-mode (unpinned raw `hf:`) artifact has no verified local
+        // bytes: the engine self-downloads the weights at launch, so the
+        // trust and file-verification invariants below apply only to
+        // pinned, content-addressed snapshots.
+        let repo_mode = self.artifact.repo.is_some();
+        if !repo_mode && self.artifact.metadata.trust != "verified" {
             return Err(EngineDriverError::artifact_not_ready(format!(
                 "artifact {} has trust state {:?}",
                 self.artifact.artifact_digest, self.artifact.metadata.trust
@@ -459,7 +504,7 @@ impl LaunchRequest {
                 "verified snapshot path must be absolute",
             ));
         }
-        if self.artifact.files.len() != self.artifact.metadata.files.len() {
+        if !repo_mode && self.artifact.files.len() != self.artifact.metadata.files.len() {
             return Err(EngineDriverError::artifact_not_ready(
                 "verified file map does not match artifact metadata",
             ));
@@ -492,8 +537,16 @@ impl LaunchRequest {
                 self.artifact.metadata.format,
                 ArtifactFormat::Safetensors | ArtifactFormat::Pickle
             ),
+            // SGLang mirrors vLLM here: it loads the same safetensors and
+            // approved-pickle formats.
+            EngineKind::SGLang => matches!(
+                self.artifact.metadata.format,
+                ArtifactFormat::Safetensors | ArtifactFormat::Pickle
+            ),
             EngineKind::LlamaCpp => self.artifact.metadata.format == ArtifactFormat::Gguf,
-            EngineKind::Embedded => self.artifact.metadata.format == ArtifactFormat::Safetensors,
+            // Safetensors-only for now: GGUF stays llama.cpp's certified
+            // lane (WOR-1861).
+            EngineKind::MistralRs => self.artifact.metadata.format == ArtifactFormat::Safetensors,
         };
         if !compatible {
             return Err(EngineDriverError::new(
@@ -611,6 +664,9 @@ enum ArgumentRule {
 enum ArgumentValue {
     Unsigned,
     VllmDtype,
+    /// A finite, non-negative float, for tuning knobs such as SGLang's
+    /// `--schedule-conservativeness` (default 1.0, values may exceed 1).
+    NonNegativeFloat,
 }
 
 fn argument_rule(kind: EngineKind, flag: &str) -> Option<ArgumentRule> {
@@ -621,10 +677,30 @@ fn argument_rule(kind: EngineKind, flag: &str) -> Option<ArgumentRule> {
         ) => Some(ArgumentRule::Boolean),
         (EngineKind::Vllm, "--seed") => Some(ArgumentRule::Value(ArgumentValue::Unsigned)),
         (EngineKind::Vllm, "--dtype") => Some(ArgumentRule::Value(ArgumentValue::VllmDtype)),
+        // SGLang's stable allowlist. `--model-path`, `--host`, `--port`,
+        // `--tp-size`, and `--mem-fraction-static` stay off it: they are
+        // runtime-owned, the same way vLLM keeps `--tensor-parallel-size`
+        // and `--gpu-memory-utilization` off. The runtime derives the
+        // static memory fraction from the fit plan, so an operator flag
+        // would either duplicate or fight it.
+        (EngineKind::SGLang, "--enable-torch-compile" | "--disable-radix-cache") => {
+            Some(ArgumentRule::Boolean)
+        }
+        (EngineKind::SGLang, "--schedule-conservativeness") => {
+            Some(ArgumentRule::Value(ArgumentValue::NonNegativeFloat))
+        }
         (EngineKind::LlamaCpp, "--flash-attn" | "--no-mmap" | "--mlock") => {
             Some(ArgumentRule::Boolean)
         }
         (EngineKind::LlamaCpp, "--threads" | "--batch-size" | "--ubatch-size" | "--seed") => {
+            Some(ArgumentRule::Value(ArgumentValue::Unsigned))
+        }
+        // mistral.rs's stable allowlist (WOR-1861). `-m`, `--host`,
+        // `--port`, `--max-seq-len`, `--max-seqs`, and `--cpu` stay off
+        // it: they are runtime-owned, derived from the fit plan and the
+        // launch request.
+        (EngineKind::MistralRs, "--no-kv-cache") => Some(ArgumentRule::Boolean),
+        (EngineKind::MistralRs, "--prefix-cache-n") => {
             Some(ArgumentRule::Value(ArgumentValue::Unsigned))
         }
         _ => None,
@@ -651,6 +727,9 @@ fn validate_argument_value(
         ArgumentValue::VllmDtype => {
             matches!(value, "auto" | "half" | "float16" | "bfloat16" | "float32")
         }
+        ArgumentValue::NonNegativeFloat => value
+            .parse::<f64>()
+            .is_ok_and(|parsed| parsed.is_finite() && parsed >= 0.0),
     };
     if !valid {
         return Err(EngineDriverError::unsafe_argument(format!(

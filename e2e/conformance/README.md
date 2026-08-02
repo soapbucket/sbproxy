@@ -1,28 +1,38 @@
-# SBproxy E2E Test Suite
-*Last modified: 2026-04-27*
+# SBproxy HTTP compatibility catalog
 
-End-to-end tests that exercise every OSS feature of sbproxy using curl against a running proxy instance with local mock backends.
+*Last modified: 2026-07-28*
 
-## Quick Start
+Black-box HTTP cases that use curl against a running Rust proxy and
+local mock backends. The default command is a maintained smoke set.
+The directory also preserves a larger historical catalog for schema
+migration and compatibility audits.
+
+## Quick start
 
 ```bash
-# Run all 71 test cases
-./e2e/run-tests.sh
+# Build the Rust binary, then run the maintained smoke set
+../../scripts/build-e2e.sh
+./run-tests.sh
 
 # Run specific tests by number
-./e2e/run-tests.sh 01 02 05 37
+./run-tests.sh 01 02 05 37
+
+# Audit all 93 historical cases
+./run-tests.sh --all
 
 # Run load test (direct vs proxied comparison)
-./e2e/load-test.sh
+./load-test.sh
 ```
 
 ## Prerequisites
 
-- **Go** (to build sbproxy)
+- **Rust and Cargo** (to build sbproxy)
 - **Node.js** (for mock backend servers)
 - **curl** (for HTTP assertions)
 - **jq** (for JSON body assertions)
 - **python3** (for JWT token generation in auth tests)
+- **lsof** (to verify ownership of test listeners)
+- **OpenSSL** (to generate local test certificates on the first run)
 
 ## Directory Structure
 
@@ -37,19 +47,23 @@ e2e/
   cases/
     01-basic-proxy/sb.yml    # Test case configs (one per feature)
     ...
-    71-ai-failure-modes/sb.yml
+    93-accept-parser/sb.yml
   certs/                     # Generated (gitignored)
   logs/                      # Generated (gitignored)
 ```
 
-## How It Works
+## How it works
 
-1. Builds sbproxy from source
+1. Uses an already-built Rust `target/release/sbproxy` binary (or the
+   executable specified by `SBPROXY_BIN`)
 2. Starts local Node.js mock servers (test-server on :18888, mock-ai on :18889)
-3. For each test case: starts sbproxy with the case's `sb.yml`, runs curl assertions, stops sbproxy
+3. For each selected case: starts sbproxy with the case's `sb.yml`, runs curl assertions, stops sbproxy
 4. Reports pass/fail with color-coded output
 
-All tests use local backends only - no external network calls.
+The runner adds an allowlist for its loopback mock servers to a
+temporary copy of each configuration. It refuses to reuse occupied
+test ports and only stops processes it started. No case needs an
+external provider or internet connection.
 
 ## Test Cases
 
@@ -163,6 +177,33 @@ All tests use local backends only - no external network calls.
 | 69 | Circuit Breaker | Healthy/dead targets, circuit open recovery |
 | 70 | Forward Auth Failure | Dead auth service returns 503 |
 | 71 | AI Failure Modes | failure_mode: open vs closed |
+
+### Deployment and Compatibility (72-93)
+
+| # | Test | Features Tested |
+|---|------|-----------------|
+| 72 | Blue-Green | Ordered load-balancer targets and active-backend headers |
+| 73 | Canary Routing | Deterministic weighted routing |
+| 74 | Traffic Mirroring | Fire-and-forget shadow requests |
+| 75 | Retry Budget | Retry limits and transport behavior |
+| 76 | Outlier Detection | Load-balancer circuit breaking |
+| 77 | Connection Draining | Proxy connection settings |
+| 78 | Header Routing | Request-header target matching |
+| 79 | Priority Routing | Header-based priority selection |
+| 80 | Fault Injection | Forward-rule static failure response |
+| 81 | Idempotency Keys | AI request replay protection |
+| 82 | Model Aliasing | AI model-name mapping |
+| 83 | Threat-Protected Proxy | Request limits and bounded JSON threat scanning |
+| 84 | Origin Metrics | Per-origin Prometheus metrics |
+| 85 | Metrics Cardinality | Bounded metric labels |
+| 86 | Security Header Array | Array-form security-header policy |
+| 87 | Secret References | Environment-backed API-key configuration |
+| 88 | Removed Config Version | Strict rejection of the old origin key |
+| 89 | Access Logging | Top-level access-log configuration |
+| 90 | Error Negotiation | JSON, HTML, and text error responses |
+| 91 | Consistent Hashing | Header-hash load balancing |
+| 92 | gRPC-Web | gRPC-Web binary and text content types |
+| 93 | Accept Parser | Content negotiation for error pages |
 
 ## Writing New Tests
 

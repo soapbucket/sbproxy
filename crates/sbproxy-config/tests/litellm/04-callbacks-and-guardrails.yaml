@@ -1,5 +1,6 @@
-# Observability callbacks plus an external guardrail. These translate with
-# warnings (the operator wires the equivalent sbproxy sink/guardrail) but the
+# Observability callbacks plus an external guardrail. Known sink callbacks
+# (langfuse, datadog) emit real usage_sinks entries with env-interpolated
+# credentials; the external guardrail still warns for manual wiring. The
 # emitted config must still compile.
 model_list:
   - model_name: gpt-4o

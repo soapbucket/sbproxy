@@ -26,6 +26,7 @@ RESET := \033[0m
         fmt fmt-check \
         lint lint-all \
         check \
+        tapes tapes-gen tapes-check \
         clean \
         docker docker-build \
         e2e
@@ -115,6 +116,11 @@ tapes: build-release ## Record VHS cassettes (docs/tapes/*.tape -> docs/assets/*
 
 tapes-gen: ## Regenerate per-example tapes from their documented curls
 	python3 scripts/gen-example-tapes.py
+
+tapes-check: ## Verify generated tapes, GIF wiring, and doc-generator behavior
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/gen-example-tapes.py --check
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/wire-example-gifs.py --check
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts.tests.test_doc_generators
 
 # --- Docker ------------------------------------------------------------------
 

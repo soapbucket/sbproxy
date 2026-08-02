@@ -1,5 +1,5 @@
 # object_authz policy
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-01*
 
 The `object_authz` policy enforces object- and function-level authorization at the gateway, catching the two top OWASP API risks: BOLA (API1:2023, Broken Object Level Authorization) and BFLA (API5:2023, Broken Function Level Authorization). Alias: `bola`.
 
@@ -65,6 +65,83 @@ For an `object_rule`, the policy parses the matched path against the template, e
 For a `function_rule`, the policy checks the request's `method` is in the rule's set and the caller's roles include `require_role`. A missing role is the same fixed 403 (or an allow under `test_mode`).
 
 For `enumeration`, the policy keeps a per-principal sliding window of distinct object ids (the `object_param` captures). When `max_distinct` is exceeded inside `window_secs`, every subsequent request from that principal is blocked for the rest of the window. The tracker is bounded at 50,000 principals; a flood that exceeds the cap clears the map (brief detection gap, not a correctness problem).
+
+## Calling it
+
+The runnable configuration is
+[`examples/object-authz/`](../examples/object-authz/). It validates HS256 JWTs
+signed with `dev-secret-change-me` (issuer `https://issuer.local`, audience
+`sbproxy-demo`), resolves the owner from `sub`, gates
+`DELETE /admin/users/{user_id}` behind `require_role: admin`, and sets
+`enumeration` to `max_distinct: 100` over `window_secs: 60`. Start it:
+
+```bash
+make run CONFIG=examples/object-authz/sb.yml
+```
+
+Mint a token whose `sub` is `tenant-A`, using the script in that example's
+README, then read the results against the upstream. The upstream is a shared
+echo with no `/tenants` route, so a `404` means the gateway forwarded the
+request and a `403` means the gateway stopped it. That distinction is what
+makes the outcomes legible without a real backend:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: api.local' \
+  -H "Authorization: Bearer $JWT_A" \
+  http://127.0.0.1:8080/tenants/tenant-A/orders/42
+# 404, forwarded: the path's owner segment matches the token's sub
+
+curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: api.local' \
+  -H "Authorization: Bearer $JWT_A" \
+  http://127.0.0.1:8080/tenants/tenant-B/orders/42
+# 403, blocked at the gateway: BOLA
+```
+
+Only the tenant segment changed. The 403 body is deliberately uninformative:
+
+```json
+{"error":"forbidden: object-level authorization check failed"}
+```
+
+It names neither the expected owner nor the rule that fired, so probing
+traffic cannot map the ownership model. The OWASP tag and the detailed reason
+go to the security audit log instead.
+
+A request with no token at all is a `401` rather than a `403`, because auth
+runs before this policy and there is no subject to compare against yet.
+
+The function-level rule is the one that surprises people:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X DELETE -H 'Host: api.local' \
+  -H "Authorization: Bearer $JWT_ADMIN" \
+  http://127.0.0.1:8080/admin/users/u1
+# 403
+```
+
+That token carries `roles: ["admin"]` and is still refused. The policy never
+reads roles from JWT claims. Roles come only from the `x-roles` header, and
+only when `principal.trust_role_header: true` says a trusted upstream sets it.
+This config leaves the default `false`, so `require_role: admin` fails closed
+and every such `DELETE` is denied. If you are wiring this up and every
+role-gated route returns 403, that default is why.
+
+Enumeration is a per-principal counter over distinct captures of
+`object_param`, not a request-rate limit. Walk 150 distinct order ids inside
+one window:
+
+```bash
+for i in $(seq 1 150); do
+  curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: api.local' \
+    -H "Authorization: Bearer $JWT_A" \
+    "http://127.0.0.1:8080/tenants/tenant-A/orders/$i"
+done
+```
+
+The first 100 are forwarded and answer `404`. The 101st is the first `403`,
+and every request from that principal stays blocked for the rest of the
+60-second window even for ids it already fetched successfully. Re-requesting
+the same id repeatedly never trips it, because only distinct ids count.
 
 ## Observability
 

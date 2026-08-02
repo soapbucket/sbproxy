@@ -8,6 +8,7 @@ mod replay;
 mod request;
 mod server;
 
+pub(crate) use client::ModelPlaneQuotaAttempt;
 pub(crate) use request::{multipart_model, rewrite_engine_model};
 
 pub use client::{ModelPlaneClient, ModelPlaneClientSecurity, ModelPlaneResponse};

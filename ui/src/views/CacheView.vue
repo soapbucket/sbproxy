@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
-import { api, ApiError, type CacheStatus } from "../api";
+import { api, type CacheStatus } from "../api";
 import { useAsync } from "../composables/useAsync";
+import { toast } from "../composables/useToasts";
 import { parsePrometheus, findFamily, sumSamples } from "../lib/metrics";
 import { formatNumber } from "../lib/format";
 import PageHeader from "../components/PageHeader.vue";
@@ -19,11 +20,33 @@ function refresh() {
 }
 onMounted(refresh);
 
+// Origin scope. The response-cache counter and the semantic-cache
+// debug report both key by origin, so one picker scopes the page;
+// "all origins" is the default aggregate.
+const selectedOrigin = ref("");
+const cacheResultsFamily = computed(() => {
+  const text = metricsReq.data.value;
+  if (!text) return undefined;
+  return findFamily(parsePrometheus(text), "sbproxy_cache_results_total");
+});
+const originOptions = computed(() => {
+  const fromMetrics =
+    cacheResultsFamily.value?.samples
+      .map((s) => s.labels.origin)
+      .filter((o): o is string => !!o) ?? [];
+  const fromSemantic = (semanticReq.data.value?.caches ?? []).map((c) => c.origin);
+  return [...new Set([...fromMetrics, ...fromSemantic])].sort();
+});
+
 // Semantic (embedding) cache decisions, flattened per origin. Only shown
 // when at least one AI origin has an embedding cache with recorded
 // lookups.
 const semanticCaches = computed(() =>
-  (semanticReq.data.value?.caches ?? []).filter((c) => c.recent.length > 0),
+  (semanticReq.data.value?.caches ?? []).filter(
+    (c) =>
+      c.recent.length > 0 &&
+      (!selectedOrigin.value || c.origin === selectedOrigin.value),
+  ),
 );
 function decisionTone(reason: string): string {
   return reason === "hit" ? "var(--sb-accent)" : "var(--sb-text-muted)";
@@ -34,14 +57,18 @@ const enabled = computed(() => !!status.value?.enabled);
 const backend = computed(() => status.value?.backend ?? "n/a");
 const prefixSupported = computed(() => !!status.value?.prefix_purge_supported);
 
-// Hit / miss from the Prometheus scrape (sbproxy_cache_hits_total{result}).
+// Hit / miss from the Prometheus scrape. The live family is
+// sbproxy_cache_results_total{origin, result}; the hits name is kept
+// as a fallback for older binaries.
 const cacheHits = computed(() => {
-  const text = metricsReq.data.value;
-  if (!text) return { hits: 0, misses: 0 };
-  const fam = findFamily(parsePrometheus(text), "sbproxy_cache_hits_total");
+  const fam = cacheResultsFamily.value;
+  if (!fam) return { hits: 0, misses: 0 };
+  const scope: Record<string, string> = selectedOrigin.value
+    ? { origin: selectedOrigin.value }
+    : {};
   return {
-    hits: sumSamples(fam, { result: "hit" }),
-    misses: sumSamples(fam, { result: "miss" }),
+    hits: sumSamples(fam, { result: "hit", ...scope }),
+    misses: sumSamples(fam, { result: "miss", ...scope }),
   };
 });
 const hitRate = computed(() => {
@@ -55,38 +82,56 @@ const purgeKey = ref("");
 const purgePrefix = ref("");
 const evictId = ref("");
 const busy = ref("");
-const banner = ref<{ tone: "ok" | "err"; text: string } | null>(null);
 
-async function run(label: string, fn: () => Promise<unknown>, ok: string) {
+async function run(
+  label: string,
+  fn: () => Promise<unknown>,
+  action: string,
+  ok: string,
+) {
   if (busy.value) return;
   busy.value = label;
-  banner.value = null;
   try {
     await fn();
-    banner.value = { tone: "ok", text: ok };
+    toast.success(ok);
     refresh();
   } catch (e) {
-    const msg = e instanceof ApiError ? `${e.hint}` : e instanceof Error ? e.message : "Failed.";
-    banner.value = { tone: "err", text: msg };
+    toast.error(e, action);
   } finally {
     busy.value = "";
   }
 }
 
 const purgeAll = () =>
-  run("all", () => api.cachePurge({}), "Purged the entire response cache.");
+  run("all", () => api.cachePurge({}), "Purge cache", "Purged the entire response cache");
 const purgeByKey = () =>
-  run("key", () => api.cachePurge({ key: purgeKey.value }), `Purged key "${purgeKey.value}".`);
+  run(
+    "key",
+    () => api.cachePurge({ key: purgeKey.value }),
+    "Purge key",
+    `Purged key "${purgeKey.value}"`,
+  );
 const purgeByPrefix = () =>
   run(
     "prefix",
     () => api.cachePurge({ prefix: purgePrefix.value }),
-    `Purged entries under "${purgePrefix.value}".`,
+    "Purge prefix",
+    `Purged entries under "${purgePrefix.value}"`,
   );
 const evictKey = () =>
-  run("evict", () => api.evictKeyPolicy(evictId.value), `Evicted cached policy for "${evictId.value}".`);
+  run(
+    "evict",
+    () => api.evictKeyPolicy(evictId.value),
+    "Evict key policy",
+    `Evicted cached policy for "${evictId.value}"`,
+  );
 const evictAllPolicies = () =>
-  run("evict-all", () => api.evictKeyPolicy(), "Evicted all cached key policies.");
+  run(
+    "evict-all",
+    () => api.evictKeyPolicy(),
+    "Evict key policies",
+    "Evicted all cached key policies",
+  );
 </script>
 
 <template>
@@ -95,14 +140,21 @@ const evictAllPolicies = () =>
     subtitle="Response-cache status and eviction, plus dynamic key-policy cache invalidation."
   >
     <template #actions>
+      <select
+        v-if="originOptions.length > 1"
+        class="sb-select origin-select"
+        v-model="selectedOrigin"
+        aria-label="Scope to origin"
+      >
+        <option value="">all origins</option>
+        <option v-for="o in originOptions" :key="o" :value="o">{{ o }}</option>
+      </select>
       <button class="sb-btn sb-btn--sm" @click="refresh">Refresh</button>
     </template>
   </PageHeader>
 
   <ErrorState v-if="statusReq.error.value" :error="statusReq.error.value" @retry="refresh" />
   <template v-else>
-    <p v-if="banner" class="banner" :class="`banner--${banner.tone}`">{{ banner.text }}</p>
-
     <div class="grid">
       <StatCard
         label="Response cache"
@@ -209,6 +261,12 @@ const evictAllPolicies = () =>
 </template>
 
 <style scoped>
+.origin-select {
+  width: auto;
+  min-width: 170px;
+  font-family: var(--sb-font-mono);
+  font-size: 0.78rem;
+}
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
@@ -230,20 +288,6 @@ const evictAllPolicies = () =>
 }
 .action .sb-input {
   max-width: 320px;
-}
-.banner {
-  padding: var(--sb-space-3) var(--sb-space-4);
-  border-radius: var(--sb-radius-sm);
-  margin-bottom: var(--sb-space-4);
-  font-size: 0.9rem;
-}
-.banner--ok {
-  background: var(--sb-accent-tint);
-  color: var(--sb-accent);
-}
-.banner--err {
-  background: #fdecea;
-  color: #c0392b;
 }
 .semantic {
   margin-top: var(--sb-space-4);

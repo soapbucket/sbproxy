@@ -122,6 +122,17 @@ ignore = [
   # transitive; revisit when tract-onnx and tokenizers update.
   "RUSTSEC-2024-0436",
 
+  # RUSTSEC-2026-0217: tract-nnef 0.21.10, integer overflow in the NNEF
+  # tensor parser on attacker-controlled .dat files. Not reachable here:
+  # sbproxy never parses NNEF. tract loads only our digest-pinned ONNX
+  # artifacts (classifier centroids and the in-process embedding model
+  # fail closed on digest mismatch), and the embedded engine uses
+  # mistralrs's own gguf/safetensors loaders. The in-range fix (0.21.16)
+  # is blocked by mistralrs 0.9.0's git-pinned `half` requirement;
+  # upgrade lands with the next mistralrs tag bump. Tracked internally;
+  # remove this entry on that bump.
+  "RUSTSEC-2026-0217",
+
   # RUSTSEC-2025-0057: fxhash 0.2.1, unmaintained. Path: fxhash -> bm25 ->
   # mistralrs-core -> mistralrs -> sbproxy-model-host, i.e. only the
   # off-by-default `embedded` inference engine tree (WOR-1658); not in the
@@ -260,4 +271,12 @@ unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # WOR-1772: pingora is patched to our fork (dynamic rustls cert resolver).
-allow-git = ["https://github.com/soapbucket/pingora"]
+# WOR-1861: mistral.rs 0.9 (and its candle transitive) are only on git; the
+# 0.9 release is not yet on crates.io. Both are pulled solely by the opt-in
+# `embedded` cargo feature, never the default build. Re-pin to crates.io and
+# drop these once mistral.rs 0.9 publishes.
+allow-git = [
+    "https://github.com/soapbucket/pingora",
+    "https://github.com/EricLBuehler/mistral.rs",
+    "https://github.com/huggingface/candle.git",
+]

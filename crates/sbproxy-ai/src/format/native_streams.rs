@@ -591,7 +591,17 @@ fn bedrock_stop_reason_to_hub(reason: &str) -> FinishReason {
 /// every frame as `data:` (Gemini, OpenAI).
 #[derive(Debug, Default)]
 pub struct SseFramer {
-    buf: String,
+    buf: Vec<u8>,
+    error: Option<SseFramingError>,
+}
+
+/// Structural failure while incrementally reassembling an SSE stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SseFramingError {
+    /// A complete frame or trailing partial frame was not valid UTF-8.
+    InvalidUtf8,
+    /// An event exceeded the bounded reassembly buffer without a separator.
+    FrameTooLarge,
 }
 
 /// Hard cap on the reassembly buffer (WOR-1693). A well-behaved
@@ -612,29 +622,31 @@ impl SseFramer {
 
     /// Feed bytes and pull any complete frames the buffer now holds.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<String> {
-        // Append decoded text; non-UTF8 bytes are replaced.
-        self.buf.push_str(&String::from_utf8_lossy(bytes));
+        self.buf.extend_from_slice(bytes);
         let mut frames = Vec::new();
-        loop {
-            let lf2 = self.buf.find("\n\n");
-            let crlf2 = self.buf.find("\r\n\r\n");
-            let (idx, sep_len) = match (lf2, crlf2) {
-                (Some(a), Some(b)) if a < b => (a, 2),
-                (Some(_), Some(b)) => (b, 4),
-                (Some(a), None) => (a, 2),
-                (None, Some(b)) => (b, 4),
-                (None, None) => break,
-            };
-            let frame: String = self.buf.drain(..idx).collect();
+        while let Some((idx, sep_len)) = next_sse_separator(&self.buf) {
+            let frame: Vec<u8> = self.buf.drain(..idx).collect();
             self.buf.drain(..sep_len);
             if !frame.is_empty() {
-                frames.push(frame);
+                match String::from_utf8(frame) {
+                    Ok(frame) => frames.push(frame),
+                    Err(_) => {
+                        self.error.get_or_insert(SseFramingError::InvalidUtf8);
+                    }
+                }
             }
         }
         // Bound the buffer: a stream with no frame separator cannot be
         // allowed to accumulate indefinitely.
         if self.buf.len() > MAX_BUFFERED_BYTES {
-            frames.push(std::mem::take(&mut self.buf));
+            self.error.get_or_insert(SseFramingError::FrameTooLarge);
+            let oversized = std::mem::take(&mut self.buf);
+            match String::from_utf8(oversized) {
+                Ok(frame) => frames.push(frame),
+                Err(_) => {
+                    self.error = Some(SseFramingError::InvalidUtf8);
+                }
+            }
         }
         frames
     }
@@ -644,9 +656,32 @@ impl SseFramer {
         if self.buf.is_empty() {
             None
         } else {
-            Some(std::mem::take(&mut self.buf))
+            match String::from_utf8(std::mem::take(&mut self.buf)) {
+                Ok(frame) => Some(frame),
+                Err(_) => {
+                    self.error.get_or_insert(SseFramingError::InvalidUtf8);
+                    None
+                }
+            }
         }
     }
+
+    /// Return the first framing failure observed by this stream.
+    pub fn error(&self) -> Option<SseFramingError> {
+        self.error
+    }
+}
+
+fn next_sse_separator(bytes: &[u8]) -> Option<(usize, usize)> {
+    for index in 0..bytes.len().saturating_sub(1) {
+        if bytes[index..].starts_with(b"\r\n\r\n") {
+            return Some((index, 4));
+        }
+        if bytes[index..].starts_with(b"\n\n") || bytes[index..].starts_with(b"\r\r") {
+            return Some((index, 2));
+        }
+    }
+    None
 }
 
 /// One of the three native upstream SSE wire shapes the relay parses
@@ -1237,6 +1272,51 @@ mod tests {
         );
         // After the flush the retained buffer is back under the cap.
         assert!(f.buf.len() <= MAX_BUFFERED_BYTES);
+    }
+
+    #[test]
+    fn sse_framer_preserves_utf8_across_every_network_split() {
+        let wire =
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"café 🙂\"}}]}\r\n\r\n";
+        for split in 1..wire.len() {
+            let mut framer = SseFramer::new();
+            let mut frames = framer.feed(&wire.as_bytes()[..split]);
+            frames.extend(framer.feed(&wire.as_bytes()[split..]));
+            assert_eq!(
+                frames,
+                [wire.trim_end_matches("\r\n\r\n")],
+                "split at byte {split} changed the decoded frame"
+            );
+            assert!(framer.flush().is_none());
+        }
+    }
+
+    #[test]
+    fn sse_framer_rejects_invalid_utf8_instead_of_replacing_it() {
+        let mut framer = SseFramer::new();
+        let frames = framer.feed(b"data: {\"delta\":\"\xff\"}\n\n");
+
+        assert!(
+            frames.is_empty(),
+            "invalid UTF-8 must not become a replacement character in a canonical event"
+        );
+        assert!(framer.flush().is_none());
+    }
+
+    #[test]
+    fn sse_framer_preserves_comments_fields_multiline_data_and_crlf() {
+        let wire =
+            ": keepalive\r\nid: 7\r\nretry: 1000\r\nevent: custom\r\ndata: {\"a\":\r\ndata: 1}\r\n\r\n";
+        let mut framer = SseFramer::new();
+        let mut frames = Vec::new();
+        for byte in wire.as_bytes() {
+            frames.extend(framer.feed(std::slice::from_ref(byte)));
+        }
+
+        assert_eq!(frames, [wire.trim_end_matches("\r\n\r\n")]);
+        let (event, data) = split_sse_frame(&frames[0]);
+        assert_eq!(event.as_deref(), Some("custom"));
+        assert_eq!(data, "{\"a\":\n1}");
     }
 
     #[test]

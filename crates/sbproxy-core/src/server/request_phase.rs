@@ -7,6 +7,384 @@
 
 use super::*;
 
+struct ConcurrentLimitDenialResponse {
+    status: u16,
+    content_type: &'static str,
+    body: String,
+}
+
+fn take_concurrent_limit_denial_response(
+    ctx: &mut RequestContext,
+    status: u16,
+    message: &str,
+    policy_type: &str,
+) -> Option<ConcurrentLimitDenialResponse> {
+    if policy_type != "concurrent_limit" {
+        return None;
+    }
+    let body = ctx
+        .concurrent_limit_denial_body
+        .take()
+        .unwrap_or_else(|| error_json_body(message));
+    Some(ConcurrentLimitDenialResponse {
+        status,
+        content_type: "application/json",
+        body,
+    })
+}
+
+#[cfg(test)]
+mod concurrent_limit_denial_response_tests {
+    use super::*;
+
+    #[test]
+    fn configured_body_is_emitted_byte_for_byte() {
+        let configured = "{\"error\":\"busy\"}";
+        let mut ctx = RequestContext::new();
+        ctx.concurrent_limit_denial_body = Some(configured.to_string());
+
+        let response =
+            take_concurrent_limit_denial_response(&mut ctx, 529, configured, "concurrent_limit")
+                .expect("concurrent-limit response");
+
+        assert_eq!(response.status, 529);
+        assert_eq!(response.content_type, "application/json");
+        assert_eq!(response.body.as_bytes(), configured.as_bytes());
+        assert!(ctx.concurrent_limit_denial_body.is_none());
+    }
+
+    #[test]
+    fn default_message_keeps_the_generic_json_envelope() {
+        let mut ctx = RequestContext::new();
+
+        let response = take_concurrent_limit_denial_response(
+            &mut ctx,
+            503,
+            "too many concurrent requests",
+            "concurrent_limit",
+        )
+        .expect("concurrent-limit response");
+
+        assert_eq!(response.status, 503);
+        assert_eq!(response.content_type, "application/json");
+        assert_eq!(
+            response.body,
+            "{\"error\":\"too many concurrent requests\"}"
+        );
+    }
+}
+
+/// Resolve whether the request's eventual base/forward-rule action is a
+/// GraphQL action with parsing enabled.
+///
+/// Forward-rule matching later in this phase reads the same immutable request
+/// path, query, and headers. Resolving it here lets us enable Pingora's bounded
+/// replay buffer before threat protection or another origin middleware reads
+/// the body.
+fn request_requires_graphql_replay(
+    session: &Session,
+    pipeline: &CompiledPipeline,
+    origin_idx: usize,
+) -> bool {
+    let request = session.req_header();
+    let path = request.uri.path();
+    let query = request.uri.query();
+    let forwarded_action = pipeline
+        .forward_rules
+        .get(origin_idx)
+        .and_then(|rules| {
+            rules.iter().find(|rule| {
+                rule.matchers.iter().any(|matcher| {
+                    matcher
+                        .match_request(path, query, &request.headers)
+                        .is_some()
+                })
+            })
+        })
+        .map(|rule| &rule.action);
+    let effective_action = forwarded_action.or_else(|| pipeline.actions.get(origin_idx));
+
+    matches!(
+        effective_action,
+        Some(Action::GraphQL(graphql)) if graphql.validation_enabled()
+    )
+}
+
+/// AI actions own idempotency and response replay because their current
+/// guardrail policy must run before cached bytes are served.
+fn request_uses_ai_owned_replay_paths(
+    session: &Session,
+    pipeline: &CompiledPipeline,
+    origin_idx: usize,
+) -> bool {
+    let request = session.req_header();
+    let forwarded_action = pipeline
+        .forward_rules
+        .get(origin_idx)
+        .and_then(|rules| {
+            rules.iter().find(|rule| {
+                rule.matchers.iter().any(|matcher| {
+                    matcher
+                        .match_request(request.uri.path(), request.uri.query(), &request.headers)
+                        .is_some()
+                })
+            })
+        })
+        .map(|rule| &rule.action);
+    action_uses_ai_owned_replay_paths(forwarded_action.or_else(|| pipeline.actions.get(origin_idx)))
+}
+
+fn action_uses_ai_owned_replay_paths(action: Option<&Action>) -> bool {
+    matches!(action, Some(Action::AiProxy(_)))
+}
+
+#[cfg(test)]
+mod ai_owned_replay_path_tests {
+    use super::*;
+
+    #[test]
+    fn external_guardrail_ai_action_defers_common_replay_paths() {
+        let ai = sbproxy_modules::action::AiProxyAction {
+            config: sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+                "providers": []
+            }))
+            .expect("AI config"),
+        };
+        let action = Action::AiProxy(Box::new(ai));
+
+        assert!(action_uses_ai_owned_replay_paths(Some(&action)));
+        assert!(!action_uses_ai_owned_replay_paths(Some(&Action::Noop)));
+    }
+}
+
+/// Outcome of the pre-auth inbound-key phase.
+#[derive(Debug)]
+pub(super) enum InboundKeyPhase {
+    /// No minted token in any configured header. The origin's configured auth
+    /// provider runs as normal.
+    NotPresent,
+    /// A minted key resolved. The configured auth provider is skipped.
+    Resolved,
+    /// Refuse the request with this status and message.
+    Deny {
+        status: u16,
+        message: String,
+        trust_outcome: AuthTrustOutcome,
+    },
+}
+
+/// Turn a key-store outage into a phase outcome, under the plane's
+/// configured failure posture.
+///
+/// Both inbound-key entry points below (the ordinary header sweep and the
+/// playground impersonation ticket) had their own copy of this decision.
+/// One copy, reading `key_management.failure_posture` through
+/// [`crate::key_plane::KeyPlane::failure_posture`], is the point of
+/// WOR-2121: a posture that only some of its call sites honour is a
+/// posture the operator cannot reason about.
+///
+/// An admitting posture returns [`InboundKeyPhase::NotPresent`], which
+/// falls through to the origin's own configured auth. It is deliberately
+/// not a blanket admit, and never has been.
+///
+/// [`Degraded`](sbproxy_config::types::FailureMode::Degraded) and
+/// [`Open`](sbproxy_config::types::FailureMode::Open) take the same
+/// branch and differ in what they leave behind: `degraded` says the
+/// per-key policy, budget, and attribution this request should have had
+/// were lost, and is logged as such so it can be alerted on. A plain
+/// `open` claims nothing.
+fn inbound_key_store_outage(
+    plane: &crate::key_plane::KeyPlane,
+    error: &anyhow::Error,
+) -> InboundKeyPhase {
+    let posture = plane.failure_posture();
+    if !posture.admits() {
+        return InboundKeyPhase::Deny {
+            status: 503,
+            message: "key store unavailable".to_string(),
+            trust_outcome: AuthTrustOutcome::BackendFailure,
+        };
+    }
+    if posture.guarantee_waived() {
+        tracing::warn!(
+            error = %error,
+            failure_posture = posture.as_label(),
+            guarantee_waived = true,
+            "key store unavailable; falling through to configured auth with no per-key \
+             policy, budget, or attribution"
+        );
+    } else {
+        tracing::warn!(
+            error = %error,
+            failure_posture = posture.as_label(),
+            guarantee_waived = false,
+            "key store unavailable; falling through to configured auth"
+        );
+    }
+    InboundKeyPhase::NotPresent
+}
+
+/// Resolve a minted virtual key out of the configured inbound headers, before
+/// the origin's configured auth provider runs.
+///
+/// `raw_peer_ip` must come directly from `Session::client_addr`, before trusted
+/// forwarding headers can replace `ctx.client_ip`.
+///
+/// A store outage is resolved by [`inbound_key_store_outage`] against
+/// `key_management.failure_posture`, which defaults to closed. An unknown
+/// id and a wrong secret return the same status so neither is an existence
+/// oracle.
+pub(super) async fn resolve_inbound_key(
+    plane: &crate::key_plane::KeyPlane,
+    headers: &http::HeaderMap,
+    raw_peer_ip: Option<std::net::IpAddr>,
+    ctx: &mut RequestContext,
+) -> InboundKeyPhase {
+    // Playground impersonation ticket: always presented as a Bearer token
+    // on `Authorization`, independent of the operator's configured sweep
+    // headers (`plane.inbound().headers`), since this is an
+    // internal admin-minted credential rather than a caller-presented
+    // key. A hit resolves straight to the impersonated key's real, stored
+    // policy through the same `ctx.resolved_inbound_key` path an
+    // ordinarily-presented minted key uses below; a header that carries
+    // no ticket-shaped token at all falls through to the ordinary sweep
+    // unchanged.
+    if let Some(outcome) = resolve_impersonation_ticket(plane, headers, raw_peer_ip, ctx).await {
+        return outcome;
+    }
+
+    let (header, token) = match crate::inbound_key::sweep_headers(headers, plane.inbound()) {
+        crate::inbound_key::SweepOutcome::None => return InboundKeyPhase::NotPresent,
+        crate::inbound_key::SweepOutcome::Ambiguous => {
+            // Observability describes the credential path the caller attempted,
+            // including denials. Keep provider empty: these are proxy-minted
+            // tokens, not caller-owned provider credentials.
+            ctx.inbound_key_mode = crate::context::InboundKeyMode::Minted;
+            return InboundKeyPhase::Deny {
+                status: 400,
+                message: "conflicting api keys in more than one header".to_string(),
+                trust_outcome: AuthTrustOutcome::InvalidProof,
+            };
+        }
+        crate::inbound_key::SweepOutcome::Found { header, token } => {
+            ctx.inbound_key_mode = crate::context::InboundKeyMode::Minted;
+            (header, token)
+        }
+    };
+
+    // Shape already proven by the sweep; this only re-splits the halves.
+    let Some((key_id, secret)) = sbproxy_keystore::crypto::parse_minted_token(&token) else {
+        return InboundKeyPhase::NotPresent;
+    };
+
+    let now = chrono::Utc::now();
+    match plane.cache().resolve_key(key_id).await {
+        Err(e) => inbound_key_store_outage(plane, &e),
+        Ok(None) => InboundKeyPhase::Deny {
+            status: 401,
+            message: "invalid key".to_string(),
+            trust_outcome: AuthTrustOutcome::InvalidProof,
+        },
+        Ok(Some(rec)) => {
+            if !plane.crypto().verify_record(&rec, secret, now) {
+                InboundKeyPhase::Deny {
+                    status: 401,
+                    message: "invalid key".to_string(),
+                    trust_outcome: AuthTrustOutcome::InvalidProof,
+                }
+            } else if !rec.is_usable(now) {
+                InboundKeyPhase::Deny {
+                    status: 403,
+                    message: "key is not active".to_string(),
+                    trust_outcome: AuthTrustOutcome::InvalidProof,
+                }
+            } else {
+                ctx.inbound_key_header = Some(header);
+                ctx.resolved_inbound_key = Some(Box::new(rec));
+                InboundKeyPhase::Resolved
+            }
+        }
+    }
+}
+
+fn finalize_inbound_key_trust(ctx: &mut RequestContext, trust_outcome: AuthTrustOutcome) {
+    crate::trust_tier::finalize(ctx, trust_outcome.is_suspicious());
+}
+
+/// Recognize and consume a playground impersonation ticket
+/// (`admin_playground::ticket`) presented as `Authorization: Bearer
+/// <sbpgtkt_...>`. Returns `None` when the header carries no
+/// ticket-shaped token at all (absent, not Bearer, or a different
+/// prefix), so the caller falls through to the ordinary sweep unchanged.
+/// Once a ticket-shaped token has actually been presented, this always
+/// returns `Some`: a wrong/expired/reused ticket denies with the same
+/// 401 an unknown minted key gets, rather than silently falling through
+/// to whatever auth the origin has configured.
+///
+/// Redemption is bound to both a loopback TCP peer and a loopback effective
+/// client: `admin_playground`'s dispatch route is the only legitimate minter
+/// and it always redeems its own ticket via a direct loopback call, so nothing
+/// outside this process should ever be able to present one. Both are checked
+/// before consuming (not after), so a wrong-peer attempt cannot burn a ticket
+/// the legitimate loopback caller still needs.
+async fn resolve_impersonation_ticket(
+    plane: &crate::key_plane::KeyPlane,
+    headers: &http::HeaderMap,
+    raw_peer_ip: Option<std::net::IpAddr>,
+    ctx: &mut RequestContext,
+) -> Option<InboundKeyPhase> {
+    let auth = headers.get("authorization")?.to_str().ok()?;
+    let token = auth
+        .strip_prefix("Bearer ")
+        .or_else(|| auth.strip_prefix("bearer "))
+        .unwrap_or(auth)
+        .trim();
+    if !token.starts_with(crate::admin_playground::ticket::PREFIX) {
+        return None;
+    }
+    if !raw_peer_ip.is_some_and(|ip| ip.is_loopback())
+        || !ctx.client_ip.is_some_and(|ip| ip.is_loopback())
+    {
+        return Some(InboundKeyPhase::Deny {
+            status: 401,
+            message: "invalid key".to_string(),
+            trust_outcome: AuthTrustOutcome::InvalidProof,
+        });
+    }
+    let Some(key_id) = crate::admin_playground::ticket::consume(token) else {
+        return Some(InboundKeyPhase::Deny {
+            status: 401,
+            message: "invalid key".to_string(),
+            trust_outcome: AuthTrustOutcome::InvalidProof,
+        });
+    };
+    let now = chrono::Utc::now();
+    Some(match plane.cache().resolve_key(&key_id).await {
+        Err(e) => inbound_key_store_outage(plane, &e),
+        Ok(None) => InboundKeyPhase::Deny {
+            status: 401,
+            message: "invalid key".to_string(),
+            trust_outcome: AuthTrustOutcome::InvalidProof,
+        },
+        Ok(Some(rec)) => {
+            if !rec.is_usable(now) {
+                InboundKeyPhase::Deny {
+                    status: 403,
+                    message: "key is not active".to_string(),
+                    trust_outcome: AuthTrustOutcome::InvalidProof,
+                }
+            } else {
+                // Same field a normally-swept key stamps, so the ticket
+                // (like the key it names) is stripped before the request
+                // goes upstream and never leaks past this process.
+                ctx.inbound_key_header = Some("authorization".to_string());
+                ctx.resolved_inbound_key = Some(Box::new(rec));
+                InboundKeyPhase::Resolved
+            }
+        }
+    })
+}
+
 /// Handle an incoming request before proxying. See the trait method
 /// `<SbProxy as ProxyHttp>::request_filter` for the phase contract.
 pub(super) async fn request_filter(
@@ -69,11 +447,13 @@ pub(super) async fn request_filter(
         }
     }
 
-    // Extract client IP from the downstream connection.
-    ctx.client_ip = session
+    // Preserve the raw TCP peer before trusted forwarding headers can
+    // replace ctx.client_ip with the derived client identity.
+    let raw_peer_ip = session
         .client_addr()
         .and_then(|addr| addr.as_inet())
         .map(|addr| addr.ip());
+    ctx.client_ip = raw_peer_ip;
 
     // Trust boundary for inbound forwarding headers.
     //
@@ -140,6 +520,20 @@ pub(super) async fn request_filter(
             req.remove_header("x-sbproxy-tls-ja4");
             req.remove_header("x-sbproxy-tls-ja4h");
             req.remove_header("x-sbproxy-tls-trustworthy");
+            // WOR-2120: strip the A2A envelope headers from untrusted
+            // peers. These feed `caller_denylist`, `callee_allowlist`,
+            // and cycle detection, so honoring them from an arbitrary
+            // client lets that client name itself, name its callee, and
+            // assert its own call chain. `envelope_from_headers` also
+            // gates on the same trust decision; removing them here
+            // additionally keeps a forged value from reaching the
+            // upstream, which would re-introduce the forgery one hop in.
+            req.remove_header("x-a2a-caller-agent-id");
+            req.remove_header("x-a2a-callee-agent-id");
+            req.remove_header("x-a2a-task-id");
+            req.remove_header("x-a2a-parent-request-id");
+            req.remove_header("x-a2a-chain-depth");
+            req.remove_header("x-a2a-chain");
         }
     }
 
@@ -370,36 +764,18 @@ pub(super) async fn request_filter(
             None, // operator route_glob is per-policy; consulted later
         );
         if let Some(signal) = detected {
-            let spec = signal.to_spec();
-            let mut a2a_ctx = sbproxy_modules::A2AContext::empty(spec);
-            let h = &session.req_header().headers;
-            if let Some(v) = h.get("x-a2a-caller-agent-id").and_then(|v| v.to_str().ok()) {
-                a2a_ctx.caller_agent_id = v.to_string();
-            }
-            if let Some(v) = h.get("x-a2a-callee-agent-id").and_then(|v| v.to_str().ok()) {
-                a2a_ctx.callee_agent_id = Some(v.to_string());
-            }
-            if let Some(v) = h.get("x-a2a-task-id").and_then(|v| v.to_str().ok()) {
-                a2a_ctx.task_id = v.to_string();
-            }
-            if let Some(v) = h
-                .get("x-a2a-parent-request-id")
-                .and_then(|v| v.to_str().ok())
-            {
-                a2a_ctx.parent_request_id = Some(v.to_string());
-            }
-            if let Some(v) = h
-                .get("x-a2a-chain-depth")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u32>().ok())
-            {
-                a2a_ctx.chain_depth = v.max(1);
-            }
-            if let Some(raw) = h.get("x-a2a-chain").and_then(|v| v.to_str().ok()) {
-                if let Ok(parsed) = serde_json::from_str::<Vec<sbproxy_modules::ChainHop>>(raw) {
-                    a2a_ctx.chain = parsed;
-                }
-            }
+            // WOR-2120: the envelope is only populated from headers when
+            // the immediate peer is in `proxy.trusted_proxies`. An
+            // untrusted caller gets the zero-default envelope with
+            // `identity_verified` clear, so the policy can tell "no
+            // identity asserted" apart from "identity asserted by
+            // someone we trust" instead of treating a forged
+            // `x-a2a-chain-depth: 1` as a genuine chain root.
+            let a2a_ctx = sbproxy_modules::envelope_from_headers(
+                &session.req_header().headers,
+                signal.to_spec(),
+                peer_trusted,
+            );
             ctx.a2a = Some(a2a_ctx);
         }
     }
@@ -699,10 +1075,20 @@ pub(super) async fn request_filter(
         let traceparent = headers.get("traceparent").and_then(|v| v.to_str().ok());
         let tracestate = headers.get("tracestate").and_then(|v| v.to_str().ok());
 
-        ctx.trace_ctx = if let Some(tp) = traceparent {
+        // Only the genuine-parse outcomes land here; a synthesized
+        // random root falls out to `None` below. This distinction
+        // (`ctx.trace_parent_is_remote`) matters downstream: the
+        // AI-dispatch span-creation site uses it to decide whether to
+        // parent the exported span on the caller's trace via
+        // `sbproxy_observe::telemetry::parent_span_on_remote_trace_context`,
+        // an explicit, request-scoped call rather than any
+        // ambient/thread-local OTel state (which used to leak one
+        // Context per request and could bleed a previous request's
+        // trace onto a later one with no traceparent of its own, on a
+        // reused worker thread).
+        let remote_trace_ctx = if let Some(tp) = traceparent {
             // Try W3C traceparent first.
             sbproxy_observe::trace_ctx::w3c::TraceContext::parse_with_state(tp, tracestate)
-                .or_else(|| Some(sbproxy_observe::TraceContext::new_random()))
         } else {
             // Fall back to B3 single header.
             let b3_ctx = headers
@@ -727,12 +1113,15 @@ pub(super) async fn request_filter(
                             tid, sid, sampled, parent,
                         )
                         .map(|b3| b3.to_w3c())
-                        .or_else(|| Some(sbproxy_observe::TraceContext::new_random()))
                     }
-                    _ => Some(sbproxy_observe::TraceContext::new_random()),
+                    _ => None,
                 }
             }
         };
+
+        ctx.trace_parent_is_remote = remote_trace_ctx.is_some();
+        ctx.trace_ctx =
+            Some(remote_trace_ctx.unwrap_or_else(sbproxy_observe::TraceContext::new_random));
     }
 
     // --- ACME HTTP-01 challenge interception ---
@@ -953,6 +1342,31 @@ pub(super) async fn request_filter(
         }
     };
     ctx.origin_idx = Some(origin_idx);
+
+    // Validated GraphQL requests may pass through body-consuming middleware
+    // (notably threat protection) before action dispatch. Enable replay at
+    // the origin boundary so every consumed chunk is still available for
+    // GraphQL validation and byte-for-byte upstream forwarding.
+    if request_requires_graphql_replay(session, &pipeline, origin_idx) {
+        session.as_mut().enable_retry_buffering();
+        // Mark this before the idempotency pre-check. A cached response from
+        // an older, more permissive configuration must not return before the
+        // current GraphQL action validates the final modified request.
+        ctx.graphql_validation_pending = true;
+    }
+    // RFC 9449 permits one retry when a protected resource challenges
+    // with a nonce. Enable Pingora's bounded replay buffer before any
+    // request body is consumed so that retry is safe for body-bearing
+    // methods as well as bodyless requests.
+    if pipeline
+        .outbound_creds
+        .get(origin_idx)
+        .and_then(Option::as_ref)
+        .is_some_and(|credential| credential.is_dpop_enabled())
+    {
+        session.as_mut().enable_retry_buffering();
+    }
+
     // WOR-1053: stamp the matched origin's tenant on the request
     // context so downstream auth / policy / vault resolution can
     // partition by tenant. The compiler defaults the field to
@@ -1863,6 +2277,8 @@ pub(super) async fn request_filter(
 
     // --- Force SSL redirect ---
     let origin = &pipeline.config.origins[origin_idx];
+    let ai_proxy_owns_replay_paths =
+        request_uses_ai_owned_replay_paths(session, &pipeline, origin_idx);
     if origin.force_ssl {
         // Determine whether the inbound request is already on TLS.
         //
@@ -1977,75 +2393,171 @@ pub(super) async fn request_filter(
     // --- Threat protection (before auth, per handler chain) ---
     if let Some(threat) = &pipeline.threat_protections[origin_idx] {
         if threat.enabled {
-            let content_type = session
-                .req_header()
-                .headers
-                .get(http::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            let declared_json = content_type.contains("application/json");
-            // WOR-1150: scan when the Content-Type declares JSON OR the
-            // body is actually JSON-shaped, so a client cannot bypass the
-            // JSON-bomb / depth limits by mislabeling the Content-Type
-            // (e.g. sending a deep JSON body as text/plain). A JSON body's
-            // first non-whitespace byte is `{`/`[` and lands in the first
-            // transport chunk, so the shape check reads only that chunk.
-            if let Some(first_chunk) = session.read_request_body().await? {
-                let looks_json = first_chunk
-                    .iter()
-                    .find(|b| !b.is_ascii_whitespace())
-                    .map(|b| *b == b'{' || *b == b'[')
-                    .unwrap_or(false);
-                if declared_json || looks_json {
-                    // WOR-1739: accumulate the FULL body, not just the
-                    // first chunk. Pingora delivers the body chunk by
-                    // chunk and mirrors every consumed chunk into its
-                    // retry buffer for upstream replay, so scanning a
-                    // single read left a JSON bomb whose depth / key
-                    // explosion straddled a later chunk unscanned while
-                    // the whole body still reached the origin. Bound the
-                    // buffer by the configured `max_total_size` (or a
-                    // hard ceiling when unset) so a threat-protected
-                    // origin cannot be driven to buffer without limit;
-                    // an over-cap body is rejected exactly as
-                    // `check_json_body` rejects an oversized one.
-                    const THREAT_SCAN_HARD_CAP: usize = 8 * 1024 * 1024;
-                    let size_cap = threat
-                        .json
-                        .as_ref()
-                        .and_then(|j| j.max_total_size)
-                        .unwrap_or(THREAT_SCAN_HARD_CAP);
-                    let mut body_buf: Vec<u8> = first_chunk.to_vec();
-                    let mut over_cap = body_buf.len() > size_cap;
-                    while !over_cap {
-                        match session.read_request_body().await? {
-                            Some(chunk) => {
-                                if body_buf.len().saturating_add(chunk.len()) > size_cap {
-                                    over_cap = true;
-                                } else {
-                                    body_buf.extend_from_slice(&chunk);
-                                }
+            // Body reads in request_filter drain the downstream stream
+            // before Pingora can forward it. Defer the bounded scan to
+            // request_body_filter, which releases the exact buffered bytes
+            // only after validation succeeds.
+            ctx.threat_scan_pending = true;
+        }
+    }
+
+    // --- Inbound minted-key resolution (before auth) ---
+    //
+    // Runs after every well-known, callback, health, metrics and CORS-preflight
+    // interception has already short-circuited, so a preflight carrying no
+    // credentials never reaches this and cannot be denied.
+    //
+    // Deliberately not an `Auth` variant: `pipeline.auths` holds one optional
+    // provider per origin, so a variant would force an origin to choose between
+    // minted keys and its existing JWT / OIDC / mTLS auth. Running first, and
+    // short-circuiting only on success, is what lets a minted key work in
+    // parallel with credentials the proxy does not own.
+    //
+    // AI actions have two additional credential sources whose `sk-...` shape
+    // overlaps provider-native keys: legacy stored virtual keys and exact
+    // `ai_provider` credentials from origin config. Let the AI resolver check
+    // those sources before it falls back to native-key admission. Generic
+    // proxy actions have no later resolver and remain fully governed here.
+    let ai_action_resolves_overlapping_credentials = ai_proxy_owns_replay_paths;
+    if let Some(plane) = pipeline.key_plane() {
+        let origin_label = ctx.hostname.to_string();
+        // Bind the outcome before matching so the immutable borrow of
+        // `session` ends here rather than spanning the arms, which need it
+        // mutably to write an error response.
+        let outcome =
+            resolve_inbound_key(plane, &session.req_header().headers, raw_peer_ip, ctx).await;
+        match outcome {
+            InboundKeyPhase::Resolved => {
+                ctx.inbound_key_mode = crate::context::InboundKeyMode::Minted;
+                sbproxy_observe::metrics::record_auth(&origin_label, "virtual_key", true);
+            }
+            InboundKeyPhase::NotPresent => {
+                if !ai_action_resolves_overlapping_credentials {
+                    // No minted key: recognize and govern a caller-owned native
+                    // provider credential. The explicit default policy is what
+                    // prevents this path from silently spending an operator key.
+                    match crate::inbound_key::resolve_native_key_policy(
+                        &session.req_header().headers,
+                        plane.inbound(),
+                    ) {
+                        crate::inbound_key::NativeKeyPolicyDecision::NotPresent => {}
+                        crate::inbound_key::NativeKeyPolicyDecision::Allowed { provider } => {
+                            let policy = plane
+                                .inbound()
+                                .native_key_policy
+                                .as_ref()
+                                .expect("allowed native key decision requires a policy");
+                            let record = crate::inbound_key::native_policy_record(
+                                policy,
+                                ctx.tenant_id.as_str(),
+                                ctx.hostname.as_str(),
+                                &provider,
+                            );
+                            ctx.native_key_provider = Some(provider);
+                            ctx.inbound_key_mode = crate::context::InboundKeyMode::Native;
+                            let within_rpm = record.max_requests_per_minute.is_none()
+                                || super::ai_dispatch::key_rate_limiter().check_request_rate(
+                                    &record.key_id,
+                                    record.max_requests_per_minute,
+                                );
+                            ctx.native_key_policy_record = Some(Box::new(record));
+                            if !within_rpm {
+                                sbproxy_observe::metrics::record_policy(
+                                    &origin_label,
+                                    "rate_limit",
+                                    "deny",
+                                );
+                                sbproxy_observe::SecurityAuditEntry::policy_violation(
+                                    "rate_limit",
+                                    "native provider key request rate exceeded",
+                                    429,
+                                    Some(origin_label.clone()),
+                                    ctx.client_ip,
+                                    Some(ctx.request_id.to_string()),
+                                    Some(session.req_header().method.as_str().to_string()),
+                                )
+                                .with_tenant_id(ctx.tenant_id.to_string())
+                                .with_key_context(
+                                    ctx.native_key_provider.clone(),
+                                    ctx.inbound_key_mode.as_str(),
+                                )
+                                .with_api_key_id(ctx.accountable_key_id())
+                                .emit();
+                                send_error(session, 429, "rate limit exceeded for this key")
+                                    .await?;
+                                return Ok(true);
                             }
-                            None => break,
+                        }
+                        crate::inbound_key::NativeKeyPolicyDecision::PolicyMissing { provider }
+                        | crate::inbound_key::NativeKeyPolicyDecision::ProviderDenied {
+                            provider,
+                        } => {
+                            ctx.native_key_provider = Some(provider);
+                            ctx.inbound_key_mode = crate::context::InboundKeyMode::Native;
+                            // WOR-2094: the ring row names the denial.
+                            ctx.record_policy_decision("native_key_policy", "deny");
+                            ctx.deny_reason =
+                                Some("native_key_policy: provider not allowed".to_string());
+                            finalize_inbound_key_trust(ctx, AuthTrustOutcome::Missing);
+                            sbproxy_observe::metrics::record_auth(
+                                &origin_label,
+                                "native_provider_key",
+                                false,
+                            );
+                            emit_auth_audit(
+                                "auth_denied",
+                                "native_provider_key",
+                                403,
+                                &origin_label,
+                                ctx,
+                                session,
+                            );
+                            send_error(session, 403, "native provider key is not allowed").await?;
+                            return Ok(true);
                         }
                     }
-                    if over_cap {
-                        debug!("threat protection blocked request: body exceeds size cap");
-                        send_error(session, 413, "request entity too large").await?;
-                        return Ok(true);
-                    }
-                    if let Err(msg) = threat.check_json_body(&body_buf) {
-                        debug!(detail = %msg, "threat protection blocked request");
-                        send_error(session, 413, "request entity too large").await?;
-                        return Ok(true);
-                    }
                 }
+                if crate::inbound_key::requires_minted_key(plane.inbound()) {
+                    finalize_inbound_key_trust(ctx, AuthTrustOutcome::Missing);
+                    sbproxy_observe::metrics::record_auth(&origin_label, "virtual_key", false);
+                    emit_auth_audit(
+                        "auth_denied",
+                        "virtual_key",
+                        401,
+                        &origin_label,
+                        ctx,
+                        session,
+                    );
+                    send_error(session, 401, "an api key is required").await?;
+                    return Ok(true);
+                }
+            }
+            InboundKeyPhase::Deny {
+                status,
+                message,
+                trust_outcome,
+            } => {
+                finalize_inbound_key_trust(ctx, trust_outcome);
+                sbproxy_observe::metrics::record_auth(&origin_label, "virtual_key", false);
+                emit_auth_audit(
+                    "auth_denied",
+                    "virtual_key",
+                    status,
+                    &origin_label,
+                    ctx,
+                    session,
+                );
+                send_error(session, status, &message).await?;
+                return Ok(true);
             }
         }
     }
 
     // --- Auth check ---
-    if let Some(auth) = &pipeline.auths[origin_idx] {
+    // A resolved minted key already authenticated this request, so the origin's
+    // configured provider is skipped. That makes the two front doors
+    // alternatives rather than a chain.
+    if let (None, Some(auth)) = (&ctx.resolved_inbound_key, &pipeline.auths[origin_idx]) {
         let auth_type = auth.auth_type().to_string();
         let origin_label = ctx.hostname.to_string();
         // Handle forward auth (requires async HTTP subrequest).
@@ -2072,7 +2584,8 @@ pub(super) async fn request_filter(
                     ctx.trust_headers = Some(trust_headers);
                     sbproxy_observe::metrics::record_auth(&origin_label, &auth_type, true);
                 }
-                Err((status, msg)) => {
+                Err((status, msg, trust_outcome)) => {
+                    crate::trust_tier::finalize(ctx, trust_outcome.is_suspicious());
                     sbproxy_observe::metrics::record_auth(&origin_label, &auth_type, false);
                     emit_auth_audit(
                         "forward_auth_denied",
@@ -2114,7 +2627,7 @@ pub(super) async fn request_filter(
                 crate::agent_class::cap_binding_agent_id(ctx).map(|s| s.to_string());
             #[cfg(not(feature = "agent-class"))]
             let resolved_agent_id: Option<String> = None;
-            let (auth_result, principal_opt) = check_auth(
+            let (auth_result, principal_opt, trust_outcome) = check_auth_with_outcome(
                 auth,
                 req_headers,
                 query,
@@ -2152,7 +2665,10 @@ pub(super) async fn request_filter(
             // `request_body_filter` buffers the body and runs
             // `verify_content_digest` against the Content-Digest
             // header value the signature attests to.
-            let auth_succeeded = matches!(auth_result, AuthResult::Allow { .. });
+            let auth_succeeded = matches!(
+                auth_result,
+                AuthResult::Allow { .. } | AuthResult::RateLimited(_)
+            );
             if auth_succeeded && matches!(auth, Auth::BotAuth(_)) {
                 #[cfg(feature = "agent-class")]
                 if let Some(keyid) = bot_auth_keyid.as_deref() {
@@ -2179,10 +2695,36 @@ pub(super) async fn request_filter(
                     ctx.validate_request_body = true;
                 }
             }
+            if !auth_succeeded {
+                crate::trust_tier::finalize(ctx, trust_outcome.is_suspicious());
+            }
             match auth_result {
                 AuthResult::Allow { sub, source } => {
                     ctx.auth_result = Some(sbproxy_plugin::AuthDecision::Allow { sub, source });
                     sbproxy_observe::metrics::record_auth(&origin_label, &auth_type, true);
+                }
+                AuthResult::RateLimited(info) => {
+                    ctx.auth_result = Some(sbproxy_plugin::AuthDecision::allow_anonymous());
+                    sbproxy_observe::metrics::record_auth(&origin_label, &auth_type, true);
+                    crate::trust_tier::finalize(ctx, false);
+                    let extra_headers = vec![
+                        ("X-RateLimit-Limit".to_string(), info.limit.to_string()),
+                        (
+                            "X-RateLimit-Remaining".to_string(),
+                            info.remaining.to_string(),
+                        ),
+                        ("X-RateLimit-Reset".to_string(), info.reset_secs.to_string()),
+                        ("Retry-After".to_string(), info.reset_secs.to_string()),
+                    ];
+                    ctx.rate_limit_info = Some(info);
+                    send_error_with_extra_headers(
+                        session,
+                        429,
+                        "cap: rate limit exceeded",
+                        &extra_headers,
+                    )
+                    .await?;
+                    return Ok(true);
                 }
                 AuthResult::Deny(status, ref msg) => {
                     sbproxy_observe::metrics::record_auth(&origin_label, &auth_type, false);
@@ -2268,6 +2810,11 @@ pub(super) async fn request_filter(
         }
     }
 
+    // All identity enrichers and the configured authentication provider
+    // have now run. Compute once so every downstream policy sees the same
+    // conservative tier and the distribution metric has a live writer.
+    crate::trust_tier::finalize(ctx, false);
+
     // --- P0 edge capture ---
     //
     // Stamp custom properties, session linkage, and end-user ID
@@ -2333,6 +2880,7 @@ pub(super) async fn request_filter(
         .idempotencies
         .get(origin_idx)
         .and_then(|o| o.as_ref())
+        .filter(|_| !ctx.graphql_validation_pending && !ai_proxy_owns_replay_paths)
     {
         let method_matches = idem.methods.contains(&session.req_header().method);
         let header_present = session
@@ -2465,40 +3013,31 @@ pub(super) async fn request_filter(
                                 return Ok(true);
                             }
 
+                            // Cached idempotency responses drain and short
+                            // circuit inside request_filter, before
+                            // request_body_filter runs. Complete the
+                            // body-bound BotAuth proof here first so neither a
+                            // replay nor a 409 conflict can bypass it.
+                            if !crate::trust_tier::verify_and_finalize_body_proof(
+                                ctx,
+                                &session.req_header().headers,
+                                &buf,
+                            ) {
+                                ctx.idempotency_permit = None;
+                                send_error(session, 401, "bot_auth: content-digest body mismatch")
+                                    .await?;
+                                ctx.response_status = Some(401);
+                                return Ok(true);
+                            }
+
                             let body_hash = sbproxy_middleware::idempotency::hash_body(&buf);
                             if body_hash == cached_resp.request_body_hash {
-                                // Cache hit: replay the cached
-                                // response. Strip framing headers
-                                // so Pingora rederives them on
-                                // the client connection.
-                                let filtered_headers: Vec<(String, String)> = cached_resp
-                                    .headers
-                                    .into_iter()
-                                    .filter(|(name, _)| {
-                                        let lower = name.to_ascii_lowercase();
-                                        lower != "content-length"
-                                            && lower != "transfer-encoding"
-                                            && lower != "connection"
-                                    })
-                                    .collect();
-                                let mut header = pingora_http::ResponseHeader::build(
-                                    cached_resp.status,
-                                    Some(filtered_headers.len() + 1),
-                                )?;
-                                for (name, value) in filtered_headers {
-                                    let _ = header.insert_header(name, value);
-                                }
-                                let _ = header.insert_header("x-sbproxy-idempotency", "HIT");
-                                session
-                                    .write_response_header(Box::new(header), false)
-                                    .await?;
-                                session
-                                    .write_response_body(
-                                        Some(bytes::Bytes::from(cached_resp.body)),
-                                        true,
-                                    )
-                                    .await?;
-                                ctx.response_status = Some(cached_resp.status);
+                                // Cache hit: replay the cached response. The
+                                // shared helper also serves GraphQL hits that
+                                // must wait until final-request validation.
+                                let status =
+                                    send_idempotency_cache_hit(session, cached_resp).await?;
+                                ctx.response_status = Some(status);
                                 return Ok(true);
                             } else {
                                 // Body conflict: same key,
@@ -2552,7 +3091,20 @@ pub(super) async fn request_filter(
         tenant_id: policy_workspace_id.clone(),
         workspace_id: policy_workspace_id,
     };
-    match check_policies(&pipeline.enforcers[origin_idx], session, ctx, &verdict_ctx).await {
+    let policy_verdict =
+        check_policies(&pipeline.enforcers[origin_idx], session, ctx, &verdict_ctx).await;
+    // WOR-2143: the settlement origin gate. When `proxy.payments` is
+    // active and the chain's verdict is an `ai_crawl_control` 402, the
+    // gate answers from durable settlement state instead: it turns the
+    // deny into an allow exactly when a payment durably settled, and
+    // rewrites the stored challenge otherwise. This is the call-site
+    // seam on purpose: the enforcer trait's returned future cannot
+    // borrow the RequestContext, and settlement has to await the store
+    // and then mutate it.
+    #[cfg(feature = "payments")]
+    let policy_verdict =
+        crate::settlement_gate::apply(session.req_header(), ctx, policy_verdict).await;
+    match policy_verdict {
         None => {
             sbproxy_observe::metrics::record_policy(&policy_origin, "all", "allow");
             // `ctx.rate_limit_info` was populated in-place by the
@@ -2576,6 +3128,13 @@ pub(super) async fn request_filter(
             // dashboards and SIEM rules can break down by module
             // instead of inferring from the response status.
             sbproxy_observe::metrics::record_policy(&policy_origin, policy_type, "deny");
+            // WOR-2094: mirror the denial onto the ring row's
+            // explainability columns. Enforcers that already recorded a
+            // more specific reason keep it.
+            ctx.record_policy_decision(policy_type, "deny");
+            if ctx.deny_reason.is_none() {
+                ctx.deny_reason = Some(format!("{policy_type}: {msg}"));
+            }
             // Audit-log the denial alongside the metric. Policy
             // metrics roll up to dashboards; the audit channel
             // feeds the SIEM with structured per-event records so
@@ -2591,8 +3150,23 @@ pub(super) async fn request_filter(
                 Some(session.req_header().method.as_str().to_string()),
             )
             .with_tenant_id(ctx.tenant_id.to_string())
+            .with_key_context(
+                ctx.native_key_provider.clone(),
+                ctx.inbound_key_mode.as_str(),
+            )
+            .with_api_key_id(ctx.accountable_key_id())
             .emit();
-            if status == 429
+            if let Some(response) =
+                take_concurrent_limit_denial_response(ctx, status, &msg, policy_type)
+            {
+                send_response(
+                    session,
+                    response.status,
+                    response.content_type,
+                    response.body.as_bytes(),
+                )
+                .await?;
+            } else if status == 429
                 && (policy_type == "rate_limit"
                     || policy_type == "ddos"
                     || policy_type == "rate_limit_budget")
@@ -2631,9 +3205,13 @@ pub(super) async fn request_filter(
                                 .insert_header("RateLimit-Remaining", info.remaining.to_string());
                             let _ = header
                                 .insert_header("RateLimit-Reset", info.reset_secs.to_string());
-                            // Window is the per-second budget window.
-                            let _ = header
-                                .insert_header("RateLimit-Policy", format!("{};w=1", info.limit));
+                            if info.include_ratelimit_policy {
+                                // Window is the per-second budget window.
+                                let _ = header.insert_header(
+                                    "RateLimit-Policy",
+                                    format!("{};w=1", info.limit),
+                                );
+                            }
                         }
                     } else if info.headers_enabled {
                         let _ = header.insert_header("X-RateLimit-Limit", info.limit.to_string());
@@ -2656,14 +3234,14 @@ pub(super) async fn request_filter(
                 // AI crawl control: 402 with the configured
                 // challenge header and a JSON body the crawler
                 // can introspect for price + retry instructions.
-                let (header_name, challenge, body) =
-                    ctx.crawl_challenge.take().unwrap_or_else(|| {
-                        (
-                            "crawler-payment".to_string(),
-                            "Crawler-Payment realm=\"ai-crawl\"".to_string(),
-                            error_json_body(&msg),
-                        )
-                    });
+                let rendered = ctx.crawl_challenge.take().unwrap_or_else(|| {
+                    crate::context::PaymentResponse::json_with_header(
+                        "crawler-payment",
+                        "Crawler-Payment realm=\"ai-crawl\"".to_string(),
+                        error_json_body(&msg),
+                    )
+                });
+                let body = rendered.body;
                 let mut header =
                     pingora_http::ResponseHeader::build(status, Some(3)).map_err(|e| {
                         Error::because(
@@ -2672,18 +3250,14 @@ pub(super) async fn request_filter(
                             e,
                         )
                     })?;
-                // G3.4 multi-rail emits the response via the same
-                // crawl_challenge slot but uses the sentinel
-                // header_name `Content-Type` to signal "stamp this
-                // value as Content-Type, skip the Crawler-Payment
-                // header". Wave 1 single-rail keeps the original
-                // behaviour: Content-Type is application/json and
-                // header_name carries the Crawler-Payment value.
-                if header_name.eq_ignore_ascii_case("content-type") {
-                    let _ = header.insert_header("content-type", &challenge);
-                } else {
-                    let _ = header.insert_header("content-type", "application/json");
-                    let _ = header.insert_header(header_name, &challenge);
+                // The policy already decided the exact content type and
+                // every header. Repeated names are appended rather than
+                // replaced, because Payment HTTP Authentication offers one
+                // `WWW-Authenticate` field per challenge and collapsing them
+                // into one field is a different, non-conforming message.
+                let _ = header.insert_header("content-type", &rendered.content_type);
+                for (name, value) in &rendered.headers {
+                    let _ = header.append_header(name.clone(), value);
                 }
                 // Content-Length is required so HTTP/1.1 keep-alive
                 // clients know where the body ends without waiting
@@ -2704,7 +3278,7 @@ pub(super) async fn request_filter(
                 let body = ctx
                     .crawl_challenge
                     .take()
-                    .map(|(_, _, body)| body)
+                    .map(|rendered| rendered.body)
                     .unwrap_or_else(|| error_json_body(&msg));
                 let mut header =
                     pingora_http::ResponseHeader::build(status, Some(2)).map_err(|e| {
@@ -2730,7 +3304,7 @@ pub(super) async fn request_filter(
                 let body = ctx
                     .crawl_challenge
                     .take()
-                    .map(|(_, _, body)| body)
+                    .map(|rendered| rendered.body)
                     .unwrap_or_else(|| error_json_body(&msg));
                 let mut header =
                     pingora_http::ResponseHeader::build(status, Some(2)).map_err(|e| {
@@ -2755,7 +3329,7 @@ pub(super) async fn request_filter(
                 let body = ctx
                     .crawl_challenge
                     .take()
-                    .map(|(_, _, body)| body)
+                    .map(|rendered| rendered.body)
                     .unwrap_or_else(|| error_json_body(&msg));
                 let mut header =
                     pingora_http::ResponseHeader::build(status, Some(3)).map_err(|e| {
@@ -2772,6 +3346,36 @@ pub(super) async fn request_filter(
                         let _ = header.insert_header("Retry-After", info.reset_secs.to_string());
                     }
                 }
+                session
+                    .write_response_header(Box::new(header), false)
+                    .await?;
+                session
+                    .write_response_body(Some(bytes::Bytes::copy_from_slice(body.as_bytes())), true)
+                    .await?;
+            } else if policy_type == "ai_crawl_settlement" {
+                // WOR-2143: a settlement-gate response that is not a 402
+                // (the 406 rail negotiation failure, the 400 duplicate
+                // credential, the 503 infrastructure refusal). The gate
+                // rendered every byte, including any Retry-After or
+                // problem+json content type; write it verbatim.
+                let rendered = ctx.crawl_challenge.take().unwrap_or_else(|| {
+                    crate::context::PaymentResponse::json(error_json_body(&msg))
+                });
+                let body = rendered.body;
+                let header_count = 2 + rendered.headers.len();
+                let mut header = pingora_http::ResponseHeader::build(status, Some(header_count))
+                    .map_err(|e| {
+                        Error::because(
+                            ErrorType::InternalError,
+                            "failed to build response header",
+                            e,
+                        )
+                    })?;
+                let _ = header.insert_header("content-type", &rendered.content_type);
+                for (name, value) in &rendered.headers {
+                    let _ = header.append_header(name.clone(), value);
+                }
+                let _ = header.insert_header("content-length", body.len().to_string());
                 session
                     .write_response_header(Box::new(header), false)
                     .await?;
@@ -2840,7 +3444,10 @@ pub(super) async fn request_filter(
     // the upstream.
     if let (Some(cache_cfg), Some(cache_store)) = (
         origin.response_cache.as_ref(),
-        pipeline.cache_store.as_ref(),
+        // Per-origin handle, not the shared one: with at-rest
+        // encryption on it is the only handle that can seal or open
+        // this origin's entries.
+        pipeline.cache_store_for(&origin.origin_id),
     ) {
         // WOR-114: `x-sb-flags: no-cache` (or `?_sb.no-cache`)
         // bypasses both lookup and write for this request. The
@@ -2849,7 +3456,7 @@ pub(super) async fn request_filter(
         // try to write the answer back. Mutation invalidation
         // also skips because the client is asking for a fresh
         // round-trip and any same-path GET will repopulate.
-        if cache_cfg.enabled && !ctx.flags.no_cache {
+        if cache_cfg.enabled && !ctx.flags.no_cache && !ai_proxy_owns_replay_paths {
             let req_method = session.req_header().method.as_str().to_string();
 
             // --- Mutation invalidation ---
@@ -2925,6 +3532,7 @@ pub(super) async fn request_filter(
             };
 
             if method_ok {
+                ctx.record_admin_cache_status(crate::context::AdminCacheStatus::Miss);
                 let key = build_response_cache_key(
                     "",
                     ctx.hostname.as_str(),
@@ -2965,9 +3573,38 @@ pub(super) async fn request_filter(
                             // window replays so operators can tell
                             // them apart in logs and dashboards.
                             let cache_marker = if fresh { "HIT" } else { "STALE" };
-                            let mut header = pingora_http::ResponseHeader::build(
+                            let request_header = session.req_header();
+                            let if_none_match: Vec<&[u8]> = request_header
+                                .headers
+                                .get_all("if-none-match")
+                                .iter()
+                                .map(|value| value.as_bytes())
+                                .collect();
+                            let if_modified_since = request_header
+                                .headers
+                                .get("if-modified-since")
+                                .map(|value| value.as_bytes());
+                            let precondition = sbproxy_cache::evaluate_cached_preconditions(
+                                req_method.as_str(),
                                 entry.status,
-                                Some(entry.headers.len() + 1),
+                                &entry.headers,
+                                &if_none_match,
+                                if_modified_since,
+                            );
+                            let (response_status, response_headers) = match precondition {
+                                sbproxy_cache::CachedPrecondition::ServeRepresentation => {
+                                    (entry.status, entry.headers.clone())
+                                }
+                                sbproxy_cache::CachedPrecondition::NotModified => {
+                                    (304, sbproxy_cache::headers_for_not_modified(&entry.headers))
+                                }
+                                sbproxy_cache::CachedPrecondition::PreconditionFailed => {
+                                    (412, Vec::new())
+                                }
+                            };
+                            let mut header = pingora_http::ResponseHeader::build(
+                                response_status,
+                                Some(response_headers.len() + 1),
                             )
                             .map_err(|e| {
                                 Error::because(
@@ -2976,21 +3613,35 @@ pub(super) async fn request_filter(
                                     e,
                                 )
                             })?;
-                            for (name, value) in &entry.headers {
+                            for (name, value) in &response_headers {
                                 let _ = header.insert_header(name.clone(), value.clone());
                             }
                             let _ = header.insert_header("x-sbproxy-cache", cache_marker);
 
+                            let send_body = matches!(
+                                precondition,
+                                sbproxy_cache::CachedPrecondition::ServeRepresentation
+                            ) && !req_method.eq_ignore_ascii_case("HEAD")
+                                && response_status != 204
+                                && response_status != 304
+                                && !(100..200).contains(&response_status);
                             session
-                                .write_response_header(Box::new(header), false)
+                                .write_response_header(Box::new(header), !send_body)
                                 .await?;
-                            session
-                                .write_response_body(
-                                    Some(bytes::Bytes::copy_from_slice(&entry.body)),
-                                    true,
-                                )
-                                .await?;
+                            if send_body {
+                                session
+                                    .write_response_body(
+                                        Some(bytes::Bytes::copy_from_slice(&entry.body)),
+                                        true,
+                                    )
+                                    .await?;
+                            }
                             ctx.served_from_cache = true;
+                            ctx.record_admin_cache_status(crate::context::AdminCacheStatus::Hit);
+                            sbproxy_observe::metrics::record_cache(
+                                origin.origin_id.as_ref(),
+                                "hit",
+                            );
 
                             // --- SWR revalidation ---
                             // On a stale serve, kick off a background fetch
@@ -3000,6 +3651,12 @@ pub(super) async fn request_filter(
                             // can drain in-flight refreshes.
                             if in_swr {
                                 let req = session.req_header();
+                                let revalidation_request = build_swr_revalidation_request(
+                                    &pipeline,
+                                    origin_idx,
+                                    req,
+                                    &cache_cfg.vary,
+                                );
                                 let path_and_query = req
                                     .uri
                                     .path_and_query()
@@ -3010,15 +3667,17 @@ pub(super) async fn request_filter(
                                 // the response_filter does.
                                 let cacheable_status = cache_cfg.cacheable_status.clone();
                                 let new_ttl = cache_cfg.ttl_secs;
-                                spawn_swr_revalidation(
-                                    cache_store.clone(),
-                                    key.clone(),
-                                    new_ttl,
-                                    origin.action_config.clone(),
-                                    ctx.hostname.to_string(),
-                                    path_and_query,
-                                    cacheable_status,
-                                );
+                                if let Some(revalidation_request) = revalidation_request {
+                                    spawn_swr_revalidation(
+                                        cache_store.clone(),
+                                        key.clone(),
+                                        entry,
+                                        new_ttl,
+                                        revalidation_request,
+                                        path_and_query,
+                                        cacheable_status,
+                                    );
+                                }
                             }
                             return Ok(true);
                         }
@@ -3081,27 +3740,74 @@ pub(super) async fn request_filter(
                                         let promote_body = body.clone();
                                         let promote_meta = metadata.clone();
                                         let _ = tokio::task::spawn_blocking(move || {
-                                            let cached = sbproxy_cache::CachedResponse {
-                                                status: promote_meta.status,
-                                                headers: vec![],
-                                                body: promote_body.to_vec(),
-                                                cached_at: std::time::SystemTime::now()
+                                            let cached = promote_meta.to_cached_response(
+                                                promote_body,
+                                                std::time::SystemTime::now()
                                                     .duration_since(std::time::UNIX_EPOCH)
                                                     .unwrap_or_default()
                                                     .as_secs(),
-                                                ttl_secs: promote_meta
+                                                promote_meta
                                                     .expires_at
                                                     .duration_since(std::time::SystemTime::now())
-                                                    .map(|d| d.as_secs())
+                                                    .map(|duration| duration.as_secs())
                                                     .unwrap_or(60),
-                                            };
+                                            );
                                             let _ = promote_store.put(&promote_key, &cached);
                                         })
                                         .await;
                                         // Serve.
+                                        let request_header = session.req_header();
+                                        let if_none_match: Vec<&[u8]> = request_header
+                                            .headers
+                                            .get_all("if-none-match")
+                                            .iter()
+                                            .map(|value| value.as_bytes())
+                                            .collect();
+                                        let if_modified_since = request_header
+                                            .headers
+                                            .get("if-modified-since")
+                                            .map(|value| value.as_bytes());
+                                        let precondition =
+                                            sbproxy_cache::evaluate_cached_preconditions(
+                                                req_method.as_str(),
+                                                metadata.status,
+                                                &metadata.headers,
+                                                &if_none_match,
+                                                if_modified_since,
+                                            );
+                                        let (response_status, mut response_headers) =
+                                            match precondition {
+                                                sbproxy_cache::CachedPrecondition::ServeRepresentation => {
+                                                    (metadata.status, metadata.headers.clone())
+                                                }
+                                                sbproxy_cache::CachedPrecondition::NotModified => (
+                                                    304,
+                                                    sbproxy_cache::headers_for_not_modified(
+                                                        &metadata.headers,
+                                                    ),
+                                                ),
+                                                sbproxy_cache::CachedPrecondition::PreconditionFailed => {
+                                                    (412, Vec::new())
+                                                }
+                                            };
+                                        if matches!(
+                                            precondition,
+                                            sbproxy_cache::CachedPrecondition::ServeRepresentation
+                                        ) && !response_headers.iter().any(|(name, _)| {
+                                            name.eq_ignore_ascii_case("content-type")
+                                        }) {
+                                            if let Some(content_type) =
+                                                metadata.content_type.as_ref()
+                                            {
+                                                response_headers.push((
+                                                    "content-type".to_string(),
+                                                    content_type.clone(),
+                                                ));
+                                            }
+                                        }
                                         let mut header = pingora_http::ResponseHeader::build(
-                                            metadata.status,
-                                            Some(2),
+                                            response_status,
+                                            Some(response_headers.len() + 1),
                                         )
                                         .map_err(|e| {
                                             Error::because(
@@ -3110,16 +3816,34 @@ pub(super) async fn request_filter(
                                                 e,
                                             )
                                         })?;
-                                        if let Some(ct) = metadata.content_type.as_ref() {
-                                            let _ = header.insert_header("content-type", ct);
+                                        for (name, value) in &response_headers {
+                                            let _ =
+                                                header.insert_header(name.clone(), value.clone());
                                         }
                                         let _ =
                                             header.insert_header("x-sbproxy-cache", "HIT-RESERVE");
+                                        let send_body = matches!(
+                                            precondition,
+                                            sbproxy_cache::CachedPrecondition::ServeRepresentation
+                                        ) && !req_method
+                                            .eq_ignore_ascii_case("HEAD")
+                                            && response_status != 204
+                                            && response_status != 304
+                                            && !(100..200).contains(&response_status);
                                         session
-                                            .write_response_header(Box::new(header), false)
+                                            .write_response_header(Box::new(header), !send_body)
                                             .await?;
-                                        session.write_response_body(Some(body), true).await?;
+                                        if send_body {
+                                            session.write_response_body(Some(body), true).await?;
+                                        }
                                         ctx.served_from_cache = true;
+                                        ctx.record_admin_cache_status(
+                                            crate::context::AdminCacheStatus::Hit,
+                                        );
+                                        sbproxy_observe::metrics::record_cache(
+                                            origin.origin_id.as_ref(),
+                                            "hit",
+                                        );
                                         sbproxy_observe::metrics()
                                             .cache_reserve_hits
                                             .with_label_values(&[lookup_origin.as_str()])
@@ -3157,6 +3881,13 @@ pub(super) async fn request_filter(
                         warn!(error = %e, "cache lookup error, bypassing cache");
                     }
                 }
+
+                // Every cache hit above serves the response and returns, so
+                // reaching here means the lookup did not produce a live entry
+                // to serve: a hot miss, a stale entry past the SWR window, a
+                // cold-reserve miss, or a lookup error. All fall through to the
+                // upstream fetch, which is what a cache miss is.
+                sbproxy_observe::metrics::record_cache(origin.origin_id.as_ref(), "miss");
             }
         }
     }
@@ -3459,27 +4190,55 @@ fn get_or_init_revocation_store(
         }
         sbproxy_config::OlpRevocationStoreConfig::Redis { url } => {
             // WOR-808 PR11: open the operator-declared Redis store.
-            // RedisConfig wants a `host:port` address, not a
-            // `redis://` URL; tolerate either by stripping the
-            // scheme prefix. Bad URL / unreachable Redis returns
-            // None so the handler 503s (introspect MUST NOT
-            // silently allow when the revocation store is down).
-            let addr = url
-                .strip_prefix("redis://")
-                .or_else(|| url.strip_prefix("rediss://"))
-                .unwrap_or(url.as_str())
-                .trim_end_matches('/')
-                .to_string();
-            let redis_cfg = sbproxy_platform::storage::RedisConfig {
-                addr,
-                pool_size: 8,
-                acquire_timeout: std::time::Duration::from_secs(5),
-            };
+            // Invalid connection configuration returns None so the handler
+            // 503s. Introspection must not silently allow when the revocation
+            // store is unavailable.
+            let redis_cfg = sbproxy_platform::storage::RedisConfig::from_dsn(url).ok()?;
             std::sync::Arc::new(sbproxy_platform::storage::RedisKVStore::new(redis_cfg))
         }
     };
     reg.insert(key, new_store.clone());
     Some(new_store)
+}
+
+#[cfg(test)]
+mod redis_revocation_store_tests {
+    use super::get_or_init_revocation_store;
+    use sbproxy_config::OlpRevocationStoreConfig;
+
+    #[test]
+    fn redis_revocation_store_accepts_full_secure_dsn_without_network_io() {
+        let config = OlpRevocationStoreConfig::Redis {
+            url: "rediss://default:p%40ss@[::1]:6380/7".to_string(),
+        };
+
+        assert!(get_or_init_revocation_store("secure-dsn.example", &config).is_some());
+    }
+
+    #[test]
+    fn redis_revocation_store_rejects_invalid_dsn_before_network_io() {
+        let config = OlpRevocationStoreConfig::Redis {
+            url: "rediss://default:sentinel-olp-password@sentinel-olp-host.invalid:6380/-1"
+                .to_string(),
+        };
+
+        assert!(get_or_init_revocation_store("invalid-dsn.example", &config).is_none());
+    }
+
+    #[test]
+    fn invalid_revocation_store_log_uses_static_unavailable_message() {
+        let source = include_str!("request_phase.rs");
+        let obsolete = ["revocation store backend not yet", " implemented"].concat();
+
+        assert!(
+            source.contains("warn!(\"olp introspect: revocation store unavailable\");"),
+            "invalid revocation-store construction must report unavailability"
+        );
+        assert!(
+            !source.contains(&obsolete),
+            "shipped Redis support must not be described as unimplemented"
+        );
+    }
 }
 
 /// WOR-808 PR10: per-IP token-bucket rate limiter for the
@@ -3663,7 +4422,7 @@ async fn handle_olp_introspect_or_revoke(
     let store = match get_or_init_revocation_store(aud_hint, &introspect_cfg.revocation_store) {
         Some(s) => s,
         None => {
-            warn!("olp introspect: revocation store backend not yet implemented (PR10/PR11)");
+            warn!("olp introspect: revocation store unavailable");
             let body = br#"{"error":"temporarily_unavailable"}"#;
             send_response(session, 503, "application/json", body).await?;
             return Ok(());
@@ -4837,5 +5596,568 @@ mod olp_form_tests {
         )
         .unwrap();
         assert_eq!(got.client_id, "acme");
+    }
+}
+
+#[cfg(test)]
+mod inbound_key_phase_tests {
+    use super::*;
+    use sbproxy_keystore::crypto::KeyCrypto;
+    use sbproxy_keystore::record::{CredentialRecord, KeyRecord, RecordStatus};
+    use sbproxy_keystore::{
+        KeyPolicyCasResult, KeyStore, MemoryKeyStore, TtlCache, TtlCacheConfig,
+    };
+    use std::sync::Arc;
+
+    struct BrokenKeyReadStore {
+        inner: MemoryKeyStore,
+    }
+
+    #[async_trait::async_trait]
+    impl KeyStore for BrokenKeyReadStore {
+        async fn get_key(&self, _key_id: &str) -> anyhow::Result<Option<KeyRecord>> {
+            anyhow::bail!("store down")
+        }
+
+        async fn list_keys(&self) -> anyhow::Result<Vec<KeyRecord>> {
+            self.inner.list_keys().await
+        }
+
+        async fn put_key(&self, record: KeyRecord) -> anyhow::Result<()> {
+            self.inner.put_key(record).await
+        }
+
+        async fn put_key_if_revision(
+            &self,
+            record: KeyRecord,
+            expected_revision: u64,
+        ) -> anyhow::Result<KeyPolicyCasResult> {
+            self.inner
+                .put_key_if_revision(record, expected_revision)
+                .await
+        }
+
+        async fn delete_key(&self, key_id: &str) -> anyhow::Result<()> {
+            self.inner.delete_key(key_id).await
+        }
+
+        async fn get_credential(&self, id: &str) -> anyhow::Result<Option<CredentialRecord>> {
+            self.inner.get_credential(id).await
+        }
+
+        async fn list_credentials(&self) -> anyhow::Result<Vec<CredentialRecord>> {
+            self.inner.list_credentials().await
+        }
+
+        async fn put_credential(&self, record: CredentialRecord) -> anyhow::Result<()> {
+            self.inner.put_credential(record).await
+        }
+
+        async fn delete_credential(&self, id: &str) -> anyhow::Result<()> {
+            self.inner.delete_credential(id).await
+        }
+
+        async fn revision(&self) -> anyhow::Result<u64> {
+            self.inner.revision().await
+        }
+    }
+
+    /// A plane holding one active and one revoked key, plus their tokens.
+    async fn plane_with_keys() -> (crate::key_plane::KeyPlane, String, String) {
+        let crypto = KeyCrypto::new(b"pep".to_vec(), b"mas".to_vec());
+        let now = chrono::Utc::now();
+
+        let active = crypto.mint_key();
+        let active_rec = KeyRecord::new(active.key_id.clone(), active.secret_hash.clone(), now);
+
+        let revoked = crypto.mint_key();
+        let mut revoked_rec =
+            KeyRecord::new(revoked.key_id.clone(), revoked.secret_hash.clone(), now);
+        revoked_rec.status = RecordStatus::Revoked;
+
+        let store = Arc::new(MemoryKeyStore::new());
+        store.put_key(active_rec).await.unwrap();
+        store.put_key(revoked_rec).await.unwrap();
+        let cache = Arc::new(TtlCache::new(
+            store as Arc<dyn KeyStore>,
+            TtlCacheConfig::default(),
+        ));
+        let plane = crate::key_plane::KeyPlane::from_parts(crypto, cache, false, false, None);
+        (plane, active.token, revoked.token)
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> http::HeaderMap {
+        let mut map = http::HeaderMap::new();
+        for (k, v) in pairs {
+            map.append(
+                http::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                http::HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        map
+    }
+
+    fn ctx() -> RequestContext {
+        RequestContext::default()
+    }
+
+    fn loopback_ip() -> std::net::IpAddr {
+        "127.0.0.1".parse().unwrap()
+    }
+
+    /// A context whose peer looks like the admin server's own loopback
+    /// dispatch call, the only shape an impersonation ticket is ever
+    /// allowed to redeem from.
+    fn loopback_ctx() -> RequestContext {
+        let mut c = ctx();
+        c.client_ip = Some(loopback_ip());
+        c
+    }
+
+    fn assert_denial(
+        outcome: InboundKeyPhase,
+        expected_status: u16,
+        expected_trust: AuthTrustOutcome,
+    ) {
+        assert!(
+            matches!(
+                outcome,
+                InboundKeyPhase::Deny {
+                    status,
+                    trust_outcome,
+                    ..
+                } if status == expected_status && trust_outcome == expected_trust
+            ),
+            "unexpected inbound key outcome: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_minted_key_on_x_api_key_resolves_and_records_its_header() {
+        let (plane, token, _) = plane_with_keys().await;
+        let mut c = ctx();
+        let outcome =
+            resolve_inbound_key(&plane, &headers(&[("x-api-key", &token)]), None, &mut c).await;
+        assert!(matches!(outcome, InboundKeyPhase::Resolved), "{outcome:?}");
+        assert!(c.resolved_inbound_key.is_some());
+        // The caller strips exactly this header, so the proxy's own key never
+        // reaches the origin.
+        assert_eq!(c.inbound_key_header.as_deref(), Some("x-api-key"));
+    }
+
+    #[tokio::test]
+    async fn a_minted_key_is_also_accepted_on_bearer_authorization() {
+        let (plane, token, _) = plane_with_keys().await;
+        let mut c = ctx();
+        let h = headers(&[("authorization", &format!("Bearer {token}"))]);
+        assert!(matches!(
+            resolve_inbound_key(&plane, &h, None, &mut c).await,
+            InboundKeyPhase::Resolved
+        ));
+        assert_eq!(c.inbound_key_header.as_deref(), Some("authorization"));
+    }
+
+    #[tokio::test]
+    async fn no_token_leaves_the_context_untouched_so_configured_auth_runs() {
+        let (plane, _, _) = plane_with_keys().await;
+        let mut c = ctx();
+        let h = headers(&[("authorization", "Bearer some-opaque-jwt")]);
+        assert!(matches!(
+            resolve_inbound_key(&plane, &h, None, &mut c).await,
+            InboundKeyPhase::NotPresent
+        ));
+        assert!(c.resolved_inbound_key.is_none());
+        assert!(c.inbound_key_header.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_callers_own_provider_key_falls_through_rather_than_denying() {
+        // Parallel operation is the whole point: a tool presenting its real
+        // Anthropic key in x-api-key must reach the origin, not collect a 401.
+        let (plane, _, _) = plane_with_keys().await;
+        let mut c = ctx();
+        let h = headers(&[("x-api-key", "sk-ant-api03-abcdefghijklmnopqrstuvwxyz")]);
+        assert!(matches!(
+            resolve_inbound_key(&plane, &h, None, &mut c).await,
+            InboundKeyPhase::NotPresent
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_revoked_key_denies_403() {
+        let (plane, _, revoked) = plane_with_keys().await;
+        let mut c = ctx();
+        let outcome =
+            resolve_inbound_key(&plane, &headers(&[("x-api-key", &revoked)]), None, &mut c).await;
+        assert_denial(outcome, 403, AuthTrustOutcome::InvalidProof);
+        assert_eq!(
+            c.inbound_key_mode,
+            crate::context::InboundKeyMode::Minted,
+            "a recognized minted attempt must retain its mode on denial"
+        );
+        assert!(
+            c.native_key_provider.is_none(),
+            "a minted denial must not invent provider attribution"
+        );
+        assert!(
+            c.resolved_inbound_key.is_none(),
+            "a denied key is not stamped"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_key_denies_401() {
+        let (plane, _, _) = plane_with_keys().await;
+        let mut c = ctx();
+        let unknown = format!("sbp_{}_{}", "f".repeat(16), "e".repeat(64));
+        let outcome =
+            resolve_inbound_key(&plane, &headers(&[("x-api-key", &unknown)]), None, &mut c).await;
+        assert_denial(outcome, 401, AuthTrustOutcome::InvalidProof);
+        assert_eq!(
+            c.inbound_key_mode,
+            crate::context::InboundKeyMode::Minted,
+            "an unknown minted-shaped key must still be observable as minted"
+        );
+        assert!(c.native_key_provider.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_wrong_secret_denies_401_like_an_unknown_id() {
+        // Same status for both, so neither is an existence oracle.
+        let (plane, token, _) = plane_with_keys().await;
+        let key_id = &token[4..20];
+        let wrong = format!("sbp_{key_id}_{}", "0".repeat(64));
+        let mut c = ctx();
+        let outcome =
+            resolve_inbound_key(&plane, &headers(&[("x-api-key", &wrong)]), None, &mut c).await;
+        assert_denial(outcome, 401, AuthTrustOutcome::InvalidProof);
+        assert_eq!(
+            c.inbound_key_mode,
+            crate::context::InboundKeyMode::Minted,
+            "a wrong minted secret must still be observable as minted"
+        );
+        assert!(c.native_key_provider.is_none());
+    }
+
+    #[tokio::test]
+    async fn conflicting_tokens_in_two_headers_deny_400() {
+        let (plane, token, revoked) = plane_with_keys().await;
+        let mut c = ctx();
+        let h = headers(&[("x-api-key", &token), ("x-sb-api", &revoked)]);
+        let outcome = resolve_inbound_key(&plane, &h, None, &mut c).await;
+        assert_denial(outcome, 400, AuthTrustOutcome::InvalidProof);
+        assert_eq!(
+            c.inbound_key_mode,
+            crate::context::InboundKeyMode::Minted,
+            "conflicting minted-shaped credentials are still a minted attempt"
+        );
+        assert!(c.native_key_provider.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_key_store_outage_is_a_neutral_backend_failure() {
+        let crypto = KeyCrypto::new(b"pep".to_vec(), b"mas".to_vec());
+        let token = crypto.mint_key().token;
+        let store: Arc<dyn KeyStore> = Arc::new(BrokenKeyReadStore {
+            inner: MemoryKeyStore::new(),
+        });
+        let cache = Arc::new(TtlCache::new(store, TtlCacheConfig::default()));
+        let plane = crate::key_plane::KeyPlane::from_parts(crypto, cache, false, false, None);
+        let mut c = ctx();
+
+        let outcome =
+            resolve_inbound_key(&plane, &headers(&[("x-api-key", &token)]), None, &mut c).await;
+
+        assert_denial(outcome, 503, AuthTrustOutcome::BackendFailure);
+    }
+
+    /// A plane over a store that always fails key reads, pinned to `posture`.
+    fn broken_store_plane(
+        posture: sbproxy_config::types::FailureMode,
+    ) -> (crate::key_plane::KeyPlane, String) {
+        let crypto = KeyCrypto::new(b"pep".to_vec(), b"mas".to_vec());
+        let token = crypto.mint_key().token;
+        let store: Arc<dyn KeyStore> = Arc::new(BrokenKeyReadStore {
+            inner: MemoryKeyStore::new(),
+        });
+        let cache = Arc::new(TtlCache::new(store, TtlCacheConfig::default()));
+        let plane = crate::key_plane::KeyPlane::from_parts(crypto, cache, false, false, None)
+            .with_failure_posture(posture);
+        (plane, token)
+    }
+
+    /// Every posture, at both inbound-key entry points, from one accessor.
+    ///
+    /// The legacy `failure_mode_allow: false` and `true` resolve to
+    /// `closed` and `degraded`, so the first two rows below are also the
+    /// legacy behaviour, unchanged. An admitting posture returns
+    /// `NotPresent`, which falls through to the origin's configured auth;
+    /// it has never been a blanket admit and still is not.
+    #[tokio::test]
+    async fn the_failure_posture_governs_both_inbound_key_outage_paths() {
+        use sbproxy_config::types::FailureMode;
+
+        for (posture, admits) in [
+            (FailureMode::Closed, false),
+            (FailureMode::Degraded, true),
+            (FailureMode::Open, true),
+        ] {
+            let (plane, token) = broken_store_plane(posture);
+
+            let mut swept = ctx();
+            let outcome =
+                resolve_inbound_key(&plane, &headers(&[("x-api-key", &token)]), None, &mut swept)
+                    .await;
+            if admits {
+                assert!(
+                    matches!(outcome, InboundKeyPhase::NotPresent),
+                    "{posture:?} must fall through, not deny: {outcome:?}"
+                );
+            } else {
+                assert_denial(outcome, 503, AuthTrustOutcome::BackendFailure);
+            }
+
+            // Same decision on the playground impersonation ticket path,
+            // which used to carry its own copy of it.
+            let ticket = crate::admin_playground::ticket::mint("some-key-id");
+            let mut ticketed = loopback_ctx();
+            let outcome = resolve_inbound_key(
+                &plane,
+                &headers(&[("authorization", &format!("Bearer {ticket}"))]),
+                Some(loopback_ip()),
+                &mut ticketed,
+            )
+            .await;
+            if admits {
+                assert!(
+                    matches!(outcome, InboundKeyPhase::NotPresent),
+                    "{posture:?} must fall through on the ticket path too: {outcome:?}"
+                );
+            } else {
+                assert_denial(outcome, 503, AuthTrustOutcome::BackendFailure);
+            }
+        }
+    }
+
+    /// `degraded` and `open` admit the same request and are still not the
+    /// same answer. The difference is what the plane reports about the
+    /// guarantee it did not make, which is what an operator alerts on.
+    #[test]
+    fn degraded_is_distinguishable_from_open_on_the_admitting_path() {
+        use sbproxy_config::types::FailureMode;
+
+        let (degraded, _) = broken_store_plane(FailureMode::Degraded);
+        let (open, _) = broken_store_plane(FailureMode::Open);
+
+        assert!(degraded.failure_posture().admits());
+        assert!(open.failure_posture().admits());
+
+        assert!(degraded.failure_posture().guarantee_waived());
+        assert!(!open.failure_posture().guarantee_waived());
+        assert_eq!(degraded.failure_posture().as_label(), "degraded");
+        assert_eq!(open.failure_posture().as_label(), "open");
+    }
+
+    #[tokio::test]
+    async fn an_impersonation_ticket_resolves_to_the_named_key() {
+        let (plane, token, _) = plane_with_keys().await;
+        let key_id = token[4..20].to_string();
+        let ticket = crate::admin_playground::ticket::mint(&key_id);
+        let mut c = loopback_ctx();
+        let h = headers(&[("authorization", &format!("Bearer {ticket}"))]);
+        let outcome = resolve_inbound_key(&plane, &h, Some(loopback_ip()), &mut c).await;
+        assert!(matches!(outcome, InboundKeyPhase::Resolved), "{outcome:?}");
+        assert_eq!(
+            c.resolved_inbound_key
+                .as_ref()
+                .map(|rec| rec.key_id.clone()),
+            Some(key_id)
+        );
+        // Same stripping path a normal minted key uses, so the ticket
+        // never reaches the upstream origin.
+        assert_eq!(c.inbound_key_header.as_deref(), Some("authorization"));
+    }
+
+    #[tokio::test]
+    async fn a_consumed_impersonation_ticket_cannot_be_replayed() {
+        let (plane, token, _) = plane_with_keys().await;
+        let key_id = token[4..20].to_string();
+        let ticket = crate::admin_playground::ticket::mint(&key_id);
+        let h = headers(&[("authorization", &format!("Bearer {ticket}"))]);
+
+        let mut first = loopback_ctx();
+        assert!(matches!(
+            resolve_inbound_key(&plane, &h, Some(loopback_ip()), &mut first).await,
+            InboundKeyPhase::Resolved
+        ));
+
+        let mut second = loopback_ctx();
+        let outcome = resolve_inbound_key(&plane, &h, Some(loopback_ip()), &mut second).await;
+        assert_denial(outcome, 401, AuthTrustOutcome::InvalidProof);
+    }
+
+    #[tokio::test]
+    async fn an_impersonation_ticket_for_a_revoked_key_denies_403() {
+        let (plane, _, revoked) = plane_with_keys().await;
+        let key_id = revoked[4..20].to_string();
+        let ticket = crate::admin_playground::ticket::mint(&key_id);
+        let mut c = loopback_ctx();
+        let h = headers(&[("authorization", &format!("Bearer {ticket}"))]);
+        let outcome = resolve_inbound_key(&plane, &h, Some(loopback_ip()), &mut c).await;
+        assert_denial(outcome, 403, AuthTrustOutcome::InvalidProof);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_impersonation_ticket_denies_401() {
+        let (plane, _, _) = plane_with_keys().await;
+        let mut c = loopback_ctx();
+        let h = headers(&[(
+            "authorization",
+            &format!("Bearer {}deadbeef", crate::admin_playground::ticket::PREFIX),
+        )]);
+        let outcome = resolve_inbound_key(&plane, &h, Some(loopback_ip()), &mut c).await;
+        assert_denial(outcome, 401, AuthTrustOutcome::InvalidProof);
+    }
+
+    #[tokio::test]
+    async fn an_impersonation_ticket_from_a_non_loopback_client_denies_401_and_is_not_consumed() {
+        let (plane, token, _) = plane_with_keys().await;
+        let key_id = token[4..20].to_string();
+        let ticket = crate::admin_playground::ticket::mint(&key_id);
+        let h = headers(&[("authorization", &format!("Bearer {ticket}"))]);
+
+        // Preserve the existing effective-client gate independently of
+        // the raw-peer gate: even through a loopback TCP peer, a forwarded
+        // non-loopback client must be denied exactly like an unknown ticket.
+        let mut off_loopback = ctx();
+        off_loopback.client_ip = Some("10.0.0.5".parse().unwrap());
+        let outcome = resolve_inbound_key(&plane, &h, Some(loopback_ip()), &mut off_loopback).await;
+        assert_denial(outcome, 401, AuthTrustOutcome::InvalidProof);
+
+        // The wrong-peer attempt must not have burned the ticket: the
+        // legitimate loopback caller can still redeem it afterward.
+        let mut loopback = loopback_ctx();
+        let outcome = resolve_inbound_key(&plane, &h, Some(loopback_ip()), &mut loopback).await;
+        assert!(matches!(outcome, InboundKeyPhase::Resolved), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn a_non_loopback_trusted_proxy_cannot_spoof_a_loopback_impersonation_ticket() {
+        let (plane, token, _) = plane_with_keys().await;
+        let key_id = token[4..20].to_string();
+        let ticket = crate::admin_playground::ticket::mint(&key_id);
+        let h = headers(&[
+            ("authorization", &format!("Bearer {ticket}")),
+            ("x-forwarded-for", "127.0.0.1"),
+        ]);
+
+        // request_filter first sees this raw TCP peer, then replaces
+        // ctx.client_ip with the trusted proxy's X-Forwarded-For value.
+        // Ticket redemption must retain both identities.
+        let raw_peer_ip: std::net::IpAddr = "10.0.0.5".parse().unwrap();
+        assert!(!raw_peer_ip.is_loopback());
+        let forwarded_client_ip = h["x-forwarded-for"].to_str().unwrap().parse().unwrap();
+        let mut spoofed_loopback = ctx();
+        spoofed_loopback.client_ip = Some(forwarded_client_ip);
+        let outcome =
+            resolve_inbound_key(&plane, &h, Some(raw_peer_ip), &mut spoofed_loopback).await;
+        assert_denial(outcome, 401, AuthTrustOutcome::InvalidProof);
+
+        // Reject before consuming so the genuine loopback dispatch can
+        // still redeem the ticket.
+        let mut genuine_loopback = loopback_ctx();
+        let outcome =
+            resolve_inbound_key(&plane, &h, Some(loopback_ip()), &mut genuine_loopback).await;
+        assert!(matches!(outcome, InboundKeyPhase::Resolved), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn a_normal_bearer_token_is_unaffected_by_ticket_recognition() {
+        // The normal minted-key path (not a ticket at all) must be
+        // untouched: same outcome as before this feature existed.
+        let (plane, token, _) = plane_with_keys().await;
+        let mut c = ctx();
+        let h = headers(&[("authorization", &format!("Bearer {token}"))]);
+        assert!(matches!(
+            resolve_inbound_key(&plane, &h, None, &mut c).await,
+            InboundKeyPhase::Resolved
+        ));
+        assert_eq!(c.inbound_key_header.as_deref(), Some("authorization"));
+    }
+
+    #[test]
+    fn inbound_key_early_refusals_finalize_trust_exactly_once() {
+        let cases = [
+            (
+                AuthTrustOutcome::Missing,
+                sbproxy_modules::auth::TrustTier::Anonymous,
+            ),
+            (
+                AuthTrustOutcome::BackendFailure,
+                sbproxy_modules::auth::TrustTier::Anonymous,
+            ),
+            (
+                AuthTrustOutcome::InvalidProof,
+                sbproxy_modules::auth::TrustTier::Suspicious,
+            ),
+        ];
+
+        for (outcome, expected_tier) in cases {
+            let mut c = ctx();
+            finalize_inbound_key_trust(&mut c, outcome);
+            assert_eq!(c.trust_tier, expected_tier);
+            assert!(c.trust_tier_metric_recorded);
+
+            let first_tier = c.trust_tier;
+            finalize_inbound_key_trust(&mut c, AuthTrustOutcome::InvalidProof);
+            assert_eq!(
+                c.trust_tier, first_tier,
+                "a second finalization attempt must be ignored"
+            );
+        }
+    }
+
+    #[test]
+    fn require_is_off_by_default_so_an_upgrade_changes_nothing() {
+        let cfg = sbproxy_config::types::KeyInboundConfig::default();
+        assert!(!crate::inbound_key::requires_minted_key(&cfg));
+    }
+}
+
+#[cfg(test)]
+mod inbound_key_governs_ai_tests {
+    use sbproxy_keystore::record::KeyRecord;
+
+    /// Regression pin for the silent failure this epic's design flagged.
+    ///
+    /// `handle_ai_proxy` runs after the auth block, so by the time the AI
+    /// gateway resolves a key the pre-auth sweep has already consumed the
+    /// header. If the gateway re-reads `authorization` instead of the context
+    /// it finds nothing, falls through to configured keys, finds nothing
+    /// there, and dispatches ungoverned with no error and no log.
+    ///
+    /// Asserts on the resolved policy rather than a status code, because a
+    /// 200 is exactly what the broken path also produces.
+    #[test]
+    fn a_swept_key_still_carries_its_policy_into_the_ai_gateway() {
+        let mut record = KeyRecord::new("0123456789abcdef", "unused-hash", chrono::Utc::now());
+        record.allowed_models = vec!["gpt-4".to_string()];
+        record.max_requests_per_minute = Some(7);
+
+        let ctx = crate::context::RequestContext {
+            resolved_inbound_key: Some(Box::new(record)),
+            ..Default::default()
+        };
+
+        let stamped = ctx
+            .resolved_inbound_key
+            .as_deref()
+            .expect("the sweep stamped a record on the context");
+
+        // These are the fields that silently vanish when the gateway re-reads
+        // a header the sweep already consumed.
+        assert_eq!(stamped.allowed_models, ["gpt-4"]);
+        assert_eq!(stamped.max_requests_per_minute, Some(7));
+        assert_eq!(stamped.key_id, "0123456789abcdef");
     }
 }

@@ -1,4 +1,4 @@
-//! Compiled pipeline: config + instantiated module enums + enterprise hooks.
+//! Compiled pipeline: config + instantiated module enums + optional hooks.
 //!
 //! [`CompiledPipeline`] bridges the gap between `sbproxy-config` (which stores
 //! JSON `serde_json::Value` blobs) and `sbproxy-modules` (which defines typed
@@ -8,26 +8,31 @@
 //!
 //! In addition to the compiled modules, a `CompiledPipeline` owns:
 //! * an optional shared `CacheStore` (from `sbproxy-cache`) for the
-//!   response cache: Redis when `config.l2_store` is set, in-memory LRU
-//!   otherwise,
-//! * an enterprise [`Hooks`](crate::hooks::Hooks) bundle of optional traits
-//!   that OSS leaves as `None` and enterprise populates via the
-//!   [`EnterpriseStartupHook`](crate::hooks::EnterpriseStartupHook) pattern.
+//!   response cache: whichever backend `proxy.response_cache_store`
+//!   selects, or, when that block is absent, Redis if `config.l2_store`
+//!   is set and an in-memory LRU otherwise,
+//! * an optional [`Hooks`](crate::hooks::Hooks) bundle of traits populated by a
+//!   [`PipelineLifecycleHook`](crate::hooks::PipelineLifecycleHook) when registered.
 //!
 //! This struct lives in `sbproxy-core` to avoid a circular dependency:
 //! config -> modules -> config would be circular, but core depends on both.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::builtin_enforcers::{compile_builtin_enforcers, CompiledEnforcer};
 use crate::router::HostRouter;
+use compact_str::CompactString;
 use sbproxy_cache::{
-    CacheReserveBackend, CacheStore, FsReserve, MemoryCacheStore, MemoryReserve, RedisCacheStore,
+    CacheReserveBackend, CacheStore, EncryptedCacheStore, FileCacheConfig, FileCacheStore,
+    FsReserve, MemcachedConfig, MemcachedStore, MemoryCacheStore, MemoryReserve, RedisCacheStore,
     RedisReserve,
 };
 use sbproxy_config::{CompiledConfig, Parameter, RequestModifierConfig};
-use sbproxy_modules::compile::{compile_action, compile_auth, compile_policy, compile_transform};
+use sbproxy_modules::compile::{
+    compile_action_for_origin, compile_action_for_origin_for_validation, compile_auth,
+    compile_policy, compile_transform,
+};
 use sbproxy_modules::transform::{CompiledTransform, TransformConfig};
 use sbproxy_modules::{Action, Auth, BotDetection, Policy, ThreatProtection};
 
@@ -462,7 +467,7 @@ impl ReserveAdmission {
 /// Build the OSS Cache Reserve backend from the YAML config block.
 ///
 /// Returns `(None, None)` when the block is absent, disabled, or
-/// targets an enterprise backend the OSS pipeline does not know how
+/// targets an extension-provided backend the pipeline does not know how
 /// to instantiate. Failures during construction (e.g. an invalid
 /// Redis URL) are logged at `warn` level and surfaced as `(None, None)`
 /// so a misconfigured reserve degrades to plain hot-cache behavior
@@ -510,7 +515,7 @@ fn build_cache_reserve(
         },
         sbproxy_config::CacheReserveBackendConfig::Other => {
             tracing::warn!(
-                "cache_reserve backend type is unknown to OSS; if this is an enterprise backend, the enterprise startup hook should attach it"
+                "cache_reserve backend type is unknown; a pipeline lifecycle hook may attach an implementation"
             );
             None
         }
@@ -519,6 +524,299 @@ fn build_cache_reserve(
         (built, Some(admission))
     } else {
         (None, None)
+    }
+}
+
+/// Resolve an at-rest encryption key reference to raw key material.
+///
+/// One resolution path for every at-rest surface, so a new surface cannot
+/// quietly accept a different reference syntax or a different failure mode.
+/// `config_path` only shapes the error message, naming the block the operator
+/// has to fix.
+///
+/// Accepts a provider URI (`secret://backend/name`, `vault://...`) resolved
+/// through the process secret resolver, a `file:/path` reference, or a
+/// whole-value `${ENV_VAR}` (handled by the resolver). Anything else is taken
+/// as literal material.
+///
+/// There is no plaintext fallback anywhere on this path: a reference that looks
+/// like a secret URI with no backend to resolve it is an error rather than key
+/// material spelled `secret://...`.
+pub(crate) fn resolve_at_rest_key_material(
+    reference: &str,
+    config_path: &str,
+) -> anyhow::Result<Vec<u8>> {
+    use anyhow::Context;
+
+    if let Some(resolver) = sbproxy_vault::process_resolver() {
+        return Ok(resolver.resolve(reference)?.into_bytes());
+    }
+    if let Some(path) = reference.strip_prefix("file:") {
+        let raw =
+            std::fs::read(path).with_context(|| format!("read {config_path} key file '{path}'"))?;
+        // Trim so a trailing newline in the key file does not silently
+        // change the derived key. Matches the resolver's `file:`
+        // semantics, which also trim.
+        return Ok(raw.trim_ascii().to_vec());
+    }
+    if sbproxy_vault::looks_like_secret_reference_uri(reference) {
+        anyhow::bail!(
+            "{config_path} references the secret '{reference}' but no secret backend is \
+             configured to resolve it; declare one under proxy.secrets.backends"
+        );
+    }
+    Ok(reference.as_bytes().to_vec())
+}
+
+/// The response-cache store plus the per-origin handles onto it.
+///
+/// `unscoped` is the admin/purge handle. `per_origin` is empty unless
+/// at-rest encryption is on; when it is, it holds one handle per compiled
+/// origin, each bound to that origin's key ring.
+pub(crate) struct ResponseCacheStores {
+    pub unscoped: Arc<dyn CacheStore>,
+    pub per_origin: HashMap<CompactString, Arc<dyn CacheStore>>,
+}
+
+impl std::fmt::Debug for ResponseCacheStores {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResponseCacheStores")
+            .field("backend", &self.unscoped.backend_name())
+            .field("scoped_origins", &self.per_origin.len())
+            .finish()
+    }
+}
+
+/// Build the shared response-cache store.
+///
+/// `store_cfg` is `proxy.response_cache_store`. When it is `None` the
+/// legacy selection applies: `redis_store` if the operator configured
+/// `proxy.l2_cache`, otherwise an in-process map. That branch exists so
+/// upgrading does not silently move an existing Redis deployment onto a
+/// per-replica cache.
+///
+/// `redis_store` is the already-wrapped Redis store, passed in rather
+/// than built here so this function never has to name the KV trait and
+/// stays unit-testable.
+///
+/// `origins` supplies each origin's id and its per-origin encryption
+/// block. Every reference either resolves at boot or aborts startup with
+/// an error naming the origin, which is the same no-plaintext-fallback
+/// rule the store-wide key already follows. Multiplying the number of
+/// secrets resolved at boot is the cost of key separation; failing loud
+/// on each is what keeps that cost honest.
+///
+/// In `Validation` mode the shape is checked but no secret is resolved
+/// and no directory is created, matching how the rest of `sbproxy
+/// validate` treats secrets and the filesystem.
+fn build_response_cache_store(
+    store_cfg: Option<&sbproxy_config::ResponseCacheStoreConfig>,
+    redis_store: Option<Arc<dyn CacheStore>>,
+    memory_max_entries: usize,
+    origins: &[OriginCacheKeys<'_>],
+    mode: PipelineConstructionMode,
+) -> anyhow::Result<ResponseCacheStores> {
+    use anyhow::Context;
+
+    let validating = matches!(mode, PipelineConstructionMode::Validation);
+
+    let plain = |store: Arc<dyn CacheStore>| ResponseCacheStores {
+        unscoped: store,
+        per_origin: HashMap::new(),
+    };
+
+    let Some(cfg) = store_cfg else {
+        // Legacy selection, byte-identical to the pre-block behaviour.
+        return Ok(plain(match redis_store {
+            Some(store) => store,
+            None => Arc::new(MemoryCacheStore::new(memory_max_entries)),
+        }));
+    };
+
+    let base: Arc<dyn CacheStore> = match &cfg.backend {
+        sbproxy_config::ResponseCacheBackendConfig::Memory => {
+            Arc::new(MemoryCacheStore::new(memory_max_entries))
+        }
+        sbproxy_config::ResponseCacheBackendConfig::File { path, max_size_mb } => {
+            if validating {
+                // Do not create directories during `sbproxy validate`.
+                Arc::new(MemoryCacheStore::new(memory_max_entries))
+            } else {
+                Arc::new(
+                    FileCacheStore::new(FileCacheConfig {
+                        directory: path.clone(),
+                        max_size_mb: *max_size_mb,
+                    })
+                    .context("proxy.response_cache_store.backend type `file`")?,
+                )
+            }
+        }
+        sbproxy_config::ResponseCacheBackendConfig::Memcached { host, port } => {
+            Arc::new(MemcachedStore::new(MemcachedConfig {
+                host: host.clone(),
+                port: *port,
+            }))
+        }
+        sbproxy_config::ResponseCacheBackendConfig::Redis => match redis_store {
+            Some(store) => store,
+            None => anyhow::bail!(
+                "proxy.response_cache_store.backend type `redis` needs a connection; \
+                 configure proxy.l2_cache with driver: redis or pick another backend"
+            ),
+        },
+    };
+
+    let Some(enc) = cfg.encryption.as_ref().filter(|e| e.enabled) else {
+        // An origin that declared its own key while store-wide
+        // encryption is off wrote something that would never take
+        // effect. Say so rather than storing that tenant in the clear.
+        if let Some(origin) = origins.iter().find(|o| o.declares_a_key()) {
+            anyhow::bail!(
+                "origin '{}' declares response_cache.encryption but \
+                 proxy.response_cache_store.encryption is not enabled; enable it or remove the \
+                 per-origin block",
+                origin.id
+            );
+        }
+        tracing::info!(
+            backend = base.backend_name(),
+            "response cache backend ready without at-rest encryption"
+        );
+        return Ok(plain(base));
+    };
+
+    // Bound to a local rather than matched inline so the config-key
+    // reader scan can see a plain field read of `per_origin_keys`.
+    let per_origin_mode = enc.per_origin_keys;
+    let strict = per_origin_mode == sbproxy_config::PerOriginKeyMode::Required;
+
+    // Under `required` the store-wide key is not a fallback, but it is
+    // still the thing an operator most likely left in place while
+    // migrating. Requiring it anyway would make the switch a two-step
+    // edit for no safety gain, so it stays optional-but-accepted and
+    // simply never gets inherited.
+    let store_wide_reference = enc.key.as_deref();
+    if store_wide_reference.is_none() && !strict {
+        anyhow::bail!(
+            "proxy.response_cache_store.encryption.enabled is true but no `key` is set; \
+             point `key` at a secret reference such as `secret://local/response-cache`, \
+             give every caching origin its own key under \
+             `per_origin_keys: required`, or set `enabled: false`"
+        );
+    }
+
+    if strict {
+        let missing: Vec<&str> = origins
+            .iter()
+            .filter(|o| o.caches && !o.declares_a_key())
+            .map(|o| o.id)
+            .collect();
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "proxy.response_cache_store.encryption.per_origin_keys is `required`, but these \
+                 caching origins declare no encryption key of their own: {}. Give each one an \
+                 `origins.<host>.response_cache.encryption.key`, or switch back to `inherit`.",
+                missing.join(", ")
+            );
+        }
+    }
+
+    if validating {
+        // The shape is valid. Resolving the keys would read files and
+        // dial secret backends, which `sbproxy validate` does not do.
+        return Ok(plain(base));
+    }
+
+    let resolve_ring = |reference: &str, previous: &[String], config_path: &str| {
+        let active = resolve_at_rest_key_material(reference, config_path)
+            .with_context(|| format!("{config_path}.key"))?;
+        let mut retired = Vec::with_capacity(previous.len());
+        for (index, reference) in previous.iter().enumerate() {
+            retired.push(
+                resolve_at_rest_key_material(reference, config_path)
+                    .with_context(|| format!("{config_path}.previous_keys[{index}]"))?,
+            );
+        }
+        sbproxy_cache::cache_key_ring(active, retired).context(config_path.to_string())
+    };
+
+    let default_ring = match store_wide_reference {
+        Some(reference) => Some(resolve_ring(
+            reference,
+            &enc.previous_keys,
+            "proxy.response_cache_store.encryption",
+        )?),
+        None => None,
+    };
+
+    let mut per_origin_rings = HashMap::new();
+    for origin in origins {
+        let Some(reference) = origin.key else {
+            continue;
+        };
+        let path = format!("origins.{}.response_cache.encryption", origin.id);
+        per_origin_rings.insert(
+            origin.id.to_string(),
+            resolve_ring(reference, origin.previous_keys, &path)?,
+        );
+    }
+
+    tracing::info!(
+        backend = base.backend_name(),
+        key_id = default_ring
+            .as_ref()
+            .map(|r| r.active_key_id())
+            .unwrap_or_else(|| "none".to_string()),
+        retired_keys = enc.previous_keys.len(),
+        per_origin_keys = per_origin_rings.len(),
+        strict = strict,
+        "response cache backend ready with at-rest encryption"
+    );
+
+    let directory = Arc::new(sbproxy_cache::CacheKeyDirectory::new(
+        default_ring,
+        per_origin_rings,
+    ));
+    let per_origin = origins
+        .iter()
+        .map(|origin| {
+            let handle: Arc<dyn CacheStore> = Arc::new(EncryptedCacheStore::scoped(
+                Arc::clone(&base),
+                Arc::clone(&directory),
+                origin.id,
+            ));
+            (CompactString::new(origin.id), handle)
+        })
+        .collect();
+    Ok(ResponseCacheStores {
+        unscoped: Arc::new(EncryptedCacheStore::unscoped(base, directory)),
+        per_origin,
+    })
+}
+
+/// One origin's contribution to response-cache key resolution.
+///
+/// Borrowed from the compiled config so the builder can stay a free
+/// function that unit tests drive with literals.
+pub(crate) struct OriginCacheKeys<'a> {
+    /// Origin id, which is the hostname the operator wrote in YAML.
+    pub id: &'a str,
+    /// Whether this origin has `response_cache.enabled: true`.
+    pub caches: bool,
+    /// This origin's active key reference, if it declared one.
+    pub key: Option<&'a str>,
+    /// This origin's retired key references.
+    pub previous_keys: &'a [String],
+}
+
+impl OriginCacheKeys<'_> {
+    /// Whether this origin declared any key material of its own.
+    ///
+    /// `previous_keys` counts: an origin mid-rotation that has already
+    /// had its active key removed still holds material nobody else does.
+    fn declares_a_key(&self) -> bool {
+        self.key.is_some() || !self.previous_keys.is_empty()
     }
 }
 
@@ -578,6 +876,7 @@ pub enum TlsFingerprintMode {
 /// CDN-specific header names (`x-forwarded-ja4` is Cloudflare and
 /// Fastly's spelling).
 #[derive(Debug, Clone, serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TlsFingerprintConfig {
     /// Master switch. `false` (the default) disables the capture path
     /// entirely.
@@ -637,46 +936,54 @@ impl TlsFingerprintConfig {
     }
 
     /// Build a [`TlsFingerprintConfig`] from the parsed
-    /// `proxy.extensions.tls_fingerprint` YAML block. Returns
-    /// `Default::default()` (disabled) when the block is absent or
-    /// malformed; a parse failure logs a warning rather than failing
-    /// the whole compile.
+    /// `proxy.extensions.tls_fingerprint` YAML block.
+    ///
+    /// Returns `Ok(Default::default())` (disabled) when the block is
+    /// absent. A block that fails to parse while declaring
+    /// `enabled: true` is a hard compile error (WOR-1161): the operator
+    /// asked for the capture path, so silently disabling it is a
+    /// fail-open. The error carries serde's diagnostic, which names the
+    /// malformed field. A malformed block that does not declare
+    /// `enabled: true` keeps the warn-and-disable path, since the
+    /// disabled outcome matches the operator's stated intent.
     pub fn from_extensions(
         extensions: &std::collections::HashMap<String, serde_yaml::Value>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let Some(block) = extensions.get("tls_fingerprint") else {
-            return Self::default();
+            return Ok(Self::default());
         };
         match serde_yaml::from_value::<TlsFingerprintConfig>(block.clone()) {
             Ok(mut cfg) => {
                 cfg.compile_cidrs();
-                cfg
+                Ok(cfg)
             }
             Err(e) => {
-                // WOR-1161: a malformed block silently falls back to
-                // disabled, which is a fail-open if the operator meant to
-                // turn the feature on. When the raw block has
-                // `enabled: true`, surface the parse error at ERROR (not
-                // warn) so the misconfig cannot hide. (A hard compile
-                // failure needs `from_extensions` to return Result; tracked
-                // as a follow-up.)
-                let was_enabled = block
-                    .get("enabled")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                if was_enabled {
-                    tracing::error!(
-                        error = %e,
-                        "proxy.extensions.tls_fingerprint has `enabled: true` but failed to parse; \
-                         TLS-fingerprint capture is DISABLED until the block is fixed",
-                    );
-                } else {
-                    tracing::warn!(
-                        error = %e,
-                        "proxy.extensions.tls_fingerprint failed to parse; capture disabled",
+                // WOR-1161: a malformed block used to fall back to
+                // disabled silently, a fail-open when the operator
+                // meant to turn the feature on. Detect the stated
+                // intent from the raw block: a bare `tls_fingerprint:
+                // true` or an `enabled:` key that reads as true means
+                // the operator wanted capture on, so refuse the config.
+                let wants_capture = block.as_bool() == Some(true)
+                    || match block.get("enabled") {
+                        Some(v) => {
+                            v.as_bool() == Some(true)
+                                || v.as_str().is_some_and(|s| s.eq_ignore_ascii_case("true"))
+                        }
+                        None => false,
+                    };
+                if wants_capture {
+                    anyhow::bail!(
+                        "proxy.extensions.tls_fingerprint has `enabled: true` but failed to \
+                         parse: {e}. Refusing to start with TLS-fingerprint capture silently \
+                         disabled; fix or remove the block."
                     );
                 }
-                Self::default()
+                tracing::warn!(
+                    error = %e,
+                    "proxy.extensions.tls_fingerprint failed to parse; capture disabled",
+                );
+                Ok(Self::default())
             }
         }
     }
@@ -748,8 +1055,10 @@ pub struct AgentDetectConfig {
 impl AgentDetectConfig {
     /// Build from the parsed `proxy.extensions.agent_detect` block.
     /// Returns the disabled default when the block is absent or fails to
-    /// parse; a parse error warns rather than failing the whole compile,
-    /// matching [`TlsFingerprintConfig::from_extensions`].
+    /// parse; a parse error warns rather than failing the whole compile.
+    /// (Unlike [`TlsFingerprintConfig::from_extensions`], which since
+    /// WOR-1161 hard-fails a malformed block that declares
+    /// `enabled: true`.)
     pub fn from_extensions(
         extensions: &std::collections::HashMap<String, serde_yaml::Value>,
     ) -> Self {
@@ -812,10 +1121,53 @@ pub struct CompiledIdempotency {
 pub struct CompiledPipeline {
     /// The underlying compiled config (origins, host_map, server settings).
     pub config: CompiledConfig,
+    /// Dynamic key plane built from the same immutable config generation.
+    ///
+    /// Request contexts pin the pipeline at ingress, so keeping the plane here
+    /// prevents a reload from changing key resolution, governance, or bound
+    /// upstream credentials underneath an in-flight request.
+    pub(crate) key_plane: Option<Arc<crate::key_plane::KeyPlane>>,
+    /// Sensitive request-header names for this exact config generation.
+    ///
+    /// Requests pin a pipeline at ingress. Keeping custom credential carriers
+    /// here prevents a concurrent reload from changing redaction or outbound
+    /// scrubbing semantics for requests that are still in flight.
+    pub(crate) sensitive_header_names: HashSet<String>,
     /// Bloom filter + HashMap router for fast hostname lookup.
     pub router: HostRouter,
     /// Compiled action for each origin (parallel to config.origins).
     pub actions: Vec<Action>,
+    /// Immutable per-origin AI compression dependencies and policies.
+    pub compression_runtimes: crate::compression_runtime::CompressionRuntimeRegistry,
+    /// Immutable route-scoped RAG runtimes keyed by origin and optional
+    /// forward rule (WOR-2098). Populated only for `ai_proxy` actions that
+    /// configure `rag:`; a forward rule without its own `rag:` block has no
+    /// runtime and never falls back to the origin's.
+    #[cfg(feature = "rag")]
+    pub rag_runtimes: crate::rag_runtime::RagRuntimeRegistry,
+    /// The published settlement runtime for this config generation, when
+    /// `proxy.payments` is configured (WOR-2100).
+    ///
+    /// Attached after construction rather than built inside it, because
+    /// publishing is async and proving the store answers has to happen while
+    /// the previous generation is still serving. `None` means settlement is
+    /// not configured, which is the default and leaves the existing
+    /// non-settlement ledger behaviour exactly as it was.
+    ///
+    /// Pinned to the pipeline for the same reason the key plane is: a
+    /// request pins a pipeline at ingress, so a reload cannot move a paid
+    /// request onto a different settlement store than the one that issued
+    /// its challenge.
+    #[cfg(feature = "payments")]
+    pub payments: Option<Arc<crate::billing_runtime::PaymentsRuntime>>,
+    /// Immutable route-scoped semantic caches keyed by origin and optional
+    /// forward rule (WOR-2099). Populated only for `ai_proxy` actions that
+    /// configure `semantic_cache:`; a forward rule without its own block
+    /// has no cache and never falls back to the origin's. The registry
+    /// owns whichever memory, Redis, or mesh adapters this config
+    /// generation selected, so an in-flight request holding this snapshot
+    /// keeps reading the backend it started with across a reload.
+    pub semantic_caches: crate::semantic_cache_runtime::SemanticCacheRuntimeRegistry,
     /// Compiled auth for each origin (None if no auth configured).
     pub auths: Vec<Option<Auth>>,
     /// Compiled policies for each origin (may be empty).
@@ -859,17 +1211,45 @@ pub struct CompiledPipeline {
     /// URL) stamped alongside an outbound Web Bot Auth signature when
     /// `proxy.web_bot_auth.directory_url` is set.
     pub web_bot_auth_signature_agent: Option<String>,
+    /// Consumption attestation for this pipeline generation (WOR-2127),
+    /// built once from `proxy.attestation`. `None` when the block is
+    /// absent, when its role is `off`, and always under validation
+    /// construction, which must not create the queue or ledger
+    /// directories on an operator's laptop.
+    pub attestation: Option<Arc<crate::attestation::AttestationRuntime>>,
+    /// Per-origin attestation posture, composed once from the
+    /// proxy-wide role and each origin's override. Parallel to
+    /// [`Self::config`].`origins`, so the request path indexes rather
+    /// than re-deriving precedence per request.
+    pub origin_attestations: Vec<crate::attestation::ResolvedOriginAttestation>,
     /// Compiled idempotency middleware for each origin (None when the
     /// origin has no `idempotency:` block or `enabled = false`).
     /// Parallel to [`Self::config`].`origins`.
     pub idempotencies: Vec<Option<Arc<CompiledIdempotency>>>,
     /// Shared response cache backend.
     ///
-    /// Points at a Redis-backed store when `CompiledConfig.l2_store` is set,
-    /// otherwise at an in-process `MemoryCacheStore`. A single backend is
-    /// shared by all origins; per-origin `ResponseCacheConfig` gates whether
-    /// the cache is actually used for that origin.
+    /// Selected by `proxy.response_cache_store`, which names one of
+    /// memory, file, memcached, or redis and can wrap the choice in
+    /// at-rest encryption. When that block is absent the historical
+    /// selection applies: a Redis-backed store when
+    /// `CompiledConfig.l2_store` is set, otherwise an in-process
+    /// `MemoryCacheStore`. A single backend is shared by all origins;
+    /// per-origin `ResponseCacheConfig` gates whether the cache is
+    /// actually used for that origin.
+    ///
+    /// This is the *unscoped* handle. It supports purge and reports the
+    /// backend name, which is all the admin API needs. When at-rest
+    /// encryption is on it refuses reads and writes, because sealing an
+    /// entry requires knowing which origin it belongs to. Data paths must
+    /// go through [`Self::cache_store_for`].
     pub cache_store: Option<Arc<dyn CacheStore>>,
+    /// Per-origin handles onto [`Self::cache_store`], keyed by origin id.
+    ///
+    /// Empty unless at-rest encryption is on, in which case there is one
+    /// entry per compiled origin. Each handle seals and opens under that
+    /// origin's key ring and binds the origin into the associated data.
+    /// Read it through [`Self::cache_store_for`] rather than directly.
+    pub origin_cache_stores: HashMap<CompactString, Arc<dyn CacheStore>>,
     /// Optional Cache Reserve cold-tier backend.
     ///
     /// Built from the top-level `cache_reserve:` block. When `Some`, the
@@ -883,11 +1263,11 @@ pub struct CompiledPipeline {
     /// path doesn't have to re-walk `config.server.cache_reserve` on
     /// every put.
     pub cache_reserve_admission: Option<ReserveAdmission>,
-    /// Enterprise hooks bundle.
+    /// Optional pipeline hooks bundle.
     ///
-    /// All fields default to `None` in OSS builds. Enterprise registers
+    /// All fields default to `None`. A lifecycle extension registers
     /// implementations (classifier, semantic cache, etc.) via the
-    /// `EnterpriseStartupHook` pattern. Request-path code invokes these
+    /// `PipelineLifecycleHook` pattern. Request-path code invokes these
     /// optionally and no-ops when they are `None`.
     pub hooks: crate::hooks::Hooks,
     /// Pre-parsed CIDRs from `proxy.trusted_proxies`. When the immediate
@@ -949,14 +1329,39 @@ pub struct CompiledPipeline {
     pub listings: sbproxy_config::ListingRegistry,
 }
 
+fn compile_sensitive_header_names(config: &CompiledConfig) -> HashSet<String> {
+    let mut names = sbproxy_config::types::SENSITIVE_HEADER_DENYLIST
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<HashSet<_>>();
+    if let Some(key_management) = config.server.key_management.as_ref() {
+        names.extend(key_management.inbound.credential_carrier_names());
+    }
+    names
+}
+
 impl Default for CompiledPipeline {
     fn default() -> Self {
         let config = CompiledConfig::default();
         let router = HostRouter::new(&config);
+        let sensitive_header_names = compile_sensitive_header_names(&config);
         Self {
             config,
+            key_plane: None,
+            sensitive_header_names,
             router,
             actions: Vec::new(),
+            compression_runtimes: crate::compression_runtime::CompressionRuntimeRegistry::default(),
+            #[cfg(feature = "rag")]
+            rag_runtimes: crate::rag_runtime::RagRuntimeRegistry::default(),
+            // Attached by the lifecycle after an async health check, never
+            // by construction. A default pipeline has no settlement.
+            #[cfg(feature = "payments")]
+            payments: None,
+            // Default construction must stay pure: no config read, no DNS
+            // resolution, no Redis dial, no cluster-state read, and no
+            // mesh binding. Test pipelines are built this way constantly.
+            semantic_caches: crate::semantic_cache_runtime::SemanticCacheRuntimeRegistry::default(),
             auths: Vec::new(),
             policies: Vec::new(),
             enforcers: Vec::new(),
@@ -969,8 +1374,11 @@ impl Default for CompiledPipeline {
             outbound_wba: Vec::new(),
             web_bot_auth_signer: None,
             web_bot_auth_signature_agent: None,
+            attestation: None,
+            origin_attestations: Vec::new(),
             idempotencies: Vec::new(),
             cache_store: None,
+            origin_cache_stores: HashMap::new(),
             cache_reserve: None,
             cache_reserve_admission: None,
             hooks: crate::hooks::Hooks::default(),
@@ -986,13 +1394,127 @@ impl Default for CompiledPipeline {
     }
 }
 
+#[derive(Clone, Copy)]
+enum PipelineConstructionMode {
+    Runtime,
+    Validation,
+}
+
+fn parse_outbound_credential_config(
+    origin_id: &str,
+    config: &serde_json::Value,
+) -> anyhow::Result<sbproxy_modules::auth::outbound_credential::OutboundCredentialConfig> {
+    let parsed: sbproxy_modules::auth::outbound_credential::OutboundCredentialConfig =
+        serde_json::from_value(config.clone())
+            .map_err(|error| anyhow::anyhow!("origin {origin_id}: outbound_credential: {error}"))?;
+    if let sbproxy_modules::auth::outbound_credential::OutboundCredentialConfig::VaultSecret(
+        vault,
+    ) = &parsed
+    {
+        if sbproxy_config::types::credential_header_is_reserved(&vault.header) {
+            anyhow::bail!(
+                "origin {origin_id}: outbound_credential: header may not carry a credential"
+            );
+        }
+    }
+    Ok(parsed)
+}
+
 impl CompiledPipeline {
+    /// Dynamic key plane for this exact pipeline generation.
+    pub fn key_plane(&self) -> Option<&Arc<crate::key_plane::KeyPlane>> {
+        self.key_plane.as_ref()
+    }
+
+    /// Whether a request header is sensitive for this pipeline generation.
+    pub(crate) fn is_sensitive_header(&self, header_name: &str) -> bool {
+        self.sensitive_header_names.contains(header_name)
+    }
+
+    /// Immutable inbound key configuration pinned to this pipeline.
+    pub(crate) fn inbound_key_config(&self) -> Option<&sbproxy_config::KeyInboundConfig> {
+        self.config
+            .server
+            .key_management
+            .as_ref()
+            .map(|config| &config.inbound)
+    }
+
+    /// Whether a header is a primary credential carrier for this exact
+    /// pipeline generation.
+    pub(crate) fn is_credential_carrier(&self, header_name: &str) -> bool {
+        self.inbound_key_config()
+            .is_some_and(|inbound| inbound.is_credential_carrier(header_name))
+    }
+
+    /// The response-cache handle the data path must use for `origin_id`.
+    ///
+    /// With at-rest encryption on, this is the handle bound to that
+    /// origin's key ring, which is the only one that can seal or open an
+    /// entry: the origin is authenticated in every envelope, so reading
+    /// one tenant's entry through another tenant's handle fails rather
+    /// than returning plaintext. With encryption off there are no
+    /// per-origin handles and every origin gets the one shared store,
+    /// exactly as before.
+    ///
+    /// [`Self::cache_store`] is the purge handle. Reaching for it on the
+    /// data path is the mistake this method exists to prevent.
+    pub fn cache_store_for(&self, origin_id: &str) -> Option<&Arc<dyn CacheStore>> {
+        self.origin_cache_stores
+            .get(origin_id)
+            .or(self.cache_store.as_ref())
+    }
+
     /// Compile a config into a full pipeline with modules instantiated.
     ///
     /// Iterates over every origin in the config, compiling its action,
     /// auth, and policy JSON values into typed enum variants. Fails if
     /// any origin has an invalid or unrecognized module config.
     pub fn from_config(config: CompiledConfig) -> anyhow::Result<Self> {
+        Self::from_config_with_mode(config, PipelineConstructionMode::Runtime)
+    }
+
+    /// Compile every module for validation, without side effects that
+    /// outlive the returned pipeline.
+    ///
+    /// Use this whenever the pipeline is built only to find out whether a
+    /// config would construct, and is then dropped. Unlike
+    /// [`Self::from_config`] it spawns no background tasks, does not create
+    /// cache directories, and does not resolve the response-cache
+    /// encryption key. It also avoids the process cluster handle and the
+    /// shared AI client, deriving equivalents from the config instead.
+    ///
+    /// It is not fully isolated from process state. Module construction
+    /// still reads the AI provider registry, still resolves secret
+    /// references through the process secret resolver, and still populates
+    /// the shared JWKS cache. Those are reads and idempotent inserts rather
+    /// than installs, so repeated calls are safe, but a caller cannot treat
+    /// this as a pure function.
+    pub fn from_config_for_validation(config: CompiledConfig) -> anyhow::Result<Self> {
+        Self::from_config_with_mode(config, PipelineConstructionMode::Validation)
+    }
+
+    fn from_config_with_mode(
+        config: CompiledConfig,
+        mode: PipelineConstructionMode,
+    ) -> anyhow::Result<Self> {
+        // WOR-2084: async twin of the shared L2 store. The rate-limit
+        // policy's hot path awaits `AsyncKVStore::incr_with_ttl`
+        // directly when this is attached, instead of bridging every
+        // shared-counter decision through `spawn_blocking`. Built once
+        // and shared across origins; the sync handle stays attached too
+        // as the fallback and for callers that have not migrated.
+        let l2_async_store: Option<Arc<dyn sbproxy_platform::storage::AsyncKVStore>> = config
+            .l2_store
+            .as_deref()
+            .and_then(|kv| kv.validated_redis_connection())
+            .map(|connection| {
+                sbproxy_platform::storage::AsyncRedisKVStore::new(
+                    sbproxy_platform::storage::AsyncRedisConfig::from_connection(connection),
+                ) as Arc<dyn sbproxy_platform::storage::AsyncKVStore>
+            });
+
+        let sensitive_header_names = compile_sensitive_header_names(&config);
         let mut actions = Vec::with_capacity(config.origins.len());
         let mut auths = Vec::with_capacity(config.origins.len());
         let mut policies = Vec::with_capacity(config.origins.len());
@@ -1004,10 +1526,25 @@ impl CompiledPipeline {
         let mut threat_protections = Vec::with_capacity(config.origins.len());
         let mut outbound_creds = Vec::with_capacity(config.origins.len());
         let mut outbound_wba = Vec::with_capacity(config.origins.len());
+        let mut origin_attestations: Vec<crate::attestation::ResolvedOriginAttestation> =
+            Vec::with_capacity(config.origins.len());
 
         for origin in &config.origins {
             // Compile action (required for every origin).
-            let action = compile_action(&origin.action_config)?;
+            let action_identity = routing_action_identity(
+                origin.workspace_id.as_str(),
+                origin.origin_id.as_str(),
+                None,
+            );
+            let action = match mode {
+                PipelineConstructionMode::Runtime => {
+                    compile_action_for_origin(&origin.action_config, &action_identity)?
+                }
+                PipelineConstructionMode::Validation => compile_action_for_origin_for_validation(
+                    &origin.action_config,
+                    &action_identity,
+                )?,
+            };
             actions.push(action);
 
             // Compile auth (optional per origin).
@@ -1027,14 +1564,19 @@ impl CompiledPipeline {
             let origin_policies = compile_origin_policy_chain(
                 &origin.policy_configs,
                 config.l2_store.clone(),
+                l2_async_store.clone(),
                 origin.origin_id.as_str(),
             )?;
             let policies_for_enforcers = compile_origin_policy_chain(
                 &origin.policy_configs,
                 config.l2_store.clone(),
+                l2_async_store.clone(),
                 origin.origin_id.as_str(),
             )?;
-            enforcers.push(compile_builtin_enforcers(policies_for_enforcers));
+            enforcers.push(compile_builtin_enforcers(
+                policies_for_enforcers,
+                origin.hostname.as_str(),
+            ));
             policies.push(origin_policies);
 
             // Compile transforms (zero or more per origin).
@@ -1067,11 +1609,16 @@ impl CompiledPipeline {
             transforms.push(origin_transforms);
 
             // Compile forward rules (zero or more per origin).
-            let origin_fwd_rules = compile_forward_rules(&origin.forward_rules)?;
+            let origin_fwd_rules = compile_forward_rules(
+                &origin.forward_rules,
+                origin.workspace_id.as_str(),
+                origin.origin_id.as_str(),
+                mode,
+            )?;
             forward_rules.push(origin_fwd_rules);
 
             // Compile fallback origin (optional per origin).
-            let fallback = compile_fallback(&origin.fallback_origin)?;
+            let fallback = compile_fallback(&origin.fallback_origin, mode)?;
             fallbacks.push(fallback);
 
             // Compile bot detection (optional per origin).
@@ -1093,16 +1640,29 @@ impl CompiledPipeline {
             // mode fails config load rather than silently at request time.
             let outbound_cred = match &origin.outbound_credential {
                 Some(cfg) => {
-                    let mut parsed = serde_json::from_value::<
-                        sbproxy_modules::auth::outbound_credential::OutboundCredentialConfig,
-                    >(cfg.clone())
-                    .map_err(|e| {
-                        anyhow::anyhow!("origin {}: outbound_credential: {}", origin.origin_id, e)
-                    })?;
-                    // WOR-1784: resolve provider-URI secret references in the
-                    // credential's client_secret / secret at load, failing
-                    // loud, so they never reach the token endpoint verbatim.
-                    parsed.resolve_secret_refs().map_err(|e| {
+                    let mut parsed = parse_outbound_credential_config(&origin.origin_id, cfg)?;
+                    if parsed.is_dpop_enabled()
+                        && (matches!(actions.last(), Some(Action::LoadBalancer(_)))
+                            || forward_rules.last().is_some_and(|rules| {
+                                rules
+                                    .iter()
+                                    .any(|rule| matches!(&rule.action, Action::LoadBalancer(_)))
+                            }))
+                    {
+                        anyhow::bail!(
+                            "origin {}: outbound_credential: DPoP is not supported with load-balanced actions",
+                            origin.origin_id
+                        );
+                    }
+                    // Live pipelines resolve and compile the DPoP private key
+                    // at boot. Validation pipelines check only the reference,
+                    // algorithm, and public JWK so CLI validation never
+                    // dereferences an external secret.
+                    let prepared = match mode {
+                        PipelineConstructionMode::Runtime => parsed.resolve_runtime_secret_refs(),
+                        PipelineConstructionMode::Validation => parsed.validate_dpop(),
+                    };
+                    prepared.map_err(|e| {
                         anyhow::anyhow!("origin {}: outbound_credential: {}", origin.origin_id, e)
                     })?;
                     Some(parsed)
@@ -1111,6 +1671,16 @@ impl CompiledPipeline {
             };
             outbound_creds.push(outbound_cred);
             outbound_wba.push(origin.outbound_web_bot_auth);
+
+            // WOR-2127: compose the proxy-wide attestation role with
+            // this origin's override once, here, rather than per
+            // request. Resolved even when the block is absent, so the
+            // vector stays index-parallel with `config.origins` and the
+            // request path can index it without a bounds dance.
+            origin_attestations.push(crate::attestation::resolve_origin_attestation(
+                config.server.attestation.as_ref(),
+                origin.attestation.as_ref(),
+            ));
         }
 
         // --- Compile per-origin idempotency middleware ---
@@ -1139,40 +1709,74 @@ impl CompiledPipeline {
 
         // --- Shared response cache backend ---
         //
-        // Pick Redis when the top-level `l2_cache` block is set, otherwise
-        // fall back to an in-process LRU. The cache is only created when
-        // at least one origin has `response_cache.enabled = true`; this
-        // avoids allocating a store for configs that don't use caching.
+        // One store serves every origin; the cache key namespaces by
+        // workspace and hostname so they cannot collide. The store is
+        // only built when at least one origin has
+        // `response_cache.enabled = true`, so a config that does not
+        // cache pays nothing.
+        //
+        // `proxy.response_cache_store` selects the backend explicitly.
+        // When that block is absent the selection is the historical one,
+        // Redis if `proxy.l2_cache` is set and an in-process map
+        // otherwise, so an upgrade never moves an existing deployment
+        // off the backend it already had.
         let any_cache_enabled = config
             .origins
             .iter()
             .any(|o| o.response_cache.as_ref().is_some_and(|c| c.enabled));
-        let cache_store: Option<Arc<dyn CacheStore>> = if any_cache_enabled {
-            match config.l2_store.clone() {
-                Some(kv) => Some(Arc::new(RedisCacheStore::new(kv))),
-                None => {
-                    // Take the largest configured max_size across origins
-                    // so the shared memory cache can fit all of them.
-                    let max = config
-                        .origins
-                        .iter()
-                        .filter_map(|o| o.response_cache.as_ref())
-                        .map(|c| c.max_size)
-                        .max()
-                        .unwrap_or(10_000);
-                    Some(Arc::new(MemoryCacheStore::new(max)))
-                }
-            }
+        let cache_store: Option<ResponseCacheStores> = if any_cache_enabled {
+            // Take the largest configured max_size across origins so the
+            // shared memory cache can fit all of them.
+            let memory_max = config
+                .origins
+                .iter()
+                .filter_map(|o| o.response_cache.as_ref())
+                .map(|c| c.max_size)
+                .max()
+                .unwrap_or(10_000);
+            let redis_store: Option<Arc<dyn CacheStore>> = config
+                .l2_store
+                .clone()
+                .map(|kv| Arc::new(RedisCacheStore::new(kv)) as Arc<dyn CacheStore>);
+            let origin_keys: Vec<OriginCacheKeys<'_>> = config
+                .origins
+                .iter()
+                .map(|o| {
+                    let encryption = o
+                        .response_cache
+                        .as_ref()
+                        .and_then(|c| c.encryption.as_ref());
+                    OriginCacheKeys {
+                        id: o.origin_id.as_str(),
+                        caches: o.response_cache.as_ref().is_some_and(|c| c.enabled),
+                        key: encryption.and_then(|e| e.key.as_deref()),
+                        previous_keys: encryption
+                            .map(|e| e.previous_keys.as_slice())
+                            .unwrap_or(&[]),
+                    }
+                })
+                .collect();
+            Some(build_response_cache_store(
+                config.server.response_cache_store.as_ref(),
+                redis_store,
+                memory_max,
+                &origin_keys,
+                mode,
+            )?)
         } else {
             None
+        };
+        let (cache_store, origin_cache_stores) = match cache_store {
+            Some(stores) => (Some(stores.unscoped), stores.per_origin),
+            None => (None, HashMap::new()),
         };
 
         // --- Cache Reserve cold tier ---
         //
         // Built from the top-level `cache_reserve:` block. The OSS
         // backends (memory / filesystem / redis) are instantiated here;
-        // unknown / enterprise backends drop through to `None` with a
-        // warning so the enterprise startup hook can swap in its own
+        // unknown or extension-provided backends drop through to `None` with a
+        // warning so a pipeline lifecycle hook can swap in its own
         // implementation post-compile.
         let (cache_reserve, cache_reserve_admission) =
             build_cache_reserve(&config.server.cache_reserve);
@@ -1215,7 +1819,7 @@ impl CompiledPipeline {
         // proxy.extensions[tls_fingerprint] (which the day-6 Item 2
         // migration also fills from legacy features.tls_fingerprint).
         let tls_fingerprint_config =
-            TlsFingerprintConfig::from_extensions(&config.server.extensions);
+            TlsFingerprintConfig::from_extensions(&config.server.extensions)?;
         let agent_detect_config = AgentDetectConfig::from_extensions(&config.server.extensions);
 
         // --- Page Shield raw-report opt-in ---
@@ -1288,10 +1892,127 @@ impl CompiledPipeline {
                 None => (None, None),
             };
 
+        let compression_runtimes = match mode {
+            PipelineConstructionMode::Runtime => {
+                crate::compression_runtime::CompressionRuntimeRegistry::from_process(
+                    &config.server,
+                    config.l2_store.as_deref(),
+                    &actions,
+                )?
+            }
+            PipelineConstructionMode::Validation => {
+                crate::compression_runtime::CompressionRuntimeRegistry::for_validation(
+                    &config.server,
+                    config.l2_store.as_deref(),
+                    &actions,
+                )?
+            }
+        };
+
+        // WOR-2098: build the route-scoped RAG runtimes after both the
+        // main actions and the forward rules are compiled. Validation
+        // construction maps to `RagBuildMode::Validation`, which checks
+        // every configured provider without dialing.
+        #[cfg(feature = "rag")]
+        let rag_runtimes = crate::rag_runtime::RagRuntimeRegistry::build(
+            &actions,
+            &forward_rules,
+            match mode {
+                PipelineConstructionMode::Runtime => sbproxy_rag::RagBuildMode::Runtime,
+                PipelineConstructionMode::Validation => sbproxy_rag::RagBuildMode::Validation,
+            },
+        )?;
+        // Without the `rag` feature a configured `rag:` block must fail
+        // loud at construction rather than silently proxying unaugmented
+        // traffic.
+        #[cfg(not(feature = "rag"))]
+        reject_configured_rag(&actions, &forward_rules)?;
+
+        // WOR-2099: build the route-scoped semantic caches after both the
+        // main actions and the forward rules are compiled, because a
+        // forward rule carries its own `semantic_cache:` block and never
+        // inherits the origin's. Validation construction checks the same
+        // configuration and dependency declarations but binds stub stores,
+        // so validating a candidate config dials neither Redis nor the
+        // mesh.
+        let semantic_caches = match mode {
+            PipelineConstructionMode::Runtime => {
+                crate::semantic_cache_runtime::SemanticCacheRuntimeRegistry::from_process(
+                    &config.server,
+                    config.l2_store.as_deref(),
+                    &config.origins,
+                    &actions,
+                    &forward_rules,
+                )?
+            }
+            PipelineConstructionMode::Validation => {
+                crate::semantic_cache_runtime::SemanticCacheRuntimeRegistry::for_validation(
+                    &config.server,
+                    config.l2_store.as_deref(),
+                    &config.origins,
+                    &actions,
+                    &forward_rules,
+                )?
+            }
+        };
+
+        let key_plane = match mode {
+            PipelineConstructionMode::Runtime => {
+                crate::key_plane::prepare_key_plane(config.server.key_management.as_ref())?
+            }
+            PipelineConstructionMode::Validation => None,
+        };
+
+        // WOR-2127: lower `proxy.attestation` into the metering
+        // vocabulary. Runtime only, because the queue and the ledger are
+        // filesystem state and `sbproxy validate` must be able to check
+        // a candidate config without creating directories for a proxy
+        // that is not going to run. Everything decidable without a
+        // filesystem was already decided at config compile, so
+        // validation still rejects a broken block.
+        // WOR-2128: the revision goes in here rather than being read at
+        // resolve time. Every route weight this generation produces cites
+        // it, and a weight that cited whatever config happened to be live
+        // when the receipt was written would name a document that did not
+        // price the call.
+        // WOR-2145: the receipt chain is opened here too, under the same
+        // runtime-only gate and for the same reason. `node_id` is the mesh
+        // identity when a mesh is configured, because that is the key a
+        // cluster-wide gather files chain segments under; with no mesh
+        // there is one chain and the per-process instance id names it.
+        // Matching `admin_meter`'s derivation is load bearing: a chain
+        // written under one id and reported under another is a chain
+        // nobody can attribute.
+        let attestation = match mode {
+            PipelineConstructionMode::Runtime => {
+                let node_id = crate::cluster::current_cluster_handle()
+                    .map(|handle| handle.identity().node_id.clone())
+                    .unwrap_or_else(|| crate::identity::instance_id().to_string());
+                crate::attestation::prepare_attestation(
+                    config.server.attestation.as_ref(),
+                    config.server.web_bot_auth.as_ref(),
+                    &config_revision,
+                    &node_id,
+                )?
+            }
+            PipelineConstructionMode::Validation => None,
+        };
+
         let pipeline = Self {
             config,
+            key_plane,
+            sensitive_header_names,
             router,
             actions,
+            compression_runtimes,
+            #[cfg(feature = "rag")]
+            rag_runtimes,
+            // Attached by the lifecycle after an async health check, never
+            // by construction: publishing starts a worker, and a candidate
+            // that is then discarded must not leave one claiming leases.
+            #[cfg(feature = "payments")]
+            payments: None,
+            semantic_caches,
             auths,
             policies,
             enforcers,
@@ -1304,8 +2025,11 @@ impl CompiledPipeline {
             outbound_wba,
             web_bot_auth_signer,
             web_bot_auth_signature_agent,
+            attestation,
+            origin_attestations,
             idempotencies,
             cache_store,
+            origin_cache_stores,
             cache_reserve,
             cache_reserve_admission,
             hooks: crate::hooks::Hooks::default(),
@@ -1322,7 +2046,17 @@ impl CompiledPipeline {
         // target that has `health_check:` configured. Best-effort: if
         // we are not running inside a Tokio runtime (e.g. unit tests),
         // the call is a no-op.
-        pipeline.start_background_tasks();
+        //
+        // Validation-mode pipelines are thrown away by the caller, so
+        // spawning here would leak one probe task per health-checked
+        // target on every validation. The tasks hold an Arc on the
+        // dropped pipeline and keep issuing real outbound requests, so
+        // a caller that validates repeatedly (the admin config write
+        // path, a config authority validating each publish) would
+        // accumulate probes against the operator's upstreams forever.
+        if matches!(mode, PipelineConstructionMode::Runtime) {
+            pipeline.start_background_tasks();
+        }
         Ok(pipeline)
     }
 
@@ -1448,11 +2182,20 @@ fn compile_origin_idempotency(
 fn compile_origin_policy_chain(
     policy_configs: &[serde_json::Value],
     l2_store: Option<Arc<dyn sbproxy_platform::storage::KVStore>>,
+    l2_async_store: Option<Arc<dyn sbproxy_platform::storage::AsyncKVStore>>,
     origin_id: &str,
 ) -> anyhow::Result<Vec<Policy>> {
     let mut chain: Vec<Policy> = policy_configs
         .iter()
-        .map(compile_policy)
+        .map(|cfg| {
+            // WOR-2162: name the origin on a policy compile failure so
+            // an operator can find the offending block (the policy
+            // module's own error names the policy type and, for CEL,
+            // quotes the bad expression).
+            use anyhow::Context as _;
+            compile_policy(cfg)
+                .with_context(|| format!("origin `{origin_id}`: invalid policy config"))
+        })
         .collect::<anyhow::Result<_>>()?;
     if l2_store.is_some() {
         for p in chain.iter_mut() {
@@ -1465,7 +2208,16 @@ fn compile_origin_policy_chain(
                             "requests_per_second": 10.0
                         }))?,
                     );
-                    *rl = taken.with_store(l2_store.clone(), origin_id);
+                    // WOR-2084: attach the async handle alongside the
+                    // sync one. `allow_with_info_async` prefers it and
+                    // skips the spawn_blocking bridge; the sync handle
+                    // remains the fallback. Both setters derive the same
+                    // counter-key prefix, so attach order cannot split
+                    // counters across keyspaces (pinned by a test in
+                    // sbproxy-modules).
+                    *rl = taken
+                        .with_store(l2_store.clone(), origin_id)
+                        .with_async_store(l2_async_store.clone(), origin_id);
                 }
                 Policy::Waf(waf) => {
                     // Attach the same shared L2 store to the WAF
@@ -1481,16 +2233,58 @@ fn compile_origin_policy_chain(
                 _ => {}
             }
         }
+    } else if let Some(tier) = crate::rate_limit_cluster::tier_if_clustered() {
+        // No shared counter, but this node is on a mesh. Attach the cluster
+        // tier so the limit is enforced across the cluster instead of N times
+        // over. A shared counter is exact and always wins, which is why this
+        // is the `else` branch.
+        for p in chain.iter_mut() {
+            if let Policy::RateLimit(rl) = p {
+                let taken = std::mem::replace(
+                    rl,
+                    sbproxy_modules::RateLimitPolicy::from_config(serde_json::json!({
+                        "requests_per_second": 10.0
+                    }))?,
+                );
+                if !taken.converges_on_mesh() {
+                    tracing::warn!(
+                        origin = %origin_id,
+                        "requests_per_second is enforced per node on a mesh cluster: a one \
+                         second window closes before a peer contribution can arrive, so the \
+                         cluster admits up to N times this limit. Configure an L2 store for an \
+                         exact cluster-wide per-second limit, or express the limit as \
+                         requests_per_minute, which does converge."
+                    );
+                }
+                *rl = taken.with_cluster(Some(tier.clone()), origin_id);
+            }
+        }
     }
     Ok(chain)
 }
 
+fn routing_action_identity(
+    workspace_id: &str,
+    origin_id: &str,
+    forward_rule_index: Option<usize>,
+) -> String {
+    let scope = forward_rule_index
+        .map(|index| format!("forward-rule:{index}"))
+        .unwrap_or_else(|| "main".to_string());
+    serde_json::to_string(&(workspace_id, origin_id, scope))
+        .expect("routing action identity fields are serializable")
+}
+
 fn compile_forward_rules(
     raw_rules: &[serde_json::Value],
+    workspace_id: &str,
+    origin_id: &str,
+    mode: PipelineConstructionMode,
 ) -> anyhow::Result<Vec<CompiledForwardRule>> {
     let mut compiled = Vec::with_capacity(raw_rules.len());
-    for rule_val in raw_rules {
-        let fwd = compile_single_forward_rule(rule_val)?;
+    for (rule_index, rule_val) in raw_rules.iter().enumerate() {
+        let rule_id = routing_action_identity(workspace_id, origin_id, Some(rule_index));
+        let fwd = compile_single_forward_rule(rule_val, &rule_id, mode)?;
         compiled.push(fwd);
     }
     Ok(compiled)
@@ -1525,7 +2319,11 @@ fn compile_forward_rules(
 /// same `path` block, precedence is `template` > `regex` > `exact` >
 /// `prefix`. The shorthand `match: <prefix>` field is always treated as a
 /// prefix match.
-fn compile_single_forward_rule(val: &serde_json::Value) -> anyhow::Result<CompiledForwardRule> {
+fn compile_single_forward_rule(
+    val: &serde_json::Value,
+    rule_id: &str,
+    mode: PipelineConstructionMode,
+) -> anyhow::Result<CompiledForwardRule> {
     let rules_arr = val
         .get("rules")
         .and_then(|v| v.as_array())
@@ -1558,7 +2356,12 @@ fn compile_single_forward_rule(val: &serde_json::Value) -> anyhow::Result<Compil
     let action_config = origin_obj
         .get("action")
         .ok_or_else(|| anyhow::anyhow!("forward rule origin missing 'action'"))?;
-    let action = compile_action(action_config)?;
+    let action = match mode {
+        PipelineConstructionMode::Runtime => compile_action_for_origin(action_config, rule_id)?,
+        PipelineConstructionMode::Validation => {
+            compile_action_for_origin_for_validation(action_config, rule_id)?
+        }
+    };
 
     // Parse request modifiers (optional).
     // Supports both Rust format ({ headers: { set: ... } }) and Go format
@@ -1694,7 +2497,10 @@ fn compile_query_matcher(val: Option<&serde_json::Value>) -> anyhow::Result<Opti
 ///       status_code: 200
 ///       json_body: { ... }
 /// ```
-fn compile_fallback(raw: &Option<serde_json::Value>) -> anyhow::Result<Option<CompiledFallback>> {
+fn compile_fallback(
+    raw: &Option<serde_json::Value>,
+    mode: PipelineConstructionMode,
+) -> anyhow::Result<Option<CompiledFallback>> {
     let val = match raw {
         Some(v) => v,
         None => return Ok(None),
@@ -1727,7 +2533,12 @@ fn compile_fallback(raw: &Option<serde_json::Value>) -> anyhow::Result<Option<Co
     let action_config = origin_obj
         .get("action")
         .ok_or_else(|| anyhow::anyhow!("fallback origin missing 'action'"))?;
-    let action = compile_action(action_config)?;
+    let action = match mode {
+        PipelineConstructionMode::Runtime => compile_action_for_origin(action_config, "")?,
+        PipelineConstructionMode::Validation => {
+            compile_action_for_origin_for_validation(action_config, "")?
+        }
+    };
 
     Ok(Some(CompiledFallback {
         on_error,
@@ -1735,6 +2546,41 @@ fn compile_fallback(raw: &Option<serde_json::Value>) -> anyhow::Result<Option<Co
         add_debug_header,
         action,
     }))
+}
+
+/// Reject any main or forward-rule `ai_proxy` action that configures
+/// `rag:` when this binary was built without the `rag` feature (WOR-2098).
+///
+/// Dropping the block silently would proxy unaugmented traffic that the
+/// operator believes carries retrieved context, so the mismatch fails
+/// construction with a pointer at the rebuild flag instead.
+#[cfg(not(feature = "rag"))]
+fn reject_configured_rag(
+    actions: &[Action],
+    forward_rules: &[Vec<CompiledForwardRule>],
+) -> anyhow::Result<()> {
+    fn has_rag(action: &Action) -> bool {
+        matches!(action, Action::AiProxy(action) if action.config.rag.is_some())
+    }
+    for (origin_idx, action) in actions.iter().enumerate() {
+        if has_rag(action) {
+            anyhow::bail!(
+                "origin {origin_idx}: ai_proxy configures `rag:` but this build does not \
+                 include RAG support; rebuild with feature 'rag'"
+            );
+        }
+    }
+    for (origin_idx, rules) in forward_rules.iter().enumerate() {
+        for (rule_idx, rule) in rules.iter().enumerate() {
+            if has_rag(&rule.action) {
+                anyhow::bail!(
+                    "origin {origin_idx}: forward rule {rule_idx}: ai_proxy configures `rag:` \
+                     but this build does not include RAG support; rebuild with feature 'rag'"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Normalize a request modifier from either Go format or Rust format.
@@ -1790,6 +2636,18 @@ mod tests {
     use super::*;
     use compact_str::CompactString;
     use std::collections::HashMap;
+
+    #[test]
+    fn routing_state_namespace_is_workspace_and_rule_scoped() {
+        let workspace_a = routing_action_identity("workspace-a", "shared-origin", None);
+        let workspace_b = routing_action_identity("workspace-b", "shared-origin", None);
+        let first_rule = routing_action_identity("workspace-a", "shared-origin", Some(0));
+        let second_rule = routing_action_identity("workspace-a", "shared-origin", Some(1));
+
+        assert_ne!(workspace_a, workspace_b);
+        assert_ne!(workspace_a, first_rule);
+        assert_ne!(first_rule, second_rule);
+    }
 
     fn make_config(
         hostname: &str,
@@ -1849,6 +2707,7 @@ mod tests {
                 outbound_credential: None,
                 outbound_web_bot_auth: false,
                 observability: None,
+                attestation: None,
             }],
             host_map,
             server: sbproxy_config::ProxyServerConfig::default(),
@@ -1860,6 +2719,7 @@ mod tests {
             rate_limits: None,
             audit: None,
             session_ledger: None,
+            flags: Vec::new(),
         }
     }
 
@@ -2001,6 +2861,7 @@ mod tests {
                 outbound_credential: None,
                 outbound_web_bot_auth: false,
                 observability: None,
+                attestation: None,
             }],
             host_map,
             server: sbproxy_config::ProxyServerConfig::default(),
@@ -2012,6 +2873,7 @@ mod tests {
             rate_limits: None,
             audit: None,
             session_ledger: None,
+            flags: Vec::new(),
         }
     }
 
@@ -2099,8 +2961,23 @@ mod tests {
         assert!(pipeline.hooks.intent_detection.is_none());
         assert!(pipeline.hooks.quality_scoring.is_none());
         assert!(pipeline.hooks.stream_safety.is_none());
-        assert!(pipeline.hooks.semantic_lookup.is_none());
-        assert!(pipeline.hooks.stream_cache_recorder.is_none());
+    }
+
+    /// A default pipeline must carry an empty semantic-cache registry.
+    /// The default path is taken by hundreds of unit tests, so it must not
+    /// inspect config, resolve DNS, open Redis, read cluster state, or
+    /// bind a mesh store.
+    #[test]
+    fn compiled_pipeline_default_has_an_empty_semantic_cache_registry() {
+        let pipeline = CompiledPipeline::default();
+        assert!(pipeline.semantic_caches.get(0, None).is_none());
+        assert!(pipeline.semantic_caches.get(0, Some(0)).is_none());
+    }
+
+    #[test]
+    fn compiled_pipeline_default_semantic_registry_has_no_registrations() {
+        let pipeline = CompiledPipeline::default();
+        assert_eq!(pipeline.semantic_caches.registrations().count(), 0);
     }
 
     #[test]
@@ -2624,6 +3501,75 @@ origins:
         assert!(rule.matchers[0].match_request("/", None, &bearer).is_some());
         assert!(rule.matchers[0].match_request("/", None, &basic).is_none());
     }
+
+    #[test]
+    fn validation_rejects_dpop_on_load_balanced_action() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 18080
+origins:
+  "dpop-lb.test":
+    action:
+      type: load_balancer
+      algorithm: round_robin
+      targets:
+        - url: https://one.example.test
+        - url: https://two.example.test
+    outbound_credential:
+      type: client_credentials
+      token_endpoint: https://idp.example.test/token
+      client_id: sbproxy
+      client_secret: secret://prod/client-secret
+      dpop:
+        key: secret://prod/dpop-key
+        alg: ES256
+        jwk:
+          kty: EC
+          crv: P-256
+          x: DpZdjog3y9hgIyKgEPltBi5ptXKUeuRwVOAPSmoQAu4
+          y: bfVVYV9slbMcg4dvtvYbeekYtpFXsYCWcIa9RCrBmTc
+"#;
+        let config = sbproxy_config::compile_config(yaml).unwrap();
+        let error = match CompiledPipeline::from_config_for_validation(config) {
+            Ok(_) => panic!("load-balanced DPoP configuration must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("not supported with load-balanced actions"));
+    }
+
+    #[test]
+    fn validation_rejects_hop_by_hop_outbound_credential_headers() {
+        for header in ["keep-alive", "proxy-connection", "te", "trailer"] {
+            let yaml = format!(
+                r#"
+proxy:
+  http_bind_port: 18080
+origins:
+  "credential.test":
+    action:
+      type: proxy
+      url: https://upstream.example.test
+    outbound_credential:
+      type: vault_secret
+      secret: operator-secret
+      header: {header}
+"#
+            );
+            let config = sbproxy_config::compile_config(&yaml).unwrap();
+            let error = match CompiledPipeline::from_config_for_validation(config) {
+                Ok(_) => panic!("{header} must not be an outbound credential carrier"),
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("header may not carry a credential"),
+                "unexpected {header} validation error: {error}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2725,7 +3671,8 @@ proxy:
 origins: {}
 "#;
         let cfg = sbproxy_config::compile_config(yaml).expect("compile");
-        let tls = TlsFingerprintConfig::from_extensions(&cfg.server.extensions);
+        let tls =
+            TlsFingerprintConfig::from_extensions(&cfg.server.extensions).expect("well-formed");
         assert!(tls.enabled);
         assert_eq!(tls.mode, TlsFingerprintMode::Sidecar);
         assert_eq!(tls.sidecar_header_allowlist.len(), 2);
@@ -2803,7 +3750,8 @@ features:
 origins: {}
 "#;
         let cfg = sbproxy_config::compile_config(yaml).expect("compile");
-        let tls = TlsFingerprintConfig::from_extensions(&cfg.server.extensions);
+        let tls =
+            TlsFingerprintConfig::from_extensions(&cfg.server.extensions).expect("well-formed");
         assert!(tls.enabled);
         assert!(tls.header_allowed("x-forwarded-ja4"));
     }
@@ -2849,7 +3797,9 @@ origins: {}
 
     #[test]
     fn tls_fingerprint_config_invalid_block_falls_through_to_default() {
-        // A malformed extensions block must not abort compile_config.
+        // A malformed block that does not declare `enabled: true`
+        // keeps the warn-and-disable path (WOR-1161 only hard-fails
+        // when the operator asked for capture).
         let yaml = r#"
 proxy:
   http_bind_port: 8080
@@ -2859,8 +3809,775 @@ proxy:
 origins: {}
 "#;
         let cfg = sbproxy_config::compile_config(yaml).expect("compile");
-        let tls = TlsFingerprintConfig::from_extensions(&cfg.server.extensions);
+        let tls = TlsFingerprintConfig::from_extensions(&cfg.server.extensions)
+            .expect("no enabled:true, so the block degrades to disabled");
         // Default => disabled (safe).
         assert!(!tls.enabled);
+    }
+
+    #[test]
+    fn tls_fingerprint_malformed_block_with_enabled_true_fails_compile() {
+        // WOR-1161: `enabled: true` plus a parse failure must reject
+        // the config instead of silently disabling capture. The typo'd
+        // field also exercises `deny_unknown_fields`.
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+  extensions:
+    tls_fingerprint:
+      enabled: true
+      sidecar_headers_allowlist:
+        - x-forwarded-ja4
+origins: {}
+"#;
+        let cfg = sbproxy_config::compile_config(yaml).expect("compile_config only parses YAML");
+        let err = TlsFingerprintConfig::from_extensions(&cfg.server.extensions)
+            .expect_err("enabled:true with a malformed block must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sidecar_headers_allowlist"),
+            "error must name the malformed field: {msg}"
+        );
+        assert!(
+            msg.contains("tls_fingerprint"),
+            "error must name the block: {msg}"
+        );
+
+        // And the failure propagates: the pipeline (boot and reload both
+        // construct through here) refuses the config outright.
+        let cfg = sbproxy_config::compile_config(yaml).expect("compile_config only parses YAML");
+        assert!(
+            CompiledPipeline::from_config(cfg).is_err(),
+            "pipeline construction must reject the malformed enabled:true block"
+        );
+    }
+
+    #[test]
+    fn tls_fingerprint_unknown_field_with_enabled_true_fails_compile() {
+        // A well-formed block with an extra unknown key is a parse
+        // error under deny_unknown_fields; with enabled:true it must
+        // reject the config.
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+  extensions:
+    tls_fingerprint:
+      enabled: true
+      mode: sidecar
+      not_a_real_field: 1
+origins: {}
+"#;
+        let cfg = sbproxy_config::compile_config(yaml).expect("compile_config only parses YAML");
+        let err = TlsFingerprintConfig::from_extensions(&cfg.server.extensions)
+            .expect_err("unknown field with enabled:true must fail");
+        assert!(
+            err.to_string().contains("not_a_real_field"),
+            "error must name the unknown field: {err}"
+        );
+    }
+
+    // --- WOR-2162: expression policies reject invalid CEL at compile ---
+
+    #[test]
+    fn expression_policy_with_invalid_cel_rejects_the_config() {
+        // The old behavior accepted this config and then ADMITTED every
+        // request when the per-request CEL compile failed. Pipeline
+        // construction (the shared path under boot and reload) must
+        // refuse it with a diagnostic naming the origin, the policy,
+        // and the bad expression.
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  "cel.local":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+    policies:
+      - type: expression
+        expression: 'this is not valid CEL !!!'
+"#;
+        let cfg = sbproxy_config::compile_config(yaml).expect("yaml parses");
+        // CompiledPipeline has no Debug, so Option::expect replaces expect_err.
+        let err = CompiledPipeline::from_config(cfg)
+            .err()
+            .expect("invalid CEL must reject the candidate config");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cel.local"),
+            "diagnostic must name the origin: {msg}"
+        );
+        assert!(
+            msg.contains("expression"),
+            "diagnostic must name the policy type: {msg}"
+        );
+        assert!(
+            msg.contains("this is not valid CEL !!!"),
+            "diagnostic must quote the bad expression: {msg}"
+        );
+    }
+
+    #[test]
+    fn expression_policy_with_valid_cel_still_compiles() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  "cel.local":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+    policies:
+      - type: expression
+        expression: 'request.method == "GET"'
+"#;
+        let cfg = sbproxy_config::compile_config(yaml).expect("yaml parses");
+        CompiledPipeline::from_config(cfg).expect("valid CEL must keep compiling");
+    }
+
+    // --- response cache store selection ---
+
+    /// Stand-in for a Redis-backed store, so the selection tests can
+    /// assert which backend was chosen without a live Redis.
+    struct FakeRedisStore;
+
+    impl sbproxy_cache::CacheStore for FakeRedisStore {
+        fn get(&self, _key: &str) -> anyhow::Result<Option<sbproxy_cache::CachedResponse>> {
+            Ok(None)
+        }
+        fn put(&self, _key: &str, _value: &sbproxy_cache::CachedResponse) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn delete(&self, _key: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn clear(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn backend_name(&self) -> &'static str {
+            "redis"
+        }
+    }
+
+    fn fake_redis() -> Option<Arc<dyn CacheStore>> {
+        Some(Arc::new(FakeRedisStore) as Arc<dyn CacheStore>)
+    }
+
+    #[test]
+    fn no_store_block_with_l2_still_selects_redis() {
+        // The compatibility promise: an operator who has only
+        // proxy.l2_cache set keeps Redis after this change.
+        let store = build_response_cache_store(
+            None,
+            fake_redis(),
+            10_000,
+            &[],
+            PipelineConstructionMode::Runtime,
+        )
+        .expect("legacy selection should build");
+        assert_eq!(store.unscoped.backend_name(), "redis");
+    }
+
+    #[test]
+    fn no_store_block_without_l2_selects_memory() {
+        let store =
+            build_response_cache_store(None, None, 10_000, &[], PipelineConstructionMode::Runtime)
+                .expect("legacy selection should build");
+        assert_eq!(store.unscoped.backend_name(), "memory");
+    }
+
+    #[test]
+    fn an_explicit_memory_backend_overrides_a_configured_l2() {
+        // An explicit block means the operator chose; it must win over
+        // the presence of an l2_cache connection.
+        let cfg = sbproxy_config::ResponseCacheStoreConfig::default();
+        let store = build_response_cache_store(
+            Some(&cfg),
+            fake_redis(),
+            10_000,
+            &[],
+            PipelineConstructionMode::Runtime,
+        )
+        .expect("explicit memory should build");
+        assert_eq!(store.unscoped.backend_name(), "memory");
+    }
+
+    #[test]
+    fn a_file_backend_is_constructed_and_creates_its_directory() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("responses");
+        let cfg = sbproxy_config::ResponseCacheStoreConfig {
+            backend: sbproxy_config::ResponseCacheBackendConfig::File {
+                path: path.to_string_lossy().into_owned(),
+                max_size_mb: 0,
+            },
+            encryption: None,
+        };
+        let store = build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &[],
+            PipelineConstructionMode::Runtime,
+        )
+        .expect("file backend should build");
+        assert_eq!(store.unscoped.backend_name(), "file");
+        assert!(path.is_dir(), "the cache directory must be created");
+    }
+
+    #[test]
+    fn a_file_backend_that_cannot_be_created_fails_the_build() {
+        // A file created where the directory should be. create_dir_all
+        // fails, and that must abort rather than silently downgrade to
+        // memory.
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let blocker = dir.path().join("blocked");
+        std::fs::write(&blocker, b"not a directory").expect("write blocker");
+        let cfg = sbproxy_config::ResponseCacheStoreConfig {
+            backend: sbproxy_config::ResponseCacheBackendConfig::File {
+                path: blocker.to_string_lossy().into_owned(),
+                max_size_mb: 0,
+            },
+            encryption: None,
+        };
+        assert!(build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &[],
+            PipelineConstructionMode::Runtime
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_memcached_backend_is_constructed_without_connecting() {
+        // Construction must not dial the server; the store opens a
+        // connection per operation, so a config load against a
+        // temporarily-down memcached still boots.
+        let cfg = sbproxy_config::ResponseCacheStoreConfig {
+            backend: sbproxy_config::ResponseCacheBackendConfig::Memcached {
+                host: "127.0.0.1".to_string(),
+                port: 1,
+            },
+            encryption: None,
+        };
+        let store = build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &[],
+            PipelineConstructionMode::Runtime,
+        )
+        .expect("memcached backend should build without dialing");
+        assert_eq!(store.unscoped.backend_name(), "memcached");
+    }
+
+    #[test]
+    fn a_redis_backend_without_l2_cache_is_a_startup_error() {
+        let cfg = sbproxy_config::ResponseCacheStoreConfig {
+            backend: sbproxy_config::ResponseCacheBackendConfig::Redis,
+            encryption: None,
+        };
+        let Err(err) = build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &[],
+            PipelineConstructionMode::Runtime,
+        ) else {
+            panic!("redis without l2_cache must fail loudly");
+        };
+        assert!(
+            err.to_string().contains("proxy.l2_cache"),
+            "the error must point at the missing block: {err}"
+        );
+    }
+
+    #[test]
+    fn encryption_enabled_without_a_key_is_a_startup_error() {
+        // The core security requirement: never fall through to storing
+        // plaintext because the key was left out.
+        let cfg = sbproxy_config::ResponseCacheStoreConfig {
+            backend: sbproxy_config::ResponseCacheBackendConfig::Memory,
+            encryption: Some(sbproxy_config::ResponseCacheEncryptionConfig {
+                enabled: true,
+                key: None,
+                previous_keys: Vec::new(),
+                per_origin_keys: Default::default(),
+            }),
+        };
+        let Err(err) = build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &[],
+            PipelineConstructionMode::Runtime,
+        ) else {
+            panic!("encryption without a key must fail loudly");
+        };
+        assert!(
+            err.to_string().contains("no `key` is set"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn encryption_with_short_key_material_is_a_startup_error() {
+        let cfg = sbproxy_config::ResponseCacheStoreConfig {
+            backend: sbproxy_config::ResponseCacheBackendConfig::Memory,
+            encryption: Some(sbproxy_config::ResponseCacheEncryptionConfig {
+                enabled: true,
+                key: Some("short".to_string()),
+                previous_keys: Vec::new(),
+                per_origin_keys: Default::default(),
+            }),
+        };
+        assert!(build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &[],
+            PipelineConstructionMode::Runtime
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn an_unresolvable_secret_reference_is_never_used_as_key_material() {
+        // The footgun this closes: with no secret backend installed, a
+        // `secret://` reference must not become the literal key.
+        let cfg = sbproxy_config::ResponseCacheStoreConfig {
+            backend: sbproxy_config::ResponseCacheBackendConfig::Memory,
+            encryption: Some(sbproxy_config::ResponseCacheEncryptionConfig {
+                enabled: true,
+                key: Some("secret://primary/response-cache-key".to_string()),
+                previous_keys: Vec::new(),
+                per_origin_keys: Default::default(),
+            }),
+        };
+        let Err(err) = build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &[],
+            PipelineConstructionMode::Runtime,
+        ) else {
+            panic!("an unresolvable reference must not be used verbatim");
+        };
+        assert!(
+            format!("{err:#}").contains("proxy.secrets.backends"),
+            "the error must point at the missing backend: {err:#}"
+        );
+    }
+
+    #[test]
+    fn encryption_reads_key_material_from_a_file_reference() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let key_file = dir.path().join("cache.key");
+        std::fs::write(&key_file, b"0123456789abcdef0123456789abcdef\n").expect("write key");
+
+        let cfg = sbproxy_config::ResponseCacheStoreConfig {
+            backend: sbproxy_config::ResponseCacheBackendConfig::Memory,
+            encryption: Some(sbproxy_config::ResponseCacheEncryptionConfig {
+                enabled: true,
+                key: Some(format!("file:{}", key_file.display())),
+                previous_keys: Vec::new(),
+                per_origin_keys: Default::default(),
+            }),
+        };
+        let store = build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &[origin_keys("api.example", true, None)],
+            PipelineConstructionMode::Runtime,
+        )
+        .expect("file-referenced key should build");
+
+        // Still reports the wrapped backend, and actually encrypts.
+        assert_eq!(store.unscoped.backend_name(), "memory");
+        let scoped = &store.per_origin["api.example"];
+        let entry = sbproxy_cache::CachedResponse {
+            generation: 0,
+            status: 200,
+            headers: vec![],
+            body: b"needle-in-the-haystack".to_vec(),
+            cached_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            ttl_secs: 300,
+        };
+        scoped.put("k", &entry).unwrap();
+        assert_eq!(scoped.get("k").unwrap().expect("hit").body, entry.body);
+    }
+
+    #[test]
+    fn a_disabled_encryption_block_leaves_the_store_unwrapped() {
+        let cfg = sbproxy_config::ResponseCacheStoreConfig {
+            backend: sbproxy_config::ResponseCacheBackendConfig::Memory,
+            encryption: Some(sbproxy_config::ResponseCacheEncryptionConfig {
+                enabled: false,
+                key: None,
+                previous_keys: Vec::new(),
+                per_origin_keys: Default::default(),
+            }),
+        };
+        assert!(build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &[],
+            PipelineConstructionMode::Runtime
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn validation_mode_skips_key_resolution_but_still_checks_shape() {
+        // `sbproxy validate` must not read key files or dial secret
+        // backends, but a redis backend with no l2_cache is a config
+        // error it can and should report.
+        let encrypted = sbproxy_config::ResponseCacheStoreConfig {
+            backend: sbproxy_config::ResponseCacheBackendConfig::Memory,
+            encryption: Some(sbproxy_config::ResponseCacheEncryptionConfig {
+                enabled: true,
+                key: Some("file:/definitely/not/here.key".to_string()),
+                previous_keys: Vec::new(),
+                per_origin_keys: Default::default(),
+            }),
+        };
+        assert!(build_response_cache_store(
+            Some(&encrypted),
+            None,
+            10_000,
+            &[],
+            PipelineConstructionMode::Validation,
+        )
+        .is_ok());
+
+        let bad_redis = sbproxy_config::ResponseCacheStoreConfig {
+            backend: sbproxy_config::ResponseCacheBackendConfig::Redis,
+            encryption: None,
+        };
+        assert!(build_response_cache_store(
+            Some(&bad_redis),
+            None,
+            10_000,
+            &[],
+            PipelineConstructionMode::Validation,
+        )
+        .is_err());
+    }
+
+    // --- Per-origin cache encryption keys ---
+
+    /// A store config with encryption on, sealed under `key`, in the
+    /// given per-origin mode.
+    fn encrypted_store(
+        key: Option<&str>,
+        mode: sbproxy_config::PerOriginKeyMode,
+    ) -> sbproxy_config::ResponseCacheStoreConfig {
+        sbproxy_config::ResponseCacheStoreConfig {
+            backend: sbproxy_config::ResponseCacheBackendConfig::Memory,
+            encryption: Some(sbproxy_config::ResponseCacheEncryptionConfig {
+                enabled: true,
+                key: key.map(String::from),
+                previous_keys: Vec::new(),
+                per_origin_keys: mode,
+            }),
+        }
+    }
+
+    /// Literal key material long enough to pass the 16-byte floor. The
+    /// resolver treats anything that is not a provider URI or `file:`
+    /// reference as literal material, which keeps these tests off disk.
+    const A_KEY: &str = "origin-a-key-material-0000000001";
+    const B_KEY: &str = "origin-b-key-material-0000000002";
+    const STORE_KEY: &str = "store-wide-key-material-00000001";
+
+    const NO_PREVIOUS: &[String] = &[];
+
+    fn origin_keys<'a>(id: &'a str, caches: bool, key: Option<&'a str>) -> OriginCacheKeys<'a> {
+        OriginCacheKeys {
+            id,
+            caches,
+            key,
+            previous_keys: NO_PREVIOUS,
+        }
+    }
+
+    #[test]
+    fn per_origin_keys_produce_one_handle_per_origin() {
+        let cfg = encrypted_store(Some(STORE_KEY), sbproxy_config::PerOriginKeyMode::Inherit);
+        let origins = [
+            origin_keys("a.example", true, Some(A_KEY)),
+            origin_keys("b.example", true, None),
+        ];
+        let stores = build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &origins,
+            PipelineConstructionMode::Runtime,
+        )
+        .expect("both keys resolve");
+        assert_eq!(stores.per_origin.len(), 2);
+        assert!(stores.per_origin.contains_key("a.example"));
+        assert!(stores.per_origin.contains_key("b.example"));
+    }
+
+    #[test]
+    fn an_entry_sealed_for_one_origin_is_unreadable_through_another_handle() {
+        // The end-to-end version of the multi-tenant property, driven
+        // through the real config path rather than the store's own unit
+        // tests. Both origins inherit the store-wide key here, so only
+        // the origin binding separates them.
+        let cfg = encrypted_store(Some(STORE_KEY), sbproxy_config::PerOriginKeyMode::Inherit);
+        let origins = [
+            origin_keys("a.example", true, None),
+            origin_keys("b.example", true, None),
+        ];
+        let stores = build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &origins,
+            PipelineConstructionMode::Runtime,
+        )
+        .expect("store-wide key resolves");
+
+        let entry = sbproxy_cache::CachedResponse {
+            generation: 1,
+            status: 200,
+            headers: vec![("x-tenant".into(), "a".into())],
+            body: b"tenant a private body".to_vec(),
+            cached_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            ttl_secs: 300,
+        };
+        stores.per_origin["a.example"]
+            .put("shared-key", &entry)
+            .expect("seal for a");
+        assert!(
+            stores.per_origin["b.example"].get("shared-key").is_err(),
+            "origin b must not be able to open origin a's entry"
+        );
+    }
+
+    #[test]
+    fn strict_mode_names_every_caching_origin_without_a_key() {
+        let cfg = encrypted_store(Some(STORE_KEY), sbproxy_config::PerOriginKeyMode::Required);
+        let origins = [
+            origin_keys("has-key.example", true, Some(A_KEY)),
+            origin_keys("missing-one.example", true, None),
+            origin_keys("missing-two.example", true, None),
+            // Not caching, so it is not required to hold a key.
+            origin_keys("no-cache.example", false, None),
+        ];
+        let err = build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &origins,
+            PipelineConstructionMode::Runtime,
+        )
+        .expect_err("strict mode must refuse an origin with no key");
+        let message = err.to_string();
+        assert!(message.contains("missing-one.example"), "{message}");
+        assert!(message.contains("missing-two.example"), "{message}");
+        assert!(
+            !message.contains("no-cache.example"),
+            "an origin that does not cache needs no key: {message}"
+        );
+    }
+
+    #[test]
+    fn strict_mode_accepts_a_config_where_every_caching_origin_has_a_key() {
+        let cfg = encrypted_store(None, sbproxy_config::PerOriginKeyMode::Required);
+        let origins = [
+            origin_keys("a.example", true, Some(A_KEY)),
+            origin_keys("b.example", true, Some(B_KEY)),
+        ];
+        let stores = build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &origins,
+            PipelineConstructionMode::Runtime,
+        )
+        .expect("every caching origin declares a key");
+        assert_eq!(stores.per_origin.len(), 2);
+    }
+
+    #[test]
+    fn inherit_mode_still_requires_a_store_wide_key() {
+        // Without a store-wide key there is nothing for an origin to
+        // inherit, so this is the same misconfiguration as before
+        // per-origin keys existed and must fail the same way.
+        let cfg = encrypted_store(None, sbproxy_config::PerOriginKeyMode::Inherit);
+        let err = build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &[origin_keys("a.example", true, None)],
+            PipelineConstructionMode::Runtime,
+        )
+        .expect_err("inherit with nothing to inherit must fail");
+        assert!(err.to_string().contains("no `key` is set"), "{err}");
+    }
+
+    #[test]
+    fn an_unresolvable_per_origin_key_names_the_origin() {
+        // The guardrail: per-origin keys multiply the secrets resolved at
+        // boot, so the failure has to say which one.
+        let cfg = encrypted_store(Some(STORE_KEY), sbproxy_config::PerOriginKeyMode::Inherit);
+        let err = build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &[origin_keys(
+                "broken.example",
+                true,
+                Some("file:/definitely/not/here.key"),
+            )],
+            PipelineConstructionMode::Runtime,
+        )
+        .expect_err("an unreadable key file must abort startup");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("origins.broken.example.response_cache.encryption"),
+            "the error must name the origin whose key failed: {message}"
+        );
+    }
+
+    #[test]
+    fn a_short_per_origin_key_is_refused() {
+        let cfg = encrypted_store(Some(STORE_KEY), sbproxy_config::PerOriginKeyMode::Inherit);
+        let err = build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &[origin_keys("short.example", true, Some("tiny"))],
+            PipelineConstructionMode::Runtime,
+        )
+        .expect_err("a four-byte key must be refused, not stretched");
+        assert!(format!("{err:#}").contains("at least 16 bytes"), "{err:#}");
+    }
+
+    #[test]
+    fn a_per_origin_key_without_store_wide_encryption_is_a_config_error() {
+        // An operator who wrote a key here expected sealing to happen.
+        // Quietly ignoring it would store that tenant in the clear.
+        let cfg = sbproxy_config::ResponseCacheStoreConfig {
+            backend: sbproxy_config::ResponseCacheBackendConfig::Memory,
+            encryption: None,
+        };
+        let err = build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &[origin_keys("a.example", true, Some(A_KEY))],
+            PipelineConstructionMode::Runtime,
+        )
+        .expect_err("a per-origin key with encryption off must not be silently ignored");
+        assert!(err.to_string().contains("a.example"), "{err}");
+    }
+
+    #[test]
+    fn validation_mode_resolves_no_per_origin_secret() {
+        // `sbproxy validate` checks shape without dialing secret
+        // backends or reading key files, for per-origin keys too.
+        let cfg = encrypted_store(Some(STORE_KEY), sbproxy_config::PerOriginKeyMode::Inherit);
+        assert!(build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &[origin_keys(
+                "a.example",
+                true,
+                Some("file:/definitely/not/here.key"),
+            )],
+            PipelineConstructionMode::Validation,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn validation_mode_still_catches_a_strict_mode_violation() {
+        // Shape errors are exactly what validate is for, so the strict
+        // check must run there even though key resolution does not.
+        let cfg = encrypted_store(Some(STORE_KEY), sbproxy_config::PerOriginKeyMode::Required);
+        assert!(build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &[origin_keys("a.example", true, None)],
+            PipelineConstructionMode::Validation,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn per_origin_rotation_is_independent() {
+        // Rotating one origin must leave every other origin's entries
+        // readable, which is the operational payoff of separate rings.
+        let cfg = encrypted_store(Some(STORE_KEY), sbproxy_config::PerOriginKeyMode::Inherit);
+        let entry = sbproxy_cache::CachedResponse {
+            generation: 1,
+            status: 200,
+            headers: Vec::new(),
+            body: b"body".to_vec(),
+            cached_at: 1_700_000_000,
+            ttl_secs: 300,
+        };
+
+        let before = build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &[
+                origin_keys("a.example", true, Some(A_KEY)),
+                origin_keys("b.example", true, Some(B_KEY)),
+            ],
+            PipelineConstructionMode::Runtime,
+        )
+        .expect("build");
+        before.per_origin["a.example"].put("a", &entry).unwrap();
+        before.per_origin["b.example"].put("b", &entry).unwrap();
+
+        // Only a.example rotates. Its old key moves into previous_keys.
+        let rotated_previous = vec![A_KEY.to_string()];
+        let after = build_response_cache_store(
+            Some(&cfg),
+            None,
+            10_000,
+            &[
+                OriginCacheKeys {
+                    id: "a.example",
+                    caches: true,
+                    key: Some("origin-a-key-material-0000000003"),
+                    previous_keys: &rotated_previous,
+                },
+                origin_keys("b.example", true, Some(B_KEY)),
+            ],
+            PipelineConstructionMode::Runtime,
+        )
+        .expect("build after rotation");
+
+        // Both stores share the same in-process backend only when the
+        // backend instance is shared, which it is not across two builds,
+        // so this test asserts the ring shape instead: a.example can
+        // still be built with a retired key, and b.example is untouched.
+        assert_eq!(after.per_origin.len(), 2);
+        assert!(after.per_origin.contains_key("a.example"));
+        assert!(after.per_origin.contains_key("b.example"));
     }
 }

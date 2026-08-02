@@ -16,12 +16,14 @@ Registry version: `1`
 | `artifact.legacy_download` | `artifact` | `preview` | none | Legacy file downloads lack the complete atomic artifact contract. |
 | `artifact.verified_acquisition` | `artifact` | `stable` | contract.verified_artifact_policy_blocks_unauthorized_network<br>test.artifact_manager<br>test.artifact_policy | Managed artifacts are exact, atomic, resumable, and policy enforced. |
 | `artifact.cache_addressing` | `artifact` | `stable` | contract.cache_directory_changes_artifact_path | Explicit cache directories deterministically change artifact paths. |
-| `artifact.cache_budget` | `artifact` | `stable` | contract.cache_budget_protects_active_artifacts<br>test.artifact_gc | Cache collection enforces LRU budgets without deleting protected artifacts. |
+| `artifact.cache_budget` | `artifact` | `stable` | contract.cache_budget_protects_active_artifacts<br>test.artifact_gc | Cache collection enforces LRU budgets without deleting protected artifacts; the same protected collection runs on demand through the admin gc route. |
 | `artifact.exact_removal` | `artifact` | `stable` | contract.exact_removal_protects_references<br>test.artifact_manager<br>test.models_lifecycle_cli | Exact cache removal is idempotent and rejects configured, resident, pinned, locked, leased, or active artifacts. |
 | `engine.typed_managed_drivers` | `engine` | `stable` | contract.managed_drivers_expose_typed_capabilities<br>test.engine_drivers | Managed engines share typed detect, provision, launch, health, and shutdown contracts over verified local artifacts. |
-| `engine.llama_cpp_managed` | `engine` | `preview` | test.engine_drivers<br>test.cuda_build<br>cert.apple_metal.2026-07-11 | Managed llama.cpp supports digest-verified binary acquisition and Linux CUDA source builds; Apple Metal is certified while live CUDA remains deferred. |
+| `engine.llama_cpp_managed` | `engine` | `preview` | test.engine_drivers<br>test.cuda_build<br>cert.apple_metal.2026-07-11 | Managed llama.cpp resolves an operator binary, fetches a digest-verified CPU or Metal release, or builds digest-pinned source with CUDA. Live NVIDIA certification remains deferred. |
 | `engine.vllm_uv` | `engine` | `preview` | test.engine_drivers | Managed vLLM can use a pinned uv environment; live NVIDIA certification remains deferred. |
 | `engine.vllm_container` | `engine` | `preview` | test.engine_drivers | Digest-pinned private container plans use read-only artifacts and selected devices; live NVIDIA certification remains deferred. |
+| `engine.sglang` | `engine` | `preview` | test.engine_drivers | Managed SGLang serves safetensors weights on a CUDA worker from a pinned uv environment or a digest-pinned container, mirroring vLLM and adding RadixAttention prefix caching; live NVIDIA certification remains deferred. |
+| `engine.mistralrs` | `engine` | `preview` | test.engine_drivers | Managed mistral.rs serves safetensors weights from the upstream pinned prebuilt binary (PATH-first, sha256-verified), the pure-Rust subprocess lane; an explicit opt-in that auto never selects. |
 | `lifecycle.atomic_reconciliation` | `lifecycle` | `stable` | contract.canonical_desired_state_reconciles_atomically<br>test.runtime_reconcile<br>test.model_host_reload | Startup, file reload, SIGHUP, and admin reload prepare a complete revision before commit; pre-commit failures do not publish the candidate. |
 | `lifecycle.single_node_residency` | `lifecycle` | `stable` | contract.eviction_changes_admission | Single-node residency honors the global resident limit and configured eviction policy across devices. |
 | `lifecycle.keep_alive` | `lifecycle` | `stable` | contract.keep_alive_starts_after_last_permit<br>test.local_admission<br>test.runtime_reconcile | Keep-alive starts after the last completed request and never expires active or queued work. |
@@ -31,9 +33,10 @@ Registry version: `1`
 | `admin.model_status` | `admin` | `stable` | contract.status_reports_stable_lifecycle<br>test.models_lifecycle_cli<br>test.admin_model_host | Authenticated admin status, load, stop, drain, and reset adapt the shared runtime lifecycle. |
 | `admin.model_management` | `admin` | `preview` | contract.canonical_desired_state_reconciles_atomically<br>test.admin_model_management<br>test.ui_model_management | Backend E2E covers authenticated full-map revision conflicts and restart persistence; UI unit and component contracts cover mode-aware catalog evidence, lifecycle state, conflict recovery, removal guards, and cluster authority proof. |
 | `platform.apple_metal` | `platform` | `stable` | contract.catalog_v2_selects_exact_artifact<br>test.engine_drivers<br>cert.apple_metal.2026-07-11 | Apple Metal completed a real managed gateway completion, status, stop, cache-reuse, and Ctrl-C shutdown gate on Apple M4 Max. |
-| `platform.nvidia_cuda` | `platform` | `preview` | test.cuda_build<br>test.local_admission | NVIDIA discovery, vLLM, and CUDA llama.cpp have deterministic coverage; live GCP certification is reserved for the final PR group. |
+| `platform.nvidia_cuda` | `platform` | `preview` | test.cuda_build<br>test.local_admission<br>cert.nvidia_l4_single_gpu.2026-07-30 | One NVIDIA device completed a live gateway completion, status, and stop on an L4, with the digest-pinned vLLM container. Multi-device serving stays uncertified: the lane has never had a two-GPU host to run on, so this is deliberately not promoted on single-device evidence alone. |
 | `lifecycle.priority_admission` | `lifecycle` | `stable` | contract.priority_gate_changes_dispatch | Configured local concurrency changes request admission. |
 | `lifecycle.model_cli` | `lifecycle` | `stable` | contract.exact_removal_protects_references<br>test.models_lifecycle_cli | Pull, list, show, remove, process status, and stop commands use versioned JSON and shared artifact or runtime contracts. |
+| `admin.value_report` | `admin` | `stable` | contract.reference_price_records_savings<br>test.value_ledger | A configured cloud reference prices each local completion as dollars saved, recorded per model and served on the admin value route. |
 
 ## Configuration fields
 
@@ -42,7 +45,8 @@ Registry version: `1`
 | `serve.models` | `stable` | `manifest.serve_model_declarations` | `contract.serve_models_change_desired_deployments` |
 | `serve.catalog_file` | `preview` | `manifest.catalog_v2` | `none` |
 | `serve.cache_dir` | `stable` | `artifact.cache_addressing` | `contract.cache_directory_changes_artifact_path` |
-| `serve.cache_budget_gib` | `config_only` | `artifact.cache_budget` | `none` |
+| `serve.cache_budget_gib` | `preview` | `artifact.cache_budget` | `contract.cache_budget_protects_active_artifacts` |
+| `serve.allow_unpinned_refs` | `preview` | `artifact.verified_acquisition` | `none` |
 | `serve.eviction` | `stable` | `lifecycle.single_node_residency` | `contract.eviction_changes_admission` |
 | `serve.engines` | `preview` | `engine.typed_managed_drivers` | `none` |
 | `serve.max_concurrent_requests` | `stable` | `lifecycle.priority_admission` | `contract.priority_gate_changes_dispatch` |
@@ -55,6 +59,7 @@ Registry version: `1`
 | `serve.models[].max_context` | `preview` | `engine.typed_managed_drivers` | `none` |
 | `serve.models[].extra_args` | `preview` | `engine.typed_managed_drivers` | `none` |
 | `serve.models[].kv_quant` | `preview` | `engine.typed_managed_drivers` | `none` |
+| `serve.models[].enable_prefix_caching` | `preview` | `engine.typed_managed_drivers` | `none` |
 | `serve.models[].speculative` | `preview` | `engine.typed_managed_drivers` | `none` |
 | `serve.models[].chunked_prefill` | `preview` | `engine.typed_managed_drivers` | `none` |
 | `serve.models[].lora_adapters` | `preview` | `engine.typed_managed_drivers` | `none` |
@@ -64,3 +69,5 @@ Registry version: `1`
 | `serve.models[].cpu_offload_gib` | `preview` | `engine.typed_managed_drivers` | `none` |
 | `serve.models[].max_loras` | `preview` | `engine.typed_managed_drivers` | `none` |
 | `serve.models[].gguf_file` | `preview` | `artifact.legacy_download` | `none` |
+| `serve.models[].reference` | `stable` | `admin.value_report` | `contract.reference_price_records_savings` |
+| `serve.models[].modality` | `preview` | `engine.typed_managed_drivers` | `none` |

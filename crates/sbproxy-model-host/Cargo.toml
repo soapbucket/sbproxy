@@ -7,7 +7,7 @@ publish = false
 description = "Local model-serving subsystem for sbproxy: model catalog, GPU fit planner, and engine supervisor (WOR-1652). Single-node, engine-agnostic, hardware-independent core."
 
 [features]
-default = []
+default = ["tokenizer"]
 # Real NVIDIA GPU discovery via NVML (runtime dlopen, no CUDA toolkit at
 # build time). Off by default at the crate level so library builds stay
 # lean; the `sbproxy` binary enables it by default, which is safe
@@ -25,21 +25,27 @@ gpu-apple = []
 # enabled by default in the `sbproxy` binary.
 weights = ["dep:reqwest"]
 # Accurate token counting (against a model's own tokenizer.json) and
-# chat-template rendering. Off by default; both crates are already in
-# the workspace (extension/classifiers), so this adds no new lock deps.
+# chat-template rendering (WOR-1671). On by default at the crate level:
+# encoding a fixed tokenizer.json is deterministic, so unlike the other
+# optional features here there is no reason to make callers opt in, and
+# both `tokenizers` and `minijinja` are already default dependencies
+# elsewhere in the workspace (classifiers / ai / modules) at these same
+# versions, so this adds no new lock deps. Budgets and context-fit
+# previously had to fall back to a length-based heuristic for want of
+# this one flag; with it on, local-model callers get an exact count.
 tokenizer = ["dep:tokenizers", "dep:minijinja"]
-# In-process embedded engine (WOR-1658): runs a model inside the gateway
-# with no subprocess, for a single-binary / zero-external-engine deploy.
-# Off by default. Backed by mistral.rs (Gemma, Qwen, Llama, ...) served
-# over a loopback OpenAI endpoint via axum, so the runtime routes to it
-# exactly like a subprocess engine. mistral.rs is a large dependency
-# tree (candle etc.), so it is strictly opt-in and absent from the
-# default build + the lean lockfile path.
-embedded = ["dep:mistralrs", "dep:axum"]
+# Xet-aware weight download through hf-hub's managed client: a chunk
+# already local or shared with another cached file is never re-fetched.
+# Additive to `weights`, not a replacement for it -- hf-hub pulls its
+# own reqwest/hyper stack and hf-xet's chunking layer, a sizeable
+# dependency addition, so it stays strictly opt-in pending a real
+# download pass on a live host to confirm the two transports agree.
+hf-xet-transport = ["weights", "dep:hf-hub", "dep:tokio-util"]
 
 [dependencies]
 sbproxy-util.workspace = true
 sbproxy-config.workspace = true
+sbproxy-security.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_json_canonicalizer = { workspace = true }
@@ -57,23 +63,30 @@ bytes = { workspace = true }
 zeroize = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
+# `hf-xet-transport` feature only: streams the hf-hub-downloaded local
+# file back through the `ArtifactTransport` body type.
+tokio-util = { workspace = true, features = ["io"], optional = true }
 tracing = { workspace = true }
 ulid = { workspace = true }
 url = { workspace = true }
 nvml-wrapper = { version = "0.10", optional = true }
 # Weight download is a plain HTTP GET that follows HF's redirect to the
 # resolve-cache/Xet backend; reqwest's default redirect policy resolves
-# the relative Location the hub returns, which the old hf-hub 0.3 client
-# could not. No hf-hub dependency.
+# the relative Location the hub returns. This gets the request to the
+# right backend but not real chunk-level dedup, which needs the Xet CAS
+# protocol itself -- see the `hf-xet-transport` feature below.
 reqwest = { workspace = true, optional = true }
+# `hf-xet-transport` feature only: hf-hub 1.0 speaks the Xet
+# chunk-deduplication protocol transparently through its managed,
+# content-addressed download client (`HF_HUB_CACHE`); the sbproxy
+# transport seam wraps its completed local file rather than
+# reimplementing CAS chunking here.
+hf-hub = { version = "1.0", optional = true }
 # Token counting + chat-template rendering, behind the `tokenizer`
 # feature. Versions match the existing workspace users (classifiers /
 # extension) so no new lock entries are pulled.
 tokenizers = { version = "0.20", optional = true, default-features = false, features = ["onig"] }
 minijinja = { workspace = true, optional = true }
-# WOR-1658 embedded engine (feature `embedded`). Large dep tree; opt-in only.
-mistralrs = { version = "0.8", optional = true }
-axum = { version = "0.8", optional = true }
 
 # WOR-1829: the GPU/RAM probes read sysctl keys via the sysctlbyname(3)
 # syscall so they work inside sandboxes that block spawning the `sysctl`

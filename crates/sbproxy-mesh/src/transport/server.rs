@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -23,8 +24,18 @@ use tokio_rustls::TlsAcceptor;
 use crate::crypto::Cipher;
 use crate::metrics::{CRYPTO_KIND_TRANSPORT, MESH_CRYPTO_DECRYPT_FAILED};
 use crate::state::distributed_cache::DistributedCache;
+use crate::state::replicated::ReplicaShard;
 
-use super::frame::{read_frame, write_frame, CacheOp, CacheResult, Request, Response};
+use super::frame::{
+    read_frame, write_frame, CacheOp, CacheResult, CacheSnapshot, Request, Response,
+    MAX_ROUTED_SNAPSHOT_BYTES,
+};
+
+/// Fixed reply text for a snapshot request that violates its bounds.
+///
+/// The string is a constant so a rejection can never echo the requested
+/// prefix, a stored key, or a stored value back to the peer or into a log.
+const SNAPSHOT_REJECTED: &str = "invalid cache snapshot request";
 
 // --- Handle ---
 
@@ -43,6 +54,11 @@ pub struct TransportServer {
     /// OS picks an ephemeral port; tests read this back to target the
     /// server.
     local_port: u16,
+    /// Replica shard behind the WOR-1947 replicated ops. Installed after
+    /// construction (the shard needs the node's durable directory, which
+    /// bootstrap wires later); requests arriving before installation get
+    /// a clean "not enabled" error rather than a hang.
+    replica_shard: Arc<ArcSwapOption<ReplicaShard>>,
 }
 
 impl TransportServer {
@@ -95,6 +111,8 @@ impl TransportServer {
         let local_port = listener.local_addr()?.port();
 
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        let replica_shard: Arc<ArcSwapOption<ReplicaShard>> = Arc::new(ArcSwapOption::empty());
+        let replica_for_loop = replica_shard.clone();
 
         let join = tokio::spawn(async move {
             loop {
@@ -108,14 +126,22 @@ impl TransportServer {
                         match accept {
                             Ok((stream, addr)) => {
                                 tracing::debug!(peer = %addr, "transport: accepted connection");
+                                // Mirror the client-side connect: the
+                                // response leg is a small write followed by
+                                // a read, so leaving Nagle on stalls it
+                                // against the client's delayed ACK
+                                // (WOR-1949).
+                                let _ = stream.set_nodelay(true);
                                 let cache = cache.clone();
                                 let cipher = cipher.clone();
                                 let tls = tls.clone();
+                                let replica = replica_for_loop.clone();
                                 tokio::spawn(async move {
                                     match tls {
                                         Some(acceptor) => match acceptor.accept(stream).await {
                                             Ok(tls_stream) => {
-                                                handle_connection(tls_stream, cache, cipher).await
+                                                handle_connection(tls_stream, cache, cipher, replica)
+                                                    .await
                                             }
                                             Err(e) => tracing::warn!(
                                                 peer = %addr,
@@ -123,7 +149,9 @@ impl TransportServer {
                                                 "transport: peer TLS handshake failed"
                                             ),
                                         },
-                                        None => handle_connection(stream, cache, cipher).await,
+                                        None => {
+                                            handle_connection(stream, cache, cipher, replica).await
+                                        }
                                     }
                                 });
                             }
@@ -144,7 +172,16 @@ impl TransportServer {
             _join: join,
             shutdown: Some(shutdown_tx),
             local_port,
+            replica_shard,
         })
+    }
+
+    /// Install the durable replica shard behind the replicated ops
+    /// (`ReplicaApply` / `ReplicaFetch` / `SyncDigest`). Until this is
+    /// called those ops answer with a "not enabled" error. Existing
+    /// connections pick the shard up on their next request.
+    pub fn install_replica_shard(&self, shard: Arc<ReplicaShard>) {
+        self.replica_shard.store(Some(shard));
     }
 
     /// Signal the accept loop to stop. Idempotent and non-blocking; the
@@ -192,6 +229,7 @@ async fn handle_connection<S>(
     stream: S,
     cache: Arc<DistributedCache<Bytes>>,
     cipher: Option<Cipher>,
+    replica: Arc<ArcSwapOption<ReplicaShard>>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
@@ -272,6 +310,62 @@ async fn handle_connection<S>(
                     cache.purge_prefix_local(&prefix)
                 };
                 CacheResult::Purged(n as u64)
+            }
+            CacheOp::MergeVersioned {
+                key,
+                value,
+                ttl_secs,
+            } => match cache.merge_versioned_local_with_ttl(&key, value, ttl_secs) {
+                Ok(outcome) => CacheResult::VersionedMerged(outcome),
+                Err(_) => CacheResult::Error("invalid versioned mesh state".to_string()),
+            },
+            // WOR-1947 replicated substrate. Dispatch stays local, like
+            // every other arm: the sending coordinator picked this node
+            // as a replica; recursing here would amplify writes.
+            CacheOp::ReplicaApply {
+                key,
+                value,
+                ttl_secs,
+            } => match replica.load_full() {
+                Some(shard) => match shard.apply_encoded(&key, &value, ttl_secs) {
+                    Ok(outcome) => CacheResult::VersionedMerged(outcome),
+                    Err(e) => CacheResult::Error(e.to_string()),
+                },
+                None => CacheResult::Error("replicated substrate not enabled".to_string()),
+            },
+            CacheOp::ReplicaFetch { key } => match replica.load_full() {
+                Some(shard) => CacheResult::Value(shard.fetch_encoded(&key)),
+                None => CacheResult::Error("replicated substrate not enabled".to_string()),
+            },
+            CacheOp::SyncDigest {
+                prefix,
+                page_token,
+                limit,
+            } => match replica.load_full() {
+                Some(shard) => CacheResult::DigestPage(shard.digest_page(
+                    &prefix,
+                    page_token.as_deref(),
+                    limit as usize,
+                )),
+                None => CacheResult::Error("replicated substrate not enabled".to_string()),
+            },
+            // Bounded routed-prefix snapshot. Dispatch stays local like every
+            // other arm: the client already resolved the consistent-hash
+            // owner, so recursing into a routed method here would amplify the
+            // read. The bounded helper is the only entry point, so the reply
+            // can never exceed the fixed entry and byte caps.
+            CacheOp::SnapshotPrefix { prefix, maximum } => {
+                match cache.snapshot_prefix_local_bounded(
+                    &prefix,
+                    maximum as usize,
+                    MAX_ROUTED_SNAPSHOT_BYTES,
+                ) {
+                    Ok(snapshot) => CacheResult::Snapshot(CacheSnapshot {
+                        entries: snapshot.entries,
+                        truncated: snapshot.truncated,
+                    }),
+                    Err(_) => CacheResult::Error(SNAPSHOT_REJECTED.to_string()),
+                }
             }
         };
 
@@ -553,6 +647,153 @@ mod tests {
         assert_eq!(cache.get_local("b"), None);
 
         drop(stream);
+        server.shutdown();
+    }
+
+    /// Send one request over a fresh raw connection and return the reply.
+    async fn round_trip(port: u16, op: CacheOp) -> CacheResult {
+        let mut stream = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        let (mut r, mut w) = stream.split();
+        let req = Request { request_id: 1, op };
+        let bytes = crate::transport::wire::encode(&req).expect("ser");
+        write_frame(&mut w, &bytes).await.expect("write");
+        let resp_bytes = read_frame(&mut r).await.expect("read");
+        let resp: Response = crate::transport::wire::decode(&resp_bytes).expect("deser");
+        assert_eq!(resp.request_id, 1);
+        resp.result
+    }
+
+    #[tokio::test]
+    async fn server_handles_snapshot_prefix_in_lexicographic_order() {
+        let cache: Arc<DistributedCache<Bytes>> =
+            Arc::new(DistributedCache::new("server-node", 16));
+        cache.put_local("member:c", Bytes::from_static(b"three"));
+        cache.put_local("member:a", Bytes::from_static(b"one"));
+        cache.put_local("member:b", Bytes::from_static(b"two"));
+        cache.put_local("other:a", Bytes::from_static(b"skip"));
+        let server = TransportServer::start(0, cache.clone())
+            .await
+            .expect("start");
+        let port = server.local_port();
+
+        let result = round_trip(
+            port,
+            CacheOp::SnapshotPrefix {
+                prefix: "member:".to_string(),
+                maximum: 16,
+            },
+        )
+        .await;
+        match result {
+            CacheResult::Snapshot(snapshot) => {
+                assert_eq!(
+                    snapshot
+                        .entries
+                        .iter()
+                        .map(|(key, _)| key.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["member:a", "member:b", "member:c"]
+                );
+                assert!(!snapshot.truncated);
+            }
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn server_snapshot_prefix_omits_expired_entries() {
+        let cache: Arc<DistributedCache<Bytes>> =
+            Arc::new(DistributedCache::new("server-node", 16));
+        cache.put_local("member:live", Bytes::from_static(b"live"));
+        cache.put_local_with_ttl("member:gone", Bytes::from_static(b"gone"), 1);
+        let server = TransportServer::start(0, cache.clone())
+            .await
+            .expect("start");
+        let port = server.local_port();
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+
+        let result = round_trip(
+            port,
+            CacheOp::SnapshotPrefix {
+                prefix: "member:".to_string(),
+                maximum: 16,
+            },
+        )
+        .await;
+        match result {
+            CacheResult::Snapshot(snapshot) => {
+                assert_eq!(
+                    snapshot.entries,
+                    vec![("member:live".to_string(), Bytes::from_static(b"live"))]
+                );
+            }
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn server_snapshot_prefix_sets_truncated() {
+        let cache: Arc<DistributedCache<Bytes>> =
+            Arc::new(DistributedCache::new("server-node", 16));
+        for index in 0..5u32 {
+            cache.put_local(&format!("member:{index}"), Bytes::from_static(b"v"));
+        }
+        let server = TransportServer::start(0, cache.clone())
+            .await
+            .expect("start");
+        let port = server.local_port();
+
+        let result = round_trip(
+            port,
+            CacheOp::SnapshotPrefix {
+                prefix: "member:".to_string(),
+                maximum: 2,
+            },
+        )
+        .await;
+        match result {
+            CacheResult::Snapshot(snapshot) => {
+                assert_eq!(snapshot.entries.len(), 2);
+                assert!(snapshot.truncated, "a bounded page must report truncation");
+            }
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn server_snapshot_prefix_rejects_invalid_limit_without_echoing_prefix() {
+        let cache: Arc<DistributedCache<Bytes>> =
+            Arc::new(DistributedCache::new("server-node", 16));
+        cache.put_local("member:secret-suffix", Bytes::from_static(b"secret-value"));
+        let server = TransportServer::start(0, cache.clone())
+            .await
+            .expect("start");
+        let port = server.local_port();
+
+        for (prefix, maximum) in [
+            ("member:secret-suffix".to_string(), 0u32),
+            ("member:secret-suffix".to_string(), 4_097),
+            (String::new(), 16),
+        ] {
+            let result = round_trip(port, CacheOp::SnapshotPrefix { prefix, maximum }).await;
+            match result {
+                CacheResult::Error(message) => {
+                    assert_eq!(message, SNAPSHOT_REJECTED);
+                    assert!(!message.contains("secret-suffix"), "{message}");
+                    assert!(!message.contains("secret-value"), "{message}");
+                }
+                other => panic!("expected Error, got {other:?}"),
+            }
+        }
+
         server.shutdown();
     }
 

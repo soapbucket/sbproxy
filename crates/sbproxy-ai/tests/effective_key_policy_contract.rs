@@ -31,6 +31,7 @@ fn policy() -> EffectiveKeyPolicy {
         allowed_providers: vec!["openai".into(), "vertex".into()],
         blocked_providers: vec!["vertex".into()],
         route_to_model: Some("gpt-4.1".into()),
+        compression_profile: Some("coding-agent".into()),
         principal_selectors: vec![PrincipalSelector {
             team: Some("platform".into()),
             ..PrincipalSelector::default()
@@ -47,6 +48,7 @@ fn policy() -> EffectiveKeyPolicy {
             filter: vec!["search*".into()],
         }),
         bypass_prompt_injection: false,
+        allow_content_capture: true,
         max_requests_per_minute: Some(60),
         max_tokens_per_minute: Some(100_000),
         budget: Some(KeyBudgetPolicy {
@@ -63,6 +65,8 @@ const GOVERNED_KEY_E2E_SOURCE_PATH: &str = "e2e/tests/governed_key_policy.rs";
 const GOVERNED_KEY_E2E_SOURCE: &str = include_str!("../../../e2e/tests/governed_key_policy.rs");
 const AI_DISPATCH_SOURCE_PATH: &str = "crates/sbproxy-core/src/server/ai_dispatch.rs";
 const AI_DISPATCH_SOURCE: &str = include_str!("../../sbproxy-core/src/server/ai_dispatch.rs");
+const CONTENT_CAPTURE_E2E_SOURCE_PATH: &str = "e2e/tests/content_capture.rs";
+const CONTENT_CAPTURE_E2E_SOURCE: &str = include_str!("../../../e2e/tests/content_capture.rs");
 
 #[derive(Clone, Copy)]
 struct EnforcementTestRegistration {
@@ -152,6 +156,20 @@ fn governed_key_e2e_test(
     EnforcementTestRegistration {
         source_path: GOVERNED_KEY_E2E_SOURCE_PATH,
         source: GOVERNED_KEY_E2E_SOURCE,
+        test_name,
+        behavior_markers,
+        assertion,
+    }
+}
+
+fn content_capture_e2e_test(
+    test_name: &'static str,
+    behavior_markers: &'static [&'static str],
+    assertion: EnforcementAssertion,
+) -> EnforcementTestRegistration {
+    EnforcementTestRegistration {
+        source_path: CONTENT_CAPTURE_E2E_SOURCE_PATH,
+        source: CONTENT_CAPTURE_E2E_SOURCE,
         test_name,
         behavior_markers,
         assertion,
@@ -262,6 +280,24 @@ fn registered_enforcement_test(proof: PolicyEnforcementProof) -> EnforcementTest
             ],
             |policy| assert_eq!(policy.route_to_model.as_deref(), Some("gpt-4.1")),
         ),
+        PolicyEnforcementProof::CompressionSelection => governed_key_e2e_test(
+            "dynamic_compression_profile_changes_context_and_header_overrides_it",
+            &[
+                "\"compression_profile\": \"off\"",
+                "\"compression_profile\": \"on\"",
+                "\"compression_profile\": \"compact\"",
+                "the governed off selector must preserve the complete caller context",
+                "the route default must be distinct from off",
+                "on and the named compact profile must forward visibly different context",
+                "the governed compact profile must reduce the forwarded context",
+                "the header must override the governed compression profile",
+                "x-compression: off must preserve the complete caller context",
+                "the internal selection header must never reach the provider",
+                "CEL must select a profile from the pre-compression token estimate",
+                "the live CEL-selected profile must reduce the forwarded context",
+            ],
+            |policy| assert_eq!(policy.compression_profile.as_deref(), Some("coding-agent")),
+        ),
         PolicyEnforcementProof::PrincipalGate => governed_key_e2e_test(
             "dynamic_principal_selectors_gate_live_jwt_requests",
             &[
@@ -348,7 +384,7 @@ fn registered_enforcement_test(proof: PolicyEnforcementProof) -> EnforcementTest
             &[
                 "\"max_budget_tokens\": 100",
                 "provider usage must exhaust the dynamic record budget",
-                "\"max_budget_usd\": 0.000001",
+                "\"max_budget_usd\": 0.0001",
                 "recorded provider cost must exhaust the dynamic USD budget",
             ],
             |policy| {
@@ -366,6 +402,16 @@ fn registered_enforcement_test(proof: PolicyEnforcementProof) -> EnforcementTest
                 "assert_eq!(admission, sbproxy_model_host::PriorityClass::Interactive)",
             ],
             |policy| assert_eq!(policy.priority, KeyPriority::Interactive),
+        ),
+        PolicyEnforcementProof::Observability => content_capture_e2e_test(
+            "both_gates_on_captures_a_redacted_sample_and_audits_the_read",
+            &[
+                "mint_key(admin_port, true)",
+                "a planted provider token must never survive into a sample",
+                "fetch_content(admin_port, &request_id)",
+                "content inspection must be audited",
+            ],
+            |policy| assert!(policy.allow_content_capture),
         ),
     }
 }
@@ -393,12 +439,14 @@ fn every_policy_field_registers_a_concrete_enforcement_test() {
             "allowed_providers",
             "blocked_providers",
             "route_to_model",
+            "compression_profile",
             "principal_selectors",
             "require_pii_redaction",
             "allowed_tools",
             "inject_tools",
             "inject_mcp",
             "bypass_prompt_injection",
+            "allow_content_capture",
             "max_requests_per_minute",
             "max_tokens_per_minute",
             "budget",
@@ -421,7 +469,7 @@ fn every_policy_field_registers_a_concrete_enforcement_test() {
             );
         }
     }
-    assert_eq!(registered_assertions.len(), 14);
+    assert_eq!(registered_assertions.len(), 16);
 }
 
 #[test]
@@ -653,6 +701,22 @@ fn serialized_effective_policy_has_no_secret_or_hash_fields() {
         assert!(!object.contains_key(forbidden), "found {forbidden}");
     }
     assert_eq!(object.get("key_id"), Some(&json!("key_01")));
+}
+
+#[test]
+fn effective_policy_v1_without_compression_profile_still_decodes() {
+    let mut value = serde_json::to_value(policy()).expect("effective policy JSON");
+    value["schema_version"] = json!(1);
+    value
+        .as_object_mut()
+        .expect("effective policy object")
+        .remove("compression_profile");
+
+    let decoded: EffectiveKeyPolicy =
+        serde_json::from_value(value).expect("v1 effective policy remains readable");
+
+    assert_eq!(decoded.schema_version, 1);
+    assert!(decoded.compression_profile.is_none());
 }
 
 #[test]
