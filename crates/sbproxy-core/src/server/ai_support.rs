@@ -2128,17 +2128,35 @@ pub(super) fn shadow_usage_record_from_context(
 /// realized cost-per-success. No-op unless the origin opted in (the
 /// strategy is `outcome_aware`) and the request actually reached a
 /// provider, so a pre-dispatch block records nothing.
-pub(super) fn record_routing_feedback(ctx: &crate::context::RequestContext) {
+///
+/// `status` must be the request's **final** status, which on the AI path
+/// means the one `final_response_status` resolves rather than
+/// `ctx.response_status` (WOR-2213). `ai_proxy` writes its response
+/// inside `request_filter` and returns `Ok(true)`, so Pingora's
+/// `response_filter`, the only thing that sets `ctx.response_status` for
+/// proxied traffic, never runs for AI requests. Reading that field here
+/// meant every completed AI request recorded `success = false`, every
+/// provider's score reached `f64::INFINITY`, and `best_among` pinned on
+/// `enabled[0]` forever: the strategy could not shift traffic at all,
+/// which is the entire thing it exists to do.
+pub(super) fn record_routing_feedback(ctx: &crate::context::RequestContext, status: u16) {
     if !ctx.ai_record_routing_feedback {
         return;
     }
     let Some(provider) = ctx.ai_provider.as_deref() else {
         return;
     };
-    let status = ctx.response_status.unwrap_or(0);
     let success = (200..300).contains(&status);
     // A provider-side refusal / content-filter, distinct from our own
     // guardrail or policy blocks (those never set a provider).
+    //
+    // Only `content_filter` is produced today (`ai_dispatch.rs:7090`).
+    // Nothing anywhere assigns `refusal`, so that arm cannot fire, and
+    // the refusal rate this feeds is really a content-filter rate. The
+    // arm stays because whether a provider refusal should be a distinct
+    // signal from a content filter is a design question rather than a
+    // typo, but a reader should not take its presence as evidence that
+    // refusals are being counted.
     let refused = matches!(
         ctx.ai_outcome.as_deref(),
         Some("content_filter") | Some("refusal")
@@ -4168,5 +4186,99 @@ mod budget_window_tests {
         }
         let flood = serde_json::json!({"choices": [{"message": {"tool_calls": many}}]});
         assert_eq!(extract_tool_calls(&flood).len(), AI_TOOL_CALL_EVENTS_MAX);
+    }
+
+    // --- WOR-2213: the routing feedback sees the real status ---
+
+    use super::record_routing_feedback;
+
+    /// The regression guard for outcome-aware routing never working.
+    ///
+    /// `record_routing_feedback` read `ctx.response_status`, which only
+    /// Pingora's `response_filter` sets. `ai_proxy` answers inside
+    /// `request_filter` and returns `Ok(true)`, so that filter never runs
+    /// for AI traffic and the field is always `None` there. Every
+    /// completed AI request therefore recorded `success = false`, every
+    /// provider's score reached `f64::INFINITY`, and `best_among` pinned
+    /// on the first enabled provider forever.
+    ///
+    /// The context here is shaped exactly like the AI path leaves it:
+    /// `response_status` unset, with the true status arriving as the
+    /// argument the way `logging` now passes it.
+    #[test]
+    fn a_successful_ai_call_records_a_success_despite_an_unset_response_status() {
+        let provider = format!("wor2213-ok-{}", std::process::id());
+        let mut ctx = crate::context::RequestContext::default();
+        ctx.ai_record_routing_feedback = true;
+        ctx.ai_provider = Some(provider.clone());
+        ctx.ai_cost_usd_micros = Some(10_000);
+        // Exactly what the AI path leaves behind: nothing.
+        assert!(
+            ctx.response_status.is_none(),
+            "this test is meaningless if the AI path sets response_status"
+        );
+
+        record_routing_feedback(&ctx, 200);
+
+        let store = sbproxy_ai::routing_feedback::FeedbackStore::global();
+        assert_eq!(store.samples(&provider), 1, "the outcome must be recorded");
+        let score = store.score(&provider).expect("a recorded provider scores");
+        assert!(
+            score.is_finite(),
+            "a 200 must score finite; INFINITY means the success was read as a failure \
+             and routing can never move off the first provider"
+        );
+    }
+
+    /// The other half: a real failure must still score as one, so the
+    /// fix cannot be "call everything a success".
+    #[test]
+    fn a_failed_ai_call_still_records_a_failure() {
+        let provider = format!("wor2213-fail-{}", std::process::id());
+        let mut ctx = crate::context::RequestContext::default();
+        ctx.ai_record_routing_feedback = true;
+        ctx.ai_provider = Some(provider.clone());
+
+        record_routing_feedback(&ctx, 503);
+
+        let store = sbproxy_ai::routing_feedback::FeedbackStore::global();
+        assert_eq!(store.samples(&provider), 1);
+        assert_eq!(
+            store.score(&provider),
+            Some(f64::INFINITY),
+            "a provider that only ever fails must score INFINITY"
+        );
+    }
+
+    /// The property the doc actually promises: traffic moves toward the
+    /// provider that is succeeding. Nothing asserted this before, which
+    /// is how a strategy that could not move shipped.
+    #[test]
+    fn a_failing_provider_loses_to_a_healthy_one() {
+        let healthy = format!("wor2213-healthy-{}", std::process::id());
+        let failing = format!("wor2213-failing-{}", std::process::id());
+        let store = sbproxy_ai::routing_feedback::FeedbackStore::global();
+
+        for _ in 0..5 {
+            let mut ok = crate::context::RequestContext::default();
+            ok.ai_record_routing_feedback = true;
+            ok.ai_provider = Some(healthy.clone());
+            ok.ai_cost_usd_micros = Some(20_000);
+            record_routing_feedback(&ok, 200);
+
+            let mut bad = crate::context::RequestContext::default();
+            bad.ai_record_routing_feedback = true;
+            bad.ai_provider = Some(failing.clone());
+            bad.ai_cost_usd_micros = Some(1);
+            record_routing_feedback(&bad, 500);
+        }
+
+        let healthy_score = store.score(&healthy).expect("healthy scored");
+        let failing_score = store.score(&failing).expect("failing scored");
+        assert!(
+            healthy_score < failing_score,
+            "the succeeding provider must win even though it costs more \
+             (healthy {healthy_score}, failing {failing_score})"
+        );
     }
 }

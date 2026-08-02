@@ -5807,7 +5807,10 @@ impl ProxyHttp for SbProxy {
 
         // WOR-1541: fold the realized outcome into the routing feedback
         // store (no-op unless the origin uses outcome-aware routing).
-        record_routing_feedback(ctx);
+        // WOR-2213: `status_u16`, not `ctx.response_status`. The AI
+        // path never reaches the `response_filter` that sets that field,
+        // so reading it recorded a failure for every successful call.
+        record_routing_feedback(ctx, status_u16);
 
         // WOR-2145: cut the attested consumption receipt.
         //
