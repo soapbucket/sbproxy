@@ -392,6 +392,44 @@ fn challenge_settle_allow_and_replay_refusal() {
         "the refusal names the replay: {replay_body}"
     );
     assert_eq!(stack.origin.hits(), 1, "a replay never touches the origin");
+
+    // 4. WOR-2219: the whole money path leaves an operational trace.
+    //
+    // The three assertions above are exactly the shape of test that let
+    // `sbproxy_payment_settlement_total` sit at zero through a complete
+    // settled payment: the durable rows were right, the status codes were
+    // right, and nothing looked at the metric an operator alerts on.
+    let metrics = stack
+        .harness
+        .get("/metrics", "blog.localhost")
+        .expect("GET /metrics")
+        .text()
+        .expect("metrics body is UTF-8");
+    let counted = |operation: &str, outcome: &str| {
+        metrics.lines().any(|line| {
+            line.starts_with("sbproxy_payment_settlement_total{")
+                // The rail is the one that settles, not the one advertised:
+                // the 402 above says `lightning` and this says
+                // `lightning_cln`, which is what keeps this family in one
+                // vocabulary with the reconciliation sweep.
+                && line.contains("rail=\"lightning_cln\"")
+                && line.contains(&format!("operation=\"{operation}\""))
+                && line.contains(&format!("outcome=\"{outcome}\""))
+                && !line.ends_with(" 0")
+        })
+    };
+    assert!(
+        counted("challenge", "prepared"),
+        "the 402 prepared a durable challenge and nothing counted it:\n{metrics}"
+    );
+    assert!(
+        counted("redeem", "succeeded"),
+        "a settled payment reached the origin and nothing counted it:\n{metrics}"
+    );
+    assert!(
+        counted("redeem", "proof_replayed"),
+        "the replay refusal left no trace on the settlement counter:\n{metrics}"
+    );
 }
 
 #[test]
@@ -428,6 +466,44 @@ fn an_unpaid_retry_never_reaches_the_origin() {
         stack.origin.hits(),
         0,
         "no unpaid request reaches the origin"
+    );
+}
+
+#[test]
+fn a_configured_rail_seeds_its_settlement_series() {
+    // Boot, scrape, no traffic. An operator who cannot find the family at
+    // all has no way to tell a quiet deployment from one whose settlement
+    // path reports nothing, and the second reads as the first for as long
+    // as nobody pays. The seed is what makes the absence mean
+    // misconfiguration.
+    let stack = start_stack().expect("start settlement stack");
+
+    let metrics = stack
+        .harness
+        .get("/metrics", "blog.localhost")
+        .expect("GET /metrics")
+        .text()
+        .expect("metrics body is UTF-8");
+    let seeded = |operation: &str, outcome: &str| {
+        metrics.lines().any(|line| {
+            line.starts_with("sbproxy_payment_settlement_total{")
+                && line.contains("rail=\"lightning_cln\"")
+                && line.contains(&format!("operation=\"{operation}\""))
+                && line.contains(&format!("outcome=\"{outcome}\""))
+        })
+    };
+    assert!(
+        seeded("challenge", "prepared"),
+        "a configured rail must draw a flat line before its first challenge:\n{metrics}"
+    );
+    assert!(
+        seeded("redeem", "succeeded"),
+        "a configured rail must draw a flat line before its first settlement:\n{metrics}"
+    );
+    assert_eq!(
+        stack.origin.hits(),
+        0,
+        "the seed comes from startup, not from a request"
     );
 }
 

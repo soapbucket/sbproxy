@@ -126,6 +126,30 @@ pub trait LedgerPayload: Serialize + DeserializeOwned + Clone {
     fn chain_contribution(&self) -> Option<crate::metrics::ChainContribution<'_>> {
         None
     }
+
+    /// The first claim this payload makes that cannot be true, if any.
+    ///
+    /// Every other check in this module answers "did somebody change these
+    /// bytes": the hash chain answers it for the file, the signature
+    /// answers it for the writer. Neither answers "does the document agree
+    /// with itself". A metered receipt whose unit declares one provenance
+    /// while carrying the evidence of another passes both and is still not
+    /// evidence of anything, because the whole point of shipping the
+    /// evidence beside the count is that a buyer can redo the arithmetic,
+    /// and they cannot redo arithmetic over a proof of the wrong kind.
+    ///
+    /// [`verify_ledger`] and the replay behind [`UsageLedger::open`] both
+    /// call this on every entry they decode, so a payload that implements
+    /// it is checked on every path that turns bytes back into a record. The
+    /// default is `None`, which is the honest answer for a payload with no
+    /// internal claim to contradict: `sbproxy-ai`'s usage event carries a
+    /// cost and a token count and nothing that could disagree with them.
+    ///
+    /// Implementations must be pure and allocation-free on the healthy
+    /// path. This runs once per entry per chain walk.
+    fn provenance_conflict(&self) -> Option<crate::metrics::ProvenanceConflict<'_>> {
+        None
+    }
 }
 
 /// One link in the ledger chain. Serialized as a single JSON line.
@@ -398,6 +422,14 @@ impl<P: LedgerPayload> UsageLedger<P> {
 /// Intolerant by design: a line that will not parse aborts the replay with
 /// an error rather than being skipped, because appending past damage would
 /// write a chain that can never be verified end to end.
+///
+/// A line that parses and then contradicts itself is treated the same way,
+/// through [`LedgerPayload::provenance_conflict`]. That is the deliberate
+/// call: an incoherent record is a corrupt record, not a policy question,
+/// and chaining more entries onto a chain that already carries one would
+/// extend a document nobody can settle from. The refusal is unconditional
+/// here; what it does to traffic is the caller's configured posture, which
+/// already has to answer for a chain that would not open.
 fn replay_head<P: LedgerPayload>(path: &Path) -> anyhow::Result<(u64, String, HashSet<String>)> {
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
@@ -422,6 +454,27 @@ fn replay_head<P: LedgerPayload>(path: &Path) -> anyhow::Result<(u64, String, Ha
         }
         let entry: LedgerEntry<P> = serde_json::from_str(&line)
             .map_err(|e| anyhow::anyhow!("usage ledger: corrupt entry on replay: {e}"))?;
+        if let Some(conflict) = entry.event.provenance_conflict() {
+            crate::metrics::observe_incoherent_receipt(conflict.tenant_id);
+            tracing::warn!(
+                seq = entry.seq,
+                tenant_id = %conflict.tenant_id,
+                unit = %conflict.unit,
+                declared_source = %conflict.declared_source,
+                evidence_source = %conflict.evidence_source,
+                path = %path.display(),
+                "usage ledger: a chained record contradicts its own provenance"
+            );
+            return Err(anyhow::anyhow!(
+                "usage ledger: entry {} declares source `{}` for unit `{}` while carrying \
+                 evidence for `{}`; a record that disagrees with itself is not evidence of \
+                 anything",
+                entry.seq,
+                conflict.declared_source,
+                conflict.unit,
+                conflict.evidence_source
+            ));
+        }
         head = entry.entry_hash;
         seq = entry.seq + 1;
         if let Some(rid) = entry.event.dedup_key() {
@@ -459,6 +512,14 @@ impl LedgerVerifyResult {
 /// Verify a ledger file: re-derive the hash chain from genesis and, when a
 /// `verifying_key` is supplied, check every entry's signature. Reports the
 /// first broken link.
+///
+/// Integrity is not the whole of it. An entry that survives the chain and
+/// the signature is then asked, through
+/// [`LedgerPayload::provenance_conflict`], whether it agrees with itself,
+/// and one that does not is reported as broken with the contradiction
+/// spelled out. A verifier that returned `ok` for a record nobody can
+/// settle from would be answering a narrower question than the one its
+/// caller asked.
 ///
 /// Tolerant where [`UsageLedger::open`] is strict. Damage is reported as a
 /// `LedgerVerifyResult` with `ok: false` and the sequence number it stopped
@@ -569,6 +630,32 @@ pub fn verify_ledger<P: LedgerPayload>(
                     "signature does not verify against the supplied key",
                 ));
             }
+        }
+
+        // Last, and after the signature deliberately. Everything above
+        // answers "did anybody change these bytes"; this answers "can the
+        // bytes be true at all", and reporting it before the integrity
+        // checks would tell an operator their receipt is incoherent when
+        // the real story is that somebody rewrote it. Reaching this line
+        // means the entry is exactly what the writer signed, which is what
+        // makes an incoherent one worth alerting on rather than shrugging
+        // at: nobody tampered, and it still cannot be settled from.
+        if let Some(conflict) = entry.event.provenance_conflict() {
+            crate::metrics::observe_incoherent_receipt(conflict.tenant_id);
+            tracing::warn!(
+                seq = entry.seq,
+                tenant_id = %conflict.tenant_id,
+                unit = %conflict.unit,
+                declared_source = %conflict.declared_source,
+                evidence_source = %conflict.evidence_source,
+                "usage ledger: a signed, unmodified record contradicts its own provenance"
+            );
+            let reason = format!(
+                "unit `{}` declares source `{}` while carrying evidence for `{}` (the entry is \
+                 authentic; it is the claim that cannot be true)",
+                conflict.unit, conflict.declared_source, conflict.evidence_source
+            );
+            return Ok(LedgerVerifyResult::broken(entry.seq, count, reason));
         }
 
         running_head = entry.entry_hash;
@@ -774,6 +861,117 @@ mod tests {
         let res = verify_ledger::<TestPayload>(&path, None).unwrap();
         assert!(!res.ok, "torn tail must not verify");
         assert_eq!(res.broken_seq, Some(2));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A payload that can be told to contradict itself (WOR-2211).
+    ///
+    /// Separate from [`TestPayload`] rather than a flag on it, so the
+    /// existing chain tests keep exercising the default
+    /// `provenance_conflict`, which is what a payload with no internal
+    /// claim to contradict returns and what most implementors will inherit.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct ClaimingPayload {
+        /// Who the line is charged to. The attribution a refusal has to
+        /// carry: a global count of contradictions tells an operator of a
+        /// multi-tenant deployment nothing they can act on.
+        tenant: String,
+        /// The line the claim is about.
+        unit: String,
+        /// The provenance the line declares.
+        declared_source: String,
+        /// Whether the proof it carries is the one `measured` needs.
+        evidence_is_measured: bool,
+    }
+
+    impl LedgerPayload for ClaimingPayload {
+        fn dedup_key(&self) -> Option<&str> {
+            None
+        }
+
+        fn provenance_conflict(&self) -> Option<crate::metrics::ProvenanceConflict<'_>> {
+            let evidence_source = if self.evidence_is_measured {
+                "measured"
+            } else {
+                "origin_header"
+            };
+            if self.declared_source == evidence_source {
+                return None;
+            }
+            Some(crate::metrics::ProvenanceConflict {
+                tenant_id: self.tenant.as_str(),
+                unit: self.unit.as_str(),
+                declared_source: self.declared_source.as_str(),
+                evidence_source,
+            })
+        }
+    }
+
+    fn claiming(declared_source: &str, evidence_is_measured: bool) -> ClaimingPayload {
+        ClaimingPayload {
+            tenant: "acme".to_string(),
+            unit: "result_row".to_string(),
+            declared_source: declared_source.to_string(),
+            evidence_is_measured,
+        }
+    }
+
+    #[test]
+    fn a_record_that_contradicts_itself_breaks_verification_without_being_tampered_with() {
+        // Written through the ledger, so the digests and links are the ones
+        // a production writer produces. Nothing here is edited afterwards:
+        // an edited line fails on its digest first and would prove nothing
+        // about this check.
+        let path = temp_path("incoherent");
+        let _ = std::fs::remove_file(&path);
+        {
+            let ledger = UsageLedger::<ClaimingPayload>::open(&path, None).unwrap();
+            ledger.append_checked(&claiming("measured", true)).unwrap();
+            ledger.append_checked(&claiming("measured", false)).unwrap();
+            ledger.append_checked(&claiming("measured", true)).unwrap();
+        }
+
+        let res = verify_ledger::<ClaimingPayload>(&path, None).unwrap();
+
+        assert!(!res.ok, "a record nobody can settle from must not verify");
+        assert_eq!(res.broken_seq, Some(1));
+        let reason = res.reason.as_deref().expect("a reason");
+        assert!(
+            reason.contains("measured") && reason.contains("origin_header"),
+            "the verdict names both provenances so an operator sees the contradiction: {reason}"
+        );
+        assert!(
+            reason.contains("authentic"),
+            "this is not a tampering verdict and must not read as one: {reason}"
+        );
+
+        // And the chain will not take another entry, which is what stops
+        // the meter extending a document it has already refused.
+        assert!(
+            UsageLedger::<ClaimingPayload>::open(&path, None).is_err(),
+            "an incoherent entry keeps the ledger closed, exactly as a torn tail does"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_coherent_chain_of_the_same_payload_still_verifies_and_reopens() {
+        // The half that stops the refusal being "refuse everything". Same
+        // payload type, same writer, every line agreeing with itself.
+        let path = temp_path("coherent-claims");
+        let _ = std::fs::remove_file(&path);
+        {
+            let ledger = UsageLedger::<ClaimingPayload>::open(&path, None).unwrap();
+            ledger.append_checked(&claiming("measured", true)).unwrap();
+            ledger
+                .append_checked(&claiming("origin_header", false))
+                .unwrap();
+        }
+
+        let res = verify_ledger::<ClaimingPayload>(&path, None).unwrap();
+        assert!(res.ok, "{res:?}");
+        assert_eq!(res.entries, 2);
+        assert!(UsageLedger::<ClaimingPayload>::open(&path, None).is_ok());
         let _ = std::fs::remove_file(&path);
     }
 

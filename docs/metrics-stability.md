@@ -203,6 +203,7 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_meter_chain_gap_total` | Counter | `stable` | `beta` | `tenant_id`, `failure_mode` | Records the meter owed and could not write, by tenant and the posture in force. |
 | `sbproxy_meter_chain_seq` | Gauge | `stable` | `beta` | none | Head sequence number of the meter's signed chain. |
 | `sbproxy_meter_divergence_total` | Counter | `stable` | `beta` | `tenant_id` | Windows in which counted units and chained units disagreed, by tenant. |
+| `sbproxy_meter_incoherent_receipts_total` | Counter | `stable` | `beta` | `tenant_id`, `failure_mode` | Receipts refused on decode because a unit's declared provenance contradicts its evidence, by tenant and the posture in force. |
 | `sbproxy_meter_receipts_total` | Counter | `stable` | `beta` | `tenant_id`, `outcome`, `billable` | Metered attempts, by tenant, outcome, and the operator's billing answer for it. |
 | `sbproxy_meter_units_total` | Counter | `stable` | `beta` | `tenant_id`, `unit`, `source` | Units the meter counted, by tenant, operator-chosen unit name, and provenance. |
 | `sbproxy_metrics_render_failures_total` | Counter | `stable` | `beta` | `reason` | Failures to encode the Prometheus scrape body. |
@@ -247,7 +248,7 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_payment_provider_calls_total` | Counter | `stable` | `beta` | `rail`, `operation`, `provider_class` | Payment provider calls that left the process, by rail, operation, and provider class. |
 | `sbproxy_payment_rail_enabled` | Gauge | `stable` | `beta` | `rail` | 1 for each settlement rail this build compiled and this configuration registered, 0 otherwise. |
 | `sbproxy_payment_recovery_total` | Counter | `stable` | `beta` | `operation`, `outcome` | Durable rows the settlement recovery worker moved, by recovery operation and committed outcome. |
-| `sbproxy_payment_settlement_total` | Counter | `stable` | `beta` | `rail`, `operation`, `outcome` | Durable payment settlement transitions, by rail, operation, and committed outcome. |
+| `sbproxy_payment_settlement_total` | Counter | `stable` | `beta` | `rail`, `operation`, `outcome` | Payment settlement transitions, by rail, deciding step, and outcome. The request-path gate reports `challenge` and `redeem`; the recovery sweep reports the reconciled attempt's own operation. |
 | `sbproxy_payment_worker_drain_clean` | Gauge | `stable` | `beta` | none | 1 when the settlement worker drained inside its shutdown deadline, 0 when it was abandoned mid tick. |
 | `sbproxy_payment_worker_ticks_total` | Counter | `stable` | `beta` | none | Completed settlement recovery worker ticks. |
 | `sbproxy_phase_duration_seconds` | Histogram | `stable` | `stable` | `phase`, `origin` | Intra-request phase duration, partitioned by phase + origin. |

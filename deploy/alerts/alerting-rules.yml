@@ -211,6 +211,28 @@ groups:
             Check disk space and permissions on the ledger path first.
           runbook_url: "https://docs.sbproxy.dev/runbook#rb-meter-chain-gap"
 
+      - alert: SBPROXY-METER-INCOHERENT-RECEIPT
+        expr: |
+          sum by (tenant_id) (increase(sbproxy_meter_incoherent_receipts_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: page
+          slo_id: SLO-METER-CHAIN
+          runbook_id: RB-METER-INCOHERENT-RECEIPT
+          window: 5m
+        annotations:
+          summary: "A chained receipt contradicts its own provenance"
+          description: |
+            A receipt on the chain declares one provenance for a unit and
+            carries the evidence of another. It hash-chains and it verifies
+            against the published key, so nothing was tampered with: the
+            claim itself cannot be true, and the number on it cannot be
+            checked by anybody. Reads refuse it, so the chain will not
+            reopen for appending either. Run POST /api/meter/verify for the
+            sequence number, then look at that entry before invoicing the
+            affected tenant.
+          runbook_url: "https://docs.sbproxy.dev/runbook#rb-meter-incoherent-receipt"
+
       - alert: SBPROXY-METER-DIVERGENCE
         expr: |
           sum by (tenant_id) (increase(sbproxy_meter_divergence_total[30m])) > 0

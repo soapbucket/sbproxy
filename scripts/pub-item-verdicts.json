@@ -79,10 +79,6 @@
       "verdict": "escalated",
       "reason": "The reason label for a peer that sent a graceful LeaveRequest. Its two siblings, probe_timeout and dead_timeout, are passed by production eviction sites; this one is passed only from peer_eviction.rs's own test. There is no LeaveRequest handler in the crate at all, only doc comments naming it. Question for the mesh owner: is graceful leave unimplemented, or handled somewhere that forgets to record the eviction reason? Deleting the constant would hide the gap rather than answer it."
     },
-    "crates/sbproxy-meter/src/event.rs::provenance_is_consistent": {
-      "verdict": "escalated",
-      "reason": "Checks that a unit's declared source agrees with the evidence it carries. Its own doc says the check is worth running on anything deserialised, and no decode path in the crate runs it, so a receipt that disagrees with itself is accepted today. Question for the metering owner: should the wire decode call this and reject on false? That is a behaviour change on the billing path, not a cleanup."
-    },
     "crates/sbproxy-model-host/src/hybrid.rs::record_cloud": {
       "verdict": "escalated",
       "reason": "The half of the hybrid savings split that accounts for a completion that spilled to cloud. Its sibling record_local has production callers and this one does not, so cloud_completions and cloud_spent_micros stay at zero in a live report and the reported saving only ever grows. Question for the model-host owner: is the cloud-spill path meant to be reported, and if so where should it call this?"

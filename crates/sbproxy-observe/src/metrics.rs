@@ -2660,12 +2660,13 @@ pub fn record_policy_decision_latency(surface: &str, duration_secs: f64) {
 // --- WOR-2100: payment settlement observability ---
 //
 // Four label names, and every one of them is closed by construction rather
-// than by sanitization. `rail` is the settlement rail's stable spelling and
-// has four values. `operation` names the settlement or recovery step from a
-// fixed list. `outcome` is the durable transition the store committed, one
-// of `succeeded`, `terminal`, `retry_wait`, or `needs_reconciliation`.
-// `provider_class` names the kind of provider rather than the provider
-// itself: `facilitator`, `card_processor`, `lightning_node`, or `meter`.
+// than by sanitization. `rail` is the settlement rail's stable spelling,
+// its four values plus `none` for a rail negotiation that failed before a
+// rail was chosen. `operation` names the settlement or recovery step from a
+// fixed list. `outcome` is what that step concluded, drawn from the closed
+// vocabulary the step decides in. `provider_class` names the kind of
+// provider rather than the provider itself: `facilitator`,
+// `card_processor`, `lightning_node`, or `meter`.
 //
 // None of these recorders takes a payer identifier, a tenant, a quote id, a
 // challenge id, an intent id, a provider reference, a PaymentIntent id, an
@@ -2678,26 +2679,51 @@ pub fn record_policy_decision_latency(surface: &str, duration_secs: f64) {
 // cannot overflow a cardinality budget, and routing it through the limiter
 // would consume budget slots that an unbounded label actually needs.
 
-/// Increment `sbproxy_payment_settlement_total{rail, operation, outcome}`.
+/// Add to `sbproxy_payment_settlement_total{rail, operation, outcome}`.
 ///
-/// One observation per durable settlement transition. `outcome` is the
-/// state the store committed, never the adapter's return value, so a
-/// provider that answered "paid" while the durable record moved to
-/// `needs_reconciliation` is counted as `needs_reconciliation`. That is the
-/// point: the metric has to agree with the thing that decides access.
-pub fn record_payment_settlement(rail: &str, operation: &str, outcome: &str) {
+/// One observation per settlement transition, from either half of the
+/// settlement path. `operation` says which half decided, and it is the
+/// label to read first, because each half concludes in its own closed
+/// vocabulary:
+///
+/// - `challenge` and `redeem` are the request-path gate. `challenge`
+///   concludes `prepared` or `no_acceptable_rail`. `redeem` concludes
+///   `succeeded`, `unavailable`, or the payment problem code that refused
+///   it (`proof_replayed`, `challenge_expired`, `rejected`, and the rest
+///   of that closed set).
+/// - Every other `operation` value names an attempt operation the recovery
+///   sweep reconciled, and concludes in the reconciliation vocabulary:
+///   `succeeded`, `terminal`, `retry_wait`, or `needs_reconciliation`.
+///   There, `outcome` is the state the store committed and never the
+///   adapter's return value, so a provider that answered "paid" while the
+///   durable record moved to `needs_reconciliation` is counted as
+///   `needs_reconciliation`. That is the point: the metric has to agree
+///   with the thing that decides access.
+///
+/// Splitting the two halves this way, rather than by adding a fourth
+/// label, is what keeps every query written against the recovery sweep
+/// selecting exactly the rows it selected before: the request path only
+/// ever adds `operation` values the sweep cannot produce.
+///
+/// `count` may be zero. `inc_by(0)` creates the series without asserting a
+/// transition, which is what lets startup seed the series for each
+/// configured rail. An absent series then means the rail is not
+/// configured, rather than that nothing has settled yet.
+pub fn record_payment_settlement(rail: &str, operation: &str, outcome: &str, count: u64) {
     use prometheus::{register_int_counter_vec, IntCounterVec};
     use std::sync::OnceLock;
     static C: OnceLock<IntCounterVec> = OnceLock::new();
     let counter = C.get_or_init(|| {
         register_int_counter_vec!(
             "sbproxy_payment_settlement_total",
-            "Durable payment settlement transitions, by rail, operation, and committed outcome",
+            "Payment settlement transitions, by rail, deciding step, and outcome",
             &["rail", "operation", "outcome"],
         )
         .expect("payment settlement counter registers")
     });
-    counter.with_label_values(&[rail, operation, outcome]).inc();
+    counter
+        .with_label_values(&[rail, operation, outcome])
+        .inc_by(count);
 }
 
 /// Increment
