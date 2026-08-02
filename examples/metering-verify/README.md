@@ -13,10 +13,15 @@ Every request this origin serves cuts a signed receipt onto an append-only, hash
 # so a rerun against a stale directory starts broken.
 rm -rf /tmp/sbproxy-metering
 
+# The example ships its own upstream so metered requests carry real
+# egress bytes. Start it first, then the proxy.
+python3 bin/upstream.py &
+
 sbproxy serve -f sb.yml
 ```
 
-No API keys needed; the upstream is the public echo service at `test.sbproxy.dev`.
+No API keys needed; the demo upstream is `bin/upstream.py`, a stdlib
+HTTP server on port 8099 that answers every path with a small article.
 
 ## Meter, then verify
 

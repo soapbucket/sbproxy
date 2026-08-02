@@ -20,12 +20,20 @@ The signed chain is the authoritative record. It is written before the metric is
 
 ## Configuration
 
-The config below is `examples/metering-verify/sb.yml`, the runnable example this page walks through. One origin proxies the public echo service; the attestation block makes every call it serves a metered one.
+The config below is `examples/metering-verify/sb.yml`, the runnable example this page walks through. One origin proxies the example's own demo upstream (`bin/upstream.py`, a stdlib HTTP server that answers every path with a small article, so metered requests carry real egress bytes); the attestation block makes every call it serves a metered one.
 
 <!-- sbproxy-config: examples/metering-verify/sb.yml -->
 ```yaml
 proxy:
   http_bind_port: 8080
+
+  # Only because the demo upstream runs on this machine: the SSRF guard
+  # refuses private upstream addresses unless allowlisted. A production
+  # config pointing at a real origin does not need this block.
+  extensions:
+    upstream:
+      allow_private_cidrs:
+        - '127.0.0.1/32'
 
   # The meter's operator surface: /api/meter/summary, /api/meter/receipts,
   # and POST /api/meter/verify all live on the admin server.
@@ -106,7 +114,9 @@ origins:
   "api.local":
     action:
       type: proxy
-      url: https://test.sbproxy.dev
+      # The example ships its own upstream so metered requests carry
+      # real egress bytes: python3 bin/upstream.py
+      url: 'http://127.0.0.1:8099'
 
     # Names the commercial agreement receipts on this origin bill
     # under. The role is inherited from proxy.attestation.
@@ -182,7 +192,7 @@ Three ways to turn a request into billable units, kept as three separate lists b
 
 `route_weights` is a price list written into the config: this route costs this many units of this name. The most specific match wins (a named method beats an unnamed one, an exact path beats a prefix, a longer prefix beats a shorter one), and a `weight: 0` route is metered and free, which is not the same as an unpriced one. The number is a pure function of the route and the config document, and the receipt names that document's revision, so a buyer can check the price themselves.
 
-`origin_headers` reads a count from a response header the upstream sends, for the APIs whose real unit only the origin knows (result rows, for example). It is the only resolver that can be wrong without the proxy being wrong, because the party supplying the number is the party being paid for it. So the proxy attests rather than vouches: the receipt records the header name and the raw value exactly as it arrived, and a value that does not parse bills zero and goes on the receipt verbatim. There is deliberately no knob to substitute a proxy-counted number, because a receipt that cannot separate "the origin lied" from "the proxy miscounted" is worthless in the dispute it exists for.
+`origin_headers` reads a count from a response header the upstream sends, for the APIs whose real unit only the origin knows (result rows, for example). It is the only resolver that can be wrong without the proxy being wrong, because the party supplying the number is the party being paid for it. So the proxy attests rather than vouches: the receipt records the header name and the raw value exactly as it arrived, and a value that does not parse bills zero and goes on the receipt verbatim. There is no knob to substitute a proxy-counted number, because a receipt that cannot separate "the origin lied" from "the proxy miscounted" is worthless in the dispute it exists for.
 
 Unit names must be unique across all three lists (route weights may repeat a name across routes on purpose: several routes priced differently are still one invoice line). Declaring a role with no resolvers at all is legal and logged loudly: you get an outcome-only chain that proves no call went missing and bills nothing.
 
@@ -192,6 +202,7 @@ Everything below runs from a repository checkout, against the example config. St
 
 ```bash
 rm -rf /tmp/sbproxy-metering
+python3 examples/metering-verify/bin/upstream.py &
 sbproxy serve -f examples/metering-verify/sb.yml
 ```
 
@@ -202,7 +213,11 @@ for i in 1 2 3; do curl -s -o /dev/null -w '%{http_code}\n' \
      -H 'Host: api.local' http://127.0.0.1:8080/anything/article; done
 ```
 
-<!-- CAPTURE: for i in 1 2 3; do curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: api.local' http://127.0.0.1:8080/anything/article; done -->
+```
+200
+200
+200
+```
 
 Each of those wrote one entry to the chain. Look at the first one as it sits on disk:
 
@@ -210,7 +225,48 @@ Each of those wrote one entry to the chain. Look at the first one as it sits on 
 head -1 /tmp/sbproxy-metering/receipts.ndjson | jq .
 ```
 
-<!-- CAPTURE: head -1 /tmp/sbproxy-metering/receipts.ndjson | jq . -->
+```
+{
+  "seq": 0,
+  "recorded_at": "2026-08-02T02:40:23.727231+00:00",
+  "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "entry_hash": "ea200fd6282b277f614980198c98223651b72e36119833cc4a5ad703dbccf0ab",
+  "signature": "7653d513863e8e02a5c296732ee7b6970eada242062f2a73478b14a31e159951635106673a4627b614cb71533d3a4c7c858c58d7c09845a62850d9e2883efd04",
+  "event": {
+    "seq": 0,
+    "prev": "0000000000000000000000000000000000000000000000000000000000000000",
+    "node_id": "sbproxy-node",
+    "claim_id": "019fc0580cad79d38ad6e66807528ca2",
+    "agreement_id": "agreement-2026-001",
+    "subject": {
+      "tenant": "__default__"
+    },
+    "route": "/anything/article",
+    "units": [
+      {
+        "name": "egress_kib",
+        "count": 3,
+        "source": "measured",
+        "evidence": {
+          "bytes_in": 0,
+          "bytes_out": 2525,
+          "duration_ms": 1
+        }
+      },
+      {
+        "name": "api_call",
+        "count": 1,
+        "source": "route_weight",
+        "evidence": {
+          "config_revision": "8f10eba811d1"
+        }
+      }
+    ],
+    "outcome": "delivered",
+    "config_revision": "8f10eba811d1"
+  }
+}
+```
 
 The envelope is the chain link: `seq` is the entry's position, `prev_hash` is the previous entry's digest (all zeros for the first), `entry_hash` is the SHA-256 binding this entry to everything before it, and `signature` is the Ed25519 signature over that digest. The `event` inside is the receipt itself: the subject the units are charged to, the route, the outcome, the units with their provenance and raw evidence, the agreement they bill under, and `config_revision`, the content hash of the configuration that priced the call. That last field answers "you priced my call under a config I never agreed to".
 
@@ -228,7 +284,73 @@ Three routes on the admin server, all behind the same operator gate as the rest 
 curl -s -u admin:demo-change-me 'http://127.0.0.1:9090/api/meter/summary' | jq .
 ```
 
-<!-- CAPTURE: curl -s -u admin:demo-change-me 'http://127.0.0.1:9090/api/meter/summary' | jq . -->
+```
+{
+  "attestation": {
+    "configured": true,
+    "failure_mode": "degraded",
+    "ledger_path": "/tmp/sbproxy-metering/receipts.ndjson",
+    "role": "receipt",
+    "signing_key_id": "metering-demo-2026"
+  },
+  "chain": {
+    "damage_reason": null,
+    "damaged_at_seq": null,
+    "entries": 3,
+    "head_hash": "fb1b4bb2a8ed5f5c740601cf0b021faf66fc6e465b589116e7f67627751a9ade",
+    "node_id": "sbproxy-node",
+    "present": true
+  },
+  "claims": 3,
+  "coverage": {
+    "answered": [
+      "sbproxy-node"
+    ],
+    "complete": true,
+    "expected": 1,
+    "gathered_at": "2026-08-02T02:40:24.776929+00:00",
+    "uncovered": []
+  },
+  "gaps": {
+    "by_tenant": [],
+    "divergence_total": 0,
+    "total": 0
+  },
+  "gathered_at": "2026-08-02T02:40:24.775533+00:00",
+  "group_by": "tenant",
+  "nodes": [
+    {
+      "claims": 3,
+      "covered": true,
+      "head_hash": "fb1b4bb2a8ed5f5c740601cf0b021faf66fc6e465b589116e7f67627751a9ade",
+      "head_seq": 3,
+      "local": true,
+      "node_id": "sbproxy-node",
+      "observed_at": "2026-08-02T02:40:24.775533+00:00"
+    }
+  ],
+  "reason": null,
+  "schema_version": 1,
+  "state": "reporting",
+  "tenant": null,
+  "totals": [
+    {
+      "count": 3,
+      "group": "__default__",
+      "source": "route_weight",
+      "tenant": "__default__",
+      "unit": "api_call"
+    },
+    {
+      "count": 9,
+      "group": "__default__",
+      "source": "measured",
+      "tenant": "__default__",
+      "unit": "egress_kib"
+    }
+  ]
+}
+```
 
 Every response leads with a `state` before it shows a number, because a page of zeros looks the same whether attestation is off, on with no traffic yet, or on with a meter that silently stopped writing, and those are three different problems. `off` means no chain exists and the zeros are not a measurement; `idle` means the meter is configured and has recorded nothing, a real reading of an empty chain; `reporting` means the numbers describe traffic. Nothing manufactures a sample to fill the page out.
 
@@ -241,7 +363,83 @@ curl -s -u admin:demo-change-me 'http://127.0.0.1:9090/api/meter/receipts?limit=
   | jq '.receipts[] | {seq, entry_hash, outcome: .claims.outcome, units: .claims.units}'
 ```
 
-<!-- CAPTURE: curl -s -u admin:demo-change-me 'http://127.0.0.1:9090/api/meter/receipts?limit=3' | jq '.receipts[] | {seq, entry_hash, outcome: .claims.outcome, units: .claims.units}' -->
+```
+{
+  "seq": 0,
+  "entry_hash": "ea200fd6282b277f614980198c98223651b72e36119833cc4a5ad703dbccf0ab",
+  "outcome": "delivered",
+  "units": [
+    {
+      "count": 3,
+      "evidence": {
+        "bytes_in": 0,
+        "bytes_out": 2525,
+        "duration_ms": 1
+      },
+      "name": "egress_kib",
+      "source": "measured"
+    },
+    {
+      "count": 1,
+      "evidence": {
+        "config_revision": "8f10eba811d1"
+      },
+      "name": "api_call",
+      "source": "route_weight"
+    }
+  ]
+}
+{
+  "seq": 1,
+  "entry_hash": "ada8d9ba3adc5caf73e566b77625a3372919846420acff3c7dcc933883cdd1be",
+  "outcome": "delivered",
+  "units": [
+    {
+      "count": 3,
+      "evidence": {
+        "bytes_in": 0,
+        "bytes_out": 2525,
+        "duration_ms": 0
+      },
+      "name": "egress_kib",
+      "source": "measured"
+    },
+    {
+      "count": 1,
+      "evidence": {
+        "config_revision": "8f10eba811d1"
+      },
+      "name": "api_call",
+      "source": "route_weight"
+    }
+  ]
+}
+{
+  "seq": 2,
+  "entry_hash": "fb1b4bb2a8ed5f5c740601cf0b021faf66fc6e465b589116e7f67627751a9ade",
+  "outcome": "delivered",
+  "units": [
+    {
+      "count": 3,
+      "evidence": {
+        "bytes_in": 0,
+        "bytes_out": 2525,
+        "duration_ms": 0
+      },
+      "name": "egress_kib",
+      "source": "measured"
+    },
+    {
+      "count": 1,
+      "evidence": {
+        "config_revision": "8f10eba811d1"
+      },
+      "name": "api_call",
+      "source": "route_weight"
+    }
+  ]
+}
+```
 
 An operator entry in `proxy.admin.operators` can be scoped to one tenant. Scoped operators see their own tenant's units and receipts only, and a request naming anybody else's tenant is refused with `403` rather than quietly filtered, because a silently empty result reads as "that tenant used nothing". Chain-level facts (sequence numbers, digests, the verify verdict) go to every operator, because they name no tenant and a stalled meter is everybody's problem.
 
@@ -253,7 +451,18 @@ Verification re-derives the chain from genesis: every `prev_hash` must match the
 curl -s -u admin:demo-change-me -X POST http://127.0.0.1:9090/api/meter/verify | jq .
 ```
 
-<!-- CAPTURE: curl -s -u admin:demo-change-me -X POST http://127.0.0.1:9090/api/meter/verify | jq . -->
+```
+{
+  "broken_seq": null,
+  "entries": 3,
+  "node_id": "sbproxy-node",
+  "outcome": "ok",
+  "reason": null,
+  "schema_version": 1,
+  "state": "reporting",
+  "verified_at": "2026-08-02T02:40:24.800844+00:00"
+}
+```
 
 Now tamper. The chain is a JSONL file at `proxy.attestation.ledger.path`, so the edit is one line of Python: find the first `"count"` in the second entry (sequence 1) and put a `9` in front of it, turning a small number into a much bigger one. Exactly the edit a dishonest operator, or a compromised disk, would love to get away with:
 
@@ -267,7 +476,18 @@ Run the verifier again:
 curl -s -u admin:demo-change-me -X POST http://127.0.0.1:9090/api/meter/verify | jq .
 ```
 
-<!-- CAPTURE: curl -s -u admin:demo-change-me -X POST http://127.0.0.1:9090/api/meter/verify | jq . -->
+```
+{
+  "broken_seq": 1,
+  "entries": 1,
+  "node_id": "sbproxy-node",
+  "outcome": "broken",
+  "reason": "entry_hash does not match recomputed digest (tampered event)",
+  "schema_version": 1,
+  "state": "reporting",
+  "verified_at": "2026-08-02T02:40:24.830515+00:00"
+}
+```
 
 The verdict names the broken index: the recomputed digest of entry 1 no longer matches the `entry_hash` that entry 2's `prev_hash` committed to. One edited byte anywhere in the history breaks the link at that exact position, which is the property that makes the chain worth more than a log file. Re-signing the edited entry does not help the attacker either, because the signature has to verify against the published key they do not hold.
 
@@ -282,7 +502,20 @@ curl -s -H 'Host: api.local' \
   http://127.0.0.1:8080/.well-known/http-message-signatures-directory | jq .
 ```
 
-<!-- CAPTURE: curl -s -H 'Host: api.local' http://127.0.0.1:8080/.well-known/http-message-signatures-directory | jq . -->
+```
+{
+  "keys": [
+    {
+      "alg": "EdDSA",
+      "crv": "Ed25519",
+      "kid": "metering-demo-2026",
+      "kty": "OKP",
+      "use": "sig",
+      "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"
+    }
+  ]
+}
+```
 
 That is a standard JWKS-shaped document; the `x` field is the raw Ed25519 public key, base64url-encoded, and `kid` matches the key id on every receipt. From those two inputs you can check, with no SBproxy software and no trust in the operator:
 
@@ -293,7 +526,7 @@ That is a standard JWKS-shaped document; the `x` field is the raw Ed25519 public
 
 Be equally clear about what the chain does not prove. It proves the record is intact and attributable, not that the meter observed honestly in the first place: a `measured` unit is the proxy's own arithmetic over bytes it served you, a `route_weight` is checkable against the signed config revision on the receipt, but an `origin_header` unit is the upstream's claim, recorded verbatim, and the receipt proves only that the origin sent that value. The provenance is on every unit precisely so you can price your skepticism per source.
 
-The repository ships a reference implementation of the whole check, about a hundred lines of Python with no SBproxy imports, at `examples/metering-verify/bin/verify-chain.py`:
+The repository ships a reference implementation of the whole check, about 150 lines of Python with no SBproxy imports, at `examples/metering-verify/bin/verify-chain.py`:
 
 ```bash
 curl -s -H 'Host: api.local' \
@@ -305,7 +538,9 @@ examples/metering-verify/bin/verify-chain.py \
 
 Run against the chain tampered with above, it finds the same break the operator's verifier found, from the outside:
 
-<!-- CAPTURE: examples/metering-verify/bin/verify-chain.py --chain /tmp/sbproxy-metering/receipts.ndjson --jwks jwks.json -->
+```
+chain verify: FAILED at seq 1: entry_hash does not match recomputed digest (tampered event)
+```
 
 That symmetry is the point of the design. The operator's verify endpoint and your script disagree with each other only if one of you has different bytes, and the signature says whose bytes the operator stands behind.
 
