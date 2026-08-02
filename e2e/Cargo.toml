@@ -53,6 +53,14 @@ sbproxy-modules.workspace = true
 # rustls ClientHello bytes and feeds them through the production parser.
 sbproxy-tls.workspace = true
 
+# WOR-2169: the usage-bridge e2e asserts against the settlement SQLite file
+# the recovery worker drains, opened read-only so the assertion cannot
+# perturb the file the running proxy still owns. Reading the durable row is
+# the point of that suite: a metric proves something was counted, and only
+# the row proves the provider deduplication identifier that was written.
+# Same pin the settlement store already uses, so this compiles nothing new.
+rusqlite = { workspace = true }
+
 # WOR-805 publish-signed e2e (web_bot_auth_publish_signed_e2e.rs)
 # rehydrates the signed JWKS response as an http::Request and runs
 # the production verifier against the published JWK as the trust

@@ -2782,8 +2782,16 @@ usage_reporters:
         // on a dashboard is indistinguishable from a route nobody calls.
         for (source, unit) in [("ai", "totl_tokens"), ("mcp", "tool_calls")] {
             let mut typo = document();
-            set(&mut typo, &["usage_reporters", "stripe_meter", "source"], source.into());
-            set(&mut typo, &["usage_reporters", "stripe_meter", "unit"], unit.into());
+            set(
+                &mut typo,
+                &["usage_reporters", "stripe_meter", "source"],
+                source.into(),
+            );
+            set(
+                &mut typo,
+                &["usage_reporters", "stripe_meter", "unit"],
+                unit.into(),
+            );
             let error = expect_error(
                 parse(typo).expect("it deserializes").validate(),
                 "a unit outside the source's vocabulary must be refused",

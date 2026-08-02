@@ -552,6 +552,28 @@ pub struct RequestContext {
     /// record, which is the one outcome `closed` exists to prevent.
     pub meter_refused: bool,
 
+    // --- Billable usage (WOR-2169) ---
+    /// MCP tool calls this request dispatched that a configured usage
+    /// reporter bills for.
+    ///
+    /// Recorded during dispatch and drained once in `logging`, because a
+    /// tool call happens deep inside `handle_mcp_action` and the durable
+    /// billing queue is written at the end of the request, by which point
+    /// the dispatcher is long gone.
+    ///
+    /// A [`parking_lot::Mutex`] rather than a plain `Vec` because
+    /// `handle_mcp_action` takes the context immutably and threads it
+    /// through a dozen helpers that do the same; widening all of them to
+    /// `&mut` to append to one vector would be a large diff whose only
+    /// purpose is a borrow. Uncontended in practice: one request writes it,
+    /// on one task, and `logging` reads it after the dispatcher has
+    /// finished.
+    ///
+    /// Empty unless a usage reporter is configured. The dispatcher checks
+    /// before it pushes, so a deployment with no reporter allocates
+    /// nothing.
+    pub mcp_billable_calls: parking_lot::Mutex<Vec<crate::usage_bridge::McpToolCall>>,
+
     // --- Request mirror state ---
     /// Captured-at-`request_filter` parameters for a request whose
     /// mirror should fire from `request_body_filter` (so the body
@@ -1557,6 +1579,7 @@ impl RequestContext {
             response_body_bytes: 0,
             meter_origin_headers: Vec::new(),
             meter_refused: false,
+            mcp_billable_calls: parking_lot::Mutex::new(Vec::new()),
             mirror_pending: None,
             auth_result: None,
             trust_tier: sbproxy_modules::auth::TrustTier::Anonymous,

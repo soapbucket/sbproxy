@@ -7399,7 +7399,9 @@
       "type": "object",
       "required": [
         "customer_field",
-        "event_name"
+        "event_name",
+        "source",
+        "unit"
       ],
       "properties": {
         "event_name": {
@@ -7407,11 +7409,58 @@
           "type": "string"
         },
         "customer_field": {
-          "description": "Field on the request context that carries the Stripe customer identifier.",
+          "description": "Field on the request context that carries the Stripe customer identifier.\n\nResolved against the authenticated principal's metadata map, so the identifier travels with the credential rather than with the request. A request whose principal carries no such entry is not reported: a meter event with nobody to bill is refused by Stripe anyway, and queueing one would turn a missing credential attribute into a permanently failing durable row.",
           "type": "string"
+        },
+        "source": {
+          "description": "Which request-path record is authoritative for this meter event.\n\nRequired, with no default. See [`UsageSource`].",
+          "allOf": [
+            {
+              "$ref": "#/definitions/UsageSource"
+            }
+          ]
+        },
+        "unit": {
+          "description": "The unit this meter event bills.\n\nFor [`UsageSource::Http`] this is one of the operator's own `proxy.attestation` unit names, and only billable units carrying that name are reported. For the other two sources it is one of [`UsageSource::known_units`].\n\nOne unit per meter event rather than a list, because a Stripe meter event carries one quantity. Two units summed into one number is exactly the unfalsifiable figure the metering vocabulary exists to prevent.",
+          "type": "string"
+        },
+        "failure_posture": {
+          "description": "What the request path does when the durable enqueue fails.\n\nDefaults to [`crate::types::FailureMode::Degraded`] rather than the surface-wide `closed`, for the same reason `proxy.attestation.failure_mode` does: billing is not a security boundary, and a settlement database that will not accept a write must not take the API down. `degraded` is what keeps the resulting hole provable rather than silent.",
+          "default": "degraded",
+          "allOf": [
+            {
+              "$ref": "#/definitions/FailureMode"
+            }
+          ]
         }
       },
       "additionalProperties": false
+    },
+    "UsageSource": {
+      "description": "Which request-path record is authoritative for one meter event.\n\nOne meter event, one source. A single request can produce a request receipt, an AI usage record, and one record per MCP tool call, and two of those can easily describe the same commercial unit: an AI request served through the gateway is also an HTTP request the meter priced. Reporting both against one Stripe meter charges the customer twice for one sale.\n\nThe defence is that the operator names the authoritative source per meter event and the proxy never guesses. There is deliberately no `Default` and no serde default: an unstated answer here is the double-charge, and a default would be this crate picking a side of a commercial argument on the operator's behalf.\n\nAn operator who genuinely wants to bill both dimensions configures two meter events, which is a decision they made rather than one the proxy made for them.",
+      "oneOf": [
+        {
+          "description": "The request receipt the `proxy.attestation` meter settled.\n\nUnits come from that block's `measured`, `route_weights`, and `origin_headers` resolvers, after the `billable` outcome table has decided which of them survive this request's outcome.",
+          "type": "string",
+          "enum": [
+            "http"
+          ]
+        },
+        {
+          "description": "The AI usage record for a request that reached a model.",
+          "type": "string",
+          "enum": [
+            "ai"
+          ]
+        },
+        {
+          "description": "One record per MCP tool call the request dispatched.",
+          "type": "string",
+          "enum": [
+            "mcp"
+          ]
+        }
+      ]
     },
     "RawOriginConfig": {
       "description": "A single origin config as it appears in YAML. Plugin-specific fields are kept as `serde_json::Value` for deferred parsing.",

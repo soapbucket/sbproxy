@@ -19,8 +19,13 @@
 //! started one step past the missing step.
 //!
 //! This module is the producer. It is the only place in the request path
-//! that calls
-//! [`sbproxy_billing::store::SettlementStore::enqueue_usage_event`].
+//! that calls `sbproxy_billing::store::SettlementStore::enqueue_usage_event`.
+//!
+//! Every reference to the billing crate in this file's documentation is a
+//! plain code span rather than an intra-doc link, on purpose. `payments` is
+//! not a default feature, and the docs lane builds with default features, so
+//! a link to a feature-gated item resolves on a `payments` build and fails
+//! the gate on every other one.
 //!
 //! # Why the bridge lives here rather than in the meter
 //!
@@ -35,7 +40,7 @@
 //!
 //! Everything below writes one durable row and stops. No HTTP call to
 //! Stripe happens on a request, ever: the provider call is
-//! [`sbproxy_billing::worker::SettlementWorker`]'s job, behind its own
+//! `sbproxy_billing::worker::SettlementWorker`'s job, behind its own
 //! lease, its own idempotency key, and its own dispatch stamp. A meter that
 //! called Stripe inline would put a third party's availability on the
 //! request path of a proxy whose entire value proposition is not doing that.
@@ -53,17 +58,17 @@
 //!
 //! # Doing nothing is the common case and costs nothing
 //!
-//! A deployment with no reporter configured reaches
-//! [`record_billable_usage`], finds no bridge on the pinned pipeline, and
-//! returns. No allocation, no mapping, no lock, no store call.
-//! `a_request_with_no_reporter_configured_does_no_billing_work` in the e2e
-//! suite proves it from outside the process.
+//! A deployment with no reporter configured reaches `record_billable_usage`,
+//! finds no bridge on the pinned pipeline, and returns. No allocation, no
+//! mapping, no lock, no store call.
+//! `an_ai_request_with_no_reporter_configured_queues_nothing` in
+//! `e2e/tests/usage_bridge.rs` proves it from outside the process, against
+//! both the durable queue and the metric.
 
 use sha2::{Digest as _, Sha256};
 
 use sbproxy_config::payments::{
-    UsageSource, USAGE_UNIT_COMPLETION_TOKENS, USAGE_UNIT_PROMPT_TOKENS, USAGE_UNIT_TOOL_CALL,
-    USAGE_UNIT_TOTAL_TOKENS,
+    USAGE_UNIT_COMPLETION_TOKENS, USAGE_UNIT_PROMPT_TOKENS, USAGE_UNIT_TOTAL_TOKENS,
 };
 
 /// Prefix on every identifier this module derives.
@@ -119,19 +124,6 @@ impl ResourceKind {
             Self::HttpRoute => "http_route",
             Self::AiModel => "ai_model",
             Self::McpTool => "mcp_tool",
-        }
-    }
-
-    /// The resource kind one configured source produces.
-    ///
-    /// An exhaustive match with no wildcard arm: a fifth source would be a
-    /// fifth kind of thing on an invoice, and inheriting one of these three
-    /// would put a name on a bill that nothing produced.
-    pub(crate) const fn for_source(source: UsageSource) -> Self {
-        match source {
-            UsageSource::Http => Self::HttpRoute,
-            UsageSource::Ai => Self::AiModel,
-            UsageSource::Mcp => Self::McpTool,
         }
     }
 }
@@ -367,9 +359,22 @@ mod runtime {
     /// shares, so a queued row joins back to the signed receipt.
     pub(crate) const ATTRIBUTE_CLAIM_ID: &str = "claim_id";
 
+    /// Attribute naming the outcome the operator's table priced.
+    ///
+    /// Carried so a queued row states, in the vocabulary of the receipt
+    /// beside it, *why* it is a charge. "You billed me for a cache hit" is
+    /// a complaint an operator answers by pointing at their own table, and
+    /// they can only do that if the row says the outcome was `cache_hit`
+    /// rather than leaving them to infer it from a timestamp.
+    pub(crate) const ATTRIBUTE_OUTCOME: &str = "outcome";
+
     /// One configured meter event, lowered.
+    ///
+    /// Crate visible rather than public: nothing outside this crate has a
+    /// reason to name one, and a public type here would widen the surface
+    /// the pub-item ratchet has to keep honest for no benefit.
     #[derive(Debug)]
-    pub struct UsageBinding {
+    pub(crate) struct UsageBinding {
         /// The reporter this event is drained through.
         pub(crate) reporter: String,
         /// The provider's event name.
@@ -387,8 +392,10 @@ mod runtime {
     /// Every configured meter event, plus the posture that decides what
     /// happens when the queue will not take a row.
     ///
-    /// Built once per settlement runtime and then immutable except for
-    /// [`Self::writable`], so the request path never re-reads YAML.
+    /// Built once per settlement runtime and then immutable except for the
+    /// `writable` flag, so the request path never re-reads YAML. A link
+    /// rather than a code span there would be an intra-doc link from a
+    /// public type to a private field, which rustdoc refuses.
     #[derive(Debug)]
     pub struct UsageBridgeRuntime {
         bindings: Vec<UsageBinding>,
@@ -404,32 +411,36 @@ mod runtime {
         /// tests one `Option` and stops, which is what makes "no reporter
         /// configured does no billing work" a property of the shape rather
         /// than of a length check somebody could later forget.
+        // A build with `payments` and no rail feature carries the store,
+        // the service, and the worker but no reporter, so it reads neither
+        // argument and every configured reporter has already failed the
+        // compiled-feature check by name in `billing_runtime`.
+        #[cfg_attr(not(feature = "payment-stripe"), allow(unused_variables, unused_mut))]
         #[must_use]
         pub fn from_config(config: &PaymentsConfig) -> Option<Arc<Self>> {
             let mut bindings = Vec::new();
+            let mut failure_posture = FailureMode::Degraded;
+
+            #[cfg(feature = "payment-stripe")]
             if let Some(meter) = &config.usage_reporters.stripe_meter {
                 bindings.push(UsageBinding {
                     reporter: sbproxy_billing::stripe_meter::STRIPE_METER_REPORTER.to_string(),
                     event_name: meter.event_name.clone(),
                     customer_field: meter.customer_field.clone(),
-                    customer_attribute:
-                        sbproxy_billing::stripe_meter::ATTRIBUTE_STRIPE_CUSTOMER_ID,
+                    customer_attribute: sbproxy_billing::stripe_meter::ATTRIBUTE_STRIPE_CUSTOMER_ID,
                     source: meter.source,
                     unit: meter.unit.clone(),
                 });
+                // One posture for the bridge, taken from the reporters that
+                // are configured. There is exactly one reporter today; when
+                // a second lands it gets its own posture and this becomes a
+                // per-binding field rather than a bridge-wide one.
+                failure_posture = meter.failure_posture;
             }
+
             if bindings.is_empty() {
                 return None;
             }
-            // One posture for the bridge, taken from the reporters that
-            // are configured. There is exactly one reporter today; when a
-            // second lands it gets its own posture and this collapses to a
-            // per-binding field rather than a proxy-wide one.
-            let failure_posture = config
-                .usage_reporters
-                .stripe_meter
-                .as_ref()
-                .map_or(FailureMode::Degraded, |meter| meter.failure_posture);
             Some(Arc::new(Self {
                 bindings,
                 failure_posture,
@@ -554,7 +565,13 @@ mod runtime {
                     ctx.ai_tokens_out.unwrap_or(0),
                 )
             }
-            UsageSource::Mcp => map_mcp(&binding.unit, &ctx.mcp_billable_calls.lock()),
+            UsageSource::Mcp => {
+                // The guard is taken and dropped inside this expression.
+                // Nothing below it awaits, and the caller has the mapped
+                // units by value before it reaches the store.
+                let calls = ctx.mcp_billable_calls.lock();
+                map_mcp(&binding.unit, calls.as_slice())
+            }
         }
     }
 
@@ -575,14 +592,11 @@ mod runtime {
             &binding.reporter,
             unit.kind,
             &unit.resource,
-            &binding.unit,
+            &unit.unit,
         );
 
         let mut attributes = BTreeMap::new();
-        attributes.insert(
-            binding.customer_attribute.to_string(),
-            customer.to_string(),
-        );
+        attributes.insert(binding.customer_attribute.to_string(), customer.to_string());
         attributes.insert(
             ATTRIBUTE_RESOURCE_TYPE.to_string(),
             unit.kind.as_str().to_string(),
@@ -590,6 +604,16 @@ mod runtime {
         attributes.insert(ATTRIBUTE_RESOURCE_NAME.to_string(), unit.resource.clone());
         attributes.insert(ATTRIBUTE_UNIT.to_string(), unit.unit.clone());
         attributes.insert(ATTRIBUTE_CLAIM_ID.to_string(), claim_id.clone());
+        // Only an HTTP unit has a metered outcome. An AI or MCP unit is not
+        // priced through the outcome table at all, and stamping one of its
+        // values on such a row would put a provenance on an invoice line
+        // that nothing produced.
+        if let Some(settled) = settled.filter(|_| unit.kind == ResourceKind::HttpRoute) {
+            attributes.insert(
+                ATTRIBUTE_OUTCOME.to_string(),
+                settled.outcome.as_str().to_string(),
+            );
+        }
 
         let event = UsageEvent {
             reporter: binding.reporter.clone(),
@@ -703,25 +727,6 @@ mod runtime {
             .filter(|value| !value.trim().is_empty())
             .map(str::to_string)
     }
-
-    /// A bridge for one binding, for tests that need one without a store.
-    #[cfg(test)]
-    impl UsageBridgeRuntime {
-        pub(crate) fn for_test(binding: UsageBinding, failure_posture: FailureMode) -> Self {
-            Self {
-                bindings: vec![binding],
-                failure_posture,
-                writable: AtomicBool::new(true),
-            }
-        }
-
-        pub(crate) fn bindings(&self) -> &[UsageBinding] {
-            &self.bindings
-        }
-    }
-
-    /// Resource kinds, re-exported for the metric label the caller passes.
-    pub(crate) use ResourceKind as _ResourceKind;
 }
 
 #[cfg(feature = "payments")]
@@ -733,6 +738,7 @@ pub(crate) use runtime::{preflight_refuses, record_billable_usage};
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sbproxy_config::payments::USAGE_UNIT_TOOL_CALL;
     use sbproxy_meter::{Evidence, Unit};
 
     /// The reporter every test derives an identifier under.
@@ -933,7 +939,10 @@ mod tests {
 
     #[test]
     fn http_mapping_reports_only_the_unit_the_meter_event_asked_for() {
-        let billed = vec![route_weight("search_call", 5), route_weight("egress_kib", 12)];
+        let billed = vec![
+            route_weight("search_call", 5),
+            route_weight("egress_kib", 12),
+        ];
 
         let units = map_http("search_call", "/v1/search", &billed);
 
@@ -956,7 +965,12 @@ mod tests {
         // A resolver that ran and found nothing is not a billable
         // quantity either, and a zero-quantity meter event is one Stripe
         // refuses.
-        assert!(map_http("search_call", "/v1/search", &[route_weight("search_call", 0)]).is_empty());
+        assert!(map_http(
+            "search_call",
+            "/v1/search",
+            &[route_weight("search_call", 0)]
+        )
+        .is_empty());
     }
 
     #[test]
@@ -1055,20 +1069,7 @@ mod tests {
     }
 
     #[test]
-    fn every_source_lowers_to_its_own_resource_kind() {
-        assert_eq!(
-            ResourceKind::for_source(UsageSource::Http),
-            ResourceKind::HttpRoute
-        );
-        assert_eq!(
-            ResourceKind::for_source(UsageSource::Ai),
-            ResourceKind::AiModel
-        );
-        assert_eq!(
-            ResourceKind::for_source(UsageSource::Mcp),
-            ResourceKind::McpTool
-        );
-
+    fn every_resource_kind_has_a_distinct_wire_spelling() {
         let names: Vec<&str> = [
             ResourceKind::HttpRoute,
             ResourceKind::AiModel,

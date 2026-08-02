@@ -2818,6 +2818,98 @@ pub fn record_payment_rail_enabled(rail: &str, enabled: bool) {
     gauge.with_label_values(&[rail]).set(i64::from(enabled));
 }
 
+// --- WOR-2169: the usage bridge ---
+//
+// Unlike the settlement families above, both of these carry `tenant_id`,
+// and the difference is not an inconsistency. A settlement metric describes
+// one payment and a payer identifier on it would be a way to read who paid
+// for what. A usage metric describes metered consumption, this deployment
+// is multi-tenant, and a billing counter that merged every tenant into one
+// series answers no question an operator has: "are we billing anyone" and
+// "are we billing *this customer*" are different questions and only the
+// second one gets anybody out of bed. The neighbouring `sbproxy_meter_*`
+// families label themselves the same way and for the same reason.
+//
+// Every other label is closed by construction. `reporter` is a registered
+// reporter name, `resource_type` is one of three values held in code, and
+// `failure_mode` is the four-posture vocabulary. No route, no model, no
+// tool, no customer identifier, and no usage identifier is a parameter
+// here: the durable row carries all of those, and it is the thing an
+// operator reconciles against anyway.
+
+/// Keep a usage-bridge tenant label bounded, and never empty.
+///
+/// An empty label value is legal Prometheus and useless to read: it renders
+/// as an absent dimension and silently joins with every other series that
+/// omits the label, which for a billing counter means one tenant's spend
+/// quietly aggregating into another's panel. `sbproxy_meter_*` substitutes
+/// the same placeholder for the same reason.
+fn usage_bridge_tenant(tenant_id: &str) -> String {
+    if tenant_id.is_empty() {
+        return "unknown".to_string();
+    }
+    sanitize_label("tenant_id", tenant_id)
+}
+
+/// Increment
+/// `sbproxy_usage_bridge_enqueued_total{tenant_id, reporter, resource_type, result}`.
+///
+/// One observation per billable unit the request path offered to the
+/// durable queue. `result` separates `queued` from `duplicate`, because the
+/// store deduplicates on the provider identifier and a duplicate is the
+/// idempotency contract working rather than a failure. A deployment where
+/// that series is entirely `duplicate` has an identifier that is not varying
+/// when it should, which is the shape of a silently dropped charge.
+pub fn record_usage_bridge_enqueued(
+    tenant_id: &str,
+    reporter: &str,
+    resource_type: &str,
+    inserted: bool,
+) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_usage_bridge_enqueued_total",
+            "Billable units the request path queued for a usage reporter, by tenant, reporter, resource type, and whether the row was new",
+            &["tenant_id", "reporter", "resource_type", "result"],
+        )
+        .expect("usage bridge enqueue counter registers")
+    });
+    let tenant = usage_bridge_tenant(tenant_id);
+    let result = if inserted { "queued" } else { "duplicate" };
+    counter
+        .with_label_values(&[tenant.as_str(), reporter, resource_type, result])
+        .inc();
+}
+
+/// Increment `sbproxy_usage_bridge_gap_total{tenant_id, failure_mode}`.
+///
+/// Nonzero means a served request produced a billable unit that never
+/// reached the durable queue, so the customer will be under-billed and
+/// nothing downstream will notice on its own. This is the family to alert
+/// on. Under `degraded` and `closed` there is also a signed `usage_gap`
+/// marker on the receipt chain naming the exact claim; under `open` this
+/// counter is the whole record.
+pub fn record_usage_bridge_gap(tenant_id: &str, failure_mode: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_usage_bridge_gap_total",
+            "Billable units that could not be queued for a usage reporter, by tenant and the posture in force",
+            &["tenant_id", "failure_mode"],
+        )
+        .expect("usage bridge gap counter registers")
+    });
+    let tenant = usage_bridge_tenant(tenant_id);
+    counter
+        .with_label_values(&[tenant.as_str(), failure_mode])
+        .inc();
+}
+
 // --- WOR-75: four exemplar-emitting histograms ---
 //
 // Each helper below registers its own `HistogramVec` lazily, calls

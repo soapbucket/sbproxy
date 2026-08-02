@@ -521,6 +521,7 @@ pub struct PaymentsRuntimeCandidate {
     worker_config: WorkerConfig,
     rails: Vec<SettlementRail>,
     gate: Option<SettlementGateSeam>,
+    usage_bridge: Option<Arc<crate::usage_bridge::UsageBridgeRuntime>>,
 }
 
 impl PaymentsRuntimeCandidate {
@@ -619,6 +620,11 @@ impl PaymentsRuntimeCandidate {
             worker_config: worker_config(config),
             rails,
             gate: inputs.gate.clone(),
+            // WOR-2169. Built here, from the same document generation as
+            // the service and the reporter registry, so the meter event a
+            // request queues and the reporter that drains it can never come
+            // from two different configurations.
+            usage_bridge: crate::usage_bridge::UsageBridgeRuntime::from_config(config),
         })
     }
 
@@ -704,6 +710,7 @@ impl PaymentsRuntimeCandidate {
             observer,
             rails: self.rails,
             gate: self.gate,
+            usage_bridge: self.usage_bridge,
         })
     }
 
@@ -732,6 +739,7 @@ pub struct PaymentsRuntime {
     observer: tokio::task::JoinHandle<()>,
     rails: Vec<SettlementRail>,
     gate: Option<SettlementGateSeam>,
+    usage_bridge: Option<Arc<crate::usage_bridge::UsageBridgeRuntime>>,
 }
 
 impl PaymentsRuntime {
@@ -739,6 +747,17 @@ impl PaymentsRuntime {
     #[must_use]
     pub fn service(&self) -> &Arc<BillingService> {
         &self.service
+    }
+
+    /// The producer that turns served requests into queued billable units.
+    ///
+    /// `None` when `proxy.payments.usage_reporters` is empty, which is what
+    /// makes "no reporter configured does no billing work" a property of
+    /// the shape rather than of a check on the request path. See
+    /// [`crate::usage_bridge`].
+    #[must_use]
+    pub fn usage_bridge(&self) -> Option<&Arc<crate::usage_bridge::UsageBridgeRuntime>> {
+        self.usage_bridge.as_ref()
     }
 
     /// Request-path gate material, when this runtime was built for serving.
@@ -907,6 +926,7 @@ impl PaymentsRuntime {
             observer,
             rails: _rails,
             gate: _gate,
+            usage_bridge: _usage_bridge,
         } = self;
 
         observer.abort();
