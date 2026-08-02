@@ -58,7 +58,7 @@ const CAPABILITIES: &[ProductCapability] = &[
 /// the exact cell text the table is allowed to print.
 const CLAIMS: &[Claim] = &[
     Claim {
-        row: "OSS clustering substrate (gossip mesh, no Postgres)",
+        row: "Clustering substrate (gossip mesh, no Postgres)",
         capability: "cluster.no_postgres",
         value: ClaimValue::Yes,
     },
