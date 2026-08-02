@@ -93,7 +93,13 @@ fn compile_action_for_origin_with_runtime(
             config.clone(),
         )?))),
         "noop" => Ok(Action::Noop),
-        _ => anyhow::bail!("unknown action type: {}", type_name),
+        other => match sbproxy_plugin::build_action_plugin(other, config.clone()) {
+            Some(Ok(handler)) => Ok(Action::Plugin(handler)),
+            Some(Err(error)) => {
+                Err(error).with_context(|| format!("action plugin {other:?} factory failed"))
+            }
+            None => anyhow::bail!("unknown action type: {}", other),
+        },
     }
 }
 
@@ -249,7 +255,13 @@ pub fn compile_policy(config: &serde_json::Value) -> Result<Policy> {
         "agent_budget" => Ok(Policy::AgentBudget(std::sync::Arc::new(
             crate::policy::AgentBudgetPolicy::from_config(config.clone())?,
         ))),
-        _ => anyhow::bail!("unknown policy type: {}", type_name),
+        other => match sbproxy_plugin::build_policy_plugin(other, config.clone()) {
+            Some(Ok(enforcer)) => Ok(Policy::Plugin(enforcer)),
+            Some(Err(error)) => {
+                Err(error).with_context(|| format!("policy plugin {other:?} factory failed"))
+            }
+            None => anyhow::bail!("unknown policy type: {}", other),
+        },
     }
 }
 
@@ -337,13 +349,103 @@ pub fn compile_transform(config: &serde_json::Value) -> Result<Transform> {
             A2aAgentCardRewriter::from_config(config.clone())?,
         )),
         "noop" => Ok(Transform::Noop),
-        _ => anyhow::bail!("unknown transform type: {}", type_name),
+        other => match sbproxy_plugin::build_transform_plugin(other, config.clone()) {
+            Some(Ok(handler)) => Ok(Transform::Plugin(handler)),
+            Some(Err(error)) => {
+                Err(error).with_context(|| format!("transform plugin {other:?} factory failed"))
+            }
+            None => anyhow::bail!("unknown transform type: {}", other),
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
+
+    use bytes::{Bytes, BytesMut};
+    use sbproxy_plugin::{
+        ActionHandler, ActionOutcome, ActionPluginRegistration, PluginResult, PolicyDecision,
+        PolicyEnforcer, PolicyPluginRegistration, TransformContext, TransformHandler,
+        TransformPluginRegistration,
+    };
+
     use super::*;
+
+    struct CompileFixturePolicy;
+
+    impl PolicyEnforcer for CompileFixturePolicy {
+        fn policy_type(&self) -> &str {
+            "compile_fixture_policy"
+        }
+
+        fn enforce(
+            &self,
+            _req: &http::Request<Bytes>,
+            _ctx: &mut dyn std::any::Any,
+        ) -> Pin<Box<dyn Future<Output = PluginResult<PolicyDecision>> + Send + '_>> {
+            Box::pin(async { Ok(PolicyDecision::Allow) })
+        }
+    }
+
+    struct CompileFixtureTransform;
+
+    impl TransformHandler for CompileFixtureTransform {
+        fn transform_type(&self) -> &str {
+            "compile_fixture_transform"
+        }
+
+        fn apply<'a>(
+            &'a self,
+            body: &'a mut BytesMut,
+            _content_type: Option<&'a str>,
+            _ctx: &'a TransformContext<'a>,
+        ) -> Pin<Box<dyn Future<Output = PluginResult<()>> + Send + 'a>> {
+            Box::pin(async move {
+                body.clear();
+                body.extend_from_slice(b"typed transform ran");
+                Ok(())
+            })
+        }
+    }
+
+    struct CompileFixtureAction;
+
+    impl ActionHandler for CompileFixtureAction {
+        fn handler_type(&self) -> &str {
+            "compile_fixture_action"
+        }
+
+        fn handle(
+            &self,
+            _req: &mut http::Request<Bytes>,
+            _ctx: &mut dyn std::any::Any,
+        ) -> Pin<Box<dyn Future<Output = PluginResult<ActionOutcome>> + Send + '_>> {
+            Box::pin(async { Ok(ActionOutcome::Proxy) })
+        }
+    }
+
+    inventory::submit! {
+        PolicyPluginRegistration {
+            name: "compile_fixture_policy",
+            factory: |_config| Ok(Box::new(CompileFixturePolicy)),
+        }
+    }
+
+    inventory::submit! {
+        TransformPluginRegistration {
+            name: "compile_fixture_transform",
+            factory: |_config| Ok(Box::new(CompileFixtureTransform)),
+        }
+    }
+
+    inventory::submit! {
+        ActionPluginRegistration {
+            name: "compile_fixture_action",
+            factory: |_config| Ok(Box::new(CompileFixtureAction)),
+        }
+    }
 
     // --- compile_action tests ---
 
@@ -609,6 +711,15 @@ mod tests {
     }
 
     #[test]
+    fn compile_action_builds_typed_static_plugin() {
+        let action = compile_action(&serde_json::json!({"type": "compile_fixture_action"}))
+            .expect("typed action registration must be reachable from config");
+
+        assert_eq!(action.action_type(), "compile_fixture_action");
+        assert!(matches!(action, Action::Plugin(_)));
+    }
+
+    #[test]
     fn compile_action_mcp() {
         // Note: WOR-42 makes per-server `rbac` and `timeout` hard
         // config errors until the federation dispatcher actually
@@ -749,6 +860,15 @@ mod tests {
     fn compile_policy_unknown_type() {
         let json = serde_json::json!({"type": "nonexistent_policy"});
         assert!(compile_policy(&json).is_err());
+    }
+
+    #[test]
+    fn compile_policy_builds_typed_static_plugin() {
+        let policy = compile_policy(&serde_json::json!({"type": "compile_fixture_policy"}))
+            .expect("typed policy registration must be reachable from config");
+
+        assert_eq!(policy.policy_type(), "compile_fixture_policy");
+        assert!(matches!(policy, Policy::Plugin(_)));
     }
 
     #[test]
@@ -946,6 +1066,21 @@ mod tests {
         let json = serde_json::json!({"type": "noop"});
         let transform = compile_transform(&json).unwrap();
         assert_eq!(transform.transform_type(), "noop");
+    }
+
+    #[test]
+    fn compile_transform_builds_and_runs_typed_static_plugin() {
+        let transform =
+            compile_transform(&serde_json::json!({"type": "compile_fixture_transform"}))
+                .expect("typed transform registration must be reachable from config");
+        let mut body = BytesMut::from(&b"original"[..]);
+
+        transform
+            .apply(&mut body, Some("text/plain"))
+            .expect("compiled typed transform must run without generic registration");
+
+        assert_eq!(transform.transform_type(), "compile_fixture_transform");
+        assert_eq!(&body[..], b"typed transform ran");
     }
 
     #[test]

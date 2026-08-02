@@ -11,6 +11,7 @@ use tracing::{debug, error, warn};
 
 use crate::reload;
 use sbproxy_modules::{Action, Auth};
+use sbproxy_plugin::ActionOutcome;
 use sbproxy_tls::challenges::ACME_CHALLENGE_PREFIX;
 use sbproxy_tls::h3_listener::HttpResponse;
 
@@ -346,11 +347,74 @@ async fn dispatch_action(
             warn!("H3: mcp action not yet supported in H3 dispatch");
             Ok(text_response(501, &h3_unsupported_message("mcp")))
         }
-        Action::Plugin(_) => {
-            warn!("H3: plugin action not supported in H3 dispatch");
-            Ok(text_response(501, &h3_unsupported_message("plugin")))
+        Action::Plugin(handler) => {
+            let mut request = http::Request::builder()
+                .method(method.clone())
+                .uri(uri.clone())
+                .body(body.unwrap_or_default())
+                .context("building plugin action request")?;
+            *request.headers_mut() = headers.clone();
+            let outcome = handler
+                .handle(&mut request, &mut ())
+                .await
+                .with_context(|| format!("plugin action {:?} failed", handler.handler_type()))?;
+            match outcome {
+                ActionOutcome::Response {
+                    status,
+                    headers,
+                    body,
+                } => validate_plugin_action_response(status, headers, body),
+                ActionOutcome::Proxy => {
+                    warn!("H3: plugin proxy outcome not supported in H3 dispatch");
+                    Ok(text_response(501, &h3_unsupported_message("plugin proxy")))
+                }
+                ActionOutcome::Responded => {
+                    warn!("H3: legacy plugin responded outcome cannot write through H3 dispatch");
+                    Ok(text_response(
+                        501,
+                        &h3_unsupported_message("legacy plugin response"),
+                    ))
+                }
+            }
         }
     }
+}
+
+const MAX_PLUGIN_ACTION_RESPONSE_HEADERS: usize = 64;
+const MAX_PLUGIN_ACTION_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
+
+pub(crate) fn validate_plugin_action_response(
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Bytes,
+) -> Result<HttpResponse> {
+    if !(100..=599).contains(&status) {
+        anyhow::bail!("plugin action response status must be in 100..=599, got {status}");
+    }
+    if headers.len() > MAX_PLUGIN_ACTION_RESPONSE_HEADERS {
+        anyhow::bail!(
+            "plugin action response has {} headers; maximum is {}",
+            headers.len(),
+            MAX_PLUGIN_ACTION_RESPONSE_HEADERS
+        );
+    }
+    for (name, value) in &headers {
+        http::HeaderName::from_bytes(name.as_bytes())
+            .with_context(|| format!("invalid plugin action response header name {name:?}"))?;
+        http::HeaderValue::from_str(value)
+            .with_context(|| format!("invalid plugin action response header {name:?}"))?;
+    }
+    if body.len() > MAX_PLUGIN_ACTION_RESPONSE_BODY_BYTES {
+        anyhow::bail!(
+            "plugin action response body exceeds 1 MiB (1048576 bytes): {} bytes",
+            body.len()
+        );
+    }
+    Ok(HttpResponse {
+        status,
+        headers,
+        body: Some(body),
+    })
 }
 
 /// Build the standard 501 body for action types that the H3 dispatch path
@@ -583,7 +647,127 @@ impl BoolNot for bool {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
+
+    use sbproxy_plugin::{ActionHandler, ActionOutcome, PluginResult};
+
     use super::*;
+
+    struct OutcomeAction(ActionOutcome);
+
+    impl ActionHandler for OutcomeAction {
+        fn handler_type(&self) -> &str {
+            "plugin_action_fixture"
+        }
+
+        fn handle(
+            &self,
+            _req: &mut http::Request<Bytes>,
+            _ctx: &mut dyn std::any::Any,
+        ) -> Pin<Box<dyn Future<Output = PluginResult<ActionOutcome>> + Send + '_>> {
+            let outcome = self.0.clone();
+            Box::pin(async move { Ok(outcome) })
+        }
+    }
+
+    fn plugin_action_response(status: u16, headers: Vec<(String, String)>, body: Bytes) -> Action {
+        Action::Plugin(Box::new(OutcomeAction(ActionOutcome::Response {
+            status,
+            headers,
+            body,
+        })))
+    }
+
+    async fn dispatch_plugin_action(action: &Action) -> Result<HttpResponse> {
+        dispatch_action(
+            action,
+            &http::Method::POST,
+            &"/jobs".parse().expect("fixture URI"),
+            &http::HeaderMap::new(),
+            Some(Bytes::from_static(b"payload")),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn plugin_action_h3_dispatches_structured_response() {
+        let action = plugin_action_response(
+            202,
+            vec![("content-type".into(), "text/plain".into())],
+            Bytes::from_static(b"queued"),
+        );
+
+        let response = dispatch_plugin_action(&action)
+            .await
+            .expect("valid plugin response");
+
+        assert_eq!(response.status, 202);
+        assert_eq!(
+            response.headers,
+            vec![("content-type".to_string(), "text/plain".to_string())]
+        );
+        assert_eq!(response.body.as_deref(), Some(&b"queued"[..]));
+    }
+
+    #[tokio::test]
+    async fn plugin_action_h3_rejects_status_below_100() {
+        let action = plugin_action_response(99, Vec::new(), Bytes::new());
+
+        let error = dispatch_plugin_action(&action)
+            .await
+            .err()
+            .expect("status below 100 must be rejected");
+
+        assert!(error.to_string().contains("status"), "error: {error:#}");
+    }
+
+    #[tokio::test]
+    async fn plugin_action_h3_rejects_crlf_header_value() {
+        let action = plugin_action_response(
+            200,
+            vec![("x-safe".into(), "ok\r\nx-injected: bad".into())],
+            Bytes::new(),
+        );
+
+        let error = dispatch_plugin_action(&action)
+            .await
+            .err()
+            .expect("CR/LF header values must be rejected");
+
+        assert!(error.to_string().contains("header"), "error: {error:#}");
+    }
+
+    #[tokio::test]
+    async fn plugin_action_h3_rejects_more_than_64_headers() {
+        let headers = (0..65)
+            .map(|index| (format!("x-fixture-{index}"), "value".to_string()))
+            .collect();
+        let action = plugin_action_response(200, headers, Bytes::new());
+
+        let error = dispatch_plugin_action(&action)
+            .await
+            .err()
+            .expect("header count must be bounded");
+
+        assert!(error.to_string().contains("64"), "error: {error:#}");
+    }
+
+    #[tokio::test]
+    async fn plugin_action_h3_rejects_body_above_one_mib() {
+        let action =
+            plugin_action_response(200, Vec::new(), Bytes::from(vec![b'x'; 1024 * 1024 + 1]));
+
+        let error = dispatch_plugin_action(&action)
+            .await
+            .err()
+            .expect("response body must be bounded");
+
+        assert!(
+            error.to_string().contains("1048576") || error.to_string().contains("1 MiB"),
+            "error: {error:#}"
+        );
+    }
 
     // --- Health check ---
 

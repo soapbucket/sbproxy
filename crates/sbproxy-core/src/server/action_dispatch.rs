@@ -828,10 +828,327 @@ pub(super) async fn handle_action(
             Ok(true)
         }
 
-        Action::Plugin(_) => {
-            send_error(session, 501, "plugin actions not yet supported").await?;
-            Ok(true)
+        Action::Plugin(handler) => {
+            let request_header = session.req_header();
+            let method = request_header.method.clone();
+            let uri = request_header.uri.clone();
+            let headers = request_header.headers.clone();
+            let mut request_body = bytes::BytesMut::new();
+            while let Some(chunk) = session.read_request_body().await? {
+                request_body.extend_from_slice(&chunk);
+            }
+            let mut request = http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(request_body.freeze())
+                .map_err(|error| {
+                    Error::because(
+                        ErrorType::InternalError,
+                        "failed to build plugin action request",
+                        error,
+                    )
+                })?;
+            *request.headers_mut() = headers;
+            let outcome = handler.handle(&mut request, ctx).await.map_err(|error| {
+                Error::because(ErrorType::InternalError, "plugin action failed", error)
+            })?;
+            match outcome {
+                sbproxy_plugin::ActionOutcome::Proxy => Ok(false),
+                sbproxy_plugin::ActionOutcome::Responded => Ok(true),
+                sbproxy_plugin::ActionOutcome::Response {
+                    status,
+                    headers,
+                    body,
+                } => {
+                    let response =
+                        crate::dispatch::validate_plugin_action_response(status, headers, body)
+                            .map_err(|error| {
+                                Error::because(
+                                    ErrorType::InternalError,
+                                    "invalid plugin action response",
+                                    error,
+                                )
+                            })?;
+                    let (status, headers, body) = apply_plugin_action_response_modifiers(
+                        response.status,
+                        response.headers,
+                        response.body.unwrap_or_default(),
+                        pipeline,
+                        origin_idx,
+                        ctx,
+                    );
+                    let (content_type, extras) = split_plugin_action_response_headers(headers);
+                    ctx.response_status = Some(status);
+                    send_response_with_extras(
+                        session,
+                        status,
+                        &content_type,
+                        body.as_ref(),
+                        &extras,
+                    )
+                    .await?;
+                    Ok(true)
+                }
+            }
         }
+    }
+}
+
+fn apply_plugin_action_response_modifiers(
+    mut status: u16,
+    mut headers: Vec<(String, String)>,
+    mut body: Bytes,
+    pipeline: &CompiledPipeline,
+    origin_idx: Option<usize>,
+    ctx: &RequestContext,
+) -> (u16, Vec<(String, String)>, Bytes) {
+    let Some(origin) = origin_idx.and_then(|idx| pipeline.config.origins.get(idx)) else {
+        return (status, headers, body);
+    };
+    let mut response_headers = serde_json::Map::new();
+    for (name, value) in &headers {
+        insert_json_header(&mut response_headers, name, value);
+    }
+    for modifier in &origin.response_modifiers {
+        if let Some(body_modifier) = &modifier.body {
+            if let Some(json) = &body_modifier.replace_json {
+                body = Bytes::from(json.to_string());
+            } else if let Some(text) = &body_modifier.replace {
+                body = Bytes::from(text.clone());
+            }
+        }
+        if let Some(status_modifier) = &modifier.status {
+            status = status_modifier.code;
+        }
+        if let Some(header_modifier) = &modifier.headers {
+            for name in &header_modifier.remove {
+                headers.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+                response_headers.remove(name);
+            }
+            for (name, value) in &header_modifier.set {
+                set_plugin_action_response_header(&mut headers, name, value);
+                insert_json_header(&mut response_headers, name, value);
+            }
+            for (name, value) in &header_modifier.add {
+                headers.push((name.clone(), value.clone()));
+                insert_json_header(&mut response_headers, name, value);
+            }
+        }
+        if let Some(script) = &modifier.lua_script {
+            match lua_response_modifier(script, status, &response_headers, ctx) {
+                Ok(modified) => {
+                    for (name, value) in modified {
+                        set_plugin_action_response_header(&mut headers, &name, &value);
+                        insert_json_header(&mut response_headers, name, value);
+                    }
+                }
+                Err(error) => {
+                    warn!(error = %error, "Lua response modifier on plugin action failed");
+                }
+            }
+        }
+        if let Some(script) = &modifier.js_script {
+            match js_response_modifier(script, status, &response_headers, ctx) {
+                Ok(modified) => {
+                    for (name, value) in modified {
+                        set_plugin_action_response_header(&mut headers, &name, &value);
+                        insert_json_header(&mut response_headers, name, value);
+                    }
+                }
+                Err(error) => {
+                    warn!(error = %error, "JavaScript response modifier on plugin action failed");
+                }
+            }
+        }
+    }
+    (status, headers, body)
+}
+
+fn set_plugin_action_response_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
+    headers.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+    headers.push((name.to_string(), value.to_string()));
+}
+
+fn split_plugin_action_response_headers(
+    headers: Vec<(String, String)>,
+) -> (String, Vec<(String, String)>) {
+    let mut content_type = "application/octet-stream".to_string();
+    let mut extras = Vec::with_capacity(headers.len());
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("content-type") {
+            content_type = value;
+        } else if !name.eq_ignore_ascii_case("content-length")
+            && !name.eq_ignore_ascii_case("transfer-encoding")
+            && !name.eq_ignore_ascii_case("connection")
+        {
+            extras.push((name, value));
+        }
+    }
+    (content_type, extras)
+}
+
+#[cfg(test)]
+mod plugin_action_tests {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::time::Duration;
+
+    use pingora_core::protocols::l4::stream::Stream;
+    use sbproxy_plugin::{ActionHandler, ActionOutcome, PluginResult};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
+
+    struct OutcomeAction(ActionOutcome);
+
+    impl ActionHandler for OutcomeAction {
+        fn handler_type(&self) -> &str {
+            "plugin_action_fixture"
+        }
+
+        fn handle(
+            &self,
+            _req: &mut http::Request<Bytes>,
+            _ctx: &mut dyn std::any::Any,
+        ) -> Pin<Box<dyn Future<Output = PluginResult<ActionOutcome>> + Send + '_>> {
+            let outcome = self.0.clone();
+            Box::pin(async move { Ok(outcome) })
+        }
+    }
+
+    fn response_action(status: u16, headers: Vec<(String, String)>, body: Bytes) -> Action {
+        Action::Plugin(Box::new(OutcomeAction(ActionOutcome::Response {
+            status,
+            headers,
+            body,
+        })))
+    }
+
+    async fn exchange(
+        action: &Action,
+        pipeline: &CompiledPipeline,
+        origin_idx: Option<usize>,
+    ) -> (pingora_error::Result<bool>, Vec<u8>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind downstream fixture");
+        let address = listener.local_addr().expect("downstream address");
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect downstream fixture");
+            stream
+                .write_all(
+                    b"POST /jobs HTTP/1.1\r\nHost: plugin.test\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .expect("write request");
+            stream.shutdown().await.expect("half-close request");
+            let mut response = Vec::new();
+            stream
+                .read_to_end(&mut response)
+                .await
+                .expect("read response");
+            response
+        });
+        let (stream, _) = listener.accept().await.expect("accept downstream");
+        let mut session = Session::new_h1(Box::new(Stream::from(stream)));
+        session
+            .as_downstream_mut()
+            .read_request()
+            .await
+            .expect("parse downstream request");
+        let mut ctx = RequestContext::new();
+
+        let result = handle_action(action, &mut session, pipeline, origin_idx, &mut ctx).await;
+        drop(session);
+        let response = tokio::time::timeout(Duration::from_secs(2), client)
+            .await
+            .expect("downstream response timeout")
+            .expect("downstream client task");
+        (result, response)
+    }
+
+    #[tokio::test]
+    async fn plugin_action_http1_dispatches_structured_response() {
+        let action = response_action(
+            202,
+            vec![("content-type".into(), "text/plain".into())],
+            Bytes::from_static(b"queued"),
+        );
+        let pipeline = CompiledPipeline::empty_for_test();
+
+        let (result, wire) = exchange(&action, &pipeline, None).await;
+
+        assert!(result.expect("valid plugin response must dispatch"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        assert!(response.starts_with("HTTP/1.1 202"), "response: {response}");
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("content-type: text/plain"),
+            "response: {response}"
+        );
+        assert!(response.ends_with("\r\n\r\nqueued"), "response: {response}");
+    }
+
+    #[tokio::test]
+    async fn plugin_action_http1_applies_ordinary_response_modifiers() {
+        let config = sbproxy_config::compile_config(
+            r#"
+origins:
+  "plugin.test":
+    action:
+      type: static
+      body: placeholder
+    response_modifiers:
+      - status:
+          code: 203
+        headers:
+          set:
+            x-plugin-modified: applied
+        body:
+          replace: modified
+"#,
+        )
+        .expect("fixture config");
+        let pipeline = CompiledPipeline::from_config(config).expect("fixture pipeline");
+        let action = response_action(
+            202,
+            vec![("content-type".into(), "text/plain".into())],
+            Bytes::from_static(b"queued"),
+        );
+
+        let (result, wire) = exchange(&action, &pipeline, Some(0)).await;
+
+        assert!(result.expect("valid plugin response must dispatch"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        assert!(response.starts_with("HTTP/1.1 203"), "response: {response}");
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("x-plugin-modified: applied"),
+            "response: {response}"
+        );
+        assert!(
+            response.ends_with("\r\n\r\nmodified"),
+            "response: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_action_http1_validates_before_writing_response() {
+        let action = response_action(
+            200,
+            vec![("x-safe".into(), "ok\r\nx-injected: bad".into())],
+            Bytes::from_static(b"must not be written"),
+        );
+        let pipeline = CompiledPipeline::empty_for_test();
+
+        let (result, wire) = exchange(&action, &pipeline, None).await;
+
+        assert!(result.is_err(), "invalid plugin response must fail");
+        assert!(wire.is_empty(), "invalid response wrote bytes: {wire:?}");
     }
 }
 

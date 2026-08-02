@@ -83,7 +83,7 @@ pub enum TransformError {
     #[error("transform plugin {plugin}: {detail}")]
     Plugin {
         /// Plugin name (`TransformHandler::transform_type()`).
-        plugin: &'static str,
+        plugin: String,
         /// Either "timed out after Nms" or "panicked".
         detail: String,
     },
@@ -315,14 +315,7 @@ fn dispatch_plugin_within(
     content_type: Option<&str>,
     timeout: std::time::Duration,
 ) -> anyhow::Result<()> {
-    let plugin_name = handler.transform_type();
-    if sbproxy_plugin::get_plugin(sbproxy_plugin::PluginKind::Transform, plugin_name).is_none() {
-        anyhow::bail!(
-            "transform plugin {:?} is not registered in the inventory registry",
-            plugin_name
-        );
-    }
-    let plugin_name_static: &'static str = plugin_name;
+    let plugin_name = handler.transform_type().to_string();
     let ctx = TransformContext::empty();
     use futures::FutureExt;
     let future = std::panic::AssertUnwindSafe(async {
@@ -345,7 +338,7 @@ fn dispatch_plugin_within(
             Ok(rt) => rt.block_on(future),
             Err(e) => {
                 return Err(anyhow::Error::new(TransformError::Plugin {
-                    plugin: plugin_name_static,
+                    plugin: plugin_name.clone(),
                     detail: format!("could not build dispatch runtime: {e}"),
                 }));
             }
@@ -359,12 +352,12 @@ fn dispatch_plugin_within(
         Ok(Ok(apply_result)) => apply_result.map_err(anyhow::Error::from),
         // tokio::time::timeout fired before the plugin finished.
         Ok(Err(_elapsed)) => Err(anyhow::Error::new(TransformError::Plugin {
-            plugin: plugin_name_static,
+            plugin: plugin_name.clone(),
             detail: format!("timed out after {}ms", timeout.as_millis()),
         })),
         // The plugin (or the surrounding future) panicked.
         Err(_panic) => Err(anyhow::Error::new(TransformError::Plugin {
-            plugin: plugin_name_static,
+            plugin: plugin_name,
             detail: "panicked".to_string(),
         })),
     }
@@ -1498,7 +1491,7 @@ mod tests {
     }
 
     #[test]
-    fn plugin_apply_errors_when_not_registered() {
+    fn typed_plugin_apply_does_not_require_generic_registration() {
         struct UnregisteredHandler;
         impl TransformHandler for UnregisteredHandler {
             fn transform_type(&self) -> &'static str {
@@ -1518,8 +1511,8 @@ mod tests {
 
         let t = Transform::Plugin(Box::new(UnregisteredHandler));
         let mut body = BytesMut::from(&b"x"[..]);
-        let err = t.apply(&mut body, None).unwrap_err();
-        assert!(err.to_string().contains("unregistered-transform"));
+        t.apply(&mut body, None)
+            .expect("the compiled typed handler is the registration proof");
     }
 
     // --- WOR-168 plugin dispatch reliability tests ---
@@ -1573,7 +1566,7 @@ mod tests {
         );
         match typed {
             TransformError::Plugin { plugin, detail } => {
-                assert_eq!(*plugin, "test-panicking-transform");
+                assert_eq!(plugin, "test-panicking-transform");
                 assert!(detail.contains("panic"), "detail: {detail}");
             }
             other => panic!("expected Plugin error variant, got {:?}", other),
@@ -1645,7 +1638,7 @@ mod tests {
             .expect("slow plugin must surface as TransformError::Plugin");
         match typed {
             TransformError::Plugin { plugin, detail } => {
-                assert_eq!(*plugin, "test-slow-transform");
+                assert_eq!(plugin, "test-slow-transform");
                 assert!(detail.contains("timed out"), "detail: {detail}");
             }
             other => panic!("expected Plugin error variant, got {:?}", other),
