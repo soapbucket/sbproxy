@@ -32,3 +32,14 @@ node_modules/
 # tagged with the interpreter version, so it churns per machine.
 __pycache__/
 *.pyc
+
+# Environment files. Nothing in this repository needs one committed, and
+# the ones that exist locally hold live provider credentials: the
+# recording and e2e setups read OPENAI_API_KEY, ANTHROPIC_API_KEY and
+# friends from a `.env` outside the tree. That placement is the only
+# reason none has ever been committed, which is luck rather than a
+# control. This makes it a rule.
+.env
+.env.*
+!.env.example
+

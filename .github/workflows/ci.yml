@@ -221,6 +221,12 @@ jobs:
       - name: fmt
         run: cargo fmt --all -- --check
 
+      # A GIF is the worst place for a secret to land: nothing greps it,
+      # no secret scanner reads it, and it survives every later edit to
+      # the doc around it. Two shipped that way before this existed.
+      - name: no tape renders a credential into a GIF
+        run: bash scripts/check-tape-secrets.sh
+
       # Shares one script with scripts/check.sh so the local gate fails on
       # the same drift, instead of this being the only place that looks.
       # The script discovers the nested workspaces rather than listing
