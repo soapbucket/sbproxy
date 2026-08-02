@@ -4208,10 +4208,12 @@ mod budget_window_tests {
     #[test]
     fn a_successful_ai_call_records_a_success_despite_an_unset_response_status() {
         let provider = format!("wor2213-ok-{}", std::process::id());
-        let mut ctx = crate::context::RequestContext::default();
-        ctx.ai_record_routing_feedback = true;
-        ctx.ai_provider = Some(provider.clone());
-        ctx.ai_cost_usd_micros = Some(10_000);
+        let ctx = crate::context::RequestContext {
+            ai_record_routing_feedback: true,
+            ai_provider: Some(provider.clone()),
+            ai_cost_usd_micros: Some(10_000),
+            ..Default::default()
+        };
         // Exactly what the AI path leaves behind: nothing.
         assert!(
             ctx.response_status.is_none(),
@@ -4235,9 +4237,11 @@ mod budget_window_tests {
     #[test]
     fn a_failed_ai_call_still_records_a_failure() {
         let provider = format!("wor2213-fail-{}", std::process::id());
-        let mut ctx = crate::context::RequestContext::default();
-        ctx.ai_record_routing_feedback = true;
-        ctx.ai_provider = Some(provider.clone());
+        let ctx = crate::context::RequestContext {
+            ai_record_routing_feedback: true,
+            ai_provider: Some(provider.clone()),
+            ..Default::default()
+        };
 
         record_routing_feedback(&ctx, 503);
 
@@ -4260,16 +4264,20 @@ mod budget_window_tests {
         let store = sbproxy_ai::routing_feedback::FeedbackStore::global();
 
         for _ in 0..5 {
-            let mut ok = crate::context::RequestContext::default();
-            ok.ai_record_routing_feedback = true;
-            ok.ai_provider = Some(healthy.clone());
-            ok.ai_cost_usd_micros = Some(20_000);
+            let ok = crate::context::RequestContext {
+                ai_record_routing_feedback: true,
+                ai_provider: Some(healthy.clone()),
+                ai_cost_usd_micros: Some(20_000),
+                ..Default::default()
+            };
             record_routing_feedback(&ok, 200);
 
-            let mut bad = crate::context::RequestContext::default();
-            bad.ai_record_routing_feedback = true;
-            bad.ai_provider = Some(failing.clone());
-            bad.ai_cost_usd_micros = Some(1);
+            let bad = crate::context::RequestContext {
+                ai_record_routing_feedback: true,
+                ai_provider: Some(failing.clone()),
+                ai_cost_usd_micros: Some(1),
+                ..Default::default()
+            };
             record_routing_feedback(&bad, 500);
         }
 
