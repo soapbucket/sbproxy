@@ -73,7 +73,7 @@ grep -F 'soft-landing' /tmp/sbproxy-predictive-budget.log
 
 <!-- CAPTURE: grep -F 'soft-landing' /tmp/sbproxy-predictive-budget.log -->
 
-The `budget_soft_landing` tag is on the usage record and nowhere else: not on the response, not in metrics, not in the access log. A sink is the only way to query which requests were degraded:
+The `budget_soft_landing` tag is on the usage record and nowhere else: not on the response, not in metrics, not in the access log. A sink is the only way to query which requests were degraded. Only the downgrade band is tagged, because only a downgraded request was changed; a warn-band request is dispatched as sent and shows up in the log above and nowhere here:
 
 ```bash
 python3 -c 'import json; [print(json.dumps({k: json.loads(l).get(k) for k in ("model","tag","cost_usd")})) for l in open("/tmp/sbproxy-predictive-budget-usage.jsonl") if json.loads(l).get("tag")]'

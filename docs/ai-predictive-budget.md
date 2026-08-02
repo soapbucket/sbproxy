@@ -61,6 +61,11 @@ the degradation is queryable in the spend history. Nothing is stamped on
 the response: there is no header for a warn or a downgrade, and the only
 signal a client sees is the model the upstream was actually handed.
 
+Only the downgrade band is tagged. A warn-band request is dispatched
+exactly as it was sent, so it leaves nothing behind on the usage record and
+a tag query will not find it. The warn log line is the only place it shows,
+which is why the two bands are read from different surfaces below.
+
 The bands run on the chat and completions dispatch path. Other AI surfaces
 and realtime run the hard pre-flight only, so they block at the cap with no
 warn band and no downgrade.
@@ -83,8 +88,11 @@ model back, which is what makes the rewrite visible from the client.
 
 ```bash
 python3 examples/ai-predictive-budget/fixture.py &
-make run CONFIG=examples/ai-predictive-budget/sb.yml
+make run CONFIG=examples/ai-predictive-budget/sb.yml 2>&1 | tee /tmp/sbproxy-predictive-budget.log
 ```
+
+The proxy logs to stderr and writes no log file of its own, so the `tee` is
+what gives the `grep` further down something to read. Nothing else needs it.
 
 The four bands, with the fraction the gateway compared each threshold
 against:
