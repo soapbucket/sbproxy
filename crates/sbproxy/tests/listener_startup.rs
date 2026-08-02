@@ -24,6 +24,68 @@ fn temp_dir(label: &str) -> PathBuf {
 }
 
 #[test]
+fn a_configured_bind_address_reaches_the_listener() {
+    // WOR-2199. The only test that can tell the difference between
+    // formatting proxy.bind_address into a string and the listener
+    // actually binding it. Occupy loopback specifically, configure
+    // loopback specifically, and require the startup failure to name
+    // it: a proxy still binding 0.0.0.0 would not collide with a
+    // loopback-only holder on most hosts, and would start clean.
+    let occupied = TcpListener::bind("127.0.0.1:0").expect("occupy ephemeral loopback port");
+    let port = occupied.local_addr().expect("occupied address").port();
+    let root = temp_dir("bind-address");
+    let config = root.join("sb.yml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"proxy:
+  http_bind_port: {port}
+  bind_address: 127.0.0.1
+origins:
+  "listener.test":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: ok
+"#
+        ),
+    )
+    .expect("write bind-address config");
+
+    let mut child = Command::new(binary())
+        .arg("serve")
+        .arg(&config)
+        .env_remove("SB_CONFIG_FILE")
+        .env("SBPROXY_ENGINE_OWNERSHIP_DIR", root.join("ownership"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start sbproxy");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll sbproxy") {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("sbproxy did not exit after binding an occupied loopback port");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let output = child.wait_with_output().expect("collect sbproxy output");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!status.success(), "occupied listener must exit nonzero");
+    assert!(
+        stderr.contains(&format!("127.0.0.1:{port}")),
+        "the failure must name the configured address, not 0.0.0.0: {stderr}"
+    );
+    drop(occupied);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn occupied_public_listener_fails_startup_with_address_and_cause() {
     let occupied = TcpListener::bind("0.0.0.0:0").expect("occupy ephemeral public port");
     let port = occupied.local_addr().expect("occupied address").port();

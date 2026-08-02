@@ -1530,6 +1530,11 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         }
     }
 
+    // WOR-2199: a bind address the operator cannot express is a bind
+    // address they cannot restrict, and one they misspell must not fall
+    // back to every interface.
+    config_file.proxy.validate_bind_address()?;
+
     Ok(CompiledConfig {
         origins,
         host_map,
@@ -3631,6 +3636,47 @@ origins:
         assert_eq!(origin.allowed_methods.len(), 2);
         assert!(origin.allowed_methods.contains(&http::Method::GET));
         assert!(origin.allowed_methods.contains(&http::Method::POST));
+    }
+
+    #[test]
+    fn a_malformed_bind_address_fails_config_load() {
+        // WOR-2199. Rejected at compile, not at bind: a proxy that
+        // starts and then cannot listen has already told the operator
+        // it was fine, and one that silently falls back to every
+        // interface is the bug this field exists to prevent.
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+  bind_address: "127.0.0.999"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: http://localhost:3000
+"#;
+        let err = compile_config(yaml)
+            .err()
+            .expect("a malformed bind address must not compile");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("bind_address"), "{msg}");
+        assert!(msg.contains("127.0.0.999"), "{msg}");
+    }
+
+    #[test]
+    fn an_absent_bind_address_still_binds_every_interface() {
+        // The compatibility half of the same change. Every config
+        // written before this field existed must keep the reach it had.
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: http://localhost:3000
+"#;
+        let compiled = compile_config(yaml).expect("config without the field compiles");
+        assert_eq!(compiled.server.effective_bind_address(), "0.0.0.0");
     }
 
     #[test]

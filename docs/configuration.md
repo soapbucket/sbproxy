@@ -310,6 +310,7 @@ proxy:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `http_bind_port` | int | 8080 | HTTP listen port |
+| `bind_address` | string | `0.0.0.0` | Address the public HTTP and HTTPS listeners bind. See [Choosing a bind address](#choosing-a-bind-address). |
 | `http2_cleartext` | bool | false | Enable h2c on the plain HTTP listener for plaintext HTTP/2 and gRPC clients. |
 | `https_bind_port` | int | unset | Optional HTTPS listen port. Requires `tls_cert_file` + `tls_key_file` or an `acme` block. |
 | `tls_cert_file` | string | | Path to PEM-encoded TLS certificate. Ignored when `acme` is configured. |
@@ -342,6 +343,31 @@ proxy:
 | `tenants` | list | `[]` | Declared tenants referenced by `origins.*.tenant_id`. |
 | `credentials` | list | `[]` | Proxy-scope credentials inherited by tenant and origin scopes. |
 | `extensions` | object | | Opaque map for out-of-tree top-level config blocks. The proxy never parses them. |
+
+### Choosing a bind address
+
+`bind_address` is the network interface the public listeners answer on. It applies to `http_bind_port` and `https_bind_port` together, on purpose: two separate fields would let you lock down HTTP, leave HTTPS on every interface, and believe the box was closed.
+
+```yaml
+proxy:
+  http_bind_port: 8080
+  bind_address: 0.0.0.0     # default: every interface
+```
+
+| Value | Who can reach the listener |
+|-------|---------------------------|
+| `0.0.0.0` | Anything that can route to this host, on any interface. The default, because a reverse proxy is usually deployed to be reached. |
+| `127.0.0.1` | Only processes on this machine. |
+| `10.0.1.5` | Only traffic arriving on that interface. |
+| `::1`, or any IPv6 literal | The IPv6 equivalents. |
+
+The value must be an IP literal. Hostnames are refused at config load, because a name can resolve to several addresses or to a different one after a DNS change, and a listener that quietly moves between interfaces is not one you can reason about.
+
+A malformed address is also refused at config load rather than warned past. That is deliberate: the failure worth preventing is an operator restricting the listener, mistyping it, and getting every interface while believing otherwise. There is no safe direction to guess in.
+
+**This is reach, not authorization.** Binding loopback limits who can open a connection. It does not authenticate anyone who can. An origin exposed on a shared host is still exposed to every process on it, and `origins:` hostname matching is not a substitute either, since the `Host` header is set by the caller.
+
+`sbproxy run` and `sbproxy service install` generate `bind_address: 127.0.0.1`. Those commands configure one machine to serve itself, their generated `origins:` map is keyed on loopback names, and the URL they print at startup is a loopback URL. Binding every interface there would publish an unauthenticated model gateway to the network while telling you it was local. To serve other machines, write a config and set `bind_address` yourself, which makes it a decision rather than a default.
 
 ### HTTP client timeouts
 
