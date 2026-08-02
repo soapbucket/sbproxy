@@ -28,9 +28,21 @@ Each entry in the manifest carries:
 - `url` - relative, path-absolute, or fully-qualified.
 - `digest` - `sha256:<lowercase-hex>` of the artifact body.
 
-URLs are resolved per RFC 3986 against the request authority at serve
-time, so the manifest's URLs stay portable across hostnames and
-schemes.
+A `url` is resolved at serve time against the request authority, so
+the manifest stays portable across hostnames and schemes. A relative
+`url` and a path-absolute one name the same artifact and resolve to
+the same address; a fully-qualified `url` is emitted verbatim and is
+not re-hosted.
+
+Where a re-hosted artifact lands depends on which surface serves the
+manifest. The `agent_skills:` block below re-hosts at the bare path,
+so `skills/deploy-via-pr.md` and `/skills/deploy-via-pr.md` both
+advertise `https://<host>/skills/deploy-via-pr.md`. The same entry
+shape under a Listing's `spec.skills[]` re-hosts under that Listing's
+own segment instead, so both spellings advertise
+`https://<host>/.well-known/agent-skills/<listing>/skills/deploy-via-pr.md`.
+Either way the URL the manifest publishes is the URL the proxy
+answers.
 
 ## Configuration
 
