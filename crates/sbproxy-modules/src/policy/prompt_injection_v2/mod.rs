@@ -375,7 +375,12 @@ impl PromptInjectionV2Policy {
         }
     }
 
-    /// Override the score threshold. Used by tests.
+    /// Override the score threshold.
+    ///
+    /// Test-only: the production path takes the threshold from config, so
+    /// this is gated out of release builds rather than left for the reader
+    /// to discover from its callers.
+    #[cfg(test)]
     pub(crate) fn with_threshold(mut self, threshold: f64) -> Self {
         self.threshold = threshold;
         self
