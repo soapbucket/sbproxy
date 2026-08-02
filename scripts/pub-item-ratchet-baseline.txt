@@ -65,4 +65,22 @@
 # the x402 challenge renderer and header codecs, the Payment Auth
 # challenge binder and credential selector, and the CLN challenge
 # fields.
+#
+# Raised to 314 on WOR-2081, 2026-08-01, and this one is a measurement
+# correction rather than new write-only code. Deleting the unwired
+# `sbproxy-cache/src/two_tier.rs` removed five candidates, but all five
+# carried a recorded `escalated` verdict, so none of them were ever
+# counted in this number. What the deletion did change is the textual
+# match this scan is built on: `two_tier.rs` defined its own
+# `with_threshold`, and because the scan counts an identifier as
+# referenced when the word appears in any non-test file, that unrelated
+# definition was standing in as a production reference for
+# `prompt_injection_v2::with_threshold` in sbproxy-modules. Both of that
+# item's real callers are inside `#[cfg(test)]` blocks
+# (`prompt_injection_v2/mod.rs` and `body_aware.rs`), so it has been
+# tests-only all along and the scan simply could not see it.
+#
+# The number going up here means the scan got more accurate, not that
+# the workspace got worse. Narrowing that builder is a separate change
+# against sbproxy-modules and is not bundled into a cache deletion.
 313

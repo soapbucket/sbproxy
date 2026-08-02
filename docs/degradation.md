@@ -441,4 +441,4 @@ See [`examples/service-discovery/sb.yml`](../examples/service-discovery/sb.yml).
 
 ## Extension points
 
-The OSS code base reserves opaque `extensions` blocks at both the proxy and origin level so third-party crates can read their own keys without OSS needing to know about them. `Hooks` slots are `Option<Arc<dyn TraitName>>`; the OSS binary leaves them `None` and the request path falls through unannotated. Plugin crates can register concrete implementations through the `sbproxy-plugin` registry.
+The code base reserves opaque `extensions` blocks at both the proxy and origin level so out-of-tree crates can read their own keys without the proxy needing to know about them. `Hooks` slots are `Option<Arc<dyn TraitName>>`; the shipped binary leaves them `None` and the request path falls through unannotated. Plugin crates can register concrete implementations through the `sbproxy-plugin` registry.

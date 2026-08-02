@@ -1,6 +1,6 @@
 # SBproxy architecture and deployment guide
 
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-02*
 
 This document covers the internal architecture of SBproxy, the request lifecycle, the plugin
 system, the AI gateway, caching, events, and common deployment topologies.
@@ -402,7 +402,7 @@ pipeline retains its old cache scope.
 instruction prefix, newest protocol unit, contiguous recent suffix, and tool
 call/result groups. `query_select` ranks marked text sentences against the
 marked query without external state. `token_prune` uses a shared lazy client to
-an OSS classifier sidecar, validates its extractive result, and fails open at
+the classifier sidecar, validates its extractive result, and fails open at
 the lever boundary. `summary_buffer` defaults to a process-owned Local redb
 store and accepts explicit Redis or mesh state. Redis serializes updates across
 processes; mesh uses the replicated substrate's eventual last-writer-wins

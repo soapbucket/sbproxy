@@ -4,7 +4,7 @@
 Successor to the v1 `prompt_injection` heuristic guardrail. The v2
 policy splits *detection* from *enforcement*: a swappable detector
 returns a numeric score plus a categorical label, and the policy maps
-the score onto an action. The OSS build includes heuristic, in-process
+the score onto an action. The binary includes heuristic, in-process
 ONNX, and sidecar detectors. When `detector` is omitted, SBproxy uses a
 verified in-process model if a complete artifact pair is staged and
 otherwise logs one startup event and uses the heuristic.
@@ -50,12 +50,12 @@ pub trait Detector: Send + Sync + 'static {
 request hot path. Async work or remote calls belong in a wrapper that
 pre-loads state at startup, not in `detect` itself.
 
-## Registered detectors (OSS build)
+## Registered detectors
 
 | Name | Description |
 |------|-------------|
 | `heuristic-v1` | Case-insensitive substring matching against the OWASP-LLM-01 vocabulary plus a small "suspicious" cue list. Explicit choice and the no-artifact auto fallback. |
-| `sidecar` | Runs inference in a separate process over gRPC instead of in the proxy. The proxy holds one client; the sidecar (minimal OSS or richer enterprise) implements the shared `InferenceService`. Isolates the model runtime so a bad model cannot exhaust the proxy. Fail-open by default. See [Running detection out of process](#running-detection-out-of-process-the-sidecar-detector). |
+| `sidecar` | Runs inference in a separate process over gRPC instead of in the proxy. The proxy holds one client; the sidecar implements the shared `InferenceService`. Isolates the model runtime so a bad model cannot exhaust the proxy. Fail-open by default. See [Running detection out of process](#running-detection-out-of-process-the-sidecar-detector). |
 | `inprocess` | Runs the ONNX classifier inside the proxy via the pure-Rust tract engine. It can be selected explicitly or automatically when `detector` is omitted and a complete verified pair is staged. Prefer `sidecar` for process isolation. See [In-process detection](#in-process-detection-the-inprocess-detector). |
 
 ### In-process detection (the `inprocess` detector)
@@ -63,8 +63,8 @@ pre-loads state at startup, not in `detect` itself.
 For a single binary, run the ONNX classifier in the proxy. SBproxy
 checks regular-file/readability constraints, the model and tokenizer
 size budgets, mandatory SHA-256 pins, optional detached Ed25519
-signatures, and only then parses either artifact. OSS ships no
-prompt-injection weights.
+signatures, and only then parses either artifact. No prompt-injection
+weights ship with it.
 
 ```yaml
 policies:
@@ -185,7 +185,7 @@ classifier lands.
 
 ## In-process vs out-of-process model inference
 
-The OSS build ships two ways to run a learned classifier alongside the
+SBproxy ships two ways to run a learned classifier alongside the
 heuristic detector. `detector: sidecar` runs the model out of process
 behind a gRPC contract and is the preferred choice: a malformed or
 oversized model can only take down the sidecar, not the proxy.
@@ -194,7 +194,7 @@ the proxy address space; omission can also select it through the
 verified artifact rules above. The legacy `detector: onnx` name was
 removed and fails at config load with a pointer to supported choices.
 
-The trained model weights do not ship in OSS. The registry intentionally
+The trained model weights do not ship at all. The registry intentionally
 has no trusted `prompt-injection-v2` entry: the audited first-party
 Apache-2.0 candidates exceeded the unchanged 200 MiB default limit,
 while smaller community exports lacked sufficient license or artifact
@@ -205,7 +205,7 @@ The eval gate (precision and recall >= 0.7 against the bundled golden
 corpora) is opt-in: the test at
 `crates/sbproxy-modules/tests/prompt_injection_eval.rs` is marked
 `#[ignore]` and only runs when invoked with `-- --ignored`, so the
-default OSS test suite does not exercise it.
+default test suite does not exercise it.
 
 ## Running detection out of process: the sidecar detector
 
@@ -216,14 +216,11 @@ and returns a label and score. Because the proxy and the model runtime
 do not share an address space, a bad model takes down the sidecar (which
 an orchestrator restarts) rather than the proxy.
 
-Two sidecars implement the same contract:
-
-- The minimal OSS sidecar (`sbproxy-classifier-sidecar`) wraps the
-  `tract-onnx` engine.
-- The enterprise sidecar adds batching, GPU execution providers, and a
-  model registry behind the identical proto.
-
-Switching between them is a deployment change, not a config change.
+The sidecar that ships here, `sbproxy-classifier-sidecar`, wraps the
+`tract-onnx` engine. The proto is the whole contract, so any process
+implementing `InferenceService` can stand in its place: pointing the
+proxy at a build of your own, with batching or a GPU execution
+provider, is a deployment change rather than a config change.
 
 ### Config
 
@@ -284,11 +281,11 @@ exactly like a sidecar that is down; it is never interpreted as a clean
 verdict. Labels are ordered highest score first after validation, so
 the verdict does not depend on the order the sidecar sent them in.
 
-### Running the OSS sidecar
+### Running the sidecar
 
-The sidecar is a separate binary built from this workspace. The OSS
-build does not ship model weights; supply your own reviewed ONNX file
-and matching tokenizer:
+The sidecar is a separate binary built from this workspace. It ships no
+model weights; supply your own reviewed ONNX file and matching
+tokenizer:
 
 ```bash
 cargo run -p sbproxy-classifier-sidecar -- \
@@ -425,7 +422,7 @@ in YAML yet; the wire-up is in code (the proxy holds the
 supervisor next to the lazy client and drives both from the
 same config block).
 
-## What the OSS scaffold scans
+## What the scaffold scans
 
 The scaffold runs detection at request-filter time on the request URI
 plus all non-auth headers. Tag mode stamps the score / label headers

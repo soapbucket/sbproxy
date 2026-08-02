@@ -51,7 +51,7 @@ For human-facing documentation, see `docs/architecture.md`, `docs/configuration.
 ## Audit
 
 - admin_audit_envelope: typed `AdminAuditEvent` carrying actor, action, target, before/after diff, reason, request_id, trace_id, ip, and user_agent; emitted by every state-mutating endpoint.
-- admin_audit_log_sink: OSS deployments emit audit events through the structured-log audit sink.
+- admin_audit_log_sink: audit events are emitted through the structured-log audit sink.
 - audit_envelope_versioning: the `AdminAuditEvent` schema is forward-compatible.
 
 ## Webhooks

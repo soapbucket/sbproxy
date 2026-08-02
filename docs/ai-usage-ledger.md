@@ -1,5 +1,5 @@
 # Verifiable usage ledger
-*Last modified: 2026-06-24*
+*Last modified: 2026-08-02*
 
 The usage ledger turns the stream of completed LLM calls into a
 tamper-evident, optionally signed record. Where a plain usage sink ships
@@ -9,9 +9,10 @@ past record breaks every link after it, and with a signing seed configured
 each entry is Ed25519-signed so the record is attributable to the proxy
 that wrote it.
 
-This is open source. Anchoring receipts to an external transparency log or
-a reporting portal is an enterprise extension that consumes the same
-entries.
+All of this ships in the Apache-2.0 binary. The proxy writes the chain and
+verifies it. It does not publish entries to an external transparency log or
+a reporting portal, so anchoring to one is something you build on top of
+the same entries.
 
 ## How it works
 

@@ -1,6 +1,6 @@
 # SBproxy documentation
 
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-02*
 
 SBproxy is an open source Enterprise AI Gateway for API, MCP and agent, and AI model traffic. Every feature in this repository ships under Apache-2.0.
 
@@ -104,7 +104,7 @@ Point a framework you already run at the gateway: chat completions through the O
 - [secrets.md](secrets.md) - vault backend setup for HashiCorp Vault, AWS Secrets Manager, and Kubernetes Secrets.
 - [multi-tenant.md](multi-tenant.md) - when to use the multi-tenant shape, the three scopes, isolation guarantees, the synthetic `__default__` tenant.
 - [operator-runbook.md](operator-runbook.md) - dashboard triage and rollback actions.
-- [threat-model.md](threat-model.md) - OSS trust boundaries and per-wave review checklist.
+- [threat-model.md](threat-model.md) - trust boundaries and per-wave review checklist.
 - [events.md](events.md) - the event bus, callback hooks, and emitted event types.
 - [openapi-emission.md](openapi-emission.md) - publishing an OpenAPI 3.0 document from the live config.
 - [policy.md](policy.md) - the policy engine, the `semantic_constraint` policy, and the `request_validator`, `concurrent_limit`, `rate_limit_budget`, `http_framing`, and `a2a` policy reference.
@@ -117,7 +117,7 @@ Point a framework you already run at the gateway: chat completions through the O
 - [upgrade.md](upgrade.md) - migration notes between releases.
 - [mesh-replication.md](mesh-replication.md) - the replicated cluster-state substrate: replication factor, read/write consistency, durable restart, handoff, anti-entropy, and the tombstone deletion protocol.
 - [quickstart-operator.md](quickstart-operator.md) - first 24 hours running the Kubernetes operator.
-- [kubernetes.md](kubernetes.md) - the OSS Kubernetes operator and its CRDs.
+- [kubernetes.md](kubernetes.md) - the Kubernetes operator and its CRDs.
 - [sidecar-deployment.md](sidecar-deployment.md) - running sbproxy as a per-pod sidecar: traffic capture (iptables / eBPF), service-mesh integration (Istio, Linkerd), and the kustomize overlay under `deploy/k8s/sidecar/`.
 
 ## Reference

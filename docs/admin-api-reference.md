@@ -1,6 +1,6 @@
 # Admin API reference
 
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-02*
 
 The embedded admin server publishes the full control-plane HTTP surface for
 operator tooling: liveness probes, session login, key and credential
@@ -1380,7 +1380,7 @@ installed.
 A few subsystems are allowed to fail without refusing the reload,
 because a stale AI catalog is better than a proxy pinned on an old
 config: the AI provider registry, the dynamic key plane, the listings
-registry, the sink dispatcher, and the enterprise reload hook. When one
+registry, the sink dispatcher, and the pipeline lifecycle hook. When one
 of them fails, the swap still happens, `fully_applied` is `false`, and
 `degraded` names what did not take effect:
 

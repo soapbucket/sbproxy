@@ -1,8 +1,8 @@
 # SBproxy threat model
 
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-02*
 
-This is the OSS threat-model companion to [`operator-runbook.md`](operator-runbook.md).
+This is the threat-model companion to [`operator-runbook.md`](operator-runbook.md).
 It records the operator-facing assumptions that should be revisited at the end
 of each implementation wave.
 
@@ -36,7 +36,7 @@ of each implementation wave.
   allow.
 - **Build supply chain:** the reproducible-build probe is informational until
   binary diffs are driven to zero.
-- **Upstream TLS verification:** the OSS build relies on the rustls verifier
+- **Upstream TLS verification:** SBproxy relies on the rustls verifier
   defaults that ship with Pingora, validating upstream certificates against
   the system CA bundle in the runtime image. Pin-by-SPKI is not implemented.
   Operators who need stricter assurance for sensitive upstreams should

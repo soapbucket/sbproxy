@@ -1,8 +1,8 @@
 # SBproxy events
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-02*
 
-SBproxy has a small in-process event bus in `sbproxy-observe`. It defines a closed set of typed lifecycle events and a bus that code-level embedders publish to and register handler closures against. The shipped `sbproxy` binary does not publish to a global bus today; its own request telemetry flows through the `sbproxy_*` Prometheus metrics, the access log, and the request-event sink. The bus is the seam for embedders building on the workspace crates. Nothing crosses the process boundary; OSS has no webhook, file, or Lua sink.
+SBproxy has a small in-process event bus in `sbproxy-observe`. It defines a closed set of typed lifecycle events and a bus that code-level embedders publish to and register handler closures against. The shipped `sbproxy` binary does not publish to a global bus today; its own request telemetry flows through the `sbproxy_*` Prometheus metrics, the access log, and the request-event sink. The bus is the seam for embedders building on the workspace crates. Nothing crosses the process boundary; there is no webhook, file, or Lua sink.
 
 ## Event types
 
@@ -22,7 +22,7 @@ SBproxy has a small in-process event bus in `sbproxy-observe`. It defines a clos
 | `guardrail_triggered` | An AI guardrail flagged or blocked content. |
 | `config_reloaded` | The proxy configuration reloaded successfully. |
 
-Circuit-breaker activity is a metric in OSS (`sbproxy_circuit_breaker_transitions_total`), not an event. See [metrics-stability.md](metrics-stability.md).
+Circuit-breaker activity is a metric (`sbproxy_circuit_breaker_transitions_total`), not an event. See [metrics-stability.md](metrics-stability.md).
 
 The three AI variants (`provider_selected`, `budget_exceeded`, `guardrail_triggered`) name AI-gateway moments, but the shipped AI path records those through the `sbproxy_ai_*` metrics and the [usage ledger](ai-usage-ledger.md) rather than through this bus. Use the enum variants when your embedding code publishes its own events; use the metrics and ledger when you want the gateway's built-in accounting.
 
@@ -62,7 +62,7 @@ Handlers run on the publisher's thread, so a slow or panicking handler stalls th
 
 ## No `events:` YAML block
 
-The OSS bus is a code-level extension point, so there is no `events:` config. Webhook, file, and Lua sinks are tracked under the enterprise roadmap; the YAML block lands with them.
+The bus is a code-level extension point, so there is no `events:` config. Webhook, file, and Lua sinks are not implemented; the YAML block lands with them.
 
 ## See also
 

@@ -588,7 +588,7 @@ The sliding window is one minute, shared across all configured origins
 (state is process-global). Realtime runs configured hard-budget admission
 before its WebSocket upgrade, but the byte-transparent relay does not inspect
 or charge individual frames. Frame-derived audio or token caps therefore
-remain unavailable on the OSS path.
+remain unavailable.
 
 ## Guardrails
 
@@ -1495,7 +1495,7 @@ Per-surface knobs live under `per_surface_rate_limits` (see [Per-surface rate li
 
 ### Reranking
 
-`reranking` ships in the OSS build. It classifies the surface, dispatches it when a configured provider supports it (Cohere today), and captures the request's document count for per-unit billing. When no configured provider supports reranking, the proxy returns 501 before any upstream call, the same as every other surface.
+`reranking` ships. It classifies the surface, dispatches it when a configured provider supports it (Cohere today), and captures the request's document count for per-unit billing. When no configured provider supports reranking, the proxy returns 501 before any upstream call, the same as every other surface.
 
 ## Reasoning policy
 
@@ -1618,7 +1618,7 @@ OpenAI/Anthropic tool-call groupings.
 Marked retrieval blocks can run a quality-first fallback sequence:
 `query_select`, `token_prune`, then `window_fit`. The first lever is local and
 deterministic. The second calls an operator-supplied
-LLMLingua-2-compatible ONNX model through the OSS classifier sidecar. If the
+LLMLingua-2-compatible ONNX model through the classifier sidecar. If the
 query has no usable sentence, the sidecar is down, or its response fails
 validation, later levers still receive the last valid message list.
 
@@ -2014,7 +2014,7 @@ The proxy exposes aggregate AI usage as Prometheus metrics. The `/metrics` endpo
 | `sbproxy_ai_budget_utilization_ratio` | Gauge | `scope` | Current budget utilization as a 0 to 1 ratio |
 | `sbproxy_ai_realtime_sessions_active` | Gauge | | Currently open OpenAI Realtime API WebSocket sessions |
 | `sbproxy_ai_realtime_session_duration_seconds` | Histogram | `provider`, `close_reason` | Wall-clock duration of a Realtime WebSocket session, observed at close. `close_reason` is `client_closed` or `error` |
-| `sbproxy_ai_realtime_audio_seconds_total` | Counter | `provider`, `direction` | Cumulative audio seconds forwarded over Realtime sessions. Frame-exact accounting requires terminate-and-relay (not on the OSS path); the OSS dispatcher uses session wall-clock as a duration proxy on close |
+| `sbproxy_ai_realtime_audio_seconds_total` | Counter | `provider`, `direction` | Cumulative audio seconds forwarded over Realtime sessions. Frame-exact accounting requires terminate-and-relay, which is not implemented; the dispatcher uses session wall-clock as a duration proxy on close |
 | `sbproxy_ai_realtime_frames_forwarded_total` | Counter | `provider`, `direction`, `kind` | Cumulative frames forwarded over Realtime sessions (`kind` is `text` or `audio`). A future terminate-and-relay implementation would add per-frame inspection. |
 
 Use these to build spending dashboards, set budget alerts, and track provider reliability without any application-level instrumentation.
@@ -2181,7 +2181,7 @@ What runs during the session:
 What runs at session close (the `logging` hook):
 - For an accepted session, the active-sessions gauge ticks down.
 - `sbproxy_ai_realtime_session_duration_seconds` records the wall-clock session lifetime.
-- An `AiBillingEvent` fires with `usage = AudioSeconds { seconds = wall_clock }` so operators see realtime usage on the standard billing event bus. Cost is reported as 0.0 in OSS until the realtime rate card lands in the pricing helper; downstream consumers can compute cost from the duration.
+- An `AiBillingEvent` fires with `usage = AudioSeconds { seconds = wall_clock }` so operators see realtime usage on the standard billing event bus. Cost is reported as 0.0 until the realtime rate card lands in the pricing helper; downstream consumers can compute cost from the duration.
 
 ```yaml
 origins:

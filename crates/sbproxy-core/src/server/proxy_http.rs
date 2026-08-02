@@ -57,9 +57,15 @@ fn emit_graphql_validated_request_body(
 /// into a local buffer must leave an empty chunk in the slot. Leaving
 /// `None` ends the upstream body at whatever bytes were already
 /// forwarded and the upstream sees a silently truncated request
-/// (WOR-2138). Every buffering branch that consumes a chunk before
-/// end-of-stream goes through this function rather than writing the
-/// slot directly.
+/// (WOR-2138; the gRPC transcode and gRPC-Web branches had the same
+/// fault, fixed in WOR-2163). Every buffering branch that consumes a
+/// chunk before end-of-stream goes through this function rather than
+/// writing the slot directly.
+///
+/// Both upstream legs drop the empty chunk rather than writing it, so
+/// holding costs nothing on the wire: `proxy_h1::send_body_to_upstream`
+/// and `proxy_h2::send_body_to2` each return early when the slot holds
+/// an empty chunk and the stream has not ended.
 fn hold_request_body_chunk(body: &mut Option<Bytes>) {
     *body = Some(Bytes::new());
 }
@@ -3773,6 +3779,13 @@ impl ProxyHttp for SbProxy {
                     }
                     if !buffered.is_empty() {
                         *body = Some(buffered.freeze());
+                    } else if !end_of_stream {
+                        // Nothing accumulated to release, but the take
+                        // above emptied the slot and `None` would end
+                        // the upstream body here (WOR-2163). At
+                        // end-of-stream `None` is the right answer and
+                        // this arm is skipped.
+                        hold_request_body_chunk(body);
                     }
                 }
             }
@@ -3788,6 +3801,13 @@ impl ProxyHttp for SbProxy {
         // `:path` and headers were already rewritten. A malformed body is
         // rejected without contacting the upstream. (An unmapped REST path
         // is rejected earlier, in `handle_action`.)
+        //
+        // WOR-2163: this is a buffer-then-release branch like the two
+        // above, so a mid-stream chunk consumed into the accumulator has
+        // to leave an empty chunk behind (see `hold_request_body_chunk`).
+        // A REST body large enough to arrive in several chunks otherwise
+        // ended the upstream request body on the first one, and the
+        // gRPC upstream received a request with no message frame at all.
         if ctx.transcode_active {
             let buf = ctx
                 .request_body_buf
@@ -3858,6 +3878,12 @@ impl ProxyHttp for SbProxy {
                         ));
                     }
                 }
+            } else {
+                // The chunk above went into the accumulator; the slot
+                // must carry an empty chunk rather than `None` so the
+                // upstream body stays open for the framed message this
+                // branch emits at end-of-stream.
+                hold_request_body_chunk(body);
             }
             return Ok(());
         }
@@ -3868,6 +3894,12 @@ impl ProxyHttp for SbProxy {
         // it into native gRPC message frames (base64-decoding the `-text`
         // variant). The upstream `:path`/method/content-type were already
         // set to the native gRPC shape in `upstream_request_filter`.
+        //
+        // WOR-2163: same buffer-then-release rule as the transcode branch
+        // above. A gRPC-Web frame big enough to span several inbound
+        // chunks must not leave the slot `None` mid-stream, or the native
+        // gRPC upstream sees the request body end before the de-framed
+        // message is written.
         if ctx.grpc_web_active {
             let buf = ctx
                 .request_body_buf
@@ -3899,6 +3931,12 @@ impl ProxyHttp for SbProxy {
                         ));
                     }
                 }
+            } else {
+                // The chunk above went into the accumulator; the slot
+                // must carry an empty chunk rather than `None` so the
+                // upstream body stays open for the de-framed message
+                // this branch emits at end-of-stream.
+                hold_request_body_chunk(body);
             }
             return Ok(());
         }

@@ -1,6 +1,6 @@
 # MCP gateway
 
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-02*
 
 SBproxy ships an MCP (Model Context Protocol) gateway that speaks
 JSON-RPC 2.0 over HTTP POST. Configure the `mcp` action on an origin
@@ -545,12 +545,12 @@ OpenAPI section above). Source:
 
 ### Prompt-linked audit
 
-When a subscriber is attached to the `mcp_audit` tracing target (the
-enterprise audit layer), each `tools/call` emits an `mcp_audit` event
-carrying the tool name, arguments, the SEP-1865 `params.audit.cause`
-when present, the upstream status, and the duration. The event is
-gated on that subscriber, so an OSS-only deployment pays nothing;
-there is no separate YAML knob. The per-call spend and behavioural
+When a subscriber is attached to the `mcp_audit` tracing target, each
+`tools/call` emits an `mcp_audit` event carrying the tool name,
+arguments, the SEP-1865 `params.audit.cause` when present, the upstream
+status, and the duration. The event is gated on that subscriber, so a
+deployment that attaches none pays nothing; there is no separate YAML
+knob. The per-call spend and behavioural
 record live in the session ledger below, not this event. Source:
 `emit_mcp_prompt_audit` in
 `crates/sbproxy-core/src/server/action_dispatch.rs`.

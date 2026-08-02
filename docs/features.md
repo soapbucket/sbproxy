@@ -1,6 +1,6 @@
 # SBproxy features manual
 
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-02*
 
 The capability tour: each section covers what a feature does, a minimal config to turn it on, and a working example against `test.sbproxy.dev`, with a link to the doc that owns the full reference. Installation and runtime operations live in [manual.md](manual.md); the complete field schema lives in [configuration.md](configuration.md).
 
@@ -567,7 +567,7 @@ curl -H "Host: api.test.sbproxy.dev" \
 
 #### Rule feed
 
-The OSS WAF can subscribe to a remote feed that publishes signed rule bundles. The proxy downloads, verifies, and hot-loads bundles in the background; in-flight requests see a stable snapshot. This lets operators ship updated detection signatures without redeploying.
+The WAF can subscribe to a remote feed that publishes signed rule bundles. The proxy downloads, verifies, and hot-loads bundles in the background; in-flight requests see a stable snapshot. This lets operators ship updated detection signatures without redeploying.
 
 The subscriber documented below is in the proxy. Operators provide the service that
 signs and serves rule bundles.
@@ -702,7 +702,7 @@ The `security_audit` channel is separate from the operational log; route it to a
 
 #### Recommended configuration
 
-The policy ships off by default in OSS. Enable on every public-facing origin:
+The policy ships off by default. Enable on every public-facing origin:
 
 ```yaml
 origins:
@@ -1030,7 +1030,7 @@ response_cache:
 ### Implementation: Vary, query normalization, SWR, mutation invalidation
 
 The Rust pipeline ships a subset of the schema above with concrete
-runtime semantics. The fields below are live in OSS today and pinned
+runtime semantics. The fields below are live today and pinned
 by `e2e/tests/cache_response.rs`.
 
 #### `vary`
