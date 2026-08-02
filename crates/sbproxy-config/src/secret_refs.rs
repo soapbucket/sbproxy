@@ -334,9 +334,10 @@ origins:
     #[test]
     fn undeclared_backend_fails_compile_with_the_field_path() {
         let yaml = ai_config("", "secret://no-such-backend/openai-prod");
-        let error = compile_config(&yaml)
-            .expect_err("a reference to an undeclared backend must not compile")
-            .to_string();
+        let Err(error) = compile_config(&yaml) else {
+            panic!("a reference to an undeclared backend must not compile");
+        };
+        let error = error.to_string();
         assert!(
             error.contains("origins.api.example.com.action.providers[0].api_key"),
             "the error must name the field path: {error}"
@@ -352,9 +353,10 @@ origins:
     #[test]
     fn declared_backend_of_the_wrong_kind_fails_compile() {
         let yaml = ai_config(HASHICORP_BACKEND, "secret://cache/openai-prod");
-        let error = compile_config(&yaml)
-            .expect_err("`secret://` must not resolve against a hashicorp backend")
-            .to_string();
+        let Err(error) = compile_config(&yaml) else {
+            panic!("`secret://` must not resolve against a hashicorp backend");
+        };
+        let error = error.to_string();
         assert!(
             error.contains("hashicorp") && error.contains("local"),
             "the error must contrast the declared type with the required one: {error}"
@@ -370,9 +372,10 @@ origins:
     #[test]
     fn secret_scheme_with_an_env_authority_points_at_the_environment_form() {
         let yaml = ai_config("", "secret://env/OPENAI_API_KEY");
-        let error = compile_config(&yaml)
-            .expect_err("`secret://env/NAME` must not compile")
-            .to_string();
+        let Err(error) = compile_config(&yaml) else {
+            panic!("`secret://env/NAME` must not compile");
+        };
+        let error = error.to_string();
         assert!(
             error.contains("not the environment form"),
             "the error must say the shape is not the environment form: {error}"
@@ -387,9 +390,10 @@ origins:
     #[test]
     fn secret_scheme_with_a_file_authority_points_at_the_file_form() {
         let yaml = ai_config("", "secretfile://file/etc/sbproxy/openai");
-        let error = compile_config(&yaml)
-            .expect_err("`secretfile://file/...` must not compile")
-            .to_string();
+        let Err(error) = compile_config(&yaml) else {
+            panic!("`secretfile://file/...` must not compile");
+        };
+        let error = error.to_string();
         assert!(
             error.contains("not the file form") && error.contains("file:/etc/sbproxy/openai"),
             "the error must point at the file form: {error}"
@@ -439,9 +443,10 @@ origins:
         compile_config(&ai_config(declared, "vault://aws/prod/openai-key"))
             .expect("`vault://aws/...` resolves against an `aws` backend named `aws`");
 
-        let error = compile_config(&ai_config("", "vault://aws/prod/openai-key"))
-            .expect_err("`vault://aws/...` must not compile without that backend")
-            .to_string();
+        let Err(error) = compile_config(&ai_config("", "vault://aws/prod/openai-key")) else {
+            panic!("`vault://aws/...` must not compile without that backend");
+        };
+        let error = error.to_string();
         assert!(
             error.contains("`aws` backend"),
             "the error must name the rewritten backend type: {error}"
@@ -454,9 +459,10 @@ origins:
     #[test]
     fn a_reference_with_no_key_segment_fails_compile() {
         let yaml = ai_config("", "secret://openai-prod");
-        let error = compile_config(&yaml)
-            .expect_err("`secret://<name>` has no key segment and must not compile")
-            .to_string();
+        let Err(error) = compile_config(&yaml) else {
+            panic!("`secret://<name>` has no key segment and must not compile");
+        };
+        let error = error.to_string();
         assert!(
             error.contains("secret://<backend>/<key>"),
             "the error must show the reference form: {error}"
@@ -498,9 +504,10 @@ origins:
         - name: anthropic
           api_key: secret://missing-two/key
 "#;
-        let error = compile_config(yaml)
-            .expect_err("both references must be rejected")
-            .to_string();
+        let Err(error) = compile_config(yaml) else {
+            panic!("both references must be rejected");
+        };
+        let error = error.to_string();
         assert!(
             error.contains("missing-one") && error.contains("missing-two"),
             "both offending references must appear: {error}"
