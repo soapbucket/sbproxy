@@ -581,7 +581,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Stable,
         registry: Registry::Default,
         labels: &["scope"],
-        description: "Budget utilization as ratio 0-1.",
+        description: "Budget utilization as a fraction of the limit; above 1 is over budget.",
         dead_reason: None,
     },
     MetricCapability {
@@ -3614,7 +3614,7 @@ pub fn run_scoped_label_gaps(
 pub fn render_markdown() -> String {
     let mut out = String::from(
         "# Metrics stability\n\
-         *Last modified: 2026-07-27*\n\n\
+         *Last modified: 2026-08-02*\n\n\
          *Generated from the executable metric registry. Do not hand-edit; run \
          `cargo run -q -p sbproxy-observe --bin generate-metrics-stability > \
          docs/metrics-stability.md`.*\n\n\

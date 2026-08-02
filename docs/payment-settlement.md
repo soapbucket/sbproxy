@@ -628,6 +628,14 @@ api_key: env:STRIPE_SECRET_KEY
 macaroon: file:/run/secrets/lnd/macaroon.hex
 ```
 
+`env:NAME` and `file:/path` need no other configuration: the proxy
+resolves both itself at startup. A provider URI such as
+`secret://<backend>/<name>` resolves through a backend declared under
+`proxy.secrets.backends`, and a config that writes one without declaring
+that backend does not boot. Validation does not catch it, because
+validation resolves no secrets; the failure is a startup failure naming
+the field.
+
 Do not write `${STRIPE_SECRET_KEY}` in a payments field. Environment
 interpolation runs before parsing, so the field would arrive holding the
 literal credential and be rejected as inline.
