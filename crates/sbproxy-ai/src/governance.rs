@@ -119,6 +119,15 @@ pub struct Reservation {
     pub window_reset_at_millis: u64,
 }
 
+/// Input for extending an active reservation lease without changing held units.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenewRequest {
+    /// Identifier returned by [`GovernanceStore::reserve`].
+    pub reservation_id: String,
+    /// Immutable, non-secret governed key identifier used to locate state.
+    pub key_id: String,
+}
+
 /// Input for settling a reservation with actual usage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SettleRequest {
@@ -338,6 +347,12 @@ pub enum GovernanceError {
 pub trait GovernanceStore: Send + Sync {
     /// Atomically check every limit and hold the requested ceilings.
     async fn reserve(&self, request: ReserveRequest) -> Result<Reservation, GovernanceError>;
+
+    /// Atomically extend an active reservation lease without changing held
+    /// units. A renewal never shortens the current lease. Terminal
+    /// reservations, including expired ones, refuse renewal so a reclaimed
+    /// hold can never be silently revived.
+    async fn renew(&self, request: RenewRequest) -> Result<Reservation, GovernanceError>;
 
     /// Atomically replace a reservation with actual usage exactly once.
     async fn settle(&self, request: SettleRequest) -> Result<Settlement, GovernanceError>;
@@ -637,6 +652,43 @@ impl GovernanceStore for InMemoryGovernanceStore {
             },
         );
         Ok(reservation)
+    }
+
+    async fn renew(&self, request: RenewRequest) -> Result<Reservation, GovernanceError> {
+        validate_reservation_id(&request.reservation_id)?;
+        validate_key_id(&request.key_id)?;
+        let now_millis = self.inner.clock.now_millis();
+        let candidate_expiry = now_millis
+            .checked_add(self.inner.config.reservation_ttl_millis)
+            .ok_or(GovernanceError::ArithmeticOverflow {
+                field: "expires_at_millis",
+            })?;
+        let mut state = self.inner.state.lock();
+        cleanup_expired(
+            &mut state,
+            now_millis,
+            self.inner.config.terminal_retention_millis,
+        )?;
+        let record = state
+            .reservations
+            .get_mut(&request.reservation_id)
+            .ok_or_else(|| GovernanceError::ReservationNotFound {
+                reservation_id: request.reservation_id.clone(),
+            })?;
+        if record.reservation.key_id != request.key_id {
+            return Err(GovernanceError::ReservationNotFound {
+                reservation_id: request.reservation_id,
+            });
+        }
+        if let Some(terminal_state) = record.outcome.terminal_state() {
+            return Err(GovernanceError::TerminalConflict {
+                reservation_id: request.reservation_id,
+                state: terminal_state,
+            });
+        }
+        record.reservation.expires_at_millis =
+            record.reservation.expires_at_millis.max(candidate_expiry);
+        Ok(record.reservation.clone())
     }
 
     async fn settle(&self, request: SettleRequest) -> Result<Settlement, GovernanceError> {

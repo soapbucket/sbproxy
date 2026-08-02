@@ -14,13 +14,14 @@ use sha2::{Digest, Sha256};
 use crate::governance::{
     CounterSnapshot, GovernanceBackendHealth, GovernanceBackendStatus, GovernanceConsistency,
     GovernanceDenial, GovernanceDimension, GovernanceError, GovernanceLimits, GovernanceSnapshot,
-    GovernanceStore, GovernanceUsage, Release, ReleaseRequest, Reservation,
+    GovernanceStore, GovernanceUsage, Release, ReleaseRequest, RenewRequest, Reservation,
     ReservationTerminalState, ReserveRequest, SettleRequest, Settlement, SnapshotKey,
 };
 
 const LUA_MAX_EXACT_INTEGER: u64 = 9_007_199_254_740_991;
 const COMMON_LUA: &str = include_str!("governance_redis/common.lua");
 const RESERVE_LUA: &str = include_str!("governance_redis/reserve.lua");
+const RENEW_LUA: &str = include_str!("governance_redis/renew.lua");
 const SETTLE_LUA: &str = include_str!("governance_redis/settle.lua");
 const RELEASE_LUA: &str = include_str!("governance_redis/release.lua");
 const SNAPSHOT_LUA: &str = include_str!("governance_redis/snapshot.lua");
@@ -146,6 +147,45 @@ impl GovernanceStore for RedisGovernanceStore {
             Some("terminal") => Err(GovernanceError::TerminalConflict {
                 reservation_id: request.reservation_id,
                 state: response_terminal_state(&response, 1)?,
+            }),
+            _ => Err(protocol_error()),
+        }
+    }
+
+    async fn renew(&self, request: RenewRequest) -> Result<Reservation, GovernanceError> {
+        validate_reservation_id(&request.reservation_id)?;
+        validate_key_id(&request.key_id)?;
+        let keys = vec![redis_governance_key(
+            &self.config.key_prefix,
+            &request.key_id,
+        )];
+        let args = vec![
+            reservation_prefix(&request.reservation_id),
+            self.config.reservation_ttl_millis.to_string(),
+            self.config.terminal_retention_millis.to_string(),
+        ];
+        let response = self.invoke(RENEW_LUA, &keys, &args).await?;
+
+        match response.first().map(String::as_str) {
+            Some("renewed") => Ok(Reservation {
+                reservation_id: request.reservation_id,
+                key_id: request.key_id,
+                policy_revision: response_u64(&response, 1, "renew_policy_revision")?,
+                reserved: GovernanceUsage {
+                    requests: 1,
+                    tokens: response_u64(&response, 2, "renew_reserved_tokens")?,
+                    micro_usd: response_u64(&response, 3, "renew_reserved_micro_usd")?,
+                },
+                created_at_millis: response_u64(&response, 4, "renew_created_at")?,
+                expires_at_millis: response_u64(&response, 5, "renew_expires_at")?,
+                window_reset_at_millis: response_u64(&response, 6, "renew_window_reset")?,
+            }),
+            Some("terminal") => Err(GovernanceError::TerminalConflict {
+                reservation_id: request.reservation_id,
+                state: response_terminal_state(&response, 1)?,
+            }),
+            Some("not_found") => Err(GovernanceError::ReservationNotFound {
+                reservation_id: request.reservation_id,
             }),
             _ => Err(protocol_error()),
         }

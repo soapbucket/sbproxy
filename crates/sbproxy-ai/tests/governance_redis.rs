@@ -7,13 +7,14 @@ use std::{sync::Arc, time::Duration};
 
 use governance::{
     GovernanceDenial, GovernanceDimension, GovernanceError, GovernanceLimits, GovernanceStore,
-    ReleaseRequest, ReserveRequest, SettleRequest, SnapshotKey,
+    ReleaseRequest, RenewRequest, ReserveRequest, SettleRequest, SnapshotKey,
 };
 use governance_redis::{redis_governance_key, RedisGovernanceConfig, RedisGovernanceStore};
 use sbproxy_platform::storage::{AsyncKVStore, AsyncRedisConfig, AsyncRedisKVStore};
 
 const COMMON_LUA: &str = include_str!("../src/governance_redis/common.lua");
 const RESERVE_LUA: &str = include_str!("../src/governance_redis/reserve.lua");
+const RENEW_LUA: &str = include_str!("../src/governance_redis/renew.lua");
 const SETTLE_LUA: &str = include_str!("../src/governance_redis/settle.lua");
 const RELEASE_LUA: &str = include_str!("../src/governance_redis/release.lua");
 const SNAPSHOT_LUA: &str = include_str!("../src/governance_redis/snapshot.lua");
@@ -75,13 +76,15 @@ fn state_scripts_are_one_key_redis_time_contracts() {
     assert!(COMMON_LUA.contains("HGETALL"));
     assert!(COMMON_LUA.contains("HDEL"));
 
-    for operation in [RESERVE_LUA, SETTLE_LUA, RELEASE_LUA, SNAPSHOT_LUA] {
+    for operation in [RESERVE_LUA, RENEW_LUA, SETTLE_LUA, RELEASE_LUA, SNAPSHOT_LUA] {
         assert!(operation.contains("#KEYS ~= 1"));
         assert!(!operation.contains("KEYS[2]"));
         assert!(!operation.contains("redis.call('EVAL'"));
     }
     assert!(RESERVE_LUA.contains("cleanup_expired"));
     assert!(RESERVE_LUA.contains("denied"));
+    assert!(RENEW_LUA.contains("cleanup_expired"));
+    assert!(RENEW_LUA.contains("renewed"));
     assert!(SETTLE_LUA.contains("settled"));
     assert!(RELEASE_LUA.contains("released"));
     assert!(SNAPSHOT_LUA.contains("cleanup_expired"));
@@ -218,6 +221,67 @@ async fn another_store_repairs_an_expired_lease_before_admission() {
         .unwrap();
     let key = redis_governance_key(&prefix, &key_id);
     redis_b.delete(key.as_bytes()).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires REDIS_URL"]
+async fn renewal_extends_a_lease_across_its_original_expiry() {
+    let url = std::env::var("REDIS_URL").expect("REDIS_URL must name a disposable Redis");
+    let prefix = unique_prefix("renewal");
+    let key_id = format!("renew-key-{}", std::process::id());
+    let redis = AsyncRedisKVStore::new(AsyncRedisConfig::new(&url));
+    let store =
+        RedisGovernanceStore::new(redis.clone(), redis_config(prefix.clone(), 200)).unwrap();
+
+    let reservation = store
+        .reserve(reserve_request("renewed-reservation", &key_id))
+        .await
+        .unwrap();
+
+    // Two renewal rounds carry the lease well past its original 200ms
+    // expiry without changing the held units.
+    let mut renewed_expiry = reservation.expires_at_millis;
+    for _ in 0..2 {
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let renewed = store
+            .renew(RenewRequest {
+                reservation_id: "renewed-reservation".to_string(),
+                key_id: key_id.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(renewed.expires_at_millis >= renewed_expiry);
+        renewed_expiry = renewed.expires_at_millis;
+        assert_eq!(renewed.reserved.tokens, 80);
+        assert_eq!(renewed.reserved.micro_usd, 600);
+    }
+
+    // 240ms after admission an un-renewed lease would already be expired
+    // and reclaimed; the renewed one still settles its actual usage.
+    let settlement = store
+        .settle(SettleRequest {
+            reservation_id: "renewed-reservation".to_string(),
+            key_id: key_id.clone(),
+            actual_tokens: 40,
+            actual_micro_usd: 300,
+        })
+        .await
+        .unwrap();
+    assert_eq!(settlement.actual.tokens, 40);
+
+    // A settled reservation refuses renewal instead of reviving the hold.
+    assert!(matches!(
+        store
+            .renew(RenewRequest {
+                reservation_id: "renewed-reservation".to_string(),
+                key_id: key_id.clone(),
+            })
+            .await,
+        Err(GovernanceError::TerminalConflict { .. })
+    ));
+
+    let key = redis_governance_key(&prefix, &key_id);
+    redis.delete(key.as_bytes()).await.unwrap();
 }
 
 #[tokio::test]

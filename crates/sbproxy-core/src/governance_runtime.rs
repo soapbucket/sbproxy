@@ -1,10 +1,10 @@
 //! Request-lifetime ownership for accepted governance reservations.
 
-use std::{fmt, sync::Arc};
+use std::{fmt, sync::Arc, time::Duration};
 
 use sbproxy_ai::governance::{
-    GovernanceError, GovernanceStore, Release, ReleaseRequest, Reservation, SettleRequest,
-    Settlement,
+    GovernanceError, GovernanceStore, Release, ReleaseRequest, RenewRequest, Reservation,
+    SettleRequest, Settlement,
 };
 
 /// Terminal state already reached by a governance lease.
@@ -58,21 +58,36 @@ impl LeaseState {
 /// lease reaches `Drop`, it schedules a best-effort terminal repair on the
 /// current Tokio runtime. The repair releases an unused reservation or settles
 /// the bounded usage most recently armed by the request path.
+///
+/// While the lease is active a background task renews the reservation with
+/// the backend at half the lease lifetime, so a long-running request or
+/// stream cannot have its hold reclaimed as expired mid-flight. The task
+/// stops as soon as the lease reaches a terminal state or is dropped.
 pub struct GovernanceLease {
     store: Arc<dyn GovernanceStore>,
     reservation: Reservation,
     state: LeaseState,
     drop_action: Option<DropAction>,
+    renewal_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl GovernanceLease {
     /// Take ownership of an accepted reservation and its backing store.
     pub fn new(store: Arc<dyn GovernanceStore>, reservation: Reservation) -> Self {
+        let renewal_task = spawn_renewal_task(&store, &reservation);
         Self {
             store,
             reservation,
             state: LeaseState::Active,
             drop_action: Some(DropAction::Release),
+            renewal_task,
+        }
+    }
+
+    async fn stop_renewal(&mut self) {
+        if let Some(task) = self.renewal_task.take() {
+            task.abort();
+            let _ = task.await;
         }
     }
 
@@ -126,6 +141,7 @@ impl GovernanceLease {
             .await?;
         self.state = LeaseState::Settled;
         self.drop_action = None;
+        self.stop_renewal().await;
         Ok(GovernanceLeaseTransition::Applied(settlement))
     }
 
@@ -145,8 +161,68 @@ impl GovernanceLease {
             .await?;
         self.state = LeaseState::Released;
         self.drop_action = None;
+        self.stop_renewal().await;
         Ok(GovernanceLeaseTransition::Applied(release))
     }
+}
+
+/// Spawn the half-lease auto-renew loop for an accepted reservation.
+///
+/// Renewal keeps a long-running request or stream alive past the backend's
+/// reservation TTL. The loop is bounded at two backend calls per lease
+/// lifetime while healthy; a failing backend is retried on a short delay
+/// until the last known expiry passes, after which the reservation is
+/// expired on the backend and further renewal is pointless. Outside a Tokio
+/// runtime no task is spawned and the lease simply lives within one TTL.
+fn spawn_renewal_task(
+    store: &Arc<dyn GovernanceStore>,
+    reservation: &Reservation,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let runtime = tokio::runtime::Handle::try_current().ok()?;
+    let lease_millis = reservation
+        .expires_at_millis
+        .saturating_sub(reservation.created_at_millis)
+        .max(2);
+    let delay = Duration::from_millis((lease_millis / 2).max(1));
+    let store = Arc::clone(store);
+    let request = RenewRequest {
+        reservation_id: reservation.reservation_id.clone(),
+        key_id: reservation.key_id.clone(),
+    };
+    Some(runtime.spawn(async move {
+        let ttl = Duration::from_millis(lease_millis);
+        let retry_delay = Duration::from_millis((lease_millis / 10).clamp(1, 1_000));
+        let mut next_delay = delay;
+        let mut known_deadline = tokio::time::Instant::now() + ttl;
+        loop {
+            // Sleeping after every completed renewal avoids Tokio interval
+            // catch-up bursts and keeps the healthy backend path bounded at
+            // two calls per lease TTL even when the runtime is briefly
+            // stalled.
+            tokio::time::sleep(next_delay).await;
+            match store.renew(request.clone()).await {
+                Ok(_) => {
+                    known_deadline = tokio::time::Instant::now() + ttl;
+                    next_delay = delay;
+                }
+                Err(error) => {
+                    let now = tokio::time::Instant::now();
+                    if now + retry_delay >= known_deadline {
+                        tracing::warn!(
+                            error = %error,
+                            "AI governance lease renewal failed until its known expiry"
+                        );
+                        break;
+                    }
+                    tracing::warn!(
+                        error = %error,
+                        "AI governance lease renewal failed; retrying before expiry"
+                    );
+                    next_delay = retry_delay;
+                }
+            }
+        }
+    }))
 }
 
 impl fmt::Debug for GovernanceLease {
@@ -163,6 +239,9 @@ impl fmt::Debug for GovernanceLease {
 
 impl Drop for GovernanceLease {
     fn drop(&mut self) {
+        if let Some(task) = self.renewal_task.take() {
+            task.abort();
+        }
         if !self.is_active() {
             return;
         }
@@ -212,7 +291,8 @@ mod tests {
     use sbproxy_ai::governance::{
         CounterSnapshot, GovernanceBackendHealth, GovernanceBackendStatus, GovernanceConsistency,
         GovernanceError, GovernanceSnapshot, GovernanceStore, GovernanceUsage, Release,
-        ReleaseRequest, Reservation, ReserveRequest, SettleRequest, Settlement, SnapshotKey,
+        ReleaseRequest, RenewRequest, Reservation, ReserveRequest, SettleRequest, Settlement,
+        SnapshotKey,
     };
     use tokio::sync::mpsc;
 
@@ -224,6 +304,7 @@ mod tests {
     struct FakeState {
         settle_requests: Vec<SettleRequest>,
         release_requests: Vec<ReleaseRequest>,
+        renew_requests: Vec<RenewRequest>,
         settle_failures_remaining: usize,
         release_failures_remaining: usize,
     }
@@ -272,11 +353,20 @@ mod tests {
         fn release_requests(&self) -> Vec<ReleaseRequest> {
             self.state.lock().release_requests.clone()
         }
+
+        fn renew_count(&self) -> usize {
+            self.state.lock().renew_requests.len()
+        }
     }
 
     #[async_trait]
     impl GovernanceStore for FakeStore {
         async fn reserve(&self, _request: ReserveRequest) -> Result<Reservation, GovernanceError> {
+            Ok(self.reservation.clone())
+        }
+
+        async fn renew(&self, request: RenewRequest) -> Result<Reservation, GovernanceError> {
+            self.state.lock().renew_requests.push(request);
             Ok(self.reservation.clone())
         }
 
@@ -557,6 +647,54 @@ mod tests {
         assert_eq!(request.actual_micro_usd, 63);
         assert_eq!(store.settle_requests().len(), 2);
         assert!(store.release_requests().is_empty());
+    }
+
+    fn short_lease_reservation(lease_millis: u64) -> Reservation {
+        Reservation {
+            expires_at_millis: 1_000 + lease_millis,
+            ..reservation()
+        }
+    }
+
+    #[tokio::test]
+    async fn active_lease_auto_renews_and_stops_after_settlement() {
+        let store = Arc::new(FakeStore::new(short_lease_reservation(100)));
+        let dyn_store: Arc<dyn GovernanceStore> = store.clone();
+        let mut lease = GovernanceLease::new(dyn_store, short_lease_reservation(100));
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while store.renew_count() == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("an active lease renews within its lifetime");
+
+        assert!(matches!(
+            lease.settle(10, 20).await,
+            Ok(GovernanceLeaseTransition::Applied(_))
+        ));
+        let renewals_at_settlement = store.renew_count();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            store.renew_count(),
+            renewals_at_settlement,
+            "settlement stops the renewal loop"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_an_active_lease_stops_renewal() {
+        let store = Arc::new(FakeStore::new(short_lease_reservation(50)));
+        let dyn_store: Arc<dyn GovernanceStore> = store.clone();
+        drop(GovernanceLease::new(dyn_store, short_lease_reservation(50)));
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            store.renew_count(),
+            0,
+            "a dropped lease must not keep renewing its reservation"
+        );
     }
 
     #[test]

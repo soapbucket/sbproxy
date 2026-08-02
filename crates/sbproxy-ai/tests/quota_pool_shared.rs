@@ -4,8 +4,8 @@ use futures::future::join_all;
 use sbproxy_ai::{
     governance::{
         GovernanceBackendHealth, GovernanceError, GovernanceLimits, GovernanceSnapshot,
-        GovernanceStore, InMemoryGovernanceStore, Release, ReleaseRequest, Reservation,
-        ReserveRequest, SettleRequest, Settlement, SnapshotKey,
+        GovernanceStore, InMemoryGovernanceStore, Release, ReleaseRequest, RenewRequest,
+        Reservation, ReserveRequest, SettleRequest, Settlement, SnapshotKey,
     },
     governance_crdt::{merge_contributions, GovernanceContribution},
     quota_pool::{
@@ -77,6 +77,10 @@ impl GovernanceStore for ObservedGovernance {
             return Err(GovernanceError::BackendUnavailable { backend: "test" });
         }
         self.inner.reserve(request).await
+    }
+
+    async fn renew(&self, request: RenewRequest) -> Result<Reservation, GovernanceError> {
+        self.inner.renew(request).await
     }
 
     async fn settle(&self, request: SettleRequest) -> Result<Settlement, GovernanceError> {

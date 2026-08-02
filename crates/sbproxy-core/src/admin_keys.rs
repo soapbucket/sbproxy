@@ -1967,8 +1967,8 @@ mod tests {
     use parking_lot::Mutex;
     use sbproxy_ai::governance::{
         CounterSnapshot, GovernanceBackendHealth, GovernanceBackendStatus, GovernanceConsistency,
-        GovernanceError, GovernanceSnapshot, GovernanceStore, Release, ReleaseRequest, Reservation,
-        ReserveRequest, SettleRequest, Settlement, SnapshotKey,
+        GovernanceError, GovernanceSnapshot, GovernanceStore, Release, ReleaseRequest,
+        RenewRequest, Reservation, ReserveRequest, SettleRequest, Settlement, SnapshotKey,
     };
     use sbproxy_keystore::crypto::KeyCrypto;
     use sbproxy_keystore::{KeyStore, MemoryKeyStore, TtlCache, TtlCacheConfig};
@@ -2029,6 +2029,10 @@ mod tests {
     #[async_trait]
     impl GovernanceStore for RecordingGovernanceStore {
         async fn reserve(&self, _request: ReserveRequest) -> Result<Reservation, GovernanceError> {
+            Err(GovernanceError::BackendUnavailable { backend: "redis" })
+        }
+
+        async fn renew(&self, _request: RenewRequest) -> Result<Reservation, GovernanceError> {
             Err(GovernanceError::BackendUnavailable { backend: "redis" })
         }
 
