@@ -2131,17 +2131,35 @@ pub(super) fn shadow_usage_record_from_context(
 /// realized cost-per-success. No-op unless the origin opted in (the
 /// strategy is `outcome_aware`) and the request actually reached a
 /// provider, so a pre-dispatch block records nothing.
-pub(super) fn record_routing_feedback(ctx: &crate::context::RequestContext) {
+///
+/// `status` must be the request's **final** status, which on the AI path
+/// means the one `final_response_status` resolves rather than
+/// `ctx.response_status` (WOR-2213). `ai_proxy` writes its response
+/// inside `request_filter` and returns `Ok(true)`, so Pingora's
+/// `response_filter`, the only thing that sets `ctx.response_status` for
+/// proxied traffic, never runs for AI requests. Reading that field here
+/// meant every completed AI request recorded `success = false`, every
+/// provider's score reached `f64::INFINITY`, and `best_among` pinned on
+/// `enabled[0]` forever: the strategy could not shift traffic at all,
+/// which is the entire thing it exists to do.
+pub(super) fn record_routing_feedback(ctx: &crate::context::RequestContext, status: u16) {
     if !ctx.ai_record_routing_feedback {
         return;
     }
     let Some(provider) = ctx.ai_provider.as_deref() else {
         return;
     };
-    let status = ctx.response_status.unwrap_or(0);
     let success = (200..300).contains(&status);
     // A provider-side refusal / content-filter, distinct from our own
     // guardrail or policy blocks (those never set a provider).
+    //
+    // Only `content_filter` is produced today (`ai_dispatch.rs:7090`).
+    // Nothing anywhere assigns `refusal`, so that arm cannot fire, and
+    // the refusal rate this feeds is really a content-filter rate. The
+    // arm stays because whether a provider refusal should be a distinct
+    // signal from a content filter is a design question rather than a
+    // typo, but a reader should not take its presence as evidence that
+    // refusals are being counted.
     let refused = matches!(
         ctx.ai_outcome.as_deref(),
         Some("content_filter") | Some("refusal")
