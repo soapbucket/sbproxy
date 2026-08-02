@@ -89,7 +89,13 @@ origins:
         on_exceed: block
         limits:
           - scope: api_key
-            max_tokens: 90
+            # Sized to admit the two vendor calls this walkthrough makes
+            # and refuse the third, which is the point it is demonstrating.
+            # At 90 it refused the second, because the OpenAI reply costs
+            # about 45 tokens and the Anthropic one about 215, so the cap
+            # was spent before the demo reached the vendor it exists to
+            # compare against. Raise this if you add a call.
+            max_tokens: 300
             period: daily
 
       # Append every completed call to a hash-chained ledger: provider,
