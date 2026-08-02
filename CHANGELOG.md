@@ -12,6 +12,34 @@ the next version cut.
 
 ### Added
 
+- **A configured usage reporter now receives live proxy traffic.**
+  `proxy.payments.usage_reporters.stripe_meter` shipped with a reporter,
+  a durable queue, and a worker that drains it, and with nothing that
+  produced an event. An operator could configure the block, pass
+  validation, pass startup, serve traffic, and bill nothing. The request
+  path now enqueues each billable unit immediately after the meter
+  settles the request receipt, billing from that settlement rather than
+  re-deriving it, so a cache hit or a policy block is charged or not
+  charged according to the same outcome table the signed receipt used.
+  The HTTP call to the provider stays in the background worker: a served
+  request writes one durable row and stops, so no request ever waits on
+  Stripe. Two counters describe it, `sbproxy_usage_bridge_enqueued_total`
+  and `sbproxy_usage_bridge_gap_total`, both labelled by tenant. See
+  [`docs/payment-settlement.md`](docs/payment-settlement.md).
+
+  **`usage_reporters.stripe_meter` gains two required fields, `source`
+  and `unit` [BREAKING].** A config with a `stripe_meter` block and no
+  `source` no longer parses. There is deliberately no default: one
+  request can produce a request receipt, an AI usage record, and a
+  record per MCP tool call, and two of those can describe the same sale,
+  so billing both against one meter charges the customer twice. An
+  unstated answer there *is* the double charge, and a default would be
+  this proxy picking a side of a commercial argument on the operator's
+  behalf. Set `source` to `http`, `ai`, or `mcp`, and `unit` to the unit
+  that meter bills. An operator who wants both dimensions configures two
+  meter events. The block shipped one day before this change, so the
+  affected population should be close to nobody.
+
 - **mistral.rs is a subprocess engine kind.** `engine: mistralrs` drives the
   upstream v0.9 `mistralrs` CLI as a supervised subprocess over its
   OpenAI-compatible surface, acquired exactly like llama.cpp: PATH-first,
@@ -327,6 +355,34 @@ the next version cut.
   An expression that evaluates cleanly to null or an empty string still
   means "no key for this request" and still falls back to the default
   client key, because that is the operator's own logic talking.
+- **Outbound HTTP no longer follows a redirect without re-authorizing it,
+  and the AI provider client no longer follows one at all.** The AI
+  client, the webhook, Langfuse, and Datadog usage sinks, the MCP token
+  exchange, and engine artifact downloads all followed redirects inside
+  `reqwest` with no second look, so a host allowlist only ever covered
+  hop one. Each of them now runs an explicit hop loop: every hop is
+  authorized from scratch, an off-allowlist target is reported
+  separately from a hop-one refusal, and the chain is capped at ten.
+  Credentials are stripped when a hop leaves its origin, keyed on
+  whether the header is marked sensitive, which matters because
+  `reqwest` strips `Authorization` and nothing else: `x-api-key`,
+  `api-key`, and `DD-API-KEY` were riding along. **A provider base URL
+  that depended on a 301 to add a trailing slash will now fail instead
+  of silently working.** Point the config at the URL the provider
+  actually serves.
+- **Egress authorization resolves DNS for real.** These same consumers
+  ran their egress gate against a fixed synthetic resolver that always
+  answered `93.184.216.34`. Because that address is public and always
+  resolves, the private-address rule and the resolution-failure rule
+  were unreachable: an allowlisted hostname pointing at
+  `169.254.169.254` passed the gate. Resolution now goes through a
+  cached system resolver with a 30 second TTL, shared between the
+  authorize step and the verify step so a mismatch means the answer
+  genuinely changed. Refusals are counted by
+  `sbproxy_egress_refused_total{purpose, reason, tenant, origin}`.
+  Dial-time pinning on the shared long-lived clients is deliberately
+  still open; `docs/threat-model.md` records that exemption, its
+  residual risk, and the two ways to close it.
 - **Admin operator passwords are now hashed at rest [BREAKING].**
   `proxy.admin.operators[].password` is replaced by `password_hash`, an
   HMAC-SHA256 hash (hex-encoded) using the same pepper the inbound key

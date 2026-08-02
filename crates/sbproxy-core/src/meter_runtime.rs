@@ -116,6 +116,25 @@ const CHAIN_GAP_OUTCOME: &str = "chain_gap";
 /// the retry.
 const GAP_CLAIM_SUFFIX: &str = ":chain_gap";
 
+/// The outcome a usage-bridge gap marker carries.
+///
+/// Distinct from [`CHAIN_GAP_OUTCOME`] because the two holes are
+/// different holes. A chain gap says the signed record of a request could
+/// not be written. A usage gap says the record was written and the
+/// billable unit it describes never reached the durable provider queue,
+/// so the receipt is right and the invoice will be short.
+const USAGE_GAP_OUTCOME: &str = "usage_gap";
+
+/// Suffix that distinguishes a usage-bridge gap marker's dedup key.
+///
+/// Load bearing for the same reason [`GAP_CLAIM_SUFFIX`] is, and it has
+/// to be a *different* suffix rather than a shared one. The chain dedups
+/// on [`sbproxy_meter::ledger::LedgerPayload::dedup_key`], so a request
+/// that lost both its receipt and its billable unit would file its second
+/// marker under a key the first already occupied and the second would be
+/// silently discarded as a duplicate.
+const USAGE_GAP_CLAIM_SUFFIX: &str = ":usage_gap";
+
 // --- The chained payload ---
 
 /// The document one receipt-chain entry attests to.
@@ -589,6 +608,34 @@ pub(crate) fn preflight_refuses(ctx: &RequestContext) -> bool {
 
 // --- Cutting the receipt ---
 
+/// What the meter settled for one request.
+///
+/// Returned by [`record_response`] so that anything downstream which has to
+/// agree with the receipt reads the receipt's own answer instead of
+/// re-deriving it. The usage bridge (WOR-2169) is the first such consumer:
+/// whether a cache hit, a policy block, or a cut stream is billable is the
+/// operator's `proxy.attestation.billable` table's decision, taken once,
+/// here, and a second derivation elsewhere would eventually disagree with
+/// this one and put a charge on an invoice the receipt says is free.
+///
+/// `billed` is [`sbproxy_meter::OutcomeTable::billable_units`]'s output, so
+/// an outcome the table prices at `no` arrives as an empty list rather than
+/// as a list plus a flag somebody has to remember to check.
+// Only the `payments` build has a consumer for these fields today. Gating
+// the whole type instead would mean two `record_response` signatures, and a
+// second signature is a second place for the outcome decision to drift.
+#[cfg_attr(not(feature = "payments"), allow(dead_code))]
+pub(crate) struct SettledRequest {
+    /// Groups every attempt at one unit of work under one invoice line.
+    pub(crate) claim_id: String,
+    /// The route that matched, as the operator named it.
+    pub(crate) route: String,
+    /// What happened, in the terms the billing table is written in.
+    pub(crate) outcome: BillableOutcome,
+    /// Everything this attempt billed, after the outcome table ran.
+    pub(crate) billed: Vec<Unit>,
+}
+
 /// Record what this request consumed.
 ///
 /// Called from `logging()`, once, with the request line, the final status,
@@ -603,21 +650,21 @@ pub(crate) fn preflight_refuses(ctx: &RequestContext) -> bool {
 ///
 /// Everything else comes from `ctx.pipeline`, the generation pinned at
 /// ingress. See the module docs for why a reload must not reach this.
+///
+/// Returns what the outcome table settled, or `None` when this origin
+/// writes no receipts and there is therefore no operator answer about what
+/// is billable. See [`SettledRequest`].
 pub(crate) fn record_response(
     ctx: &RequestContext,
     method: &str,
     path: &str,
     status: u16,
     client_disconnected: bool,
-) {
-    let Some(runtime) = ctx.pipeline.attestation.as_deref() else {
-        return;
-    };
-    let Some(origin) = resolved_origin(ctx) else {
-        return;
-    };
+) -> Option<SettledRequest> {
+    let runtime = ctx.pipeline.attestation.as_deref()?;
+    let origin = resolved_origin(ctx)?;
     if !origin.role.writes_receipts() {
-        return;
+        return None;
     }
 
     let tenant = ctx.tenant_id.as_str();
@@ -666,12 +713,24 @@ pub(crate) fn record_response(
     // indistinguishable from a call that never happened.
     let units: Vec<ReceiptUnit> = billed.iter().map(ReceiptUnit::from).collect();
 
+    // Built before the chain is touched, and returned whatever the chain
+    // does. A receipt that could not be written is still a request whose
+    // billable units the operator's table settled, and the queue is a
+    // different durability mechanism from the ledger: losing one is not a
+    // reason to lose the other too.
+    let settled = SettledRequest {
+        claim_id: facts.claim_id.clone(),
+        route: path.to_string(),
+        outcome,
+        billed: billed.clone(),
+    };
+
     let Some(chain) = runtime.chain.as_deref().filter(|chain| chain.is_writable()) else {
         // No chain, or one already shut. There is nowhere to write a
         // marker, so the counter is the only record left of this one, and
         // the posture still decides what that record says.
         take_failure_branch(runtime.failure_mode, None, tenant, &facts);
-        return;
+        return Some(settled);
     };
 
     let appended = chain.append(|seq, prev| {
@@ -715,6 +774,78 @@ pub(crate) fn record_response(
             );
             take_failure_branch(runtime.failure_mode, Some(chain), tenant, &facts);
         }
+    }
+
+    Some(settled)
+}
+
+/// Write the marker that says a billable unit was owed to the durable usage
+/// queue and never got there (WOR-2169).
+///
+/// The billing queue has no chain of its own, so the hole is recorded on the
+/// one chain this node already keeps. The marker is an ordinary chained,
+/// signed receipt with no units and a `usage_gap` outcome, so a later
+/// verification walks straight through it and an operator reconciling a
+/// provider invoice against the ledger can see exactly which claim went
+/// unbilled.
+///
+/// Best effort by construction, and silently a no-op when there is no chain
+/// to write to: this runs because a durable write already failed, so the
+/// next one may fail too, and the counter is the record that survives either
+/// way.
+// The usage queue this marker stands in for only exists in a `payments`
+// build, so the only production caller is gated. The unit test below is not.
+#[cfg_attr(not(feature = "payments"), allow(dead_code))]
+pub(crate) fn write_usage_gap_marker(ctx: &RequestContext, settled: Option<&SettledRequest>) {
+    let Some(runtime) = ctx.pipeline.attestation.as_deref() else {
+        return;
+    };
+    let Some(chain) = runtime.chain.as_deref() else {
+        return;
+    };
+    let Some(origin) = resolved_origin(ctx) else {
+        return;
+    };
+
+    // The claim the receipt used when there was one, so the marker and the
+    // receipt name the same unit of work. The request id otherwise, which
+    // is what the meter itself mints a claim from.
+    let claim_id = settled.map_or_else(
+        || ctx.request_id.to_string(),
+        |settled| settled.claim_id.clone(),
+    );
+    let route = settled.map_or_else(String::new, |settled| settled.route.clone());
+
+    let facts = ReceiptFacts {
+        claim_id,
+        agreement_id: origin.agreement_id.clone().unwrap_or_default(),
+        subject: ReceiptSubject {
+            tenant: ctx.tenant_id.to_string(),
+            key_id: ctx.accountable_key_id().map(str::to_string),
+            agent: None,
+        },
+        route,
+        config_revision: ctx.pipeline.config_revision.clone(),
+    };
+
+    let marker = chain.append(|seq, prev| {
+        facts.claims(
+            chain.node_id(),
+            seq,
+            prev,
+            format!("{}{USAGE_GAP_CLAIM_SUFFIX}", facts.claim_id),
+            USAGE_GAP_OUTCOME.to_string(),
+            Vec::new(),
+        )
+    });
+    if let Err(error) = marker {
+        tracing::warn!(
+            %error,
+            claim_id = %facts.claim_id,
+            tenant_id = %ctx.tenant_id,
+            "meter-runtime: the usage gap marker could not be written either; \
+             sbproxy_usage_bridge_gap_total is the only record of this one"
+        );
     }
 }
 
@@ -1063,7 +1194,7 @@ mod tests {
         let ledger_path = dir.path().join("receipts.ndjson");
         let ctx = context(runtime(&ledger_path, FailureMode::Degraded));
 
-        record_response(&ctx, METHOD, PATH, 200, false);
+        let _ = record_response(&ctx, METHOD, PATH, 200, false);
 
         let written = entries(&ledger_path);
         assert_eq!(written.len(), 1, "one served request, one receipt");
@@ -1092,7 +1223,7 @@ mod tests {
         let ledger_path = dir.path().join("receipts.ndjson");
         let ctx = context(runtime(&ledger_path, FailureMode::Degraded));
 
-        record_response(&ctx, METHOD, PATH, 200, false);
+        let _ = record_response(&ctx, METHOD, PATH, 200, false);
 
         let written = entries(&ledger_path);
         let units = &written[0].event.0.units;
@@ -1118,11 +1249,11 @@ mod tests {
         let attestation = runtime(&ledger_path, FailureMode::Degraded);
 
         let first = context(Arc::clone(&attestation));
-        record_response(&first, METHOD, PATH, 200, false);
+        let _ = record_response(&first, METHOD, PATH, 200, false);
 
         let mut second = context(Arc::clone(&attestation));
         second.request_id = compact_str::CompactString::new("01J9ZQ8N4T7WYQ4CQ9K5R2VXCD");
-        record_response(&second, METHOD, PATH, 200, false);
+        let _ = record_response(&second, METHOD, PATH, 200, false);
 
         let written = entries(&ledger_path);
         assert_eq!(written.len(), 2);
@@ -1143,7 +1274,7 @@ mod tests {
         for index in 0..4u32 {
             let mut ctx = context(Arc::clone(&attestation));
             ctx.request_id = compact_str::CompactString::new(format!("claim-{index}"));
-            record_response(&ctx, METHOD, PATH, 200, false);
+            let _ = record_response(&ctx, METHOD, PATH, 200, false);
         }
 
         let unkeyed =
@@ -1172,7 +1303,7 @@ mod tests {
         for index in 0..8u32 {
             let mut ctx = context(Arc::clone(&attestation));
             ctx.request_id = compact_str::CompactString::new(format!("claim-{index}"));
-            record_response(&ctx, METHOD, PATH, 200, false);
+            let _ = record_response(&ctx, METHOD, PATH, 200, false);
         }
 
         let written = entries(&ledger_path);
@@ -1211,7 +1342,7 @@ mod tests {
                 scope.spawn(move || {
                     let mut ctx = context(attestation);
                     ctx.request_id = compact_str::CompactString::new(format!("claim-{index}"));
-                    record_response(&ctx, METHOD, PATH, 200, false);
+                    let _ = record_response(&ctx, METHOD, PATH, 200, false);
                 });
             }
         });
@@ -1259,7 +1390,7 @@ mod tests {
         let ledger_path = dir.path().join("receipts.ndjson");
         let ctx = context(runtime(&ledger_path, FailureMode::Degraded));
 
-        record_response(&ctx, METHOD, PATH, 503, false);
+        let _ = record_response(&ctx, METHOD, PATH, 503, false);
 
         let written = entries(&ledger_path);
         assert_eq!(written.len(), 1);
@@ -1295,7 +1426,7 @@ mod tests {
         capture_origin_headers(&mut ctx, &response(None));
         assert!(ctx.meter_origin_headers.is_empty());
 
-        record_response(&ctx, METHOD, PATH, 200, false);
+        let _ = record_response(&ctx, METHOD, PATH, 200, false);
         let written = entries(&ledger_path);
         let claimed = &written[0].event.0.units[2];
         assert_eq!(claimed.count, 0);
@@ -1396,6 +1527,129 @@ mod tests {
         );
     }
 
+    // --- What the meter hands downstream (WOR-2169) ---
+
+    #[test]
+    fn the_settlement_handed_downstream_is_the_one_the_receipt_was_cut_from() {
+        // The usage bridge bills from this value rather than re-deriving
+        // it. Two derivations of "is this billable" would eventually
+        // disagree, and the disagreement would be a charge on an invoice
+        // that the signed receipt beside it says is free.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ledger_path = dir.path().join("receipts.ndjson");
+        let ctx = context(runtime(&ledger_path, FailureMode::Degraded));
+
+        let settled = record_response(&ctx, METHOD, PATH, 200, false)
+            .expect("a receipt-writing origin settles something");
+
+        assert_eq!(settled.claim_id, ctx.request_id.as_str());
+        assert_eq!(settled.route, PATH);
+        assert_eq!(settled.outcome, BillableOutcome::Delivered);
+
+        // And it agrees, name for name and count for count, with the units
+        // that actually reached the signed receipt.
+        let receipt = &entries(&ledger_path)[0].event.0;
+        let receipt_units: Vec<(String, u64)> = receipt
+            .units
+            .iter()
+            .map(|unit| (unit.name.clone(), unit.count))
+            .collect();
+        let settled_units: Vec<(String, u64)> = settled
+            .billed
+            .iter()
+            .map(|unit| (unit.name.clone(), unit.count))
+            .collect();
+        assert_eq!(settled_units, receipt_units);
+        assert!(!settled_units.is_empty(), "the fixture route is priced");
+    }
+
+    #[test]
+    fn an_outcome_the_table_prices_at_free_settles_with_nothing_billable() {
+        // The fixture table answers `origin_5xx: no`. Nothing downstream
+        // needs a rule about 5xx responses: the empty list is the rule,
+        // and it came from the operator's document.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ledger_path = dir.path().join("receipts.ndjson");
+        let ctx = context(runtime(&ledger_path, FailureMode::Degraded));
+
+        let settled = record_response(&ctx, METHOD, PATH, 500, false)
+            .expect("a receipt-writing origin settles something");
+
+        assert_eq!(settled.outcome, BillableOutcome::Origin5xx);
+        assert!(
+            settled.billed.is_empty(),
+            "the table says origin_5xx is free: {:?}",
+            settled.billed
+        );
+    }
+
+    #[test]
+    fn an_origin_that_writes_no_receipts_settles_nothing_at_all() {
+        // No receipt means no outcome table ran, so there is no operator
+        // answer about what is billable and nothing downstream may invent
+        // one.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ledger_path = dir.path().join("receipts.ndjson");
+        let ctx = context_for_role(
+            runtime(&ledger_path, FailureMode::Degraded),
+            AttestationRole::Claim,
+        );
+
+        assert!(record_response(&ctx, METHOD, PATH, 200, false).is_none());
+    }
+
+    #[test]
+    fn a_usage_gap_marker_cannot_collide_with_the_receipt_or_with_a_chain_gap() {
+        // Both markers key off the same claim, and the chain deduplicates
+        // on that key. A shared suffix would mean a request that lost both
+        // its receipt and its billable unit filed the second marker under
+        // a key the first already occupied, and the second would vanish.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ledger_path = dir.path().join("receipts.ndjson");
+        let ctx = context(runtime(&ledger_path, FailureMode::Degraded));
+
+        let settled = record_response(&ctx, METHOD, PATH, 200, false).expect("a receipt is cut");
+        write_usage_gap_marker(&ctx, Some(&settled));
+
+        let written = entries(&ledger_path);
+        assert_eq!(written.len(), 2, "the receipt, then the usage gap marker");
+
+        let receipt = &written[0].event.0;
+        let marker = &written[1].event.0;
+        assert_eq!(receipt.claim_id, settled.claim_id);
+        assert_eq!(
+            marker.claim_id,
+            format!("{}{USAGE_GAP_CLAIM_SUFFIX}", settled.claim_id)
+        );
+        assert_ne!(
+            marker.claim_id,
+            format!("{}{GAP_CLAIM_SUFFIX}", settled.claim_id),
+            "a usage gap and a chain gap are different holes and cannot share a key"
+        );
+        assert_eq!(marker.outcome, USAGE_GAP_OUTCOME);
+        assert!(
+            marker.units.is_empty(),
+            "a gap marker records an absence, never a charge"
+        );
+        assert_eq!(marker.route, PATH, "the route whose unit went unbilled");
+        assert_eq!(marker.subject.tenant, "acme", "the tenant it was owed to");
+
+        // It chains like any other entry, so a buyer verifying the file
+        // walks straight through it.
+        assert_eq!(marker.seq, 1);
+        assert_eq!(marker.prev, written[0].entry_hash);
+        assert!(written[1].signature.is_some(), "the marker is signed too");
+
+        let verifying = verifying_key_from_seed_hex(SEED).expect("the seed derives a public key");
+        let result = verify_ledger::<ChainedReceipt>(&ledger_path, Some(&verifying))
+            .expect("the chain is readable");
+        assert!(
+            result.ok,
+            "a chain carrying a usage gap marker still verifies: {result:?}"
+        );
+        assert_eq!(result.entries, 2);
+    }
+
     // --- Failure postures ---
 
     #[test]
@@ -1410,7 +1664,7 @@ mod tests {
             .as_deref()
             .expect("a receipt role opens a chain")
             .fail_next_append();
-        record_response(&ctx, METHOD, PATH, 200, false);
+        let _ = record_response(&ctx, METHOD, PATH, 200, false);
 
         let written = entries(&ledger_path);
         assert_eq!(written.len(), 1, "the receipt failed, the marker landed");
@@ -1437,7 +1691,7 @@ mod tests {
         let attestation = runtime(&ledger_path, FailureMode::Degraded);
 
         let first = context(Arc::clone(&attestation));
-        record_response(&first, METHOD, PATH, 200, false);
+        let _ = record_response(&first, METHOD, PATH, 200, false);
 
         let mut failing = context(Arc::clone(&attestation));
         failing.request_id = compact_str::CompactString::new("01J9ZQ8N4T7WYQ4CQ9K5R2VXCD");
@@ -1446,7 +1700,7 @@ mod tests {
             .as_deref()
             .expect("a receipt role opens a chain")
             .fail_next_append();
-        record_response(&failing, METHOD, PATH, 200, false);
+        let _ = record_response(&failing, METHOD, PATH, 200, false);
 
         let written = entries(&ledger_path);
         assert_eq!(written.len(), 2);
@@ -1480,7 +1734,7 @@ mod tests {
             .as_deref()
             .expect("a receipt role opens a chain")
             .fail_next_append();
-        record_response(&ctx, METHOD, PATH, 200, false);
+        let _ = record_response(&ctx, METHOD, PATH, 200, false);
 
         assert!(
             preflight_refuses(&ctx),
@@ -1513,7 +1767,7 @@ mod tests {
         );
 
         // The counter is the only record left, and the call must return.
-        record_response(&ctx, METHOD, PATH, 200, false);
+        let _ = record_response(&ctx, METHOD, PATH, 200, false);
     }
 
     #[test]
@@ -1525,7 +1779,7 @@ mod tests {
 
         assert!(preflight_refuses(&ctx));
         // And recording it is still a return rather than a panic.
-        record_response(&ctx, METHOD, PATH, 200, false);
+        let _ = record_response(&ctx, METHOD, PATH, 200, false);
     }
 
     #[test]
@@ -1562,7 +1816,7 @@ mod tests {
         let attestation = runtime(&ledger_path, FailureMode::Degraded);
         let ctx = context_for_role(attestation, AttestationRole::Off);
 
-        record_response(&ctx, METHOD, PATH, 200, false);
+        let _ = record_response(&ctx, METHOD, PATH, 200, false);
 
         // The file exists: opening a ledger creates it. What matters is
         // that nothing was written into it, because an origin whose
@@ -1582,8 +1836,8 @@ mod tests {
         let attestation = runtime(&ledger_path, FailureMode::Degraded);
 
         let ctx = context(Arc::clone(&attestation));
-        record_response(&ctx, METHOD, PATH, 200, false);
-        record_response(&ctx, METHOD, PATH, 200, false);
+        let _ = record_response(&ctx, METHOD, PATH, 200, false);
+        let _ = record_response(&ctx, METHOD, PATH, 200, false);
 
         assert_eq!(
             entries(&ledger_path).len(),
@@ -1600,12 +1854,12 @@ mod tests {
 
         let mut silent = context(Arc::clone(&attestation));
         silent.meter_origin_headers.clear();
-        record_response(&silent, METHOD, PATH, 200, false);
+        let _ = record_response(&silent, METHOD, PATH, 200, false);
 
         let mut reported_zero = context(Arc::clone(&attestation));
         reported_zero.request_id = compact_str::CompactString::new("claim-zero");
         reported_zero.meter_origin_headers = vec![("X-Rows-Returned".into(), "0".into())];
-        record_response(&reported_zero, METHOD, PATH, 200, false);
+        let _ = record_response(&reported_zero, METHOD, PATH, 200, false);
 
         let written = entries(&ledger_path);
         assert_eq!(written.len(), 2);
@@ -1630,7 +1884,7 @@ mod tests {
         let ledger_path = dir.path().join("receipts.ndjson");
         let ctx = context(runtime(&ledger_path, FailureMode::Degraded));
 
-        record_response(&ctx, "GET", "/v1/health", 200, false);
+        let _ = record_response(&ctx, "GET", "/v1/health", 200, false);
 
         let written = entries(&ledger_path);
         let names: Vec<&str> = written[0]

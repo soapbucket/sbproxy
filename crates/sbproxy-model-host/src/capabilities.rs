@@ -1212,7 +1212,7 @@ const CAPABILITIES: &[CapabilityEntry] = &[
         evidence: &[
             "test.engine_drivers",
             "test.cuda_build",
-            "cert.apple_metal.2026-07-11",
+            "cert.apple_metal.2026-08-02",
         ],
         consumer: None,
     },
@@ -1352,7 +1352,7 @@ const CAPABILITIES: &[CapabilityEntry] = &[
         evidence: &[
             "contract.catalog_v2_selects_exact_artifact",
             "test.engine_drivers",
-            "cert.apple_metal.2026-07-11",
+            "cert.apple_metal.2026-08-02",
         ],
         consumer: Some(ConsumerContract::CatalogV2SelectsExactArtifact),
     },

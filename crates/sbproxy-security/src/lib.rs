@@ -26,6 +26,13 @@ pub use crypto::{
     aes256gcm_decrypt, aes256gcm_encrypt, hkdf_derive_purpose, random_aes256_key,
     random_aes_gcm_nonce, HkdfPurpose, AES256_KEY_LEN, AES_GCM_NONCE_LEN,
 };
+// WOR-2165's additions (`evaluate_hop`, `record_egress_refused`,
+// `CachedSystemResolver`, `SystemHostResolver`, `RedirectRule`,
+// `RedirectHop`, `MAX_REDIRECT_HOPS`) are reached through
+// `sbproxy_security::egress::` rather than re-exported here: every
+// consumer already imports from the module path, and a root re-export
+// nobody names is exactly the write-only surface the pub-item ratchet
+// exists to stop.
 pub use egress::{
     AuthorizedDestination, EgressAuthorizer, EgressConfig, EgressDenied, EgressPurpose,
     GovernedHttpClient, GovernedHttpResponse, GovernedRedirectSeam, HostResolver, PurposeAllowlist,

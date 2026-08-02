@@ -168,6 +168,7 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_config_reload_total` | Counter | `stable` | `beta` | `result` | Config reload attempts, by result. |
 | `sbproxy_config_source_fetch_total` | Counter | `stable` | `beta` | `kind`, `result` | Config source resolutions, by source kind and result. |
 | `sbproxy_config_source_revision_info` | Gauge | `stable` | `beta` | `sha` | Commit the config source resolved to; always 1, the commit is the label. |
+| `sbproxy_egress_refused_total` | Counter | `stable` | `beta` | `purpose`, `reason`, `tenant`, `origin` | Outbound dials refused by purpose-scoped egress authorization, by purpose, closed reason, tenant, and origin. |
 | `sbproxy_errors_total` | Counter | `stable` | `beta` | `hostname`, `error_type` | Total errors. |
 | `sbproxy_governance_fail_open_total` | Counter | `stable` | `beta` | `key_id` | Governed admissions that bypassed reservation because the governance backend was unavailable and failure_mode is allow_unreserved. |
 | `sbproxy_grpc_status_total` | Counter | `stable` | `beta` | `code` | Observed gRPC status codes, by canonical name. |
@@ -288,4 +289,6 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_upstream_timeout_retries_total` | Counter | `stable` | `beta` | `origin`, `phase` | Upstream retries triggered by a timeout-classed failure, by origin and phase (connect or upstream). |
 | `sbproxy_vault_resolution_duration_seconds` | Histogram | `stable` | `beta` | `backend`, `result` | Vault resolution duration, by backend and outcome. |
 | `sbproxy_vault_resolution_total` | Counter | `stable` | `beta` | `backend`, `result` | Vault resolution attempts, by backend and outcome. |
+| `sbproxy_usage_bridge_enqueued_total` | Counter | `stable` | `beta` | `tenant_id`, `reporter`, `resource_type`, `result` | Billable units the request path queued for a usage reporter, by tenant, reporter, resource type, and whether the row was new. |
+| `sbproxy_usage_bridge_gap_total` | Counter | `stable` | `beta` | `tenant_id`, `failure_mode` | Billable units that could not be queued for a usage reporter, by tenant and the posture in force. |
 | `sbproxy_waf_persistent_blocks_total` | Counter | `stable` | `beta` | `origin`, `tenant`, `event`, `key_kind` | WAF persistent (time-boxed) block actions, by lifecycle event and key kind. |

@@ -3588,7 +3588,20 @@ impl ProxyHttp for SbProxy {
         // Only `closed` reaches this branch. `degraded`, `open`, and
         // `observe` all admit, and each leaves its own kind of trace
         // when the receipt is cut.
-        if crate::meter_runtime::preflight_refuses(ctx) {
+        //
+        // WOR-2169 adds a second reason to be here, on the same terms.
+        // A usage reporter under `failure_posture: closed` whose durable
+        // queue has already refused a write shuts itself, and the next
+        // response is refused rather than served unbilled. The two are
+        // deliberately one branch: from the client's side there is no
+        // difference between "we cannot record what you consumed" and
+        // "we cannot bill you for what you consumed", and an operator
+        // who asked for `closed` asked for the same answer to both.
+        #[cfg(feature = "payments")]
+        let billing_refuses = crate::usage_bridge::preflight_refuses(ctx);
+        #[cfg(not(feature = "payments"))]
+        let billing_refuses = false;
+        if crate::meter_runtime::preflight_refuses(ctx) || billing_refuses {
             ctx.meter_refused = true;
             ctx.response_status = Some(503);
             upstream_response
@@ -5815,13 +5828,33 @@ impl ProxyHttp for SbProxy {
             let client_disconnected =
                 e.is_some_and(|error| *error.esource() == pingora_error::ErrorSource::Downstream);
             let path = session.req_header().uri.path().to_string();
-            crate::meter_runtime::record_response(
+            let settled = crate::meter_runtime::record_response(
                 ctx,
                 &method,
                 &path,
                 status_u16,
                 client_disconnected,
             );
+
+            // WOR-2169: queue what this request owes a usage reporter.
+            //
+            // Immediately after the receipt and from the same settlement,
+            // never from a second derivation: whether a cache hit or a
+            // policy block is billable is the operator's outcome table's
+            // answer, and two independent readings of that table would
+            // eventually disagree and put a charge on an invoice the
+            // signed receipt says is free.
+            //
+            // A durable enqueue and nothing else. The provider call is the
+            // recovery worker's, behind its own lease and its own
+            // idempotency key, so no request ever waits on Stripe.
+            //
+            // No-op unless a usage reporter is configured, which is a
+            // single `Option` test on the pinned pipeline.
+            #[cfg(feature = "payments")]
+            crate::usage_bridge::record_billable_usage(ctx, settled.as_ref()).await;
+            #[cfg(not(feature = "payments"))]
+            let _ = settled;
         }
 
         // --- Wave 3 / G1.6 wire: per-agent labels on the hot path ---

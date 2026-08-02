@@ -5,6 +5,15 @@
 //! never auto-follows redirects. Call sites adopt these primitives per
 //! purpose; dial paths close the resolve-to-connect window through
 //! [`EgressAuthorizer::verify_dial_addrs`] immediately before connect.
+//!
+//! [`evaluate_hop`] is the per-hop half of that contract for consumers
+//! that let their HTTP client follow redirects. A host allowlist checked
+//! once covers hop one and nothing after it, so a chain that starts at an
+//! approved host and ends somewhere else was never actually gated. Every
+//! consumer disables its client's own redirect following and runs each
+//! `Location` back through [`evaluate_hop`], bounded by
+//! [`MAX_REDIRECT_HOPS`]. Refusals are counted through
+//! [`record_egress_refused`].
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -39,6 +48,32 @@ pub enum EgressDenied {
     InvalidUrl,
     /// Resolved address is private/internal and not explicitly allowed.
     PrivateAddress,
+    /// The redirect chain exceeded [`MAX_REDIRECT_HOPS`].
+    TooManyRedirects,
+}
+
+impl EgressDenied {
+    /// Stable, bounded label for metrics and structured logs.
+    ///
+    /// Closed set by construction: the returned strings are the same
+    /// vocabulary as the variants, so a counter labelled with them
+    /// cannot grow cardinality with traffic and cannot leak a host,
+    /// allowlist entry, or secret.
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::UnlistedPurpose => "unlisted_purpose",
+            Self::UnlistedHost => "unlisted_host",
+            Self::DisallowedScheme => "disallowed_scheme",
+            Self::DisallowedPort => "disallowed_port",
+            Self::DnsPinMismatch => "dns_pin_mismatch",
+            Self::RedirectToUnlistedHost => "redirect_to_unlisted_host",
+            Self::DnsResolutionFailed => "dns_resolution_failed",
+            Self::MissingHost => "missing_host",
+            Self::InvalidUrl => "invalid_url",
+            Self::PrivateAddress => "private_address",
+            Self::TooManyRedirects => "too_many_redirects",
+        }
+    }
 }
 
 /// Logical purpose for an outbound connection.
@@ -65,6 +100,23 @@ pub enum EgressPurpose {
     ModelArtifact,
     /// Engine artifact download.
     EngineArtifact,
+}
+
+impl EgressPurpose {
+    /// Stable, bounded label for metrics and structured logs.
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::AiProvider => "ai_provider",
+            Self::AiJudge => "ai_judge",
+            Self::McpUpstream => "mcp_upstream",
+            Self::OpenApiTool => "openapi_tool",
+            Self::TokenExchange => "token_exchange",
+            Self::Webhook => "webhook",
+            Self::UsageSink => "usage_sink",
+            Self::ModelArtifact => "model_artifact",
+            Self::EngineArtifact => "engine_artifact",
+        }
+    }
 }
 
 /// Per-purpose allowlist entry under the sketched `proxy.egress` shape.
@@ -372,6 +424,233 @@ impl GovernedRedirectSeam {
     }
 }
 
+/// Live system DNS resolver for production egress checks.
+///
+/// This is the resolver a production dial path must pass. Passing a
+/// fixture resolver instead makes the authorization a self-consistent
+/// statement about the fixture rather than about the address the HTTP
+/// stack is going to dial, which is worse than no check at all because
+/// it reads as coverage. Unit tests inject a map resolver; production
+/// call sites inject this.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemHostResolver;
+
+impl HostResolver for SystemHostResolver {
+    fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, ()> {
+        use std::net::ToSocketAddrs;
+        (host, port)
+            .to_socket_addrs()
+            .map(|iter| iter.collect())
+            .map_err(|_| ())
+    }
+}
+
+/// Process-wide TTL for [`CachedSystemResolver`] answers.
+const RESOLVER_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+/// Entry ceiling for [`CachedSystemResolver`]. Reaching it clears the
+/// map rather than evicting one entry, so a resolver cache can never
+/// become an unbounded allocation under hostile input.
+const RESOLVER_CACHE_MAX_ENTRIES: usize = 1024;
+
+type ResolverCache =
+    std::collections::HashMap<(String, u16), (std::time::Instant, Vec<SocketAddr>)>;
+
+fn resolver_cache() -> &'static std::sync::Mutex<ResolverCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<ResolverCache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// [`SystemHostResolver`] behind a short process-wide TTL cache.
+///
+/// This is the resolver a per-request gate should use.
+/// [`EgressAuthorizer::authorize`] resolves on every call, and the
+/// authorize-then-verify contract resolves twice; run uncached on a hot
+/// dial path and that is two blocking `getaddrinfo` calls per request,
+/// which is a latency regression rather than a security gain. It also
+/// makes the pin check flaky by construction: a host behind a rotating
+/// CDN answer can legitimately return a different address set between
+/// the two calls, and the strict all-addresses-pinned rule would refuse
+/// a request that nothing attacked.
+///
+/// Caching for a fixed 30-second TTL fixes both. DNS work drops to one
+/// lookup per host per TTL, and authorize and verify read the same
+/// answer, so a mismatch means the answer actually changed rather than
+/// that two queries raced. The residual window is the TTL itself: an
+/// answer that rebinds inside it is still dialled. That is the correct
+/// trade because the pinned answer is what the connector is handed, so
+/// a rebind mid-TTL cannot redirect a dial that has already been
+/// pinned; it only delays noticing a legitimate DNS change.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CachedSystemResolver;
+
+impl HostResolver for CachedSystemResolver {
+    fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, ()> {
+        let key = (host.to_string(), port);
+        if let Ok(cache) = resolver_cache().lock() {
+            if let Some((at, addrs)) = cache.get(&key) {
+                if at.elapsed() < RESOLVER_CACHE_TTL {
+                    return Ok(addrs.clone());
+                }
+            }
+        }
+        let addrs = SystemHostResolver.resolve(host, port)?;
+        if let Ok(mut cache) = resolver_cache().lock() {
+            if cache.len() >= RESOLVER_CACHE_MAX_ENTRIES {
+                cache.clear();
+            }
+            cache.insert(key, (std::time::Instant::now(), addrs.clone()));
+        }
+        Ok(addrs)
+    }
+}
+
+/// Maximum redirect hops any governed egress path will follow.
+///
+/// Matches the bound the OpenAPI-backed MCP tool-call loop already
+/// enforces (WOR-2080), so every consumer that adopts the per-hop
+/// contract agrees on the same ceiling.
+pub const MAX_REDIRECT_HOPS: usize = 10;
+
+/// What a governed dial path does with a cross-origin redirect when no
+/// [`EgressAuthorizer`] is attached.
+///
+/// With an authorizer attached the allowlist is the authority and this
+/// rule does not apply: a hop to another allowlisted host is permitted,
+/// a hop off the allowlist is refused. The rule only decides what
+/// "allowlist" means when the operator has configured none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedirectRule {
+    /// Refuse any hop that changes scheme, host, or port.
+    ///
+    /// The correct default for a request carrying a credential the HTTP
+    /// client will not strip on its own (a provider API key in
+    /// `x-api-key`, a `DD-API-KEY` header, an OAuth subject token in a
+    /// form body). With no allowlist configured, the only host the
+    /// operator has approved is the one they wrote down, so that is the
+    /// only host the chain may reach.
+    SameOriginOnly,
+    /// Follow a cross-origin hop, reporting that credentials must be
+    /// stripped before the next request.
+    ///
+    /// For paths where a cross-origin redirect is load bearing rather
+    /// than anomalous: object-storage and CDN handoffs on artifact
+    /// downloads redirect off the origin host by design, so refusing
+    /// them would break the feature rather than harden it.
+    CrossOriginAllowed,
+}
+
+/// One re-authorized redirect hop.
+#[derive(Debug, Clone)]
+pub struct RedirectHop {
+    /// Absolute URL for the next request.
+    pub url: Url,
+    /// Addresses pinned for this hop, empty when the hop was evaluated
+    /// without an authorizer (nothing resolved, so nothing to pin).
+    pub pinned_addrs: Vec<SocketAddr>,
+    /// True when the hop crosses origin and credentials must not ride
+    /// along. Callers strip their own credential headers; they must not
+    /// rely on the HTTP client, which strips `Authorization` but leaves
+    /// provider-specific header names and request bodies alone.
+    pub strip_credentials: bool,
+}
+
+/// Re-authorize one redirect hop before any second connect.
+///
+/// `hop_index` is 1 for the first redirect, so a chain is refused with
+/// [`EgressDenied::TooManyRedirects`] once it passes
+/// [`MAX_REDIRECT_HOPS`]. `from` is the URL that produced the redirect
+/// and `location` is its raw `Location` value, which may be relative.
+///
+/// With an authorizer, the hop is authorized from scratch for `purpose`
+/// (host, scheme, port, private-address, and fresh DNS pins), and an
+/// off-allowlist host is reported as
+/// [`EgressDenied::RedirectToUnlistedHost`] rather than
+/// [`EgressDenied::UnlistedHost`] so refusals on hop one and hop two
+/// stay distinguishable in metrics. Without one, `rule` decides.
+pub fn evaluate_hop(
+    authorizer: Option<&EgressAuthorizer>,
+    purpose: EgressPurpose,
+    from: &Url,
+    location: &str,
+    hop_index: usize,
+    rule: RedirectRule,
+    resolver: &dyn HostResolver,
+) -> Result<RedirectHop, EgressDenied> {
+    if hop_index > MAX_REDIRECT_HOPS {
+        return Err(EgressDenied::TooManyRedirects);
+    }
+    let next = resolve_redirect_url(from, location)?;
+    if next.host_str().is_none() {
+        return Err(EgressDenied::MissingHost);
+    }
+    let strip_credentials = is_cross_origin(from, &next);
+    match authorizer {
+        Some(auth) => {
+            let dest = auth
+                .authorize(purpose, next.as_str(), resolver)
+                .map_err(|e| match e {
+                    EgressDenied::UnlistedHost => EgressDenied::RedirectToUnlistedHost,
+                    other => other,
+                })?;
+            Ok(RedirectHop {
+                url: dest.url,
+                pinned_addrs: dest.pinned_addrs,
+                strip_credentials,
+            })
+        }
+        None if strip_credentials && rule == RedirectRule::SameOriginOnly => {
+            Err(EgressDenied::RedirectToUnlistedHost)
+        }
+        None => Ok(RedirectHop {
+            url: next,
+            pinned_addrs: Vec::new(),
+            strip_credentials,
+        }),
+    }
+}
+
+/// Count and log one refused outbound dial.
+///
+/// Emits `sbproxy_egress_refused_total{purpose, reason, tenant, origin}`.
+/// Every label is bounded: `purpose` and `reason` are closed enums, and
+/// callers pass a tenant id and a configuration-scoped `origin` (an
+/// origin id, provider name, or sink name), never a request-scoped
+/// value such as a URL, request id, or trace id. Pass `"unset"` for a
+/// dimension the surrounding code genuinely does not carry, so an
+/// absent attribution is visible in the series rather than silently
+/// merged into another tenant's.
+pub fn record_egress_refused(
+    purpose: EgressPurpose,
+    reason: EgressDenied,
+    tenant: &str,
+    origin: &str,
+) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_egress_refused_total",
+            "Outbound dials refused by purpose-scoped egress authorization, by purpose, closed reason, tenant, and origin",
+            &["purpose", "reason", "tenant", "origin"],
+        )
+        .expect("egress refusal counter registers")
+    });
+    let tenant = if tenant.is_empty() { "unset" } else { tenant };
+    let origin = if origin.is_empty() { "unset" } else { origin };
+    counter
+        .with_label_values(&[purpose.as_label(), reason.as_label(), tenant, origin])
+        .inc();
+    tracing::warn!(
+        target: "sbproxy::egress",
+        purpose = purpose.as_label(),
+        reason = reason.as_label(),
+        tenant = tenant,
+        origin = origin,
+        "outbound dial refused by egress authorization"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -651,6 +930,166 @@ mod tests {
         assert!(decision.strip_credentials);
         assert!(decision.destination.url.username().is_empty());
         assert_eq!(decision.destination.url.password(), None);
+    }
+
+    #[test]
+    fn hop_without_an_authorizer_refuses_a_cross_origin_redirect() {
+        let resolver = MapResolver::new(vec![]);
+        let from = Url::parse("https://api.openai.com/v1/chat").expect("test url");
+        let err = evaluate_hop(
+            None,
+            EgressPurpose::AiProvider,
+            &from,
+            "https://evil.example/steal",
+            1,
+            RedirectRule::SameOriginOnly,
+            &resolver,
+        )
+        .expect_err("an unconfigured path must not leave the host it was told to call");
+        assert_eq!(err, EgressDenied::RedirectToUnlistedHost);
+    }
+
+    #[test]
+    fn hop_without_an_authorizer_follows_same_origin_and_keeps_credentials() {
+        let resolver = MapResolver::new(vec![]);
+        let from = Url::parse("https://api.openai.com/v1/chat").expect("test url");
+        let hop = evaluate_hop(
+            None,
+            EgressPurpose::AiProvider,
+            &from,
+            "/v1/chat/completions",
+            1,
+            RedirectRule::SameOriginOnly,
+            &resolver,
+        )
+        .expect("a same-origin hop is the one redirect an unconfigured path may follow");
+        assert_eq!(
+            hop.url.as_str(),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert!(!hop.strip_credentials);
+        assert!(hop.pinned_addrs.is_empty(), "no authorizer means no pins");
+    }
+
+    #[test]
+    fn cross_origin_allowed_rule_follows_but_reports_a_credential_strip() {
+        let resolver = MapResolver::new(vec![]);
+        let from = Url::parse("https://huggingface.co/model/resolve/main/f.bin").expect("test url");
+        let hop = evaluate_hop(
+            None,
+            EgressPurpose::ModelArtifact,
+            &from,
+            "https://cdn.example/blob/abc",
+            1,
+            RedirectRule::CrossOriginAllowed,
+            &resolver,
+        )
+        .expect("artifact downloads redirect to object storage by design");
+        assert_eq!(hop.url.as_str(), "https://cdn.example/blob/abc");
+        assert!(
+            hop.strip_credentials,
+            "the source credential must not follow the hop off-origin"
+        );
+    }
+
+    #[test]
+    fn hop_with_an_authorizer_refuses_an_off_allowlist_host_distinguishably() {
+        let auth = EgressAuthorizer::new(ai_provider_https_443(&["api.openai.com"]));
+        let resolver =
+            MapResolver::new(vec![("evil.example", vec![addr([93, 184, 216, 34], 443)])]);
+        let from = Url::parse("https://api.openai.com/v1/chat").expect("test url");
+        let err = evaluate_hop(
+            Some(&auth),
+            EgressPurpose::AiProvider,
+            &from,
+            "https://evil.example/steal",
+            1,
+            RedirectRule::SameOriginOnly,
+            &resolver,
+        )
+        .expect_err("an off-allowlist hop must be refused");
+        assert_eq!(
+            err,
+            EgressDenied::RedirectToUnlistedHost,
+            "hop-two refusals stay distinguishable from hop-one UnlistedHost"
+        );
+    }
+
+    #[test]
+    fn hop_with_an_authorizer_pins_the_redirect_target() {
+        let auth =
+            EgressAuthorizer::new(ai_provider_https_443(&["api.openai.com", "cdn.openai.com"]));
+        let pinned = vec![addr([104, 18, 2, 2], 443)];
+        let resolver = MapResolver::new(vec![
+            ("api.openai.com", vec![addr([104, 18, 1, 1], 443)]),
+            ("cdn.openai.com", pinned.clone()),
+        ]);
+        let from = Url::parse("https://api.openai.com/v1/chat").expect("test url");
+        let hop = evaluate_hop(
+            Some(&auth),
+            EgressPurpose::AiProvider,
+            &from,
+            "https://cdn.openai.com/file",
+            1,
+            RedirectRule::SameOriginOnly,
+            &resolver,
+        )
+        .expect("an allowlisted hop authorizes");
+        assert_eq!(hop.pinned_addrs, pinned);
+        assert!(hop.strip_credentials, "the hop crosses origin");
+    }
+
+    #[test]
+    fn hop_beyond_the_ceiling_is_refused_before_any_resolution() {
+        // No resolver entries at all: reaching resolution would fail
+        // with DnsResolutionFailed, so TooManyRedirects proves the hop
+        // cap fires first.
+        let auth = EgressAuthorizer::new(ai_provider_https_443(&["api.openai.com"]));
+        let resolver = MapResolver::new(vec![]);
+        let from = Url::parse("https://api.openai.com/v1/chat").expect("test url");
+        // Matched rather than compared: `RedirectHop` is deliberately
+        // not `PartialEq`, and deriving it to make one test read
+        // slightly better would widen a public type's contract for the
+        // convenience of an assertion.
+        let outcome = evaluate_hop(
+            Some(&auth),
+            EgressPurpose::AiProvider,
+            &from,
+            "https://api.openai.com/again",
+            MAX_REDIRECT_HOPS + 1,
+            RedirectRule::SameOriginOnly,
+            &resolver,
+        );
+        assert!(
+            matches!(outcome, Err(EgressDenied::TooManyRedirects)),
+            "the hop cap must fire before resolution is attempted"
+        );
+    }
+
+    #[test]
+    fn denial_and_purpose_labels_are_closed_and_leak_nothing() {
+        for reason in [
+            EgressDenied::UnlistedPurpose,
+            EgressDenied::UnlistedHost,
+            EgressDenied::DisallowedScheme,
+            EgressDenied::DisallowedPort,
+            EgressDenied::DnsPinMismatch,
+            EgressDenied::RedirectToUnlistedHost,
+            EgressDenied::DnsResolutionFailed,
+            EgressDenied::MissingHost,
+            EgressDenied::InvalidUrl,
+            EgressDenied::PrivateAddress,
+            EgressDenied::TooManyRedirects,
+        ] {
+            let label = reason.as_label();
+            assert!(!label.is_empty());
+            assert!(
+                label.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "label must be a bounded identifier, got {label}"
+            );
+        }
+        assert_eq!(EgressPurpose::AiProvider.as_label(), "ai_provider");
+        assert_eq!(EgressPurpose::ModelArtifact.as_label(), "model_artifact");
     }
 
     #[test]

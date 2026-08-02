@@ -484,6 +484,85 @@ pub struct UsageReportersConfig {
     pub stripe_meter: Option<StripeMeterReporterConfig>,
 }
 
+/// Which request-path record is authoritative for one meter event.
+///
+/// One meter event, one source. A single request can produce a request
+/// receipt, an AI usage record, and one record per MCP tool call, and
+/// two of those can easily describe the same commercial unit: an AI
+/// request served through the gateway is also an HTTP request the meter
+/// priced. Reporting both against one Stripe meter charges the customer
+/// twice for one sale.
+///
+/// The defence is that the operator names the authoritative source per
+/// meter event and the proxy never guesses. There is deliberately no
+/// `Default` and no serde default: an unstated answer here is the
+/// double-charge, and a default would be this crate picking a side of a
+/// commercial argument on the operator's behalf.
+///
+/// An operator who genuinely wants to bill both dimensions configures
+/// two meter events, which is a decision they made rather than one the
+/// proxy made for them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageSource {
+    /// The request receipt the `proxy.attestation` meter settled.
+    ///
+    /// Units come from that block's `measured`, `route_weights`, and
+    /// `origin_headers` resolvers, after the `billable` outcome table
+    /// has decided which of them survive this request's outcome.
+    Http,
+    /// The AI usage record for a request that reached a model.
+    Ai,
+    /// One record per MCP tool call the request dispatched.
+    Mcp,
+}
+
+impl UsageSource {
+    /// Stable snake-case name used in config, metric labels, and the
+    /// `resource_type` attribute on a queued usage event.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Ai => "ai",
+            Self::Mcp => "mcp",
+        }
+    }
+
+    /// The unit names this source can report.
+    ///
+    /// `Http` returns an empty slice: its unit names are whatever the
+    /// operator called their `proxy.attestation` resolvers, so this
+    /// crate cannot enumerate them and validation does not try. The
+    /// other two are closed vocabularies owned here, and naming one
+    /// that does not exist is a typo that would otherwise surface as a
+    /// meter that silently reports nothing.
+    #[must_use]
+    pub const fn known_units(self) -> &'static [&'static str] {
+        match self {
+            Self::Http => &[],
+            Self::Ai => &[
+                USAGE_UNIT_PROMPT_TOKENS,
+                USAGE_UNIT_COMPLETION_TOKENS,
+                USAGE_UNIT_TOTAL_TOKENS,
+            ],
+            Self::Mcp => &[USAGE_UNIT_TOOL_CALL],
+        }
+    }
+}
+
+/// AI unit name: input tokens the model was given.
+pub const USAGE_UNIT_PROMPT_TOKENS: &str = "prompt_tokens";
+
+/// AI unit name: output tokens the model produced.
+pub const USAGE_UNIT_COMPLETION_TOKENS: &str = "completion_tokens";
+
+/// AI unit name: prompt plus completion.
+pub const USAGE_UNIT_TOTAL_TOKENS: &str = "total_tokens";
+
+/// MCP unit name: one dispatched tool call.
+pub const USAGE_UNIT_TOOL_CALL: &str = "tool_call";
+
 /// Stripe Meter Events reporter.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -492,7 +571,45 @@ pub struct StripeMeterReporterConfig {
     pub event_name: String,
     /// Field on the request context that carries the Stripe customer
     /// identifier.
+    ///
+    /// Resolved against the authenticated principal's metadata map, so
+    /// the identifier travels with the credential rather than with the
+    /// request. A request whose principal carries no such entry is not
+    /// reported: a meter event with nobody to bill is refused by Stripe
+    /// anyway, and queueing one would turn a missing credential
+    /// attribute into a permanently failing durable row.
     pub customer_field: String,
+    /// Which request-path record is authoritative for this meter event.
+    ///
+    /// Required, with no default. See [`UsageSource`].
+    pub source: UsageSource,
+    /// The unit this meter event bills.
+    ///
+    /// For [`UsageSource::Http`] this is one of the operator's own
+    /// `proxy.attestation` unit names, and only billable units carrying
+    /// that name are reported. For the other two sources it is one of
+    /// [`UsageSource::known_units`].
+    ///
+    /// One unit per meter event rather than a list, because a Stripe
+    /// meter event carries one quantity. Two units summed into one
+    /// number is exactly the unfalsifiable figure the metering
+    /// vocabulary exists to prevent.
+    pub unit: String,
+    /// What the request path does when the durable enqueue fails.
+    ///
+    /// Defaults to [`crate::types::FailureMode::Degraded`] rather than
+    /// the surface-wide `closed`, for the same reason
+    /// `proxy.attestation.failure_mode` does: billing is not a security
+    /// boundary, and a settlement database that will not accept a write
+    /// must not take the API down. `degraded` is what keeps the
+    /// resulting hole provable rather than silent.
+    #[serde(default = "default_usage_failure_posture")]
+    pub failure_posture: crate::types::FailureMode,
+}
+
+/// The posture a usage reporter runs under when nothing says otherwise.
+fn default_usage_failure_posture() -> crate::types::FailureMode {
+    crate::types::FailureMode::Degraded
 }
 
 // --- Advertised rails ---
@@ -1560,6 +1677,32 @@ impl StripeMeterReporterConfig {
             "usage_reporters.stripe_meter.customer_field",
             &self.customer_field,
         )?;
+        bounded("usage_reporters.stripe_meter.unit", &self.unit)?;
+
+        // An `http` unit name is the operator's own, so there is nothing
+        // to compare it against here. The other two vocabularies are
+        // owned by this crate, and a typo in one would otherwise ship as
+        // a meter that queues nothing and reads on a dashboard exactly
+        // like a route nobody called.
+        let known = self.source.known_units();
+        if !known.is_empty() && !known.contains(&self.unit.as_str()) {
+            return Err(PaymentsConfigError::Value {
+                field: "usage_reporters.stripe_meter.unit".to_string(),
+            });
+        }
+
+        // `observe` is a rollout posture for a control that refuses
+        // things. Nothing in the usage bridge refuses anything, so
+        // `observe` and `open` would be the same behaviour under two
+        // names, and an operator who picked `observe` would reasonably
+        // expect the queue to be exercised while the charge is withheld.
+        // It is not, so the value is refused rather than silently
+        // treated as `open`.
+        if matches!(self.failure_posture, crate::types::FailureMode::Observe) {
+            return Err(PaymentsConfigError::Value {
+                field: "usage_reporters.stripe_meter.failure_posture".to_string(),
+            });
+        }
         Ok(())
     }
 }
@@ -1993,6 +2136,9 @@ usage_reporters:
   stripe_meter:
     event_name: sbproxy_ai_tokens
     customer_field: stripe_customer_id
+    source: ai
+    unit: total_tokens
+    failure_posture: degraded
 "#;
 
     /// The reference document, parsed but not yet validated.
@@ -2606,6 +2752,131 @@ usage_reporters:
             ),
             PaymentsConfigError::MeterWithoutStripe
         ));
+    }
+
+    #[test]
+    fn a_meter_event_has_to_name_the_source_that_is_authoritative_for_it() {
+        // The double-charge this field exists to prevent: one request
+        // that is both an HTTP call the meter priced and an AI call the
+        // gateway recorded. Leaving the answer out is not "take the
+        // obvious one", because there is no obvious one.
+        let mut unstated = document();
+        let meter = unstated
+            .get_mut("usage_reporters")
+            .and_then(|reporters| reporters.get_mut("stripe_meter"))
+            .and_then(serde_yaml::Value::as_mapping_mut)
+            .expect("the reference document configures the meter");
+        meter.remove(serde_yaml::Value::String("source".to_string()));
+
+        let error = parse(unstated).expect_err("a meter with no source must not deserialize");
+        assert!(
+            error.contains("source"),
+            "the parse failure has to name the missing key: {error}"
+        );
+    }
+
+    #[test]
+    fn a_unit_outside_a_closed_vocabulary_is_refused_before_it_meters_nothing() {
+        // `ai` and `mcp` own their unit names, so a typo is catchable.
+        // Left uncaught it ships as a meter that queues nothing, which
+        // on a dashboard is indistinguishable from a route nobody calls.
+        for (source, unit) in [("ai", "totl_tokens"), ("mcp", "tool_calls")] {
+            let mut typo = document();
+            set(
+                &mut typo,
+                &["usage_reporters", "stripe_meter", "source"],
+                source.into(),
+            );
+            set(
+                &mut typo,
+                &["usage_reporters", "stripe_meter", "unit"],
+                unit.into(),
+            );
+            let error = expect_error(
+                parse(typo).expect("it deserializes").validate(),
+                "a unit outside the source's vocabulary must be refused",
+            );
+            assert!(
+                matches!(&error, PaymentsConfigError::Value { field } if field.ends_with("unit")),
+                "expected the unit field to be named, got {error}"
+            );
+        }
+
+        // An `http` unit is whatever the operator called their own
+        // attestation resolver, so this crate has nothing to check it
+        // against and must not invent a vocabulary to reject it with.
+        let mut operator_named = document();
+        set(
+            &mut operator_named,
+            &["usage_reporters", "stripe_meter", "source"],
+            "http".into(),
+        );
+        set(
+            &mut operator_named,
+            &["usage_reporters", "stripe_meter", "unit"],
+            "search_call".into(),
+        );
+        parse(operator_named)
+            .expect("it deserializes")
+            .validate()
+            .expect("an operator-named http unit validates");
+    }
+
+    #[test]
+    fn the_meter_defaults_to_degraded_and_refuses_the_posture_it_cannot_honour() {
+        // Billing is not a security boundary, so an unstated posture
+        // admits and leaves a provable hole rather than refusing.
+        let meter = reference_config()
+            .usage_reporters
+            .stripe_meter
+            .expect("the reference document configures the meter");
+        assert_eq!(meter.failure_posture, crate::types::FailureMode::Degraded);
+
+        let mut unstated = document();
+        let mapping = unstated
+            .get_mut("usage_reporters")
+            .and_then(|reporters| reporters.get_mut("stripe_meter"))
+            .and_then(serde_yaml::Value::as_mapping_mut)
+            .expect("the reference document configures the meter");
+        mapping.remove(serde_yaml::Value::String("failure_posture".to_string()));
+        let defaulted = parse(unstated).expect("an omitted posture deserializes");
+        assert_eq!(
+            defaulted
+                .usage_reporters
+                .stripe_meter
+                .expect("still configured")
+                .failure_posture,
+            crate::types::FailureMode::Degraded,
+        );
+
+        // Nothing in the bridge refuses a request, so `observe` would be
+        // `open` under a name that promises otherwise.
+        let error = expect_error(
+            validate_with(
+                &["usage_reporters", "stripe_meter", "failure_posture"],
+                "observe".into(),
+            ),
+            "a posture the bridge cannot honour must be refused",
+        );
+        assert!(
+            matches!(&error, PaymentsConfigError::Value { field } if field.ends_with("failure_posture")),
+            "expected the posture field to be named, got {error}"
+        );
+    }
+
+    #[test]
+    fn every_source_has_a_distinct_wire_spelling_and_a_stated_vocabulary() {
+        assert_eq!(UsageSource::Http.as_str(), "http");
+        assert_eq!(UsageSource::Ai.as_str(), "ai");
+        assert_eq!(UsageSource::Mcp.as_str(), "mcp");
+        assert!(
+            UsageSource::Http.known_units().is_empty(),
+            "http unit names belong to the operator, not to this crate"
+        );
+        assert!(UsageSource::Ai
+            .known_units()
+            .contains(&USAGE_UNIT_TOTAL_TOKENS));
+        assert_eq!(UsageSource::Mcp.known_units(), &[USAGE_UNIT_TOOL_CALL]);
     }
 
     #[test]

@@ -1669,6 +1669,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_egress_refused_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_egress_refused"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["purpose", "reason", "tenant", "origin"],
+        description: "Outbound dials refused by purpose-scoped egress authorization, by purpose, closed reason, tenant, and origin.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_errors_total",
         kind: MetricKind::Counter,
         writer: Writer::Field("errors_total"),
@@ -3080,6 +3091,28 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_usage_bridge_enqueued_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_usage_bridge_enqueued"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["tenant_id", "reporter", "resource_type", "result"],
+        description: "Billable units the request path queued for a usage reporter, by tenant, reporter, resource type, and whether the row was new.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_usage_bridge_gap_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_usage_bridge_gap"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["tenant_id", "failure_mode"],
+        description: "Billable units that could not be queued for a usage reporter, by tenant and the posture in force.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_waf_persistent_blocks_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_waf_persistent_block"),
@@ -3162,6 +3195,11 @@ pub const TENANT_SCOPED_METRICS: &[&str] = &[
     "sbproxy_ai_tokens_saved_total",
     "sbproxy_capture_budget_dropped_total",
     "sbproxy_capture_dropped_total",
+    // WOR-2165. An egress refusal is a security verdict about one
+    // tenant's outbound traffic. Merged across tenants it answers
+    // "something was refused somewhere", which is not a question an
+    // operator of a multi-tenant deployment can act on.
+    "sbproxy_egress_refused_total",
     "sbproxy_http_framing_blocks_total",
     "sbproxy_inbound_key_requests_total",
     "sbproxy_judge_budget_exhausted_total",
@@ -3182,6 +3220,8 @@ pub const TENANT_SCOPED_METRICS: &[&str] = &[
     "sbproxy_rate_limit_suspend_total",
     "sbproxy_rate_limit_total",
     "sbproxy_semantic_cache_results_total",
+    "sbproxy_usage_bridge_enqueued_total",
+    "sbproxy_usage_bridge_gap_total",
     "sbproxy_waf_persistent_blocks_total",
 ];
 

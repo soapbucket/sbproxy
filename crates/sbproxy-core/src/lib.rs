@@ -216,6 +216,12 @@ pub mod synthetic;
 #[cfg(test)]
 mod test_env;
 mod trust_tier;
+/// WOR-2169: the producer that turns a served request into rows in the
+/// durable billing queue. Owns the resource and unit mapping, the provider
+/// deduplication identifier, and the posture that decides what happens when
+/// a billable unit cannot be queued. The reporter, the queue, and the
+/// worker that drains it all predate this and none of them had a caller.
+pub mod usage_bridge;
 
 // Re-export the main entry point for convenience.
 pub use server::{run, GraceConfig};

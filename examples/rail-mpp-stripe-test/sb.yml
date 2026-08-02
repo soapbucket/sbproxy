@@ -102,6 +102,21 @@ proxy:
       stripe_meter:
         event_name: sbproxy_feed_fetches
         customer_field: stripe_customer_id
+        # Which request-path record is authoritative for this meter
+        # event. Required, and deliberately without a default: one
+        # request can produce a request receipt, an AI usage record, and
+        # a record per MCP tool call, and billing two of them against
+        # one meter charges the customer twice for one sale.
+        #
+        # `http` bills the signed request receipt, so it needs a
+        # `proxy.attestation` block with a role that writes receipts and
+        # a `billable` outcome table naming this unit. This example does
+        # not configure one, because its subject is the payment rails
+        # rather than metering: the reporter is here to show that a
+        # meter event can never settle a payment. See docs/metering.md
+        # for the attestation half.
+        source: http
+        unit: feed_fetch
 
 origins:
   "feed.test.sbproxy.dev":

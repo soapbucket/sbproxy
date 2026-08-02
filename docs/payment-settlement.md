@@ -1,6 +1,6 @@
 # Payment settlement
 
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-02*
 
 `proxy.payments` is how SBproxy charges for a request and proves it was
 paid. It is Apache-2.0, it is off unless you configure it, and it holds
@@ -324,6 +324,9 @@ proxy:
       stripe_meter:
         event_name: sbproxy_ai_tokens
         customer_field: stripe_customer_id
+        source: ai
+        unit: total_tokens
+        failure_posture: degraded
 ```
 
 Every block under `payments` rejects unknown keys, so a typo is a load
@@ -455,14 +458,164 @@ boot.
 
 | Field | Default | What it does |
 |---|---|---|
-| `event_name` | required | The meter event name registered in the Stripe dashboard. |
-| `customer_field` | required | The request-context field carrying the Stripe customer identifier. |
+| `event_name` | required | The meter event name registered in the Stripe dashboard. Every row this reporter queues carries it, and Stripe rejects one it does not recognise. |
+| `customer_field` | required | Which entry in the authenticated credential's `metadata` map holds the Stripe customer id. Read from the credential and never from a request header: a caller who could name the account their usage bills to could name somebody else's. A request whose principal carries no such entry queues nothing, because a meter event with nobody to bill is one Stripe refuses anyway. |
+| `source` | required | Which request-path record is authoritative for this meter event: `http`, `ai`, or `mcp`. There is no default, on purpose. See "Which source is authoritative" below. |
+| `unit` | required | The quantity this meter event bills. For `ai`, one of `prompt_tokens`, `completion_tokens`, `total_tokens`. For `mcp`, `tool_call`. For `http`, one of your own `proxy.attestation` unit names, and only billable units carrying that name are reported. One unit rather than a list, because a Stripe meter event carries one number and two units summed is a figure nobody can take apart. |
+| `failure_posture` | `degraded` | What the request path does when the durable queue will not take a row. `closed`, `open`, or `degraded`; `observe` is rejected at load. See "When the queue will not take a row" below. |
 
 Meter events record consumption. They are a different registry, a
 different queue, and a different return type from settlement, and no
 meter report can move an intent to `Succeeded`. Configuring this block
 without `rails.stripe` is a load error, because the reporter borrows that
 rail's API credentials.
+
+## Metering usage into a provider
+
+Configuring the reporter above is what makes the proxy *able* to report
+usage. What produces the usage is the request path, and there are three
+places consumption comes from. Each one is a different kind of thing on an
+invoice and each is reported as itself.
+
+| `source` | Where the quantity comes from | `resource_type` on the queued row | `resource_name` |
+|---|---|---|---|
+| `http` | The signed request receipt `proxy.attestation` cuts, after its `billable` outcome table has run. | `http_route` | The route path, for example `/v1/search`. |
+| `ai` | The completed AI call's own token counts. | `ai_model` | `provider/model`, for example `openai/gpt-4o`. |
+| `mcp` | Each MCP tool call the request dispatched, counted per tool. | `mcp_tool` | `server/tool`, for example `acme/search`. |
+
+An MCP tool call is queued as a tool call. The AI usage log encodes one as
+`provider: "mcp"` with the server name in the `model` field so tool spend is
+filterable next to model spend in one stream, which is a reasonable thing to
+do to a log and a bad thing to put on a bill: a buyer reading `model:
+acme-search` on an invoice line for a tool call has been told something
+untrue about what they bought.
+
+### Which source is authoritative
+
+`source` is required and has no default because one request can honestly be
+described more than one way. An AI request served through the gateway is
+also an HTTP request the meter priced. Report both against one Stripe meter
+and the customer is charged twice for one sale.
+
+So each meter event names the record that is authoritative for it, and the
+proxy never guesses at runtime. A deployment that genuinely wants to bill
+two dimensions configures two meter events, which is a decision an operator
+made rather than one the proxy made for them.
+
+A meter event bound to a source the request did not produce queues nothing.
+An `http` meter event needs `proxy.attestation` configured with a role that
+writes receipts: without one there is no outcome table, so there is no
+answer about whether the request was billable, and inventing one is exactly
+what this field exists to prevent.
+
+### What the outcome table decides, and what this does not
+
+For `source: http` the quantity is whatever
+`proxy.attestation.billable` said survived the request's outcome. A cache
+hit, a policy block, a rate limit, and a client disconnect are charged or
+not charged according to that table and to nothing in the reporter. If the
+table prices `cache_hit` at `no`, a cache hit queues nothing, and there is
+no rule anywhere in the billing path that mentions caching. The queued row
+carries the outcome it was priced under, so "you billed me for a cache hit"
+is a question answered by pointing at your own table.
+
+### The provider deduplication identifier
+
+Every queued row carries a `usage_identifier`, which is the key Stripe
+deduplicates meter events on. Getting it wrong has two outcomes and both
+are bad: an identifier that collides silently drops a charge, and one that
+varies between two reports of the same unit charges the customer twice.
+
+It is derived from the claim the receipt names, the reporter, the resource
+type, the resource name, and the unit. All five, because one request
+routinely produces several billable units and keying them on the request
+alone would report the first and let the provider discard the rest.
+
+The derivation reads no clock, no counter, and no random source, so a
+retry after a restart reproduces the identifier exactly. The rendered form
+is `sbu-<claim>-<digest>`: the claim is carried in the clear so you can find
+the request from a provider dashboard, and the digest is what guarantees
+uniqueness.
+
+### When the queue will not take a row
+
+A queue is a durability mechanism, not a failure mode, so the failure mode
+is stated separately. `failure_posture` uses the same vocabulary as every
+other posture in this proxy.
+
+| Posture | What happens to the request | What is left behind |
+|---|---|---|
+| `degraded` (default) | Served. | A signed `usage_gap` marker on the receipt chain naming the claim, plus `sbproxy_usage_bridge_gap_total`. |
+| `closed` | This one is served, because it has already been written to the client and cannot be recalled. The bridge then shuts, and the *next* response over that origin is refused with a 503 before its body goes out. | The same marker and counter. |
+| `open` | Served. | The counter, and nothing else. |
+| `observe` | Rejected at load. | Nothing in the bridge refuses a request, so `observe` would be `open` under a name that promises otherwise. |
+
+`degraded` is the default for the same reason `proxy.attestation.failure_mode`
+defaults to it: billing is not a security boundary, and a settlement
+database that will not accept a write must not take the API down. What
+makes admitting defensible is that the hole is provable afterwards. The
+gap marker is an ordinary chained, signed entry, so a chain carrying one
+still verifies and an operator reconciling a provider invoice can see
+exactly which claim went unbilled.
+
+The marker's claim id is suffixed `:usage_gap` so it cannot collide with
+the receipt it stands beside, or with the `:chain_gap` marker the meter
+writes when it cannot chain a receipt at all. Those are different holes and
+a shared key would make the second one vanish.
+
+### The request path enqueues, and only the worker calls the provider
+
+A served request writes one durable row and stops. The HTTP call to Stripe
+belongs to the recovery worker, behind its own lease, its own dispatch
+stamp, and its own idempotency key. Nothing on the request path ever waits
+on a provider, which is the whole point of metering through a queue rather
+than through a callback.
+
+The visible half of that is the row's status: a freshly queued row reads
+`queued`, and only the worker moves it on.
+
+### Seeing it work
+
+With the block above configured and a request served, the queue holds one
+row per billable unit:
+
+<!-- CAPTURE: sqlite3 /var/lib/sbproxy/payments.sqlite3 'select reporter, usage_identifier, tenant_id, origin_id, status, quantity from usage_reports order by created_at_ms' -->
+
+The full event the worker will hand the reporter, including the resource
+attribution and the customer the charge lands on:
+
+<!-- CAPTURE: sqlite3 /var/lib/sbproxy/payments.sqlite3 'select event_jcs from usage_reports order by created_at_ms limit 1' -->
+
+Two counters describe the bridge, both labelled by tenant because a billing
+number that merged every tenant into one series answers a question nobody
+asks:
+
+<!-- CAPTURE: curl -s http://127.0.0.1:9090/metrics | grep sbproxy_usage_bridge -->
+
+`sbproxy_usage_bridge_enqueued_total` splits on `result`. A `duplicate` is
+the idempotency contract working and is expected on a retry; a series that
+is entirely `duplicate` means an identifier is not varying when it should,
+which is the shape of a silently dropped charge.
+
+`sbproxy_usage_bridge_gap_total` is the one to alert on. Nonzero means a
+served request produced a billable unit that never reached the queue, so
+the customer will be under-billed and nothing downstream notices on its
+own.
+
+Once the worker has drained a row, the gap markers and receipts for the same
+claims are on the chain and it still verifies:
+
+<!-- CAPTURE: curl -s -u admin:secret -X POST http://127.0.0.1:9090/api/meter/verify -->
+
+### Reconciling a provider invoice
+
+The queued row is the join. It carries `claim_id`, which is the same claim
+the signed receipt names, so a line on a Stripe invoice reaches the
+`usage_identifier`, the identifier reaches the row, the row names the claim,
+and the claim names the receipt that says what was consumed and under which
+outcome. Reconcile against the chain rather than against a dashboard: the
+counters above are operational telemetry and they are lossy by
+construction.
 
 ## Secret references
 

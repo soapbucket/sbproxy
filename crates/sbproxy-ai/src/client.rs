@@ -1,12 +1,14 @@
 //! HTTP client for forwarding requests to AI providers.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use sbproxy_security::egress::{EgressAuthorizer, EgressDenied, EgressPurpose, HostResolver};
+use sbproxy_security::egress::{
+    evaluate_hop, record_egress_refused, CachedSystemResolver, EgressAuthorizer, EgressDenied,
+    EgressPurpose, HostResolver, RedirectRule,
+};
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
@@ -330,6 +332,11 @@ impl AiClient {
         Self {
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
+                // WOR-2165: redirects are followed by `send_governed`,
+                // which re-authorizes each hop. Letting the client
+                // follow them would carry the provider credential to a
+                // host no gate ever saw.
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("AI HTTP client builder failed; cannot enforce the request timeout"),
             shadow_supervisor: Arc::new(ShadowSupervisor::default()),
@@ -352,6 +359,11 @@ impl AiClient {
         Self {
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
+                // WOR-2165: redirects are followed by `send_governed`,
+                // which re-authorizes each hop. Letting the client
+                // follow them would carry the provider credential to a
+                // host no gate ever saw.
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("AI HTTP client builder failed; cannot enforce the request timeout"),
             shadow_supervisor: supervisor,
@@ -373,9 +385,33 @@ impl AiClient {
             .map(|_| ())
     }
 
-    fn gate_provider_url(&self, url: &str) -> Result<()> {
-        self.authorize_provider_url(url, &PublicPinResolver)
-            .map_err(|e| anyhow::anyhow!("egress denied: {e:?}"))
+    /// Gate one provider URL before any I/O, attributing a refusal to
+    /// `provider_name`.
+    ///
+    /// WOR-2165: the resolver is [`CachedSystemResolver`], a live
+    /// answer, not the fixed synthetic pin this gate used to run
+    /// against. The synthetic address was always public and always
+    /// resolvable, so `allow_private` and `DnsResolutionFailed` could
+    /// not fire and the check asserted only what the URL string said.
+    /// Nothing resolves when no authorizer is attached, which is every
+    /// production call site today, so the live resolver costs nothing
+    /// until an operator turns egress on.
+    fn gate_provider_url(&self, url: &str, provider_name: &str) -> Result<()> {
+        self.authorize_provider_url(url, &CachedSystemResolver)
+            .map_err(|e| {
+                record_egress_refused(EgressPurpose::AiProvider, e, "unset", provider_name);
+                anyhow::anyhow!("egress denied: {e:?}")
+            })
+    }
+
+    /// Send one already-built provider request under the governed
+    /// redirect contract (WOR-2165).
+    async fn send_provider_request(
+        &self,
+        request: reqwest::Request,
+        provider_name: &str,
+    ) -> Result<reqwest::Response> {
+        send_governed(&self.http, self.egress.as_ref(), provider_name, request).await
     }
 
     /// Borrow the shadow supervisor (test + diagnostic accessor).
@@ -987,7 +1023,7 @@ impl AiClient {
         let base_url_owned = provider.effective_base_url();
         let base_url = base_url_owned.trim_end_matches('/');
         let url_string = build_url(base_url, &translated_path);
-        self.gate_provider_url(&url_string)?;
+        self.gate_provider_url(&url_string, &provider.name)?;
         let url = reqwest::Url::parse(&url_string)?;
 
         let (auth_header, auth_value) = provider_auth_header(provider)?;
@@ -1012,9 +1048,9 @@ impl AiClient {
             req = req.header("anthropic-version", "2023-06-01");
         }
 
-        let req = req.json(send_body);
+        let req = req.json(send_body).build()?;
         commit_quota_attempt(quota_attempt).await?;
-        let resp = req.send().await?;
+        let resp = self.send_provider_request(req, &provider.name).await?;
 
         Ok(resp)
     }
@@ -1048,7 +1084,7 @@ impl AiClient {
         let base_url_owned = provider.effective_base_url();
         let base_url = base_url_owned.trim_end_matches('/');
         let url_string = build_url(base_url, path);
-        self.gate_provider_url(&url_string)?;
+        self.gate_provider_url(&url_string, &provider.name)?;
         let url = reqwest::Url::parse(&url_string)?;
 
         let (auth_header, auth_value) = provider_auth_header(provider)?;
@@ -1059,9 +1095,9 @@ impl AiClient {
             "forwarding AI GET request to provider"
         );
 
-        let req = self.http.get(url).header(auth_header, auth_value);
+        let req = self.http.get(url).header(auth_header, auth_value).build()?;
         commit_quota_attempt(quota_attempt).await?;
-        let resp = req.send().await?;
+        let resp = self.send_provider_request(req, &provider.name).await?;
 
         Ok(resp)
     }
@@ -1127,7 +1163,7 @@ impl AiClient {
         let base_url_owned = provider.effective_base_url();
         let base_url = base_url_owned.trim_end_matches('/');
         let url_string = build_url(base_url, &translated_path);
-        self.gate_provider_url(&url_string)?;
+        self.gate_provider_url(&url_string, &provider.name)?;
         let url = reqwest::Url::parse(&url_string)?;
 
         let (auth_header, auth_value) = provider_auth_header(provider)?;
@@ -1155,8 +1191,9 @@ impl AiClient {
             req = req.header("content-type", "application/json").json(sb);
         }
 
+        let req = req.build()?;
         commit_quota_attempt(quota_attempt).await?;
-        let resp = req.send().await?;
+        let resp = self.send_provider_request(req, &provider.name).await?;
         Ok(resp)
     }
 }
@@ -1250,7 +1287,7 @@ impl AiClient {
         let base_url_owned = provider.effective_base_url();
         let base_url = base_url_owned.trim_end_matches('/');
         let url_string = build_url(base_url, native_path);
-        self.gate_provider_url(&url_string)?;
+        self.gate_provider_url(&url_string, &provider.name)?;
         let url = reqwest::Url::parse(&url_string)?;
         let (auth_header, auth_value) = provider_auth_header(provider)?;
         let reqwest_method = parse_http_method(method)?;
@@ -1273,9 +1310,9 @@ impl AiClient {
             req = req.header("anthropic-version", "2023-06-01");
         }
 
-        let req = req.body(body);
+        let req = req.body(body).build()?;
         commit_quota_attempt(quota_attempt).await?;
-        let resp = req.send().await?;
+        let resp = self.send_provider_request(req, &provider.name).await?;
         Ok(resp)
     }
 
@@ -1334,7 +1371,7 @@ impl AiClient {
         let base_url_owned = provider.effective_base_url();
         let base_url = base_url_owned.trim_end_matches('/');
         let url_string = build_url(base_url, path);
-        self.gate_provider_url(&url_string)?;
+        self.gate_provider_url(&url_string, &provider.name)?;
         let url = reqwest::Url::parse(&url_string)?;
         let (auth_header, auth_value) = provider_auth_header(provider)?;
         let content_type_header = reqwest::header::HeaderValue::from_str(content_type)?;
@@ -1354,9 +1391,10 @@ impl AiClient {
             .request(reqwest_method, url)
             .header(auth_header, auth_value)
             .header("content-type", content_type_header)
-            .body(body);
+            .body(body)
+            .build()?;
         commit_quota_attempt(quota_attempt).await?;
-        let resp = req.send().await?;
+        let resp = self.send_provider_request(req, &provider.name).await?;
         Ok(resp)
     }
 }
@@ -1398,18 +1436,94 @@ fn parse_http_method(method: &str) -> Result<reqwest::Method> {
     }
 }
 
-/// Resolver that pins a fixed public address so unit tests and the
-/// pre-flight gate never touch the network. Production GS wiring may
-/// inject a real DNS resolver; until then host/scheme/port checks still
-/// run fail-closed when an authorizer is attached.
-struct PublicPinResolver;
+/// Strip every credential-bearing header before a cross-origin hop.
+///
+/// `provider_auth_header` marks the provider credential sensitive, so
+/// the sensitivity flag is the authority here rather than a hardcoded
+/// name list: providers authenticate with `Authorization`, `x-api-key`,
+/// and `api-key` depending on the vendor, and the HTTP client only
+/// strips the first of those on its own. `Authorization` and `Cookie`
+/// are removed unconditionally in case a caller set one without the
+/// flag.
+pub(crate) fn strip_sensitive_headers(headers: &mut reqwest::header::HeaderMap) {
+    let sensitive: Vec<reqwest::header::HeaderName> = headers
+        .iter()
+        .filter(|(_, value)| value.is_sensitive())
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in sensitive {
+        headers.remove(&name);
+    }
+    headers.remove(reqwest::header::AUTHORIZATION);
+    headers.remove(reqwest::header::COOKIE);
+}
 
-impl HostResolver for PublicPinResolver {
-    fn resolve(&self, _host: &str, port: u16) -> Result<Vec<SocketAddr>, ()> {
-        Ok(vec![SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
-            port,
-        )])
+/// Send `request`, re-authorizing every redirect hop (WOR-2165).
+///
+/// The shared provider client no longer follows redirects on its own.
+/// A provider dial carries an API key, and a host allowlist checked
+/// once covers hop one only, so a 302 was enough to walk the credential
+/// off the approved host. Each `Location` now runs back through
+/// [`evaluate_hop`] before the next connect, bounded at
+/// `sbproxy_security::egress::MAX_REDIRECT_HOPS`.
+///
+/// With no authorizer configured (every production call site today) the
+/// rule is [`RedirectRule::SameOriginOnly`]: the operator named one
+/// host, so that is the only host the chain may reach, and no DNS work
+/// happens at all. With an authorizer, each hop is authorized against
+/// the allowlist for [`EgressPurpose::AiProvider`] and credentials are
+/// stripped when the hop crosses origin.
+async fn send_governed(
+    http: &reqwest::Client,
+    egress: Option<&EgressAuthorizer>,
+    origin_label: &str,
+    mut request: reqwest::Request,
+) -> Result<reqwest::Response> {
+    let mut hop = 0usize;
+    loop {
+        // Clone before the send consumes the request so a hop can reuse
+        // the method, headers, and body.
+        let replay = request.try_clone();
+        let from = request.url().clone();
+        let resp = http.execute(request).await?;
+        if !resp.status().is_redirection() {
+            return Ok(resp);
+        }
+        let Some(location) = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+        else {
+            // A redirect status with no usable Location is not a hop.
+            // Hand it back rather than inventing a destination.
+            return Ok(resp);
+        };
+        hop += 1;
+        let next = evaluate_hop(
+            egress,
+            EgressPurpose::AiProvider,
+            &from,
+            &location,
+            hop,
+            RedirectRule::SameOriginOnly,
+            &CachedSystemResolver,
+        )
+        .map_err(|denied| {
+            record_egress_refused(EgressPurpose::AiProvider, denied, "unset", origin_label);
+            anyhow::anyhow!("egress denied: {denied:?}")
+        })?;
+        let Some(mut replay) = replay else {
+            // A non-replayable body (a stream) cannot be re-sent on the
+            // hop. Returning the redirect response is honest; sending
+            // the hop with the body silently dropped is not.
+            return Ok(resp);
+        };
+        if next.strip_credentials {
+            strip_sensitive_headers(replay.headers_mut());
+        }
+        *replay.url_mut() = next.url;
+        request = replay;
     }
 }
 
@@ -1505,6 +1619,7 @@ impl AiClient {
             let (body_owned, reasoning_outcome) =
                 prepare_provider_attempt_body(config, &provider, body);
             let http = self.http.clone();
+            let egress = self.egress.clone();
             let i = *idx;
             // Pre-authorize before spawning so an unlisted host is
             // denied without opening a connection.
@@ -1515,7 +1630,7 @@ impl AiClient {
                 let base_url_owned = provider.effective_base_url();
                 let base_url = base_url_owned.trim_end_matches('/');
                 let url = build_url(base_url, &translated_path);
-                self.gate_provider_url(&url)?;
+                self.gate_provider_url(&url, &provider.name)?;
             }
             tasks.push(async move {
                 let format = provider_format(&provider);
@@ -1525,16 +1640,28 @@ impl AiClient {
                 let base_url_owned = provider.effective_base_url();
                 let base_url = base_url_owned.trim_end_matches('/');
                 let url = build_url(base_url, &translated_path);
-                let (auth_header, auth_value) = provider.auth_header();
-                let mut req = http
-                    .post(&url)
-                    .header("content-type", "application/json")
-                    .header(auth_header, &auth_value);
+                // WOR-2165: mark the credential sensitive so a
+                // cross-origin hop strips it, the same as every other
+                // provider dial. The raw `provider.auth_header()` pair
+                // this leg used to build did not.
+                let auth = provider_auth_header(&provider);
+                let mut req = match auth {
+                    Ok((auth_header, auth_value)) => http
+                        .post(&url)
+                        .header("content-type", "application/json")
+                        .header(auth_header, auth_value),
+                    Err(error) => return (i, provider, Err(error)),
+                };
                 if matches!(format, ProviderFormat::Anthropic) {
                     req = req.header("anthropic-version", "2023-06-01");
                 }
                 ai_metrics::record_reasoning_policy_attempt(&provider.name, reasoning_outcome);
-                let resp = req.json(send_body).send().await;
+                let resp = match req.json(send_body).build() {
+                    Ok(request) => {
+                        send_governed(&http, egress.as_ref(), &provider.name, request).await
+                    }
+                    Err(error) => Err(anyhow::Error::new(error)),
+                };
                 (i, provider, resp)
             });
         }
@@ -1566,7 +1693,10 @@ impl AiClient {
                 }
                 Err(e) => {
                     router.record_provider_failure(idx, provider.name.as_str());
-                    last_err = Some(anyhow::Error::from(e));
+                    // WOR-2165: the leg now returns anyhow::Error (an
+                    // egress refusal is not a transport error), so this
+                    // is already the right type.
+                    last_err = Some(e);
                     continue;
                 }
             }
@@ -2225,7 +2355,19 @@ async fn run_shadow_request(
         );
         return failed_shadow_call(started);
     }
-    let mut resp = match req.send().await {
+    // WOR-2165: a shadow copy carries the same provider credential as
+    // the primary, so it follows redirects under the same governed
+    // contract. `try_spawn_shadow` already suppresses the copy outright
+    // when an authorizer is attached, so the hop rule here is always
+    // the unconfigured one: same origin or nothing.
+    let request = match req.build() {
+        Ok(request) => request,
+        Err(error) => {
+            warn!(provider = %provider.name, %error, "shadow request could not be built");
+            return failed_shadow_call(started);
+        }
+    };
+    let mut resp = match send_governed(&http, None, &provider.name, request).await {
         Ok(r) => r,
         Err(e) => {
             warn!(provider = %provider.name, error = %e, "shadow request transport error");
@@ -2429,6 +2571,7 @@ pub(crate) fn build_url(base_url: &str, path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
 
     static SHADOW_METRIC_TEST_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
@@ -3840,6 +3983,37 @@ mod tests {
         );
     }
 
+    /// Test resolver mapping a host to fixed addresses. Production
+    /// paths pass `CachedSystemResolver`; a fixture resolver belongs
+    /// only here, where the fixture is the thing under test.
+    struct MapResolver {
+        map: std::collections::HashMap<String, Vec<std::net::SocketAddr>>,
+    }
+
+    impl MapResolver {
+        fn new(entries: Vec<(&str, Vec<std::net::SocketAddr>)>) -> Self {
+            Self {
+                map: entries
+                    .into_iter()
+                    .map(|(h, a)| (h.to_string(), a))
+                    .collect(),
+            }
+        }
+    }
+
+    impl HostResolver for MapResolver {
+        fn resolve(&self, host: &str, _port: u16) -> Result<Vec<std::net::SocketAddr>, ()> {
+            self.map.get(host).cloned().ok_or(())
+        }
+    }
+
+    fn public_addr(port: u16) -> std::net::SocketAddr {
+        std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34)),
+            port,
+        )
+    }
+
     fn enforce_ai_provider(hosts: &[&str]) -> EgressAuthorizer {
         use sbproxy_security::egress::{EgressConfig, PurposeAllowlist};
         use std::collections::HashMap;
@@ -3859,29 +4033,151 @@ mod tests {
     #[test]
     fn provider_egress_denies_unlisted_host_with_closed_vocabulary() {
         let client = AiClient::new().with_egress(enforce_ai_provider(&["api.openai.com"]));
+        let resolver = MapResolver::new(vec![("evil.example", vec![public_addr(443)])]);
         let err = client
-            .authorize_provider_url("https://evil.example/v1/chat", &PublicPinResolver)
+            .authorize_provider_url("https://evil.example/v1/chat", &resolver)
             .expect_err("unlisted host must be denied");
         assert_eq!(err, EgressDenied::UnlistedHost);
         assert!(!format!("{err:?}").contains("evil.example"));
     }
 
     #[test]
+    fn provider_egress_denies_an_allowlisted_host_that_resolves_internal() {
+        // The old fixed synthetic resolver returned a public address for
+        // every host, so `allow_private` could not fire and this whole
+        // class of denial was unreachable. With a live answer it is the
+        // first thing the gate catches.
+        let client = AiClient::new().with_egress(enforce_ai_provider(&["api.internal.test"]));
+        let resolver = MapResolver::new(vec![(
+            "api.internal.test",
+            vec![std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(169, 254, 169, 254)),
+                443,
+            )],
+        )]);
+        assert_eq!(
+            client
+                .authorize_provider_url("https://api.internal.test/v1", &resolver)
+                .unwrap_err(),
+            EgressDenied::PrivateAddress
+        );
+    }
+
+    #[test]
     fn omitted_egress_preserves_legacy_provider_compatibility() {
         let client = AiClient::new();
+        let resolver = MapResolver::new(vec![]);
         client
-            .authorize_provider_url("https://evil.example/v1/chat", &PublicPinResolver)
-            .expect("omitted egress must not deny");
+            .authorize_provider_url("https://evil.example/v1/chat", &resolver)
+            .expect("omitted egress must not deny, and must not even resolve");
     }
 
     #[test]
     fn enforce_egress_fails_closed_for_unlisted_purpose_host() {
         let client = AiClient::new().with_egress(enforce_ai_provider(&["api.openai.com"]));
+        let resolver = MapResolver::new(vec![("api.anthropic.com", vec![public_addr(443)])]);
         assert_eq!(
             client
-                .authorize_provider_url("https://api.anthropic.com/v1", &PublicPinResolver)
+                .authorize_provider_url("https://api.anthropic.com/v1", &resolver)
                 .unwrap_err(),
             EgressDenied::UnlistedHost
         );
+    }
+
+    /// One-shot loopback fixture that serves `response` verbatim to the
+    /// first connection and reports whether it was contacted. Mirrors
+    /// the `dial_fixture` shape the OpenAPI redirect test uses.
+    fn dial_fixture(response: String) -> Option<(std::net::SocketAddr, Arc<AtomicBool>)> {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+        let addr = listener.local_addr().ok()?;
+        let hit = Arc::new(AtomicBool::new(false));
+        let hit_writer = Arc::clone(&hit);
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                hit_writer.store(true, Ordering::SeqCst);
+                let mut scratch = [0u8; 2048];
+                let _ = stream.read(&mut scratch);
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        Some((addr, hit))
+    }
+
+    fn ok_response(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[tokio::test]
+    async fn provider_dial_refuses_a_cross_origin_redirect_hop() {
+        // Hop one is the host the operator configured and serves a 302
+        // to a different host. The credential must not follow: the
+        // second listener must never be contacted.
+        let Some((sink_addr, sink_hit)) = dial_fixture(ok_response("{}")) else {
+            return;
+        };
+        let redirect = format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{}/steal\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            sink_addr.port()
+        );
+        let Some((first_addr, first_hit)) = dial_fixture(redirect) else {
+            return;
+        };
+
+        let client = AiClient::new();
+        let request = client
+            .http
+            .post(format!("http://{first_addr}/v1/chat/completions"))
+            .header("x-api-key", {
+                let mut v = reqwest::header::HeaderValue::from_static("sk-secret");
+                v.set_sensitive(true);
+                v
+            })
+            .json(&serde_json::json!({"model": "gpt-4o"}))
+            .build()
+            .expect("test request builds");
+
+        let err = send_governed(&client.http, None, "test-provider", request)
+            .await
+            .expect_err("a cross-origin hop must be refused, not followed");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("RedirectToUnlistedHost"),
+            "expected RedirectToUnlistedHost, got: {rendered}"
+        );
+        assert!(
+            first_hit.load(Ordering::SeqCst),
+            "hop one must have served the redirect"
+        );
+        assert!(
+            !sink_hit.load(Ordering::SeqCst),
+            "the redirect target must never be contacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_dial_returns_a_non_redirect_response_unchanged() {
+        // The governed loop must not perturb the ordinary path: a 200
+        // comes back on the first pass with one dial and no hop
+        // evaluation at all.
+        let body = r#"{"ok":true}"#;
+        let Some((addr, hit)) = dial_fixture(ok_response(body)) else {
+            return;
+        };
+        let client = AiClient::new();
+        let request = client
+            .http
+            .get(format!("http://{addr}/v1/models"))
+            .build()
+            .expect("test request builds");
+        let resp = send_governed(&client.http, None, "test-provider", request)
+            .await
+            .expect("a non-redirect response returns unchanged");
+        assert_eq!(resp.status().as_u16(), 200);
+        assert!(hit.load(Ordering::SeqCst));
     }
 }

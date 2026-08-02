@@ -2048,7 +2048,18 @@ pub(super) async fn handle_mcp_action(
                                         )
                                         .await;
                                     };
-                                    let http = reqwest::Client::new();
+                                    // WOR-2165: the token-exchange POST
+                                    // carries the caller's subject token
+                                    // in the form body, which a 307 or
+                                    // 308 replays verbatim at whatever
+                                    // host the Location names. The
+                                    // client must not follow redirects
+                                    // on its own; `mint_token_exchange`
+                                    // re-authorizes each hop instead.
+                                    let http = reqwest::Client::builder()
+                                        .redirect(reqwest::redirect::Policy::none())
+                                        .build()
+                                        .unwrap_or_else(|_| reqwest::Client::new());
                                     let subject_token = session
                                         .req_header()
                                         .headers
@@ -2606,6 +2617,43 @@ fn emit_tool_call_ledger(
     });
 }
 
+/// WOR-2169: record one dispatched tool call for the durable billing queue.
+///
+/// The tool name is stored with its `<server>__` federation prefix stripped,
+/// so `acme__search` dispatched through federation and `search` dispatched
+/// directly against the same server are one billable resource rather than
+/// two. A buyer reading `acme/search` on an invoice should not have to know
+/// which route the gateway took to get there.
+///
+/// A no-op unless a usage reporter is configured, which is the common case
+/// and costs one `Option` test.
+#[cfg(feature = "payments")]
+fn record_billable_tool_call(ctx: &RequestContext, tool_name: &str, server: &str) {
+    let configured = ctx
+        .pipeline
+        .payments
+        .as_ref()
+        .is_some_and(|payments| payments.usage_bridge().is_some());
+    if !configured {
+        return;
+    }
+    let bare = tool_name
+        .strip_prefix(&format!("{server}__"))
+        .unwrap_or(tool_name);
+    ctx.mcp_billable_calls
+        .lock()
+        .push(crate::usage_bridge::McpToolCall {
+            server: server.to_string(),
+            tool: bare.to_string(),
+        });
+}
+
+/// Stand-in for a build with no settlement stack compiled in.
+///
+/// There is no durable queue to record into, so there is nothing to record.
+#[cfg(not(feature = "payments"))]
+fn record_billable_tool_call(_ctx: &RequestContext, _tool_name: &str, _server: &str) {}
+
 /// WOR-1644: attribute one MCP `tools/call` into the usage plane.
 /// Records the dispatch count and duration on
 /// `sbproxy_mcp_tool_dispatch_*`, the resolved cost on
@@ -2645,6 +2693,19 @@ fn emit_mcp_tool_attribution(
     if let Some(cost_usd) = cost {
         sbproxy_observe::metrics::record_mcp_tool_cost(tool_name, server, cost_usd);
     }
+
+    // WOR-2169: record the call for the durable billing queue, which is
+    // written at the end of the request. A tool call is a billable unit in
+    // its own right, so it is recorded here whether or not a usage sink is
+    // listening: the sinks below are an observability stream and the queue
+    // is an invoice, and gating one on the other would mean a deployment
+    // that bills for tools but logs nothing bills for nothing.
+    //
+    // Recorded only when a reporter is configured, so the common path takes
+    // one `Option` test and allocates nothing. Errors are recorded too: an
+    // operator's outcome position on a failed tool call belongs in their
+    // configuration, and dropping the record here would decide it for them.
+    record_billable_tool_call(ctx, tool_name, server);
 
     // Usage-sink row: only build it when a sink is listening.
     if mcp.usage_sinks.is_empty() {
