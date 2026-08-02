@@ -44,7 +44,7 @@ billed.
 |---|---|---|
 | Deterministic model-host suites | passed 2026-07-30 | Artifact, driver, fit, admission, reconcile, reload, capability, and CLI suites. |
 | CPU admission | passed 2026-07-30 | Local admission and cold-start policy on an accelerator-free path. |
-| Apple Silicon Metal | **rerun required** | The 2026-07-30 M4 Max run passed 11 of 12 checks. The listener/engine lifecycle defect behind the failed check now has deterministic real-process coverage and a blocking Apple-lane assertion, but the updated lane has not yet run on live Apple hardware. |
+| Apple Silicon Metal | passed 2026-08-02 | Apple M4 Max, macOS 26.5.2 (25F84), 36 GiB, revision `e2858994` on a clean tree. All 12 checks: cold start ready in 17s, nonempty completion, public model name echoed, truthful status (`llama_cpp b9905`, digest `830f2915`), stop reaped the engine, clean SIGTERM in 61s with no orphan and the public port released, and a second run that downloaded nothing and matched the digest. The 2026-07-30 run's one failure was the listener release; that check now passes against the widened exit window. |
 | NVIDIA CUDA single GPU | passed 2026-07-30 | Live vLLM container completion on an NVIDIA L4: NVML probe, fit plan, public model echo, full status, and a stop that returned the device to 0 MiB. |
 | NVIDIA multi-GPU | unsupported | Needs two visible devices. The billing account this project runs under is capped at one GPU, so the lane has never had hardware to run on. Detail below. |
 | Air-gapped | passed 2026-07-30 | Offline, manual, and file pull policies short-circuit transport; a digest mismatch fails closed. |
