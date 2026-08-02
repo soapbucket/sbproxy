@@ -101,3 +101,5 @@ docker compose down -v
 ## Read more
 
 [docs/langchain.md](../../docs/langchain.md) walks through the config, the virtual key semantics, the Anthropic-native path, and the MCP tool path. [docs/ai-gateway.md](../../docs/ai-gateway.md) is the full AI gateway reference.
+
+This example covers the chat-completions half of the page only. For the MCP tool half, [examples/mcp-federation](../mcp-federation/) is the runnable federation stack the doc sends you to: it ships its own upstream, so `tools/list` and `tools/call` complete without an external tool server.

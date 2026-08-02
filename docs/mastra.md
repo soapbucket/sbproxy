@@ -151,6 +151,37 @@ origins:
 
 Bare hostnames under `federated_servers` are normalised to `https://<host>/mcp`; use a full URL for any other path. The `prefix` is the server label: by default tool names stay bare in the federated catalog and the label steps in only when two upstreams advertise the same name (the first-listed server keeps the bare name and the later server's tool becomes `orders.get_order_status`). Set `namespace: always` on an entry to prefix everything it exposes. An origin key carries one action, so when you want chat completions and MCP behind the same gateway process, give each its own origin keyed by hostname.
 
+The two remaining fields are the gateway's own identity. `mode: gateway` is what puts the origin in federating mode, where the gateway owns the catalog and fans each `tools/call` out to the upstream that holds the tool; `server_info` is the name and version the gateway reports for itself during the `initialize` handshake, which is what MCP clients display when they list their connected servers.
+
+Both `federated_servers` entries above are placeholders. `orders.internal` and `weather.internal` do not resolve, so booting that config as written gives you an empty `tools/list`: the gateway degrades per server, dropping an unreachable upstream with a log line instead of failing the whole catalog. Substitute your own tool servers, or run the federation example below against an upstream that answers.
+
+### Run the MCP half without writing a tool server
+
+[`examples/mcp-federation/`](../examples/mcp-federation/) is the runnable version of the config above, and it ships its own upstream so nothing external has to resolve. Its `gh` entry is a `type: openapi` federated server: the gateway derives MCP tools from an inline OpenAPI spec and dispatches each `tools/call` as an ordinary REST request, so there is no MCP server code anywhere in the example. It also sets `namespace: always`, which is why its tools arrive prefixed as `gh.*` rather than bare. Its `db` entry is left unresolvable on purpose, so you can watch the per-server degradation described above happen right next to an upstream that works.
+
+It runs as two processes, the mock REST API and the gateway that federates it:
+
+```bash
+sbproxy serve -f examples/mcp-federation/upstream.yml &
+sbproxy serve -f examples/mcp-federation/sb.yml
+```
+
+Every call below is an HTTP POST of a JSON-RPC envelope. The `Accept` header has to offer both `application/json` and `text/event-stream`, because the streamable HTTP transport picks between them per response, and `MCPClient` sends both for you.
+
+This is the federated catalog, the same list `mcp.listTools()` returns:
+
+```
+{"description":"Search repositories by query.","inputSchema":{"properties":{"q":{"type":"string"}},"required":["q"],"type":"object"},"name":"gh.search_repos"}
+```
+
+One tool, not two, because the `db` upstream never answered. Calling the tool that did register dispatches a real HTTP request to the mock upstream and returns its response as MCP tool-result content:
+
+```
+[{"full_name":"soapbucket/sbproxy","name":"sbproxy","stars":4200},{"full_name":"soapbucket/docs","name":"docs","stars":12}]
+```
+
+To point the script below at this stack, set the server entry's `url` to `http://127.0.0.1:8080/` with a `Host: mcp.example.com` header. Mastra namespaces by your server entry name on top of the gateway's own prefix, so the tool arrives as `gateway_gh.search_repos`; the suffix match in the snippet still finds it if you search for `search_repos`. The example's origin is keyed by hostname, so the `Host` header is what selects the MCP origin.
+
 Mastra consumes the gateway through the `MCPClient` in `@mastra/mcp` (validated at 1.13.1), which speaks the streamable HTTP transport the gateway serves. One server entry pointed at the gateway is enough, because the gateway is already the aggregation point:
 
 ```typescript
