@@ -28,4 +28,5 @@ origins:
       - type: rate_limiting
         requests_per_second: 50
         burst: 100
-        key: ip
+        # `key` is a CEL expression evaluated per request, not a keyword.
+        key: 'connection.remote_ip'

@@ -19,12 +19,100 @@
 //! record. The resulting values ride through the same redaction pass as
 //! every other field because they are set on the entry before
 //! `AccessLogEntry::emit`.
+//!
+//! ## CEL fields compile once per config publication (WOR-2164)
+//!
+//! A `engine: cel` field used to be parsed again for every log record
+//! it appeared on, which is once per request on a busy origin, and a
+//! malformed expression was only ever discovered there: the config
+//! booted, the field quietly never appeared, and the operator had a
+//! debug line for it at best. [`compile_cel_programs`] now parses every
+//! CEL field across every scope while the pipeline is being built, so
+//! malformed source rejects the candidate config and the log path only
+//! evaluates. Lua and JS fields still build their interpreter per
+//! record by design (that is their isolation model).
 
 use std::collections::{BTreeMap, HashMap};
 
 use pingora_proxy::Session;
+use sbproxy_extension::cel::CompiledCel;
 
 use crate::context::RequestContext;
+
+/// Every `engine: cel` custom log field in a config generation,
+/// compiled once and keyed by its source text.
+///
+/// Keyed by source rather than by field name because the same
+/// expression can be declared at proxy, tenant, and origin scope, and
+/// because scope resolution happens per request: the log path has the
+/// winning field in hand and needs the program for its source.
+pub(crate) type CompiledLogPrograms = HashMap<String, CompiledCel>;
+
+/// Compile every CEL custom log field declared at proxy, tenant, or
+/// origin scope.
+///
+/// Called once per config publication, from `CompiledPipeline::from_config`,
+/// so malformed CEL rejects the candidate config at boot and at reload.
+/// The diagnostic names the scope and the field.
+pub(crate) fn compile_cel_programs(
+    config: &sbproxy_config::CompiledConfig,
+) -> anyhow::Result<CompiledLogPrograms> {
+    let mut programs = CompiledLogPrograms::new();
+
+    let proxy_fields = config
+        .server
+        .observability
+        .as_ref()
+        .and_then(|o| o.log.as_ref())
+        .map(|l| l.custom_fields.as_slice())
+        .unwrap_or(&[]);
+    compile_scope(&mut programs, "proxy", proxy_fields)?;
+
+    for tenant in &config.server.tenants {
+        let scope = format!("tenant `{}`", tenant.id);
+        let fields = tenant
+            .observability
+            .as_ref()
+            .map(|o| o.log.custom_fields.as_slice())
+            .unwrap_or(&[]);
+        compile_scope(&mut programs, &scope, fields)?;
+    }
+
+    for origin in &config.origins {
+        let scope = format!("origin `{}`", origin.origin_id);
+        let fields = origin
+            .observability
+            .as_ref()
+            .map(|o| o.log.custom_fields.as_slice())
+            .unwrap_or(&[]);
+        compile_scope(&mut programs, &scope, fields)?;
+    }
+
+    Ok(programs)
+}
+
+/// Compile the CEL fields of one scope into `programs`. Non-CEL fields
+/// (static values, Lua, JS) are skipped.
+fn compile_scope(
+    programs: &mut CompiledLogPrograms,
+    scope: &str,
+    fields: &[sbproxy_config::CustomLogFieldConfig],
+) -> anyhow::Result<()> {
+    for field in fields {
+        let (Some("cel"), Some(source)) = (field.engine.as_deref(), field.source.as_deref()) else {
+            continue;
+        };
+        if programs.contains_key(source) {
+            continue;
+        }
+        let compiled = CompiledCel::compile(
+            format!("{scope}: custom log field `{}`", field.name),
+            source,
+        )?;
+        programs.insert(source.to_string(), compiled);
+    }
+    Ok(())
+}
 
 /// Evaluate the configured custom fields into the access line's `custom`
 /// map. Returns an empty map when nothing is configured or nothing
@@ -40,6 +128,7 @@ pub(super) fn evaluate(
     path: &str,
 ) -> BTreeMap<String, String> {
     let context = build_context(session, ctx, status, host, method, path);
+    let programs = &ctx.pipeline.custom_log_programs;
     let mut out = BTreeMap::new();
     for field in fields {
         let value = if let Some(template) = field.value.as_deref() {
@@ -47,7 +136,7 @@ pub(super) fn evaluate(
         } else if let (Some(engine), Some(source)) =
             (field.engine.as_deref(), field.source.as_deref())
         {
-            match eval_script(engine, source, &context) {
+            match eval_script(engine, source, programs, &context) {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::debug!(
@@ -207,9 +296,14 @@ fn resolve_var(key: &str, context: &serde_json::Value) -> String {
 }
 
 /// Evaluate an inline script and stringify its result.
-fn eval_script(engine: &str, source: &str, context: &serde_json::Value) -> anyhow::Result<String> {
+fn eval_script(
+    engine: &str,
+    source: &str,
+    programs: &CompiledLogPrograms,
+    context: &serde_json::Value,
+) -> anyhow::Result<String> {
     match engine {
-        "cel" => eval_cel(source, context),
+        "cel" => eval_cel(source, programs, context),
         "lua" => {
             let lua = sbproxy_extension::lua::LuaEngine::new()?;
             let value = lua.execute(source, script_globals(context))?;
@@ -235,20 +329,31 @@ fn script_globals(context: &serde_json::Value) -> HashMap<String, serde_json::Va
     g
 }
 
-/// Evaluate a CEL expression against a context whose top-level keys
-/// mirror the shared context object.
-fn eval_cel(source: &str, context: &serde_json::Value) -> anyhow::Result<String> {
-    use sbproxy_extension::cel::{CelContext, CelEngine};
+/// Evaluate a CEL custom log field against a context whose top-level
+/// keys mirror the shared context object.
+///
+/// The program comes from `programs`, compiled at config publication.
+/// A source with no entry there did not go through
+/// [`compile_cel_programs`], which for a live request means the field
+/// was not part of the pinned config generation; the field is omitted
+/// and the caller logs, exactly as an evaluation error would be. The
+/// log path never falls back to parsing the source.
+fn eval_cel(
+    source: &str,
+    programs: &CompiledLogPrograms,
+    context: &serde_json::Value,
+) -> anyhow::Result<String> {
+    use sbproxy_extension::cel::CelContext;
+    let Some(program) = programs.get(source) else {
+        anyhow::bail!("custom log field: no compiled CEL program for this config generation");
+    };
     let mut cel = CelContext::new();
     if let Some(obj) = context.as_object() {
         for (key, value) in obj {
             cel.set(key.clone(), json_to_cel(value));
         }
     }
-    let engine = CelEngine::new();
-    let result = engine
-        .eval_source(source, &cel)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let result = program.eval(&cel).map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(cel_to_string(&result))
 }
 
@@ -385,16 +490,126 @@ mod tests {
         assert_eq!(interpolate("price is $5", &c), "price is $5");
     }
 
+    /// Build the compiled-program map a config publication would
+    /// produce for `sources`.
+    fn programs_for(sources: &[&str]) -> CompiledLogPrograms {
+        let fields: Vec<sbproxy_config::CustomLogFieldConfig> = sources
+            .iter()
+            .enumerate()
+            .map(|(i, source)| sbproxy_config::CustomLogFieldConfig {
+                name: format!("f{i}"),
+                value: None,
+                engine: Some("cel".to_string()),
+                source: Some((*source).to_string()),
+            })
+            .collect();
+        let mut programs = CompiledLogPrograms::new();
+        compile_scope(&mut programs, "test scope", &fields).expect("valid CEL compiles");
+        programs
+    }
+
     #[test]
     fn cel_field_reads_context() {
         let c = ctx();
+        let sources = [
+            "tenant_id",
+            "request.headers[\"x-tier\"]",
+            "provider + \"/\" + model",
+        ];
+        let programs = programs_for(&sources);
         // CEL sees the top-level keys directly.
-        assert_eq!(eval_cel("tenant_id", &c).unwrap(), "acme");
-        assert_eq!(eval_cel("request.headers[\"x-tier\"]", &c).unwrap(), "gold");
-        assert_eq!(
-            eval_cel("provider + \"/\" + model", &c).unwrap(),
-            "openai/gpt-4o"
+        assert_eq!(eval_cel(sources[0], &programs, &c).unwrap(), "acme");
+        assert_eq!(eval_cel(sources[1], &programs, &c).unwrap(), "gold");
+        assert_eq!(eval_cel(sources[2], &programs, &c).unwrap(), "openai/gpt-4o");
+    }
+
+    #[test]
+    fn compile_scope_rejects_malformed_cel_and_names_the_field() {
+        // WOR-2164: a malformed CEL log field used to boot fine and
+        // then quietly never appear in the log line.
+        let fields = vec![sbproxy_config::CustomLogFieldConfig {
+            name: "caller_tier".to_string(),
+            value: None,
+            engine: Some("cel".to_string()),
+            source: Some("this is not valid CEL !!!".to_string()),
+        }];
+        let mut programs = CompiledLogPrograms::new();
+        let err = compile_scope(&mut programs, "proxy", &fields)
+            .expect_err("malformed CEL must not compile");
+        let msg = err.to_string();
+        assert!(msg.contains("proxy"), "must name the scope: {msg}");
+        assert!(msg.contains("caller_tier"), "must name the field: {msg}");
+        assert!(
+            msg.contains("this is not valid CEL !!!"),
+            "must quote the source: {msg}"
         );
+    }
+
+    #[test]
+    fn compile_scope_skips_static_and_non_cel_fields() {
+        let fields = vec![
+            field("region", "${env.REGION}"),
+            sbproxy_config::CustomLogFieldConfig {
+                name: "lua_field".to_string(),
+                value: None,
+                engine: Some("lua".to_string()),
+                source: Some("return 1".to_string()),
+            },
+        ];
+        let mut programs = CompiledLogPrograms::new();
+        compile_scope(&mut programs, "proxy", &fields).expect("nothing to compile");
+        assert!(programs.is_empty());
+    }
+
+    #[test]
+    fn cel_log_fields_compile_once_per_publication_not_per_record() {
+        // WOR-2164: the log path evaluates, it does not parse. The
+        // engine stamps `sbproxy_script_compile_total{engine="cel"}` on
+        // every parse, so the counter is the arbiter.
+        let before = cel_compile_count();
+        let programs = programs_for(&["tenant_id"]);
+        let after_load = cel_compile_count();
+        assert_eq!(after_load - before, 1, "one parse per publication");
+
+        let c = ctx();
+        for _ in 0..25 {
+            assert_eq!(eval_cel("tenant_id", &programs, &c).unwrap(), "acme");
+        }
+        assert_eq!(cel_compile_count(), after_load, "no parse per log record");
+    }
+
+    #[test]
+    fn cel_field_without_a_compiled_program_is_omitted_rather_than_compiled() {
+        // The only way to reach this is a source that never went
+        // through compile_cel_programs. It must not fall back to
+        // parsing on the log path.
+        let c = ctx();
+        let programs = CompiledLogPrograms::new();
+        let before = cel_compile_count();
+        assert!(eval_cel("tenant_id", &programs, &c).is_err());
+        assert_eq!(cel_compile_count(), before, "no program, no compile");
+    }
+
+    /// Total CEL compiles recorded by the engine so far, across every
+    /// result label.
+    fn cel_compile_count() -> u64 {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.name() == "sbproxy_script_compile_total")
+            .map(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .filter(|metric| {
+                        metric
+                            .get_label()
+                            .iter()
+                            .any(|label| label.name() == "engine" && label.value() == "cel")
+                    })
+                    .map(|metric| metric.get_counter().value() as u64)
+                    .sum()
+            })
+            .unwrap_or_default()
     }
 
     #[test]

@@ -37,11 +37,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use sbproxy_extension::cel::CompiledCel;
 use sbproxy_modules::policy::waf::BlockKeyKind;
 use sbproxy_modules::policy::WafPolicy;
 use sbproxy_modules::WafResult;
 use sbproxy_plugin::{PolicyDecision, PolicyEnforcer};
 
+use super::rate_limit::CelKeyOutcome;
 use crate::context::RequestContext;
 
 /// Newtype wrapper that adapts [`WafPolicy`] to the
@@ -53,9 +55,17 @@ pub struct WafEnforcer(pub Arc<WafPolicy>);
 /// failed CEL eval); the caller treats an empty key as "cannot track" and
 /// skips persistent blocking for that request rather than collapsing
 /// every untrackable client into one shared bucket.
+///
+/// The CEL expression arrives compiled from config load (WOR-2164), so
+/// a syntax error never reaches here. A runtime evaluation error keeps
+/// this surface's long-standing posture, which is the strict one:
+/// `None`, meaning this request is not tracked at all. Persistent
+/// blocking is a punitive control, and striking a client under a key
+/// the expression could not actually compute would block whoever else
+/// lands in that key.
 fn resolve_block_key(
     kind: BlockKeyKind,
-    cel_key: Option<&str>,
+    cel_key: Option<&CompiledCel>,
     req: &http::Request<Bytes>,
     ctx: &RequestContext,
 ) -> Option<String> {
@@ -69,7 +79,10 @@ fn resolve_block_key(
             .map(|s| s.to_string()),
         BlockKeyKind::Cel => {
             let expr = cel_key?;
-            super::rate_limit::rate_limit_key_from_cel(req, ctx, expr)
+            match super::rate_limit::rate_limit_key_from_cel(req, ctx, expr) {
+                CelKeyOutcome::Resolved(key) => Some(key),
+                CelKeyOutcome::NoKey | CelKeyOutcome::EvalError => None,
+            }
         }
     }
 }

@@ -1,6 +1,6 @@
 # SBproxy scripting reference: CEL, Lua, JavaScript, and WASM
 
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-02*
 
 SBproxy includes four scripting engines for custom logic: CEL (Common Expression Language), Lua, JavaScript, and WASM. All run in sandboxed environments with access to request context.
 
@@ -19,12 +19,14 @@ Reach for CEL for one-liner expressions that evaluate in microseconds. Reach for
 
 | Engine | Execution | Isolation |
 |--------|-----------|-----------|
-| CEL | Non-Turing-complete expression, compiled and evaluated by the engine per call | No loops, no side effects, no I/O |
+| CEL | Non-Turing-complete expression, compiled once at config load, evaluated per call | No loops, no side effects, no I/O |
 | Lua | Interpreted, fresh sandboxed VM per invocation | Globals set by one call never leak into the next |
 | JavaScript | QuickJS interpreter, fresh engine per invocation | Dangerous globals removed, CPU/memory/stack caps |
 | WASM | Compiled to native via Wasmtime once at config load | Fresh `Store` per request; module state never leaks |
 
 Lua and JavaScript deliberately build a fresh interpreter state for every invocation so one request's script can never observe another's globals. WASM modules compile once and instantiate per request.
+
+CEL expressions that come from `sb.yml` are parsed once, while the config compiles, and the request path only evaluates them. That is what makes a CEL syntax error a config error: the proxy refuses to boot on one, and a hot reload carrying one is rejected with the previously active config still serving. It also means a config change is the only thing that can ever reparse an expression. Every CEL surface in the table below works this way.
 
 ---
 
@@ -33,7 +35,10 @@ Lua and JavaScript deliberately build a fresh interpreter state for every invoca
 | Config field | Engine | Contract |
 |---|---|---|
 | `policies[] type: expression`, field `expression` | CEL | Returns bool; `false` denies the request with `deny_status` / `deny_message` |
+| `policies[] type: assertion`, field `expression` | CEL | Returns bool at response time; a false assertion is logged and never blocks traffic |
 | `policies[] type: rate_limiting`, field `key` | CEL | Returns the rate-limit bucket key (e.g. `jwt.claims.tenant_id`) |
+| `policies[] type: waf`, field `persistent_block.key` | CEL | Returns the persistent-block tracking key when `track_by: cel` |
+| `observability.log.custom_fields[]` with `engine: cel` | CEL | Returns the value of one operator-defined access-log field |
 | `request_modifiers[].lua_script` | Lua | Defines `modify_request(req, ctx)`; returned `set_headers` are applied to the upstream request |
 | `response_modifiers[].lua_script` | Lua | Defines `modify_response(resp, ctx)`; returned `set_headers` are applied to the response |
 | `response_modifiers[].js_script` | JavaScript | Defines `modify_response(resp, ctx)`; returned `set_headers` are applied to the response |
@@ -296,6 +301,34 @@ policies:
 
 The full working config is in [examples/ratelimit-by-claim/](../examples/ratelimit-by-claim/).
 
+The `key:` expression compiles with the config, so a syntax error in it refuses the config the same way an `expression` policy does. At request time, an expression that evaluates to null or an empty string means "no key for this request" and the request falls back to the default client key (client IP, or the hostname when no client IP is known). An expression that *fails* to evaluate is different: the request is bucketed under a `__cel_key_error__:` prefix on the default client key, and the failure is logged. Rate limiting stays on either way, and error traffic never shares a bucket with correctly keyed traffic.
+
+#### Response assertions
+
+The `assertion` policy (alias `response_assertion`) evaluates CEL against the response and logs the verdict. It is observational: a false assertion never changes the response, and never blocks traffic.
+
+```yaml
+policies:
+  - type: assertion
+    name: no-5xx
+    expression: 'response.status < 500'
+```
+
+The expression compiles with the config, so a syntax error refuses the config. This matters more here than the log-only framing suggests: before, a mis-typed assertion parsed at response time, failed, and was skipped, so the check the operator wrote never ran and nothing said so.
+
+At response time an evaluation error (a key the response did not carry, a result that is not a boolean) is logged and recorded as a pass. Nothing branches on the verdict, so recording a failure would put a line in the log claiming an assertion failed when it never ran.
+
+The Go-compatible shape is accepted too, and compiles the same way:
+
+```yaml
+policies:
+  - type: response_assertion
+    assertions:
+      - name: no-5xx
+        cel_expr: 'response.status < 500'
+        action: pass
+```
+
 ### 3.4 Forward-rule matchers (not CEL)
 
 Forward rules dispatch to inline child origins with declarative matchers, evaluated in order with first match winning. Each entry in a rule's `rules:` list may carry a `path`, `header`, and `query` matcher; matchers present in one entry are ANDed, entries in the list are ORed.
@@ -387,6 +420,10 @@ origins:
 ```
 
 The expression sees `response.body`, `response.status`, `response.headers`, and the `request.*` namespace. A string result is written back verbatim; ints, floats, and bools render as strings; maps and lists are JSON-serialised; null leaves the body unchanged. `Set-Cookie` is on a deny-list: a CEL header rule cannot set it.
+
+Every expression on the transform is compiled when the config compiles: `on_response`, each rule's `value_expr`, and the reserved `on_request` field. A syntax error in any of them refuses the config, naming the origin and the field or header it belongs to. Responses then only evaluate.
+
+At response time the postures are unchanged and deliberately forgiving, because the response is already on its way out: a header rule whose expression fails is skipped and the rest of the chain still runs, and a failing `on_response` leaves the body byte-for-byte unchanged. Both are logged.
 
 ---
 
@@ -859,7 +896,7 @@ Validate your config before deployment:
 sbproxy validate sb.yml
 ```
 
-Validation checks the YAML shape and typed fields, and compiles every `expression` policy, so CEL syntax errors in request gates surface here (and at boot or reload) rather than at request time. Other script bodies (Lua, JavaScript, rate-limit `key:` expressions) are strings to the validator; their syntax errors surface at request time in the logs. Exercise a scripted route once in staging before relying on it.
+Validation checks the YAML shape and typed fields, and compiles every CEL expression the config declares: `expression` and `assertion` policies, rate-limit and WAF persistent-block `key:` expressions, `cel` transform bodies and header rules, and `engine: cel` custom log fields. A CEL syntax error in any of them surfaces here, and at boot and reload, rather than at request time. Lua and JavaScript bodies are still strings to the validator; their syntax errors surface at request time in the logs. Exercise a scripted route once in staging before relying on it.
 
 ### Enabling debug logging
 
@@ -874,9 +911,13 @@ With debug logging on, script failures are logged with the engine, the error mes
 | Surface | On error |
 |---|---|
 | `expression` policy | A CEL parse error rejects the config at compile time (boot refuses to start; a reload keeps the previous config active); an evaluation error fails closed and denies the request (the expression could not prove the request is allowed) |
+| `assertion` policy | A CEL parse error rejects the config at compile time; an evaluation error is logged and recorded as a pass (the policy is log-only and gates nothing) |
+| rate-limit `key:` | A CEL parse error rejects the config at compile time; an empty or null result falls back to the default client key; an evaluation error buckets the request under the `__cel_key_error__:` namespace and logs |
+| WAF `persistent_block.key` | A CEL parse error, or `track_by: cel` with no `key:`, rejects the config at compile time; an evaluation error leaves the request untracked (no strike, no block) |
+| `engine: cel` custom log field | A CEL parse error rejects the config at compile time; an evaluation error is logged at debug and the field is omitted from the line |
 | Lua / JS modifiers | Error logged per request; the modifier's headers are not applied; the request proceeds |
 | `lua_json` / `js_json` / `javascript` transforms | Error logged per request; the body is left unchanged |
-| `cel` transform | Missing both `on_response` and `headers` fails config compile; runtime evaluation errors leave the body unchanged |
+| `cel` transform | Missing both `on_response` and `headers`, or a CEL parse error in any expression, fails config compile; a runtime evaluation error leaves the body unchanged and skips only the failing header rule |
 | WASM transform | Missing `module_path` / `module_bytes` or a module that fails to compile fails config compile; runtime errors skip the transform |
 
 ### Common mistakes

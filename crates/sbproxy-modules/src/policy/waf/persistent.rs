@@ -38,6 +38,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
+use sbproxy_extension::cel::CompiledCel;
 use sbproxy_platform::storage::KVStore;
 use serde::Deserialize;
 
@@ -195,6 +196,10 @@ pub enum StrikeOutcome {
 /// replicas; otherwise the in-process LRU map is authoritative.
 pub struct PersistentBlockStore {
     config: PersistentBlockConfig,
+    /// `key:` compiled once at config load when `track_by: cel`
+    /// (WOR-2164). Shared via `Arc` so attaching an L2 store rebuilds
+    /// the state machine without reparsing the expression.
+    compiled_key: Option<Arc<CompiledCel>>,
     /// Local (L1) per-client map. Bounded by an LRU.
     local: Mutex<lru::LruCache<String, LocalEntry>>,
     /// Optional shared (L2) store. When `Some`, strikes and block markers
@@ -218,14 +223,57 @@ impl std::fmt::Debug for PersistentBlockStore {
 impl PersistentBlockStore {
     /// Build a store from config. Local-only until [`Self::with_store`]
     /// attaches a shared backend.
-    pub fn new(config: PersistentBlockConfig) -> Self {
+    ///
+    /// Fallible since WOR-2164. A `track_by: cel` block compiles its
+    /// `key:` expression here, once, so malformed CEL rejects the
+    /// candidate config instead of being reparsed per request and
+    /// silently dropping every client out of block tracking. A
+    /// `track_by: cel` block with no `key:` is the same defect without
+    /// the CEL, and is rejected too.
+    pub fn new(config: PersistentBlockConfig) -> anyhow::Result<Self> {
+        let compiled_key = if config.key_kind() == BlockKeyKind::Cel {
+            let Some(source) = config.key.as_deref().filter(|s| !s.trim().is_empty()) else {
+                anyhow::bail!(
+                    "waf policy: `persistent_block.track_by: cel` requires a `key:` CEL \
+                     expression. Without one no client can be tracked, so persistent blocking \
+                     would be enabled and never block anything."
+                );
+            };
+            Some(Arc::new(CompiledCel::compile(
+                "waf policy `persistent_block` key",
+                source,
+            )?))
+        } else {
+            None
+        };
+        Ok(Self::from_parts(config, compiled_key))
+    }
+
+    /// Assemble a store from an already-validated config and its
+    /// already-compiled key. Keeps [`Self::new`] and
+    /// [`Self::rebuilt_with_store`] on one construction path.
+    fn from_parts(config: PersistentBlockConfig, compiled_key: Option<Arc<CompiledCel>>) -> Self {
         let cap = NonZeroUsize::new(config.max_keys.max(1)).expect("cap is at least 1");
         Self {
             config,
+            compiled_key,
             local: Mutex::new(lru::LruCache::new(cap)),
             store: None,
             key_prefix: "sbproxy:waf:block:local:".to_string(),
         }
+    }
+
+    /// Rebuild this store with a shared backend attached, reusing the
+    /// compiled `key:` expression rather than parsing it again.
+    ///
+    /// The live store sits behind an `Arc`, so attaching L2 cannot
+    /// consume it; this clones the config and the compiled program and
+    /// seeds a fresh local map (a replica that just attached shared
+    /// state has no hot cache worth keeping anyway).
+    pub fn rebuilt_with_store(&self, store: Option<Arc<dyn KVStore>>, origin_id: &str) -> Self {
+        let config = self.config.clone();
+        let compiled_key = self.compiled_key.clone();
+        Self::from_parts(config, compiled_key).with_store(store, origin_id)
     }
 
     /// Attach a shared L2 store so block state is visible across replicas.
@@ -248,13 +296,11 @@ impl PersistentBlockStore {
         self.config.enabled
     }
 
-    /// The configured CEL key expression when `track_by: cel`, else `None`.
-    pub fn cel_key(&self) -> Option<&str> {
-        if self.config.key_kind() == BlockKeyKind::Cel {
-            self.config.key.as_deref()
-        } else {
-            None
-        }
+    /// The compiled CEL key expression when `track_by: cel`, else
+    /// `None`. Compiled at config load by [`Self::new`], so the
+    /// enforcer only ever evaluates it.
+    pub fn cel_key(&self) -> Option<&CompiledCel> {
+        self.compiled_key.as_deref()
     }
 
     /// Redis key for the block marker of `client`.
@@ -508,10 +554,54 @@ mod tests {
     }
 
     #[test]
+    fn cel_tracking_compiles_its_key_once_at_config_load() {
+        // WOR-2164: the compiled program is what the enforcer gets, so
+        // the request path evaluates without reparsing.
+        let mut c = cfg(3, 60, 10);
+        c.track_by = "cel".to_string();
+        c.key = Some(r#"request.headers["x-tenant"]"#.to_string());
+        let store = PersistentBlockStore::new(c).expect("valid CEL compiles");
+        let compiled = store.cel_key().expect("cel tracking carries a program");
+        assert_eq!(compiled.source(), r#"request.headers["x-tenant"]"#);
+    }
+
+    #[test]
+    fn cel_tracking_rejects_malformed_key() {
+        let mut c = cfg(3, 60, 10);
+        c.track_by = "cel".to_string();
+        c.key = Some("this is not valid CEL !!!".to_string());
+        let err = PersistentBlockStore::new(c).expect_err("malformed CEL must not compile");
+        let msg = err.to_string();
+        assert!(msg.contains("persistent_block"), "{msg}");
+        assert!(msg.contains("this is not valid CEL !!!"), "{msg}");
+    }
+
+    #[test]
+    fn cel_tracking_rejects_a_missing_key() {
+        // `track_by: cel` with no expression tracked nobody, silently.
+        let mut c = cfg(3, 60, 10);
+        c.track_by = "cel".to_string();
+        c.key = None;
+        let err = PersistentBlockStore::new(c).expect_err("cel tracking needs a key");
+        assert!(err.to_string().contains("requires a `key:`"), "{err}");
+    }
+
+    #[test]
+    fn attaching_l2_keeps_the_compiled_key() {
+        let mut c = cfg(3, 60, 10);
+        c.track_by = "cel".to_string();
+        c.key = Some("request.key_id".to_string());
+        let store = PersistentBlockStore::new(c).expect("valid CEL compiles");
+        let rebuilt = store.rebuilt_with_store(Some(Arc::new(MemoryKVStore::new(0))), "origin-x");
+        let source = rebuilt.cel_key().map(|c| c.source());
+        assert_eq!(source, Some("request.key_id"), "compiled key carries over");
+    }
+
+    #[test]
     fn disabled_store_never_blocks_or_escalates() {
         let mut c = cfg(1, 60, 10);
         c.enabled = false;
-        let store = PersistentBlockStore::new(c);
+        let store = PersistentBlockStore::new(c).expect("ip tracking needs no CEL");
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             assert_eq!(store.record_strike("1.2.3.4").await, StrikeOutcome::Counted);
@@ -521,7 +611,7 @@ mod tests {
 
     #[test]
     fn local_escalates_after_threshold_then_blocks() {
-        let store = PersistentBlockStore::new(cfg(3, 60, 10));
+        let store = PersistentBlockStore::new(cfg(3, 60, 10)).expect("ip tracking needs no CEL");
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             assert!(!store.is_blocked("1.2.3.4").await);
@@ -540,7 +630,7 @@ mod tests {
         // A 1-minute block clamps up from a sub-minute request, so use the
         // raw field manipulation to test the lazy release path: set the
         // block window to the minimum and force an elapsed block.
-        let store = PersistentBlockStore::new(cfg(1, 60, 1));
+        let store = PersistentBlockStore::new(cfg(1, 60, 1)).expect("ip tracking needs no CEL");
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             assert_eq!(
@@ -567,7 +657,7 @@ mod tests {
         // window of 0 clamps to 1s; strikes spaced beyond the window get
         // pruned so the threshold is never reached. We simulate aging by
         // rewriting the deque timestamps.
-        let store = PersistentBlockStore::new(cfg(3, 1, 10));
+        let store = PersistentBlockStore::new(cfg(3, 1, 10)).expect("ip tracking needs no CEL");
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             assert_eq!(store.record_strike("8.8.8.8").await, StrikeOutcome::Counted);
@@ -588,7 +678,7 @@ mod tests {
 
     #[test]
     fn distinct_clients_tracked_independently() {
-        let store = PersistentBlockStore::new(cfg(2, 60, 10));
+        let store = PersistentBlockStore::new(cfg(2, 60, 10)).expect("ip tracking needs no CEL");
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             assert_eq!(store.record_strike("a").await, StrikeOutcome::Counted);
@@ -608,6 +698,7 @@ mod tests {
         // the shared tier (and, by construction, across replicas).
         let fake = Arc::new(FakeTtlStore::new());
         let store = PersistentBlockStore::new(cfg(3, 60, 1))
+            .expect("ip tracking needs no CEL")
             .with_store(Some(fake.clone() as Arc<dyn KVStore>), "origin-x");
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -631,6 +722,7 @@ mod tests {
         // degrade safely (never escalate, never block) rather than drop
         // requests.
         let store = PersistentBlockStore::new(cfg(2, 60, 10))
+            .expect("ip tracking needs no CEL")
             .with_store(Some(Arc::new(MemoryKVStore::new(0))), "origin-x");
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -646,6 +738,7 @@ mod tests {
     #[test]
     fn l2_key_prefix_includes_origin() {
         let store = PersistentBlockStore::new(cfg(2, 60, 10))
+            .expect("ip tracking needs no CEL")
             .with_store(Some(Arc::new(MemoryKVStore::new(0))), "api.example.com");
         let marker = String::from_utf8(store.block_marker_key("1.2.3.4")).unwrap();
         assert_eq!(marker, "sbproxy:waf:block:api.example.com:1.2.3.4:blocked");

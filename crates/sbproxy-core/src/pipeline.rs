@@ -1226,6 +1226,14 @@ pub struct CompiledPipeline {
     /// origin has no `idempotency:` block or `enabled = false`).
     /// Parallel to [`Self::config`].`origins`.
     pub idempotencies: Vec<Option<Arc<CompiledIdempotency>>>,
+    /// Every `engine: cel` custom log field in this config generation,
+    /// compiled once and keyed by source text (WOR-2164).
+    ///
+    /// The access-log path resolves the winning field per request and
+    /// looks its source up here, so a log record evaluates without
+    /// parsing. Malformed CEL rejected the config before this map was
+    /// ever built.
+    pub(crate) custom_log_programs: crate::server::custom_log::CompiledLogPrograms,
     /// Shared response cache backend.
     ///
     /// Selected by `proxy.response_cache_store`, which names one of
@@ -1377,6 +1385,7 @@ impl Default for CompiledPipeline {
             attestation: None,
             origin_attestations: Vec::new(),
             idempotencies: Vec::new(),
+            custom_log_programs: crate::server::custom_log::CompiledLogPrograms::new(),
             cache_store: None,
             origin_cache_stores: HashMap::new(),
             cache_reserve: None,
@@ -1573,10 +1582,17 @@ impl CompiledPipeline {
                 l2_async_store.clone(),
                 origin.origin_id.as_str(),
             )?;
-            enforcers.push(compile_builtin_enforcers(
-                policies_for_enforcers,
-                origin.hostname.as_str(),
-            ));
+            // WOR-2164: enforcers that compile static CEL (the rate
+            // limiter's `key:`) reject the candidate config here, so
+            // name the origin the same way the policy chain does.
+            use anyhow::Context as _;
+            let origin_id_for_enforcers = origin.origin_id.as_str();
+            enforcers.push(
+                compile_builtin_enforcers(policies_for_enforcers, origin.hostname.as_str())
+                    .with_context(|| {
+                        format!("origin `{origin_id_for_enforcers}`: invalid policy config")
+                    })?,
+            );
             policies.push(origin_policies);
 
             // Compile transforms (zero or more per origin).
@@ -1602,7 +1618,17 @@ impl CompiledPipeline {
                     }
                     let transform = match compile_transform(cfg) {
                         Ok(t) => t,
-                        Err(e) => return Some(Err(e)),
+                        // WOR-2179: name the origin, the same way the
+                        // policy chain does, so an operator can find the
+                        // offending block. The transform module's own
+                        // error names the transform and, for CEL, quotes
+                        // the bad expression.
+                        Err(e) => {
+                            return Some(Err(e.context(format!(
+                                "origin `{}`: invalid transform config",
+                                origin.origin_id
+                            ))))
+                        }
                     };
                     let failure_posture = wrapper.failure_posture();
                     Some(Ok(CompiledTransform {
@@ -2005,6 +2031,12 @@ impl CompiledPipeline {
             PipelineConstructionMode::Validation => None,
         };
 
+        // WOR-2164: parse every `engine: cel` custom log field for this
+        // generation here, while the config is still borrowable, so the
+        // access-log path evaluates rather than parsing per record and
+        // malformed source rejects the candidate config.
+        let custom_log_programs = crate::server::custom_log::compile_cel_programs(&config)?;
+
         let pipeline = Self {
             config,
             key_plane,
@@ -2035,6 +2067,7 @@ impl CompiledPipeline {
             attestation,
             origin_attestations,
             idempotencies,
+            custom_log_programs,
             cache_store,
             origin_cache_stores,
             cache_reserve,
@@ -4006,6 +4039,257 @@ origins:
 "#;
         let cfg = sbproxy_config::compile_config(yaml).expect("yaml parses");
         CompiledPipeline::from_config(cfg).expect("valid CEL must keep compiling");
+    }
+
+    // --- WOR-2179 / WOR-2164: the other static-CEL config surfaces ---
+
+    /// Build a pipeline from `yaml` and return the rejection message.
+    /// `CompiledPipeline` has no `Debug`, so `Result::expect_err` cannot
+    /// be used here.
+    fn pipeline_rejection(yaml: &str) -> String {
+        let cfg = sbproxy_config::compile_config(yaml).expect("yaml parses");
+        let err = CompiledPipeline::from_config(cfg)
+            .err()
+            .expect("invalid CEL must reject the candidate config");
+        format!("{err:#}")
+    }
+
+    #[test]
+    fn assertion_policy_with_invalid_cel_rejects_the_config() {
+        // The old behavior accepted this config, then failed the
+        // per-response compile and recorded a pass, so the assertion
+        // the operator wrote never ran.
+        let msg = pipeline_rejection(
+            r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  "assert.local":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+    policies:
+      - type: assertion
+        name: no-5xx
+        expression: 'this is not valid CEL !!!'
+"#,
+        );
+        assert!(
+            msg.contains("assert.local"),
+            "diagnostic must name the origin: {msg}"
+        );
+        assert!(
+            msg.contains("assertion"),
+            "diagnostic must name the policy: {msg}"
+        );
+        assert!(
+            msg.contains("this is not valid CEL !!!"),
+            "diagnostic must quote the expression: {msg}"
+        );
+    }
+
+    #[test]
+    fn cel_transform_with_invalid_expression_rejects_the_config() {
+        let msg = pipeline_rejection(
+            r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  "transform.local":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+    transforms:
+      - type: cel
+        on_response: 'this is not valid CEL !!!'
+"#,
+        );
+        assert!(
+            msg.contains("transform.local"),
+            "diagnostic must name the origin: {msg}"
+        );
+        assert!(
+            msg.contains("on_response"),
+            "diagnostic must name the field: {msg}"
+        );
+        assert!(
+            msg.contains("this is not valid CEL !!!"),
+            "diagnostic must quote the expression: {msg}"
+        );
+    }
+
+    #[test]
+    fn cel_transform_header_rule_with_invalid_expression_rejects_the_config() {
+        let msg = pipeline_rejection(
+            r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  "header.local":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+    transforms:
+      - type: cel
+        headers:
+          - op: set
+            name: x-tenant
+            value_expr: 'this is not valid CEL !!!'
+"#,
+        );
+        assert!(
+            msg.contains("header.local"),
+            "diagnostic must name the origin: {msg}"
+        );
+        assert!(
+            msg.contains("x-tenant"),
+            "diagnostic must name the header: {msg}"
+        );
+    }
+
+    #[test]
+    fn rate_limit_key_with_invalid_cel_rejects_the_config() {
+        // The old behavior accepted this and then dropped every
+        // request into the default bucket, silently.
+        let msg = pipeline_rejection(
+            r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  "ratelimit.local":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+    policies:
+      - type: rate_limiting
+        requests_per_second: 10
+        key: 'this is not valid CEL !!!'
+"#,
+        );
+        assert!(
+            msg.contains("ratelimit.local"),
+            "diagnostic must name the origin: {msg}"
+        );
+        assert!(
+            msg.contains("rate_limiting"),
+            "diagnostic must name the policy: {msg}"
+        );
+        assert!(
+            msg.contains("this is not valid CEL !!!"),
+            "diagnostic must quote the expression: {msg}"
+        );
+    }
+
+    #[test]
+    fn custom_log_field_with_invalid_cel_rejects_the_config() {
+        // The old behavior compiled this once per log record, failed
+        // every time, and omitted the field.
+        let msg = pipeline_rejection(
+            r#"
+proxy:
+  http_bind_port: 8080
+  observability:
+    log:
+      custom_fields:
+        - name: caller_tier
+          engine: cel
+          source: 'this is not valid CEL !!!'
+origins: {}
+"#,
+        );
+        assert!(
+            msg.contains("proxy"),
+            "diagnostic must name the scope: {msg}"
+        );
+        assert!(
+            msg.contains("caller_tier"),
+            "diagnostic must name the field: {msg}"
+        );
+        assert!(
+            msg.contains("this is not valid CEL !!!"),
+            "diagnostic must quote the source: {msg}"
+        );
+    }
+
+    #[test]
+    fn origin_scoped_custom_log_field_with_invalid_cel_rejects_the_config() {
+        let msg = pipeline_rejection(
+            r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  "log.local":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+    observability:
+      log:
+        custom_fields:
+          - name: route_tier
+            engine: cel
+            source: 'this is not valid CEL !!!'
+"#,
+        );
+        assert!(
+            msg.contains("log.local"),
+            "diagnostic must name the origin: {msg}"
+        );
+        assert!(
+            msg.contains("route_tier"),
+            "diagnostic must name the field: {msg}"
+        );
+    }
+
+    #[test]
+    fn the_static_cel_surfaces_all_keep_compiling_when_valid() {
+        // One config exercising every surface this change touched, so
+        // the rejection tests above cannot be satisfied by rejecting
+        // everything.
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+  observability:
+    log:
+      custom_fields:
+        - name: caller_tier
+          engine: cel
+          source: 'has(request.headers["x-tier"]) ? request.headers["x-tier"] : "standard"'
+origins:
+  "all.local":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+    policies:
+      - type: assertion
+        name: no-5xx
+        expression: 'response.status < 500'
+      - type: rate_limiting
+        requests_per_second: 10
+        key: 'request.key_id'
+    transforms:
+      - type: cel
+        on_response: '"rewritten"'
+        headers:
+          - op: set
+            name: x-status
+            value_expr: 'string(response.status)'
+"#;
+        let cfg = sbproxy_config::compile_config(yaml).expect("yaml parses");
+        let pipeline = CompiledPipeline::from_config(cfg).expect("valid CEL must keep compiling");
+        let programs = pipeline.custom_log_programs.len();
+        assert_eq!(programs, 1, "compiled once at publication");
     }
 
     // --- response cache store selection ---

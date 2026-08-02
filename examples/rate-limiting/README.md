@@ -47,7 +47,7 @@ rate limit exceeded
 ## What this exercises
 
 - `rate_limiting` policy - token bucket with `requests_per_second` and `burst`
-- `key: ip` partitioning - each source IP gets its own bucket
+- `key: 'connection.remote_ip'` partitioning - each source IP gets its own bucket. `key` is a CEL expression, so it can key on anything the request context carries (a JWT claim, a resolved key id, a header)
 - Pre-upstream rejection - 429 is returned without consulting `test.sbproxy.dev`, with `Retry-After` set so well-behaved clients can back off
 
 ## See also

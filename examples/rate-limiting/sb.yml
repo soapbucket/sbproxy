@@ -30,4 +30,7 @@ origins:
       - type: rate_limiting
         requests_per_second: 5
         burst: 10
-        key: ip
+        # `key` is a CEL expression evaluated per request, not a keyword.
+        # `connection.remote_ip` is the per-IP bucket; leaving `key` unset
+        # gives the same partitioning.
+        key: 'connection.remote_ip'

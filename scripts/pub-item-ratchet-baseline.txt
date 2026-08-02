@@ -65,4 +65,13 @@
 # the x402 challenge renderer and header codecs, the Payment Auth
 # challenge binder and credential selector, and the CLN challenge
 # fields.
-313
+
+# Lowered to 312 on WOR-2179 / WOR-2164, 2026-08-02. One item moved out
+# of the tests-only slice: `CelEngine::eval_bool_source`
+# (sbproxy-extension/src/cel/mod.rs). It gained no new Rust caller. The
+# new `cel::compiled` module names it in prose, where it explains that
+# the compile-per-call helpers are for request-supplied source only,
+# and this scan matches textually. Recording the number the scan now
+# reports; do not read it as the helper having found a production
+# caller.
+312

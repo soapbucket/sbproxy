@@ -3936,7 +3936,9 @@ mod request_phase;
 // re-import keeps every existing call site in this file unchanged.
 mod access_log;
 use access_log::*;
-mod custom_log;
+// `pub(crate)` because pipeline construction compiles this module's CEL
+// log fields once per config publication (WOR-2164).
+pub(crate) mod custom_log;
 
 mod lifecycle;
 pub use lifecycle::*;
