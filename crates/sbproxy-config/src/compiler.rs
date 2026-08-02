@@ -4932,7 +4932,9 @@ origins:
 "#;
         let msg = format!(
             "{:#}",
-            compile_config(yaml).expect_err("a configured bus must be refused")
+            compile_config(yaml)
+                .err()
+                .expect("a configured bus must be refused")
         );
         assert!(
             msg.contains("proxy.config_authority"),
