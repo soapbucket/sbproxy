@@ -33,6 +33,23 @@ class TemporaryRepository(unittest.TestCase):
         (self.root / "examples").mkdir()
 
     def tearDown(self) -> None:
+        # These tests start real listeners, and one of them deliberately
+        # spawns a proxy that ignores SIGTERM so the recorder's escalation
+        # can be observed. When a run dies before that escalation, the
+        # listener outlives it, holds the fixture port, and fails every
+        # later run with an assertion about missing STOP events. The
+        # failure then perpetuates itself, because each failed run leaks
+        # another one. Three gate cycles were lost to that loop before
+        # this existed.
+        #
+        # Every process these tests start carries the temp root in its
+        # command line, and the root is unique per test, so matching on it
+        # cannot reach anything else on the machine.
+        subprocess.run(
+            ["pkill", "-9", "-f", str(self.root)],
+            capture_output=True,
+            check=False,
+        )
         self.tempdir.cleanup()
 
     def copy_script(self, name: str) -> Path:

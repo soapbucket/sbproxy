@@ -230,10 +230,30 @@ impl Unit {
 
     /// Whether the declared source matches the evidence carried.
     ///
-    /// Always true for anything [`Unit::new`] built. It is worth checking on
-    /// anything deserialised, because the wire format carries the two fields
-    /// separately and a receipt that disagrees with itself is not evidence of
-    /// anything.
+    /// Always true for anything [`Unit::new`] built, so on the write side
+    /// this is an invariant rather than a check. It is the read side this
+    /// exists for: the wire format carries the two fields separately, a
+    /// signature and a hash chain both say only that nobody changed the
+    /// bytes, and a receipt that disagrees with itself survives both while
+    /// asserting something no arithmetic can check.
+    ///
+    /// # Where it is enforced
+    ///
+    /// Nowhere, for a while, which is the defect that produced this
+    /// paragraph: the doc used to tell callers the check was worth running
+    /// on anything deserialised, and no decode path ran it. Saying so is
+    /// not enforcement.
+    ///
+    /// The rule now reaches the wire through
+    /// [`crate::ledger::LedgerPayload::provenance_conflict`], which
+    /// [`crate::verify_ledger`] and the replay behind
+    /// [`crate::ledger::UsageLedger::open`] call on every entry they
+    /// decode. This proxy's own receipt payload lifts each wire unit back
+    /// into this type and asks this method, so the wire form and this one
+    /// cannot come to different answers about the same receipt; see
+    /// `sbproxy_modules::policy::receipt_token::ReceiptUnit::provenance_is_consistent`.
+    /// A new decode path is expected to go through the ledger, or to make
+    /// the same call itself.
     pub fn provenance_is_consistent(&self) -> bool {
         self.source == self.evidence.source()
     }

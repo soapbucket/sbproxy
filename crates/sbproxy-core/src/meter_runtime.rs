@@ -77,6 +77,24 @@
 //! the API down. The hole is still provable, because it is counted through
 //! `sbproxy_meter::metrics::observe_chain_gap` and, wherever a chain
 //! survives to be written to, marked in the chain itself.
+//!
+//! # A receipt on the chain still has to agree with itself (WOR-2211)
+//!
+//! Signing and chaining establish that a receipt is authentic and
+//! unmodified. They do not establish that it is coherent: a unit declaring
+//! `measured` while carrying an origin header passes both, and `measured`
+//! is the top of the trust order, so that is the direction a laundered
+//! number would travel. Nothing this module writes can be incoherent,
+//! because `sbproxy_meter::Unit::new` derives a unit's declared source from
+//! its evidence, but a chain file is bytes on a disk that outlive the
+//! process that wrote them.
+//!
+//! `ChainedReceipt` therefore implements
+//! `sbproxy_meter::ledger::LedgerPayload::provenance_conflict`, which the
+//! ledger's replay and verification both call on every entry they decode.
+//! An incoherent entry makes the chain refuse to open, which is the same
+//! condition a torn final line produces and is handled by the same
+//! `failure_mode` branch below.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -165,6 +183,27 @@ impl LedgerPayload for ChainedReceipt {
     /// through this type folds retries the way the writer did.
     fn dedup_key(&self) -> Option<&str> {
         Some(self.0.claim_id.as_str())
+    }
+
+    /// The first unit on this receipt that cannot be true.
+    ///
+    /// This is what makes the coherence check reach every path that turns
+    /// bytes back into a receipt rather than only the one somebody
+    /// remembered. `sbproxy_meter::verify_ledger` and the replay behind
+    /// `sbproxy_meter::ledger::UsageLedger::open` both ask the payload,
+    /// so wiring it once here covers the boot-time replay, the
+    /// `/api/meter/verify` route, and any future reader that goes through
+    /// the ledger rather than around it. The two admin routes that walk the
+    /// file themselves ask `ReceiptClaims::provenance_conflict` directly,
+    /// for the same reason and against the same rule.
+    fn provenance_conflict(&self) -> Option<sbproxy_meter::metrics::ProvenanceConflict<'_>> {
+        let unit = self.0.provenance_conflict()?;
+        Some(sbproxy_meter::metrics::ProvenanceConflict {
+            tenant_id: self.0.subject.tenant.as_str(),
+            unit: unit.name.as_str(),
+            declared_source: unit.source.as_str(),
+            evidence_source: unit.evidence_source(),
+        })
     }
 
     // `chain_contribution` is deliberately left at its `None` default. Read

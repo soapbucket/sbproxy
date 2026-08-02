@@ -803,6 +803,14 @@ python3 examples/settlement-gate-local/fixture.py &
 target/payments/release/sbproxy serve -f examples/settlement-gate-local/sb.yml
 ```
 
+For the challenge shape on its own, without a node to settle against,
+[`examples/rail-x402-base-sepolia/`](../examples/rail-x402-base-sepolia/)
+walks three cases: a reader who is never charged, a declared crawler who
+gets a price, and a credential the proxy never issued that buys nothing.
+`make test` in that directory runs all three against a proxy already
+serving. That one needs `--features payment-x402` rather than the
+Lightning feature above.
+
 [`examples/settlement-gate-local/`](../examples/settlement-gate-local/) is
 the one configuration here that settles a payment end to end without a
 payment provider, and its README walks each step with the output above.

@@ -197,6 +197,15 @@ if ! command -v make >/dev/null 2>&1; then
 fi
 make tapes-check
 
+# CI: ci.yml lint lane and docs-ci.yml, "every promised doc asset exists".
+# The step above keeps each tape in sync with its example's config and
+# never looks in docs/assets/, and wire-example-gifs.py only inserts an
+# image that is already on disk. So neither of them can see a tape whose
+# recording was never run, or a README embed pointing at the GIF that
+# recording would have produced. Both shipped that way before this ran.
+step "every promised doc asset exists"
+PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/check-doc-assets.py"
+
 # CI: docs-ci.yml, "documentation configs match canonical examples".
 # The `every_oss_example_compiles` half of that CI step is covered by
 # the workspace test lane below; do not add a `-p sbproxy-config`

@@ -29,6 +29,16 @@
 //! have, and so that adding a resolver forces a decision about how its
 //! numbers behave rather than letting it inherit someone else's.
 //!
+//! The two fields travel separately on the wire, because a buyer has to be
+//! able to see both, and separate fields can disagree. Signing and chaining
+//! do not catch that: they answer "did anybody change these bytes", and a
+//! unit declaring `measured` while carrying an origin header passes both
+//! while asserting something no arithmetic can check. So
+//! [`Unit::provenance_is_consistent`] is the rule, and
+//! [`ledger::LedgerPayload::provenance_conflict`] is how every path that
+//! turns bytes back into a record is made to apply it rather than each
+//! reader being trusted to remember.
+//!
 //! # Nothing about billing is left implicit
 //!
 //! [`OutcomeTable`] refuses to be built until every [`BillableOutcome`] has
@@ -127,7 +137,7 @@ pub use ledger::{
     LedgerPayload, LedgerVerifyResult, UsageLedger,
 };
 pub use measured::{resolve_measured, MeasuredQuantity, MeasuredRule, Measurement};
-pub use metrics::{ChainContribution, FailurePosture, MeterObserver};
+pub use metrics::{ChainContribution, FailurePosture, MeterObserver, ProvenanceConflict};
 pub use origin_header::{
     parse_origin_count, resolve_origin_headers, OriginClaim, OriginHeaderRule, ResolvedOriginUnit,
 };

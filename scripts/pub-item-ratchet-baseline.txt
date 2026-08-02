@@ -130,4 +130,17 @@
 # question for whoever owns the subsystem, because the answer changes
 # behaviour rather than visibility. Do not expect this number to fall much
 # further without the settlement crate's origin gate work landing.
-289
+
+# Lowered to 288 on WOR-2211, 2026-08-02, answering one of those escalated
+# questions. `Unit::provenance_is_consistent` (sbproxy-meter/src/event.rs)
+# checked that a unit's declared source agrees with the evidence it
+# carries, its own doc said the check was worth running on anything
+# deserialised, and no decode path ran it. The escalation asked whether the
+# wire decode should call it and reject on false. It should, and now does:
+# `ReceiptUnit::provenance_is_consistent` lifts each wire unit back into
+# the meter's vocabulary and asks this method, the ledger's replay and
+# verification both ask the payload through
+# `LedgerPayload::provenance_conflict`, and the two admin read paths ask
+# the claims directly. This is the ratchet's first option, wiring the item
+# to a production call site, rather than a narrowing.
+288

@@ -544,6 +544,22 @@ chain verify: FAILED at seq 1: entry_hash does not match recomputed digest (tamp
 
 That symmetry is the point of the design. The operator's verify endpoint and your script disagree with each other only if one of you has different bytes, and the signature says whose bytes the operator stands behind.
 
+## A receipt has to agree with itself
+
+Everything above answers one question: did anybody change these bytes. There is a second question it cannot reach, and it is the one the evidence on each unit exists to make answerable.
+
+Every unit carries two fields that travel separately: `source`, naming the mechanism that produced the count, and `evidence`, carrying the raw material that mechanism worked from. They can disagree. A unit reading `source: "measured"` while carrying `{"header": "X-Rows-Returned", "raw": "40000"}` is a number the upstream asserted wearing the provenance of a number the proxy counted itself. It hash-chains, it signs, it verifies against the published key, and it is not checkable by anybody, because there is no byte count to redo the arithmetic over. `measured` is the top of the trust order, which is exactly why that is the direction a laundered number would travel.
+
+So a receipt that contradicts itself is refused rather than reported. Every path that turns bytes back into a receipt makes the check:
+
+- `POST /api/meter/verify` reports it as a break, at the sequence number it found, with both provenances named. The chain and the signature are checked first, so reaching this verdict means the entry is exactly what the operator signed.
+- `GET /api/meter/summary` and `GET /api/meter/receipts` stop at that sequence number and report it through the same `damaged_at_seq` and `damage_reason` fields an unreadable line uses. They do not skip the line and keep adding up the rest, because a plausible total over a record nobody can settle from is worse than a stopped page.
+- The ledger refuses to open, so the meter does not chain more entries onto it. Your configured `failure_mode` then decides what an unopenable chain does to traffic, exactly as it does for a full disk.
+
+There is no posture that admits one. `failure_mode` answers what happens to traffic when the meter cannot write what it owes; by the time anything reads a receipt back, the request it describes is finished and the only decision left is whether to believe the document. Refusals are counted on `sbproxy_meter_incoherent_receipts_total`, labelled by tenant, and the label always reads `failure_mode="closed"`.
+
+As a buyer you can make the same check with no SBproxy software, and it is worth adding to whatever you already run: for each unit, `source: "measured"` must carry `bytes_in`, `bytes_out`, and `duration_ms`; `route_weight` must carry `config_revision`; `origin_header` must carry `header`. Anything else on a signed receipt is a claim the operator's own reader refuses, and you should refuse it too.
+
 ## Gap markers
 
 Under the `degraded` posture, a receipt that could not be written is not silently absent. The meter writes a gap marker instead: an ordinary chained, signed receipt whose outcome is `chain_gap`, with an empty units list, filed under the original claim id plus a `:chain_gap` suffix. The suffix matters: the chain deduplicates on claim id so retries bill once, and a marker filed under the bare id would make a later successful retry look like a duplicate, turning a temporary gap into a permanent one.
