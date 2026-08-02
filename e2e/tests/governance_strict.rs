@@ -31,6 +31,21 @@ const LIMIT: u64 = 10;
 /// Roughly 2x the limit, split across both gateways, fired concurrently.
 const REQUESTS: usize = 20;
 
+/// Shared per-key lifetime token budget for the token-dimension load
+/// test. Sized so the reservation ceiling for the fixture prompt (a
+/// dozen or so `o200k_base` tokens) fits several times over but cannot
+/// cover twenty requests, so the burst is guaranteed to produce both
+/// admissions and governance denials no matter how the two gateways
+/// interleave.
+const TOKEN_LIMIT: u64 = 24;
+/// Total tokens the mock upstream reports for every response, and
+/// therefore the amount each admitted request settles. Deliberately far
+/// below the reservation ceiling, which is what makes the accepted total
+/// exact rather than approximate: settled usage never exceeds the units
+/// the reserve already held, so the documented rounding unit for this
+/// case is zero. See `docs/key-management.md`.
+const SETTLED_TOKENS_PER_REQUEST: u64 = 2;
+
 fn pick_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .expect("bind ephemeral port")
@@ -171,6 +186,66 @@ origins:
     )
 }
 
+/// Same two-gateway strict shape as [`config`], but the governed key
+/// carries a lifetime token budget instead of a request-per-minute
+/// limit, so admission is decided on the token dimension.
+fn token_budget_config(
+    admin_port: u16,
+    store_path: &str,
+    redis_url: &str,
+    upstream_base: &str,
+    key_id: &str,
+    secret: &str,
+) -> String {
+    format!(
+        r#"
+proxy:
+  http_bind_port: 0
+  admin:
+    enabled: true
+    port: {admin_port}
+    username: admin
+    password: secret
+  key_management:
+    enabled: true
+    store:
+      backend: embedded
+      path: "{store_path}"
+    cache:
+      ttl_secs: 60
+    crypto:
+      pepper: governance-strict-tokens-e2e-pepper
+      master_key: governance-strict-tokens-e2e-master
+    governance:
+      consistency: strict
+      backend:
+        type: redis
+        url: "{redis_url}"
+      lease_ttl_secs: 30
+      terminal_retention_secs: 60
+      failure_posture: closed
+    seed:
+      keys:
+        - key_id: {key_id}
+          secret: {secret}
+          name: strict-shared-token-budget
+          max_budget_tokens: {TOKEN_LIMIT}
+origins:
+  "ai.localhost":
+    action:
+      type: ai_proxy
+      require_governed_key: true
+      providers:
+        - name: openai
+          api_key: sk-dummy
+          base_url: "{upstream_base}"
+          allow_private_base_url: true
+          default_model: gpt-4o
+          models: [gpt-4o]
+"#
+    )
+}
+
 fn client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(15))
@@ -187,6 +262,26 @@ fn chat(base_url: &str, token: &str) -> u16 {
         .json(&json!({
             "model": "gpt-4o-mini",
             "messages": [{"role": "user", "content": "strict admission"}],
+            "max_tokens": 1
+        }))
+        .send()
+        .expect("governed chat request")
+        .status()
+        .as_u16()
+}
+
+/// Send one governed chat request against the token-budget fixture and
+/// return the HTTP status. The prompt is short on purpose: the reserve
+/// holds a conservative ceiling derived from it, and a short prompt
+/// keeps that ceiling well inside [`TOKEN_LIMIT`].
+fn chat_tokens(base_url: &str, token: &str) -> u16 {
+    client()
+        .post(format!("{base_url}/v1/chat/completions"))
+        .header("host", "ai.localhost")
+        .header("authorization", format!("Bearer {token}"))
+        .json(&json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "budget"}],
             "max_tokens": 1
         }))
         .send()
@@ -362,6 +457,155 @@ fn two_gateways_never_admit_more_than_the_shared_strict_request_limit() {
     assert_eq!(usage["requests_per_window"]["used"], accepted as u64);
     assert_eq!(
         usage["requests_per_window"]["reserved"], 0,
+        "every reservation must be settled once its HTTP response has been sent"
+    );
+    assert_eq!(usage["backend"]["consistency"], "strict");
+    assert_eq!(usage["backend"]["status"], "healthy");
+}
+
+/// The token half of the same guarantee, which is the one that actually
+/// decides whether a spend budget means anything.
+///
+/// A request limit is trivially exact: every admission costs one unit
+/// and the unit is known before dispatch. A token budget is not, because
+/// the size of the response is unknown at reserve time. Strict mode
+/// closes that by holding a conservative ceiling and replacing it with
+/// reported usage at settlement, so the ledger can only ever move by the
+/// amount really consumed.
+///
+/// The property under test: with one shared token budget and two
+/// gateways racing a burst, the settled total is exactly
+/// `accepted * SETTLED_TOKENS_PER_REQUEST` and never passes
+/// `TOKEN_LIMIT`. The documented rounding unit here is zero, because
+/// every response settles less than its reserve already held. A response
+/// that settles more than it reserved (an unbounded completion against a
+/// short prompt) can overshoot by that excess, which the store records
+/// per reservation as `tokens_exceeded_reservation`; see
+/// `docs/key-management.md`.
+#[test]
+fn two_gateways_never_settle_more_than_the_shared_strict_token_budget() {
+    let Some(redis) = RedisGuard::spawn() else {
+        eprintln!(
+            "SKIP governance_strict::two_gateways_never_settle_more_than_the_shared_strict_token_budget: \
+             redis-server not found on PATH (optional for local runs; set \
+             SBPROXY_E2E_REQUIRE_REDIS=1 to require it)"
+        );
+        return;
+    };
+
+    let suffix = std::process::id();
+    let key_id = format!("stricttok{suffix}");
+    let secret = "shared-strict-token-secret";
+    let token = format!("sk-{key_id}-{secret}");
+
+    let store_a = format!(
+        "{}/sbproxy_e2e_governance_tokens_a_{suffix}.redb",
+        std::env::temp_dir().display()
+    );
+    let store_b = format!(
+        "{}/sbproxy_e2e_governance_tokens_b_{suffix}.redb",
+        std::env::temp_dir().display()
+    );
+    let _ = std::fs::remove_file(&store_a);
+    let _ = std::fs::remove_file(&store_b);
+
+    let upstream = MockUpstream::start(json!({
+        "id": "chatcmpl-token-governed",
+        "object": "chat.completion",
+        "model": "gpt-4o",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "ok"},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    }))
+    .expect("mock upstream");
+
+    let admin_a = pick_port();
+    let admin_b = pick_port();
+    let redis_url = redis.url();
+
+    let proxy_a = ProxyHarness::start_with_yaml(&token_budget_config(
+        admin_a,
+        &store_a,
+        &redis_url,
+        &upstream.base_url(),
+        &key_id,
+        secret,
+    ))
+    .expect("start token-budget gateway A");
+    let proxy_b = ProxyHarness::start_with_yaml(&token_budget_config(
+        admin_b,
+        &store_b,
+        &redis_url,
+        &upstream.base_url(),
+        &key_id,
+        secret,
+    ))
+    .expect("start token-budget gateway B");
+    ProxyHarness::wait_for_port(admin_a, Duration::from_secs(10)).expect("admin A ready");
+    ProxyHarness::wait_for_port(admin_b, Duration::from_secs(10)).expect("admin B ready");
+
+    let bases = [proxy_a.base_url(), proxy_b.base_url()];
+    let barrier = Arc::new(Barrier::new(REQUESTS + 1));
+    let mut workers = Vec::with_capacity(REQUESTS);
+    for index in 0..REQUESTS {
+        let base = bases[index % bases.len()].clone();
+        let token = token.clone();
+        let barrier = Arc::clone(&barrier);
+        workers.push(thread::spawn(move || {
+            barrier.wait();
+            chat_tokens(&base, &token)
+        }));
+    }
+    barrier.wait();
+    let statuses: Vec<u16> = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("request worker"))
+        .collect();
+
+    let accepted = statuses.iter().filter(|status| **status == 200).count();
+    let denied = statuses.iter().filter(|status| **status == 429).count();
+    assert_eq!(
+        accepted + denied,
+        REQUESTS,
+        "every response must be either admitted or governance-denied: {statuses:?}"
+    );
+    assert!(
+        accepted > 0,
+        "sanity: the budget covers several requests, so some must be admitted. Zero \
+         admissions means the reservation ceiling for the fixture prompt outgrew \
+         TOKEN_LIMIT ({TOKEN_LIMIT}); statuses={statuses:?}"
+    );
+    assert!(
+        denied > 0,
+        "sanity: twenty requests cannot fit a {TOKEN_LIMIT}-token budget, so the limit \
+         must bite; statuses={statuses:?}"
+    );
+    assert_eq!(
+        upstream.captured().len(),
+        accepted,
+        "only admitted requests may reach the upstream"
+    );
+
+    let usage = admin_usage(admin_a, &key_id)["usage"].clone();
+    let settled = usage["total_tokens"]["used"]
+        .as_u64()
+        .expect("settled token total");
+    assert_eq!(usage["total_tokens"]["limit"], TOKEN_LIMIT);
+    assert_eq!(
+        settled,
+        accepted as u64 * SETTLED_TOKENS_PER_REQUEST,
+        "the ledger must account for exactly the usage the admitted requests reported"
+    );
+    assert!(
+        settled <= TOKEN_LIMIT,
+        "two gateways jointly settled {settled} tokens against a shared {TOKEN_LIMIT}-token \
+         budget; statuses={statuses:?}"
+    );
+    assert_eq!(
+        usage["total_tokens"]["reserved"], 0,
         "every reservation must be settled once its HTTP response has been sent"
     );
     assert_eq!(usage["backend"]["consistency"], "strict");

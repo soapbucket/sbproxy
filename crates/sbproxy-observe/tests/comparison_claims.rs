@@ -29,10 +29,20 @@ fn repo_root() -> PathBuf {
 
 /// The capabilities a public comparison claim is allowed to cite.
 ///
-/// Support level is the truth about the code as of this commit. Cluster budget
-/// coherence is `ConfigOnly` because the CRDT counters are written and never
-/// merged; when WOR-1887 lands, it becomes `Stable` and the claim below may
-/// upgrade to a plain "Yes".
+/// Support level is the truth about the code as of this commit.
+///
+/// Cluster budget coherence was `ConfigOnly` for as long as the per-key
+/// counters were written and never merged. That is no longer the state of the
+/// code: the approximate tier publishes each node's settled counters and
+/// merges every live peer's back in on a fixed cadence, and the strict tier
+/// runs atomic reserve, settle, and release scripts against a shared Redis
+/// backend. Both have executable evidence, so the level is `Stable`.
+///
+/// The claim below stays [`ClaimValue::Qualified`] on purpose. "Stable" here
+/// says the mechanism runs, not that it is exact: the no-backend tier is
+/// coherent within a bounded staleness window, and only the shared-backend
+/// tier is exact under a concurrent burst. A plain "Yes" would erase that
+/// distinction, which is the same erasure WOR-1889 was filed to undo.
 const CAPABILITIES: &[ProductCapability] = &[
     ProductCapability {
         id: "cluster.key_plane_coherence",
@@ -48,9 +58,15 @@ const CAPABILITIES: &[ProductCapability] = &[
     },
     ProductCapability {
         id: "cluster.budget_coherence",
-        support: SupportLevel::ConfigOnly,
-        summary: "Per-key spend and rate counters are node-local; fleet coherence needs a shared backend.",
-        evidence: &[],
+        support: SupportLevel::Stable,
+        summary: "Per-key spend and rate counters merge across live peers with no shared backend, within a bounded staleness window; exact cluster-wide enforcement under concurrency needs the strict shared backend.",
+        evidence: &[
+            "crates/sbproxy-core/src/governance_cluster.rs",
+            "crates/sbproxy-core/src/rate_limit_cluster.rs",
+            "crates/sbproxy-ai/src/governance_redis.rs",
+            "e2e/tests/governance_approximate_cluster.rs",
+            "e2e/tests/governance_strict.rs",
+        ],
     },
 ];
 

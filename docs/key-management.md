@@ -1041,6 +1041,49 @@ self-hosted models hold at least one token per raw request byte, which cannot
 undercount a byte-pair encoded prompt. Settlement replaces the ceiling with
 the usage the provider actually reported.
 
+#### How close to the limit is "at the limit"
+
+Under `strict`, admission is exact: a reserve either fits inside
+`used + reserved + this request's ceiling <= limit` or it is denied, and
+that arithmetic runs inside one Redis script, so two gateways racing the
+same key cannot both win the last slot. For a request limit that makes the
+accepted total exact, with no rounding at all.
+
+For a token or monetary limit there is one rounding unit, and it is worth
+stating plainly:
+
+- **A response that settles no more than its reservation held moves the
+  ledger by exactly what it consumed.** The accepted total lands at or
+  under the limit with no overshoot. This is the ordinary case, because
+  the ceiling covers the whole prompt and most replies are much smaller
+  than the prompt they answer.
+- **A response that settles more than its reservation held overshoots by
+  that excess, once.** Only the prompt can be measured before dispatch; a
+  reply's length is not knowable until it arrives, so a short prompt with
+  a long unbounded completion can settle above its hold. The overshoot is
+  bounded by that single request's excess per in-flight request, never
+  compounding, and each such settlement is recorded against the
+  reservation as `tokens_exceeded_reservation` (or
+  `micro_usd_exceeded_reservation`) so it is countable rather than
+  invisible.
+
+If you need the second case bounded too, cap the reply: a request that
+carries `max_tokens` cannot settle more than prompt plus that cap, and the
+overshoot goes to zero.
+
+The `approximate` tier adds a second, larger unit on top of both: peers
+publish on an interval, so a node's view of fleet spend lags by up to one
+dissemination cycle. Choose `strict` when the limit has to be exact.
+
+An AI cascade counts every attempt it made, not only the one it served. A
+tier whose answer scored too low is discarded from the response but was
+still generated and still billed by the provider, so its tokens are folded
+into the same settlement as the served reply. Without that, a caller who
+can drive a cascade could hold a governed budget flat while spending
+freely. The discarded portion is separately visible as
+`sbproxy_ai_wasted_tokens{kind="failover_loser"}`, which is a breakdown of
+the billed total rather than a second charge.
+
 `missing_rate` (default `zero_cost`) governs a key that carries a
 `total_micro_usd` limit when the resolved model has no configured rate.
 `zero_cost` treats the request as free at reserve time and still settles the
