@@ -135,7 +135,15 @@ make run CONFIG=examples/wasm-transform/sb.yml
 curl -i -H 'Host: wasm.local' http://127.0.0.1:8080/
 ```
 
-<!-- CAPTURE: curl -i -H 'Host: wasm.local' http://127.0.0.1:8080/ -->
+```
+HTTP/1.1 200 OK
+content-type: text/plain
+content-length: 18
+Date: Sun, 02 Aug 2026 03:44:27 GMT
+Connection: keep-alive
+
+hello from sbproxy
+```
 
 The static body went through the module's stdin and came back from its
 stdout unchanged, because echo copies one to the other. Any other

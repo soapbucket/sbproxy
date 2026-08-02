@@ -31,7 +31,15 @@ The static body is read by the proxy, fed to `echo.wasm` on stdin, then emitted 
 curl -i -H 'Host: wasm.local' http://127.0.0.1:8080/
 ```
 
-<!-- CAPTURE: curl -i -H 'Host: wasm.local' http://127.0.0.1:8080/ -->
+```
+HTTP/1.1 200 OK
+content-type: text/plain
+content-length: 18
+Date: Sun, 02 Aug 2026 03:44:27 GMT
+Connection: keep-alive
+
+hello from sbproxy
+```
 
 Replace `module_path` with a different wasm32-wasi binary to do real work; a module that uppercased its input would yield `HELLO FROM SBPROXY` instead. A runaway module is aborted at 500ms by the epoch-interruption trap, and under the default `failure_posture: open` the response falls back to the unmodified upstream body via the standard transform error path.
 

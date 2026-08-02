@@ -79,7 +79,29 @@ curl -sS http://127.0.0.1:8080/v1/chat/completions \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"In one sentence, what does an AI gateway do?"}]}'
 ```
 
-<!-- CAPTURE: curl -sS http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -H 'Authorization: Bearer sk-your-virtual-key' -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"In one sentence, what does an AI gateway do?"}]}' -->
+```
+{
+  "id": "chatcmpl-fixture",
+  "object": "chat.completion",
+  "created": 0,
+  "model": "gpt-4o-mini",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "fixture response"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 1,
+    "completion_tokens": 1,
+    "total_tokens": 2
+  }
+}
+```
 
 Ask for a model outside the credential's allow list and the gateway refuses before any upstream call:
 
@@ -90,7 +112,15 @@ curl -sS -i http://127.0.0.1:8080/v1/chat/completions \
   -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Try the expensive model."}]}'
 ```
 
-<!-- CAPTURE: curl -sS -i http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -H 'Authorization: Bearer sk-your-virtual-key' -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Try the expensive model."}]}' -->
+```
+HTTP/1.1 403 Forbidden
+content-type: application/json
+content-length: 54
+Date: Sun, 02 Aug 2026 03:43:46 GMT
+Connection: keep-alive
+
+{"error":"model 'gpt-4o' is not allowed for this key"}
+```
 
 The `app.mjs` snippet above works against the same stack unchanged. `docker compose down -v` tears it down.
 

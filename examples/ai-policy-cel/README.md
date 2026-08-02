@@ -2,6 +2,8 @@
 
 *Last modified: 2026-08-02*
 
+![AI policy plane (CEL)](../../docs/assets/ai-policy-cel.gif)
+
 One sandboxed CEL expression that fuses guardrail verdicts, budget state,
 the routing candidate, and principal context into a closed set of typed
 actions: `block`, `redact`, `route_to:<model>`, `compression:<selector>`,
@@ -45,7 +47,9 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
   | jq -r '.model'
 ```
 
-<!-- CAPTURE: curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Host: ai.local' -H 'Content-Type: application/json' -H 'Authorization: Bearer sk-demo-app-key' -H 'SB-Attr-Risk-Tier: free' -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Hi"}]}' | jq -r '.model' -->
+```
+gpt-4o-mini
+```
 
 Any other tier keeps the requested model; the policy's else branch is
 `allow`:
@@ -59,7 +63,9 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
   | jq -r '.model'
 ```
 
-<!-- CAPTURE: curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Host: ai.local' -H 'Content-Type: application/json' -H 'Authorization: Bearer sk-demo-app-key' -H 'SB-Attr-Risk-Tier: standard' -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Hi"}]}' | jq -r '.model' -->
+```
+gpt-4o
+```
 
 Run both as checked smoke cases from the repository root with:
 

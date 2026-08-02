@@ -1,5 +1,7 @@
 # Mastra through SBproxy
 
+![Mastra through SBproxy](../../docs/assets/mastra.gif)
+
 The runnable half of [docs/mastra.md](../../docs/mastra.md). The sb.yml here is the doc's config with one substitution: the `openai` provider points at a local OpenAI-shaped fixture instead of `api.openai.com`, so the whole flow (virtual key match, model allow list, provider dispatch) runs without a provider account. The fixture answers every chat completion with the fixed string `fixture response` and echoes the requested model back.
 
 ## Run it
@@ -47,7 +49,29 @@ curl -sS http://127.0.0.1:8080/v1/chat/completions \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"In one sentence, what does an AI gateway do?"}]}'
 ```
 
-<!-- CAPTURE: curl -sS http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -H 'Authorization: Bearer sk-your-virtual-key' -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"In one sentence, what does an AI gateway do?"}]}' -->
+```
+{
+  "id": "chatcmpl-fixture",
+  "object": "chat.completion",
+  "created": 0,
+  "model": "gpt-4o-mini",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "fixture response"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 1,
+    "completion_tokens": 1,
+    "total_tokens": 2
+  }
+}
+```
 
 A model outside the credential's `models.allow` list is rejected before any upstream call:
 
@@ -58,7 +82,15 @@ curl -sS -i http://127.0.0.1:8080/v1/chat/completions \
   -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Try the expensive model."}]}'
 ```
 
-<!-- CAPTURE: curl -sS -i http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -H 'Authorization: Bearer sk-your-virtual-key' -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Try the expensive model."}]}' -->
+```
+HTTP/1.1 403 Forbidden
+content-type: application/json
+content-length: 54
+Date: Sun, 02 Aug 2026 03:43:54 GMT
+Connection: keep-alive
+
+{"error":"model 'gpt-4o' is not allowed for this key"}
+```
 
 Run the checked smoke cases from the repository root with:
 

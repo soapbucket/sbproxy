@@ -141,7 +141,9 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
   | jq -r '.model'
 ```
 
-<!-- CAPTURE: curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Host: ai.local' -H 'Content-Type: application/json' -H 'Authorization: Bearer sk-demo-app-key' -H 'SB-Attr-Risk-Tier: free' -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Hi"}]}' | jq -r '.model' -->
+```
+gpt-4o-mini
+```
 
 Any other tier takes the policy's else branch and keeps the requested
 model:
@@ -155,7 +157,9 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
   | jq -r '.model'
 ```
 
-<!-- CAPTURE: curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Host: ai.local' -H 'Content-Type: application/json' -H 'Authorization: Bearer sk-demo-app-key' -H 'SB-Attr-Risk-Tier: standard' -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Hi"}]}' | jq -r '.model' -->
+```
+gpt-4o
+```
 
 ![a request without a tenant header rejected 403, then an unlisted X-Tenant: stranger rejected before any provider call](assets/ai-cel-tenant-gate.gif)
 
