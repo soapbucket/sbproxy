@@ -7,6 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::{PluginError, PluginResult};
+
 /// Schema version emitted by [`ExtensionInventorySnapshot`].
 pub const EXTENSION_INVENTORY_SCHEMA_VERSION: u16 = 1;
 
@@ -88,7 +90,7 @@ pub enum ExtensionBodyMode {
 ///
 /// Link-time declarations use the default `&'static str` phase. Owned
 /// inventory records use `ExtensionExecution<String>`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ExtensionExecution<P = &'static str> {
     /// Pipeline phase in which the hook runs.
     pub phase: P,
@@ -113,7 +115,7 @@ impl ExtensionExecution<&'static str> {
 }
 
 /// One hook exported by a link-time extension bundle.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct ExtensionHookDeclaration {
     /// Stable hook identifier, unique within the linked binary.
     pub id: &'static str,
@@ -130,7 +132,7 @@ pub struct ExtensionHookDeclaration {
 }
 
 /// Link-time declaration for one extension bundle.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct ExtensionBundleDeclaration {
     /// Stable bundle identifier.
     pub id: &'static str,
@@ -148,13 +150,34 @@ pub struct ExtensionBundleDeclaration {
 
 inventory::collect!(ExtensionBundleDeclaration);
 
-/// Return link-time extension declarations sorted by stable bundle ID.
-pub fn collect_linked_extension_declarations() -> Vec<&'static ExtensionBundleDeclaration> {
-    let mut declarations = inventory::iter::<ExtensionBundleDeclaration>
+fn sort_and_validate_extension_declarations(
+    mut declarations: Vec<&'static ExtensionBundleDeclaration>,
+) -> PluginResult<Vec<&'static ExtensionBundleDeclaration>> {
+    declarations.sort();
+    if let Some(duplicate) = declarations
+        .windows(2)
+        .find(|pair| pair[0].id == pair[1].id)
+    {
+        return Err(PluginError::Config(format!(
+            "duplicate extension bundle id: {}",
+            duplicate[0].id
+        )));
+    }
+    Ok(declarations)
+}
+
+/// Return link-time extension declarations in deterministic order.
+///
+/// ## Errors
+///
+/// Returns [`PluginError::Config`] when more than one linked declaration
+/// uses the same stable bundle ID.
+pub fn collect_linked_extension_declarations(
+) -> PluginResult<Vec<&'static ExtensionBundleDeclaration>> {
+    let declarations = inventory::iter::<ExtensionBundleDeclaration>
         .into_iter()
         .collect::<Vec<_>>();
-    declarations.sort_by_key(|declaration| declaration.id);
-    declarations
+    sort_and_validate_extension_declarations(declarations)
 }
 
 /// Where a bundle or hook registration came from.
@@ -228,7 +251,7 @@ pub struct ExtensionInventorySummary {
 }
 
 /// Load result attached to a bundle inventory record.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ExtensionLoadRecord {
     /// Load or validation phase that produced the result.
     pub phase: String,
@@ -239,7 +262,7 @@ pub struct ExtensionLoadRecord {
 }
 
 /// Owned inventory record for one extension bundle.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ExtensionBundleRecord {
     /// Stable bundle identifier.
     pub id: String,
@@ -262,7 +285,7 @@ pub struct ExtensionBundleRecord {
 }
 
 /// Owned inventory record for one extension hook.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ExtensionHookRecord {
     /// Stable hook identifier.
     pub id: String,
@@ -291,7 +314,7 @@ pub struct ExtensionHookRecord {
 }
 
 /// One collision between registrations sharing a match key.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ExtensionCollision {
     /// Lookup key claimed by multiple registrations.
     pub match_key: String,
@@ -321,8 +344,13 @@ pub struct ExtensionInventorySnapshot {
 }
 
 impl ExtensionInventorySnapshot {
-    /// Sort every identifier-bearing inventory vector deterministically.
-    pub fn sort_stably(&mut self) {
+    /// Sort every inventory vector deterministically and validate stable IDs.
+    ///
+    /// ## Errors
+    ///
+    /// Returns [`PluginError::Config`] when two bundle records share an ID or
+    /// two hook records share an ID.
+    pub fn sort_stably(&mut self) -> PluginResult<()> {
         for bundle in &mut self.bundles {
             bundle.hook_ids.sort();
         }
@@ -332,10 +360,27 @@ impl ExtensionInventorySnapshot {
         for collision in &mut self.collisions {
             collision.registrations.sort();
         }
-        self.bundles.sort_by(|left, right| left.id.cmp(&right.id));
-        self.hooks.sort_by(|left, right| left.id.cmp(&right.id));
-        self.collisions
-            .sort_by(|left, right| left.match_key.cmp(&right.match_key));
+        self.bundles.sort();
+        self.hooks.sort();
+        self.collisions.sort();
+
+        if let Some(duplicate) = self
+            .bundles
+            .windows(2)
+            .find(|pair| pair[0].id == pair[1].id)
+        {
+            return Err(PluginError::Config(format!(
+                "duplicate extension bundle id: {}",
+                duplicate[0].id
+            )));
+        }
+        if let Some(duplicate) = self.hooks.windows(2).find(|pair| pair[0].id == pair[1].id) {
+            return Err(PluginError::Config(format!(
+                "duplicate extension hook id: {}",
+                duplicate[0].id
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -361,6 +406,24 @@ pub struct ExtensionObservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static DUPLICATE_BUNDLE_A: ExtensionBundleDeclaration = ExtensionBundleDeclaration {
+        id: "duplicate-fixture-bundle",
+        name: "Duplicate fixture A",
+        version: "1.0.0",
+        package: None,
+        runtime: ExtensionRuntime::Rust,
+        hooks: &[],
+    };
+
+    static DUPLICATE_BUNDLE_B: ExtensionBundleDeclaration = ExtensionBundleDeclaration {
+        id: "duplicate-fixture-bundle",
+        name: "Duplicate fixture B",
+        version: "2.0.0",
+        package: None,
+        runtime: ExtensionRuntime::Javascript,
+        hooks: &[],
+    };
 
     fn bundle(id: &str, hook_ids: &[&str]) -> ExtensionBundleRecord {
         ExtensionBundleRecord {
@@ -426,14 +489,20 @@ mod tests {
                 },
                 ExtensionCollision {
                     match_key: "a-key".to_owned(),
-                    registrations: Vec::new(),
+                    registrations: vec!["z".to_owned()],
                     winner: None,
-                    resolution: "rejected".to_owned(),
+                    resolution: "z-resolution".to_owned(),
+                },
+                ExtensionCollision {
+                    match_key: "a-key".to_owned(),
+                    registrations: vec!["a".to_owned()],
+                    winner: None,
+                    resolution: "a-resolution".to_owned(),
                 },
             ],
         };
 
-        snapshot.sort_stably();
+        snapshot.sort_stably().unwrap();
 
         assert_eq!(
             snapshot
@@ -459,8 +528,66 @@ mod tests {
                 .iter()
                 .map(|collision| collision.match_key.as_str())
                 .collect::<Vec<_>>(),
-            ["a-key", "z-key"]
+            ["a-key", "a-key", "z-key"]
         );
-        assert_eq!(snapshot.collisions[1].registrations, ["a", "z"]);
+        assert_eq!(snapshot.collisions[0].registrations, ["a"]);
+        assert_eq!(snapshot.collisions[1].registrations, ["z"]);
+        assert_eq!(snapshot.collisions[2].registrations, ["a", "z"]);
+    }
+
+    #[test]
+    fn declaration_collection_rejects_duplicate_bundle_ids() {
+        let error = sort_and_validate_extension_declarations(vec![
+            &DUPLICATE_BUNDLE_B,
+            &DUPLICATE_BUNDLE_A,
+        ])
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::PluginError::Config(message)
+                if message == "duplicate extension bundle id: duplicate-fixture-bundle"
+        ));
+    }
+
+    #[test]
+    fn inventory_snapshot_rejects_duplicate_bundle_and_hook_ids() {
+        let mut duplicate_bundles = ExtensionInventorySnapshot {
+            schema_version: EXTENSION_INVENTORY_SCHEMA_VERSION,
+            scope: ExtensionInventoryScope {
+                mode: ExtensionScopeMode::Doctor,
+                proxy_version: "1.0.0".to_owned(),
+                config_revision: None,
+            },
+            summary: ExtensionInventorySummary::default(),
+            bundles: vec![bundle("duplicate", &[]), bundle("duplicate", &["hook"])],
+            hooks: Vec::new(),
+            collisions: Vec::new(),
+        };
+        let bundle_error = duplicate_bundles.sort_stably().unwrap_err();
+        assert!(matches!(
+            bundle_error,
+            crate::PluginError::Config(message)
+                if message == "duplicate extension bundle id: duplicate"
+        ));
+
+        let mut duplicate_hooks = ExtensionInventorySnapshot {
+            schema_version: EXTENSION_INVENTORY_SCHEMA_VERSION,
+            scope: ExtensionInventoryScope {
+                mode: ExtensionScopeMode::Doctor,
+                proxy_version: "1.0.0".to_owned(),
+                config_revision: None,
+            },
+            summary: ExtensionInventorySummary::default(),
+            bundles: Vec::new(),
+            hooks: vec![hook("duplicate", &[]), hook("duplicate", &["write"])],
+            collisions: Vec::new(),
+        };
+        let hook_error = duplicate_hooks.sort_stably().unwrap_err();
+        assert!(matches!(
+            hook_error,
+            crate::PluginError::Config(message)
+                if message == "duplicate extension hook id: duplicate"
+        ));
     }
 }

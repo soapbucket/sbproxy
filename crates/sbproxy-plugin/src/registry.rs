@@ -7,7 +7,21 @@
 use anyhow::Result;
 
 use crate::traits::{ActionHandler, AuthProvider, PolicyEnforcer, TransformHandler};
-use crate::PluginResult;
+use crate::{PluginError, PluginResult};
+
+fn unique_registration<T: 'static>(
+    mut registrations: impl Iterator<Item = &'static T>,
+    kind: &str,
+    name: &str,
+) -> Option<PluginResult<&'static T>> {
+    let registration = registrations.next()?;
+    if registrations.next().is_some() {
+        return Some(Err(PluginError::Config(format!(
+            "duplicate {kind} plugin registration: {name}"
+        ))));
+    }
+    Some(Ok(registration))
+}
 
 /// Which kind of plugin this registration covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -157,12 +171,24 @@ inventory::collect!(PolicyPluginRegistration);
 /// Build a registered policy plugin from JSON configuration.
 ///
 /// Returns `None` when no policy is registered under `name`.
+///
+/// ## Errors
+///
+/// The inner result is [`PluginError::Config`] when more than one policy is
+/// registered under `name`. Otherwise it contains any error returned by the
+/// unique registration's factory.
 pub fn build_policy_plugin(
     name: &str,
     config: serde_json::Value,
 ) -> Option<PluginResult<Box<dyn PolicyEnforcer>>> {
-    let registration =
-        inventory::iter::<PolicyPluginRegistration>().find(|item| item.name == name)?;
+    let registration = match unique_registration(
+        inventory::iter::<PolicyPluginRegistration>().filter(|item| item.name == name),
+        "policy",
+        name,
+    )? {
+        Ok(registration) => registration,
+        Err(error) => return Some(Err(error)),
+    };
     Some((registration.factory)(config))
 }
 
@@ -182,12 +208,24 @@ inventory::collect!(TransformPluginRegistration);
 /// Build a registered transform plugin from JSON configuration.
 ///
 /// Returns `None` when no transform is registered under `name`.
+///
+/// ## Errors
+///
+/// The inner result is [`PluginError::Config`] when more than one transform is
+/// registered under `name`. Otherwise it contains any error returned by the
+/// unique registration's factory.
 pub fn build_transform_plugin(
     name: &str,
     config: serde_json::Value,
 ) -> Option<PluginResult<Box<dyn TransformHandler>>> {
-    let registration =
-        inventory::iter::<TransformPluginRegistration>().find(|item| item.name == name)?;
+    let registration = match unique_registration(
+        inventory::iter::<TransformPluginRegistration>().filter(|item| item.name == name),
+        "transform",
+        name,
+    )? {
+        Ok(registration) => registration,
+        Err(error) => return Some(Err(error)),
+    };
     Some((registration.factory)(config))
 }
 
@@ -207,12 +245,24 @@ inventory::collect!(ActionPluginRegistration);
 /// Build a registered action plugin from JSON configuration.
 ///
 /// Returns `None` when no action is registered under `name`.
+///
+/// ## Errors
+///
+/// The inner result is [`PluginError::Config`] when more than one action is
+/// registered under `name`. Otherwise it contains any error returned by the
+/// unique registration's factory.
 pub fn build_action_plugin(
     name: &str,
     config: serde_json::Value,
 ) -> Option<PluginResult<Box<dyn ActionHandler>>> {
-    let registration =
-        inventory::iter::<ActionPluginRegistration>().find(|item| item.name == name)?;
+    let registration = match unique_registration(
+        inventory::iter::<ActionPluginRegistration>().filter(|item| item.name == name),
+        "action",
+        name,
+    )? {
+        Ok(registration) => registration,
+        Err(error) => return Some(Err(error)),
+    };
     Some((registration.factory)(config))
 }
 
@@ -225,7 +275,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        ActionHandler, ActionOutcome, PluginResult, PolicyDecision, PolicyEnforcer,
+        ActionHandler, ActionOutcome, PluginError, PluginResult, PolicyDecision, PolicyEnforcer,
         TransformContext, TransformHandler,
     };
 
@@ -296,6 +346,48 @@ mod tests {
         ActionPluginRegistration {
             name: "fixture_action",
             factory: |_config| Ok(Box::new(FixtureAction)),
+        }
+    }
+
+    inventory::submit! {
+        PolicyPluginRegistration {
+            name: "duplicate_fixture_policy",
+            factory: |_config| panic!("duplicate factory must not run"),
+        }
+    }
+
+    inventory::submit! {
+        PolicyPluginRegistration {
+            name: "duplicate_fixture_policy",
+            factory: |_config| panic!("duplicate factory must not run"),
+        }
+    }
+
+    inventory::submit! {
+        TransformPluginRegistration {
+            name: "duplicate_fixture_transform",
+            factory: |_config| panic!("duplicate factory must not run"),
+        }
+    }
+
+    inventory::submit! {
+        TransformPluginRegistration {
+            name: "duplicate_fixture_transform",
+            factory: |_config| panic!("duplicate factory must not run"),
+        }
+    }
+
+    inventory::submit! {
+        ActionPluginRegistration {
+            name: "duplicate_fixture_action",
+            factory: |_config| panic!("duplicate factory must not run"),
+        }
+    }
+
+    inventory::submit! {
+        ActionPluginRegistration {
+            name: "duplicate_fixture_action",
+            factory: |_config| panic!("duplicate factory must not run"),
         }
     }
 
@@ -372,11 +464,53 @@ mod tests {
 
     #[test]
     fn typed_registries_build_each_plugin_kind() {
-        assert!(build_policy_plugin("fixture_policy", json!({"type":"fixture_policy"})).is_some());
-        assert!(
+        let policy = build_policy_plugin("fixture_policy", json!({"type":"fixture_policy"}))
+            .expect("fixture policy is registered")
+            .expect("fixture policy builds");
+        assert_eq!(policy.policy_type(), "fixture_policy");
+
+        let transform =
             build_transform_plugin("fixture_transform", json!({"type":"fixture_transform"}))
-                .is_some()
+                .expect("fixture transform is registered")
+                .expect("fixture transform builds");
+        assert_eq!(transform.transform_type(), "fixture_transform");
+
+        let action = build_action_plugin("fixture_action", json!({"type":"fixture_action"}))
+            .expect("fixture action is registered")
+            .expect("fixture action builds");
+        assert_eq!(action.handler_type(), "fixture_action");
+    }
+
+    fn config_message<T>(result: Option<PluginResult<T>>) -> String {
+        match result.expect("duplicate name has registrations") {
+            Err(PluginError::Config(message)) => message,
+            Err(other) => panic!("expected config error, got {other}"),
+            Ok(_) => panic!("duplicate registration unexpectedly built"),
+        }
+    }
+
+    #[test]
+    fn typed_registries_reject_duplicate_plugin_names() {
+        assert_eq!(
+            config_message(build_policy_plugin(
+                "duplicate_fixture_policy",
+                serde_json::Value::Null,
+            )),
+            "duplicate policy plugin registration: duplicate_fixture_policy"
         );
-        assert!(build_action_plugin("fixture_action", json!({"type":"fixture_action"})).is_some());
+        assert_eq!(
+            config_message(build_transform_plugin(
+                "duplicate_fixture_transform",
+                serde_json::Value::Null,
+            )),
+            "duplicate transform plugin registration: duplicate_fixture_transform"
+        );
+        assert_eq!(
+            config_message(build_action_plugin(
+                "duplicate_fixture_action",
+                serde_json::Value::Null,
+            )),
+            "duplicate action plugin registration: duplicate_fixture_action"
+        );
     }
 }

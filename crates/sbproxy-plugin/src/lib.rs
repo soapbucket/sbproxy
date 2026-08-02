@@ -81,7 +81,7 @@ mod extension_contract_tests {
 
     #[test]
     fn linked_extension_declarations_are_sorted_by_bundle_id() {
-        let declarations = collect_linked_extension_declarations();
+        let declarations = collect_linked_extension_declarations().unwrap();
         assert!(declarations.windows(2).all(|pair| pair[0].id <= pair[1].id));
         assert!(declarations.iter().any(|bundle| bundle.id == "fixture-a"));
         assert!(declarations.iter().any(|bundle| bundle.id == "fixture-z"));
