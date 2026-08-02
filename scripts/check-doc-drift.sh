@@ -165,16 +165,25 @@ for field in ("policies", "transforms"):
             f"origin {field} items are no longer an opaque schema boundary",
         )
 
+# The root stays open for the v1 flat-file compatibility promise; the
+# proxy and origin envelopes are closed since WOR-1140 so a misspelled
+# key fails config load instead of silently dropping. A schema that
+# reopens one of them is a regression this check now catches.
+require(isinstance(document, dict), "root schema is not an object")
+if isinstance(document, dict):
+    require(
+        document.get("additionalProperties", True) is True,
+        "root schema is no longer open; the v1 flat-file promise needs it",
+    )
 for name, typed_object in (
-    ("root", document),
     ("proxy", proxy),
     ("origin", origin),
 ):
     require(isinstance(typed_object, dict), f"{name} schema is not an object")
     if isinstance(typed_object, dict):
         require(
-            typed_object.get("additionalProperties", True) is True,
-            f"{name} schema is no longer open",
+            typed_object.get("additionalProperties", True) is False,
+            f"{name} schema is open again; unknown keys must fail config load (WOR-1140)",
         )
 
 require(
