@@ -362,7 +362,7 @@ static AI_BUDGET_UTILIZATION: LazyLock<GaugeVec> = LazyLock::new(|| {
     register_gauge_vec!(
         Opts::new(
             "sbproxy_ai_budget_utilization_ratio",
-            "Budget utilization as ratio 0-1"
+            "Budget utilization as a fraction of the limit; above 1 is over budget"
         ),
         &["scope"] // "org", "team", "project", "user"
     )

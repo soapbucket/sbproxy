@@ -2011,7 +2011,7 @@ The proxy exposes aggregate AI usage as Prometheus metrics. The `/metrics` endpo
 | `sbproxy_ai_safety_guardrail_verdicts_total` | Counter | `guardrail`, `class`, `backend`, `verdict` | Toxicity, jailbreak, and content-safety evaluations, including whether keyword or classifier mode produced the verdict |
 | `sbproxy_ai_reasoning_policy_attempts_total` | Counter | `provider`, `outcome` | Per-provider concise-reasoning result: `native`, `prompt_fallback`, `off`, `tool_bypass`, or `code_bypass` |
 | `sbproxy_ai_cache_results_total` | Counter | `provider`, `cache_type`, `result` | AI response cache results (`cache_type` is `exact` or `semantic`, `result` is `hit` or `miss`) |
-| `sbproxy_ai_budget_utilization_ratio` | Gauge | `scope` | Current budget utilization as a 0 to 1 ratio |
+| `sbproxy_ai_budget_utilization_ratio` | Gauge | `scope` | Current budget utilization as a fraction of the limit. Above 1 means the scope is over budget; the hard `on_exceed` action fires at 1 |
 | `sbproxy_ai_realtime_sessions_active` | Gauge | | Currently open OpenAI Realtime API WebSocket sessions |
 | `sbproxy_ai_realtime_session_duration_seconds` | Histogram | `provider`, `close_reason` | Wall-clock duration of a Realtime WebSocket session, observed at close. `close_reason` is `client_closed` or `error` |
 | `sbproxy_ai_realtime_audio_seconds_total` | Counter | `provider`, `direction` | Cumulative audio seconds forwarded over Realtime sessions. Frame-exact accounting requires terminate-and-relay, which is not implemented; the dispatcher uses session wall-clock as a duration proxy on close |
