@@ -209,6 +209,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: gate helper self-tests
+        run: |
+          bash scripts/tests/workspace_bin_test.sh
+          bash scripts/tests/runner_disk_test.sh
+
       # clippy-driver and rustdoc write artifacts the `test` lane cannot link
       # against, so this job keeps its own cache entry rather than fighting
       # the test lane over one key. That mutual uselessness is also why these

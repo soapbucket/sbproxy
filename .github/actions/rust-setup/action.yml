@@ -11,7 +11,7 @@
 #   - uses: ./.github/actions/rust-setup
 #     with:
 #       cache-key: ci          # short label that segregates caches
-#       free-disk: 'true'      # off when the job stays well under 14 GB
+#       free-disk: 'true'      # measure and reclaim below the 40 GiB floor
 #       install-system-deps: 'true'
 #
 # The composite intentionally does NOT run cargo. Each caller picks
@@ -35,7 +35,7 @@ inputs:
     required: false
     default: ''
   free-disk:
-    description: 'Reclaim runner disk before the build. Disable for jobs that fit comfortably under the default runner free space.'
+    description: 'Measure runner disk before the build and reclaim the allowlisted toolchains at or below the 40 GiB floor. Disable when the job needs no disk policy.'
     required: false
     default: 'true'
   install-system-deps:
@@ -50,20 +50,13 @@ inputs:
 runs:
   using: composite
   steps:
-    # Deleting the largest preinstalled toolchains reclaims ~25 GB in a couple
-    # of seconds. jlumbroso/free-disk-space used to do this and reclaimed the
-    # same space through `apt-get purge`, which cost 95 s on every run.
-    - name: reclaim runner disk
+    # Current hosted images have about 109 GB free after this cleanup, while
+    # deleting the preinstalled toolchains costs about 70 seconds. Measure
+    # first and keep the same allowlist for runners below the 40 GiB floor.
+    - name: reclaim runner disk when space is low
       if: inputs.free-disk == 'true'
       shell: bash
-      run: |
-        sudo rm -rf \
-          /usr/local/lib/android \
-          /usr/share/dotnet \
-          /opt/ghc \
-          /usr/local/.ghcup
-        sudo docker image prune --all --force >/dev/null 2>&1 || true
-        df -h /
+      run: bash "${{ github.action_path }}/reclaim-disk.sh"
 
     - name: install Rust toolchain
       uses: dtolnay/rust-toolchain@stable

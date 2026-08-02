@@ -179,6 +179,12 @@ bash "$ROOT/scripts/check-spec-citations.sh"
 step "no process-global env mutation outside test helpers"
 bash "$ROOT/scripts/check-env-mutation.sh"
 
+# These helpers steer the gate around expensive or destructive work, so run
+# their branch tests before any Cargo build or CI-equivalent cleanup.
+step "gate helper self-tests"
+bash "$ROOT/scripts/tests/workspace_bin_test.sh"
+bash "$ROOT/scripts/tests/runner_disk_test.sh"
+
 # CI: doc-drift.yml. Guards the provider-count, routing-strategy, and
 # unimplemented-feature claims in user-facing docs.
 step "doc drift"
@@ -374,13 +380,20 @@ fi
 
 # CI: ci.yml test lane, "generated artifacts are current". These exec
 # the binaries the build above produced.
+# shellcheck source=scripts/lib/workspace-bin.sh
+. "$ROOT/scripts/lib/workspace-bin.sh"
+
 step "config schema and reader coverage"
-bash "$ROOT/scripts/check-config-schema.sh"
-bash "$ROOT/scripts/check-config-readers.sh"
+run_generated_artifact_checks \
+  "$ROOT" \
+  check-config-schema.sh \
+  check-config-readers.sh
 
 step "generated docs are current"
-bash "$ROOT/scripts/check-metrics-stability.sh"
-bash "$ROOT/scripts/check-model-host-capabilities.sh"
+run_generated_artifact_checks \
+  "$ROOT" \
+  check-metrics-stability.sh \
+  check-model-host-capabilities.sh
 
 # CI: ci.yml payments lane (WOR-2222). Last in this phase because it is the
 # most expensive thing in this file, so every cheaper failure above is found
