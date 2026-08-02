@@ -107,7 +107,13 @@ mod tests {
         // The config-load callers hold `Vec<String>`; borrowing through
         // `String::as_str` must keep working without an intermediate
         // allocation.
-        let owned = vec!["10.0.0.0/8".to_string(), "bogus".to_string()];
+        // A real `Vec<String>`, collected rather than `vec!`d, because the
+        // point of the test is the caller's owned-string shape and clippy
+        // rewrites a `vec!` that is only iterated into an array.
+        let owned: Vec<String> = ["10.0.0.0/8", "bogus"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let cidrs = parse_cidrs(owned.iter().map(String::as_str), "trustworthy_client_cidrs");
         assert_eq!(cidrs.len(), 1);
     }
