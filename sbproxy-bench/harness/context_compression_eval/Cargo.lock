@@ -4240,6 +4240,7 @@ dependencies = [
  "hickory-resolver",
  "hmac",
  "ipnetwork",
+ "prometheus",
  "rand 0.8.7",
  "regex",
  "serde",
