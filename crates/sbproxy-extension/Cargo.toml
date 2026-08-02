@@ -58,6 +58,10 @@ base64.workspace = true
 sha2.workspace = true
 hex.workspace = true
 
+# Capability-based bundle traversal prevents path replacement between
+# containment checks and reads.
+cap-std.workspace = true
+
 # MCP tool-versioning compatibility oracle (mcp/compat): semver comparison for
 # the version-bump linter, JCS canonicalization for the contract digest, and
 # async-trait for the injected Judge (description-semantics) abstraction.

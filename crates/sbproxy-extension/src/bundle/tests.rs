@@ -205,6 +205,31 @@ fn collision_rejects_whole_candidate_against_dynamic_and_reserved_names() {
 }
 
 #[test]
+fn reverse_creation_order_still_reports_lexical_bundle_as_earlier_registration() {
+    let temp = TempDir::new().unwrap();
+    write_bundle(
+        temp.path(),
+        "z-created-first",
+        &manifest("lexical-z", "policy", "ordered_collision", None),
+        b"z",
+    );
+    write_bundle(
+        temp.path(),
+        "a-created-last",
+        &manifest("lexical-a", "policy", "ordered_collision", None),
+        b"a",
+    );
+
+    let error =
+        DynamicBundleRegistry::load(&local_config(temp.path()), temp.path(), &BTreeSet::new())
+            .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "bundle.collision: bundle `lexical-a` and bundle `lexical-z` both declare policy hook `ordered_collision`"
+    );
+}
+
+#[test]
 fn built_in_and_linked_static_reservations_use_the_same_kind_aware_rejection() {
     for (owner, reserved_type) in [
         ("built-in", "builtin_reserved_policy"),
@@ -270,6 +295,92 @@ fn kind_is_part_of_the_collision_key() {
             .unwrap();
     assert!(registry.policy("shared").is_some());
     assert!(registry.action("shared").is_some());
+}
+
+#[test]
+fn proxy_wasm_and_ai_lookups_map_kinds_and_sort_ai_hooks() {
+    let temp = TempDir::new().unwrap();
+    let proxy_dir = temp.path().join("proxy-filter");
+    std::fs::create_dir(&proxy_dir).unwrap();
+    std::fs::write(
+        proxy_dir.join("bundle.yaml"),
+        "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: proxy-filter\nversion: 1.0.0\nruntime: proxy_wasm\nabi: 0.2.1\nentry: filter.wasm\nhooks:\n  - kind: proxy_wasm\n    type: fixture_proxy_filter\n",
+    )
+    .unwrap();
+    std::fs::write(proxy_dir.join("filter.wasm"), b"fixture wasm bytes").unwrap();
+
+    write_bundle(
+        temp.path(),
+        "z-ai-created-first",
+        &manifest("z-ai", "ai_close", "z_close", None),
+        b"z",
+    );
+    write_bundle(
+        temp.path(),
+        "a-ai-created-last",
+        &manifest("a-ai", "ai_close", "a_close", None),
+        b"a",
+    );
+    write_bundle(
+        temp.path(),
+        "m-ai-tool",
+        &manifest("m-ai", "ai_tool_call", "tool_call", None),
+        b"tool",
+    );
+
+    let registry =
+        DynamicBundleRegistry::load(&local_config(temp.path()), temp.path(), &BTreeSet::new())
+            .unwrap();
+    let proxy = registry.proxy_wasm_filter("fixture_proxy_filter").unwrap();
+    assert_eq!(proxy.hook().kind, BundleHookKind::ProxyWasm);
+    let close_hooks = registry.ai_hooks(BundleHookKind::AiClose);
+    assert_eq!(
+        close_hooks
+            .iter()
+            .map(|hook| hook.hook().type_name.as_str())
+            .collect::<Vec<_>>(),
+        ["a_close", "z_close"]
+    );
+    let tool_hooks = registry.ai_hooks(BundleHookKind::AiToolCall);
+    assert_eq!(tool_hooks.len(), 1);
+    assert_eq!(tool_hooks[0].hook().kind, BundleHookKind::AiToolCall);
+    assert!(registry.inventory().hooks.iter().any(|hook| {
+        hook.match_key == "fixture_proxy_filter"
+            && hook.kind == ExtensionHookKind::ProxyWasmFilter
+            && hook.runtime == ExtensionRuntime::ProxyWasm
+    }));
+    assert!(registry.inventory().hooks.iter().any(|hook| {
+        hook.match_key == "a_close"
+            && hook.kind == ExtensionHookKind::AiClose
+            && hook.runtime == ExtensionRuntime::Javascript
+    }));
+    assert!(registry.inventory().hooks.iter().any(|hook| {
+        hook.match_key == "tool_call"
+            && hook.kind == ExtensionHookKind::AiToolCall
+            && hook.runtime == ExtensionRuntime::Javascript
+    }));
+}
+
+#[test]
+fn intentional_in_root_nested_entry_loads() {
+    let temp = TempDir::new().unwrap();
+    let bundle = temp.path().join("nested");
+    std::fs::create_dir_all(bundle.join("assets")).unwrap();
+    std::fs::write(
+        bundle.join("bundle.yaml"),
+        manifest("nested", "policy", "nested_policy", None)
+            .replace("entry: entry.js", "entry: assets/entry.js"),
+    )
+    .unwrap();
+    std::fs::write(bundle.join("assets/entry.js"), b"nested bytes").unwrap();
+
+    let registry =
+        DynamicBundleRegistry::load(&local_config(temp.path()), temp.path(), &BTreeSet::new())
+            .unwrap();
+    assert_eq!(
+        registry.policy("nested_policy").unwrap().artifact(),
+        b"nested bytes"
+    );
 }
 
 #[test]

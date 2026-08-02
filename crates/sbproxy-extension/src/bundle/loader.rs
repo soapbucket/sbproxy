@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
 use std::io::{Read, Take};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, DirEntry, File};
 use jsonschema::{Draft, JSONSchema};
 use sbproxy_config::{
     is_full_commit_sha, materialize_git_tree, redact_repo, BundleBodyMode, BundleHook,
@@ -202,19 +203,13 @@ impl DynamicBundleRegistry {
                         fetch_context,
                     };
                     materialize_git_tree(request, |tree| {
-                        let checkout = canonical_root(tree.root(), "Git checkout")?;
-                        let source_root = tree.root().join(path);
-                        let source_root = source_root.canonicalize().map_err(|_| {
-                            BundleLoadError::new("source", "Git bundle directory is unavailable")
-                        })?;
-                        if !source_root.starts_with(&checkout) {
-                            return Err(BundleLoadError::new(
-                                "path",
-                                "Git bundle directory escapes the verified checkout",
-                            ));
-                        }
-                        candidate.load_canonical_source_root(
-                            &source_root,
+                        let checkout = SourceRoot::open(tree.root(), "Git checkout")?;
+                        let source_root = checkout.open_subdir(
+                            Path::new(path),
+                            "Git bundle directory escapes or is unavailable in the verified checkout",
+                        )?;
+                        candidate.load_open_source_root(
+                            source_root,
                             BundleProvenance::Git {
                                 source_index,
                                 repo: redact_repo(&tree.revision().repo),
@@ -290,61 +285,33 @@ impl<'a> Candidate<'a> {
         provenance: BundleProvenance,
         require_digest: bool,
     ) -> Result<(), BundleLoadError> {
-        let root = canonical_root(root, "directory source")?;
-        self.load_canonical_source_root(&root, provenance, require_digest)
+        let root = SourceRoot::open(root, "directory source")?;
+        self.load_open_source_root(root, provenance, require_digest)
     }
 
-    fn load_canonical_source_root(
+    fn load_open_source_root(
         &mut self,
-        root: &Path,
+        root: SourceRoot,
         provenance: BundleProvenance,
         require_digest: bool,
     ) -> Result<(), BundleLoadError> {
-        let mut entries = std::fs::read_dir(root)
-            .map_err(|_| BundleLoadError::new("source", "bundle directory is unreadable"))?
-            .map(|entry| {
-                entry
-                    .map(|entry| (entry.file_name(), entry.path()))
-                    .map_err(|_| {
-                        BundleLoadError::new("source", "bundle directory entry is unreadable")
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        entries.sort_by(|left, right| left.0.cmp(&right.0));
-
-        for (_, path) in entries {
-            if !path.is_dir() {
+        for entry in root.sorted_entries()? {
+            let Some(bundle_root) = root.open_bundle(&entry)? else {
                 continue;
-            }
-            let bundle_root = path
-                .canonicalize()
-                .map_err(|_| BundleLoadError::new("path", "bundle directory cannot be resolved"))?;
-            if !bundle_root.starts_with(root) {
-                return Err(BundleLoadError::new(
-                    "path",
-                    "bundle directory symlink escapes its source root",
-                ));
-            }
-            self.load_bundle(root, &bundle_root, provenance.clone(), require_digest)?;
+            };
+            self.load_bundle(&bundle_root, provenance.clone(), require_digest)?;
         }
         Ok(())
     }
 
     fn load_bundle(
         &mut self,
-        source_root: &Path,
-        bundle_root: &Path,
+        bundle_root: &SourceRoot,
         provenance: BundleProvenance,
         require_digest: bool,
     ) -> Result<(), BundleLoadError> {
-        let manifest_path = canonical_contained_file(
-            source_root,
-            bundle_root,
-            &bundle_root.join("bundle.yaml"),
-            "manifest",
-        )?;
-        let manifest_bytes = read_capped(
-            &manifest_path,
+        let manifest_bytes = bundle_root.read_capped(
+            Path::new("bundle.yaml"),
             MAX_BUNDLE_MANIFEST_BYTES,
             "manifest",
             "256 KiB",
@@ -395,14 +362,14 @@ impl<'a> Candidate<'a> {
             ));
         }
 
-        let entry = canonical_contained_file(
-            source_root,
-            bundle_root,
-            &bundle_root.join(&manifest.entry),
-            "artifact",
-        )?;
         let artifact = Arc::<[u8]>::from(
-            read_capped(&entry, MAX_BUNDLE_ARTIFACT_BYTES, "artifact", "16 MiB")?
+            bundle_root
+                .read_capped(
+                    Path::new(&manifest.entry),
+                    MAX_BUNDLE_ARTIFACT_BYTES,
+                    "artifact",
+                    "16 MiB",
+                )?
                 .into_boxed_slice(),
         );
         let digest = hex::encode(Sha256::digest(&artifact));
@@ -512,17 +479,85 @@ fn resolve_local_path(base_dir: &Path, configured: &str) -> PathBuf {
     }
 }
 
-fn canonical_root(path: &Path, label: &str) -> Result<PathBuf, BundleLoadError> {
-    let root = path
-        .canonicalize()
-        .map_err(|_| BundleLoadError::new("source", format!("{label} is unavailable")))?;
-    if !root.is_dir() {
-        return Err(BundleLoadError::new(
-            "source",
-            format!("{label} is not a directory"),
-        ));
+struct SourceRoot {
+    dir: Dir,
+}
+
+impl SourceRoot {
+    fn open(path: &Path, label: &str) -> Result<Self, BundleLoadError> {
+        let dir = Dir::open_ambient_dir(path, ambient_authority())
+            .map_err(|_| BundleLoadError::new("source", format!("{label} is unavailable")))?;
+        dir.dir_metadata()
+            .map_err(|_| BundleLoadError::new("source", format!("{label} is unreadable")))?;
+        Ok(Self { dir })
     }
-    Ok(root)
+
+    fn open_subdir(&self, path: &Path, error: &str) -> Result<Self, BundleLoadError> {
+        self.dir
+            .open_dir(path)
+            .map(|dir| Self { dir })
+            .map_err(|_| BundleLoadError::new("path", error))
+    }
+
+    fn sorted_entries(&self) -> Result<Vec<DirEntry>, BundleLoadError> {
+        let mut entries = self
+            .dir
+            .entries()
+            .map_err(|_| BundleLoadError::new("source", "bundle directory is unreadable"))?
+            .map(|entry| {
+                entry.map_err(|_| {
+                    BundleLoadError::new("source", "bundle directory entry is unreadable")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(DirEntry::file_name);
+        Ok(entries)
+    }
+
+    fn open_bundle(&self, entry: &DirEntry) -> Result<Option<Self>, BundleLoadError> {
+        match entry.open_dir() {
+            Ok(dir) => Ok(Some(Self { dir })),
+            Err(_) => {
+                let file_type = entry.file_type().map_err(|_| {
+                    BundleLoadError::new("source", "bundle directory entry is unreadable")
+                })?;
+                if !file_type.is_symlink() {
+                    return if file_type.is_dir() {
+                        Err(BundleLoadError::new(
+                            "source",
+                            "bundle directory is unreadable",
+                        ))
+                    } else {
+                        Ok(None)
+                    };
+                }
+
+                match entry.open() {
+                    Ok(file) if file.metadata().is_ok_and(|metadata| metadata.is_file()) => Ok(None),
+                    Ok(_) | Err(_) => Err(BundleLoadError::new(
+                        "path",
+                        "bundle directory symlink escapes or is not a readable directory in its source root",
+                    )),
+                }
+            }
+        }
+    }
+
+    fn read_capped(
+        &self,
+        path: &Path,
+        maximum: usize,
+        stage: &'static str,
+        display_limit: &str,
+    ) -> Result<Vec<u8>, BundleLoadError> {
+        let file = self.dir.open(path).map_err(|_| {
+            BundleLoadError::new(
+                "path",
+                format!("bundle {stage} symlink escape or unavailable path"),
+            )
+        })?;
+        read_capped_file(file, maximum, stage, display_limit)
+    }
 }
 
 fn validate_relative_path(path: &str, label: &str) -> Result<(), BundleLoadError> {
@@ -544,42 +579,22 @@ fn validate_relative_path(path: &str, label: &str) -> Result<(), BundleLoadError
     Ok(())
 }
 
-fn canonical_contained_file(
-    source_root: &Path,
-    bundle_root: &Path,
-    path: &Path,
-    label: &'static str,
-) -> Result<PathBuf, BundleLoadError> {
-    let canonical = path
-        .canonicalize()
-        .map_err(|_| BundleLoadError::new(label, format!("bundle {label} is unavailable")))?;
-    if !canonical.starts_with(source_root) || !canonical.starts_with(bundle_root) {
-        return Err(BundleLoadError::new(
-            "path",
-            format!("bundle {label} symlink escape leaves its bundle root"),
-        ));
-    }
-    if !canonical.is_file() {
-        return Err(BundleLoadError::new(
-            label,
-            format!("bundle {label} is not a regular file"),
-        ));
-    }
-    Ok(canonical)
-}
-
-fn read_capped(
-    path: &Path,
+fn read_capped_file(
+    file: File,
     maximum: usize,
     stage: &'static str,
     display_limit: &str,
 ) -> Result<Vec<u8>, BundleLoadError> {
-    let file = File::open(path)
-        .map_err(|_| BundleLoadError::new(stage, format!("bundle {stage} is unreadable")))?;
-    let length = file
-        .metadata()
-        .map_err(|_| BundleLoadError::new(stage, format!("bundle {stage} metadata is unreadable")))?
-        .len();
+    let metadata = file.metadata().map_err(|_| {
+        BundleLoadError::new(stage, format!("bundle {stage} metadata is unreadable"))
+    })?;
+    if !metadata.is_file() {
+        return Err(BundleLoadError::new(
+            stage,
+            format!("bundle {stage} is not a regular file"),
+        ));
+    }
+    let length = metadata.len();
     if length > maximum as u64 {
         return Err(BundleLoadError::new(
             stage,
@@ -717,5 +732,45 @@ const fn hook_kind_label(kind: BundleHookKind) -> &'static str {
         BundleHookKind::AiStreamEvent => "ai_stream_event",
         BundleHookKind::AiClose => "ai_close",
         BundleHookKind::ProxyWasm => "proxy_wasm",
+    }
+}
+
+#[cfg(all(test, unix))]
+mod capability_race_tests {
+    use super::*;
+
+    #[test]
+    fn source_root_handle_prevents_post_acquisition_path_swap() {
+        let parent = tempfile::TempDir::new().unwrap();
+        let configured = parent.path().join("configured");
+        let moved = parent.path().join("moved");
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(configured.join("bundle/nested")).unwrap();
+        std::fs::create_dir_all(outside.path().join("bundle/nested")).unwrap();
+        std::fs::write(
+            configured.join("bundle/nested/entry.js"),
+            b"safe original bytes",
+        )
+        .unwrap();
+        std::fs::write(
+            outside.path().join("bundle/nested/entry.js"),
+            b"outside attacker bytes",
+        )
+        .unwrap();
+
+        let source = SourceRoot::open(&configured, "directory source").unwrap();
+        std::fs::rename(&configured, &moved).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &configured).unwrap();
+
+        let bytes = source
+            .read_capped(
+                Path::new("bundle/nested/entry.js"),
+                MAX_BUNDLE_ARTIFACT_BYTES,
+                "artifact",
+                "16 MiB",
+            )
+            .unwrap();
+        assert_eq!(bytes, b"safe original bytes");
+        assert_ne!(bytes, b"outside attacker bytes");
     }
 }

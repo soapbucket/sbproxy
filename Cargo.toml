@@ -164,6 +164,9 @@ notify = "7"
 # Plugin system
 inventory = "0.3"
 
+# Capability-based filesystem traversal
+cap-std = "4.0.2"
+
 # Observability
 # release_max_level_info compile-strips debug!/trace! calls from release
 # builds. Hot paths in server.rs / policy evaluation get their log macros
