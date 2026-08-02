@@ -202,12 +202,19 @@ struct WorkerRuntime {
 
 enum InvokeFailure {
     Guest,
+    Timeout,
     OutputLimit,
 }
 
 impl From<rquickjs::Error> for InvokeFailure {
-    fn from(_: rquickjs::Error) -> Self {
-        Self::Guest
+    fn from(error: rquickjs::Error) -> Self {
+        // Bundle guests have no host I/O or Rust futures. Once QuickJS has no
+        // pending jobs, a still-pending Promise cannot make further progress.
+        if matches!(error, rquickjs::Error::WouldBlock) {
+            Self::Timeout
+        } else {
+            Self::Guest
+        }
     }
 }
 
@@ -229,10 +236,13 @@ impl WorkerRuntime {
     ) -> (Result<Vec<u8>, RuntimeFailure>, bool) {
         self.runtime.set_memory_limit(program.limits.memory_bytes);
         self.runtime.set_max_stack_size(program.limits.stack_bytes);
-        let watchdog = arm_watchdog(
+        let watchdog = match arm_watchdog(
             Arc::clone(&self.interrupt),
             Duration::from_millis(program.limits.budget_ms),
-        );
+        ) {
+            Ok(watchdog) => watchdog,
+            Err(_) => return (Err(RuntimeFailure::Timeout), true),
+        };
         let result = Context::full(&self.runtime)
             .map_err(InvokeFailure::from)
             .and_then(|context| {
@@ -248,10 +258,10 @@ impl WorkerRuntime {
             })
             .map_err(|failure| match failure {
                 InvokeFailure::Guest => RuntimeFailure::Code("guest_exception"),
+                InvokeFailure::Timeout => RuntimeFailure::Timeout,
                 InvokeFailure::OutputLimit => RuntimeFailure::Code("output_limit"),
             });
-        let interrupted = watchdog.interrupted();
-        drop(watchdog);
+        let interrupted = watchdog.finish();
         self.interrupt.store(false, Ordering::Relaxed);
         if interrupted {
             return (Err(RuntimeFailure::Timeout), true);
@@ -307,7 +317,10 @@ fn preflight_exports(
     let watchdog = arm_watchdog(
         Arc::clone(&runtime.interrupt),
         Duration::from_millis(limits.budget_ms),
-    );
+    )
+    .map_err(|_| {
+        BundleLoadError::new("javascript", "bundle initialization runtime is unavailable")
+    })?;
     enum PreflightFailure {
         Module,
         Export,
@@ -334,8 +347,7 @@ fn preflight_exports(
                 Ok(())
             })
         });
-    let interrupted = watchdog.interrupted();
-    drop(watchdog);
+    let interrupted = watchdog.finish();
     if interrupted {
         return Err(BundleLoadError::new(
             "javascript",
@@ -1434,6 +1446,49 @@ mod tests {
             adapter.enforce(&request(b""), &mut context).await.unwrap(),
             PolicyDecision::Allow
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn javascript_times_out_a_promise_that_cannot_settle_and_replaces_its_worker() {
+        let fixture = fixture(
+            BundleHookKind::Policy,
+            "entry.js",
+            r#"
+                export function run(input) {
+                    if (input.config.pending) return new Promise(() => {});
+                    return { version: "sbproxy-envelope/v1", decision: "allow" };
+                }
+            "#,
+            "sandbox:\n  budget_ms: 10\n",
+            "",
+        );
+        let (_, pending) = prepare_program(
+            fixture.hook(),
+            BundleHookKind::Policy,
+            json!({"pending": true}),
+        )
+        .unwrap();
+        let (_, healthy) = prepare_program(
+            fixture.hook(),
+            BundleHookKind::Policy,
+            json!({"pending": false}),
+        )
+        .unwrap();
+        let executor = JavascriptExecutor::start(1, 1);
+        let request = request_value(&request(b""), pending.limits.max_input_bytes).unwrap();
+        let pending_input = hook_envelope("request", &pending, request.clone());
+        let pending_input =
+            serialize_envelope(&pending_input, pending.limits.max_input_bytes).unwrap();
+        assert_eq!(
+            executor.execute(pending, pending_input).await,
+            Err(super::RuntimeFailure::Timeout)
+        );
+
+        let healthy_input = hook_envelope("request", &healthy, request);
+        let healthy_input =
+            serialize_envelope(&healthy_input, healthy.limits.max_input_bytes).unwrap();
+        let output = executor.execute(healthy, healthy_input).await.unwrap();
+        assert_eq!(decode_policy(&output).unwrap(), PolicyDecision::Allow);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

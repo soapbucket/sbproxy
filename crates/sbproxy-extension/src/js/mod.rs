@@ -27,9 +27,9 @@
 //!   QuickJS via `Runtime::set_max_stack_size`. Guards against
 //!   deeply recursive scripts.
 
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, LazyLock};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -39,104 +39,162 @@ use thiserror::Error;
 
 pub use sbproxy_config::types::JsSandboxConfig;
 
-struct WatchdogEntry {
+const MAX_PENDING_WATCHDOGS: usize = 4_096;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct WatchdogKey {
     deadline: Instant,
     sequence: u64,
-    interrupt: Arc<AtomicBool>,
-    done: Arc<AtomicBool>,
 }
 
-impl PartialEq for WatchdogEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.sequence == other.sequence
-    }
+struct WatchdogState {
+    deadlines: BTreeMap<WatchdogKey, Arc<AtomicBool>>,
+    shutdown: bool,
 }
 
-impl Eq for WatchdogEntry {}
-
-impl PartialOrd for WatchdogEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
+struct WatchdogShared {
+    state: Mutex<WatchdogState>,
+    changed: Condvar,
 }
 
-impl Ord for WatchdogEntry {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other
-            .deadline
-            .cmp(&self.deadline)
-            .then_with(|| other.sequence.cmp(&self.sequence))
-    }
-}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WatchdogAdmissionError;
 
 struct SharedWatchdog {
-    sender: mpsc::Sender<WatchdogEntry>,
+    shared: Arc<WatchdogShared>,
     sequence: AtomicU64,
+    capacity: usize,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl SharedWatchdog {
-    fn start() -> Self {
-        let (sender, receiver) = mpsc::channel();
-        std::thread::Builder::new()
+    fn start(capacity: usize) -> Self {
+        let shared = Arc::new(WatchdogShared {
+            state: Mutex::new(WatchdogState {
+                deadlines: BTreeMap::new(),
+                shutdown: false,
+            }),
+            changed: Condvar::new(),
+        });
+        let scheduler = Arc::clone(&shared);
+        let thread = std::thread::Builder::new()
             .name("sbproxy-js-watchdog".to_owned())
-            .spawn(move || run_watchdog(receiver))
+            .spawn(move || run_watchdog(scheduler))
             .expect("JavaScript watchdog thread should start");
         Self {
-            sender,
+            shared,
             sequence: AtomicU64::new(0),
+            capacity: capacity.max(1),
+            thread: Some(thread),
         }
     }
 
-    fn arm(&self, interrupt: Arc<AtomicBool>, budget: Duration) -> WatchdogGuard {
+    fn arm(
+        &self,
+        interrupt: Arc<AtomicBool>,
+        budget: Duration,
+    ) -> Result<WatchdogGuard, WatchdogAdmissionError> {
         interrupt.store(false, Ordering::Relaxed);
-        let done = Arc::new(AtomicBool::new(false));
-        let entry = WatchdogEntry {
-            deadline: Instant::now() + budget,
-            sequence: self.sequence.fetch_add(1, Ordering::Relaxed),
-            interrupt: Arc::clone(&interrupt),
-            done: Arc::clone(&done),
-        };
-        if self.sender.send(entry).is_err() {
+        let Some(deadline) = Instant::now().checked_add(budget) else {
             interrupt.store(true, Ordering::Relaxed);
+            return Err(WatchdogAdmissionError);
+        };
+        let key = WatchdogKey {
+            deadline,
+            sequence: self.sequence.fetch_add(1, Ordering::Relaxed),
+        };
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.shutdown
+            || state.deadlines.len() >= self.capacity
+            || state.deadlines.contains_key(&key)
+        {
+            interrupt.store(true, Ordering::Relaxed);
+            return Err(WatchdogAdmissionError);
         }
-        WatchdogGuard { interrupt, done }
+        state.deadlines.insert(key, Arc::clone(&interrupt));
+        self.shared.changed.notify_one();
+        drop(state);
+        Ok(WatchdogGuard {
+            interrupt,
+            shared: Arc::clone(&self.shared),
+            key: Some(key),
+        })
+    }
+
+    #[cfg(test)]
+    fn pending_count(&self) -> usize {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .deadlines
+            .len()
     }
 }
 
-fn run_watchdog(receiver: mpsc::Receiver<WatchdogEntry>) {
-    let mut deadlines = BinaryHeap::new();
-    loop {
-        while deadlines
-            .peek()
-            .is_some_and(|entry: &WatchdogEntry| entry.deadline <= Instant::now())
+impl Drop for SharedWatchdog {
+    fn drop(&mut self) {
         {
-            let entry = deadlines.pop().expect("peeked watchdog entry should exist");
-            if !entry.done.load(Ordering::Relaxed) {
-                entry.interrupt.store(true, Ordering::Relaxed);
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for interrupt in state.deadlines.values() {
+                interrupt.store(true, Ordering::Relaxed);
             }
+            state.deadlines.clear();
+            state.shutdown = true;
+            self.shared.changed.notify_one();
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn run_watchdog(shared: Arc<WatchdogShared>) {
+    let mut state = shared
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    loop {
+        if state.shutdown {
+            return;
         }
 
-        let received = if let Some(entry) = deadlines.peek() {
-            receiver.recv_timeout(entry.deadline.saturating_duration_since(Instant::now()))
-        } else {
-            match receiver.recv() {
-                Ok(entry) => {
-                    deadlines.push(entry);
-                    continue;
-                }
-                Err(_) => return,
-            }
+        let Some((&key, _)) = state.deadlines.first_key_value() else {
+            state = shared
+                .changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            continue;
         };
 
-        match received {
-            Ok(entry) => deadlines.push(entry),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        let remaining = key.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            let interrupt = state
+                .deadlines
+                .remove(&key)
+                .expect("selected watchdog deadline should remain registered");
+            interrupt.store(true, Ordering::Relaxed);
+            continue;
         }
+
+        let (next_state, _) = shared
+            .changed
+            .wait_timeout(state, remaining)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state = next_state;
     }
 }
 
-static SHARED_WATCHDOG: LazyLock<SharedWatchdog> = LazyLock::new(SharedWatchdog::start);
+static SHARED_WATCHDOG: LazyLock<SharedWatchdog> =
+    LazyLock::new(|| SharedWatchdog::start(MAX_PENDING_WATCHDOGS));
 
 /// One scheduled JavaScript deadline.
 ///
@@ -144,24 +202,43 @@ static SHARED_WATCHDOG: LazyLock<SharedWatchdog> = LazyLock::new(SharedWatchdog:
 /// crate uses the same scheduler thread.
 pub(crate) struct WatchdogGuard {
     interrupt: Arc<AtomicBool>,
-    done: Arc<AtomicBool>,
+    shared: Arc<WatchdogShared>,
+    key: Option<WatchdogKey>,
 }
 
 impl WatchdogGuard {
-    /// Report whether the scheduler reached this deadline.
-    pub(crate) fn interrupted(&self) -> bool {
-        self.interrupt.load(Ordering::Relaxed)
+    /// Cancel this deadline and report whether the scheduler reached it first.
+    pub(crate) fn finish(mut self) -> bool {
+        self.cancel_and_interrupted()
+    }
+
+    fn cancel_and_interrupted(&mut self) -> bool {
+        let Some(key) = self.key.take() else {
+            return self.interrupt.load(Ordering::Relaxed);
+        };
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.deadlines.remove(&key);
+        let interrupted = self.interrupt.load(Ordering::Relaxed);
+        self.shared.changed.notify_one();
+        interrupted
     }
 }
 
 impl Drop for WatchdogGuard {
     fn drop(&mut self) {
-        self.done.store(true, Ordering::Relaxed);
+        let _ = self.cancel_and_interrupted();
     }
 }
 
 /// Schedule one JavaScript runtime interrupt on the shared watchdog.
-pub(crate) fn arm_watchdog(interrupt: Arc<AtomicBool>, budget: Duration) -> WatchdogGuard {
+pub(crate) fn arm_watchdog(
+    interrupt: Arc<AtomicBool>,
+    budget: Duration,
+) -> Result<WatchdogGuard, WatchdogAdmissionError> {
     SHARED_WATCHDOG.arm(interrupt, budget)
 }
 
@@ -371,17 +448,16 @@ impl JsEngine {
         let watchdog = arm_watchdog(
             Arc::clone(&self.interrupt),
             Duration::from_millis(budget_ms),
-        );
+        )
+        .map_err(|_| JsExecutionError::Interrupt { budget_ms })?;
 
         let result = f();
-        let interrupted = watchdog.interrupted();
-        drop(watchdog);
+        let interrupted = watchdog.finish();
 
-        match result {
-            Ok(v) => Ok(v),
-            Err(_) if interrupted => Err(JsExecutionError::Interrupt { budget_ms }),
-            Err(e) => Err(JsExecutionError::Other(e)),
+        if interrupted {
+            return Err(JsExecutionError::Interrupt { budget_ms });
         }
+        result.map_err(JsExecutionError::Other)
     }
 
     /// Execute a JavaScript script with the given globals set.
@@ -1341,6 +1417,119 @@ mod tests {
     }
 
     // --- CPU Budget ---
+
+    #[test]
+    fn watchdog_fast_cancellation_returns_pending_state_to_baseline() {
+        let watchdog = SharedWatchdog::start(8);
+        let baseline = watchdog.pending_count();
+
+        for _ in 0..1_000 {
+            let interrupt = Arc::new(AtomicBool::new(false));
+            let guard = watchdog
+                .arm(interrupt, Duration::from_secs(60))
+                .expect("watchdog admission should remain available after cancellation");
+            assert_eq!(watchdog.pending_count(), baseline + 1);
+            drop(guard);
+            assert_eq!(watchdog.pending_count(), baseline);
+        }
+    }
+
+    #[test]
+    fn watchdog_capacity_exhaustion_fails_closed() {
+        let watchdog = SharedWatchdog::start(1);
+        let first_interrupt = Arc::new(AtomicBool::new(false));
+        let first = watchdog
+            .arm(Arc::clone(&first_interrupt), Duration::from_secs(60))
+            .expect("first deadline should be admitted");
+
+        let rejected_interrupt = Arc::new(AtomicBool::new(false));
+        assert!(watchdog
+            .arm(Arc::clone(&rejected_interrupt), Duration::from_secs(60),)
+            .is_err());
+        assert!(rejected_interrupt.load(Ordering::Relaxed));
+        assert!(!first_interrupt.load(Ordering::Relaxed));
+        assert_eq!(watchdog.pending_count(), 1);
+
+        drop(first);
+        assert_eq!(watchdog.pending_count(), 0);
+    }
+
+    #[test]
+    fn watchdog_owner_shutdown_interrupts_admitted_guards() {
+        let watchdog = SharedWatchdog::start(1);
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let guard = watchdog
+            .arm(Arc::clone(&interrupt), Duration::from_secs(60))
+            .expect("deadline should be admitted");
+
+        drop(watchdog);
+        assert!(interrupt.load(Ordering::Relaxed));
+        drop(guard);
+    }
+
+    #[test]
+    fn watchdog_cancellation_wins_without_a_late_interrupt() {
+        let watchdog = SharedWatchdog::start(1);
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let guard = watchdog
+            .arm(Arc::clone(&interrupt), Duration::from_millis(20))
+            .expect("deadline should be admitted");
+        drop(guard);
+
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(!interrupt.load(Ordering::Relaxed));
+        assert_eq!(watchdog.pending_count(), 0);
+    }
+
+    #[test]
+    fn watchdog_finish_cancels_and_reports_whether_the_deadline_fired() {
+        let watchdog = SharedWatchdog::start(1);
+        let healthy_interrupt = Arc::new(AtomicBool::new(false));
+        let healthy = watchdog
+            .arm(healthy_interrupt, Duration::from_secs(60))
+            .expect("healthy deadline should be admitted");
+        assert!(!healthy.finish());
+        assert_eq!(watchdog.pending_count(), 0);
+
+        let expired_interrupt = Arc::new(AtomicBool::new(false));
+        let expired = watchdog
+            .arm(Arc::clone(&expired_interrupt), Duration::from_millis(10))
+            .expect("expiring deadline should be admitted");
+        let started = Instant::now();
+        while !expired_interrupt.load(Ordering::Relaxed)
+            && started.elapsed() < Duration::from_millis(500)
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(expired.finish());
+        assert_eq!(watchdog.pending_count(), 0);
+    }
+
+    #[test]
+    fn watchdog_wakes_for_a_new_earlier_deadline() {
+        let watchdog = SharedWatchdog::start(2);
+        let later_interrupt = Arc::new(AtomicBool::new(false));
+        let later = watchdog
+            .arm(Arc::clone(&later_interrupt), Duration::from_secs(5))
+            .expect("later deadline should be admitted");
+        let earlier_interrupt = Arc::new(AtomicBool::new(false));
+        let earlier = watchdog
+            .arm(Arc::clone(&earlier_interrupt), Duration::from_millis(20))
+            .expect("earlier deadline should be admitted");
+
+        let started = Instant::now();
+        while !earlier_interrupt.load(Ordering::Relaxed)
+            && started.elapsed() < Duration::from_millis(500)
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(earlier_interrupt.load(Ordering::Relaxed));
+        assert!(!later_interrupt.load(Ordering::Relaxed));
+
+        drop(earlier);
+        drop(later);
+        assert_eq!(watchdog.pending_count(), 0);
+    }
 
     /// `while (true) {}` must terminate within `budget_ms + slack` and
     /// surface as a structured `Interrupt` error tagged with the
