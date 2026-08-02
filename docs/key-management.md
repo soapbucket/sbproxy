@@ -1,6 +1,6 @@
 # SBproxy dynamic key management
 
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-02*
 
 A virtual key is a live, governed resource, not a line of YAML. With the
 `key_management:` block enabled, you mint, revoke, and rotate inbound keys at
@@ -1022,6 +1022,24 @@ since it shipped. An existing config keeps its exact behavior.
 A settle call that cannot reach the backend after a reservation already
 succeeded is unaffected by either key. It stays best-effort, and the
 reservation's own drop-time repair reconciles it later.
+
+Every accepted reservation is held under a lease of `lease_ttl_secs`
+(default 120). While the request or stream is in flight, the gateway renews
+that lease at half its lifetime, so a long-running stream keeps its hold for
+as long as it is actually running. Renewal only moves the expiry; it never
+changes the held units. If the backend stays unreachable past the lease, the
+reservation expires on the backend and its held units return to the pool; a
+settle after that point is refused rather than revived, so an outage that
+outlives the lease can leave that one request's usage uncharged.
+`terminal_retention_secs` (default 300) is how long a settled, released, or
+expired reservation's outcome is kept so replayed terminal calls stay
+idempotent.
+
+The token portion of a reservation is a conservative ceiling, not a guess:
+models with a known tokenizer hold their exact prompt count, and unknown or
+self-hosted models hold at least one token per raw request byte, which cannot
+undercount a byte-pair encoded prompt. Settlement replaces the ceiling with
+the usage the provider actually reported.
 
 `missing_rate` (default `zero_cost`) governs a key that carries a
 `total_micro_usd` limit when the resolved model has no configured rate.

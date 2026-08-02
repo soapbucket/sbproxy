@@ -1,6 +1,6 @@
 # Dependency degradation matrix
 
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-02*
 
 What happens when each dependency that SBproxy talks to is unavailable, and how the proxy degrades while it heals.
 
@@ -279,11 +279,11 @@ on state errors or rejected Redis updates.
 
 ### Governed-key budget backend (strict tier)
 
-**When down:** the dedicated Redis connection configured under `key_management.governance.backend` fails to connect, or a reserve, settle, or release script call errors.
+**When down:** the dedicated Redis connection configured under `key_management.governance.backend` fails to connect, or a reserve, renew, settle, or release script call errors.
 
-**Fallback:** this only affects keys governed under `consistency: strict`. The `approximate` tier (the default) never talks to this backend; its per-node counters keep disseminating over the cluster mesh instead, bounded by a staleness window rather than an outage. See [Governed admission: strict and approximate](key-management.md#governed-admission-strict-and-approximate) for both tiers. For a strict key, `key_management.governance.failure_posture` decides what a reserve call does when it cannot reach the backend: the default `closed` denies the request with `503` rather than let the governed limit go unenforced; `degraded` admits it without a reservation and records that decision on the `security_audit` channel; `open` admits it and records neither the audit event nor the counter. A settle call that cannot reach the backend after a reservation already succeeded is unaffected by the posture; it stays best-effort, and the reservation's own drop-time repair reconciles it later.
+**Fallback:** this only affects keys governed under `consistency: strict`. The `approximate` tier (the default) never talks to this backend; its per-node counters keep disseminating over the cluster mesh instead, bounded by a staleness window rather than an outage. See [Governed admission: strict and approximate](key-management.md#governed-admission-strict-and-approximate) for both tiers. For a strict key, `key_management.governance.failure_posture` decides what a reserve call does when it cannot reach the backend: the default `closed` denies the request with `503` rather than let the governed limit go unenforced; `degraded` admits it without a reservation and records that decision on the `security_audit` channel; `open` admits it and records neither the audit event nor the counter. A settle call that cannot reach the backend after a reservation already succeeded is unaffected by the posture; it stays best-effort, and the reservation's own drop-time repair reconciles it later. An in-flight request also renews its reservation lease at half the lease lifetime; during an outage those renewals retry on a short delay until the last known expiry passes. An outage shorter than `lease_ttl_secs` therefore costs nothing, while a longer one lets the backend reclaim the reservation as expired, after which that request's eventual settle is refused and its usage goes uncharged.
 
-**Log level:** `WARN` per admit or deny decision on a reserve call; `DEBUG` for other reserve/settle errors.
+**Log level:** `WARN` per admit or deny decision on a reserve call, and per failed lease renewal; `DEBUG` for other reserve/settle errors.
 
 **Alert:** off by default. `sbproxy_governance_fail_open_total{key_id}` counts admissions when `failure_posture: degraded` is set. It stays flat under `open`, which is the reason to prefer `degraded`.
 

@@ -1,6 +1,6 @@
 # SBproxy AI gateway guide
 
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-02*
 
 ![the same OpenAI-shape request answered by OpenAI, Claude, and Gemini, switched only by Host header](assets/ai-gateway.gif)
 
@@ -1142,9 +1142,10 @@ documented in [Dynamic key management](key-management.md).
 Stored-key token-per-minute and lifetime token or cost caps currently settle
 only on standard JSON POST inference surfaces when the provider response
 reports parseable usage. Multipart and non-POST requests can dispatch, but do
-not settle those stored-key counters. Settlement for those surfaces and strict
-multi-node reservations are deferred to WOR-1845. Treat the caps as advisory,
-not a strict ceiling, for multipart, non-POST, or concurrent multi-node traffic.
+not settle those stored-key counters, so treat the caps as advisory for those
+surfaces. For a strict cluster-wide ceiling on JSON inference traffic, govern
+the key and set `key_management.governance.consistency: strict`; see
+[Governed admission](key-management.md#governed-admission-strict-and-approximate).
 
 ```yaml
 origins:
