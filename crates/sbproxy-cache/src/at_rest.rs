@@ -1,14 +1,22 @@
 //! Where a cache keeps its entries, and whether that is protected.
 //!
 //! Several caches in this workspace are memory-only today and one
-//! backend swap away from becoming at-rest surfaces. The prompt cache in
-//! [`crate::two_tier`] says outright that real embedding caching with
-//! cluster-wide replication comes from an out-of-tree backend, and the
-//! judge cache is `pub` specifically so an out-of-tree crate can swap
-//! its in-memory backing for Redis. Neither swap would fail any check
-//! that exists today, so the day one lands, prompts and verdicts start
-//! being written somewhere they were never written before and nothing
-//! says so.
+//! backend swap away from becoming at-rest surfaces. The judge cache is
+//! `pub` specifically so an out-of-tree crate can swap its in-memory
+//! backing for Redis, and that swap would fail no check that exists
+//! today, so the day it lands, verdicts start being written somewhere
+//! they were never written before and nothing says so.
+//!
+//! The semantic cache has already made that move, and in this tree
+//! rather than out of it: WOR-2099 gave it Redis and mesh backends, so
+//! it is a real at-rest surface whenever an operator selects one, and
+//! the lifecycle check warns once per distributed backend instead of
+//! staying quiet about it.
+//!
+//! [`crate::two_tier`] holds an older prompt-cache implementation that
+//! nothing in this workspace constructs. It stores no entries in any
+//! build, so it is not an at-rest surface today whatever else is decided
+//! about it.
 //!
 //! Encrypting a memory-only cache is not the answer. An attacker who can
 //! read process heap can read the derived key out of the same heap, so
