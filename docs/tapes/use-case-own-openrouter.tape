@@ -35,7 +35,7 @@ Sleep 1.2s
 Enter
 Sleep 400ms
 
-Type `TOKEN=$(curl -s -u admin:admin -X POST localhost:9090/admin/keys -d '{"name":"team-payments"}' | jq -r .token) && echo "team-payments: $TOKEN"`
+Type `TOKEN=$(curl -s -u "admin:$SB_ADMIN_PASSWORD" -X POST localhost:9090/admin/keys -d '{"name":"team-payments"}' | jq -r .token) && echo "team-payments: ${TOKEN:0:20}...REDACTED"`
 Enter
 Sleep 2.5s
 

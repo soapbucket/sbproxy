@@ -52,14 +52,14 @@ use crate::{AgentDetection, AgentProvenance, Signals};
 
 /// Current ADRF schema version. Bumped when a backward-incompatible
 /// change lands in the rule-pack format. Slice 2 ships v0.
-pub const ADRF_VERSION: u32 = 0;
+pub(crate) const ADRF_VERSION: u32 = 0;
 
 /// Parsed rule pack. Hold this behind an `Arc` and swap it in via
 /// `arc_swap::ArcSwap` when the hot-reload slice lands.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RulePack {
-    /// ADRF schema version. Must equal [`ADRF_VERSION`] at parse time.
+    /// ADRF schema version. Must equal `ADRF_VERSION` at parse time.
     pub version: u32,
     /// Agent rules, evaluated in declaration order. First match wins.
     #[serde(default)]
@@ -132,7 +132,7 @@ pub enum RulePackError {
     /// YAML lexical or structural error.
     Yaml(String),
     /// Schema version mismatch. The current version is
-    /// [`ADRF_VERSION`]; rule packs at older or newer versions are
+    /// `ADRF_VERSION`; rule packs at older or newer versions are
     /// rejected by slice 2.
     Version {
         /// Version the rule pack declared.

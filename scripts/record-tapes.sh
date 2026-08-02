@@ -167,6 +167,12 @@ record() {
   workspace="$(mktemp -d "${TMPDIR:-/tmp}/sbproxy-record.XXXXXX")"
   workspace_start=${#ACTIVE_WORKSPACES[@]}
   ACTIVE_WORKSPACES+=("$workspace")
+  # The admin API needs the password its config resolves. Examples stopped
+  # shipping a literal one in #769 and moved to ${SB_ADMIN_PASSWORD:-...},
+  # but the tapes kept sending `admin:admin`, so every admin call in a
+  # re-record 401s and the demo silently degrades. The GIFs did not change
+  # because nothing re-records them, which is how it stayed hidden.
+  export SB_ADMIN_PASSWORD="${SB_ADMIN_PASSWORD:-demo-admin-password}"
   main_log="$workspace/main.log"
   aux_log="$workspace/aux.log"
   start_index=${#ACTIVE_PIDS[@]}

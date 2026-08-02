@@ -95,4 +95,39 @@
 # mentions it. Recording the number the scan reports; do not read it as
 # the helper having found a production caller. Its only Rust callers are
 # still tests.
-312
+
+# Lowered to 289 on WOR-2065, 2026-08-02, working the triage tail. Ten of
+# the twenty-three are a measurement fix and thirteen are real narrowings.
+#
+# The measurement fix is in `cfg_test_line_ranges`. The scan finds the
+# extent of a `#[cfg(test)]` block by counting braces forward from the
+# attribute, and `#[cfg(test)] mod test_env;` has no braces at all, so the
+# count ran on until the next `{` anywhere below and swallowed whatever
+# opened it. In `sbproxy-config/src/lib.rs` that was the
+# `pub use config_authority::{...}` façade ten lines further down, so three
+# publicly re-exported constants were filed as test-only. Ten candidates
+# were wrong this way across five crates, and every one of them would have
+# been a hard E0365 had anyone taken the scan's advice and narrowed it. The
+# scan now stops at the first `;` it reaches before any brace.
+#
+# The thirteen narrowings are the whole of what the tests-only slice had
+# left that could be narrowed at all. Six had a production caller inside
+# their own file and became `pub(crate)`: ADRF_VERSION, start_with_cipher,
+# mint_proof, as_legacy_str, resolved_headers, put_meta. Seven are helpers
+# whose own rustdoc says they exist for tests, and they became
+# `#[cfg(test)] pub(crate)` rather than plain `pub(crate)`, because a bare
+# narrowing of an item with no production caller is the dead_code failure
+# WOR-2065 already hit once on with_reverse_error: shadow_dropped_value,
+# shadow_timeout_value, ratelimit_rejected_value, clear_resolved_base,
+# set_applied_authority, clear_applied_bundle,
+# reset_sink_dispatcher_for_test.
+#
+# What is left in the 289 is not a backlog of narrowings. 279 of them are
+# reached by an integration test under `crates/<name>/tests/`, which
+# compiles as its own crate, so `pub` is the only visibility that resolves
+# and no cleanup can lower the number. The remaining 10 carry an
+# `escalated` verdict in scripts/pub-item-verdicts.json, each with a
+# question for whoever owns the subsystem, because the answer changes
+# behaviour rather than visibility. Do not expect this number to fall much
+# further without the settlement crate's origin gate work landing.
+289

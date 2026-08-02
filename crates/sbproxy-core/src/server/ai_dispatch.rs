@@ -6234,13 +6234,56 @@ pub(super) async fn handle_ai_proxy(
                         .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
                         .map(|(_, v)| v.clone())
                         .unwrap_or_else(|| "application/json".to_string());
-                    emit_ai_billing_event(
+                    // WOR-1845: the cascade path writes its own response
+                    // and never reaches `relay_ai_response_with_cache`,
+                    // so this is the only place its usage can be
+                    // reconciled. It previously billed `PerCall` at
+                    // $0.00 and let the governance lease fall off the
+                    // end of the request as a plain release, which meant
+                    // every cascade request cost the caller nothing
+                    // against a governed budget: a strict allowance
+                    // became a concurrency cap rather than a spend cap.
+                    //
+                    // Charge the served body's own usage plus every
+                    // discarded attempt's. The two are disjoint by
+                    // construction (see `CascadeOutcome::discarded_tokens`),
+                    // so summing them cannot double count. Token counts on
+                    // the billing event stay the served response's real
+                    // shape; the discarded spend rides on `cost_usd`, and
+                    // the wasted half is separately visible on
+                    // `sbproxy_ai_wasted_tokens{kind="failover_loser"}`.
+                    // That split matches the streaming path, where the
+                    // waste marker is documented as an extra signal
+                    // rather than a second charge.
+                    let (prompt_tokens, completion_tokens, cached_input, cache_creation) =
+                        extract_usage_full(o.body.as_ref());
+                    let served_usage = if prompt_tokens != 0 || completion_tokens != 0 {
+                        sbproxy_ai::budget::AiUsage::Tokens {
+                            input: prompt_tokens,
+                            output: completion_tokens,
+                            cached_input,
+                            cache_creation,
+                        }
+                    } else {
+                        sbproxy_ai::budget::AiUsage::PerCall
+                    };
+                    let served_cost =
+                        sbproxy_ai::budget::estimate_cost_for_usage(&o.model, &served_usage);
+                    let settled_tokens = prompt_tokens
+                        .saturating_add(completion_tokens)
+                        .saturating_add(o.discarded_tokens);
+                    if prompt_tokens != 0 || completion_tokens != 0 {
+                        ctx.ai_tokens_in = Some(prompt_tokens);
+                        ctx.ai_tokens_out = Some(completion_tokens);
+                        ctx.ai_tokens_cached = (cached_input > 0).then_some(cached_input);
+                    }
+                    let cost_micros = emit_ai_billing_event(
                         hostname,
                         surface_label,
                         &o.provider_name,
                         Some(o.model.clone()),
-                        sbproxy_ai::budget::AiUsage::PerCall,
-                        0.0,
+                        served_usage,
+                        served_cost + o.discarded_cost_usd,
                         Vec::new(),
                         &ctx.attribution_tags,
                         ctx.tenant_id.as_str(),
@@ -6249,6 +6292,27 @@ pub(super) async fn handle_ai_proxy(
                         billing_agent.identity(),
                         &ai_span,
                     );
+                    if cost_micros > 0 {
+                        ctx.ai_cost_usd_micros = Some(cost_micros);
+                    }
+                    // Settle before the output-guardrail arm below can
+                    // return 403: a blocked body was still generated and
+                    // still cost money, and a caller who can trip the
+                    // guardrail on demand must not get free tokens.
+                    if let Some(mut lease) = ctx.governance_lease.take() {
+                        if o.discarded_tokens > 0 {
+                            debug!(
+                                tenant_id = %ctx.tenant_id,
+                                ai.key_id = ctx.accountable_key_id().unwrap_or(""),
+                                origin = %hostname,
+                                discarded_tokens = o.discarded_tokens,
+                                settled_tokens,
+                                "AI proxy: settling governed reservation with cascade \
+                                 discarded-attempt usage folded in"
+                            );
+                        }
+                        let _ = lease.settle(settled_tokens, cost_micros).await;
+                    }
                     if (200..300).contains(&o.status) {
                         let output_external = config
                             .guardrails
@@ -8361,14 +8425,13 @@ pub(super) async fn relay_ai_response_with_cache(
                     }
                 }
             }
-            record_budget_usage(
-                args.config,
-                args.keys,
-                args.model,
-                budget_prompt_tokens,
-                budget_completion_tokens,
-            );
-            // WOR-1722: also accumulate into the cluster-shared counters
+            // WOR-2212: the local debit lives in `record_billing_event`,
+            // reached through the `emit_ai_billing_event` call below.
+            // This used to debit here as well, so every request spent
+            // its budget twice. The gauge refresh moved down beside that
+            // call so it reads the tracker after the debit.
+            //
+            // WOR-1722: accumulate into the cluster-shared counters
             // (no-op without a shared store) so other replicas enforce
             // against this spend.
             super::budget_share::record_shared_budget_usage(
@@ -8433,6 +8496,7 @@ pub(super) async fn relay_ai_response_with_cache(
                 args.agent_identity(),
                 &ai_span,
             );
+            refresh_budget_utilization(args.config, args.keys);
             if cost_micros > 0 {
                 if let Some(ctx_ref) = ctx.as_mut() {
                     ctx_ref.ai_cost_usd_micros = Some(cost_micros);
@@ -10489,13 +10553,10 @@ pub(super) async fn relay_ai_stream(
     if let (Some(args), Some(parser)) = (budget_recorder.as_ref(), usage_parser.as_ref()) {
         if (200..300).contains(&status) {
             if let Some(tokens) = parser.snapshot() {
-                record_budget_usage(
-                    args.config,
-                    args.keys,
-                    args.model,
-                    tokens.prompt_tokens as u64,
-                    tokens.completion_tokens as u64,
-                );
+                // WOR-2212: same single-writer rule as the relay path.
+                // The local debit is `record_billing_event`, below; the
+                // gauge refresh follows it.
+                //
                 // WOR-1722: mirror into the cluster-shared counters.
                 super::budget_share::record_shared_budget_usage(
                     args.config,
@@ -10547,6 +10608,7 @@ pub(super) async fn relay_ai_stream(
                     args.agent_identity(),
                     &ai_span,
                 );
+                refresh_budget_utilization(args.config, args.keys);
                 // WOR-1835: governed-key settlement. `ai_admission` never
                 // reconciles on the streaming path (its reservation is
                 // simply refunded in full on drop), a pre-existing gap
@@ -13018,6 +13080,138 @@ mod external_guardrail_context_tests {
                 "model": "selected-model",
                 "phase": "output"
             })
+        );
+    }
+
+    /// Two-tier cascade over two fixture upstreams, no guardrails. The
+    /// first tier scores below the bar so its body is discarded; the
+    /// second is accepted and served.
+    fn two_tier_cascade_proxy_config(low_url: &str, high_url: &str) -> sbproxy_ai::AiHandlerConfig {
+        sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {
+                    "name": "cascade-low",
+                    "base_url": low_url,
+                    "allow_private_base_url": true,
+                    "api_key": "fixture-key"
+                },
+                {
+                    "name": "cascade-high",
+                    "base_url": high_url,
+                    "allow_private_base_url": true,
+                    "api_key": "fixture-key"
+                }
+            ],
+            "routing": {
+                "strategy": "cascade",
+                "tiers": [
+                    {
+                        "provider_id": "cascade-low",
+                        "model": "gpt-4o",
+                        "quality_threshold": 0.5
+                    },
+                    {
+                        "provider_id": "cascade-high",
+                        "model": "gpt-4o",
+                        "quality_threshold": 0.5
+                    }
+                ]
+            }
+        }))
+        .expect("two-tier cascade proxy config")
+    }
+
+    /// WOR-1845: the cascade path writes its own response and never
+    /// reaches `relay_ai_response_with_cache`, so before this it billed
+    /// `PerCall` at $0 and let the governed reservation fall off the end
+    /// of the request as a plain release. Both the served body's usage
+    /// and every discarded attempt's have to land on the settlement, or
+    /// a caller can hold a strict allowance flat by forcing cascades.
+    #[tokio::test]
+    async fn cascade_settles_the_governed_reservation_with_served_plus_discarded_usage() {
+        use sbproxy_ai::governance::{
+            GovernanceLimits, GovernanceStore, InMemoryGovernanceConfig, InMemoryGovernanceStore,
+            ReserveRequest, SnapshotKey,
+        };
+
+        let (low_url, low_hits) = upstream_fixture(
+            r#"{"confidence_score":0.1,"choices":[{"message":{"role":"assistant","content":"weak"}}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
+        )
+        .await;
+        let (high_url, high_hits) = upstream_fixture(
+            r#"{"confidence_score":1.0,"choices":[{"message":{"role":"assistant","content":"strong"}}],"usage":{"prompt_tokens":20,"completion_tokens":7,"total_tokens":27}}"#,
+        )
+        .await;
+        let config = two_tier_cascade_proxy_config(&low_url, &high_url);
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+
+        let store: Arc<dyn GovernanceStore> = Arc::new(
+            InMemoryGovernanceStore::new(InMemoryGovernanceConfig::default())
+                .expect("default in-memory governance bounds are valid"),
+        );
+        let reservation = store
+            .reserve(ReserveRequest {
+                reservation_id: "cascade-governed".to_string(),
+                key_id: "cascade-key".to_string(),
+                policy_revision: 1,
+                limits: GovernanceLimits::default(),
+                token_ceiling: 500,
+                micro_usd_ceiling: 500,
+            })
+            .await
+            .expect("seed reservation");
+
+        let mut context = crate::context::RequestContext::new();
+        context.governance_lease = Some(crate::governance_runtime::GovernanceLease::new(
+            Arc::clone(&store),
+            reservation,
+        ));
+        let (pipeline, _semantic, _idempotency) = pipeline_with_recording_caches().await;
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("cascade dispatch is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response utf8");
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "response was {response}"
+        );
+        assert_eq!(low_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(high_hits.load(Ordering::SeqCst), 1);
+        // The access log carries the served body's real token shape,
+        // not the `PerCall` placeholder it used to record.
+        assert_eq!(context.ai_tokens_in, Some(20));
+        assert_eq!(context.ai_tokens_out, Some(7));
+
+        let snapshot = store
+            .snapshot(SnapshotKey {
+                key_id: "cascade-key".to_string(),
+                policy_revision: 1,
+                limits: GovernanceLimits::default(),
+            })
+            .await
+            .expect("governance snapshot");
+        assert_eq!(
+            snapshot.total_tokens.used, 42,
+            "settlement must charge the served 27 tokens plus the discarded tier's 15"
+        );
+        assert_eq!(
+            snapshot.total_tokens.reserved, 0,
+            "the reservation must be settled, not left held or released"
         );
     }
 

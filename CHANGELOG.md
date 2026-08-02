@@ -125,6 +125,34 @@ the next version cut.
 
 ### Fixed
 
+- **`sbproxy run` and `sbproxy service install` no longer publish the
+  local model gateway to the network.** Both generate a config the code
+  calls secure defaults, and the admin half was: loopback bind, random
+  port, a 32-byte `OsRng` password written at mode 0600. The public
+  listener was hardcoded to `0.0.0.0` in the server, with no schema
+  field able to express anything else and no authentication in front of
+  it, while the ready banner printed `http://127.0.0.1:<port>` and
+  handed you an `OPENAI_BASE_URL` built from it. On a laptop on a shared
+  network that was an open inference endpoint, described as local. The
+  generated `origins:` map restricting to `127.0.0.1` and `localhost`
+  was not a defence, because that matches on the `Host` header, which
+  the caller sets.
+
+  Both commands now generate `bind_address: 127.0.0.1`, so the banner's
+  URL is true. **If you relied on `sbproxy run` being reachable from
+  another machine, it no longer is.** Write a config and set
+  `proxy.bind_address` to `0.0.0.0` or a specific interface, and put
+  authentication in front of it.
+- **`proxy.bind_address` makes the public listener's interface
+  configurable at all.** It applies to `http_bind_port` and
+  `https_bind_port` together, because two fields would let an operator
+  lock down HTTP, leave HTTPS open, and believe the box was closed. It
+  defaults to `0.0.0.0`, so every existing config keeps the reach it
+  has. The value must be an IP literal: hostnames are refused because a
+  name can resolve to more than one address, and a malformed address is
+  refused at config load rather than falling back to a default, since
+  falling back is precisely the failure the field exists to prevent. See
+  [`docs/configuration.md`](docs/configuration.md#choosing-a-bind-address).
 - **The `a2a` policy no longer decides on inputs the caller controls.**
   Chain depth, chain membership, and caller and callee identity were read
   from `X-A2A-*` request headers with no verification and no ingress

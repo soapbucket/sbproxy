@@ -1736,6 +1736,24 @@ pub struct CascadeOutcome {
     /// Providers that received a request, in attempt order. Skipped or
     /// ineligible tiers are omitted.
     pub attempted_providers: Vec<String>,
+    /// WOR-1845: prompt plus completion tokens consumed by every tier
+    /// whose body was thrown away before this one, summed across
+    /// attempts. Never includes the usage reported inside
+    /// [`Self::body`], so a caller can add the two without double
+    /// counting.
+    ///
+    /// A cascade that discards two attempts and serves the third has
+    /// really spent all three. Leaving the first two out of the billing
+    /// event under-bills the customer, and leaving them out of the
+    /// governed-key settlement lets a caller exceed a strict allowance
+    /// by forcing cascades. Reconcile against
+    /// `discarded_tokens + usage(body)`.
+    pub discarded_tokens: u64,
+    /// WOR-1845: estimated USD spend for [`Self::discarded_tokens`],
+    /// priced per attempt against that attempt's own model rather than
+    /// the model that eventually won. Excludes [`Self::body`]'s cost
+    /// for the same reason.
+    pub discarded_cost_usd: f64,
 }
 
 impl AiClient {
@@ -1914,6 +1932,14 @@ impl AiClient {
         let mut last_outcome: Option<CascadeOutcome> = None;
         let mut total_cost_micros: u64 = 0;
         let mut attempted_providers: Vec<String> = Vec::new();
+        // WOR-1845: usage consumed by attempts whose bodies were thrown
+        // away. Each `CascadeOutcome` below is built with the totals as
+        // they stand *before* its own attempt is folded in, because that
+        // outcome's body is what the caller reconciles from. Folding the
+        // current attempt in first would double count the one case where
+        // the cascade exhausts its tiers and returns the last loser.
+        let mut discarded_tokens: u64 = 0;
+        let mut discarded_cost_usd: f64 = 0.0;
         let router = config.router();
 
         for (tier_idx, tier) in cascade.tiers.iter().enumerate() {
@@ -2101,7 +2127,7 @@ impl AiClient {
                     "cascade: tier returned 5xx; trying next"
                 );
                 ai_metrics::record_cascade_tier_outcome(tier_idx, "retry");
-                record_cascade_loser_waste(
+                let wasted = record_cascade_loser_waste(
                     &provider.name,
                     &tier.model,
                     surface,
@@ -2118,7 +2144,11 @@ impl AiClient {
                     tier_index: tier_idx,
                     accepted: false,
                     attempted_providers: attempted_providers.clone(),
+                    discarded_tokens,
+                    discarded_cost_usd,
                 });
+                discarded_tokens = discarded_tokens.saturating_add(wasted.0);
+                discarded_cost_usd += wasted.1;
                 continue;
             }
 
@@ -2136,7 +2166,7 @@ impl AiClient {
                     "cascade: tier returned empty or refused response; trying next"
                 );
                 ai_metrics::record_cascade_tier_outcome(tier_idx, "retry");
-                record_cascade_loser_waste(
+                let wasted = record_cascade_loser_waste(
                     &provider.name,
                     &tier.model,
                     surface,
@@ -2153,7 +2183,11 @@ impl AiClient {
                     tier_index: tier_idx,
                     accepted: false,
                     attempted_providers: attempted_providers.clone(),
+                    discarded_tokens,
+                    discarded_cost_usd,
                 });
+                discarded_tokens = discarded_tokens.saturating_add(wasted.0);
+                discarded_cost_usd += wasted.1;
                 continue;
             }
 
@@ -2166,7 +2200,7 @@ impl AiClient {
                     "cascade: tier scored below threshold; trying next"
                 );
                 ai_metrics::record_cascade_tier_outcome(tier_idx, "retry");
-                record_cascade_loser_waste(
+                let wasted = record_cascade_loser_waste(
                     &provider.name,
                     &tier.model,
                     surface,
@@ -2183,7 +2217,11 @@ impl AiClient {
                     tier_index: tier_idx,
                     accepted: false,
                     attempted_providers: attempted_providers.clone(),
+                    discarded_tokens,
+                    discarded_cost_usd,
                 });
+                discarded_tokens = discarded_tokens.saturating_add(wasted.0);
+                discarded_cost_usd += wasted.1;
                 continue;
             }
 
@@ -2199,6 +2237,8 @@ impl AiClient {
                 tier_index: tier_idx,
                 accepted: true,
                 attempted_providers,
+                discarded_tokens,
+                discarded_cost_usd,
             });
         }
 
@@ -2243,17 +2283,24 @@ fn extract_usage_tokens(body: &[u8]) -> (u64, u64) {
 /// tokens that bought no served outcome. Flag those tokens as
 /// `failover_loser` waste, reusing the usage already present in the
 /// translated body. A loser with no parseable usage records nothing.
+///
+/// WOR-1845: also returns the `(tokens, cost_usd)` it just flagged so
+/// the dispatcher can aggregate every discarded attempt onto
+/// [`CascadeOutcome`]. The waste metric alone leaves that spend out of
+/// the billing ledger and out of the governed-key reservation, which
+/// lets a caller walk past a strict allowance by forcing cascades.
+/// Returns `(0, 0.0)` when the body carries no parseable usage.
 fn record_cascade_loser_waste(
     provider: &str,
     model: &str,
     surface: &str,
     tags: &crate::attribution::AttributionTags,
     body: &[u8],
-) {
+) -> (u64, f64) {
     let (prompt, completion) = extract_usage_tokens(body);
     let tokens = prompt.saturating_add(completion);
     if tokens == 0 {
-        return;
+        return (0, 0.0);
     }
     let cost = crate::budget::estimate_cost(model, prompt, completion);
     ai_metrics::record_waste(
@@ -2265,6 +2312,7 @@ fn record_cascade_loser_waste(
         tokens,
         cost,
     );
+    (tokens, cost)
 }
 
 /// Look for a top-level `confidence_score` JSON number in the
@@ -3131,6 +3179,140 @@ mod tests {
         );
         first_request.abort();
         second_request.await.expect("healthy request captured");
+    }
+
+    // --- Cascade discarded-usage aggregation (WOR-1845) ---
+    //
+    // A cascade that throws a tier's body away still paid for it. The
+    // gateway settles a governed-key reservation from what the outcome
+    // reports, so usage the outcome does not carry is usage nobody is
+    // charged for, and a caller who can force a cascade can walk past a
+    // strict allowance. These pin the two halves of the contract:
+    // discarded attempts are summed, and the body the caller is about
+    // to read is never summed twice.
+
+    fn priced_two_tier_cascade_config(first_url: &str, second_url: &str) -> AiHandlerConfig {
+        AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {
+                    "name": "first",
+                    "api_key": "test-key",
+                    "base_url": first_url,
+                    "allow_private_base_url": true
+                },
+                {
+                    "name": "second",
+                    "api_key": "test-key",
+                    "base_url": second_url,
+                    "allow_private_base_url": true
+                }
+            ],
+            "routing": {
+                "strategy": "cascade",
+                "tiers": [
+                    {
+                        "provider_id": "first",
+                        "model": "gpt-4o-mini",
+                        "quality_threshold": 0.5
+                    },
+                    {
+                        "provider_id": "second",
+                        "model": "gpt-4o-mini",
+                        "quality_threshold": 0.5
+                    }
+                ]
+            }
+        }))
+        .expect("priced cascade fixture")
+    }
+
+    const CASCADE_LOSER_BODY: &str = r#"{"confidence_score":0.1,"choices":[{"message":{"content":"try another tier"}}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#;
+    const CASCADE_WINNER_BODY: &str = r#"{"confidence_score":1.0,"choices":[{"message":{"content":"accepted"}}],"usage":{"prompt_tokens":20,"completion_tokens":7,"total_tokens":27}}"#;
+
+    #[tokio::test]
+    async fn cascade_aggregates_discarded_attempt_usage_and_excludes_the_served_body() {
+        let (first_url, first_request) = serve_one_json_response(CASCADE_LOSER_BODY).await;
+        let (second_url, second_request) = serve_one_json_response(CASCADE_WINNER_BODY).await;
+        let config = priced_two_tier_cascade_config(&first_url, &second_url);
+        let cascade = config.router().cascade_config().cloned().expect("cascade");
+
+        let outcome = AiClient::new()
+            .forward_cascade_with_policy(
+                &config,
+                &cascade,
+                &[],
+                &[],
+                "/v1/chat/completions",
+                &serde_json::json!({"model": "gpt-4o-mini"}),
+                &crate::attribution::AttributionTags::default(),
+                "chat_completions",
+            )
+            .await
+            .expect("second cascade tier is accepted");
+
+        assert!(outcome.accepted);
+        assert_eq!(outcome.provider_name, "second");
+        assert_eq!(
+            outcome.discarded_tokens, 15,
+            "the discarded first tier's 10 prompt + 5 completion tokens must be reported"
+        );
+        assert_eq!(
+            outcome.discarded_cost_usd,
+            crate::budget::estimate_cost("gpt-4o-mini", 10, 5),
+            "discarded spend is priced against the attempt's own model"
+        );
+        assert!(
+            outcome.discarded_cost_usd > 0.0,
+            "a priced model must produce a non-zero discarded cost, or this test proves nothing"
+        );
+        // The served body still reports its own usage, so the caller's
+        // `discarded + body` sum is the whole cascade exactly once.
+        assert_eq!(extract_usage_tokens(outcome.body.as_ref()), (20, 7));
+
+        first_request.await.expect("first request captured");
+        second_request.await.expect("second request captured");
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_cascade_does_not_count_the_returned_losers_own_usage() {
+        // Both tiers score low, so the cascade runs out of tiers and
+        // hands back the last loser as the response. That body is the
+        // one the caller reconciles from, so counting it in
+        // `discarded_tokens` too would charge it twice.
+        let (first_url, first_request) = serve_one_json_response(CASCADE_LOSER_BODY).await;
+        let (second_url, second_request) = serve_one_json_response(CASCADE_WINNER_BODY).await;
+        let config = priced_two_tier_cascade_config(&first_url, &second_url);
+        // Raise both thresholds above the winner body's 1.0 score so
+        // neither tier can be accepted.
+        let mut cascade = config.router().cascade_config().cloned().expect("cascade");
+        for tier in &mut cascade.tiers {
+            tier.quality_threshold = 2.0;
+        }
+
+        let outcome = AiClient::new()
+            .forward_cascade_with_policy(
+                &config,
+                &cascade,
+                &[],
+                &[],
+                "/v1/chat/completions",
+                &serde_json::json!({"model": "gpt-4o-mini"}),
+                &crate::attribution::AttributionTags::default(),
+                "chat_completions",
+            )
+            .await
+            .expect("an exhausted cascade returns its last attempt");
+
+        assert!(!outcome.accepted);
+        assert_eq!(outcome.provider_name, "second");
+        assert_eq!(extract_usage_tokens(outcome.body.as_ref()), (20, 7));
+        assert_eq!(
+            outcome.discarded_tokens, 15,
+            "only the earlier discarded tier counts; the returned body is the caller's to add"
+        );
+
+        first_request.await.expect("first request captured");
+        second_request.await.expect("second request captured");
     }
 
     // --- Shadow supervisor tests ---

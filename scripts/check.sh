@@ -244,6 +244,7 @@ cargo fmt --all -- --check
 # this gate opens them, which is why that drift used to reach CI
 # untouched.
 step "standalone workspace lockfiles are current"
+bash "$ROOT/scripts/check-tape-secrets.sh"
 bash "$ROOT/scripts/check-nested-lockfiles.sh"
 
 # CI: ci.yml supply-chain lane, EmbarkStudios/cargo-deny-action with

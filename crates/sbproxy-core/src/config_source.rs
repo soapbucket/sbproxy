@@ -110,8 +110,8 @@ pub fn current_resolved_base() -> Option<Arc<ResolvedBase>> {
 }
 
 /// Forget the resolved base. Test-only; a running node never unresolves.
-#[doc(hidden)]
-pub fn clear_resolved_base() {
+#[cfg(test)]
+pub(crate) fn clear_resolved_base() {
     resolved_base_slot().store(None);
 }
 

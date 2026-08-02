@@ -1307,6 +1307,10 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
         log_capture_header_warnings(al);
     }
     let port = compiled.server.http_bind_port;
+    // WOR-2199: one address for both public listeners. Validated at
+    // config compile, so formatting it into a socket address here cannot
+    // produce something the listener will reject.
+    let bind_address = compiled.server.effective_bind_address().to_string();
 
     // Extract TLS-relevant fields before compiled is consumed by from_config.
     let server_config = compiled.server.clone();
@@ -1722,7 +1726,7 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
             return Err(proxy_service_startup_error(payload.as_ref()));
         }
     };
-    proxy_service.add_tcp(&format!("0.0.0.0:{port}"));
+    proxy_service.add_tcp(&format!("{bind_address}:{port}"));
 
     // --- HTTP/2 cleartext (h2c) ---
     //
@@ -1746,7 +1750,7 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
         }
     }
 
-    tracing::info!(port = %port, "starting sbproxy on 0.0.0.0:{}", port);
+    tracing::info!(port = %port, bind = %bind_address, "starting sbproxy on {}:{}", bind_address, port);
 
     // Add HTTPS listener if TLS configured.
     if let Some(ref tls) = tls_state {
@@ -1764,7 +1768,7 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
                     match build_mtls_tls_settings(cert_path, key_path, mtls_cfg, cache) {
                         Ok(settings) => {
                             proxy_service.add_tls_with_settings(
-                                &format!("0.0.0.0:{https_port}"),
+                                &format!("{bind_address}:{https_port}"),
                                 None,
                                 settings,
                             );
@@ -1780,7 +1784,11 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
                                 "mTLS setup failed; falling back to non-mTLS HTTPS"
                             );
                             proxy_service
-                                .add_tls(&format!("0.0.0.0:{https_port}"), cert_path, key_path)
+                                .add_tls(
+                                    &format!("{bind_address}:{https_port}"),
+                                    cert_path,
+                                    key_path,
+                                )
                                 .map_err(|e| {
                                     anyhow::anyhow!("failed to add TLS listener: {}", e)
                                 })?;
@@ -1789,7 +1797,7 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
                 } else {
                     let settings = build_tls_settings(cert_path, key_path)?;
                     proxy_service.add_tls_with_settings(
-                        &format!("0.0.0.0:{https_port}"),
+                        &format!("{bind_address}:{https_port}"),
                         None,
                         settings,
                     );
@@ -1820,7 +1828,7 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
                     ) {
                         Ok(settings) => {
                             proxy_service.add_tls_with_settings(
-                                &format!("0.0.0.0:{https_port}"),
+                                &format!("{bind_address}:{https_port}"),
                                 None,
                                 settings,
                             );
@@ -1841,7 +1849,7 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
                     match build_tls_settings_with_resolver(tls.resolver.clone()) {
                         Ok(settings) => {
                             proxy_service.add_tls_with_settings(
-                                &format!("0.0.0.0:{https_port}"),
+                                &format!("{bind_address}:{https_port}"),
                                 None,
                                 settings,
                             );

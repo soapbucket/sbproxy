@@ -34,7 +34,7 @@ Sleep 1.4s
 Enter
 Sleep 400ms
 
-Type `curl -s -u admin:admin -X POST localhost:9090/admin/keys -d '{"name":"ci-runner","max_requests_per_minute":60,"allowed_models":["gpt-4o-mini"]}' | jq '{token, key: {key_id: .key.key_id, name: .key.name, status: .key.status, rpm: .key.max_requests_per_minute}}'`
+Type `curl -s -u admin:admin -X POST localhost:9090/admin/keys -d '{"name":"ci-runner","max_requests_per_minute":60,"allowed_models":["gpt-4o-mini"]}' | jq '{token: (.token[0:20] + "...REDACTED"), key: {key_id: .key.key_id, name: .key.name, status: .key.status, rpm: .key.max_requests_per_minute}}'`
 Enter
 Sleep 2.5s
 
@@ -52,7 +52,7 @@ Sleep 1.2s
 Enter
 Sleep 400ms
 
-Type `curl -s -u admin:admin -X POST localhost:9090/admin/keys/seed0001/rotate -d '{"grace_secs":3600}' | jq '{token, grace_expires_at, key_id: .key.key_id}'`
+Type `curl -s -u admin:admin -X POST localhost:9090/admin/keys/seed0001/rotate -d '{"grace_secs":3600}' | jq '{token: (.token[0:20] + "...REDACTED"), grace_expires_at, key_id: .key.key_id}'`
 Enter
 Sleep 2.5s
 

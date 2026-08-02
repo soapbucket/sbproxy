@@ -673,9 +673,15 @@ impl TlsState {
             .https_bind_port
             .expect("https_bind_port is validated in init()");
 
-        let bind_addr: std::net::SocketAddr = format!("0.0.0.0:{https_port}")
-            .parse()
-            .context("parsing H3 bind addr")?;
+        // WOR-2199: same interface as the TCP listeners. Enabling HTTP/3
+        // is rejected at config load today, so this path does not run,
+        // which is exactly why it is worth fixing now: a listener that
+        // ignored proxy.bind_address would reopen the restriction the
+        // operator asked for on the day someone turns the feature on.
+        let bind_addr: std::net::SocketAddr =
+            format!("{}:{https_port}", config.effective_bind_address())
+                .parse()
+                .context("parsing H3 bind addr")?;
 
         let handle = h3_listener::start_h3_listener(
             bind_addr,

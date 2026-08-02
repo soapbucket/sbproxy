@@ -113,7 +113,7 @@ impl CertStore {
     /// on the RFC 3339 timestamp is logged at warn and the metric is
     /// skipped (the persistence path still succeeds so the cert
     /// is not lost).
-    pub fn put_meta(&self, hostname: &str, meta: &CertMeta) -> Result<()> {
+    pub(crate) fn put_meta(&self, hostname: &str, meta: &CertMeta) -> Result<()> {
         let json = serde_json::to_vec(meta)?;
         self.store.put(meta_key(hostname).as_bytes(), &json)?;
         match chrono::DateTime::parse_from_rfc3339(&meta.expires_at) {
