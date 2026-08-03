@@ -1212,9 +1212,6 @@ origins:
           weight: 70
         - url: https://backend-2.internal:8080
           weight: 30
-      sticky:
-        cookie_name: sb_sticky
-        ttl: 3600
 ```
 
 | Field | Type | Default | Description |
@@ -1224,7 +1221,7 @@ origins:
 | `strategy` | string | unset | Registered routing strategy name. The compiled strategy runs before `algorithm`; unknown names fail config compilation. See [Routing strategies](routing-strategies.md). |
 | `strategy_config` | object | `{}` | Strategy-specific settings. Must be an object. |
 | `lb_method` | string | unset | Compatibility marker for plugin routing. `plugin` requires `strategy`; `algorithm` remains the fallback. |
-| `sticky` | object | | Sticky-session config: `cookie_name` (default `sb_sticky`), `ttl` seconds. |
+| `sticky` | object | | **config-only.** Parses (`cookie_name`, `ttl`) and does nothing: no affinity cookie is issued and traffic distributes by `algorithm` as if the block were absent. Setting it warns at boot. For session affinity use the `cookie_hash`, `header_hash`, or `ip_hash` algorithm. |
 | `deployment_mode` | object | `{mode: normal}` | Deployment mode. See below. |
 | `outlier_detection` | object | unset | Passive ejection policy. See [Outlier detection](#outlier-detection). |
 
@@ -1255,7 +1252,7 @@ Target fields:
 | `backup` | bool | false | Reserved for fallback. Excluded from normal selection. |
 | `group` | string | | Deployment group label (`blue`, `green`, `canary`). |
 | `priority` | int | 5 | Routing priority (1 = highest, 10 = lowest). Read from `X-Priority` header when not set here. |
-| `zone` | string | | Availability zone or region label for locality-aware routing. |
+| `zone` | string | | Availability zone or region label. An operator-visible tag only: the admin API reports it as `origins[].targets[].zone`, and target selection does not read it. Tagging targets with zones does not keep traffic local to one. |
 | `metadata` | object | `{}` | Strategy-specific JSON signals such as `loaded_adapters` or `gpu_utilization`. Limited to 64 entries per target and 64 bytes per key. |
 | `health_check` | object | | Active health-check probe config. See [Active health checks](#active-health-checks). |
 | `host_override` | string | unset | Override the upstream `Host` for this target. Default is the target URL's hostname. |
@@ -1378,7 +1375,7 @@ origins:
 | `ai_policy` | object | | One sandboxed CEL expression over the AI decision pipeline (`expression`, `on_error`). See [ai-policy-cel.md](ai-policy-cel.md). |
 | `usage_sinks` | list | `[]` | Destinations for completed-call usage records. The `ledger` sink (`path`, optional `signing_seed_hex`) writes a hash-chained, signable record. See [ai-usage-ledger.md](ai-usage-ledger.md). |
 
-Routing strategies: `round_robin`, `weighted`, `fallback_chain`, `random`, `lowest_latency`, `least_connections`, `cost_optimized`, `token_rate`, `least_token_usage`, `prefix_affinity`, `peak_ewma`, `sticky`, `race`, `cascade`, `cost_quality`, `outcome_aware`. See [ai-gateway.md](ai-gateway.md#routing-strategies) for each; `outcome_aware` has its own page in [ai-outcome-aware-routing.md](ai-outcome-aware-routing.md).
+Routing strategies: `round_robin`, `weighted`, `fallback_chain`, `random`, `lowest_latency`, `least_connections`, `cost_optimized`, `least_token_usage`, `prefix_affinity`, `peak_ewma`, `sticky`, `race`, `cascade`, `cost_quality`, `outcome_aware`. See [ai-gateway.md](ai-gateway.md#routing-strategies) for each; `outcome_aware` has its own page in [ai-outcome-aware-routing.md](ai-outcome-aware-routing.md). `token_rate` is refused at config load: it scores headroom against a per-provider token limit that no field declares, which makes it `least_token_usage` under another name. See [ai-gateway.md#token_rate-refused](ai-gateway.md#token_rate-refused).
 
 Peak EWMA accepts the object form:
 

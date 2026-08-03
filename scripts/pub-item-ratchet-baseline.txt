@@ -143,4 +143,64 @@
 # `LedgerPayload::provenance_conflict`, and the two admin read paths ask
 # the claims directly. This is the ratchet's first option, wiring the item
 # to a production call site, rather than a narrowing.
-288
+
+# Lowered to 287 on WOR-2224, 2026-08-02, answering another one.
+# `Router::set_provider_health` (sbproxy-ai/src/routing.rs) is the writer
+# for the active-probe axis that `provider_eligible` intersects on every
+# AI routing decision. The escalation asked whether the probe task was
+# ever wired or whether passive ejection was the whole story. It was never
+# wired: the axis, the `AiHealthCheckConfig` struct, and the
+# `resilience.health_check` config block all landed together in the
+# original AI-resilience commit and the task that was supposed to drive
+# them was never written, so every provider sat at the `unknown` default
+# while docs, `docs/configuration.md`, and `examples/ai-resilience` all
+# described a working probe. The new `sbproxy-ai/src/health_probe.rs`
+# spawns it from the pipeline's existing background-task seam. This is the
+#
+# Lowered to 287 on WOR-2223, 2026-08-02, answering another one.
+# `LaneSplit::record_cloud` (sbproxy-model-host/src/hybrid.rs) is the
+# cloud half of the hybrid savings split, and the escalation asked where
+# the cloud-spill path should call it. The answer is the same place the
+# local half is recorded: `ValueSink`, the usage sink that prices every
+# finished completion of a model with a configured `reference`. It now
+# reads the serving lane off the usage event instead of assuming local,
+# so a completion that spilled to a cloud provider lands in
+# cloud_completions and cloud_spent_micros rather than nowhere. The
+# ratchet's first option again, a production call site rather than a
+# narrowing.
+284
+#
+#
+# Lowered to 286 on WOR-2225, 2026-08-02, answering three more of the
+# escalated questions. Each one asked the same thing: two implementations
+# of one job exist and only one runs, so which is the real one.
+#
+# `parse_endpoint` (sbproxy-ai/src/api_routes.rs) is deleted, along with
+# the `AiEndpoint` enum and `provider_supports_endpoint`. It was the
+# predecessor of `classify_surface`, which the request path has always
+# called and which recognises a strict superset of its vocabulary. Its
+# capability matrix had also gone stale against the live one, advertising
+# Google image, audio, and reranking surfaces that have no translator.
+#
+# `select_default` (sbproxy-core/src/compression_runtime.rs) is narrowed to
+# `pub(crate)`. There were never two definitions of the route default:
+# this was `select(On)` with an `expect` around it, and dispatch reaches
+# the default through `select(On)` as one arm of the general selector path.
+# `select` now delegates to it, so the two cannot come apart, and the
+# `expect` is gone rather than pushed onto the request path.
+#
+# `install_key_plane` (sbproxy-core/src/key_plane.rs) is now
+# `#[cfg(test)] pub(crate) install_key_plane_for_test`, and the dead
+# `uninstall_key_plane` beside it is deleted. The production path,
+# `activate_key_plane`, was not skipping an invariant this wrapper held:
+# the wrapper was a bare slot write and `activate_key_plane` does the
+# readiness retraction, the invalidation subscriber, and the shared budget
+# handoff on top of it.
+#
+# 286 rather than 285 because the WOR-2225 regression test in
+# `server/ai_dispatch.rs` compares behaviour fingerprints, and
+# `SelectedCompressionRuntime::behavior_fingerprint` had no reference
+# outside its own file at all before that. It moves from the wider
+# unreferenced list into the tests-only slice without anything about it
+# changing. It is worth a look on its own: the fingerprint is computed for
+# every compiled pipeline and nothing in production reads it.

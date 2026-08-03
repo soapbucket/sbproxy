@@ -509,6 +509,28 @@ pub trait SettlementStore: Send + Sync {
         intent_id: &str,
     ) -> Result<Option<SettlementReceipt>, BillingError>;
 
+    /// Returns the oldest unresolved intent covering one route, if any.
+    ///
+    /// Unresolved means [`IntentStatus::NeedsReconciliation`] and nothing
+    /// else. Those are the intents whose funds may already have moved and
+    /// which no sweep will ever expire, so they are the only ones whose
+    /// existence should stop a fresh bill for the same content.
+    ///
+    /// The request path reads this before pricing a new challenge. The key is
+    /// the content, not the payer: nothing durable identifies who is paying,
+    /// and a second challenge for a route whose first payment is unresolved is
+    /// the shape of a double charge whoever presents it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BillingError::Storage`] when the query fails.
+    async fn unresolved_intent_for_route(
+        &self,
+        tenant_id: &str,
+        origin_id: &str,
+        route: &str,
+    ) -> Result<Option<String>, BillingError>;
+
     /// Reserves a proof digest for one intent, or reports the replay.
     ///
     /// The digest is unique per tenant, and one intent binds exactly one

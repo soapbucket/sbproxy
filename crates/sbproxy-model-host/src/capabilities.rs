@@ -324,10 +324,15 @@ impl ConsumerContract {
 }
 
 fn assert_reference_price_records_savings() -> Result<(), String> {
-    // A serve entry with an explicit reference prices each local
-    // completion at the cloud rate it displaced and folds it into the
-    // per-model value report. This is the deterministic core the
-    // request-path value recorder and the admin value route consume.
+    // A serve entry with an explicit reference prices each completion at
+    // the cloud rate, and puts it in the lane that answered: displaced
+    // cost when the local engine served it, real cost when it spilled to
+    // a provider instead. This is the deterministic core the request-path
+    // value recorder and the admin value route consume.
+    //
+    // Both halves are asserted because only one of them used to have a
+    // caller (WOR-2223), which made every deployment's report read as a
+    // hybrid split while the cloud numbers were structurally zero.
     let config: ModelHostConfig = serde_yaml::from_str(
         "models:\n  - model: qwen3-32b\n    name: qwen\n    reference:\n      model: gpt-4o\n      prompt_micros_per_mtok: 3000000\n      completion_micros_per_mtok: 15000000\n",
     )
@@ -341,10 +346,13 @@ fn assert_reference_price_records_savings() -> Result<(), String> {
     let mut lane = crate::LaneSplit::default();
     lane.record_local(1000, 500, price);
     lane.record_local(1000, 500, price);
+    lane.record_cloud(1000, 500, price);
     let lanes = std::collections::BTreeMap::from([(entry.effective_name()?, lane)]);
     let report = crate::ValueReport::from_lanes(&lanes);
     if report.total_saved_micros != 21_000
         || report.total_local_completions != 2
+        || report.total_cloud_completions != 1
+        || report.total_cloud_spent_micros != 10_500
         || report.models.len() != 1
         || report.models[0].model != "qwen"
     {

@@ -36,6 +36,13 @@
 //! policy's configured challenge header, and the retry re-presents it
 //! there verbatim.
 //!
+//! One thing stops that path before it prices anything: an intent for the
+//! same route already sitting in `NeedsReconciliation`. That payment may
+//! have moved a payer's money and nothing expires it, so a fresh invoice
+//! for the same content would be a second bill for it. The answer is a 503
+//! with `Retry-After`, counted as `operation="challenge"`,
+//! `outcome="unresolved_payment"` (WOR-2230).
+//!
 //! The retry path authenticates the presented quote token, addresses the
 //! durable intent through
 //! [`sbproxy_billing::types::derive_intent_id`] with the requirement id as
@@ -168,12 +175,24 @@ const OUTCOME_UNAVAILABLE: &str = "unavailable";
 /// The `outcome` label for a preference set no configured rail satisfies.
 const OUTCOME_NO_ACCEPTABLE_RAIL: &str = "no_acceptable_rail";
 
-/// The `rail` label when negotiation failed before a rail was chosen.
+/// The `outcome` label for a challenge withheld over an unresolved payment.
 ///
-/// The alternative was to leave the 406 off this family entirely, which
-/// would hide the one refusal that means "crawlers keep asking to pay us in
-/// a currency we do not accept": revenue the deployment is configured to
-/// decline.
+/// Its own row rather than a share of `unavailable`, because this one says
+/// something an operator has to act on: a payment for this content is stuck,
+/// and until it resolves the route earns nothing. Alert on it.
+const OUTCOME_UNRESOLVED_PAYMENT: &str = "unresolved_payment";
+
+/// The `rail` label for a challenge the gate abandoned before compiling a
+/// requirement.
+///
+/// The settling rail is a field of the compiled draft, so until the compiler
+/// has run there is no honest value: negotiation may have picked an advertised
+/// name, but `lightning` is two settling rails and reporting it would put them
+/// in one counter. Both refusals that stop this early, the 406 and the
+/// withheld challenge over an unresolved payment, are worth counting anyway.
+/// Leaving the 406 off the family would hide the one refusal that means
+/// "crawlers keep asking to pay us in a currency we do not accept": revenue
+/// the deployment is configured to decline.
 const RAIL_NONE: &str = "none";
 
 /// Record one settlement transition the request path decided.
@@ -852,6 +871,44 @@ async fn challenge_path(
             .resolve_price_for_request(request.path, request.agent_id, request.accept);
     if price.amount_micros == 0 {
         return Ok(ChallengeOutcome::KeepLegacy("route priced at zero"));
+    }
+
+    // WOR-2230: never bill twice for content whose first payment is
+    // unresolved.
+    //
+    // An intent in `NeedsReconciliation` may already have moved a payer's
+    // money, and nothing expires it: it sits there until a provider answers.
+    // The service refuses to redeem one (the payer waits for the worker
+    // instead), but that only helps a payer that still holds its quote token.
+    // A payer that dropped an expired token, or one that was refused as a
+    // replay, arrives here with no token at all, and a fresh invoice is a
+    // second bill for the same article.
+    //
+    // The key is the content, because that is the only thing durable state
+    // knows: no column identifies a payer. So this refuses every payer for the
+    // route while one payment on it is unresolved, which trades revenue for
+    // never double charging. On a healthy rail the wait is one worker tick.
+    // On a rail with no status endpoint it lasts until an operator resolves
+    // the intent with the provider, which is why it gets a loud counter and a
+    // warning rather than a quiet 503.
+    let unresolved = deps
+        .service
+        .store()
+        .unresolved_intent_for_route(request.tenant, request.origin_id, request.path)
+        .await
+        .map_err(|error| infra("unresolved_intent_for_route", &error))?;
+    if let Some(intent_id) = unresolved {
+        tracing::warn!(
+            intent_id = %intent_id,
+            origin_id = request.origin_id,
+            route = request.path,
+            "a payment for this route is unresolved; withholding a fresh challenge \
+             rather than billing again for content that may already be paid for",
+        );
+        record_gate_settlement(None, OP_CHALLENGE, OUTCOME_UNRESOLVED_PAYMENT);
+        // The same two seconds the redeem path answers a stranded payment
+        // with. One number for "come back when the worker has been round".
+        return Ok(ChallengeOutcome::Respond(unavailable_response(2)));
     }
 
     // The requirement id doubles as the request idempotency key, because
@@ -1633,6 +1690,14 @@ mod tests {
         ) -> Result<Option<SettlementReceipt>, BillingError> {
             Err(BillingError::Storage("induced store failure"))
         }
+        async fn unresolved_intent_for_route(
+            &self,
+            _tenant_id: &str,
+            _origin_id: &str,
+            _route: &str,
+        ) -> Result<Option<String>, BillingError> {
+            Err(BillingError::Storage("induced store failure"))
+        }
         async fn reserve_proof(
             &self,
             _intent_id: &str,
@@ -1881,6 +1946,12 @@ mod tests {
         }
 
         async fn decide_with(&self, headers: &http::HeaderMap) -> GateDecision {
+            self.decide_path("/article", headers).await
+        }
+
+        /// The same decision against a named route, for the rules that are
+        /// scoped to one piece of content rather than to the deployment.
+        async fn decide_path(&self, path: &str, headers: &http::HeaderMap) -> GateDecision {
             let accept = headers
                 .get(http::header::ACCEPT)
                 .and_then(|value| value.to_str().ok());
@@ -1890,7 +1961,7 @@ mod tests {
             let request = GateRequest {
                 headers,
                 host: "blog.test",
-                path: "/article",
+                path,
                 tenant: "tenant-1",
                 origin_id: "origin-1",
                 agent_id: "",
@@ -2266,6 +2337,91 @@ mod tests {
             "an expired challenge dispatches nothing"
         );
         assert!(gate.receipt_for_token(&token).await.is_none());
+    }
+
+    // --- A payment that may already have moved money is never re-billed ---
+    //
+    // WOR-2230. Both halves start the same way: a crawler retries before the
+    // rail has settled, which strands the intent in `NeedsReconciliation`.
+    // From there a payer can come back holding its quote token or having
+    // dropped it, and until this landed the second route minted a fresh
+    // invoice for content the first payment may already have covered.
+
+    /// Strands one intent for `/article` and returns its retry headers.
+    async fn strand(gate: &Gate) -> http::HeaderMap {
+        gate.script(Script::NotSettled);
+        let challenge = gate.challenge(&crawler_headers()).await;
+        let mut retry = crawler_headers();
+        add_header(&mut retry, "crawler-payment", &quote_token_of(&challenge));
+        add_header(
+            &mut retry,
+            "PAYMENT-SIGNATURE",
+            &x402_credential(&challenge.response.body),
+        );
+        let response = expect_respond(gate.decide_with(&retry).await);
+        assert_eq!(
+            response.status, 503,
+            "verified but not settled is what strands an intent",
+        );
+        retry
+    }
+
+    #[tokio::test]
+    async fn a_stranded_payment_outliving_its_challenge_still_answers_503() {
+        let gate = Gate::x402();
+        let retry = strand(&gate).await;
+
+        // The provider stays unreachable past the challenge TTL. Nothing
+        // expires a stranded intent, so all that has changed is the clock.
+        gate.clock.advance(CHALLENGE_TTL_MS + 1_000);
+        let response = expect_respond(gate.decide_with(&retry).await);
+        assert_eq!(
+            response.status, 503,
+            "an aged-out challenge over an unresolved payment is still a wait",
+        );
+        header_value(&response, "Retry-After");
+        assert!(
+            !response.response.body.contains("challenge_expired"),
+            "a payer whose money may be gone must not be told to pay again: {}",
+            response.response.body,
+        );
+        assert_eq!(
+            gate.settle_calls(),
+            1,
+            "nothing was dispatched a second time"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stranded_payment_withholds_a_fresh_challenge_for_its_route() {
+        let before = settlement_count("none", "challenge", "unresolved_payment");
+        let gate = Gate::x402();
+        strand(&gate).await;
+
+        // A crawler with no token at all. This is the request that used to
+        // mint a second invoice for the same article, whether it arrived
+        // because the payer dropped an expired token or because it never had
+        // one.
+        let response = expect_respond(gate.decide_with(&crawler_headers()).await);
+        assert_eq!(
+            response.status, 503,
+            "no fresh bill while a payment for this content is unresolved",
+        );
+        header_value(&response, "Retry-After");
+        assert_eq!(gate.settle_calls(), 1);
+        assert!(
+            settlement_count("none", "challenge", "unresolved_payment") > before,
+            "withholding a challenge takes a route's revenue to zero until the \
+             payment resolves, which an operator has to be able to alert on",
+        );
+
+        // Scoped to the content, not the deployment: every other route is
+        // still payable.
+        let other = expect_respond(gate.decide_path("/other", &crawler_headers()).await);
+        assert_eq!(
+            other.status, 402,
+            "one stuck payment must not stop the rest of the site earning",
+        );
     }
 
     #[tokio::test]

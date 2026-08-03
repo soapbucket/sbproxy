@@ -57,15 +57,21 @@ pub enum RoutingStrategy {
     /// Pick the cheapest provider that can serve the requested model.
     CostOptimized,
     /// Choose providers by remaining tokens-per-minute headroom.
+    ///
+    /// WOR-2233: refused at config load. The headroom it scores is
+    /// measured against a per-provider limit that no configuration
+    /// field supplies, so every limit is zero and the score reduces to
+    /// observed usage alone, which is `LeastTokenUsage`. The variant
+    /// stays so the wire form still parses and the refusal can name it;
+    /// nothing reaches the arm below it while the config gate stands.
     TokenRate,
     /// WOR-798: choose the provider with the lowest recent token
     /// throughput in the current minute window, regardless of any
-    /// configured TPM limit. Unlike `TokenRate` (which picks by
-    /// remaining headroom against a per-provider limit), this picks
-    /// by absolute observed throughput, so it does the right thing
-    /// for self-hosted vLLM / SGLang pools where the operator does
-    /// not pre-declare a token cap. Untried providers (zero
-    /// observed tokens) sort lowest and are explored first.
+    /// configured TPM limit. It picks by absolute observed throughput
+    /// rather than by headroom against a per-provider limit, so it does
+    /// the right thing for self-hosted vLLM / SGLang pools where the
+    /// operator does not pre-declare a token cap. Untried providers
+    /// (zero observed tokens) sort lowest and are explored first.
     LeastTokenUsage,
     /// Prefix-affinity routing for self-hosted LLM pools (vLLM, SGLang)
     /// whose workers retain prompt KV caches.
@@ -323,16 +329,22 @@ pub struct Router {
     /// it without limit (WOR-1693).
     sticky_map: parking_lot::Mutex<lru::LruCache<String, usize>>,
     /// Per-provider circuit breakers. Empty when no resilience policy
-    /// is configured; populated when the AI handler config carries a
-    /// `resilience.circuit_breaker` block.
+    /// is configured; populated by `AiHandlerConfig::router` when the
+    /// handler config carries a `resilience.circuit_breaker` block, and
+    /// by nothing else.
     breakers: Vec<Arc<CircuitBreaker>>,
-    /// Optional shared outlier detector. Keys requests by provider
-    /// name (matches the AI provider's stable id rather than its
-    /// index so reload-time provider list changes don't reset state).
+    /// Optional shared outlier detector, populated by
+    /// `AiHandlerConfig::router` from a `resilience.outlier_detection`
+    /// block. Keys requests by provider name (matches the AI provider's
+    /// stable id rather than its index so reload-time provider list
+    /// changes don't reset state).
     outlier: Option<Arc<OutlierDetector>>,
     /// Per-provider active-probe health. `0` = unknown, `1` =
-    /// healthy, `2` = unhealthy. Updated by background probe tasks
-    /// when an `health_check` config is present.
+    /// healthy, `2` = unhealthy. Written by the probe tasks
+    /// [`crate::health_probe`] spawns when the handler config carries a
+    /// `resilience.health_check` block, and by nothing else. A pool
+    /// with no probe configured stays at `unknown`, which reads as
+    /// healthy so this axis simply abstains.
     health: Vec<AtomicU8>,
     /// Header-derived quota snapshots for headroom / reset-aware scoring.
     quota: ProviderRateLimitTracker,
@@ -436,28 +448,45 @@ impl Router {
         *self.last_filtered_fallback.lock() = reason;
     }
 
-    /// Attach circuit breakers and an outlier detector built from the
-    /// handler's `resilience` config. Idempotent: calling twice
-    /// replaces the previous bundle, which is what the pipeline does
-    /// on hot reload.
-    pub fn with_resilience(
+    /// Attach one circuit breaker per provider, sized to the pool this
+    /// router was built for.
+    ///
+    /// Deliberately separate from [`Self::with_outlier_detection`].
+    /// `resilience.circuit_breaker` and `resilience.outlier_detection`
+    /// are independent blocks, and the single constructor this replaces
+    /// took both, so wiring it would have armed breakers on default
+    /// thresholds for an operator who had configured only outlier
+    /// detection. Each axis is attached by the block that asks for it
+    /// and by nothing else, which is how the probe axis is wired too
+    /// (WOR-2224).
+    pub fn with_circuit_breakers(
         mut self,
-        num_providers: usize,
-        cb_failure_threshold: u32,
-        cb_success_threshold: u32,
-        cb_open_duration_secs: u64,
-        outlier: Option<OutlierDetectorConfig>,
+        failure_threshold: u32,
+        success_threshold: u32,
+        open_duration_secs: u64,
     ) -> Self {
-        self.breakers = (0..num_providers)
+        // Sized from an existing per-provider vec rather than from a
+        // caller-supplied count, so `breakers[idx]` cannot drift out of
+        // step with the index every other axis is keyed by.
+        self.breakers = (0..self.latencies.len())
             .map(|_| {
                 Arc::new(CircuitBreaker::new(
-                    cb_failure_threshold,
-                    cb_success_threshold,
-                    std::time::Duration::from_secs(cb_open_duration_secs),
+                    failure_threshold,
+                    success_threshold,
+                    std::time::Duration::from_secs(open_duration_secs),
                 ))
             })
             .collect();
-        self.outlier = outlier.map(|cfg| Arc::new(OutlierDetector::new(cfg)));
+        self
+    }
+
+    /// Attach the shared sliding-window outlier detector.
+    ///
+    /// One detector serves the whole pool because it keys by provider
+    /// name rather than index, so a hot reload that adds or reorders
+    /// providers does not silently hand one provider another's history.
+    pub fn with_outlier_detection(mut self, config: OutlierDetectorConfig) -> Self {
+        self.outlier = Some(Arc::new(OutlierDetector::new(config)));
         self
     }
 
@@ -472,7 +501,19 @@ impl Router {
     /// after a 2xx response.
     pub fn record_provider_success(&self, provider_idx: usize, provider_name: &str) {
         if let Some(b) = self.breakers.get(provider_idx) {
-            b.record_success();
+            // Only a half-open probe that met `success_threshold`
+            // returns a transition. Logging it is the only signal an
+            // operator gets that a provider came back, and a recovery
+            // that never appears is the failure mode this whole ticket
+            // is about.
+            if let Some((from, to)) = b.record_success() {
+                tracing::info!(
+                    provider = %provider_name,
+                    from = from.as_str(),
+                    to = to.as_str(),
+                    "ai provider circuit breaker closed"
+                );
+            }
         }
         if let Some(d) = &self.outlier {
             d.record_success(provider_name);
@@ -484,24 +525,59 @@ impl Router {
     /// failures, and feeds the sliding-window outlier detector.
     pub fn record_provider_failure(&self, provider_idx: usize, provider_name: &str) {
         if let Some(b) = self.breakers.get(provider_idx) {
-            b.record_failure();
+            if let Some((from, to)) = b.record_failure() {
+                tracing::warn!(
+                    provider = %provider_name,
+                    from = from.as_str(),
+                    to = to.as_str(),
+                    "ai provider circuit breaker opened"
+                );
+            }
         }
         if let Some(d) = &self.outlier {
             d.record_failure(provider_name);
-            let _ = d.check_ejections();
+            // The detector evaluates every provider it has seen, not
+            // just this one, so a name here can differ from the caller's.
+            // Ejection is the moment traffic stops reaching a provider;
+            // it has to be visible somewhere an operator looks.
+            for ejected in d.check_ejections() {
+                tracing::warn!(
+                    provider = %ejected,
+                    "ai provider ejected by outlier detection"
+                );
+            }
         }
     }
 
-    /// Set a provider's active-probe health flag (used by the
-    /// background health-check task).
+    /// Set a provider's active-probe health flag.
+    ///
+    /// The probe loop in [`crate::health_probe`] is the only production
+    /// caller. This axis is that module's to own: the breaker and the
+    /// outlier detector keep their own state and are intersected with
+    /// this one at selection time, rather than all three writing a
+    /// single flag with three different recovery rules.
     pub fn set_provider_health(&self, provider_idx: usize, healthy: bool) {
         if let Some(slot) = self.health.get(provider_idx) {
             slot.store(if healthy { 1 } else { 2 }, Ordering::Relaxed);
         }
     }
 
+    /// Intersect the three resilience axes for one provider.
+    ///
+    /// Each axis abstains when its config block is absent, so a pool
+    /// with no `resilience` block answers `true` here for everything
+    /// and the three checks cost three loads.
+    ///
+    /// The axes never write to each other, and each one has a path back
+    /// to eligible that does not depend on the other two. That is the
+    /// property that makes the intersection safe: an `AND` of three
+    /// gates only lets a provider return if every gate that closed can
+    /// reopen on its own evidence.
     fn provider_eligible(&self, idx: usize, name: &str) -> bool {
-        // Active health probe verdict (default unknown is treated as healthy).
+        // Active health probe verdict (default unknown is treated as
+        // healthy). Clears when `healthy_threshold` probes pass in a
+        // row, which the probe task keeps taking whether or not this
+        // provider is receiving traffic.
         let health_ok = self
             .health
             .get(idx)
@@ -510,7 +586,11 @@ impl Router {
         if !health_ok {
             return false;
         }
-        // Circuit-breaker gate.
+        // Circuit-breaker gate. `allow_request` is not a pure read: it
+        // performs the Open -> HalfOpen transition once
+        // `open_duration_secs` has elapsed, so asking the question is
+        // also what lets a cooled-down breaker admit its probe. A
+        // breaker that no caller consulted would stay Open forever.
         let breaker_ok = self
             .breakers
             .get(idx)
@@ -519,7 +599,9 @@ impl Router {
         if !breaker_ok {
             return false;
         }
-        // Outlier ejection.
+        // Outlier ejection. Also not a pure read: `is_ejected` drops an
+        // expired entry as it passes over it, so the ejection lapses
+        // after `ejection_duration_secs` without anyone sweeping it.
         if let Some(d) = &self.outlier {
             if d.is_ejected(name) {
                 return false;
@@ -692,9 +774,13 @@ impl Router {
 
     /// Pick an enabled provider permitted by the credential policy.
     ///
-    /// Policy and resilience filters are intersected. Unlike [`Self::select`],
-    /// this strict dispatch path does not revive the narrowed set when every
-    /// permitted provider is unhealthy, ejected, or breaker-blocked.
+    /// The credential policy is a hard filter: a provider this key may
+    /// not use is never selected, and `None` is the honest answer when
+    /// the key is permitted nothing. Resilience is a soft filter on top
+    /// of that set, on the same terms as [`Self::select`] and
+    /// [`Self::routable_candidate_indices`], so an all-ejected pool
+    /// still returns a provider the key is allowed to reach rather than
+    /// failing the request.
     pub fn select_with_policy(
         &self,
         providers: &[ProviderConfig],
@@ -712,9 +798,10 @@ impl Router {
         picked
     }
 
-    /// `select_inner` with an additional predicate. The predicate and
-    /// resilience filters are both hard gates: an empty intersection returns
-    /// `None` instead of reviving a provider that either gate rejected.
+    /// `select_inner` with an additional predicate. The predicate is a
+    /// hard gate and an empty predicate result returns `None`;
+    /// resilience narrows what is left and gives the set back when it
+    /// would narrow it to nothing.
     ///
     /// Candidate ranking reuses the same strategy dispatch as
     /// [`Self::select_inner`] on the narrowed set. Round-robin fallback
@@ -736,7 +823,7 @@ impl Router {
             return None;
         }
         let candidates = enabled.iter().map(|(idx, _)| *idx).collect::<Vec<_>>();
-        let eligible = self.eligible_candidate_indices(providers, &candidates);
+        let eligible = self.routable_candidate_indices(providers, &candidates);
         let eligible = eligible
             .into_iter()
             .filter_map(|idx| providers.get(idx).map(|provider| (idx, provider)))
@@ -1278,6 +1365,54 @@ impl Router {
                 })
             })
             .collect()
+    }
+
+    /// The candidate list narrowed to resilience-eligible providers, or
+    /// the list's still-enabled members when that narrowing empties it.
+    ///
+    /// Callers hand this the set a request is already permitted to use:
+    /// credential policy, model eligibility, and the training opt-out
+    /// have run, and those stay hard here. `enabled` stays hard too;
+    /// it is an operator switch, not a health signal. The three
+    /// resilience axes are the soft part, because what they express is
+    /// which provider is the better bet among several. With nothing
+    /// left to prefer they have nothing to say, and refusing the
+    /// request would let three advisory signals combine into an outage
+    /// none of them can cause alone.
+    ///
+    /// This is what `resilience` has promised since it shipped, in
+    /// `docs/configuration.md` and in `examples/ai-resilience`, what
+    /// [`Self::select`] already does, and what the load balancer's own
+    /// three-axis filter does with the same reasoning. Reach for
+    /// [`Self::eligible_candidate_indices`] instead where reviving is
+    /// wrong: the cascade asks per tier, and skipping to the next tier
+    /// is already its fallback.
+    pub fn routable_candidate_indices(
+        &self,
+        providers: &[ProviderConfig],
+        candidate_indices: &[usize],
+    ) -> Vec<usize> {
+        let eligible = self.eligible_candidate_indices(providers, candidate_indices);
+        if !eligible.is_empty() {
+            return eligible;
+        }
+        let enabled = candidate_indices
+            .iter()
+            .copied()
+            .filter(|idx| providers.get(*idx).is_some_and(|provider| provider.enabled))
+            .collect::<Vec<_>>();
+        if !enabled.is_empty() {
+            // Debug rather than warn because this sits on the request
+            // path and would repeat per request for as long as the pool
+            // stays down. The ejections that produced this state each
+            // logged a warning once, at the transition, which is the
+            // signal an operator should be alerting on.
+            tracing::debug!(
+                candidates = enabled.len(),
+                "every eligible ai provider is ejected; routing to the full permitted set"
+            );
+        }
+        enabled
     }
 
     /// Select with the configured strategy from an exact candidate list.
@@ -2508,8 +2643,222 @@ mod tests {
         assert_eq!(providers[pick].name, "anthropic");
     }
 
+    // --- Resilience axes (WOR-2233) ---
+    //
+    // Every test below fails against the router as it shipped, because
+    // `breakers` was empty and `outlier` was `None` on every router the
+    // proxy ever built, so both arms of `provider_eligible` passed
+    // unconditionally and `check_ejections` never ran.
+
     #[test]
-    fn select_with_policy_returns_none_when_every_permitted_provider_is_unhealthy() {
+    fn a_breaker_that_reached_its_threshold_takes_its_provider_out_of_rotation() {
+        let providers = vec![
+            make_provider("failing", 1, None, true),
+            make_provider("healthy", 1, None, true),
+        ];
+        let router = Router::new(RoutingStrategy::RoundRobin, providers.len())
+            .with_circuit_breakers(2, 1, 30);
+
+        router.record_provider_failure(0, "failing");
+        assert_eq!(
+            router.eligible_indices(&providers),
+            vec![0, 1],
+            "one failure is under the threshold"
+        );
+
+        router.record_provider_failure(0, "failing");
+        assert_eq!(
+            router.eligible_indices(&providers),
+            vec![1],
+            "the second failure opens the breaker and the provider leaves"
+        );
+        for _ in 0..4 {
+            assert_eq!(router.select(&providers), Some(1));
+        }
+    }
+
+    #[test]
+    fn an_open_breaker_admits_a_probe_once_its_cooldown_elapses_and_closes_on_success() {
+        let providers = vec![
+            make_provider("recovering", 1, None, true),
+            make_provider("healthy", 1, None, true),
+        ];
+        // A zero cooldown makes the Open -> HalfOpen transition
+        // observable without sleeping; the transition is driven by
+        // elapsed time either way.
+        let router = Router::new(RoutingStrategy::RoundRobin, providers.len())
+            .with_circuit_breakers(1, 1, 0);
+
+        router.record_provider_failure(0, "recovering");
+        // `allow_request` performs the transition, so the provider is
+        // back as a half-open probe on the very next eligibility check.
+        assert_eq!(router.eligible_indices(&providers), vec![0, 1]);
+
+        router.record_provider_success(0, "recovering");
+        assert_eq!(
+            router.breakers()[0].state(),
+            sbproxy_platform::circuitbreaker::CircuitState::Closed,
+            "one half-open success meets success_threshold 1 and closes it"
+        );
+    }
+
+    /// The outlier axis clears on its own clock, and clears without any
+    /// caller sweeping it: `is_ejected` drops an entry whose deadline
+    /// has passed as it reads over it. A zero-second ejection makes
+    /// that observable without a sleep, since the deadline is already
+    /// in the past by the first read.
+    #[test]
+    fn an_outlier_ejection_lapses_without_anyone_sweeping_it() {
+        let providers = vec![
+            make_provider("flaky", 1, None, true),
+            make_provider("healthy", 1, None, true),
+        ];
+        let router = Router::new(RoutingStrategy::RoundRobin, providers.len())
+            .with_outlier_detection(OutlierDetectorConfig {
+                threshold: 0.5,
+                window_secs: 60,
+                min_requests: 2,
+                ejection_duration_secs: 0,
+            });
+
+        router.record_provider_failure(0, "flaky");
+        router.record_provider_failure(0, "flaky");
+        assert!(
+            router
+                .outlier
+                .as_ref()
+                .expect("detector")
+                .check_ejections()
+                .is_empty(),
+            "the second failure already ejected it, so there is nothing new to report"
+        );
+        assert_eq!(
+            router.eligible_indices(&providers),
+            vec![0, 1],
+            "a lapsed ejection re-admits on the next eligibility read"
+        );
+    }
+
+    #[test]
+    fn an_outlier_ejection_holds_a_provider_out_while_it_is_live() {
+        let providers = vec![
+            make_provider("flaky", 1, None, true),
+            make_provider("healthy", 1, None, true),
+        ];
+        let router = Router::new(RoutingStrategy::RoundRobin, providers.len())
+            .with_outlier_detection(OutlierDetectorConfig {
+                threshold: 0.5,
+                window_secs: 60,
+                min_requests: 2,
+                ejection_duration_secs: 300,
+            });
+
+        router.record_provider_failure(0, "flaky");
+        router.record_provider_failure(0, "flaky");
+        assert_eq!(router.eligible_indices(&providers), vec![1]);
+        for _ in 0..4 {
+            assert_eq!(router.select(&providers), Some(1));
+        }
+    }
+
+    #[test]
+    fn each_axis_is_armed_only_by_its_own_config_block() {
+        let router = Router::new(RoutingStrategy::RoundRobin, 2)
+            .with_outlier_detection(OutlierDetectorConfig::default());
+        assert!(
+            router.breakers().is_empty(),
+            "outlier_detection alone must not arm circuit breakers on defaults nobody asked for"
+        );
+
+        let router = Router::new(RoutingStrategy::RoundRobin, 2).with_circuit_breakers(5, 2, 30);
+        assert_eq!(router.breakers().len(), 2, "one breaker per provider slot");
+        assert!(
+            router.outlier.is_none(),
+            "circuit_breaker alone must not arm outlier detection"
+        );
+    }
+
+    /// A provider that failed on more than one axis has to clear every
+    /// axis it failed before it returns, and no axis speaks for another.
+    /// The breaker here clears itself on elapsed time while the probe
+    /// verdict stands until a probe changes it, which is exactly the
+    /// mismatch that makes cross-feeding the axes a trap: one signal
+    /// written into both would leave a provider ejected until an
+    /// unrelated clock agreed.
+    #[test]
+    fn a_provider_returns_only_once_every_axis_it_failed_has_cleared() {
+        let providers = vec![
+            make_provider("both", 1, None, true),
+            make_provider("healthy", 1, None, true),
+        ];
+        // A zero cooldown means the breaker is willing again the moment
+        // it is asked, so what is left holding the provider out is only
+        // the probe verdict.
+        let router = Router::new(RoutingStrategy::RoundRobin, providers.len())
+            .with_circuit_breakers(1, 1, 0);
+
+        router.record_provider_failure(0, "both");
+        router.set_provider_health(0, false);
+        assert_eq!(
+            router.eligible_indices(&providers),
+            vec![1],
+            "a breaker that has already cooled down does not revive the health axis"
+        );
+
+        router.set_provider_health(0, true);
+        assert_eq!(
+            router.eligible_indices(&providers),
+            vec![0, 1],
+            "both axes have cleared on their own terms, so the provider is back"
+        );
+    }
+
+    #[test]
+    fn an_all_ejected_pool_routes_to_the_permitted_set_rather_than_refusing() {
+        let providers = vec![
+            make_provider("first", 1, None, true),
+            make_provider("second", 1, None, true),
+        ];
+        let router = Router::new(RoutingStrategy::RoundRobin, providers.len())
+            .with_circuit_breakers(1, 1, 300);
+
+        router.record_provider_failure(0, "first");
+        router.record_provider_failure(1, "second");
+        assert!(router.eligible_indices(&providers).is_empty());
+
+        assert_eq!(
+            router.routable_candidate_indices(&providers, &[0, 1]),
+            vec![0, 1],
+            "with nothing left to prefer, the axes have nothing to say"
+        );
+        assert!(router.select(&providers).is_some());
+        assert!(router.select_with_policy(&providers, &[], &[]).is_some());
+    }
+
+    #[test]
+    fn reviving_an_all_ejected_pool_still_skips_a_disabled_provider() {
+        let mut providers = vec![
+            make_provider("ejected", 1, None, true),
+            make_provider("switched-off", 1, None, true),
+        ];
+        providers[1].enabled = false;
+        let router = Router::new(RoutingStrategy::RoundRobin, providers.len())
+            .with_circuit_breakers(1, 1, 300);
+
+        router.record_provider_failure(0, "ejected");
+        assert_eq!(
+            router.routable_candidate_indices(&providers, &[0, 1]),
+            vec![0],
+            "enabled is an operator switch, not a health signal, and stays hard"
+        );
+    }
+
+    /// The all-ejected case under a credential policy. Resilience is
+    /// advisory and gives the permitted set back rather than failing
+    /// the request, but it must not reach past the policy to do it:
+    /// the healthy provider here is one this key may not use.
+    #[test]
+    fn select_with_policy_revives_the_permitted_set_but_never_crosses_the_policy() {
         let router = Router::new(RoutingStrategy::RoundRobin, 2);
         let providers = vec![
             make_provider("permitted-but-unhealthy", 1, None, true),
@@ -2517,6 +2866,23 @@ mod tests {
         ];
         router.set_provider_health(0, false);
         let allowed = vec!["permitted-but-unhealthy".to_string()];
+
+        assert_eq!(
+            router.select_with_policy(&providers, &allowed, &[]),
+            Some(0)
+        );
+    }
+
+    /// A key permitted nothing still gets `None`. Reviving is about
+    /// resilience state, and there is no permitted set to revive here.
+    #[test]
+    fn select_with_policy_returns_none_when_the_policy_permits_no_provider() {
+        let router = Router::new(RoutingStrategy::RoundRobin, 2);
+        let providers = vec![
+            make_provider("openai", 1, None, true),
+            make_provider("anthropic", 1, None, true),
+        ];
+        let allowed = vec!["not-a-configured-provider".to_string()];
 
         assert_eq!(router.select_with_policy(&providers, &allowed, &[]), None);
     }

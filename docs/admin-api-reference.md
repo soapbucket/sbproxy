@@ -1637,8 +1637,15 @@ for the full request schema and validation order.
 }
 ```
 
-Empty (all-zero) until a locally served or compressed request
-completes successfully. `compression` is sorted by model and lever;
+Empty (all-zero) until a request that is served locally, spills to a
+cloud provider, or is compressed completes successfully. A model's
+`local_completions` / `saved_micros` and its `cloud_completions` /
+`cloud_spent_micros` are the two halves of one split, priced against the
+same configured `reference`, so the saved figure is gross and the
+difference is net. Both halves are keyed on the model the caller asked
+for rather than the id the answering provider billed under. See
+[model-host.md](model-host.md#value-delivered) for the lane rules.
+`compression` is sorted by model and lever;
 `compression_totals` aggregates by lever name. A known target-model
 tokenizer produces `model_tokenizer` precision; the UTF-8
 byte-length fallback produces `heuristic`. Both are sbproxy estimates,

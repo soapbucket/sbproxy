@@ -1182,6 +1182,14 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         );
     }
 
+    // WOR-2227: a secret reference whose authority is not declared under
+    // `proxy.secrets.backends` used to compile, validate, and plan clean,
+    // then die at boot inside whichever module first tried to resolve it.
+    // Three shipped examples were broken that way. Checked here rather
+    // than at resolve time so `sbproxy validate`, `sbproxy plan`, and the
+    // example sweeps all inherit it without touching a backend.
+    crate::secret_refs::check_secret_backend_references(&yaml, config_file.proxy.secrets.as_ref())?;
+
     {
         let mut names = std::collections::HashSet::with_capacity(config_file.flags.len());
         for flag in &config_file.flags {

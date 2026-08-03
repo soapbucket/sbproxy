@@ -38,6 +38,12 @@
 //!
 //! There is no row in that table where a request reaches the origin without a
 //! committed receipt.
+//!
+//! The three `NeedsReconciliation` rows outrank the challenge's expiry, and
+//! that ordering is load bearing. An intent in that state is never expired by
+//! any sweep, so an aged-out challenge over it means only that the provider
+//! has stayed unreachable. Answering `challenge_expired` there would hand a
+//! payer whose funds may already have moved a fresh bill for the same content.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -668,22 +674,45 @@ impl BillingService {
                 None => Ok(unavailable(self.retry_after_seconds)),
             };
         }
+        if intent.status == IntentStatus::NeedsReconciliation {
+            // A write is outstanding. Trying again here is how a double charge
+            // happens, so the client waits for the worker instead.
+            //
+            // Ahead of the expiry check on purpose (WOR-2230). Nothing ever
+            // expires an intent in this state: `expire_stale_challenges` only
+            // sweeps `Pending`, and it skips any intent with a dispatched,
+            // unanswered attempt. So the wall clock passing the challenge's
+            // expiry says nothing about the funds; it only means the provider
+            // has been unreachable for a while. Refusing with
+            // `challenge_expired` here would send a payer whose money may
+            // already be gone back for a second invoice, which is the double
+            // charge this branch exists to prevent, reached from the other
+            // side.
+            if intent.draft.is_expired(now_ms) {
+                tracing::warn!(
+                    intent_id = %intent_id,
+                    rail = intent.settlement_rail.as_str(),
+                    "a payment that may have moved funds has outlived its challenge; \
+                     the payer is being told to wait rather than pay again",
+                );
+            }
+            return Ok(unavailable(self.retry_after_seconds));
+        }
         if intent.draft.is_expired(now_ms) {
             return Ok(refuse(
                 PaymentProblemCode::ChallengeExpired,
                 &BillingError::IntentExpired,
             ));
         }
+        // Expiry is judged before this, because the sweep collapses an expired
+        // `Pending` intent into `Terminal` with an `Expired` category. Reading
+        // the clock first is what keeps a challenge that simply aged out from
+        // being reported as a provider rejection.
         if intent.status == IntentStatus::Terminal {
             return Ok(refuse(
                 PaymentProblemCode::Rejected,
                 &BillingError::ProviderRejected,
             ));
-        }
-        if intent.status == IntentStatus::NeedsReconciliation {
-            // A write is outstanding. Trying again here is how a double charge
-            // happens, so the client waits for the worker instead.
-            return Ok(unavailable(self.retry_after_seconds));
         }
 
         let rail = intent.settlement_rail;
