@@ -168,7 +168,7 @@
 # cloud_completions and cloud_spent_micros rather than nowhere. The
 # ratchet's first option again, a production call site rather than a
 # narrowing.
-286
+284
 #
 #
 # Lowered to 286 on WOR-2225, 2026-08-02, answering three more of the
