@@ -517,6 +517,45 @@ pub fn hash_admin_operator_password(password: &str, pepper: &[u8]) -> String {
     sbproxy_keystore::crypto::hash_secret(password, pepper)
 }
 
+/// Warn when provider hints will recognize a native credential that nothing
+/// admits, so enabling `key_management` cannot silently start refusing all
+/// caller-supplied provider keys.
+///
+/// `provider_hints` defaults to a non-empty set and `native_key_policy`
+/// defaults to absent, so this combination is what an operator gets by simply
+/// switching `key_management.enabled` on. The result is a 403 on every native
+/// credential, which is deliberate and fail-closed, but was previously
+/// silent: nothing in validation or at boot said the recognition was armed
+/// with no policy behind it.
+///
+/// The message names both opt-ins. Admission needs the proxy-wide policy
+/// *and* a per-provider `accept_native_credentials_for` destination binding,
+/// and a config carrying only the first is the more confusing state of the
+/// two because the policy looks finished.
+fn warn_on_ungoverned_provider_hints(cfg: &KeyManagementConfig) {
+    let inbound = &cfg.inbound;
+    if inbound.provider_hints.is_empty() || inbound.native_key_policy.is_some() {
+        return;
+    }
+    let mut providers: Vec<&str> = inbound
+        .provider_hints
+        .iter()
+        .map(|hint| hint.provider.as_str())
+        .collect();
+    providers.sort_unstable();
+    providers.dedup();
+    tracing::warn!(
+        providers = providers.join(", "),
+        "key_management.inbound.provider_hints recognizes native provider \
+         credentials but no inbound.native_key_policy admits any of them, so \
+         every one is refused with 403. Declare \
+         inbound.native_key_policy.allowed_providers, and on each ai_proxy \
+         provider that may receive a caller credential set \
+         accept_native_credentials_for; or set provider_hints: [] to stop \
+         recognizing them."
+    );
+}
+
 /// Build the `KeyCrypto` handle from config, generating ephemeral secrets
 /// with a warning when the operator did not pin them.
 fn build_crypto(cfg: &KeyManagementConfig) -> Result<KeyCrypto> {
@@ -914,6 +953,7 @@ pub(crate) fn prepare_key_plane(
     let Some(cfg) = cfg.filter(|cfg| cfg.enabled) else {
         return Ok(None);
     };
+    warn_on_ungoverned_provider_hints(cfg);
     let (governance_store, approximate_store) = build_governance_store(&cfg.governance)?;
     let crypto = build_crypto(cfg)?;
     let store = build_store(cfg)?;
