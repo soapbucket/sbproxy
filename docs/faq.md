@@ -157,7 +157,7 @@ Sub-millisecond p99 at 50k+ rps on commodity hardware for plain proxy paths; AI 
 
 ### How do I tune SBproxy for high concurrency?
 
-`performance.md` has the operator-facing tuning guide. The two settings that move the needle: the `SB_WORKER_THREADS` environment variable (defaults to the detected CPU parallelism, which honours cgroup quotas on Linux) and the connection pool sizes per upstream.
+`performance.md` has the operator-facing tuning guide. The two settings that move the needle: the `SB_WORKER_THREADS` environment variable (defaults to the detected CPU parallelism, which honors cgroup quotas on Linux) and the connection pool sizes per upstream.
 
 ## Configuration patterns
 

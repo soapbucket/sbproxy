@@ -75,6 +75,8 @@ pub mod types;
 #[cfg(feature = "runtime")]
 pub mod dispatch;
 #[cfg(feature = "runtime")]
+pub mod lifecycle;
+#[cfg(feature = "runtime")]
 pub mod registry;
 #[cfg(feature = "runtime")]
 pub mod service;
@@ -128,6 +130,11 @@ pub use types::{
 
 #[cfg(feature = "runtime")]
 pub use dispatch::{DispatchContext, DispatchOutcome, DispatchSubject, UsageDispatch};
+#[cfg(feature = "runtime")]
+pub use lifecycle::{
+    NoOpPaymentLifecycleObserver, PaymentLifecycleDecision, PaymentLifecycleEvent,
+    PaymentLifecycleObserver, PaymentLifecycleOutcome, PaymentLifecyclePhase,
+};
 #[cfg(feature = "runtime")]
 pub use registry::{
     AuthoritativePayment, ChallengeMaterial, ChallengePreparation, PaymentMethodAdapter,

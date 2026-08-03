@@ -583,6 +583,7 @@ mod tests {
             auth_config,
             policy_configs: Vec::new(),
             transform_configs: Vec::new(),
+            filters: Vec::new(),
             cors: None,
             hsts: None,
             compression: None,
@@ -633,6 +634,7 @@ mod tests {
             host_map.insert(origin.hostname.clone(), idx);
         }
         Arc::new(CompiledConfig {
+            extension_bundles: Default::default(),
             origins,
             host_map,
             server: ProxyServerConfig::default(),

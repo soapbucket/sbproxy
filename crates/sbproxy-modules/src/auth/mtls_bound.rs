@@ -7,7 +7,7 @@
 //! Certificate-Bound Access Tokens) defines an alternative
 //! proof-of-possession scheme to DPoP for deployments that already
 //! have a mTLS substrate. The access token carries a `cnf.x5t#S256`
-//! claim — the base64url-no-pad SHA-256 thumbprint of the legitimate
+//! claim, the base64url-no-pad SHA-256 thumbprint of the legitimate
 //! client's X.509 certificate. On every request, the proxy compares
 //! this claim against the SHA-256 thumbprint of the cert the inbound
 //! TLS connection actually presented; a mismatch (or a missing cert)
@@ -313,7 +313,7 @@ mod tests {
     #[test]
     fn malformed_thumbprint_rejected() {
         let v = MtlsBoundVerifier::default();
-        // Wrong byte length (decoded to 31 bytes) — not a SHA-256.
+        // Wrong byte length (decoded to 31 bytes), not a SHA-256.
         let claims = claims_with_cnf("short_thumbprint_aaaaa");
         let result = v.verify(&claims, Some(FIXTURE_THUMBPRINT));
         assert!(matches!(

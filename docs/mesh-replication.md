@@ -80,7 +80,7 @@ version any reachable replica holds), fan out to the whole preference
 list, and report success only after the configured number of replicas
 acknowledged:
 
-- `one`: a single acknowledgement. The write is durable on at least one
+- `one`: a single acknowledgment. The write is durable on at least one
   node.
 - `quorum`: a majority of the key's replica set. With `factor: 2` this
   means both replicas; with `factor: 3` it means two.
@@ -121,7 +121,7 @@ deletion safety, explained next.
 
 A delete is a write: it replicates a tombstone through the same quorum
 path. Tombstones never expire by TTL. They are physically removed only
-by acknowledgement-aware garbage collection, which requires both:
+by acknowledgment-aware garbage collection, which requires both:
 
 1. The tombstone is older than `tombstone_gc_grace_secs`.
 2. Every replica in the key's current preference list confirms it holds

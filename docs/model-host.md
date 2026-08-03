@@ -1,6 +1,6 @@
 # Model host
 
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-02*
 
 SBproxy can own model processes on one worker or place them across a managed
 cluster. Model-host control lives under `proxy.model_host`. Depending on its
@@ -600,7 +600,7 @@ not substitute evidence from a different variant. Pickle variants fail closed
 unless the logical catalog entry explicitly opts in with `allow_pickle: true`.
 
 Creating a deployment or changing its logical model requires explicit license
-acknowledgement. The form covers deployment ID, logical model, automatic or
+acknowledgment. The form covers deployment ID, logical model, automatic or
 exact variant selection, heterogeneous variants, replicas, required labels,
 spread keys, pull policy, warm behavior, engine, rollout policy, keep-alive,
 maximum concurrency, queue depth, and queue timeout. Add, edit, rename, and
@@ -820,10 +820,26 @@ Host-wide settings sit on the `serve:` block itself.
 The authenticated `GET /admin/model-host/value` endpoint reports two separate
 sources of value:
 
-- locally served completions priced against each model's configured
-  `reference`;
+- completions of a model that declares a `reference`, split across the lane
+  that answered each one;
 - target-model input tokens and gross input cost avoided by each successful
   context-compression lever.
+
+The lane split is what makes the savings figure readable. A completion a
+local engine answered adds to `local_completions` and prices its displaced
+cloud cost into `saved_micros`: the marginal API cost of serving on your own
+hardware is zero, so the whole displaced price is the saving. A completion
+that spilled to a cloud provider instead, because the local engine was busy,
+unhealthy, or absent, adds to `cloud_completions` and prices what it cost into
+`cloud_spent_micros`. Both halves use the same `reference` price, so the two
+totals are in one unit and subtract: `saved_micros` is the gross figure and
+the difference is what the local lane netted.
+
+Both lanes land under the model the caller asked for, not under the id the
+provider that answered billed as. That is the only key the two halves share,
+and it is what lets one row say what a model cost you across both lanes.
+A model without a `reference` is absent from the split entirely, in both
+directions: SBproxy makes no savings claim it cannot price.
 
 Compression does not count as a local or cloud completion. The request path
 records it only after the terminal provider attempt returns a billable `2xx`.
@@ -1197,7 +1213,7 @@ sbproxy cluster status --admin-url "${SB_ADMIN_URL}" --format json
 
 `GET /admin/cluster/status` is the stable cluster-view backend. It always lists
 the complete membership roster, including unhealthy and excluded nodes. Each
-node includes membership state, acknowledgement age, health, stable reasons,
+node includes membership state, acknowledgment age, health, stable reasons,
 roles, labels, model endpoint, snapshot age and generation, engine/device and
 artifact counts, replica truth, model eligibility, and exclusion reason. The
 top-level `unhealthy_nodes` array repeats only actionable nodes so an admin UI

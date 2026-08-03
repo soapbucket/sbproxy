@@ -331,11 +331,16 @@ impl AiHandlerConfig {
             .get_or_init(|| {
                 let mut sinks = crate::usage_sink::build_sinks(&self.usage_sinks);
                 // WOR-1913: a served model that declares a `reference:` cloud
-                // price gets a value recorder that prices each local completion
-                // it serves at that reference, so the admin value route and the
-                // dollars-saved doc claim are backed by a real per-completion
-                // tally. No reference configured means no recorder, never a
-                // guessed saving.
+                // price gets a value recorder that prices each of its
+                // completions at that reference, so the admin value route and
+                // the dollars-saved doc claim are backed by a real
+                // per-completion tally. No reference configured means no
+                // recorder, never a guessed saving.
+                //
+                // WOR-2223: "each of its completions" covers both lanes. This
+                // map prices a completion that spilled past the local engine
+                // too, which is why it is keyed on the served model name
+                // rather than on the provider that ends up billing.
                 let mut references = std::collections::BTreeMap::new();
                 let mut ledger_dir: Option<String> = None;
                 for provider in &self.providers {
@@ -401,13 +406,60 @@ impl AiHandlerConfig {
     /// / connection state, so it must be reused across requests rather
     /// than reconstructed per request; this accessor guarantees a single
     /// instance per `AiHandlerConfig` (until config reload).
+    /// The `resilience` blocks are attached here rather than by a
+    /// background task, because a breaker and a detector are passive:
+    /// they need to exist before the first request, not to be driven on
+    /// a timer the way the probe axis is. This accessor is the one
+    /// place a router is built, so it is the only place that can
+    /// guarantee no request ever meets an unarmed one. That guarantee
+    /// is the bug (WOR-2233): both blocks parsed, and neither was ever
+    /// attached to anything.
     pub fn router(&self) -> std::sync::Arc<crate::routing::Router> {
         self.router
             .get_or_init(|| {
-                std::sync::Arc::new(crate::routing::Router::new(
-                    self.routing.clone(),
-                    self.providers.len(),
-                ))
+                let mut router =
+                    crate::routing::Router::new(self.routing.clone(), self.providers.len());
+                if let Some(resilience) = self.resilience.as_ref() {
+                    if let Some(breaker) = resilience.circuit_breaker.as_ref() {
+                        let failure_threshold = breaker.failure_threshold.max(1);
+                        if failure_threshold != breaker.failure_threshold {
+                            tracing::warn!(
+                                configured = breaker.failure_threshold,
+                                applied = failure_threshold,
+                                "ai circuit breaker: failure_threshold below 1 would open on \
+                                 the first failure; raising it"
+                            );
+                        }
+                        router = router.with_circuit_breakers(
+                            failure_threshold,
+                            // No warning for this one: a success
+                            // threshold of 0 and one of 1 both close the
+                            // breaker on the first half-open success, so
+                            // there is nothing an operator would want to
+                            // change.
+                            breaker.success_threshold.max(1),
+                            breaker.open_duration_secs,
+                        );
+                        tracing::info!(
+                            providers = self.providers.len(),
+                            failure_threshold,
+                            open_duration_secs = breaker.open_duration_secs,
+                            "ai circuit breakers armed"
+                        );
+                    }
+                    if let Some(outlier) = resilience.outlier_detection.as_ref() {
+                        let config = outlier.detector_config();
+                        tracing::info!(
+                            threshold = config.threshold,
+                            window_secs = config.window_secs,
+                            min_requests = config.min_requests,
+                            ejection_duration_secs = config.ejection_duration_secs,
+                            "ai outlier detection armed"
+                        );
+                        router = router.with_outlier_detection(config);
+                    }
+                }
+                std::sync::Arc::new(router)
             })
             .clone()
     }
@@ -626,6 +678,49 @@ pub struct AiOutlierConfig {
     pub ejection_duration_secs: u64,
 }
 
+impl AiOutlierConfig {
+    /// Translate to the platform detector's config, refusing the two
+    /// values that would eject a provider the evidence does not
+    /// condemn.
+    ///
+    /// A threshold of `0.0` ejects on `failure_rate >= 0.0`, which
+    /// every provider satisfies including one that has never failed,
+    /// and `min_requests: 0` lets that fire before a single request has
+    /// been observed. Together they eject the whole pool on the first
+    /// tick. Both parsed happily while nothing read this block, so no
+    /// deployment has ever felt them; the first deployment to feel them
+    /// should not be one that typed a zero.
+    fn detector_config(&self) -> sbproxy_platform::outlier::OutlierDetectorConfig {
+        let usable = self.threshold.is_finite() && self.threshold > 0.0;
+        let threshold = if usable {
+            self.threshold.min(1.0)
+        } else {
+            default_outlier_threshold()
+        };
+        if !usable || self.threshold > 1.0 {
+            tracing::warn!(
+                configured = self.threshold,
+                applied = threshold,
+                "ai outlier detection: threshold is a failure rate above 0 and at most 1"
+            );
+        }
+        let min_requests = self.min_requests.max(1);
+        if min_requests != self.min_requests {
+            tracing::warn!(
+                applied = min_requests,
+                "ai outlier detection: min_requests of 0 would judge a provider before it \
+                 had answered anything; raising it"
+            );
+        }
+        sbproxy_platform::outlier::OutlierDetectorConfig {
+            threshold,
+            window_secs: self.window_secs,
+            min_requests,
+            ejection_duration_secs: self.ejection_duration_secs,
+        }
+    }
+}
+
 fn default_outlier_threshold() -> f64 {
     0.5
 }
@@ -839,6 +934,27 @@ impl AiHandlerConfig {
             .reasoning
             .validate()
             .map_err(|error| anyhow::anyhow!("ai reasoning: {error}"))?;
+        // WOR-2233: `token_rate` scores remaining headroom against a
+        // per-provider tokens-per-minute limit, and nothing supplies
+        // one. `Router::token_limits` has no config field and no
+        // production writer, so every limit is zero and the score
+        // reduces to `-tokens_used`: the documented strategy silently
+        // becomes `least_token_usage`. Refusing is the honest
+        // disposition until a limit field and the window reset that
+        // would make it mean anything both exist. Anyone selecting it
+        // today is already getting `least_token_usage`, so the fix
+        // named in this message preserves their behaviour exactly.
+        if matches!(config.routing, RoutingStrategy::TokenRate) {
+            anyhow::bail!(
+                "ai routing strategy `token_rate` ranks providers by remaining \
+                 tokens-per-minute headroom against a declared per-provider limit, \
+                 and no configuration field declares one. Every limit is zero, so \
+                 the strategy would rank by observed usage alone and behave exactly \
+                 like `least_token_usage`. Set `routing.strategy: least_token_usage` \
+                 to keep that behaviour, or use `headroom` or `reset_aware`, which \
+                 score the rate-limit headers providers actually return."
+            );
+        }
         if let Some(guardrails) = &config.guardrails {
             crate::guardrails::validate_pipeline_config(guardrails)
                 .map_err(|error| anyhow::anyhow!("ai guardrails: {error}"))?;
@@ -1355,6 +1471,172 @@ pub fn classify_surface(_method: &str, path: &str) -> AiSurface {
 mod tests {
     use super::*;
     use crate::reasoning::ReasoningPolicy;
+
+    // --- Resilience wiring (WOR-2233) ---
+    //
+    // The defect these pin is not that ejection was wrong, it is that
+    // ejection never happened: `router()` built a bare `Router`, so
+    // `breakers` was empty and `outlier` was `None` no matter what the
+    // config said. Each test below asserts behaviour rather than
+    // reading the router's fields, because the fields were only ever
+    // wrong in the sense of being untouched, and a behavioural
+    // assertion fails the same way while also covering the axis.
+
+    fn resilience_config(resilience: serde_json::Value) -> AiHandlerConfig {
+        AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "openai", "api_key": "k"},
+                {"name": "anthropic", "api_key": "k"},
+            ],
+            "resilience": resilience,
+        }))
+        .expect("config compiles")
+    }
+
+    #[test]
+    fn a_circuit_breaker_block_produces_a_router_that_actually_ejects() {
+        let config = resilience_config(serde_json::json!({
+            "circuit_breaker": {
+                "failure_threshold": 2,
+                "success_threshold": 1,
+                "open_duration_secs": 300,
+            },
+        }));
+        let router = config.router();
+
+        assert_eq!(
+            router.eligible_indices(&config.providers),
+            vec![0, 1],
+            "nothing has failed yet"
+        );
+        router.record_provider_failure(0, "openai");
+        router.record_provider_failure(0, "openai");
+        assert_eq!(
+            router.eligible_indices(&config.providers),
+            vec![1],
+            "the configured threshold was reached and the provider left the pool"
+        );
+    }
+
+    #[test]
+    fn an_outlier_detection_block_produces_a_router_that_actually_ejects() {
+        let config = resilience_config(serde_json::json!({
+            "outlier_detection": {
+                "threshold": 0.5,
+                "window_secs": 60,
+                "min_requests": 2,
+                "ejection_duration_secs": 300,
+            },
+        }));
+        let router = config.router();
+
+        router.record_provider_failure(1, "anthropic");
+        assert_eq!(
+            router.eligible_indices(&config.providers),
+            vec![0, 1],
+            "one sample is under min_requests"
+        );
+        router.record_provider_failure(1, "anthropic");
+        assert_eq!(
+            router.eligible_indices(&config.providers),
+            vec![0],
+            "the failure rate crossed the threshold and the provider was ejected"
+        );
+    }
+
+    #[test]
+    fn a_config_without_a_resilience_block_ejects_nothing() {
+        let config = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "openai", "api_key": "k"},
+                {"name": "anthropic", "api_key": "k"},
+            ],
+        }))
+        .expect("config compiles");
+        let router = config.router();
+
+        for _ in 0..50 {
+            router.record_provider_failure(0, "openai");
+        }
+        assert_eq!(
+            router.eligible_indices(&config.providers),
+            vec![0, 1],
+            "an operator who configured no resilience gets none, however badly a provider behaves"
+        );
+    }
+
+    #[test]
+    fn one_configured_block_does_not_arm_the_other_axis() {
+        // Only outlier detection is configured, and its thresholds are
+        // far looser than the circuit breaker's defaults. If the two
+        // axes shared a constructor, five failures would open a breaker
+        // nobody asked for and the provider would leave anyway.
+        let config = resilience_config(serde_json::json!({
+            "outlier_detection": {
+                "threshold": 1.0,
+                "window_secs": 60,
+                "min_requests": 1000,
+                "ejection_duration_secs": 300,
+            },
+        }));
+        let router = config.router();
+
+        for _ in 0..10 {
+            router.record_provider_failure(0, "openai");
+        }
+        assert_eq!(
+            router.eligible_indices(&config.providers),
+            vec![0, 1],
+            "no circuit_breaker block means no circuit breaker"
+        );
+    }
+
+    #[test]
+    fn an_outlier_threshold_of_zero_does_not_eject_a_provider_that_never_failed() {
+        let config = resilience_config(serde_json::json!({
+            "outlier_detection": {
+                "threshold": 0.0,
+                "min_requests": 0,
+                "ejection_duration_secs": 300,
+            },
+        }));
+        let router = config.router();
+
+        for _ in 0..10 {
+            router.record_provider_success(0, "openai");
+            router.record_provider_success(1, "anthropic");
+        }
+        // A failure is needed to run the evaluation at all, and it has
+        // to be on a provider we are not asserting about.
+        router.record_provider_failure(1, "anthropic");
+        assert!(
+            router.eligible_indices(&config.providers).contains(&0),
+            "a provider with ten successes and no failures must survive a zeroed threshold"
+        );
+    }
+
+    #[test]
+    fn token_rate_is_refused_instead_of_quietly_becoming_least_token_usage() {
+        let error = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "k"}],
+            "routing": "token_rate",
+        }))
+        .expect_err("token_rate has no per-provider limit to score against");
+        let message = error.to_string();
+        assert!(
+            message.contains("least_token_usage"),
+            "the error has to name the strategy that preserves today's behaviour: {message}"
+        );
+    }
+
+    #[test]
+    fn least_token_usage_is_still_accepted() {
+        AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "k"}],
+            "routing": "least_token_usage",
+        }))
+        .expect("the strategy token_rate degenerates into stays available");
+    }
 
     #[test]
     fn usage_sinks_parse_and_build_from_config() {
@@ -2625,8 +2907,8 @@ mod tests {
     #[test]
     fn classify_fine_tuning_surface_uses_underscore_path() {
         // OpenAI uses /v1/fine_tuning (underscore), not /v1/fine-tuning.
-        // The pre-existing parse_endpoint test treated /v1/fine-tuning/jobs
-        // as Unknown; classify_surface accepts the canonical underscore form.
+        // The hyphenated spelling stays Unknown, which is the right
+        // answer: it is not a path OpenAI serves.
         for path in [
             "/v1/fine_tuning/jobs",
             "/v1/fine_tuning/jobs/ftjob_abc",

@@ -85,7 +85,7 @@ sink rather than a human:
 same reload triggered by editing the file on disk records `file_watcher` and
 carries no `actor`. The three `origins_*` arrays are empty and
 `prior_revision` equals `next_revision` because nothing in the file actually
-changed between the two reads. That is the useful shape to recognise: a reload
+changed between the two reads. That is the useful shape to recognize: a reload
 that was applied but was a no-op looks exactly like this, and a reload that
 changed something names the hostnames and moves the revision.
 

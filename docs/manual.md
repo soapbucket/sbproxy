@@ -411,7 +411,7 @@ single object on stdout.
 Generates an Ed25519 key pair, writes `authority-signing.key` owner-only
 (0600) and `authority-keys.json` for distribution, and prints what to
 copy where. Local: it writes two files and contacts nothing, because a
-signing key that travelled over a network to reach its own authority has
+signing key that traveled over a network to reach its own authority has
 been somewhere else.
 
 The default `--key-id` is derived from the new public key
@@ -1028,7 +1028,7 @@ Lock off the per-request feature-flag surface (`x-sb-flags` header and
 and the `extra` map is empty; CEL expressions that branch on
 `features.*` see the same shape as a request with no flags. Use this
 to harden production deployments that do not expect clients to drive
-proxy behaviour.
+proxy behavior.
 
 - **Default:** off; the flag surface is active.
 - **Environment:** `SB_DISABLE_SB_FLAGS` (accepts `1`, `true`, `yes`,
@@ -1055,7 +1055,7 @@ sbproxy --config sb.yml --check
 
 ### Planned, not yet wired
 
-The following flag appears in older release notes but is not honoured
+The following flag appears in older release notes but is not honored
 by the current binary:
 
 - `--config-dir` / `SB_CONFIG_DIR`. Pass an absolute or relative path
@@ -1068,7 +1068,7 @@ by the current binary:
 
 ### CPU detection
 
-SBproxy sizes its Pingora worker pool to `std::thread::available_parallelism()`, which honours cgroup CPU quotas on Linux. In a container with a 2-CPU quota, the proxy spawns workers that match the actual available CPU capacity instead of getting throttled. To override (pin a benchmark to a known worker count, or cap workers below the cgroup quota), set `SB_WORKER_THREADS` to a positive integer:
+SBproxy sizes its Pingora worker pool to `std::thread::available_parallelism()`, which honors cgroup CPU quotas on Linux. In a container with a 2-CPU quota, the proxy spawns workers that match the actual available CPU capacity instead of getting throttled. To override (pin a benchmark to a known worker count, or cap workers below the cgroup quota), set `SB_WORKER_THREADS` to a positive integer:
 
 ```bash
 SB_WORKER_THREADS=4 sbproxy --config sb.yml
@@ -1100,7 +1100,7 @@ plane, pipeline lifecycle hooks) log and degrade instead of blocking.
    (`proxy.key_management`), and the session-ledger sink when enabled.
    These keep accumulated state across reloads.
 6. **Detection singletons**: installs the agent-class resolver, the
-   TLS-fingerprint catalogue, and the agent-detect scorer.
+   TLS-fingerprint catalog, and the agent-detect scorer.
 7. **Pipeline compile**: builds the routing pipeline (origins, actions,
    auth, policies) and loads `listings/*.yaml` from the config file's
    directory. A pipeline compile error is fatal.
@@ -1662,7 +1662,7 @@ Status codes:
 | 400 | YAML parse error. The response sanitises the file path so error envelopes never leak the absolute path on disk. |
 | 401 | Missing or invalid basic auth. |
 | 405 | Wrong HTTP method (only `POST` is accepted). |
-| 409 | Another reload is already in flight. The proxy serialises the file watcher and the admin route on the same single-flight guard. |
+| 409 | Another reload is already in flight. The proxy serializes the file watcher and the admin route on the same single-flight guard. |
 | 500 | Pipeline compile or filesystem read failed. |
 | 503 | Admin server is running without a configured `config_path` (typical for embedded test fixtures). |
 
@@ -2098,7 +2098,7 @@ restart.
 | `SB_APPLY_CONFIG` | (none) | (unset) | Path to the proposed YAML used by `sbproxy apply -p <plan-file>`. Required for the `-p` flow because the plan file does not embed the YAML path. |
 | `SB_APPLY_BASELINE` | (none) | (unset) | Optional baseline override for `sbproxy apply -p`. When set, apply compares the plan's recorded baseline revision against this YAML's revision; otherwise the empty config is the baseline. |
 
-In addition, the standard `RUST_LOG` env var is honoured when neither
+In addition, the standard `RUST_LOG` env var is honored when neither
 `--log-level` nor `SB_LOG_LEVEL` is set.
 
 ### OpenTelemetry configuration

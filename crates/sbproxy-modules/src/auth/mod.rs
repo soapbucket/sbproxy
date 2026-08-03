@@ -172,7 +172,7 @@ pub enum Auth {
     /// WOR-892 PR1 step 2/3 ships the types + helpers; step 3/3
     /// wires the `/oidc/callback` synthetic endpoint + challenge
     /// redirect. Boxed so the `Auth` enum stays the size of the
-    /// smaller variants — the OIDC config has grown a lot of
+    /// smaller variants, the OIDC config has grown a lot of
     /// optional URLs (logout, end-session, userinfo, allowlist) and
     /// inline storage would force every other Auth variant to carry
     /// the same footprint.

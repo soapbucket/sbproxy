@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod bundle;
 pub mod cel;
 pub mod flags;
 pub mod js;

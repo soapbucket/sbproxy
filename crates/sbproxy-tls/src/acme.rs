@@ -710,9 +710,9 @@ impl AcmeClient {
     /// from anywhere). The caller chooses which terminal status to wait
     /// for:
     ///
-    /// * `&["ready", "valid"]` — pre-finalize: accept "ready" (challenges
+    /// * `&["ready", "valid"]`: pre-finalize: accept "ready" (challenges
     ///   validated, awaiting CSR submission) or "valid" (already issued).
-    /// * `&["valid"]` — post-finalize: must be issued.
+    /// * `&["valid"]`: post-finalize: must be issued.
     ///
     /// Uses exponential backoff starting at 1s, doubling up to 30s.
     /// Returns the final `Order` on success, or an error if the order
@@ -885,7 +885,7 @@ impl AcmeClient {
             .await
             .context("poll authorization to valid")?;
 
-        // Accept "valid" too — some servers (incl. Pebble in some
+        // Accept "valid" too, some servers (incl. Pebble in some
         // configurations) finalize automatically once the challenge
         // is satisfied, in which case we skip step 7.
         let order = self

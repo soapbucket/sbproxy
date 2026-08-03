@@ -119,7 +119,7 @@ pub use waf::{
     WafFeedSubscriber, WafFeedTransport, WafPolicy, WafResult,
 };
 
-use sbproxy_plugin::PolicyEnforcer;
+use crate::PluginPolicy;
 
 // --- Policy Enum ---
 
@@ -224,7 +224,7 @@ pub enum Policy {
     /// of how many TCP connections it opens.
     AgentBudget(std::sync::Arc<AgentBudgetPolicy>),
     /// Third-party plugin (only case using dynamic dispatch).
-    Plugin(Box<dyn PolicyEnforcer>),
+    Plugin(PluginPolicy),
 }
 
 impl Policy {
@@ -258,7 +258,7 @@ impl Policy {
             Self::A2A(_) => "a2a",
             Self::SemanticConstraint(_) => "semantic_constraint",
             Self::AgentBudget(_) => "agent_budget",
-            Self::Plugin(p) => p.policy_type(),
+            Self::Plugin(p) => p.enforcer().policy_type(),
         }
     }
 }

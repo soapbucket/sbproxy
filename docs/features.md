@@ -1,6 +1,6 @@
 # SBproxy features manual
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-03*
 
 The capability tour: each section covers what a feature does, a minimal config to turn it on, and a working example against `test.sbproxy.dev`, with a link to the doc that owns the full reference. Installation and runtime operations live in [manual.md](manual.md); the complete field schema lives in [configuration.md](configuration.md).
 
@@ -147,7 +147,7 @@ See [providers.md](providers.md) for the full provider matrix.
 
 ### Routing strategies
 
-The `routing.strategy` field controls how requests are distributed across providers. Sixteen strategies ship, from the simple (`round_robin`, `weighted`, `fallback_chain`, `random`, `sticky`) through load- and cost-driven (`lowest_latency`, `least_connections`, `cost_optimized`, `token_rate`, `least_token_usage`, `prefix_affinity`, `peak_ewma`) to the quality- and outcome-driven set (`race`, `cascade`, `cost_quality`, `outcome_aware`). [ai-gateway.md](ai-gateway.md#routing-strategies) documents each one; `outcome_aware`, which routes on realized cost-per-success, has its own page in [ai-outcome-aware-routing.md](ai-outcome-aware-routing.md).
+The `routing.strategy` field controls how requests are distributed across providers. Fifteen strategies ship, from the simple (`round_robin`, `weighted`, `fallback_chain`, `random`, `sticky`) through load- and cost-driven (`lowest_latency`, `least_connections`, `cost_optimized`, `least_token_usage`, `prefix_affinity`, `peak_ewma`) to the quality- and outcome-driven set (`race`, `cascade`, `cost_quality`, `outcome_aware`). [ai-gateway.md](ai-gateway.md#routing-strategies) documents each one; `outcome_aware`, which routes on realized cost-per-success, has its own page in [ai-outcome-aware-routing.md](ai-outcome-aware-routing.md).
 
 ```yaml
 action:
@@ -272,23 +272,39 @@ action:
 
 `cookie_hash` follows the same pattern with `cookie: <name>`.
 
-### Sticky sessions
+### Session affinity
 
-Set `sticky:` to issue an affinity cookie so subsequent requests from the same client return to the same target:
+The three hash algorithms are how you pin a client to one target. Pick the one whose key your clients already carry:
+
+| You have | Use | Pinned by |
+|---|---|---|
+| A session cookie your app already sets | `cookie_hash` with `cookie: <name>` | Cookie value |
+| A tenant or user id on the request | `header_hash` with `header: <name>` | Header value |
+| Neither, but stable client addresses | `ip_hash` | Client IP |
 
 ```yaml
 action:
   type: load_balancer
-  algorithm: round_robin
-  sticky:
-    cookie_name: _sb_backend     # Defaults to sb_sticky
-    ttl: 3600                    # Optional cookie TTL in seconds
+  algorithm:
+    cookie_hash:
+      cookie: session_id
   targets:
     - url: https://backend-1.test.sbproxy.dev
     - url: https://backend-2.test.sbproxy.dev
 ```
 
-`ip_hash`, `header_hash`, and `cookie_hash` are inherently sticky and do not need a separate `sticky:` block.
+```bash
+for i in $(seq 1 3); do
+  curl -s -H "Host: lb.test.sbproxy.dev" -H "Cookie: session_id=alpha" \
+    http://localhost:8080/echo | grep -o '"path":"[^"]*"'
+done
+```
+
+All three hash over the *eligible* targets, the ones left after the active health check, the outlier detector, and the circuit breaker have each had their say. So a target going unhealthy drops out of the hash and the clients pinned to it move somewhere healthy, rather than staying pinned to something broken.
+
+Requests whose key is missing all hash to the same target, since they all hash the empty string. Pick a key your clients actually send.
+
+There is also a `sticky:` block on this action. It is accepted for compatibility and does nothing: no `Set-Cookie` is ever issued, and traffic distributes exactly as the configured algorithm says. Setting it logs a warning at boot naming the key. Use one of the three algorithms above instead.
 
 ### Targets
 
@@ -301,7 +317,7 @@ Each target is an object with `url` plus optional fields:
 | `backup` | bool | Reserved for fallback only |
 | `group` | string | Tag used by blue-green / canary (`blue`, `green`, `canary`) |
 | `priority` | int | 1 (highest) to 10 (lowest); default 5 |
-| `zone` | string | Availability zone label for locality routing |
+| `zone` | string | Availability zone label. Reported by the admin API; does not affect target selection |
 | `health_check` | object | Health check configuration (Go-compat opaque) |
 
 ### Deployment modes
@@ -1971,7 +1987,7 @@ origins:
           allow: [gh.search_repos, db.query]
 ```
 
-The action speaks JSON-RPC 2.0: `initialize` returns the configured `server_info`, `tools/list` aggregates the federated catalogue, `tools/call` enforces the allowlist guardrail and routes to the upstream that owns the prefix. Tool aggregation, name-collision handling, and the upstream transports (`streamable_http`, `sse`) live in the federation library at `crates/sbproxy-extension/src/mcp/`. See [examples/mcp-federation/](../examples/mcp-federation/) for a runnable config.
+The action speaks JSON-RPC 2.0: `initialize` returns the configured `server_info`, `tools/list` aggregates the federated catalog, `tools/call` enforces the allowlist guardrail and routes to the upstream that owns the prefix. Tool aggregation, name-collision handling, and the upstream transports (`streamable_http`, `sse`) live in the federation library at `crates/sbproxy-extension/src/mcp/`. See [examples/mcp-federation/](../examples/mcp-federation/) for a runnable config.
 
 The action also carries the tool rollout plane: a `rollout:` block under `tool_versioning` publishes several versions of one tool at once, resolves the right one per consumer (call `_meta`, session requirements, principal pins, `search_v1` aliases, default), routes or adapts each version, and sunsets old ones on a date, with per-version call metrics for migration. See [tool-versioning.md](tool-versioning.md) and [examples/mcp-tool-rollout/](../examples/mcp-tool-rollout/).
 
@@ -2000,7 +2016,7 @@ spec:
     docsUrl: "/docs/example-api"
 ```
 
-See [listings.md](listings.md) for the full schema reference, the loader behaviour, the plan-validation rules, and a runnable example at [examples/listing-primitive/](../examples/listing-primitive/).
+See [listings.md](listings.md) for the full schema reference, the loader behavior, the plan-validation rules, and a runnable example at [examples/listing-primitive/](../examples/listing-primitive/).
 
 ---
 
@@ -2171,28 +2187,35 @@ Implement `ActionHandler` and submit a registration entry:
 ```rust,no_run
 use std::future::Future;
 use std::pin::Pin;
-use anyhow::Result;
-use sbproxy_plugin::{ActionHandler, ActionOutcome, PluginKind, PluginRegistration};
+use bytes::Bytes;
+use sbproxy_plugin::{
+    ActionHandler, ActionOutcome, ActionPluginRegistration, PluginResult,
+};
 
 pub struct MyAction;
 
 impl ActionHandler for MyAction {
-    fn handler_type(&self) -> &'static str { "my_action" }
+    fn handler_type(&self) -> &str { "my_action" }
 
     fn handle(
         &self,
-        _req: &mut http::Request<bytes::Bytes>,
+        _req: &mut http::Request<Bytes>,
         _ctx: &mut dyn std::any::Any,
-    ) -> Pin<Box<dyn Future<Output = Result<ActionOutcome>> + Send + '_>> {
-        Box::pin(async { Ok(ActionOutcome::Responded) })
+    ) -> Pin<Box<dyn Future<Output = PluginResult<ActionOutcome>> + Send + '_>> {
+        Box::pin(async {
+            Ok(ActionOutcome::Response {
+                status: 200,
+                headers: vec![("content-type".into(), "text/plain".into())],
+                body: Bytes::from_static(b"hello"),
+            })
+        })
     }
 }
 
 inventory::submit! {
-    PluginRegistration {
-        kind: PluginKind::Action,
+    ActionPluginRegistration {
         name: "my_action",
-        factory: |_cfg| Ok(Box::new(MyAction)),
+        factory: |_config| Ok(Box::new(MyAction)),
     }
 }
 ```
@@ -2274,11 +2297,11 @@ External plugins ship as separate crates that depend on `sbproxy-plugin` and sub
 
 ### CORS security defaults
 
-The CORS middleware enforces the following safety rules. These changes are tracked under OPENSOURCE.md H5 and are a deliberate breaking change versus the pre-1.0 development behaviour.
+The CORS middleware enforces the following safety rules. These changes are tracked under OPENSOURCE.md H5 and are a deliberate breaking change versus the pre-1.0 development behavior.
 
 - **Empty `allowed_origins` is deny-all.** Earlier revisions echoed any `Origin` header back when `allowed_origins` was empty. Combined with `allow_credentials: true` this allowed credentialed cross-origin access from arbitrary callers. The middleware now emits no CORS headers when the list is empty, regardless of `allow_credentials`.
-- **Wildcard plus credentials is refused.** The combination `allowed_origins: ["*"]` with `allow_credentials: true` is rejected at config-load time by `cors::validate_cors_config`, and the runtime path also refuses to emit headers for that combination as a belt-and-suspenders check. Browsers reject this pairing per the Fetch spec; surfacing it as a config error matches that behaviour.
-- **Explicit any-origin opt-in.** Operators who genuinely want to permit any origin must set `allowed_origins: ["*"]` and `allow_credentials: false`. Echo-the-request-origin behaviour is no longer reachable through configuration; the only way to allow a specific origin is to list it.
+- **Wildcard plus credentials is refused.** The combination `allowed_origins: ["*"]` with `allow_credentials: true` is rejected at config-load time by `cors::validate_cors_config`, and the runtime path also refuses to emit headers for that combination as a belt-and-suspenders check. Browsers reject this pairing per the Fetch spec; surfacing it as a config error matches that behavior.
+- **Explicit any-origin opt-in.** Operators who genuinely want to permit any origin must set `allowed_origins: ["*"]` and `allow_credentials: false`. Echo-the-request-origin behavior is no longer reachable through configuration; the only way to allow a specific origin is to list it.
 
 Migration notes for existing configs:
 

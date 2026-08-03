@@ -331,7 +331,7 @@ proxy:
 | `compression_state` | object | unset | Process-owned Local AI summary-state path. See [compression_state](#compression_state). |
 | `response_cache_store` | object | unset | Picks the backing store for the shared response cache and optionally encrypts entries at rest. See [Choosing the backing store](#choosing-the-backing-store). When unset, the store is Redis if `l2_cache_settings` is configured and an in-process map otherwise. |
 | `messenger_settings` | object | | Not supported. Setting it fails config load. See [messenger_settings](#messenger_settings). |
-| `trusted_proxies` | array of CIDR strings | `[]` | Source ranges whose inbound `X-Forwarded-For` / `X-Real-IP` / `Forwarded` headers are honoured. Connections from outside the list have those headers stripped on ingress so they cannot spoof identity. IPv6 CIDRs work. See [Trusted proxies and forwarding headers](#trusted-proxies-and-forwarding-headers). |
+| `trusted_proxies` | array of CIDR strings | `[]` | Source ranges whose inbound `X-Forwarded-For` / `X-Real-IP` / `Forwarded` headers are honored. Connections from outside the list have those headers stripped on ingress so they cannot spoof identity. IPv6 CIDRs work. See [Trusted proxies and forwarding headers](#trusted-proxies-and-forwarding-headers). |
 | `correlation_id` | object | enabled, `X-Request-Id`, echo on | Correlation-ID propagation policy. See [Correlation ID](#correlation-id). |
 | `mtls` | object | unset | mTLS client-certificate verification on the HTTPS listener. See [mTLS client authentication](#mtls-client-authentication). |
 | `ai_providers_file` | string | unset | Override the embedded AI provider catalog at startup. |
@@ -373,7 +373,7 @@ A malformed address is also refused at config load rather than warned past. That
 
 The proxy keeps a small set of pooled `reqwest::Client` instances for its outbound helper requests. Each one used to bake a hardcoded timeout into the binary; operators who wanted a slower forward-auth deadline or a shorter callback budget had to fork the binary. The `http_client_timeouts` block exposes those numbers as config keys.
 
-All fields default to the values the binary used before this block existed, so omitting it leaves behaviour unchanged.
+All fields default to the values the binary used before this block existed, so omitting it leaves behavior unchanged.
 
 ```yaml
 proxy:
@@ -856,7 +856,7 @@ and consumes an event.
 
 SBproxy is a multi-tenant gateway. A tenant scope groups an operator's tenant of record (a customer, a deployment slice, a regulatory boundary) so the same proxy binary can serve isolated configurations. Every origin resolves to exactly one tenant; downstream auth, policy, and vault resolution picks the tenant-scoped config block before falling back to proxy-level defaults.
 
-For single-tenant deployments the synthetic `__default__` tenant is used implicitly; no operator action is required and existing configs see no behaviour change.
+For single-tenant deployments the synthetic `__default__` tenant is used implicitly; no operator action is required and existing configs see no behavior change.
 
 ```yaml
 proxy:
@@ -1212,9 +1212,6 @@ origins:
           weight: 70
         - url: https://backend-2.internal:8080
           weight: 30
-      sticky:
-        cookie_name: sb_sticky
-        ttl: 3600
 ```
 
 | Field | Type | Default | Description |
@@ -1224,7 +1221,7 @@ origins:
 | `strategy` | string | unset | Registered routing strategy name. The compiled strategy runs before `algorithm`; unknown names fail config compilation. See [Routing strategies](routing-strategies.md). |
 | `strategy_config` | object | `{}` | Strategy-specific settings. Must be an object. |
 | `lb_method` | string | unset | Compatibility marker for plugin routing. `plugin` requires `strategy`; `algorithm` remains the fallback. |
-| `sticky` | object | | Sticky-session config: `cookie_name` (default `sb_sticky`), `ttl` seconds. |
+| `sticky` | object | | **config-only.** Parses (`cookie_name`, `ttl`) and does nothing: no affinity cookie is issued and traffic distributes by `algorithm` as if the block were absent. Setting it warns at boot. For session affinity use the `cookie_hash`, `header_hash`, or `ip_hash` algorithm. |
 | `deployment_mode` | object | `{mode: normal}` | Deployment mode. See below. |
 | `outlier_detection` | object | unset | Passive ejection policy. See [Outlier detection](#outlier-detection). |
 
@@ -1255,7 +1252,7 @@ Target fields:
 | `backup` | bool | false | Reserved for fallback. Excluded from normal selection. |
 | `group` | string | | Deployment group label (`blue`, `green`, `canary`). |
 | `priority` | int | 5 | Routing priority (1 = highest, 10 = lowest). Read from `X-Priority` header when not set here. |
-| `zone` | string | | Availability zone or region label for locality-aware routing. |
+| `zone` | string | | Availability zone or region label. An operator-visible tag only: the admin API reports it as `origins[].targets[].zone`, and target selection does not read it. Tagging targets with zones does not keep traffic local to one. |
 | `metadata` | object | `{}` | Strategy-specific JSON signals such as `loaded_adapters` or `gpu_utilization`. Limited to 64 entries per target and 64 bytes per key. |
 | `health_check` | object | | Active health-check probe config. See [Active health checks](#active-health-checks). |
 | `host_override` | string | unset | Override the upstream `Host` for this target. Default is the target URL's hostname. |
@@ -1378,7 +1375,7 @@ origins:
 | `ai_policy` | object | | One sandboxed CEL expression over the AI decision pipeline (`expression`, `on_error`). See [ai-policy-cel.md](ai-policy-cel.md). |
 | `usage_sinks` | list | `[]` | Destinations for completed-call usage records. The `ledger` sink (`path`, optional `signing_seed_hex`) writes a hash-chained, signable record. See [ai-usage-ledger.md](ai-usage-ledger.md). |
 
-Routing strategies: `round_robin`, `weighted`, `fallback_chain`, `random`, `lowest_latency`, `least_connections`, `cost_optimized`, `token_rate`, `least_token_usage`, `prefix_affinity`, `peak_ewma`, `sticky`, `race`, `cascade`, `cost_quality`, `outcome_aware`. See [ai-gateway.md](ai-gateway.md#routing-strategies) for each; `outcome_aware` has its own page in [ai-outcome-aware-routing.md](ai-outcome-aware-routing.md).
+Routing strategies: `round_robin`, `weighted`, `fallback_chain`, `random`, `lowest_latency`, `least_connections`, `cost_optimized`, `least_token_usage`, `prefix_affinity`, `peak_ewma`, `sticky`, `race`, `cascade`, `cost_quality`, `outcome_aware`. See [ai-gateway.md](ai-gateway.md#routing-strategies) for each; `outcome_aware` has its own page in [ai-outcome-aware-routing.md](ai-outcome-aware-routing.md). `token_rate` is refused at config load: it scores headroom against a per-provider token limit that no field declares, which makes it `least_token_usage` under another name. See [ai-gateway.md#token_rate-refused](ai-gateway.md#token_rate-refused).
 
 Peak EWMA accepts the object form:
 
@@ -2752,7 +2749,7 @@ The intake accepts up to 64 KiB per report via `POST /__sbproxy/csp-report` and 
 
 ### dlp
 
-Data Loss Prevention scan over the request URI and headers. Matches against the configured detector catalogue (or every default when `detectors: []`) and either tags the upstream request with `dlp-detection: <names>` (`action: tag`, default) or rejects with `403` (`action: block`).
+Data Loss Prevention scan over the request URI and headers. Matches against the configured detector catalog (or every default when `detectors: []`) and either tags the upstream request with `dlp-detection: <names>` (`action: tag`, default) or rejects with `403` (`action: block`).
 
 ```yaml
 policies:
@@ -2774,9 +2771,9 @@ policies:
 | `action` | string | `tag` | `tag` stamps `<header>: <detector_csv>` on the upstream. `block` returns `403`. |
 | `direction` | string | `request` | `request` is the only path enforced today; `response` and `both` are accepted for forward compatibility. |
 | `header` | string | `dlp-detection` | Header name when `action: tag`. |
-| `rules` | list | `[]` | Custom regex rules layered on top of the catalogue. Same shape as the `pii.rules` block on `ai_proxy` origins. |
+| `rules` | list | `[]` | Custom regex rules layered on top of the catalog. Same shape as the `pii.rules` block on `ai_proxy` origins. |
 
-The scan covers the request URI (path + query) and request headers; auth-class headers (`Authorization`, `Cookie`, `Set-Cookie`) are excluded so tokens carried by design don't self-flag. Body scanning is on the roadmap; the existing `pii:` block on `ai_proxy` origins handles request-body redaction with the same regex catalogue today.
+The scan covers the request URI (path + query) and request headers; auth-class headers (`Authorization`, `Cookie`, `Set-Cookie`) are excluded so tokens carried by design don't self-flag. Body scanning is on the roadmap; the existing `pii:` block on `ai_proxy` origins handles request-body redaction with the same regex catalog today.
 
 ### prompt_injection_v2
 
@@ -2821,7 +2818,7 @@ policies:
 | `a2a.root_action` | string | inherit | `log` or `block`, applied to an agent-to-agent hit at delegation depth 0. Omitted follows `action`, with `tag` resolving to `log`. |
 | `a2a.block_above_delegation_depth` | integer or null | `0` | Delegation depth above which an agent-to-agent hit blocks regardless of `a2a.root_action`. Depth 0 is the chain root, so the default blocks any delegated hop. `null` disables the escalation. |
 
-The generic policy scans the request URI + non-auth headers (`Authorization`, `Cookie`, `Set-Cookie` are excluded so tokens carried by design don't self-flag) at request-filter time. Tag mode stamps the score / label headers via the existing trust-headers channel before `upstream_request_filter` builds the upstream request; block mode rejects with `403` immediately. Set `enable_body_aware: true` after measuring false positives to scan buffered request bodies as well; on a plain origin pair it with `block` or `log`, since a body hit arrives after the upstream request is assembled and cannot tag (`tag` + body-aware is refused at config compile there). A body-borne block honours `block_content_type`. See [prompt-injection-v2.md](prompt-injection-v2.md) for the phase table, auto-selection failure boundaries, the eval harness, and custom detector registration.
+The generic policy scans the request URI + non-auth headers (`Authorization`, `Cookie`, `Set-Cookie` are excluded so tokens carried by design don't self-flag) at request-filter time. Tag mode stamps the score / label headers via the existing trust-headers channel before `upstream_request_filter` builds the upstream request; block mode rejects with `403` immediately. Set `enable_body_aware: true` after measuring false positives to scan buffered request bodies as well; on a plain origin pair it with `block` or `log`, since a body hit arrives after the upstream request is assembled and cannot tag (`tag` + body-aware is refused at config compile there). A body-borne block honors `block_content_type`. See [prompt-injection-v2.md](prompt-injection-v2.md) for the phase table, auto-selection failure boundaries, the eval harness, and custom detector registration.
 
 The `a2a.*` keys apply only when an `a2a` policy is configured on the same origin and the request is detected as A2A 1.0. There is no `tag` in the agent-boundary vocabulary: the scan runs at the request-body phase, after the upstream request header has been built, so there is no header left to stamp. See [prompt-injection-v2.md](prompt-injection-v2.md#the-agent-boundary).
 
@@ -3620,7 +3617,7 @@ admin:
 
 The same reference syntax as every other config secret: a provider URI against a backend declared under `proxy.secrets.backends`, a `file:/path` reference, or a whole-value `${ENV_VAR}`.
 
-Behaviour worth knowing before enabling it:
+Behavior worth knowing before enabling it:
 
 - **No plaintext fallback.** `enabled: true` with no `key`, an unresolvable reference, or material shorter than 16 bytes aborts startup. This is stricter than the rest of prompt persistence, where an unreadable file only degrades to in-memory-only edits. Losing a file loses saved prompts; silently writing records in the clear after asking for encryption is worse.
 - **Turning it on does not orphan an existing file.** Records already written as plaintext keep hydrating, and each one seals the next time it is written.
@@ -3793,7 +3790,7 @@ origins:
 
 ### Inline origin
 
-The `origin:` field carries the same action types as a top-level origin (proxy, static, redirect, mock, echo, beacon, noop, ai_proxy, load_balancer, websocket, grpc). Authentication, policies, and transforms are not applied to the fallback path; only the action runs. If you need richer behaviour from the fallback, point its action at another origin via `proxy` and let the host router apply that origin's full chain.
+The `origin:` field carries the same action types as a top-level origin (proxy, static, redirect, mock, echo, beacon, noop, ai_proxy, load_balancer, websocket, grpc). Authentication, policies, and transforms are not applied to the fallback path; only the action runs. If you need richer behavior from the fallback, point its action at another origin via `proxy` and let the host router apply that origin's full chain.
 
 ---
 
@@ -4283,7 +4280,7 @@ proxy:
     - 2001:db8::/32        # IPv6 supported
 ```
 
-Behaviour:
+Behavior:
 
 - If the immediate TCP peer falls inside any trusted CIDR, the proxy parses the inbound `X-Forwarded-For` chain and uses the leftmost untrusted hop as the real client IP. This becomes `ctx.client_ip` for the rest of the request: rate limits, IP filters, audit logs.
 - If the immediate TCP peer is **not** trusted, every inbound forwarding header is stripped on ingress. A direct client cannot spoof its source identity by setting `X-Forwarded-For: 1.2.3.4`.
@@ -4637,7 +4634,7 @@ on_request:
 
 The signed material is `"<timestamp>.<body>"`. Receivers should:
 
-1. Read `X-Sbproxy-Timestamp` and reject anything older than ~5 minutes (replay defence).
+1. Read `X-Sbproxy-Timestamp` and reject anything older than ~5 minutes (replay defense).
 2. Compute `HMAC-SHA256(secret, timestamp + "." + raw_body)`.
 3. Compare to `X-Sbproxy-Signature` (`v1=<hex>`) using a constant-time comparison.
 
@@ -4939,9 +4936,9 @@ tier, so there is nothing to broadcast.
 
 ## Config source (GitOps)
 
-The top-level `source:` block says where the configuration document comes from. Without it, the file you hand the binary *is* the configuration, which is the historical behaviour and still the default. With it, that file is a pointer and the document it names is what compiles, boots, and serves traffic.
+The top-level `source:` block says where the configuration document comes from. Without it, the file you hand the binary *is* the configuration, which is the historical behavior and still the default. With it, that file is a pointer and the document it names is what compiles, boots, and serves traffic.
 
-Earlier releases parsed this block, published it in the JSON Schema, and then ignored it: a proxy configured with `source: {kind: git}` started clean and quietly served whatever was in the local file. That is fixed. The block is honoured at boot, on every reload, on a refresh timer, and by `sbproxy validate` and `sbproxy plan`. A `source:` block that cannot be resolved now stops the proxy starting instead of being skipped.
+Earlier releases parsed this block, published it in the JSON Schema, and then ignored it: a proxy configured with `source: {kind: git}` started clean and quietly served whatever was in the local file. That is fixed. The block is honored at boot, on every reload, on a refresh timer, and by `sbproxy validate` and `sbproxy plan`. A `source:` block that cannot be resolved now stops the proxy starting instead of being skipped.
 
 ```yaml
 source:
@@ -4992,7 +4989,7 @@ The resolved commit is the change detector. Each cycle re-resolves the source an
 
 The interval carries jitter, so a fleet that restarts together does not hit your git host in lockstep. The apply step never waits for the reload lock: another reload in flight skips the cycle and the next interval retries, rather than queueing up cycles for a commit that has since been superseded.
 
-| Situation | Behaviour |
+| Situation | Behavior |
 |---|---|
 | Remote unreachable, or `git` missing | Keep serving the document already applied. Error log, `unreachable` counter. |
 | Fetch exceeded `timeout_secs` | Child process killed. Keep serving. `timeout`. |
@@ -5361,9 +5358,9 @@ One cycle: conditional `GET`, verify the envelope, merge over the local document
 
 **Boot does no network I/O.** Startup that depends on a remote fetch is startup that hangs when the remote is slow. A node reads its cache and its key file and nothing else, so an empty cache means booting on the local document under `overlay` (with a loud warning) or refusing to start under `replace`. The first poll a few seconds later brings the authority's document in. Seeding `cache_path` with a signed bundle is how a `replace` subscriber comes up the first time.
 
-**Failure behaviour.** Every arm leaves the previously applied configuration serving:
+**Failure behavior.** Every arm leaves the previously applied configuration serving:
 
-| Situation | Behaviour |
+| Situation | Behavior |
 |---|---|
 | Authority unreachable, or any answer other than `200` / `304` | Keep serving the cached bundle. Error log, age gauge climbs. |
 | Signature, schema, digest, expiry, declared-mode, or replay refusal | Reject the candidate. |

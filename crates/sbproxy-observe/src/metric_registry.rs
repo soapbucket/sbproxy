@@ -5,7 +5,7 @@
 //!
 //! This table is the metrics half of the executable capability registry. It
 //! exists because `docs/metrics-stability.md` was hand-maintained, and a
-//! hand-maintained catalogue drifts in exactly one direction: toward claiming
+//! hand-maintained catalog drifts in exactly one direction: toward claiming
 //! more than the code does. Eight metrics were published as `stable` while
 //! nothing incremented them. A Grafana panel drew a flat zero over a
 //! guardrail that had never once been observed. An alert on a queue depth
@@ -49,7 +49,7 @@
 //! was stated in three places and enforced in none before `WOR-2139`:
 //! `docs/observability.md` in prose, `A2AContext::task_id` in a doc comment,
 //! and `PROMPT_INJECTION_REASON` in
-//! `crates/sbproxy-core/src/server/a2a_body_phase.rs`, which honoured it only
+//! `crates/sbproxy-core/src/server/a2a_body_phase.rs`, which honored it only
 //! by never passing one. Prose does not fail a build.
 
 use sbproxy_capability::scan::ReferenceExemption;
@@ -449,7 +449,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &["route", "reason"],
-        description: "A2A hops denied by the a2a policy, labelled by route and reason.",
+        description: "A2A hops denied by the a2a policy, labeled by route and reason.",
         dead_reason: None,
     },
     MetricCapability {
@@ -460,7 +460,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &["route", "spec", "decision"],
-        description: "A2A hops observed by the proxy, labelled by route, spec, and policy decision.",
+        description: "A2A hops observed by the proxy, labeled by route, spec, and policy decision.",
         dead_reason: None,
     },
     MetricCapability {
@@ -471,7 +471,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &["route", "method"],
-        description: "A2A 1.0 JSON-RPC methods observed by the proxy, labelled by route and method.",
+        description: "A2A 1.0 JSON-RPC methods observed by the proxy, labeled by route and method.",
         dead_reason: None,
     },
     MetricCapability {
@@ -515,7 +515,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &["agent_id", "outcome"],
-        description: "agent_budget policy verdicts, labelled by agent and outcome.",
+        description: "agent_budget policy verdicts, labeled by agent and outcome.",
         dead_reason: None,
     },
     MetricCapability {
@@ -1218,7 +1218,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &[],
-        description: "Shadow tasks cancelled after their wall-clock supervisor timeout.",
+        description: "Shadow tasks canceled after their wall-clock supervisor timeout.",
         dead_reason: None,
     },
     MetricCapability {
@@ -1714,25 +1714,20 @@ pub const METRICS: &[MetricCapability] = &[
     },
     // Composed at runtime as `sbproxy_{lane}_channel_dropped_total`, so the
     // declaration scan cannot see it: there is no name literal to find. Only
-    // the `hooks` lane is ever instantiated. It is registered on the proxy
+    // the `hooks` lane is instantiated. It is registered on the proxy
     // registry alone; registering it on both was what emitted a duplicate
     // family and broke `/metrics` under precisely the backpressure that
     // creates it.
     MetricCapability {
         name: "sbproxy_hooks_channel_dropped_total",
         kind: MetricKind::Counter,
-        writer: Writer::Nothing,
-        // Downgraded from Stable with the writer: the registry's own rule
-        // is that nothing unwritten may claim stability, and a counter no
-        // code can increment is not a signal an operator should build on.
-        support: SupportLevel::ConfigOnly,
+        writer: Writer::Recorder("record_channel_drop"),
+        support: SupportLevel::Stable,
         compat: CompatTier::Beta,
         registry: Registry::Proxy,
         labels: &["reason"],
-        description: "Bounded channel sends dropped on the hot path, labelled by drop reason.",
-        dead_reason: Some(
-            "the only bounded hook channel this counted was the stream cache recorder, and              WOR-2099 deleted that hook: semantic caching is now compiled per action into              the semantic-cache registry and reached directly, so there is no channel left              to drop from. The recorder (record_channel_drop) is deliberately kept because              it is lane-generic and the family name is composed at runtime, so the next              bounded hook channel wires this by passing its own lane. Until then the              counter is honestly dead rather than a flat zero claiming to be live. Delete              both if no such channel appears",
-        ),
+        description: "Bounded channel sends dropped on the hot path, labeled by drop reason.",
+        dead_reason: None,
     },
     MetricCapability {
         name: "sbproxy_http_framing_blocks_total",
@@ -1867,6 +1862,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_label_cardinality_budget",
+        kind: MetricKind::Gauge,
+        writer: Writer::Recorder("refresh_cardinality_gauges"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Proxy,
+        labels: &["label"],
+        description: "Cap the accepted unique values for a label name are counted against. Denominator for sbproxy_label_cardinality_unique_values.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_label_cardinality_overflow_per_tenant_total",
         kind: MetricKind::Counter,
         writer: Writer::Field("counter"),
@@ -1886,6 +1892,17 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Proxy,
         labels: &["metric", "label"],
         description: "Number of label values demoted to __other__ because the per-label budget was exhausted.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_label_cardinality_unique_values",
+        kind: MetricKind::Gauge,
+        writer: Writer::Recorder("refresh_cardinality_gauges"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Proxy,
+        labels: &["label"],
+        description: "Unique values a label name has accepted so far. Divided by sbproxy_label_cardinality_budget it gives how close the label is to collapsing new values into __other__, which is a warning the overflow counter can only give after the fact.",
         dead_reason: None,
     },
     MetricCapability {
@@ -2697,7 +2714,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &["verdict", "surface", "policy_id"],
-        description: "Policy decisions emitted on the audit event bus, labelled by verdict, surface, and policy_id.",
+        description: "Policy decisions emitted on the audit event bus, labeled by verdict, surface, and policy_id.",
         dead_reason: None,
     },
     MetricCapability {
@@ -3225,7 +3242,7 @@ pub const TENANT_SCOPED_METRICS: &[&str] = &[
     "sbproxy_judge_budget_exhausted_total",
     "sbproxy_label_cardinality_overflow_per_tenant_total",
     // Every meter family with a tenant dimension. Tenant-relevant is not a
-    // judgement call here: a metering counter exists to say what one
+    // judgment call here: a metering counter exists to say what one
     // customer owes, and one that merged every customer's units into a
     // single series would answer a question nobody asked while sitting
     // under a name that promises otherwise. `sbproxy_meter_chain_seq` and
@@ -3606,7 +3623,7 @@ pub fn run_scoped_label_gaps(
     errors
 }
 
-/// Render the catalogue published as `docs/metrics-stability.md`.
+/// Render the catalog published as `docs/metrics-stability.md`.
 ///
 /// Deterministic and byte-stable: `scripts/check-metrics-stability.sh`
 /// regenerates it and diffs, so the committed file cannot drift from the code.
@@ -3644,7 +3661,7 @@ pub fn render_markdown() -> String {
          `beta` names are functional and may still be renamed or relabeled in a \
          minor release, with a changelog entry.\n\n\
          `alpha` names may be renamed, relabeled, or removed in any release.\n\n\
-         ## Catalogue\n\n",
+         ## Catalog\n\n",
     );
 
     out.push_str("| Metric | Type | Support | Compat | Labels | Description |\n");

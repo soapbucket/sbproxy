@@ -1543,7 +1543,13 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
     // back to every interface.
     config_file.proxy.validate_bind_address()?;
 
+    config_file
+        .extensions
+        .validate()
+        .context("config compile: invalid extension bundle source")?;
+
     Ok(CompiledConfig {
+        extension_bundles: config_file.extensions,
         origins,
         host_map,
         server: config_file.proxy,
@@ -2113,6 +2119,9 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
     for transform in &mut config.transforms {
         interpolate_config_vars(transform, &config.variables);
     }
+    for filter in &mut config.filters {
+        interpolate_config_vars(&mut filter.config, &config.variables);
+    }
     for fwd_rule in &mut config.forward_rules {
         // Forward rules are typed in `RawOriginConfig` but the interpolator
         // walks `serde_json::Value` recursively. Round-trip through JSON so
@@ -2451,6 +2460,7 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
         auth_config: config.authentication,
         policy_configs: config.policies,
         transform_configs: config.transforms,
+        filters: config.filters,
         cors: config.cors,
         hsts: config.hsts,
         compression: config.compression,

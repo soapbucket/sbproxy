@@ -12,8 +12,13 @@
 //! run on the admin / boot path where a brief synchronous file operation is
 //! acceptable.
 
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Weak};
+
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use redb::{Database, ReadableTable, TableDefinition};
 
 use crate::record::{CredentialRecord, KeyRecord};
@@ -23,6 +28,35 @@ const KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("keys");
 const CREDS: TableDefinition<&str, &[u8]> = TableDefinition::new("credentials");
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 const REVISION_KEY: &str = "revision";
+
+/// Stores this process currently holds, keyed by resolved database path.
+///
+/// See [`EmbeddedKeyStore::open_shared`] for why one handle per file per
+/// process is a requirement rather than an optimization.
+static OPEN_STORES: LazyLock<Mutex<HashMap<PathBuf, Weak<EmbeddedKeyStore>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Resolve `path` to the key the registry compares on, so two spellings of
+/// one file (a relative path and its absolute form, a symlinked directory) do
+/// not look like two files and re-open the same database.
+///
+/// The database file may not exist yet on a first open, in which case
+/// `canonicalize` on the file itself fails and the parent directory carries
+/// the resolution. Falling back to the path as written is correct but weaker:
+/// a missed match only costs the "already open" error the caller would have
+/// hit anyway.
+fn registry_key(path: &Path) -> PathBuf {
+    if let Ok(resolved) = path.canonicalize() {
+        return resolved;
+    }
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    match (parent.and_then(|p| p.canonicalize().ok()), path.file_name()) {
+        (Some(dir), Some(name)) => dir.join(name),
+        _ => std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf()),
+    }
+}
 
 /// A redb-backed key store. The database file is created at the given path.
 pub struct EmbeddedKeyStore {
@@ -45,6 +79,40 @@ impl EmbeddedKeyStore {
         }
         write_txn.commit().context("commit init transaction")?;
         Ok(Self { db })
+    }
+
+    /// Open the store at `path`, reusing the handle this process already holds
+    /// for that file when there is one.
+    ///
+    /// redb locks the database file exclusively, so a second [`Self::open`] of
+    /// a path this process is already holding fails with `Database already
+    /// open. Cannot acquire lock.` That is not hypothetical: a config reload
+    /// builds a candidate key plane while the live generation still owns its
+    /// store, so an unconditional re-open makes every reload of a config with
+    /// an embedded keystore fail and leaves the node on the old config. One
+    /// redb handle per file per process is the invariant, and it belongs to
+    /// the type that owns the handle rather than to each caller that might
+    /// open one.
+    ///
+    /// Sharing is safe, and is what the other backends already do: `Database`
+    /// is `Send + Sync` and every mutation runs in its own ACID transaction,
+    /// so two generations pointed at one file are two views of one system of
+    /// record, which is what they are meant to be. The registry holds [`Weak`]
+    /// references, so the file closes once the last generation referencing it
+    /// is dropped and a later open reads it afresh.
+    pub fn open_shared(path: impl AsRef<Path>) -> Result<Arc<Self>> {
+        let path = path.as_ref();
+        let key = registry_key(path);
+        let mut live = OPEN_STORES.lock();
+        if let Some(existing) = live.get(&key).and_then(Weak::upgrade) {
+            return Ok(existing);
+        }
+        let store = Arc::new(Self::open(path)?);
+        // Forget stores nobody holds, so a long-lived process that reloads
+        // through a series of paths does not accumulate dead entries.
+        live.retain(|_, handle| handle.strong_count() > 0);
+        live.insert(key, Arc::downgrade(&store));
+        Ok(store)
     }
 
     /// Bump the revision counter inside an already-open write transaction.
@@ -301,6 +369,53 @@ mod tests {
         assert_eq!(stored.policy_revision, 2);
         assert_eq!(stored.blocked_providers, ["vertex"]);
         assert_eq!(store.revision().await.unwrap(), 2);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A config reload opens the candidate generation's store while the live
+    /// generation still holds its own, and redb locks the file exclusively.
+    /// `open` fails there; `open_shared` hands back the live handle and the
+    /// two generations read one system of record.
+    #[tokio::test]
+    async fn open_shared_reuses_the_handle_this_process_already_holds() {
+        let path = temp_path();
+        let live = EmbeddedKeyStore::open_shared(&path).unwrap();
+
+        assert!(
+            EmbeddedKeyStore::open(&path).is_err(),
+            "redb should refuse a second exclusive open, which is what makes \
+             open_shared necessary rather than merely cheaper"
+        );
+
+        let candidate = EmbeddedKeyStore::open_shared(&path).expect("second open_shared");
+        assert!(
+            Arc::ptr_eq(&live, &candidate),
+            "both generations must share one handle"
+        );
+
+        live.put_key(KeyRecord::new("k1", "hash", now()))
+            .await
+            .unwrap();
+        assert!(candidate.get_key("k1").await.unwrap().is_some());
+
+        // Another spelling of the same file resolves to the same handle.
+        let dotted = Path::new(&path)
+            .parent()
+            .unwrap()
+            .join(".")
+            .join(Path::new(&path).file_name().unwrap());
+        let via_dotted = EmbeddedKeyStore::open_shared(&dotted).expect("dotted open_shared");
+        assert!(Arc::ptr_eq(&live, &via_dotted));
+
+        // Once every generation is gone the file is closed, so a later boot
+        // opens it afresh rather than inheriting a handle nobody holds.
+        drop(candidate);
+        drop(via_dotted);
+        drop(live);
+        let reopened = EmbeddedKeyStore::open_shared(&path).expect("reopen after drop");
+        assert_eq!(reopened.revision().await.unwrap(), 1);
+        drop(reopened);
+
         std::fs::remove_file(&path).ok();
     }
 }

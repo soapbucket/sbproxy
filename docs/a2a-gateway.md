@@ -46,7 +46,7 @@ would otherwise choose for itself. A caller that sets its own
 `X-A2A-Chain-Depth: 1` clears any `max_chain_depth`. One that omits
 `X-A2A-Chain` presents an empty chain, and cycle detection has nothing
 to compare. One that sets its own `X-A2A-Caller-Agent-Id` renames itself
-off `caller_denylist`. Honouring these from an arbitrary client makes
+off `caller_denylist`. Honoring these from an arbitrary client makes
 the policy advisory: it governs well-behaved agents that declare
 themselves honestly and does nothing to the ones you configured it for.
 
@@ -161,7 +161,7 @@ and nothing else. It is the wrong one for an origin where the A2A route
 sits alongside a website.
 
 A note on the shape of the key: the policy block ignores keys it does
-not recognise, so `failure_postures: closed` or `failure-posture:
+not recognize, so `failure_postures: closed` or `failure-posture:
 closed` compiles and does nothing. Misspell the *value* and config
 compile fails naming the policy; misspell the *key* and you get the
 default. Check the metric after a change rather than trusting that the
@@ -279,7 +279,7 @@ origins:
             description: "Find a free table by time + party size"
 ```
 
-The action stores the card verbatim as JSON; the config accepts any card body. The typed `AgentCard` parser in `sbproxy-modules` types only the fields it consumes (`capabilities`, `defaultInputModes`, `defaultOutputModes`, `name`, `description`, `version`, `url`, `skills`). Anything else the operator pastes (the A2A spec's optional `provider`, `authentication`, `supportsAuthenticatedExtendedCard`, etc.) lands on `extensions` and serialises back verbatim, so a card round-trips through the parser without loss.
+The action stores the card verbatim as JSON; the config accepts any card body. The typed `AgentCard` parser in `sbproxy-modules` types only the fields it consumes (`capabilities`, `defaultInputModes`, `defaultOutputModes`, `name`, `description`, `version`, `url`, `skills`). Anything else the operator pastes (the A2A spec's optional `provider`, `authentication`, `supportsAuthenticatedExtendedCard`, etc.) lands on `extensions` and serializes back verbatim, so a card round-trips through the parser without loss.
 
 ## Capability discovery (design)
 
@@ -289,7 +289,7 @@ The design also surfaces `capabilities.streaming` and `capabilities.pushNotifica
 
 ## Modality negotiation (library only)
 
-SBproxy ships pure-function helpers `AgentCard::negotiate_input` and `AgentCard::negotiate_output` that pair the caller's `Content-Type` and `Accept` against the agent's advertised `defaultInputModes` and `defaultOutputModes`. They are library code: nothing on the gateway's request path calls them yet, so the "effect" column below describes the intended wiring, not current behaviour. Each call returns one of four typed outcomes:
+SBproxy ships pure-function helpers `AgentCard::negotiate_input` and `AgentCard::negotiate_output` that pair the caller's `Content-Type` and `Accept` against the agent's advertised `defaultInputModes` and `defaultOutputModes`. They are library code: nothing on the gateway's request path calls them yet, so the "effect" column below describes the intended wiring, not current behavior. Each call returns one of four typed outcomes:
 
 | Outcome | When | Intended effect on the upstream call |
 |---|---|---|
@@ -298,7 +298,7 @@ SBproxy ships pure-function helpers `AgentCard::negotiate_input` and `AgentCard:
 | `AgentUndeclared(mode)` | the agent's mode list is empty (no restriction) | proceed with the caller's preference |
 | `Mismatch { requested, advertised }` | no overlap | gateway would return 406 with both lists in the error body |
 
-The negotiator is case-insensitive on the MIME `type/subtype` head and strips `;`-parameters before comparing, so `application/json; charset=utf-8` matches `application/json`. The output side honours `*/*` by collapsing to the agent's first declared output mode.
+The negotiator is case-insensitive on the MIME `type/subtype` head and strips `;`-parameters before comparing, so `application/json; charset=utf-8` matches `application/json`. The output side honors `*/*` by collapsing to the agent's first declared output mode.
 
 ## See also
 

@@ -740,7 +740,7 @@ cluster substrate. The write path behaves as follows:
   that lever), and the surviving record carries `conflict_detected: true`.
 - A delete replicates a tombstone through the same quorum write path.
   Tombstones fence stale live copies on every replica and are collected only
-  by acknowledgement-aware garbage collection, so a deleted summary does not
+  by acknowledgment-aware garbage collection, so a deleted summary does not
   resurrect after a partition, restart, or rebalance. A writer that has read
   the tombstone re-creates the session at the next version.
 

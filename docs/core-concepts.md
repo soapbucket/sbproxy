@@ -21,7 +21,7 @@ The detailed order and extension points are in [architecture.md](architecture.md
 | Traffic type | What the client sends | What SBproxy routes | Typical result |
 |---|---|---|---|
 | HTTP API | An HTTP method, path, headers, and body | An HTTP request to an upstream service | The upstream HTTP response |
-| MCP | A JSON-RPC method such as `tools/list` or `tools/call` | A tool call to a configured MCP or OpenAPI-backed server | A JSON-RPC tool catalogue or tool result |
+| MCP | A JSON-RPC method such as `tools/list` or `tools/call` | A tool call to a configured MCP or OpenAPI-backed server | A JSON-RPC tool catalog or tool result |
 | AI | An OpenAI- or Anthropic-shaped completion request | A request to a hosted provider or local model | A completion, possibly streamed |
 
 MCP is a protocol for discovering and calling tools. It does not supply model inference. An AI provider generates model output. An HTTP API is the general case: it can be an application backend, a service used by an MCP tool, or an OpenAI-compatible local inference server.

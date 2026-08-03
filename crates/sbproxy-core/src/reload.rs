@@ -175,6 +175,10 @@ pub fn load_pipeline(new_pipeline: CompiledPipeline) {
     // while the pipeline pointer is swapped, then install its matching flag
     // snapshot before CEL readers can resume. Direct/library callers therefore
     // cannot publish flag-bearing config without seeding `flag_enabled`.
+    // Activate generation-owned tasks here as well: construction may still be
+    // rejected by a lifecycle hook, while every successful startup and reload
+    // converges on this publication boundary.
+    new_pipeline.activate_background_tasks();
     sbproxy_extension::flags::replace_global_store_after(next_feature_flags, || {
         pipeline_store().store(Arc::new(new_pipeline));
     });
@@ -555,6 +559,7 @@ mod tests {
         let mut host_map = HashMap::new();
         host_map.insert(CompactString::new(hostname), 0);
         CompiledConfig {
+            extension_bundles: Default::default(),
             origins: vec![sbproxy_config::CompiledOrigin {
                 hostname: CompactString::new(hostname),
                 origin_id: CompactString::new(hostname),
@@ -564,6 +569,7 @@ mod tests {
                 auth_config: None,
                 policy_configs: Vec::new(),
                 transform_configs: Vec::new(),
+                filters: Vec::new(),
                 cors: None,
                 hsts: None,
                 compression: None,

@@ -207,6 +207,38 @@ pub const KNOWN_TRANSFORM_TYPES: &[&str] = &[
     "noop",
 ];
 
+/// Return built-in policy, transform, and action hook names as deterministic,
+/// kind-aware extension reservations.
+///
+/// Dynamic bundle loaders pass this set to
+/// [`crate::extensions::BundleManifest::validate`] before constructing a
+/// candidate registry. Authentication types are absent because dynamic bundles
+/// do not export authentication hooks in this release.
+#[must_use]
+pub fn reserved_builtin_hook_names(
+) -> std::collections::BTreeSet<(crate::extensions::BundleHookKind, String)> {
+    let mut reservations = std::collections::BTreeSet::new();
+    reservations.extend(KNOWN_POLICY_TYPES.iter().map(|type_name| {
+        (
+            crate::extensions::BundleHookKind::Policy,
+            (*type_name).to_owned(),
+        )
+    }));
+    reservations.extend(KNOWN_TRANSFORM_TYPES.iter().map(|type_name| {
+        (
+            crate::extensions::BundleHookKind::Transform,
+            (*type_name).to_owned(),
+        )
+    }));
+    reservations.extend(KNOWN_ACTION_TYPES.iter().map(|type_name| {
+        (
+            crate::extensions::BundleHookKind::Action,
+            (*type_name).to_owned(),
+        )
+    }));
+    reservations
+}
+
 // --- Public entry point --------------------------------------------
 
 /// Validate the proposed [`ConfigFile`] and return the list of

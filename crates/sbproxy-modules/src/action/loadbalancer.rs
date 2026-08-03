@@ -26,6 +26,16 @@ const MAX_TARGET_METADATA_KEY_BYTES: usize = 64;
 const MAX_TARGET_METADATA_SERIALIZED_BYTES: usize = 16 * 1024;
 const MAX_TARGET_METADATA_NESTING_DEPTH: usize = 8;
 
+/// Operator-facing reason attached to an authored `sticky:` block.
+///
+/// Worded like the entries in `sbproxy-config`'s `key_registry`, because
+/// an operator meets both kinds of warning in the same boot log and
+/// should not have to notice they came from different registries.
+const STICKY_CONFIG_ONLY_REASON: &str =
+    "The load balancer issues no affinity cookie and never has; nothing on the response path \
+     writes Set-Cookie. Use the cookie_hash, header_hash, or ip_hash algorithm for session \
+     affinity, each of which hashes over the healthy target slice. Classified under WOR-2246.";
+
 // --- Configuration types ---
 
 /// Deployment mode for the load balancer.
@@ -49,7 +59,7 @@ pub enum DeploymentMode {
     /// (targets with `group = "canary"`); remaining traffic uses primary targets.
     #[serde(rename = "canary")]
     Canary {
-        /// Percentage of requests routed to canary targets (0–100).
+        /// Percentage of requests routed to canary targets (0 to 100).
         weight: u8,
     },
 }
@@ -60,7 +70,11 @@ pub struct LoadBalancerAction {
     pub targets: Vec<Target>,
     /// Routing algorithm used to pick a target per request.
     pub algorithm: Algorithm,
-    /// Optional sticky-session configuration.
+    /// Sticky-session block exactly as authored. Parsed for
+    /// compatibility and reported by
+    /// [`LoadBalancerAction::config_only_keys`]; no selection or
+    /// response path reads it, so no affinity cookie is issued. See
+    /// [`StickyConfig`].
     pub sticky: Option<StickyConfig>,
     /// Deployment mode (normal, blue-green, or canary).
     pub deployment_mode: DeploymentMode,
@@ -245,7 +259,14 @@ pub struct Target {
     /// Read from `X-Priority` header when not set here; defaults to 5.
     #[serde(default = "default_priority")]
     pub priority: u8,
-    /// Availability zone or region label for locality-aware routing (e.g. "us-east-1a").
+    /// Availability zone or region label, e.g. `"us-east-1a"`.
+    ///
+    /// A label, not a routing input (WOR-2246). Its one reader is the
+    /// admin API, which echoes it back as
+    /// `origins[].targets[].zone` so an operator can tell replicas
+    /// apart in the target listing. `select_target_for_request` never
+    /// consults it, so tagging targets with zones does not keep traffic
+    /// local to one.
     #[serde(default)]
     pub zone: Option<String>,
     /// Active health-check configuration for this target. When set,
@@ -339,13 +360,33 @@ pub enum Algorithm {
     },
 }
 
-/// Sticky session configuration.
+/// Sticky-session block, accepted for compatibility and inert (WOR-2246).
+///
+/// This never issued a cookie. Nothing in this crate writes `Set-Cookie`,
+/// so an authored block only produced round-robin traffic that looked
+/// pinned to nobody. It stays parseable because unknown keys inside
+/// `action:` are not rejected, and deleting the struct would turn a
+/// visible warning back into a silent no-op.
+///
+/// The live way to pin a client to a target is one of the hash
+/// algorithms. Each hashes over the eligible target slice, which is
+/// computed after the outlier, active-health, and circuit-breaker
+/// filters have run, so an unhealthy target drops out of the modulus
+/// and the client moves rather than staying pinned to something broken:
+///
+/// * [`Algorithm::CookieHash`] keys on a cookie the client already
+///   holds, which is the closest equivalent to this block.
+/// * [`Algorithm::HeaderHash`] keys on a request header such as a
+///   tenant or user id.
+/// * [`Algorithm::IpHash`] keys on the client address.
 #[derive(Debug, Clone, Deserialize)]
 pub struct StickyConfig {
-    /// Name of the cookie used to pin a client to a target.
+    /// Cookie name that would have pinned a client to a target. Parsed,
+    /// never emitted.
     #[serde(default = "default_cookie_name")]
     pub cookie_name: String,
-    /// Optional cookie TTL in seconds.
+    /// Cookie TTL in seconds that would have bounded the pin. Parsed,
+    /// never emitted.
     #[serde(default)]
     pub ttl: Option<u64>,
 }
@@ -552,7 +593,7 @@ impl LoadBalancerAction {
                 .collect::<Vec<_>>()
         });
 
-        Ok(Self {
+        let action = Self {
             targets: config.targets,
             algorithm: config.algorithm,
             sticky: config.sticky,
@@ -568,7 +609,39 @@ impl LoadBalancerAction {
                 health: (0..num_targets).map(|_| AtomicU8::new(0)).collect(),
                 metadata,
             },
-        })
+        };
+
+        // `sbproxy-config`'s key_registry cannot reach these keys: `action:`
+        // is an untyped `serde_json::Value` in the generated schema, so the
+        // build-time reader guard never walks into a module's own config
+        // (WOR-2245). The action therefore warns for its own inert keys
+        // here, at the same compile step the registry warns at, so an
+        // operator meets one boot log rather than two classes of silence.
+        for (path, reason) in action.config_only_keys() {
+            tracing::warn!(
+                config_key = path,
+                reason,
+                "config-only key is set and does not activate runtime behavior"
+            );
+        }
+
+        Ok(action)
+    }
+
+    /// Keys this action parses for compatibility that reach no runtime
+    /// behavior, each paired with what does not happen.
+    ///
+    /// The boot warning and the regression test both read this list, so a
+    /// key cannot be reclassified in one place and left stale in the
+    /// other. Wiring one of these up means deleting its entry here, which
+    /// fails the test that pins it until the test is rewritten around the
+    /// behavior that now exists.
+    pub fn config_only_keys(&self) -> Vec<(&'static str, &'static str)> {
+        let mut keys = Vec::new();
+        if self.sticky.is_some() {
+            keys.push(("action.sticky", STICKY_CONFIG_ONLY_REASON));
+        }
+        keys
     }
 
     /// Atomically replace one target's bounded strategy metadata snapshot.
@@ -657,6 +730,18 @@ impl LoadBalancerAction {
     /// threshold is met, and feeds the same signal into the shared
     /// outlier detector when one is configured.
     pub fn spawn_health_probes(self: &std::sync::Arc<Self>) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        self.spawn_health_probes_on(&handle);
+    }
+
+    /// Spawn health probes on a caller-owned runtime.
+    ///
+    /// Each loop holds only a weak reference while it sleeps. Replacing a
+    /// pipeline generation therefore lets its probes stop as soon as no
+    /// request still pins that generation.
+    pub fn spawn_health_probes_on(self: &std::sync::Arc<Self>, handle: &tokio::runtime::Handle) {
         for (idx, target) in self.targets.iter().enumerate() {
             let cfg = match &target.health_check {
                 Some(c) => c.clone(),
@@ -673,8 +758,8 @@ impl LoadBalancerAction {
                     continue;
                 }
             };
-            let lb = std::sync::Arc::clone(self);
-            tokio::spawn(async move {
+            let lb = std::sync::Arc::downgrade(self);
+            handle.spawn(async move {
                 run_health_probe_loop(lb, idx, probe_url, cfg).await;
             });
         }
@@ -1108,7 +1193,7 @@ fn build_health_probe_url(target_url: &str, probe_path: &str) -> anyhow::Result<
 /// the LB's outlier detector when one is configured (so a single
 /// shared store records both passive and active failures).
 async fn run_health_probe_loop(
-    lb: std::sync::Arc<LoadBalancerAction>,
+    lb: std::sync::Weak<LoadBalancerAction>,
     target_idx: usize,
     probe_url: String,
     cfg: HealthCheckConfig,
@@ -1130,6 +1215,9 @@ async fn run_health_probe_loop(
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         interval.tick().await;
+        let Some(lb) = lb.upgrade() else {
+            return;
+        };
         let ok = match client.get(&probe_url).send().await {
             Ok(resp) => resp.status().is_success(),
             Err(_) => false,
@@ -1157,37 +1245,14 @@ async fn run_health_probe_loop(
     }
 }
 
-// --- Locality-aware routing ---
-
-/// Configuration for zone/region-aware target selection.
-#[derive(Debug, Clone, Deserialize)]
-pub struct LocalityConfig {
-    /// The availability zone or region label of this proxy instance, e.g. `"us-east-1a"`.
-    pub local_zone: String,
-    /// When `true`, prefer targets in the same zone before falling back to all targets.
-    #[serde(default = "default_prefer_local")]
-    pub prefer_local: bool,
-}
-
-fn default_prefer_local() -> bool {
-    true
-}
-
-/// Return the indices of targets in `local_zone`.
-/// If no targets match, returns all target indices as a fallback.
-pub fn locality_filter(targets: &[Target], local_zone: &str) -> Vec<usize> {
-    let local: Vec<usize> = targets
-        .iter()
-        .enumerate()
-        .filter(|(_, t)| t.zone.as_deref() == Some(local_zone))
-        .map(|(i, _)| i)
-        .collect();
-    if local.is_empty() {
-        (0..targets.len()).collect()
-    } else {
-        local
-    }
-}
+// WOR-2246: `LocalityConfig` and `locality_filter` lived here and were
+// reached only by their own tests. No config key ever deserialized a
+// `LocalityConfig` (there is no `local_zone` leaf in the schema), and
+// `select_target_for_request` never called the filter, so the pair
+// existed solely to make `targets[].zone` look like a routing input.
+// Deleted rather than wired: zone-aware routing is a feature nobody has
+// asked for, and leaving a plausible-looking helper in the module is how
+// the docs came to promise locality routing in the first place.
 
 // --- Session affinity via consistent hashing ---
 
@@ -1657,6 +1722,80 @@ mod tests {
         let sticky = lb.sticky.as_ref().unwrap();
         assert_eq!(sticky.cookie_name, "sb_sticky");
         assert!(sticky.ttl.is_none());
+    }
+
+    // --- sticky: is parsed and inert (WOR-2246) ---
+    //
+    // The two tests above assert only that the block deserializes, which
+    // is what let `docs/features.md` ship a worked example promising an
+    // affinity cookie the module never wrote. These pin the gap itself.
+
+    #[test]
+    fn an_authored_sticky_block_is_reported_config_only() {
+        let lb = make_lb(serde_json::json!({
+            "targets": [{"url": "http://a:8080"}],
+            "sticky": {"cookie_name": "_sb_backend", "ttl": 3600}
+        }));
+
+        let keys = lb.config_only_keys();
+        assert_eq!(
+            keys.iter().map(|(path, _)| *path).collect::<Vec<_>>(),
+            ["action.sticky"],
+            "an authored sticky block must warn at boot, not compile silently"
+        );
+        let reason = keys[0].1;
+        assert!(
+            reason.contains("WOR-"),
+            "a config-only reason must point at the work tracking it: '{reason}'"
+        );
+        assert!(
+            reason.contains("cookie_hash"),
+            "the reason must name the live alternative, not just say no: '{reason}'"
+        );
+    }
+
+    #[test]
+    fn omitting_sticky_stays_quiet() {
+        let lb = make_lb(serde_json::json!({
+            "targets": [{"url": "http://a:8080"}]
+        }));
+        assert!(
+            lb.config_only_keys().is_empty(),
+            "a config that never mentioned sticky must not be warned at"
+        );
+    }
+
+    #[test]
+    fn sticky_does_not_pin_a_client_to_one_target() {
+        // The behavior `docs/features.md:277` claimed: repeated requests
+        // from one client returning to one target. Round robin is the
+        // configured algorithm and sticky does not override it, so the
+        // same client walks both targets.
+        let lb = make_lb(serde_json::json!({
+            "targets": [{"url": "http://a:8080"}, {"url": "http://b:8080"}],
+            "algorithm": "round_robin",
+            "sticky": {"cookie_name": "_sb_backend"}
+        }));
+
+        // The cookie the doc told operators to expect back, offered on
+        // every request. Nothing reads it.
+        let mut headers = http::HeaderMap::new();
+        headers.insert("cookie", http::HeaderValue::from_static("_sb_backend=0"));
+        let visited: std::collections::BTreeSet<usize> = (0..6)
+            .map(|_| {
+                lb.select_target(Some("203.0.113.7"), "/", &headers)
+                    .expect("a two-target pool always selects")
+                    .3
+            })
+            .collect();
+
+        assert_eq!(
+            visited,
+            std::collections::BTreeSet::from([0, 1]),
+            "sticky is inert: one client still round-robins across both targets"
+        );
+        // `cookie_hash_consistent` covers the other half of this: the
+        // algorithm the warning points operators at does pin.
     }
 
     #[test]
@@ -2594,7 +2733,7 @@ mod tests {
             }
         }
         // With weight=20, approximately 20% should go to canary.
-        // Allow some tolerance: 15–25%.
+        // Allow some tolerance: 15 to 25%.
         assert!(
             (15..=25).contains(&canary_count),
             "canary should receive ~20% of traffic, got {}%",
@@ -2688,126 +2827,38 @@ mod tests {
         );
     }
 
-    // --- locality_filter tests ---
+    // WOR-2246: four locality_filter tests stood here. They were the
+    // only callers the helper ever had, which is how a routing input
+    // nothing routed on kept looking covered. The helper is gone; what
+    // is pinned now is that `zone` does not steer selection.
 
     #[test]
-    fn locality_filter_returns_same_zone_indices() {
-        let targets = vec![
-            Target {
-                url: "http://a:80".into(),
-                weight: 1,
-                backup: false,
-                group: None,
-                priority: 5,
-                zone: Some("us-east-1a".into()),
-                health_check: None,
-                host_override: None,
-                metadata: HashMap::new(),
-                forwarding: Default::default(),
-            },
-            Target {
-                url: "http://b:80".into(),
-                weight: 1,
-                backup: false,
-                group: None,
-                priority: 5,
-                zone: Some("us-west-2a".into()),
-                health_check: None,
-                host_override: None,
-                metadata: HashMap::new(),
-                forwarding: Default::default(),
-            },
-            Target {
-                url: "http://c:80".into(),
-                weight: 1,
-                backup: false,
-                group: None,
-                priority: 5,
-                zone: Some("us-east-1a".into()),
-                health_check: None,
-                host_override: None,
-                metadata: HashMap::new(),
-                forwarding: Default::default(),
-            },
-        ];
-        let indices = locality_filter(&targets, "us-east-1a");
-        assert_eq!(indices, vec![0, 2], "should return only same-zone targets");
-    }
+    fn zone_does_not_steer_target_selection() {
+        // Two targets in different zones, no zone-aware anything. Both
+        // must take traffic, because `zone` is a label the admin API
+        // echoes and nothing in the selection path reads it.
+        let lb = make_lb(serde_json::json!({
+            "targets": [
+                {"url": "http://a:8080", "zone": "us-east-1a"},
+                {"url": "http://b:8080", "zone": "us-west-2a"}
+            ],
+            "algorithm": "round_robin"
+        }));
 
-    #[test]
-    fn locality_filter_fallback_when_no_match() {
-        let targets = vec![
-            Target {
-                url: "http://a:80".into(),
-                weight: 1,
-                backup: false,
-                group: None,
-                priority: 5,
-                zone: Some("eu-west-1a".into()),
-                health_check: None,
-                host_override: None,
-                metadata: HashMap::new(),
-                forwarding: Default::default(),
-            },
-            Target {
-                url: "http://b:80".into(),
-                weight: 1,
-                backup: false,
-                group: None,
-                priority: 5,
-                zone: Some("eu-central-1a".into()),
-                health_check: None,
-                host_override: None,
-                metadata: HashMap::new(),
-                forwarding: Default::default(),
-            },
-        ];
-        let indices = locality_filter(&targets, "us-east-1a");
-        // No same-zone targets, should return all.
+        let headers = empty_headers();
+        let visited: std::collections::BTreeSet<usize> = (0..6)
+            .map(|_| {
+                lb.select_target(Some("203.0.113.7"), "/", &headers)
+                    .expect("a two-target pool always selects")
+                    .3
+            })
+            .collect();
+
         assert_eq!(
-            indices,
-            vec![0, 1],
-            "should fall back to all targets when no zone match"
+            visited,
+            std::collections::BTreeSet::from([0, 1]),
+            "zone tags must not keep traffic inside one zone"
         );
-    }
-
-    #[test]
-    fn locality_filter_targets_without_zone_not_matched() {
-        let targets = vec![
-            Target {
-                url: "http://a:80".into(),
-                weight: 1,
-                backup: false,
-                group: None,
-                priority: 5,
-                zone: None,
-                health_check: None,
-                host_override: None,
-                metadata: HashMap::new(),
-                forwarding: Default::default(),
-            },
-            Target {
-                url: "http://b:80".into(),
-                weight: 1,
-                backup: false,
-                group: None,
-                priority: 5,
-                zone: Some("us-east-1a".into()),
-                health_check: None,
-                host_override: None,
-                metadata: HashMap::new(),
-                forwarding: Default::default(),
-            },
-        ];
-        let indices = locality_filter(&targets, "us-east-1a");
-        assert_eq!(indices, vec![1], "target without zone should not match");
-    }
-
-    #[test]
-    fn locality_filter_empty_targets_returns_empty() {
-        let targets: Vec<Target> = vec![];
-        let indices = locality_filter(&targets, "us-east-1a");
-        assert!(indices.is_empty());
     }
 
     // --- ConsistentHash tests ---

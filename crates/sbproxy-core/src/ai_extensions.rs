@@ -1,0 +1,579 @@
+//! Request-local adaptation between the AI hub and extension events.
+
+use sbproxy_ai::format::{ContentPartDelta, FinishReason, HubChunk};
+use sbproxy_ai::guardrails::stream::CompletedToolCall;
+use sbproxy_extension::bundle::{AiExtensionChain, AiExtensionSession};
+use sbproxy_plugin::{
+    AiExtensionDecision, AiExtensionEvent, AiExtensionEventPayload, AiExtensionMessage,
+    AiExtensionRole, AiExtensionStreamChunk, AiExtensionToolCall, ExtensionHookKind,
+    AI_EXTENSION_EVENT_SCHEMA_VERSION,
+};
+
+const MAX_EVENT_TEXT_BYTES: usize = 1024 * 1024;
+const MAX_EVENT_MESSAGES: usize = 256;
+const MAX_EVENT_ID_BYTES: usize = 512;
+
+/// Client-safe refusal returned by an enforcing AI extension.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AiExtensionBlock {
+    pub(crate) status: u16,
+    pub(crate) code: String,
+    pub(crate) message: String,
+}
+
+impl AiExtensionBlock {
+    fn runtime_failure() -> Self {
+        Self {
+            status: 503,
+            code: "ai_extension_failed".to_owned(),
+            message: "An AI extension could not evaluate this event".to_owned(),
+        }
+    }
+
+    fn event_too_large() -> Self {
+        Self {
+            status: 413,
+            code: "ai_extension_event_too_large".to_owned(),
+            message: "The normalized AI event exceeded its safety limit".to_owned(),
+        }
+    }
+}
+
+/// AI hook state pinned to one request and one pipeline generation.
+pub(crate) struct AiRequestExtensions {
+    session: AiExtensionSession,
+    sequence: u64,
+    request_id: Option<String>,
+    model: Option<String>,
+    kinds: AiHookKinds,
+    stats: AiStreamStats,
+    closed: bool,
+}
+
+#[derive(Clone, Copy)]
+struct AiHookKinds {
+    input: bool,
+    output: bool,
+    tool: bool,
+    stream: bool,
+    close: bool,
+    enforcing_input: bool,
+    enforcing_output: bool,
+    enforcing_tool: bool,
+    enforcing_stream: bool,
+}
+
+#[derive(Default)]
+struct AiStreamStats {
+    finish_reason: Option<String>,
+    content_bytes: u64,
+    content_delta_count: u64,
+    tool_call_count: u64,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+}
+
+impl AiRequestExtensions {
+    /// Start request-local state when this generation has AI hooks.
+    pub(crate) fn start(chain: &AiExtensionChain, request_id: &str, model: &str) -> Option<Self> {
+        if chain.is_empty() {
+            return None;
+        }
+        let kind = |kind| chain.has_kind(kind);
+        let enforcing = |kind| chain.has_enforcing(kind);
+        Some(Self {
+            session: chain.start_session(),
+            sequence: 0,
+            request_id: Some(bounded_id(request_id)),
+            model: Some(bounded_id(model)),
+            kinds: AiHookKinds {
+                input: kind(ExtensionHookKind::AiGuardrailInput),
+                output: kind(ExtensionHookKind::AiGuardrailOutput),
+                tool: kind(ExtensionHookKind::AiToolCall),
+                stream: kind(ExtensionHookKind::AiStreamEvent),
+                close: kind(ExtensionHookKind::AiClose),
+                enforcing_input: enforcing(ExtensionHookKind::AiGuardrailInput),
+                enforcing_output: enforcing(ExtensionHookKind::AiGuardrailOutput),
+                enforcing_tool: enforcing(ExtensionHookKind::AiToolCall),
+                enforcing_stream: enforcing(ExtensionHookKind::AiStreamEvent),
+            },
+            stats: AiStreamStats::default(),
+            closed: false,
+        })
+    }
+
+    pub(crate) const fn needs_stream_decode(&self) -> bool {
+        self.kinds.stream || self.kinds.tool || self.kinds.close
+    }
+
+    pub(crate) const fn needs_tool_assembly(&self) -> bool {
+        self.kinds.tool
+    }
+
+    pub(crate) const fn enforces_stream_events(&self) -> bool {
+        self.kinds.enforcing_stream
+    }
+
+    pub(crate) const fn delays_first_downstream_byte(&self) -> bool {
+        self.kinds.enforcing_stream || self.kinds.enforcing_tool
+    }
+
+    pub(crate) const fn holds_tool_frames(&self) -> bool {
+        self.kinds.enforcing_tool
+    }
+
+    pub(crate) async fn guard_input(
+        &mut self,
+        stage: &str,
+        body: &serde_json::Value,
+    ) -> Result<(), AiExtensionBlock> {
+        if !self.kinds.input {
+            return Ok(());
+        }
+        let messages = match canonical_input_messages(body) {
+            Ok(messages) => messages,
+            Err(()) if self.kinds.enforcing_input => {
+                return Err(AiExtensionBlock::event_too_large());
+            }
+            Err(()) => {
+                tracing::warn!("AI observation event exceeded its normalized input limit");
+                return Ok(());
+            }
+        };
+        self.dispatch(AiExtensionEventPayload::GuardrailInput {
+            stage: bounded_id(stage),
+            messages,
+        })
+        .await
+    }
+
+    pub(crate) async fn guard_output(&mut self, body: &[u8]) -> Result<(), AiExtensionBlock> {
+        if !self.kinds.output {
+            return Ok(());
+        }
+        let Some(content) = canonical_output_text(body) else {
+            return Ok(());
+        };
+        if content.len() > MAX_EVENT_TEXT_BYTES {
+            if self.kinds.enforcing_output {
+                return Err(AiExtensionBlock::event_too_large());
+            }
+            tracing::warn!("AI output observation exceeded its normalized event limit");
+            return Ok(());
+        }
+        self.dispatch(AiExtensionEventPayload::GuardrailOutput { content })
+            .await
+    }
+
+    /// Record and enforce normalized hub chunks before their wire frames ship.
+    pub(crate) async fn stream_chunks(
+        &mut self,
+        chunks: &[HubChunk],
+    ) -> Result<(), AiExtensionBlock> {
+        for chunk in chunks {
+            let event = match chunk {
+                HubChunk::MessageStart { model, .. } => {
+                    self.model = Some(bounded_id(model));
+                    Some(AiExtensionStreamChunk::MessageStart)
+                }
+                HubChunk::ContentDelta {
+                    index,
+                    delta: ContentPartDelta::Text(text),
+                } => {
+                    if text.len() > MAX_EVENT_TEXT_BYTES {
+                        if self.kinds.enforcing_stream {
+                            return Err(AiExtensionBlock::event_too_large());
+                        }
+                        tracing::warn!("AI stream observation delta exceeded its event limit");
+                        None
+                    } else {
+                        self.stats.content_bytes = self
+                            .stats
+                            .content_bytes
+                            .saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX));
+                        self.stats.content_delta_count =
+                            self.stats.content_delta_count.saturating_add(1);
+                        Some(AiExtensionStreamChunk::ContentDelta {
+                            index: *index,
+                            text: text.clone(),
+                        })
+                    }
+                }
+                HubChunk::Usage(usage) => {
+                    self.stats.prompt_tokens = Some(usage.prompt_tokens);
+                    self.stats.completion_tokens = Some(usage.completion_tokens);
+                    Some(AiExtensionStreamChunk::Usage {
+                        prompt_tokens: usage.prompt_tokens,
+                        completion_tokens: usage.completion_tokens,
+                        total_tokens: usage.total_tokens,
+                    })
+                }
+                HubChunk::MessageStop { finish_reason } => {
+                    let reason = finish_reason_label(finish_reason);
+                    self.stats.finish_reason = Some(reason.clone());
+                    Some(AiExtensionStreamChunk::MessageStop {
+                        finish_reason: reason,
+                    })
+                }
+                HubChunk::ToolCallDelta { .. } => None,
+            };
+            if self.kinds.stream {
+                if let Some(chunk) = event {
+                    self.dispatch(AiExtensionEventPayload::Stream { chunk })
+                        .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Enforce complete tool calls before held frames are released.
+    pub(crate) async fn tool_calls(
+        &mut self,
+        calls: &[CompletedToolCall],
+    ) -> Result<(), AiExtensionBlock> {
+        self.stats.tool_call_count = self
+            .stats
+            .tool_call_count
+            .saturating_add(u64::try_from(calls.len()).unwrap_or(u64::MAX));
+        if !self.kinds.tool {
+            return Ok(());
+        }
+        for call in calls {
+            if call.args_json.len() > MAX_EVENT_TEXT_BYTES {
+                if self.kinds.enforcing_tool {
+                    return Err(AiExtensionBlock::event_too_large());
+                }
+                tracing::warn!("AI tool-call observation exceeded its event limit");
+                continue;
+            }
+            self.dispatch(AiExtensionEventPayload::ToolCall {
+                call: AiExtensionToolCall {
+                    index: call.index,
+                    id: call.id.as_deref().map(bounded_id),
+                    name: bounded_id(&call.name),
+                    arguments_json: call.args_json.clone(),
+                },
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Emit close metadata once and finish runtime contexts.
+    pub(crate) async fn close(&mut self) -> Result<(), AiExtensionBlock> {
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+        let decision = if self.kinds.close {
+            self.dispatch(AiExtensionEventPayload::Close {
+                finish_reason: self.stats.finish_reason.clone(),
+                content_bytes: self.stats.content_bytes,
+                content_delta_count: self.stats.content_delta_count,
+                tool_call_count: self.stats.tool_call_count,
+                prompt_tokens: self.stats.prompt_tokens,
+                completion_tokens: self.stats.completion_tokens,
+            })
+            .await
+        } else {
+            Ok(())
+        };
+        let finish = self
+            .session
+            .finish()
+            .map_err(|_| AiExtensionBlock::runtime_failure());
+        decision.and(finish)
+    }
+
+    async fn dispatch(&mut self, payload: AiExtensionEventPayload) -> Result<(), AiExtensionBlock> {
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or_else(AiExtensionBlock::runtime_failure)?;
+        let event = AiExtensionEvent {
+            schema_version: AI_EXTENSION_EVENT_SCHEMA_VERSION,
+            sequence: self.sequence,
+            request_id: self.request_id.clone(),
+            model: self.model.clone(),
+            payload,
+        };
+        match self.session.dispatch(&event).await {
+            Ok(AiExtensionDecision::Release | AiExtensionDecision::Flag { .. }) => Ok(()),
+            Ok(AiExtensionDecision::Block {
+                status,
+                code,
+                message,
+            }) => Err(AiExtensionBlock {
+                status,
+                code,
+                message,
+            }),
+            Err(error) => {
+                tracing::warn!(error = %error, "enforcing AI extension hook failed");
+                Err(AiExtensionBlock::runtime_failure())
+            }
+        }
+    }
+}
+
+fn bounded_id(value: &str) -> String {
+    if value.len() <= MAX_EVENT_ID_BYTES {
+        return value.to_owned();
+    }
+    let mut end = MAX_EVENT_ID_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
+}
+
+fn canonical_output_text(body: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(body).ok()?;
+    if serde_json::from_str::<serde_json::Value>(text).is_ok() {
+        sbproxy_ai::guardrails::assistant_response_text(text)
+    } else {
+        Some(text.to_owned())
+    }
+}
+
+fn finish_reason_label(reason: &FinishReason) -> String {
+    match reason {
+        FinishReason::Stop => "stop".to_owned(),
+        FinishReason::Length => "length".to_owned(),
+        FinishReason::ToolCalls => "tool_calls".to_owned(),
+        FinishReason::ContentFilter => "content_filter".to_owned(),
+        FinishReason::Other(reason) => bounded_id(reason),
+    }
+}
+
+fn canonical_input_messages(body: &serde_json::Value) -> Result<Vec<AiExtensionMessage>, ()> {
+    if let Some(messages) = body.get("messages").and_then(serde_json::Value::as_array) {
+        return messages
+            .iter()
+            .map(canonical_message)
+            .take(MAX_EVENT_MESSAGES + 1)
+            .collect::<Result<Vec<_>, _>>()
+            .and_then(limit_messages);
+    }
+    if let Some(input) = body.get("input") {
+        if let Some(text) = input.as_str() {
+            return Ok(vec![user_message(text)?]);
+        }
+        if let Some(messages) = input.as_array() {
+            return messages
+                .iter()
+                .map(canonical_message)
+                .take(MAX_EVENT_MESSAGES + 1)
+                .collect::<Result<Vec<_>, _>>()
+                .and_then(limit_messages);
+        }
+    }
+    for field in ["prompt", "query"] {
+        if let Some(text) = body.get(field).and_then(serde_json::Value::as_str) {
+            return Ok(vec![user_message(text)?]);
+        }
+    }
+    Ok(Vec::new())
+}
+
+fn limit_messages(messages: Vec<AiExtensionMessage>) -> Result<Vec<AiExtensionMessage>, ()> {
+    (messages.len() <= MAX_EVENT_MESSAGES)
+        .then_some(messages)
+        .ok_or(())
+}
+
+fn user_message(content: &str) -> Result<AiExtensionMessage, ()> {
+    Ok(AiExtensionMessage {
+        role: AiExtensionRole::User,
+        content: bounded_text(content)?,
+        name: None,
+        tool_call_id: None,
+    })
+}
+
+fn canonical_message(value: &serde_json::Value) -> Result<AiExtensionMessage, ()> {
+    let role = match value
+        .get("role")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("user")
+    {
+        "system" | "developer" => AiExtensionRole::System,
+        "assistant" => AiExtensionRole::Assistant,
+        "tool" | "function" => AiExtensionRole::Tool,
+        _ => AiExtensionRole::User,
+    };
+    let content = value
+        .get("content")
+        .and_then(content_text)
+        .or_else(|| {
+            value
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_default();
+    Ok(AiExtensionMessage {
+        role,
+        content: bounded_text(&content)?,
+        name: value
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(bounded_id),
+        tool_call_id: value
+            .get("tool_call_id")
+            .and_then(serde_json::Value::as_str)
+            .map(bounded_id),
+    })
+}
+
+fn content_text(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Array(parts) => {
+            let text = parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+                .collect::<Vec<_>>();
+            (!text.is_empty()).then(|| text.join("\n"))
+        }
+        _ => None,
+    }
+}
+
+fn bounded_text(value: &str) -> Result<String, ()> {
+    (value.len() <= MAX_EVENT_TEXT_BYTES)
+        .then(|| value.to_owned())
+        .ok_or(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use sbproxy_ai::format::{ContentPartDelta, FinishReason, HubChunk, HubUsage};
+    use sbproxy_config::ExtensionBundlesConfig;
+    use sbproxy_extension::bundle::{AiExtensionChain, DynamicBundleRegistry};
+    use sbproxy_plugin::{AiExtensionMessage, AiExtensionRole};
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use super::{canonical_input_messages, AiRequestExtensions};
+
+    fn chain(manifest: &str, javascript: &str) -> (TempDir, AiExtensionChain) {
+        let directory = TempDir::new().unwrap();
+        let bundle = directory.path().join("fixture");
+        std::fs::create_dir(&bundle).unwrap();
+        std::fs::write(bundle.join("bundle.yaml"), manifest).unwrap();
+        std::fs::write(bundle.join("entry.js"), javascript).unwrap();
+        let registry = DynamicBundleRegistry::load(
+            &ExtensionBundlesConfig {
+                bundles_dir: Some(directory.path().display().to_string()),
+                sources: Vec::new(),
+            },
+            directory.path(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let chain = AiExtensionChain::from_registry(registry.as_ref()).unwrap();
+        (directory, chain)
+    }
+
+    #[test]
+    fn canonical_input_messages_cover_chat_responses_and_prompt_shapes() {
+        let chat = canonical_input_messages(&json!({
+            "messages": [
+                {"role": "system", "content": "rules"},
+                {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+                {"role": "tool", "content": "result", "name": "lookup", "tool_call_id": "call-1"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            chat,
+            vec![
+                AiExtensionMessage {
+                    role: AiExtensionRole::System,
+                    content: "rules".to_owned(),
+                    name: None,
+                    tool_call_id: None,
+                },
+                AiExtensionMessage {
+                    role: AiExtensionRole::User,
+                    content: "hello".to_owned(),
+                    name: None,
+                    tool_call_id: None,
+                },
+                AiExtensionMessage {
+                    role: AiExtensionRole::Tool,
+                    content: "result".to_owned(),
+                    name: Some("lookup".to_owned()),
+                    tool_call_id: Some("call-1".to_owned()),
+                },
+            ]
+        );
+
+        let responses = canonical_input_messages(&json!({
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "question"}]}]
+        }))
+        .unwrap();
+        assert_eq!(responses[0].content, "question");
+
+        let prompt = canonical_input_messages(&json!({"prompt": "complete this"})).unwrap();
+        assert_eq!(prompt[0].role, AiExtensionRole::User);
+        assert_eq!(prompt[0].content, "complete this");
+    }
+
+    #[tokio::test]
+    async fn enforcing_input_bundle_blocks_before_dispatch() {
+        let (_directory, chain) = chain(
+            "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: input-block\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nhooks:\n  - kind: ai_guardrail_input\n    type: inspect_input\n    export: inspect\n",
+            r#"export function inspect(input) { if (input.event.messages[0].content !== "blocked") throw new Error("wrong input"); return {version:"sbproxy-envelope/v1",decision:"block",status:422,code:"fixture_input",message:"fixture blocked"}; }"#,
+        );
+        let mut request = AiRequestExtensions::start(&chain, "request-1", "model-1").unwrap();
+
+        let block = request
+            .guard_input(
+                "original",
+                &json!({"messages": [{"role": "user", "content": "blocked"}]}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(block.status, 422);
+        assert_eq!(block.code, "fixture_input");
+    }
+
+    #[tokio::test]
+    async fn close_bundle_receives_stream_aggregates() {
+        let (_directory, chain) = chain(
+            "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: close-block\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nhooks:\n  - kind: ai_close\n    type: inspect_close\n    export: inspect\n",
+            r#"export function inspect(input) { const e=input.event; if (e.content_bytes !== 5 || e.content_delta_count !== 1 || e.prompt_tokens !== 3 || e.completion_tokens !== 2 || e.finish_reason !== "stop") throw new Error("wrong aggregate"); return {version:"sbproxy-envelope/v1",decision:"block",status:409,code:"fixture_close",message:"fixture close"}; }"#,
+        );
+        let mut request = AiRequestExtensions::start(&chain, "request-1", "model-1").unwrap();
+        request
+            .stream_chunks(&[
+                HubChunk::MessageStart {
+                    id: "response-1".to_owned(),
+                    model: "model-1".to_owned(),
+                },
+                HubChunk::ContentDelta {
+                    index: 0,
+                    delta: ContentPartDelta::Text("hello".to_owned()),
+                },
+                HubChunk::Usage(HubUsage {
+                    prompt_tokens: 3,
+                    completion_tokens: 2,
+                    total_tokens: 5,
+                }),
+                HubChunk::MessageStop {
+                    finish_reason: FinishReason::Stop,
+                },
+            ])
+            .await
+            .unwrap();
+
+        let block = request.close().await.unwrap_err();
+        assert_eq!(block.status, 409);
+        assert_eq!(block.code, "fixture_close");
+    }
+}

@@ -202,23 +202,20 @@ routing:
   strategy: random
 ```
 
-### token_rate
+### token_rate (refused)
 
-Routes to the provider with the most remaining token-per-minute capacity. Pair with per-provider token limits so the router can score headroom.
+`token_rate` ranks providers by remaining tokens-per-minute headroom against a declared per-provider limit, and no configuration field declares one. With every limit at zero the score reduces to observed usage alone, which is `least_token_usage` under a different name. A config that selects it is now refused at load rather than served as a strategy other than the one it asks for.
 
-```yaml
-routing:
-  strategy: token_rate
-```
+If you have `strategy: token_rate` today, `least_token_usage` is the strategy you have actually been getting; switching to it keeps your routing unchanged. For capacity-aware routing that scores real numbers, `headroom` and `reset_aware` read the rate-limit headers providers return.
 
 ### headroom
 
 Routes to the provider with the lowest request-quota pressure from fresh
 provider rate-limit headers (`1 - remaining/limit`). Ties keep enabled-list
 order. Unknown or stale snapshots are advisory only: they sort after known
-fresh observations and never invent a capacity guarantee. Prefer pairing
-with live header updates on the dispatch path; local `token_rate` counters
-remain a separate strategy.
+fresh observations and never invent a capacity guarantee. It scores what a
+provider reports about itself, which is why it is the capacity-aware
+strategy to reach for.
 
 ```yaml
 routing:
@@ -239,7 +236,7 @@ routing:
 
 ### race
 
-![one request fanned out to every provider, the first 2xx returned and the slow racer cancelled](assets/ai-race-routing.gif)
+![one request fanned out to every provider, the first 2xx returned and the slow racer canceled](assets/ai-race-routing.gif)
 
 Lower tail latency at the cost of duplicate upstream calls ([config](../examples/ai-race-routing/)).
 
@@ -255,10 +252,10 @@ See [examples/ai-race](../examples/ai-race/sb.yml). Billing implications, stream
 ### least_token_usage
 
 Routes to the provider with the lowest absolute observed token throughput in
-the current 60-second window, regardless of any configured limit. Unlike
-`token_rate`, which scores remaining headroom against a declared per-provider
-TPM cap, this scores raw observed throughput, so it suits self-hosted vLLM or
-SGLang pools that do not pre-declare a token cap. Untried providers sort lowest
+the current 60-second window, regardless of any configured limit. It scores
+raw observed throughput rather than headroom against a declared cap, so it
+suits self-hosted vLLM or SGLang pools that do not pre-declare a token cap,
+and it is the strategy `token_rate` collapsed into. Untried providers sort lowest
 and are explored first. The same recent-token state breaks ties for
 `prefix_affinity`.
 
@@ -394,6 +391,8 @@ resilience:
     unhealthy_threshold: 3
     healthy_threshold: 2
 ```
+
+Each signal also recovers on its own terms, and none of them writes to another. A breaker admits a probe once `open_duration_secs` has passed and closes after `success_threshold` probes succeed. An outlier ejection lapses after `ejection_duration_secs`. A probe verdict flips back after `healthy_threshold` consecutive passes, whether or not the provider is receiving traffic. A provider that failed on two signals returns when both have cleared, and no signal can hold it out on another's behalf.
 
 See [examples/ai-resilience](../examples/ai-resilience/sb.yml). Field reference in [configuration.md#resilience-resilience](configuration.md#resilience-resilience).
 
@@ -854,7 +853,7 @@ A block reports the failing JSON path and the schema keyword in the form `Schema
 
 ### Context-poisoning guardrail
 
-![a clean tool result summarised normally, then a tool result carrying an embedded instruction blocked](assets/ai-context-poisoning.gif)
+![a clean tool result summarized normally, then a tool result carrying an embedded instruction blocked](assets/ai-context-poisoning.gif)
 
 The guardrail scans tool and retrieval content, not just the user turn ([config](../examples/ai-context-poisoning/)).
 
@@ -876,7 +875,7 @@ guardrails:
         - cp_conflicting_directive
 ```
 
-The rule catalogue covers four families:
+The rule catalog covers four families:
 
 | Family | Sample rule IDs | Detects |
 |---|---|---|
@@ -913,7 +912,7 @@ guardrails:
       max_tool_calls_per_turn: 4
 ```
 
-`mode: flag` records every violation as a log line + access-log entry but lets the request through; once the operator has tuned the rule lists they flip to `mode: block` so the dispatch loop short-circuits to a 400 on the next violation. Tool calls in any of three shapes are recognised: OpenAI (`tool_calls[*].function.name` + `function.arguments`), Anthropic (`tool_calls[*].name` + `input`), and MCP (`tool_calls[*].tool` or `tool_calls[*].name` + `arguments`). The forbidden-substring scan is case-insensitive against the JSON encoding of whichever argument field is present.
+`mode: flag` records every violation as a log line + access-log entry but lets the request through; once the operator has tuned the rule lists they flip to `mode: block` so the dispatch loop short-circuits to a 400 on the next violation. Tool calls in any of three shapes are recognized: OpenAI (`tool_calls[*].function.name` + `function.arguments`), Anthropic (`tool_calls[*].name` + `input`), and MCP (`tool_calls[*].tool` or `tool_calls[*].name` + `arguments`). The forbidden-substring scan is case-insensitive against the JSON encoding of whichever argument field is present.
 
 See `examples/ai-agent-alignment/` for a runnable configuration that exercises every rule.
 
@@ -1056,7 +1055,7 @@ action:
 | `period` | string | unset | One of `daily`, `weekly`, `monthly`, `total`. Window over which usage accumulates. |
 | `downgrade_to` | string | unset | Model name routed to when this limit fires and `on_exceed` is `downgrade`. |
 
-### Behaviour notes
+### Behavior notes
 
 - A limit fires the first time `usage >= max_tokens` or `usage >= max_cost_usd`. Limits are checked in declaration order and the first match wins.
 - `on_exceed: log` records a warning and a `sbproxy_ai_budget_utilization_ratio` gauge update, then lets the request through.
@@ -1066,7 +1065,7 @@ action:
   available.
 - Setting only `max_tokens` and leaving `max_cost_usd` unset (or vice versa) is supported. A limit with neither field is a no-op.
 - Multiple limits on the same scope with different `period` values (for example daily and monthly) accrue in separate window buckets. Each limit is checked against its own key; the tightest binding that is exceeded fires first in declaration order. There is no separate org/team/project hierarchy tracker: `BudgetScope` is the single enum (`workspace`, `api_key`, `user`, `model`, `origin`, `tag`, `agent`) used by `BudgetLimit`.
-- An `agent`-scoped limit keys on the agent-to-agent caller identity, so per-agent spend is enforced rather than only reported. It names an agent only when the proxy verified that identity: asserted by a peer listed in `proxy.trusted_proxies`, or lifted from the RFC 8693 `act` chain of a signed token. An unverified caller names itself, so honouring the name would let it spend to the cap and then rename itself for a fresh allowance, or burn through the budget of an agent whose name it borrowed. Unverified and unidentified spend therefore pools into one shared bucket that is still capped, which is the same `__unattributed__` fallback a request missing `x-user-id` gets. That fails closed: one noisy unverified caller can exhaust the shared bucket, and no unverified caller can reach a named agent's budget. Reporting keeps the finer grain, since the usage ledger records the claimed id and the trust flag either way. This is a different mechanism from the `agent_budget` policy, which rate-limits requests per fingerprinted agent class; this caps spend per asserted agent identity.
+- An `agent`-scoped limit keys on the agent-to-agent caller identity, so per-agent spend is enforced rather than only reported. It names an agent only when the proxy verified that identity: asserted by a peer listed in `proxy.trusted_proxies`, or lifted from the RFC 8693 `act` chain of a signed token. An unverified caller names itself, so honoring the name would let it spend to the cap and then rename itself for a fresh allowance, or burn through the budget of an agent whose name it borrowed. Unverified and unidentified spend therefore pools into one shared bucket that is still capped, which is the same `__unattributed__` fallback a request missing `x-user-id` gets. That fails closed: one noisy unverified caller can exhaust the shared bucket, and no unverified caller can reach a named agent's budget. Reporting keeps the finer grain, since the usage ledger records the claimed id and the trust flag either way. This is a different mechanism from the `agent_budget` policy, which rate-limits requests per fingerprinted agent class; this caps spend per asserted agent identity.
 - Realtime WebSocket requests run the same hard-limit preflight before the
   upgrade. `block` returns 402 without an upstream WebSocket handshake, `log`
   permits the upgrade, and `downgrade` replaces every inbound `model` query
@@ -1210,7 +1209,7 @@ surface. For near-duplicate prompts, use the semantic cache.
 
 Different words, same meaning, no provider call ([config](../examples/semantic-cache-openai/)).
 
-Serves cached responses to prompts that mean the same thing without a provider call. Implemented in `semantic_cache.rs` as `EmbeddingCache`: on a miss the dispatcher embeds the prompt once via the configured source, and on later requests a cosine-similarity scan over the stored vectors replays the closest response that meets `threshold`. Vectors are L2-normalised at insert time, eviction is LRU with a `max_entries` cap, entries past `ttl_secs` are dropped lazily on lookup, and every entry is scoped to the calling tenant and credential so one caller's cached response is never replayed to another. Embedding failures fail open to an uncached upstream call.
+Serves cached responses to prompts that mean the same thing without a provider call. Implemented in `semantic_cache.rs` as `EmbeddingCache`: on a miss the dispatcher embeds the prompt once via the configured source, and on later requests a cosine-similarity scan over the stored vectors replays the closest response that meets `threshold`. Vectors are L2-normalized at insert time, eviction is LRU with a `max_entries` cap, entries past `ttl_secs` are dropped lazily on lookup, and every entry is scoped to the calling tenant and credential so one caller's cached response is never replayed to another. Embedding failures fail open to an uncached upstream call.
 
 A request bypasses semantic-cache reads and writes when it carries an explicit
 header, governed-key, or CEL compression selector; when its route declares
@@ -1327,7 +1326,7 @@ Signal quality is explicit:
 | `Stale` | Observed before, but aged past freshness or cleared after reset | Advisory only; must not invent hard guarantees |
 | `Unknown` | Never observed for that provider | No invented capacity; throttle stays off |
 
-Recognised response headers (case-insensitive):
+Recognized response headers (case-insensitive):
 
 - `x-ratelimit-remaining-requests`, `x-ratelimit-remaining-tokens`
 - `x-ratelimit-limit-requests`, `x-ratelimit-limit-tokens`
@@ -1434,11 +1433,11 @@ Provider capability is the source of truth for which surfaces a configured provi
 
 ### Response shape contract
 
-"Supported" in the table above means the gateway accepts the surface and routes it. It does NOT mean the gateway normalises the response. Per-surface translation behaviour:
+"Supported" in the table above means the gateway accepts the surface and routes it. It does NOT mean the gateway normalizes the response. Per-surface translation behavior:
 
 | Surface | Response shape |
 |---|---|
-| `chat_completions` | normalised to / from the OpenAI shape on Anthropic and Google (gemini) formats; passthrough on OpenAI-compatible upstreams |
+| `chat_completions` | normalized to / from the OpenAI shape on Anthropic and Google (gemini) formats; passthrough on OpenAI-compatible upstreams |
 | `messages`, `responses` | accepted in their native client shapes and governed through the chat hub. Successful generations return in the shape the client used. Provider error envelopes keep the provider's status and body. A safe Anthropic-to-Anthropic request can use the native bypass described below. |
 | `models` | `GET /v1/models` and `GET /models` are served locally for every AI origin as an OpenAI `{"object": "list", "data": [...]}` logical listing. Other model endpoints use the ordinary GET dispatch path and have no unified response shape. |
 | everything else | passthrough on the providers listed in the table; clients see the upstream's native response shape |
@@ -1757,7 +1756,7 @@ The dispatch pipeline measures streaming responses inline: time to first token,
 output throughput, and average inter-token latency are recorded in
 `sbproxy_ai_ttft_seconds`,
 `sbproxy_ai_output_throughput_tokens_per_second`, and
-`sbproxy_ai_inter_token_latency_seconds`, labelled by provider and model.
+`sbproxy_ai_inter_token_latency_seconds`, labeled by provider and model.
 
 ## Structured output
 
@@ -1771,10 +1770,12 @@ the returned JSON, and there is no `structured_output:` config key.
 Assistants, threads, batches, image generation, audio, and fine-tuning remain
 live passthrough surfaces. `classify_surface(method, path)` in
 `crates/sbproxy-ai/src/handler.rs` labels every request with an `AiSurface`,
-and `parse_endpoint(path)` in `crates/sbproxy-ai/src/api_routes.rs` types the
-endpoint subset used by provider capability checks. The gateway forwards the
-request to an eligible provider; it does not emulate those provider APIs
-locally, and there are no per-surface emulation config blocks.
+and `provider_supports_surface(provider, surface)` in
+`crates/sbproxy-ai/src/api_routes.rs` answers whether that provider exposes it.
+Those two are the whole path: a surface the classifier names is a surface the
+matrix answers for. The gateway forwards the request to an eligible provider;
+it does not emulate those provider APIs locally, and there are no per-surface
+emulation config blocks.
 
 ### `realtime`
 
@@ -1843,7 +1844,7 @@ metadata.
 
 `api_key_id` answers "which credential spent this". It stops answering the
 question you actually have the moment one service runs several agents behind one
-key, which is the normal shape: a planner, a researcher, and a summariser all
+key, which is the normal shape: a planner, a researcher, and a summarizer all
 holding the same credential, and a bill that says only that the credential spent
 $4,000.
 
@@ -1934,7 +1935,7 @@ a span, not a cost dimension you can roll up.
 The part worth insisting on is where the numbers come from. Our token counts and
 USD figures are parsed out of the provider's own response, in
 `crates/sbproxy-ai/src/usage_parser.rs`, at the point the response passes through
-the proxy. They are the provider's numbers, priced against a pinned catalogue
+the proxy. They are the provider's numbers, priced against a pinned catalog
 whose revision is stamped on the span so a re-price can reproduce the original
 math. A tool that only observes the agent protocol never sees the provider
 response. It has to take the agent's word for what it spent, which means an agent

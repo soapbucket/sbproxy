@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 /// Configuration for the [`OutlierDetector`].
 pub struct OutlierDetectorConfig {
-    /// Error rate threshold for ejection (0.0 – 1.0).
+    /// Error rate threshold for ejection (0.0 to 1.0).
     ///
     /// An endpoint is ejected when `failures / (successes + failures) >= threshold`.
     /// Default: 0.5 (50 %).

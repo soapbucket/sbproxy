@@ -164,6 +164,9 @@ notify = "7"
 # Plugin system
 inventory = "0.3"
 
+# Capability-based filesystem traversal
+cap-std = "4.0.2"
+
 # Observability
 # release_max_level_info compile-strips debug!/trace! calls from release
 # builds. Hot paths in server.rs / policy evaluation get their log macros
@@ -224,6 +227,13 @@ mlua = { version = "0.11", features = ["luau", "serialize", "vendored", "error-s
 
 # JavaScript scripting
 rquickjs = { version = "0.11", features = ["bindgen", "classes", "properties", "parallel"] }
+swc_common = "24"
+swc_ecma_ast = "27"
+swc_ecma_codegen = "30"
+swc_ecma_parser = { version = "43", default-features = false, features = ["typescript"] }
+swc_ecma_transforms_base = "47"
+swc_ecma_transforms_typescript = "53"
+swc_ecma_visit = "27"
 
 # WebAssembly scripting (sandboxed module runtime).
 # wasmtime + wasi-common move in lockstep; bump both together. The version
@@ -231,6 +241,7 @@ rquickjs = { version = "0.11", features = ["bindgen", "classes", "properties", "
 # unpatched RUSTSEC entry against wasmtime.
 wasmtime = { version = "46.0.2", default-features = false, features = ["cranelift", "runtime", "parallel-compilation"] }
 wasi-common = "46"
+wasmtime-wasi = { version = "46.0.2", default-features = false, features = ["p1"] }
 
 # HTTP client
 reqwest = { version = "0.12", features = ["json", "stream", "blocking"] }

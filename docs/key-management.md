@@ -342,7 +342,7 @@ to disk, so the fleet needs no external store at all.
 
 The consistency levels are pinned by the backend and are not configurable:
 writes and reads run at quorum, and revocation is written at one
-acknowledgement. The only knobs that apply come from the cluster's existing
+acknowledgment. The only knobs that apply come from the cluster's existing
 `replication` block, which the keystore shares with every other consumer of
 the substrate.
 
@@ -403,7 +403,7 @@ What the backend guarantees, stated exactly:
 | Revocation visible cluster-wide | Eventual: bounded by `anti_entropy_interval_secs` plus `cache.ttl_secs`. Redis is bounded by `cache.ttl_secs` alone, because its pub/sub invalidation pushes to every node. |
 | Revisioned policy CAS | Write-then-verify: the backend reads at quorum, writes, reads back, and reports success only if its exact write won. Never a false success; a false conflict is possible and the caller retries. |
 | Mint from a partitioned minority | No. A minority cannot reach a write quorum, so the mint fails. |
-| Revoke from a partitioned minority | Yes. Revocation is written at one acknowledgement, and anti-entropy carries it across the heal. |
+| Revoke from a partitioned minority | Yes. Revocation is written at one acknowledgment, and anti-entropy carries it across the heal. |
 
 If you need synchronous cluster-wide denial, the mesh backend is the wrong
 tool: use the `redis` backend, whose invalidation channel drops the record

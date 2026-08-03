@@ -102,7 +102,7 @@ impl ProxyBinaryFlavor {
                 "run `cargo build --release -p sbproxy` or set SBPROXY_E2E_BIN"
             }
             Self::NoDefaultFeatures => {
-                "run `CARGO_TARGET_DIR=target/no-default-features cargo build -p sbproxy --no-default-features` or set SBPROXY_E2E_NO_DEFAULT_FEATURES_BIN"
+                "run `CARGO_TARGET_DIR=target/no-default-features cargo build --release -p sbproxy --no-default-features` or set SBPROXY_E2E_NO_DEFAULT_FEATURES_BIN"
             }
             Self::Payments => {
                 "run `CARGO_TARGET_DIR=target/payments cargo build --release -p sbproxy --features payment-x402,payment-mpp,payment-stripe,payment-lightning-cln` or set SBPROXY_E2E_PAYMENTS_BIN"
@@ -152,11 +152,16 @@ fn proxy_binary_path_for(flavor: ProxyBinaryFlavor) -> PathBuf {
         return path;
     }
     let paths = flavor.search_paths();
+    // Fall back to the *preferred* path, not the last one searched. The
+    // caller puts this path in its "binary missing at ..." error beside
+    // `missing_hint`, and every hint builds `--release`, so naming the
+    // debug path told the reader to create one file and then look for a
+    // different one.
     paths
         .iter()
         .find(|path| path.is_file())
         .cloned()
-        .unwrap_or_else(|| paths.last().expect("binary search paths").clone())
+        .unwrap_or_else(|| paths.first().expect("binary search paths").clone())
 }
 
 /// Locate the default-feature `sbproxy` binary built by the workspace.
@@ -418,7 +423,16 @@ impl ProxyHarness {
     /// listing loader's "config-file parent is the Repo root"
     /// contract holds.
     pub fn start_with_workspace(yaml: &str, files: &[(&str, &str)]) -> anyhow::Result<Self> {
-        Self::start_with_workspace_and_optional_shutdown_grace(yaml, files, None, &[])
+        let byte_files: Vec<(&str, &[u8])> = files
+            .iter()
+            .map(|(path, body)| (*path, body.as_bytes()))
+            .collect();
+        Self::start_with_workspace_bytes(yaml, &byte_files)
+    }
+
+    /// Start the proxy against a temp workspace that may contain binary files.
+    pub fn start_with_workspace_bytes(yaml: &str, files: &[(&str, &[u8])]) -> anyhow::Result<Self> {
+        Self::start_with_workspace_bytes_and_optional_shutdown_grace(yaml, files, None, &[])
     }
 
     /// Start the proxy in an isolated config workspace with a test-specific
@@ -461,6 +475,24 @@ impl ProxyHarness {
     fn start_with_workspace_and_optional_shutdown_grace(
         yaml: &str,
         files: &[(&str, &str)],
+        shutdown_grace_ms: Option<u64>,
+        env: &[(&str, &str)],
+    ) -> anyhow::Result<Self> {
+        let byte_files: Vec<(&str, &[u8])> = files
+            .iter()
+            .map(|(path, body)| (*path, body.as_bytes()))
+            .collect();
+        Self::start_with_workspace_bytes_and_optional_shutdown_grace(
+            yaml,
+            &byte_files,
+            shutdown_grace_ms,
+            env,
+        )
+    }
+
+    fn start_with_workspace_bytes_and_optional_shutdown_grace(
+        yaml: &str,
+        files: &[(&str, &[u8])],
         shutdown_grace_ms: Option<u64>,
         env: &[(&str, &str)],
     ) -> anyhow::Result<Self> {
@@ -527,6 +559,56 @@ impl ProxyHarness {
                 .unwrap_or_else(|read_error| format!("<read child stderr: {read_error}>"));
             anyhow::anyhow!("{error:#}\nchild stdout:\n{stdout}\nchild stderr:\n{stderr}")
         })
+    }
+
+    /// Wait for a second port this proxy is expected to bind, and on failure
+    /// report why the child could not get there.
+    ///
+    /// The associated [`Self::wait_for_port`] cannot do this: it takes only a
+    /// port number, so it has no access to the child's captured output. That
+    /// gap has a cost. A payments config whose `recovery_encryption.key`
+    /// resolved to the wrong length exited during payments initialization,
+    /// which happens *after* the HTTP listener binds, so startup readiness
+    /// passed and the only symptom was `wait_for_port(admin_port)` timing out
+    /// on a healthy-looking proxy. The fatal line was sitting in the captured
+    /// stderr the whole time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when nothing answers on `port` within `timeout`,
+    /// carrying whether the child is still running plus its captured output.
+    pub fn wait_for_secondary_port(&self, port: u16, timeout: Duration) -> anyhow::Result<()> {
+        if Self::wait_for_port(port, timeout).is_ok() {
+            return Ok(());
+        }
+        let liveness = match self.child_is_running() {
+            true => "child is still running".to_owned(),
+            false => "child has already exited".to_owned(),
+        };
+        let stdout = self.stdout_contents();
+        let stderr = std::fs::read_to_string(self._stderr.path())
+            .unwrap_or_else(|read_error| format!("<read child stderr: {read_error}>"));
+        anyhow::bail!(
+            "nothing responding to HTTP on 127.0.0.1:{port} within {timeout:?} ({liveness})\n\
+             child stdout:\n{stdout}\nchild stderr:\n{stderr}"
+        )
+    }
+
+    /// Whether the child process has not yet exited.
+    fn child_is_running(&self) -> bool {
+        // `Child::try_wait` needs `&mut self`, and the callers that want this
+        // hold `&self`, so ask the OS directly with signal 0.
+        // SAFETY: `kill` with signal 0 performs a permission and existence
+        // check and delivers nothing.
+        #[cfg(unix)]
+        {
+            let pid = self.child.id() as i32;
+            unsafe { libc::kill(pid, 0) == 0 }
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
     }
 
     /// Build (or return) the lazy-initialised blocking HTTP client.

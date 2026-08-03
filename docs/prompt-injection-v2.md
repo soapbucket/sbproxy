@@ -15,7 +15,7 @@ The v1 `prompt_injection` guardrail is a substring match that returns
 a boolean block. That works as a first cut but does not give operators
 a way to tune sensitivity, observe near-miss prompts, or upgrade the
 detector to a probabilistic model. The v2 policy preserves the v1
-behaviour as the default detector while exposing a richer interface:
+behavior as the default detector while exposing a richer interface:
 
 - Score in `[0.0, 1.0]` plus a label (`Clean`, `Suspicious`,
   `Injection`).
@@ -162,7 +162,7 @@ totalling 71 injection prompts and 93 clean prompts:
 - `golden_injection_owasp.txt`: 38 further injection prompts
   paraphrased from the OWASP LLM01 taxonomy.
 - `golden_clean.txt`: 35 known-clean prompts (typical user queries).
-- `golden_clean_v2.txt`: 58 additional known-clean prompts modelled on
+- `golden_clean_v2.txt`: 58 additional known-clean prompts modeled on
   public conversation corpora (ShareGPT, WildChat, HH-RLHF): code
   questions, factual Q and A, debugging, brainstorming, creative
   writing.
@@ -460,7 +460,7 @@ each at `threshold: 0.5`. Start it:
 make run CONFIG=examples/prompt-injection-v2/sb.yml
 ```
 
-Send a payload the heuristic recognises:
+Send a payload the heuristic recognizes:
 
 ```bash
 curl -sS -i -H 'Host: block.local' -H 'Content-Type: application/json' \
@@ -477,7 +477,7 @@ content-length: 37
 ```
 
 The body is the configured `block_body` and the content type is the
-configured `block_content_type`. A body-borne block honours it the same way
+configured `block_content_type`. A body-borne block honors it the same way
 the `ai_proxy` and A2A dispatch paths always have. Two settings on that
 origin make this exchange work: `block_content_type: application/json`
 shapes the response, and `enable_body_aware: true` is what makes the body

@@ -1,0 +1,10 @@
+apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: fixture-action
+version: 1.0.0
+runtime: javascript
+entry: entry.js
+hooks:
+  - kind: action
+    type: fixture_action
+    export: run

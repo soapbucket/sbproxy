@@ -100,6 +100,9 @@ proxy:
       pepper: governed-key-policy-e2e-pepper
       master_key: governed-key-policy-e2e-master
     failure_mode_allow: false
+    inbound:
+      native_key_policy:
+        allowed_providers: [openai]
     oidc_claim_map:
       claim_field: key_ref
 access_log:
@@ -204,6 +207,7 @@ origins:
           api_key: sk-openai
           base_url: "{openai_base}"
           allow_private_base_url: true
+          accept_native_credentials_for: openai
           default_model: gpt-client
           models: [gpt-client]
   "{STRICT_B_HOST}":
@@ -217,6 +221,7 @@ origins:
           api_key: sk-openai
           base_url: "{openai_base}"
           allow_private_base_url: true
+          accept_native_credentials_for: openai
           default_model: gpt-client
           models: [gpt-client]
   "{COMPAT_HOST}":
@@ -242,6 +247,7 @@ origins:
           api_key: sk-openai
           base_url: "{openai_base}"
           allow_private_base_url: true
+          accept_native_credentials_for: openai
           default_model: gpt-client
           models: [gpt-client]
     authentication:
@@ -1402,10 +1408,17 @@ fn governed_key_requirement_is_origin_scoped_and_tenant_safe() {
         401,
         "a strict origin must deny a missing credential",
     );
+    // The config admits native OpenAI credentials, proxy-wide and on this
+    // origin's provider, so this key clears native admission and arrives as a
+    // recognized caller-owned credential. It is still refused, because a
+    // caller's own provider key is not a *governed* key and this origin
+    // requires one. Without the two opt-ins above the request would be refused
+    // one gate earlier with a 403, which would pass a weaker assertion for the
+    // wrong reason.
     assert_status(
         &chat(&world, STRICT_A_HOST, Some("sk-bogus-secretsecret"), &body),
         401,
-        "a strict origin must deny an unknown dynamic credential",
+        "a strict origin must deny an admitted native credential: it is not governed",
     );
     assert_eq!(
         total_captures(&world),

@@ -29,7 +29,7 @@ Content-Type: application/json
 
 `initialize` negotiates the protocol version (see below) and returns
 the server identity plus a capability advertisement. `tools/list`
-returns the aggregated tool catalogue across every federated upstream.
+returns the aggregated tool catalog across every federated upstream.
 `tools/call` routes by tool name to the owning upstream.
 `resources/list` and `resources/read` pass the federated resource
 surface through (the OpenAI Apps SDK / SEP-1865 UI-template path).
@@ -129,9 +129,9 @@ every federated server down.
 
 One tool, not two. The config federates two servers: `gh`, an OpenAPI-backed
 server pointed at the mock, and `db`, pointed at `postgres.example.com`, a
-reserved placeholder that does not resolve. The catalogue degrades per server
+reserved placeholder that does not resolve. The catalog degrades per server
 rather than failing as a whole, so `db` is dropped with a log line and `gh`
-still answers. A federated catalogue that silently shrinks is the failure mode
+still answers. A federated catalog that silently shrinks is the failure mode
 to watch for here: check `tools/list` against the servers you configured, not
 against what your client happens to need.
 
@@ -183,13 +183,13 @@ success.
 | `rbac_policies` | map<string, ToolAccessPolicy> | `{}` | Named tool-access labels referenced by `federated_servers[].rbac`. |
 | `federated_servers` | list | required, non-empty | Upstream MCP servers to aggregate. |
 | `guardrails` | list | `[]` | Gateway-level safety checks. |
-| `progressive_discovery` | bool | `false` | Advertise `search` / `execute` meta-tools instead of the full catalogue (see [`examples/mcp-progressive-discovery`](../examples/mcp-progressive-discovery)). |
+| `progressive_discovery` | bool | `false` | Advertise `search` / `execute` meta-tools instead of the full catalog (see [`examples/mcp-progressive-discovery`](../examples/mcp-progressive-discovery)). |
 | `oauth` | object | unset | RFC 9728 auth discovery (see the OAuth section below and [`examples/mcp-oauth-discovery`](../examples/mcp-oauth-discovery)). |
 | `sessions` | object | unset | Streamable HTTP session management: `{enabled, ttl}` (see [`examples/mcp-sessions`](../examples/mcp-sessions)). |
 | `egress` | object | unset | Default OpenAPI REST egress policy. See [mcp-archestra-guardrails.md](mcp-archestra-guardrails.md). |
 | `token_compaction` | object | unset | Opt-in compaction for large MCP text result blocks. |
 | `dual_llm_quarantine` | object | unset | Opt-in dual-LLM judge quarantine for untrusted MCP text result blocks (`enabled`, `endpoint`, optional `model` / `timeout`). Fail closed; reason-code only. |
-| `refresh_interval` | duration | `60s` | How often the background task re-fetches upstream catalogues. Inbound requests always serve the cached snapshot; this is the only steady-state fan-out. |
+| `refresh_interval` | duration | `60s` | How often the background task re-fetches upstream catalogs. Inbound requests always serve the cached snapshot; this is the only steady-state fan-out. |
 | `upstream_connect_timeout` | duration | `5s` | TCP connect deadline per upstream exchange. |
 | `upstream_timeout` | duration | `30s` | Whole-request deadline per upstream exchange (refreshes, calls, reads). Per-server `timeout:` can only shorten it for `tools/call`. |
 | `max_upstream_response_bytes` | integer | `8388608` | Cap on upstream response bytes buffered per exchange. |
@@ -201,7 +201,7 @@ success.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `origin` | string | required | For an `mcp` server, a bare hostname (normalised to `https://<host>/mcp`) or a full URL. For an `openapi` server, the REST base URL. |
+| `origin` | string | required | For an `mcp` server, a bare hostname (normalized to `https://<host>/mcp`) or a full URL. For an `openapi` server, the REST base URL. |
 | `type` | string | `mcp` | `mcp` speaks MCP to the origin; `openapi` derives tools from a spec and dispatches `tools/call` as REST (see the OpenAPI section below). |
 | `spec` / `spec_path` | object / string | unset | Inline OpenAPI spec or a path to one, for a `type: openapi` server. Read at config load; a bad spec fails startup. |
 | `prefix` | string | derived from host | Namespace prefix applied to every tool from this upstream. Tools become `<prefix>.<tool>`. |
@@ -235,9 +235,9 @@ denies every call. No guardrails means open access. Source:
 
 Set `progressive_discovery: true` and `tools/list` advertises exactly
 two meta-tools, `search` and `execute`, instead of the full federated
-catalogue. The agent calls `search` with a `query` to find relevant
+catalog. The agent calls `search` with a `query` to find relevant
 tools, then `execute` with a tool `name` and `arguments` to invoke
-one. This keeps a large catalogue out of the model's context window.
+one. This keeps a large catalog out of the model's context window.
 See [`examples/mcp-progressive-discovery`](../examples/mcp-progressive-discovery).
 
 ## OAuth auth discovery (RFC 9728)
@@ -288,7 +288,7 @@ With `sessions.enabled`, the gateway issues an `Mcp-Session-Id` on
 ends a session on `DELETE`. A GET with `Accept: text/event-stream`
 opens the server-to-client stream that delivers
 `notifications/tools/list_changed` and
-`notifications/resources/list_changed` when the federated catalogue
+`notifications/resources/list_changed` when the federated catalog
 changes, which is what the `listChanged` capability advertises. Off by
 default: the gateway is otherwise stateless. See
 [`examples/mcp-sessions`](../examples/mcp-sessions).
@@ -374,7 +374,7 @@ upstream can tell an untraced call from a malformed one. See
 
 ### What does not carry it
 
-Catalogue refreshes do not. The `tools/list`, `resources/list`, and
+Catalog refreshes do not. The `tools/list`, `resources/list`, and
 `initialize` calls the federation makes on its own refresh schedule
 are gateway housekeeping, not work done for a caller. Attributing a
 background refresh to whichever request happened to be in flight when
@@ -386,7 +386,7 @@ result would be wrong rather than absent.
 The gateway is built on `crates/sbproxy-extension/src/mcp/`. The
 `mcp` action is a thin wrapper that translates YAML into calls into
 that library. Each submodule below is operator-visible either
-through a YAML knob or a runtime behaviour worth knowing about.
+through a YAML knob or a runtime behavior worth knowing about.
 
 ### JSON-RPC dispatcher
 
@@ -413,17 +413,17 @@ Defines `JsonRpcRequest`, `JsonRpcResponse`, `JsonRpcError`, the
 standard error codes (`-32600` through `-32700`), and the MCP `Tool`
 shape. Source: `crates/sbproxy-extension/src/mcp/types.rs`.
 
-### `federation`: aggregate upstream catalogues
+### `federation`: aggregate upstream catalogs
 
 Fetches `tools/list` from every entry under `federated_servers` and
 merges the results into one registry. Tool-name collisions are
 resolved by prefixing the later entry with its server name. The
-catalogue is stored in an `ArcSwap` so refreshes do not block
+catalog is stored in an `ArcSwap` so refreshes do not block
 in-flight `tools/call` traffic. Source:
 `crates/sbproxy-extension/src/mcp/federation.rs:McpFederation`.
 
 Refresh failures on one upstream are logged at `error` level and the
-remaining upstreams still contribute to the merged catalogue.
+remaining upstreams still contribute to the merged catalog.
 
 ### `streamable`: Streamable HTTP transport
 
@@ -451,7 +451,7 @@ inbound `Principal` (tenant, virtual key, team, project, role, sub),
 walks an ordered `tool_access[]` rule list, and either allows or
 denies the named tool. The policy is **default-deny**: an unknown
 caller (no matching rule) is denied; an empty `allowed: []` is
-"deny all". Operators who want the legacy open-by-default behaviour
+"deny all". Operators who want the legacy open-by-default behavior
 add `default_allow: true` to the policy.
 
 The legacy `key_permissions: { key: [tools] }` shape is gone.
@@ -490,7 +490,7 @@ rbac_policies:
         allowed: [search, list_projects]
 ```
 
-#### Legacy open behaviour
+#### Legacy open behavior
 
 ```yaml
 rbac_policies:
@@ -500,9 +500,9 @@ rbac_policies:
 
 #### `tools/list` RBAC filter
 
-`tools/list` now returns only the subset of the federated catalogue
+`tools/list` now returns only the subset of the federated catalog
 the inbound principal can call. The legacy schema returned the full
-catalogue even when the matching `tools/call` would be denied,
+catalog even when the matching `tools/call` would be denied,
 leaking tool names to callers that could not invoke them.
 
 #### Per-tool quotas
@@ -550,7 +550,7 @@ When a subscriber is attached to the `mcp_audit` tracing target, each
 arguments, the SEP-1865 `params.audit.cause` when present, the upstream
 status, and the duration. The event is gated on that subscriber, so a
 deployment that attaches none pays nothing; there is no separate YAML
-knob. The per-call spend and behavioural
+knob. The per-call spend and behavioral
 record live in the session ledger below, not this event. Source:
 `emit_mcp_prompt_audit` in
 `crates/sbproxy-core/src/server/action_dispatch.rs`.

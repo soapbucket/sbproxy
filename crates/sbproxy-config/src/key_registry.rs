@@ -50,22 +50,7 @@ const fn unsupported(path: &'static str, note: &'static str) -> ConfigKeyCapabil
 const OUTBOUND_CREDENTIAL_CONSUMER: &str =
     "sbproxy_core::pipeline::parse_outbound_credential_config";
 
-const AI_BREAKER_NOTE: &str =
-    "The AI router is built without per-provider circuit breakers. `Router::with_resilience` is \
-     the only path that would install them and nothing calls it, so the breaker gate never \
-     fires. Setting `resilience` at all does still widen cross-provider retries, which is why \
-     this is easy to miss in production. Tracked by WOR-2233.";
-
-const AI_OUTLIER_NOTE: &str =
-    "The AI router is built without an outlier detector, for the same reason its circuit \
-     breakers are missing, so no provider is ever ejected on failure rate. Use \
-     `resilience.health_check`, which is live, to drop an unhealthy provider. Tracked by \
-     WOR-2233.";
-
-const LB_STICKY_NOTE: &str =
-    "The load balancer never issues an affinity cookie and never reads one back, so this block \
-     pins no client to any target. Use the `ip_hash`, `header_hash`, or `cookie_hash` \
-     algorithms, which are inherently sticky. Tracked by WOR-2246.";
+const AI_RESILIENCE_CONSUMER: &str = "sbproxy_ai::handler::AiHandlerConfig::router";
 
 const LB_ZONE_NOTE: &str =
     "Target selection is not locality aware. The `locality_filter` that would read this label \
@@ -115,36 +100,44 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
     // has no leaf to pin: the key is `routing`, the key is read, and it is
     // one accepted *value* of it that does nothing. No reader-based check
     // can see that shape.
-    config_only(
+    // These were pinned config-only on this branch, from a main where the AI
+    // router was built without breakers or a detector because the only
+    // installing path had no callers. Both are armed now: the handler calls
+    // `with_circuit_breakers` and `with_outlier_detection` when the config
+    // asks for them, so pinning them would report working features as inert.
+    stable(
         "origins.*.action.resilience.circuit_breaker.failure_threshold",
-        AI_BREAKER_NOTE,
+        AI_RESILIENCE_CONSUMER,
     ),
-    config_only(
+    stable(
         "origins.*.action.resilience.circuit_breaker.open_duration_secs",
-        AI_BREAKER_NOTE,
+        AI_RESILIENCE_CONSUMER,
     ),
-    config_only(
+    stable(
         "origins.*.action.resilience.circuit_breaker.success_threshold",
-        AI_BREAKER_NOTE,
+        AI_RESILIENCE_CONSUMER,
     ),
-    config_only(
+    stable(
         "origins.*.action.resilience.outlier_detection.ejection_duration_secs",
-        AI_OUTLIER_NOTE,
+        AI_RESILIENCE_CONSUMER,
     ),
-    config_only(
+    stable(
         "origins.*.action.resilience.outlier_detection.min_requests",
-        AI_OUTLIER_NOTE,
+        AI_RESILIENCE_CONSUMER,
     ),
-    config_only(
+    stable(
         "origins.*.action.resilience.outlier_detection.threshold",
-        AI_OUTLIER_NOTE,
+        AI_RESILIENCE_CONSUMER,
     ),
-    config_only(
+    stable(
         "origins.*.action.resilience.outlier_detection.window_secs",
-        AI_OUTLIER_NOTE,
+        AI_RESILIENCE_CONSUMER,
     ),
-    config_only("origins.*.action.sticky.cookie_name", LB_STICKY_NOTE),
-    config_only("origins.*.action.sticky.ttl", LB_STICKY_NOTE),
+    // `origins.*.action.sticky.*` is deliberately absent. The load balancer
+    // warns for it itself through `LoadBalancerAction::config_only_keys`,
+    // using this registry's own message shape, so an entry here would be a
+    // second competing classification of one field and two boot warnings for
+    // it.
     config_only("origins.*.action.targets[].zone", LB_ZONE_NOTE),
     config_only(
         "origins.*.agent_skills[].max_clock_skew_secs",

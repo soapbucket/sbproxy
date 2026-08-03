@@ -42,7 +42,7 @@ The pipeline ignores unknown backend types with a warning.
 
 ### Admission filter
 
-| Field | Default | Behaviour |
+| Field | Default | Behavior |
 |-------|---------|-----------|
 | `sample_rate` | `0.1` | Fraction of hot-cache writes mirrored into the reserve. Use a low rate when the reserve is on a paid object store. |
 | `min_ttl` | `3600` | Skip entries whose TTL is below this (seconds). Items that won't outlive a typical hot eviction window aren't worth carrying. |
@@ -215,7 +215,7 @@ The reserve emits four Prometheus counters via the standard `sbproxy_*` registry
 | `sbproxy_cache_reserve_writes_total` | Entries written into the reserve. |
 | `sbproxy_cache_reserve_evictions_total` | Explicit reserve deletions (invalidate-on-mutation). |
 
-Each counter is labelled by `origin`. Watch the hits / (hits + misses) ratio to size the reserve appropriately and the writes counter to confirm the admission filter is actually limiting reserve I/O.
+Each counter is labeled by `origin`. Watch the hits / (hits + misses) ratio to size the reserve appropriately and the writes counter to confirm the admission filter is actually limiting reserve I/O.
 
 ## When the reserve helps
 
@@ -227,7 +227,7 @@ Each counter is labelled by `origin`. Watch the hits / (hits + misses) ratio to 
 
 - A failed reserve `put` is logged at `warn` level and does not fail the request. The hot tier already accepted the entry.
 - A failed reserve `get` falls through to origin. The hot tier's value, when present, is returned before the reserve is consulted, so primary hits are unaffected by reserve outages.
-- A failed reserve construction (e.g. invalid Redis URL) is logged at warn and degrades to "no reserve" rather than failing the whole config load. Plain hot-cache behaviour resumes.
+- A failed reserve construction (e.g. invalid Redis URL) is logged at warn and degrades to "no reserve" rather than failing the whole config load. Plain hot-cache behavior resumes.
 
 ## Tuning
 

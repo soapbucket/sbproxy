@@ -28,6 +28,7 @@ pub mod config_authority;
 pub mod config_bundle;
 pub mod config_merge;
 pub mod duration;
+pub mod extensions;
 pub mod key_registry;
 pub mod listing;
 pub mod litellm;
@@ -61,6 +62,7 @@ pub use config_merge::{
     changed_leaf_paths, denied_paths_in, merge_config, BaseOrigin, MergeError, MergeMode,
     MergeOutcome, Provenance, ProvenanceMap, AUTHORITY_DENIED_PATHS,
 };
+pub use extensions::*;
 pub use listing::{
     is_well_placed_skill_url, load_listing_file, load_listings_from_repo, validate_listings,
     Listing, ListingAccessPlan, ListingAuth, ListingFreeTier, ListingLifecycle, ListingLoadError,
@@ -88,12 +90,12 @@ pub use schema::{config_json_schema, CONFIG_SCHEMA_FILE};
 pub use snapshot::*;
 pub use source::{
     credential_references, is_full_commit_sha, load_from_source, load_source_blocking,
-    parse_source_head, redact_repo, refresh_interval, resolve_document, scrub_credentials, Cloner,
-    ConfigSourceError, FetchContext, FetchRequest, GitBinaryCloner, ResolvedDocument,
-    ResolvedRevision, MAX_RECURSION_DEPTH,
+    materialize_git_tree, parse_source_head, redact_repo, refresh_interval, resolve_document,
+    scrub_credentials, Cloner, ConfigSourceError, FetchContext, FetchRequest, GitBinaryCloner,
+    GitTreeRequest, MaterializedGitTree, ResolvedDocument, ResolvedRevision, MAX_RECURSION_DEPTH,
 };
 pub use types::*;
 pub use validate::{
-    validate, PlanFinding, Severity, ValidationOptions, KNOWN_ACTION_TYPES, KNOWN_AUTH_TYPES,
-    KNOWN_POLICY_TYPES, KNOWN_TRANSFORM_TYPES,
+    reserved_builtin_hook_names, validate, PlanFinding, Severity, ValidationOptions,
+    KNOWN_ACTION_TYPES, KNOWN_AUTH_TYPES, KNOWN_POLICY_TYPES, KNOWN_TRANSFORM_TYPES,
 };

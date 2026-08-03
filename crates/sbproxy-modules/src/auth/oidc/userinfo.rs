@@ -14,12 +14,12 @@
 //! (same pattern as `discovery::DiscoveryCache::get_or_fetch`); this
 //! module stays off the `reqwest` graph.
 //!
-//! 1. [`UserInfoClaims`] — typed subset of the userinfo JSON.
-//! 2. [`parse_userinfo`] — JSON → claims with operator-friendly
+//! 1. [`UserInfoClaims`]: typed subset of the userinfo JSON.
+//! 2. [`parse_userinfo`]: JSON → claims with operator-friendly
 //!    error wrapping.
-//! 3. [`build_userinfo_authorization_header`] — assembles the
+//! 3. [`build_userinfo_authorization_header`]: assembles the
 //!    `Authorization: Bearer …` value the caller sends to the OP.
-//! 4. [`trust_headers_from_claims`] — maps validated claims into a
+//! 4. [`trust_headers_from_claims`]: maps validated claims into a
 //!    `Vec<(name, value)>` ready to be set on the upstream request.
 //!
 //! ### Header naming

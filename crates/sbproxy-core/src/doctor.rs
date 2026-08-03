@@ -376,6 +376,9 @@ pub struct DoctorReport {
     pub host: HostInfo,
     /// Capability features compiled into the binary.
     pub features: BuildFeatures,
+    /// Extension bundles visible to this binary and optional inspected config.
+    /// Doctor never presents this stopped-process view as a running generation.
+    pub extensions: sbproxy_plugin::ExtensionInventorySnapshot,
     /// GPUs (or the CPU / unified-memory budget) the admission path sees.
     pub gpus: Vec<GpuDescriptor>,
     /// GPU drivers / runtimes present.
@@ -443,6 +446,7 @@ impl DoctorReport {
 
     fn build(deep: bool) -> Self {
         let features = BuildFeatures::current();
+        let extensions = crate::extension_inventory::doctor_inventory(None, Path::new("."), None);
         let gpus = crate::server::model_host::make_probe().probe();
 
         let host = HostInfo {
@@ -532,6 +536,7 @@ impl DoctorReport {
         Self {
             host,
             features,
+            extensions,
             gpus,
             drivers,
             nvidia_smi,
@@ -551,6 +556,42 @@ impl DoctorReport {
             serve_demand: ServeDemand::default(),
             local_serving,
         }
+    }
+
+    /// Load extension bundles for a safe diagnostic when candidate construction fails.
+    ///
+    /// This loader-level fallback cannot prove pipeline attachment, so
+    /// successful hooks remain `not_evaluated`. Prefer
+    /// [`Self::with_extension_candidate`] after a validation pipeline compiles.
+    /// This diagnostic does not alter the existing doctor exit-code rules.
+    pub fn with_extension_config(
+        mut self,
+        config: &sbproxy_config::ExtensionBundlesConfig,
+        base_dir: &Path,
+        config_revision: Option<&str>,
+    ) -> Self {
+        self.extensions =
+            crate::extension_inventory::doctor_inventory(Some(config), base_dir, config_revision);
+        self
+    }
+
+    /// Use the attachment inventory owned by a successfully compiled candidate.
+    ///
+    /// Candidate `active` means the stopped candidate selected and wired the
+    /// hook. It makes no claim about live traffic, runtime health, or a
+    /// published generation.
+    #[must_use]
+    pub fn with_extension_candidate(
+        mut self,
+        candidate: &crate::pipeline::CompiledPipeline,
+    ) -> Self {
+        debug_assert_eq!(
+            candidate.extension_inventory.scope.mode,
+            sbproxy_plugin::ExtensionScopeMode::Doctor,
+            "doctor must consume a validation candidate inventory"
+        );
+        self.extensions = candidate.extension_inventory.clone();
+        self
     }
 
     /// Evaluate a `serve:` block against this host: engine resolution
@@ -1173,6 +1214,67 @@ impl DoctorReport {
             None => out.push_str("  not present on this host\n"),
         }
 
+        out.push_str("\nextensions\n");
+        out.push_str(&format!(
+            "  {} snapshot, schema {}",
+            extension_wire_label(&self.extensions.scope.mode),
+            self.extensions.schema_version
+        ));
+        if let Some(revision) = &self.extensions.scope.config_revision {
+            out.push_str(&format!(", config revision {revision}"));
+        }
+        out.push('\n');
+        out.push_str(&format!(
+            "  {} bundle(s), {} hook(s), {} active, {} available, {} failed, {} collision(s)\n",
+            self.extensions.summary.bundles,
+            self.extensions.summary.hooks,
+            self.extensions.summary.active,
+            self.extensions.summary.available,
+            self.extensions.summary.failed,
+            self.extensions.summary.collisions,
+        ));
+        out.push_str(
+            "  lifecycle: installed, available, active, failed, shadowed, unconsumed, not_evaluated\n",
+        );
+        if self.extensions.bundles.is_empty() {
+            out.push_str("  no extension bundles found\n");
+        }
+        for bundle in &self.extensions.bundles {
+            out.push_str(&format!(
+                "  [{}] {} {} ({}, {})\n",
+                extension_wire_label(&bundle.state),
+                bundle.name,
+                bundle.version,
+                extension_wire_label(&bundle.runtime),
+                extension_wire_label(&bundle.source),
+            ));
+            out.push_str(&format!(
+                "    load: {}/{}",
+                bundle.load.phase, bundle.load.status
+            ));
+            if let Some(detail) = &bundle.load.detail {
+                out.push_str(&format!(" ({detail})"));
+            }
+            out.push('\n');
+        }
+        for hook in &self.extensions.hooks {
+            out.push_str(&format!(
+                "    [{}] {}: {} ({})\n",
+                extension_wire_label(&hook.state),
+                extension_wire_label(&hook.kind),
+                hook.match_key,
+                hook.id,
+            ));
+        }
+        for collision in &self.extensions.collisions {
+            out.push_str(&format!(
+                "  collision {}: {} [{}]\n",
+                collision.match_key,
+                collision.resolution,
+                collision.registrations.join(", "),
+            ));
+        }
+
         if !self.serve_entries.is_empty() {
             out.push_str("\nconfigured models\n");
             for e in &self.serve_entries {
@@ -1199,6 +1301,13 @@ impl DoctorReport {
         }
         out
     }
+}
+
+fn extension_wire_label(value: &impl Serialize) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 /// The subset of the environment the acquisition-option logic reads.
@@ -1873,6 +1982,139 @@ mod tests {
             assert!(json.get(key).is_some(), "missing key {key}");
         }
         let _ = report.render_text();
+    }
+
+    #[test]
+    fn doctor_extensions_json_includes_the_versioned_stopped_snapshot() {
+        let report = DoctorReport::collect();
+        let json = serde_json::to_value(&report).expect("report serializes");
+        let extensions = json
+            .get("extensions")
+            .expect("doctor JSON should include extensions");
+
+        assert_eq!(
+            extensions["schema_version"],
+            sbproxy_plugin::EXTENSION_INVENTORY_SCHEMA_VERSION
+        );
+        assert_eq!(extensions["scope"]["mode"], "doctor");
+        assert_eq!(extensions["summary"]["active"], 0);
+    }
+
+    #[test]
+    fn doctor_extensions_use_the_compiled_candidate_attachment_inventory() {
+        let directory = tempfile::TempDir::new().expect("temporary extension directory");
+        let bundle = directory.path().join("bundles").join("doctor-fixture");
+        std::fs::create_dir_all(&bundle).expect("create bundle directory");
+        std::fs::write(
+            bundle.join("entry.js"),
+            "export function enforce() { return { version: 'sbproxy-envelope/v1', decision: 'allow' }; }",
+        )
+        .expect("write bundle artifact");
+        std::fs::write(
+            bundle.join("bundle.yaml"),
+            r#"apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: doctor-fixture
+version: 1.0.0
+runtime: javascript
+entry: entry.js
+hooks:
+  - kind: policy
+    type: doctor_fixture
+    export: enforce
+"#,
+        )
+        .expect("write bundle manifest");
+        let config = sbproxy_config::compile_config(
+            r#"proxy: {}
+extensions:
+  bundles_dir: bundles
+origins:
+  doctor.test:
+    action:
+      type: static
+      body: ok
+    policies:
+      - type: doctor_fixture
+"#,
+        )
+        .expect("compile doctor candidate config");
+        let candidate = crate::pipeline::CompiledPipeline::from_config_for_validation_at(
+            config,
+            directory.path(),
+        )
+        .expect("construct stopped doctor candidate");
+
+        let before = DoctorReport::collect();
+        let exit_code = before.exit_code();
+        let report = before.with_extension_candidate(&candidate);
+
+        assert_eq!(report.exit_code(), exit_code);
+        let bundle = report
+            .extensions
+            .bundles
+            .iter()
+            .find(|bundle| bundle.id == "doctor-fixture")
+            .expect("configured bundle must be reported");
+        let hook = report
+            .extensions
+            .hooks
+            .iter()
+            .find(|hook| hook.match_key == "doctor_fixture")
+            .expect("configured hook must be reported");
+        assert_eq!(
+            report.extensions.scope.mode,
+            sbproxy_plugin::ExtensionScopeMode::Doctor
+        );
+        assert_eq!(bundle.state, sbproxy_plugin::ExtensionState::Active);
+        assert_eq!(hook.state, sbproxy_plugin::ExtensionState::Active);
+        assert_eq!(report.extensions.summary.active, 1);
+        assert_eq!(
+            report.extensions.scope.config_revision.as_deref(),
+            Some(candidate.config_revision.as_str())
+        );
+        assert_eq!(bundle.load.status, "validated");
+    }
+
+    #[test]
+    fn doctor_extensions_reports_bounded_candidate_failure_without_changing_exit_code() {
+        let directory = tempfile::TempDir::new().expect("temporary extension directory");
+        let bundle = directory.path().join("bundles").join("broken");
+        std::fs::create_dir_all(&bundle).expect("create bundle directory");
+        std::fs::write(bundle.join("bundle.yaml"), "not: a bundle").expect("write broken manifest");
+        let config = sbproxy_config::ExtensionBundlesConfig {
+            bundles_dir: Some("bundles".to_owned()),
+            sources: Vec::new(),
+        };
+        let before = DoctorReport::collect();
+        let exit_code = before.exit_code();
+
+        let report = before.with_extension_config(&config, directory.path(), None);
+
+        assert_eq!(report.exit_code(), exit_code);
+        assert_eq!(report.extensions.summary.failed, 1);
+        assert_eq!(report.extensions.bundles[0].id, "unattributed");
+        assert_eq!(
+            report.extensions.bundles[0].state,
+            sbproxy_plugin::ExtensionState::Failed
+        );
+        let detail = report.extensions.bundles[0]
+            .load
+            .detail
+            .as_deref()
+            .expect("failure should carry safe detail");
+        assert!(detail.len() <= 512);
+        assert!(!detail.contains(directory.path().to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn doctor_extensions_text_names_the_scope_and_lifecycle_state() {
+        let report = DoctorReport::collect();
+        let text = report.render_text();
+
+        assert!(text.contains("\nextensions\n"), "{text}");
+        assert!(text.contains("doctor snapshot"), "{text}");
+        assert!(text.contains("not_evaluated"), "{text}");
     }
 
     /// Look one named check up out of a strict run, so a test asserts on

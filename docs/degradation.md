@@ -163,7 +163,7 @@ All four signals come from one config ([config](../examples/resilience-stack/)).
 
 **When down:** the provider returns a 5xx, times out, or signals rate-limit. Streaming responses that fail mid-stream are not retried (no proxy can replay a partial SSE stream cleanly).
 
-**Fallback:** the routing strategy (`fallback_chain`, `cost_optimized`, `weighted`, ...) picks the next provider. Per-provider rate limits and budgets are honoured across the fallback chain. If every configured provider fails, the request returns 502.
+**Fallback:** the routing strategy (`fallback_chain`, `cost_optimized`, `weighted`, ...) picks the next provider. Per-provider rate limits and budgets are honored across the fallback chain. If every configured provider fails, the request returns 502.
 
 **Log level:** `INFO` per failover, `WARN` once a request walks past two providers, `ERROR` on chain exhaustion.
 

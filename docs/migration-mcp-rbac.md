@@ -25,7 +25,7 @@ tool when the policy table was absent, when the per-server `rbac:`
 label was omitted, or when an empty allowlist was misread as
 "unrestricted". Each of those failure modes appeared in real configs
 during the v1.0 audit. The fix is to make the safe shape the default
-and force operators who need the legacy behaviour to opt in.
+and force operators who need the legacy behavior to opt in.
 
 ## What changed at a glance
 
@@ -34,7 +34,7 @@ and force operators who need the legacy behaviour to opt in.
 | Policy schema | `key_permissions: { key: [tools] }` | `tool_access[]` with `principals[]` + `allowed[]` |
 | Default for an unknown caller | Allow | Deny |
 | Empty `allowed: []` | Allow all | Deny all |
-| `tools/list` | Returned full catalogue | Filtered by per-server RBAC against inbound principal |
+| `tools/list` | Returned full catalog | Filtered by per-server RBAC against inbound principal |
 | Per-tool quotas | Not supported | `tool_quotas[]` sliding-window, keyed on `(tenant_id, principal_id, tool_name)` |
 | Identity carrier | Resolved auth subject only | `Principal` (tenant, virtual key, team, project, role, sub) |
 
@@ -73,7 +73,7 @@ origins:
           rbac: legacy_open
 ```
 
-The `default_allow: true` flag preserves the legacy behaviour for
+The `default_allow: true` flag preserves the legacy behavior for
 the upstream that binds to the `legacy_open` label. New upstreams
 inherit the deny-by-default until you bind them to a policy with
 their own `allowed[]` list.

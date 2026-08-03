@@ -3,7 +3,7 @@
 
 //! RFC 9449 inbound DPoP proof verification (WOR-1070).
 //!
-//! A DPoP-bound access token carries a `cnf.jkt` claim — the JWK
+//! A DPoP-bound access token carries a `cnf.jkt` claim, the JWK
 //! thumbprint of the public key the legitimate client controls. On
 //! every request, the client presents a fresh DPoP proof (a JWS
 //! signed by the matching private key) in the `DPoP:` header. The

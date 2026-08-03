@@ -28,8 +28,10 @@ use crate::routing::Router;
 /// carries a `resilience.health_check` block, and return how many were
 /// started.
 ///
-/// Must be called from inside a Tokio runtime; the proxy calls it once
-/// per `ai_proxy` action after the pipeline finishes compiling.
+/// Spawns on the ambient Tokio runtime and returns 0 when there is
+/// none. The proxy reaches this through the pipeline's publication
+/// boundary, which owns a runtime and calls
+/// [`spawn_provider_health_probes_on`] directly.
 ///
 /// The count is returned rather than discarded so a test can assert
 /// that a config asking for probes actually gets them. The defect this
@@ -37,6 +39,24 @@ use crate::routing::Router;
 /// spawn count is the cheapest assertion that fails if the wiring is
 /// ever cut again.
 pub fn spawn_provider_health_probes(config: &AiHandlerConfig) -> usize {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return 0;
+    };
+    spawn_provider_health_probes_on(config, &handle)
+}
+
+/// Spawn the same per-provider probes on a caller-owned runtime.
+///
+/// A pipeline generation is compiled before Pingora creates its service
+/// runtimes, and a candidate generation may be rejected before it ever
+/// serves traffic, so the publication boundary starts probes on a
+/// process-lifetime runtime rather than whichever short-lived runtime
+/// happened to compile the pipeline. Reaching for the ambient runtime
+/// here would panic on that path instead.
+pub fn spawn_provider_health_probes_on(
+    config: &AiHandlerConfig,
+    handle: &tokio::runtime::Handle,
+) -> usize {
     let Some(cfg) = config
         .resilience
         .as_ref()
@@ -75,7 +95,7 @@ pub fn spawn_provider_health_probes(config: &AiHandlerConfig) -> usize {
         let router = Arc::downgrade(&router);
         let cfg = cfg.clone();
         let provider_name = provider.name.to_string();
-        tokio::spawn(async move {
+        handle.spawn(async move {
             run_probe_loop(router, provider_idx, provider_name, probe_url, auth, cfg).await;
         });
         spawned += 1;

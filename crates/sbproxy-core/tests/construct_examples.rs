@@ -224,7 +224,11 @@ fn every_oss_example_constructs_its_pipeline() {
             .and_then(Path::file_name)
             .is_some_and(|name| name == "ai-rag-local");
         let expect_missing_rag_feature = is_rag_example && !cfg!(feature = "rag");
-        match sbproxy_core::pipeline::CompiledPipeline::from_config_for_validation(compiled) {
+        match sbproxy_core::pipeline::CompiledPipeline::from_config_for_validation_at(
+            compiled,
+            file.parent()
+                .expect("an example config should have a parent directory"),
+        ) {
             Ok(_) => {
                 if expect_missing_rag_feature {
                     failures.push(format!(

@@ -52,6 +52,8 @@ pub mod admin_ui;
 /// and the per-request context. Feature-gated by `agent-class`.
 #[cfg(feature = "agent-class")]
 pub mod agent_class;
+/// Generation-pinned dispatch for provider-neutral AI extension events.
+pub mod ai_extensions;
 /// Boot wiring for the alert evaluation loop (dispatcher + engine + drain).
 pub mod alerting;
 /// Lowering `proxy.attestation` into the metering vocabulary the
@@ -118,6 +120,8 @@ pub mod context;
 pub mod dispatch;
 /// Host capability diagnostics behind `sbproxy doctor`.
 pub mod doctor;
+pub(crate) mod extension_inventory;
+pub(crate) mod extension_refresh;
 /// WOR-1835: disseminate + merge approximate governance counters over the
 /// mesh, so cross-node key budgets work without an external database.
 pub mod governance_cluster;
@@ -153,6 +157,9 @@ pub mod meter_runtime;
 pub mod model_discovery;
 /// Authenticated private model-plane dispatch primitives.
 pub mod model_plane;
+/// Fail-open delivery for terminal payment extension events.
+#[cfg(feature = "payments")]
+pub mod payment_extensions;
 /// Signs payment requirements into the existing quote JWS.
 #[cfg(feature = "payments")]
 pub mod payment_signer;
@@ -181,6 +188,8 @@ pub mod policy_bus;
 /// in its own module so the helpers can be exercised by
 /// integration tests in `crates/sbproxy-core/tests/`.
 pub mod policy_dispatch;
+mod proxy_wasm_http;
+pub(crate) mod request_body_plan;
 /// WOR-1130: module-owned workspace rate-limit budget state machine.
 ///
 /// Re-exported here for admin/runtime compatibility; the implementation

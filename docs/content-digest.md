@@ -3,7 +3,7 @@
 
 The `content_digest` policy verifies an inbound request body against the digest the client advertises in the `Content-Digest:` header (RFC 9530). On mismatch, malformed header, or unsupported algorithm, the proxy rejects the request before forwarding. The intended audience is integrity-critical inboxes: webhook receivers, agent endpoints, payment callbacks, audit-ingest paths.
 
-The policy honours `Content-Digest:` first and falls back to `Repr-Digest:` if `Content-Digest:` is absent. RFC 9530 §2 makes the two interchangeable for inbound traffic that does not decode `Content-Encoding`. SHA-256 and SHA-512 are supported; unknown algorithms fall through to the configured failure mode.
+The policy honors `Content-Digest:` first and falls back to `Repr-Digest:` if `Content-Digest:` is absent. RFC 9530 §2 makes the two interchangeable for inbound traffic that does not decode `Content-Encoding`. SHA-256 and SHA-512 are supported; unknown algorithms fall through to the configured failure mode.
 
 Verification runs in `request_body_filter` once the body is fully buffered. The pairing enforcer sets `ctx.validate_request_body = true` so the proxy buffers the body for hashing; bypass it on routes that do not need this check.
 
@@ -27,7 +27,7 @@ origins:
 
 ## Failure modes
 
-| Condition | Behaviour |
+| Condition | Behavior |
 |---|---|
 | Header present, digest matches | Pass; sets `ctx.content_digest_verified = true` |
 | Header present, digest mismatch | Reject with `reject_status` |

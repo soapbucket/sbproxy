@@ -137,7 +137,7 @@ pub struct OidcAuth {
     #[serde(default = "default_tx_ttl_secs")]
     pub tx_ttl_secs: u64,
     /// Name of the session cookie. Defaults to `__Host-sbproxy_session`
-    /// per [RFC 6265bis] — the `__Host-` prefix forces `Secure` +
+    /// per [RFC 6265bis], the `__Host-` prefix forces `Secure` +
     /// `Path=/` + no `Domain`, which closes the cookie-tossing
     /// attack against the session secret.
     #[serde(default = "default_session_cookie_name")]

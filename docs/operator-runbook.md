@@ -1,6 +1,6 @@
 # Operator runbook
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-03*
 
 This runbook is the dashboard/action companion to
 [`quickstart-operator.md`](quickstart-operator.md). Use the quickstart for first
@@ -79,6 +79,163 @@ When red:
 - Confirm service discovery and DNS resolution are returning current endpoints.
 - If a circuit breaker opened, wait for the configured half-open interval or
   roll back the origin config that triggered failures.
+
+## Extension bundles
+
+Treat a bundle release as immutable files plus a config change. sbproxy has no
+extension install command, TypeScript CLI, package manager, or runtime dependency
+resolver. Your deployment system copies the bundle directories into place. If
+JavaScript uses dependencies, build them ahead of time and ship one flat `.js`
+entry artifact with all dependencies included.
+
+### Install a local release
+
+Stage each release in a new directory instead of overwriting the running entry
+files:
+
+```bash
+install -d /opt/sbproxy/extension-releases/2026-08-02
+cp -R ./bundles/. /opt/sbproxy/extension-releases/2026-08-02/
+```
+
+Point `sb.yml` at that release. A relative path resolves from the directory that
+contains `sb.yml`. An absolute path decouples the release location from the
+config directory:
+
+```yaml
+extensions:
+  bundles_dir: /opt/sbproxy/extension-releases/2026-08-02
+```
+
+Every direct child needs a `bundle.yaml` and its declared `entry` file. Pin the
+exact entry bytes in the manifest. The digest is 64 lowercase hexadecimal
+characters only, without a `sha256:` prefix:
+
+```bash
+# macOS
+shasum -a 256 /opt/sbproxy/extension-releases/2026-08-02/hello/entry.js
+
+# Linux
+sha256sum /opt/sbproxy/extension-releases/2026-08-02/hello/entry.js
+```
+
+Calculate the value after the artifact is final, then put that exact value in
+`bundle.yaml`. A TypeScript digest covers the `.ts` entry bytes. If your build
+produces a flat `.js` artifact instead, point `entry` at the `.js` file and hash
+that final file.
+
+### Follow a verified Git release
+
+Use a private Git source when your release system already publishes immutable
+bundle trees there:
+
+```yaml
+extensions:
+  sources:
+    - type: git
+      repo: https://github.com/acme/sbproxy-extensions.git
+      revision: production
+      path: bundles
+      credential: env:SB_EXTENSION_GIT_TOKEN
+      verify_signature: true
+      timeout_secs: 60
+      refresh_interval_secs: 60
+```
+
+Use a full commit SHA for a fixed release. A pinned SHA never changes on a
+refresh cycle, so update the configured SHA and reload to move it. Use a signed
+reference when this node should follow verified releases automatically. Set
+`refresh_interval_secs: 0` to fetch only at startup and ordinary reload, or 1
+through 86400 for timed refresh. Multiple Git sources refresh together at the
+shortest enabled interval.
+
+The credential must be a secret reference. SBproxy resolves it through the
+configured process secret backend and keeps the value out of the remote URL,
+Git arguments, checkout metadata, logs, errors, and inventory. Configure SSH
+keys on the host when `repo` uses an SSH transport.
+
+### Validate before reload
+
+Run both views before publishing:
+
+```bash
+sbproxy validate /etc/sbproxy/sb.yml
+sbproxy doctor /etc/sbproxy/sb.yml --format json \
+  | jq '.extensions | {scope, summary, bundles, hooks, collisions}'
+```
+
+`validate` performs the startup construction path and exits nonzero for a bad
+source, manifest, digest, JavaScript or TypeScript export, WASM module, config
+schema, or hook collision. `doctor` reports a stopped candidate with
+`scope.mode: "doctor"`. An `active` hook was selected and wired in that
+candidate after its chain prepared successfully. It has not served traffic, and
+doctor is not reporting runtime health. Loaded hooks with no attachment are
+`unconsumed`. A `not_evaluated` hook came from the loader-level fallback because
+doctor could not finish candidate construction. Inspect
+`extensions.summary.failed` in the JSON. An extension finding does not, by
+itself, change the general doctor exit code.
+
+### Reload and confirm the running generation
+
+After validation, reload explicitly. The `sb.yml` file watcher does not treat an
+entry artifact edit as a config change:
+
+```bash
+curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" -X POST \
+  "${SB_ADMIN_URL}/admin/reload" | jq '{config_revision, fully_applied, degraded}'
+
+curl -fsS -u "oncall:${ONCALL_PASSWORD}" \
+  "${SB_ADMIN_URL}/api/extensions" \
+  | jq '{scope, summary, bundles, hooks, collisions}'
+```
+
+`GET /api/extensions` is authenticated, allows `read_only` operators, and
+reports the pipeline generation serving traffic. Expect `scope.mode: "running"`
+and the new config revision. `active` means the hook is attached to this
+generation. `available` or `unconsumed` means it loaded but is not attached.
+AI hooks become active when their compiled lifecycle chain attaches. Payment
+hooks stay `unconsumed` until the payment dispatcher installs successfully.
+`failed` and a nonempty `collisions` list need investigation.
+
+For a Git bundle, `bundles[].load.detail` names the redacted repository,
+requested reference, verified commit, and latest refresh health. After a failed
+refresh it says the node is serving the last verified generation and counts
+consecutive failures. It does not copy the rejected error or any secret
+material into inventory.
+
+Bundle loading is part of the candidate transaction. A bad digest, missing
+export, invalid WASM artifact, unsupported Proxy-Wasm import, or colliding hook
+name refuses the candidate. The old pipeline and old bundle registry continue
+serving together. In-flight requests stay pinned to their original generation.
+
+### Triage and rollback
+
+Start with the bounded phase in the error or inventory record:
+
+- `source`: the release directory, bundle directory, or entry is missing,
+  unreadable, outside its allowed root, or the Git source or credential could
+  not be resolved.
+- `manifest`: `bundle.yaml` is malformed or violates the runtime and hook
+  contract.
+- `digest`: the entry bytes do not match `sha256`. Recompute the final artifact;
+  do not change the manifest to bless an unexplained file.
+- `javascript`: source, TypeScript transpilation, import rejection, or export
+  preflight failed. Ship a dependency-free `.ts` entry or a prebuilt flat `.js`
+  artifact.
+- `wasm` or `proxy_wasm`: ABI, module validation, unsupported import, or resource
+  validation failed.
+- `collision`: two registrations claimed the same hook kind and type.
+
+For rollback, restore `extensions.bundles_dir` to the prior immutable release,
+run `validate`, and reload again. If the failed candidate never published, this
+step is only needed to make the declared config match the generation that kept
+serving.
+
+The complete local release is runnable at
+[examples/extension-bundles](../examples/extension-bundles/). The developer
+contracts are in [scripting.md section 12](scripting.md#12-dynamic-extension-bundles),
+and the inventory response is in
+[admin-api-reference.md](admin-api-reference.md#get-apiextensions).
 
 ## Helm Value Reconciliation
 

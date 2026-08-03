@@ -1,0 +1,10 @@
+apiVersion: sbproxy.dev/v0
+kind: Bundle
+name: broken-guard
+version: 0.1.0
+runtime: javascript
+entry: missing.js
+hooks:
+  - kind: policy
+    type: broken_guard
+    export: enforce
