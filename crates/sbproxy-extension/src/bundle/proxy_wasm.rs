@@ -1427,13 +1427,44 @@ fn host_log(mut caller: Caller<'_, ProxyWasmHostState>, level: i32, data: i32, s
         Ok(message) => String::from_utf8_lossy(&message).into_owned(),
         Err(status) => return status,
     };
-    tracing::debug!(
-        target: "sbproxy::proxy_wasm",
-        log_level = level,
-        context_id = caller.data().active_context,
-        message = %message,
-        "Proxy-Wasm guest log"
-    );
+    match level {
+        0 => tracing::trace!(
+            target: "sbproxy::proxy_wasm",
+            log_level = level,
+            context_id = caller.data().active_context,
+            message = %message,
+            "Proxy-Wasm guest log"
+        ),
+        1 => tracing::debug!(
+            target: "sbproxy::proxy_wasm",
+            log_level = level,
+            context_id = caller.data().active_context,
+            message = %message,
+            "Proxy-Wasm guest log"
+        ),
+        2 => tracing::info!(
+            target: "sbproxy::proxy_wasm",
+            log_level = level,
+            context_id = caller.data().active_context,
+            message = %message,
+            "Proxy-Wasm guest log"
+        ),
+        3 => tracing::warn!(
+            target: "sbproxy::proxy_wasm",
+            log_level = level,
+            context_id = caller.data().active_context,
+            message = %message,
+            "Proxy-Wasm guest log"
+        ),
+        4 | 5 => tracing::error!(
+            target: "sbproxy::proxy_wasm",
+            log_level = level,
+            context_id = caller.data().active_context,
+            message = %message,
+            "Proxy-Wasm guest log"
+        ),
+        _ => unreachable!("log level was validated"),
+    }
     STATUS_OK
 }
 
@@ -1862,7 +1893,10 @@ fn proxy_wasm_linker(engine: &Engine) -> Result<Linker<ProxyWasmHostState>, Prox
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
     use super::*;
 
@@ -1948,6 +1982,7 @@ mod tests {
             "deferred-done" => include_bytes!("testdata/proxy_wasm/deferred-done.wasm"),
             "http" => include_bytes!("testdata/proxy_wasm/http.wasm"),
             "log-headers" => include_bytes!("testdata/proxy_wasm/log-headers.wasm"),
+            "log-levels" => include_bytes!("testdata/proxy_wasm/log-levels.wasm"),
             "loop" => include_bytes!("testdata/proxy_wasm/loop.wasm"),
             "memory" => include_bytes!("testdata/proxy_wasm/memory.wasm"),
             "output-limit" => include_bytes!("testdata/proxy_wasm/output-limit.wasm"),
@@ -2023,6 +2058,73 @@ mod tests {
             .unwrap();
 
         session.finish().unwrap();
+    }
+
+    #[derive(Clone)]
+    struct GuestLogLevelCapture {
+        levels: Arc<Mutex<Vec<tracing::Level>>>,
+    }
+
+    impl tracing::Subscriber for GuestLogLevelCapture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target() == "sbproxy::proxy_wasm"
+        }
+
+        fn register_callsite(
+            &self,
+            _metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::TRACE)
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            if event.metadata().target() == "sbproxy::proxy_wasm" {
+                self.levels.lock().unwrap().push(*event.metadata().level());
+            }
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn guest_logs_preserve_proxy_wasm_severity() {
+        let levels = Arc::new(Mutex::new(Vec::new()));
+        let capture = GuestLogLevelCapture {
+            levels: Arc::clone(&levels),
+        };
+        let mut session = runtime("log-levels", limits())
+            .start_session(b"{}")
+            .unwrap();
+
+        tracing::subscriber::with_default(capture, || {
+            session.on_request_headers(Vec::new(), true).unwrap();
+        });
+
+        assert_eq!(
+            *levels.lock().unwrap(),
+            [
+                tracing::Level::TRACE,
+                tracing::Level::DEBUG,
+                tracing::Level::INFO,
+                tracing::Level::WARN,
+                tracing::Level::ERROR,
+                tracing::Level::ERROR,
+            ]
+        );
     }
 
     #[test]
