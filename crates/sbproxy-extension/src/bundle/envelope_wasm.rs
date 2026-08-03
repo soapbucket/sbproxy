@@ -33,6 +33,8 @@ pub(crate) struct EnvelopeWasmProgram {
     max_output_bytes: usize,
     budget: std::time::Duration,
     #[cfg(test)]
+    metrics_engine: &'static str,
+    #[cfg(test)]
     execution_started: Arc<AtomicBool>,
     #[cfg(test)]
     execution_finished: Arc<AtomicBool>,
@@ -89,8 +91,26 @@ impl EnvelopeWasmProgram {
             max_input_bytes: 1024 * 1024,
             max_output_bytes: 1024 * 1024,
             budget,
+            metrics_engine: "wasm",
             execution_started: Arc::new(AtomicBool::new(false)),
             execution_finished: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_metrics_engine(mut self, metrics_engine: &'static str) -> Self {
+        self.metrics_engine = metrics_engine;
+        self
+    }
+
+    fn metrics_engine(&self) -> &'static str {
+        #[cfg(test)]
+        {
+            self.metrics_engine
+        }
+        #[cfg(not(test))]
+        {
+            "wasm"
         }
     }
 
@@ -159,15 +179,21 @@ impl WasmInvocation {
 struct WasmInvocationGuard {
     invocation: Arc<WasmInvocation>,
     started: std::time::Instant,
+    metrics_engine: &'static str,
     admission_permit: Option<OwnedSemaphorePermit>,
     recorded: bool,
 }
 
 impl WasmInvocationGuard {
-    fn new(invocation: Arc<WasmInvocation>, started: std::time::Instant) -> Self {
+    fn new(
+        invocation: Arc<WasmInvocation>,
+        started: std::time::Instant,
+        metrics_engine: &'static str,
+    ) -> Self {
         Self {
             invocation,
             started,
+            metrics_engine,
             admission_permit: None,
             recorded: false,
         }
@@ -183,10 +209,10 @@ impl WasmInvocationGuard {
         }
         self.recorded = true;
         sbproxy_observe::metrics::record_script_duration(
-            "wasm",
+            self.metrics_engine,
             self.started.elapsed().as_secs_f64(),
         );
-        sbproxy_observe::metrics::record_script_invocation("wasm", outcome);
+        sbproxy_observe::metrics::record_script_invocation(self.metrics_engine, outcome);
     }
 }
 
@@ -246,7 +272,8 @@ impl WasmExecutor {
             .checked_add(budget)
             .ok_or(WasmCallFailure::HostFailure)?;
         let invocation = Arc::new(WasmInvocation::new(deadline));
-        let mut guard = WasmInvocationGuard::new(Arc::clone(&invocation), started);
+        let mut guard =
+            WasmInvocationGuard::new(Arc::clone(&invocation), started, program.metrics_engine());
         let timed_result =
             tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
                 let permit = Arc::clone(&self.admission)
@@ -381,6 +408,8 @@ pub(crate) fn prepare_wasm_program(
             max_input_bytes,
             max_output_bytes,
             budget,
+            #[cfg(test)]
+            metrics_engine: "wasm",
             #[cfg(test)]
             execution_started: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -569,8 +598,6 @@ mod tests {
     };
     use crate::bundle::{BundleRegistry, DynamicBundleRegistry, LoadedBundleHook};
     use crate::wasm::{WasmBundleLimits, WasmCallFailure, WasmRuntime};
-
-    static METRIC_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     struct BundleFixture {
         _directory: TempDir,
@@ -957,14 +984,15 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn canceled_queued_wasm_is_removed_before_execution() {
-        let _metric_guard = METRIC_TEST_LOCK.lock().await;
+        const METRICS_ENGINE: &str = "wasm_test_cancelled_queued";
         let mut blocker_limits = limits();
         blocker_limits.budget = Duration::from_millis(100);
         blocker_limits.fuel = 1_000_000_000;
         let blocker = EnvelopeWasmProgram::for_test_with_budget(
             runtime("loop.wasm", blocker_limits),
             Duration::from_millis(100),
-        );
+        )
+        .with_metrics_engine(METRICS_ENGINE);
         let blocker_observer = blocker.clone();
         let mut canceled_limits = limits();
         canceled_limits.budget = Duration::from_millis(300);
@@ -972,16 +1000,18 @@ mod tests {
         let canceled = EnvelopeWasmProgram::for_test_with_budget(
             runtime("loop.wasm", canceled_limits),
             Duration::from_millis(300),
-        );
+        )
+        .with_metrics_engine(METRICS_ENGINE);
         let canceled_observer = canceled.clone();
         let healthy = EnvelopeWasmProgram::for_test_with_budget(
             runtime("fresh-global.wasm", limits()),
             Duration::from_millis(500),
-        );
+        )
+        .with_metrics_engine(METRICS_ENGINE);
         let executor = Arc::new(WasmExecutor::start(1, 2).unwrap());
         let before = metric_value(
             "sbproxy_script_invocations_total",
-            &[("engine", "wasm"), ("result", "cancelled")],
+            &[("engine", METRICS_ENGINE), ("result", "cancelled")],
         );
 
         let blocker_call = tokio::spawn({
@@ -1019,7 +1049,7 @@ mod tests {
         assert_eq!(
             metric_value(
                 "sbproxy_script_invocations_total",
-                &[("engine", "wasm"), ("result", "cancelled")],
+                &[("engine", METRICS_ENGINE), ("result", "cancelled")],
             ) - before,
             1.0
         );
@@ -1027,23 +1057,25 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn canceled_running_wasm_releases_its_worker() {
-        let _metric_guard = METRIC_TEST_LOCK.lock().await;
+        const METRICS_ENGINE: &str = "wasm_test_cancelled_running";
         let mut runaway_limits = limits();
         runaway_limits.budget = Duration::from_millis(500);
         runaway_limits.fuel = 1_000_000_000;
         let runaway = EnvelopeWasmProgram::for_test_with_budget(
             runtime("loop.wasm", runaway_limits),
             Duration::from_millis(500),
-        );
+        )
+        .with_metrics_engine(METRICS_ENGINE);
         let runaway_observer = runaway.clone();
         let healthy = EnvelopeWasmProgram::for_test_with_budget(
             runtime("fresh-global.wasm", limits()),
             Duration::from_millis(100),
-        );
+        )
+        .with_metrics_engine(METRICS_ENGINE);
         let executor = Arc::new(WasmExecutor::start(1, 1).unwrap());
         let before = metric_value(
             "sbproxy_script_invocations_total",
-            &[("engine", "wasm"), ("result", "cancelled")],
+            &[("engine", METRICS_ENGINE), ("result", "cancelled")],
         );
 
         let runaway_call = tokio::spawn({
@@ -1062,7 +1094,7 @@ mod tests {
         assert_eq!(
             metric_value(
                 "sbproxy_script_invocations_total",
-                &[("engine", "wasm"), ("result", "cancelled")],
+                &[("engine", METRICS_ENGINE), ("result", "cancelled")],
             ) - before,
             1.0
         );
@@ -1070,14 +1102,14 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn queued_timeout_records_one_invocation_and_total_duration() {
-        let _metric_guard = METRIC_TEST_LOCK.lock().await;
+        const METRICS_ENGINE: &str = "wasm_test_queue_timeout";
         let before_timeout = metric_value(
             "sbproxy_script_invocations_total",
-            &[("engine", "wasm"), ("result", "queue_timeout")],
+            &[("engine", METRICS_ENGINE), ("result", "queue_timeout")],
         );
         let before_duration = metric_value(
             "sbproxy_script_duration_seconds_count",
-            &[("engine", "wasm")],
+            &[("engine", METRICS_ENGINE)],
         );
         let mut blocker_limits = limits();
         blocker_limits.budget = Duration::from_millis(100);
@@ -1085,12 +1117,14 @@ mod tests {
         let blocker = EnvelopeWasmProgram::for_test_with_budget(
             runtime("loop.wasm", blocker_limits),
             Duration::from_millis(100),
-        );
+        )
+        .with_metrics_engine(METRICS_ENGINE);
         let blocker_observer = blocker.clone();
         let queued = EnvelopeWasmProgram::for_test_with_budget(
             runtime("loop.wasm", limits()),
             Duration::from_millis(20),
-        );
+        )
+        .with_metrics_engine(METRICS_ENGINE);
         let executor = Arc::new(WasmExecutor::start(1, 1).unwrap());
 
         let blocker_call = tokio::spawn({
@@ -1107,14 +1141,14 @@ mod tests {
         assert_eq!(
             metric_value(
                 "sbproxy_script_invocations_total",
-                &[("engine", "wasm"), ("result", "queue_timeout")],
+                &[("engine", METRICS_ENGINE), ("result", "queue_timeout")],
             ) - before_timeout,
             1.0
         );
         assert_eq!(
             metric_value(
                 "sbproxy_script_duration_seconds_count",
-                &[("engine", "wasm")],
+                &[("engine", METRICS_ENGINE)],
             ) - before_duration,
             2.0
         );
@@ -1122,14 +1156,14 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn admission_timeout_records_one_invocation_and_total_duration() {
-        let _metric_guard = METRIC_TEST_LOCK.lock().await;
+        const METRICS_ENGINE: &str = "wasm_test_admission_timeout";
         let before_timeout = metric_value(
             "sbproxy_script_invocations_total",
-            &[("engine", "wasm"), ("result", "admission_timeout")],
+            &[("engine", METRICS_ENGINE), ("result", "admission_timeout")],
         );
         let before_duration = metric_value(
             "sbproxy_script_duration_seconds_count",
-            &[("engine", "wasm")],
+            &[("engine", METRICS_ENGINE)],
         );
         let mut running_limits = limits();
         running_limits.budget = Duration::from_millis(100);
@@ -1137,7 +1171,8 @@ mod tests {
         let running = EnvelopeWasmProgram::for_test_with_budget(
             runtime("loop.wasm", running_limits),
             Duration::from_millis(100),
-        );
+        )
+        .with_metrics_engine(METRICS_ENGINE);
         let running_observer = running.clone();
         let mut queued_limits = limits();
         queued_limits.budget = Duration::from_millis(300);
@@ -1145,11 +1180,13 @@ mod tests {
         let queued = EnvelopeWasmProgram::for_test_with_budget(
             runtime("loop.wasm", queued_limits),
             Duration::from_millis(300),
-        );
+        )
+        .with_metrics_engine(METRICS_ENGINE);
         let waiting_for_admission = EnvelopeWasmProgram::for_test_with_budget(
             runtime("fresh-global.wasm", limits()),
             Duration::from_millis(20),
-        );
+        )
+        .with_metrics_engine(METRICS_ENGINE);
         let executor = Arc::new(WasmExecutor::start(1, 1).unwrap());
 
         let running_call = tokio::spawn({
@@ -1177,14 +1214,14 @@ mod tests {
         assert_eq!(
             metric_value(
                 "sbproxy_script_invocations_total",
-                &[("engine", "wasm"), ("result", "admission_timeout")],
+                &[("engine", METRICS_ENGINE), ("result", "admission_timeout")],
             ) - before_timeout,
             1.0
         );
         assert_eq!(
             metric_value(
                 "sbproxy_script_duration_seconds_count",
-                &[("engine", "wasm")],
+                &[("engine", METRICS_ENGINE)],
             ) - before_duration,
             3.0
         );
