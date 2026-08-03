@@ -94,11 +94,23 @@ impl SharedWatchdog {
         interrupt: Arc<AtomicBool>,
         budget: Duration,
     ) -> Result<WatchdogGuard, WatchdogAdmissionError> {
-        interrupt.store(false, Ordering::Relaxed);
         let Some(deadline) = Instant::now().checked_add(budget) else {
             interrupt.store(true, Ordering::Relaxed);
             return Err(WatchdogAdmissionError);
         };
+        self.arm_until(interrupt, deadline)
+    }
+
+    fn arm_until(
+        &self,
+        interrupt: Arc<AtomicBool>,
+        deadline: Instant,
+    ) -> Result<WatchdogGuard, WatchdogAdmissionError> {
+        interrupt.store(false, Ordering::Relaxed);
+        if deadline <= Instant::now() {
+            interrupt.store(true, Ordering::Relaxed);
+            return Err(WatchdogAdmissionError);
+        }
         let key = WatchdogKey {
             deadline,
             sequence: self.sequence.fetch_add(1, Ordering::Relaxed),
@@ -240,6 +252,14 @@ pub(crate) fn arm_watchdog(
     budget: Duration,
 ) -> Result<WatchdogGuard, WatchdogAdmissionError> {
     SHARED_WATCHDOG.arm(interrupt, budget)
+}
+
+/// Schedule one JavaScript runtime interrupt at an existing monotonic deadline.
+pub(crate) fn arm_watchdog_until(
+    interrupt: Arc<AtomicBool>,
+    deadline: Instant,
+) -> Result<WatchdogGuard, WatchdogAdmissionError> {
+    SHARED_WATCHDOG.arm_until(interrupt, deadline)
 }
 
 // --- Errors ---

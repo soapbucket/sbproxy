@@ -1,7 +1,7 @@
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use bytes::{Bytes, BytesMut};
@@ -24,7 +24,7 @@ use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 
 use super::envelope::{self, EnvelopeError};
 use super::{BundleLoadError, LoadedBundleHook};
-use crate::js::arm_watchdog;
+use crate::js::{arm_watchdog, arm_watchdog_until};
 
 /// Version placed on every JavaScript hook request and response envelope.
 pub const JAVASCRIPT_ENVELOPE_VERSION: &str = envelope::ENVELOPE_VERSION;
@@ -119,6 +119,7 @@ impl From<EnvelopeError> for RuntimeFailure {
 struct JavascriptJob {
     program: JavascriptProgram,
     input: Vec<u8>,
+    deadline: Instant,
     reply: oneshot::Sender<Result<Vec<u8>, RuntimeFailure>>,
     _permit: OwnedSemaphorePermit,
 }
@@ -152,23 +153,41 @@ impl JavascriptExecutor {
         program: JavascriptProgram,
         input: Vec<u8>,
     ) -> Result<Vec<u8>, RuntimeFailure> {
-        let permit = Arc::clone(&self.admission)
-            .acquire_owned()
-            .await
-            .map_err(|_| RuntimeFailure::Code("runtime_unavailable"))?;
-        let (reply, response) = oneshot::channel();
-        self.sender
-            .send(JavascriptJob {
-                program,
-                input,
-                reply,
-                _permit: permit,
-            })
-            .await
-            .map_err(|_| RuntimeFailure::Code("runtime_unavailable"))?;
-        response
-            .await
-            .map_err(|_| RuntimeFailure::Code("runtime_unavailable"))?
+        let deadline = Instant::now()
+            .checked_add(Duration::from_millis(program.limits.budget_ms))
+            .ok_or(RuntimeFailure::Code("runtime_unavailable"))?;
+        let result = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+            let permit = Arc::clone(&self.admission)
+                .acquire_owned()
+                .await
+                .map_err(|_| RuntimeFailure::Code("runtime_unavailable"))?;
+            let (reply, response) = oneshot::channel();
+            self.sender
+                .send(JavascriptJob {
+                    program,
+                    input,
+                    deadline,
+                    reply,
+                    _permit: permit,
+                })
+                .await
+                .map_err(|_| RuntimeFailure::Code("runtime_unavailable"))?;
+            response
+                .await
+                .map_err(|_| RuntimeFailure::Code("runtime_unavailable"))?
+        })
+        .await;
+        result.unwrap_or(Err(RuntimeFailure::Timeout))
+    }
+
+    #[cfg(test)]
+    fn available_admission(&self) -> usize {
+        self.admission.available_permits()
+    }
+
+    #[cfg(test)]
+    fn available_queue(&self) -> usize {
+        self.sender.capacity()
     }
 }
 
@@ -198,7 +217,7 @@ fn javascript_worker(receiver: Arc<Mutex<mpsc::Receiver<JavascriptJob>>>) {
             runtime = WorkerRuntime::new().ok();
         }
         let (result, poisoned) = match runtime.as_mut() {
-            Some(runtime) => runtime.invoke(&job.program, &job.input),
+            Some(runtime) => runtime.invoke(&job.program, &job.input, job.deadline),
             None => (Err(RuntimeFailure::Code("runtime_unavailable")), true),
         };
         if poisoned {
@@ -246,13 +265,14 @@ impl WorkerRuntime {
         &mut self,
         program: &JavascriptProgram,
         input: &[u8],
+        deadline: Instant,
     ) -> (Result<Vec<u8>, RuntimeFailure>, bool) {
+        if deadline <= Instant::now() {
+            return (Err(RuntimeFailure::Timeout), false);
+        }
         self.runtime.set_memory_limit(program.limits.memory_bytes);
         self.runtime.set_max_stack_size(program.limits.stack_bytes);
-        let watchdog = match arm_watchdog(
-            Arc::clone(&self.interrupt),
-            Duration::from_millis(program.limits.budget_ms),
-        ) {
+        let watchdog = match arm_watchdog_until(Arc::clone(&self.interrupt), deadline) {
             Ok(watchdog) => watchdog,
             Err(_) => return (Err(RuntimeFailure::Timeout), true),
         };
@@ -858,6 +878,22 @@ mod tests {
 
     fn allow_source() -> &'static str {
         include_str!("testdata/javascript/direct-policy.js")
+    }
+
+    fn invocation_input(program: &super::JavascriptProgram) -> Vec<u8> {
+        let request = request_value(&request(b""), program.limits.max_input_bytes).unwrap();
+        let input = hook_envelope("request", program, request);
+        serialize_envelope(&input, program.limits.max_input_bytes).unwrap()
+    }
+
+    async fn wait_until(description: &str, condition: impl Fn() -> bool) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !condition() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {description}"));
     }
 
     #[test]
@@ -1472,6 +1508,135 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn javascript_queue_wait_consumes_the_hook_budget() {
+        let fixture = fixture(
+            BundleHookKind::Policy,
+            "entry.js",
+            r#"
+                export function run(input) {
+                    const until = Date.now() + input.config.hold_ms;
+                    while (Date.now() < until) {}
+                    return { version: "sbproxy-envelope/v1", decision: "allow" };
+                }
+            "#,
+            "sandbox:\n  budget_ms: 1000\n",
+            "",
+        );
+        let (_, blocker) = prepare_program(
+            fixture.hook(),
+            BundleHookKind::Policy,
+            json!({"hold_ms": 400}),
+        )
+        .unwrap();
+        let (_, mut queued) = prepare_program(
+            fixture.hook(),
+            BundleHookKind::Policy,
+            json!({"hold_ms": 1000}),
+        )
+        .unwrap();
+        queued.limits.budget_ms = 200;
+        let blocker_input = invocation_input(&blocker);
+        let queued_input = invocation_input(&queued);
+        let executor = Arc::new(JavascriptExecutor::start(1, 1));
+
+        let blocker_call = tokio::spawn({
+            let executor = Arc::clone(&executor);
+            async move { executor.execute(blocker, blocker_input).await }
+        });
+        wait_until("running JavaScript blocker", || {
+            executor.available_admission() == 1 && executor.available_queue() == 1
+        })
+        .await;
+
+        let started = Instant::now();
+        assert_eq!(
+            executor.execute(queued, queued_input).await,
+            Err(super::RuntimeFailure::Timeout)
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(300),
+            "queued hook should time out before the blocker completes"
+        );
+        assert!(blocker_call.await.unwrap().is_ok());
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while executor.available_admission() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("expired queued hook should not receive a fresh runtime budget");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn javascript_admission_wait_consumes_the_hook_budget() {
+        let fixture = fixture(
+            BundleHookKind::Policy,
+            "entry.js",
+            r#"
+                export function run(input) {
+                    const until = Date.now() + input.config.hold_ms;
+                    while (Date.now() < until) {}
+                    return { version: "sbproxy-envelope/v1", decision: "allow" };
+                }
+            "#,
+            "sandbox:\n  budget_ms: 1000\n",
+            "",
+        );
+        let (_, first_blocker) = prepare_program(
+            fixture.hook(),
+            BundleHookKind::Policy,
+            json!({"hold_ms": 250}),
+        )
+        .unwrap();
+        let (_, second_blocker) = prepare_program(
+            fixture.hook(),
+            BundleHookKind::Policy,
+            json!({"hold_ms": 250}),
+        )
+        .unwrap();
+        let (_, mut waiting) = prepare_program(
+            fixture.hook(),
+            BundleHookKind::Policy,
+            json!({"hold_ms": 0}),
+        )
+        .unwrap();
+        waiting.limits.budget_ms = 50;
+        let first_input = invocation_input(&first_blocker);
+        let second_input = invocation_input(&second_blocker);
+        let waiting_input = invocation_input(&waiting);
+        let executor = Arc::new(JavascriptExecutor::start(1, 1));
+
+        let first_call = tokio::spawn({
+            let executor = Arc::clone(&executor);
+            async move { executor.execute(first_blocker, first_input).await }
+        });
+        wait_until("running JavaScript blocker", || {
+            executor.available_admission() == 1 && executor.available_queue() == 1
+        })
+        .await;
+        let second_call = tokio::spawn({
+            let executor = Arc::clone(&executor);
+            async move { executor.execute(second_blocker, second_input).await }
+        });
+        wait_until("full JavaScript admission", || {
+            executor.available_admission() == 0 && executor.available_queue() == 0
+        })
+        .await;
+
+        let started = Instant::now();
+        assert_eq!(
+            executor.execute(waiting, waiting_input).await,
+            Err(super::RuntimeFailure::Timeout)
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "admission waiter should time out before a slot opens"
+        );
+        assert!(first_call.await.unwrap().is_ok());
+        assert!(second_call.await.unwrap().is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn javascript_does_not_carry_globals_between_requests() {
         let fixture = fixture(
             BundleHookKind::Policy,
@@ -1516,6 +1681,7 @@ mod tests {
         let adapter = Arc::new(
             build_javascript_policy(fixture.hook(), Value::Object(Default::default())).unwrap(),
         );
+        let admission_capacity = super::JAVASCRIPT_EXECUTOR.available_admission();
         let ticker = tokio::spawn(async {
             tokio::time::sleep(Duration::from_millis(10)).await;
             Instant::now()
@@ -1533,9 +1699,22 @@ mod tests {
             .expect("Tokio timer should run while JavaScript admission waits")
             .unwrap();
         assert!(ticked_at.elapsed() < Duration::from_secs(1));
+        let mut timeout_count = 0;
         for call in calls {
-            call.await.unwrap().unwrap();
+            match call.await.unwrap() {
+                Ok(PolicyDecision::Allow) => {}
+                Err(sbproxy_plugin::PluginError::Timeout) => timeout_count += 1,
+                result => panic!("unexpected saturated JavaScript result: {result:?}"),
+            }
         }
+        assert!(
+            timeout_count > 0,
+            "saturated calls should consume their budget while waiting"
+        );
+        wait_until("saturated JavaScript cleanup", || {
+            super::JAVASCRIPT_EXECUTOR.available_admission() == admission_capacity
+        })
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
