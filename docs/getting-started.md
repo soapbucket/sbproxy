@@ -116,7 +116,7 @@ curl -sS -o /dev/null -w 'initialized: HTTP %{http_code}\n' \
   http://127.0.0.1:8080/
 ```
 
-List the tool catalogue:
+List the tool catalog:
 
 ```bash
 curl -sS \

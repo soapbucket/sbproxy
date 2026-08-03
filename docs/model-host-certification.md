@@ -115,7 +115,7 @@ The four failures from the 2026-07-30 run now have explicit contracts:
   bounded early-exit diagnostics and clears the durable record. After SIGKILL,
   the next boot reaps an exact stale process group before binding listeners or
   spawning a replacement. A live owner is preserved. A reused engine PID is
-  never signalled; when its process group is still occupied, the record stays
+  never signaled; when its process group is still occupied, the record stays
   in place because ownership cannot be proved. Linux uses a parent-death
   signal. macOS uses `posix_spawn` plus private atomically close-on-exec gate
   endpoints, so parent exit closes the gate without a concurrent-fork fd leak.

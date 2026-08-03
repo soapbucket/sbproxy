@@ -417,9 +417,9 @@ pub enum SessionLedgerSinkKind {
 /// and consumed directly. When `source:` is present, the compiler
 /// resolves it to a config text string before parsing.
 ///
-/// Three kinds are recognised today:
+/// Three kinds are recognized today:
 ///
-/// * `local` keeps the historical behaviour - the inline file is the
+/// * `local` keeps the historical behavior - the inline file is the
 ///   config. This is the form that round-trips when an operator writes
 ///   `source: { kind: local }` explicitly.
 /// * `git` points at a remote git repository, an optional revision
@@ -439,7 +439,7 @@ pub enum SessionLedgerSinkKind {
 #[serde(deny_unknown_fields)]
 pub enum ConfigSource {
     /// The inline file is the config; nothing is fetched. This is the
-    /// historical behaviour and the implied default when `source:`
+    /// historical behavior and the implied default when `source:`
     /// is omitted.
     Local,
     /// Clone a git repository and read a single file inside it as the
@@ -586,7 +586,7 @@ pub struct AgentClassResolverConfig {
     /// `true`. Disable when the runtime has no working DNS resolver.
     #[serde(default = "default_resolver_rdns_enabled")]
     pub rdns_enabled: bool,
-    /// Honour the verified Web Bot Auth `keyid` as resolver step 1.
+    /// Honor the verified Web Bot Auth `keyid` as resolver step 1.
     /// Default `true`. Off forces the resolver to fall through to
     /// rDNS / UA matching even when bot-auth verified the request.
     #[serde(default = "default_resolver_bot_auth_keyid_enabled")]
@@ -794,7 +794,7 @@ pub struct ProxyServerConfig {
     /// inbound forwarding metadata is honored.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
-    /// Correlation-ID propagation policy. By default, the proxy honours
+    /// Correlation-ID propagation policy. By default, the proxy honors
     /// any inbound `X-Request-Id` header, generates one if absent,
     /// forwards the value to the upstream, and echoes it in the
     /// downstream response. Set fields here to change the header name
@@ -851,7 +851,7 @@ pub struct ProxyServerConfig {
     /// Tunable client-side timeouts for the proxy's outbound HTTP
     /// helpers (forward-auth, callbacks, mirrors, SWR refreshes, bot-
     /// auth directory). Defaults match the prior hardcoded literals
-    /// so existing configs see no behaviour change. See
+    /// so existing configs see no behavior change. See
     /// [`HttpClientTimeoutsConfig`] for the field list.
     #[serde(default)]
     pub http_client_timeouts: HttpClientTimeoutsConfig,
@@ -881,7 +881,7 @@ pub struct ProxyServerConfig {
     ///
     /// When empty, every origin resolves to the synthetic
     /// `__default__` tenant. Existing single-tenant configs see no
-    /// behaviour change. An origin that names a tenant not declared
+    /// behavior change. An origin that names a tenant not declared
     /// here fails config compile.
     #[serde(default)]
     pub tenants: Vec<ProxyTenantConfig>,
@@ -898,7 +898,7 @@ pub struct ProxyServerConfig {
     #[serde(default)]
     pub credentials: Vec<CredentialBlock>,
     /// Durable payment settlement. When absent, the proxy keeps its
-    /// existing non-settlement crawl-ledger behaviour exactly. When
+    /// existing non-settlement crawl-ledger behavior exactly. When
     /// present, a paid request reaches the origin only after its
     /// durable intent has committed `Succeeded`.
     ///
@@ -2635,13 +2635,13 @@ impl KeyGovernanceConfig {
     /// [`FailureMode::Observe`] records the decision a control *would*
     /// have taken. A reserve call that never reached its backend produced
     /// no such decision, so accepting `observe` here would mean silently
-    /// picking some other behaviour on the operator's behalf. Refusing at
+    /// picking some other behavior on the operator's behalf. Refusing at
     /// config-compile time is the honest alternative.
     ///
     /// # Errors
     ///
     /// Returns the operator-facing message, naming the exact config path,
-    /// when the posture cannot be honoured at this site.
+    /// when the posture cannot be honored at this site.
     pub fn validate_failure_posture(&self) -> Result<(), String> {
         if self.failure_posture == Some(FailureMode::Observe) {
             return Err(
@@ -3226,12 +3226,12 @@ impl KeyManagementConfig {
     /// [`FailureMode::Observe`] records the decision a control *would*
     /// have taken. A store that could not be read produced no such
     /// decision, so accepting `observe` would mean silently picking some
-    /// other behaviour on the operator's behalf.
+    /// other behavior on the operator's behalf.
     ///
     /// # Errors
     ///
     /// Returns the operator-facing message, naming the exact config path,
-    /// when the posture cannot be honoured at the site that declares it.
+    /// when the posture cannot be honored at the site that declares it.
     pub fn validate_failure_posture(&self) -> Result<(), String> {
         if self.failure_posture == Some(FailureMode::Observe) {
             return Err(
@@ -3651,7 +3651,7 @@ pub struct SeedKeyConfig {
     /// authenticates, replacing any client-supplied tools.
     #[serde(default)]
     pub inject_tools: Vec<serde_json::Value>,
-    /// Federated MCP catalogue reference injected for this key.
+    /// Federated MCP catalog reference injected for this key.
     #[serde(default)]
     pub inject_mcp: Option<serde_json::Value>,
     /// Skip the body-aware prompt-injection scan for this key. Default false.
@@ -4162,7 +4162,7 @@ mod correlation_id_tests {
     use super::*;
 
     #[test]
-    fn defaults_match_documented_behaviour() {
+    fn defaults_match_documented_behavior() {
         let cfg = CorrelationIdConfig::default();
         assert!(cfg.enabled);
         assert_eq!(cfg.header, "X-Request-Id");
@@ -4629,7 +4629,7 @@ pub enum ResponseCacheBackendConfig {
 /// [`ResponseCacheEncryptionConfig`]: a key that is missing,
 /// unresolvable, or shorter than 16 bytes aborts startup. That is
 /// deliberately stricter than the surrounding prompt-persistence
-/// behaviour, where an unreadable file only degrades to ephemeral
+/// behavior, where an unreadable file only degrades to ephemeral
 /// mutations. An unreadable file loses saved prompts; a key the operator
 /// asked for and cannot supply would silently write secrets in the
 /// clear.
@@ -4714,7 +4714,7 @@ pub struct ResponseCacheEncryptionConfig {
     /// key under `origins.<host>.response_cache.encryption`.
     ///
     /// Defaults to [`PerOriginKeyMode::Inherit`], which is the
-    /// backwards-compatible behaviour and is safe on its own terms: the
+    /// backwards-compatible behavior and is safe on its own terms: the
     /// origin is bound into the associated data either way, so an entry
     /// sealed for one origin never opens as another even when both
     /// inherit this key. Set [`PerOriginKeyMode::Required`] when the
@@ -4767,7 +4767,7 @@ pub enum PerOriginKeyMode {
 #[serde(deny_unknown_fields)]
 pub struct OriginCacheEncryptionConfig {
     /// Secret reference for this origin's active key. When absent, the
-    /// behaviour follows [`ResponseCacheEncryptionConfig::per_origin_keys`].
+    /// behavior follows [`ResponseCacheEncryptionConfig::per_origin_keys`].
     #[serde(default)]
     pub key: Option<String>,
 
@@ -4844,7 +4844,7 @@ pub struct AdminConfig {
     pub prompt_persistence_path: Option<std::path::PathBuf>,
     /// At-rest encryption for [`Self::prompt_persistence_path`]. Absent
     /// or disabled stores prompt records as plaintext JSON, which is the
-    /// pre-existing behaviour and stays the default so an upgrade cannot
+    /// pre-existing behavior and stays the default so an upgrade cannot
     /// orphan an existing file.
     #[serde(default)]
     pub prompt_persistence_encryption: Option<PromptPersistenceEncryptionConfig>,
@@ -4990,7 +4990,7 @@ fn default_http_port() -> u16 {
 /// shorten one for an aggressive deadline budget.
 ///
 /// All fields default to the prior hardcoded values so existing
-/// configs see no behaviour change. Operators only set a field here
+/// configs see no behavior change. Operators only set a field here
 /// to nudge a specific timeout.
 ///
 /// Example:
@@ -5199,7 +5199,7 @@ pub struct AccessLogConfig {
     #[serde(default)]
     pub capture_headers: CaptureHeadersConfig,
     /// Log every request at or above this latency, regardless of
-    /// `sample_rate`. `None` preserves sampler-only behaviour.
+    /// `sample_rate`. `None` preserves sampler-only behavior.
     #[serde(default)]
     pub slow_request_threshold_ms: Option<f64>,
     /// Log every 5xx response regardless of `sample_rate`.
@@ -5732,7 +5732,7 @@ pub struct ObservabilityPiiConfig {
     #[serde(default)]
     pub rules: Vec<String>,
     /// Names of built-in rules to opt out of even when included by
-    /// `rules:` or by the default-all behaviour. The matching name is
+    /// `rules:` or by the default-all behavior. The matching name is
     /// case-sensitive. At a tenant or origin scope the list is
     /// SUBTRACTED from the resolved set (parent inheritance plus this
     /// scope's `rules:` additions).
@@ -5793,7 +5793,7 @@ pub struct ObservabilitySinkConfig {
     #[serde(default)]
     pub format: Option<String>,
     /// Where the line goes. `output: { type: stdout }` keeps the
-    /// legacy stdout behaviour; `file` reuses the access-log rotation
+    /// legacy stdout behavior; `file` reuses the access-log rotation
     /// stack; `otlp` lands under WOR-1046.
     pub output: ObservabilitySinkOutput,
     /// Redaction profile applied to this sink's lines. One of
@@ -5847,7 +5847,7 @@ pub enum ObservabilitySinkOutput {
         /// OTLP collector endpoint (e.g.
         /// `http://otel-collector:4318/v1/logs` for HTTP/proto,
         /// `http://otel-collector:4317` for gRPC). The path component
-        /// is honoured for HTTP transport; the gRPC variant uses the
+        /// is honored for HTTP transport; the gRPC variant uses the
         /// host:port only.
         endpoint: String,
         /// Transport selector: `http` or `grpc`. Defaults to whatever
@@ -5856,7 +5856,7 @@ pub enum ObservabilitySinkOutput {
         #[serde(default)]
         transport: Option<String>,
         /// Per-export timeout in seconds. Defaults to 10 seconds when
-        /// omitted; honoured by the underlying OTLP exporter's HTTP /
+        /// omitted; honored by the underlying OTLP exporter's HTTP /
         /// gRPC client.
         #[serde(default)]
         timeout_secs: Option<u64>,
@@ -6082,7 +6082,7 @@ pub struct TenantObservabilityConfig {
     /// value count across `sbproxy_requests_total` and friends for
     /// just this tenant so a noisy tenant cannot demote labels for
     /// every other tenant. Omitting the block leaves this tenant on
-    /// the proxy-wide budget (today's behaviour).
+    /// the proxy-wide budget (today's behavior).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cardinality: Option<TenantCardinalityConfig>,
 }
@@ -6092,7 +6092,7 @@ pub struct TenantObservabilityConfig {
 /// tenant B do not touch tenant A's accepted-value set. The
 /// `__default__` tenant continues to use the proxy-wide
 /// `CardinalityLimiter` (in `sbproxy-observe`) so single-tenant
-/// deployments stay bit-for-bit identical to pre-WOR-1067 behaviour.
+/// deployments stay bit-for-bit identical to pre-WOR-1067 behavior.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TenantCardinalityConfig {
@@ -6142,7 +6142,7 @@ pub struct TenantObservabilityLogConfig {
     pub custom_fields: Vec<CustomLogFieldConfig>,
 }
 
-/// Tenant-scope `redact:` sub-block. Today only `pii:` is honoured;
+/// Tenant-scope `redact:` sub-block. Today only `pii:` is honored;
 /// the field-key and pattern overrides remain proxy-scope only because
 /// they touch the rendered JSON, which is tenant-agnostic in the
 /// emitter.
@@ -6253,7 +6253,7 @@ pub struct CredentialBlock {
     /// unrestricted and an explicit empty list denies every caller tool.
     #[serde(default)]
     pub allowed_tools: Option<Vec<String>>,
-    /// WOR-1646: inject a federated MCP gateway's live catalogue as
+    /// WOR-1646: inject a federated MCP gateway's live catalog as
     /// this credential's tool surface. Raw passthrough of the
     /// `InjectMcpRef` shape (`{ref, format, filter}`) on the
     /// underlying `VirtualKeyConfig`; resolved at request time.
@@ -6285,7 +6285,7 @@ pub struct PrincipalSelector {
     #[serde(default)]
     pub role: Option<String>,
     /// Match an exact key=value entry on `Principal.attrs.claims`.
-    /// Serialised as a flat map for readability.
+    /// Serialized as a flat map for readability.
     #[serde(default)]
     pub claim: std::collections::BTreeMap<String, String>,
 }
@@ -6670,7 +6670,7 @@ pub struct RawOriginConfig {
     /// Per-origin default content shape used when the agent's
     /// `Accept` header is `*/*` or absent. Threaded into the
     /// synthesised `auto_content_negotiate` config by
-    /// [`crate::compile_origin`]. Recognised values: `markdown`,
+    /// [`crate::compile_origin`]. Recognized values: `markdown`,
     /// `json`, `html`, `pdf`, `other`. Unset falls back to `html`.
     #[serde(default)]
     pub default_content_shape: Option<String>,
@@ -6688,7 +6688,7 @@ pub struct RawOriginConfig {
     /// `html_to_markdown` transform's `token_bytes_ratio` field and
     /// the projection fallback path so the `x-markdown-tokens`
     /// response header and the JSON envelope's `token_estimate` field
-    /// both honour the override. Unset falls back to
+    /// both honor the override. Unset falls back to
     /// `DEFAULT_TOKEN_BYTES_RATIO` (0.25).
     #[serde(default)]
     pub token_bytes_ratio: Option<f32>,
@@ -8177,7 +8177,7 @@ observability:
 
     /// WOR-1053 PR1: an empty `proxy.tenants:` field is the default;
     /// every origin resolves to the synthetic `__default__` tenant
-    /// and existing single-tenant configs see no behaviour change.
+    /// and existing single-tenant configs see no behavior change.
     #[test]
     fn proxy_tenants_defaults_empty() {
         let proxy: ProxyServerConfig = ProxyServerConfig::default();
@@ -8202,7 +8202,7 @@ tenants:
     }
 
     /// WOR-1045 PR1: empty `sinks:` field is the default. An operator
-    /// who never wrote a sinks block keeps the legacy stdout behaviour.
+    /// who never wrote a sinks block keeps the legacy stdout behavior.
     #[test]
     fn observability_sinks_defaults_empty() {
         let yaml = r#"
@@ -8218,7 +8218,7 @@ log:
     fn observability_defaults_to_none() {
         // ProxyServerConfig::default sets observability to None so an
         // operator who never wrote the YAML block keeps existing
-        // behaviour (CLI / env only).
+        // behavior (CLI / env only).
         let proxy: ProxyServerConfig = ProxyServerConfig::default();
         assert!(proxy.observability.is_none());
     }
@@ -9622,7 +9622,7 @@ pub struct WebBotAuthPublishConfig {
     /// without relying solely on TLS. Absent leaves the responses
     /// unsigned; the Web Bot Auth IETF draft permits both shapes and
     /// verifiers MAY treat unsigned directories as lower-trust. The
-    /// secret-resolver pass honours secret references at config load
+    /// secret-resolver pass honors secret references at config load
     /// so the raw seed never has to live in the YAML.
     #[serde(default)]
     pub signing_key_hex: Option<String>,
@@ -9640,7 +9640,7 @@ pub struct OlpConfig {
     pub enabled: bool,
     /// Ed25519 signing key, hex-encoded 32-byte seed. Operators
     /// generate one with `openssl rand -hex 32` or read it from a
-    /// secret store. The secret-resolver pass honours provider-specific
+    /// secret store. The secret-resolver pass honors provider-specific
     /// references at config-load time, mirroring how other key-material
     /// fields work.
     pub signing_key: String,
@@ -9694,7 +9694,7 @@ pub struct OlpConfig {
 /// Both endpoints share one `auth` policy because the same actor that
 /// can ask "is this token active" should also be able to assert "this
 /// token is no longer trusted." Rate-limiting on `active: false`
-/// responses (RFC 7662 §2.1 scan-attack defence) and DPoP-bound
+/// responses (RFC 7662 §2.1 scan-attack defense) and DPoP-bound
 /// confirmation checks ship in a follow-up PR.
 #[derive(
     Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq, Default, schemars::JsonSchema,
@@ -10802,7 +10802,7 @@ mod sweep_header_capture_tests {
     fn bind_address_defaults_to_every_interface() {
         // The default has to stay 0.0.0.0 or every existing config
         // silently loses reachability on upgrade. This is the one
-        // behaviour in the feature that must not change.
+        // behavior in the feature that must not change.
         let cfg = ProxyServerConfig::default();
         assert_eq!(cfg.effective_bind_address(), DEFAULT_PUBLIC_BIND_ADDRESS);
         assert_eq!(cfg.effective_bind_address(), "0.0.0.0");

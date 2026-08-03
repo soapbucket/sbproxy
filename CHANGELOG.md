@@ -53,7 +53,7 @@ the next version cut.
   The HTTP call to the provider stays in the background worker: a served
   request writes one durable row and stops, so no request ever waits on
   Stripe. Two counters describe it, `sbproxy_usage_bridge_enqueued_total`
-  and `sbproxy_usage_bridge_gap_total`, both labelled by tenant. See
+  and `sbproxy_usage_bridge_gap_total`, both labeled by tenant. See
   [`docs/payment-settlement.md`](docs/payment-settlement.md).
 
   **`usage_reporters.stripe_meter` gains two required fields, `source`
@@ -269,7 +269,7 @@ the next version cut.
   handed you an `OPENAI_BASE_URL` built from it. On a laptop on a shared
   network that was an open inference endpoint, described as local. The
   generated `origins:` map restricting to `127.0.0.1` and `localhost`
-  was not a defence, because that matches on the `Host` header, which
+  was not a defense, because that matches on the `Host` header, which
   the caller sets.
 
   Both commands now generate `bind_address: 127.0.0.1`, so the banner's
@@ -294,7 +294,7 @@ the next version cut.
   and clear `max_chain_depth` and cycle detection together, or rename
   itself off `caller_denylist`. The envelope now comes from the RFC 8693
   `act` claim chain on the verified principal, which a caller cannot
-  flatten, and the `X-A2A-*` headers are honoured only from a peer in
+  flatten, and the `X-A2A-*` headers are honored only from a peer in
   `proxy.trusted_proxies` and stripped from everyone else. Operators
   relying on the header transport must now list the peer that stamps it;
   `examples/a2a-protocol/` shows the shape. The policy's `route_glob` is
@@ -922,7 +922,7 @@ across the estate so a multi-tenant gateway reports per tenant.
   and always exited 0; it now needs to reach one. If you call `apply` in
   CI as a validation step, switch it to the new `--validate-only`, which
   runs every check and stops without contacting anything. That flag is
-  the honest name for what the old behaviour was actually doing.
+  the honest name for what the old behavior was actually doing.
 
 
 - **The admin console follows the sbproxy.dev editorial system.**
@@ -1177,7 +1177,7 @@ v1.5.0.
   indirect-probe retries, enrollment outcomes, transport RPC errors by
   phase and durations by operation, owner-routing outcomes, and a live
   peer-count gauge; every mesh metric now sits in the executable
-  stability catalogue under the sanctioned `mesh_` prefix.
+  stability catalog under the sanctioned `mesh_` prefix.
 - **The Kubernetes operator forms the mesh.** With
   `spec.clustering.enabled`, the operator reconciles a StatefulSet
   (stable per-pod identity, one-peer-at-a-time rolling restarts), a
@@ -1224,7 +1224,7 @@ v1.5.0.
   under the `mcp` action's `tool_versioning` declares versions, where each
   routes, and who gets which. Resolution walks a ladder (per-call `_meta`
   requirement, per-session requirements declared at `initialize`, operator
-  pins on the authenticated principal, `search_v1`-style catalogue aliases,
+  pins on the authenticated principal, `search_v1`-style catalog aliases,
   then the default), all as semver ranges. Old versions can route to the
   upstream that still serves them or run JavaScript request/response
   adapters against the new one, carry a sunset date that warns or blocks
@@ -1830,7 +1830,7 @@ AI providers behind one OpenAI-compatible API.
   open-by-default to closed-by-default. An unknown caller (no
   matching ACL rule) is denied every tool. An empty `allowed: []`
   list under an ACL rule means "deny all", not "allow all".
-  Operators who want the legacy behaviour add `default_allow: true`
+  Operators who want the legacy behavior add `default_allow: true`
   on the origin's MCP action. The legacy `key_permissions: { key: [tools] }`
   shape is gone; rewrite to the principal-aware `tool_access[]`
   selector list. See `docs/migration-mcp-rbac.md`.
@@ -1883,12 +1883,12 @@ AI providers behind one OpenAI-compatible API.
   land together so downstream tooling can read them in one swing:
   optional `session_id` and `user_id` top-level fields parallel the
   `RequestEvent` envelope (cross-surface JOIN no longer relies on
-  `request_id` alone); the field-key redaction marker is normalised
+  `request_id` alone); the field-key redaction marker is normalized
   to `[REDACTED:<NAME>]` everywhere (was `<redacted:name>` in v1) so
   the schema-v1 layer matches the existing PII-rule replacement
   shape; the schema bump is additive on the field set (a v1 reader
   parsing a v2 line keeps working because every new field is
-  `skip_serializing_if = Option::is_none`). Marker normalisation is
+  `skip_serializing_if = Option::is_none`). Marker normalization is
   a string change; downstream tooling that greps for the old
   `<redacted:...>` form must update.
 
@@ -2494,7 +2494,7 @@ AI providers behind one OpenAI-compatible API.
   0.14 because Rust unifies the array element type to `&String` and
   rejects bare `&str` literals. Coerced all such call sites to
   uniform `&[&str]` via `.as_str()` so the workspace builds clean
-  again. No behavioural change.
+  again. No behavioral change.
   ([crates/sbproxy-observe/src/metrics.rs],
   [crates/sbproxy-core/src/server.rs])
 

@@ -222,7 +222,7 @@ policies:
 | `free_preview_bytes` | u64, optional | Byte budget the crawler may read without paying. Surfaced in the challenge body so cooperative crawlers can decide up front whether the preview alone meets their need. |
 | `paywall_position` | enum, optional | Hint to the crawler about where the paywall sits in the rendered response: `top_of_page` (paywall replaces the entire body; any free preview is a separate excerpt), `inline` (free preview served inline, paywall follows in the same body), `bottom_of_page` (paywall after the full or near-full preview; discouraged for high-value content). |
 
-The first tier whose `route_pattern` matches wins. When no tier matches, the policy falls back to the top-level `price` and `currency`. An empty `tiers` list keeps the original flat-price behaviour.
+The first tier whose `route_pattern` matches wins. When no tier matches, the policy falls back to the top-level `price` and `currency`. An empty `tiers` list keeps the original flat-price behavior.
 
 ### Per-shape pricing
 
@@ -256,7 +256,7 @@ policies:
         open_duration_ms: 5000         # default 5000
 ```
 
-The HMAC key resolves through `secret_ref`, which takes either `env: <VAR>` (an environment variable holding the hex-encoded key) or `secret: <name>` (a logical secret resolved through the secrets layer). For dev configs and tests only, an inline `key_hex:` is honoured when `secret_ref` is absent; it should not appear in a production `sb.yml`. The agent identity fields on the redeem payload come from the request-time agent-class resolver, not from ledger config.
+The HMAC key resolves through `secret_ref`, which takes either `env: <VAR>` (an environment variable holding the hex-encoded key) or `secret: <name>` (a logical secret resolved through the secrets layer). For dev configs and tests only, an inline `key_hex:` is honored when `secret_ref` is absent; it should not appear in a production `sb.yml`. The agent identity fields on the redeem payload come from the request-time agent-class resolver, not from ledger config.
 
 For a ledger signed by a private CA, each `trust_roots` entry may contain one or more PEM `CERTIFICATE` blocks. These certificates are added to the system trust store rather than replacing it, so public HTTPS endpoints continue to validate normally. Malformed or empty PEM bundles fail at config load.
 
@@ -299,13 +299,13 @@ Every attempt carries an `Idempotency-Key` header (a fresh ULID per logical oper
 Exponential backoff with full jitter, max 5 attempts, per-attempt deadline 5 s, total deadline 30 s. The base schedule is 0 ms, 250 ms, 500 ms, 1 s, 2 s, each with `[0, base)` jitter added. Retries fire only on:
 
 - network errors (DNS, TCP RST, TLS handshake, read timeout)
-- HTTP 429 (with `Retry-After` honoured)
+- HTTP 429 (with `Retry-After` honored)
 - HTTP 502 / 503 / 504
 - error envelopes with `retryable: true`
 
 Hard failures (`ledger.token_already_spent`, `ledger.signature_invalid`, `ledger.bad_request`) translate directly to a 402 to the crawler. There is no point retrying a token the ledger already rejected as spent.
 
-The circuit breaker opens after 10 consecutive failures, half-opens after 5 s with one probe, and closes on probe success. While the breaker is open, the client returns a synthetic `ledger.unavailable` error without making the network call. The policy treats that as "ledger is down" and fails closed: the crawler gets a 503 with a `ledger_unavailable` JSON body and a `Retry-After` header. There is no `on_ledger_failure` knob; fail-closed is the fixed behaviour, because failing open would hand out the content the paywall exists to price.
+The circuit breaker opens after 10 consecutive failures, half-opens after 5 s with one probe, and closes on probe success. While the breaker is open, the client returns a synthetic `ledger.unavailable` error without making the network call. The policy treats that as "ledger is down" and fails closed: the crawler gets a 503 with a `ledger_unavailable` JSON body and a `Retry-After` header. There is no `on_ledger_failure` knob; fail-closed is the fixed behavior, because failing open would hand out the content the paywall exists to price.
 
 A ledger `Retry-After` propagates straight to the crawler on that 503 (defaulting to 5 seconds when the ledger did not send one), so the crawler knows when to come back.
 
@@ -417,7 +417,7 @@ What ships now: exemplars on `sbproxy_ledger_redeem_duration_seconds_bucket` car
 
 ## Limitations
 
-- Detection is User-Agent based by default. Crawlers that lie about their UA bypass the check unless reverse-DNS or Web Bot Auth signals catch them; layer this with bot-detection or WAF policies for defence in depth.
+- Detection is User-Agent based by default. Crawlers that lie about their UA bypass the check unless reverse-DNS or Web Bot Auth signals catch them; layer this with bot-detection or WAF policies for defense in depth.
 - The in-memory ledger is single-process. Multi-replica deployments without an HTTP ledger need sticky session affinity to one replica.
 - `content_shape` is advisory. The field flows through metrics and the redeem payload but is not yet used as a tier filter.
 - Per-agent pricing requires the agent-class resolver to be enabled; the resolver runs unconditionally by default, but operators who explicitly disable it fall back to UA-only matching and lose the per-vendor distinction.

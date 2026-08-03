@@ -54,7 +54,7 @@ proxy:
   http_bind_port: 8080
 
   # The immediate TCP peer is the Ingress controller, not the real
-  # client. Honour its X-Forwarded-For only from cluster-internal
+  # client. Honor its X-Forwarded-For only from cluster-internal
   # ranges; strip spoofed XFF from anywhere else.
   trusted_proxies:
     - 10.0.0.0/8       # K8s Pod CIDR
@@ -152,7 +152,7 @@ You get a `200 OK`. The response carries an `x-request-id` header, and the JSON 
 }
 ```
 
-Reuse a client-supplied request id and the proxy honours it rather than minting a new one:
+Reuse a client-supplied request id and the proxy honors it rather than minting a new one:
 
 ```bash
 curl -i \

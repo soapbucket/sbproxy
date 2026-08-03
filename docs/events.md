@@ -6,7 +6,7 @@ SBproxy has a small in-process event bus in `sbproxy-observe`. It defines a clos
 
 ## Event types
 
-`ProxyEvent::event_type` is the closed enum below. Variants serialise to snake_case JSON.
+`ProxyEvent::event_type` is the closed enum below. Variants serialize to snake_case JSON.
 
 | Name | When |
 |------|------|

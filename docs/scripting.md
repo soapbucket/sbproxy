@@ -217,7 +217,7 @@ CEL includes the standard operators (`+`, `-`, `*`, `/`, `%`, `in`, `==`, `!=`, 
 | `s.trim()` | string | Trim leading and trailing whitespace |
 | `s.split(sep)` | list | Split `s` on `sep` |
 | `flag_enabled(name, key)` | bool | Resolve a feature flag against the live flag store; unknown flags evaluate false |
-| `tls_fingerprint_matches(ja4, agent_class_id)` | bool | True when `ja4` is a known fingerprint for the catalogued agent class, or when the catalogue has no entry for the class (conservative) |
+| `tls_fingerprint_matches(ja4, agent_class_id)` | bool | True when `ja4` is a known fingerprint for the cataloged agent class, or when the catalog has no entry for the class (conservative) |
 
 `flag_enabled` reads the process-wide set declared by the top-level `flags:` block. Its second argument is the stable bucketing key; use a user, tenant, or subject identifier rather than a random request ID. Successful hot reloads replace the full flag set atomically, and an absent `flags:` block clears it. Unknown flags evaluate to `false`. See [Edge feature flags](feature-flags.md) for the rule grammar.
 
@@ -422,7 +422,7 @@ origins:
           - { op: remove, name: x-internal-trace }
 ```
 
-The expression sees `response.body`, `response.status`, `response.headers`, and the `request.*` namespace. A string result is written back verbatim; ints, floats, and bools render as strings; maps and lists are JSON-serialised; null leaves the body unchanged. `Set-Cookie` is on a deny-list: a CEL header rule cannot set it.
+The expression sees `response.body`, `response.status`, `response.headers`, and the `request.*` namespace. A string result is written back verbatim; ints, floats, and bools render as strings; maps and lists are JSON-serialized; null leaves the body unchanged. `Set-Cookie` is on a deny-list: a CEL header rule cannot set it.
 
 Every expression on the transform is compiled when the config compiles: `on_response`, each rule's `value_expr`, and the reserved `on_request` field. A syntax error in any of them refuses the config, naming the origin and the field or header it belongs to. Responses then only evaluate.
 
@@ -693,7 +693,7 @@ response_modifiers:
       }
 ```
 
-Body transforms come in two shapes. `type: javascript` runs `transform(body, ctx)` over the raw body string (a non-string return value is JSON-serialised); `type: js_json` runs `modify_json(data, ctx)` over the parsed JSON body. Both accept an optional `function_name` to call a differently named entrypoint.
+Body transforms come in two shapes. `type: javascript` runs `transform(body, ctx)` over the raw body string (a non-string return value is JSON-serialized); `type: js_json` runs `modify_json(data, ctx)` over the parsed JSON body. Both accept an optional `function_name` to call a differently named entrypoint.
 
 ```yaml
 transforms:
@@ -1046,7 +1046,7 @@ Where a hook's `failure_posture` applies, an attachment in `sb.yml` can override
 2. The bundle manifest's own `failure_posture`.
 3. The attachment's default, which for a `transforms:` entry is `open`.
 
-Writing nothing on the attachment is not the same as writing `open` there. A bundle that ships `failure_posture: closed` keeps it unless you say otherwise, which is what makes step two worth having: the bundle author's judgement about their own hook is the fallback, not the wrapper's default.
+Writing nothing on the attachment is not the same as writing `open` there. A bundle that ships `failure_posture: closed` keeps it unless you say otherwise, which is what makes step two worth having: the bundle author's judgment about their own hook is the fallback, not the wrapper's default.
 
 ### 12.2 Exact SHA-256 validation
 

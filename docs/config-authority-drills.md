@@ -220,7 +220,7 @@ Stated plainly so nobody reads a green run as more than it is.
   TLS startup tests. Nothing in a green drill run says anything about
   the TLS listener.
 - **A real network.** Everything is loopback, so nothing here says
-  anything about behaviour across a partition, under packet loss, or
+  anything about behavior across a partition, under packet loss, or
   against a slow DNS resolver.
 - **Scale.** One subscriber. The per-subscriber and fleet-wide rate
   limits are unit-tested; how an authority behaves with a thousand

@@ -92,7 +92,7 @@ origins:
 
 The legacy `max_tokens_per_minute: 60000` has no equivalent and is dropped; if the key needs a token ceiling, use `attrs.budget.max_tokens`.
 
-Behaviour is identical at runtime: the compile-time lowering materialises the credentials of type `ai_provider` as entries in the legacy `VirtualKeyConfig` registry the AI dispatch already reads. Existing access-log columns (`project`, `user`, `metadata`) and per-credential attribution metrics keep populating from the unified `Principal` write.
+Behavior is identical at runtime: the compile-time lowering materialises the credentials of type `ai_provider` as entries in the legacy `VirtualKeyConfig` registry the AI dispatch already reads. Existing access-log columns (`project`, `user`, `metadata`) and per-credential attribution metrics keep populating from the unified `Principal` write.
 
 ## Multi-tenant scope
 

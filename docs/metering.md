@@ -556,7 +556,7 @@ So a receipt that contradicts itself is refused rather than reported. Every path
 - `GET /api/meter/summary` and `GET /api/meter/receipts` stop at that sequence number and report it through the same `damaged_at_seq` and `damage_reason` fields an unreadable line uses. They do not skip the line and keep adding up the rest, because a plausible total over a record nobody can settle from is worse than a stopped page.
 - The ledger refuses to open, so the meter does not chain more entries onto it. Your configured `failure_mode` then decides what an unopenable chain does to traffic, exactly as it does for a full disk.
 
-There is no posture that admits one. `failure_mode` answers what happens to traffic when the meter cannot write what it owes; by the time anything reads a receipt back, the request it describes is finished and the only decision left is whether to believe the document. Refusals are counted on `sbproxy_meter_incoherent_receipts_total`, labelled by tenant, and the label always reads `failure_mode="closed"`.
+There is no posture that admits one. `failure_mode` answers what happens to traffic when the meter cannot write what it owes; by the time anything reads a receipt back, the request it describes is finished and the only decision left is whether to believe the document. Refusals are counted on `sbproxy_meter_incoherent_receipts_total`, labeled by tenant, and the label always reads `failure_mode="closed"`.
 
 As a buyer you can make the same check with no SBproxy software, and it is worth adding to whatever you already run: for each unit, `source: "measured"` must carry `bytes_in`, `bytes_out`, and `duration_ms`; `route_weight` must carry `config_revision`; `origin_header` must carry `header`. Anything else on a signed receipt is a claim the operator's own reader refuses, and you should refuse it too.
 
@@ -572,13 +572,13 @@ Reading one in a chain means: a record was owed here and the chain could not tak
 
 When the marker itself cannot be written, the counter is the only record left; that is the failure mode's floor, and it is why the metric and the marker both exist rather than either alone.
 
-## Cluster totals are labelled, never estimated
+## Cluster totals are labeled, never estimated
 
 Chains are per node. Two nodes serving the same tenant each write their own sequence, so a sequence number is only meaningful next to the node id it was counted under, and a cluster total is an assembly of per-node chains, not a number any single chain contains.
 
 `/api/meter/summary` therefore never quotes a cluster figure without a `coverage` block naming which nodes are inside it: how many nodes were expected, how many answered, and, for each node that did not, the last chain head it was ever seen at. An unreachable node stays in the report at its last known position rather than being dropped, counted as zero, or extrapolated. When no mesh is configured, `coverage` is `null`, because there is exactly one chain and a coverage block would claim a fan-out that never happened.
 
-The refusal to estimate is a billing decision, not a reporting limitation. A partial total labelled partial is a fact; a partial total padded to look complete is an invoice line nobody can reproduce from any chain, and being reproducible from the chain is the only property that makes any number on this page worth writing down.
+The refusal to estimate is a billing decision, not a reporting limitation. A partial total labeled partial is a fact; a partial total padded to look complete is an invoice line nobody can reproduce from any chain, and being reproducible from the chain is the only property that makes any number on this page worth writing down.
 
 ## See also
 

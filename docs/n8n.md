@@ -102,7 +102,7 @@ origins:
           prefix: weather
 ```
 
-Bare hostnames under `federated_servers` are normalised to `https://<host>/mcp`; use a full URL for any other path. Tool names stay bare in the federated catalog by default; each upstream's `prefix` steps in only to disambiguate a clash, when two upstreams advertise the same tool name. An origin key carries one action, so to run chat completions and MCP behind the same gateway process, give each its own origin keyed by hostname.
+Bare hostnames under `federated_servers` are normalized to `https://<host>/mcp`; use a full URL for any other path. Tool names stay bare in the federated catalog by default; each upstream's `prefix` steps in only to disambiguate a clash, when two upstreams advertise the same tool name. An origin key carries one action, so to run chat completions and MCP behind the same gateway process, give each its own origin keyed by hostname.
 
 ### Verify the gateway side
 

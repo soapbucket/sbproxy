@@ -482,7 +482,7 @@ boot.
 
 | Field | Default | What it does |
 |---|---|---|
-| `event_name` | required | The meter event name registered in the Stripe dashboard. Every row this reporter queues carries it, and Stripe rejects one it does not recognise. |
+| `event_name` | required | The meter event name registered in the Stripe dashboard. Every row this reporter queues carries it, and Stripe rejects one it does not recognize. |
 | `customer_field` | required | Which entry in the authenticated credential's `metadata` map holds the Stripe customer id. Read from the credential and never from a request header: a caller who could name the account their usage bills to could name somebody else's. A request whose principal carries no such entry queues nothing, because a meter event with nobody to bill is one Stripe refuses anyway. |
 | `source` | required | Which request-path record is authoritative for this meter event: `http`, `ai`, or `mcp`. There is no default, on purpose. See "Which source is authoritative" below. |
 | `unit` | required | The quantity this meter event bills. For `ai`, one of `prompt_tokens`, `completion_tokens`, `total_tokens`. For `mcp`, `tool_call`. For `http`, one of your own `proxy.attestation` unit names, and only billable units carrying that name are reported. One unit rather than a list, because a Stripe meter event carries one number and two units summed is a figure nobody can take apart. |
@@ -610,7 +610,7 @@ attribution and the customer the charge lands on:
 
 <!-- CAPTURE: sqlite3 /var/lib/sbproxy/payments.sqlite3 'select event_jcs from usage_reports order by created_at_ms limit 1' -->
 
-Two counters describe the bridge, both labelled by tenant because a billing
+Two counters describe the bridge, both labeled by tenant because a billing
 number that merged every tenant into one series answers a question nobody
 asks:
 

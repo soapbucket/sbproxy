@@ -600,7 +600,7 @@ not substitute evidence from a different variant. Pickle variants fail closed
 unless the logical catalog entry explicitly opts in with `allow_pickle: true`.
 
 Creating a deployment or changing its logical model requires explicit license
-acknowledgement. The form covers deployment ID, logical model, automatic or
+acknowledgment. The form covers deployment ID, logical model, automatic or
 exact variant selection, heterogeneous variants, replicas, required labels,
 spread keys, pull policy, warm behavior, engine, rollout policy, keep-alive,
 maximum concurrency, queue depth, and queue timeout. Add, edit, rename, and
@@ -1213,7 +1213,7 @@ sbproxy cluster status --admin-url "${SB_ADMIN_URL}" --format json
 
 `GET /admin/cluster/status` is the stable cluster-view backend. It always lists
 the complete membership roster, including unhealthy and excluded nodes. Each
-node includes membership state, acknowledgement age, health, stable reasons,
+node includes membership state, acknowledgment age, health, stable reasons,
 roles, labels, model endpoint, snapshot age and generation, engine/device and
 artifact counts, replica truth, model eligibility, and exclusion reason. The
 top-level `unhealthy_nodes` array repeats only actionable nodes so an admin UI

@@ -1987,7 +1987,7 @@ origins:
           allow: [gh.search_repos, db.query]
 ```
 
-The action speaks JSON-RPC 2.0: `initialize` returns the configured `server_info`, `tools/list` aggregates the federated catalogue, `tools/call` enforces the allowlist guardrail and routes to the upstream that owns the prefix. Tool aggregation, name-collision handling, and the upstream transports (`streamable_http`, `sse`) live in the federation library at `crates/sbproxy-extension/src/mcp/`. See [examples/mcp-federation/](../examples/mcp-federation/) for a runnable config.
+The action speaks JSON-RPC 2.0: `initialize` returns the configured `server_info`, `tools/list` aggregates the federated catalog, `tools/call` enforces the allowlist guardrail and routes to the upstream that owns the prefix. Tool aggregation, name-collision handling, and the upstream transports (`streamable_http`, `sse`) live in the federation library at `crates/sbproxy-extension/src/mcp/`. See [examples/mcp-federation/](../examples/mcp-federation/) for a runnable config.
 
 The action also carries the tool rollout plane: a `rollout:` block under `tool_versioning` publishes several versions of one tool at once, resolves the right one per consumer (call `_meta`, session requirements, principal pins, `search_v1` aliases, default), routes or adapts each version, and sunsets old ones on a date, with per-version call metrics for migration. See [tool-versioning.md](tool-versioning.md) and [examples/mcp-tool-rollout/](../examples/mcp-tool-rollout/).
 
@@ -2016,7 +2016,7 @@ spec:
     docsUrl: "/docs/example-api"
 ```
 
-See [listings.md](listings.md) for the full schema reference, the loader behaviour, the plan-validation rules, and a runnable example at [examples/listing-primitive/](../examples/listing-primitive/).
+See [listings.md](listings.md) for the full schema reference, the loader behavior, the plan-validation rules, and a runnable example at [examples/listing-primitive/](../examples/listing-primitive/).
 
 ---
 
@@ -2297,11 +2297,11 @@ External plugins ship as separate crates that depend on `sbproxy-plugin` and sub
 
 ### CORS security defaults
 
-The CORS middleware enforces the following safety rules. These changes are tracked under OPENSOURCE.md H5 and are a deliberate breaking change versus the pre-1.0 development behaviour.
+The CORS middleware enforces the following safety rules. These changes are tracked under OPENSOURCE.md H5 and are a deliberate breaking change versus the pre-1.0 development behavior.
 
 - **Empty `allowed_origins` is deny-all.** Earlier revisions echoed any `Origin` header back when `allowed_origins` was empty. Combined with `allow_credentials: true` this allowed credentialed cross-origin access from arbitrary callers. The middleware now emits no CORS headers when the list is empty, regardless of `allow_credentials`.
-- **Wildcard plus credentials is refused.** The combination `allowed_origins: ["*"]` with `allow_credentials: true` is rejected at config-load time by `cors::validate_cors_config`, and the runtime path also refuses to emit headers for that combination as a belt-and-suspenders check. Browsers reject this pairing per the Fetch spec; surfacing it as a config error matches that behaviour.
-- **Explicit any-origin opt-in.** Operators who genuinely want to permit any origin must set `allowed_origins: ["*"]` and `allow_credentials: false`. Echo-the-request-origin behaviour is no longer reachable through configuration; the only way to allow a specific origin is to list it.
+- **Wildcard plus credentials is refused.** The combination `allowed_origins: ["*"]` with `allow_credentials: true` is rejected at config-load time by `cors::validate_cors_config`, and the runtime path also refuses to emit headers for that combination as a belt-and-suspenders check. Browsers reject this pairing per the Fetch spec; surfacing it as a config error matches that behavior.
+- **Explicit any-origin opt-in.** Operators who genuinely want to permit any origin must set `allowed_origins: ["*"]` and `allow_credentials: false`. Echo-the-request-origin behavior is no longer reachable through configuration; the only way to allow a specific origin is to list it.
 
 Migration notes for existing configs:
 

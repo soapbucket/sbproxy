@@ -156,7 +156,7 @@ flips the top-level status to `unready` and the response to `503`.
 
 Kubernetes-style readiness probe. Returns `200` once all required
 components are ready to serve traffic, `503` while any required
-component is still initialising or has failed. K8s polls this to
+component is still initializing or has failed. K8s polls this to
 gate traffic shifting during rolling restarts.
 
 ### `GET /livez`, `GET /live`
@@ -623,7 +623,7 @@ diagnose why a load balancer is short on candidates.
 | `origins[].origin_id` | string | Stable identifier for this origin within its workspace. |
 | `origins[].targets[].index` | int | Position in the configured target list. |
 | `origins[].targets[].url` | string | Upstream URL. |
-| `origins[].targets[].eligible` | bool | True when `healthy && !outlier_ejected && circuit_breaker_state != "open"`; matches what `select_target` honours. |
+| `origins[].targets[].eligible` | bool | True when `healthy && !outlier_ejected && circuit_breaker_state != "open"`; matches what `select_target` honors. |
 | `origins[].targets[].healthy` | bool | Latest active-health-check verdict. |
 | `origins[].targets[].outlier_ejected` | bool | True when the outlier detector has temporarily ejected this target. |
 | `origins[].targets[].circuit_breaker_state` | string \| null | `"closed"`, `"open"`, `"half_open"`, or null when the breaker is unconfigured. |
@@ -2054,7 +2054,7 @@ persist to the operator-configured redb file when
 
 The full set of POST shapes and request schemas is documented in
 [ai-gateway.md](./ai-gateway.md) under "Stored prompts". This
-reference only catalogues the route surface; the request/response
+reference only catalogs the route surface; the request/response
 contracts live with the feature.
 
 ---
