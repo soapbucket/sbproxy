@@ -2112,6 +2112,15 @@ fn usage_event_from_context(
             .trace_id
             .clone()
             .filter(|id| !id.is_empty()),
+        // WOR-2223: the two halves of the hybrid lane split. The failover
+        // loop rewrites `ai_model` to whatever the provider that answered
+        // bills under, so by the time this runs a spilled completion no
+        // longer names the lane it came from; `ai_logical_model` still
+        // does. `ai_serve_model` is set only by the code that resolved a
+        // local engine and is cleared at the top of every attempt, so it
+        // is present exactly when the request never left the box.
+        logical_model: ctx.ai_logical_model.clone(),
+        served_model: ctx.ai_serve_model.clone(),
     }
 }
 
@@ -4058,6 +4067,91 @@ mod governed_usage_attribution_tests {
             Some("cc-42")
         );
         assert_ne!(event.key_id.as_deref(), Some("mutable display name"));
+    }
+
+    /// A value recorder over an in-memory ledger priced against
+    /// `gpt-4o-mini` for the served model `qwen3-14b`, the shape
+    /// `examples/use-case-local-first` configures.
+    fn value_recorder() -> (
+        std::sync::Arc<sbproxy_ai::value_ledger::ValueLedger>,
+        sbproxy_ai::value_ledger::ValueSink,
+    ) {
+        let price = sbproxy_model_host::CloudPrice {
+            prompt_micros_per_mtok: 3_000_000,
+            completion_micros_per_mtok: 15_000_000,
+        };
+        let ledger = std::sync::Arc::new(
+            sbproxy_ai::value_ledger::ValueLedger::open("").expect("memory ledger"),
+        );
+        let references = std::collections::BTreeMap::from([(
+            "qwen3-14b".to_string(),
+            ("gpt-4o-mini".to_string(), price),
+        )]);
+        let sink = sbproxy_ai::value_ledger::ValueSink::new(ledger.clone(), references);
+        (ledger, sink)
+    }
+
+    /// A finished 1000-prompt / 500-completion request, with the lane
+    /// fields the dispatch loop leaves behind.
+    fn completed_ctx(
+        logical_model: &str,
+        served_model: Option<&str>,
+        billed_model: &str,
+    ) -> crate::context::RequestContext {
+        let mut ctx = crate::context::RequestContext::new();
+        ctx.response_status = Some(200);
+        ctx.ai_tokens_in = Some(1000);
+        ctx.ai_tokens_out = Some(500);
+        ctx.ai_logical_model = Some(logical_model.to_string());
+        ctx.ai_serve_model = served_model.map(str::to_string);
+        ctx.ai_model = Some(billed_model.to_string());
+        ctx
+    }
+
+    #[test]
+    fn a_spilled_completion_records_cloud_spend_against_the_served_model() {
+        // WOR-2223: the whole path, from the context the failover loop
+        // leaves behind to the numbers the admin value route serves. The
+        // recorder had a caller for the local lane and none for the cloud
+        // lane, so every deployment reported gross savings as a hybrid
+        // split. One spill has to move both cloud numbers.
+        let (ledger, sink) = value_recorder();
+        // The local engine could not take the request, so the loop
+        // advanced: no serve marker, and `ai_model` is now the fallback
+        // provider's mapping rather than the id the caller sent.
+        let ctx = completed_ctx("qwen3-14b", None, "gpt-4o-mini");
+
+        let event = usage_event_from_context(&ctx, "openai".to_string());
+        assert_eq!(event.logical_model.as_deref(), Some("qwen3-14b"));
+        assert_eq!(event.served_model, None);
+        sbproxy_ai::usage_sink::UsageSink::record(&sink, &event);
+
+        let report = ledger.report();
+        assert_eq!(report.total_cloud_completions, 1);
+        assert_eq!(report.total_cloud_spent_micros, 10_500);
+        assert_eq!(report.total_local_completions, 0);
+        assert_eq!(report.total_saved_micros, 0);
+        assert_eq!(
+            report.models[0].model, "qwen3-14b",
+            "the spend belongs to the lane it displaced, not to the provider's billing id"
+        );
+    }
+
+    #[test]
+    fn a_locally_served_completion_still_records_the_saving() {
+        // The other half of the same discriminator: with the serve marker
+        // present the identical token counts are a saving, not spend.
+        let (ledger, sink) = value_recorder();
+        let ctx = completed_ctx("qwen3-14b", Some("qwen3-14b"), "qwen3-14b");
+
+        let event = usage_event_from_context(&ctx, "local".to_string());
+        sbproxy_ai::usage_sink::UsageSink::record(&sink, &event);
+
+        let report = ledger.report();
+        assert_eq!(report.total_local_completions, 1);
+        assert_eq!(report.total_saved_micros, 10_500);
+        assert_eq!(report.total_cloud_completions, 0);
+        assert_eq!(report.total_cloud_spent_micros, 0);
     }
 
     #[test]
