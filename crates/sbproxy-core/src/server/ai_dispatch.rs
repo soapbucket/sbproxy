@@ -77,6 +77,18 @@ mod native_destination_tests {
 enum DynamicKeyOutcome {
     /// Not a virtual-key-shaped token (or no token); let other auth handle it.
     NotApplicable,
+    /// The key store could not be read and `key_management.failure_posture`
+    /// chose to admit the request anyway.
+    ///
+    /// Distinct from [`Self::NotApplicable`] because the two mean opposite
+    /// things to a later gate. `NotApplicable` says nothing was decided here.
+    /// This says a posture deliberately let the request through without
+    /// per-key policy, budget, or attribution, which is the contract
+    /// `docs/degradation.md` states for `degraded` and `open`: fall through to
+    /// the origin's own auth. Collapsing the two let the native-provider-key
+    /// gate refuse a request the posture had already admitted, so a documented
+    /// degradation path returned 403 during exactly the outage it exists for.
+    AdmittedByFailurePosture,
     /// Resolved to a usable stored record. Canonical policy lowering happens
     /// once after authentication and before any dispatch branch.
     Resolved(Box<sbproxy_keystore::record::KeyRecord>),
@@ -260,6 +272,16 @@ fn effective_policy_to_virtual_key(
 enum ResolvedPolicyOrigin {
     Stored,
     Configured,
+    /// Synthesized from `inbound.native_key_policy` for a caller-owned
+    /// provider credential.
+    ///
+    /// Separate from [`Self::Stored`] because a native record is lowered
+    /// through the same path as a minted one and would otherwise be
+    /// indistinguishable from it. That mattered: it carries an effective
+    /// policy, so `require_governed_key: true` was satisfied by any caller
+    /// presenting their own `sk-...` key, which voids the premise of the
+    /// setting on every policy-configured origin.
+    Native,
 }
 
 struct ResolvedRequestKey {
@@ -520,13 +542,35 @@ impl ResolvedRequestKey {
         record: &sbproxy_keystore::record::KeyRecord,
         origin_tenant_id: &str,
     ) -> std::result::Result<Self, StoredPolicyError> {
+        Self::from_record_with_origin(record, origin_tenant_id, ResolvedPolicyOrigin::Stored)
+    }
+
+    /// Lower a record that was synthesized for a caller-owned native
+    /// credential rather than minted by this proxy.
+    fn from_native_record(
+        record: &sbproxy_keystore::record::KeyRecord,
+        origin_tenant_id: &str,
+    ) -> std::result::Result<Self, StoredPolicyError> {
+        Self::from_record_with_origin(record, origin_tenant_id, ResolvedPolicyOrigin::Native)
+    }
+
+    fn from_record_with_origin(
+        record: &sbproxy_keystore::record::KeyRecord,
+        origin_tenant_id: &str,
+        policy_origin: ResolvedPolicyOrigin,
+    ) -> std::result::Result<Self, StoredPolicyError> {
         let effective_policy = key_record_to_effective_policy(record, origin_tenant_id)?;
         let virtual_key = effective_policy_to_virtual_key(&effective_policy);
         Ok(Self {
             virtual_key,
             effective_policy: Some(effective_policy),
-            policy_origin: ResolvedPolicyOrigin::Stored,
+            policy_origin,
         })
+    }
+
+    /// Whether this key was presented by the caller rather than minted here.
+    const fn is_native(&self) -> bool {
+        matches!(self.policy_origin, ResolvedPolicyOrigin::Native)
     }
 
     fn from_configured(
@@ -688,7 +732,19 @@ fn governed_key_requirement(
     required: bool,
     resolved: Option<&ResolvedRequestKey>,
 ) -> std::result::Result<(), (u16, &'static str)> {
-    if required && resolved.and_then(ResolvedRequestKey::policy).is_none() {
+    if !required {
+        return Ok(());
+    }
+    // A caller-owned native credential is not a governed key. It carries an
+    // effective policy so the rest of the pipeline has something to read, but
+    // that policy was synthesized from `native_key_policy`, not minted and
+    // revisioned by this proxy, so accepting it here would let any caller
+    // presenting their own provider key satisfy a setting whose whole purpose
+    // is to require one this proxy governs.
+    if resolved.is_some_and(ResolvedRequestKey::is_native) {
+        return Err((401, "governed credential required"));
+    }
+    if resolved.and_then(ResolvedRequestKey::policy).is_none() {
         return Err((401, "governed credential required"));
     }
     Ok(())
@@ -717,6 +773,10 @@ fn peer_policy_revision(
         ResolvedPolicyOrigin::Configured => {
             format!("c:{config_revision}:{digest_prefix}")
         }
+        // A native policy is not a revisioned artifact this proxy published,
+        // so it is labelled by its source rather than given a revision that
+        // would imply an authority behind it.
+        ResolvedPolicyOrigin::Native => format!("native:{config_revision}:{digest_prefix}"),
     })
 }
 
@@ -1659,7 +1719,7 @@ fn dynamic_key_store_outage(
             "key store unavailable; passing through"
         );
     }
-    DynamicKeyOutcome::NotApplicable
+    DynamicKeyOutcome::AdmittedByFailurePosture
 }
 
 /// WOR-1555: map a verified OIDC/JWT identity to a stored virtual-key record's
@@ -1808,6 +1868,9 @@ async fn resolve_request_virtual_key(
                         .map(Some);
                 }
                 DynamicKeyOutcome::NotApplicable => {}
+                DynamicKeyOutcome::AdmittedByFailurePosture => {
+                    ctx.key_store_admitted_by_posture = true;
+                }
                 DynamicKeyOutcome::Deny(status, message) => {
                     stamp_minted_key_mode(ctx);
                     ctx.inbound_key_header = Some(header.clone());
@@ -1839,6 +1902,9 @@ async fn resolve_request_virtual_key(
                     .map(Some);
             }
             DynamicKeyOutcome::NotApplicable => {}
+            DynamicKeyOutcome::AdmittedByFailurePosture => {
+                ctx.key_store_admitted_by_posture = true;
+            }
             DynamicKeyOutcome::Deny(status, message) => return Err((status, message)),
         }
     }
@@ -1875,7 +1941,7 @@ async fn resolve_request_virtual_key(
                 ctx.hostname.as_str(),
                 &provider,
             ));
-            let resolved = lower_stored_request_key(&record, origin_tenant_id)?;
+            let resolved = lower_native_request_key(&record, origin_tenant_id)?;
             ctx.native_key_policy_record = Some(record);
             ctx.native_key_provider = Some(provider);
             ctx.inbound_key_mode = crate::context::InboundKeyMode::Native;
@@ -1883,6 +1949,22 @@ async fn resolve_request_virtual_key(
         }
         crate::inbound_key::NativeKeyPolicyDecision::PolicyMissing { provider }
         | crate::inbound_key::NativeKeyPolicyDecision::ProviderDenied { provider } => {
+            // An admitting `key_management.failure_posture` already decided
+            // this request proceeds without per-key governance, and this gate
+            // needs no key store to reach a verdict, so denying here would
+            // override a decision that was made deliberately and contradict
+            // the fall-through `docs/degradation.md` promises for `degraded`
+            // and `open`. The request continues to the origin's own auth.
+            if ctx.key_store_admitted_by_posture {
+                tracing::warn!(
+                    provider = %provider,
+                    "native provider key not governed: key store unavailable and \
+                     failure_posture admitted the request"
+                );
+                ctx.native_key_provider = Some(provider);
+                ctx.inbound_key_mode = crate::context::InboundKeyMode::Native;
+                return Ok(None);
+            }
             ctx.native_key_provider = Some(provider);
             ctx.inbound_key_mode = crate::context::InboundKeyMode::Native;
             crate::trust_tier::finalize(ctx, AuthTrustOutcome::Missing.is_suspicious());
@@ -1944,6 +2026,24 @@ fn lower_stored_request_key(
 /// Dynamic bearer and OIDC mapping can resolve after the pre-auth sweep. The
 /// upstream phase still needs the original record's credential binding, so
 /// retain it on the request context only after policy validation succeeds.
+/// Lower a synthesized native-credential record.
+///
+/// Separate from [`lower_stored_request_key`] only in the policy origin it
+/// stamps, which is what keeps a caller-owned key from satisfying
+/// `require_governed_key`.
+fn lower_native_request_key(
+    record: &sbproxy_keystore::record::KeyRecord,
+    origin_tenant_id: &str,
+) -> std::result::Result<ResolvedRequestKey, (u16, String)> {
+    ResolvedRequestKey::from_native_record(record, origin_tenant_id).map_err(|error| {
+        warn!(
+            reason = error.safe_reason(),
+            "AI proxy: native credential policy rejected"
+        );
+        (403, "credential policy is invalid".to_string())
+    })
+}
+
 fn lower_and_preserve_stored_request_key(
     ctx: &mut RequestContext,
     record: Box<sbproxy_keystore::record::KeyRecord>,
@@ -15570,6 +15670,54 @@ mod dynamic_key_resolution_tests {
     }
 
     #[test]
+    fn a_caller_owned_native_key_is_not_a_governed_credential() {
+        // The record a native policy synthesizes carries an effective policy,
+        // so the `policy().is_none()` test alone admitted it and any caller
+        // presenting their own `sk-...` satisfied `require_governed_key`. The
+        // origin discriminator is what refuses it.
+        let policy = sbproxy_config::NativeKeyPolicyConfig {
+            allowed_providers: vec!["openai".to_owned()],
+            ..Default::default()
+        };
+        let record =
+            crate::inbound_key::native_policy_record(&policy, "tenant-a", "api.example", "openai");
+        let native = ResolvedRequestKey::from_native_record(&record, "tenant-a")
+            .expect("native record lowers");
+
+        assert!(
+            native.policy().is_some(),
+            "the native record must still carry a policy, or this test proves nothing"
+        );
+        assert!(native.is_native());
+        assert_eq!(
+            governed_key_requirement(true, Some(&native)),
+            Err((401, "governed credential required")),
+            "a caller-owned native key must not satisfy require_governed_key"
+        );
+        // Without the requirement it still passes, because the native key is
+        // a legitimate credential; it is only not a *governed* one.
+        assert!(governed_key_requirement(false, Some(&native)).is_ok());
+    }
+
+    #[test]
+    fn a_native_policy_revision_is_labelled_by_source_not_given_a_revision() {
+        let policy = sbproxy_config::NativeKeyPolicyConfig {
+            allowed_providers: vec!["openai".to_owned()],
+            ..Default::default()
+        };
+        let record =
+            crate::inbound_key::native_policy_record(&policy, "tenant-a", "api.example", "openai");
+        let native = ResolvedRequestKey::from_native_record(&record, "tenant-a")
+            .expect("native record lowers");
+        let version = peer_policy_revision(Some(&native), "cfgrev").expect("native version");
+
+        assert!(
+            version.starts_with("native:cfgrev:"),
+            "a synthesized policy must not claim a published revision: {version}"
+        );
+    }
+
+    #[test]
     fn disabled_configured_key_never_resolves_and_required_mode_denies_it() {
         let disabled: sbproxy_ai::identity::VirtualKeyConfig =
             serde_json::from_value(serde_json::json!({
@@ -15712,6 +15860,7 @@ mod dynamic_key_resolution_tests {
         match o {
             DynamicKeyOutcome::Resolved(_) => "resolved",
             DynamicKeyOutcome::NotApplicable => "not-applicable",
+            DynamicKeyOutcome::AdmittedByFailurePosture => "admitted-by-failure-posture",
             DynamicKeyOutcome::Deny(_, _) => "deny",
         }
     }

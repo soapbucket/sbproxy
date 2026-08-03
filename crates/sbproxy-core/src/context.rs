@@ -1186,6 +1186,15 @@ pub struct RequestContext {
     pub native_key_provider: Option<String>,
     /// Secret-free inbound key classification for metrics and audit.
     pub inbound_key_mode: InboundKeyMode,
+    /// Set when the key store could not be read and
+    /// `key_management.failure_posture` admitted the request anyway.
+    ///
+    /// Read by the native-provider-key gate, which must not refuse a request
+    /// an admitting posture already let through: `docs/degradation.md` states
+    /// that `degraded` and `open` fall through to the origin's own auth, and
+    /// the native gate needs no key store to reach a verdict, so without this
+    /// it denied during exactly the outage the posture exists for.
+    pub key_store_admitted_by_posture: bool,
     /// Governed key-policy revision applied to this request, in the
     /// `r{rev}:{digest}` / `c:{rev}:{digest}` vocabulary the
     /// `sbproxy.policy_version` span attribute uses. `None` when no
@@ -1711,6 +1720,7 @@ impl RequestContext {
             native_key_policy_record: None,
             inbound_key_header: None,
             native_key_provider: None,
+            key_store_admitted_by_posture: false,
             inbound_key_mode: InboundKeyMode::None,
             ai_policy_version: None,
             policy_decisions: Vec::new(),
