@@ -431,22 +431,28 @@ impl ProxyWasmSession {
         }
 
         self.begin_callback()?;
-        self.store.data_mut().set_buffer(6, Vec::new());
-        let vm_started = self.call_bool2("proxy_on_vm_start", 0, 0)?;
-        if vm_started.is_some() {
-            self.lifecycle_trace.push("vm_start");
-        }
-        if vm_started.is_some_and(|accepted| !accepted) {
-            return Err(ProxyWasmCallFailure::ConfigureRejected);
-        }
-
-        self.begin_callback()?;
+        self.store.data_mut().active_context = ROOT_CONTEXT_ID;
         if self.call_void2(
             "proxy_on_context_create",
             i32::try_from(ROOT_CONTEXT_ID).unwrap_or(1),
             0,
         )? {
             self.lifecycle_trace.push("root_create");
+        }
+
+        self.begin_callback()?;
+        self.store.data_mut().active_context = ROOT_CONTEXT_ID;
+        self.store.data_mut().set_buffer(6, Vec::new());
+        let vm_started = self.call_bool2(
+            "proxy_on_vm_start",
+            i32::try_from(ROOT_CONTEXT_ID).unwrap_or(1),
+            0,
+        )?;
+        if vm_started.is_some() {
+            self.lifecycle_trace.push("vm_start");
+        }
+        if vm_started.is_some_and(|accepted| !accepted) {
+            return Err(ProxyWasmCallFailure::ConfigureRejected);
         }
 
         self.begin_callback()?;
@@ -468,6 +474,7 @@ impl ProxyWasmSession {
         }
 
         self.begin_callback()?;
+        self.store.data_mut().active_context = HTTP_CONTEXT_ID;
         if self.call_void2(
             "proxy_on_context_create",
             i32::try_from(HTTP_CONTEXT_ID).unwrap_or(2),
@@ -1838,12 +1845,25 @@ mod tests {
             "loop" => include_bytes!("testdata/proxy_wasm/loop.wasm"),
             "memory" => include_bytes!("testdata/proxy_wasm/memory.wasm"),
             "output-limit" => include_bytes!("testdata/proxy_wasm/output-limit.wasm"),
+            "sdk-lifecycle" => include_bytes!("testdata/proxy_wasm/sdk-lifecycle.wasm"),
             "stack" => include_bytes!("testdata/proxy_wasm/stack.wasm"),
             "start-trap" => include_bytes!("testdata/proxy_wasm/start-trap.wasm"),
             "table-grow" => include_bytes!("testdata/proxy_wasm/table-grow.wasm"),
             _ => panic!("unknown fixture"),
         };
         ProxyWasmRuntime::from_bundle_bytes(bytes, limits).unwrap()
+    }
+
+    #[test]
+    fn vm_start_uses_an_existing_sdk_root_context() {
+        let runtime = runtime("sdk-lifecycle", limits());
+
+        let session = runtime.start_session(b"{}").unwrap();
+
+        assert_eq!(
+            session.lifecycle_trace(),
+            ["root_create", "vm_start", "configure", "http_create"]
+        );
     }
 
     #[test]
@@ -1876,8 +1896,8 @@ mod tests {
         assert_eq!(
             session.lifecycle_trace(),
             [
-                "vm_start",
                 "root_create",
+                "vm_start",
                 "configure",
                 "http_create",
                 "request_headers",
@@ -1950,8 +1970,8 @@ mod tests {
         assert_eq!(
             session.lifecycle_trace(),
             [
-                "vm_start",
                 "root_create",
+                "vm_start",
                 "configure",
                 "http_create",
                 "request_body:chunk",
