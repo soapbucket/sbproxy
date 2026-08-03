@@ -5544,7 +5544,12 @@ fn configured_artifact_protection(
     let yaml = std::fs::read_to_string(config_path)
         .map_err(|error| anyhow::anyhow!("read config '{}': {error}", config_path.display()))?;
     let compiled = sbproxy_config::compile_config(&yaml)?;
-    let pipeline = sbproxy_core::pipeline::CompiledPipeline::from_config(compiled)?;
+    let config_dir = config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let pipeline = sbproxy_core::pipeline::CompiledPipeline::from_config_for_validation_at(
+        compiled, config_dir,
+    )?;
     let mut protection = sbproxy_model_host::CacheProtection::default();
 
     if let Some(control) = pipeline.config.server.model_host.as_ref() {
@@ -12385,6 +12390,65 @@ hooks:
         (path, bundle_directory)
     }
 
+    fn temp_model_cli_extension_config() -> (std::path::PathBuf, std::path::PathBuf) {
+        let path = temp_config("");
+        let bundle_directory_name = format!(
+            "{}-bundles",
+            path.file_stem()
+                .expect("temporary config has a file stem")
+                .to_string_lossy()
+        );
+        let bundle_directory = path
+            .parent()
+            .expect("temporary config has a parent")
+            .join(&bundle_directory_name);
+        let bundle_root = bundle_directory.join("model-cli-chain");
+        std::fs::create_dir_all(&bundle_root).expect("create model CLI bundle directory");
+        std::fs::write(
+            bundle_root.join("entry.js"),
+            r#"export function respond() {
+  return { version: "sbproxy-envelope/v1", outcome: "response", status: 204, headers: [], body_base64: "" };
+}
+export function allow() {
+  return { version: "sbproxy-envelope/v1", decision: "allow" };
+}
+export function transform() {
+  return { version: "sbproxy-envelope/v1", body_base64: "" };
+}
+"#,
+        )
+        .expect("write model CLI bundle entry");
+        std::fs::write(
+            bundle_root.join("bundle.yaml"),
+            r#"apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: model-cli-chain
+version: 1.0.0
+runtime: javascript
+entry: entry.js
+hooks:
+  - kind: action
+    type: model_cli_action
+    export: respond
+  - kind: policy
+    type: model_cli_policy
+    export: allow
+  - kind: transform
+    type: model_cli_transform
+    export: transform
+"#,
+        )
+        .expect("write model CLI bundle manifest");
+        std::fs::write(
+            &path,
+            format!(
+                "extensions:\n  bundles_dir: {bundle_directory_name}\norigins:\n  model-cli.local:\n    action:\n      type: model_cli_action\n    policies:\n      - type: model_cli_policy\n    transforms:\n      - type: model_cli_transform\n"
+            ),
+        )
+        .expect("write model CLI extension config");
+        (path, bundle_directory)
+    }
+
     #[test]
     fn validate_loads_dynamic_action_bundle_relative_to_config() {
         let (path, bundle_directory) = temp_extension_config(
@@ -12405,6 +12469,24 @@ hooks:
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir_all(bundle_directory);
         assert_eq!(outcome.expect("dynamic action config should validate"), 0);
+    }
+
+    #[test]
+    fn model_cli_artifact_protection_loads_the_relative_dynamic_chain() {
+        let (path, bundle_directory) = temp_model_cli_extension_config();
+        let worker = sbproxy_model_host::WorkerProfile {
+            accelerator: sbproxy_model_host::AcceleratorKind::Cpu,
+            compute_capability: None,
+            memory_bytes: u64::MAX,
+            engines: std::collections::BTreeSet::new(),
+        };
+
+        let outcome =
+            configured_artifact_protection(&path, &sbproxy_model_host::Catalog::builtin(), &worker);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(bundle_directory);
+        outcome.expect("model pull and remove should load the configured extension chain");
     }
 
     #[test]
