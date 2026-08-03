@@ -5222,10 +5222,29 @@ impl ProxyHttp for SbProxy {
                             // onto the response as
                             // `x-sbproxy-transform-error` so the caller
                             // and operator can correlate.
+                            //
+                            // WOR-2268 carves one case out of that rule. A
+                            // dynamic bundle transform declares its own
+                            // posture in its manifest, and the operator
+                            // installing it is making the same call WOR-168
+                            // reserved for the host: a guest that times out
+                            // or panics is exactly what `failure_posture`
+                            // was written to describe. An invariant
+                            // violation is still the host's own bug and
+                            // still a 500 either way.
                             let transform_name = compiled_transform.transform.transform_type();
-                            let is_typed_transform_error = e
-                                .downcast_ref::<sbproxy_modules::transform::TransformError>()
-                                .is_some();
+                            let typed_error =
+                                e.downcast_ref::<sbproxy_modules::transform::TransformError>();
+                            let guest_declared_posture = matches!(
+                                typed_error,
+                                Some(sbproxy_modules::transform::TransformError::Plugin { .. })
+                            ) && matches!(
+                                &compiled_transform.transform,
+                                sbproxy_modules::Transform::Plugin(plugin)
+                                    if plugin.dynamic_hook().is_some()
+                            );
+                            let is_typed_transform_error =
+                                typed_error.is_some() && !guest_declared_posture;
                             if is_typed_transform_error {
                                 tracing::error!(
                                     hostname = %ctx.hostname,

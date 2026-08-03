@@ -6,7 +6,7 @@
 //! traits.
 
 use sbproxy_config::{BundleBodyMode, FailureMode};
-use sbproxy_plugin::{ActionHandler, PolicyEnforcer};
+use sbproxy_plugin::{ActionHandler, PolicyEnforcer, TransformHandler};
 
 /// Manifest-derived execution metadata for one dynamic bundle hook.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,5 +141,50 @@ impl PluginPolicy {
     #[must_use]
     pub fn into_parts(self) -> (Box<dyn PolicyEnforcer>, Option<DynamicHookMetadata>) {
         (self.enforcer, self.dynamic_hook)
+    }
+}
+
+/// A dynamically dispatched transform plus optional bundle metadata.
+///
+/// A transform's failure posture reaches the response pipeline through
+/// [`CompiledTransform`](crate::CompiledTransform), but only the
+/// attachment side of it was ever populated. A bundle that declares
+/// `failure_posture: open` needs its manifest read here, because the
+/// attachment has no posture of its own unless the operator wrote one
+/// (WOR-2268).
+pub struct PluginTransform {
+    handler: Box<dyn TransformHandler>,
+    dynamic_hook: Option<DynamicHookMetadata>,
+}
+
+impl PluginTransform {
+    /// Wrap a linked plugin transform, which carries no manifest.
+    #[must_use]
+    pub fn linked(handler: Box<dyn TransformHandler>) -> Self {
+        Self {
+            handler,
+            dynamic_hook: None,
+        }
+    }
+
+    /// Wrap a dynamic bundle transform and retain its execution metadata.
+    #[must_use]
+    pub fn dynamic(handler: Box<dyn TransformHandler>, metadata: DynamicHookMetadata) -> Self {
+        Self {
+            handler,
+            dynamic_hook: Some(metadata),
+        }
+    }
+
+    /// Borrow the transform handler.
+    #[must_use]
+    pub fn handler(&self) -> &dyn TransformHandler {
+        self.handler.as_ref()
+    }
+
+    /// Return dynamic bundle metadata, or none for linked plugins.
+    #[must_use]
+    pub fn dynamic_hook(&self) -> Option<&DynamicHookMetadata> {
+        self.dynamic_hook.as_ref()
     }
 }

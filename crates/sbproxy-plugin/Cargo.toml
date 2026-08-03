@@ -3,7 +3,13 @@ name = "sbproxy-plugin"
 # 0.1 -> 0.2: breaking change to the plugin trait API (WOR-620) -- trait
 # methods now return PluginError instead of anyhow::Error. 0.x breaking
 # changes bump the minor per semver.
-version = "0.2.0"
+#
+# 0.2 -> 0.3: breaking change to ActionOutcome (WOR-2276). The enum gained
+# the data-bearing `Response` variant that the bundle action contract
+# returns, which drops its `Copy` impl and makes any exhaustive match on
+# the 0.2 variants non-exhaustive. See `ActionOutcome`'s rustdoc for the
+# migration.
+version = "0.3.0"
 edition = "2021"
 license.workspace = true
 publish = false

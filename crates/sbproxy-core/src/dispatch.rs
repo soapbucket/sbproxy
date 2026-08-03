@@ -400,9 +400,11 @@ pub(crate) fn validate_plugin_action_response(
     mut headers: Vec<(String, String)>,
     body: Bytes,
 ) -> Result<HttpResponse> {
-    if !(100..=599).contains(&status) {
-        anyhow::bail!("plugin action response status must be in 100..=599, got {status}");
-    }
+    // A dynamic action's return value ends dispatch, so an informational
+    // status or a body under a bodyless status has to be caught here
+    // rather than at the transport, which would already be committed to
+    // whatever framing the status implied (WOR-2274).
+    sbproxy_extension::bundle::validate_extension_response(status, body.len())?;
     if headers.len() > MAX_PLUGIN_ACTION_RESPONSE_HEADERS {
         anyhow::bail!(
             "plugin action response has {} headers; maximum is {}",
@@ -801,7 +803,9 @@ mod tests {
 
     #[tokio::test]
     async fn plugin_action_h3_rejects_proxy_without_an_upstream() {
-        let action = Action::Plugin(Box::new(OutcomeAction(ActionOutcome::Proxy)));
+        let action = Action::Plugin(sbproxy_modules::PluginAction::linked(Box::new(
+            OutcomeAction(ActionOutcome::Proxy),
+        )));
 
         let error = match dispatch_plugin_action(&action).await {
             Ok(_) => panic!("a plugin action cannot continue without an upstream"),
@@ -876,6 +880,54 @@ mod tests {
             .expect("status below 100 must be rejected");
 
         assert!(error.to_string().contains("status"), "error: {error:#}");
+    }
+
+    #[tokio::test]
+    async fn plugin_action_h3_rejects_informational_status() {
+        // A 1xx is not a final response, but dispatch has already been
+        // torn down by the time the outcome arrives, so the client would
+        // wait forever for a final status that never comes (WOR-2274).
+        for status in [100, 101, 103] {
+            let action = plugin_action_response(status, Vec::new(), Bytes::new());
+
+            let error = dispatch_plugin_action(&action)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("status {status} must be rejected"));
+
+            assert!(
+                error.to_string().contains("informational"),
+                "status {status} error: {error:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_action_h3_rejects_a_body_under_a_bodyless_status() {
+        for status in [204, 304] {
+            let action = plugin_action_response(status, Vec::new(), Bytes::from_static(b"nope"));
+
+            let error = dispatch_plugin_action(&action)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("status {status} with a body must be rejected"));
+
+            assert!(
+                error.to_string().contains("forbids a response body"),
+                "status {status} error: {error:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_action_h3_allows_a_bodyless_status_with_no_body() {
+        let action = plugin_action_response(204, Vec::new(), Bytes::new());
+
+        let response = dispatch_plugin_action(&action)
+            .await
+            .expect("204 with an empty body is well formed");
+
+        assert_eq!(response.status, 204);
     }
 
     #[tokio::test]

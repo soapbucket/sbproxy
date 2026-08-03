@@ -48,6 +48,9 @@ enum PreparedAiRunner {
 #[derive(Clone)]
 struct PreparedAiHook {
     id: String,
+    /// Inventory lookup key, so a reported chain position can be matched
+    /// back to the hook record the operator sees (WOR-2272).
+    match_key: String,
     kind: ExtensionHookKind,
     enforcement: AiExtensionEnforcement,
     failure_posture: FailureMode,
@@ -82,6 +85,7 @@ impl AiExtensionChain {
                 .map_err(|error| BundleLoadError::new("ai", error.to_string()))?;
             hooks.extend(linked.into_iter().map(|registration| PreparedAiHook {
                 id: registration.id.to_owned(),
+                match_key: registration.id.to_owned(),
                 kind: public_kind,
                 enforcement: registration.enforcement,
                 failure_posture: FailureMode::Closed,
@@ -101,6 +105,19 @@ impl AiExtensionChain {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.hooks.is_empty()
+    }
+
+    /// Return every prepared hook's kind and lookup key in dispatch order.
+    ///
+    /// Inventory used to re-derive a chain position by sorting hook
+    /// identities alphabetically, which reported an order the pipeline
+    /// never runs. This is the real one (WOR-2272).
+    #[must_use]
+    pub fn dispatch_order(&self) -> Vec<(ExtensionHookKind, String)> {
+        self.hooks
+            .iter()
+            .map(|hook| (hook.kind, hook.match_key.clone()))
+            .collect()
     }
 
     /// True when at least one hook receives this event kind.
@@ -181,6 +198,7 @@ fn prepare_dynamic_hook(
     };
     Ok(PreparedAiHook {
         id: format!("{}:{}", hook.manifest().name, hook.hook().type_name),
+        match_key: hook.hook().type_name.clone(),
         kind: public_kind,
         enforcement,
         failure_posture: hook.manifest().failure_posture,

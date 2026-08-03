@@ -1783,7 +1783,14 @@ fn host_send_local_response(
     let Ok(status) = u16::try_from(status) else {
         return STATUS_BAD_ARGUMENT;
     };
-    if !(100..=599).contains(&status) || caller.data().local_response.is_some() {
+    // The ABI has one rejection channel here, and rejecting is the only
+    // safe answer: a local response ends the stream, so an informational
+    // status would strand the client and a body under 204 or 304 would
+    // desynchronize the connection. The body length is known from the
+    // ABI argument, before any guest memory is read (WOR-2274).
+    if super::validate_extension_response(status, abi_usize(body_size)).is_err()
+        || caller.data().local_response.is_some()
+    {
         return STATUS_BAD_ARGUMENT;
     }
     if abi_usize(details_size) > 512

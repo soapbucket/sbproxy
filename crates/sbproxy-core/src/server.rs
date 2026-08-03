@@ -3711,19 +3711,38 @@ async fn check_buffered_dynamic_policies(
         let decision = match compiled.enforcer.enforce(&req_snapshot, ctx_any).await {
             Ok(decision) => decision,
             Err(error) => {
+                // The manifest posture decides this, not the host. A
+                // bundle that declares `failure_posture: open` is asking
+                // for its own breakage to be non-fatal, and denying
+                // anyway made the setting inert (WOR-2268).
+                let posture = metadata.failure_posture();
+                let verdict = if posture.admits() {
+                    VerdictTag::Allow
+                } else {
+                    VerdictTag::Deny
+                };
                 tracing::warn!(
                     target: "sbproxy::policy",
                     error = %error,
                     policy = %policy_id,
-                    "buffered dynamic policy enforce() returned error; treating as deny"
+                    bundle = metadata.bundle_id(),
+                    failure_posture = posture.as_label(),
+                    "buffered dynamic policy enforce() returned error"
                 );
-                emit_policy_verdict(
-                    verdict_ctx,
-                    policy_id,
-                    compiled.surface,
-                    VerdictTag::Deny,
-                    started,
-                );
+                emit_policy_verdict(verdict_ctx, policy_id, compiled.surface, verdict, started);
+                if posture.admits() {
+                    // `Observe` and `Degraded` both proceed, and both
+                    // want the counterfactual on the record: the label
+                    // is what an operator alerts on to find controls
+                    // that are admitting traffic they never evaluated.
+                    let label = if posture.records_counterfactual() || posture.guarantee_waived() {
+                        posture.as_label()
+                    } else {
+                        verdict.as_label()
+                    };
+                    ctx.record_policy_decision(policy_id, label);
+                    continue;
+                }
                 ctx.record_policy_decision(policy_id, VerdictTag::Deny.as_label());
                 ctx.deny_reason = Some(format!("{policy_id}: enforce error"));
                 return Some((500, "policy error".to_string(), "plugin"));

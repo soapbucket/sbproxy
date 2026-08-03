@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use sbproxy_config::{BundleHookKind, CompiledConfig};
-use sbproxy_extension::bundle::{AiExtensionChain, BundleRegistry, DynamicBundleRegistry};
+use sbproxy_extension::bundle::{
+    AiExtensionChain, BundleRegistry, DynamicBundleRegistry, PaymentExtensionChain,
+};
 use sbproxy_plugin::{
     collect_linked_extension_declarations, ActionPluginRegistration, AuthPluginRegistration,
     ExtensionBodyMode, ExtensionBundleDeclaration, ExtensionBundleRecord, ExtensionCollision,
@@ -74,7 +76,11 @@ impl ExtensionInventorySnapshotExt for ExtensionInventorySnapshot {
 pub(crate) struct CompiledExtensionAttachments<'a> {
     pub(crate) scope: ExtensionScopeMode,
     pub(crate) ai_chain: &'a AiExtensionChain,
-    pub(crate) payment_chain_attached: bool,
+    /// The attached payment chain, or none when payment dispatch has not
+    /// installed one. Carrying the chain rather than a bare flag is what
+    /// lets inventory report each payment hook's real lifecycle position
+    /// (WOR-2272).
+    pub(crate) payment_chain: Option<&'a PaymentExtensionChain>,
 }
 
 /// Build the authoritative inventory pinned to one compiled pipeline.
@@ -94,7 +100,7 @@ pub(crate) fn compiled_inventory(
         &declarations,
         &preliminary.hooks,
         attachments.ai_chain,
-        attachments.payment_chain_attached,
+        attachments.payment_chain,
         &mut active,
     );
     let observations = compiled_observations(&declarations, &preliminary.hooks, &active);
@@ -309,26 +315,97 @@ pub(crate) fn reserved_extension_hook_names() -> PluginResult<BTreeSet<(BundleHo
     Ok(names)
 }
 
+/// Attached hooks and the position each one holds in its real chain.
+///
+/// Inventory used to carry only the set of attached keys and then invent
+/// a position by sorting hook identities alphabetically and counting.
+/// That reported an order the pipeline never runs: two Proxy-Wasm filters
+/// listed `b` then `a` came back as `a` at 0 and `b` at 1, the reverse of
+/// their execution order, and a hook attached at several chain slots
+/// collapsed to one entry. Positions now come from the same enumeration
+/// the compiler walks (WOR-2272).
+#[derive(Debug, Default)]
+struct AttachedChains {
+    /// Attached hooks, mapped to a chain position where one is known.
+    ///
+    /// Presence of the key is the attachment fact. The inner `Option` is
+    /// separate on purpose: a hook can be provably attached while its
+    /// position is not derivable, and reporting no position is honest
+    /// where inventing one was the original defect.
+    positions: BTreeMap<(ExtensionHookKind, String), Option<u32>>,
+}
+
+impl AttachedChains {
+    /// Record an attachment at a known chain position.
+    ///
+    /// Origins are walked in config order and each chain in execution
+    /// order, so the first recorded position is the earliest attachment
+    /// site in the document. A hook attached to several origins, or
+    /// twice in one chain, reports that site rather than whichever one
+    /// happened to be written last.
+    fn attach(&mut self, kind: ExtensionHookKind, match_key: String, position: u32) {
+        self.positions
+            .entry((kind, match_key))
+            .and_modify(|slot| {
+                if slot.is_none() {
+                    *slot = Some(position);
+                }
+            })
+            .or_insert(Some(position));
+    }
+
+    /// Record an attachment whose chain position is not derivable.
+    fn attach_without_position(&mut self, kind: ExtensionHookKind, match_key: String) {
+        self.positions.entry((kind, match_key)).or_insert(None);
+    }
+
+    fn position(&self, kind: ExtensionHookKind, match_key: &str) -> Option<u32> {
+        self.positions
+            .get(&(kind, match_key.to_owned()))
+            .copied()
+            .flatten()
+    }
+
+    fn is_attached(&self, kind: ExtensionHookKind, match_key: &str) -> bool {
+        self.positions.contains_key(&(kind, match_key.to_owned()))
+    }
+}
+
 fn active_extension_hooks(
     config: &CompiledConfig,
     registry: &dyn BundleRegistry,
-) -> BTreeSet<(ExtensionHookKind, String)> {
-    let mut active = BTreeSet::new();
+) -> AttachedChains {
+    let mut active = AttachedChains::default();
     for origin in &config.origins {
-        for filter in &origin.filters {
+        for (position, filter) in origin.filters.iter().enumerate() {
             if registry.proxy_wasm_filter(&filter.type_name).is_some() {
-                active.insert((ExtensionHookKind::ProxyWasmFilter, filter.type_name.clone()));
+                active.attach(
+                    ExtensionHookKind::ProxyWasmFilter,
+                    filter.type_name.clone(),
+                    position as u32,
+                );
             }
         }
-        record_configured_action(&origin.action_config, registry, &mut active);
+        // An origin has exactly one action and one auth provider, so
+        // both are position 0 by construction rather than by counting.
+        record_configured_action(&origin.action_config, registry, 0, &mut active);
         if let Some(auth) = &origin.auth_config {
-            record_configured_hook(auth, ExtensionHookKind::Auth, false, &mut active);
+            record_configured_hook(auth, ExtensionHookKind::Auth, false, 0, &mut active);
         }
-        for policy in &origin.policy_configs {
+        for (position, policy) in origin.policy_configs.iter().enumerate() {
             let dynamic =
                 configured_type(policy).is_some_and(|name| registry.policy(name).is_some());
-            record_configured_hook(policy, ExtensionHookKind::Policy, dynamic, &mut active);
+            record_configured_hook(
+                policy,
+                ExtensionHookKind::Policy,
+                dynamic,
+                position as u32,
+                &mut active,
+            );
         }
+        // A disabled transform never runs, so it takes no slot and the
+        // transforms after it keep the positions the pipeline gives them.
+        let mut transform_position = 0u32;
         for transform in &origin.transform_configs {
             let enabled = serde_json::from_value::<sbproxy_modules::transform::TransformConfig>(
                 transform.clone(),
@@ -341,13 +418,15 @@ fn active_extension_hooks(
                     transform,
                     ExtensionHookKind::Transform,
                     dynamic,
+                    transform_position,
                     &mut active,
                 );
+                transform_position = transform_position.saturating_add(1);
             }
         }
         for rule in &origin.forward_rules {
             if let Some(value) = rule.get("origin").and_then(|origin| origin.get("action")) {
-                record_configured_action(value, registry, &mut active);
+                record_configured_action(value, registry, 0, &mut active);
             }
         }
         if let Some(value) = origin
@@ -356,7 +435,7 @@ fn active_extension_hooks(
             .and_then(|fallback| fallback.get("origin"))
             .and_then(|origin| origin.get("action"))
         {
-            record_configured_action(value, registry, &mut active);
+            record_configured_action(value, registry, 0, &mut active);
         }
     }
     active
@@ -366,48 +445,88 @@ fn record_lifecycle_attachments(
     declarations: &[&ExtensionBundleDeclaration],
     hooks: &[ExtensionHookRecord],
     ai_chain: &AiExtensionChain,
-    payment_chain_attached: bool,
-    active: &mut BTreeSet<(ExtensionHookKind, String)>,
+    payment_chain: Option<&PaymentExtensionChain>,
+    active: &mut AttachedChains,
 ) {
-    for hook in hooks {
-        let attached = ai_chain.has_kind(hook.kind)
-            || (payment_chain_attached && hook.kind == ExtensionHookKind::Payment);
-        if attached {
-            active.insert((hook.kind, hook.match_key.clone()));
+    // AI and payment hooks are not attached by an origin's config; they
+    // attach by being present in their prepared chain. Read the position
+    // straight off that chain, per kind for AI (each event kind is its
+    // own chain) and across the whole chain for payments (one lifecycle
+    // chain sees every phase).
+    let mut ai_positions = BTreeMap::<(ExtensionHookKind, String), u32>::new();
+    let mut per_kind = BTreeMap::<ExtensionHookKind, u32>::new();
+    for (kind, match_key) in ai_chain.dispatch_order() {
+        let next = per_kind.entry(kind).or_default();
+        ai_positions.entry((kind, match_key)).or_insert(*next);
+        *next = next.saturating_add(1);
+    }
+    let payment_positions = payment_chain
+        .map(|chain| {
+            chain
+                .dispatch_order()
+                .into_iter()
+                .enumerate()
+                .map(|(position, match_key)| (match_key, position as u32))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+
+    let payment_attached = payment_chain.is_some();
+    let mut record = |kind: ExtensionHookKind, match_key: &str| {
+        // Attachment is still decided by the chain carrying this kind,
+        // exactly as before. Only the position is new, and it is claimed
+        // only when this hook is one the chain can name.
+        let attached =
+            ai_chain.has_kind(kind) || (payment_attached && kind == ExtensionHookKind::Payment);
+        if !attached {
+            return;
         }
+        if let Some(position) = ai_positions.get(&(kind, match_key.to_owned())) {
+            active.attach(kind, match_key.to_owned(), *position);
+            return;
+        }
+        if kind == ExtensionHookKind::Payment {
+            if let Some(position) = payment_positions.get(match_key) {
+                active.attach(kind, match_key.to_owned(), *position);
+                return;
+            }
+        }
+        active.attach_without_position(kind, match_key.to_owned());
+    };
+
+    for hook in hooks {
+        record(hook.kind, &hook.match_key);
     }
     for hook in declarations
         .iter()
         .flat_map(|declaration| declaration.hooks)
     {
-        let attached = ai_chain.has_kind(hook.kind)
-            || (payment_chain_attached && hook.kind == ExtensionHookKind::Payment);
-        if attached {
-            active.insert((hook.kind, hook.match_key.to_owned()));
-        }
+        record(hook.kind, hook.match_key);
     }
 }
 
 fn record_configured_action(
     value: &serde_json::Value,
     registry: &dyn BundleRegistry,
-    active: &mut BTreeSet<(ExtensionHookKind, String)>,
+    position: u32,
+    active: &mut AttachedChains,
 ) {
     let dynamic = configured_type(value).is_some_and(|name| registry.action(name).is_some());
-    record_configured_hook(value, ExtensionHookKind::Action, dynamic, active);
+    record_configured_hook(value, ExtensionHookKind::Action, dynamic, position, active);
 }
 
 fn record_configured_hook(
     value: &serde_json::Value,
     kind: ExtensionHookKind,
     dynamic: bool,
-    active: &mut BTreeSet<(ExtensionHookKind, String)>,
+    position: u32,
+    active: &mut AttachedChains,
 ) {
     let Some(name) = configured_type(value) else {
         return;
     };
     if dynamic || linked_registration_exists(kind, name) {
-        active.insert((kind, name.to_owned()));
+        active.attach(kind, name.to_owned(), position);
     }
 }
 
@@ -437,7 +556,7 @@ fn linked_registration_exists(kind: ExtensionHookKind, name: &str) -> bool {
 fn compiled_observations(
     declarations: &[&ExtensionBundleDeclaration],
     preliminary_hooks: &[ExtensionHookRecord],
-    active: &BTreeSet<(ExtensionHookKind, String)>,
+    active: &AttachedChains,
 ) -> Vec<ExtensionObservation> {
     let mut hooks = preliminary_hooks
         .iter()
@@ -462,6 +581,9 @@ fn compiled_observations(
             )
         }));
     }
+    // Reporting order stays sorted by identity so the JSON is stable
+    // across runs. The position no longer comes from this ordering: it
+    // is read from the chain the pipeline actually executes.
     hooks.sort_by(|left, right| {
         (left.2, left.3.as_str(), left.0.as_str()).cmp(&(
             right.2,
@@ -470,17 +592,13 @@ fn compiled_observations(
         ))
     });
 
-    let mut positions = BTreeMap::<(ExtensionHookKind, String), u32>::new();
     hooks
         .into_iter()
         .map(|(id, bundle_id, kind, match_key, source)| {
-            let attached = active.contains(&(kind, match_key.clone()));
-            let position = attached.then(|| {
-                let next = positions.entry((kind, match_key)).or_default();
-                let position = *next;
-                *next = next.saturating_add(1);
-                position
-            });
+            let attached = active.is_attached(kind, &match_key);
+            let position = attached
+                .then(|| active.position(kind, &match_key))
+                .flatten();
             ExtensionObservation {
                 bundle_id,
                 hook_id: Some(id),
@@ -1122,6 +1240,7 @@ fn bounded_count(count: usize) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use super::{compiled_observations, AttachedChains};
     use sbproxy_config::BundleHookKind;
     use sbproxy_plugin::{
         ExtensionBodyMode, ExtensionBundleDeclaration, ExtensionBundleRecord, ExtensionCollision,
@@ -1347,6 +1466,82 @@ mod tests {
         assert_eq!(snapshot.summary.available, 0);
         assert_eq!(snapshot.hooks[0].position, Some(0));
         assert_eq!(snapshot.hooks[1].state, ExtensionState::Unconsumed);
+    }
+
+    fn proxy_wasm_hook(id: &str, match_key: &str) -> ExtensionHookRecord {
+        let mut record = hook(id, "dynamic", match_key);
+        record.kind = ExtensionHookKind::ProxyWasmFilter;
+        record.dispatch = ExtensionDispatch::Chain;
+        record
+    }
+
+    #[test]
+    fn chain_positions_follow_execution_order_not_hook_names() {
+        // The filters run `zeta` then `alpha`. Sorting hook identities
+        // and counting reported the reverse, so an operator reading
+        // inventory saw a filter order the proxy never executes.
+        let mut active = AttachedChains::default();
+        active.attach(ExtensionHookKind::ProxyWasmFilter, "zeta".to_owned(), 0);
+        active.attach(ExtensionHookKind::ProxyWasmFilter, "alpha".to_owned(), 1);
+
+        let hooks = [
+            proxy_wasm_hook("alpha-hook", "alpha"),
+            proxy_wasm_hook("zeta-hook", "zeta"),
+        ];
+        let observations = compiled_observations(&[], &hooks, &active);
+
+        let position_of = |hook_id: &str| {
+            observations
+                .iter()
+                .find(|observation| observation.hook_id.as_deref() == Some(hook_id))
+                .and_then(|observation| observation.position)
+        };
+        assert_eq!(position_of("zeta-hook"), Some(0));
+        assert_eq!(position_of("alpha-hook"), Some(1));
+    }
+
+    #[test]
+    fn a_hook_attached_at_several_sites_reports_the_first_one() {
+        // Deterministic reporting for the multi-origin case: origins are
+        // walked in config order, so the earliest site in the document
+        // wins regardless of which one was recorded last.
+        let mut active = AttachedChains::default();
+        active.attach(ExtensionHookKind::Policy, "shared".to_owned(), 2);
+        active.attach(ExtensionHookKind::Policy, "shared".to_owned(), 7);
+
+        let hooks = [hook("shared-hook", "dynamic", "shared")];
+        let observations = compiled_observations(&[], &hooks, &active);
+
+        assert_eq!(observations[0].position, Some(2));
+        assert_eq!(observations[0].state, ExtensionState::Active);
+    }
+
+    #[test]
+    fn an_attachment_without_a_derivable_position_stays_attached() {
+        // Attachment and position are separate facts. A hook the chain
+        // cannot name is still attached; claiming a position for it was
+        // the original defect, so it reports none.
+        let mut active = AttachedChains::default();
+        active.attach_without_position(ExtensionHookKind::Policy, "opaque".to_owned());
+
+        let hooks = [hook("opaque-hook", "dynamic", "opaque")];
+        let observations = compiled_observations(&[], &hooks, &active);
+
+        assert_eq!(observations[0].state, ExtensionState::Active);
+        assert_eq!(observations[0].position, None);
+        assert!(active.is_attached(ExtensionHookKind::Policy, "opaque"));
+    }
+
+    #[test]
+    fn a_known_position_wins_over_an_earlier_unknown_one() {
+        let mut active = AttachedChains::default();
+        active.attach_without_position(ExtensionHookKind::Payment, "settle".to_owned());
+        active.attach(ExtensionHookKind::Payment, "settle".to_owned(), 3);
+
+        assert_eq!(
+            active.position(ExtensionHookKind::Payment, "settle"),
+            Some(3)
+        );
     }
 
     #[test]

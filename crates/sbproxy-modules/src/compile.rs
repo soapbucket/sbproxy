@@ -426,7 +426,7 @@ fn compile_transform_with_optional_registry(
         )),
         "noop" => Ok(Transform::Noop),
         other => match sbproxy_plugin::build_transform_plugin(other, config.clone()) {
-            Some(Ok(handler)) => Ok(Transform::Plugin(handler)),
+            Some(Ok(handler)) => Ok(Transform::Plugin(crate::PluginTransform::linked(handler))),
             Some(Err(error)) => {
                 Err(error).with_context(|| format!("transform plugin {other:?} factory failed"))
             }
@@ -491,7 +491,10 @@ fn compile_bundle_transform(
             anyhow::bail!("Proxy-Wasm bundles cannot provide transform hooks")
         }
     };
-    Ok(Transform::Plugin(handler))
+    Ok(Transform::Plugin(crate::PluginTransform::dynamic(
+        handler,
+        dynamic_hook_metadata(hook)?,
+    )))
 }
 
 fn compile_bundle_action(hook: &LoadedBundleHook, config: serde_json::Value) -> Result<Action> {
@@ -738,6 +741,7 @@ hooks:
         };
         let mut body = BytesMut::from(&b"original"[..]);
         transform
+            .handler()
             .apply(
                 &mut body,
                 Some("text/plain"),

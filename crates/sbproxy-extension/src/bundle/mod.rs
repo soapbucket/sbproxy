@@ -13,6 +13,7 @@ mod loader;
 mod payments;
 mod proxy_wasm;
 mod registry;
+mod response_semantics;
 #[cfg(test)]
 mod tests;
 
@@ -34,4 +35,7 @@ pub use proxy_wasm::{
 };
 pub use registry::{
     BundleConfigValidationError, BundleProvenance, BundleRegistry, LoadedBundleHook,
+};
+pub use response_semantics::{
+    status_forbids_body, validate_extension_response, ExtensionResponseError,
 };

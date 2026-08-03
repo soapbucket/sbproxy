@@ -1418,7 +1418,9 @@ mod plugin_action_tests {
 
     #[tokio::test]
     async fn plugin_action_http1_rejects_proxy_without_an_upstream() {
-        let action = Action::Plugin(Box::new(OutcomeAction(ActionOutcome::Proxy)));
+        let action = Action::Plugin(sbproxy_modules::PluginAction::linked(Box::new(
+            OutcomeAction(ActionOutcome::Proxy),
+        )));
         let pipeline = CompiledPipeline::empty_for_test();
 
         let (result, wire) = exchange(&action, &pipeline, None).await;

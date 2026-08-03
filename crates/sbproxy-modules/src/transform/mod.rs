@@ -174,7 +174,12 @@ pub enum Transform {
     /// No transformation applied.
     Noop,
     /// Third-party plugin (only case using dynamic dispatch).
-    Plugin(Box<dyn TransformHandler>),
+    ///
+    /// Carries the bundle's manifest metadata when a dynamic bundle
+    /// supplied the handler, so the response pipeline can read the
+    /// declared failure posture. A linked plugin has no manifest and
+    /// leaves it unset.
+    Plugin(crate::PluginTransform),
 }
 
 impl Transform {
@@ -207,7 +212,7 @@ impl Transform {
             Self::CelScript(_) => "cel",
             Self::A2aAgentCardRewrite(_) => "a2a_agent_card_rewrite",
             Self::Noop => "noop",
-            Self::Plugin(p) => p.transform_type(),
+            Self::Plugin(p) => p.handler().transform_type(),
         }
     }
 
@@ -255,7 +260,7 @@ impl Transform {
             // response-filter wiring.
             Self::A2aAgentCardRewrite(t) => t.apply(body),
             Self::Noop => Ok(()),
-            Self::Plugin(handler) => dispatch_plugin(handler.as_ref(), body, content_type),
+            Self::Plugin(handler) => dispatch_plugin(handler.handler(), body, content_type),
         }
     }
 }
@@ -472,6 +477,18 @@ impl TransformConfig {
     pub fn failure_posture(&self) -> FailureMode {
         self.failure_posture
             .unwrap_or_else(|| FailureMode::from_fail_closed(self.fail_on_error.unwrap_or(false)))
+    }
+
+    /// True when the operator wrote a posture on this attachment.
+    ///
+    /// [`Self::failure_posture`] cannot answer this, because its default
+    /// and an explicit `failure_posture: open` are the same value. A
+    /// bundle transform needs the difference: its manifest posture
+    /// applies unless the attachment overrides it, and an attachment
+    /// that says nothing must not be read as saying `open` (WOR-2268).
+    #[must_use]
+    pub fn has_explicit_failure_posture(&self) -> bool {
+        self.failure_posture.is_some() || self.fail_on_error.is_some()
     }
 
     /// Reject a failure axis that says two things at once, or that says
@@ -1483,7 +1500,7 @@ mod tests {
         let handler = RecordingTransformHandler {
             calls: calls.clone(),
         };
-        let t = Transform::Plugin(Box::new(handler));
+        let t = Transform::Plugin(crate::PluginTransform::linked(Box::new(handler)));
         let mut body = BytesMut::from(&b"original"[..]);
         t.apply(&mut body, Some("text/plain")).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -1509,7 +1526,9 @@ mod tests {
             }
         }
 
-        let t = Transform::Plugin(Box::new(UnregisteredHandler));
+        let t = Transform::Plugin(crate::PluginTransform::linked(Box::new(
+            UnregisteredHandler,
+        )));
         let mut body = BytesMut::from(&b"x"[..]);
         t.apply(&mut body, None)
             .expect("the compiled typed handler is the registration proof");
@@ -1558,7 +1577,7 @@ mod tests {
             }
         }
 
-        let t = Transform::Plugin(Box::new(PanickingHandler));
+        let t = Transform::Plugin(crate::PluginTransform::linked(Box::new(PanickingHandler)));
         let mut body = BytesMut::from(&b"x"[..]);
         let err = t.apply(&mut body, None).unwrap_err();
         let typed = err.downcast_ref::<TransformError>().expect(

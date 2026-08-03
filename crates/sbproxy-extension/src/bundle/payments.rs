@@ -10,6 +10,8 @@ use super::{BundleLoadError, BundleRegistry};
 #[derive(Clone)]
 struct PreparedPaymentHook {
     id: String,
+    /// Inventory lookup key for chain-position reporting (WOR-2272).
+    match_key: String,
     enforcement_mode: EnforcementMode,
     failure_posture: FailureMode,
     program: EnvelopeEventProgram,
@@ -43,6 +45,7 @@ impl PaymentExtensionChain {
             .map(|hook| {
                 Ok(PreparedPaymentHook {
                     id: format!("{}:{}", hook.manifest().name, hook.hook().type_name),
+                    match_key: hook.hook().type_name.clone(),
                     enforcement_mode: hook.hook().enforcement_mode,
                     failure_posture: hook.manifest().failure_posture,
                     program: EnvelopeEventProgram::prepare(
@@ -56,6 +59,18 @@ impl PaymentExtensionChain {
         Ok(Self {
             hooks: Arc::from(hooks),
         })
+    }
+
+    /// Return each prepared hook's lookup key in dispatch order.
+    ///
+    /// The payment chain runs in registry order; inventory reports that
+    /// order rather than re-deriving one from sorted names (WOR-2272).
+    #[must_use]
+    pub fn dispatch_order(&self) -> Vec<String> {
+        self.hooks
+            .iter()
+            .map(|hook| hook.match_key.clone())
+            .collect()
     }
 
     /// True when no payment hooks were prepared.

@@ -1464,7 +1464,7 @@ impl Default for CompiledPipeline {
             CompiledExtensionAttachments {
                 scope: ExtensionScopeMode::Running,
                 ai_chain: ai_extension_chain.as_ref(),
-                payment_chain_attached: false,
+                payment_chain: None,
             },
         )
         .expect("linked extension inventory must be valid");
@@ -1601,10 +1601,10 @@ impl CompiledPipeline {
             CompiledExtensionAttachments {
                 scope: ExtensionScopeMode::Running,
                 ai_chain: self.ai_extension_chain.as_ref(),
-                payment_chain_attached: self
+                payment_chain: self
                     .payment_extension_chain
                     .as_ref()
-                    .is_some_and(|chain| !chain.is_empty()),
+                    .filter(|chain| !chain.is_empty()),
             },
         )?)
     }
@@ -1932,7 +1932,7 @@ impl CompiledPipeline {
                             ))))
                         }
                     };
-                    let failure_posture = wrapper.failure_posture();
+                    let failure_posture = effective_transform_posture(&wrapper, &transform);
                     Some(Ok(CompiledTransform {
                         transform,
                         content_types: wrapper.content_types,
@@ -2365,10 +2365,10 @@ impl CompiledPipeline {
             CompiledExtensionAttachments {
                 scope,
                 ai_chain: ai_extension_chain.as_ref(),
-                payment_chain_attached: matches!(mode, PipelineConstructionMode::Validation)
-                    && payment_extension_chain
-                        .as_ref()
-                        .is_some_and(|chain| !chain.is_empty()),
+                payment_chain: matches!(mode, PipelineConstructionMode::Validation)
+                    .then(|| payment_extension_chain.as_ref())
+                    .flatten()
+                    .filter(|chain| !chain.is_empty()),
             },
         )?;
 
@@ -3057,6 +3057,131 @@ fn normalize_request_modifier(val: &serde_json::Value) -> RequestModifierConfig 
 
     // Fallback: try direct deserialization (handles url, query, method, body modifier types).
     serde_json::from_value(val.clone()).unwrap_or_else(|_| default_request_modifier())
+}
+
+/// Resolve the posture the response pipeline applies when this transform
+/// fails.
+///
+/// Precedence, highest first:
+///
+/// 1. An explicit `failure_posture` or `fail_on_error` on the attachment.
+///    The operator wiring the transform into an origin overrides whoever
+///    wrote the bundle.
+/// 2. The bundle manifest's declared posture, for a dynamic bundle hook.
+/// 3. The attachment default, which is [`FailureMode::Open`].
+///
+/// Two and three have to be distinguished by whether the operator wrote
+/// anything, not by the resolved value: `TransformConfig::failure_posture`
+/// returns `Open` both for an explicit `open` and for silence, and reading
+/// silence as `open` is what dropped the manifest posture on the floor
+/// (WOR-2268).
+fn effective_transform_posture(
+    wrapper: &sbproxy_modules::transform::TransformConfig,
+    transform: &sbproxy_modules::Transform,
+) -> sbproxy_config::FailureMode {
+    if wrapper.has_explicit_failure_posture() {
+        return wrapper.failure_posture();
+    }
+    match transform {
+        sbproxy_modules::Transform::Plugin(plugin) => plugin
+            .dynamic_hook()
+            .map(|hook| hook.failure_posture())
+            .unwrap_or_else(|| wrapper.failure_posture()),
+        _ => wrapper.failure_posture(),
+    }
+}
+
+#[cfg(test)]
+mod transform_posture_tests {
+    use super::effective_transform_posture;
+    use sbproxy_config::{BundleBodyMode, FailureMode};
+    use sbproxy_modules::transform::TransformConfig;
+    use sbproxy_modules::{DynamicHookMetadata, PluginTransform, Transform};
+    use sbproxy_plugin::{TransformContext, TransformHandler};
+
+    struct StubTransform;
+
+    impl TransformHandler for StubTransform {
+        fn transform_type(&self) -> &str {
+            "stub_bundle_transform"
+        }
+
+        fn apply<'a>(
+            &'a self,
+            _body: &'a mut bytes::BytesMut,
+            _content_type: Option<&'a str>,
+            _ctx: &'a TransformContext,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = sbproxy_plugin::PluginResult<()>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn wrapper(json: serde_json::Value) -> TransformConfig {
+        serde_json::from_value(json).expect("transform wrapper fixture")
+    }
+
+    fn dynamic_transform(posture: FailureMode) -> Transform {
+        Transform::Plugin(PluginTransform::dynamic(
+            Box::new(StubTransform),
+            DynamicHookMetadata::new(
+                "stub-bundle",
+                "stub_bundle_transform",
+                BundleBodyMode::Buffered,
+                1024,
+                posture,
+            ),
+        ))
+    }
+
+    #[test]
+    fn a_silent_attachment_inherits_the_manifest_posture() {
+        let posture = effective_transform_posture(
+            &wrapper(serde_json::json!({"type": "stub_bundle_transform"})),
+            &dynamic_transform(FailureMode::Closed),
+        );
+        assert_eq!(posture, FailureMode::Closed);
+    }
+
+    #[test]
+    fn an_explicit_attachment_posture_overrides_the_manifest() {
+        let posture = effective_transform_posture(
+            &wrapper(
+                serde_json::json!({"type": "stub_bundle_transform", "failure_posture": "open"}),
+            ),
+            &dynamic_transform(FailureMode::Closed),
+        );
+        assert_eq!(posture, FailureMode::Open);
+    }
+
+    #[test]
+    fn the_legacy_boolean_also_counts_as_explicit() {
+        let posture = effective_transform_posture(
+            &wrapper(serde_json::json!({"type": "stub_bundle_transform", "fail_on_error": true})),
+            &dynamic_transform(FailureMode::Open),
+        );
+        assert_eq!(posture, FailureMode::Closed);
+    }
+
+    #[test]
+    fn a_linked_plugin_keeps_the_attachment_default() {
+        let linked = Transform::Plugin(PluginTransform::linked(Box::new(StubTransform)));
+        let posture = effective_transform_posture(
+            &wrapper(serde_json::json!({"type": "stub_bundle_transform"})),
+            &linked,
+        );
+        assert_eq!(posture, FailureMode::Open);
+    }
+
+    #[test]
+    fn a_built_in_transform_is_unaffected() {
+        let posture = effective_transform_posture(
+            &wrapper(serde_json::json!({"type": "noop"})),
+            &Transform::Noop,
+        );
+        assert_eq!(posture, FailureMode::Open);
+    }
 }
 
 #[cfg(test)]
