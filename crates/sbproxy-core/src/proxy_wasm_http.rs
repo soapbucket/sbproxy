@@ -1199,6 +1199,7 @@ mod tests {
     use std::path::Path;
 
     use sbproxy_config::FailureMode;
+    use sbproxy_plugin::ExtensionState;
     use tempfile::TempDir;
 
     use crate::pipeline::CompiledPipeline;
@@ -1295,6 +1296,26 @@ proxy: {{}}
             .as_ref()
             .expect("compiled Proxy-Wasm chain");
         assert!(chain.streams_bodies());
+    }
+
+    #[test]
+    fn pipeline_inventory_marks_an_attached_proxy_wasm_filter_active() {
+        let directory = TempDir::new().expect("temporary bundle directory");
+        write_bundle(directory.path(), &[("fixture_filter", "streamed")]);
+
+        let pipeline =
+            CompiledPipeline::from_config_at(compile_config(&["fixture_filter"]), directory.path())
+                .expect("compile attached Proxy-Wasm filter");
+        let hook = pipeline
+            .extension_inventory()
+            .hooks
+            .iter()
+            .find(|hook| hook.match_key == "fixture_filter")
+            .expect("attached filter inventory record");
+
+        assert_eq!(hook.state, ExtensionState::Active);
+        assert_eq!(hook.position, Some(0));
+        assert_eq!(pipeline.extension_inventory().summary.active, 1);
     }
 
     #[test]
