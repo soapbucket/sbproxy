@@ -7632,6 +7632,14 @@
           "type": "array",
           "items": true
         },
+        "filters": {
+          "description": "Proxy-Wasm HTTP filters evaluated in declaration order.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ProxyWasmFilterAttachment"
+          }
+        },
         "request_modifiers": {
           "description": "Request modifiers (header rewrites, path edits, etc.).",
           "default": [],
@@ -8015,6 +8023,36 @@
           "anyOf": [
             {
               "$ref": "#/definitions/OriginObservabilityConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ProxyWasmFilterAttachment": {
+      "description": "One Proxy-Wasm HTTP filter attached to an origin.",
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "description": "Stable hook type declared by an installed Proxy-Wasm bundle.",
+          "type": "string"
+        },
+        "config": {
+          "description": "Plugin configuration exposed through `proxy_get_buffer_bytes`.",
+          "default": {}
+        },
+        "failure_posture": {
+          "description": "Optional origin-specific override for the bundle failure posture.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/FailureMode"
             },
             {
               "type": "null"
