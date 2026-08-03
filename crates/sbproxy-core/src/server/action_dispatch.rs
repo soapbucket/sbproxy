@@ -1160,9 +1160,12 @@ fn apply_plugin_action_response_transforms(
             apply_transform_with_ctx(compiled_transform, &mut body, content_type, ctx)
         {
             let transform_name = compiled_transform.transform.transform_type();
-            let is_typed_transform_error = error
-                .downcast_ref::<sbproxy_modules::transform::TransformError>()
-                .is_some();
+            // Same carve-out the upstream response path applies: a
+            // bundle transform's declared posture decides its own
+            // failure, and a host invariant violation never does
+            // (WOR-2268).
+            let is_typed_transform_error =
+                crate::server::transform_error_is_unconditional_500(compiled_transform, &error);
             if is_typed_transform_error {
                 tracing::error!(
                     hostname = %ctx.hostname,

@@ -354,6 +354,137 @@ fn stamp_content_negotiation(
 /// which is a no-op for those two variants.
 ///
 /// All other transform variants delegate to the standard apply.
+/// Decide whether a failed transform's posture is the operator's call or
+/// an unconditional host 500.
+///
+/// WOR-168 promotes any typed [`TransformError`] to a 500 regardless of
+/// posture, on the grounds that it is a code-level bug or a misbehaving
+/// plugin. WOR-2268 carves out one case. A dynamic bundle transform
+/// declares its own posture in its manifest, and a guest that times out
+/// or panics is precisely what that key describes, so the declaration
+/// decides it. An `InvariantViolated` is still the host's own bug and
+/// still a 500 either way.
+///
+/// Both response paths that run transforms consult this, so the two
+/// cannot drift apart.
+///
+/// [`TransformError`]: sbproxy_modules::transform::TransformError
+pub(crate) fn transform_error_is_unconditional_500(
+    compiled: &sbproxy_modules::CompiledTransform,
+    error: &anyhow::Error,
+) -> bool {
+    use sbproxy_modules::transform::TransformError;
+    let Some(typed) = error.downcast_ref::<TransformError>() else {
+        return false;
+    };
+    let guest_declared_posture = matches!(typed, TransformError::Plugin { .. })
+        && matches!(
+            &compiled.transform,
+            sbproxy_modules::Transform::Plugin(plugin) if plugin.dynamic_hook().is_some()
+        );
+    !guest_declared_posture
+}
+
+#[cfg(test)]
+mod transform_failure_routing_tests {
+    use super::transform_error_is_unconditional_500;
+    use sbproxy_config::{BundleBodyMode, FailureMode};
+    use sbproxy_modules::transform::TransformError;
+    use sbproxy_modules::{
+        CompiledTransform, DynamicHookMetadata, PluginTransform, Transform, TransformContext,
+    };
+    use sbproxy_plugin::TransformHandler;
+
+    struct StubTransform;
+
+    impl TransformHandler for StubTransform {
+        fn transform_type(&self) -> &str {
+            "stub_bundle_transform"
+        }
+
+        fn apply<'a>(
+            &'a self,
+            _body: &'a mut bytes::BytesMut,
+            _content_type: Option<&'a str>,
+            _ctx: &'a TransformContext,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = sbproxy_plugin::PluginResult<()>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn compiled(transform: Transform) -> CompiledTransform {
+        CompiledTransform {
+            transform,
+            content_types: Vec::new(),
+            failure_posture: FailureMode::Open,
+            max_body_size: 1024,
+        }
+    }
+
+    fn dynamic() -> Transform {
+        Transform::Plugin(PluginTransform::dynamic(
+            Box::new(StubTransform),
+            DynamicHookMetadata::new(
+                "stub-bundle",
+                "stub_bundle_transform",
+                BundleBodyMode::Buffered,
+                1024,
+                FailureMode::Open,
+            ),
+        ))
+    }
+
+    fn plugin_error() -> anyhow::Error {
+        anyhow::Error::new(TransformError::Plugin {
+            plugin: "stub_bundle_transform".to_owned(),
+            detail: "timed out after 100ms".to_owned(),
+        })
+    }
+
+    fn invariant_error() -> anyhow::Error {
+        anyhow::Error::new(TransformError::InvariantViolated {
+            reason: "body vanished".to_owned(),
+        })
+    }
+
+    #[test]
+    fn a_bundle_transforms_own_failure_follows_its_declared_posture() {
+        assert!(!transform_error_is_unconditional_500(
+            &compiled(dynamic()),
+            &plugin_error()
+        ));
+    }
+
+    #[test]
+    fn a_host_invariant_violation_is_a_500_even_for_a_bundle() {
+        assert!(transform_error_is_unconditional_500(
+            &compiled(dynamic()),
+            &invariant_error()
+        ));
+    }
+
+    #[test]
+    fn a_linked_plugin_keeps_the_unconditional_500() {
+        // A linked plugin declares no posture, so WOR-168's original
+        // rule is still the only one that can apply to it.
+        let linked = Transform::Plugin(PluginTransform::linked(Box::new(StubTransform)));
+        assert!(transform_error_is_unconditional_500(
+            &compiled(linked),
+            &plugin_error()
+        ));
+    }
+
+    #[test]
+    fn an_ordinary_config_error_was_never_a_typed_error() {
+        assert!(!transform_error_is_unconditional_500(
+            &compiled(Transform::Noop),
+            &anyhow::anyhow!("bad regex")
+        ));
+    }
+}
+
 fn apply_transform_with_ctx(
     compiled: &sbproxy_modules::CompiledTransform,
     body: &mut bytes::BytesMut,

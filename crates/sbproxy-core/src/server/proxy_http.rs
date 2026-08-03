@@ -5233,18 +5233,11 @@ impl ProxyHttp for SbProxy {
                             // violation is still the host's own bug and
                             // still a 500 either way.
                             let transform_name = compiled_transform.transform.transform_type();
-                            let typed_error =
-                                e.downcast_ref::<sbproxy_modules::transform::TransformError>();
-                            let guest_declared_posture = matches!(
-                                typed_error,
-                                Some(sbproxy_modules::transform::TransformError::Plugin { .. })
-                            ) && matches!(
-                                &compiled_transform.transform,
-                                sbproxy_modules::Transform::Plugin(plugin)
-                                    if plugin.dynamic_hook().is_some()
-                            );
                             let is_typed_transform_error =
-                                typed_error.is_some() && !guest_declared_posture;
+                                crate::server::transform_error_is_unconditional_500(
+                                    compiled_transform,
+                                    &e,
+                                );
                             if is_typed_transform_error {
                                 tracing::error!(
                                     hostname = %ctx.hostname,
