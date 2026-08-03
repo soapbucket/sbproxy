@@ -524,6 +524,7 @@ const fn bundle_hook_kind(kind: ExtensionHookKind) -> Option<BundleHookKind> {
         ExtensionHookKind::AiGuardrailOutput => Some(BundleHookKind::AiGuardrailOutput),
         ExtensionHookKind::AiStreamEvent => Some(BundleHookKind::AiStreamEvent),
         ExtensionHookKind::AiClose => Some(BundleHookKind::AiClose),
+        ExtensionHookKind::Payment => Some(BundleHookKind::Payment),
         ExtensionHookKind::Auth
         | ExtensionHookKind::Enricher
         | ExtensionHookKind::Startup
@@ -552,6 +553,7 @@ const fn hook_kind_label(kind: ExtensionHookKind) -> &'static str {
         ExtensionHookKind::AiGuardrailOutput => "ai_guardrail_output",
         ExtensionHookKind::AiStreamEvent => "ai_stream_event",
         ExtensionHookKind::AiClose => "ai_close",
+        ExtensionHookKind::Payment => "payment",
     }
 }
 
@@ -565,6 +567,7 @@ const fn hook_phase(kind: ExtensionHookKind) -> &'static str {
         | ExtensionHookKind::AiGuardrailOutput
         | ExtensionHookKind::AiStreamEvent
         | ExtensionHookKind::AiClose => "ai",
+        ExtensionHookKind::Payment => "payment",
         ExtensionHookKind::Mcp => "mcp",
         ExtensionHookKind::ProxyWasmFilter => "http",
         ExtensionHookKind::Action
@@ -1047,6 +1050,7 @@ fn bounded_count(count: usize) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use sbproxy_config::BundleHookKind;
     use sbproxy_plugin::{
         ExtensionBodyMode, ExtensionBundleDeclaration, ExtensionBundleRecord, ExtensionCollision,
         ExtensionDispatch, ExtensionExecution, ExtensionHookDeclaration, ExtensionHookKind,
@@ -1056,7 +1060,7 @@ mod tests {
         EXTENSION_INVENTORY_SCHEMA_VERSION,
     };
 
-    use super::ExtensionInventorySnapshotExt;
+    use super::{bundle_hook_kind, hook_kind_label, hook_phase, ExtensionInventorySnapshotExt};
 
     static LINKED_HOOKS: [ExtensionHookDeclaration; 1] = [ExtensionHookDeclaration {
         id: "linked-policy",
@@ -1155,6 +1159,16 @@ mod tests {
         assert!(snapshot.bundles.is_empty());
         assert!(snapshot.hooks.is_empty());
         assert!(snapshot.collisions.is_empty());
+    }
+
+    #[test]
+    fn payment_hook_uses_the_dynamic_bundle_inventory_contract() {
+        assert_eq!(
+            bundle_hook_kind(ExtensionHookKind::Payment),
+            Some(BundleHookKind::Payment)
+        );
+        assert_eq!(hook_kind_label(ExtensionHookKind::Payment), "payment");
+        assert_eq!(hook_phase(ExtensionHookKind::Payment), "payment");
     }
 
     #[test]

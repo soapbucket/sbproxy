@@ -1665,15 +1665,14 @@ impl CompiledPipeline {
         config: CompiledConfig,
         base_dir: &Path,
     ) -> anyhow::Result<Self> {
-        let extension_registry = DynamicBundleRegistry::load(
-            &config.extension_bundles,
-            base_dir,
-            &reserved_extension_hook_names(),
-        )?;
+        let reserved_names = reserved_extension_hook_names()?;
+        let extension_registry =
+            DynamicBundleRegistry::load(&config.extension_bundles, base_dir, &reserved_names)?;
         Self::from_config_with_mode_and_registry(
             config,
             PipelineConstructionMode::Validation,
             extension_registry,
+            false,
         )
     }
 
