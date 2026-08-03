@@ -8,18 +8,22 @@
 #![cfg(feature = "runtime")]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sbproxy_billing::error::BillingError;
 use sbproxy_billing::registry::RailRegistry;
 use sbproxy_billing::service::{
-    AuthorizationDecision, BillingService, PaymentProblemCode, RedemptionRequest,
+    AuthorizationDecision, BillingService, PaymentProblemCode, RedemptionRequest, RequirementInput,
 };
 use sbproxy_billing::sqlite::SqliteSettlementStore;
 use sbproxy_billing::store::{BillingClock, SharedSettlementStore};
 use sbproxy_billing::types::{
     IntentStatus, PaymentProof, PaymentRequirement, SettlementRail, SignedPaymentRequirement,
+};
+use sbproxy_billing::{
+    NoOpPaymentLifecycleObserver, PaymentLifecycleDecision, PaymentLifecycleEvent,
+    PaymentLifecycleObserver, PaymentLifecycleOutcome, PaymentLifecyclePhase,
 };
 
 mod common;
@@ -71,6 +75,20 @@ impl World {
     /// Builds a world with a fixture x402 adapter and a fifty millisecond
     /// deadline, so a hanging provider does not slow the suite down.
     fn new() -> Self {
+        Self::with_payment_observer(Arc::new(NoOpPaymentLifecycleObserver))
+    }
+
+    /// Builds a world with an explicit payment lifecycle observer.
+    fn with_payment_observer(observer: Arc<dyn PaymentLifecycleObserver>) -> Self {
+        Self::with_payment_observer_and_signer(observer, true)
+    }
+
+    /// Builds a world that can omit its signer to exercise a pre-provider
+    /// challenge failure.
+    fn with_payment_observer_and_signer(
+        observer: Arc<dyn PaymentLifecycleObserver>,
+        install_signer: bool,
+    ) -> Self {
         let directory = tempfile::tempdir().expect("temp dir");
         let path = directory.path().join("settlement.sqlite3");
         let clock = TestClock::new(START_MS);
@@ -87,13 +105,16 @@ impl World {
                 Arc::clone(&state),
             ))
             .expect("register adapter");
-        let service = BillingService::builder(Arc::clone(&store))
+        let mut service = BillingService::builder(Arc::clone(&store))
             .adapters(registry)
             .clock(Arc::clone(&clock) as Arc<dyn BillingClock>)
-            .signer(Arc::new(FixtureSigner))
+            .payment_observer(observer)
             .deadline(Duration::from_millis(50))
-            .expect("deadline inside the ceiling")
-            .build();
+            .expect("deadline inside the ceiling");
+        if install_signer {
+            service = service.signer(Arc::new(FixtureSigner));
+        }
+        let service = service.build();
 
         Self {
             store,
@@ -164,6 +185,100 @@ impl World {
     }
 }
 
+#[derive(Default)]
+struct RejectSettlementObserver {
+    events: Mutex<Vec<(PaymentLifecyclePhase, PaymentLifecycleOutcome)>>,
+}
+
+#[derive(Default)]
+struct RecordingObserver {
+    events: Mutex<Vec<(PaymentLifecyclePhase, PaymentLifecycleOutcome)>>,
+}
+
+#[derive(Default)]
+struct RejectChallengeObserver {
+    events: Mutex<Vec<(PaymentLifecyclePhase, PaymentLifecycleOutcome)>>,
+}
+
+#[derive(Default)]
+struct PayloadRecordingObserver {
+    events: Mutex<Vec<PaymentLifecycleEvent>>,
+}
+
+#[async_trait::async_trait]
+impl PaymentLifecycleObserver for PayloadRecordingObserver {
+    async fn started(&self, event: &PaymentLifecycleEvent) -> PaymentLifecycleDecision {
+        self.events.lock().unwrap().push(event.clone());
+        PaymentLifecycleDecision::Continue
+    }
+
+    fn terminal(&self, event: PaymentLifecycleEvent) {
+        self.events.lock().unwrap().push(event);
+    }
+}
+
+#[async_trait::async_trait]
+impl PaymentLifecycleObserver for RejectChallengeObserver {
+    async fn started(&self, event: &PaymentLifecycleEvent) -> PaymentLifecycleDecision {
+        self.events
+            .lock()
+            .unwrap()
+            .push((event.phase(), event.outcome()));
+        if event.phase() == PaymentLifecyclePhase::Challenge {
+            PaymentLifecycleDecision::Reject
+        } else {
+            PaymentLifecycleDecision::Continue
+        }
+    }
+
+    fn terminal(&self, event: PaymentLifecycleEvent) {
+        self.events
+            .lock()
+            .unwrap()
+            .push((event.phase(), event.outcome()));
+    }
+}
+
+#[async_trait::async_trait]
+impl PaymentLifecycleObserver for RecordingObserver {
+    async fn started(&self, event: &PaymentLifecycleEvent) -> PaymentLifecycleDecision {
+        self.events
+            .lock()
+            .unwrap()
+            .push((event.phase(), event.outcome()));
+        PaymentLifecycleDecision::Continue
+    }
+
+    fn terminal(&self, event: PaymentLifecycleEvent) {
+        self.events
+            .lock()
+            .unwrap()
+            .push((event.phase(), event.outcome()));
+    }
+}
+
+#[async_trait::async_trait]
+impl PaymentLifecycleObserver for RejectSettlementObserver {
+    async fn started(&self, event: &PaymentLifecycleEvent) -> PaymentLifecycleDecision {
+        self.events
+            .lock()
+            .unwrap()
+            .push((event.phase(), event.outcome()));
+        if event.phase() == PaymentLifecyclePhase::Settle {
+            PaymentLifecycleDecision::Reject
+        } else {
+            PaymentLifecycleDecision::Continue
+        }
+    }
+
+    fn terminal(&self, event: PaymentLifecycleEvent) {
+        self.events
+            .lock()
+            .unwrap()
+            .push((event.phase(), event.outcome()));
+    }
+}
+
 #[tokio::test]
 async fn a_committed_receipt_is_the_only_thing_that_opens_the_origin() {
     let world = World::new();
@@ -179,6 +294,222 @@ async fn a_committed_receipt_is_the_only_thing_that_opens_the_origin() {
     assert_eq!(world.status("request-key").await, IntentStatus::Succeeded);
     assert!(world.has_receipt("request-key").await);
     assert_eq!(world.state.provider_writes(), 1);
+}
+
+#[tokio::test]
+async fn started_settlement_rejection_prevents_provider_write() {
+    let observer = Arc::new(RejectSettlementObserver::default());
+    let world = World::with_payment_observer(observer.clone());
+    let signed = world.challenge("req-1", "request-key").await;
+
+    let decision = world
+        .redeem(&signed, "request-key", "spt_secret_value")
+        .await;
+
+    assert!(matches!(
+        decision,
+        AuthorizationDecision::PaymentRequired(ref problem)
+            if problem.code == PaymentProblemCode::Rejected
+    ));
+    assert_eq!(world.state.settle_calls(), 0);
+    assert_eq!(world.state.provider_writes(), 0);
+    assert_eq!(world.gate.releases(), 0);
+    assert_eq!(
+        *observer.events.lock().unwrap(),
+        [
+            (
+                PaymentLifecyclePhase::Settle,
+                PaymentLifecycleOutcome::Started,
+            ),
+            (
+                PaymentLifecyclePhase::Settle,
+                PaymentLifecycleOutcome::Rejected,
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn started_challenge_rejection_happens_before_intent_or_provider_write() {
+    let observer = Arc::new(RejectChallengeObserver::default());
+    let world = World::with_payment_observer(observer.clone());
+    let draft = sample_draft("tenant-1", "req-1", EXPIRY_MS);
+
+    let error = match world
+        .service
+        .prepare_requirement(RequirementInput {
+            draft,
+            request_idempotency_key: "challenge-key".to_owned(),
+        })
+        .await
+    {
+        Ok(_) => panic!("challenge extension rejection must stop the response"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error, BillingError::ExtensionRejected);
+    let intent_id = sbproxy_billing::derive_intent_id("tenant-1", "challenge-key");
+    assert!(world.store.load_intent(&intent_id).await.unwrap().is_none());
+    assert_eq!(world.state.prepare_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(world.state.provider_writes(), 0);
+    assert_eq!(
+        *observer.events.lock().unwrap(),
+        [
+            (
+                PaymentLifecyclePhase::Challenge,
+                PaymentLifecycleOutcome::Started,
+            ),
+            (
+                PaymentLifecyclePhase::Challenge,
+                PaymentLifecycleOutcome::Rejected,
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn challenge_success_is_observed_after_durable_finalization() {
+    let observer = Arc::new(RecordingObserver::default());
+    let world = World::with_payment_observer(observer.clone());
+    let draft = sample_draft("tenant-1", "req-1", EXPIRY_MS);
+
+    let prepared = world
+        .service
+        .prepare_requirement(RequirementInput {
+            draft,
+            request_idempotency_key: "challenge-key".to_owned(),
+        })
+        .await
+        .expect("challenge prepares");
+
+    let intent = world
+        .store
+        .load_intent(&prepared.intent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(intent.requirement_digest.is_some());
+    assert_eq!(world.state.provider_writes(), 1);
+    assert_eq!(
+        *observer.events.lock().unwrap(),
+        [
+            (
+                PaymentLifecyclePhase::Challenge,
+                PaymentLifecycleOutcome::Started,
+            ),
+            (
+                PaymentLifecyclePhase::Challenge,
+                PaymentLifecycleOutcome::Succeeded,
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn challenge_failure_emits_terminal_without_provider_write() {
+    let observer = Arc::new(RecordingObserver::default());
+    let world = World::with_payment_observer_and_signer(observer.clone(), false);
+    let draft = sample_draft("tenant-1", "req-1", EXPIRY_MS);
+
+    let error = match world
+        .service
+        .prepare_requirement(RequirementInput {
+            draft,
+            request_idempotency_key: "challenge-key".to_owned(),
+        })
+        .await
+    {
+        Ok(_) => panic!("a challenge without a signer must fail"),
+        Err(error) => error,
+    };
+
+    assert_eq!(
+        error,
+        BillingError::InvalidRequirement("requirement_signer_not_configured")
+    );
+    assert_eq!(world.state.prepare_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(world.state.provider_writes(), 0);
+    assert_eq!(
+        *observer.events.lock().unwrap(),
+        [
+            (
+                PaymentLifecyclePhase::Challenge,
+                PaymentLifecycleOutcome::Started,
+            ),
+            (
+                PaymentLifecyclePhase::Challenge,
+                PaymentLifecycleOutcome::Failed,
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn settlement_terminal_events_follow_durable_outcomes() {
+    for (behavior, expected) in [
+        (Behavior::Settle, PaymentLifecycleOutcome::Succeeded),
+        (Behavior::Reject, PaymentLifecycleOutcome::Rejected),
+        (Behavior::BreakerOpen, PaymentLifecycleOutcome::Failed),
+        (Behavior::Malformed, PaymentLifecycleOutcome::Ambiguous),
+    ] {
+        let observer = Arc::new(RecordingObserver::default());
+        let world = World::with_payment_observer(observer.clone());
+        let signed = world.challenge("req-1", "request-key").await;
+        world.state.set_behavior(behavior);
+
+        let _decision = world
+            .redeem(&signed, "request-key", "spt_secret_value")
+            .await;
+
+        assert_eq!(
+            *observer.events.lock().unwrap(),
+            [
+                (
+                    PaymentLifecyclePhase::Settle,
+                    PaymentLifecycleOutcome::Started,
+                ),
+                (PaymentLifecyclePhase::Settle, expected),
+            ],
+            "wrong lifecycle for {behavior:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn payment_lifecycle_events_exclude_credentials_and_recipient_data() {
+    let observer = Arc::new(PayloadRecordingObserver::default());
+    let world = World::with_payment_observer(observer.clone());
+    let signed = world.challenge("req-1", "request-key").await;
+
+    let _decision = world
+        .redeem(&signed, "request-key", "PAYMENT-SIGNATURE_raw-proof-secret")
+        .await;
+
+    let events = observer.events.lock().unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].rail(), "x402");
+    assert_eq!(events[0].method(), Some("exact"));
+    assert_eq!(events[0].network(), Some("base-sepolia"));
+    assert_eq!(events[0].asset(), Some("usdc"));
+    assert_eq!(events[0].amount_micros(), 10_000);
+    assert_eq!(events[0].currency(), "USD");
+    assert!(events[0].intent_id().starts_with("sbpi_"));
+    assert_eq!(events[0].request_id(), Some("req-1"));
+    assert_eq!(events[0].provider_reference(), None);
+    assert_eq!(events[1].provider_reference(), Some("pi_fixture_1"));
+
+    let exposed = format!("{events:?}");
+    for forbidden in [
+        "PAYMENT-SIGNATURE_raw-proof-secret",
+        "0xrecipient",
+        "facilitator.test.sbproxy.dev",
+        "fixture-signature",
+    ] {
+        assert!(
+            !exposed.contains(forbidden),
+            "leaked {forbidden}: {exposed}"
+        );
+    }
 }
 
 #[tokio::test]

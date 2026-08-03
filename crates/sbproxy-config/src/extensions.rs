@@ -219,6 +219,8 @@ pub enum BundleHookKind {
     AiStreamEvent,
     /// AI stream-close hook.
     AiClose,
+    /// Payment lifecycle event hook.
+    Payment,
     /// Proxy-Wasm HTTP lifecycle filter.
     ProxyWasm,
 }
@@ -229,6 +231,8 @@ pub enum BundleHookKind {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum BundleBodyMode {
+    /// The hook receives no request or response body.
+    None,
     /// The host supplies a complete buffered body.
     #[default]
     Buffered,
@@ -488,6 +492,11 @@ impl BundleManifest {
                 && self.runtime != BundleRuntime::ProxyWasm
             {
                 return invalid("body_mode streamed is available only for runtime proxy_wasm");
+            }
+            if hook.kind == BundleHookKind::Payment
+                && hook.execution.body_mode != BundleBodyMode::None
+            {
+                return invalid("payment hooks require body_mode none");
             }
             if let Some(schema) = &hook.config_schema {
                 validate_schema(schema)?;
@@ -783,6 +792,7 @@ const fn hook_kind_label(kind: BundleHookKind) -> &'static str {
         BundleHookKind::AiGuardrailOutput => "ai_guardrail_output",
         BundleHookKind::AiStreamEvent => "ai_stream_event",
         BundleHookKind::AiClose => "ai_close",
+        BundleHookKind::Payment => "payment",
         BundleHookKind::ProxyWasm => "proxy_wasm",
     }
 }

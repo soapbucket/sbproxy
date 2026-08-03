@@ -47,6 +47,11 @@ use zeroize::Zeroizing;
 
 use crate::dispatch::{DispatchContext, DispatchOutcome, UsageDispatch};
 use crate::error::BillingError;
+use crate::lifecycle::{
+    NoOpPaymentLifecycleObserver, PaymentLifecycleCompletion, PaymentLifecycleDecision,
+    PaymentLifecycleEvent, PaymentLifecycleObserver, PaymentLifecycleOutcome,
+    PaymentLifecyclePhase,
+};
 use crate::registry::{
     AuthoritativePayment, ChallengePreparation, ProviderQueryResult, RailRegistry,
 };
@@ -239,6 +244,7 @@ pub struct BillingServiceBuilder {
     deadline: Duration,
     retry_after_seconds: u32,
     retry_backoff_ms: i64,
+    payment_observer: Arc<dyn PaymentLifecycleObserver>,
     #[cfg(feature = "recovery-crypto")]
     recovery_cipher: Option<RecoveryCipher>,
 }
@@ -254,6 +260,7 @@ impl BillingServiceBuilder {
             deadline: Duration::from_millis(MAX_AUTHORIZATION_DEADLINE_MS),
             retry_after_seconds: 2,
             retry_backoff_ms: 1_000,
+            payment_observer: Arc::new(NoOpPaymentLifecycleObserver),
             #[cfg(feature = "recovery-crypto")]
             recovery_cipher: None,
         }
@@ -294,6 +301,13 @@ impl BillingServiceBuilder {
         self
     }
 
+    /// Installs the generation-scoped payment lifecycle observer.
+    #[must_use]
+    pub fn payment_observer(mut self, observer: Arc<dyn PaymentLifecycleObserver>) -> Self {
+        self.payment_observer = observer;
+        self
+    }
+
     /// Installs the recovery cipher for replayable provider writes.
     #[cfg(feature = "recovery-crypto")]
     #[must_use]
@@ -330,6 +344,7 @@ impl BillingServiceBuilder {
             deadline: self.deadline,
             retry_after_seconds: self.retry_after_seconds,
             retry_backoff_ms: self.retry_backoff_ms,
+            payment_observer: self.payment_observer,
             #[cfg(feature = "recovery-crypto")]
             recovery_cipher: self.recovery_cipher,
         }
@@ -345,6 +360,7 @@ pub struct BillingService {
     deadline: Duration,
     retry_after_seconds: u32,
     retry_backoff_ms: i64,
+    payment_observer: Arc<dyn PaymentLifecycleObserver>,
     #[cfg(feature = "recovery-crypto")]
     recovery_cipher: Option<RecoveryCipher>,
 }
@@ -403,6 +419,28 @@ impl BillingService {
         } = input;
         draft.canonicalize()?;
         let draft_digest = draft.digest()?;
+        let event_intent_id =
+            crate::types::derive_intent_id(&draft.tenant_id, &request_idempotency_key);
+        let challenge_event = PaymentLifecycleEvent::from_draft(
+            PaymentLifecyclePhase::Challenge,
+            PaymentLifecycleOutcome::Started,
+            &event_intent_id,
+            &draft,
+        );
+        if self.payment_observer.started(&challenge_event).await == PaymentLifecycleDecision::Reject
+        {
+            self.notify_terminal(
+                challenge_event
+                    .clone()
+                    .with_outcome(PaymentLifecycleOutcome::Rejected),
+            );
+            return Err(BillingError::ExtensionRejected);
+        }
+        let mut challenge_completion = PaymentLifecycleCompletion::new(
+            Arc::clone(&self.payment_observer),
+            challenge_event.clone(),
+            PaymentLifecycleOutcome::Failed,
+        );
         let now_ms = self.clock.now_ms();
 
         let created = self
@@ -418,12 +456,14 @@ impl BillingService {
                 .load_intent(&created.intent_id)
                 .await?
                 .ok_or(BillingError::IntentNotFound)?;
-            return Ok(PreparedPaymentResponse {
+            let response = PreparedPaymentResponse {
                 intent_id: created.intent_id,
                 signed: rebuild_signed(&intent)?,
                 challenge_fields: BTreeMap::new(),
                 client_secret: None,
-            });
+            };
+            challenge_completion.terminal(PaymentLifecycleOutcome::Succeeded);
+            return Ok(response);
         }
 
         let signer = self.signer.clone().ok_or(BillingError::InvalidRequirement(
@@ -441,6 +481,7 @@ impl BillingService {
             .await?
         {
             if previous.status == crate::types::AttemptStatus::Succeeded {
+                challenge_completion.set_fallback(PaymentLifecycleOutcome::Ambiguous);
                 let requirement = PaymentRequirement {
                     draft,
                     provider_handle: previous.provider_handle,
@@ -456,12 +497,14 @@ impl BillingService {
                 self.store
                     .finalize_requirement(&created.intent_id, &signed)
                     .await?;
-                return Ok(PreparedPaymentResponse {
+                let response = PreparedPaymentResponse {
                     intent_id: created.intent_id,
                     signed,
                     challenge_fields: BTreeMap::new(),
                     client_secret: None,
-                });
+                };
+                challenge_completion.terminal(PaymentLifecycleOutcome::Succeeded);
+                return Ok(response);
             }
         }
 
@@ -495,11 +538,16 @@ impl BillingService {
             draft_digest,
             now_ms,
         };
+        // Cancellation during an adapter call may happen after its protected
+        // write. The dispatch record will refine a returned error, but a
+        // dropped future must conservatively report ambiguity.
+        challenge_completion.set_fallback(PaymentLifecycleOutcome::Ambiguous);
         let material = match adapter.prepare_challenge(request, &dispatch).await {
             Ok(material) => material,
             Err(error) => {
-                self.record_failed_attempt(&prepared, &dispatch, &error)
+                self.record_failed_attempt(&prepared, &dispatch, &error, Some(&challenge_event))
                     .await;
+                challenge_completion.disarm();
                 return Err(error);
             }
         };
@@ -529,12 +577,14 @@ impl BillingService {
             .finalize_requirement(&created.intent_id, &signed)
             .await?;
 
-        Ok(PreparedPaymentResponse {
+        let response = PreparedPaymentResponse {
             intent_id: created.intent_id,
             signed,
             challenge_fields: material.challenge_fields,
             client_secret: material.client_secret,
-        })
+        };
+        challenge_completion.terminal(PaymentLifecycleOutcome::Succeeded);
+        Ok(response)
     }
 
     /// Authorizes one credential against its durable challenge.
@@ -641,6 +691,7 @@ impl BillingService {
             Ok(adapter) => adapter,
             Err(error) => return Ok(refuse(PaymentProblemCode::RailUnsupported, &error)),
         };
+        let adapter_manages_lifecycle = adapter.manages_authorization_lifecycle();
 
         let generation = self
             .store
@@ -687,10 +738,46 @@ impl BillingService {
             Err(error) => return Err(error),
         };
 
-        let dispatch = DispatchContext::for_attempt(
+        let settlement_event = PaymentLifecycleEvent::from_draft(
+            PaymentLifecyclePhase::Settle,
+            PaymentLifecycleOutcome::Started,
+            &intent_id,
+            &intent.draft,
+        );
+        if !adapter_manages_lifecycle
+            && self.payment_observer.started(&settlement_event).await
+                == PaymentLifecycleDecision::Reject
+        {
+            let failure = SafeFailure::category(FailureCategory::Rejected, false);
+            let recorded = self
+                .store
+                .mark_terminal(prepared.attempt_id(), prepared.lease_token(), failure)
+                .await;
+            if let Err(error) = recorded {
+                tracing::warn!(
+                    attempt_id = prepared.attempt_id(),
+                    category = %SafeFailure::from(&error).category,
+                    "could not record payment extension rejection",
+                );
+                return Ok(unavailable(self.retry_after_seconds));
+            }
+            self.notify_terminal(
+                settlement_event
+                    .clone()
+                    .with_outcome(PaymentLifecycleOutcome::Rejected),
+            );
+            return Ok(refuse(
+                PaymentProblemCode::Rejected,
+                &BillingError::ProviderRejected,
+            ));
+        }
+
+        let dispatch = DispatchContext::for_payment_attempt(
             Arc::clone(&self.store),
             Arc::clone(&self.clock),
             prepared.clone(),
+            Arc::clone(&self.payment_observer),
+            settlement_event.clone(),
         );
         let payment = AuthoritativePayment {
             intent_id: intent_id.clone(),
@@ -709,14 +796,26 @@ impl BillingService {
         {
             Ok(Ok(receipt)) => receipt,
             Ok(Err(error)) => {
+                let terminal_event = (!adapter_manages_lifecycle
+                    || dispatch.settlement_lifecycle_started())
+                .then_some(&settlement_event)
+                .filter(|_| !matches!(error, BillingError::ExtensionRejected));
                 let decision = self
-                    .record_failed_attempt(&prepared, &dispatch, &error)
+                    .record_failed_attempt(&prepared, &dispatch, &error, terminal_event)
                     .await;
                 return Ok(decision);
             }
             Err(_elapsed) => {
+                let terminal_event = (!adapter_manages_lifecycle
+                    || dispatch.settlement_lifecycle_started())
+                .then_some(&settlement_event);
                 let decision = self
-                    .record_failed_attempt(&prepared, &dispatch, &BillingError::ProviderTimeout)
+                    .record_failed_attempt(
+                        &prepared,
+                        &dispatch,
+                        &BillingError::ProviderTimeout,
+                        terminal_event,
+                    )
                     .await;
                 return Ok(decision);
             }
@@ -753,17 +852,54 @@ impl BillingService {
                     "could not record a malformed provider receipt",
                 );
             }
+            self.notify_terminal(settlement_event.clone().with_outcome(
+                if dispatch.was_dispatched() {
+                    PaymentLifecycleOutcome::Ambiguous
+                } else {
+                    PaymentLifecycleOutcome::Failed
+                },
+            ));
             return Ok(unavailable(self.retry_after_seconds));
         }
 
-        self.store
+        if let Err(error) = self
+            .store
             .mark_succeeded(prepared.attempt_id(), prepared.lease_token(), settled)
-            .await?;
+            .await
+        {
+            self.notify_terminal(
+                settlement_event
+                    .clone()
+                    .with_outcome(PaymentLifecycleOutcome::Ambiguous),
+            );
+            return Err(error);
+        }
 
         // The decision comes from the committed row, never from the adapter.
-        match self.store.load_access_receipt(&intent_id).await? {
-            Some(receipt) => Ok(AuthorizationDecision::Settled(receipt)),
-            None => Ok(unavailable(self.retry_after_seconds)),
+        match self.store.load_access_receipt(&intent_id).await {
+            Ok(Some(receipt)) => {
+                self.notify_terminal(
+                    settlement_event
+                        .clone()
+                        .with_outcome(PaymentLifecycleOutcome::Succeeded)
+                        .with_provider_reference(&receipt.provider_reference),
+                );
+                Ok(AuthorizationDecision::Settled(receipt))
+            }
+            Ok(None) => {
+                self.notify_terminal(
+                    settlement_event
+                        .clone()
+                        .with_outcome(PaymentLifecycleOutcome::Ambiguous),
+                );
+                Ok(unavailable(self.retry_after_seconds))
+            }
+            Err(error) => {
+                self.notify_terminal(
+                    settlement_event.with_outcome(PaymentLifecycleOutcome::Ambiguous),
+                );
+                Err(error)
+            }
         }
     }
 
@@ -783,10 +919,55 @@ impl BillingService {
     ) -> Result<ReconciliationOutcome, BillingError> {
         let now_ms = self.clock.now_ms();
         let attempt = claimed.attempt.clone();
-        let dispatch = DispatchContext::for_attempt(
+        let draft = match attempt.requirement.as_ref() {
+            Some(requirement) => requirement.draft.clone(),
+            None => {
+                self.store
+                    .load_intent(&attempt.intent_id)
+                    .await?
+                    .ok_or(BillingError::IntentNotFound)?
+                    .draft
+            }
+        };
+        let reconciliation_event = PaymentLifecycleEvent::from_draft(
+            PaymentLifecyclePhase::Reconcile,
+            PaymentLifecycleOutcome::Started,
+            &attempt.intent_id,
+            &draft,
+        );
+        let reconciliation_decision = self.payment_observer.started(&reconciliation_event).await;
+        let mut reconciliation_completion = PaymentLifecycleCompletion::new(
+            Arc::clone(&self.payment_observer),
+            reconciliation_event.clone(),
+            if reconciliation_decision == PaymentLifecycleDecision::Reject {
+                PaymentLifecycleOutcome::Rejected
+            } else {
+                PaymentLifecycleOutcome::Failed
+            },
+        );
+        if reconciliation_decision == PaymentLifecycleDecision::Reject {
+            let outcome = ReconciliationOutcome::Unresolved(SafeFailure::category(
+                FailureCategory::Rejected,
+                false,
+            ));
+            self.store
+                .record_reconciliation(
+                    claimed.attempt_id(),
+                    claimed.lease_token(),
+                    outcome.clone(),
+                    now_ms,
+                )
+                .await?;
+            reconciliation_completion.terminal(PaymentLifecycleOutcome::Rejected);
+            return Ok(outcome);
+        }
+
+        let dispatch = DispatchContext::for_payment_attempt(
             Arc::clone(&self.store),
             Arc::clone(&self.clock),
             claimed.clone(),
+            Arc::clone(&self.payment_observer),
+            reconciliation_event.clone(),
         );
 
         let outcome = match self.adapters.adapter(attempt.rail) {
@@ -830,6 +1011,37 @@ impl BillingService {
                 now_ms,
             )
             .await?;
+        let lifecycle_outcome = match &outcome {
+            ReconciliationOutcome::ProvenSucceeded(_) => {
+                reconciliation_completion.set_fallback(PaymentLifecycleOutcome::Ambiguous);
+                match self.store.load_access_receipt(&attempt.intent_id).await? {
+                    Some(durable) => {
+                        reconciliation_completion.disarm();
+                        self.notify_terminal(
+                            reconciliation_event
+                                .with_outcome(PaymentLifecycleOutcome::Succeeded)
+                                .with_provider_reference(&durable.provider_reference),
+                        );
+                        return Ok(outcome);
+                    }
+                    None => PaymentLifecycleOutcome::Ambiguous,
+                }
+            }
+            ReconciliationOutcome::ProvenNotDispatched(_) => PaymentLifecycleOutcome::Succeeded,
+            ReconciliationOutcome::ProvenFailed(_) => PaymentLifecycleOutcome::Rejected,
+            ReconciliationOutcome::Unresolved(failure)
+                if failure.category == FailureCategory::Unsupported =>
+            {
+                PaymentLifecycleOutcome::Unsupported
+            }
+            ReconciliationOutcome::Unresolved(failure)
+                if failure.category == FailureCategory::Ambiguous =>
+            {
+                PaymentLifecycleOutcome::Ambiguous
+            }
+            ReconciliationOutcome::Unresolved(_) => PaymentLifecycleOutcome::Failed,
+        };
+        reconciliation_completion.terminal(lifecycle_outcome);
         Ok(outcome)
     }
 
@@ -948,10 +1160,39 @@ impl BillingService {
         prepared: &crate::store::PreparedAttempt,
         dispatch: &DispatchContext,
         error: &BillingError,
+        terminal_event: Option<&PaymentLifecycleEvent>,
     ) -> AuthorizationDecision {
         let failure = SafeFailure::from(error);
         let now_ms = self.clock.now_ms();
-        let recorded = match dispatch.outcome() {
+        if matches!(error, BillingError::ExtensionRejected)
+            && dispatch.outcome() == DispatchOutcome::NeverDispatched
+        {
+            return match self
+                .store
+                .mark_terminal(prepared.attempt_id(), prepared.lease_token(), failure)
+                .await
+            {
+                Ok(()) => {
+                    if let Some(event) = terminal_event {
+                        self.notify_terminal(
+                            event
+                                .clone()
+                                .with_outcome(PaymentLifecycleOutcome::Rejected),
+                        );
+                    }
+                    refuse(PaymentProblemCode::Rejected, error)
+                }
+                Err(store_error) => {
+                    tracing::warn!(
+                        attempt_id = prepared.attempt_id(),
+                        category = %SafeFailure::from(&store_error).category,
+                        "could not record payment extension rejection",
+                    );
+                    unavailable(self.retry_after_seconds)
+                }
+            };
+        }
+        let (recorded, lifecycle_outcome) = match dispatch.outcome() {
             DispatchOutcome::NeverDispatched => {
                 let result = self
                     .store
@@ -962,7 +1203,10 @@ impl BillingService {
                         failure.clone(),
                     )
                     .await;
-                result.map(|()| unavailable(self.retry_after_seconds))
+                (
+                    result.map(|()| unavailable(self.retry_after_seconds)),
+                    PaymentLifecycleOutcome::Failed,
+                )
             }
             DispatchOutcome::Resolved => {
                 let result = self
@@ -973,7 +1217,10 @@ impl BillingService {
                         failure.clone(),
                     )
                     .await;
-                result.map(|()| refuse(PaymentProblemCode::Rejected, error))
+                (
+                    result.map(|()| refuse(PaymentProblemCode::Rejected, error)),
+                    PaymentLifecycleOutcome::Rejected,
+                )
             }
             DispatchOutcome::Ambiguous => {
                 let result = self
@@ -984,12 +1231,20 @@ impl BillingService {
                         failure.clone(),
                     )
                     .await;
-                result.map(|()| unavailable(self.retry_after_seconds))
+                (
+                    result.map(|()| unavailable(self.retry_after_seconds)),
+                    PaymentLifecycleOutcome::Ambiguous,
+                )
             }
         };
 
         match recorded {
-            Ok(decision) => decision,
+            Ok(decision) => {
+                if let Some(event) = terminal_event {
+                    self.notify_terminal(event.clone().with_outcome(lifecycle_outcome));
+                }
+                decision
+            }
             Err(store_error) => {
                 // The durable record is what authorizes, so a store failure
                 // here can only ever produce a refusal to authorize.
@@ -1002,6 +1257,10 @@ impl BillingService {
                 unavailable(self.retry_after_seconds)
             }
         }
+    }
+
+    fn notify_terminal(&self, event: PaymentLifecycleEvent) {
+        self.payment_observer.terminal(event);
     }
 }
 

@@ -63,6 +63,7 @@ use serde::de::{self, DeserializeOwned, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::BillingError;
+use crate::lifecycle::{PaymentLifecycleDecision, PaymentLifecycleOutcome, PaymentLifecyclePhase};
 use crate::types::{PaymentProof, SettlementRail, SettlementReceipt};
 
 /// The protocol version this adapter speaks. Never negotiated.
@@ -961,6 +962,14 @@ pub trait FacilitatorTransport: Send + Sync {
 /// adapter cannot perform a provider write without going through it.
 #[async_trait::async_trait]
 pub trait SettleDispatchGate: Send + Sync {
+    /// Inspect a payment lifecycle `started` event before its protected effect.
+    async fn payment_started(&self, _phase: PaymentLifecyclePhase) -> PaymentLifecycleDecision {
+        PaymentLifecycleDecision::Continue
+    }
+
+    /// Observe a terminal payment lifecycle event without awaiting hook work.
+    fn payment_terminal(&self, _phase: PaymentLifecyclePhase, _outcome: PaymentLifecycleOutcome) {}
+
     /// Commits the settle dispatch stamp.
     ///
     /// # Errors
@@ -1144,45 +1153,46 @@ impl<T: FacilitatorTransport> X402ExactSettler<T> {
         dispatched: &AtomicBool,
         started: tokio::time::Instant,
     ) -> Result<X402Settlement, BillingError> {
-        // Everything local first. A payload that is not the signed
-        // obligation costs the facilitator nothing.
-        validate_echoed_payload(request.payload, &request.challenge)?;
-
-        if self.breaker.admit(request.now_ms) == BreakerVerdict::Open {
-            return Err(BillingError::ProviderUnavailable);
+        if gate.payment_started(PaymentLifecyclePhase::Verify).await
+            == PaymentLifecycleDecision::Reject
+        {
+            gate.payment_terminal(
+                PaymentLifecyclePhase::Verify,
+                PaymentLifecycleOutcome::Rejected,
+            );
+            return Err(BillingError::ExtensionRejected);
         }
 
-        let body = serde_json::to_vec(&FacilitatorRequest {
-            x402_version: X402_VERSION,
-            payment_payload: request.payload.clone(),
-            payment_requirements: request.challenge.accepted.clone(),
-        })
-        .map_err(|_| BillingError::ProviderMalformed)?;
+        let (verified, body) = match self.verify(request, started).await {
+            Ok(verified) => verified,
+            Err(error) => {
+                let outcome = if matches!(
+                    error,
+                    BillingError::ProviderRejected
+                        | BillingError::RequirementMismatch
+                        | BillingError::InvalidProof
+                ) {
+                    PaymentLifecycleOutcome::Rejected
+                } else {
+                    PaymentLifecycleOutcome::Failed
+                };
+                gate.payment_terminal(PaymentLifecyclePhase::Verify, outcome);
+                return Err(error);
+            }
+        };
+        gate.payment_terminal(
+            PaymentLifecyclePhase::Verify,
+            PaymentLifecycleOutcome::Succeeded,
+        );
 
-        // Step 1: verify. Not a provider write, so no dispatch stamp.
-        let response = self
-            .post(
-                self.endpoints.verify_url(),
-                &body,
-                self.remaining(started, self.verify_timeout)?,
-            )
-            .await
-            .map_err(|failure| self.pre_dispatch_error(failure, request.now_ms))?;
-
-        if response.status >= 500 {
-            self.breaker.record_transport_failure(request.now_ms);
-            return Err(BillingError::ProviderUnavailable);
-        }
-        if !(200..300).contains(&response.status) {
-            return Err(BillingError::ProviderMalformed);
-        }
-        let verified: VerifyResponse =
-            decode_x402_json(&response.body).map_err(BillingError::from)?;
-        self.breaker.record_success();
-        if verified.is_valid != Some(true) {
-            // An authoritative rejection. Settle is never prepared and
-            // never called.
-            return Err(BillingError::ProviderRejected);
+        if gate.payment_started(PaymentLifecyclePhase::Settle).await
+            == PaymentLifecycleDecision::Reject
+        {
+            gate.payment_terminal(
+                PaymentLifecyclePhase::Settle,
+                PaymentLifecycleOutcome::Rejected,
+            );
+            return Err(BillingError::ExtensionRejected);
         }
 
         // The settle budget is computed before the stamp, so an already
@@ -1229,6 +1239,52 @@ impl<T: FacilitatorTransport> X402ExactSettler<T> {
             receipt,
             response: settled,
         })
+    }
+
+    async fn verify(
+        &self,
+        request: &X402AuthorizationRequest<'_>,
+        started: tokio::time::Instant,
+    ) -> Result<(VerifyResponse, Vec<u8>), BillingError> {
+        // Everything local first. A payload that is not the signed
+        // obligation costs the facilitator nothing.
+        validate_echoed_payload(request.payload, &request.challenge)?;
+
+        if self.breaker.admit(request.now_ms) == BreakerVerdict::Open {
+            return Err(BillingError::ProviderUnavailable);
+        }
+
+        let body = serde_json::to_vec(&FacilitatorRequest {
+            x402_version: X402_VERSION,
+            payment_payload: request.payload.clone(),
+            payment_requirements: request.challenge.accepted.clone(),
+        })
+        .map_err(|_| BillingError::ProviderMalformed)?;
+
+        // Verify is a read, so it never commits a dispatch stamp.
+        let response = self
+            .post(
+                self.endpoints.verify_url(),
+                &body,
+                self.remaining(started, self.verify_timeout)?,
+            )
+            .await
+            .map_err(|failure| self.pre_dispatch_error(failure, request.now_ms))?;
+
+        if response.status >= 500 {
+            self.breaker.record_transport_failure(request.now_ms);
+            return Err(BillingError::ProviderUnavailable);
+        }
+        if !(200..300).contains(&response.status) {
+            return Err(BillingError::ProviderMalformed);
+        }
+        let verified: VerifyResponse =
+            decode_x402_json(&response.body).map_err(BillingError::from)?;
+        self.breaker.record_success();
+        if verified.is_valid != Some(true) {
+            return Err(BillingError::ProviderRejected);
+        }
+        Ok((verified, body))
     }
 
     /// Validates a settle response and builds the receipt from it.

@@ -6,7 +6,10 @@ use sbproxy_config::{
     BundleHookKind, BundleSourceConfig, Cloner, ConfigSourceError, ExtensionBundlesConfig,
     FetchContext, FetchRequest, ResolvedRevision,
 };
-use sbproxy_plugin::{ExtensionHookKind, ExtensionRegistrationSource, ExtensionRuntime};
+use sbproxy_plugin::{
+    ExtensionBodyMode, ExtensionDispatch, ExtensionHookKind, ExtensionRegistrationSource,
+    ExtensionRuntime,
+};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
@@ -399,6 +402,44 @@ fn invalid_proxy_wasm_module_rejects_the_complete_candidate() {
             .unwrap_err();
 
     assert_eq!(error.to_string(), "bundle.proxy_wasm: invalid_module");
+}
+
+#[test]
+fn payment_hooks_load_in_deterministic_order_and_use_no_body_inventory() {
+    let temp = TempDir::new().unwrap();
+    for (directory, bundle, type_name) in [
+        ("z-created-first", "z-payment", "z_payment"),
+        ("a-created-last", "a-payment", "a_payment"),
+    ] {
+        let manifest = manifest(bundle, "payment", type_name, None).replace(
+            "    export: run\n",
+            "    export: run\n    execution:\n      body_mode: none\n",
+        );
+        write_bundle(temp.path(), directory, &manifest, VALID_JAVASCRIPT);
+    }
+
+    let registry =
+        DynamicBundleRegistry::load(&local_config(temp.path()), temp.path(), &BTreeSet::new())
+            .unwrap();
+
+    assert_eq!(
+        registry
+            .payment_hooks()
+            .iter()
+            .map(|hook| hook.hook().type_name.as_str())
+            .collect::<Vec<_>>(),
+        ["a_payment", "z_payment"]
+    );
+    let record = registry
+        .inventory()
+        .hooks
+        .iter()
+        .find(|hook| hook.match_key == "a_payment")
+        .unwrap();
+    assert_eq!(record.kind, ExtensionHookKind::Payment);
+    assert_eq!(record.dispatch, ExtensionDispatch::Chain);
+    assert_eq!(record.execution.phase, "payment");
+    assert_eq!(record.execution.body_mode, ExtensionBodyMode::None);
 }
 
 #[test]

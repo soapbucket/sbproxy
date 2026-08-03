@@ -21,7 +21,18 @@ use sbproxy_billing::x402::{
     X402AuthorizationRequest, X402Error, X402ExactSettler, X402QueryResult,
     REQUIREMENT_EXTENSION_KEY, REQUIREMENT_EXTENSION_SCHEMA,
 };
-use sbproxy_billing::BillingError;
+use sbproxy_billing::{
+    BillingClock, BillingService, PaymentLifecycleEvent, PaymentLifecycleObserver, PaymentProof,
+    RailRegistry, RedemptionRequest, RequirementInput, SignedPaymentRequirement,
+    SqliteSettlementStore, X402Adapter,
+};
+use sbproxy_billing::{
+    BillingError, PaymentLifecycleDecision, PaymentLifecycleOutcome, PaymentLifecyclePhase,
+};
+
+mod common;
+
+use common::{sample_draft, FixtureSigner, TestClock};
 
 /// The frozen envelope shapes.
 const ENVELOPE: &str = include_str!("fixtures/x402/exact_envelope.json");
@@ -155,6 +166,58 @@ struct RecordingGate {
     delay_ms: u64,
 }
 
+struct LifecycleGate {
+    events: Arc<Mutex<Vec<(PaymentLifecyclePhase, PaymentLifecycleOutcome)>>>,
+    stamps: Arc<AtomicUsize>,
+}
+
+struct RejectPhaseObserver {
+    reject: Option<PaymentLifecyclePhase>,
+    events: Mutex<Vec<(PaymentLifecyclePhase, PaymentLifecycleOutcome)>>,
+}
+
+#[async_trait::async_trait]
+impl PaymentLifecycleObserver for RejectPhaseObserver {
+    async fn started(&self, event: &PaymentLifecycleEvent) -> PaymentLifecycleDecision {
+        self.events
+            .lock()
+            .unwrap()
+            .push((event.phase(), event.outcome()));
+        if Some(event.phase()) == self.reject {
+            PaymentLifecycleDecision::Reject
+        } else {
+            PaymentLifecycleDecision::Continue
+        }
+    }
+
+    fn terminal(&self, event: PaymentLifecycleEvent) {
+        self.events
+            .lock()
+            .unwrap()
+            .push((event.phase(), event.outcome()));
+    }
+}
+
+#[async_trait::async_trait]
+impl SettleDispatchGate for LifecycleGate {
+    async fn stamp_settle_dispatch(&self) -> Result<(), BillingError> {
+        self.stamps.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn payment_started(&self, phase: PaymentLifecyclePhase) -> PaymentLifecycleDecision {
+        self.events
+            .lock()
+            .unwrap()
+            .push((phase, PaymentLifecycleOutcome::Started));
+        PaymentLifecycleDecision::Continue
+    }
+
+    fn payment_terminal(&self, phase: PaymentLifecyclePhase, outcome: PaymentLifecycleOutcome) {
+        self.events.lock().unwrap().push((phase, outcome));
+    }
+}
+
 #[async_trait::async_trait]
 impl SettleDispatchGate for RecordingGate {
     async fn stamp_settle_dispatch(&self) -> Result<(), BillingError> {
@@ -202,6 +265,86 @@ fn ok(name: &str) -> Reply {
         body: body(name),
         delay_ms: 0,
     }
+}
+
+struct ServiceLifecycleFixture {
+    service: BillingService,
+    signed: SignedPaymentRequirement,
+    observer: Arc<RejectPhaseObserver>,
+    calls: Arc<Mutex<Vec<String>>>,
+    _directory: tempfile::TempDir,
+}
+
+async fn service_lifecycle_fixture(
+    reject: Option<PaymentLifecyclePhase>,
+    settle: Reply,
+) -> ServiceLifecycleFixture {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let observer = Arc::new(RejectPhaseObserver {
+        reject,
+        events: Mutex::new(Vec::new()),
+    });
+    let exact = Arc::new(settler(
+        ok("verify_response"),
+        settle,
+        calls.clone(),
+        breaker(),
+    ));
+    let mut registry = RailRegistry::new();
+    registry
+        .register_adapter(Arc::new(X402Adapter::new(vec![exact]).unwrap()))
+        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let clock = TestClock::new(1_700_000_000_000);
+    let store = SqliteSettlementStore::open(&directory.path().join("settlement.sqlite3"))
+        .unwrap()
+        .with_clock(Arc::clone(&clock) as Arc<dyn BillingClock>)
+        .shared();
+    let service = BillingService::builder(store)
+        .adapters(registry)
+        .clock(clock as Arc<dyn BillingClock>)
+        .signer(Arc::new(FixtureSigner))
+        .payment_observer(observer.clone())
+        .build();
+    let mut draft = sample_draft("tenant-1", "sbpr_fixture_req_0001", 1_700_000_600_000);
+    let sbproxy_billing::RequirementTerms::X402Exact {
+        facilitator_url, ..
+    } = &mut draft.terms
+    else {
+        unreachable!()
+    };
+    *facilitator_url = "https://facilitator.example/base".to_owned();
+    let prepared = service
+        .prepare_requirement(RequirementInput {
+            draft,
+            request_idempotency_key: "request-key".to_owned(),
+        })
+        .await
+        .expect("challenge prepares");
+    observer.events.lock().unwrap().clear();
+    calls.lock().unwrap().clear();
+
+    ServiceLifecycleFixture {
+        service,
+        signed: prepared.signed,
+        observer,
+        calls,
+        _directory: directory,
+    }
+}
+
+async fn authorize_fixture(
+    fixture: &ServiceLifecycleFixture,
+) -> sbproxy_billing::AuthorizationDecision {
+    fixture
+        .service
+        .authorize(RedemptionRequest {
+            signed: fixture.signed.clone(),
+            request_idempotency_key: "request-key".to_owned(),
+            proof: PaymentProof::new("Payment", r#"{"signature":"secret"}"#.to_owned()).unwrap(),
+        })
+        .await
+        .unwrap()
 }
 
 #[test]
@@ -418,6 +561,265 @@ async fn verify_then_settle_commits_a_receipt_from_real_values() {
         ]
     );
     assert_eq!(stamps.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn x402_lifecycle_events_follow_verify_then_settle_order() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let settler = settler(
+        ok("verify_response"),
+        ok("settle_response"),
+        Arc::new(Mutex::new(Vec::new())),
+        breaker(),
+    );
+    let required = frozen_required();
+    let payload = frozen_payload();
+
+    settler
+        .authorize_and_settle(
+            X402AuthorizationRequest {
+                challenge: challenge(&required),
+                payload: &payload,
+                now_ms: 1_800_000_000_000,
+            },
+            &LifecycleGate {
+                events: events.clone(),
+                stamps: Arc::new(AtomicUsize::new(0)),
+            },
+        )
+        .await
+        .expect("payment settles");
+
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            (
+                PaymentLifecyclePhase::Verify,
+                PaymentLifecycleOutcome::Started,
+            ),
+            (
+                PaymentLifecyclePhase::Verify,
+                PaymentLifecycleOutcome::Succeeded,
+            ),
+            (
+                PaymentLifecyclePhase::Settle,
+                PaymentLifecycleOutcome::Started,
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn x402_verify_rejection_emits_rejected_without_settle_start() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let settler = settler(
+        ok("verify_rejection"),
+        ok("settle_response"),
+        calls.clone(),
+        breaker(),
+    );
+    let required = frozen_required();
+    let payload = frozen_payload();
+
+    let error = expect_error(
+        settler
+            .authorize_and_settle(
+                X402AuthorizationRequest {
+                    challenge: challenge(&required),
+                    payload: &payload,
+                    now_ms: 1_800_000_000_000,
+                },
+                &LifecycleGate {
+                    events: events.clone(),
+                    stamps: Arc::new(AtomicUsize::new(0)),
+                },
+            )
+            .await,
+        "verify rejection must stop settlement",
+    );
+
+    assert_eq!(error, BillingError::ProviderRejected);
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            (
+                PaymentLifecyclePhase::Verify,
+                PaymentLifecycleOutcome::Started,
+            ),
+            (
+                PaymentLifecyclePhase::Verify,
+                PaymentLifecycleOutcome::Rejected,
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn x402_verify_failure_emits_failed_without_settle_start() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let settler = settler(
+        Reply::Fail(TransportFailure::Connection),
+        ok("settle_response"),
+        Arc::new(Mutex::new(Vec::new())),
+        breaker(),
+    );
+    let required = frozen_required();
+    let payload = frozen_payload();
+
+    let error = expect_error(
+        settler
+            .authorize_and_settle(
+                X402AuthorizationRequest {
+                    challenge: challenge(&required),
+                    payload: &payload,
+                    now_ms: 1_800_000_000_000,
+                },
+                &LifecycleGate {
+                    events: events.clone(),
+                    stamps: Arc::new(AtomicUsize::new(0)),
+                },
+            )
+            .await,
+        "verify transport failure must stop settlement",
+    );
+
+    assert_eq!(error, BillingError::ProviderUnavailable);
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            (
+                PaymentLifecyclePhase::Verify,
+                PaymentLifecycleOutcome::Started,
+            ),
+            (
+                PaymentLifecyclePhase::Verify,
+                PaymentLifecycleOutcome::Failed,
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn x402_verify_started_rejection_prevents_facilitator_access() {
+    let fixture =
+        service_lifecycle_fixture(Some(PaymentLifecyclePhase::Verify), ok("settle_response")).await;
+
+    let decision = authorize_fixture(&fixture).await;
+
+    assert!(
+        matches!(
+            decision,
+            sbproxy_billing::AuthorizationDecision::PaymentRequired(_)
+        ),
+        "decision={decision:?} events={:?}",
+        fixture.observer.events.lock().unwrap()
+    );
+    assert!(fixture.calls.lock().unwrap().is_empty());
+    assert_eq!(
+        *fixture.observer.events.lock().unwrap(),
+        [
+            (
+                PaymentLifecyclePhase::Verify,
+                PaymentLifecycleOutcome::Started,
+            ),
+            (
+                PaymentLifecyclePhase::Verify,
+                PaymentLifecycleOutcome::Rejected,
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn x402_settle_started_rejection_prevents_provider_write() {
+    let fixture =
+        service_lifecycle_fixture(Some(PaymentLifecyclePhase::Settle), ok("settle_response")).await;
+
+    let decision = authorize_fixture(&fixture).await;
+
+    assert!(matches!(
+        decision,
+        sbproxy_billing::AuthorizationDecision::PaymentRequired(_)
+    ));
+    assert_eq!(
+        *fixture.calls.lock().unwrap(),
+        ["https://facilitator.example/base/verify"]
+    );
+    assert_eq!(
+        *fixture.observer.events.lock().unwrap(),
+        [
+            (
+                PaymentLifecyclePhase::Verify,
+                PaymentLifecycleOutcome::Started,
+            ),
+            (
+                PaymentLifecyclePhase::Verify,
+                PaymentLifecycleOutcome::Succeeded,
+            ),
+            (
+                PaymentLifecyclePhase::Settle,
+                PaymentLifecycleOutcome::Started,
+            ),
+            (
+                PaymentLifecyclePhase::Settle,
+                PaymentLifecycleOutcome::Rejected,
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn x402_service_emits_succeeded_after_durable_settlement() {
+    let settle = Reply::Body {
+        status: 200,
+        body: serde_json::to_vec(&serde_json::json!({
+            "success": true,
+            "transaction": "tx_fixture_1",
+            "network": "base-sepolia",
+            "amount": "10000",
+            "payer": "0x2222222222222222222222222222222222222222"
+        }))
+        .unwrap(),
+        delay_ms: 0,
+    };
+    let fixture = service_lifecycle_fixture(None, settle).await;
+
+    let decision = authorize_fixture(&fixture).await;
+
+    let sbproxy_billing::AuthorizationDecision::Settled(receipt) = decision else {
+        panic!("payment did not settle");
+    };
+    assert_eq!(receipt.provider_reference, "tx_fixture_1");
+    assert_eq!(
+        *fixture.calls.lock().unwrap(),
+        [
+            "https://facilitator.example/base/verify",
+            "https://facilitator.example/base/settle",
+        ]
+    );
+    assert_eq!(
+        *fixture.observer.events.lock().unwrap(),
+        [
+            (
+                PaymentLifecyclePhase::Verify,
+                PaymentLifecycleOutcome::Started,
+            ),
+            (
+                PaymentLifecyclePhase::Verify,
+                PaymentLifecycleOutcome::Succeeded,
+            ),
+            (
+                PaymentLifecyclePhase::Settle,
+                PaymentLifecycleOutcome::Started,
+            ),
+            (
+                PaymentLifecyclePhase::Settle,
+                PaymentLifecycleOutcome::Succeeded,
+            ),
+        ]
+    );
 }
 
 #[tokio::test]

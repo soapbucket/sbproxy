@@ -12,6 +12,257 @@ use crate::{PluginError, PluginResult};
 /// Schema version emitted by [`ExtensionInventorySnapshot`].
 pub const EXTENSION_INVENTORY_SCHEMA_VERSION: u16 = 1;
 
+/// Schema version emitted by [`PaymentExtensionEvent`].
+pub const PAYMENT_EXTENSION_SCHEMA_VERSION: u16 = 1;
+
+/// Maximum UTF-8 byte length for a payment rail or method label.
+pub const PAYMENT_EXTENSION_MAX_LABEL_BYTES: usize = 64;
+
+/// Maximum UTF-8 byte length for a payment network, asset, or identifier.
+pub const PAYMENT_EXTENSION_MAX_VALUE_BYTES: usize = 128;
+
+/// Stage of the payment lifecycle represented by an extension event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaymentExtensionPhase {
+    /// A payment challenge is being prepared.
+    Challenge,
+    /// Payment evidence is being verified.
+    Verify,
+    /// A verified payment is being settled.
+    Settle,
+    /// An uncertain payment attempt is being reconciled.
+    Reconcile,
+}
+
+/// Bounded outcome reported for a payment lifecycle stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaymentExtensionOutcome {
+    /// The operation has not performed a provider write or released access.
+    Started,
+    /// The operation completed successfully.
+    Succeeded,
+    /// The operation was conclusively rejected.
+    Rejected,
+    /// The operation failed before an irreversible provider write.
+    Failed,
+    /// The operation may have performed an irreversible provider write.
+    Ambiguous,
+    /// The payment rail does not support the requested operation.
+    Unsupported,
+}
+
+/// Decision returned by a payment extension for a `started` event.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaymentExtensionDecision {
+    /// Continue the payment operation.
+    #[default]
+    Continue,
+    /// Reject the payment operation before it can perform a provider write.
+    Reject,
+}
+
+/// Bounded monetary amount exposed to a payment extension.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PaymentExtensionAmount {
+    amount_micros: u64,
+    currency: String,
+}
+
+/// Credential-free payment lifecycle event exposed to extensions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PaymentExtensionEvent {
+    schema_version: u16,
+    phase: PaymentExtensionPhase,
+    outcome: PaymentExtensionOutcome,
+    rail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    network: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    asset: Option<String>,
+    amount: PaymentExtensionAmount,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    intent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_reference: Option<String>,
+}
+
+impl PaymentExtensionEvent {
+    /// Start building a payment event from its required bounded fields.
+    pub fn builder(
+        phase: PaymentExtensionPhase,
+        outcome: PaymentExtensionOutcome,
+        rail: impl Into<String>,
+        amount_micros: u64,
+        currency: impl Into<String>,
+    ) -> PaymentExtensionEventBuilder {
+        PaymentExtensionEventBuilder {
+            phase,
+            outcome,
+            rail: rail.into(),
+            method: None,
+            network: None,
+            asset: None,
+            amount_micros,
+            currency: currency.into(),
+            intent_id: None,
+            request_id: None,
+            provider_reference: None,
+        }
+    }
+}
+
+/// Builder that validates payment metadata before creating an event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaymentExtensionEventBuilder {
+    phase: PaymentExtensionPhase,
+    outcome: PaymentExtensionOutcome,
+    rail: String,
+    method: Option<String>,
+    network: Option<String>,
+    asset: Option<String>,
+    amount_micros: u64,
+    currency: String,
+    intent_id: Option<String>,
+    request_id: Option<String>,
+    provider_reference: Option<String>,
+}
+
+impl PaymentExtensionEventBuilder {
+    /// Attach a payment method or scheme.
+    #[must_use]
+    pub fn method(mut self, value: impl Into<String>) -> Self {
+        self.method = Some(value.into());
+        self
+    }
+
+    /// Attach the payment network.
+    #[must_use]
+    pub fn network(mut self, value: impl Into<String>) -> Self {
+        self.network = Some(value.into());
+        self
+    }
+
+    /// Attach the payment asset.
+    #[must_use]
+    pub fn asset(mut self, value: impl Into<String>) -> Self {
+        self.asset = Some(value.into());
+        self
+    }
+
+    /// Attach the stable payment intent identifier.
+    #[must_use]
+    pub fn intent_id(mut self, value: impl Into<String>) -> Self {
+        self.intent_id = Some(value.into());
+        self
+    }
+
+    /// Attach the stable request identifier.
+    #[must_use]
+    pub fn request_id(mut self, value: impl Into<String>) -> Self {
+        self.request_id = Some(value.into());
+        self
+    }
+
+    /// Attach a sanitized provider reference for a successful operation.
+    #[must_use]
+    pub fn provider_reference(mut self, value: impl Into<String>) -> Self {
+        self.provider_reference = Some(value.into());
+        self
+    }
+
+    /// Validate all fields and create the payment event.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PluginError::Config`] when any field is outside the payment
+    /// event contract.
+    pub fn build(self) -> PluginResult<PaymentExtensionEvent> {
+        validate_payment_label("rail", &self.rail)?;
+        if let Some(method) = &self.method {
+            validate_payment_label("method", method)?;
+        }
+        for (field, value) in [
+            ("network", self.network.as_deref()),
+            ("asset", self.asset.as_deref()),
+            ("intent_id", self.intent_id.as_deref()),
+            ("request_id", self.request_id.as_deref()),
+            ("provider_reference", self.provider_reference.as_deref()),
+        ] {
+            if let Some(value) = value {
+                validate_payment_value(field, value)?;
+            }
+        }
+        if self.amount_micros == 0 || self.amount_micros > i64::MAX as u64 {
+            return Err(PluginError::Config(
+                "payment extension amount is outside the supported range".to_owned(),
+            ));
+        }
+        if self.currency.len() != 3 || !self.currency.bytes().all(|byte| byte.is_ascii_uppercase())
+        {
+            return Err(PluginError::Config(
+                "payment extension currency must be three uppercase ASCII letters".to_owned(),
+            ));
+        }
+        if self.provider_reference.is_some() && self.outcome != PaymentExtensionOutcome::Succeeded {
+            return Err(PluginError::Config(
+                "payment extension provider reference requires a succeeded outcome".to_owned(),
+            ));
+        }
+
+        Ok(PaymentExtensionEvent {
+            schema_version: PAYMENT_EXTENSION_SCHEMA_VERSION,
+            phase: self.phase,
+            outcome: self.outcome,
+            rail: self.rail,
+            method: self.method,
+            network: self.network,
+            asset: self.asset,
+            amount: PaymentExtensionAmount {
+                amount_micros: self.amount_micros,
+                currency: self.currency,
+            },
+            intent_id: self.intent_id,
+            request_id: self.request_id,
+            provider_reference: self.provider_reference,
+        })
+    }
+}
+
+fn validate_payment_label(field: &str, value: &str) -> PluginResult<()> {
+    if value.is_empty()
+        || value.len() > PAYMENT_EXTENSION_MAX_LABEL_BYTES
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
+    {
+        return Err(PluginError::Config(format!(
+            "payment extension {field} is not a bounded label"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_payment_value(field: &str, value: &str) -> PluginResult<()> {
+    if value.is_empty()
+        || value.len() > PAYMENT_EXTENSION_MAX_VALUE_BYTES
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')
+        })
+    {
+        return Err(PluginError::Config(format!(
+            "payment extension {field} is not a bounded value"
+        )));
+    }
+    Ok(())
+}
+
 /// Runtime used to execute an extension bundle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -62,6 +313,8 @@ pub enum ExtensionHookKind {
     AiStreamEvent,
     /// AI stream-close event hook.
     AiClose,
+    /// Payment lifecycle event hook.
+    Payment,
 }
 
 /// How hooks sharing a match key participate in dispatch.
@@ -589,5 +842,141 @@ mod tests {
             crate::PluginError::Config(message)
                 if message == "duplicate extension hook id: duplicate"
         ));
+    }
+
+    #[test]
+    fn payment_extension_phases_and_outcomes_serialize_stably() {
+        let phases = [
+            PaymentExtensionPhase::Challenge,
+            PaymentExtensionPhase::Verify,
+            PaymentExtensionPhase::Settle,
+            PaymentExtensionPhase::Reconcile,
+        ];
+        let outcomes = [
+            PaymentExtensionOutcome::Started,
+            PaymentExtensionOutcome::Succeeded,
+            PaymentExtensionOutcome::Rejected,
+            PaymentExtensionOutcome::Failed,
+            PaymentExtensionOutcome::Ambiguous,
+            PaymentExtensionOutcome::Unsupported,
+        ];
+
+        assert_eq!(
+            serde_json::to_value(phases).unwrap(),
+            serde_json::json!(["challenge", "verify", "settle", "reconcile"])
+        );
+        assert_eq!(
+            serde_json::to_value(outcomes).unwrap(),
+            serde_json::json!([
+                "started",
+                "succeeded",
+                "rejected",
+                "failed",
+                "ambiguous",
+                "unsupported"
+            ])
+        );
+    }
+
+    #[test]
+    fn payment_extension_event_serializes_only_bounded_metadata() {
+        let event = PaymentExtensionEvent::builder(
+            PaymentExtensionPhase::Settle,
+            PaymentExtensionOutcome::Succeeded,
+            "x402",
+            1_250_000,
+            "USD",
+        )
+        .method("exact")
+        .network("eip155:8453")
+        .asset("eip155:8453/erc20:0x1234")
+        .intent_id("sbpi_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+        .request_id("req_123")
+        .provider_reference("0xabc123")
+        .build()
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(event).unwrap(),
+            serde_json::json!({
+                "schema_version": 1,
+                "phase": "settle",
+                "outcome": "succeeded",
+                "rail": "x402",
+                "method": "exact",
+                "network": "eip155:8453",
+                "asset": "eip155:8453/erc20:0x1234",
+                "amount": {
+                    "amount_micros": 1_250_000,
+                    "currency": "USD"
+                },
+                "intent_id": "sbpi_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "request_id": "req_123",
+                "provider_reference": "0xabc123"
+            })
+        );
+    }
+
+    #[test]
+    fn payment_extension_event_rejects_unbounded_or_unsafe_metadata() {
+        let event = |rail: &str, amount_micros, currency: &str| {
+            PaymentExtensionEvent::builder(
+                PaymentExtensionPhase::Settle,
+                PaymentExtensionOutcome::Succeeded,
+                rail,
+                amount_micros,
+                currency,
+            )
+        };
+
+        assert!(event("", 1, "USD").build().is_err());
+        assert!(event(&"x".repeat(65), 1, "USD").build().is_err());
+        assert!(event("X402", 1, "USD").build().is_err());
+        assert!(event("x402", 0, "USD").build().is_err());
+        assert!(event("x402", i64::MAX as u64 + 1, "USD").build().is_err());
+        assert!(event("x402", 1, "usd").build().is_err());
+        assert!(event("x402", 1, "USDC").build().is_err());
+
+        for invalid in ["", "contains a space", &"x".repeat(129)] {
+            assert!(event("x402", 1, "USD").network(invalid).build().is_err());
+            assert!(event("x402", 1, "USD").asset(invalid).build().is_err());
+            assert!(event("x402", 1, "USD").intent_id(invalid).build().is_err());
+            assert!(event("x402", 1, "USD").request_id(invalid).build().is_err());
+            assert!(event("x402", 1, "USD")
+                .provider_reference(invalid)
+                .build()
+                .is_err());
+        }
+
+        assert!(PaymentExtensionEvent::builder(
+            PaymentExtensionPhase::Settle,
+            PaymentExtensionOutcome::Failed,
+            "x402",
+            1,
+            "USD",
+        )
+        .provider_reference("0xabc123")
+        .build()
+        .is_err());
+    }
+
+    #[test]
+    fn payment_extension_decisions_serialize_stably() {
+        assert_eq!(
+            serde_json::to_value([
+                PaymentExtensionDecision::Continue,
+                PaymentExtensionDecision::Reject,
+            ])
+            .unwrap(),
+            serde_json::json!(["continue", "reject"])
+        );
+    }
+
+    #[test]
+    fn payment_extension_hook_kind_serializes_stably() {
+        assert_eq!(
+            serde_json::to_value(ExtensionHookKind::Payment).unwrap(),
+            serde_json::json!("payment")
+        );
     }
 }

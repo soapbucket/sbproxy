@@ -153,6 +153,9 @@ pub mod meter_runtime;
 pub mod model_discovery;
 /// Authenticated private model-plane dispatch primitives.
 pub mod model_plane;
+/// Fail-open delivery for terminal payment extension events.
+#[cfg(feature = "payments")]
+pub mod payment_extensions;
 /// Signs payment requirements into the existing quote JWS.
 #[cfg(feature = "payments")]
 pub mod payment_signer;

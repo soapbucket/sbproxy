@@ -284,6 +284,15 @@ impl BundleRegistry for DynamicBundleRegistry {
             .filter_map(|((hook_kind, _), hook)| (*hook_kind == kind).then_some(hook.as_ref()))
             .collect()
     }
+
+    fn payment_hooks(&self) -> Vec<&LoadedBundleHook> {
+        self.hooks
+            .iter()
+            .filter_map(|((kind, _), hook)| {
+                (*kind == BundleHookKind::Payment).then_some(hook.as_ref())
+            })
+            .collect()
+    }
 }
 
 struct Candidate<'a> {
@@ -707,7 +716,7 @@ fn hook_inventory(
         bundle_id: manifest.name.clone(),
         kind: inventory_hook_kind(hook.kind),
         registration: source,
-        dispatch: if is_ai_kind(hook.kind) {
+        dispatch: if is_ai_kind(hook.kind) || hook.kind == BundleHookKind::Payment {
             ExtensionDispatch::Chain
         } else {
             ExtensionDispatch::Exclusive
@@ -720,6 +729,7 @@ fn hook_inventory(
         execution: ExtensionExecution {
             phase: hook_phase(hook.kind).to_owned(),
             body_mode: match hook.execution.body_mode {
+                BundleBodyMode::None => ExtensionBodyMode::None,
                 BundleBodyMode::Buffered => ExtensionBodyMode::Buffered,
                 BundleBodyMode::Streamed => ExtensionBodyMode::Streamed,
             },
@@ -771,6 +781,7 @@ const fn inventory_hook_kind(kind: BundleHookKind) -> ExtensionHookKind {
         BundleHookKind::AiGuardrailOutput => ExtensionHookKind::AiGuardrailOutput,
         BundleHookKind::AiStreamEvent => ExtensionHookKind::AiStreamEvent,
         BundleHookKind::AiClose => ExtensionHookKind::AiClose,
+        BundleHookKind::Payment => ExtensionHookKind::Payment,
         BundleHookKind::ProxyWasm => ExtensionHookKind::ProxyWasmFilter,
     }
 }
@@ -785,6 +796,7 @@ const fn hook_phase(kind: BundleHookKind) -> &'static str {
         | BundleHookKind::AiGuardrailOutput
         | BundleHookKind::AiStreamEvent
         | BundleHookKind::AiClose => "ai",
+        BundleHookKind::Payment => "payment",
     }
 }
 
@@ -809,6 +821,7 @@ const fn hook_kind_label(kind: BundleHookKind) -> &'static str {
         BundleHookKind::AiGuardrailOutput => "ai_guardrail_output",
         BundleHookKind::AiStreamEvent => "ai_stream_event",
         BundleHookKind::AiClose => "ai_close",
+        BundleHookKind::Payment => "payment",
         BundleHookKind::ProxyWasm => "proxy_wasm",
     }
 }

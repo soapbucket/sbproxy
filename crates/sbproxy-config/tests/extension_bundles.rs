@@ -141,6 +141,33 @@ fn javascript_runtime_accepts_direct_js_entry() {
 }
 
 #[test]
+fn payment_hook_manifest_uses_no_body_contract() {
+    let yaml = JAVASCRIPT_MANIFEST
+        .replace("kind: policy", "kind: payment")
+        .replace(
+            "    export: enforce",
+            "    export: enforce\n    execution:\n      body_mode: none",
+        );
+
+    let manifest = parse_manifest(&yaml);
+
+    assert_eq!(manifest.hooks[0].kind, BundleHookKind::Payment);
+    assert_eq!(manifest.hooks[0].execution.body_mode, BundleBodyMode::None);
+}
+
+#[test]
+fn payment_hook_manifest_rejects_body_access() {
+    let yaml = JAVASCRIPT_MANIFEST.replace("kind: policy", "kind: payment");
+
+    let error = manifest_error(&yaml);
+
+    assert!(
+        error.contains("payment") && error.contains("body_mode none"),
+        "{error}"
+    );
+}
+
+#[test]
 fn manifest_is_strict_and_versioned() {
     for (from, to, needle) in [
         (
