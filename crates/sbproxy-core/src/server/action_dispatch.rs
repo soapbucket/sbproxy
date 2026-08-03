@@ -6,6 +6,7 @@
 //! `use` aliases, so the moved code needs no rewiring.
 
 use super::*;
+use sbproxy_config::types::FailureMode;
 
 /// Handle non-proxy actions directly in request_filter.
 /// Returns Ok(true) if the action was handled (short-circuit), Ok(false) for Proxy.
@@ -877,9 +878,11 @@ pub(super) async fn handle_action(
                         origin_idx,
                         ctx,
                     );
+                    let transformed_status =
+                        ctx.response_status_override.unwrap_or(response.status);
                     let (status, headers, body) = apply_plugin_action_response_modifiers(
                         session,
-                        response.status,
+                        transformed_status,
                         response.headers,
                         body,
                         pipeline,
@@ -927,6 +930,15 @@ fn apply_plugin_action_response_transforms(
     let ratio = resolved_token_bytes_ratio(pipeline.config.origins.get(origin_idx));
     let mut body = bytes::BytesMut::from(body.as_ref());
     for compiled_transform in transforms {
+        if body.len() > compiled_transform.max_body_size {
+            warn!(
+                transform = compiled_transform.transform.transform_type(),
+                body_bytes = body.len(),
+                max_body_size = compiled_transform.max_body_size,
+                "plugin action transform skipped because the response body exceeds its limit"
+            );
+            continue;
+        }
         let needs_synth_projection = matches!(
             compiled_transform.transform,
             sbproxy_modules::Transform::CitationBlock(_)
@@ -938,11 +950,54 @@ fn apply_plugin_action_response_transforms(
         if let Err(error) =
             apply_transform_with_ctx(compiled_transform, &mut body, content_type, ctx)
         {
-            warn!(
-                transform = compiled_transform.transform.transform_type(),
-                error = %error,
-                "plugin action transform failed, continuing"
-            );
+            let transform_name = compiled_transform.transform.transform_type();
+            let is_typed_transform_error = error
+                .downcast_ref::<sbproxy_modules::transform::TransformError>()
+                .is_some();
+            if is_typed_transform_error {
+                tracing::error!(
+                    hostname = %ctx.hostname,
+                    transform = transform_name,
+                    error = %error,
+                    "plugin action transform invariant violated, returning a generic response"
+                );
+                ctx.response_status_override = Some(500);
+                ctx.transform_error_attribution = Some(transform_name.to_string());
+                body.clear();
+                body.extend_from_slice(b"{\"error\":\"internal server error\"}");
+                break;
+            }
+            match compiled_transform.failure_posture {
+                FailureMode::Closed => {
+                    warn!(
+                        hostname = %ctx.hostname,
+                        transform = transform_name,
+                        error = %error,
+                        failure_posture = FailureMode::Closed.as_label(),
+                        "plugin action transform failed; replacing the response body"
+                    );
+                    body.clear();
+                    body.extend_from_slice(b"{\"error\":\"internal server error\"}");
+                    break;
+                }
+                FailureMode::Open => {
+                    warn!(
+                        hostname = %ctx.hostname,
+                        transform = transform_name,
+                        error = %error,
+                        "plugin action transform failed, continuing with the next transform"
+                    );
+                }
+                FailureMode::Degraded | FailureMode::Observe => {
+                    warn!(
+                        hostname = %ctx.hostname,
+                        transform = transform_name,
+                        error = %error,
+                        failure_posture = compiled_transform.failure_posture.as_label(),
+                        "plugin action transform failed; posture admits the original body"
+                    );
+                }
+            }
         }
     }
     body.freeze()
@@ -1289,6 +1344,107 @@ origins:
             response.ends_with("\r\n\r\ntransformed"),
             "response: {response}"
         );
+    }
+
+    #[tokio::test]
+    async fn plugin_action_http1_honors_closed_transform_failures() {
+        let config = sbproxy_config::compile_config(
+            r#"
+origins:
+  "plugin.test":
+    action:
+      type: static
+      body: placeholder
+    transforms:
+      - type: json
+        set:
+          safe: true
+        failure_posture: closed
+"#,
+        )
+        .expect("fixture config");
+        let pipeline = CompiledPipeline::from_config(config).expect("fixture pipeline");
+        let action = response_action(
+            200,
+            vec![("content-type".into(), "application/json".into())],
+            Bytes::from_static(b"not-json"),
+        );
+
+        let (result, wire) = exchange(&action, &pipeline, Some(0)).await;
+
+        assert!(result.expect("closed transform failure must dispatch a safe response"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        assert!(
+            response.ends_with("\r\n\r\n{\"error\":\"internal server error\"}"),
+            "response: {response}"
+        );
+        assert!(!response.contains("not-json"), "response: {response}");
+    }
+
+    #[tokio::test]
+    async fn plugin_action_http1_honors_open_transform_failures() {
+        let config = sbproxy_config::compile_config(
+            r#"
+origins:
+  "plugin.test":
+    action:
+      type: static
+      body: placeholder
+    transforms:
+      - type: json
+        set:
+          safe: true
+        failure_posture: open
+"#,
+        )
+        .expect("fixture config");
+        let pipeline = CompiledPipeline::from_config(config).expect("fixture pipeline");
+        let action = response_action(
+            200,
+            vec![("content-type".into(), "application/json".into())],
+            Bytes::from_static(b"not-json"),
+        );
+
+        let (result, wire) = exchange(&action, &pipeline, Some(0)).await;
+
+        assert!(result.expect("open transform failure must admit the original response"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        assert!(
+            response.ends_with("\r\n\r\nnot-json"),
+            "response: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_action_http1_skips_transform_over_its_body_limit() {
+        let config = sbproxy_config::compile_config(
+            r#"
+origins:
+  "plugin.test":
+    action:
+      type: static
+      body: placeholder
+    transforms:
+      - type: replace_strings
+        replacements:
+          - find: queued
+            replace: transformed
+        max_body_size: 3
+"#,
+        )
+        .expect("fixture config");
+        let pipeline = CompiledPipeline::from_config(config).expect("fixture pipeline");
+        let action = response_action(
+            200,
+            vec![("content-type".into(), "text/plain".into())],
+            Bytes::from_static(b"queued"),
+        );
+
+        let (result, wire) = exchange(&action, &pipeline, Some(0)).await;
+
+        assert!(result.expect("oversized action response must remain dispatchable"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        assert!(response.ends_with("\r\n\r\nqueued"), "response: {response}");
     }
 
     #[tokio::test]
