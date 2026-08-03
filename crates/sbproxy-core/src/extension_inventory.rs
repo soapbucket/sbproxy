@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use sbproxy_config::{BundleHookKind, CompiledConfig};
-use sbproxy_extension::bundle::{BundleRegistry, DynamicBundleRegistry};
+use sbproxy_extension::bundle::{AiExtensionChain, BundleRegistry, DynamicBundleRegistry};
 use sbproxy_plugin::{
     collect_linked_extension_declarations, ActionPluginRegistration, AuthPluginRegistration,
     ExtensionBodyMode, ExtensionBundleDeclaration, ExtensionBundleRecord, ExtensionCollision,
@@ -70,26 +70,50 @@ impl ExtensionInventorySnapshotExt for ExtensionInventorySnapshot {
     }
 }
 
+/// Attachment proof supplied by one successfully compiled pipeline perspective.
+pub(crate) struct CompiledExtensionAttachments<'a> {
+    pub(crate) scope: ExtensionScopeMode,
+    pub(crate) ai_chain: &'a AiExtensionChain,
+    pub(crate) payment_chain_attached: bool,
+}
+
 /// Build the authoritative inventory pinned to one compiled pipeline.
-pub(crate) fn running_inventory(
+pub(crate) fn compiled_inventory(
     registry: &DynamicBundleRegistry,
     config: &CompiledConfig,
     config_revision: &str,
+    attachments: CompiledExtensionAttachments<'_>,
 ) -> PluginResult<ExtensionInventorySnapshot> {
     let declarations = collect_linked_extension_declarations()?;
     let mut preliminary = registry.inventory().clone();
     preliminary
         .hooks
         .extend(unattributed_registration_hooks(&declarations));
-    let active = active_extension_hooks(config, registry);
-    let observations = running_observations(&declarations, &preliminary.hooks, &active);
-    ExtensionInventorySnapshot::running(
-        env!("CARGO_PKG_VERSION"),
-        Some(config_revision),
+    let mut active = active_extension_hooks(config, registry);
+    record_lifecycle_attachments(
         &declarations,
-        preliminary,
-        &observations,
-    )
+        &preliminary.hooks,
+        attachments.ai_chain,
+        attachments.payment_chain_attached,
+        &mut active,
+    );
+    let observations = compiled_observations(&declarations, &preliminary.hooks, &active);
+    match attachments.scope {
+        ExtensionScopeMode::Running => ExtensionInventorySnapshot::running(
+            env!("CARGO_PKG_VERSION"),
+            Some(config_revision),
+            &declarations,
+            preliminary,
+            &observations,
+        ),
+        ExtensionScopeMode::Doctor => ExtensionInventorySnapshot::doctor(
+            env!("CARGO_PKG_VERSION"),
+            Some(config_revision),
+            &declarations,
+            preliminary,
+            &observations,
+        ),
+    }
 }
 
 /// Inspect linked and configured extensions without claiming a running state.
@@ -321,6 +345,32 @@ fn active_extension_hooks(
     active
 }
 
+fn record_lifecycle_attachments(
+    declarations: &[&ExtensionBundleDeclaration],
+    hooks: &[ExtensionHookRecord],
+    ai_chain: &AiExtensionChain,
+    payment_chain_attached: bool,
+    active: &mut BTreeSet<(ExtensionHookKind, String)>,
+) {
+    for hook in hooks {
+        let attached = ai_chain.has_kind(hook.kind)
+            || (payment_chain_attached && hook.kind == ExtensionHookKind::Payment);
+        if attached {
+            active.insert((hook.kind, hook.match_key.clone()));
+        }
+    }
+    for hook in declarations
+        .iter()
+        .flat_map(|declaration| declaration.hooks)
+    {
+        let attached = ai_chain.has_kind(hook.kind)
+            || (payment_chain_attached && hook.kind == ExtensionHookKind::Payment);
+        if attached {
+            active.insert((hook.kind, hook.match_key.to_owned()));
+        }
+    }
+}
+
 fn record_configured_action(
     value: &serde_json::Value,
     registry: &dyn BundleRegistry,
@@ -367,7 +417,7 @@ fn linked_registration_exists(kind: ExtensionHookKind, name: &str) -> bool {
     }
 }
 
-fn running_observations(
+fn compiled_observations(
     declarations: &[&ExtensionBundleDeclaration],
     preliminary_hooks: &[ExtensionHookRecord],
     active: &BTreeSet<(ExtensionHookKind, String)>,
@@ -818,7 +868,7 @@ fn apply_observation(
     hooks: &mut [ExtensionHookRecord],
     observed_bundles: &mut BTreeSet<String>,
 ) {
-    let state = state_without_running_evaluation(mode, observation.state);
+    let state = observation.state;
     if let Some(hook_id) = observation.hook_id.as_deref() {
         if let Some(hook) = hooks.iter_mut().find(|hook| hook.id == hook_id) {
             hook.state = state;

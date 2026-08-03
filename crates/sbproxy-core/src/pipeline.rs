@@ -23,7 +23,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::builtin_enforcers::{compile_builtin_enforcers, CompiledEnforcer};
-use crate::extension_inventory::{reserved_extension_hook_names, running_inventory};
+use crate::extension_inventory::{
+    compiled_inventory, reserved_extension_hook_names, CompiledExtensionAttachments,
+};
 use crate::router::HostRouter;
 use compact_str::CompactString;
 use sbproxy_cache::{
@@ -41,7 +43,7 @@ use sbproxy_modules::compile::{
 };
 use sbproxy_modules::transform::{CompiledTransform, TransformConfig};
 use sbproxy_modules::{Action, Auth, BotDetection, Policy, ThreatProtection};
-use sbproxy_plugin::ExtensionInventorySnapshot;
+use sbproxy_plugin::{ExtensionInventorySnapshot, ExtensionScopeMode};
 
 // --- Forward Rule types ---
 
@@ -1196,7 +1198,10 @@ pub struct CompiledPipeline {
     pub(crate) extension_registry: Arc<DynamicBundleRegistry>,
     /// Awaited AI hook chain prepared with this exact generation.
     pub(crate) ai_extension_chain: Arc<sbproxy_extension::bundle::AiExtensionChain>,
-    /// Running-state inventory derived from this generation's attachments.
+    /// Prepared payment hook chain selected by this generation's config.
+    #[cfg(feature = "payments")]
+    pub(crate) payment_extension_chain: Option<sbproxy_extension::bundle::PaymentExtensionChain>,
+    /// Candidate or running inventory derived from this generation's attachments.
     pub(crate) extension_inventory: ExtensionInventorySnapshot,
     /// Dynamic key plane built from the same immutable config generation.
     ///
@@ -1452,12 +1457,23 @@ impl Default for CompiledPipeline {
             sbproxy_extension::bundle::AiExtensionChain::from_registry(extension_registry.as_ref())
                 .expect("linked AI extension registrations must be valid"),
         );
-        let extension_inventory = running_inventory(&extension_registry, &config, "")
-            .expect("linked extension inventory must be valid");
+        let extension_inventory = compiled_inventory(
+            &extension_registry,
+            &config,
+            "",
+            CompiledExtensionAttachments {
+                scope: ExtensionScopeMode::Running,
+                ai_chain: ai_extension_chain.as_ref(),
+                payment_chain_attached: false,
+            },
+        )
+        .expect("linked extension inventory must be valid");
         Self {
             config,
             extension_registry,
             ai_extension_chain,
+            #[cfg(feature = "payments")]
+            payment_extension_chain: None,
             extension_inventory,
             key_plane: None,
             sensitive_header_names,
@@ -1563,6 +1579,44 @@ impl CompiledPipeline {
     /// Awaited AI hook chain pinned to this pipeline generation.
     pub(crate) fn ai_extension_chain(&self) -> &Arc<sbproxy_extension::bundle::AiExtensionChain> {
         &self.ai_extension_chain
+    }
+
+    /// Prepared payment hook chain pinned to this pipeline generation.
+    #[cfg(feature = "payments")]
+    pub(crate) fn payment_extension_chain(
+        &self,
+    ) -> Option<&sbproxy_extension::bundle::PaymentExtensionChain> {
+        self.payment_extension_chain.as_ref()
+    }
+
+    /// Prepare this running generation's inventory for successful payment attachment.
+    #[cfg(feature = "payments")]
+    pub(crate) fn inventory_with_payment_extensions_attached(
+        &self,
+    ) -> anyhow::Result<ExtensionInventorySnapshot> {
+        Ok(compiled_inventory(
+            self.extension_registry.as_ref(),
+            &self.config,
+            &self.config_revision,
+            CompiledExtensionAttachments {
+                scope: ExtensionScopeMode::Running,
+                ai_chain: self.ai_extension_chain.as_ref(),
+                payment_chain_attached: self
+                    .payment_extension_chain
+                    .as_ref()
+                    .is_some_and(|chain| !chain.is_empty()),
+            },
+        )?)
+    }
+
+    /// Publish a precomputed inventory after payment dispatch attaches.
+    #[cfg(feature = "payments")]
+    pub(crate) fn mark_payment_extensions_attached(
+        &mut self,
+        inventory: ExtensionInventorySnapshot,
+    ) {
+        debug_assert_eq!(inventory.scope.mode, ExtensionScopeMode::Running);
+        self.extension_inventory = inventory;
     }
 
     /// Authoritative extension inventory for this pipeline generation.
@@ -2267,13 +2321,40 @@ impl CompiledPipeline {
             Arc::new(sbproxy_extension::bundle::AiExtensionChain::from_registry(
                 extension_registry.as_ref(),
             )?);
-        let extension_inventory =
-            running_inventory(extension_registry.as_ref(), &config, &config_revision)?;
+        let payment_extension_chain = config
+            .server
+            .payments
+            .as_ref()
+            .map(|_| {
+                sbproxy_extension::bundle::PaymentExtensionChain::from_registry(
+                    extension_registry.as_ref(),
+                )
+            })
+            .transpose()?;
+        let scope = match mode {
+            PipelineConstructionMode::Runtime => ExtensionScopeMode::Running,
+            PipelineConstructionMode::Validation => ExtensionScopeMode::Doctor,
+        };
+        let extension_inventory = compiled_inventory(
+            extension_registry.as_ref(),
+            &config,
+            &config_revision,
+            CompiledExtensionAttachments {
+                scope,
+                ai_chain: ai_extension_chain.as_ref(),
+                payment_chain_attached: matches!(mode, PipelineConstructionMode::Validation)
+                    && payment_extension_chain
+                        .as_ref()
+                        .is_some_and(|chain| !chain.is_empty()),
+            },
+        )?;
 
         let pipeline = Self {
             config,
             extension_registry,
             ai_extension_chain,
+            #[cfg(feature = "payments")]
+            payment_extension_chain,
             extension_inventory,
             key_plane,
             sensitive_header_names,
@@ -2948,7 +3029,7 @@ mod tests {
     use super::*;
     use compact_str::CompactString;
     use sbproxy_extension::bundle::BundleRegistry;
-    use sbproxy_plugin::ExtensionState;
+    use sbproxy_plugin::{ExtensionHookKind, ExtensionState};
     use std::collections::HashMap;
     use tempfile::TempDir;
 
@@ -3087,6 +3168,144 @@ hooks:
         );
         config.extension_bundles.bundles_dir = Some("bundles".to_owned());
         config
+    }
+
+    fn write_lifecycle_inventory_bundle(root: &std::path::Path) {
+        let bundle = root.join("bundles").join("lifecycle-inventory");
+        std::fs::create_dir_all(&bundle).expect("create lifecycle bundle directory");
+        std::fs::write(
+            bundle.join("entry.js"),
+            r#"export function inspect() {
+                return { version: "sbproxy-envelope/v1", decision: "continue" };
+            }
+            export function enforce() {
+                return { version: "sbproxy-envelope/v1", decision: "allow" };
+            }
+"#,
+        )
+        .expect("write lifecycle bundle artifact");
+        std::fs::write(
+            bundle.join("bundle.yaml"),
+            r#"apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: lifecycle-inventory
+version: 1.0.0
+runtime: javascript
+entry: entry.js
+hooks:
+  - kind: ai_guardrail_input
+    type: candidate_guardrail
+    export: inspect
+  - kind: payment
+    type: candidate_payment
+    export: inspect
+    execution:
+      body_mode: none
+  - kind: policy
+    type: unattached_policy
+    export: enforce
+"#,
+        )
+        .expect("write lifecycle bundle manifest");
+    }
+
+    fn lifecycle_inventory_config(root: &std::path::Path) -> CompiledConfig {
+        let mut config = make_config(
+            "extension.example",
+            serde_json::json!({"type": "static", "body": "ok"}),
+            None,
+            Vec::new(),
+        );
+        config.extension_bundles.bundles_dir = Some("bundles".to_owned());
+        config.server.payments = Some(sbproxy_config::PaymentsConfig {
+            state_path: root.join("payments.sqlite3").display().to_string(),
+            challenge_binding_key: "secretfile:///unused-candidate-secret".to_owned(),
+            authorization_timeout_ms: 2_000,
+            max_body_bytes: 65_536,
+            failure_mode: sbproxy_config::FailureMode::Closed,
+            recovery_encryption: None,
+            worker: sbproxy_config::PaymentsWorkerConfig::default(),
+            protocols: sbproxy_config::PaymentProtocolsConfig::default(),
+            rails: sbproxy_config::PaymentRailsConfig::default(),
+            usage_reporters: sbproxy_config::UsageReportersConfig::default(),
+        });
+        config
+    }
+
+    #[test]
+    fn extension_inventory_validation_candidate_proves_lifecycle_attachments() {
+        let directory = TempDir::new().expect("temporary config directory");
+        write_lifecycle_inventory_bundle(directory.path());
+
+        let pipeline = CompiledPipeline::from_config_for_validation_at(
+            lifecycle_inventory_config(directory.path()),
+            directory.path(),
+        )
+        .expect("validation candidate should prepare lifecycle hooks");
+        let inventory = pipeline.extension_inventory();
+
+        assert_eq!(inventory.scope.mode, ExtensionScopeMode::Doctor);
+        let state = |kind, match_key| {
+            inventory
+                .hooks
+                .iter()
+                .find(|hook| hook.kind == kind && hook.match_key == match_key)
+                .map(|hook| (hook.id.as_str(), hook.state))
+                .expect("lifecycle hook should be inventoried")
+        };
+        assert_eq!(
+            state(ExtensionHookKind::AiGuardrailInput, "candidate_guardrail"),
+            (
+                "lifecycle-inventory:ai_guardrail_input:candidate_guardrail",
+                ExtensionState::Active,
+            )
+        );
+        assert_eq!(
+            state(ExtensionHookKind::Payment, "candidate_payment"),
+            (
+                "lifecycle-inventory:payment:candidate_payment",
+                ExtensionState::Active,
+            )
+        );
+        assert_eq!(
+            state(ExtensionHookKind::Policy, "unattached_policy").1,
+            ExtensionState::Unconsumed
+        );
+    }
+
+    #[test]
+    fn extension_inventory_running_leaves_unconfigured_payment_hook_unconsumed() {
+        let directory = TempDir::new().expect("temporary config directory");
+        write_lifecycle_inventory_bundle(directory.path());
+        let mut config = make_config(
+            "extension.example",
+            serde_json::json!({"type": "static", "body": "ok"}),
+            None,
+            Vec::new(),
+        );
+        config.extension_bundles.bundles_dir = Some("bundles".to_owned());
+
+        let pipeline = CompiledPipeline::from_config_at(config, directory.path())
+            .expect("runtime candidate should prepare configured lifecycle paths");
+        let inventory = pipeline.extension_inventory();
+
+        assert_eq!(inventory.scope.mode, ExtensionScopeMode::Running);
+        assert_eq!(
+            inventory
+                .hooks
+                .iter()
+                .find(|hook| hook.kind == ExtensionHookKind::AiGuardrailInput)
+                .map(|hook| hook.state),
+            Some(ExtensionState::Active)
+        );
+        assert_eq!(
+            inventory
+                .hooks
+                .iter()
+                .find(|hook| hook.kind == ExtensionHookKind::Payment)
+                .map(|hook| hook.state),
+            Some(ExtensionState::Unconsumed)
+        );
     }
 
     #[test]
