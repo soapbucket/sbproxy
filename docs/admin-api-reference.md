@@ -4,7 +4,7 @@
 
 The embedded admin server publishes the full control-plane HTTP surface for
 operator tooling: liveness probes, session login, key and credential
-lifecycle, the request log and its live stream, recent sessions, alert
+lifecycle, the running extension inventory, the request log and its live stream, recent sessions, alert
 operations, per-target health, spend and audit, config read/write and hot reload/drift, model-host catalog and
 deployment lifecycle, the response/semantic/key-policy caches, cluster
 status and the replicated-state substrate, prompts, the chat playground, and
@@ -25,7 +25,7 @@ built-in dashboard over this same API, see [admin-ui.md](admin-ui.md).
 - [Probe routes](#probe-routes-unauthenticated) (unauthenticated)
 - [Session routes](#session-routes) - login, logout, whoami
 - [API keys and credentials](#api-keys-and-credentials) - full virtual-key and upstream-credential lifecycle
-- [Read routes](#read-routes-authenticated) - request log + stream, alerts, health, spend, audit, rate-limit budget, UI settings, OpenAPI
+- [Read routes](#read-routes-authenticated) - request log + stream, extension inventory, alerts, health, spend, audit, rate-limit budget, UI settings, OpenAPI
 - [AI compression session state](#ai-compression-session-state)
 - [Config and control routes](#config-and-control-routes-authenticated) - reload, drift, config read/write, log level
 - [Model host admin](#model-host-admin) - catalog, deployments, lifecycle, artifact cache
@@ -648,6 +648,110 @@ Prometheus `/metrics` endpoint, served on the data-plane port and
 mirrored on the admin port so ops can scrape via the
 access-controlled admin listener (see
 [metrics-stability.md](metrics-stability.md)).
+
+### `GET /api/extensions`
+
+Returns the versioned extension inventory pinned to the pipeline generation
+currently serving traffic. The request does not reread `sb.yml` or the bundle
+directories, so a rejected reload does not change this view.
+Both `admin` and `read_only` operators may call the route.
+
+A shortened response with one directory bundle looks like this:
+
+```json
+{
+  "schema_version": 1,
+  "scope": {
+    "mode": "running",
+    "proxy_version": "1.9.0",
+    "config_revision": "abc123..."
+  },
+  "summary": {
+    "bundles": 1,
+    "hooks": 1,
+    "active": 1,
+    "available": 0,
+    "failed": 0,
+    "collisions": 0
+  },
+  "bundles": [
+    {
+      "id": "hello-javascript",
+      "name": "hello-javascript",
+      "version": "1.0.0",
+      "package": "entry.js",
+      "source": "directory",
+      "runtime": "javascript",
+      "state": "active",
+      "hook_ids": ["hello-javascript:action:hello_javascript"],
+      "load": {"phase": "candidate_load", "status": "ok", "detail": null}
+    }
+  ],
+  "hooks": [
+    {
+      "id": "hello-javascript:action:hello_javascript",
+      "bundle_id": "hello-javascript",
+      "kind": "action",
+      "registration": "directory",
+      "dispatch": "exclusive",
+      "match_key": "hello_javascript",
+      "position": 0,
+      "state": "active",
+      "detail": null,
+      "runtime": "javascript",
+      "execution": {
+        "phase": "request",
+        "body_mode": "buffered",
+        "timeout_ms": 50,
+        "max_buffer_bytes": 1048576
+      },
+      "capabilities": []
+    }
+  ],
+  "collisions": []
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `schema_version` | Version of this response contract. |
+| `scope.mode` | Always `running` on this endpoint. `doctor` is the stopped diagnostic mode. |
+| `scope.proxy_version` | Proxy binary version that built the snapshot. |
+| `scope.config_revision` | Config revision of the serving generation. Use it to correlate reload and request data. |
+| `summary` | Counts of bundles, hooks, active hooks, available hooks, failures, and collisions. `failed` counts failed bundles plus failed hooks. |
+| `bundles[]` | Stable identity, version, entry filename, registration source, runtime, lifecycle state, hook IDs, and bounded load result. |
+| `hooks[]` | Stable identity, hook kind, attachment key, dispatch shape, chain position, state, runtime, execution plan, and declared capabilities. |
+| `collisions[]` | Match key, claiming registration IDs, optional winner, and a bounded resolution. A healthy dynamic candidate normally has none. |
+
+Registration sources are `link_time`, `directory`, or `git`. Runtimes are
+`rust`, `javascript`, `wasm`, or `proxy_wasm`. Hook states are:
+
+| State | Meaning in the running view |
+|---|---|
+| `installed` | Linked into the binary, without a more specific running attachment observation. |
+| `available` | Loaded and ready for attachment. |
+| `active` | Attached to this pipeline generation. `position` is present when the hook participates in a resolved chain. |
+| `unconsumed` | Loaded successfully but not attached by this config. |
+| `failed` | Load, validation, initialization, or unresolved collision failed. |
+| `shadowed` | A higher-precedence registration won a resolved collision. |
+| `not_evaluated` | Used by doctor snapshots only. |
+
+The response deliberately omits executable bytes, artifact digests, source
+paths, hook attachment config, and secrets. This route serves operational
+metadata only.
+
+| Status | When |
+|---|---|
+| `200` | Running snapshot serialized successfully. |
+| `401` | Missing or invalid admin authentication. |
+| `405` | Method other than GET. |
+| `500` | The in-memory snapshot could not be serialized. |
+
+For preflight, run `sbproxy doctor <config> --format json` and inspect its
+top-level `extensions` field. That snapshot has `scope.mode: "doctor"` and
+marks successfully inspected hooks `not_evaluated`, because doctor does not
+start or attach a pipeline. See the
+[extension bundle runbook](operator-runbook.md#extension-bundles).
 
 ### `GET /api/openapi.json`, `GET /api/openapi.yaml`
 
@@ -1988,6 +2092,11 @@ curl -s -u admin:secret \
 # Watch per-target health.
 curl -s -u admin:secret \
   http://127.0.0.1:9090/api/health/targets | jq '.origins[].targets'
+
+# Inspect extensions attached to the serving generation.
+curl -s -u admin:secret \
+  http://127.0.0.1:9090/api/extensions \
+  | jq '{scope,summary,bundles,hooks,collisions}'
 
 # Show the full cluster roster and unhealthy-node alerts.
 curl -s -u admin:secret \
