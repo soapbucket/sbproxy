@@ -36,7 +36,7 @@ the next version cut.
   startup, validation, doctor, or reload before the candidate can become
   active. Reload swaps bundles as one pipeline generation, so a rejected
   candidate never leaves half its hooks attached. `GET
-  /admin/extensions` and `sbproxy doctor` both report what is installed,
+  /api/extensions` and `sbproxy doctor` both report what is installed,
   what is attached, and where each hook sits in its chain. Worked
   examples are in [examples/extension-bundles](examples/extension-bundles/),
   and the reference is section 12 of [docs/scripting.md](docs/scripting.md).
