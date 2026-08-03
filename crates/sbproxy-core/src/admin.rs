@@ -1724,7 +1724,13 @@ fn handle_config_write(
     // Construct for validation only: this pipeline is dropped immediately,
     // and the runtime constructor would spawn health-check probes that
     // outlive it and keep hitting the operator's upstreams.
-    if let Err(e) = crate::pipeline::CompiledPipeline::from_config_for_validation(compiled) {
+    let config_dir = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    if let Err(e) =
+        crate::pipeline::CompiledPipeline::from_config_for_validation_at(compiled, config_dir)
+    {
         return (
             400,
             "application/json",

@@ -1746,7 +1746,24 @@ impl CompiledPipeline {
     /// than installs, so repeated calls are safe, but a caller cannot treat
     /// this as a pure function.
     pub fn from_config_for_validation(config: CompiledConfig) -> anyhow::Result<Self> {
-        Self::from_config_with_mode(config, PipelineConstructionMode::Validation)
+        Self::from_config_for_validation_at(config, Path::new("."))
+    }
+
+    /// Compile every module for validation with bundle paths relative to its config document.
+    pub fn from_config_for_validation_at(
+        config: CompiledConfig,
+        base_dir: &Path,
+    ) -> anyhow::Result<Self> {
+        let extension_registry = DynamicBundleRegistry::load(
+            &config.extension_bundles,
+            base_dir,
+            &reserved_extension_hook_names(),
+        )?;
+        Self::from_config_with_mode_and_registry(
+            config,
+            PipelineConstructionMode::Validation,
+            extension_registry,
+        )
     }
 
     fn from_config_with_mode(
@@ -1800,9 +1817,8 @@ impl CompiledPipeline {
                 None,
             );
             let action = match mode {
-                PipelineConstructionMode::Runtime
-                    if configured_type(&origin.action_config)
-                        .is_some_and(|name| extension_registry.action(name).is_some()) =>
+                _ if configured_type(&origin.action_config)
+                    .is_some_and(|name| extension_registry.action(name).is_some()) =>
                 {
                     compile_action_for_origin_with_registry(
                         &origin.action_config,
@@ -2672,9 +2688,8 @@ fn compile_single_forward_rule(
         .get("action")
         .ok_or_else(|| anyhow::anyhow!("forward rule origin missing 'action'"))?;
     let action = match mode {
-        PipelineConstructionMode::Runtime
-            if configured_type(action_config)
-                .is_some_and(|name| extension_registry.action(name).is_some()) =>
+        _ if configured_type(action_config)
+            .is_some_and(|name| extension_registry.action(name).is_some()) =>
         {
             compile_action_for_origin_with_registry(action_config, rule_id, extension_registry)?
         }
@@ -2855,12 +2870,16 @@ fn compile_fallback(
     let action_config = origin_obj
         .get("action")
         .ok_or_else(|| anyhow::anyhow!("fallback origin missing 'action'"))?;
-    let action = match mode {
-        PipelineConstructionMode::Runtime => {
-            compile_action_with_registry(action_config, extension_registry)?
-        }
-        PipelineConstructionMode::Validation => {
-            compile_action_for_origin_for_validation(action_config, "")?
+    let action = if configured_type(action_config)
+        .is_some_and(|name| extension_registry.action(name).is_some())
+    {
+        compile_action_with_registry(action_config, extension_registry)?
+    } else {
+        match mode {
+            PipelineConstructionMode::Runtime => compile_action_for_origin(action_config, "")?,
+            PipelineConstructionMode::Validation => {
+                compile_action_for_origin_for_validation(action_config, "")?
+            }
         }
     };
 
