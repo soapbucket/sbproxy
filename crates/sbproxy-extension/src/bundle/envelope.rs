@@ -1,6 +1,8 @@
 use base64::Engine as _;
 use bytes::Bytes;
-use sbproxy_plugin::{ActionOutcome, PolicyDecision};
+use sbproxy_plugin::{
+    ActionOutcome, AiExtensionDecision, PaymentExtensionDecision, PolicyDecision,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -9,6 +11,7 @@ use sbproxy_config::BundleHookKind;
 pub(crate) const ENVELOPE_VERSION: &str = sbproxy_config::BUNDLE_ENVELOPE_ABI;
 
 const MAX_POLICY_MESSAGE_BYTES: usize = 4 * 1024;
+const MAX_EVENT_CODE_BYTES: usize = 64;
 const MAX_ACTION_HEADERS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,5 +270,147 @@ pub(crate) fn decode_action(bytes: &[u8], maximum: usize) -> Result<ActionOutcom
             })
         }
         _ => Err(EnvelopeError::new("invalid_envelope")),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AiDecisionWire {
+    version: String,
+    decision: String,
+    #[serde(default)]
+    status: Option<u16>,
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+fn valid_event_code(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_EVENT_CODE_BYTES
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-' | b'.')
+        })
+}
+
+pub(crate) fn decode_ai_decision(bytes: &[u8]) -> Result<AiExtensionDecision, EnvelopeError> {
+    let response: AiDecisionWire =
+        serde_json::from_slice(bytes).map_err(|_| EnvelopeError::new("invalid_envelope"))?;
+    if response.version != ENVELOPE_VERSION {
+        return Err(EnvelopeError::new("invalid_version"));
+    }
+    match response.decision.as_str() {
+        "release"
+            if response.status.is_none()
+                && response.code.is_none()
+                && response.message.is_none() =>
+        {
+            Ok(AiExtensionDecision::Release)
+        }
+        "block" | "flag" => {
+            let code = response
+                .code
+                .filter(|value| valid_event_code(value))
+                .ok_or_else(|| EnvelopeError::new("invalid_envelope"))?;
+            let message = response
+                .message
+                .filter(|value| !value.is_empty() && value.len() <= MAX_POLICY_MESSAGE_BYTES)
+                .ok_or_else(|| EnvelopeError::new("invalid_envelope"))?;
+            if response.decision == "block" {
+                let status = response
+                    .status
+                    .filter(|status| (400..=599).contains(status))
+                    .ok_or_else(|| EnvelopeError::new("invalid_envelope"))?;
+                Ok(AiExtensionDecision::Block {
+                    status,
+                    code,
+                    message,
+                })
+            } else if response.status.is_none() {
+                Ok(AiExtensionDecision::Flag { code, message })
+            } else {
+                Err(EnvelopeError::new("invalid_envelope"))
+            }
+        }
+        _ => Err(EnvelopeError::new("invalid_envelope")),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PaymentDecisionWire {
+    version: String,
+    decision: String,
+}
+
+pub(crate) fn decode_payment_decision(
+    bytes: &[u8],
+) -> Result<PaymentExtensionDecision, EnvelopeError> {
+    let response: PaymentDecisionWire =
+        serde_json::from_slice(bytes).map_err(|_| EnvelopeError::new("invalid_envelope"))?;
+    if response.version != ENVELOPE_VERSION {
+        return Err(EnvelopeError::new("invalid_version"));
+    }
+    match response.decision.as_str() {
+        "continue" => Ok(PaymentExtensionDecision::Continue),
+        "reject" => Ok(PaymentExtensionDecision::Reject),
+        _ => Err(EnvelopeError::new("invalid_envelope")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sbproxy_plugin::{AiExtensionDecision, PaymentExtensionDecision};
+
+    use super::*;
+
+    #[test]
+    fn ai_decision_wire_is_strict_and_bounded() {
+        assert_eq!(
+            decode_ai_decision(
+                br#"{"version":"sbproxy-envelope/v1","decision":"block","status":403,"code":"policy_denied","message":"request denied"}"#,
+            )
+            .unwrap(),
+            AiExtensionDecision::Block {
+                status: 403,
+                code: "policy_denied".to_owned(),
+                message: "request denied".to_owned(),
+            }
+        );
+        assert_eq!(
+            decode_ai_decision(br#"{"version":"sbproxy-envelope/v1","decision":"release"}"#,)
+                .unwrap(),
+            AiExtensionDecision::Release
+        );
+        assert!(decode_ai_decision(
+            br#"{"version":"sbproxy-envelope/v1","decision":"block","status":200,"code":"bad","message":"bad"}"#,
+        )
+        .is_err());
+        let oversized = serde_json::json!({
+            "version": ENVELOPE_VERSION,
+            "decision": "flag",
+            "code": "x".repeat(65),
+            "message": "safe",
+        });
+        assert!(decode_ai_decision(oversized.to_string().as_bytes()).is_err());
+    }
+
+    #[test]
+    fn payment_decision_wire_accepts_only_continue_or_reject() {
+        assert_eq!(
+            decode_payment_decision(br#"{"version":"sbproxy-envelope/v1","decision":"continue"}"#,)
+                .unwrap(),
+            PaymentExtensionDecision::Continue
+        );
+        assert_eq!(
+            decode_payment_decision(br#"{"version":"sbproxy-envelope/v1","decision":"reject"}"#,)
+                .unwrap(),
+            PaymentExtensionDecision::Reject
+        );
+        assert!(decode_payment_decision(
+            br#"{"version":"sbproxy-envelope/v1","decision":"reject","message":"secret"}"#,
+        )
+        .is_err());
     }
 }

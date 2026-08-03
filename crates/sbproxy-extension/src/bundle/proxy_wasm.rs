@@ -206,9 +206,15 @@ pub fn build_proxy_wasm_filter(
     hook: &LoadedBundleHook,
     configuration: Value,
 ) -> Result<ProxyWasmFilter, BundleLoadError> {
-    if hook.manifest().runtime != BundleRuntime::ProxyWasm
-        || hook.hook().kind != BundleHookKind::ProxyWasm
-    {
+    build_proxy_wasm_filter_for_kind(hook, BundleHookKind::ProxyWasm, configuration)
+}
+
+pub(super) fn build_proxy_wasm_filter_for_kind(
+    hook: &LoadedBundleHook,
+    expected_kind: BundleHookKind,
+    configuration: Value,
+) -> Result<ProxyWasmFilter, BundleLoadError> {
+    if hook.manifest().runtime != BundleRuntime::ProxyWasm || hook.hook().kind != expected_kind {
         return Err(BundleLoadError::new(
             "proxy_wasm",
             "hook kind does not match the requested Proxy-Wasm adapter",

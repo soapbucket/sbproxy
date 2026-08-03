@@ -62,7 +62,7 @@ fn checked_limit(value: u64, multiplier: usize, name: &str) -> Result<usize, Bun
 }
 
 #[derive(Clone)]
-struct JavascriptProgram {
+pub(super) struct JavascriptProgram {
     source: Arc<str>,
     export: Arc<str>,
     hook_kind: &'static str,
@@ -80,6 +80,16 @@ impl std::fmt::Debug for JavascriptProgram {
             .field("hook_kind", &self.hook_kind)
             .field("type_name", &self.type_name)
             .finish_non_exhaustive()
+    }
+}
+
+impl JavascriptProgram {
+    pub(super) async fn invoke(
+        &self,
+        payload_name: &str,
+        payload: Value,
+    ) -> Result<Vec<u8>, PluginError> {
+        invoke_program(self, hook_envelope(payload_name, self, payload)).await
     }
 }
 
@@ -497,7 +507,7 @@ fn reject_imports(program: &Program) -> Result<(), BundleLoadError> {
     Ok(())
 }
 
-fn prepare_program(
+pub(super) fn prepare_program(
     hook: &LoadedBundleHook,
     expected_kind: BundleHookKind,
     config: Value,
