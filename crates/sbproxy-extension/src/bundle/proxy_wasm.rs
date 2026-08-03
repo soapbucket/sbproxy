@@ -114,6 +114,8 @@ pub enum ProxyWasmAction {
 pub struct ProxyWasmLocalResponse {
     /// Validated HTTP status code.
     pub status: u16,
+    /// gRPC status supplied by the guest, absent for an ordinary HTTP response.
+    pub grpc_status: Option<u32>,
     /// Validated response headers, with duplicates preserved.
     pub headers: Vec<(String, String)>,
     /// Response body bounded by the manifest output cap.
@@ -1743,7 +1745,7 @@ fn host_send_local_response(
     body_size: i32,
     headers_data: i32,
     headers_size: i32,
-    _grpc_status: i32,
+    grpc_status: i32,
 ) -> i32 {
     let Ok(status) = u16::try_from(status) else {
         return STATUS_BAD_ARGUMENT;
@@ -1781,8 +1783,10 @@ fn host_send_local_response(
         caller.data_mut().fail(ProxyWasmCallFailure::OutputLimit);
         return STATUS_BAD_ARGUMENT;
     }
+    let grpc_status = grpc_status as u32;
     caller.data_mut().local_response = Some(ProxyWasmLocalResponse {
         status,
+        grpc_status: (grpc_status != u32::MAX).then_some(grpc_status),
         headers,
         body: Bytes::from(body),
     });
@@ -1980,6 +1984,7 @@ mod tests {
     fn runtime(fixture: &str, limits: WasmBundleLimits) -> ProxyWasmRuntime {
         let bytes: &[u8] = match fixture {
             "deferred-done" => include_bytes!("testdata/proxy_wasm/deferred-done.wasm"),
+            "grpc-response" => include_bytes!("testdata/proxy_wasm/grpc-response.wasm"),
             "http" => include_bytes!("testdata/proxy_wasm/http.wasm"),
             "log-headers" => include_bytes!("testdata/proxy_wasm/log-headers.wasm"),
             "log-levels" => include_bytes!("testdata/proxy_wasm/log-levels.wasm"),
@@ -2210,6 +2215,19 @@ mod tests {
             response.headers,
             [("content-type".to_owned(), "text/plain".to_owned())]
         );
+        assert_eq!(response.grpc_status, None);
+    }
+
+    #[test]
+    fn local_response_preserves_grpc_status() {
+        let mut session = runtime("grpc-response", limits())
+            .start_session(b"{}")
+            .unwrap();
+
+        let result = session.on_request_headers(Vec::new(), true).unwrap();
+        let response = result.local_response.unwrap();
+
+        assert_eq!(response.grpc_status, Some(7));
     }
 
     #[test]

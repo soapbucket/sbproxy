@@ -83,7 +83,7 @@
     i32.eqz
     if
       i32.const 403 i32.const 0 i32.const 0 i32.const 180 i32.const 7
-      i32.const 200 i32.const 36 i32.const 0
+      i32.const 200 i32.const 36 i32.const -1
       call $local_response drop
       i32.const 1 return
     end
