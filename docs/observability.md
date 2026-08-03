@@ -312,6 +312,14 @@ That distinction is what makes per-agent cost attribution expressible at all. An
 
 When a budget is exhausted the offending label demotes to `__other__` and `sbproxy_label_cardinality_overflow_total` increments. The metric update still happens; a demoted bucket is preferable to a missing one because gaps look like real traffic dips.
 
+That counter tells you a label has already collapsed, which is late. In a multi-tenant deployment the collapse merges tenants into one `__other__` series, so a per-tenant panel keeps drawing and quietly starts answering a different question, and the only tell is spotting `__other__` in a query result. Two gauges give the approach instead of the arrival: `sbproxy_label_cardinality_unique_values{label}` is how many distinct values a label has accepted, and `sbproxy_label_cardinality_budget{label}` is the cap it is counted against. Both are computed from the limiter at scrape time, so the ratio is the alert an operator wants:
+
+```promql
+sbproxy_label_cardinality_unique_values / sbproxy_label_cardinality_budget > 0.9
+```
+
+Both are labelled by label name and nothing else. There is no `metric` label, because one budget is shared by every metric using that label name and splitting by metric would be a lie. There is no `tenant_id` label either, because that would multiply the series count by the tenant budget, which is the failure these gauges exist to warn about.
+
 Forbidding the label does not mean losing the identifier. A run id reaches the AI span as `session.id` and the access log as `a2a_context_id`, which is where reconstructing one run is exactly the point. The one place it cannot reach is an outbound request header on the hop that learned it: the A2A `contextId` lives in the JSON-RPC request body, the body is parsed at the body phase, and the body phase runs after the upstream request header has already been assembled and sent. Run correlation between hops rides the W3C trace context instead. "[The phase constraint: a run id cannot ride an outbound header](#the-phase-constraint-a-run-id-cannot-ride-an-outbound-header)" under Traces has the detail.
 
 ### Fleet totals across a cluster

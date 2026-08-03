@@ -104,9 +104,15 @@ impl PeerEvictor {
         fired
     }
 
-    /// Explicitly evict a peer (e.g. on a graceful LeaveRequest or after
-    /// a `dead_timeout` in the health monitor). The given `reason` is
-    /// used as the `reason` label on the metric.
+    /// Explicitly evict a peer, bypassing the failure counter. The given
+    /// `reason` is used as the `reason` label on the metric.
+    ///
+    /// The one production caller is the SWIM sweep, which passes
+    /// `dead_timeout` when a Suspect peer outlives `suspect_timeout`.
+    /// There is no graceful-leave caller: no leave message exists on the
+    /// wire, so a departing node is only ever noticed by the failure
+    /// detector. The `graceful_leave` reason on [`metrics::MESH_PEER_EVICTED`]
+    /// carries the detail.
     pub fn evict(&self, peer: &str, reason: &str) {
         {
             let mut map = self.failures.lock().expect("mutex poisoned");
