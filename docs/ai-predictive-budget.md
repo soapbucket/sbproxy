@@ -97,7 +97,12 @@ what gives the `grep` further down something to read. Nothing else needs it.
 The four bands, with the fraction the gateway compared each threshold
 against:
 
-<!-- CAPTURE: bash examples/ai-predictive-budget/bin/soft-landing.sh -->
+```
+1 below warn_at          preflight=0        status=200  served=gpt-4o
+2 past warn_at           preflight=0.85     status=200  served=gpt-4o
+3 past downgrade_at      preflight=0.969    status=200  served=gpt-4o-mini
+4 at the cap             preflight=6000.969059999999 status=402  served=budget_exceeded
+```
 
 The third row is the feature: the client asked for `gpt-4o`, and
 `gpt-4o-mini` is what the upstream was handed.
@@ -105,18 +110,38 @@ The third row is the feature: the client asked for `gpt-4o`, and
 The fraction itself is a gauge, served unauthenticated on the data-plane
 port:
 
-<!-- CAPTURE: curl -s http://127.0.0.1:8080/metrics | grep sbproxy_ai_budget_utilization_ratio -->
+```
+# HELP sbproxy_ai_budget_utilization_ratio Budget utilization as ratio 0-1
+# TYPE sbproxy_ai_budget_utilization_ratio gauge
+sbproxy_ai_budget_utilization_ratio{scope="workspace"} 6000.969059999999
+```
 
 Both bands log at warn level, and the downgrade line names the model it
 rewrote to:
 
-<!-- CAPTURE: grep -F 'soft-landing' /tmp/sbproxy-predictive-budget.log -->
+```
+2026-08-02T20:38:51.639345Z  WARN sbproxy_core::server::ai_dispatch: AI budget: approaching limit (soft-landing warn) fraction=0.85
+2026-08-02T20:38:51.704920Z  WARN sbproxy_core::server::ai_dispatch: AI budget: approaching limit (soft-landing warn) fraction=0.851
+2026-08-02T20:38:51.753606Z  WARN sbproxy_core::server::ai_dispatch: AI budget: soft-landing downgrade before hard cap fraction=0.969 new_model=gpt-4o-mini
+2026-08-02T20:38:51.792899Z  WARN sbproxy_core::server::ai_dispatch: AI budget: soft-landing downgrade before hard cap fraction=0.9690599999999999 new_model=gpt-4o-mini
+```
 
 The tag lands on the usage record and nowhere else, so a sink is what makes
 the degradation queryable afterwards:
 
-<!-- CAPTURE: python3 -c 'import json; [print(json.dumps({k: json.loads(l).get(k) for k in ("model","tag","cost_usd")})) for l in open("/tmp/sbproxy-predictive-budget-usage.jsonl") if json.loads(l).get("tag")]' -->
+```
+{"model": "gpt-4o-mini", "tag": "budget_soft_landing", "cost_usd": 0.06}
+{"model": "gpt-4o-mini", "tag": "budget_soft_landing", "cost_usd": 6000000.0}
+```
 
 And the cap, once the window is spent:
 
-<!-- CAPTURE: curl -s -i http://127.0.0.1:8080/v1/chat/completions -H 'Host: ai.local' -H 'Content-Type: application/json' -d '{"model":"gpt-4o","messages":[{"role":"user","content":"spend=1"}]}' -->
+```
+HTTP/1.1 402 Payment Required
+content-type: application/json
+content-length: 117
+Date: Sun, 02 Aug 2026 20:38:51 GMT
+Connection: keep-alive
+
+{"error":{"message":"cost limit exceeded: $6000969.0600 >= $1000.0000","scope":"workspace","type":"budget_exceeded"}}
+```

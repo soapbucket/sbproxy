@@ -86,6 +86,17 @@ A `NeedsReconciliation` intent is never retried by the request path. A
 second attempt is how a payer gets charged twice, so the client waits for
 the recovery worker instead.
 
+An ordinary client reaches that state by being early. A crawler that
+retries before its invoice is paid is answered 503, and that same 503
+leaves its intent in `NeedsReconciliation`, because the rail verified the
+payment and did not settle it. Paying afterwards does not clear it:
+nothing on the request path is allowed to try again. The next sweep
+clears it, one `worker.reconcile_interval_ms` later at the outside and
+1000 ms by default, and the retry after that reaches the origin. The
+`Retry-After` on the 503 asks for exactly that wait, so a client that
+honors it never sees the difference, and one that polls faster than the
+worker sweeps sees a short run of 503s first.
+
 ## The request path, end to end
 
 With `proxy.payments` present, an `ai_crawl_control` 402 is settled
@@ -221,7 +232,9 @@ token rides the header the policy configured:
 
 The retry before the payment settles. The token authenticates and names a
 live intent, so this is not a refusal. It is the 503 case, and it is the
-one the gate exists for:
+one the gate exists for. It also leaves the intent in
+`NeedsReconciliation`, which is why the walkthrough below retries in a
+loop rather than asking once:
 
 <!-- CAPTURE: TOKEN=$(curl -sS -D - -o /dev/null -H 'Host: blog.local' -H 'User-Agent: GPTBot/1.0' http://127.0.0.1:8080/article | tr -d '\r' | awk '/^crawler-payment:/ {print $2}'); curl -is -H 'Host: blog.local' -H 'User-Agent: GPTBot/1.0' -H "crawler-payment: $TOKEN" http://127.0.0.1:8080/article -->
 
@@ -233,7 +246,12 @@ cannot pay:
 
 The whole sequence, with the origin's own hit counter after each step,
 because that counter is what proves one settled payment served the
-content exactly once:
+content exactly once. Its third step retries in a bounded loop for the
+reason above: the second step stranded the intent, so the request that
+reaches the origin is whichever one lands after the worker has swept.
+The script asserts every status it prints and, if the loop runs out,
+fails with the durable intent status rather than reporting a 503 as
+though it were the answer:
 
 <!-- CAPTURE: bash examples/settlement-gate-local/bin/settle-once.sh -->
 

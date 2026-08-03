@@ -39,7 +39,11 @@ There is no `docker-compose.yml`, and the reason is the build rather than the st
 bash examples/usage-bridge-queue/bin/bill-one-call.sh
 ```
 
-<!-- CAPTURE: bash examples/usage-bridge-queue/bin/bill-one-call.sh -->
+```
+minted a governed key naming customer=cus_demo_usage_bridge
+chat completion               status=200
+rows on the usage queue       1
+```
 
 ## What landed
 
@@ -50,7 +54,9 @@ sqlite3 /tmp/sbproxy-usage-bridge/payments.sqlite3 \
   "select reporter, usage_identifier, tenant_id, origin_id, status, failure_category, json_extract(event_jcs, '\$.quantity') as quantity from usage_reports order by created_at_ms"
 ```
 
-<!-- CAPTURE: sqlite3 /tmp/sbproxy-usage-bridge/payments.sqlite3 "select reporter, usage_identifier, tenant_id, origin_id, status, failure_category, json_extract(event_jcs, '\$.quantity') as quantity from usage_reports order by created_at_ms" -->
+```
+stripe_meter|sbu-019fc4332bc872f0bbfbb36cb735cc14-edba0b3d3dfd9c8ddd3718560501eb69|tenant-a|billing.local|queued||1020
+```
 
 The full event the worker will hand the reporter, including the resource attribution and the customer the charge lands on:
 
@@ -59,7 +65,9 @@ sqlite3 /tmp/sbproxy-usage-bridge/payments.sqlite3 \
   'select event_jcs from usage_reports order by created_at_ms limit 1'
 ```
 
-<!-- CAPTURE: sqlite3 /tmp/sbproxy-usage-bridge/payments.sqlite3 'select event_jcs from usage_reports order by created_at_ms limit 1' -->
+```
+{"attributes":{"claim_id":"019fc4332bc872f0bbfbb36cb735cc14","resource_name":"openai/gpt-4o-mini","resource_type":"ai_model","stripe_customer_id":"cus_demo_usage_bridge","unit":"total_tokens"},"event_name":"sbproxy_ai_tokens","occurred_at_ms":1785703115773,"origin_id":"billing.local","quantity":1020,"reporter":"stripe_meter","tenant_id":"tenant-a","usage_identifier":"sbu-019fc4332bc872f0bbfbb36cb735cc14-edba0b3d3dfd9c8ddd3718560501eb69"}
+```
 
 Two counters describe the bridge, both labelled by tenant, because a billing number that merged every tenant into one series answers a question nobody asks:
 
@@ -67,7 +75,11 @@ Two counters describe the bridge, both labelled by tenant, because a billing num
 curl -s http://127.0.0.1:8080/metrics | grep sbproxy_usage_bridge
 ```
 
-<!-- CAPTURE: curl -s http://127.0.0.1:8080/metrics | grep sbproxy_usage_bridge -->
+```
+# HELP sbproxy_usage_bridge_enqueued_total Billable units the request path queued for a usage reporter, by tenant, reporter, resource type, and whether the row was new
+# TYPE sbproxy_usage_bridge_enqueued_total counter
+sbproxy_usage_bridge_enqueued_total{reporter="stripe_meter",resource_type="ai_model",result="queued",tenant_id="tenant-a"} 1
+```
 
 `sbproxy_usage_bridge_enqueued_total` splits on `result`. A `duplicate` is the idempotency contract working and is expected on a retry; a series that is entirely `duplicate` means an identifier is not varying when it should, which is the shape of a silently dropped charge. `sbproxy_usage_bridge_gap_total` is the one to alert on: nonzero means a served request produced a billable unit that never reached the queue.
 

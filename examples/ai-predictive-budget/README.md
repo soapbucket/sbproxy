@@ -49,7 +49,12 @@ Soft landing compares a threshold against a live fraction, so the walkthrough ha
 bash examples/ai-predictive-budget/bin/soft-landing.sh
 ```
 
-<!-- CAPTURE: bash examples/ai-predictive-budget/bin/soft-landing.sh -->
+```
+1 below warn_at          preflight=0        status=200  served=gpt-4o
+2 past warn_at           preflight=0.85     status=200  served=gpt-4o
+3 past downgrade_at      preflight=0.969    status=200  served=gpt-4o-mini
+4 at the cap             preflight=6000.969059999999 status=402  served=budget_exceeded
+```
 
 Row 3 is the whole feature: the client asked for `gpt-4o` and the upstream was handed `gpt-4o-mini`, with no header, no error, and no change to the response shape.
 
@@ -63,7 +68,11 @@ The gauge is the fraction the thresholds are compared against, and it is served 
 curl -s http://127.0.0.1:8080/metrics | grep sbproxy_ai_budget_utilization_ratio
 ```
 
-<!-- CAPTURE: curl -s http://127.0.0.1:8080/metrics | grep sbproxy_ai_budget_utilization_ratio -->
+```
+# HELP sbproxy_ai_budget_utilization_ratio Budget utilization as ratio 0-1
+# TYPE sbproxy_ai_budget_utilization_ratio gauge
+sbproxy_ai_budget_utilization_ratio{scope="workspace"} 6000.969059999999
+```
 
 Both soft-landing bands log at warn level, and the downgrade line names the model it rewrote to:
 
@@ -71,7 +80,12 @@ Both soft-landing bands log at warn level, and the downgrade line names the mode
 grep -F 'soft-landing' /tmp/sbproxy-predictive-budget.log
 ```
 
-<!-- CAPTURE: grep -F 'soft-landing' /tmp/sbproxy-predictive-budget.log -->
+```
+2026-08-02T20:38:51.639345Z  WARN sbproxy_core::server::ai_dispatch: AI budget: approaching limit (soft-landing warn) fraction=0.85
+2026-08-02T20:38:51.704920Z  WARN sbproxy_core::server::ai_dispatch: AI budget: approaching limit (soft-landing warn) fraction=0.851
+2026-08-02T20:38:51.753606Z  WARN sbproxy_core::server::ai_dispatch: AI budget: soft-landing downgrade before hard cap fraction=0.969 new_model=gpt-4o-mini
+2026-08-02T20:38:51.792899Z  WARN sbproxy_core::server::ai_dispatch: AI budget: soft-landing downgrade before hard cap fraction=0.9690599999999999 new_model=gpt-4o-mini
+```
 
 The `budget_soft_landing` tag is on the usage record and nowhere else: not on the response, not in metrics, not in the access log. A sink is the only way to query which requests were degraded. Only the downgrade band is tagged, because only a downgraded request was changed; a warn-band request is dispatched as sent and shows up in the log above and nowhere here:
 
@@ -79,7 +93,10 @@ The `budget_soft_landing` tag is on the usage record and nowhere else: not on th
 python3 -c 'import json; [print(json.dumps({k: json.loads(l).get(k) for k in ("model","tag","cost_usd")})) for l in open("/tmp/sbproxy-predictive-budget-usage.jsonl") if json.loads(l).get("tag")]'
 ```
 
-<!-- CAPTURE: python3 -c 'import json; [print(json.dumps({k: json.loads(l).get(k) for k in ("model","tag","cost_usd")})) for l in open("/tmp/sbproxy-predictive-budget-usage.jsonl") if json.loads(l).get("tag")]' -->
+```
+{"model": "gpt-4o-mini", "tag": "budget_soft_landing", "cost_usd": 0.06}
+{"model": "gpt-4o-mini", "tag": "budget_soft_landing", "cost_usd": 6000000.0}
+```
 
 And the cap itself, once the window is spent:
 
@@ -89,7 +106,15 @@ curl -s -i http://127.0.0.1:8080/v1/chat/completions -H 'Host: ai.local' \
   -d '{"model":"gpt-4o","messages":[{"role":"user","content":"spend=1"}]}'
 ```
 
-<!-- CAPTURE: curl -s -i http://127.0.0.1:8080/v1/chat/completions -H 'Host: ai.local' -H 'Content-Type: application/json' -d '{"model":"gpt-4o","messages":[{"role":"user","content":"spend=1"}]}' -->
+```
+HTTP/1.1 402 Payment Required
+content-type: application/json
+content-length: 117
+Date: Sun, 02 Aug 2026 20:38:51 GMT
+Connection: keep-alive
+
+{"error":{"message":"cost limit exceeded: $6000969.0600 >= $1000.0000","scope":"workspace","type":"budget_exceeded"}}
+```
 
 Run the checked smoke cases from the repository root with:
 

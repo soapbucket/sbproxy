@@ -34,7 +34,7 @@ python3 examples/settlement-gate-local/fixture.py &
 target/payments/release/sbproxy serve -f examples/settlement-gate-local/sb.yml
 ```
 
-There is no `docker-compose.yml`, and the reason is the build rather than the stack: `Dockerfile.cloudbuild` compiles the default feature set, so the image the other examples share would start this config and fail on the rail. That also means `scripts/examples-smoke.sh` skips this directory; `smoke.json` records the contract it would assert, and [`e2e/tests/settlement_gate.rs`](../../e2e/tests/settlement_gate.rs) asserts the same five outcomes automatically against the same stub shapes.
+There is no `docker-compose.yml`, and the reason is the build rather than the stack: `Dockerfile.cloudbuild` compiles the default feature set, so the image the other examples share would start this config and fail on the rail. That also means `scripts/examples-smoke.sh` skips this directory; `smoke.json` records the contract it would assert, and [`e2e/tests/settlement_gate.rs`](../../e2e/tests/settlement_gate.rs) drives the same stub node and the same counting origin from Rust. It pays before its first retry, so it proves the challenge, the settle, and the replay refusal, and it does not cover the reconciliation the script below walks through.
 
 ## The whole sequence, with the origin's own counter
 
@@ -45,6 +45,10 @@ bash examples/settlement-gate-local/bin/settle-once.sh
 ```
 
 <!-- CAPTURE: bash examples/settlement-gate-local/bin/settle-once.sh -->
+
+Step 3 retries in a loop instead of asking once, and the reason is worth reading before you write a crawler against this. Step 2 retried before the invoice was paid, which is ordinary client behavior and is also what leaves the intent in `needs_reconciliation`: the rail verified the payment and did not settle it. From there the request path never tries again, because a second attempt is how a payer gets charged twice, so paying the invoice does not on its own get the crawler in. The recovery worker clears it on its next sweep, `worker.reconcile_interval_ms` apart and 1000 ms in this config, and the retry after that reaches the origin. That is what the 503's `Retry-After: 2` is asking a client to do.
+
+The loop is bounded at 100 attempts 0.2s apart, which is twenty times the sweep interval. Running out is a failure and says so, printing the intent's durable status, because a walkthrough that prints a 503 where a 200 belongs teaches the wrong thing quietly. Every status the script prints is asserted for the same reason. `SETTLE_ATTEMPTS` and `SETTLE_INTERVAL` move the bound if you raise `reconcile_interval_ms`.
 
 ## Step by step
 
@@ -66,7 +70,7 @@ curl -is -H 'Host: blog.local' -H 'User-Agent: GPTBot/1.0' \
 
 <!-- CAPTURE: curl -is -H 'Host: blog.local' -H 'User-Agent: GPTBot/1.0' http://127.0.0.1:8080/article -->
 
-Retrying before the invoice is paid is the case the gate exists for. The quote token authenticates and names a live intent, so this is not a refusal; it is verified-but-not-settled, which is a 503 with `Retry-After` and never origin access:
+Retrying before the invoice is paid is the case the gate exists for. The quote token authenticates and names a live intent, so this is not a refusal; it is verified-but-not-settled, which is a 503 with `Retry-After` and never origin access. It is also what strands the intent in `needs_reconciliation` until the worker sweeps, so run this and the crawler's next successful request is one sweep away rather than immediate:
 
 ```bash
 TOKEN=$(curl -sS -D - -o /dev/null -H 'Host: blog.local' -H 'User-Agent: GPTBot/1.0' http://127.0.0.1:8080/article | tr -d '\r' | awk '/^crawler-payment:/ {print $2}'); curl -is -H 'Host: blog.local' -H 'User-Agent: GPTBot/1.0' -H "crawler-payment: $TOKEN" http://127.0.0.1:8080/article
