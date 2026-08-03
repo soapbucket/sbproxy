@@ -1876,6 +1876,7 @@ pub(super) fn emit_ai_billing_event(
     rollup_properties: &std::collections::BTreeMap<String, String>,
     agent: sbproxy_ai::budget::AgentIdentity<'_>,
     ai_span: &tracing::Span,
+    debit: sbproxy_ai::budget::TokenDebit,
 ) -> u64 {
     let cost_usd_micros = cost_usd_to_micros(cost_usd);
     // Feed the per-attribution spend metrics from the single billing
@@ -2003,7 +2004,7 @@ pub(super) fn emit_ai_billing_event(
             // every sink reading the event off the bus sees the same
             // identity the budget keys were derived from.
             .with_agent(agent);
-    sbproxy_ai::budget::record_billing_event(&BUDGET_TRACKER, &event);
+    sbproxy_ai::budget::record_billing_event(&BUDGET_TRACKER, &event, debit);
     // WOR-1809: debug, not info. This fires per billing scope, so one
     // completion can emit a burst of identical lines; the ledger sinks
     // and metrics are the durable record, the log line is a trace.

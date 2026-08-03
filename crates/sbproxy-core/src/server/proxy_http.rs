@@ -5923,6 +5923,9 @@ impl ProxyHttp for SbProxy {
                     verified: ctx.a2a.as_ref().is_some_and(|a2a| a2a.identity_verified),
                 },
                 &span,
+                // The realtime close path reports the usage it measured over
+                // the session; there is no estimate to substitute here.
+                sbproxy_ai::budget::TokenDebit::Measured,
             );
             info!(
                 ai.surface = rd.surface_label,

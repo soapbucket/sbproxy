@@ -3241,6 +3241,7 @@ pub(super) async fn handle_ai_proxy(
             &ctx.rollup_properties,
             billing_agent.identity(),
             &ai_span,
+            sbproxy_ai::budget::TokenDebit::Measured,
         );
         return relay_ai_response(
             session,
@@ -3520,6 +3521,7 @@ pub(super) async fn handle_ai_proxy(
             &ctx.rollup_properties,
             billing_agent.identity(),
             &ai_span,
+            sbproxy_ai::budget::TokenDebit::Measured,
         );
         return relay_ai_response_with_idempotency(
             session,
@@ -4072,6 +4074,7 @@ pub(super) async fn handle_ai_proxy(
                 &ctx.rollup_properties,
                 billing_agent.identity(),
                 &ai_span,
+                sbproxy_ai::budget::TokenDebit::Measured,
             );
             if cost_micros > 0 {
                 ctx.ai_cost_usd_micros = Some(cost_micros);
@@ -4113,6 +4116,7 @@ pub(super) async fn handle_ai_proxy(
             &ctx.rollup_properties,
             billing_agent.identity(),
             &ai_span,
+            sbproxy_ai::budget::TokenDebit::Measured,
         );
         if let Some(block) = multipart_external_output_guardrail_block(
             status,
@@ -6367,6 +6371,7 @@ pub(super) async fn handle_ai_proxy(
                         &ctx.rollup_properties,
                         billing_agent.identity(),
                         &ai_span,
+                        sbproxy_ai::budget::TokenDebit::Measured,
                     );
                     if cost_micros > 0 {
                         ctx.ai_cost_usd_micros = Some(cost_micros);
@@ -8638,6 +8643,22 @@ pub(super) async fn relay_ai_response_with_cache(
             } else {
                 sbproxy_ai::budget::AiUsage::PerCall
             };
+            // Enforcement debits the estimate; the event above keeps the
+            // measured (0,0). WOR-1146 computed this estimate and WOR-2212
+            // then consolidated the debit onto the billing event, which is
+            // built from measured usage by design, so on any single-node
+            // deployment the estimate was computed and discarded and a
+            // usage-less 2xx debited nothing at all. `max_tokens` stopped
+            // being a cap for any provider that omits `usage`.
+            let budget_debit = if budget_prompt_tokens != prompt_tokens
+                || budget_completion_tokens != completion_tokens
+            {
+                sbproxy_ai::budget::TokenDebit::Estimated(
+                    budget_prompt_tokens.saturating_add(budget_completion_tokens),
+                )
+            } else {
+                sbproxy_ai::budget::TokenDebit::Measured
+            };
             let cost = sbproxy_ai::budget::estimate_cost_for_usage(args.model, &usage);
             let scope_keys = args.keys.iter().map(|(_, k)| k.clone()).collect::<Vec<_>>();
             let cost_micros = emit_ai_billing_event(
@@ -8654,6 +8675,7 @@ pub(super) async fn relay_ai_response_with_cache(
                 &args.rollup_properties,
                 args.agent_identity(),
                 &ai_span,
+                budget_debit,
             );
             refresh_budget_utilization(args.config, args.keys);
             if cost_micros > 0 {
@@ -8724,6 +8746,7 @@ pub(super) async fn relay_ai_response_with_cache(
                     &ctx.rollup_properties,
                     agent.identity(),
                     &ai_span,
+                    sbproxy_ai::budget::TokenDebit::Measured,
                 );
                 if cost_micros > 0 {
                     ctx.ai_cost_usd_micros = Some(cost_micros);
@@ -11010,6 +11033,7 @@ pub(super) async fn relay_ai_stream(
                     &args.rollup_properties,
                     args.agent_identity(),
                     &ai_span,
+                    sbproxy_ai::budget::TokenDebit::Measured,
                 );
                 refresh_budget_utilization(args.config, args.keys);
                 // WOR-1835: governed-key settlement. `ai_admission` never
