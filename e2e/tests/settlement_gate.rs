@@ -469,6 +469,100 @@ fn an_unpaid_retry_never_reaches_the_origin() {
     );
 }
 
+/// The value of one `sbproxy_payment_settlement_total` series in a scrape,
+/// or zero when nothing has created it.
+fn settlement_total(metrics: &str, operation: &str, outcome: &str) -> f64 {
+    metrics
+        .lines()
+        .find(|line| {
+            line.starts_with("sbproxy_payment_settlement_total{")
+                && line.contains("rail=\"lightning_cln\"")
+                && line.contains(&format!("operation=\"{operation}\""))
+                && line.contains(&format!("outcome=\"{outcome}\""))
+        })
+        .and_then(|line| line.rsplit(' ').next())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_default()
+}
+
+#[test]
+fn an_early_retry_then_payment_is_never_billed_twice() {
+    // WOR-2230, and the sequence this suite never ran: retry, then pay, then
+    // retry. `challenge_settle_allow_and_replay_refusal` pays before its
+    // first retry, so its intent is never stranded, and
+    // `an_unpaid_retry_never_reaches_the_origin` stops at the 503. Between
+    // them they left the whole reconciliation path uncovered, which is how a
+    // double charge survived in it.
+    let stack = start_stack().expect("start settlement stack");
+
+    let challenge = stack
+        .harness
+        .get_with_headers("/article", "blog.localhost", &[CRAWLER_UA])
+        .expect("challenge request");
+    assert_eq!(challenge.status, 402, "unpaid crawl is challenged");
+    let token = challenge
+        .headers
+        .get("crawler-payment")
+        .expect("the 402 carries the quote token")
+        .clone();
+
+    // 1. Retry a little early, before paying. Ordinary crawler behaviour.
+    //    The rail verifies the invoice, finds it unpaid, and the intent
+    //    strands in `NeedsReconciliation` with a dispatch outstanding.
+    let early = stack
+        .harness
+        .get_with_headers(
+            "/article",
+            "blog.localhost",
+            &[CRAWLER_UA, ("crawler-payment", token.as_str())],
+        )
+        .expect("early retry");
+    assert_eq!(early.status, 503, "an unpaid retry strands the intent");
+    assert_eq!(stack.origin.hits(), 0);
+
+    // 2. The crawler pays. The money is really gone.
+    stack.node.pay_invoice();
+
+    // 3. Retry until the strand resolves. The request path never retries a
+    //    stranded intent, so what unblocks this is the recovery worker
+    //    proving the invoice paid, not a second settle from here.
+    let mut last = 0_u16;
+    for _ in 0..80 {
+        let retry = stack
+            .harness
+            .get_with_headers(
+                "/article",
+                "blog.localhost",
+                &[CRAWLER_UA, ("crawler-payment", token.as_str())],
+            )
+            .expect("retry after paying");
+        last = retry.status;
+        if last != 503 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    assert_eq!(
+        last, 200,
+        "a payment the worker proved settled has to serve the content it bought",
+    );
+    assert_eq!(stack.origin.hits(), 1, "the origin served exactly once");
+
+    // 4. One payment, one invoice. This is the assertion the bug was about:
+    //    a second prepared challenge here is a second bill for an article
+    //    the crawler already paid for.
+    let metrics = stack
+        .harness
+        .get("/metrics", "blog.localhost")
+        .expect("GET /metrics")
+        .text()
+        .expect("metrics body is UTF-8");
+    assert!(
+        (settlement_total(&metrics, "challenge", "prepared") - 1.0).abs() < f64::EPSILON,
+        "exactly one challenge may ever be prepared for one paid article:\n{metrics}"
+    );
+}
+
 #[test]
 fn a_configured_rail_seeds_its_settlement_series() {
     // Boot, scrape, no traffic. An operator who cannot find the family at

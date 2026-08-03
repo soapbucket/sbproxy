@@ -670,7 +670,11 @@ pub enum PaymentsConfigError {
     },
     /// A credential field carried a value inline instead of naming a
     /// secret.
-    #[error("proxy.payments.{field} must name a secret (for example `secret://env/NAME`, `env:NAME`, or `${{NAME}}`) rather than carrying the credential inline")]
+    // The example this message used to lead with was `secret://env/NAME`,
+    // which does not resolve: `env` is read as a backend name, so the
+    // config validated and then failed at boot. Three shipped examples
+    // copied it from here (WOR-2227).
+    #[error("proxy.payments.{field} must name a secret rather than carrying the credential inline: write `env:NAME` or `${{NAME}}` for an environment variable, `file:/path/to/secret` for a file, or `secret://<backend>/<name>` with `<backend>` declared under proxy.secrets.backends. `secret://env/NAME` is not the environment form; the authority there is a backend name, so it asks for a backend literally called `env`")]
     InlineSecret {
         /// Dotted path of the offending field.
         field: String,
@@ -2070,12 +2074,12 @@ mod tests {
     /// The reference `proxy.payments` document.
     const REFERENCE: &str = r#"
 state_path: /var/lib/sbproxy/payments.sqlite3
-challenge_binding_key: secret://env/SBPROXY_PAYMENT_BINDING_KEY
+challenge_binding_key: env:SBPROXY_PAYMENT_BINDING_KEY
 authorization_timeout_ms: 2000
 max_body_bytes: 1048576
 recovery_encryption:
   key_id: payments-2026-07
-  key: secret://env/SBPROXY_PAYMENT_RECOVERY_KEY
+  key: env:SBPROXY_PAYMENT_RECOVERY_KEY
   max_age_hours: 23
 worker:
   reconcile_interval_ms: 1000
@@ -2108,7 +2112,7 @@ rails:
       open_ms: 5000
       half_open_max: 1
   stripe:
-    api_key: secret://env/STRIPE_SECRET_KEY
+    api_key: env:STRIPE_SECRET_KEY
     api_version: 2026-06-24.dahlia
     account_context: platform
     business_network_id: profile_test_example
@@ -2120,7 +2124,7 @@ rails:
       capture_method: manual
   lightning_cln:
     socket_path: /run/lightning/lightning-rpc
-    rune: secret://env/CLN_RUNE
+    rune: env:CLN_RUNE
     minimum_version: "26.06"
     quote_currency: BTC
     settlement_decimals: 11
@@ -2128,7 +2132,7 @@ rails:
   lightning_lnd:
     endpoint: https://lnd.internal:10009
     tls_certificate_path: /run/secrets/lnd/tls.cert
-    macaroon: secret://env/LND_MACAROON_HEX
+    macaroon: env:LND_MACAROON_HEX
     quote_currency: BTC
     settlement_decimals: 11
     invoice_expiry_seconds: 300
