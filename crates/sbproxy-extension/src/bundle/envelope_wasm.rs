@@ -570,6 +570,8 @@ mod tests {
     use crate::bundle::{BundleRegistry, DynamicBundleRegistry, LoadedBundleHook};
     use crate::wasm::{WasmBundleLimits, WasmCallFailure, WasmRuntime};
 
+    static METRIC_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     struct BundleFixture {
         _directory: TempDir,
         registry: Arc<DynamicBundleRegistry>,
@@ -955,6 +957,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn canceled_queued_wasm_is_removed_before_execution() {
+        let _metric_guard = METRIC_TEST_LOCK.lock().await;
         let mut blocker_limits = limits();
         blocker_limits.budget = Duration::from_millis(100);
         blocker_limits.fuel = 1_000_000_000;
@@ -1024,6 +1027,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn canceled_running_wasm_releases_its_worker() {
+        let _metric_guard = METRIC_TEST_LOCK.lock().await;
         let mut runaway_limits = limits();
         runaway_limits.budget = Duration::from_millis(500);
         runaway_limits.fuel = 1_000_000_000;
@@ -1066,6 +1070,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn queued_timeout_records_one_invocation_and_total_duration() {
+        let _metric_guard = METRIC_TEST_LOCK.lock().await;
         let before_timeout = metric_value(
             "sbproxy_script_invocations_total",
             &[("engine", "wasm"), ("result", "queue_timeout")],
@@ -1117,6 +1122,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn admission_timeout_records_one_invocation_and_total_duration() {
+        let _metric_guard = METRIC_TEST_LOCK.lock().await;
         let before_timeout = metric_value(
             "sbproxy_script_invocations_total",
             &[("engine", "wasm"), ("result", "admission_timeout")],
