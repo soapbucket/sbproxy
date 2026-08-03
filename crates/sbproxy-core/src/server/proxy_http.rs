@@ -2411,6 +2411,11 @@ impl ProxyHttp for SbProxy {
             commit_realtime_quota_attempt(ctx).await?;
         }
 
+        // Body-transforming Proxy-Wasm filters own the outbound message
+        // framing. Apply that only to Pingora's upstream copy so an HTTP/1.0
+        // downstream request keeps its original protocol semantics.
+        crate::proxy_wasm_http::filter_upstream_request_headers(upstream_request, ctx)?;
+
         Ok(())
     }
 

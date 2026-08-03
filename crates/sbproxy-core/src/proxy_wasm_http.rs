@@ -45,6 +45,13 @@ pub(crate) struct ProxyWasmHttpState {
     response_body_bypass: bool,
     pending_local_response: Option<ProxyWasmLocalResponse>,
     response_stream_failed: bool,
+    request_header_framing: HeaderBodyFraming,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeaderBodyFraming {
+    Preserve,
+    Stream,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -234,6 +241,7 @@ impl ProxyWasmFilterChain {
             response_body_bypass: false,
             pending_local_response: None,
             response_stream_failed: false,
+            request_header_framing: HeaderBodyFraming::Preserve,
         })
     }
 }
@@ -255,6 +263,32 @@ fn finish_session(type_name: &str, session: &mut ProxyWasmSession) {
 }
 
 impl ProxyWasmHttpState {
+    fn request_header_framing(&self, end_of_stream: bool) -> HeaderBodyFraming {
+        if !end_of_stream
+            && self
+                .filters
+                .iter()
+                .any(|filter| filter.active && filter.request_body_enabled)
+        {
+            HeaderBodyFraming::Stream
+        } else {
+            HeaderBodyFraming::Preserve
+        }
+    }
+
+    fn response_header_framing(&self, end_of_stream: bool) -> HeaderBodyFraming {
+        if !end_of_stream
+            && self
+                .filters
+                .iter()
+                .any(|filter| filter.active && filter.response_body_enabled)
+        {
+            HeaderBodyFraming::Stream
+        } else {
+            HeaderBodyFraming::Preserve
+        }
+    }
+
     pub(crate) fn filter_request_headers(
         &mut self,
         header: &mut RequestHeader,
@@ -324,7 +358,13 @@ impl ProxyWasmHttpState {
                 }
             }
         }
-        apply_request_header_map(header, &headers, &opaque_headers)
+        self.request_header_framing = self.request_header_framing(end_of_stream);
+        apply_request_header_map(
+            header,
+            &headers,
+            &opaque_headers,
+            self.request_header_framing,
+        )
     }
 
     pub(crate) fn filter_response_headers(
@@ -396,7 +436,12 @@ impl ProxyWasmHttpState {
                 }
             }
         }
-        apply_response_header_map(header, &headers, &opaque_headers)
+        apply_response_header_map(
+            header,
+            &headers,
+            &opaque_headers,
+            self.response_header_framing(end_of_stream),
+        )
     }
 
     pub(crate) fn take_pending_local_response(&mut self) -> Option<ProxyWasmLocalResponse> {
@@ -798,7 +843,20 @@ fn apply_request_header_map(
     header: &mut RequestHeader,
     headers: &[(String, String)],
     opaque_headers: &[(HeaderName, HeaderValue)],
+    framing: HeaderBodyFraming,
 ) -> Result<(), ProxyWasmHttpFailure> {
+    let original_content_length = header
+        .headers
+        .get_all(http::header::CONTENT_LENGTH)
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let original_transfer_encoding = header
+        .headers
+        .get_all(http::header::TRANSFER_ENCODING)
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
     let mut method = header.method.clone();
     let mut uri = header.uri.clone();
     let mut authority = header.uri.authority().map(ToString::to_string).or_else(|| {
@@ -856,6 +914,25 @@ fn apply_request_header_map(
             .append_header(name.clone(), value.clone())
             .map_err(|_| ProxyWasmHttpFailure::new("host", "invalid_request_header"))?;
     }
+    match framing {
+        HeaderBodyFraming::Preserve => {
+            for value in original_content_length {
+                header
+                    .append_header(http::header::CONTENT_LENGTH, value)
+                    .map_err(|_| {
+                        ProxyWasmHttpFailure::new("host", "invalid_request_content_length")
+                    })?;
+            }
+            for value in original_transfer_encoding {
+                header
+                    .append_header(http::header::TRANSFER_ENCODING, value)
+                    .map_err(|_| {
+                        ProxyWasmHttpFailure::new("host", "invalid_request_transfer_encoding")
+                    })?;
+            }
+        }
+        HeaderBodyFraming::Stream => {}
+    }
     Ok(())
 }
 
@@ -863,7 +940,20 @@ fn apply_response_header_map(
     header: &mut ResponseHeader,
     headers: &[(String, String)],
     opaque_headers: &[(HeaderName, HeaderValue)],
+    framing: HeaderBodyFraming,
 ) -> Result<(), ProxyWasmHttpFailure> {
+    let original_content_length = header
+        .headers
+        .get_all(http::header::CONTENT_LENGTH)
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let original_transfer_encoding = header
+        .headers
+        .get_all(http::header::TRANSFER_ENCODING)
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
     let mut status = header.status;
     let mut ordinary = Vec::new();
     for (name, value) in headers {
@@ -901,6 +991,22 @@ fn apply_response_header_map(
         header
             .append_header(name.clone(), value.clone())
             .map_err(|_| ProxyWasmHttpFailure::new("host", "invalid_response_header"))?;
+    }
+    if framing == HeaderBodyFraming::Preserve {
+        for value in original_content_length {
+            header
+                .append_header(http::header::CONTENT_LENGTH, value)
+                .map_err(|_| {
+                    ProxyWasmHttpFailure::new("host", "invalid_response_content_length")
+                })?;
+        }
+        for value in original_transfer_encoding {
+            header
+                .append_header(http::header::TRANSFER_ENCODING, value)
+                .map_err(|_| {
+                    ProxyWasmHttpFailure::new("host", "invalid_response_transfer_encoding")
+                })?;
+        }
     }
     Ok(())
 }
@@ -1021,7 +1127,7 @@ pub(crate) async fn start_request(
 }
 
 pub(crate) fn filter_response_headers(
-    session: &pingora_proxy::Session,
+    session: &mut pingora_proxy::Session,
     header: &mut ResponseHeader,
     ctx: &mut crate::context::RequestContext,
 ) -> pingora_error::Result<()> {
@@ -1044,6 +1150,50 @@ pub(crate) fn filter_response_headers(
             pingora_error::ErrorType::HTTPStatus(status),
             "proxy_wasm:local_response",
         ));
+    }
+    if state.response_header_framing(end_of_stream) == HeaderBodyFraming::Stream {
+        match session.req_header().version {
+            http::Version::HTTP_11 => header
+                .insert_header(http::header::TRANSFER_ENCODING, "chunked")
+                .map_err(|_| {
+                    pingora_filter_error(&ProxyWasmHttpFailure::new(
+                        "host",
+                        "invalid_response_transfer_encoding",
+                    ))
+                })?,
+            http::Version::HTTP_10 => session.set_keepalive(None),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn filter_upstream_request_headers(
+    header: &mut RequestHeader,
+    ctx: &crate::context::RequestContext,
+) -> pingora_error::Result<()> {
+    let Some(state) = ctx.proxy_wasm.as_ref() else {
+        return Ok(());
+    };
+    if state.lock().request_header_framing != HeaderBodyFraming::Stream {
+        return Ok(());
+    }
+
+    header.remove_header(&http::header::CONTENT_LENGTH);
+    header.remove_header(&http::header::TRANSFER_ENCODING);
+    if matches!(
+        header.version,
+        http::Version::HTTP_10 | http::Version::HTTP_11
+    ) {
+        header.set_version(http::Version::HTTP_11);
+        header
+            .insert_header(http::header::TRANSFER_ENCODING, "chunked")
+            .map_err(|_| {
+                pingora_filter_error(&ProxyWasmHttpFailure::new(
+                    "host",
+                    "invalid_request_transfer_encoding",
+                ))
+            })?;
     }
     Ok(())
 }
@@ -1579,6 +1729,64 @@ proxy: {}
                 .and_then(|value| value.to_str().ok()),
             Some("filtered")
         );
+    }
+
+    #[test]
+    fn body_neutral_headers_preserve_http1_message_framing() {
+        let mut state = start_state_with_mode(FailureMode::Closed, "none");
+        let mut request = pingora_http::RequestHeader::build("POST", b"/neutral", Some(3))
+            .expect("build neutral request");
+        request.set_version(http::Version::HTTP_11);
+        request
+            .append_header("host", "filter.example")
+            .expect("set host");
+        request
+            .append_header("content-length", "7")
+            .expect("set request length");
+
+        state
+            .filter_request_headers(&mut request, false)
+            .expect("filter neutral request headers");
+
+        assert_eq!(request.headers.get("content-length").unwrap(), "7");
+        assert!(!request.headers.contains_key("transfer-encoding"));
+
+        let mut response =
+            pingora_http::ResponseHeader::build(200, Some(2)).expect("build neutral response");
+        response
+            .append_header("content-length", "6")
+            .expect("set response length");
+        state
+            .filter_response_headers(&mut response, false)
+            .expect("filter neutral response headers");
+
+        assert_eq!(response.headers.get("content-length").unwrap(), "6");
+        assert!(!response.headers.contains_key("transfer-encoding"));
+    }
+
+    #[test]
+    fn body_filter_defers_http1_request_framing_to_the_upstream_copy() {
+        let mut state = start_state_with_mode(FailureMode::Closed, "streamed");
+        let mut request = pingora_http::RequestHeader::build("POST", b"/streamed", Some(3))
+            .expect("build streamed request");
+        request.set_version(http::Version::HTTP_11);
+        request
+            .append_header("host", "filter.example")
+            .expect("set host");
+        request
+            .append_header("content-length", "7")
+            .expect("set request length");
+
+        state
+            .filter_request_headers(&mut request, false)
+            .expect("filter streamed request headers");
+
+        assert!(!request.headers.contains_key("content-length"));
+        assert!(!request.headers.contains_key("transfer-encoding"));
+        assert!(matches!(
+            state.request_header_framing,
+            super::HeaderBodyFraming::Stream
+        ));
     }
 
     #[test]

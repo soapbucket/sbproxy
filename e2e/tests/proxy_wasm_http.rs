@@ -1,8 +1,10 @@
 //! Real-process coverage for Proxy-Wasm HTTP filter attachment.
 
-use std::io::{Read, Write};
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -26,6 +28,10 @@ hooks:
     type: fixture_http_filter
     execution:
       body_mode: streamed
+  - kind: proxy_wasm
+    type: fixture_http_filter_neutral
+    execution:
+      body_mode: none
 "#;
 
 const HEADER_RESPONSE_MANIFEST: &str = r#"apiVersion: sbproxy.dev/v1alpha1
@@ -84,6 +90,57 @@ struct HeaderResponseUpstream {
     port: u16,
     release: Sender<()>,
     join: Option<JoinHandle<std::io::Result<()>>>,
+}
+
+#[derive(Debug, Clone)]
+struct FramedRequest {
+    path: String,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+struct FramingUpstream {
+    port: u16,
+    captured: Arc<Mutex<Vec<FramedRequest>>>,
+    join: Option<JoinHandle<std::io::Result<()>>>,
+}
+
+impl FramingUpstream {
+    fn start() -> std::io::Result<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let worker_capture = Arc::clone(&captured);
+        let join = thread::spawn(move || serve_framed_requests(listener, worker_capture));
+        Ok(Self {
+            port,
+            captured,
+            join: Some(join),
+        })
+    }
+
+    fn base_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    fn captured(&self) -> Vec<FramedRequest> {
+        self.captured.lock().expect("framing capture lock").clone()
+    }
+}
+
+impl Drop for FramingUpstream {
+    fn drop(&mut self) {
+        for _ in 0..4 {
+            if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", self.port)) {
+                let _ = stream.write_all(
+                    b"POST /shutdown HTTP/1.1\r\nHost: framing.localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        }
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
 }
 
 impl HeaderResponseUpstream {
@@ -196,6 +253,129 @@ fn serve_header_responses(listener: TcpListener, released: Receiver<()>) -> std:
     Ok(())
 }
 
+fn serve_framed_requests(
+    listener: TcpListener,
+    captured: Arc<Mutex<Vec<FramedRequest>>>,
+) -> std::io::Result<()> {
+    for _ in 0..5 {
+        let (stream, _) = listener.accept()?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        let mut stream = BufReader::new(stream);
+        let request = read_framed_request(&mut stream)?;
+        captured.lock().expect("framing capture lock").push(request);
+        stream.get_mut().write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 6\r\nConnection: close\r\n\r\norigin",
+        )?;
+        stream.get_mut().flush()?;
+    }
+    Ok(())
+}
+
+fn read_framed_request(stream: &mut BufReader<TcpStream>) -> std::io::Result<FramedRequest> {
+    let request_line = read_http_line(stream)?;
+    let path = request_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("/")
+        .to_string();
+    let headers = read_http_headers(stream)?;
+    let body = read_http_body(stream, &headers)?;
+    Ok(FramedRequest {
+        path,
+        headers,
+        body,
+    })
+}
+
+fn read_http_response(
+    stream: &mut BufReader<TcpStream>,
+) -> std::io::Result<(u16, HashMap<String, String>, Vec<u8>)> {
+    let status_line = read_http_line(stream)?;
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or_else(|| std::io::Error::other(format!("invalid status line: {status_line:?}")))?;
+    let headers = read_http_headers(stream)?;
+    let body = read_http_body(stream, &headers)?;
+    Ok((status, headers, body))
+}
+
+fn read_http_line(stream: &mut BufReader<TcpStream>) -> std::io::Result<String> {
+    let mut line = String::new();
+    let read = stream.read_line(&mut line)?;
+    if read == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "HTTP peer closed before the next line",
+        ));
+    }
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
+fn read_http_headers(
+    stream: &mut BufReader<TcpStream>,
+) -> std::io::Result<HashMap<String, String>> {
+    let mut headers = HashMap::new();
+    loop {
+        let line = read_http_line(stream)?;
+        if line.is_empty() {
+            break;
+        }
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| std::io::Error::other(format!("invalid HTTP header: {line:?}")))?;
+        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+    }
+    Ok(headers)
+}
+
+fn read_http_body(
+    stream: &mut BufReader<TcpStream>,
+    headers: &HashMap<String, String>,
+) -> std::io::Result<Vec<u8>> {
+    if headers
+        .get("transfer-encoding")
+        .is_some_and(|value| value.eq_ignore_ascii_case("chunked"))
+    {
+        return read_chunked_body(stream);
+    }
+    let length = headers
+        .get("content-length")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut body = vec![0_u8; length];
+    stream.read_exact(&mut body)?;
+    Ok(body)
+}
+
+fn read_chunked_body(stream: &mut BufReader<TcpStream>) -> std::io::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    loop {
+        let size_line = read_http_line(stream)?;
+        let size =
+            usize::from_str_radix(size_line.split(';').next().unwrap_or_default().trim(), 16)
+                .map_err(|error| std::io::Error::other(format!("invalid chunk size: {error}")))?;
+        if size == 0 {
+            loop {
+                if read_http_line(stream)?.is_empty() {
+                    break;
+                }
+            }
+            return Ok(body);
+        }
+        let start = body.len();
+        body.resize(start + size, 0);
+        stream.read_exact(&mut body[start..])?;
+        let mut terminator = [0_u8; 2];
+        stream.read_exact(&mut terminator)?;
+        if terminator != *b"\r\n" {
+            return Err(std::io::Error::other("invalid chunk terminator"));
+        }
+    }
+}
+
 fn config(upstream: &MockUpstream, gated: &GatedChunkedUpstream) -> String {
     format!(
         r#"proxy:
@@ -246,6 +426,105 @@ origins:
 "#,
         upstream.base_url(),
     )
+}
+
+fn framing_config(upstream: &FramingUpstream) -> String {
+    format!(
+        r#"proxy:
+  http_bind_port: 0
+extensions:
+  bundles_dir: bundles
+origins:
+  neutral.localhost:
+    action:
+      type: proxy
+      url: "{}"
+    filters:
+      - type: fixture_http_filter_neutral
+        config:
+          enabled: true
+        failure_posture: closed
+  transformed.localhost:
+    action:
+      type: proxy
+      url: "{}"
+    filters:
+      - type: fixture_http_filter
+        config:
+          enabled: true
+        failure_posture: closed
+"#,
+        upstream.base_url(),
+        upstream.base_url(),
+    )
+}
+
+fn assert_reusable_post_exchange(
+    proxy: &ProxyHarness,
+    host: &str,
+    expected_body: &[u8],
+    expected_framing: (&str, &str),
+) {
+    let stream = TcpStream::connect(("127.0.0.1", proxy.port())).expect("connect HTTP/1 client");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("bound HTTP/1 reads");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .expect("bound HTTP/1 writes");
+    let mut stream = BufReader::new(stream);
+
+    for request_index in 0..2 {
+        write!(
+            stream.get_mut(),
+            "POST /request-{request_index} HTTP/1.1\r\nHost: {host}\r\nContent-Length: 7\r\nConnection: keep-alive\r\n\r\npayload"
+        )
+        .expect("write HTTP/1 POST");
+        stream.get_mut().flush().expect("flush HTTP/1 POST");
+
+        let (status, headers, body) =
+            read_http_response(&mut stream).expect("read framed HTTP/1 response");
+        assert_eq!(status, 200);
+        assert_eq!(body, expected_body);
+        assert_eq!(
+            headers.get(expected_framing.0).map(String::as_str),
+            Some(expected_framing.1)
+        );
+        assert_eq!(
+            headers.get("connection").map(String::as_str),
+            Some("keep-alive")
+        );
+    }
+}
+
+fn assert_http10_transformed_exchange(proxy: &ProxyHarness) {
+    let mut stream =
+        TcpStream::connect(("127.0.0.1", proxy.port())).expect("connect HTTP/1.0 client");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("bound HTTP/1.0 reads");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .expect("bound HTTP/1.0 writes");
+    stream
+        .write_all(
+            b"POST /request-http10 HTTP/1.0\r\nHost: transformed.localhost\r\nContent-Length: 7\r\nConnection: keep-alive\r\n\r\npayload",
+        )
+        .expect("write HTTP/1.0 POST");
+    stream.flush().expect("flush HTTP/1.0 POST");
+
+    let mut stream = BufReader::new(stream);
+    let status_line = read_http_line(&mut stream).expect("read HTTP/1.0 status");
+    assert!(status_line.starts_with("HTTP/1.") && status_line.contains(" 200 "));
+    let headers = read_http_headers(&mut stream).expect("read HTTP/1.0 headers");
+    assert!(!headers.contains_key("content-length"));
+    assert!(!headers.contains_key("transfer-encoding"));
+    assert_eq!(headers.get("connection").map(String::as_str), Some("close"));
+    let mut body = Vec::new();
+    stream
+        .read_to_end(&mut body)
+        .expect("read close-delimited HTTP/1.0 body");
+    assert_eq!(body, b"filtered");
 }
 
 #[test]
@@ -400,4 +679,50 @@ fn response_header_local_response_does_not_wait_for_an_origin_body() {
     let (status, body) = stalled.expect("local response must not wait for the stalled origin body");
     assert_eq!(status, 403);
     assert_eq!(body.as_ref(), b"local");
+}
+
+#[test]
+fn proxy_wasm_keeps_http1_bodies_framed_and_connections_reusable() {
+    let upstream = FramingUpstream::start().expect("start framing upstream");
+    let files = [
+        ("bundles/http-filter/bundle.yaml", MANIFEST.as_bytes()),
+        ("bundles/http-filter/filter.wasm", FILTER_WASM),
+    ];
+    let proxy = ProxyHarness::start_with_workspace_bytes(&framing_config(&upstream), &files)
+        .expect("start proxy with framing filters");
+
+    assert_reusable_post_exchange(
+        &proxy,
+        "neutral.localhost",
+        b"origin",
+        ("content-length", "6"),
+    );
+    assert_reusable_post_exchange(
+        &proxy,
+        "transformed.localhost",
+        b"filtered",
+        ("transfer-encoding", "chunked"),
+    );
+    assert_http10_transformed_exchange(&proxy);
+
+    let captured = upstream.captured();
+    assert_eq!(captured.len(), 5, "captured requests: {captured:?}");
+    for request in &captured[..2] {
+        assert!(request.path.starts_with("/request-"));
+        assert_eq!(request.body, b"payload");
+        assert_eq!(
+            request.headers.get("content-length").map(String::as_str),
+            Some("7")
+        );
+        assert!(!request.headers.contains_key("transfer-encoding"));
+    }
+    for request in &captured[2..] {
+        assert!(request.path.starts_with("/request-"));
+        assert_eq!(request.body, b"payload");
+        assert_eq!(
+            request.headers.get("transfer-encoding").map(String::as_str),
+            Some("chunked")
+        );
+        assert!(!request.headers.contains_key("content-length"));
+    }
 }
