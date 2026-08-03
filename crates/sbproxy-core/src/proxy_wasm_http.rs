@@ -577,9 +577,23 @@ fn run_body_filters(
         match result {
             Ok(result) => {
                 if let Some(local_response) = result.local_response {
-                    let local_response =
-                        body_local_response(direction, &filter.type_name, local_response)?;
-                    return Ok((Bytes::new(), local_response));
+                    match direction {
+                        BodyDirection::Request => {
+                            return Ok((Bytes::new(), Some(local_response)));
+                        }
+                        BodyDirection::Response => {
+                            let deactivate = handle_filter_failure(
+                                &filter.type_name,
+                                filter.failure_posture,
+                                "late_local_response",
+                            )?;
+                            body = before;
+                            if deactivate {
+                                deactivate_filter(filter);
+                            }
+                            continue;
+                        }
+                    }
                 }
                 match result.action {
                     ProxyWasmAction::Continue => body = result.body,
@@ -621,20 +635,6 @@ fn run_body_filters(
         }
     }
     Ok((body, None))
-}
-
-fn body_local_response(
-    direction: BodyDirection,
-    filter_type: &str,
-    local_response: ProxyWasmLocalResponse,
-) -> Result<Option<ProxyWasmLocalResponse>, ProxyWasmHttpFailure> {
-    match direction {
-        BodyDirection::Request => Ok(Some(local_response)),
-        BodyDirection::Response => Err(ProxyWasmHttpFailure::new(
-            filter_type,
-            "late_local_response",
-        )),
-    }
 }
 
 fn handle_buffer_limits(
@@ -1208,11 +1208,17 @@ mod tests {
         include_bytes!("../../sbproxy-extension/src/bundle/testdata/proxy_wasm/http.wasm");
     const DEFERRED_DONE_WASM: &[u8] =
         include_bytes!("../../sbproxy-extension/src/bundle/testdata/proxy_wasm/deferred-done.wasm");
+    const LATE_RESPONSE_WASM: &[u8] =
+        include_bytes!("../../sbproxy-extension/src/bundle/testdata/proxy_wasm/late-response.wasm");
 
     fn write_bundle(root: &Path, hooks: &[(&str, &str)]) {
+        write_bundle_with_wasm(root, hooks, FILTER_WASM);
+    }
+
+    fn write_bundle_with_wasm(root: &Path, hooks: &[(&str, &str)], wasm: &[u8]) {
         let bundle = root.join("bundles/http-filter");
         std::fs::create_dir_all(&bundle).expect("create Proxy-Wasm bundle directory");
-        std::fs::write(bundle.join("filter.wasm"), FILTER_WASM).expect("write Proxy-Wasm fixture");
+        std::fs::write(bundle.join("filter.wasm"), wasm).expect("write Proxy-Wasm fixture");
         let hooks = hooks
             .iter()
             .map(|(type_name, body_mode)| {
@@ -1820,19 +1826,62 @@ proxy: {}
     }
 
     #[test]
-    fn response_body_rejects_a_local_response_after_headers_are_committed() {
-        let local = sbproxy_extension::bundle::ProxyWasmLocalResponse {
-            status: 403,
-            grpc_status: None,
-            headers: vec![("content-type".to_string(), "text/plain".to_string())],
-            body: bytes::Bytes::from_static(b"blocked"),
-        };
+    fn closed_response_body_filter_rejects_a_late_local_response() {
+        let directory = TempDir::new().expect("temporary bundle directory");
+        write_bundle_with_wasm(
+            directory.path(),
+            &[("late_filter", "streamed")],
+            LATE_RESPONSE_WASM,
+        );
+        let pipeline =
+            CompiledPipeline::from_config_at(compile_config(&["late_filter"]), directory.path())
+                .expect("compile closed late-response filter");
+        let mut state = pipeline.proxy_wasm_filters[0]
+            .as_ref()
+            .expect("compiled Proxy-Wasm chain")
+            .start()
+            .expect("start Proxy-Wasm chain");
+        let mut body = Some(bytes::Bytes::from_static(b"origin"));
 
-        let failure =
-            super::body_local_response(super::BodyDirection::Response, "fixture_filter", local)
-                .expect_err("a late local response must close the committed response stream");
+        let failure = state
+            .filter_response_body(&mut body, true)
+            .expect_err("closed posture must close after a late local response");
 
         assert_eq!(failure.code(), "late_local_response");
+    }
+
+    #[test]
+    fn open_response_body_filter_restores_the_chunk_and_deactivates() {
+        let directory = TempDir::new().expect("temporary bundle directory");
+        write_bundle_with_wasm(
+            directory.path(),
+            &[("late_filter", "streamed")],
+            LATE_RESPONSE_WASM,
+        );
+        let mut config = compile_config(&["late_filter"]);
+        config.origins[0].filters[0].failure_posture = Some(FailureMode::Open);
+        let pipeline = CompiledPipeline::from_config_at(config, directory.path())
+            .expect("compile open late-response filter");
+        let mut state = pipeline.proxy_wasm_filters[0]
+            .as_ref()
+            .expect("compiled Proxy-Wasm chain")
+            .start()
+            .expect("start Proxy-Wasm chain");
+        let mut body = Some(bytes::Bytes::from_static(b"origin"));
+
+        state
+            .filter_response_body(&mut body, false)
+            .expect("open posture must admit the committed response");
+
+        assert_eq!(body.as_deref(), Some(&b"origin"[..]));
+        assert!(!state.filters[0].active);
+        assert!(state.filters[0].finalized);
+
+        let mut later = Some(bytes::Bytes::from_static(b" later"));
+        state
+            .filter_response_body(&mut later, true)
+            .expect("deactivated filter must stay out of later response chunks");
+        assert_eq!(later.as_deref(), Some(&b" later"[..]));
     }
 
     #[test]
