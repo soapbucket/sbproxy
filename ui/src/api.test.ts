@@ -6,6 +6,7 @@ import {
   setCsrfToken,
   type ClusterDeploymentBundleDraft,
   type DeploymentReplacementRequest,
+  type ExtensionInventorySnapshot,
   type ModelDeployment,
   type ModelDeploymentRequest,
 } from "./api";
@@ -237,6 +238,103 @@ describe("request observability contracts", () => {
 
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/requests",
+      expect.objectContaining({ method: "GET" }),
+    );
+  });
+});
+
+describe("extension inventory contract", () => {
+  it("loads the authoritative running snapshot from the authenticated API", async () => {
+    const snapshot: ExtensionInventorySnapshot = {
+      schema_version: 1,
+      scope: {
+        mode: "running",
+        proxy_version: "0.9.0",
+        config_revision: "sha256:config-revision",
+      },
+      summary: {
+        bundles: 2,
+        hooks: 2,
+        active: 1,
+        available: 1,
+        failed: 1,
+        collisions: 0,
+      },
+      bundles: [
+        {
+          id: "request-policy",
+          name: "Request policy",
+          version: "1.2.0",
+          package: "entry.js",
+          source: "git",
+          runtime: "javascript",
+          state: "active",
+          hook_ids: ["request-policy:policy:request_policy"],
+          load: { phase: "candidate_load", status: "ok", detail: null },
+        },
+        {
+          id: "broken-policy",
+          name: "Broken policy",
+          version: "0.1.0",
+          package: null,
+          source: "directory",
+          runtime: "javascript",
+          state: "failed",
+          hook_ids: [],
+          load: {
+            phase: "manifest",
+            status: "failed",
+            detail: "hook kind is unsupported",
+          },
+        },
+      ],
+      hooks: [
+        {
+          id: "request-policy:policy:request_policy",
+          bundle_id: "request-policy",
+          kind: "policy",
+          registration: "git",
+          dispatch: "chain",
+          match_key: "request_policy",
+          position: 0,
+          state: "active",
+          detail: null,
+          runtime: "javascript",
+          execution: {
+            phase: "request",
+            body_mode: "none",
+            timeout_ms: 25,
+            max_buffer_bytes: null,
+          },
+          capabilities: ["request.headers.read"],
+        },
+        {
+          id: "request-policy:policy:fallback_policy",
+          bundle_id: "request-policy",
+          kind: "policy",
+          registration: "git",
+          dispatch: "chain",
+          match_key: "fallback_policy",
+          position: null,
+          state: "available",
+          detail: "loaded but not attached",
+          runtime: "javascript",
+          execution: {
+            phase: "request",
+            body_mode: "none",
+            timeout_ms: 25,
+            max_buffer_bytes: null,
+          },
+          capabilities: [],
+        },
+      ],
+      collisions: [],
+    };
+    const fetchMock = stubFetch(JSON.stringify(snapshot));
+
+    await expect(api.extensions()).resolves.toEqual(snapshot);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/extensions",
       expect.objectContaining({ method: "GET" }),
     );
   });

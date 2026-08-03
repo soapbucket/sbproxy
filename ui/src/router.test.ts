@@ -80,6 +80,15 @@ describe("alert route", () => {
   });
 });
 
+describe("extension route", () => {
+  it("resolves the running extension inventory page", () => {
+    const route = router.resolve("/extensions");
+
+    expect(route.name).toBe("extensions");
+    expect(route.meta.title).toBe("Extensions");
+  });
+});
+
 describe("auth guard", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
