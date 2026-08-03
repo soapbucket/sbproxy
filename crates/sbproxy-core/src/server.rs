@@ -390,10 +390,8 @@ mod transform_failure_routing_tests {
     use super::transform_error_is_unconditional_500;
     use sbproxy_config::{BundleBodyMode, FailureMode};
     use sbproxy_modules::transform::TransformError;
-    use sbproxy_modules::{
-        CompiledTransform, DynamicHookMetadata, PluginTransform, Transform, TransformContext,
-    };
-    use sbproxy_plugin::TransformHandler;
+    use sbproxy_modules::{CompiledTransform, DynamicHookMetadata, PluginTransform, Transform};
+    use sbproxy_plugin::{TransformContext, TransformHandler};
 
     struct StubTransform;
 
