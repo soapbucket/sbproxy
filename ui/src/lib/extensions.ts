@@ -25,15 +25,16 @@ export function sourceLabel(source: ExtensionRegistrationSource): string {
   }
 }
 
-export function verificationLabel(load: ExtensionLoadRecord): string {
+export function loadLabel(load: ExtensionLoadRecord): string {
   switch (load.status) {
     case "ok":
-      return "passed";
+      return "loaded";
     case "failed":
-    case "degraded":
       return "failed";
+    case "degraded":
+      return "degraded";
     case "installed":
-      return "built in";
+      return "linked";
     case "unattributed":
       return "not reported";
     default:

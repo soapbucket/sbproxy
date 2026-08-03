@@ -14,9 +14,9 @@ import StatusBadge from "../components/StatusBadge.vue";
 import { useAsync } from "../composables/useAsync";
 import {
   hooksForBundle,
+  loadLabel,
   sourceLabel,
   stateTone,
-  verificationLabel,
 } from "../lib/extensions";
 
 const inventory = useAsync(() => api.extensions(), {
@@ -48,7 +48,7 @@ function shortRevision(revision: string | null): string {
   return revision.length > 28 ? `${revision.slice(0, 25)}...` : revision;
 }
 
-function verificationTone(load: ExtensionLoadRecord) {
+function loadTone(load: ExtensionLoadRecord) {
   return load.status === "ok"
     ? "ok"
     : load.status === "failed" || load.status === "degraded"
@@ -253,11 +253,11 @@ function bundleHooks(bundle: ExtensionBundleRecord): ExtensionHookRecord[] {
             <dd>{{ label(bundle.runtime) }}</dd>
           </div>
           <div>
-            <dt>Verification</dt>
+            <dt>Load</dt>
             <dd>
               <StatusBadge
-                :label="verificationLabel(bundle.load)"
-                :tone="verificationTone(bundle.load)"
+                :label="loadLabel(bundle.load)"
+                :tone="loadTone(bundle.load)"
               />
               <small>{{ label(bundle.load.phase) }}</small>
             </dd>

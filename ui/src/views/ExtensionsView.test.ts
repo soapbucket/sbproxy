@@ -6,9 +6,9 @@ import type {
 } from "../api";
 import {
   hooksForBundle,
+  loadLabel,
   sourceLabel,
   stateTone,
-  verificationLabel,
 } from "../lib/extensions";
 import extensionsView from "./ExtensionsView.vue?raw";
 
@@ -91,13 +91,13 @@ describe("extension inventory presentation", () => {
     ]);
   });
 
-  it("describes safe provenance and loader verification without inventing a digest", () => {
+  it("describes safe provenance and load evidence without inventing a digest", () => {
     expect(sourceLabel("link_time")).toBe("linked into binary");
     expect(sourceLabel("directory")).toBe("bundle directory");
     expect(sourceLabel("git")).toBe("pinned Git");
-    expect(verificationLabel(bundle.load)).toBe("passed");
+    expect(loadLabel(bundle.load)).toBe("loaded");
     expect(
-      verificationLabel({
+      loadLabel({
         phase: "manifest",
         status: "failed",
         detail: "hook kind is unsupported",
@@ -120,6 +120,8 @@ describe("extension inventory presentation", () => {
     expect(extensionsView).toContain("bundle.load.detail");
     expect(extensionsView).toContain("hook.execution.timeout_ms");
     expect(extensionsView).toContain("hook.capabilities");
+    expect(extensionsView).toContain("<dt>Load</dt>");
+    expect(extensionsView).not.toContain("Verification");
     expect(extensionsView).not.toContain("JSON.stringify(snapshot");
   });
 });
