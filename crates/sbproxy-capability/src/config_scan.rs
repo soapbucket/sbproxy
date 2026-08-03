@@ -294,7 +294,7 @@ fn collect_module_keys(
     // the decision.
     for flattened_field in index.flattened_fields.get(owner).into_iter().flatten() {
         let Some(reference) = index
-            .fields
+            .declared_fields
             .get(owner)
             .and_then(|fields| fields.get(flattened_field))
             .and_then(Option::as_ref)
@@ -342,7 +342,7 @@ fn collect_module_keys(
         // field behind it. It is a leaf, and it needs a reviewed override
         // naming the compiler that reads the discriminator.
         let Some(declared) = index
-            .fields
+            .declared_fields
             .get(owner)
             .and_then(|fields| fields.get(rust_field))
             .and_then(Option::as_ref)
@@ -661,7 +661,8 @@ fn dispatch_module_names(
     visitor.names.ok_or_else(|| {
         format!(
             "dispatch function `{}` has no match over string literals. The module coverage \
-             check cannot read the accepted `type:` names from it",
+             check cannot read the accepted `type:` names from it. If the function now \
+             delegates, point this entry at the one holding the match",
             dispatch.function
         )
     })
@@ -1222,6 +1223,16 @@ impl NamespaceResolution {
 #[derive(Default)]
 struct RustTypeIndex {
     fields: BTreeMap<String, BTreeMap<String, Option<TypeReference>>>,
+    /// Field types as declared, with their container wrappers intact.
+    ///
+    /// `fields` holds the *innermost* nominal type, which is what the
+    /// reader check wants: a read of `targets` proves a read whether the
+    /// field is a `Target` or a `Vec<Target>`. The module walk needs the
+    /// opposite, because the container is exactly what decides the path
+    /// an operator writes: a `Vec` adds `[]` and a map adds `.*`. Reading
+    /// the peeled type for that purpose silently produced
+    /// `targets.zone` for a list of targets.
+    declared_fields: BTreeMap<String, BTreeMap<String, Option<TypeReference>>>,
     schema_fields: BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
     /// Rust field names carrying `#[serde(flatten)]`, by owning type.
     ///
@@ -1467,6 +1478,13 @@ impl RustTypeIndex {
                         .or_default()
                         .insert(field_name.clone());
                 }
+                self.declared_fields
+                    .entry(owner.to_string())
+                    .or_default()
+                    .insert(
+                        field_name.clone(),
+                        nominal_type_reference(&field.ty, context),
+                    );
                 self.fields
                     .entry(owner.to_string())
                     .or_default()
@@ -6380,11 +6398,49 @@ fn has_unambiguous_field_read(
     typed_reads.contains(&(owner, rust_field.to_string()))
 }
 
+/// Whether a named consumer resolves to a real production symbol.
+///
+/// Two shapes resolve, because real readers come in both. A free
+/// function is `crate::module::function`. A method is
+/// `crate::module::Type::method`, and the last-but-one segment is then a
+/// type rather than another module. The free-function reading is tried
+/// first and the method reading only if the module file it implies does
+/// not exist, so a module and a type sharing a name cannot make one
+/// shape silently satisfy the other.
+///
+/// Rejecting methods outright is what this used to do, and it left no
+/// way to name a reader like `AiHandlerConfig::router`: the only
+/// options were to invent a free function that existed to be cited, or
+/// to misclassify a wired key as `config_only`. Both are worse than
+/// teaching the guard the second shape.
 fn production_consumer_exists(consumer: &str, sources: &[&SourceFile]) -> bool {
     let segments: Vec<&str> = consumer.split("::").collect();
     let [crate_name, modules @ .., symbol] = segments.as_slice() else {
         return false;
     };
+    if consumer_symbol_exists(crate_name, modules, symbol, None, sources) {
+        return true;
+    }
+    // `modules` ends with a type name for the method shape, so the file
+    // is one segment shorter than the free-function reading assumed.
+    let [outer @ .., type_name] = modules else {
+        return false;
+    };
+    consumer_symbol_exists(crate_name, outer, symbol, Some(type_name), sources)
+}
+
+/// Resolve one reading of a consumer path against the scanned sources.
+///
+/// `impl_type` selects the shape: `None` looks for a free function in
+/// the module file, `Some(type)` for a method in an `impl type` block
+/// inside it.
+fn consumer_symbol_exists(
+    crate_name: &str,
+    modules: &[&str],
+    symbol: &str,
+    impl_type: Option<&str>,
+    sources: &[&SourceFile],
+) -> bool {
     let crate_dir = crate_name.replace('_', "-");
     let module_path = modules.join("/");
     let expected_files: Vec<String> = if module_path.is_empty() {
@@ -6404,7 +6460,10 @@ fn production_consumer_exists(consumer: &str, sources: &[&SourceFile]) -> bool {
         expected_files
             .iter()
             .any(|expected| normalized.ends_with(expected))
-            && source_declares_function(source, symbol)
+            && match impl_type {
+                None => source_declares_function(source, symbol),
+                Some(type_name) => source_declares_method(source, type_name, symbol),
+            }
     })
 }
 
@@ -6419,6 +6478,44 @@ fn source_declares_function(source: &SourceFile, symbol: &str) -> bool {
                 if function.sig.ident == symbol
                     && !attributes_exclude_production(&function.attrs)
         )
+    })
+}
+
+/// Whether `impl type_name` in this file declares `symbol` as a method.
+///
+/// Trait impls are skipped. A trait method's name is the trait's rather
+/// than this type's, so accepting them would let a path like
+/// `Type::fmt` stand as evidence that a config key is read.
+fn source_declares_method(source: &SourceFile, type_name: &str, symbol: &str) -> bool {
+    let Ok(file) = &source.ast else {
+        return false;
+    };
+    file.items.iter().any(|item| {
+        let syn::Item::Impl(block) = item else {
+            return false;
+        };
+        if block.trait_.is_some() || attributes_exclude_production(&block.attrs) {
+            return false;
+        }
+        let syn::Type::Path(path) = block.self_ty.as_ref() else {
+            return false;
+        };
+        if path
+            .path
+            .segments
+            .last()
+            .is_none_or(|last| last.ident != type_name)
+        {
+            return false;
+        }
+        block.items.iter().any(|item| {
+            matches!(
+                item,
+                syn::ImplItem::Fn(method)
+                    if method.sig.ident == symbol
+                        && !attributes_exclude_production(&method.attrs)
+            )
+        })
     })
 }
 
@@ -9758,6 +9855,48 @@ fn cfg_test(config: &Config) {
                 "nested or test-only namesake must not prove an exact consumer: {errors:?}"
             );
         }
+    }
+
+    #[test]
+    fn stable_consumer_resolves_an_inherent_method_but_not_a_trait_method() {
+        let keys = [key("proxy.router.mode", "mode")];
+        let stable_entry = |consumer| ConfigKeyCapability {
+            path: "proxy.router.mode",
+            support: SupportLevel::Stable,
+            consumer: Some(consumer),
+            note: None,
+        };
+        let sources = [source_at(
+            "crates/example/src/handler.rs",
+            "pub struct HandlerConfig;\n\
+             impl HandlerConfig { pub fn router(&self) {} }\n\
+             impl std::fmt::Debug for HandlerConfig {\n\
+                 fn fmt(&self, _: &mut std::fmt::Formatter) -> std::fmt::Result { Ok(()) }\n\
+             }",
+        )];
+
+        assert_eq!(
+            verify_config_readers(
+                &keys,
+                &[stable_entry("example::handler::HandlerConfig::router")],
+                &sources
+            ),
+            vec![],
+            "an inherent method is a real reader and must satisfy stable evidence"
+        );
+
+        // A trait method's name belongs to the trait, so citing one would let
+        // any type with a `Debug` impl stand as evidence for any key.
+        assert!(
+            verify_config_readers(
+                &keys,
+                &[stable_entry("example::handler::HandlerConfig::fmt")],
+                &sources
+            )
+            .iter()
+            .any(|error| error.subject == "proxy.router.mode"),
+            "a trait method must not prove a config key is read"
+        );
     }
 
     #[test]

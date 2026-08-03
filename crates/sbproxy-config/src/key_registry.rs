@@ -853,8 +853,9 @@ const MODULE_CONFIG_ROOTS: &[ModuleConfigRoot] = &[
         path: "origins.*.action",
         rust_type: "sbproxy_modules::action::loadbalancer::LoadBalancerConfig",
         enforcement: ModuleRootEnforcement::ReportOnly(
-            "sticky sessions and target zones are dead here and are pinned above; the rest of \
-             the load_balancer surface has not been triaged. WOR-2246.",
+            "target zones are dead here and are pinned above, and the load balancer warns for \
+             sticky itself; the rest of the load_balancer surface has not been triaged. \
+             WOR-2246.",
         ),
     },
     // Rooted at the subtree rather than at `AiHandlerConfig`, deliberately.
@@ -866,7 +867,7 @@ const MODULE_CONFIG_ROOTS: &[ModuleConfigRoot] = &[
         path: "origins.*.action.resilience",
         rust_type: "sbproxy_ai::handler::AiResilienceConfig",
         enforcement: ModuleRootEnforcement::ReportOnly(
-            "the circuit-breaker and outlier-detection blocks are dead here and are pinned \
+            "the circuit-breaker and outlier-detection blocks are wired and are pinned stable \
              above; retry_policy and llm_aware have not been triaged. WOR-2233.",
         ),
     },
@@ -886,15 +887,18 @@ const MODULE_DISPATCHES: &[ModuleDispatch] = &[
         source: "crates/sbproxy-modules/src/compile.rs",
         function: "compile_auth",
     },
+    // Both name the private `_with_optional_registry` function rather
+    // than the `pub` wrapper. Bundle support turned the wrapper into a
+    // one-line delegation, so the `type:` table lives one level down.
     ModuleDispatch {
         kind: "policy",
         source: "crates/sbproxy-modules/src/compile.rs",
-        function: "compile_policy",
+        function: "compile_policy_with_optional_registry",
     },
     ModuleDispatch {
         kind: "transform",
         source: "crates/sbproxy-modules/src/compile.rs",
-        function: "compile_transform",
+        function: "compile_transform_with_optional_registry",
     },
 ];
 
