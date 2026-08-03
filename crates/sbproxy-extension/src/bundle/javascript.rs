@@ -69,6 +69,7 @@ pub(super) struct JavascriptProgram {
     type_name: Arc<str>,
     config: Arc<Value>,
     limits: RuntimeLimits,
+    executor: Arc<JavascriptExecutor>,
 }
 
 impl std::fmt::Debug for JavascriptProgram {
@@ -199,7 +200,8 @@ fn default_executor() -> JavascriptExecutor {
     JavascriptExecutor::start(worker_count, worker_count * QUEUE_SLOTS_PER_WORKER)
 }
 
-static JAVASCRIPT_EXECUTOR: LazyLock<JavascriptExecutor> = LazyLock::new(default_executor);
+static JAVASCRIPT_EXECUTOR: LazyLock<Arc<JavascriptExecutor>> =
+    LazyLock::new(|| Arc::new(default_executor()));
 
 fn javascript_worker(receiver: Arc<Mutex<mpsc::Receiver<JavascriptJob>>>) {
     let mut runtime = None;
@@ -562,6 +564,7 @@ pub(super) fn prepare_program(
             type_name: Arc::from(type_name),
             config: Arc::new(config),
             limits,
+            executor: Arc::clone(&JAVASCRIPT_EXECUTOR),
         },
     ))
 }
@@ -580,7 +583,8 @@ async fn invoke_program(
 ) -> Result<Vec<u8>, PluginError> {
     let input = serialize_envelope(&envelope, program.limits.max_input_bytes)
         .map_err(RuntimeFailure::into_plugin_error)?;
-    JAVASCRIPT_EXECUTOR
+    program
+        .executor
         .execute(program.clone(), input)
         .await
         .map_err(RuntimeFailure::into_plugin_error)
@@ -1678,10 +1682,12 @@ mod tests {
             "sandbox:\n  budget_ms: 200\n",
             "",
         );
-        let adapter = Arc::new(
-            build_javascript_policy(fixture.hook(), Value::Object(Default::default())).unwrap(),
-        );
-        let admission_capacity = super::JAVASCRIPT_EXECUTOR.available_admission();
+        let executor = Arc::new(JavascriptExecutor::start(2, 4));
+        let mut adapter =
+            build_javascript_policy(fixture.hook(), Value::Object(Default::default())).unwrap();
+        adapter.program.executor = Arc::clone(&executor);
+        let adapter = Arc::new(adapter);
+        let admission_capacity = executor.available_admission();
         let ticker = tokio::spawn(async {
             tokio::time::sleep(Duration::from_millis(10)).await;
             Instant::now()
@@ -1712,7 +1718,7 @@ mod tests {
             "saturated calls should consume their budget while waiting"
         );
         wait_until("saturated JavaScript cleanup", || {
-            super::JAVASCRIPT_EXECUTOR.available_admission() == admission_capacity
+            executor.available_admission() == admission_capacity
         })
         .await;
     }
