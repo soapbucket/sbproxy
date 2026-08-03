@@ -1,7 +1,8 @@
 use std::io;
 use std::pin::Pin;
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use base64::Engine as _;
@@ -16,7 +17,7 @@ use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 
 use super::envelope::{self, EnvelopeError};
 use super::{BundleLoadError, LoadedBundleHook};
-use crate::wasm::{WasmCallFailure, WasmRuntime};
+use crate::wasm::{WasmCallFailure, WasmExecutionControl, WasmRuntime};
 
 const MAX_WASM_WORKERS: usize = 4;
 const QUEUE_SLOTS_PER_WORKER: usize = 2;
@@ -33,6 +34,8 @@ pub(crate) struct EnvelopeWasmProgram {
     budget: std::time::Duration,
     #[cfg(test)]
     execution_started: Arc<AtomicBool>,
+    #[cfg(test)]
+    execution_finished: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for EnvelopeWasmProgram {
@@ -87,6 +90,7 @@ impl EnvelopeWasmProgram {
             max_output_bytes: 1024 * 1024,
             budget,
             execution_started: Arc::new(AtomicBool::new(false)),
+            execution_finished: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -95,9 +99,19 @@ impl EnvelopeWasmProgram {
         self.execution_started.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
+    fn execution_finished(&self) -> bool {
+        self.execution_finished.load(Ordering::Relaxed)
+    }
+
     fn mark_execution_started(&self) {
         #[cfg(test)]
         self.execution_started.store(true, Ordering::Relaxed);
+    }
+
+    fn mark_execution_finished(&self) {
+        #[cfg(test)]
+        self.execution_finished.store(true, Ordering::Relaxed);
     }
 }
 
@@ -105,8 +119,84 @@ struct WasmJob {
     program: EnvelopeWasmProgram,
     input: Vec<u8>,
     reply: oneshot::Sender<Result<Vec<u8>, WasmCallFailure>>,
-    deadline: std::time::Instant,
-    _permit: OwnedSemaphorePermit,
+    invocation: Arc<WasmInvocation>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum WasmInvocationStage {
+    Admission = 0,
+    Queue = 1,
+    Running = 2,
+}
+
+struct WasmInvocation {
+    execution: Arc<WasmExecutionControl>,
+    stage: AtomicU8,
+}
+
+impl WasmInvocation {
+    fn new(deadline: std::time::Instant) -> Self {
+        Self {
+            execution: Arc::new(WasmExecutionControl::new(deadline)),
+            stage: AtomicU8::new(WasmInvocationStage::Admission as u8),
+        }
+    }
+
+    fn set_stage(&self, stage: WasmInvocationStage) {
+        self.stage.store(stage as u8, Ordering::Release);
+    }
+
+    fn stage(&self) -> WasmInvocationStage {
+        match self.stage.load(Ordering::Acquire) {
+            value if value == WasmInvocationStage::Queue as u8 => WasmInvocationStage::Queue,
+            value if value == WasmInvocationStage::Running as u8 => WasmInvocationStage::Running,
+            _ => WasmInvocationStage::Admission,
+        }
+    }
+}
+
+struct WasmInvocationGuard {
+    invocation: Arc<WasmInvocation>,
+    started: std::time::Instant,
+    admission_permit: Option<OwnedSemaphorePermit>,
+    recorded: bool,
+}
+
+impl WasmInvocationGuard {
+    fn new(invocation: Arc<WasmInvocation>, started: std::time::Instant) -> Self {
+        Self {
+            invocation,
+            started,
+            admission_permit: None,
+            recorded: false,
+        }
+    }
+
+    fn admit(&mut self, permit: OwnedSemaphorePermit) {
+        self.admission_permit = Some(permit);
+    }
+
+    fn finish(&mut self, outcome: &'static str) {
+        if self.recorded {
+            return;
+        }
+        self.recorded = true;
+        sbproxy_observe::metrics::record_script_duration(
+            "wasm",
+            self.started.elapsed().as_secs_f64(),
+        );
+        sbproxy_observe::metrics::record_script_invocation("wasm", outcome);
+    }
+}
+
+impl Drop for WasmInvocationGuard {
+    fn drop(&mut self) {
+        if !self.recorded {
+            self.invocation.execution.cancel();
+            self.finish("cancelled");
+        }
+    }
 }
 
 struct WasmExecutor {
@@ -151,27 +241,36 @@ impl WasmExecutor {
         input: Vec<u8>,
     ) -> Result<Vec<u8>, WasmCallFailure> {
         let budget = program.budget;
-        let deadline = std::time::Instant::now() + budget;
-        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
-            let permit = Arc::clone(&self.admission)
-                .acquire_owned()
-                .await
-                .map_err(|_| WasmCallFailure::HostFailure)?;
-            let (reply, response) = oneshot::channel();
-            self.sender
-                .send(WasmJob {
-                    program,
-                    input,
-                    reply,
-                    deadline,
-                    _permit: permit,
-                })
-                .await
-                .map_err(|_| WasmCallFailure::HostFailure)?;
-            response.await.map_err(|_| WasmCallFailure::HostFailure)?
-        })
-        .await
-        .unwrap_or(Err(WasmCallFailure::Timeout))
+        let started = std::time::Instant::now();
+        let deadline = started
+            .checked_add(budget)
+            .ok_or(WasmCallFailure::HostFailure)?;
+        let invocation = Arc::new(WasmInvocation::new(deadline));
+        let mut guard = WasmInvocationGuard::new(Arc::clone(&invocation), started);
+        let timed_result =
+            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+                let permit = Arc::clone(&self.admission)
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| WasmCallFailure::HostFailure)?;
+                guard.admit(permit);
+                invocation.set_stage(WasmInvocationStage::Queue);
+                let (reply, response) = oneshot::channel();
+                self.sender
+                    .send(WasmJob {
+                        program,
+                        input,
+                        reply,
+                        invocation: Arc::clone(&invocation),
+                    })
+                    .await
+                    .map_err(|_| WasmCallFailure::HostFailure)?;
+                response.await.map_err(|_| WasmCallFailure::HostFailure)?
+            })
+            .await;
+        let result = timed_result.unwrap_or(Err(WasmCallFailure::Timeout));
+        guard.finish(wasm_invocation_outcome(&result, invocation.stage()));
+        result
     }
 
     #[cfg(test)]
@@ -201,20 +300,45 @@ fn wasm_worker(receiver: Arc<Mutex<mpsc::Receiver<WasmJob>>>) {
         let Some(job) = job else {
             return;
         };
-        let result = match job
-            .deadline
-            .checked_duration_since(std::time::Instant::now())
-            .filter(|remaining| !remaining.is_zero())
-        {
-            Some(remaining) => {
-                job.program.mark_execution_started();
-                job.program
-                    .runtime
-                    .execute_bounded_with_budget(&job.input, remaining)
+        let result = match job.invocation.execution.stop_reason() {
+            None => {
+                job.invocation.set_stage(WasmInvocationStage::Running);
+                if let Some(reason) = job.invocation.execution.stop_reason() {
+                    Err(reason)
+                } else {
+                    let execution = Arc::clone(&job.invocation.execution);
+                    job.program.mark_execution_started();
+                    job.program
+                        .runtime
+                        .execute_bounded_until(&job.input, execution)
+                }
             }
-            None => Err(WasmCallFailure::Timeout),
+            Some(reason) => Err(reason),
         };
+        job.program.mark_execution_finished();
         let _ = job.reply.send(result);
+    }
+}
+
+fn wasm_invocation_outcome(
+    result: &Result<Vec<u8>, WasmCallFailure>,
+    stage: WasmInvocationStage,
+) -> &'static str {
+    match result {
+        Ok(_) => "ok",
+        Err(WasmCallFailure::InputLimit) => "input_limit",
+        Err(WasmCallFailure::Cancelled) => "cancelled",
+        Err(WasmCallFailure::Timeout) => match stage {
+            WasmInvocationStage::Admission => "admission_timeout",
+            WasmInvocationStage::Queue => "queue_timeout",
+            WasmInvocationStage::Running => "timeout",
+        },
+        Err(WasmCallFailure::FuelLimit) => "instruction_cap",
+        Err(WasmCallFailure::MemoryLimit) => "memory_cap",
+        Err(WasmCallFailure::StackLimit) => "stack_cap",
+        Err(WasmCallFailure::OutputLimit) => "output_limit",
+        Err(WasmCallFailure::GuestTrap) => "guest_exception",
+        Err(WasmCallFailure::HostFailure) => "runtime_unavailable",
     }
 }
 
@@ -238,6 +362,9 @@ pub(crate) fn prepare_wasm_program(
     let runtime = hook
         .prepared_wasm_runtime()
         .ok_or_else(|| BundleLoadError::new("wasm", "bundle has no prepared WASM runtime"))?;
+    let budget = runtime
+        .bundle_budget()
+        .ok_or_else(|| BundleLoadError::new("wasm", "bundle has no WASM execution budget"))?;
     let max_input_bytes = usize::try_from(hook.manifest().sandbox.max_buffer_bytes)
         .map_err(|_| BundleLoadError::new("wasm", "input limit is unsupported"))?;
     let max_output_bytes = usize::try_from(hook.manifest().sandbox.max_output_bytes)
@@ -252,9 +379,11 @@ pub(crate) fn prepare_wasm_program(
             config: Arc::new(config),
             max_input_bytes,
             max_output_bytes,
-            budget: std::time::Duration::from_millis(hook.manifest().sandbox.budget_ms),
+            budget,
             #[cfg(test)]
             execution_started: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            execution_finished: Arc::new(AtomicBool::new(false)),
         },
     ))
 }
@@ -264,7 +393,7 @@ fn envelope_plugin_error(error: EnvelopeError) -> PluginError {
 }
 
 fn wasm_plugin_error(error: WasmCallFailure) -> PluginError {
-    if error == WasmCallFailure::Timeout {
+    if matches!(error, WasmCallFailure::Timeout | WasmCallFailure::Cancelled) {
         PluginError::Timeout
     } else {
         PluginError::Internal(anyhow::anyhow!("wasm bundle hook failed: {}", error.code()))
@@ -422,7 +551,7 @@ mod tests {
     use std::collections::BTreeSet;
     use std::io;
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use bytes::{Bytes, BytesMut};
     use sbproxy_config::{BundleHookKind, ExtensionBundlesConfig};
@@ -515,6 +644,33 @@ mod tests {
         )
         .unwrap();
         Arc::new(WasmRuntime::from_bundle_bytes(&bytes, limits).unwrap())
+    }
+
+    async fn wait_until(description: &str, condition: impl Fn() -> bool) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !condition() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {description}"));
+    }
+
+    fn metric_value(name: &str, labels: &[(&str, &str)]) -> f64 {
+        sbproxy_observe::metrics::metrics()
+            .render()
+            .lines()
+            .find_map(|line| {
+                if !line.starts_with(name)
+                    || labels
+                        .iter()
+                        .any(|(key, value)| !line.contains(&format!("{key}=\"{value}\"")))
+                {
+                    return None;
+                }
+                line.split_whitespace().nth(1)?.parse().ok()
+            })
+            .unwrap_or(0.0)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -692,6 +848,7 @@ mod tests {
         call_limits.fuel = 1_000_000_000;
         let runtime = runtime("loop.wasm", call_limits);
         let program = EnvelopeWasmProgram::for_test(runtime);
+        let execution_observer = program.clone();
         let executor = Arc::new(WasmExecutor::start(1, 1).unwrap());
 
         let first = tokio::spawn({
@@ -704,16 +861,25 @@ mod tests {
             let program = program.clone();
             async move { executor.execute(program, b"{}".to_vec()).await }
         });
-        let admission_deadline = Instant::now() + Duration::from_millis(100);
-        while executor.available_admission() != 0 && Instant::now() < admission_deadline {
-            tokio::task::yield_now().await;
-        }
+        wait_until("bounded executor admission", || {
+            executor.available_admission() == 0
+        })
+        .await;
+        wait_until("first Wasmtime execution", || {
+            execution_observer.execution_started()
+        })
+        .await;
         assert_eq!(executor.available_admission(), 0);
 
-        let started = Instant::now();
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        assert!(started.elapsed() < Duration::from_millis(30));
-        let third_started = Instant::now();
+        let (responsive, observed) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            let _ = responsive.send(());
+        });
+        tokio::time::timeout(Duration::from_millis(30), observed)
+            .await
+            .expect("Tokio task must run while Wasmtime occupies its OS worker")
+            .expect("responsiveness sender must complete");
         let third = tokio::spawn({
             let executor = Arc::clone(&executor);
             async move { executor.execute(program, b"{}".to_vec()).await }
@@ -727,10 +893,6 @@ mod tests {
         assert_eq!(first.await.unwrap(), Err(WasmCallFailure::Timeout));
         assert_eq!(second.await.unwrap(), Err(WasmCallFailure::Timeout));
         assert_eq!(third.await.unwrap(), Err(WasmCallFailure::Timeout));
-        assert!(
-            third_started.elapsed() < Duration::from_millis(70),
-            "queue time must count against the hook budget"
-        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -742,6 +904,7 @@ mod tests {
             runtime("loop.wasm", slow_limits),
             Duration::from_millis(80),
         );
+        let slow_observer = slow.clone();
         let mut abandoned_limits = limits();
         abandoned_limits.budget = Duration::from_millis(50);
         abandoned_limits.fuel = 1_000_000_000;
@@ -760,7 +923,10 @@ mod tests {
             let executor = Arc::clone(&executor);
             async move { executor.execute(slow, b"{}".to_vec()).await }
         });
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        wait_until("slow Wasmtime execution", || {
+            slow_observer.execution_started()
+        })
+        .await;
         assert_eq!(
             executor.execute(abandoned, b"{}".to_vec()).await,
             Err(WasmCallFailure::Timeout)
@@ -775,6 +941,237 @@ mod tests {
         assert!(
             !abandoned_observer.execution_started(),
             "an expired queued guest must not consume the worker"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canceled_queued_wasm_is_removed_before_execution() {
+        let mut blocker_limits = limits();
+        blocker_limits.budget = Duration::from_millis(100);
+        blocker_limits.fuel = 1_000_000_000;
+        let blocker = EnvelopeWasmProgram::for_test_with_budget(
+            runtime("loop.wasm", blocker_limits),
+            Duration::from_millis(100),
+        );
+        let blocker_observer = blocker.clone();
+        let mut canceled_limits = limits();
+        canceled_limits.budget = Duration::from_millis(300);
+        canceled_limits.fuel = 1_000_000_000;
+        let canceled = EnvelopeWasmProgram::for_test_with_budget(
+            runtime("loop.wasm", canceled_limits),
+            Duration::from_millis(300),
+        );
+        let canceled_observer = canceled.clone();
+        let healthy = EnvelopeWasmProgram::for_test_with_budget(
+            runtime("fresh-global.wasm", limits()),
+            Duration::from_millis(500),
+        );
+        let executor = Arc::new(WasmExecutor::start(1, 2).unwrap());
+        let before = metric_value(
+            "sbproxy_script_invocations_total",
+            &[("engine", "wasm"), ("result", "cancelled")],
+        );
+
+        let blocker_call = tokio::spawn({
+            let executor = Arc::clone(&executor);
+            async move { executor.execute(blocker, b"{}".to_vec()).await }
+        });
+        wait_until("blocker execution", || blocker_observer.execution_started()).await;
+        let canceled_call = tokio::spawn({
+            let executor = Arc::clone(&executor);
+            async move { executor.execute(canceled, b"{}".to_vec()).await }
+        });
+        wait_until("canceled call queue admission", || {
+            executor.available_admission() == 1
+        })
+        .await;
+        canceled_call.abort();
+        assert!(canceled_call.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            executor.available_admission(),
+            2,
+            "canceling a queued call must release its admission permit immediately"
+        );
+
+        let healthy_call = tokio::spawn({
+            let executor = Arc::clone(&executor);
+            async move { executor.execute(healthy, b"{}".to_vec()).await }
+        });
+        assert_eq!(blocker_call.await.unwrap(), Err(WasmCallFailure::Timeout));
+        assert!(healthy_call.await.unwrap().is_ok());
+        assert!(canceled_observer.execution_finished());
+        assert!(
+            !canceled_observer.execution_started(),
+            "a canceled queued call must never enter Wasmtime"
+        );
+        assert_eq!(
+            metric_value(
+                "sbproxy_script_invocations_total",
+                &[("engine", "wasm"), ("result", "cancelled")],
+            ) - before,
+            1.0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canceled_running_wasm_releases_its_worker() {
+        let mut runaway_limits = limits();
+        runaway_limits.budget = Duration::from_millis(500);
+        runaway_limits.fuel = 1_000_000_000;
+        let runaway = EnvelopeWasmProgram::for_test_with_budget(
+            runtime("loop.wasm", runaway_limits),
+            Duration::from_millis(500),
+        );
+        let runaway_observer = runaway.clone();
+        let healthy = EnvelopeWasmProgram::for_test_with_budget(
+            runtime("fresh-global.wasm", limits()),
+            Duration::from_millis(100),
+        );
+        let executor = Arc::new(WasmExecutor::start(1, 1).unwrap());
+        let before = metric_value(
+            "sbproxy_script_invocations_total",
+            &[("engine", "wasm"), ("result", "cancelled")],
+        );
+
+        let runaway_call = tokio::spawn({
+            let executor = Arc::clone(&executor);
+            async move { executor.execute(runaway, b"{}".to_vec()).await }
+        });
+        wait_until("runaway execution", || runaway_observer.execution_started()).await;
+        runaway_call.abort();
+        assert!(runaway_call.await.unwrap_err().is_cancelled());
+
+        assert!(executor.execute(healthy, b"{}".to_vec()).await.is_ok());
+        wait_until("canceled Wasmtime execution to stop", || {
+            runaway_observer.execution_finished()
+        })
+        .await;
+        assert_eq!(
+            metric_value(
+                "sbproxy_script_invocations_total",
+                &[("engine", "wasm"), ("result", "cancelled")],
+            ) - before,
+            1.0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_timeout_records_one_invocation_and_total_duration() {
+        let before_timeout = metric_value(
+            "sbproxy_script_invocations_total",
+            &[("engine", "wasm"), ("result", "queue_timeout")],
+        );
+        let before_duration = metric_value(
+            "sbproxy_script_duration_seconds_count",
+            &[("engine", "wasm")],
+        );
+        let mut blocker_limits = limits();
+        blocker_limits.budget = Duration::from_millis(100);
+        blocker_limits.fuel = 1_000_000_000;
+        let blocker = EnvelopeWasmProgram::for_test_with_budget(
+            runtime("loop.wasm", blocker_limits),
+            Duration::from_millis(100),
+        );
+        let blocker_observer = blocker.clone();
+        let queued = EnvelopeWasmProgram::for_test_with_budget(
+            runtime("loop.wasm", limits()),
+            Duration::from_millis(20),
+        );
+        let executor = Arc::new(WasmExecutor::start(1, 1).unwrap());
+
+        let blocker_call = tokio::spawn({
+            let executor = Arc::clone(&executor);
+            async move { executor.execute(blocker, b"{}".to_vec()).await }
+        });
+        wait_until("blocker execution", || blocker_observer.execution_started()).await;
+        assert_eq!(
+            executor.execute(queued, b"{}".to_vec()).await,
+            Err(WasmCallFailure::Timeout)
+        );
+        assert_eq!(blocker_call.await.unwrap(), Err(WasmCallFailure::Timeout));
+
+        assert_eq!(
+            metric_value(
+                "sbproxy_script_invocations_total",
+                &[("engine", "wasm"), ("result", "queue_timeout")],
+            ) - before_timeout,
+            1.0
+        );
+        assert_eq!(
+            metric_value(
+                "sbproxy_script_duration_seconds_count",
+                &[("engine", "wasm")],
+            ) - before_duration,
+            2.0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admission_timeout_records_one_invocation_and_total_duration() {
+        let before_timeout = metric_value(
+            "sbproxy_script_invocations_total",
+            &[("engine", "wasm"), ("result", "admission_timeout")],
+        );
+        let before_duration = metric_value(
+            "sbproxy_script_duration_seconds_count",
+            &[("engine", "wasm")],
+        );
+        let mut running_limits = limits();
+        running_limits.budget = Duration::from_millis(100);
+        running_limits.fuel = 1_000_000_000;
+        let running = EnvelopeWasmProgram::for_test_with_budget(
+            runtime("loop.wasm", running_limits),
+            Duration::from_millis(100),
+        );
+        let running_observer = running.clone();
+        let mut queued_limits = limits();
+        queued_limits.budget = Duration::from_millis(300);
+        queued_limits.fuel = 1_000_000_000;
+        let queued = EnvelopeWasmProgram::for_test_with_budget(
+            runtime("loop.wasm", queued_limits),
+            Duration::from_millis(300),
+        );
+        let waiting_for_admission = EnvelopeWasmProgram::for_test_with_budget(
+            runtime("fresh-global.wasm", limits()),
+            Duration::from_millis(20),
+        );
+        let executor = Arc::new(WasmExecutor::start(1, 1).unwrap());
+
+        let running_call = tokio::spawn({
+            let executor = Arc::clone(&executor);
+            async move { executor.execute(running, b"{}".to_vec()).await }
+        });
+        wait_until("running call", || running_observer.execution_started()).await;
+        let queued_call = tokio::spawn({
+            let executor = Arc::clone(&executor);
+            async move { executor.execute(queued, b"{}".to_vec()).await }
+        });
+        wait_until("full executor admission", || {
+            executor.available_admission() == 0
+        })
+        .await;
+        assert_eq!(
+            executor
+                .execute(waiting_for_admission, b"{}".to_vec())
+                .await,
+            Err(WasmCallFailure::Timeout)
+        );
+        assert_eq!(running_call.await.unwrap(), Err(WasmCallFailure::Timeout));
+        assert_eq!(queued_call.await.unwrap(), Err(WasmCallFailure::Timeout));
+
+        assert_eq!(
+            metric_value(
+                "sbproxy_script_invocations_total",
+                &[("engine", "wasm"), ("result", "admission_timeout")],
+            ) - before_timeout,
+            1.0
+        );
+        assert_eq!(
+            metric_value(
+                "sbproxy_script_duration_seconds_count",
+                &[("engine", "wasm")],
+            ) - before_duration,
+            3.0
         );
     }
 

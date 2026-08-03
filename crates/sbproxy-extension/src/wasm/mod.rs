@@ -34,9 +34,9 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use wasi_common::pipe::{ReadPipe, WritePipe};
 use wasi_common::sync::WasiCtxBuilder;
 use wasi_common::WasiCtx;
@@ -204,6 +204,7 @@ impl WasmLoadFailure {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WasmCallFailure {
     InputLimit,
+    Cancelled,
     Timeout,
     FuelLimit,
     MemoryLimit,
@@ -217,6 +218,7 @@ impl WasmCallFailure {
     pub(crate) const fn code(self) -> &'static str {
         match self {
             Self::InputLimit => "input_limit",
+            Self::Cancelled => "cancelled",
             Self::Timeout => "timeout",
             Self::FuelLimit => "instruction_cap",
             Self::MemoryLimit => "memory_cap",
@@ -224,6 +226,35 @@ impl WasmCallFailure {
             Self::OutputLimit => "output_limit",
             Self::GuestTrap => "guest_exception",
             Self::HostFailure => "runtime_unavailable",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct WasmExecutionControl {
+    deadline: Instant,
+    cancelled: AtomicBool,
+}
+
+impl WasmExecutionControl {
+    pub(crate) fn new(deadline: Instant) -> Self {
+        Self {
+            deadline,
+            cancelled: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn stop_reason(&self) -> Option<WasmCallFailure> {
+        if self.cancelled.load(Ordering::Acquire) {
+            Some(WasmCallFailure::Cancelled)
+        } else if Instant::now() >= self.deadline {
+            Some(WasmCallFailure::Timeout)
+        } else {
+            None
         }
     }
 }
@@ -404,6 +435,10 @@ impl WasmRuntime {
         self.module.is_some()
     }
 
+    pub(crate) fn bundle_budget(&self) -> Option<Duration> {
+        self.bundle_limits.map(|limits| limits.budget)
+    }
+
     /// Invoke the module's `_start` function, passing `input` on stdin
     /// and returning whatever the module wrote to stdout.
     ///
@@ -524,46 +559,33 @@ impl WasmRuntime {
         &self,
         input: &[u8],
     ) -> std::result::Result<Vec<u8>, WasmCallFailure> {
-        let budget = self
-            .bundle_limits
-            .map(|limits| limits.budget)
+        let deadline = Instant::now()
+            .checked_add(
+                self.bundle_limits
+                    .map(|limits| limits.budget)
+                    .ok_or(WasmCallFailure::HostFailure)?,
+            )
             .ok_or(WasmCallFailure::HostFailure)?;
-        self.execute_bounded_with_budget(input, budget)
+        self.execute_bounded_until(input, Arc::new(WasmExecutionControl::new(deadline)))
     }
 
-    pub(crate) fn execute_bounded_with_budget(
+    pub(crate) fn execute_bounded_until(
         &self,
         input: &[u8],
-        budget: Duration,
+        execution: Arc<WasmExecutionControl>,
     ) -> std::result::Result<Vec<u8>, WasmCallFailure> {
-        let configured_budget = self
-            .bundle_limits
-            .map(|limits| limits.budget)
-            .ok_or(WasmCallFailure::HostFailure)?;
-        let budget = budget.min(configured_budget);
-        let started = std::time::Instant::now();
-        let result = self.execute_bounded_inner(input, budget);
-        sbproxy_observe::metrics::record_script_duration("wasm", started.elapsed().as_secs_f64());
-        let outcome = match &result {
-            Ok(_) => "ok",
-            Err(WasmCallFailure::InputLimit) => "input_limit",
-            Err(WasmCallFailure::Timeout) => "timeout",
-            Err(WasmCallFailure::FuelLimit) => "instruction_cap",
-            Err(WasmCallFailure::MemoryLimit) => "memory_cap",
-            Err(WasmCallFailure::StackLimit) => "stack_cap",
-            Err(WasmCallFailure::OutputLimit) => "output_limit",
-            Err(WasmCallFailure::GuestTrap) => "guest_exception",
-            Err(WasmCallFailure::HostFailure) => "runtime_unavailable",
-        };
-        sbproxy_observe::metrics::record_script_invocation("wasm", outcome);
-        result
+        self.bundle_limits.ok_or(WasmCallFailure::HostFailure)?;
+        self.execute_bounded_inner(input, execution)
     }
 
     fn execute_bounded_inner(
         &self,
         input: &[u8],
-        budget: Duration,
+        execution: Arc<WasmExecutionControl>,
     ) -> std::result::Result<Vec<u8>, WasmCallFailure> {
+        if let Some(reason) = execution.stop_reason() {
+            return Err(reason);
+        }
         let limits = self.bundle_limits.ok_or(WasmCallFailure::HostFailure)?;
         if input.len() > limits.max_input_bytes {
             return Err(WasmCallFailure::InputLimit);
@@ -598,7 +620,14 @@ impl WasmRuntime {
         store
             .set_fuel(limits.fuel)
             .map_err(|_| WasmCallFailure::HostFailure)?;
-        store.set_epoch_deadline(budget.as_millis().max(1) as u64);
+        store.set_epoch_deadline(1);
+        let callback_execution = Arc::clone(&execution);
+        store.epoch_deadline_callback(move |_store| {
+            Ok(match callback_execution.stop_reason() {
+                Some(_) => wasmtime::UpdateDeadline::Interrupt,
+                None => wasmtime::UpdateDeadline::Continue(1),
+            })
+        });
 
         let call_result = (|| -> wasmtime::Result<()> {
             let instance = instance_pre.instantiate(&mut store)?;
@@ -624,6 +653,9 @@ impl WasmRuntime {
         match call_result {
             Ok(()) => Ok(output.to_vec()),
             Err(error) if is_successful_exit(&error) => Ok(output.to_vec()),
+            Err(error) if matches!(error.downcast_ref::<Trap>(), Some(Trap::Interrupt)) => {
+                Err(execution.stop_reason().unwrap_or(WasmCallFailure::Timeout))
+            }
             Err(error) => Err(classify_call_error(&error)),
         }
     }
