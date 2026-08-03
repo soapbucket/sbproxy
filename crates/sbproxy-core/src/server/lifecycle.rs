@@ -41,9 +41,8 @@ pub enum DegradedSubsystem {
     /// One or more `listings/*.yaml` entries failed to load; the
     /// pipeline went live without them.
     Listings,
-    /// The pipeline lifecycle hook returned an error, or its runtime
-    /// could not be built. Optional slots on the new pipeline may
-    /// carry prior state.
+    /// Compatibility label for older reload responses. Atomic candidate
+    /// publication now rejects lifecycle failures before this can be emitted.
     PipelineLifecycleHook,
     /// The telemetry sink dispatcher could not be installed; log and
     /// event export falls back to the legacy tracing subscriber.
@@ -237,8 +236,8 @@ impl Drop for ProviderRegistryRollback {
 ///
 /// Reads the file, runs `compile_config` (which also drives the
 /// features.* migration), constructs a fresh
-/// [`CompiledPipeline`], invokes the pipeline lifecycle hook
-/// (best-effort), and atomically swaps the live pipeline. Returns a
+/// [`CompiledPipeline`], invokes the pipeline lifecycle hook, and
+/// atomically swaps the live pipeline. Returns a
 /// [`ReloadOutcome`] on success; logs and returns `Err` on any step's
 /// failure so the caller can decide whether to retry.
 ///
@@ -573,6 +572,10 @@ fn reload_from_config_yaml_locked(config_path: &str, yaml: &str) -> anyhow::Resu
     // re-fetch.
     let resolved = crate::config_source::resolve(yaml)?;
     let compiled = sbproxy_config::compile_config(&resolved.text)?;
+    let config_dir = std::path::Path::new(config_path)
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
     if let Some(al) = compiled.access_log.as_ref() {
         log_capture_header_warnings(al);
     }
@@ -631,7 +634,7 @@ fn reload_from_config_yaml_locked(config_path: &str, yaml: &str) -> anyhow::Resu
         }
     };
 
-    let mut new_pipeline = CompiledPipeline::from_config(compiled)?;
+    let mut new_pipeline = CompiledPipeline::from_config_at(compiled, config_dir)?;
     preflight_default_safety_centroids(&new_pipeline)?;
     // A settlement runtime that will not start fails the reload before the
     // pipeline is swapped, so the previous generation keeps serving with its
@@ -646,10 +649,7 @@ fn reload_from_config_yaml_locked(config_path: &str, yaml: &str) -> anyhow::Resu
     // at warn level and the registry stays empty; the OSS surface
     // continues to serve the top-level `agent_skills:` block.
     {
-        let repo_root = std::path::Path::new(config_path)
-            .parent()
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let repo_root = config_dir.to_path_buf();
         let mut load_errors: Vec<sbproxy_config::ListingLoadError> = Vec::new();
         let loaded = sbproxy_config::load_listings_from_repo(&repo_root, &mut load_errors);
         for err in &load_errors {
@@ -673,68 +673,26 @@ fn reload_from_config_yaml_locked(config_path: &str, yaml: &str) -> anyhow::Resu
         }
     }
 
-    // Invoke the pipeline lifecycle hook (best-effort): the reload
-    // path must continue to swap the pipeline even if a downstream
-    // hook errors, otherwise a failing lifecycle extension would
-    // permanently pin the operator on the old config. The failure is
-    // reported through `ReloadOutcome` instead. We spin up a
-    // current-thread runtime when no ambient tokio runtime exists so
-    // the file-watcher thread (plain std thread) can also call this.
+    // Reattach the one linked lifecycle hook before initialization.
+    // Collection and initialization are part of candidate construction,
+    // so either failure leaves the published pointer unchanged.
+    new_pipeline.hooks.startup = crate::hook_registry::try_collect_startup_hook()?;
     if let Some(startup) = new_pipeline.hooks.startup.clone() {
-        let hook_failed = if tokio::runtime::Handle::try_current().is_ok() {
+        let hook_result = if tokio::runtime::Handle::try_current().is_ok() {
             tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
-                    if let Err(e) = startup.on_reload(&mut new_pipeline).await {
-                        tracing::warn!(
-                            error = %e,
-                            "pipeline lifecycle hook failed; serving with prior hook state",
-                        );
-                        return true;
-                    }
-                    false
-                })
+                tokio::runtime::Handle::current().block_on(startup.on_reload(&mut new_pipeline))
             })
         } else {
-            match tokio::runtime::Builder::new_current_thread()
+            let hook_rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-            {
-                Ok(hook_rt) => {
-                    if let Err(e) = hook_rt.block_on(startup.on_reload(&mut new_pipeline)) {
-                        tracing::warn!(
-                            error = %e,
-                            "pipeline lifecycle hook failed; serving with prior hook state",
-                        );
-                        true
-                    } else {
-                        false
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "failed to build reload-hook runtime; skipping reload hook",
-                    );
-                    true
-                }
-            }
+                .map_err(|error| anyhow::anyhow!("build reload-hook runtime: {error}"))?;
+            hook_rt.block_on(startup.on_reload(&mut new_pipeline))
         };
-        if hook_failed {
-            outcome.degrade(DegradedSubsystem::PipelineLifecycleHook);
-        }
+        hook_result
+            .map_err(|error| anyhow::anyhow!("pipeline lifecycle hook rejected reload: {error}"))?;
     }
-    // Same check the boot path runs, but a reload cannot abort: refusing
-    // here would pin the operator on the old config until they fixed an
-    // extension, which is exactly what the reload contract avoids
-    // elsewhere. The violation is loud and shows up as a degraded
-    // subsystem in the /admin/reload response instead.
-    if let Err(e) = enforce_cache_at_rest_posture(&new_pipeline) {
-        tracing::error!(error = %e, "reloaded pipeline has a cache that stores plaintext at rest");
-        outcome.degrade(DegradedSubsystem::PipelineLifecycleHook);
-    }
-    let config_dir = std::path::Path::new(config_path)
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."));
+    enforce_cache_at_rest_posture(&new_pipeline)?;
     super::model_host::reconcile_model_runtime_blocking(&new_pipeline, config_dir)
         .map_err(|error| anyhow::anyhow!("model runtime reconciliation failed: {error}"))?;
     // --- Phase 3: commit ---
@@ -1456,7 +1414,11 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     }
 
     // Compile config into a pipeline with action/auth/policy module instances.
-    let mut pipeline = CompiledPipeline::from_config(compiled)?;
+    let config_dir = std::path::Path::new(config_path)
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let mut pipeline = CompiledPipeline::from_config_at(compiled, config_dir)?;
     preflight_default_safety_centroids(&pipeline)?;
     attach_payments_runtime(&mut pipeline)?;
 
@@ -1467,10 +1429,7 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // same wiring in `reload_from_config_path` so SIGHUP and file-
     // watcher reloads pick up listing edits too.
     {
-        let repo_root = std::path::Path::new(config_path)
-            .parent()
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let repo_root = config_dir.to_path_buf();
         let mut load_errors: Vec<sbproxy_config::ListingLoadError> = Vec::new();
         let loaded = sbproxy_config::load_listings_from_repo(&repo_root, &mut load_errors);
         for err in &load_errors {
@@ -1490,28 +1449,20 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
         }
     }
 
-    // Give the lifecycle extension a chance to wire its hooks, construct clients,
-    // and register origins. Failures here do NOT block serving: they log
-    // and return None-hooks, so request paths fall through to OSS behavior.
-    //
-    // `pub fn run` is sync (called from `main` before Pingora's runtime
-    // starts), so we drive the async hook on a short-lived current-thread
-    // runtime. The cloned Arc avoids holding a borrow of `pipeline.hooks`
-    // across the await, which would conflict with the `&mut pipeline` arg.
-    if pipeline.hooks.startup.is_none() {
-        pipeline.hooks.startup = crate::hook_registry::collect_startup_hook();
-    }
+    // Give the linked lifecycle extension a chance to initialize the
+    // candidate before it becomes requestable. Startup is synchronous here,
+    // so the async hook runs on a short-lived current-thread runtime.
+    pipeline.hooks.startup = crate::hook_registry::try_collect_startup_hook()?;
     if let Some(startup) = pipeline.hooks.startup.clone() {
         let hook_rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| anyhow::anyhow!("failed to build startup-hook runtime: {}", e))?;
-        if let Err(e) = hook_rt.block_on(startup.on_startup(&mut pipeline)) {
-            tracing::warn!(
-                error = %e,
-                "pipeline lifecycle hook failed; continuing without optional features"
-            );
-        }
+        hook_rt
+            .block_on(startup.on_startup(&mut pipeline))
+            .map_err(|error| {
+                anyhow::anyhow!("pipeline lifecycle hook rejected startup: {error}")
+            })?;
     }
 
     // The lifecycle hook has now had its chance to install cache
@@ -1523,9 +1474,6 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // Prepare and publish the complete model desired state before the
     // pipeline becomes requestable. The permanent runtime exists even
     // when this first snapshot contains no managed deployments.
-    let config_dir = std::path::Path::new(config_path)
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."));
     super::model_host::reconcile_model_runtime_blocking(&pipeline, config_dir)
         .map_err(|error| anyhow::anyhow!("model runtime reconciliation failed: {error}"))?;
     let _model_runtime_shutdown = ModelRuntimeShutdownGuard;
@@ -3395,6 +3343,147 @@ fn compile_one_sink(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    static HOOK_ORDER_CALLS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    struct ReloadHookFixture;
+
+    #[async_trait::async_trait]
+    impl crate::hooks::PipelineLifecycleHook for ReloadHookFixture {
+        async fn on_startup(
+            &self,
+            _pipeline: &mut crate::pipeline::CompiledPipeline,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn on_reload(
+            &self,
+            pipeline: &mut crate::pipeline::CompiledPipeline,
+        ) -> anyhow::Result<()> {
+            assert!(
+                pipeline.hooks.startup.is_some(),
+                "the linked hook must be attached before on_reload runs"
+            );
+            if pipeline
+                .config
+                .origins
+                .iter()
+                .any(|origin| origin.hostname == "hook-order-fixture.test")
+            {
+                HOOK_ORDER_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            if pipeline
+                .config
+                .origins
+                .iter()
+                .any(|origin| origin.hostname == "hook-failure-fixture.test")
+            {
+                anyhow::bail!("fixture reload hook rejected the candidate");
+            }
+            Ok(())
+        }
+    }
+
+    fn reload_hook_fixture() -> std::sync::Arc<dyn crate::hooks::PipelineLifecycleHook> {
+        std::sync::Arc::new(ReloadHookFixture)
+    }
+
+    crate::register_startup_hook!(reload_hook_fixture);
+
+    #[test]
+    fn reload_reattaches_extension_startup_hook_before_on_reload() {
+        HOOK_ORDER_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        reload_from_config_yaml(
+            "sb.yml",
+            r#"proxy: {}
+origins:
+  hook-order-fixture.test:
+    action:
+      type: static
+      body: hook ran
+"#,
+        )
+        .expect("reload should publish");
+
+        assert_eq!(
+            HOOK_ORDER_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one linked hook must receive one reload callback"
+        );
+    }
+
+    #[test]
+    fn extension_load_failure_preserves_the_current_pipeline_pointer() {
+        let directory = tempfile::tempdir().expect("temporary config directory");
+        let bundle = directory.path().join("bundles").join("reload-fixture");
+        std::fs::create_dir_all(&bundle).expect("create bundle directory");
+        std::fs::write(
+            bundle.join("bundle.yaml"),
+            r#"apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: reload-fixture
+version: 1.0.0
+runtime: javascript
+entry: entry.js
+hooks:
+  - kind: policy
+    type: reload_fixture_policy
+    export: run
+"#,
+        )
+        .expect("write bundle manifest");
+        std::fs::write(
+            bundle.join("entry.js"),
+            "export function run() { return { version: 'sbproxy-envelope/v1', decision: 'allow' }; }",
+        )
+        .expect("write valid bundle artifact");
+        let config_path = directory.path().join("sb.yml");
+        let yaml = "proxy: {}\nextensions:\n  bundles_dir: bundles\n";
+        reload_from_config_yaml(config_path.to_str().expect("UTF-8 config path"), yaml)
+            .expect("first candidate should publish");
+        let current = crate::reload::current_pipeline_full();
+
+        std::fs::write(bundle.join("entry.js"), "export function anotherName() {}")
+            .expect("replace bundle artifact with an invalid export");
+        let error = reload_from_config_yaml(config_path.to_str().expect("UTF-8 config path"), yaml)
+            .expect_err("invalid bundle candidate must fail reload");
+        let after_failure = crate::reload::current_pipeline_full();
+
+        assert!(error.to_string().contains("export"), "{error:#}");
+        assert!(Arc::ptr_eq(&current, &after_failure));
+    }
+
+    #[test]
+    fn extension_lifecycle_failure_preserves_the_current_pipeline_pointer() {
+        reload_from_config_yaml("sb.yml", "proxy: {}\n")
+            .expect("baseline candidate should publish");
+        let current = crate::reload::current_pipeline_full();
+
+        let error = reload_from_config_yaml(
+            "sb.yml",
+            r#"proxy: {}
+origins:
+  hook-failure-fixture.test:
+    action:
+      type: static
+      body: rejected
+"#,
+        )
+        .expect_err("a lifecycle failure must reject the candidate");
+        let after_failure = crate::reload::current_pipeline_full();
+
+        assert!(
+            error
+                .to_string()
+                .contains("fixture reload hook rejected the candidate"),
+            "{error:#}"
+        );
+        assert!(Arc::ptr_eq(&current, &after_failure));
+    }
 
     #[test]
     fn pipeline_lifecycle_hook_has_product_neutral_identifiers() {

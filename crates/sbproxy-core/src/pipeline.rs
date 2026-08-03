@@ -17,7 +17,8 @@
 //! This struct lives in `sbproxy-core` to avoid a circular dependency:
 //! config -> modules -> config would be circular, but core depends on both.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::builtin_enforcers::{compile_builtin_enforcers, CompiledEnforcer};
@@ -28,13 +29,20 @@ use sbproxy_cache::{
     FsReserve, MemcachedConfig, MemcachedStore, MemoryCacheStore, MemoryReserve, RedisCacheStore,
     RedisReserve,
 };
-use sbproxy_config::{CompiledConfig, Parameter, RequestModifierConfig};
+use sbproxy_config::{BundleHookKind, CompiledConfig, Parameter, RequestModifierConfig};
+use sbproxy_extension::bundle::{BundleRegistry, DynamicBundleRegistry};
 use sbproxy_modules::compile::{
-    compile_action_for_origin, compile_action_for_origin_for_validation, compile_auth,
-    compile_policy, compile_transform,
+    compile_action_for_origin, compile_action_for_origin_for_validation,
+    compile_action_for_origin_with_registry, compile_action_with_registry, compile_auth,
+    compile_policy, compile_policy_with_registry, compile_transform,
+    compile_transform_with_registry,
 };
 use sbproxy_modules::transform::{CompiledTransform, TransformConfig};
 use sbproxy_modules::{Action, Auth, BotDetection, Policy, ThreatProtection};
+use sbproxy_plugin::{
+    ActionPluginRegistration, ExtensionHookKind, ExtensionInventorySnapshot, ExtensionState,
+    PolicyPluginRegistration, TransformPluginRegistration,
+};
 
 // --- Forward Rule types ---
 
@@ -1184,6 +1192,12 @@ pub struct CompiledIdempotency {
 pub struct CompiledPipeline {
     /// The underlying compiled config (origins, host_map, server settings).
     pub config: CompiledConfig,
+    /// Dynamic hooks loaded and compiled with this pipeline generation.
+    #[allow(dead_code)]
+    pub(crate) extension_registry: Arc<DynamicBundleRegistry>,
+    /// Running-state inventory derived from this generation's attachments.
+    #[allow(dead_code)]
+    pub(crate) extension_inventory: ExtensionInventorySnapshot,
     /// Dynamic key plane built from the same immutable config generation.
     ///
     /// Request contexts pin the pipeline at ingress, so keeping the plane here
@@ -1411,13 +1425,144 @@ fn compile_sensitive_header_names(config: &CompiledConfig) -> HashSet<String> {
     names
 }
 
+fn reserved_extension_hook_names() -> BTreeSet<(BundleHookKind, String)> {
+    let mut names = sbproxy_config::reserved_builtin_hook_names();
+    names.extend(
+        inventory::iter::<PolicyPluginRegistration>
+            .into_iter()
+            .map(|registration| (BundleHookKind::Policy, registration.name.to_owned())),
+    );
+    names.extend(
+        inventory::iter::<TransformPluginRegistration>
+            .into_iter()
+            .map(|registration| (BundleHookKind::Transform, registration.name.to_owned())),
+    );
+    names.extend(
+        inventory::iter::<ActionPluginRegistration>
+            .into_iter()
+            .map(|registration| (BundleHookKind::Action, registration.name.to_owned())),
+    );
+    names
+}
+
+fn empty_extension_registry() -> Arc<DynamicBundleRegistry> {
+    DynamicBundleRegistry::load(
+        &sbproxy_config::ExtensionBundlesConfig::default(),
+        Path::new("."),
+        &BTreeSet::new(),
+    )
+    .expect("an empty extension bundle configuration is valid")
+}
+
+fn configured_type(value: &serde_json::Value) -> Option<&str> {
+    value.get("type").and_then(serde_json::Value::as_str)
+}
+
+fn record_dynamic_action(
+    value: &serde_json::Value,
+    registry: &dyn BundleRegistry,
+    active: &mut BTreeSet<(ExtensionHookKind, String)>,
+) {
+    if let Some(type_name) = configured_type(value) {
+        if registry.action(type_name).is_some() {
+            active.insert((ExtensionHookKind::Action, type_name.to_owned()));
+        }
+    }
+}
+
+fn active_extension_hooks(
+    config: &CompiledConfig,
+    registry: &dyn BundleRegistry,
+) -> BTreeSet<(ExtensionHookKind, String)> {
+    let mut active = BTreeSet::new();
+
+    for origin in &config.origins {
+        record_dynamic_action(&origin.action_config, registry, &mut active);
+        for policy in &origin.policy_configs {
+            if let Some(type_name) = configured_type(policy) {
+                if registry.policy(type_name).is_some() {
+                    active.insert((ExtensionHookKind::Policy, type_name.to_owned()));
+                }
+            }
+        }
+        for transform in &origin.transform_configs {
+            let enabled = serde_json::from_value::<TransformConfig>(transform.clone())
+                .is_ok_and(|wrapper| !wrapper.disabled);
+            if enabled {
+                if let Some(type_name) = configured_type(transform) {
+                    if registry.transform(type_name).is_some() {
+                        active.insert((ExtensionHookKind::Transform, type_name.to_owned()));
+                    }
+                }
+            }
+        }
+        for rule in &origin.forward_rules {
+            if let Some(value) = rule.get("origin").and_then(|origin| origin.get("action")) {
+                record_dynamic_action(value, registry, &mut active);
+            }
+        }
+        if let Some(value) = origin
+            .fallback_origin
+            .as_ref()
+            .and_then(|fallback| fallback.get("origin"))
+            .and_then(|origin| origin.get("action"))
+        {
+            record_dynamic_action(value, registry, &mut active);
+        }
+    }
+    active
+}
+
+fn running_extension_inventory(
+    registry: &DynamicBundleRegistry,
+    config: &CompiledConfig,
+    config_revision: &str,
+) -> ExtensionInventorySnapshot {
+    let active = active_extension_hooks(config, registry);
+    let mut snapshot = registry.inventory().clone();
+    snapshot.scope.config_revision = Some(config_revision.to_owned());
+    for hook in &mut snapshot.hooks {
+        hook.state = if active.contains(&(hook.kind, hook.match_key.clone())) {
+            ExtensionState::Active
+        } else {
+            ExtensionState::Unconsumed
+        };
+    }
+    for bundle in &mut snapshot.bundles {
+        bundle.state = if bundle.hook_ids.iter().any(|id| {
+            snapshot
+                .hooks
+                .iter()
+                .any(|hook| hook.id == *id && hook.state == ExtensionState::Active)
+        }) {
+            ExtensionState::Active
+        } else {
+            ExtensionState::Unconsumed
+        };
+    }
+    snapshot.summary.active = u32::try_from(
+        snapshot
+            .hooks
+            .iter()
+            .filter(|hook| hook.state == ExtensionState::Active)
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
+    snapshot.summary.available = 0;
+    snapshot
+}
+
 impl Default for CompiledPipeline {
     fn default() -> Self {
         let config = CompiledConfig::default();
         let router = HostRouter::new(&config);
         let sensitive_header_names = compile_sensitive_header_names(&config);
+        let extension_registry = empty_extension_registry();
+        let extension_inventory = running_extension_inventory(&extension_registry, &config, "");
         Self {
             config,
+            extension_registry,
+            extension_inventory,
             key_plane: None,
             sensitive_header_names,
             router,
@@ -1493,6 +1638,18 @@ fn parse_outbound_credential_config(
 }
 
 impl CompiledPipeline {
+    /// Dynamic bundle registry pinned to this pipeline generation.
+    #[cfg(test)]
+    pub(crate) fn extension_registry(&self) -> &Arc<DynamicBundleRegistry> {
+        &self.extension_registry
+    }
+
+    /// Authoritative extension inventory for this pipeline generation.
+    #[cfg(test)]
+    pub(crate) const fn extension_inventory(&self) -> &ExtensionInventorySnapshot {
+        &self.extension_inventory
+    }
+
     /// Dynamic key plane for this exact pipeline generation.
     pub fn key_plane(&self) -> Option<&Arc<crate::key_plane::KeyPlane>> {
         self.key_plane.as_ref()
@@ -1546,6 +1703,20 @@ impl CompiledPipeline {
         Self::from_config_with_mode(config, PipelineConstructionMode::Runtime)
     }
 
+    /// Compile a runtime pipeline with bundle paths relative to its config document.
+    pub fn from_config_at(config: CompiledConfig, base_dir: &Path) -> anyhow::Result<Self> {
+        let extension_registry = DynamicBundleRegistry::load(
+            &config.extension_bundles,
+            base_dir,
+            &reserved_extension_hook_names(),
+        )?;
+        Self::from_config_with_mode_and_registry(
+            config,
+            PipelineConstructionMode::Runtime,
+            extension_registry,
+        )
+    }
+
     /// Compile every module for validation, without side effects that
     /// outlive the returned pipeline.
     ///
@@ -1569,6 +1740,14 @@ impl CompiledPipeline {
     fn from_config_with_mode(
         config: CompiledConfig,
         mode: PipelineConstructionMode,
+    ) -> anyhow::Result<Self> {
+        Self::from_config_with_mode_and_registry(config, mode, empty_extension_registry())
+    }
+
+    fn from_config_with_mode_and_registry(
+        config: CompiledConfig,
+        mode: PipelineConstructionMode,
+        extension_registry: Arc<DynamicBundleRegistry>,
     ) -> anyhow::Result<Self> {
         // WOR-2084: async twin of the shared L2 store. The rate-limit
         // policy's hot path awaits `AsyncKVStore::incr_with_ttl`
@@ -1609,6 +1788,16 @@ impl CompiledPipeline {
                 None,
             );
             let action = match mode {
+                PipelineConstructionMode::Runtime
+                    if configured_type(&origin.action_config)
+                        .is_some_and(|name| extension_registry.action(name).is_some()) =>
+                {
+                    compile_action_for_origin_with_registry(
+                        &origin.action_config,
+                        &action_identity,
+                        extension_registry.as_ref(),
+                    )?
+                }
                 PipelineConstructionMode::Runtime => {
                     compile_action_for_origin(&origin.action_config, &action_identity)?
                 }
@@ -1638,12 +1827,14 @@ impl CompiledPipeline {
                 config.l2_store.clone(),
                 l2_async_store.clone(),
                 origin.origin_id.as_str(),
+                extension_registry.as_ref(),
             )?;
             let policies_for_enforcers = compile_origin_policy_chain(
                 &origin.policy_configs,
                 config.l2_store.clone(),
                 l2_async_store.clone(),
                 origin.origin_id.as_str(),
+                extension_registry.as_ref(),
             )?;
             // WOR-2164: enforcers that compile static CEL (the rate
             // limiter's `key:`) reject the candidate config here, so
@@ -1679,7 +1870,14 @@ impl CompiledPipeline {
                     if wrapper.disabled {
                         return None;
                     }
-                    let transform = match compile_transform(cfg) {
+                    let compiled = if configured_type(cfg)
+                        .is_some_and(|name| extension_registry.transform(name).is_some())
+                    {
+                        compile_transform_with_registry(cfg, extension_registry.as_ref())
+                    } else {
+                        compile_transform(cfg)
+                    };
+                    let transform = match compiled {
                         Ok(t) => t,
                         // WOR-2179: name the origin, the same way the
                         // policy chain does, so an operator can find the
@@ -1710,11 +1908,13 @@ impl CompiledPipeline {
                 origin.workspace_id.as_str(),
                 origin.origin_id.as_str(),
                 mode,
+                extension_registry.as_ref(),
             )?;
             forward_rules.push(origin_fwd_rules);
 
             // Compile fallback origin (optional per origin).
-            let fallback = compile_fallback(&origin.fallback_origin, mode)?;
+            let fallback =
+                compile_fallback(&origin.fallback_origin, mode, extension_registry.as_ref())?;
             fallbacks.push(fallback);
 
             // Compile bot detection (optional per origin).
@@ -2081,9 +2281,13 @@ impl CompiledPipeline {
         // access-log path evaluates rather than parsing per record and
         // malformed source rejects the candidate config.
         let custom_log_programs = crate::server::custom_log::compile_cel_programs(&config)?;
+        let extension_inventory =
+            running_extension_inventory(extension_registry.as_ref(), &config, &config_revision);
 
         let pipeline = Self {
             config,
+            extension_registry,
+            extension_inventory,
             key_plane,
             sensitive_header_names,
             router,
@@ -2269,6 +2473,7 @@ fn compile_origin_policy_chain(
     l2_store: Option<Arc<dyn sbproxy_platform::storage::KVStore>>,
     l2_async_store: Option<Arc<dyn sbproxy_platform::storage::AsyncKVStore>>,
     origin_id: &str,
+    extension_registry: &dyn BundleRegistry,
 ) -> anyhow::Result<Vec<Policy>> {
     let mut chain: Vec<Policy> = policy_configs
         .iter()
@@ -2278,8 +2483,14 @@ fn compile_origin_policy_chain(
             // module's own error names the policy type and, for CEL,
             // quotes the bad expression).
             use anyhow::Context as _;
-            compile_policy(cfg)
-                .with_context(|| format!("origin `{origin_id}`: invalid policy config"))
+            let compiled = if configured_type(cfg)
+                .is_some_and(|name| extension_registry.policy(name).is_some())
+            {
+                compile_policy_with_registry(cfg, extension_registry)
+            } else {
+                compile_policy(cfg)
+            };
+            compiled.with_context(|| format!("origin `{origin_id}`: invalid policy config"))
         })
         .collect::<anyhow::Result<_>>()?;
     if l2_store.is_some() {
@@ -2365,11 +2576,12 @@ fn compile_forward_rules(
     workspace_id: &str,
     origin_id: &str,
     mode: PipelineConstructionMode,
+    extension_registry: &dyn BundleRegistry,
 ) -> anyhow::Result<Vec<CompiledForwardRule>> {
     let mut compiled = Vec::with_capacity(raw_rules.len());
     for (rule_index, rule_val) in raw_rules.iter().enumerate() {
         let rule_id = routing_action_identity(workspace_id, origin_id, Some(rule_index));
-        let fwd = compile_single_forward_rule(rule_val, &rule_id, mode)?;
+        let fwd = compile_single_forward_rule(rule_val, &rule_id, mode, extension_registry)?;
         compiled.push(fwd);
     }
     Ok(compiled)
@@ -2408,6 +2620,7 @@ fn compile_single_forward_rule(
     val: &serde_json::Value,
     rule_id: &str,
     mode: PipelineConstructionMode,
+    extension_registry: &dyn BundleRegistry,
 ) -> anyhow::Result<CompiledForwardRule> {
     let rules_arr = val
         .get("rules")
@@ -2442,6 +2655,12 @@ fn compile_single_forward_rule(
         .get("action")
         .ok_or_else(|| anyhow::anyhow!("forward rule origin missing 'action'"))?;
     let action = match mode {
+        PipelineConstructionMode::Runtime
+            if configured_type(action_config)
+                .is_some_and(|name| extension_registry.action(name).is_some()) =>
+        {
+            compile_action_for_origin_with_registry(action_config, rule_id, extension_registry)?
+        }
         PipelineConstructionMode::Runtime => compile_action_for_origin(action_config, rule_id)?,
         PipelineConstructionMode::Validation => {
             compile_action_for_origin_for_validation(action_config, rule_id)?
@@ -2585,6 +2804,7 @@ fn compile_query_matcher(val: Option<&serde_json::Value>) -> anyhow::Result<Opti
 fn compile_fallback(
     raw: &Option<serde_json::Value>,
     mode: PipelineConstructionMode,
+    extension_registry: &dyn BundleRegistry,
 ) -> anyhow::Result<Option<CompiledFallback>> {
     let val = match raw {
         Some(v) => v,
@@ -2619,7 +2839,9 @@ fn compile_fallback(
         .get("action")
         .ok_or_else(|| anyhow::anyhow!("fallback origin missing 'action'"))?;
     let action = match mode {
-        PipelineConstructionMode::Runtime => compile_action_for_origin(action_config, "")?,
+        PipelineConstructionMode::Runtime => {
+            compile_action_with_registry(action_config, extension_registry)?
+        }
         PipelineConstructionMode::Validation => {
             compile_action_for_origin_for_validation(action_config, "")?
         }
@@ -2720,7 +2942,10 @@ fn normalize_request_modifier(val: &serde_json::Value) -> RequestModifierConfig 
 mod tests {
     use super::*;
     use compact_str::CompactString;
+    use sbproxy_extension::bundle::BundleRegistry;
+    use sbproxy_plugin::ExtensionState;
     use std::collections::HashMap;
+    use tempfile::TempDir;
 
     #[test]
     fn routing_state_namespace_is_workspace_and_rule_scoped() {
@@ -2806,6 +3031,168 @@ mod tests {
             session_ledger: None,
             flags: Vec::new(),
         }
+    }
+
+    fn write_dynamic_action_bundle(root: &std::path::Path, version: &str, marker: &str) {
+        let bundle = root.join("bundles").join("generation-action");
+        std::fs::create_dir_all(&bundle).expect("create extension bundle directory");
+        std::fs::write(
+            bundle.join("entry.js"),
+            format!(
+                r#"export function run() {{
+                    return {{ version: "sbproxy-envelope/v1", outcome: "proxy" }};
+                }}
+                // {marker}
+"#
+            ),
+        )
+        .expect("write extension artifact");
+        std::fs::write(
+            bundle.join("bundle.yaml"),
+            format!(
+                r#"apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: generation-action
+version: {version}
+runtime: javascript
+entry: entry.js
+hooks:
+  - kind: action
+    type: generation_action
+    export: run
+"#
+            ),
+        )
+        .expect("write extension manifest");
+    }
+
+    fn dynamic_action_config() -> CompiledConfig {
+        let mut config = make_config(
+            "extension.example",
+            serde_json::json!({"type": "generation_action"}),
+            None,
+            Vec::new(),
+        );
+        config.extension_bundles.bundles_dir = Some("bundles".to_owned());
+        config
+    }
+
+    #[test]
+    fn extension_pipeline_loads_relative_bundle_and_owns_running_inventory() {
+        let directory = TempDir::new().expect("temporary config directory");
+        write_dynamic_action_bundle(directory.path(), "1.0.0", "generation one");
+
+        let pipeline = CompiledPipeline::from_config_at(dynamic_action_config(), directory.path())
+            .expect("pipeline should load its relative bundle directory");
+
+        assert_eq!(pipeline.actions[0].action_type(), "generation_action");
+        assert!(pipeline
+            .extension_registry()
+            .action("generation_action")
+            .is_some());
+        assert_eq!(pipeline.extension_inventory().summary.active, 1);
+        assert_eq!(pipeline.extension_inventory().summary.available, 0);
+        assert_eq!(
+            pipeline
+                .extension_inventory()
+                .scope
+                .config_revision
+                .as_deref(),
+            Some(pipeline.config_revision.as_str())
+        );
+        assert_eq!(
+            pipeline.extension_inventory().hooks[0].state,
+            ExtensionState::Active
+        );
+        assert_eq!(
+            pipeline.extension_inventory().bundles[0].state,
+            ExtensionState::Active
+        );
+    }
+
+    #[test]
+    fn extension_pipeline_rejects_a_bundle_that_claims_a_builtin_name() {
+        let directory = TempDir::new().expect("temporary config directory");
+        let bundle = directory.path().join("bundles").join("collision");
+        std::fs::create_dir_all(&bundle).expect("create extension bundle directory");
+        std::fs::write(
+            bundle.join("entry.js"),
+            "export function run() { return { version: 'sbproxy-envelope/v1', outcome: 'proxy' }; }",
+        )
+        .expect("write extension artifact");
+        std::fs::write(
+            bundle.join("bundle.yaml"),
+            r#"apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: collision
+version: 1.0.0
+runtime: javascript
+entry: entry.js
+hooks:
+  - kind: action
+    type: noop
+    export: run
+"#,
+        )
+        .expect("write extension manifest");
+        let mut config = make_config(
+            "extension.example",
+            serde_json::json!({"type": "noop"}),
+            None,
+            Vec::new(),
+        );
+        config.extension_bundles.bundles_dir = Some("bundles".to_owned());
+
+        let error = match CompiledPipeline::from_config_at(config, directory.path()) {
+            Ok(_) => panic!("a built-in hook name must stay reserved"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("reserved"), "{error:#}");
+    }
+
+    #[test]
+    fn reload_keeps_the_prior_extension_generation_alive_for_a_pinned_request() {
+        let first_directory = TempDir::new().expect("first config directory");
+        write_dynamic_action_bundle(first_directory.path(), "1.0.0", "generation one");
+        let first =
+            CompiledPipeline::from_config_at(dynamic_action_config(), first_directory.path())
+                .expect("first extension generation should compile");
+        let first_registry = Arc::downgrade(first.extension_registry());
+        crate::reload::load_pipeline(first);
+        let pinned_request = crate::reload::current_pipeline_full();
+
+        let second_directory = TempDir::new().expect("second config directory");
+        write_dynamic_action_bundle(second_directory.path(), "2.0.0", "generation two");
+        let second =
+            CompiledPipeline::from_config_at(dynamic_action_config(), second_directory.path())
+                .expect("second extension generation should compile");
+        crate::reload::load_pipeline(second);
+        let next_request = crate::reload::current_pipeline_full();
+
+        assert!(!Arc::ptr_eq(&pinned_request, &next_request));
+        assert!(std::str::from_utf8(
+            pinned_request
+                .extension_registry()
+                .action("generation_action")
+                .expect("first hook remains reachable")
+                .artifact(),
+        )
+        .expect("fixture source is UTF-8")
+        .contains("generation one"));
+        assert!(std::str::from_utf8(
+            next_request
+                .extension_registry()
+                .action("generation_action")
+                .expect("second hook is reachable")
+                .artifact(),
+        )
+        .expect("fixture source is UTF-8")
+        .contains("generation two"));
+        assert!(first_registry.upgrade().is_some());
+
+        drop(pinned_request);
+        assert!(first_registry.upgrade().is_none());
     }
 
     #[test]
