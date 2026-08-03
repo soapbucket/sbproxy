@@ -503,6 +503,7 @@ impl ProxyWasmSession {
             "proxy_on_request_headers",
             "request_headers",
             0,
+            0,
             headers,
             end_of_stream,
         )
@@ -518,6 +519,7 @@ impl ProxyWasmSession {
             "proxy_on_response_headers",
             "response_headers",
             2,
+            1,
             headers,
             end_of_stream,
         )
@@ -540,6 +542,7 @@ impl ProxyWasmSession {
                 "request_body:chunk"
             },
             0,
+            0,
             body,
             end_of_stream,
         )
@@ -561,6 +564,7 @@ impl ProxyWasmSession {
             } else {
                 "response_body:chunk"
             },
+            1,
             1,
             body,
             end_of_stream,
@@ -647,6 +651,7 @@ impl ProxyWasmSession {
         callback: &str,
         trace: &'static str,
         map_id: i32,
+        stream_index: usize,
         headers: Vec<(String, String)>,
         end_of_stream: bool,
     ) -> Result<ProxyWasmHeaderResult, ProxyWasmCallFailure> {
@@ -658,8 +663,12 @@ impl ProxyWasmSession {
             },
         )?;
         self.begin_callback()?;
-        self.store.data_mut().active_context = HTTP_CONTEXT_ID;
-        self.store.data_mut().set_map(map_id, headers);
+        {
+            let state = self.store.data_mut();
+            state.active_context = HTTP_CONTEXT_ID;
+            state.active_stream = Some(stream_index);
+            state.set_map(map_id, headers);
+        }
         let header_count = self
             .store
             .data()
@@ -687,7 +696,7 @@ impl ProxyWasmSession {
             .unwrap_or_default();
         validate_headers(&headers, self.limits.max_output_bytes)?;
         let local_response = self.store.data_mut().local_response.take();
-        let action = effective_action(self.store.data_mut(), raw_action)?;
+        let action = effective_action(self.store.data_mut(), stream_index, raw_action)?;
         Ok(ProxyWasmHeaderResult {
             action: if local_response.is_some() {
                 ProxyWasmAction::Close
@@ -704,6 +713,7 @@ impl ProxyWasmSession {
         callback: &str,
         trace: &'static str,
         buffer_id: i32,
+        stream_index: usize,
         body: Bytes,
         end_of_stream: bool,
     ) -> Result<ProxyWasmBodyResult, ProxyWasmCallFailure> {
@@ -712,8 +722,12 @@ impl ProxyWasmSession {
             return Err(ProxyWasmCallFailure::InputLimit);
         }
         self.begin_callback()?;
-        self.store.data_mut().active_context = HTTP_CONTEXT_ID;
-        self.store.data_mut().set_buffer(buffer_id, body.to_vec());
+        {
+            let state = self.store.data_mut();
+            state.active_context = HTTP_CONTEXT_ID;
+            state.active_stream = Some(stream_index);
+            state.set_buffer(buffer_id, body.to_vec());
+        }
         let body_size = i32::try_from(body.len()).map_err(|_| ProxyWasmCallFailure::InputLimit)?;
         let (raw_action, called) = self.call_action3(
             callback,
@@ -735,7 +749,7 @@ impl ProxyWasmSession {
             return Err(ProxyWasmCallFailure::OutputLimit);
         }
         let local_response = self.store.data_mut().local_response.take();
-        let action = effective_action(self.store.data_mut(), raw_action)?;
+        let action = effective_action(self.store.data_mut(), stream_index, raw_action)?;
         Ok(ProxyWasmBodyResult {
             action: if local_response.is_some() {
                 ProxyWasmAction::Close
@@ -947,13 +961,17 @@ fn classify_host_call_error(
 
 fn effective_action(
     state: &mut ProxyWasmHostState,
+    stream_index: usize,
     raw_action: i32,
 ) -> Result<ProxyWasmAction, ProxyWasmCallFailure> {
-    if state.close_requested {
-        return Ok(ProxyWasmAction::Close);
-    }
-    if state.continue_requested {
-        return Ok(ProxyWasmAction::Continue);
+    let requested = state
+        .stream_actions
+        .get_mut(stream_index)
+        .ok_or(ProxyWasmCallFailure::InvalidHostData)?
+        .take();
+    state.active_stream = None;
+    if let Some(requested) = requested {
+        return Ok(requested);
     }
     match raw_action {
         0 => Ok(ProxyWasmAction::Continue),
@@ -989,8 +1007,8 @@ struct ProxyWasmHostState {
     header_maps: BTreeMap<i32, Vec<(String, String)>>,
     writable_map: Option<i32>,
     local_response: Option<ProxyWasmLocalResponse>,
-    continue_requested: bool,
-    close_requested: bool,
+    stream_actions: [Option<ProxyWasmAction>; 2],
+    active_stream: Option<usize>,
     failure: Option<ProxyWasmCallFailure>,
 }
 
@@ -1016,8 +1034,8 @@ impl ProxyWasmHostState {
             header_maps: BTreeMap::new(),
             writable_map: None,
             local_response: None,
-            continue_requested: false,
-            close_requested: false,
+            stream_actions: [None; 2],
+            active_stream: None,
             failure: None,
         }
     }
@@ -1028,8 +1046,7 @@ impl ProxyWasmHostState {
         self.current_buffer = None;
         self.writable_map = None;
         self.local_response = None;
-        self.continue_requested = false;
-        self.close_requested = false;
+        self.active_stream = None;
         self.failure = None;
     }
 
@@ -1710,18 +1727,25 @@ fn host_remove_header_map_value(
 }
 
 fn host_continue_stream(mut caller: Caller<'_, ProxyWasmHostState>, stream_type: i32) -> i32 {
-    if !matches!(stream_type, 0 | 1) {
-        return STATUS_BAD_ARGUMENT;
+    let stream_index = match stream_type {
+        0 => 0,
+        1 => 1,
+        _ => return STATUS_BAD_ARGUMENT,
+    };
+    let action = &mut caller.data_mut().stream_actions[stream_index];
+    if *action != Some(ProxyWasmAction::Close) {
+        *action = Some(ProxyWasmAction::Continue);
     }
-    caller.data_mut().continue_requested = true;
     STATUS_OK
 }
 
 fn host_close_stream(mut caller: Caller<'_, ProxyWasmHostState>, stream_type: i32) -> i32 {
-    if !matches!(stream_type, 0 | 1) {
-        return STATUS_BAD_ARGUMENT;
-    }
-    caller.data_mut().close_requested = true;
+    let stream_index = match stream_type {
+        0 => 0,
+        1 => 1,
+        _ => return STATUS_BAD_ARGUMENT,
+    };
+    caller.data_mut().stream_actions[stream_index] = Some(ProxyWasmAction::Close);
     STATUS_OK
 }
 
@@ -1784,13 +1808,17 @@ fn host_send_local_response(
         return STATUS_BAD_ARGUMENT;
     }
     let grpc_status = grpc_status as u32;
-    caller.data_mut().local_response = Some(ProxyWasmLocalResponse {
+    let active_stream = caller.data().active_stream;
+    let state = caller.data_mut();
+    state.local_response = Some(ProxyWasmLocalResponse {
         status,
         grpc_status: (grpc_status != u32::MAX).then_some(grpc_status),
         headers,
         body: Bytes::from(body),
     });
-    caller.data_mut().close_requested = true;
+    if let Some(action) = active_stream.and_then(|index| state.stream_actions.get_mut(index)) {
+        *action = Some(ProxyWasmAction::Close);
+    }
     STATUS_OK
 }
 
@@ -1994,6 +2022,7 @@ mod tests {
             "sdk-lifecycle" => include_bytes!("testdata/proxy_wasm/sdk-lifecycle.wasm"),
             "stack" => include_bytes!("testdata/proxy_wasm/stack.wasm"),
             "start-trap" => include_bytes!("testdata/proxy_wasm/start-trap.wasm"),
+            "stream-direction" => include_bytes!("testdata/proxy_wasm/stream-direction.wasm"),
             "table-grow" => include_bytes!("testdata/proxy_wasm/table-grow.wasm"),
             _ => panic!("unknown fixture"),
         };
@@ -2259,6 +2288,31 @@ mod tests {
                 "request_body:eos",
             ]
         );
+    }
+
+    #[test]
+    fn stream_controls_apply_only_to_the_target_direction() {
+        let runtime = runtime("stream-direction", limits());
+
+        let mut continued_response = runtime.start_session(b"{}").unwrap();
+        let request = continued_response
+            .on_request_headers(Vec::new(), false)
+            .unwrap();
+        let response = continued_response
+            .on_response_headers(Vec::new(), true)
+            .unwrap();
+        assert_eq!(request.action, ProxyWasmAction::Pause);
+        assert_eq!(response.action, ProxyWasmAction::Continue);
+
+        let mut closed_response = runtime.start_session(b"{}").unwrap();
+        let request = closed_response
+            .on_request_body(Bytes::new(), false)
+            .unwrap();
+        let response = closed_response
+            .on_response_body(Bytes::new(), true)
+            .unwrap();
+        assert_eq!(request.action, ProxyWasmAction::Continue);
+        assert_eq!(response.action, ProxyWasmAction::Close);
     }
 
     #[test]
