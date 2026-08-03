@@ -3676,6 +3676,20 @@ async fn check_policies(
                 .enumerate()
                 .map(|(index, compiled)| (index, compiled.dynamic_hook.as_ref())),
         );
+    // Record the non-dynamic buffering demand before the empty-chain exit.
+    //
+    // `request_body_filter` releases the body early when nothing needs it,
+    // and it decides that from this flag plus the dynamic policy set. An
+    // origin with no policies took the exit below, so the flag kept its
+    // `false` default while `ctx.validate_request_body` was already true,
+    // and the early release then skipped Web Bot Auth's body-bound proof:
+    // a signed request whose body did not match its covered
+    // `content-digest` was admitted with a 200. Every consumer that sets
+    // `validate_request_body` outside the policy chain, Web Bot Auth at
+    // `request_phase::request_filter` among them, runs before this point,
+    // so recording it here sees all of them.
+    ctx.dynamic_request_body_plan
+        .set_other_buffering_required(ctx.validate_request_body);
     if enforcers.is_empty() {
         return None;
     }

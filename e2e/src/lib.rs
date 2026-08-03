@@ -102,7 +102,7 @@ impl ProxyBinaryFlavor {
                 "run `cargo build --release -p sbproxy` or set SBPROXY_E2E_BIN"
             }
             Self::NoDefaultFeatures => {
-                "run `CARGO_TARGET_DIR=target/no-default-features cargo build -p sbproxy --no-default-features` or set SBPROXY_E2E_NO_DEFAULT_FEATURES_BIN"
+                "run `CARGO_TARGET_DIR=target/no-default-features cargo build --release -p sbproxy --no-default-features` or set SBPROXY_E2E_NO_DEFAULT_FEATURES_BIN"
             }
             Self::Payments => {
                 "run `CARGO_TARGET_DIR=target/payments cargo build --release -p sbproxy --features payment-x402,payment-mpp,payment-stripe,payment-lightning-cln` or set SBPROXY_E2E_PAYMENTS_BIN"
@@ -152,11 +152,16 @@ fn proxy_binary_path_for(flavor: ProxyBinaryFlavor) -> PathBuf {
         return path;
     }
     let paths = flavor.search_paths();
+    // Fall back to the *preferred* path, not the last one searched. The
+    // caller puts this path in its "binary missing at ..." error beside
+    // `missing_hint`, and every hint builds `--release`, so naming the
+    // debug path told the reader to create one file and then look for a
+    // different one.
     paths
         .iter()
         .find(|path| path.is_file())
         .cloned()
-        .unwrap_or_else(|| paths.last().expect("binary search paths").clone())
+        .unwrap_or_else(|| paths.first().expect("binary search paths").clone())
 }
 
 /// Locate the default-feature `sbproxy` binary built by the workspace.
