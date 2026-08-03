@@ -536,9 +536,14 @@ fn build_store(cfg: &KeyManagementConfig) -> Result<Arc<dyn KeyStore>> {
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("create keystore directory '{}'", parent.display()))?;
             }
-            let store = EmbeddedKeyStore::open(&cfg.store.path)
+            // `open_shared`, not `open`: reload builds this candidate while
+            // the live generation still holds its handle, and redb locks the
+            // database file exclusively. An unconditional re-open failed
+            // every reload of a config carrying an embedded keystore, which
+            // is the default backend, and left the node on the old config.
+            let store: Arc<dyn KeyStore> = EmbeddedKeyStore::open_shared(&cfg.store.path)
                 .with_context(|| format!("open embedded keystore at '{}'", cfg.store.path))?;
-            Ok(Arc::new(store))
+            Ok(store)
         }
         KeyStoreBackend::Redis => {
             let url = cfg

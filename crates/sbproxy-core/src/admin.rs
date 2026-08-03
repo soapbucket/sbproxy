@@ -1280,8 +1280,14 @@ fn handle_reload(state: &AdminState) -> (u16, &'static str, String) {
         Ok(outcome) => outcome,
         Err(error) => {
             sbproxy_observe::metrics::record_config_reload("failure");
-            tracing::error!(error = %error, "admin reload: shared reload transaction failed");
-            let msg = sanitise_path_in_error(&error.to_string(), &path);
+            // `{error:#}`, not `{error}`. The alternate form walks the whole
+            // anyhow chain; the plain one renders only the outermost context,
+            // which is where a reload failure loses its own cause. An
+            // embedded keystore that could not be re-opened reported "open
+            // embedded keystore at '<path>'" and dropped the reason, so the
+            // operator saw a path they could read and nothing to act on.
+            tracing::error!(error = ?error, "admin reload: shared reload transaction failed");
+            let msg = sanitise_path_in_error(&format!("{error:#}"), &path);
             return (
                 500,
                 "application/json",

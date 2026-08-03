@@ -157,7 +157,8 @@ pub async fn assert_complete_ai_span_exports(
     // WOR-2085: the operation slot carries the OTel GenAI operation
     // vocabulary, not the surface label. A chat completion is `chat`;
     // `chat_completions` is not a value in the pinned v1.36.0 vocabulary
-    // (see `OTEL_GENAI_SEMCONV_SOURCE`). The finer-grained endpoint
+    // (the pinned source is recorded beside the version constant in
+    // `sbproxy-ai`'s span module). The finer-grained endpoint
     // identity rides on `sbproxy.ai.surface`, asserted next, so both
     // halves of the split are pinned here as they are in the
     // `tracing_spans` unit tests.
