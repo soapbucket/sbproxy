@@ -36,6 +36,7 @@ pub mod payments;
 pub mod plan;
 pub mod raw;
 pub mod schema;
+mod secret_refs;
 pub mod snapshot;
 pub mod source;
 #[cfg(test)]

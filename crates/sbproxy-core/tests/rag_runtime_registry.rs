@@ -123,6 +123,14 @@ origins:
             r#"
 proxy:
   http_bind_port: 0
+  # Declared so the config compiles: `compile_config` refuses a
+  # `secret://<backend>/...` whose backend is not under
+  # `proxy.secrets.backends`. No entries are needed, because the
+  # `CountingVault` this test installs is what actually answers.
+  secrets:
+    backends:
+      - type: local
+        name: counting-rag
 origins:
   "rag.test":
     action:

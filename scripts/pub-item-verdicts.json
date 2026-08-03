@@ -59,10 +59,6 @@
       "verdict": "keep",
       "reason": "Its doc states the purpose: unit tests in other crates assert that a helper stamped an exemplar onto a metric without reaching into the private store. Only this crate's own test modules use it today, so cfg(test) pub(crate) would compile and would quietly remove the cross-crate seam the doc promises."
     },
-    "crates/sbproxy-ai/src/routing.rs::set_provider_health": {
-      "verdict": "escalated",
-      "reason": "Its doc says the background health-check task sets this flag, and no such caller exists anywhere in the workspace, so the active-probe health axis is written but never driven. The router still reads self.health on the routing path, so the default values are load bearing and this is not a plain deletion. Question for the AI gateway owner: was the active-probe task ever wired, or is passive ejection (record_failure plus check_ejections) the whole health story?"
-    },
     "crates/sbproxy-mesh/src/metrics.rs::EVICT_REASON_GRACEFUL_LEAVE": {
       "verdict": "escalated",
       "reason": "The reason label for a peer that sent a graceful LeaveRequest. Its two siblings, probe_timeout and dead_timeout, are passed by production eviction sites; this one is passed only from peer_eviction.rs's own test. There is no LeaveRequest handler in the crate at all, only doc comments naming it. Question for the mesh owner: is graceful leave unimplemented, or handled somewhere that forgets to record the eviction reason? Deleting the constant would hide the gap rather than answer it."

@@ -144,6 +144,22 @@
 # the claims directly. This is the ratchet's first option, wiring the item
 # to a production call site, rather than a narrowing.
 
+# Lowered to 287 on WOR-2224, 2026-08-02, answering another one.
+# `Router::set_provider_health` (sbproxy-ai/src/routing.rs) is the writer
+# for the active-probe axis that `provider_eligible` intersects on every
+# AI routing decision. The escalation asked whether the probe task was
+# ever wired or whether passive ejection was the whole story. It was never
+# wired: the axis, the `AiHealthCheckConfig` struct, and the
+# `resilience.health_check` config block all landed together in the
+# original AI-resilience commit and the task that was supposed to drive
+# them was never written, so every provider sat at the `unknown` default
+# while docs, `docs/configuration.md`, and `examples/ai-resilience` all
+# described a working probe. The new `sbproxy-ai/src/health_probe.rs`
+# spawns it from the pipeline's existing background-task seam. This is the
+# ratchet's first option again, a production call site rather than a
+# narrowing.
+285
+#
 # Lowered to 286 on WOR-2225, 2026-08-02, answering three more of the
 # escalated questions. Each one asked the same thing: two implementations
 # of one job exist and only one runs, so which is the real one.
@@ -177,4 +193,3 @@
 # unreferenced list into the tests-only slice without anything about it
 # changing. It is worth a look on its own: the fingerprint is computed for
 # every compiled pipeline and nothing in production reads it.
-286
