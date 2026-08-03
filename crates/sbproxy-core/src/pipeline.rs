@@ -19,6 +19,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::builtin_enforcers::{compile_builtin_enforcers, CompiledEnforcer};
@@ -1216,6 +1217,8 @@ pub struct CompiledPipeline {
     pub router: HostRouter,
     /// Compiled action for each origin (parallel to config.origins).
     pub actions: Vec<Action>,
+    /// Guards the one-time activation of this generation's background tasks.
+    pub(crate) background_tasks_started: AtomicBool,
     /// Immutable per-origin AI compression dependencies and policies.
     pub compression_runtimes: crate::compression_runtime::CompressionRuntimeRegistry,
     /// Immutable route-scoped RAG runtimes keyed by origin and optional
@@ -1574,6 +1577,7 @@ impl Default for CompiledPipeline {
             sensitive_header_names,
             router,
             actions: Vec::new(),
+            background_tasks_started: AtomicBool::new(false),
             compression_runtimes: crate::compression_runtime::CompressionRuntimeRegistry::default(),
             #[cfg(feature = "rag")]
             rag_runtimes: crate::rag_runtime::RagRuntimeRegistry::default(),
@@ -1622,6 +1626,24 @@ impl Default for CompiledPipeline {
 enum PipelineConstructionMode {
     Runtime,
     Validation,
+}
+
+/// Process-lifetime runtime for tasks owned by published pipeline generations.
+///
+/// The synchronous startup path publishes its pipeline before Pingora creates
+/// a service runtime. Keeping these tasks here gives startup and reload the
+/// same lifetime and prevents a temporary hook or validation runtime from
+/// becoming their accidental owner.
+fn pipeline_background_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("sbproxy-pipeline-tasks")
+            .enable_all()
+            .build()
+            .expect("build pipeline background-task runtime")
+    })
 }
 
 fn parse_outbound_credential_config(
@@ -1716,6 +1738,10 @@ impl CompiledPipeline {
     }
 
     /// Compile a runtime pipeline with bundle paths relative to its config document.
+    ///
+    /// Background tasks stay dormant until the pipeline reaches
+    /// [`crate::reload::load_pipeline`], so a lifecycle hook can still reject
+    /// this candidate without leaving work behind.
     pub fn from_config_at(config: CompiledConfig, base_dir: &Path) -> anyhow::Result<Self> {
         let extension_registry = DynamicBundleRegistry::load(
             &config.extension_bundles,
@@ -1726,6 +1752,7 @@ impl CompiledPipeline {
             config,
             PipelineConstructionMode::Runtime,
             extension_registry,
+            false,
         )
     }
 
@@ -1770,13 +1797,19 @@ impl CompiledPipeline {
         config: CompiledConfig,
         mode: PipelineConstructionMode,
     ) -> anyhow::Result<Self> {
-        Self::from_config_with_mode_and_registry(config, mode, empty_extension_registry())
+        Self::from_config_with_mode_and_registry(
+            config,
+            mode,
+            empty_extension_registry(),
+            matches!(mode, PipelineConstructionMode::Runtime),
+        )
     }
 
     fn from_config_with_mode_and_registry(
         config: CompiledConfig,
         mode: PipelineConstructionMode,
         extension_registry: Arc<DynamicBundleRegistry>,
+        start_background_tasks: bool,
     ) -> anyhow::Result<Self> {
         // WOR-2084: async twin of the shared L2 store. The rate-limit
         // policy's hot path awaits `AsyncKVStore::incr_with_ttl`
@@ -2325,6 +2358,7 @@ impl CompiledPipeline {
             sensitive_header_names,
             router,
             actions,
+            background_tasks_started: AtomicBool::new(false),
             compression_runtimes,
             #[cfg(feature = "rag")]
             rag_runtimes,
@@ -2369,14 +2403,11 @@ impl CompiledPipeline {
         // we are not running inside a Tokio runtime (e.g. unit tests),
         // the call is a no-op.
         //
-        // Validation-mode pipelines are thrown away by the caller, so
-        // spawning here would leak one probe task per health-checked
-        // target on every validation. The tasks hold an Arc on the
-        // dropped pipeline and keep issuing real outbound requests, so
-        // a caller that validates repeatedly (the admin config write
-        // path, a config authority validating each publish) would
-        // accumulate probes against the operator's upstreams forever.
-        if matches!(mode, PipelineConstructionMode::Runtime) {
+        // Validation-mode pipelines are thrown away by the caller, so they
+        // must never issue probes against the operator's upstreams. Runtime
+        // candidates built relative to a config path are activated only by
+        // the publication boundary after lifecycle hooks have accepted them.
+        if start_background_tasks {
             pipeline.start_background_tasks();
         }
         Ok(pipeline)
@@ -2389,12 +2420,28 @@ impl CompiledPipeline {
     /// pipeline-scoped task (e.g. periodic cache eviction sweeps,
     /// dynamic blocklist refresh) will plug into.
     fn start_background_tasks(&self) {
-        if tokio::runtime::Handle::try_current().is_err() {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        self.start_background_tasks_on(&handle);
+    }
+
+    /// Activate tasks for a pipeline that has passed every publication gate.
+    ///
+    /// Startup compilation runs before Pingora creates its service runtimes,
+    /// so published tasks live on a dedicated process-lifetime runtime rather
+    /// than whichever short-lived runtime happened to construct the pipeline.
+    pub(crate) fn activate_background_tasks(&self) {
+        self.start_background_tasks_on(pipeline_background_runtime().handle());
+    }
+
+    fn start_background_tasks_on(&self, handle: &tokio::runtime::Handle) {
+        if self.background_tasks_started.swap(true, Ordering::AcqRel) {
             return;
         }
         for action in &self.actions {
             if let sbproxy_modules::Action::LoadBalancer(lb) = action {
-                lb.spawn_health_probes();
+                lb.spawn_health_probes_on(handle);
             }
         }
     }

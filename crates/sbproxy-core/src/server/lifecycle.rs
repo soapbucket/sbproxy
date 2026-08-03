@@ -3495,6 +3495,156 @@ origins:
         assert!(Arc::ptr_eq(&current, &after_failure));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejected_reload_candidate_starts_no_health_probes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind probe listener");
+        let port = listener
+            .local_addr()
+            .expect("probe listener address")
+            .port();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener_hits = Arc::clone(&hits);
+        let listener_task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                listener_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        let yaml = format!(
+            r#"proxy: {{}}
+origins:
+  hook-failure-fixture.test:
+    action:
+      type: load_balancer
+      targets:
+        - url: "http://127.0.0.1:{port}"
+          health_check:
+            path: /healthz
+            interval_secs: 1
+            timeout_ms: 100
+"#
+        );
+
+        let error = reload_from_config_yaml("sb.yml", &yaml)
+            .expect_err("the lifecycle hook must reject the candidate");
+        tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+
+        listener_task.abort();
+        let _ = listener_task.await;
+        assert!(
+            error
+                .to_string()
+                .contains("fixture reload hook rejected the candidate"),
+            "{error:#}"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a rejected candidate started a health-probe task"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn accepted_reload_candidate_starts_each_health_probe_once() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind probe listener");
+        let port = listener
+            .local_addr()
+            .expect("probe listener address")
+            .port();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener_hits = Arc::clone(&hits);
+        let listener_task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                listener_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        let yaml = format!(
+            r#"proxy: {{}}
+origins:
+  accepted-probe-fixture.test:
+    action:
+      type: load_balancer
+      targets:
+        - url: "http://127.0.0.1:{port}"
+          health_check:
+            path: /healthz
+            interval_secs: 10
+            timeout_ms: 100
+"#
+        );
+
+        reload_from_config_yaml("sb.yml", &yaml).expect("the candidate must publish");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let observed_hits = hits.load(std::sync::atomic::Ordering::SeqCst);
+        crate::reload::load_pipeline(crate::pipeline::CompiledPipeline::default());
+        listener_task.abort();
+        let _ = listener_task.await;
+        assert_eq!(
+            observed_hits, 1,
+            "a published candidate must start exactly one task per health-checked target"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replaced_reload_candidate_stops_health_probes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind probe listener");
+        let port = listener
+            .local_addr()
+            .expect("probe listener address")
+            .port();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener_hits = Arc::clone(&hits);
+        let listener_task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                listener_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        let yaml = format!(
+            r#"proxy: {{}}
+origins:
+  replaceable-probe-fixture.test:
+    action:
+      type: load_balancer
+      targets:
+        - url: "http://127.0.0.1:{port}"
+          health_check:
+            path: /healthz
+            interval_secs: 1
+            timeout_ms: 100
+"#
+        );
+
+        reload_from_config_yaml("sb.yml", &yaml).expect("the candidate must publish");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while hits.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the first health probe must run");
+
+        crate::reload::load_pipeline(crate::pipeline::CompiledPipeline::default());
+        let hits_after_replacement = hits.load(std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(1_250)).await;
+
+        listener_task.abort();
+        let _ = listener_task.await;
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            hits_after_replacement,
+            "a replaced generation kept its health-probe task alive"
+        );
+    }
+
     #[test]
     fn pipeline_lifecycle_hook_has_product_neutral_identifiers() {
         let subsystem = DegradedSubsystem::PipelineLifecycleHook;

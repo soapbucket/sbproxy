@@ -88,8 +88,8 @@ pub enum Action {
     /// Return a 1x1 transparent GIF tracking pixel.
     Beacon(BeaconAction),
     /// Distribute requests across multiple upstream targets.
-    /// Wrapped in `Arc` so background tasks (active health probes) can
-    /// hold a stable handle to the action without copying its state.
+    /// Wrapped in `Arc` so active health probes can upgrade a generation-owned
+    /// weak handle without copying the action's state.
     LoadBalancer(std::sync::Arc<LoadBalancerAction>),
     /// AI proxy action (boxed because it is large and behind feature flag).
     AiProxy(Box<AiProxyAction>),
