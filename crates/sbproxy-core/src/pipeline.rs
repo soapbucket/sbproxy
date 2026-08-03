@@ -2147,17 +2147,29 @@ impl CompiledPipeline {
 
     /// Start background tasks owned by the pipeline.
     ///
-    /// Currently this only covers the active health-check probes on
-    /// `Action::LoadBalancer` targets, but it is the seam any future
-    /// pipeline-scoped task (e.g. periodic cache eviction sweeps,
-    /// dynamic blocklist refresh) will plug into.
+    /// Currently this covers the active health-check probes on
+    /// `Action::LoadBalancer` targets and on `Action::AiProxy` provider
+    /// pools, but it is the seam any future pipeline-scoped task (e.g.
+    /// periodic cache eviction sweeps, dynamic blocklist refresh) will
+    /// plug into.
     fn start_background_tasks(&self) {
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
         for action in &self.actions {
-            if let sbproxy_modules::Action::LoadBalancer(lb) = action {
-                lb.spawn_health_probes();
+            match action {
+                sbproxy_modules::Action::LoadBalancer(lb) => {
+                    lb.spawn_health_probes();
+                }
+                // The AI provider pool carries the same active-probe
+                // axis, and its router consults the flag on every
+                // routing decision. Without this arm the pool's
+                // `resilience.health_check` block parses and is then
+                // never acted on (WOR-2224).
+                sbproxy_modules::Action::AiProxy(ai) => {
+                    sbproxy_ai::health_probe::spawn_provider_health_probes(&ai.config);
+                }
+                _ => {}
             }
         }
     }
