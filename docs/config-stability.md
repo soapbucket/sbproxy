@@ -83,12 +83,29 @@ Adding a key to `types.rs` without wiring it now fails with the complete dotted
 schema path. Adding a reviewed `ConfigOnly` entry makes the exception explicit
 and stale entries fail when their schema path is removed or renamed.
 
+### Module and AI-gateway keys
+
+The generated schema stops at `action:`, `authentication:`, `policies:` and
+`transforms:`, because modules are pluggable and the configuration crate does
+not name their types. Keys below those four are covered by a second input: a
+registry of subtrees, each naming the Rust type the subtree deserializes into,
+which the same scan walks directly.
+
+Coverage is deliberately incremental. Every module an operator can name must
+say whether its configuration is walked, and a module that reaches the config
+compiler without saying so fails the build. Saying "not yet" is a valid answer
+and requires a reason.
+
 ### Current config-only compatibility fields
 
 | Field or subtree | What happens today |
 |---|---|
 | `agent_classes.hosted_feed.url`, `.bootstrap_keys` | The resolver uses builtin or inline catalogs; it does not fetch or verify a hosted feed. |
 | `audit.sink` | Admin-action rows always use the in-memory ring and tracing mirror; this selector has no effect. |
+| `origins.*.action.resilience.circuit_breaker` | The AI router is built without per-provider breakers, so the breaker gate never fires. Setting `resilience` at all still widens cross-provider retries. |
+| `origins.*.action.resilience.outlier_detection` | The AI router is built without an outlier detector, so no provider is ejected on failure rate. Use `resilience.health_check`, which is live. |
+| `origins.*.action.sticky` (load_balancer) | No affinity cookie is issued and none is read back. Use the `ip_hash`, `header_hash`, or `cookie_hash` algorithms, which are inherently sticky. |
+| `origins.*.action.targets[].zone` (load_balancer) | Target selection is not locality aware. The label is echoed in the admin targets view and nowhere else. |
 | `origins.*.agent_skills[].max_clock_skew_secs` | Reserved for signed artifact freshness headers that are not emitted yet. |
 | `origins.*.connection_pool` | Pingora's built-in upstream pool is used; these per-origin limits are not applied. |
 | `origins.*.compression.level` | Compression libraries use their runtime defaults; this parsed level is not applied. |

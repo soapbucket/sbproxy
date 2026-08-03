@@ -50,6 +50,28 @@ const fn unsupported(path: &'static str, note: &'static str) -> ConfigKeyCapabil
 const OUTBOUND_CREDENTIAL_CONSUMER: &str =
     "sbproxy_core::pipeline::parse_outbound_credential_config";
 
+const AI_BREAKER_NOTE: &str =
+    "The AI router is built without per-provider circuit breakers. `Router::with_resilience` is \
+     the only path that would install them and nothing calls it, so the breaker gate never \
+     fires. Setting `resilience` at all does still widen cross-provider retries, which is why \
+     this is easy to miss in production. Tracked by WOR-2233.";
+
+const AI_OUTLIER_NOTE: &str =
+    "The AI router is built without an outlier detector, for the same reason its circuit \
+     breakers are missing, so no provider is ever ejected on failure rate. Use \
+     `resilience.health_check`, which is live, to drop an unhealthy provider. Tracked by \
+     WOR-2233.";
+
+const LB_STICKY_NOTE: &str =
+    "The load balancer never issues an affinity cookie and never reads one back, so this block \
+     pins no client to any target. Use the `ip_hash`, `header_hash`, or `cookie_hash` \
+     algorithms, which are inherently sticky. Tracked by WOR-2246.";
+
+const LB_ZONE_NOTE: &str =
+    "Target selection is not locality aware. The `locality_filter` that would read this label \
+     has no production caller and no key turns it on, so the value only ever appears in the \
+     admin targets view. Tracked by WOR-2246.";
+
 /// Keys whose reader is indirect, plus deliberately inert compatibility keys.
 ///
 /// Every override names one exact schema leaf. Parent entries never suppress
@@ -82,6 +104,48 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "The OSS admin-action audit path always retains its bounded in-memory ring and mirrors \
          rows to tracing; this selector is not installed. Classified under WOR-1976.",
     ),
+    // The ten entries below are the first keys pinned from the module and
+    // AI-gateway surface, which the generated schema cannot describe and
+    // which `MODULE_CONFIG_ROOTS` now walks instead. They are pre-existing
+    // debt, pinned rather than fixed, so the widened scan lands without
+    // turning the build red on work it did not cause.
+    //
+    // They cover four of the five findings in the WOR-2245 audit. The fifth,
+    // `routing.strategy: token_rate` degenerating into `least_token_usage`,
+    // has no leaf to pin: the key is `routing`, the key is read, and it is
+    // one accepted *value* of it that does nothing. No reader-based check
+    // can see that shape.
+    config_only(
+        "origins.*.action.resilience.circuit_breaker.failure_threshold",
+        AI_BREAKER_NOTE,
+    ),
+    config_only(
+        "origins.*.action.resilience.circuit_breaker.open_duration_secs",
+        AI_BREAKER_NOTE,
+    ),
+    config_only(
+        "origins.*.action.resilience.circuit_breaker.success_threshold",
+        AI_BREAKER_NOTE,
+    ),
+    config_only(
+        "origins.*.action.resilience.outlier_detection.ejection_duration_secs",
+        AI_OUTLIER_NOTE,
+    ),
+    config_only(
+        "origins.*.action.resilience.outlier_detection.min_requests",
+        AI_OUTLIER_NOTE,
+    ),
+    config_only(
+        "origins.*.action.resilience.outlier_detection.threshold",
+        AI_OUTLIER_NOTE,
+    ),
+    config_only(
+        "origins.*.action.resilience.outlier_detection.window_secs",
+        AI_OUTLIER_NOTE,
+    ),
+    config_only("origins.*.action.sticky.cookie_name", LB_STICKY_NOTE),
+    config_only("origins.*.action.sticky.ttl", LB_STICKY_NOTE),
+    config_only("origins.*.action.targets[].zone", LB_ZONE_NOTE),
     config_only(
         "origins.*.agent_skills[].max_clock_skew_secs",
         "Agent Skills responses do not yet carry the signed freshness headers this limit would \
@@ -735,6 +799,218 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
     stable("source.kind", "sbproxy_config::source::load_with_depth"),
 ];
 
+// --- Module and AI-gateway surface (WOR-2245) ---
+//
+// Everything below drives the build-time guard and has no runtime consumer,
+// so it is compiled only for tests. `CONFIG_KEY_OVERRIDES` above is the
+// opposite: it is production data because the boot warning reads it.
+//
+// The guard walks the generated `ConfigFile` schema, and `ConfigFile` types
+// `action`, `authentication`, `policies` and `transforms` as
+// `serde_json::Value` on purpose, because modules are pluggable and this
+// crate must not need to name their types. The consequence is that no key
+// below any of them reaches the schema: `schemas/sb-config.schema.json` is
+// 419KB and contains no occurrence of `resilience`, `circuit_breaker`,
+// `outlier_detection` or `load_balancer`. Every confirmed-dead config
+// finding from the WOR-2245 audit sat in that hole.
+//
+// A root closes the hole for one subtree by naming the Rust type the
+// subtree deserializes into, which the scan walks with the same `syn` index
+// it already uses to prove reads.
+
+#[cfg(test)]
+use sbproxy_capability::config_scan::{
+    ModuleConfigRoot, ModuleCoverage, ModuleCoverageState, ModuleDispatch, ModuleRootEnforcement,
+};
+
+#[cfg(test)]
+const MODULE_TRIAGE_NOTE: &str = "not yet walked; classified under WOR-2245";
+
+#[cfg(test)]
+const fn deferred(kind: &'static str, name: &'static str) -> ModuleCoverage {
+    ModuleCoverage {
+        kind,
+        name,
+        state: ModuleCoverageState::Deferred(MODULE_TRIAGE_NOTE),
+    }
+}
+
+#[cfg(test)]
+const fn rooted(kind: &'static str, name: &'static str) -> ModuleCoverage {
+    ModuleCoverage {
+        kind,
+        name,
+        state: ModuleCoverageState::Rooted,
+    }
+}
+
+/// Configuration subtrees the generated schema cannot reach.
+///
+/// Both entries are `ReportOnly` for now. Their findings print, they do not
+/// fail the build, and the ones already traced by hand are pinned in
+/// `CONFIG_KEY_OVERRIDES` so an operator who sets them is warned at boot.
+/// Turning a root `Enforced` is a separate, deliberate step: it means
+/// somebody has read every finding under it and either wired the key or
+/// pinned it. Doing that on the same change that widened the scan would
+/// fail the build on five pre-existing dead keys, and a check that does
+/// that gets reverted rather than fixed.
+#[cfg(test)]
+const MODULE_CONFIG_ROOTS: &[ModuleConfigRoot] = &[
+    ModuleConfigRoot {
+        path: "origins.*.action",
+        rust_type: "sbproxy_modules::action::loadbalancer::LoadBalancerConfig",
+        enforcement: ModuleRootEnforcement::ReportOnly(
+            "sticky sessions and target zones are dead here and are pinned above; the rest of \
+             the load_balancer surface has not been triaged. WOR-2246.",
+        ),
+    },
+    // Rooted at the subtree rather than at `AiHandlerConfig`, deliberately.
+    // The whole AI action is several hundred keys and nobody has triaged
+    // them; `resilience` is where the confirmed-dead ones are. A root is a
+    // path and a type, so coverage can grow a subtree at a time instead of
+    // waiting for one very large review.
+    ModuleConfigRoot {
+        path: "origins.*.action.resilience",
+        rust_type: "sbproxy_ai::handler::AiResilienceConfig",
+        enforcement: ModuleRootEnforcement::ReportOnly(
+            "the circuit-breaker and outlier-detection blocks are dead here and are pinned \
+             above; retry_policy and llm_aware have not been triaged. WOR-2233.",
+        ),
+    },
+];
+
+/// Where the config compiler turns an operator's `type:` string into a
+/// module.
+#[cfg(test)]
+const MODULE_DISPATCHES: &[ModuleDispatch] = &[
+    ModuleDispatch {
+        kind: "action",
+        source: "crates/sbproxy-modules/src/compile.rs",
+        function: "compile_action_for_origin_with_runtime",
+    },
+    ModuleDispatch {
+        kind: "auth",
+        source: "crates/sbproxy-modules/src/compile.rs",
+        function: "compile_auth",
+    },
+    ModuleDispatch {
+        kind: "policy",
+        source: "crates/sbproxy-modules/src/compile.rs",
+        function: "compile_policy",
+    },
+    ModuleDispatch {
+        kind: "transform",
+        source: "crates/sbproxy-modules/src/compile.rs",
+        function: "compile_transform",
+    },
+];
+
+/// Every module an operator can name, and whether its config is walked.
+///
+/// This is what makes forgetting impossible rather than merely unlikely. A
+/// registry of roots alone covers the modules somebody remembered; a module
+/// added next month would go unguarded until the next audit noticed. Here
+/// the guard reads the dispatch tables themselves, so a new `type:` string
+/// that reaches operators without an entry below fails the build on the day
+/// it lands. Deferring is a legitimate answer and costs one line: the point
+/// is that the decision gets recorded instead of skipped.
+///
+/// Aliases are separate entries because an operator can write either
+/// spelling. Checked in both directions, so a removed module cannot leave a
+/// stale classification behind.
+#[cfg(test)]
+const MODULE_COVERAGE: &[ModuleCoverage] = &[
+    rooted("action", "load_balancer"),
+    // Only the `resilience` subtree of the AI action has a root today.
+    deferred("action", "ai_proxy"),
+    deferred("action", "a2a"),
+    deferred("action", "beacon"),
+    deferred("action", "echo"),
+    deferred("action", "graphql"),
+    deferred("action", "grpc"),
+    deferred("action", "mcp"),
+    deferred("action", "mock"),
+    deferred("action", "noop"),
+    deferred("action", "proxy"),
+    deferred("action", "redirect"),
+    deferred("action", "static"),
+    deferred("action", "storage"),
+    deferred("action", "websocket"),
+    deferred("auth", "api_key"),
+    deferred("auth", "basic_auth"),
+    deferred("auth", "bearer"),
+    deferred("auth", "bearer_token"),
+    deferred("auth", "bot_auth"),
+    deferred("auth", "cap"),
+    deferred("auth", "digest"),
+    deferred("auth", "forward"),
+    deferred("auth", "forward_auth"),
+    deferred("auth", "jwt"),
+    deferred("auth", "noop"),
+    deferred("auth", "oidc"),
+    deferred("auth", "web_bot_auth"),
+    deferred("policy", "a2a"),
+    deferred("policy", "agent_budget"),
+    deferred("policy", "agent_class"),
+    deferred("policy", "ai_crawl_control"),
+    deferred("policy", "assertion"),
+    deferred("policy", "bola"),
+    deferred("policy", "concurrent_limit"),
+    deferred("policy", "concurrent_limiting"),
+    deferred("policy", "content_digest"),
+    deferred("policy", "csrf"),
+    deferred("policy", "ddos"),
+    deferred("policy", "ddos_protection"),
+    deferred("policy", "dlp"),
+    deferred("policy", "exposed_credentials"),
+    deferred("policy", "expression"),
+    deferred("policy", "http_framing"),
+    deferred("policy", "ip_filter"),
+    deferred("policy", "ip_filtering"),
+    deferred("policy", "leaked_credentials"),
+    deferred("policy", "object_authz"),
+    deferred("policy", "openapi_validation"),
+    deferred("policy", "page_shield"),
+    deferred("policy", "pay_per_crawl"),
+    deferred("policy", "prompt_injection_v2"),
+    deferred("policy", "rate_limit_budget"),
+    deferred("policy", "rate_limiting"),
+    deferred("policy", "request_limit"),
+    deferred("policy", "request_limiting"),
+    deferred("policy", "request_validator"),
+    deferred("policy", "response_assertion"),
+    deferred("policy", "security_headers"),
+    deferred("policy", "semantic_constraint"),
+    deferred("policy", "sri"),
+    deferred("policy", "waf"),
+    deferred("transform", "a2a_agent_card_rewrite"),
+    deferred("transform", "boilerplate"),
+    deferred("transform", "cel"),
+    deferred("transform", "citation_block"),
+    deferred("transform", "css"),
+    deferred("transform", "discard"),
+    deferred("transform", "encoding"),
+    deferred("transform", "format_convert"),
+    deferred("transform", "html"),
+    deferred("transform", "html_to_markdown"),
+    deferred("transform", "javascript"),
+    deferred("transform", "js_json"),
+    deferred("transform", "json"),
+    deferred("transform", "json_envelope"),
+    deferred("transform", "json_projection"),
+    deferred("transform", "json_schema"),
+    deferred("transform", "lua_json"),
+    deferred("transform", "markdown"),
+    deferred("transform", "noop"),
+    deferred("transform", "normalize"),
+    deferred("transform", "optimize_html"),
+    deferred("transform", "payload_limit"),
+    deferred("transform", "replace_strings"),
+    deferred("transform", "sse_chunking"),
+    deferred("transform", "template"),
+    deferred("transform", "wasm"),
+];
+
 const CONFIG_KEY_ALIASES: &[(&str, &str)] = &[
     (
         "agent_classes.hosted_feed.bootstrap_keys",
@@ -799,7 +1075,9 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use sbproxy_capability::config_scan::{schema_key_paths, verify_config_readers};
+    use sbproxy_capability::config_scan::{
+        schema_key_paths, verify_config_readers_with_modules, verify_module_dispatch_coverage,
+    };
     use sbproxy_capability::scan::rust_sources;
 
     #[test]
@@ -947,6 +1225,21 @@ origins:
     }
 
     #[test]
+    fn every_deferred_module_names_its_tracking_issue() {
+        for entry in MODULE_COVERAGE {
+            let ModuleCoverageState::Deferred(note) = entry.state else {
+                continue;
+            };
+            assert!(
+                note.contains("WOR-"),
+                "deferred module {}:{} must point at the work that tracks it: '{note}'",
+                entry.kind,
+                entry.name
+            );
+        }
+    }
+
+    #[test]
     fn every_schema_key_has_a_production_reader_or_reviewed_override() {
         let schema = serde_json::to_value(schemars::schema_for!(crate::types::ConfigFile))
             .expect("config schema serializes");
@@ -957,11 +1250,57 @@ origins:
             .expect("sbproxy-config crate lives under crates/");
         let sources = rust_sources(repo_root);
 
-        let errors = verify_config_readers(&keys, CONFIG_KEY_OVERRIDES, sources);
+        let report = verify_config_readers_with_modules(
+            &keys,
+            MODULE_CONFIG_ROOTS,
+            CONFIG_KEY_OVERRIDES,
+            sources,
+        );
+
+        // Findings under a `ReportOnly` root are printed, never asserted on.
+        // They are pre-existing debt: WOR-2233 and WOR-2246 decide whether
+        // each one gets wired or removed, and failing here would only mean
+        // this guard gets reverted before either lands.
+        if !report.reported.is_empty() {
+            println!(
+                "module-surface keys with no production reader ({} of {} walked keys). These do \
+                 not fail the build yet; see MODULE_CONFIG_ROOTS:\n{}",
+                report.reported.len(),
+                report.module_keys.len(),
+                report
+                    .reported
+                    .iter()
+                    .map(|finding| format!("  - {finding}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        }
+
+        assert!(
+            report.errors.is_empty(),
+            "configuration keys without production readers:\n{}",
+            report
+                .errors
+                .iter()
+                .map(|error| format!("  - {error}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    #[test]
+    fn every_dispatchable_module_declares_whether_its_config_is_guarded() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("sbproxy-config crate lives under crates/");
+        let sources = rust_sources(repo_root);
+
+        let errors = verify_module_dispatch_coverage(MODULE_DISPATCHES, MODULE_COVERAGE, sources);
 
         assert!(
             errors.is_empty(),
-            "configuration keys without production readers:\n{}",
+            "module coverage registry is out of step with the config dispatch tables:\n{}",
             errors
                 .iter()
                 .map(|error| format!("  - {error}"))

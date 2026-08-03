@@ -158,4 +158,22 @@
 # spawns it from the pipeline's existing background-task seam. This is the
 # ratchet's first option again, a production call site rather than a
 # narrowing.
-287
+
+# Raised to 290 on WOR-2245, 2026-08-02, for three items in
+# sbproxy-capability's config_scan that widen the build-time config-reader
+# guard onto the module and AI-gateway surface: `ModuleCoverage`,
+# `ModuleCoverageState`, and `verify_module_dispatch_coverage`, plus the
+# `verify_config_readers_with_modules` entry point that replaces the old
+# `verify_config_readers` call and nets out against it.
+#
+# These are the ratchet's "pub is required" case, and the scan says so
+# itself. sbproxy-config declares the roots and the module-coverage
+# registry, and sbproxy-capability runs the guard, so every one of these
+# crosses a crate boundary. Narrowing any of them does not compile. They
+# are also guard configuration by nature: their only caller is the test
+# that enforces the guard, in exactly the way `schema_key_paths` and
+# `verify_config_readers` already were before this change, and there is no
+# production call site to wire them to because a build-time check has none.
+#
+# Do not expect this number to come back down by finding them callers.
+290

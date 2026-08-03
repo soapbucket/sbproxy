@@ -207,6 +207,511 @@ fn rust_field_name(serialized: &str) -> String {
     serialized.replace('-', "_")
 }
 
+/// How much of a declared module root this guard enforces today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleRootEnforcement {
+    /// A key under this root with no production read fails the build.
+    Enforced,
+    /// Findings under this root are reported but not fatal.
+    ///
+    /// The string says why, in the same voice the `ConfigOnly` notes use,
+    /// and names the work that will make the root `Enforced`. A root lands
+    /// here when nobody has triaged its existing findings yet: turning it
+    /// fatal on day one would fail the build on debt this change did not
+    /// create, and a check that does that gets reverted rather than fixed.
+    ReportOnly(&'static str),
+}
+
+/// One configuration subtree the generated JSON Schema cannot describe.
+///
+/// `ConfigFile` types `action`, `authentication`, `policies` and
+/// `transforms` as `serde_json::Value`, deliberately: modules are pluggable
+/// and the config crate must not need to name their types. The cost is that
+/// `schemars::schema_for!(ConfigFile)` emits no leaf below any of them, so
+/// the entire module and AI-gateway surface is invisible to
+/// [`schema_key_paths`] and therefore to [`verify_config_readers`].
+///
+/// A root closes that hole for one subtree by naming the Rust type the
+/// subtree deserializes into. The walk that follows reads the same `syn`
+/// index the reader side reads, so the key list and the read list come from
+/// one parse of one file rather than from two toolchains that can disagree.
+#[derive(Debug, Clone, Copy)]
+pub struct ModuleConfigRoot {
+    /// Dotted path of the subtree, in the same shape [`ConfigSchemaKey`]
+    /// uses: `*` for a map key, `[]` for an array element. This is the
+    /// operator's YAML path, because the boot-time `ConfigOnly` warning
+    /// matches registry paths against raw YAML.
+    pub path: &'static str,
+    /// Fully qualified Rust type, as `crate_name::module::Type`.
+    pub rust_type: &'static str,
+    /// Whether findings under this root fail the build.
+    pub enforcement: ModuleRootEnforcement,
+}
+
+/// What a reader-coverage run found.
+#[derive(Debug, Default)]
+pub struct ConfigReaderReport {
+    /// Findings that must fail the build.
+    pub errors: Vec<RegistryError>,
+    /// Findings under a [`ModuleRootEnforcement::ReportOnly`] root, each
+    /// carrying that root's reason for not being fatal yet.
+    ///
+    /// Real, and not yet fatal. Print them; do not assert on them.
+    pub reported: Vec<RegistryError>,
+    /// Every key the declared module roots produced.
+    pub module_keys: Vec<ConfigSchemaKey>,
+}
+
+/// Walk the Rust config type graph from one root and collect its leaf keys.
+///
+/// This is the module-surface twin of [`collect_schema`], and it emits the
+/// same [`ConfigSchemaKey`] shape so both key sources feed one check. The
+/// difference is the input: [`collect_schema`] reads a generated JSON
+/// Schema, this reads the `Deserialize` types themselves, because the types
+/// under a module root never reach a schema at all.
+///
+/// A leaf is emitted for any field whose type this scan cannot descend
+/// into: a primitive, a type from outside `crates/`, an opaque
+/// `serde_json::Value`, or an enum serde does not tag internally.
+fn collect_module_keys(
+    index: &RustTypeIndex,
+    owner: &str,
+    path: &str,
+    active: &mut Vec<String>,
+    out: &mut BTreeSet<ConfigSchemaKey>,
+) {
+    // A config type that contains itself (a rule that nests rules, say)
+    // repeats key names forever without naming a new field, so the cycle is
+    // cut at the first repeat rather than unrolled to some arbitrary depth.
+    if active.iter().any(|entry| entry == owner) {
+        return;
+    }
+    active.push(owner.to_string());
+
+    // A flattened field contributes no path segment of its own: serde lifts
+    // its fields into the parent object, so an operator writes them at the
+    // parent's level. Walked first so the parent's own fields cannot shadow
+    // the decision.
+    for flattened_field in index.flattened_fields.get(owner).into_iter().flatten() {
+        let Some(reference) = index
+            .fields
+            .get(owner)
+            .and_then(|fields| fields.get(flattened_field))
+            .and_then(Option::as_ref)
+        else {
+            continue;
+        };
+        let (suffix, inner) = peel_config_containers(reference);
+        // A flattened map is serde's catch-all for unknown keys. It has no
+        // fixed key surface, so there is nothing to enumerate.
+        if !suffix.is_empty() {
+            continue;
+        }
+        let Some(child_owner) = index.resolve_type_reference(inner) else {
+            continue;
+        };
+        if walkable_config_type(index, &child_owner) {
+            collect_module_keys(index, &child_owner, path, active, out);
+        }
+    }
+
+    let no_fields = BTreeMap::new();
+    let schema_fields = index.schema_fields.get(owner).unwrap_or(&no_fields);
+    for (schema_field, rust_fields) in schema_fields {
+        // Two Rust fields serializing under one name means the reader check
+        // cannot say which one a read proves, and `rust_field_for_schema_field`
+        // refuses the same pair. Emitting the key anyway would produce a
+        // finding nobody can clear.
+        if rust_fields.len() != 1 {
+            continue;
+        }
+        let Some(rust_field) = rust_fields.first() else {
+            continue;
+        };
+        if index
+            .flattened_fields
+            .get(owner)
+            .is_some_and(|flattened| flattened.contains(rust_field))
+        {
+            continue;
+        }
+
+        let child_path = join_path(path, schema_field);
+        // No declared type means a serde-only pseudo-field: the internal tag
+        // of a tagged enum, which is a real config key (`type:`) with no Rust
+        // field behind it. It is a leaf, and it needs a reviewed override
+        // naming the compiler that reads the discriminator.
+        let Some(declared) = index
+            .fields
+            .get(owner)
+            .and_then(|fields| fields.get(rust_field))
+            .and_then(Option::as_ref)
+        else {
+            out.insert(module_leaf_key(&child_path, schema_field, owner));
+            continue;
+        };
+
+        let (suffix, inner) = peel_config_containers(declared);
+        let child_path = format!("{child_path}{suffix}");
+        let Some(child_owner) = index.resolve_type_reference(inner) else {
+            out.insert(module_leaf_key(&child_path, schema_field, owner));
+            continue;
+        };
+        if !walkable_config_type(index, &child_owner) {
+            out.insert(module_leaf_key(&child_path, schema_field, owner));
+            continue;
+        }
+
+        // Same rule the schema walk uses: a node with descendants is not a
+        // key, its leaves are. A walkable type that yields nothing is still
+        // one key, so the parent's field does not go unchecked.
+        let before = out.len();
+        collect_module_keys(index, &child_owner, &child_path, active, out);
+        if out.len() == before {
+            out.insert(module_leaf_key(&child_path, schema_field, owner));
+        }
+    }
+
+    active.pop();
+}
+
+fn module_leaf_key(path: &str, schema_field: &str, owner: &str) -> ConfigSchemaKey {
+    ConfigSchemaKey {
+        path: path.to_string(),
+        rust_field: schema_field.to_string(),
+        rust_owner: Some(owner.to_string()),
+    }
+}
+
+/// Strip the container wrappers off a declared field type.
+///
+/// Returns the path suffix the containers contribute and the innermost
+/// nominal reference. A sequence adds `[]` and a map adds `.*`, matching the
+/// shape [`collect_schema`] produces from `items` and `additionalProperties`.
+/// `Option`, `Box` and `Arc` add nothing, because none of them adds a level
+/// to the document an operator writes.
+fn peel_config_containers(reference: &TypeReference) -> (String, &TypeReference) {
+    let mut suffix = String::new();
+    let mut current = reference;
+    loop {
+        let Some(argument) = syntactic_transparent_wrapper_argument_index(current, true) else {
+            return (suffix, current);
+        };
+        let Some(GenericArgumentReference::Type(inner)) = current.generic_arguments.get(argument)
+        else {
+            return (suffix, current);
+        };
+        match current.segments.last().map(String::as_str) {
+            Some("Vec" | "VecDeque" | "HashSet" | "BTreeSet" | "SmallVec") => suffix.push_str("[]"),
+            Some("HashMap" | "BTreeMap" | "IndexMap") => suffix.push_str(".*"),
+            _ => {}
+        }
+        current = inner;
+    }
+}
+
+/// Whether the walk should descend into a type or treat it as one key.
+///
+/// Three ways to stop. A type this scan never parsed is outside `crates/`.
+/// A type without a derived `Deserialize` is not part of the document at
+/// all, so its fields are runtime state rather than config keys, and a
+/// hand-written `Deserialize` impl stops here too because its accepted shape
+/// is not readable from the field list. An enum only presents a flat key
+/// surface when serde tags it internally: externally and adjacently tagged
+/// enums nest their payload under a variant name this walk does not model,
+/// so descending would invent paths no operator can write.
+///
+/// Stopping checks the type as a single key, which is honest, rather than
+/// describing its interior wrongly.
+fn walkable_config_type(index: &RustTypeIndex, owner: &str) -> bool {
+    if !index.fields.contains_key(owner) {
+        return false;
+    }
+    if index
+        .derived_traits
+        .get(owner)
+        .is_none_or(|traits| !traits.contains("Deserialize"))
+    {
+        return false;
+    }
+    if index
+        .schema_fields
+        .get(owner)
+        .is_none_or(|fields| fields.is_empty())
+    {
+        return false;
+    }
+    !index.enum_variants.contains_key(owner) || index.enum_tags.contains_key(owner)
+}
+
+/// Derive every module-surface key the declared roots reach.
+fn module_keys_for_roots(
+    index: &RustTypeIndex,
+    roots: &[ModuleConfigRoot],
+) -> (
+    BTreeSet<ConfigSchemaKey>,
+    BTreeMap<String, &'static str>,
+    Vec<RegistryError>,
+) {
+    let mut keys = BTreeSet::new();
+    let mut enforced = BTreeSet::new();
+    let mut report_only = BTreeMap::new();
+    let mut errors = Vec::new();
+
+    for root in roots {
+        if !index.fields.contains_key(root.rust_type) {
+            errors.push(RegistryError {
+                subject: root.path.to_string(),
+                message: format!(
+                    "names module config root `{}`, which this scan cannot see. A config \
+                     shape declared inside a function body is invisible to module indexing: \
+                     give it module scope, or correct the type path",
+                    root.rust_type
+                ),
+            });
+            continue;
+        }
+
+        let mut produced = BTreeSet::new();
+        collect_module_keys(
+            index,
+            root.rust_type,
+            root.path,
+            &mut Vec::new(),
+            &mut produced,
+        );
+        if produced.is_empty() {
+            errors.push(RegistryError {
+                subject: root.path.to_string(),
+                message: format!(
+                    "names module config root `{}`, which produced no keys. A root that \
+                     walks to nothing guards nothing",
+                    root.rust_type
+                ),
+            });
+        }
+
+        // A path two roots both reach is enforced if either root enforces it.
+        // Overlap is possible because module roots share the operator's YAML
+        // path: `origins.*.action` is one path with a different shape per
+        // action type.
+        match root.enforcement {
+            ModuleRootEnforcement::Enforced => {
+                enforced.extend(produced.iter().map(|key| key.path.clone()));
+            }
+            ModuleRootEnforcement::ReportOnly(note) => {
+                report_only.extend(produced.iter().map(|key| (key.path.clone(), note)));
+            }
+        }
+        keys.extend(produced);
+    }
+
+    report_only.retain(|path, _| !enforced.contains(path));
+    (keys, report_only, errors)
+}
+
+/// One place the config compiler turns an operator's `type:` string into a
+/// module.
+///
+/// This is the authoritative list of what an operator can name, and it is a
+/// `match` over string literals in one function, which makes it something a
+/// scan can read.
+#[derive(Debug, Clone, Copy)]
+pub struct ModuleDispatch {
+    /// Module kind as an operator says it: `action`, `auth`, `policy`,
+    /// `transform`.
+    pub kind: &'static str,
+    /// Repo-relative source file holding the dispatch.
+    pub source: &'static str,
+    /// Function whose first string-literal `match` is the dispatch table.
+    pub function: &'static str,
+}
+
+/// What the widened scan knows about one module's configuration surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleCoverageState {
+    /// A declared [`ModuleConfigRoot`] walks this module's config type.
+    Rooted,
+    /// Not walked. The note says why and names the work that will change it.
+    Deferred(&'static str),
+}
+
+/// One module name from a dispatch table, and its coverage classification.
+#[derive(Debug, Clone, Copy)]
+pub struct ModuleCoverage {
+    /// Matches [`ModuleDispatch::kind`].
+    pub kind: &'static str,
+    /// The `type:` string an operator writes.
+    pub name: &'static str,
+    /// Whether the module's config surface is walked.
+    pub state: ModuleCoverageState,
+}
+
+/// Require every dispatchable module to say whether its config is guarded.
+///
+/// This is the difference between a registry of roots and a registry that
+/// cannot be silently outgrown. Adding a root for each module we happen to
+/// remember leaves the next module unguarded until somebody notices; here a
+/// module name that reaches the dispatch table without a [`ModuleCoverage`]
+/// entry fails the build on the day it lands. Deferring is allowed and
+/// costs one line plus a reason, which is the point: the decision is
+/// recorded rather than skipped.
+///
+/// Checked in both directions, so a removed module cannot leave a stale
+/// classification behind.
+pub fn verify_module_dispatch_coverage(
+    dispatches: &[ModuleDispatch],
+    coverage: &[ModuleCoverage],
+    sources: &[SourceFile],
+) -> Vec<RegistryError> {
+    let mut errors = Vec::new();
+    let production_sources: Vec<&SourceFile> = sources
+        .iter()
+        .filter(|source| source_is_production(&source.path))
+        .collect();
+
+    // Both sides are keyed on `kind:name`, which is how an operator would
+    // say it and how the errors below read.
+    let mut declared: BTreeSet<String> = BTreeSet::new();
+    for entry in coverage {
+        let subject = format!("{}:{}", entry.kind, entry.name);
+        if !declared.insert(subject.clone()) {
+            errors.push(RegistryError {
+                subject,
+                message: "is classified twice in the module coverage registry".to_string(),
+            });
+        }
+    }
+
+    let mut dispatched: BTreeSet<String> = BTreeSet::new();
+    for dispatch in dispatches {
+        match dispatch_module_names(dispatch, &production_sources) {
+            Ok(names) => dispatched.extend(
+                names
+                    .into_iter()
+                    .map(|name| format!("{}:{name}", dispatch.kind)),
+            ),
+            Err(message) => errors.push(RegistryError {
+                subject: format!("{}:{}", dispatch.kind, dispatch.function),
+                message,
+            }),
+        }
+    }
+
+    for subject in dispatched.difference(&declared) {
+        errors.push(RegistryError {
+            subject: subject.clone(),
+            message: "is dispatchable from config but is not classified in the module coverage \
+                      registry. Give it a config root so the reader guard walks its keys, or \
+                      defer it with a reason and a tracking issue"
+                .to_string(),
+        });
+    }
+
+    for subject in declared.difference(&dispatched) {
+        errors.push(RegistryError {
+            subject: subject.clone(),
+            message: "is classified in the module coverage registry but no dispatch table \
+                      accepts it. Remove the classification, or correct the name"
+                .to_string(),
+        });
+    }
+
+    errors
+}
+
+/// Read the `type:` strings one dispatch function accepts.
+fn dispatch_module_names(
+    dispatch: &ModuleDispatch,
+    sources: &[&SourceFile],
+) -> Result<BTreeSet<String>, String> {
+    let source = sources
+        .iter()
+        .find(|source| {
+            source
+                .path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .ends_with(dispatch.source)
+        })
+        .ok_or_else(|| format!("dispatch source `{}` was not scanned", dispatch.source))?;
+    let file = source.ast.as_ref().map_err(|error| {
+        format!(
+            "dispatch source `{}` did not parse: {error}",
+            dispatch.source
+        )
+    })?;
+    let function = file
+        .items
+        .iter()
+        .find_map(|item| match item {
+            syn::Item::Fn(function) if function.sig.ident == dispatch.function => Some(function),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            format!(
+                "dispatch function `{}` no longer exists in `{}`. The module coverage check \
+                 reads its match arms; point it at the function that dispatches now",
+                dispatch.function, dispatch.source
+            )
+        })?;
+
+    let mut visitor = DispatchArmVisitor { names: None };
+    visitor.visit_item_fn(function);
+    visitor.names.ok_or_else(|| {
+        format!(
+            "dispatch function `{}` has no match over string literals. The module coverage \
+             check cannot read the accepted `type:` names from it",
+            dispatch.function
+        )
+    })
+}
+
+/// Collect the string-literal arms of the outermost `match` in a function.
+///
+/// The outermost one is the dispatch: `compile_auth` has an inner `match`
+/// over the plugin-registry outcome, and taking the first hit rather than
+/// the last keeps that from being mistaken for the table.
+struct DispatchArmVisitor {
+    names: Option<BTreeSet<String>>,
+}
+
+impl<'ast> Visit<'ast> for DispatchArmVisitor {
+    fn visit_expr_match(&mut self, node: &'ast syn::ExprMatch) {
+        if self.names.is_some() {
+            return;
+        }
+        let mut names = BTreeSet::new();
+        for arm in &node.arms {
+            collect_pattern_literals(&arm.pat, &mut names);
+        }
+        if names.is_empty() {
+            // Some other match on the way to the dispatch. Keep descending.
+            syn::visit::visit_expr_match(self, node);
+            return;
+        }
+        self.names = Some(names);
+    }
+}
+
+fn collect_pattern_literals(pattern: &syn::Pat, out: &mut BTreeSet<String>) {
+    match pattern {
+        syn::Pat::Lit(literal) => {
+            if let syn::Lit::Str(value) = &literal.lit {
+                out.insert(value.value());
+            }
+        }
+        syn::Pat::Or(alternatives) => {
+            for alternative in &alternatives.cases {
+                collect_pattern_literals(alternative, out);
+            }
+        }
+        syn::Pat::Paren(inner) => collect_pattern_literals(&inner.pat, out),
+        syn::Pat::Reference(inner) => collect_pattern_literals(&inner.pat, out),
+        _ => {}
+    }
+}
+
 /// Verify that every schema key has either a production field read or a
 /// reviewed override.
 ///
@@ -220,8 +725,65 @@ pub fn verify_config_readers(
     overrides: &[ConfigKeyCapability],
     sources: &[SourceFile],
 ) -> Vec<RegistryError> {
+    verify_config_readers_with_modules(keys, &[], overrides, sources).errors
+}
+
+/// Verify reader coverage across both key sources at once.
+///
+/// The generated schema describes everything `ConfigFile` types concretely.
+/// `roots` describes the module and AI-gateway subtrees it types as
+/// `serde_json::Value`, which is where the keys an operator can set and the
+/// runtime ignores have historically hidden. Both sources produce the same
+/// [`ConfigSchemaKey`] and are checked by one pass, so an override is proved
+/// against the union: a `ConfigOnly` pin on a module key is subject to the
+/// same stale-path check as every other entry.
+///
+/// This answers "is this key read?". It does not answer "does reading it do
+/// anything". A function can read every field of a config struct into real
+/// runtime state and still have no callers, which leaves the key inert with
+/// a perfectly good read behind it. That shape needs a zero-caller pass over
+/// the reachable call graph; `scripts/check-pub-item-ratchet.sh` does part of
+/// it and skips trait-impl methods. The two checks are complementary and
+/// neither subsumes the other. Do not try to make this one catch both.
+pub fn verify_config_readers_with_modules(
+    keys: &[ConfigSchemaKey],
+    roots: &[ModuleConfigRoot],
+    overrides: &[ConfigKeyCapability],
+    sources: &[SourceFile],
+) -> ConfigReaderReport {
     let mut errors = validate_config_keys(overrides);
-    let declared: BTreeSet<&str> = keys.iter().map(|key| key.path.as_str()).collect();
+    let mut reported = Vec::new();
+
+    let production_sources: Vec<&SourceFile> = sources
+        .iter()
+        .filter(|source| source_is_production(&source.path))
+        .collect();
+    for source in &production_sources {
+        if let Err(error) = &source.ast {
+            errors.push(RegistryError {
+                subject: source.path.display().to_string(),
+                message: format!(
+                    "could not parse production Rust source while proving config readers: {error}"
+                ),
+            });
+        }
+    }
+    // Built once and shared: parsing the workspace is the dominant cost in
+    // this guard, and the module walk and the reader check both need the
+    // same index. Deriving the keys from it rather than from a second
+    // schema generator is also what keeps the two halves consistent.
+    let type_index = rust_type_index(&production_sources);
+    let typed_reads = typed_field_reads(&production_sources, &type_index);
+
+    let (module_keys, report_only, root_errors) = module_keys_for_roots(&type_index, roots);
+    errors.extend(root_errors);
+
+    let all_keys: Vec<ConfigSchemaKey> = keys
+        .iter()
+        .cloned()
+        .chain(module_keys.iter().cloned())
+        .collect();
+    let declared: BTreeSet<&str> = all_keys.iter().map(|key| key.path.as_str()).collect();
     let override_index: BTreeMap<&str, &ConfigKeyCapability> =
         overrides.iter().map(|entry| (entry.path, entry)).collect();
 
@@ -241,24 +803,7 @@ pub fn verify_config_readers(
         }
     }
 
-    let production_sources: Vec<&SourceFile> = sources
-        .iter()
-        .filter(|source| source_is_production(&source.path))
-        .collect();
-    for source in &production_sources {
-        if let Err(error) = &source.ast {
-            errors.push(RegistryError {
-                subject: source.path.display().to_string(),
-                message: format!(
-                    "could not parse production Rust source while proving config readers: {error}"
-                ),
-            });
-        }
-    }
-    let type_index = rust_type_index(&production_sources);
-    let typed_reads = typed_field_reads(&production_sources, &type_index);
-
-    for key in keys {
+    for key in &all_keys {
         if let Some(entry) = override_index.get(key.path.as_str()) {
             if entry.support == SupportLevel::Stable {
                 if let Some(consumer) = entry.consumer {
@@ -276,20 +821,31 @@ pub fn verify_config_readers(
             continue;
         }
         if !has_unambiguous_field_read(key, &typed_reads, &type_index) {
-            errors.push(RegistryError {
-                subject: key.path.clone(),
-                message: format!(
-                    "is accepted by the generated schema but has no unambiguous non-test Rust \
-                     read of `{}::{}`. Wire the key, or add an exact reviewed override with \
-                     production consumer evidence or a ConfigOnly reason",
-                    key.rust_owner.as_deref().unwrap_or("<unknown>"),
-                    key.rust_field,
-                ),
-            });
+            let message = format!(
+                "is accepted by the configuration but has no unambiguous non-test Rust read of \
+                 `{}::{}`. Wire the key, or add an exact reviewed override with production \
+                 consumer evidence or a ConfigOnly reason",
+                key.rust_owner.as_deref().unwrap_or("<unknown>"),
+                key.rust_field,
+            );
+            match report_only.get(key.path.as_str()) {
+                Some(note) => reported.push(RegistryError {
+                    subject: key.path.clone(),
+                    message: format!("{message}. Reported rather than fatal: {note}"),
+                }),
+                None => errors.push(RegistryError {
+                    subject: key.path.clone(),
+                    message,
+                }),
+            }
         }
     }
 
-    errors
+    ConfigReaderReport {
+        errors,
+        reported,
+        module_keys: module_keys.into_iter().collect(),
+    }
 }
 
 fn source_is_production(path: &std::path::Path) -> bool {
@@ -667,6 +1223,13 @@ impl NamespaceResolution {
 struct RustTypeIndex {
     fields: BTreeMap<String, BTreeMap<String, Option<TypeReference>>>,
     schema_fields: BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
+    /// Rust field names carrying `#[serde(flatten)]`, by owning type.
+    ///
+    /// Only the module-surface walk needs this. A flattened field has no key
+    /// of its own: its own fields are lifted into the parent object, so a
+    /// walk that treated it like any other field would invent a path segment
+    /// no operator can write.
+    flattened_fields: BTreeMap<String, BTreeSet<String>>,
     type_components: BTreeMap<String, Vec<Option<TypeReference>>>,
     generic_type_parameters: BTreeMap<String, Vec<TypeAliasParameter>>,
     tuple_struct_fields: BTreeMap<String, Vec<Option<TypeReference>>>,
@@ -888,6 +1451,12 @@ impl RustTypeIndex {
                 .push(nominal_type_reference(&field.ty, context));
             if let Some(ident) = &field.ident {
                 let field_name = ident.to_string().trim_start_matches("r#").to_string();
+                if field_is_flattened(&field.attrs) {
+                    self.flattened_fields
+                        .entry(owner.to_string())
+                        .or_default()
+                        .insert(field_name.clone());
+                }
                 for serialized_name in
                     possible_schema_field_names(&field_name, &field.attrs, container_attributes)
                 {
@@ -1969,6 +2538,15 @@ impl RustTypeIndex {
     }
 
     fn schema_owner(&self, owner: &str) -> Option<String> {
+        // A key produced by the module-surface walk names its owner exactly,
+        // because that walk resolved the type as it descended instead of
+        // reading a bare definition title out of a JSON Schema. Every key in
+        // `fields` is fully qualified (`crate::module::Type`), so a bare
+        // schema title can never land here and the JSON-Schema callers below
+        // keep their existing name-based resolution.
+        if self.fields.contains_key(owner) {
+            return Some(owner.to_string());
+        }
         let candidates = self.types_by_name.get(owner)?;
         if candidates.len() == 1 {
             return candidates.first().cloned();
@@ -2915,6 +3493,31 @@ fn serde_enum_tag(attributes: &[syn::Attribute]) -> Option<String> {
         });
     }
     tag
+}
+
+/// Whether a struct field is lifted into its parent object by serde.
+///
+/// Written the same way as [`serde_enum_tag`], and with the same known
+/// limitation: an attribute shaped `rename(serialize = "a")` makes
+/// `parse_nested_meta` give up part-way, so anything after it in the same
+/// attribute is not seen. Config types do not mix that form with `flatten`
+/// today, and being wrong here costs a spurious path segment rather than a
+/// missed read.
+fn field_is_flattened(attributes: &[syn::Attribute]) -> bool {
+    let mut flattened = false;
+    for attribute in attributes.iter().filter(|attribute| {
+        attribute.path().is_ident("serde") || attribute.path().is_ident("schemars")
+    }) {
+        let _ = attribute.parse_nested_meta(|meta| {
+            if meta.path.is_ident("flatten") {
+                flattened = true;
+            } else if meta.input.peek(syn::Token![=]) {
+                let _ = meta.value()?.parse::<syn::Expr>()?;
+            }
+            Ok(())
+        });
+    }
+    flattened
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -10328,5 +10931,375 @@ const DOC: &str = "config.unread";
         let errors = verify_config_readers(&keys, &[], &sources);
 
         assert_eq!(errors.len(), 1, "{errors:?}");
+    }
+
+    // --- Module surface ---
+
+    fn module_index(sources: &[SourceFile]) -> RustTypeIndex {
+        let production: Vec<&SourceFile> = sources.iter().collect();
+        rust_type_index(&production)
+    }
+
+    fn module_paths(sources: &[SourceFile], rust_type: &'static str) -> BTreeSet<String> {
+        let index = module_index(sources);
+        let (keys, _, errors) = module_keys_for_roots(
+            &index,
+            &[ModuleConfigRoot {
+                path: "origins.*.action",
+                rust_type,
+                enforcement: ModuleRootEnforcement::Enforced,
+            }],
+        );
+        assert_eq!(errors, vec![], "the fixture root must resolve");
+        keys.into_iter().map(|key| key.path).collect()
+    }
+
+    #[test]
+    fn module_walk_reaches_keys_the_generated_schema_cannot_describe() {
+        let sources = [source(
+            r#"
+#[derive(Deserialize)]
+struct ActionConfig {
+    targets: Vec<Target>,
+    sticky: Option<Sticky>,
+    labels: std::collections::HashMap<String, String>,
+    opaque: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+struct Target {
+    url: String,
+    zone: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct Sticky {
+    #[serde(rename = "cookie")]
+    cookie_name: String,
+}
+"#,
+        )];
+
+        assert_eq!(
+            module_paths(&sources, "example::ActionConfig"),
+            BTreeSet::from([
+                "origins.*.action.labels.*".to_string(),
+                "origins.*.action.opaque".to_string(),
+                "origins.*.action.sticky.cookie".to_string(),
+                "origins.*.action.targets[].url".to_string(),
+                "origins.*.action.targets[].zone".to_string(),
+            ]),
+            "a sequence adds `[]`, a map adds `.*`, and Option adds no level"
+        );
+    }
+
+    #[test]
+    fn module_walk_lifts_a_flattened_block_into_its_parent_path() {
+        let sources = [source(
+            r#"
+#[derive(Deserialize)]
+struct ActionConfig {
+    url: String,
+    #[serde(flatten, default)]
+    forwarding: Forwarding,
+}
+
+#[derive(Deserialize)]
+struct Forwarding {
+    forwarded_for: bool,
+}
+"#,
+        )];
+
+        assert_eq!(
+            module_paths(&sources, "example::ActionConfig"),
+            BTreeSet::from([
+                "origins.*.action.forwarded_for".to_string(),
+                "origins.*.action.url".to_string(),
+            ]),
+            "serde lifts a flattened block, so it owns no path segment"
+        );
+    }
+
+    #[test]
+    fn module_walk_stops_at_an_enum_serde_does_not_tag_internally() {
+        let sources = [source(
+            r#"
+#[derive(Deserialize)]
+struct ActionConfig {
+    algorithm: Algorithm,
+    backend: Backend,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Algorithm {
+    RoundRobin,
+    HeaderHash { header: String },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum Backend {
+    Redis { url: String },
+}
+"#,
+        )];
+
+        assert_eq!(
+            module_paths(&sources, "example::ActionConfig"),
+            BTreeSet::from([
+                "origins.*.action.algorithm".to_string(),
+                "origins.*.action.backend.kind".to_string(),
+                "origins.*.action.backend.url".to_string(),
+            ]),
+            "an externally tagged variant nests under a name this walk does not \
+             model, so the enum is checked as one key instead of described wrongly"
+        );
+    }
+
+    #[test]
+    fn a_report_only_root_reports_findings_without_failing_the_build() {
+        let sources = [source(
+            r#"
+#[derive(Deserialize)]
+struct ActionConfig {
+    zone: Option<String>,
+}
+"#,
+        )];
+
+        let report = verify_config_readers_with_modules(
+            &[],
+            &[ModuleConfigRoot {
+                path: "origins.*.action",
+                rust_type: "example::ActionConfig",
+                enforcement: ModuleRootEnforcement::ReportOnly("triaged under WOR-2246"),
+            }],
+            &[],
+            &sources,
+        );
+
+        assert_eq!(
+            report.errors,
+            vec![],
+            "pre-existing debt is not a build break"
+        );
+        assert_eq!(
+            report
+                .reported
+                .iter()
+                .map(|error| error.subject.clone())
+                .collect::<Vec<_>>(),
+            vec!["origins.*.action.zone".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_enforced_root_fails_on_a_key_nothing_reads() {
+        let sources = [source(
+            r#"
+#[derive(Deserialize)]
+struct ActionConfig {
+    zone: Option<String>,
+}
+"#,
+        )];
+
+        let report = verify_config_readers_with_modules(
+            &[],
+            &[ModuleConfigRoot {
+                path: "origins.*.action",
+                rust_type: "example::ActionConfig",
+                enforcement: ModuleRootEnforcement::Enforced,
+            }],
+            &[],
+            &sources,
+        );
+
+        assert_eq!(report.reported, vec![]);
+        assert_eq!(
+            report
+                .errors
+                .iter()
+                .map(|error| error.subject.clone())
+                .collect::<Vec<_>>(),
+            vec!["origins.*.action.zone".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_module_override_is_held_to_the_same_stale_path_check() {
+        let sources = [source(
+            r#"
+#[derive(Deserialize)]
+struct ActionConfig {
+    zone: Option<String>,
+}
+"#,
+        )];
+        let overrides = [ConfigKeyCapability {
+            path: "origins.*.action.renamed_away",
+            support: SupportLevel::ConfigOnly,
+            consumer: None,
+            note: Some("WOR-0000"),
+        }];
+
+        let report = verify_config_readers_with_modules(
+            &[],
+            &[ModuleConfigRoot {
+                path: "origins.*.action",
+                rust_type: "example::ActionConfig",
+                enforcement: ModuleRootEnforcement::ReportOnly("triaged under WOR-2246"),
+            }],
+            &overrides,
+            &sources,
+        );
+
+        assert!(
+            report.errors.iter().any(|error| {
+                error.subject == "origins.*.action.renamed_away"
+                    && error
+                        .message
+                        .contains("not present in the generated schema")
+            }),
+            "{:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn a_root_naming_a_shape_this_scan_cannot_see_says_so() {
+        let sources = [source(
+            r#"
+fn build() {
+    #[derive(Deserialize)]
+    struct Config {
+        zone: Option<String>,
+    }
+}
+"#,
+        )];
+
+        let report = verify_config_readers_with_modules(
+            &[],
+            &[ModuleConfigRoot {
+                path: "origins.*.action",
+                rust_type: "example::Config",
+                enforcement: ModuleRootEnforcement::Enforced,
+            }],
+            &[],
+            &sources,
+        );
+
+        assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+        assert!(
+            report.errors[0].message.contains("inside a function body"),
+            "{:?}",
+            report.errors[0]
+        );
+    }
+
+    fn dispatch_fixture() -> [SourceFile; 1] {
+        [source_at(
+            "crates/sbproxy-modules/src/compile.rs",
+            r#"
+pub fn compile_action(config: &serde_json::Value) -> Result<Action> {
+    let type_name = extract_type(config)?;
+    match type_name.as_str() {
+        "proxy" => Ok(Action::Proxy),
+        "load_balancer" | "lb" => Ok(Action::LoadBalancer),
+        _ => anyhow::bail!("unknown action type"),
+    }
+}
+"#,
+        )]
+    }
+
+    fn action_dispatch() -> [ModuleDispatch; 1] {
+        [ModuleDispatch {
+            kind: "action",
+            source: "crates/sbproxy-modules/src/compile.rs",
+            function: "compile_action",
+        }]
+    }
+
+    #[test]
+    fn a_dispatchable_module_must_be_classified() {
+        let errors = verify_module_dispatch_coverage(
+            &action_dispatch(),
+            &[ModuleCoverage {
+                kind: "action",
+                name: "proxy",
+                state: ModuleCoverageState::Rooted,
+            }],
+            &dispatch_fixture(),
+        );
+
+        assert_eq!(
+            errors
+                .iter()
+                .map(|error| error.subject.clone())
+                .collect::<Vec<_>>(),
+            vec!["action:lb".to_string(), "action:load_balancer".to_string()],
+            "every arm of the dispatch table needs a classification, aliases included"
+        );
+    }
+
+    #[test]
+    fn a_classification_no_dispatch_table_accepts_is_stale() {
+        let coverage = [
+            ModuleCoverage {
+                kind: "action",
+                name: "proxy",
+                state: ModuleCoverageState::Rooted,
+            },
+            ModuleCoverage {
+                kind: "action",
+                name: "lb",
+                state: ModuleCoverageState::Deferred("WOR-2246"),
+            },
+            ModuleCoverage {
+                kind: "action",
+                name: "load_balancer",
+                state: ModuleCoverageState::Deferred("WOR-2246"),
+            },
+            ModuleCoverage {
+                kind: "action",
+                name: "removed_last_release",
+                state: ModuleCoverageState::Deferred("WOR-2246"),
+            },
+        ];
+
+        let errors =
+            verify_module_dispatch_coverage(&action_dispatch(), &coverage, &dispatch_fixture());
+
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].subject, "action:removed_last_release");
+        assert!(
+            errors[0].message.contains("no dispatch table accepts it"),
+            "{:?}",
+            errors[0]
+        );
+    }
+
+    #[test]
+    fn a_dispatch_function_that_moved_is_loud_rather_than_silent() {
+        let errors = verify_module_dispatch_coverage(
+            &[ModuleDispatch {
+                kind: "action",
+                source: "crates/sbproxy-modules/src/compile.rs",
+                function: "compile_action_renamed",
+            }],
+            &[],
+            &dispatch_fixture(),
+        );
+
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].message.contains("no longer exists"),
+            "{:?}",
+            errors[0]
+        );
     }
 }

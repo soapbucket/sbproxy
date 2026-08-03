@@ -354,6 +354,51 @@ fn default_cookie_name() -> String {
     "sb_sticky".to_string()
 }
 
+/// The exact YAML shape a `load_balancer` action accepts.
+///
+/// This lives at module scope rather than inside `from_config_for_origin`
+/// because the build-time config-reader guard walks named types. A shape
+/// declared inside a function body is invisible to `syn` module indexing,
+/// so every key underneath it is unguarded: nothing can prove the key is
+/// read and nothing complains when it stops being read. Keeping the shape
+/// nameable is what lets `MODULE_CONFIG_ROOTS` in `sbproxy-config` point
+/// at it. See `crates/sbproxy-capability/src/config_scan.rs`.
+#[derive(Deserialize)]
+struct LoadBalancerConfig {
+    /// Upstream pool. At least one entry is required.
+    targets: Vec<Target>,
+    /// Built-in selection algorithm. Ignored when `strategy` names a
+    /// registered routing strategy.
+    #[serde(default = "default_algo")]
+    algorithm: Algorithm,
+    /// Sticky-session block.
+    #[serde(default)]
+    sticky: Option<StickyConfig>,
+    /// Sliding-window failure-rate ejection.
+    #[serde(default)]
+    outlier_detection: Option<OutlierDetectionConfig>,
+    /// Per-target circuit breakers.
+    #[serde(default)]
+    circuit_breaker: Option<CircuitBreakerConfig>,
+    /// Upstream retry policy applied on connect-time failure.
+    #[serde(default)]
+    retry: Option<crate::action::RetryConfig>,
+    /// Name of a registered routing strategy, which takes precedence
+    /// over `algorithm`.
+    #[serde(default)]
+    strategy: Option<String>,
+    /// Opaque per-strategy configuration handed to the named strategy.
+    #[serde(default)]
+    strategy_config: Option<serde_json::Value>,
+    /// Legacy selector kept for compatibility with the Go line.
+    #[serde(default)]
+    lb_method: Option<String>,
+}
+
+fn default_algo() -> Algorithm {
+    Algorithm::RoundRobin
+}
+
 // --- Internal state ---
 
 /// Internal state for the load balancer (not serialized).
@@ -391,30 +436,6 @@ impl LoadBalancerAction {
     /// Build a load balancer with a stable identity for strategy state.
     pub fn from_config_for_origin(value: serde_json::Value, origin_id: &str) -> Result<Self> {
         #[derive(Deserialize)]
-        struct Config {
-            targets: Vec<Target>,
-            #[serde(default = "default_algo")]
-            algorithm: Algorithm,
-            #[serde(default)]
-            sticky: Option<StickyConfig>,
-            #[serde(default)]
-            outlier_detection: Option<OutlierDetectionConfig>,
-            #[serde(default)]
-            circuit_breaker: Option<CircuitBreakerConfig>,
-            #[serde(default)]
-            retry: Option<crate::action::RetryConfig>,
-            #[serde(default)]
-            strategy: Option<String>,
-            #[serde(default)]
-            strategy_config: Option<serde_json::Value>,
-            #[serde(default)]
-            lb_method: Option<String>,
-        }
-        fn default_algo() -> Algorithm {
-            Algorithm::RoundRobin
-        }
-
-        #[derive(Deserialize)]
         struct DeploymentConfig {
             #[serde(default)]
             mode: Option<String>,
@@ -439,7 +460,7 @@ impl LoadBalancerAction {
             DeploymentMode::Normal
         };
 
-        let config: Config = serde_json::from_value(value)?;
+        let config: LoadBalancerConfig = serde_json::from_value(value)?;
         anyhow::ensure!(
             !config.targets.is_empty(),
             "load balancer requires at least one target"
