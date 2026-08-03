@@ -188,6 +188,7 @@ pub mod policy_bus;
 /// integration tests in `crates/sbproxy-core/tests/`.
 pub mod policy_dispatch;
 mod proxy_wasm_http;
+pub(crate) mod request_body_plan;
 /// WOR-1130: module-owned workspace rate-limit budget state machine.
 ///
 /// Re-exported here for admin/runtime compatibility; the implementation

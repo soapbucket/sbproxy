@@ -4013,7 +4013,10 @@ impl ProxyHttp for SbProxy {
         // response phase, signal the validator failure via
         // `validator_failed`, and emit `None` so the upstream is not
         // contacted.
-        if ctx.validate_request_body {
+        'request_validation: {
+            if !ctx.validate_request_body {
+                break 'request_validation;
+            }
             // Mirror of THREAT_SCAN_HARD_CAP above: the validator
             // accumulator is the other buffer-then-release dance in
             // this filter and gets the same bound, so a client that
@@ -4024,13 +4027,76 @@ impl ProxyHttp for SbProxy {
             // contact the upstream.
             const VALIDATE_BODY_HARD_CAP: usize = 8 * 1024 * 1024;
 
-            let buf = ctx
-                .request_body_buf
-                .get_or_insert_with(bytes::BytesMut::new);
             let incoming_len = body.as_ref().map_or(0, Bytes::len);
-            if buf.len().saturating_add(incoming_len) > VALIDATE_BODY_HARD_CAP {
+            let buffered_len = ctx
+                .request_body_buf
+                .as_ref()
+                .map_or(0, |buffer| buffer.len());
+            let proposed_len = buffered_len.saturating_add(incoming_len);
+            let skipped = match ctx
+                .dynamic_request_body_plan
+                .before_growth(proposed_len, None)
+            {
+                Ok(skipped) => skipped,
+                Err(overflow) => {
+                    let hook = overflow.metadata();
+                    debug!(
+                        bundle = hook.bundle_id(),
+                        hook = hook.hook_type(),
+                        policy_index = ?overflow.policy_index(),
+                        received = proposed_len,
+                        cap = overflow.cap(),
+                        "buffered dynamic policy blocked request body before allocation"
+                    );
+                    ctx.validator_failed = Some((
+                        413,
+                        error_json_body("request entity too large"),
+                        "application/json".to_string(),
+                    ));
+                    *body = None;
+                    return Err(pingora_error::Error::explain(
+                        pingora_error::ErrorType::HTTPStatus(413),
+                        "dynamic policy request body exceeded buffering cap",
+                    ));
+                }
+            };
+            for skipped_hook in skipped {
+                let hook = skipped_hook.metadata();
+                let posture = hook.failure_posture();
+                tracing::warn!(
+                    target: "sbproxy::extension",
+                    bundle = hook.bundle_id(),
+                    hook = hook.hook_type(),
+                    policy_index = skipped_hook.policy_index(),
+                    received = proposed_len,
+                    cap = skipped_hook.cap(),
+                    failure_posture = posture.as_label(),
+                    "skipping buffered dynamic policy whose request body exceeded its cap"
+                );
+                if posture.guarantee_waived() || posture.records_counterfactual() {
+                    ctx.record_policy_decision(hook.hook_type(), posture.as_label());
+                }
+            }
+
+            if !ctx.dynamic_request_body_plan.has_active_buffered_policies()
+                && !ctx.dynamic_request_body_plan.other_buffering_required()
+            {
+                let mut collected = ctx.request_body_buf.take().unwrap_or_default();
+                if let Some(chunk) = body.take() {
+                    collected.extend_from_slice(&chunk);
+                }
+                ctx.validate_request_body = false;
+                if !collected.is_empty() {
+                    *body = Some(collected.freeze());
+                } else if !end_of_stream {
+                    hold_request_body_chunk(body);
+                }
+                break 'request_validation;
+            }
+
+            if proposed_len > VALIDATE_BODY_HARD_CAP {
                 debug!(
-                    received = buf.len().saturating_add(incoming_len),
+                    received = proposed_len,
                     cap = VALIDATE_BODY_HARD_CAP,
                     "request body validation blocked request: body exceeds buffering cap"
                 );
@@ -4045,11 +4111,14 @@ impl ProxyHttp for SbProxy {
                     "request body validation exceeded buffering cap",
                 ));
             }
+            let buf = ctx
+                .request_body_buf
+                .get_or_insert_with(bytes::BytesMut::new);
             if let Some(chunk) = body.take() {
                 buf.extend_from_slice(&chunk);
             }
             if end_of_stream {
-                let collected = ctx.request_body_buf.take().unwrap_or_default();
+                let collected = ctx.request_body_buf.take().unwrap_or_default().freeze();
                 // A verified header signature that covers content-digest is
                 // provisional until the complete pre-transform body arrives.
                 // Authenticate that body before any validator can short
@@ -4072,6 +4141,38 @@ impl ProxyHttp for SbProxy {
                     ));
                 }
                 let pipeline = ctx.pipeline.clone();
+                if let Some(origin_idx) = ctx.origin_idx {
+                    let workspace_id = pipeline.config.origins[origin_idx].workspace_id.to_string();
+                    let verdict_ctx = PolicyVerdictCtx {
+                        request_id: ctx.request_id.to_string(),
+                        tenant_id: workspace_id.clone(),
+                        workspace_id,
+                    };
+                    if let Some((status, message, policy_type)) = check_buffered_dynamic_policies(
+                        &pipeline.enforcers[origin_idx],
+                        session,
+                        ctx,
+                        collected.clone(),
+                        &verdict_ctx,
+                    )
+                    .await
+                    {
+                        let policy_type = effective_policy_type(ctx, policy_type);
+                        sbproxy_observe::metrics::record_policy(
+                            ctx.hostname.as_str(),
+                            policy_type,
+                            "deny",
+                        );
+                        ctx.record_policy_decision(policy_type, "deny");
+                        let body_str = error_json_body(&message);
+                        ctx.validator_failed =
+                            Some((status, body_str, "application/json".to_string()));
+                        return Err(pingora_error::Error::explain(
+                            pingora_error::ErrorType::HTTPStatus(status),
+                            "request body failed dynamic policy",
+                        ));
+                    }
+                }
                 let content_type = session
                     .req_header()
                     .headers
@@ -4444,7 +4545,7 @@ impl ProxyHttp for SbProxy {
                 // Validation passed - release the buffered body as one
                 // chunk so the upstream sees the full payload.
                 let frozen = if !collected.is_empty() {
-                    let bytes = collected.freeze();
+                    let bytes = collected.clone();
                     *body = Some(bytes.clone());
                     Some(bytes)
                 } else {

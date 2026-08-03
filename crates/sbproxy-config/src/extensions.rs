@@ -478,6 +478,9 @@ impl BundleManifest {
                     hook.type_name
                 ));
             }
+            if hook.kind == BundleHookKind::Action && self.failure_posture != FailureMode::Closed {
+                return invalid("action hooks are terminal and require failure_posture closed");
+            }
             if matches!(
                 hook.kind,
                 BundleHookKind::Transform | BundleHookKind::Action

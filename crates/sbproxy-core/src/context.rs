@@ -417,6 +417,8 @@ pub struct RequestContext {
     /// accumulates the body into `request_body_buf` and runs every
     /// matching validator once the stream ends.
     pub validate_request_body: bool,
+    /// Dynamic bundle policies waiting for a complete request body.
+    pub(crate) dynamic_request_body_plan: crate::request_body_plan::DynamicRequestBodyPlan,
     /// Buffered request body, populated only when `validate_request_body`
     /// is true.
     pub request_body_buf: Option<BytesMut>,
@@ -1556,6 +1558,7 @@ impl RequestContext {
             concurrent_limit_denial_body: None,
             agent_budget_guards: Vec::new(),
             validate_request_body: false,
+            dynamic_request_body_plan: crate::request_body_plan::DynamicRequestBodyPlan::default(),
             request_body_buf: None,
             threat_scan_pending: false,
             transcode_active: false,
