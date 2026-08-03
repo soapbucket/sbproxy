@@ -272,23 +272,39 @@ action:
 
 `cookie_hash` follows the same pattern with `cookie: <name>`.
 
-### Sticky sessions
+### Session affinity
 
-Set `sticky:` to issue an affinity cookie so subsequent requests from the same client return to the same target:
+The three hash algorithms are how you pin a client to one target. Pick the one whose key your clients already carry:
+
+| You have | Use | Pinned by |
+|---|---|---|
+| A session cookie your app already sets | `cookie_hash` with `cookie: <name>` | Cookie value |
+| A tenant or user id on the request | `header_hash` with `header: <name>` | Header value |
+| Neither, but stable client addresses | `ip_hash` | Client IP |
 
 ```yaml
 action:
   type: load_balancer
-  algorithm: round_robin
-  sticky:
-    cookie_name: _sb_backend     # Defaults to sb_sticky
-    ttl: 3600                    # Optional cookie TTL in seconds
+  algorithm:
+    cookie_hash:
+      cookie: session_id
   targets:
     - url: https://backend-1.test.sbproxy.dev
     - url: https://backend-2.test.sbproxy.dev
 ```
 
-`ip_hash`, `header_hash`, and `cookie_hash` are inherently sticky and do not need a separate `sticky:` block.
+```bash
+for i in $(seq 1 3); do
+  curl -s -H "Host: lb.test.sbproxy.dev" -H "Cookie: session_id=alpha" \
+    http://localhost:8080/echo | grep -o '"path":"[^"]*"'
+done
+```
+
+All three hash over the *eligible* targets, the ones left after the active health check, the outlier detector, and the circuit breaker have each had their say. So a target going unhealthy drops out of the hash and the clients pinned to it move somewhere healthy, rather than staying pinned to something broken.
+
+Requests whose key is missing all hash to the same target, since they all hash the empty string. Pick a key your clients actually send.
+
+There is also a `sticky:` block on this action. It is accepted for compatibility and does nothing: no `Set-Cookie` is ever issued, and traffic distributes exactly as the configured algorithm says. Setting it logs a warning at boot naming the key. Use one of the three algorithms above instead.
 
 ### Targets
 
@@ -301,7 +317,7 @@ Each target is an object with `url` plus optional fields:
 | `backup` | bool | Reserved for fallback only |
 | `group` | string | Tag used by blue-green / canary (`blue`, `green`, `canary`) |
 | `priority` | int | 1 (highest) to 10 (lowest); default 5 |
-| `zone` | string | Availability zone label for locality routing |
+| `zone` | string | Availability zone label. Reported by the admin API; does not affect target selection |
 | `health_check` | object | Health check configuration (Go-compat opaque) |
 
 ### Deployment modes
