@@ -860,7 +860,7 @@ pub fn build_request_input_with_agent_class(
 /// what isolates calls. Returning a fresh `Engine` per `WasmRuntime`
 /// would burn cold-start cycles for no benefit.
 ///
-fn build_engine(stack_bytes: Option<usize>) -> Result<Arc<Engine>> {
+pub(crate) fn build_engine(stack_bytes: Option<usize>) -> Result<Arc<Engine>> {
     static ENGINES: LazyLock<Mutex<BTreeMap<Option<usize>, Weak<Engine>>>> =
         LazyLock::new(|| Mutex::new(BTreeMap::new()));
     let mut engines = ENGINES

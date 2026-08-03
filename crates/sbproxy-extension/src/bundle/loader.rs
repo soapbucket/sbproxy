@@ -22,6 +22,7 @@ use sbproxy_plugin::{
 use sha2::{Digest, Sha256};
 
 use super::javascript::prepare_javascript_artifact;
+use super::proxy_wasm::ProxyWasmRuntime;
 use super::registry::{lookup, BundleProvenance, BundleRegistry, LoadedBundleHook};
 use crate::wasm::{WasmBundleLimits, WasmRuntime};
 
@@ -434,6 +435,15 @@ impl<'a> Candidate<'a> {
         } else {
             None
         };
+        let proxy_wasm_runtime = if manifest.runtime == BundleRuntime::ProxyWasm {
+            let limits = WasmBundleLimits::from_sandbox(&manifest.sandbox)?;
+            Some(Arc::new(
+                ProxyWasmRuntime::from_bundle_bytes(&artifact, limits)
+                    .map_err(|failure| BundleLoadError::new("proxy_wasm", failure.code()))?,
+            ))
+        } else {
+            None
+        };
 
         let source = provenance.source();
         let runtime = inventory_runtime(manifest.runtime);
@@ -452,6 +462,7 @@ impl<'a> Candidate<'a> {
                 artifact: artifact.clone(),
                 javascript_source: javascript_source.clone(),
                 wasm_runtime: wasm_runtime.clone(),
+                proxy_wasm_runtime: proxy_wasm_runtime.clone(),
                 sha256: digest.clone(),
                 config_validator: validator,
                 provenance: provenance.clone(),
@@ -715,8 +726,31 @@ fn hook_inventory(
             timeout_ms: Some(manifest.sandbox.budget_ms),
             max_buffer_bytes: Some(manifest.sandbox.max_buffer_bytes),
         },
-        capabilities: Vec::new(),
+        capabilities: hook_capabilities(hook.kind),
     }
+}
+
+fn hook_capabilities(kind: BundleHookKind) -> Vec<String> {
+    if kind != BundleHookKind::ProxyWasm {
+        return Vec::new();
+    }
+    [
+        "buffer",
+        "close",
+        "configure",
+        "context_lifecycle",
+        "continue",
+        "header_map",
+        "local_response",
+        "log",
+        "request_body",
+        "request_headers",
+        "response_body",
+        "response_headers",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
 }
 
 const fn inventory_runtime(runtime: BundleRuntime) -> ExtensionRuntime {

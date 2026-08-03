@@ -10,7 +10,10 @@ use sbproxy_plugin::{ExtensionHookKind, ExtensionRegistrationSource, ExtensionRu
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
-use super::{BundleLoadError, BundleRegistry, DynamicBundleRegistry};
+use super::{
+    build_proxy_wasm_filter, BundleLoadError, BundleRegistry, DynamicBundleRegistry,
+    ProxyWasmAction,
+};
 
 const COMMIT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const VALID_JAVASCRIPT: &[u8] = b"export function run() {}";
@@ -308,7 +311,11 @@ fn proxy_wasm_and_ai_lookups_map_kinds_and_sort_ai_hooks() {
         "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: proxy-filter\nversion: 1.0.0\nruntime: proxy_wasm\nabi: 0.2.1\nentry: filter.wasm\nhooks:\n  - kind: proxy_wasm\n    type: fixture_proxy_filter\n",
     )
     .unwrap();
-    std::fs::write(proxy_dir.join("filter.wasm"), b"fixture wasm bytes").unwrap();
+    std::fs::write(
+        proxy_dir.join("filter.wasm"),
+        include_bytes!("testdata/proxy_wasm/minimal.wasm"),
+    )
+    .unwrap();
 
     write_bundle(
         temp.path(),
@@ -334,6 +341,17 @@ fn proxy_wasm_and_ai_lookups_map_kinds_and_sort_ai_hooks() {
             .unwrap();
     let proxy = registry.proxy_wasm_filter("fixture_proxy_filter").unwrap();
     assert_eq!(proxy.hook().kind, BundleHookKind::ProxyWasm);
+    let filter = build_proxy_wasm_filter(proxy, serde_json::json!({"enabled": true})).unwrap();
+    assert_eq!(filter.type_name(), "fixture_proxy_filter");
+    assert_eq!(
+        filter
+            .start_session()
+            .unwrap()
+            .on_request_headers(Vec::new(), true)
+            .unwrap()
+            .action,
+        ProxyWasmAction::Continue
+    );
     let close_hooks = registry.ai_hooks(BundleHookKind::AiClose);
     assert_eq!(
         close_hooks
@@ -349,6 +367,8 @@ fn proxy_wasm_and_ai_lookups_map_kinds_and_sort_ai_hooks() {
         hook.match_key == "fixture_proxy_filter"
             && hook.kind == ExtensionHookKind::ProxyWasmFilter
             && hook.runtime == ExtensionRuntime::ProxyWasm
+            && hook.capabilities.contains(&"request_body".to_owned())
+            && hook.capabilities.contains(&"local_response".to_owned())
     }));
     assert!(registry.inventory().hooks.iter().any(|hook| {
         hook.match_key == "a_close"
@@ -360,6 +380,25 @@ fn proxy_wasm_and_ai_lookups_map_kinds_and_sort_ai_hooks() {
             && hook.kind == ExtensionHookKind::AiToolCall
             && hook.runtime == ExtensionRuntime::Javascript
     }));
+}
+
+#[test]
+fn invalid_proxy_wasm_module_rejects_the_complete_candidate() {
+    let temp = TempDir::new().unwrap();
+    let proxy_dir = temp.path().join("proxy-filter");
+    std::fs::create_dir(&proxy_dir).unwrap();
+    std::fs::write(
+        proxy_dir.join("bundle.yaml"),
+        "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: proxy-filter\nversion: 1.0.0\nruntime: proxy_wasm\nabi: 0.2.1\nentry: filter.wasm\nhooks:\n  - kind: proxy_wasm\n    type: fixture_proxy_filter\n",
+    )
+    .unwrap();
+    std::fs::write(proxy_dir.join("filter.wasm"), b"not a wasm module").unwrap();
+
+    let error =
+        DynamicBundleRegistry::load(&local_config(temp.path()), temp.path(), &BTreeSet::new())
+            .unwrap_err();
+
+    assert_eq!(error.to_string(), "bundle.proxy_wasm: invalid_module");
 }
 
 #[test]
