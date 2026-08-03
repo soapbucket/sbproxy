@@ -1214,6 +1214,8 @@ pub struct CompiledPipeline {
     pub router: HostRouter,
     /// Compiled action for each origin (parallel to config.origins).
     pub actions: Vec<Action>,
+    /// Compiled Proxy-Wasm filter chain for each origin.
+    pub(crate) proxy_wasm_filters: Vec<Option<crate::proxy_wasm_http::ProxyWasmFilterChain>>,
     /// Guards the one-time activation of this generation's background tasks.
     pub(crate) background_tasks_started: AtomicBool,
     /// Immutable per-origin AI compression dependencies and policies.
@@ -1461,6 +1463,7 @@ impl Default for CompiledPipeline {
             sensitive_header_names,
             router,
             actions: Vec::new(),
+            proxy_wasm_filters: Vec::new(),
             background_tasks_started: AtomicBool::new(false),
             compression_runtimes: crate::compression_runtime::CompressionRuntimeRegistry::default(),
             #[cfg(feature = "rag")]
@@ -1712,6 +1715,7 @@ impl CompiledPipeline {
 
         let sensitive_header_names = compile_sensitive_header_names(&config);
         let mut actions = Vec::with_capacity(config.origins.len());
+        let mut proxy_wasm_filters = Vec::with_capacity(config.origins.len());
         let mut auths = Vec::with_capacity(config.origins.len());
         let mut policies = Vec::with_capacity(config.origins.len());
         let mut enforcers: Vec<Vec<CompiledEnforcer>> = Vec::with_capacity(config.origins.len());
@@ -1750,6 +1754,22 @@ impl CompiledPipeline {
                     &action_identity,
                 )?,
             };
+            let proxy_wasm_filter = if origin.filters.is_empty() {
+                None
+            } else {
+                if !matches!(&action, Action::Proxy(_)) {
+                    anyhow::bail!(
+                        "origin `{}`: Proxy-Wasm filters require a proxy action",
+                        origin.origin_id
+                    );
+                }
+                Some(crate::proxy_wasm_http::ProxyWasmFilterChain::compile(
+                    origin.origin_id.as_str(),
+                    &origin.filters,
+                    extension_registry.as_ref(),
+                )?)
+            };
+            proxy_wasm_filters.push(proxy_wasm_filter);
             actions.push(action);
 
             // Compile auth (optional per origin).
@@ -1854,11 +1874,29 @@ impl CompiledPipeline {
                 mode,
                 extension_registry.as_ref(),
             )?;
+            if !origin.filters.is_empty() {
+                if let Some((rule_index, _)) = origin_fwd_rules
+                    .iter()
+                    .enumerate()
+                    .find(|(_, rule)| !matches!(&rule.action, Action::Proxy(_)))
+                {
+                    anyhow::bail!(
+                        "origin `{}`: Proxy-Wasm filters require forward rule {rule_index} to use a proxy action",
+                        origin.origin_id
+                    );
+                }
+            }
             forward_rules.push(origin_fwd_rules);
 
             // Compile fallback origin (optional per origin).
             let fallback =
                 compile_fallback(&origin.fallback_origin, mode, extension_registry.as_ref())?;
+            if !origin.filters.is_empty() && fallback.is_some() {
+                anyhow::bail!(
+                    "origin `{}`: Proxy-Wasm filters do not support fallback_origin responses",
+                    origin.origin_id
+                );
+            }
             fallbacks.push(fallback);
 
             // Compile bot detection (optional per origin).
@@ -2241,6 +2279,7 @@ impl CompiledPipeline {
             sensitive_header_names,
             router,
             actions,
+            proxy_wasm_filters,
             background_tasks_started: AtomicBool::new(false),
             compression_runtimes,
             #[cfg(feature = "rag")]
@@ -2944,6 +2983,7 @@ mod tests {
                 auth_config: auth,
                 policy_configs: policies,
                 transform_configs: Vec::new(),
+                filters: Vec::new(),
                 cors: None,
                 hsts: None,
                 compression: None,
@@ -3260,6 +3300,7 @@ hooks:
                 auth_config: None,
                 policy_configs: Vec::new(),
                 transform_configs: transforms,
+                filters: Vec::new(),
                 cors: None,
                 hsts: None,
                 compression: None,

@@ -326,6 +326,10 @@ pub struct RequestContext {
     /// risks a panic or a cross-origin config read; the request simply
     /// completes on the config it started with.
     pub pipeline: std::sync::Arc<crate::pipeline::CompiledPipeline>,
+    /// Live Proxy-Wasm HTTP sessions for the pipeline generation pinned to
+    /// this request. The mutex supplies the `Sync` bound required by Pingora;
+    /// request phases still access it serially through their mutable context.
+    pub(crate) proxy_wasm: Option<parking_lot::Mutex<crate::proxy_wasm_http::ProxyWasmHttpState>>,
 
     // --- Auth state ---
     /// Authentication result, populated by the auth phase.
@@ -1533,6 +1537,7 @@ impl RequestContext {
             tenant_id: CompactString::const_new("__default__"),
             origin_idx: None,
             pipeline: crate::reload::current_pipeline_full(),
+            proxy_wasm: None,
             lb_attempt: None,
             retry_count: 0,
             retry_backoff_ms: None,

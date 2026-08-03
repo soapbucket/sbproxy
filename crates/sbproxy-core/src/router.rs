@@ -154,6 +154,7 @@ mod tests {
                 auth_config: None,
                 policy_configs: Vec::new(),
                 transform_configs: Vec::new(),
+                filters: Vec::new(),
                 cors: None,
                 hsts: None,
                 compression: None,

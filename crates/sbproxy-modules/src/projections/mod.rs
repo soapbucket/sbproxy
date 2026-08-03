@@ -811,6 +811,7 @@ mod tests {
                 auth_config: None,
                 policy_configs: vec![ai_crawl],
                 transform_configs: Vec::new(),
+                filters: Vec::new(),
                 cors: None,
                 hsts: None,
                 compression: None,

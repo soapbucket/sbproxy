@@ -274,6 +274,11 @@ fn active_extension_hooks(
 ) -> BTreeSet<(ExtensionHookKind, String)> {
     let mut active = BTreeSet::new();
     for origin in &config.origins {
+        for filter in &origin.filters {
+            if registry.proxy_wasm_filter(&filter.type_name).is_some() {
+                active.insert((ExtensionHookKind::ProxyWasmFilter, filter.type_name.clone()));
+            }
+        }
         record_configured_action(&origin.action_config, registry, &mut active);
         if let Some(auth) = &origin.auth_config {
             record_configured_hook(auth, ExtensionHookKind::Auth, false, &mut active);

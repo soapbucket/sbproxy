@@ -15,8 +15,8 @@ use crate::types::{
     AccessLogConfig, AgentClassesConfig, AgentSkillEntry, AgentsJsonConfig, CompressionConfig,
     CorsConfig, ErrorPageEntry, HstsConfig, IdempotencyConfig, MessageSignaturesConfig,
     MirrorConfig, OlpConfig, OriginAttestationConfig, ProblemDetailsConfig, ProxyServerConfig,
-    ProxyStatusConfig, RequestModifierConfig, ResponseCacheConfig, ResponseModifierConfig,
-    SessionConfig, WebBotAuthPublishConfig,
+    ProxyStatusConfig, ProxyWasmFilterAttachment, RequestModifierConfig, ResponseCacheConfig,
+    ResponseModifierConfig, SessionConfig, WebBotAuthPublishConfig,
 };
 
 /// Fully compiled, immutable origin ready for request processing.
@@ -46,6 +46,8 @@ pub struct CompiledOrigin {
     pub policy_configs: Vec<serde_json::Value>,
     /// Transform configurations (JSON shape, encoding, etc.) as JSON until module-layer compilation.
     pub transform_configs: Vec<serde_json::Value>,
+    /// Proxy-Wasm HTTP filter attachments in declaration order.
+    pub filters: Vec<ProxyWasmFilterAttachment>,
 
     /// CORS configuration applied before the action runs.
     pub cors: Option<CorsConfig>,

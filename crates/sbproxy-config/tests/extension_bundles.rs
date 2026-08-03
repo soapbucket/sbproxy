@@ -510,3 +510,45 @@ fn manifest_enforces_every_execution_ceiling() {
         assert!(error.contains(field) && error.contains(ceiling), "{error}");
     }
 }
+
+#[test]
+fn proxy_wasm_filter_attachment_compiles_with_typed_fields() {
+    let compiled = compile_config(
+        r#"
+origins:
+  filter.example:
+    action: { type: noop }
+    filters:
+      - type: fixture_http_filter
+        config: { enabled: true }
+        failure_posture: open
+proxy: {}
+"#,
+    )
+    .expect("Proxy-Wasm filter attachment compiles");
+
+    let attachment = &compiled.origins[0].filters[0];
+    assert_eq!(attachment.type_name, "fixture_http_filter");
+    assert_eq!(attachment.config, serde_json::json!({"enabled": true}));
+    assert_eq!(attachment.failure_posture, Some(FailureMode::Open));
+}
+
+#[test]
+fn proxy_wasm_filter_attachment_rejects_failure_mode_alias() {
+    let error = match compile_config(
+        r#"
+origins:
+  filter.example:
+    action: { type: noop }
+    filters:
+      - type: fixture_http_filter
+        failure_mode: open
+proxy: {}
+"#,
+    ) {
+        Ok(_) => panic!("misspelled attachment posture must fail"),
+        Err(error) => format!("{error:#}"),
+    };
+
+    assert!(error.contains("failure_mode"), "{error}");
+}

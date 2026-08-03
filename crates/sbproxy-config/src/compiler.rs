@@ -2111,6 +2111,9 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
     for transform in &mut config.transforms {
         interpolate_config_vars(transform, &config.variables);
     }
+    for filter in &mut config.filters {
+        interpolate_config_vars(&mut filter.config, &config.variables);
+    }
     for fwd_rule in &mut config.forward_rules {
         // Forward rules are typed in `RawOriginConfig` but the interpolator
         // walks `serde_json::Value` recursively. Round-trip through JSON so
@@ -2449,6 +2452,7 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
         auth_config: config.authentication,
         policy_configs: config.policies,
         transform_configs: config.transforms,
+        filters: config.filters,
         cors: config.cors,
         hsts: config.hsts,
         compression: config.compression,

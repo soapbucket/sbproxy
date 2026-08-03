@@ -7341,6 +7341,7 @@ origins:
                 auth_config: None,
                 policy_configs: vec![policy_cfg],
                 transform_configs: Vec::new(),
+                filters: Vec::new(),
                 cors: None,
                 hsts: None,
                 compression: None,

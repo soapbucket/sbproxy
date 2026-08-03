@@ -418,7 +418,16 @@ impl ProxyHarness {
     /// listing loader's "config-file parent is the Repo root"
     /// contract holds.
     pub fn start_with_workspace(yaml: &str, files: &[(&str, &str)]) -> anyhow::Result<Self> {
-        Self::start_with_workspace_and_optional_shutdown_grace(yaml, files, None, &[])
+        let byte_files: Vec<(&str, &[u8])> = files
+            .iter()
+            .map(|(path, body)| (*path, body.as_bytes()))
+            .collect();
+        Self::start_with_workspace_bytes(yaml, &byte_files)
+    }
+
+    /// Start the proxy against a temp workspace that may contain binary files.
+    pub fn start_with_workspace_bytes(yaml: &str, files: &[(&str, &[u8])]) -> anyhow::Result<Self> {
+        Self::start_with_workspace_bytes_and_optional_shutdown_grace(yaml, files, None, &[])
     }
 
     /// Start the proxy in an isolated config workspace with a test-specific
@@ -461,6 +470,24 @@ impl ProxyHarness {
     fn start_with_workspace_and_optional_shutdown_grace(
         yaml: &str,
         files: &[(&str, &str)],
+        shutdown_grace_ms: Option<u64>,
+        env: &[(&str, &str)],
+    ) -> anyhow::Result<Self> {
+        let byte_files: Vec<(&str, &[u8])> = files
+            .iter()
+            .map(|(path, body)| (*path, body.as_bytes()))
+            .collect();
+        Self::start_with_workspace_bytes_and_optional_shutdown_grace(
+            yaml,
+            &byte_files,
+            shutdown_grace_ms,
+            env,
+        )
+    }
+
+    fn start_with_workspace_bytes_and_optional_shutdown_grace(
+        yaml: &str,
+        files: &[(&str, &[u8])],
         shutdown_grace_ms: Option<u64>,
         env: &[(&str, &str)],
     ) -> anyhow::Result<Self> {

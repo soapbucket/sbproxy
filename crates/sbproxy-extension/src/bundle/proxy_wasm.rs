@@ -197,6 +197,12 @@ impl ProxyWasmFilter {
         self.body_mode
     }
 
+    /// Return the largest input accepted by one guest callback.
+    #[must_use]
+    pub fn max_input_bytes(&self) -> usize {
+        self.runtime.limits.max_input_bytes
+    }
+
     /// Create one isolated request session.
     pub fn start_session(&self) -> Result<ProxyWasmSession, ProxyWasmCallFailure> {
         self.runtime.start_session(&self.plugin_configuration)

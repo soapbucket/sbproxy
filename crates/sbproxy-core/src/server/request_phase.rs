@@ -1331,6 +1331,10 @@ pub(super) async fn request_filter(
     };
     ctx.origin_idx = Some(origin_idx);
 
+    if crate::proxy_wasm_http::start_request(session, ctx, origin_idx).await? {
+        return Ok(true);
+    }
+
     // Validated GraphQL requests may pass through body-consuming middleware
     // (notably threat protection) before action dispatch. Enable replay at
     // the origin boundary so every consumed chunk is still available for

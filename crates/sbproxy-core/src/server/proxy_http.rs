@@ -2480,6 +2480,8 @@ impl ProxyHttp for SbProxy {
         // origin-header rules.
         crate::meter_runtime::capture_origin_headers(ctx, upstream_response);
 
+        crate::proxy_wasm_http::filter_response_headers(session, upstream_response, ctx)?;
+
         // --- WOR-808: RSL `Link: rel="license"` discovery header ---
         //
         // When the origin publishes an RSL document (it has an
@@ -3644,6 +3646,8 @@ impl ProxyHttp for SbProxy {
     where
         Self::CTX: Send + Sync,
     {
+        crate::proxy_wasm_http::filter_request_body(body, end_of_stream, ctx)?;
+
         // For validated GraphQL POSTs, replace the inbound replay stream
         // before every downstream consumer. This is deliberately first:
         // request limits, body policies, idempotency, and byte accounting must
@@ -4642,6 +4646,8 @@ impl ProxyHttp for SbProxy {
             return Ok(None);
         }
 
+        crate::proxy_wasm_http::filter_response_body(body, end_of_stream, ctx)?;
+
         // Track outbound body bytes for the access log. Counts what
         // the client receives, including transformed / fallback /
         // cached bodies, since those are what downstream egress
@@ -5522,6 +5528,23 @@ impl ProxyHttp for SbProxy {
     where
         Self::CTX: Send + Sync,
     {
+        if let Some(local_response) = crate::proxy_wasm_http::take_pending_local_response(ctx) {
+            let status = local_response.status;
+            let _ = crate::proxy_wasm_http::send_local_response(session, &local_response).await;
+            ctx.response_status = Some(status);
+            return FailToProxy {
+                error_code: status,
+                can_reuse_downstream: false,
+            };
+        }
+
+        if crate::proxy_wasm_http::response_stream_failed(ctx) {
+            return FailToProxy {
+                error_code: 500,
+                can_reuse_downstream: false,
+            };
+        }
+
         // Quota settlement is intentionally the final realtime outbound seam.
         // Preserve its exact response and bypass origin fallback if it fails
         // after Pingora has selected an upstream.
@@ -5708,6 +5731,8 @@ impl ProxyHttp for SbProxy {
     where
         Self::CTX: Send + Sync,
     {
+        crate::proxy_wasm_http::finish(ctx);
+
         // A body-bound BotAuth signature is provisional during the header
         // and policy phases. If a short circuit prevented the body verifier
         // from running, close the observation conservatively without

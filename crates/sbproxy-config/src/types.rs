@@ -6469,6 +6469,25 @@ enum OutboundDpopAlgorithmSchema {
     EdDSA,
 }
 
+/// One Proxy-Wasm HTTP filter attached to an origin.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyWasmFilterAttachment {
+    /// Stable hook type declared by an installed Proxy-Wasm bundle.
+    #[serde(rename = "type")]
+    pub type_name: String,
+    /// Plugin configuration exposed through `proxy_get_buffer_bytes`.
+    #[serde(default = "empty_json_object")]
+    pub config: serde_json::Value,
+    /// Optional origin-specific override for the bundle failure posture.
+    #[serde(default)]
+    pub failure_posture: Option<FailureMode>,
+}
+
+fn empty_json_object() -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::new())
+}
+
 /// A single origin config as it appears in YAML.
 /// Plugin-specific fields are kept as `serde_json::Value` for deferred parsing.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -6495,6 +6514,9 @@ pub struct RawOriginConfig {
     /// Transform pipeline applied to request and response bodies.
     #[serde(default)]
     pub transforms: Vec<serde_json::Value>,
+    /// Proxy-Wasm HTTP filters evaluated in declaration order.
+    #[serde(default)]
+    pub filters: Vec<ProxyWasmFilterAttachment>,
     /// Request modifiers (header rewrites, path edits, etc.).
     #[serde(default)]
     pub request_modifiers: Vec<RequestModifierConfig>,
