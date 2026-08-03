@@ -2,6 +2,7 @@ use base64::Engine as _;
 use bytes::Bytes;
 use sbproxy_plugin::{
     ActionOutcome, AiExtensionDecision, PaymentExtensionDecision, PolicyDecision,
+    UNSUPPORTED_ACTION_OUTCOME_CODE,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -244,7 +245,7 @@ pub(crate) fn decode_action(bytes: &[u8], maximum: usize) -> Result<ActionOutcom
                 && response.headers.is_empty()
                 && response.body_base64.is_none() =>
         {
-            Ok(ActionOutcome::Proxy)
+            Err(EnvelopeError::new(UNSUPPORTED_ACTION_OUTCOME_CODE))
         }
         "response" => {
             let status = response
@@ -364,6 +365,17 @@ mod tests {
     use sbproxy_plugin::{AiExtensionDecision, PaymentExtensionDecision};
 
     use super::*;
+
+    #[test]
+    fn action_proxy_outcome_has_a_stable_unsupported_code() {
+        let error = decode_action(
+            br#"{"version":"sbproxy-envelope/v1","outcome":"proxy"}"#,
+            1024,
+        )
+        .expect_err("bundle actions have no upstream to proxy to");
+
+        assert_eq!(error.code(), "unsupported_action_outcome");
+    }
 
     #[test]
     fn ai_decision_wire_is_strict_and_bounded() {

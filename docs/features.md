@@ -1,6 +1,6 @@
 # SBproxy features manual
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-03*
 
 The capability tour: each section covers what a feature does, a minimal config to turn it on, and a working example against `test.sbproxy.dev`, with a link to the doc that owns the full reference. Installation and runtime operations live in [manual.md](manual.md); the complete field schema lives in [configuration.md](configuration.md).
 
@@ -2171,28 +2171,35 @@ Implement `ActionHandler` and submit a registration entry:
 ```rust,no_run
 use std::future::Future;
 use std::pin::Pin;
-use anyhow::Result;
-use sbproxy_plugin::{ActionHandler, ActionOutcome, PluginKind, PluginRegistration};
+use bytes::Bytes;
+use sbproxy_plugin::{
+    ActionHandler, ActionOutcome, ActionPluginRegistration, PluginResult,
+};
 
 pub struct MyAction;
 
 impl ActionHandler for MyAction {
-    fn handler_type(&self) -> &'static str { "my_action" }
+    fn handler_type(&self) -> &str { "my_action" }
 
     fn handle(
         &self,
-        _req: &mut http::Request<bytes::Bytes>,
+        _req: &mut http::Request<Bytes>,
         _ctx: &mut dyn std::any::Any,
-    ) -> Pin<Box<dyn Future<Output = Result<ActionOutcome>> + Send + '_>> {
-        Box::pin(async { Ok(ActionOutcome::Responded) })
+    ) -> Pin<Box<dyn Future<Output = PluginResult<ActionOutcome>> + Send + '_>> {
+        Box::pin(async {
+            Ok(ActionOutcome::Response {
+                status: 200,
+                headers: vec![("content-type".into(), "text/plain".into())],
+                body: Bytes::from_static(b"hello"),
+            })
+        })
     }
 }
 
 inventory::submit! {
-    PluginRegistration {
-        kind: PluginKind::Action,
+    ActionPluginRegistration {
         name: "my_action",
-        factory: |_cfg| Ok(Box::new(MyAction)),
+        factory: |_config| Ok(Box::new(MyAction)),
     }
 }
 ```

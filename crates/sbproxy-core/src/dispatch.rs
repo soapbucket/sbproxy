@@ -15,6 +15,13 @@ use sbproxy_plugin::ActionOutcome;
 use sbproxy_tls::challenges::ACME_CHALLENGE_PREFIX;
 use sbproxy_tls::h3_listener::HttpResponse;
 
+pub(crate) fn unsupported_plugin_action_proxy_message() -> String {
+    format!(
+        "{}: plugin action cannot proxy without a configured upstream",
+        sbproxy_plugin::UNSUPPORTED_ACTION_OUTCOME_CODE
+    )
+}
+
 // --- Public dispatch API ---
 
 /// Dispatch an HTTP/3 request through the proxy pipeline.
@@ -365,8 +372,7 @@ async fn dispatch_action(
                     body,
                 } => validate_plugin_action_response(status, headers, body),
                 ActionOutcome::Proxy => {
-                    warn!("H3: plugin proxy outcome not supported in H3 dispatch");
-                    Ok(text_response(501, &h3_unsupported_message("plugin proxy")))
+                    Err(anyhow::anyhow!(unsupported_plugin_action_proxy_message()))
                 }
                 ActionOutcome::Responded => {
                     warn!("H3: legacy plugin responded outcome cannot write through H3 dispatch");
@@ -663,6 +669,51 @@ fn text_response(status: u16, body: &str) -> HttpResponse {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn javascript_proxy_action_fixture() -> (tempfile::TempDir, Action) {
+    let directory = tempfile::TempDir::new().expect("temporary JavaScript bundle directory");
+    let bundle = directory.path().join("guest-proxy-action");
+    std::fs::create_dir_all(&bundle).expect("create JavaScript bundle directory");
+    std::fs::write(
+        bundle.join("entry.js"),
+        r#"export function run() {
+            return { version: "sbproxy-envelope/v1", outcome: "proxy" };
+        }"#,
+    )
+    .expect("write JavaScript bundle entry");
+    std::fs::write(
+        bundle.join("bundle.yaml"),
+        r#"apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: guest-proxy-action
+version: 1.0.0
+runtime: javascript
+entry: entry.js
+hooks:
+  - kind: action
+    type: guest_proxy_action
+    export: run
+"#,
+    )
+    .expect("write JavaScript bundle manifest");
+    let config = sbproxy_config::ExtensionBundlesConfig {
+        bundles_dir: Some(directory.path().display().to_string()),
+        sources: Vec::new(),
+    };
+    let registry = sbproxy_extension::bundle::DynamicBundleRegistry::load(
+        &config,
+        directory.path(),
+        &std::collections::BTreeSet::new(),
+    )
+    .expect("load JavaScript bundle");
+    let action = sbproxy_modules::compile_action_with_registry(
+        &serde_json::json!({"type": "guest_proxy_action"}),
+        registry.as_ref(),
+    )
+    .expect("compile JavaScript bundle action");
+    (directory, action)
+}
+
 // --- not() helper (std::ops::Not for bool) ---
 trait BoolNot {
     fn not(self) -> bool;
@@ -738,6 +789,36 @@ mod tests {
             vec![("content-type".to_string(), "text/plain".to_string())]
         );
         assert_eq!(response.body.as_deref(), Some(&b"queued"[..]));
+    }
+
+    #[tokio::test]
+    async fn plugin_action_h3_rejects_proxy_without_an_upstream() {
+        let action = Action::Plugin(Box::new(OutcomeAction(ActionOutcome::Proxy)));
+
+        let error = match dispatch_plugin_action(&action).await {
+            Ok(_) => panic!("a plugin action cannot continue without an upstream"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("unsupported_action_outcome"),
+            "error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn javascript_action_h3_rejects_proxy_without_an_upstream() {
+        let (_directory, action) = javascript_proxy_action_fixture();
+
+        let error = match dispatch_plugin_action(&action).await {
+            Ok(_) => panic!("a JavaScript action cannot continue without an upstream"),
+            Err(error) => error,
+        };
+
+        assert!(
+            format!("{error:#}").contains("unsupported_action_outcome"),
+            "error: {error:#}"
+        );
     }
 
     #[tokio::test]

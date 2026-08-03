@@ -12389,7 +12389,13 @@ hooks:
     fn validate_loads_dynamic_action_bundle_relative_to_config() {
         let (path, bundle_directory) = temp_extension_config(
             r#"export function run() {
-                return { version: "sbproxy-envelope/v1", outcome: "proxy" };
+                return {
+                    version: "sbproxy-envelope/v1",
+                    outcome: "response",
+                    status: 204,
+                    headers: [],
+                    body_base64: ""
+                };
             }"#,
             "validate_action",
         );

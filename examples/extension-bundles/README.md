@@ -1,6 +1,6 @@
 # Local extension bundles
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-03*
 
 This example loads six extension bundles from a directory next to `sb.yml`. Three routes exercise five HTTP hooks. Four more JavaScript hooks receive normalized AI events, one JavaScript hook receives credential-free payment events such as x402 verification, and the Proxy-Wasm module also handles live AI stream events.
 
@@ -46,6 +46,8 @@ curl -i -H 'Host: filtered.extension.local' \
 # HTTP/1.1 200
 # x-extension-filter: proxy-wasm
 ```
+
+The first two action hooks finish their requests with bounded local responses. The third route shows how forwarding is wired: `type: proxy` owns the upstream, and its Proxy-Wasm filter runs around that forwarded traffic. A bundle action has no upstream of its own, so `outcome: "proxy"` is rejected with `unsupported_action_outcome`.
 
 ## Inspect what loaded
 

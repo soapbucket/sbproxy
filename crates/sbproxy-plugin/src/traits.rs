@@ -9,12 +9,23 @@ use std::pin::Pin;
 
 use crate::PluginResult;
 
-/// Outcome of an action handler - either proxied upstream or responded directly.
+/// Stable error code for an action result the selected host action cannot honor.
+pub const UNSUPPORTED_ACTION_OUTCOME_CODE: &str = "unsupported_action_outcome";
+
+/// Outcome of a dynamically dispatched action handler.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionOutcome {
-    /// Request should be proxied to the upstream returned by upstream_peer.
+    /// Legacy request to continue to an upstream.
+    ///
+    /// Retained for linked-plugin source compatibility. The current
+    /// `Action::Plugin` host action has no upstream configuration, so dispatch
+    /// rejects this outcome with [`UNSUPPORTED_ACTION_OUTCOME_CODE`]. Routing
+    /// belongs to a concrete host action such as `proxy` or `load_balancer`.
     Proxy,
-    /// Response was written directly (static, redirect, echo, etc.).
+    /// Legacy signal that the handler wrote a response through host state.
+    ///
+    /// This variant carries no response bytes and is not part of the bundle
+    /// action contract. New implementations should return [`Self::Response`].
     Responded,
     /// Handler supplied a complete response for ordinary response middleware.
     Response {
@@ -223,17 +234,17 @@ impl PolicyDecision {
 
 /// Third-party action handler (dynamic dispatch).
 ///
-/// Implementations handle incoming requests and decide whether to proxy
-/// them upstream or respond directly.
+/// Implementations handle incoming requests and supply a complete local
+/// response. Upstream routing belongs to a concrete host action.
 pub trait ActionHandler: Send + Sync + 'static {
     /// Returns the handler type identifier (e.g. "my-custom-action").
     fn handler_type(&self) -> &str;
 
     /// Handle an incoming request.
     ///
-    /// On success the future resolves to an [`ActionOutcome`] telling the
-    /// pipeline whether the request was proxied upstream or already
-    /// responded to directly.
+    /// On success the future resolves to an [`ActionOutcome`]. New handlers
+    /// return [`ActionOutcome::Response`] so ordinary response middleware can
+    /// process the status, headers, and body.
     ///
     /// ## Errors
     ///

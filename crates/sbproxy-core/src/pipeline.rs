@@ -3046,7 +3046,13 @@ mod tests {
             bundle.join("entry.js"),
             format!(
                 r#"export function run() {{
-                    return {{ version: "sbproxy-envelope/v1", outcome: "proxy" }};
+                    return {{
+                        version: "sbproxy-envelope/v1",
+                        outcome: "response",
+                        status: 204,
+                        headers: [],
+                        body_base64: ""
+                    }};
                 }}
                 // {marker}
 "#
@@ -3123,7 +3129,7 @@ hooks:
         std::fs::create_dir_all(&bundle).expect("create extension bundle directory");
         std::fs::write(
             bundle.join("entry.js"),
-            "export function run() { return { version: 'sbproxy-envelope/v1', outcome: 'proxy' }; }",
+            "export function run() { return { version: 'sbproxy-envelope/v1', outcome: 'response', status: 204, headers: [], body_base64: '' }; }",
         )
         .expect("write extension artifact");
         std::fs::write(

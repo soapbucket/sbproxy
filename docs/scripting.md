@@ -1,6 +1,6 @@
 # SBproxy scripting reference: CEL, Lua, JavaScript, and WASM
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-03*
 
 SBproxy includes four scripting engines for custom logic: CEL (Common Expression Language), Lua, JavaScript, and WASM. All run in sandboxed environments with access to request context.
 
@@ -1039,9 +1039,11 @@ JavaScript and TypeScript entries are ES modules with named exports. The host pa
 |---|---|---|
 | `policy` | `request` plus `config` | `allow` or `deny`, with bounded status, message, and headers |
 | `transform` | `body.body_base64`, `body.content_type`, `body.origin`, plus `config` | A replacement `body_base64` |
-| `action` | `request` plus `config` | `proxy` or a bounded response with status, headers, and `body_base64` |
+| `action` | `request` plus `config` | A bounded local `response` with status, headers, and `body_base64` |
 
 Every input and result carries `"version": "sbproxy-envelope/v1"`. Unknown result fields, invalid headers, invalid base64, or an out-of-range status fail the invocation.
+
+An action bundle finishes the request locally. Its attachment has no upstream configuration, so returning `outcome: "proxy"` fails with `unsupported_action_outcome`. Configure a concrete `type: proxy` or `type: load_balancer` action when the origin should forward traffic. For extension logic around a forwarded stream, attach a Proxy-Wasm filter to that concrete action.
 
 A `.ts` entry is parsed and stripped to ES2020 JavaScript exactly once while a candidate loads. Every declared export is preflighted then. TypeScript is a source convenience; the runtime is still JavaScript.
 

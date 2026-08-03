@@ -854,7 +854,10 @@ pub(super) async fn handle_action(
                 Error::because(ErrorType::InternalError, "plugin action failed", error)
             })?;
             match outcome {
-                sbproxy_plugin::ActionOutcome::Proxy => Ok(false),
+                sbproxy_plugin::ActionOutcome::Proxy => Err(Error::explain(
+                    ErrorType::InternalError,
+                    crate::dispatch::unsupported_plugin_action_proxy_message(),
+                )),
                 sbproxy_plugin::ActionOutcome::Responded => Ok(true),
                 sbproxy_plugin::ActionOutcome::Response {
                     status,
@@ -1203,6 +1206,36 @@ mod plugin_action_tests {
             "response: {response}"
         );
         assert!(response.ends_with("\r\n\r\nqueued"), "response: {response}");
+    }
+
+    #[tokio::test]
+    async fn plugin_action_http1_rejects_proxy_without_an_upstream() {
+        let action = Action::Plugin(Box::new(OutcomeAction(ActionOutcome::Proxy)));
+        let pipeline = CompiledPipeline::empty_for_test();
+
+        let (result, wire) = exchange(&action, &pipeline, None).await;
+
+        let error = result.expect_err("a plugin action cannot continue without an upstream");
+        assert!(
+            error.to_string().contains("unsupported_action_outcome"),
+            "error: {error}"
+        );
+        assert!(wire.is_empty(), "contract failure wrote bytes: {wire:?}");
+    }
+
+    #[tokio::test]
+    async fn javascript_action_http1_rejects_proxy_without_an_upstream() {
+        let (_directory, action) = crate::dispatch::javascript_proxy_action_fixture();
+        let pipeline = CompiledPipeline::empty_for_test();
+
+        let (result, wire) = exchange(&action, &pipeline, None).await;
+
+        let error = result.expect_err("a JavaScript action cannot continue without an upstream");
+        assert!(
+            format!("{error:?}").contains("unsupported_action_outcome"),
+            "error: {error:?}"
+        );
+        assert!(wire.is_empty(), "contract failure wrote bytes: {wire:?}");
     }
 
     #[tokio::test]

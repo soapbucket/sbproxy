@@ -324,7 +324,13 @@ mod tests {
             _req: &mut http::Request<bytes::Bytes>,
             _ctx: &mut dyn std::any::Any,
         ) -> Pin<Box<dyn Future<Output = PluginResult<ActionOutcome>> + Send + '_>> {
-            Box::pin(async { Ok(ActionOutcome::Proxy) })
+            Box::pin(async {
+                Ok(ActionOutcome::Response {
+                    status: 204,
+                    headers: Vec::new(),
+                    body: bytes::Bytes::new(),
+                })
+            })
         }
     }
 
