@@ -449,6 +449,23 @@ fn resolve_secret_material(reference: &str) -> Result<Vec<u8>> {
     if let Some(path) = reference.strip_prefix("file:") {
         return std::fs::read(path).with_context(|| format!("read crypto material file '{path}'"));
     }
+    // A provider URI this site cannot resolve is an error, never key material.
+    //
+    // Without this, a mistyped or unsupported reference became the secret: set
+    // `key_management.crypto.pepper` to `awssm://prod/pepper` and the pepper
+    // was the 19-character ASCII string `awssm://prod/pepper`, published in our
+    // own docs and identical for every deployment that pasted it. A pepper's
+    // whole job is to make a leaked `password_hash` non-crackable offline, so
+    // the failure was silent and total. WOR-1767 established this rule for the
+    // central resolver; this site predates it.
+    if sbproxy_vault::looks_like_secret_reference_uri(reference) {
+        anyhow::bail!(
+            "key_management.crypto references the secret '{reference}' but this field \
+             resolves only `env:` and `file:`, so it cannot read a secrets backend even \
+             when one is declared. Inject the value into the environment or a file and \
+             reference it as `env:NAME` or `file:/path`."
+        );
+    }
     Ok(reference.as_bytes().to_vec())
 }
 
@@ -1058,6 +1075,44 @@ pub(crate) fn test_plane_guard() -> TestPlaneGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_provider_uri_never_becomes_crypto_material() {
+        // `key_management.crypto.pepper` set to a provider URI used to become
+        // the URI text itself as the pepper: source-visible, identical for
+        // every deployment that copied the line, and silently defeating the
+        // one property a pepper exists to provide.
+        for reference in [
+            "vault://hashi/pepper",
+            "awssm://prod/pepper",
+            "gcpsm://prod/pepper",
+            "azurekv://prod/pepper",
+            "k8ssecret://ns/pepper",
+            "secretfile://file/pepper",
+            "secret://local/pepper",
+        ] {
+            let error = resolve_secret_material(reference)
+                .expect_err("a provider URI must never become crypto material");
+            assert!(
+                error.to_string().contains("resolves only"),
+                "{reference} must be refused with the supported forms named, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn inline_crypto_material_and_env_still_resolve() {
+        // The guard must reject references it cannot resolve without
+        // rejecting a legitimate inline secret, which is the documented way
+        // to pin a pepper in a test or a single-node deployment.
+        let inline = "a-literal-pepper-value";
+        assert_eq!(
+            resolve_secret_material(inline).expect("inline material is allowed"),
+            inline.as_bytes().to_vec()
+        );
+        // A bare word that merely contains a colon is not a provider URI.
+        assert!(resolve_secret_material("not:a-scheme").is_ok());
+    }
     use sbproxy_config::types::{
         KeyCryptoConfig, KeySeedConfig, KeyStoreConfig, SecretsManagerProvider,
         SecretsManagerStoreConfig,

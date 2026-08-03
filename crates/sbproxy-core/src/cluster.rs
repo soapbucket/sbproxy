@@ -1461,9 +1461,19 @@ fn resolve_secret_material(reference: &str) -> Result<String> {
             .into_bytes()
     } else if let Some(path) = reference.strip_prefix("file:") {
         std::fs::read(path).with_context(|| format!("read cluster secret file {path:?}"))?
-    } else if reference.starts_with("vault://") {
+    } else if sbproxy_vault::looks_like_secret_reference_uri(reference) {
+        // Every provider scheme, not just `vault://`. The old check named one
+        // of seven, so `awssm://prod/cluster-key` fell through and *became*
+        // the shared key: 24 ASCII characters, which clears the 16-byte floor
+        // below, so two nodes configured that way agreed on a key published in
+        // our own docs and the cluster formed and reported healthy.
+        //
+        // Checked before the length floor on purpose. A floor is not a
+        // substitute for a scheme check, because a provider URI is long enough
+        // to pass it.
         anyhow::bail!(
-            "cluster peer secrets do not resolve vault:// directly; inject the secret with env: or file:"
+            "cluster peer secrets do not resolve provider URIs like '{reference}'; \
+             inject the secret with env: or file:"
         );
     } else {
         reference.as_bytes().to_vec()
@@ -1791,6 +1801,63 @@ pub(crate) fn should_disseminate_governance(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_provider_uri_is_refused_as_cluster_key_material_not_just_vault() {
+        // The old guard named `vault://` alone, so the other six schemes fell
+        // through and the URI text became the shared key. Each of these is
+        // long enough to clear the 16-byte floor below the fallback, which is
+        // why a length check was never a substitute for a scheme check.
+        for reference in [
+            "vault://hashi/cluster-key",
+            "awssm://aws/cluster-key",
+            "gcpsm://gcp/cluster-key",
+            "azurekv://az/cluster-key",
+            "k8ssecret://k8s/cluster-key",
+            "secretfile://file/cluster-key",
+            "secret://local/cluster-key",
+        ] {
+            let error = resolve_secret_material(reference)
+                .expect_err("a provider URI must never become cluster key material");
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains("do not resolve provider URIs"),
+                "{reference} must be refused as a reference, got: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_provider_uri_is_refused_before_the_length_floor_can_pass_it() {
+        // 24 characters, so it clears the >= 16 floor. The point of the test
+        // is the ordering: the scheme check has to run first or the floor
+        // silently blesses the URI.
+        let reference = "awssm://prod/cluster-key";
+        assert!(
+            reference.len() >= 16,
+            "fixture must be able to pass the floor"
+        );
+        let error = resolve_secret_material(reference).expect_err("must be refused");
+        assert!(
+            !error.to_string().contains("at least 16 bytes"),
+            "must fail on the scheme, not the length: {error}"
+        );
+    }
+
+    #[test]
+    fn inline_material_and_the_supported_prefixes_still_work() {
+        // The guard must not swallow a legitimate inline key or the two forms
+        // this site does resolve.
+        let inline = "an-inline-cluster-key-of-sufficient-length";
+        assert_eq!(
+            resolve_secret_material(inline).expect("inline material is allowed"),
+            inline
+        );
+        assert!(
+            resolve_secret_material("short").is_err(),
+            "the length floor still applies to inline material"
+        );
+    }
 
     #[derive(Debug)]
     struct FakeBootstrap;
