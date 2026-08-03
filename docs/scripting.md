@@ -49,6 +49,9 @@ CEL expressions that come from `sb.yml` are parsed once, while the config compil
 | `transforms[] type: wasm`, field `module_path` | WASM | Body on stdin, transformed body on stdout |
 | `policies[] type: waf` custom rules | Lua or JavaScript | Rule script defines `match(request)`; `true` fires the rule |
 | `action.ai_policy.expression` (in `ai_proxy`) | CEL | Returns typed action tokens over the `ai.*` namespace; see [ai-policy-cel.md](ai-policy-cel.md) |
+| `extensions` bundle hooks attached as `action`, `policies[]`, or `transforms[]` | JavaScript, load-time TypeScript, or envelope WASM | Uses a typed, versioned JSON envelope and the hook's `type` name |
+| `origins.<host>.filters[]` | Proxy-Wasm | Runs an ordered Proxy-Wasm ABI 0.2.1 HTTP filter chain |
+| Extension AI and payment hooks | JavaScript, envelope WASM, or Proxy-Wasm for AI streaming | Receives provider-neutral, credential-free events through versioned contracts |
 
 Two AI-gateway surfaces are deliberately not free-form scripting: the `ai_policy` block is a single CEL expression over gateway-computed signals ([ai-policy-cel.md](ai-policy-cel.md)), and guardrails are typed `guardrails: input:` / `output:` blocks (`injection`, `pii`, `jailbreak`, `toxicity`, `schema`, ...) documented in [ai-gateway.md](ai-gateway.md).
 
@@ -896,7 +899,7 @@ Validate your config before deployment:
 sbproxy validate sb.yml
 ```
 
-Validation checks the YAML shape and typed fields, and compiles every CEL expression the config declares: `expression` and `assertion` policies, rate-limit and WAF persistent-block `key:` expressions, `cel` transform bodies and header rules, and `engine: cel` custom log fields. A CEL syntax error in any of them surfaces here, and at boot and reload, rather than at request time. Lua and JavaScript bodies are still strings to the validator; their syntax errors surface at request time in the logs. Exercise a scripted route once in staging before relying on it.
+Validation checks the YAML shape and typed fields, and compiles every CEL expression the config declares: `expression` and `assertion` policies, rate-limit and WAF persistent-block `key:` expressions, `cel` transform bodies and header rules, and `engine: cel` custom log fields. A CEL syntax error in any of them surfaces here, and at boot and reload, rather than at request time. Inline Lua and JavaScript bodies are still strings to the validator, so their syntax errors surface at request time in the logs. Dynamic bundle JavaScript and TypeScript are different: the candidate loader parses the entry, transpiles TypeScript when needed, verifies every named export, and refuses the candidate before publication when any of those steps fails.
 
 ### Enabling debug logging
 
@@ -919,6 +922,9 @@ With debug logging on, script failures are logged with the engine, the error mes
 | `lua_json` / `js_json` / `javascript` transforms | Error logged per request; the body is left unchanged |
 | `cel` transform | Missing both `on_response` and `headers`, or a CEL parse error in any expression, fails config compile; a runtime evaluation error leaves the body unchanged and skips only the failing header rule |
 | WASM transform | Missing `module_path` / `module_bytes` or a module that fails to compile fails config compile; runtime errors skip the transform |
+| JavaScript / TypeScript bundle hook | Invalid source, imports, a missing export, an invalid return envelope, timeout, or resource-limit error follows the bundle's `failure_posture`; candidate-load failures reject the whole candidate |
+| Envelope WASM bundle hook | Invalid ABI, compile failure, malformed output, timeout, or resource-limit error follows `failure_posture`; candidate-load failures reject the whole candidate |
+| Proxy-Wasm filter | An unsupported import, invalid ABI, trap, resource-limit error, or unresolved `Pause` becomes a bounded filter failure and follows the resolved `failure_posture` |
 
 ### Common mistakes
 
@@ -934,9 +940,210 @@ Lua modifiers only set headers. Returning `path`, `status_code`, or `body` from 
 
 AI policy CEL is a different namespace. The `ai_policy` expression sees `ai.*` variables, not `request.*`; see [ai-policy-cel.md](ai-policy-cel.md).
 
+---
+
+## 12. Dynamic extension bundles
+
+Dynamic bundles add policies, transforms, actions, HTTP filters, and provider-neutral event hooks without linking a new proxy binary. A local installation is a directory of bundle directories:
+
+```text
+examples/extension-bundles/
+├── sb.yml
+└── bundles/
+    ├── hello-javascript/
+    │   ├── bundle.yaml
+    │   └── entry.js
+    └── queued-envelope-wasm/
+        ├── bundle.yaml
+        └── action.wasm
+```
+
+Point the config at the parent directory:
+
+```yaml
+extensions:
+  bundles_dir: bundles
+```
+
+A relative `bundles_dir` uses the directory containing `sb.yml` as its base. The loader visits each child directory, reads its `bundle.yaml`, then reads the declared entry artifact without following a path outside that bundle. The runnable layout is in [examples/extension-bundles](../examples/extension-bundles/).
+
+### 12.1 Bundle manifest
+
+This JavaScript bundle exports one action and one transform:
+
+```yaml
+apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: hello-javascript
+version: 1.0.0
+runtime: javascript
+entry: entry.js
+sha256: 42c3e04fdb8ad0d2539fb743311d49bf498394c46c73df0999ff0b2e07061fb4
+hooks:
+  - kind: action
+    type: hello_javascript
+    export: respond
+    config_schema:
+      type: object
+      additionalProperties: false
+      properties:
+        response_header:
+          type: string
+          default: x-extension-runtime
+      required: [response_header]
+  - kind: transform
+    type: example_javascript_transform
+    export: transformResponse
+failure_posture: closed
+sandbox:
+  budget_ms: 50
+  memory_mb: 16
+  stack_kb: 512
+  max_buffer_bytes: 1048576
+  max_output_bytes: 1048576
+  max_fuel: 100000000
+permissions: []
+```
+
+- `apiVersion` is `sbproxy.dev/v1alpha1` and `kind` is `Bundle`.
+- `name` is a stable lowercase bundle ID. Each hook `type` is the name used in `sb.yml`.
+- `runtime` is `javascript`, `wasm`, or `proxy_wasm`.
+- `entry` is a file inside the bundle directory. JavaScript accepts `.js` or `.ts`; both WASM runtimes accept `.wasm`.
+- `hooks` declares at least one typed hook. A JavaScript hook names its ES module export. WASM hooks omit `export`.
+- `config_schema` is an optional Draft 7 JSON Schema for one attachment. Defaults are applied before the hook starts, and invalid attachment config refuses the candidate.
+- `failure_posture` defaults to `closed`. `open`, `degraded`, and `observe` are only valid where that hook contract defines them.
+- `sandbox` bounds wall time, memory, stack, buffered input, output, and WASM fuel. The values shown are the defaults.
+- `permissions` must remain empty in this release. Bundle code receives no filesystem or network capability.
+
+Hook types cannot replace a built-in or linked registration of the same kind. Duplicate claims fail candidate construction instead of choosing a winner by load order.
+
+### 12.2 Exact SHA-256 validation
+
+`sha256` covers the exact bytes of the single file named by `entry`. It does not cover `bundle.yaml`, the WAT or TypeScript source used to build another entry, or the directory as a whole. The value must be exactly 64 lowercase hexadecimal characters, with no `sha256:` prefix:
+
+```bash
+# macOS
+shasum -a 256 bundles/hello-javascript/entry.js
+
+# Linux
+sha256sum bundles/hello-javascript/entry.js
+```
+
+Copy the hex value into `bundle.yaml` only after the entry artifact is final. A mismatch refuses startup, validation, doctor candidate inspection, or reload before the candidate can become active. Local directory bundles may omit the field, but production bundles should pin it. Git-sourced bundles must pin it.
+
+### 12.3 JavaScript and load-time TypeScript
+
+JavaScript and TypeScript entries are ES modules with named exports. The host passes one JSON value to the selected export and accepts one strict JSON result. For the configurable HTTP hooks:
+
+| Hook | Input field | Valid result |
+|---|---|---|
+| `policy` | `request` plus `config` | `allow` or `deny`, with bounded status, message, and headers |
+| `transform` | `body.body_base64`, `body.content_type`, `body.origin`, plus `config` | A replacement `body_base64` |
+| `action` | `request` plus `config` | `proxy` or a bounded response with status, headers, and `body_base64` |
+
+Every input and result carries `"version": "sbproxy-envelope/v1"`. Unknown result fields, invalid headers, invalid base64, or an out-of-range status fail the invocation.
+
+A `.ts` entry is parsed and stripped to ES2020 JavaScript exactly once while a candidate loads. Every declared export is preflighted then. TypeScript is a source convenience; the runtime is still JavaScript.
+
+sbproxy adds no TypeScript CLI, package manager, install command, module loader, or runtime dependency resolution. Imports, re-exports, and dynamic `import()` are rejected. If the extension uses dependencies, resolve them in your own build and ship one prebuilt flat `.js` artifact. Point `entry` at that final artifact and calculate its digest from those final bytes.
+
+### 12.4 Envelope WASM
+
+An envelope WASM manifest uses:
+
+```yaml
+runtime: wasm
+abi: sbproxy-envelope/v1
+entry: action.wasm
+```
+
+The artifact is a WASI preview 1 command module with an exported `_start`. On each invocation, sbproxy creates a fresh Wasmtime store, writes the same versioned JSON hook envelope to stdin, runs `_start`, and parses one strict JSON result from stdout. The module receives no filesystem, network, environment, or host-clock access. The compiled module is shared, but guest state is not.
+
+The worked example keeps `action.wat` beside the committed `action.wasm` and rebuilds it with `wat2wasm`. A production build can use any language that emits a compatible WASI preview 1 command module.
+
+### 12.5 Proxy-Wasm HTTP and AI stream hooks
+
+A Proxy-Wasm manifest uses ABI 0.2.1 and may declare only `proxy_wasm` or `ai_stream_event` hooks:
+
+```yaml
+runtime: proxy_wasm
+abi: 0.2.1
+entry: filter.wasm
+hooks:
+  - kind: proxy_wasm
+    type: example_http_filter
+    execution:
+      body_mode: streamed
+```
+
+Attach HTTP filters to an origin in request order:
+
+```yaml
+origins:
+  "filtered.extension.local":
+    action:
+      type: static
+      status: 200
+      body: "passed the filter\n"
+    filters:
+      - type: example_http_filter
+        config:
+          label: worked-example
+        failure_posture: closed
+```
+
+`filters` is an ordered list of `type`, `config`, and an optional `failure_posture` override. Body access comes from each manifest hook, not from the attachment. The chain buffers only when at least one attached filter declares `buffered`, using the smallest configured input limit among filters that consume a body. `none` plus `streamed` still streams, while a `none`-only chain passes bodies through untouched.
+
+The host implements a bounded HTTP subset of Proxy-Wasm. Unsupported imports fail candidate load. A callback that returns `Pause` without resolving it is treated as a filter failure, so a guest cannot leave a request stalled. The attachment or bundle failure posture decides whether traffic is admitted or refused after that failure.
+
+For `ai_stream_event`, sbproxy maps normalized AI chunks onto Proxy-Wasm request-body callbacks and keeps one filter session for the model stream. The manifest must declare `body_mode: streamed`. JavaScript and envelope WASM do not accept this hook kind.
+
+### 12.6 AI events
+
+AI hooks receive a provider-neutral event with `schema_version: 1`, a monotonically increasing request-local `sequence`, optional `request_id` and `model`, and one payload:
+
+| Manifest kind | Event payload |
+|---|---|
+| `ai_guardrail_input` | Canonical messages and an evaluation stage such as `original` |
+| `ai_tool_call` | One complete tool call with assembled JSON arguments |
+| `ai_guardrail_output` | Canonical buffered assistant text |
+| `ai_stream_event` | Normalized message-start, text-delta, usage, or message-stop chunk |
+| `ai_close` | One terminal summary with finish reason, byte and delta counts, tool-call count, and token usage when known |
+
+JavaScript and envelope WASM AI hooks return `release`, `flag`, or `block`. A `block` carries an HTTP status from 400 through 599 plus a bounded code and client-safe message. A `flag` carries the code and message but does not stop traffic. `enforcement_mode: observe` moves a hook onto a bounded observation lane; the default `block` mode waits for the decision before releasing the corresponding operation or bytes.
+
+### 12.7 Payment and x402 events
+
+A payment hook declares `execution.body_mode: none`. It receives a credential-free lifecycle event with `schema_version: 1`, a phase (`challenge`, `verify`, `settle`, or `reconcile`), an outcome, rail, monetary amount, and bounded identifiers. Optional fields include method, network, asset, intent ID, request ID, and a sanitized provider reference after success.
+
+x402 uses the shared payment extension ABI as a rail. An x402 verification can report `rail: x402`, `method: exact`, a CAIP-2 network such as `eip155:84532`, and an asset such as `USDC`. Raw payment credentials and raw provider responses never enter the event.
+
+For a `started` outcome, a blocking hook returns `continue` or `reject` before the provider write or access release. Terminal outcomes (`succeeded`, `rejected`, `failed`, `ambiguous`, or `unsupported`) are observation-only. A terminal return value cannot reverse a payment or retroactively deny access.
+
+### 12.8 Candidate load and reload
+
+Startup, `sbproxy validate`, `sbproxy doctor <config>`, the file watcher, `SIGHUP`, and `POST /admin/reload` all build a candidate before publication. Candidate construction checks the source path, manifest, exact digest, hook collisions, config schemas, JavaScript or TypeScript exports, and WASM module contract. The running registry and pipeline generation swap together only after every required check succeeds.
+
+If a bundle edit has a bad digest, syntax error, missing export, unsupported import, invalid WASM module, or conflicting hook name, reload rejects that candidate and the prior generation keeps serving. No hook from a rejected candidate leaks into the running registry.
+
+Use the two inventory views for different questions:
+
+- `sbproxy doctor sb.yml --format json` reports a stopped `doctor` snapshot. Successfully validated hooks have the `not_evaluated` state.
+- Authenticated `GET /api/extensions` reports the `running` generation, including active, available, unconsumed, failed, or shadowed state, chain position, execution limits, and collisions.
+
+### 12.9 Context from other extension systems
+
+The design comparison points are:
+
+- Envoy recommends Proxy-Wasm ABI 0.2.1 and loads Wasm configuration before request callbacks. See [Envoy's Wasm architecture overview](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/advanced/wasm) (accessed 2026-08-02).
+- Kong's JavaScript plugin server can load TypeScript directly and resolve packages from `node_modules`. sbproxy intentionally does neither at runtime. See [Kong JavaScript plugins](https://developer.konghq.com/custom-plugins/javascript/) (accessed 2026-08-02).
+- Apache APISIX runs external plugins in sidecar processes over a Unix-socket RPC path and restarts the runner on reload. sbproxy bundle guests run inside the proxy sandbox and swap with the pipeline candidate. See [APISIX external plugins](https://apisix.apache.org/docs/apisix/external-plugin/) (accessed 2026-08-02).
+- OPA activates a downloaded bundle only after verification and keeps the existing bundle when activation fails. sbproxy uses the same last-good operational model for the full pipeline candidate. See [OPA bundle management](https://www.openpolicyagent.org/docs/management-bundles) (accessed 2026-08-02).
+
 ## See also
 
 - [configuration.md](configuration.md) - general configuration model and the full `sb.yml` field reference.
 - [features.md](features.md) - higher-level feature overview.
 - [ai-gateway.md](ai-gateway.md) - AI gateway routing and guardrails.
 - [ai-policy-cel.md](ai-policy-cel.md) - the unified CEL policy plane for the AI gateway.
+- [examples/extension-bundles](../examples/extension-bundles/) - runnable JavaScript, TypeScript, envelope WASM, Proxy-Wasm, AI, and payment bundle examples.
