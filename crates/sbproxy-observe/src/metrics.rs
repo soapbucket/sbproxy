@@ -3159,10 +3159,10 @@ pub fn record_script_compile(engine: &'static str, result: &'static str) {
 /// `sbproxy_script_invocations_total{engine, result}`. `result` is one
 /// of `ok`, `runtime_error`, `timeout`, `admission_timeout`,
 /// `queue_timeout`, `cancelled`, `input_limit`, `output_limit`,
-/// `memory_cap`, `stack_cap`, `instruction_cap`, `guest_exception`, or
-/// `runtime_unavailable`. Every value is selected from a static match; guest
-/// and configuration strings never become labels. The matching duration
-/// histogram is emitted by [`record_script_duration`].
+/// `memory_cap`, `table_cap`, `stack_cap`, `instruction_cap`,
+/// `guest_exception`, or `runtime_unavailable`. Every value is selected from
+/// a static match; guest and configuration strings never become labels. The
+/// matching duration histogram is emitted by [`record_script_duration`].
 pub fn record_script_invocation(engine: &'static str, result: &'static str) {
     use prometheus::{register_int_counter_vec, IntCounterVec};
     use std::sync::OnceLock;

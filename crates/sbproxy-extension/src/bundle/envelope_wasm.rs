@@ -335,6 +335,7 @@ fn wasm_invocation_outcome(
         },
         Err(WasmCallFailure::FuelLimit) => "instruction_cap",
         Err(WasmCallFailure::MemoryLimit) => "memory_cap",
+        Err(WasmCallFailure::TableLimit) => "table_cap",
         Err(WasmCallFailure::StackLimit) => "stack_cap",
         Err(WasmCallFailure::OutputLimit) => "output_limit",
         Err(WasmCallFailure::GuestTrap) => "guest_exception",
@@ -830,6 +831,14 @@ mod tests {
         assert_eq!(
             runtime("stack.wasm", stack_limits).execute_bounded(b"{}"),
             Err(WasmCallFailure::StackLimit)
+        );
+    }
+
+    #[test]
+    fn envelope_wasm_classifies_table_growth_limit() {
+        assert_eq!(
+            runtime("table-grow.wasm", limits()).execute_bounded(b"{}"),
+            Err(WasmCallFailure::TableLimit)
         );
     }
 

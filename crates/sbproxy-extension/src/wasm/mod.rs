@@ -208,6 +208,7 @@ pub(crate) enum WasmCallFailure {
     Timeout,
     FuelLimit,
     MemoryLimit,
+    TableLimit,
     StackLimit,
     OutputLimit,
     GuestTrap,
@@ -222,6 +223,7 @@ impl WasmCallFailure {
             Self::Timeout => "timeout",
             Self::FuelLimit => "instruction_cap",
             Self::MemoryLimit => "memory_cap",
+            Self::TableLimit => "table_cap",
             Self::StackLimit => "stack_cap",
             Self::OutputLimit => "output_limit",
             Self::GuestTrap => "guest_exception",
@@ -262,6 +264,7 @@ impl WasmExecutionControl {
 struct TrackingLimits {
     inner: StoreLimits,
     memory_denied: bool,
+    table_denied: bool,
 }
 
 impl ResourceLimiter for TrackingLimits {
@@ -289,10 +292,15 @@ impl ResourceLimiter for TrackingLimits {
         desired: usize,
         maximum: Option<usize>,
     ) -> wasmtime::Result<bool> {
-        self.inner.table_growing(current, desired, maximum)
+        let result = self.inner.table_growing(current, desired, maximum);
+        if !matches!(result, Ok(true)) {
+            self.table_denied = true;
+        }
+        result
     }
 
     fn table_grow_failed(&mut self, error: wasmtime::Error) -> wasmtime::Result<()> {
+        self.table_denied = true;
         self.inner.table_grow_failed(error)
     }
 
@@ -608,6 +616,7 @@ impl WasmRuntime {
         let limits_tracker = TrackingLimits {
             inner: envelope_store_limits(limits),
             memory_denied: false,
+            table_denied: false,
         };
         let mut store = Store::new(
             &self.engine,
@@ -636,6 +645,7 @@ impl WasmRuntime {
         })();
 
         let memory_denied = store.data().limits.memory_denied;
+        let table_denied = store.data().limits.table_denied;
         drop(store);
         let output = stdout
             .try_into_inner()
@@ -648,6 +658,9 @@ impl WasmRuntime {
         }
         if memory_denied {
             return Err(WasmCallFailure::MemoryLimit);
+        }
+        if table_denied {
+            return Err(WasmCallFailure::TableLimit);
         }
 
         match call_result {
