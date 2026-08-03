@@ -125,6 +125,52 @@ the next version cut.
 
 ### Fixed
 
+- **The AI gateway's circuit breaker and outlier detection now run.**
+  `resilience.circuit_breaker` and `resilience.outlier_detection` parsed,
+  validated, and were documented and exampled, and nothing ever attached
+  them to a router. The constructor that would have done it had no
+  callers anywhere in the tree, so the breaker list was empty and the detector
+  absent on every router the proxy has ever built, both arms of the
+  eligibility check passed unconditionally, and the ejection sweep the
+  request path ran on every provider failure evaluated state nothing
+  populated.
+  A deployment that configured circuit breaking against a flaky provider
+  had none. Both blocks are now attached where the router is built, each
+  by its own config block, so configuring one does not arm the other on
+  thresholds nobody chose.
+
+  **If you have either block configured, providers will now start
+  leaving the routing pool.** On the shipped defaults a provider leaves
+  after five consecutive request failures, or after a 50% failure rate
+  over at least five requests in a 60-second window, and only a 5xx or a
+  transport error counts; a 4xx, including a 429, does not. Each signal
+  clears on its own terms without help from the others: a breaker admits
+  a probe after `open_duration_secs` and closes on `success_threshold`
+  successes, an ejection lapses after `ejection_duration_secs`, and a
+  probe verdict flips back after `healthy_threshold` consecutive passes.
+  A provider that failed on two signals returns when both have cleared.
+  Breaker transitions and outlier ejections are logged.
+
+  With every provider ejected, dispatch routes to the full permitted set
+  rather than refusing the request, which is what `resilience` has always
+  documented and what the load balancer's identical filter does. Three
+  advisory signals should not combine into an outage none of them can
+  cause alone. Credential policy, model eligibility, and `enabled` stay
+  hard filters and are never revived. An `outlier_detection.threshold` of
+  zero or a `min_requests` of zero, which together would eject a provider
+  that had never failed, are refused with a warning and the default is
+  used instead.
+- **`routing.strategy: token_rate` is refused at config load instead of
+  silently behaving as a different strategy.** It ranks providers by
+  remaining tokens-per-minute headroom against a declared per-provider
+  limit, and no configuration field declares one, so every limit was zero
+  and the score reduced to observed usage alone: `least_token_usage`
+  under another name, with no error and no warning. **If you have
+  `token_rate` set, the proxy will now refuse the config.** Change it to
+  `least_token_usage`, which is what you have been running, or to
+  `headroom` or `reset_aware`, which score the rate-limit headers
+  providers actually return. See
+  [`docs/ai-gateway.md`](docs/ai-gateway.md#token_rate-refused).
 - **`sbproxy run` and `sbproxy service install` no longer publish the
   local model gateway to the network.** Both generate a config the code
   calls secure defaults, and the admin half was: loopback bind, random

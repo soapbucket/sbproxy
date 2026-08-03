@@ -938,7 +938,7 @@ mod tests {
         let plane = Arc::new(crate::key_plane::KeyPlane::from_parts(
             crypto, cache, false, false, None,
         ));
-        crate::key_plane::install_key_plane(plane.clone());
+        crate::key_plane::install_key_plane_for_test(plane.clone());
 
         let resp = crate::admin_keys::dispatch("POST", "/admin/keys", Some(r#"{"name":"warm"}"#))
             .expect("keys route");
@@ -967,5 +967,54 @@ mod tests {
             .expect("record present");
         assert_eq!(resolved.status, RecordStatus::Revoked);
         assert!(!resolved.is_usable(Utc::now()));
+    }
+
+    /// WOR-2225: installing the live key plane is more than writing the
+    /// slot, and `activate_key_plane` is the only thing that does it.
+    ///
+    /// A committed generation that does not run the mesh backend has to
+    /// retract the published readiness view, or `/readyz` goes on
+    /// reporting a `keystore` backend that is gone. A bare store into the
+    /// plane slot skips that step, which is what the old
+    /// `install_key_plane` wrapper was, and the reason it is now
+    /// `cfg(test)` and named for it. Asserted in both directions, because
+    /// removing a plane runs through the same seam rather than a second
+    /// one.
+    #[test]
+    fn activating_a_non_mesh_generation_retracts_the_published_readiness() {
+        let _guard = crate::key_plane::test_plane_guard();
+        let backend = MeshKeyStore::new(substrate());
+        install_readiness(backend.readiness());
+        assert!(
+            current_readiness().is_some(),
+            "the mesh backend publishes readiness when it is built"
+        );
+
+        let store: Arc<dyn KeyStore> = Arc::new(backend);
+        let cache = Arc::new(sbproxy_keystore::TtlCache::new(
+            store,
+            sbproxy_keystore::TtlCacheConfig::default(),
+        ));
+        let crypto =
+            sbproxy_keystore::crypto::KeyCrypto::new(b"pepper".to_vec(), b"master".to_vec());
+        let plane = Arc::new(crate::key_plane::KeyPlane::from_parts(
+            crypto, cache, false, false, None,
+        ));
+
+        crate::key_plane::activate_key_plane(Some(plane), None);
+        assert!(
+            crate::key_plane::current_key_plane().is_some(),
+            "the generation's plane is published"
+        );
+        assert!(
+            current_readiness().is_none(),
+            "a non-mesh generation must retract the readiness view it did not build"
+        );
+
+        crate::key_plane::activate_key_plane(None, None);
+        assert!(
+            crate::key_plane::current_key_plane().is_none(),
+            "removing the plane is the same seam, not a second one"
+        );
     }
 }

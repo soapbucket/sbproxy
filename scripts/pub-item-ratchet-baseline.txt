@@ -168,8 +168,42 @@
 # cloud_completions and cloud_spent_micros rather than nowhere. The
 # ratchet's first option again, a production call site rather than a
 # narrowing.
-284
+282
 #
+#
+# Lowered to 286 on WOR-2225, 2026-08-02, answering three more of the
+# escalated questions. Each one asked the same thing: two implementations
+# of one job exist and only one runs, so which is the real one.
+#
+# `parse_endpoint` (sbproxy-ai/src/api_routes.rs) is deleted, along with
+# the `AiEndpoint` enum and `provider_supports_endpoint`. It was the
+# predecessor of `classify_surface`, which the request path has always
+# called and which recognises a strict superset of its vocabulary. Its
+# capability matrix had also gone stale against the live one, advertising
+# Google image, audio, and reranking surfaces that have no translator.
+#
+# `select_default` (sbproxy-core/src/compression_runtime.rs) is narrowed to
+# `pub(crate)`. There were never two definitions of the route default:
+# this was `select(On)` with an `expect` around it, and dispatch reaches
+# the default through `select(On)` as one arm of the general selector path.
+# `select` now delegates to it, so the two cannot come apart, and the
+# `expect` is gone rather than pushed onto the request path.
+#
+# `install_key_plane` (sbproxy-core/src/key_plane.rs) is now
+# `#[cfg(test)] pub(crate) install_key_plane_for_test`, and the dead
+# `uninstall_key_plane` beside it is deleted. The production path,
+# `activate_key_plane`, was not skipping an invariant this wrapper held:
+# the wrapper was a bare slot write and `activate_key_plane` does the
+# readiness retraction, the invalidation subscriber, and the shared budget
+# handoff on top of it.
+#
+# 286 rather than 285 because the WOR-2225 regression test in
+# `server/ai_dispatch.rs` compares behaviour fingerprints, and
+# `SelectedCompressionRuntime::behavior_fingerprint` had no reference
+# outside its own file at all before that. It moves from the wider
+# unreferenced list into the tests-only slice without anything about it
+# changing. It is worth a look on its own: the fingerprint is computed for
+# every compiled pipeline and nothing in production reads it.
 #
 # Lowered to 286 on WOR-2225, 2026-08-02, answering two more of the
 # escalated questions. Both are real, neither is a narrowing.

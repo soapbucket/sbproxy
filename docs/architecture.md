@@ -454,7 +454,6 @@ adapters (Hugging Face TGI, LM Studio, llama.cpp).
 | `lowest_latency`    | Provider with the lowest observed latency (microseconds, atomic counter). |
 | `least_connections` | Provider with the fewest in-flight requests. |
 | `cost_optimized`    | Lowest score of `connections * 1000 + weight`. Utilization dominates; weight breaks ties in favor of cheaper providers. |
-| `token_rate`        | Provider with the most remaining tokens-per-minute headroom. |
 | `least_token_usage` | Provider with the lowest recorded token throughput. |
 | `prefix_affinity`   | Hash the prompt prefix to a provider so shared-prefix sessions land on the same upstream cache. |
 | `sticky`            | Pin a session key to one provider. Falls back to round robin without a session key. |
