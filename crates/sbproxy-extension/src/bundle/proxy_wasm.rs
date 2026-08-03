@@ -568,10 +568,20 @@ impl ProxyWasmSession {
     /// Complete HTTP and root contexts in the specified done, log, delete order.
     pub fn finish(&mut self) -> Result<(), ProxyWasmCallFailure> {
         self.ensure_live()?;
-        self.finish_context(HTTP_CONTEXT_ID, "http_done", "http_log", "http_delete")?;
-        self.finish_context(ROOT_CONTEXT_ID, "root_done", "root_log", "root_delete")?;
+        if !self.finish_context(HTTP_CONTEXT_ID, "http_done", "http_log", "http_delete")? {
+            return Ok(());
+        }
+        if !self.finish_context(ROOT_CONTEXT_ID, "root_done", "root_log", "root_delete")? {
+            return Ok(());
+        }
         self.finished = true;
         Ok(())
+    }
+
+    /// Return whether both HTTP and root contexts completed deletion.
+    #[must_use]
+    pub const fn is_finished(&self) -> bool {
+        self.finished
     }
 
     fn finish_context(
@@ -580,28 +590,54 @@ impl ProxyWasmSession {
         done_label: &'static str,
         log_label: &'static str,
         delete_label: &'static str,
-    ) -> Result<(), ProxyWasmCallFailure> {
-        self.begin_callback()?;
-        self.store.data_mut().active_context = context_id;
-        let context_id =
-            i32::try_from(context_id).map_err(|_| ProxyWasmCallFailure::InvalidHostData)?;
-        if let Some(done) = self.call_bool1("proxy_on_done", context_id)? {
-            self.lifecycle_trace.push(done_label);
-            if !done {
-                return Err(ProxyWasmCallFailure::InvalidCallback);
+    ) -> Result<bool, ProxyWasmCallFailure> {
+        match self
+            .store
+            .data()
+            .context_finalization(context_id)
+            .ok_or(ProxyWasmCallFailure::InvalidHostData)?
+        {
+            ContextFinalization::Deleted => return Ok(true),
+            ContextFinalization::Pending => return Ok(false),
+            ContextFinalization::Ready => {}
+            ContextFinalization::Live => {
+                self.begin_callback()?;
+                self.store.data_mut().active_context = context_id;
+                let abi_context_id =
+                    i32::try_from(context_id).map_err(|_| ProxyWasmCallFailure::InvalidHostData)?;
+                if let Some(done) = self.call_bool1("proxy_on_done", abi_context_id)? {
+                    self.lifecycle_trace.push(done_label);
+                    if !done {
+                        self.store
+                            .data_mut()
+                            .set_context_finalization(context_id, ContextFinalization::Pending)
+                            .ok_or(ProxyWasmCallFailure::InvalidHostData)?;
+                        return Ok(false);
+                    }
+                }
+                self.store
+                    .data_mut()
+                    .set_context_finalization(context_id, ContextFinalization::Ready)
+                    .ok_or(ProxyWasmCallFailure::InvalidHostData)?;
             }
         }
+        let abi_context_id =
+            i32::try_from(context_id).map_err(|_| ProxyWasmCallFailure::InvalidHostData)?;
         self.begin_callback()?;
-        self.store.data_mut().active_context = u32::try_from(context_id).unwrap_or_default();
-        if self.call_void1("proxy_on_log", context_id)? {
+        self.store.data_mut().active_context = context_id;
+        if self.call_void1("proxy_on_log", abi_context_id)? {
             self.lifecycle_trace.push(log_label);
         }
         self.begin_callback()?;
-        self.store.data_mut().active_context = u32::try_from(context_id).unwrap_or_default();
-        if self.call_void1("proxy_on_delete", context_id)? {
+        self.store.data_mut().active_context = context_id;
+        if self.call_void1("proxy_on_delete", abi_context_id)? {
             self.lifecycle_trace.push(delete_label);
         }
-        Ok(())
+        self.store
+            .data_mut()
+            .set_context_finalization(context_id, ContextFinalization::Deleted)
+            .ok_or(ProxyWasmCallFailure::InvalidHostData)?;
+        Ok(true)
     }
 
     fn run_headers(
@@ -923,12 +959,29 @@ fn effective_action(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextFinalization {
+    Live,
+    Pending,
+    Ready,
+    Deleted,
+}
+
+fn context_index(context_id: u32) -> Option<usize> {
+    match context_id {
+        ROOT_CONTEXT_ID => Some(0),
+        HTTP_CONTEXT_ID => Some(1),
+        _ => None,
+    }
+}
+
 struct ProxyWasmHostState {
     limits: ProxyWasmStoreLimits,
     max_input_bytes: usize,
     max_output_bytes: usize,
     plugin_configuration: Arc<[u8]>,
     active_context: u32,
+    context_finalization: [ContextFinalization; 2],
     current_buffer: Option<(i32, Vec<u8>)>,
     current_map: Option<(i32, Vec<(String, String)>)>,
     local_response: Option<ProxyWasmLocalResponse>,
@@ -954,6 +1007,7 @@ impl ProxyWasmHostState {
             max_output_bytes,
             plugin_configuration: Arc::from(plugin_configuration),
             active_context: 0,
+            context_finalization: [ContextFinalization::Live; 2],
             current_buffer: None,
             current_map: None,
             local_response: None,
@@ -980,6 +1034,20 @@ impl ProxyWasmHostState {
 
     fn set_map(&mut self, map_id: i32, value: Vec<(String, String)>) {
         self.current_map = Some((map_id, value));
+    }
+
+    fn context_finalization(&self, context_id: u32) -> Option<ContextFinalization> {
+        context_index(context_id).map(|index| self.context_finalization[index])
+    }
+
+    fn set_context_finalization(
+        &mut self,
+        context_id: u32,
+        finalization: ContextFinalization,
+    ) -> Option<()> {
+        let index = context_index(context_id)?;
+        self.context_finalization[index] = finalization;
+        Some(())
     }
 
     fn fail(&mut self, failure: ProxyWasmCallFailure) {
@@ -1673,8 +1741,20 @@ fn host_send_local_response(
     STATUS_OK
 }
 
-fn host_done(_caller: Caller<'_, ProxyWasmHostState>) -> i32 {
-    STATUS_NOT_FOUND
+fn host_done(mut caller: Caller<'_, ProxyWasmHostState>) -> i32 {
+    let context_id = caller.data().active_context;
+    if caller.data().context_finalization(context_id) != Some(ContextFinalization::Pending) {
+        return STATUS_NOT_FOUND;
+    }
+    if caller
+        .data_mut()
+        .set_context_finalization(context_id, ContextFinalization::Ready)
+        .is_some()
+    {
+        STATUS_OK
+    } else {
+        STATUS_NOT_FOUND
+    }
 }
 
 fn proxy_wasm_linker(engine: &Engine) -> Result<Linker<ProxyWasmHostState>, ProxyWasmLoadFailure> {
@@ -1847,6 +1927,7 @@ mod tests {
 
     fn runtime(fixture: &str, limits: WasmBundleLimits) -> ProxyWasmRuntime {
         let bytes: &[u8] = match fixture {
+            "deferred-done" => include_bytes!("testdata/proxy_wasm/deferred-done.wasm"),
             "http" => include_bytes!("testdata/proxy_wasm/http.wasm"),
             "loop" => include_bytes!("testdata/proxy_wasm/loop.wasm"),
             "memory" => include_bytes!("testdata/proxy_wasm/memory.wasm"),
@@ -1869,6 +1950,43 @@ mod tests {
         assert_eq!(
             session.lifecycle_trace(),
             ["root_create", "vm_start", "configure", "http_create"]
+        );
+    }
+
+    #[test]
+    fn deferred_done_waits_for_proxy_done_before_log_and_delete() {
+        let mut session = runtime("deferred-done", limits())
+            .start_session(b"{}")
+            .unwrap();
+
+        session.finish().unwrap();
+        assert!(!session.is_finished());
+        assert_eq!(
+            session.lifecycle_trace(),
+            [
+                "root_create",
+                "vm_start",
+                "configure",
+                "http_create",
+                "http_done"
+            ]
+        );
+
+        session.begin_callback().unwrap();
+        session.store.data_mut().active_context = HTTP_CONTEXT_ID;
+        session.call_void0("complete_pending").unwrap();
+        session.finish().unwrap();
+
+        assert!(session.is_finished());
+        assert_eq!(
+            &session.lifecycle_trace()[5..],
+            [
+                "http_log",
+                "http_delete",
+                "root_done",
+                "root_log",
+                "root_delete"
+            ]
         );
     }
 
