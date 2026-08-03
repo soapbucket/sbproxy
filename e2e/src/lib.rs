@@ -561,6 +561,56 @@ impl ProxyHarness {
         })
     }
 
+    /// Wait for a second port this proxy is expected to bind, and on failure
+    /// report why the child could not get there.
+    ///
+    /// The associated [`Self::wait_for_port`] cannot do this: it takes only a
+    /// port number, so it has no access to the child's captured output. That
+    /// gap has a cost. A payments config whose `recovery_encryption.key`
+    /// resolved to the wrong length exited during payments initialization,
+    /// which happens *after* the HTTP listener binds, so startup readiness
+    /// passed and the only symptom was `wait_for_port(admin_port)` timing out
+    /// on a healthy-looking proxy. The fatal line was sitting in the captured
+    /// stderr the whole time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when nothing answers on `port` within `timeout`,
+    /// carrying whether the child is still running plus its captured output.
+    pub fn wait_for_secondary_port(&self, port: u16, timeout: Duration) -> anyhow::Result<()> {
+        if Self::wait_for_port(port, timeout).is_ok() {
+            return Ok(());
+        }
+        let liveness = match self.child_is_running() {
+            true => "child is still running".to_owned(),
+            false => "child has already exited".to_owned(),
+        };
+        let stdout = self.stdout_contents();
+        let stderr = std::fs::read_to_string(self._stderr.path())
+            .unwrap_or_else(|read_error| format!("<read child stderr: {read_error}>"));
+        anyhow::bail!(
+            "nothing responding to HTTP on 127.0.0.1:{port} within {timeout:?} ({liveness})\n\
+             child stdout:\n{stdout}\nchild stderr:\n{stderr}"
+        )
+    }
+
+    /// Whether the child process has not yet exited.
+    fn child_is_running(&self) -> bool {
+        // `Child::try_wait` needs `&mut self`, and the callers that want this
+        // hold `&self`, so ask the OS directly with signal 0.
+        // SAFETY: `kill` with signal 0 performs a permission and existence
+        // check and delivers nothing.
+        #[cfg(unix)]
+        {
+            let pid = self.child.id() as i32;
+            unsafe { libc::kill(pid, 0) == 0 }
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    }
+
     /// Build (or return) the lazy-initialised blocking HTTP client.
     /// Construction is deferred so harness creation does not trigger
     /// reqwest's internal runtime drop in async contexts.

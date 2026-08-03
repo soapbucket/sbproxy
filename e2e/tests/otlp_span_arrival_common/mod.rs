@@ -154,7 +154,19 @@ pub async fn assert_complete_ai_span_exports(
         });
     sbproxy_observe::telemetry::shutdown_otlp_pipeline();
 
-    assert_attr(&attrs, "gen_ai.operation.name", "chat_completions");
+    // WOR-2085: the operation slot carries the OTel GenAI operation
+    // vocabulary, not the surface label. A chat completion is `chat`;
+    // `chat_completions` is not a value in the pinned v1.36.0 vocabulary
+    // (see `OTEL_GENAI_SEMCONV_SOURCE`). The finer-grained endpoint
+    // identity rides on `sbproxy.ai.surface`, asserted next, so both
+    // halves of the split are pinned here as they are in the
+    // `tracing_spans` unit tests.
+    assert_attr(
+        &attrs,
+        "gen_ai.operation.name",
+        sbproxy_ai::tracing_spans::OP_CHAT,
+    );
+    assert_attr(&attrs, "sbproxy.ai.surface", "chat_completions");
     assert_attr(&attrs, "gen_ai.system", "openai");
     assert_attr(&attrs, "gen_ai.request.model", "gpt-4o");
     assert_attr(&attrs, "gen_ai.response.model", "gpt-4o-2024-08-06");
