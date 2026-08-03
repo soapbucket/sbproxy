@@ -11897,10 +11897,13 @@ mod external_guardrail_context_tests {
             &BTreeSet::new(),
         )
         .expect("load extension fixture");
-        let mut pipeline = crate::pipeline::CompiledPipeline::default();
-        pipeline.ai_extension_chain = Arc::new(
-            AiExtensionChain::from_registry(registry.as_ref()).expect("prepare AI extension chain"),
-        );
+        let pipeline = crate::pipeline::CompiledPipeline {
+            ai_extension_chain: Arc::new(
+                AiExtensionChain::from_registry(registry.as_ref())
+                    .expect("prepare AI extension chain"),
+            ),
+            ..Default::default()
+        };
         (directory, pipeline)
     }
 
