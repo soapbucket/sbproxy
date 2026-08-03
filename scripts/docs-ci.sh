@@ -20,7 +20,6 @@
 #
 # Env knobs:
 #   LYCHEE_BIN     path to lychee (default: lychee on PATH)
-#   RUST_SCRIPT    path to rust-script (default: rust-script on PATH)
 #   DOCS_CI_QUIET  set to 1 to suppress per-block progress
 
 set -euo pipefail
@@ -29,7 +28,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUST_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 LYCHEE_BIN="${LYCHEE_BIN:-lychee}"
-RUST_SCRIPT="${RUST_SCRIPT:-rust-script}"
 
 # --- Argument parsing -------------------------------------------------
 
@@ -227,12 +225,8 @@ run_lang_pass() {
 # Rust block checker. Type-checks via `rustc --emit=metadata`. Returns
 # 0 on success, 1 on failure.
 #
-# We tried `rust-script --check` here first, but rust-script v0.36.0
-# does not implement `--check`; it errors with "unexpected argument
-# '--check' found" and exit code 2, which would fail every block on
-# CI. The rustc path covers what we actually need (parse + type-check
-# for any top-level Rust shape) and runs in tens of milliseconds per
-# block, so the rust-script call wasn't worth retaining.
+# The harness needs parse and type checks for top-level Rust shapes. Calling
+# rustc directly covers that contract and keeps each block isolated.
 #
 # The checker tries two shapes in order: first the block as-is (which
 # works for top-level items: structs, impls, fn defs, use statements),
