@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::builtin_enforcers::{compile_builtin_enforcers, CompiledEnforcer};
+use crate::extension_inventory::{reserved_extension_hook_names, running_inventory};
 use crate::router::HostRouter;
 use compact_str::CompactString;
 use sbproxy_cache::{
@@ -30,7 +31,7 @@ use sbproxy_cache::{
     FsReserve, MemcachedConfig, MemcachedStore, MemoryCacheStore, MemoryReserve, RedisCacheStore,
     RedisReserve,
 };
-use sbproxy_config::{BundleHookKind, CompiledConfig, Parameter, RequestModifierConfig};
+use sbproxy_config::{CompiledConfig, Parameter, RequestModifierConfig};
 use sbproxy_extension::bundle::{BundleRegistry, DynamicBundleRegistry};
 use sbproxy_modules::compile::{
     compile_action_for_origin, compile_action_for_origin_for_validation,
@@ -40,10 +41,7 @@ use sbproxy_modules::compile::{
 };
 use sbproxy_modules::transform::{CompiledTransform, TransformConfig};
 use sbproxy_modules::{Action, Auth, BotDetection, Policy, ThreatProtection};
-use sbproxy_plugin::{
-    ActionPluginRegistration, ExtensionHookKind, ExtensionInventorySnapshot, ExtensionState,
-    PolicyPluginRegistration, TransformPluginRegistration,
-};
+use sbproxy_plugin::ExtensionInventorySnapshot;
 
 // --- Forward Rule types ---
 
@@ -1199,7 +1197,6 @@ pub struct CompiledPipeline {
     /// Awaited AI hook chain prepared with this exact generation.
     pub(crate) ai_extension_chain: Arc<sbproxy_extension::bundle::AiExtensionChain>,
     /// Running-state inventory derived from this generation's attachments.
-    #[allow(dead_code)]
     pub(crate) extension_inventory: ExtensionInventorySnapshot,
     /// Dynamic key plane built from the same immutable config generation.
     ///
@@ -1430,26 +1427,6 @@ fn compile_sensitive_header_names(config: &CompiledConfig) -> HashSet<String> {
     names
 }
 
-fn reserved_extension_hook_names() -> BTreeSet<(BundleHookKind, String)> {
-    let mut names = sbproxy_config::reserved_builtin_hook_names();
-    names.extend(
-        inventory::iter::<PolicyPluginRegistration>
-            .into_iter()
-            .map(|registration| (BundleHookKind::Policy, registration.name.to_owned())),
-    );
-    names.extend(
-        inventory::iter::<TransformPluginRegistration>
-            .into_iter()
-            .map(|registration| (BundleHookKind::Transform, registration.name.to_owned())),
-    );
-    names.extend(
-        inventory::iter::<ActionPluginRegistration>
-            .into_iter()
-            .map(|registration| (BundleHookKind::Action, registration.name.to_owned())),
-    );
-    names
-}
-
 fn empty_extension_registry() -> Arc<DynamicBundleRegistry> {
     DynamicBundleRegistry::load(
         &sbproxy_config::ExtensionBundlesConfig::default(),
@@ -1463,100 +1440,6 @@ fn configured_type(value: &serde_json::Value) -> Option<&str> {
     value.get("type").and_then(serde_json::Value::as_str)
 }
 
-fn record_dynamic_action(
-    value: &serde_json::Value,
-    registry: &dyn BundleRegistry,
-    active: &mut BTreeSet<(ExtensionHookKind, String)>,
-) {
-    if let Some(type_name) = configured_type(value) {
-        if registry.action(type_name).is_some() {
-            active.insert((ExtensionHookKind::Action, type_name.to_owned()));
-        }
-    }
-}
-
-fn active_extension_hooks(
-    config: &CompiledConfig,
-    registry: &dyn BundleRegistry,
-) -> BTreeSet<(ExtensionHookKind, String)> {
-    let mut active = BTreeSet::new();
-
-    for origin in &config.origins {
-        record_dynamic_action(&origin.action_config, registry, &mut active);
-        for policy in &origin.policy_configs {
-            if let Some(type_name) = configured_type(policy) {
-                if registry.policy(type_name).is_some() {
-                    active.insert((ExtensionHookKind::Policy, type_name.to_owned()));
-                }
-            }
-        }
-        for transform in &origin.transform_configs {
-            let enabled = serde_json::from_value::<TransformConfig>(transform.clone())
-                .is_ok_and(|wrapper| !wrapper.disabled);
-            if enabled {
-                if let Some(type_name) = configured_type(transform) {
-                    if registry.transform(type_name).is_some() {
-                        active.insert((ExtensionHookKind::Transform, type_name.to_owned()));
-                    }
-                }
-            }
-        }
-        for rule in &origin.forward_rules {
-            if let Some(value) = rule.get("origin").and_then(|origin| origin.get("action")) {
-                record_dynamic_action(value, registry, &mut active);
-            }
-        }
-        if let Some(value) = origin
-            .fallback_origin
-            .as_ref()
-            .and_then(|fallback| fallback.get("origin"))
-            .and_then(|origin| origin.get("action"))
-        {
-            record_dynamic_action(value, registry, &mut active);
-        }
-    }
-    active
-}
-
-fn running_extension_inventory(
-    registry: &DynamicBundleRegistry,
-    config: &CompiledConfig,
-    config_revision: &str,
-) -> ExtensionInventorySnapshot {
-    let active = active_extension_hooks(config, registry);
-    let mut snapshot = registry.inventory().clone();
-    snapshot.scope.config_revision = Some(config_revision.to_owned());
-    for hook in &mut snapshot.hooks {
-        hook.state = if active.contains(&(hook.kind, hook.match_key.clone())) {
-            ExtensionState::Active
-        } else {
-            ExtensionState::Unconsumed
-        };
-    }
-    for bundle in &mut snapshot.bundles {
-        bundle.state = if bundle.hook_ids.iter().any(|id| {
-            snapshot
-                .hooks
-                .iter()
-                .any(|hook| hook.id == *id && hook.state == ExtensionState::Active)
-        }) {
-            ExtensionState::Active
-        } else {
-            ExtensionState::Unconsumed
-        };
-    }
-    snapshot.summary.active = u32::try_from(
-        snapshot
-            .hooks
-            .iter()
-            .filter(|hook| hook.state == ExtensionState::Active)
-            .count(),
-    )
-    .unwrap_or(u32::MAX);
-    snapshot.summary.available = 0;
-    snapshot
-}
-
 impl Default for CompiledPipeline {
     fn default() -> Self {
         let config = CompiledConfig::default();
@@ -1567,7 +1450,8 @@ impl Default for CompiledPipeline {
             sbproxy_extension::bundle::AiExtensionChain::from_registry(extension_registry.as_ref())
                 .expect("linked AI extension registrations must be valid"),
         );
-        let extension_inventory = running_extension_inventory(&extension_registry, &config, "");
+        let extension_inventory = running_inventory(&extension_registry, &config, "")
+            .expect("linked extension inventory must be valid");
         Self {
             config,
             extension_registry,
@@ -1746,7 +1630,7 @@ impl CompiledPipeline {
         let extension_registry = DynamicBundleRegistry::load(
             &config.extension_bundles,
             base_dir,
-            &reserved_extension_hook_names(),
+            &reserved_extension_hook_names()?,
         )?;
         Self::from_config_with_mode_and_registry(
             config,
@@ -2347,7 +2231,7 @@ impl CompiledPipeline {
                 extension_registry.as_ref(),
             )?);
         let extension_inventory =
-            running_extension_inventory(extension_registry.as_ref(), &config, &config_revision);
+            running_inventory(extension_registry.as_ref(), &config, &config_revision)?;
 
         let pipeline = Self {
             config,
@@ -3161,7 +3045,7 @@ hooks:
     }
 
     #[test]
-    fn extension_pipeline_loads_relative_bundle_and_owns_running_inventory() {
+    fn extension_inventory_pipeline_loads_relative_bundle_and_owns_running_snapshot() {
         let directory = TempDir::new().expect("temporary config directory");
         write_dynamic_action_bundle(directory.path(), "1.0.0", "generation one");
 
@@ -3194,7 +3078,7 @@ hooks:
     }
 
     #[test]
-    fn extension_pipeline_rejects_a_bundle_that_claims_a_builtin_name() {
+    fn extension_inventory_pipeline_rejects_a_bundle_that_claims_a_builtin_name() {
         let directory = TempDir::new().expect("temporary config directory");
         let bundle = directory.path().join("bundles").join("collision");
         std::fs::create_dir_all(&bundle).expect("create extension bundle directory");

@@ -2742,6 +2742,24 @@ pub fn handle_admin_request(
             ),
         };
     }
+    if path_only == "/api/extensions" {
+        if !method.eq_ignore_ascii_case("GET") {
+            return (
+                405,
+                "application/json",
+                r#"{"error":"method not allowed"}"#.to_string(),
+            );
+        }
+        let pipeline = crate::reload::current_pipeline();
+        return match serde_json::to_string(&pipeline.extension_inventory) {
+            Ok(body) => (200, "application/json", body),
+            Err(error) => (
+                500,
+                "application/json",
+                format!(r#"{{"error":"serialization failed: {error}"}}"#),
+            ),
+        };
+    }
     // WOR-1870: operator UI settings the SPA reads at load (trace
     // deep-link template today).
     if path_only == "/api/ui-settings" {
@@ -5498,6 +5516,70 @@ mod tests {
         client.read_to_string(&mut response).await.unwrap();
         handler.await.unwrap();
         response
+    }
+
+    #[test]
+    fn admin_extensions_endpoint_requires_auth_and_only_answers_get() {
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+
+        let (status, _, _) = handle_admin_request("GET", "/api/extensions", &state, None, None);
+        assert_eq!(status, 401);
+
+        let (status, _, _) =
+            handle_admin_request("POST", "/api/extensions", &state, Some(&auth), None);
+        assert_eq!(status, 405);
+    }
+
+    #[test]
+    fn admin_extensions_endpoint_returns_the_versioned_running_snapshot() {
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+
+        let (status, content_type, body) =
+            handle_admin_request("GET", "/api/extensions", &state, Some(&auth), None);
+
+        assert_eq!(status, 200);
+        assert_eq!(content_type, "application/json");
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&body).expect("extension inventory must be JSON");
+        assert_eq!(
+            snapshot["schema_version"],
+            sbproxy_plugin::EXTENSION_INVENTORY_SCHEMA_VERSION
+        );
+        assert_eq!(snapshot["scope"]["mode"], "running");
+        assert!(snapshot["bundles"].is_array());
+        assert!(snapshot["hooks"].is_array());
+        assert!(snapshot["collisions"].is_array());
+    }
+
+    #[tokio::test]
+    async fn admin_extensions_endpoint_allows_a_read_only_operator() {
+        let state = AdminState::new(AdminConfig {
+            username: "admin".to_string(),
+            password: "secret".to_string(),
+            operators: vec![AdminOperator {
+                username: "reader".to_string(),
+                password_hash: sbproxy_keystore::crypto::hash_secret(
+                    "reader-secret",
+                    &crate::key_plane::default_admin_operator_pepper(),
+                ),
+                role: AdminRole::ReadOnly,
+                tenant: None,
+            }],
+            ..AdminConfig::default()
+        });
+        let (token, _) = state
+            .session_signer
+            .mint("reader", AdminRole::ReadOnly, 3600, unix_now());
+
+        let response = send_admin_request(
+            state,
+            format!("GET /api/extensions HTTP/1.1\r\nCookie: sb_admin_session={token}\r\n\r\n"),
+        )
+        .await;
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
     }
 
     #[tokio::test]

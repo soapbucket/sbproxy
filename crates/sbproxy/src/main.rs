@@ -2357,6 +2357,14 @@ fn handle_doctor_subcommand(args: &DoctorArgs) -> anyhow::Result<i32> {
         match std::fs::read_to_string(&path) {
             Ok(yaml) => {
                 let config_dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+                if let Ok(config) = serde_yaml::from_str::<sbproxy_config::ConfigFile>(&yaml) {
+                    let revision = sbproxy_core::identity::config_revision(yaml.as_bytes());
+                    report = report.with_extension_config(
+                        &config.extensions,
+                        config_dir,
+                        Some(&revision),
+                    );
+                }
                 match extract_serve_and_catalog(&yaml, config_dir) {
                     Ok(Some((serve, catalog))) => {
                         report = report.with_serve_config(&serve, &catalog);
