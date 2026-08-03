@@ -869,11 +869,19 @@ pub(super) async fn handle_action(
                                     error,
                                 )
                             })?;
+                    ctx.response_status = Some(response.status);
+                    let body = apply_plugin_action_response_transforms(
+                        response.body.unwrap_or_default(),
+                        &response.headers,
+                        pipeline,
+                        origin_idx,
+                        ctx,
+                    );
                     let (status, headers, body) = apply_plugin_action_response_modifiers(
                         session,
                         response.status,
                         response.headers,
-                        response.body.unwrap_or_default(),
+                        body,
                         pipeline,
                         origin_idx,
                         ctx,
@@ -893,6 +901,51 @@ pub(super) async fn handle_action(
             }
         }
     }
+}
+
+fn apply_plugin_action_response_transforms(
+    body: Bytes,
+    headers: &[(String, String)],
+    pipeline: &CompiledPipeline,
+    origin_idx: Option<usize>,
+    ctx: &mut RequestContext,
+) -> Bytes {
+    let Some(origin_idx) = origin_idx else {
+        return body;
+    };
+    let Some(transforms) = pipeline.transforms.get(origin_idx) else {
+        return body;
+    };
+    if transforms.is_empty() {
+        return body;
+    }
+
+    let content_type = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| value.as_str());
+    let ratio = resolved_token_bytes_ratio(pipeline.config.origins.get(origin_idx));
+    let mut body = bytes::BytesMut::from(body.as_ref());
+    for compiled_transform in transforms {
+        let needs_synth_projection = matches!(
+            compiled_transform.transform,
+            sbproxy_modules::Transform::CitationBlock(_)
+                | sbproxy_modules::Transform::JsonEnvelope(_)
+        );
+        if needs_synth_projection {
+            synthesise_markdown_projection_if_missing(ctx, &body, ratio);
+        }
+        if let Err(error) =
+            apply_transform_with_ctx(compiled_transform, &mut body, content_type, ctx)
+        {
+            warn!(
+                transform = compiled_transform.transform.transform_type(),
+                error = %error,
+                "plugin action transform failed, continuing"
+            );
+        }
+    }
+    body.freeze()
 }
 
 fn apply_plugin_action_response_modifiers(
@@ -1200,6 +1253,40 @@ origins:
         );
         assert!(
             response.ends_with("\r\n\r\nmodified"),
+            "response: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_action_http1_applies_configured_transforms() {
+        let config = sbproxy_config::compile_config(
+            r#"
+origins:
+  "plugin.test":
+    action:
+      type: static
+      body: placeholder
+    transforms:
+      - type: replace_strings
+        replacements:
+          - find: queued
+            replace: transformed
+"#,
+        )
+        .expect("fixture config");
+        let pipeline = CompiledPipeline::from_config(config).expect("fixture pipeline");
+        let action = response_action(
+            202,
+            vec![("content-type".into(), "text/plain".into())],
+            Bytes::from_static(b"queued"),
+        );
+
+        let (result, wire) = exchange(&action, &pipeline, Some(0)).await;
+
+        assert!(result.expect("valid plugin response must dispatch"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        assert!(
+            response.ends_with("\r\n\r\ntransformed"),
             "response: {response}"
         );
     }
