@@ -41,7 +41,8 @@ use wasi_common::pipe::{ReadPipe, WritePipe};
 use wasi_common::sync::WasiCtxBuilder;
 use wasi_common::WasiCtx;
 use wasmtime::{
-    Config, Engine, Linker, Module, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder, Trap,
+    Config, Engine, ExternType, InstancePre, Linker, Module, ResourceLimiter, Store, StoreLimits,
+    StoreLimitsBuilder, Trap,
 };
 use wasmtime_wasi::p1::WasiP1Ctx;
 use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe, SinkOutputStream};
@@ -292,6 +293,7 @@ pub struct WasmRuntime {
     config: WasmConfig,
     engine: Arc<Engine>,
     module: Option<Module>,
+    bundle_instance_pre: Option<InstancePre<EnvelopeHostState>>,
     bundle_limits: Option<WasmBundleLimits>,
     last_retained_stdout_bytes: AtomicUsize,
 }
@@ -356,6 +358,7 @@ impl WasmRuntime {
             config,
             engine,
             module,
+            bundle_instance_pre: None,
             bundle_limits: None,
             last_retained_stdout_bytes: AtomicUsize::new(0),
         })
@@ -377,7 +380,8 @@ impl WasmRuntime {
                 return Err(WasmLoadFailure::InvalidModule);
             }
         };
-        let runtime = Self {
+        let instance_pre = prepare_bundle_instance(&engine, &module)?;
+        Ok(Self {
             config: WasmConfig {
                 module_path: None,
                 module_bytes: None,
@@ -389,11 +393,10 @@ impl WasmRuntime {
             },
             engine,
             module: Some(module),
+            bundle_instance_pre: Some(instance_pre),
             bundle_limits: Some(limits),
             last_retained_stdout_bytes: AtomicUsize::new(0),
-        };
-        runtime.validate_bundle_module()?;
-        Ok(runtime)
+        })
     }
 
     /// Returns `true` when a module has been loaded.
@@ -565,7 +568,10 @@ impl WasmRuntime {
         if input.len() > limits.max_input_bytes {
             return Err(WasmCallFailure::InputLimit);
         }
-        let module = self.module.as_ref().ok_or(WasmCallFailure::HostFailure)?;
+        let instance_pre = self
+            .bundle_instance_pre
+            .as_ref()
+            .ok_or(WasmCallFailure::HostFailure)?;
         let capacity = limits
             .max_output_bytes
             .checked_add(1)
@@ -595,11 +601,7 @@ impl WasmRuntime {
         store.set_epoch_deadline(budget.as_millis().max(1) as u64);
 
         let call_result = (|| -> wasmtime::Result<()> {
-            let mut linker = Linker::new(&self.engine);
-            wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |state: &mut EnvelopeHostState| {
-                &mut state.wasi
-            })?;
-            let instance = linker.instantiate(&mut store, module)?;
+            let instance = instance_pre.instantiate(&mut store)?;
             let start = instance.get_typed_func::<(), ()>(&mut store, "_start")?;
             start.call(&mut store, ())
         })();
@@ -626,55 +628,43 @@ impl WasmRuntime {
         }
     }
 
-    fn validate_bundle_module(&self) -> std::result::Result<(), WasmLoadFailure> {
-        let limits = self
-            .bundle_limits
-            .ok_or(WasmLoadFailure::RuntimeUnavailable)?;
-        let module = self.module.as_ref().ok_or(WasmLoadFailure::InvalidModule)?;
-        if module
-            .imports()
-            .any(|import| import.module() != "wasi_snapshot_preview1")
-        {
-            return Err(WasmLoadFailure::InvalidImports);
-        }
-        let mut wasi_builder = wasmtime_wasi::WasiCtxBuilder::new();
-        wasi_builder
-            .stdin(MemoryInputPipe::new(Vec::new()))
-            .stdout(MemoryOutputPipe::new(1))
-            .stderr(SinkOutputStream);
-        let mut store = Store::new(
-            &self.engine,
-            EnvelopeHostState {
-                wasi: wasi_builder.build_p1(),
-                limits: TrackingLimits {
-                    inner: envelope_store_limits(limits),
-                    memory_denied: false,
-                },
-            },
-        );
-        store.limiter(|state| &mut state.limits);
-        store
-            .set_fuel(limits.fuel)
-            .map_err(|_| WasmLoadFailure::RuntimeUnavailable)?;
-        store.set_epoch_deadline(1_000_000_000);
-        let mut linker = Linker::new(&self.engine);
-        wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |state: &mut EnvelopeHostState| {
-            &mut state.wasi
-        })
-        .map_err(|_| WasmLoadFailure::RuntimeUnavailable)?;
-        let instance = linker
-            .instantiate(&mut store, module)
-            .map_err(|_| WasmLoadFailure::InvalidImports)?;
-        instance
-            .get_typed_func::<(), ()>(&mut store, "_start")
-            .map_err(|_| WasmLoadFailure::InvalidStart)?;
-        Ok(())
-    }
-
     #[cfg(test)]
     pub(crate) fn last_retained_stdout_bytes(&self) -> usize {
         self.last_retained_stdout_bytes.load(Ordering::Relaxed)
     }
+}
+
+fn prepare_bundle_instance(
+    engine: &Engine,
+    module: &Module,
+) -> std::result::Result<InstancePre<EnvelopeHostState>, WasmLoadFailure> {
+    // This allowlist is deliberately smaller than WASIp1. `fd_read` is backed
+    // only by MemoryInputPipe, `fd_write` only by MemoryOutputPipe or the sink,
+    // and `proc_exit` immediately raises I32Exit. None can wait on host I/O.
+    // In particular, poll_oneoff and every filesystem or socket operation are
+    // rejected before the module reaches an executor worker.
+    const NONBLOCKING_WASI_IMPORTS: &[&str] = &["fd_read", "fd_write", "proc_exit"];
+    if module.imports().any(|import| {
+        import.module() != "wasi_snapshot_preview1"
+            || !NONBLOCKING_WASI_IMPORTS.contains(&import.name())
+    }) {
+        return Err(WasmLoadFailure::InvalidImports);
+    }
+
+    match module.get_export("_start") {
+        Some(ExternType::Func(function))
+            if function.params().len() == 0 && function.results().len() == 0 => {}
+        _ => return Err(WasmLoadFailure::InvalidStart),
+    }
+
+    let mut linker = Linker::new(engine);
+    wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |state: &mut EnvelopeHostState| {
+        &mut state.wasi
+    })
+    .map_err(|_| WasmLoadFailure::RuntimeUnavailable)?;
+    linker
+        .instantiate_pre(module)
+        .map_err(|_| WasmLoadFailure::InvalidImports)
 }
 
 fn envelope_store_limits(limits: WasmBundleLimits) -> StoreLimits {
@@ -909,6 +899,27 @@ mod tests {
     /// from `examples/wasm/echo-rust/`; the resulting `.wasm` is
     /// embedded so unit tests do not need a wasm32-wasi toolchain.
     const ECHO_WASM: &[u8] = include_bytes!("testdata/echo.wasm");
+    const POLL_ONEOFF_WASM: &[u8] = include_bytes!("../bundle/testdata/wasm/poll-oneoff.wasm");
+    const CORE_START_TRAP_WASM: &[u8] =
+        include_bytes!("../bundle/testdata/wasm/core-start-trap.wasm");
+    const BAD_START_SIGNATURE_WASM: &[u8] =
+        include_bytes!("../bundle/testdata/wasm/bad-start-signature.wasm");
+    const PROC_EXIT_ZERO_WASM: &[u8] =
+        include_bytes!("../bundle/testdata/wasm/proc-exit-zero.wasm");
+    const PROC_EXIT_NONZERO_WASM: &[u8] =
+        include_bytes!("../bundle/testdata/wasm/proc-exit-nonzero.wasm");
+    const SENTINEL_TRAP_WASM: &[u8] = include_bytes!("../bundle/testdata/wasm/sentinel-trap.wasm");
+
+    fn envelope_limits() -> WasmBundleLimits {
+        WasmBundleLimits {
+            budget: Duration::from_millis(50),
+            memory_bytes: 16 * 1024 * 1024,
+            stack_bytes: 512 * 1024,
+            fuel: 100_000_000,
+            max_input_bytes: 1024 * 1024,
+            max_output_bytes: 1024 * 1024,
+        }
+    }
 
     fn config_with(bytes: &[u8]) -> WasmConfig {
         WasmConfig {
@@ -1012,6 +1023,57 @@ mod tests {
             msg.contains("compiling WASM bytes"),
             "expected compile context in error, got: {msg}"
         );
+    }
+
+    #[test]
+    fn envelope_wasm_rejects_blocking_wasi_poll_at_load_time() {
+        let result = WasmRuntime::from_bundle_bytes(POLL_ONEOFF_WASM, envelope_limits());
+        assert!(matches!(result, Err(WasmLoadFailure::InvalidImports)));
+    }
+
+    #[test]
+    fn envelope_wasm_load_validation_does_not_execute_the_core_start() {
+        let runtime = WasmRuntime::from_bundle_bytes(CORE_START_TRAP_WASM, envelope_limits())
+            .expect("link validation must not instantiate the module");
+        assert_eq!(
+            runtime.execute_bounded(b"{}"),
+            Err(WasmCallFailure::GuestTrap)
+        );
+    }
+
+    #[test]
+    fn envelope_wasm_checks_the_start_signature_without_instantiating() {
+        let result = WasmRuntime::from_bundle_bytes(BAD_START_SIGNATURE_WASM, envelope_limits());
+        assert!(matches!(result, Err(WasmLoadFailure::InvalidStart)));
+    }
+
+    #[test]
+    fn envelope_wasm_accepts_proc_exit_zero_output() {
+        let runtime = WasmRuntime::from_bundle_bytes(PROC_EXIT_ZERO_WASM, envelope_limits())
+            .expect("proc_exit is an allowed immediate import");
+        assert_eq!(
+            runtime.execute_bounded(b"{}").unwrap(),
+            br#"{"version":"sbproxy-envelope/v1","decision":"allow"}"#
+        );
+    }
+
+    #[test]
+    fn envelope_wasm_rejects_nonzero_proc_exit() {
+        let runtime = WasmRuntime::from_bundle_bytes(PROC_EXIT_NONZERO_WASM, envelope_limits())
+            .expect("proc_exit is an allowed immediate import");
+        assert_eq!(
+            runtime.execute_bounded(b"{}"),
+            Err(WasmCallFailure::GuestTrap)
+        );
+    }
+
+    #[test]
+    fn envelope_wasm_discards_stdout_when_the_guest_errors() {
+        let runtime = WasmRuntime::from_bundle_bytes(SENTINEL_TRAP_WASM, envelope_limits())
+            .expect("fd_write is an allowed in-memory import");
+        let result = runtime.execute_bounded(b"{}");
+        assert_eq!(result, Err(WasmCallFailure::GuestTrap));
+        assert!(!format!("{result:?}").contains("private-sentinel-output"));
     }
 
     #[test]
