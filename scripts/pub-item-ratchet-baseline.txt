@@ -156,9 +156,20 @@
 # while docs, `docs/configuration.md`, and `examples/ai-resilience` all
 # described a working probe. The new `sbproxy-ai/src/health_probe.rs`
 # spawns it from the pipeline's existing background-task seam. This is the
+#
+# Lowered to 287 on WOR-2223, 2026-08-02, answering another one.
+# `LaneSplit::record_cloud` (sbproxy-model-host/src/hybrid.rs) is the
+# cloud half of the hybrid savings split, and the escalation asked where
+# the cloud-spill path should call it. The answer is the same place the
+# local half is recorded: `ValueSink`, the usage sink that prices every
+# finished completion of a model with a configured `reference`. It now
+# reads the serving lane off the usage event instead of assuming local,
+# so a completion that spilled to a cloud provider lands in
+# cloud_completions and cloud_spent_micros rather than nowhere. The
 # ratchet's first option again, a production call site rather than a
 # narrowing.
-285
+284
+#
 #
 # Lowered to 286 on WOR-2225, 2026-08-02, answering two more of the
 # escalated questions. Both are real, neither is a narrowing.
