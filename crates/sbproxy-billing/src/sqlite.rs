@@ -105,6 +105,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS payment_intents_reserved_proof
 CREATE INDEX IF NOT EXISTS payment_intents_sweep
     ON payment_intents (status, expires_at_ms);
 
+CREATE INDEX IF NOT EXISTS payment_intents_route_status
+    ON payment_intents (tenant_id, origin_id, route, status);
+
 CREATE TABLE IF NOT EXISTS payment_attempts (
     attempt_id               TEXT    NOT NULL PRIMARY KEY,
     intent_id                TEXT    NOT NULL
@@ -1082,6 +1085,40 @@ impl SettlementStore for SqliteSettlementStore {
                 return Ok(None);
             }
             load_receipt(connection, &intent_id)
+        })
+        .await
+    }
+
+    async fn unresolved_intent_for_route(
+        &self,
+        tenant_id: &str,
+        origin_id: &str,
+        route: &str,
+    ) -> Result<Option<String>, BillingError> {
+        let tenant_id = tenant_id.to_string();
+        let origin_id = origin_id.to_string();
+        let route = route.to_string();
+        self.call(move |connection| {
+            // Oldest first, so the intent an operator is told about is the one
+            // that has been stuck longest rather than whichever row the
+            // planner reached first.
+            connection
+                .query_row(
+                    "SELECT intent_id FROM payment_intents
+                      WHERE tenant_id = ?1 AND origin_id = ?2 AND route = ?3
+                        AND status = ?4
+                      ORDER BY created_at_ms
+                      LIMIT 1",
+                    params![
+                        tenant_id,
+                        origin_id,
+                        route,
+                        IntentStatus::NeedsReconciliation.as_str()
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|_| BillingError::Storage("read unresolved route intent"))
         })
         .await
     }

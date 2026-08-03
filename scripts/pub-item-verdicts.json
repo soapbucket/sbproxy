@@ -63,10 +63,6 @@
       "verdict": "escalated",
       "reason": "The reason label for a peer that sent a graceful LeaveRequest. Its two siblings, probe_timeout and dead_timeout, are passed by production eviction sites; this one is passed only from peer_eviction.rs's own test. There is no LeaveRequest handler in the crate at all, only doc comments naming it. Question for the mesh owner: is graceful leave unimplemented, or handled somewhere that forgets to record the eviction reason? Deleting the constant would hide the gap rather than answer it."
     },
-    "crates/sbproxy-model-host/src/hybrid.rs::record_cloud": {
-      "verdict": "escalated",
-      "reason": "The half of the hybrid savings split that accounts for a completion that spilled to cloud. Its sibling record_local has production callers and this one does not, so cloud_completions and cloud_spent_micros stay at zero in a live report and the reported saving only ever grows. Question for the model-host owner: is the cloud-spill path meant to be reported, and if so where should it call this?"
-    },
     "crates/sbproxy-observe/src/cardinality.rs::unique_count": {
       "verdict": "escalated",
       "reason": "Reads how many unique values a label has been allowed to take, which is the number that says whether the limiter is about to start collapsing values into `other`. Only this crate's tests read it, so an operator cannot see how close a label is to its cap before the collapse happens. Question for the observability owner: should this reach an admin or metrics surface? Narrowing it is the wrong direction if the answer is yes."

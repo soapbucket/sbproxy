@@ -2754,6 +2754,11 @@ fn emit_mcp_tool_attribution(
             .trace_id
             .clone()
             .filter(|id| !id.is_empty()),
+        // A tool call belongs to neither serving lane, so it names
+        // neither. The `model` above is the owning MCP server, which is
+        // not a model any lane could have served (WOR-2223).
+        logical_model: None,
+        served_model: None,
     };
     for sink in &mcp.usage_sinks {
         sink.record(&event);
