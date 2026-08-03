@@ -211,6 +211,81 @@ fn record_label_overflow_per_tenant(metric: &str, label: &str, tenant_id: &str) 
     }
 }
 
+// --- Cardinality headroom gauges ---
+
+/// Gauges `sbproxy_label_cardinality_unique_values{label}` and
+/// `sbproxy_label_cardinality_budget{label}`.
+///
+/// The overflow counter above only moves once a label has *already*
+/// collapsed. That is the wrong moment to find out in a multi-tenant
+/// deployment: the collapse merges tenants into one `__other__` series,
+/// so a per-tenant panel keeps drawing and quietly starts answering a
+/// different question, and the only tell is noticing `__other__` in a
+/// query result. These two gauges are the before-picture, so
+/// `unique_values / budget > 0.9` is an alert an operator can act on
+/// while the label still has room.
+///
+/// Labelled by label name only, which is what the limiter's
+/// accepted-value map is keyed by. Two labels are deliberately absent.
+/// A `metric` label would be a lie, because one budget is shared by
+/// every metric using that label name. A `tenant_id` label would
+/// multiply the series count by the tenant budget, which is the failure
+/// these gauges exist to warn about.
+///
+/// Kept as one static so the pair registers together or not at all: a
+/// numerator without its denominator is not readable.
+static CARDINALITY_USAGE: OnceLock<(prometheus::IntGaugeVec, prometheus::IntGaugeVec)> =
+    OnceLock::new();
+
+fn cardinality_usage_gauges() -> &'static (prometheus::IntGaugeVec, prometheus::IntGaugeVec) {
+    CARDINALITY_USAGE.get_or_init(|| {
+        let unique = prometheus::IntGaugeVec::new(
+            Opts::new(
+                "sbproxy_label_cardinality_unique_values",
+                "Unique values a label name has accepted so far, before new ones are demoted to __other__",
+            ),
+            &["label"],
+        )
+        .expect("cardinality unique-value gauge constructs");
+        let budget = prometheus::IntGaugeVec::new(
+            Opts::new(
+                "sbproxy_label_cardinality_budget",
+                "Cap the accepted unique values for a label name are counted against",
+            ),
+            &["label"],
+        )
+        .expect("cardinality budget gauge constructs");
+        // Best-effort registration on the ProxyMetrics registry, same as
+        // the overflow counters above: a duplicate registration across
+        // `ProxyMetrics::new()` calls in tests is ignored and the local
+        // copy is used.
+        let _ = metrics().registry.register(Box::new(unique.clone()));
+        let _ = metrics().registry.register(Box::new(budget.clone()));
+        (unique, budget)
+    })
+}
+
+/// Refresh the cardinality headroom gauges from the global limiter.
+///
+/// Driven from [`ProxyMetrics::render`] rather than from the sanitize
+/// path. The counts only move when a previously unseen value is
+/// accepted, but testing for that on every request would put a gauge
+/// write in the hot path to maintain a number nobody reads between
+/// scrapes. Recomputing at scrape is one pass over the tracked label
+/// names, of which there are a few dozen.
+fn refresh_cardinality_gauges() {
+    let (unique, budget) = cardinality_usage_gauges();
+    let limiter = global_limiter();
+    for label in limiter.tracked_labels() {
+        unique
+            .with_label_values(&[label.as_str()])
+            .set(limiter.unique_count(&label) as i64);
+        budget
+            .with_label_values(&[label.as_str()])
+            .set(limiter.cap_for_label(&label) as i64);
+    }
+}
+
 /// Return a reference to the global [`ProxyMetrics`] registry, initialising it on first use.
 pub fn metrics() -> &'static ProxyMetrics {
     METRICS.get_or_init(ProxyMetrics::new)
@@ -898,6 +973,11 @@ impl ProxyMetrics {
     /// `register_*_vec!` macros). Without the second `gather()` those
     /// series exist in-process but never reach a `/metrics` scrape.
     pub fn render(&self) -> String {
+        // The cardinality gauges are derived from the limiter's
+        // accepted-value sets rather than written as they change, so
+        // snapshot them before gathering. A scrape is exactly when
+        // someone wants them current.
+        refresh_cardinality_gauges();
         let encoder = TextEncoder::new();
         let mut metric_families = self.registry.gather();
         metric_families.extend(prometheus::gather());
@@ -1029,43 +1109,22 @@ pub fn current_trace_ids() -> (String, String) {
 
 // --- Per-origin helper functions ---
 
-/// Record a completed request with all per-origin metrics.
-///
-/// Updates the requests counter, latency histogram, and bytes transferred
-/// counters for the given origin. The `origin` label is sanitized through
-/// the global cardinality limiter.
-///
-/// Legacy entry point: stamps the per-agent labels with the empty-string
-/// sentinel. Call sites with a resolved [`AgentLabels`] should prefer
-/// [`record_request_with_labels`] so the per-agent dimensions land on
-/// `sbproxy_requests_total`.
-pub fn record_request(
-    origin: &str,
-    method: &str,
-    status: u16,
-    duration_secs: f64,
-    bytes_in: u64,
-    bytes_out: u64,
-) {
-    record_request_with_labels(
-        origin,
-        method,
-        status,
-        duration_secs,
-        bytes_in,
-        bytes_out,
-        AgentLabels::unset(),
-    );
-}
-
 /// Record a completed request and stamp the per-agent labels onto
 /// `sbproxy_requests_total`.
 ///
-/// All labels run through [`sanitize_label_budget`] so the per-label
-/// cardinality budget is enforced before the value reaches Prometheus.
-/// Overflow values are demoted to
-/// `__other__` and emit a `sbproxy_label_cardinality_overflow_total`
-/// counter (rate-limited to once per minute per (metric, label)).
+/// Updates the requests counter, latency histogram, and bytes-transferred
+/// counters for the given origin. All labels run through
+/// [`sanitize_label_budget`] so the per-label cardinality budget is
+/// enforced before the value reaches Prometheus. Overflow values are
+/// demoted to `__other__` and emit a
+/// `sbproxy_label_cardinality_overflow_total` counter (rate-limited to
+/// once per minute per (metric, label)).
+///
+/// A caller with no agent context passes [`AgentLabels::unset`], which
+/// stamps the empty-string sentinel across all five agent dimensions.
+/// That is a distinct series from any positive `human` / `unknown` /
+/// `anonymous` decision, so a dashboard can tell "never classified"
+/// apart from "classified as not-an-agent".
 pub fn record_request_with_labels(
     origin: &str,
     method: &str,
@@ -5115,8 +5174,8 @@ mod tests {
         let sanitized = sanitize_label("origin", origin);
 
         // Record two requests.
-        record_request(origin, "GET", 200, 0.05, 1024, 512);
-        record_request(origin, "GET", 200, 0.10, 2048, 256);
+        record_request_with_labels(origin, "GET", 200, 0.05, 1024, 512, AgentLabels::unset());
+        record_request_with_labels(origin, "GET", 200, 0.10, 2048, 256, AgentLabels::unset());
 
         let count = m
             .per_origin_requests_total
@@ -5219,7 +5278,7 @@ mod tests {
     fn test_render_includes_new_metric_families() {
         // Touch each new metric via helpers so they appear in output.
         let origin = "render-check.example.com";
-        record_request(origin, "POST", 201, 0.02, 100, 50);
+        record_request_with_labels(origin, "POST", 201, 0.02, 100, 50, AgentLabels::unset());
         record_auth(origin, "bearer", true);
         record_policy(origin, "waf", "allow");
         record_cache(origin, "miss");
@@ -5280,6 +5339,42 @@ mod tests {
         assert_eq!(result, crate::cardinality::OTHER_LABEL);
     }
 
+    #[test]
+    fn cardinality_headroom_is_readable_before_the_collapse() {
+        // `sbproxy_label_cardinality_overflow_total` only moves after a
+        // label has already started merging values into __other__, and
+        // in a multi-tenant deployment that merge turns a per-tenant
+        // panel into a wrong number with no warning. Assert the two
+        // gauges that make the approach visible while the label still
+        // has room, since a scrape is the only place an operator can
+        // see it.
+        //
+        // The label name is unique to this test: the global limiter is
+        // shared by every test in this binary, so a name any other test
+        // could touch would make the counts racy.
+        let label = "cardinality_headroom_probe";
+        for value in ["one", "two", "three"] {
+            sanitize_label_budget("sbproxy_headroom_probe_total", label, value);
+        }
+
+        let out = metrics().render();
+        assert!(
+            out.contains(&format!(
+                "sbproxy_label_cardinality_unique_values{{label=\"{label}\"}} 3"
+            )),
+            "the accepted-value count must be scrapeable per label:\n{out}"
+        );
+        // Not in the per-label budget table, so it falls through to the
+        // workspace default. The cap has to be published too: without a
+        // denominator, 3 says nothing about how much room is left.
+        assert!(
+            out.contains(&format!(
+                "sbproxy_label_cardinality_budget{{label=\"{label}\"}} 1000"
+            )),
+            "the cap must be scrapeable per label:\n{out}"
+        );
+    }
+
     // --- Wave 1 / G1.6 per-agent label tests ---
 
     #[test]
@@ -5331,19 +5426,23 @@ mod tests {
     }
 
     #[test]
-    fn record_request_legacy_uses_empty_sentinel() {
+    fn unset_agent_labels_land_on_the_empty_sentinel_series() {
         let m = metrics();
         let origin = "test-legacy-empty.example.com";
-        record_request(origin, "POST", 201, 0.0, 0, 0);
+        record_request_with_labels(origin, "POST", 201, 0.0, 0, 0, AgentLabels::unset());
 
         let origin_san = sanitize_label("origin", origin);
-        // Legacy path attributes the increment to the empty-sentinel
-        // tuple, which is the "no agent context attached" series.
+        // An unresolved request attributes the increment to the
+        // empty-sentinel tuple, which is the "no agent context attached"
+        // series and is deliberately distinct from a positive `human` or
+        // `unknown` verdict. `sanitize_label_budget` short-circuits the
+        // empty string before the limiter sees it, so these five stay
+        // empty rather than being demoted to `__other__` under load.
         let count = m
             .requests_total
             .with_label_values(&[origin_san.as_str(), "POST", "201", "", "", "", "", ""])
             .get();
-        assert_eq!(count, 1, "legacy record_request must use empty sentinel");
+        assert_eq!(count, 1, "unset agent labels must use the empty sentinel");
     }
 
     #[test]

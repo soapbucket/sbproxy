@@ -143,4 +143,37 @@
 # `LedgerPayload::provenance_conflict`, and the two admin read paths ask
 # the claims directly. This is the ratchet's first option, wiring the item
 # to a production call site, rather than a narrowing.
-288
+
+# Lowered to 286 on WOR-2225, 2026-08-02, answering two more of the
+# escalated questions. Both are real, neither is a narrowing.
+#
+# `CardinalityLimiter::unique_count` (sbproxy-observe/src/cardinality.rs)
+# gained a production caller. It reads how many unique values a label has
+# accepted, which is the number that says whether the limiter is about to
+# start folding values into `__other__`, and until now only the crate's own
+# tests read it. In a multi-tenant deployment that collapse merges tenants
+# into one series, so a per-tenant panel keeps drawing and starts answering
+# a different question, and the only tell is spotting `__other__` in a
+# query. `metrics::refresh_cardinality_gauges` now publishes it per label
+# at scrape time as `sbproxy_label_cardinality_unique_values`, alongside
+# `sbproxy_label_cardinality_budget` for the denominator.
+#
+# `metrics::record_request` (sbproxy-observe/src/metrics.rs) was deleted.
+# It was the legacy request counter, a shim that called
+# `record_request_with_labels` with `AgentLabels::unset()`, and the
+# migration it was waiting on finished: no production caller was left. Its
+# five test call sites moved to the labelled entry point passing
+# `AgentLabels::unset()` explicitly, so no coverage went with it. The one
+# assertion worth keeping, that an unresolved request lands on the
+# empty-string sentinel series rather than a positive `human` or `unknown`
+# verdict, is still made; it now names `AgentLabels::unset()` as the thing
+# under test, which is what it was pinning all along.
+#
+# The two escalations left in scripts/pub-item-verdicts.json that this
+# sweep also answered did not move the number.
+# `EVICT_REASON_GRACEFUL_LEAVE` (sbproxy-mesh) and `decode_all_raw`
+# (sbproxy-transport) are both still tests-only and both correctly so:
+# the first reserves a label value for a feature that does not exist, the
+# second is the response-direction frame walker for a bridge direction the
+# proxy does not run. Their verdicts moved from `escalated` to `keep`.
+286

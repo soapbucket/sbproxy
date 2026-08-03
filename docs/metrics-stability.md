@@ -185,8 +185,10 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_judge_latency_seconds` | Histogram | `stable` | `beta` | `provider`, `cached` | Judge backend round-trip latency. |
 | `sbproxy_jwks_unknown_kid_refetch_total` | Counter | `stable` | `beta` | `result` | JWKS refreshes triggered by tokens whose kid was absent from the local cache. |
 | `sbproxy_key_policy_stored_rejections_total` | Counter | `stable` | `alpha` | `reason` | Stored key records rejected while lowering to an effective policy, by reason. |
+| `sbproxy_label_cardinality_budget` | Gauge | `stable` | `beta` | `label` | Cap the accepted unique values for a label name are counted against. Denominator for sbproxy_label_cardinality_unique_values. |
 | `sbproxy_label_cardinality_overflow_per_tenant_total` | Counter | `stable` | `beta` | `metric`, `label`, `tenant_id` | Per-tenant overflow demotions (`sbproxy_label_cardinality_overflow_total` with the tenant_id label). |
 | `sbproxy_label_cardinality_overflow_total` | Counter | `stable` | `beta` | `metric`, `label` | Number of label values demoted to __other__ because the per-label budget was exhausted. |
+| `sbproxy_label_cardinality_unique_values` | Gauge | `stable` | `beta` | `label` | Unique values a label name has accepted so far. Divided by sbproxy_label_cardinality_budget it gives how close the label is to collapsing new values into __other__, which is a warning the overflow counter can only give after the fact. |
 | `sbproxy_ledger_redeem_duration_seconds` | Histogram | `stable` | `beta` | `host`, `outcome` | Wall-clock latency of a single ledger token redemption. |
 | `sbproxy_managed_replica_attempts_total` | Counter | `stable` | `beta` | `provider`, `deployment`, `route_class`, `outcome` | Managed model replica attempts by provider, deployment, route class, and bounded outcome. |
 | `sbproxy_managed_replica_failovers_total` | Counter | `stable` | `beta` | `provider`, `deployment`, `reason` | Safe pre-output managed replica handovers by provider, deployment, and bounded reason. |

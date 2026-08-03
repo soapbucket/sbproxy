@@ -222,6 +222,22 @@ mod tests {
     }
 
     #[test]
+    fn decode_request_rejects_a_trailer_frame() {
+        // Trailers live in the body only because a browser cannot read
+        // them off a response. gRPC carries none on a request at all, so
+        // a `0x80` frame here is a malformed client. Rejecting it at the
+        // bridge keeps it from reaching the native gRPC upstream, which
+        // would fail the call less legibly and further from the cause.
+        let mut body = frame::encode_message(b"hello");
+        body.extend_from_slice(&encode_trailer_frame(&GrpcTrailers::ok()));
+        assert!(GrpcWebBridge::decode_request(&body, false).is_err());
+
+        // Same rule through the base64 text variant.
+        let b64 = BASE64.encode(&body).into_bytes();
+        assert!(GrpcWebBridge::decode_request(&b64, true).is_err());
+    }
+
+    #[test]
     fn encode_unary_response_appends_trailer() {
         let msg = frame::encode_message(b"response-body");
         let body = GrpcWebBridge::encode_response(&msg, &GrpcTrailers::ok(), false);
