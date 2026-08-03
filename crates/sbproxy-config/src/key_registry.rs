@@ -89,22 +89,23 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "The OSS admin-action audit path always retains its bounded in-memory ring and mirrors \
          rows to tracing; this selector is not installed. Classified under WOR-1976.",
     ),
-    // The ten entries below are the first keys pinned from the module and
-    // AI-gateway surface, which the generated schema cannot describe and
-    // which `MODULE_CONFIG_ROOTS` now walks instead. They are pre-existing
-    // debt, pinned rather than fixed, so the widened scan lands without
-    // turning the build red on work it did not cause.
+    // The eight entries below are the first from the module and AI-gateway
+    // surface, which the generated schema cannot describe and which
+    // `MODULE_CONFIG_ROOTS` now walks instead.
     //
-    // They cover four of the five findings in the WOR-2245 audit. The fifth,
-    // `routing.strategy: token_rate` degenerating into `least_token_usage`,
-    // has no leaf to pin: the key is `routing`, the key is read, and it is
-    // one accepted *value* of it that does nothing. No reader-based check
-    // can see that shape.
-    // These were pinned config-only on this branch, from a main where the AI
-    // router was built without breakers or a detector because the only
-    // installing path had no callers. Both are armed now: the handler calls
-    // `with_circuit_breakers` and `with_outlier_detection` when the config
-    // asks for them, so pinning them would report working features as inert.
+    // Each of the five WOR-2245 audit findings is now accounted for, and
+    // only one of them is still pinned. The two resilience blocks are wired,
+    // so they are `stable` below: they were pinned config-only earlier on
+    // this branch, against a main where the AI router was built without
+    // breakers or a detector because the only installing path had no
+    // callers. The handler calls `with_circuit_breakers` and
+    // `with_outlier_detection` when the config asks now, so pinning them
+    // would report working features as inert. Sticky sessions are the load
+    // balancer's own warning. `routing.strategy: token_rate` is refused by
+    // `compile_config` rather than pinned, which is the better answer and
+    // the only available one: the key is `routing`, the key is read, and it
+    // was one accepted *value* of it that did nothing, a shape no
+    // reader-based check can see. Target zones are the remaining pin.
     stable(
         "origins.*.action.resilience.circuit_breaker.failure_threshold",
         AI_RESILIENCE_CONSUMER,
