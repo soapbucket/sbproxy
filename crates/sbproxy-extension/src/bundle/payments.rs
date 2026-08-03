@@ -16,6 +16,7 @@ struct PreparedPaymentHook {
 }
 
 /// Immutable payment hook chain pinned to one compiled pipeline generation.
+#[derive(Clone)]
 pub struct PaymentExtensionChain {
     hooks: Arc<[PreparedPaymentHook]>,
 }

@@ -1021,9 +1021,14 @@ fn attach_payments_runtime(pipeline: &mut CompiledPipeline) -> anyhow::Result<()
         return Ok(());
     };
     let clustered = pipeline.config.server.cluster.is_some();
-    let extension_chain = sbproxy_extension::bundle::PaymentExtensionChain::from_registry(
-        pipeline.extension_registry().as_ref(),
-    )?;
+    let extension_chain = pipeline.payment_extension_chain().cloned().ok_or_else(|| {
+        anyhow::anyhow!("proxy.payments payment extension chain was not prepared")
+    })?;
+    let attached_inventory = if extension_chain.is_empty() {
+        None
+    } else {
+        Some(pipeline.inventory_with_payment_extensions_attached()?)
+    };
     let runtime = if extension_chain.is_empty() {
         crate::billing_runtime::install(&payments, clustered)
     } else {
@@ -1038,6 +1043,9 @@ fn attach_payments_runtime(pipeline: &mut CompiledPipeline) -> anyhow::Result<()
         schema_version = runtime.status().schema_version,
         "payment settlement runtime published",
     );
+    if let Some(inventory) = attached_inventory {
+        pipeline.mark_payment_extensions_attached(inventory);
+    }
     pipeline.payments = Some(runtime);
     Ok(())
 }
@@ -3489,6 +3497,121 @@ mod tests {
     }
 
     crate::register_startup_hook!(reload_hook_fixture);
+
+    #[cfg(feature = "payments")]
+    fn write_payment_inventory_bundle(root: &std::path::Path) {
+        let bundle = root.join("bundles").join("runtime-inventory");
+        std::fs::create_dir_all(&bundle).expect("create payment inventory bundle");
+        std::fs::write(
+            bundle.join("entry.js"),
+            r#"export function inspect() {
+                return { version: "sbproxy-envelope/v1", decision: "continue" };
+            }
+"#,
+        )
+        .expect("write payment inventory artifact");
+        std::fs::write(
+            bundle.join("bundle.yaml"),
+            r#"apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: runtime-inventory
+version: 1.0.0
+runtime: javascript
+entry: entry.js
+hooks:
+  - kind: ai_guardrail_input
+    type: runtime_guardrail
+    export: inspect
+  - kind: payment
+    type: runtime_payment
+    export: inspect
+    execution:
+      body_mode: none
+"#,
+        )
+        .expect("write payment inventory manifest");
+    }
+
+    #[cfg(feature = "payments")]
+    fn payment_inventory_config(root: &std::path::Path) -> sbproxy_config::CompiledConfig {
+        let secret_path = root.join("binding-key.txt");
+        std::fs::write(&secret_path, "binding-secret-must-not-appear")
+            .expect("write payment binding key");
+        let mut config = sbproxy_config::CompiledConfig::default();
+        config.extension_bundles.bundles_dir = Some("bundles".to_owned());
+        config.server.payments = Some(sbproxy_config::PaymentsConfig {
+            state_path: root.join("payments.sqlite3").display().to_string(),
+            challenge_binding_key: format!("file:{}", secret_path.display()),
+            authorization_timeout_ms: 2_000,
+            max_body_bytes: 65_536,
+            failure_mode: sbproxy_config::FailureMode::Closed,
+            recovery_encryption: None,
+            worker: sbproxy_config::PaymentsWorkerConfig::default(),
+            protocols: sbproxy_config::PaymentProtocolsConfig::default(),
+            rails: sbproxy_config::PaymentRailsConfig::default(),
+            usage_reporters: sbproxy_config::UsageReportersConfig::default(),
+        });
+        config
+    }
+
+    #[cfg(feature = "payments")]
+    #[test]
+    fn payment_extension_inventory_activates_only_after_dispatcher_install() {
+        let directory = tempfile::tempdir().expect("temporary payment inventory directory");
+        write_payment_inventory_bundle(directory.path());
+        let mut pipeline = crate::pipeline::CompiledPipeline::from_config_at(
+            payment_inventory_config(directory.path()),
+            directory.path(),
+        )
+        .expect("runtime candidate should prepare payment hooks");
+
+        assert_eq!(
+            pipeline.extension_inventory().scope.mode,
+            sbproxy_plugin::ExtensionScopeMode::Running
+        );
+        let state = |pipeline: &crate::pipeline::CompiledPipeline, kind| {
+            pipeline
+                .extension_inventory()
+                .hooks
+                .iter()
+                .find(|hook| hook.kind == kind)
+                .map(|hook| (hook.id.clone(), hook.state))
+                .expect("runtime lifecycle hook should be inventoried")
+        };
+        assert_eq!(
+            state(
+                &pipeline,
+                sbproxy_plugin::ExtensionHookKind::AiGuardrailInput
+            )
+            .1,
+            sbproxy_plugin::ExtensionState::Active
+        );
+        assert_eq!(
+            state(&pipeline, sbproxy_plugin::ExtensionHookKind::Payment),
+            (
+                "runtime-inventory:payment:runtime_payment".to_owned(),
+                sbproxy_plugin::ExtensionState::Unconsumed,
+            )
+        );
+
+        attach_payments_runtime(&mut pipeline).expect("payment dispatcher should install");
+
+        assert_eq!(
+            pipeline.extension_inventory().scope.mode,
+            sbproxy_plugin::ExtensionScopeMode::Running
+        );
+        assert_eq!(
+            state(&pipeline, sbproxy_plugin::ExtensionHookKind::Payment),
+            (
+                "runtime-inventory:payment:runtime_payment".to_owned(),
+                sbproxy_plugin::ExtensionState::Active,
+            )
+        );
+        let serialized = serde_json::to_string(pipeline.extension_inventory())
+            .expect("running admin inventory should serialize");
+        assert!(!serialized.contains("binding-secret-must-not-appear"));
+        assert!(!serialized.contains("provider-payload-must-not-appear"));
+    }
 
     #[test]
     fn reload_reattaches_extension_startup_hook_before_on_reload() {

@@ -1154,8 +1154,8 @@ If a bundle edit has a bad digest, syntax error, missing export, unsupported imp
 
 Use the two inventory views for different questions:
 
-- `sbproxy doctor sb.yml --format json` reports a stopped `doctor` snapshot. Successfully validated hooks have the `not_evaluated` state.
-- Authenticated `GET /api/extensions` reports the `running` generation, including active, available, unconsumed, failed, or shadowed state, chain position, execution limits, and collisions.
+- `sbproxy doctor sb.yml --format json` reports a stopped `doctor` snapshot. `active` means the candidate selected and wired the hook after preparing its chain. It does not mean traffic ran or that a runtime health check passed. A hook that loaded but has no attachment is `unconsumed`. `not_evaluated` is reserved for the loader-level fallback when doctor cannot finish candidate construction.
+- Authenticated `GET /api/extensions` reports the `running` generation, including active, available, unconsumed, failed, or shadowed state, chain position, execution limits, and collisions. AI hooks become active with their compiled lifecycle chain. Payment hooks become active after the payment dispatcher installs successfully.
 
 ### 12.9 Context from other extension systems
 

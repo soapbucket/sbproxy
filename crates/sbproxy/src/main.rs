@@ -2357,14 +2357,7 @@ fn handle_doctor_subcommand(args: &DoctorArgs) -> anyhow::Result<i32> {
         match std::fs::read_to_string(&path) {
             Ok(yaml) => {
                 let config_dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-                if let Ok(config) = serde_yaml::from_str::<sbproxy_config::ConfigFile>(&yaml) {
-                    let revision = sbproxy_core::identity::config_revision(yaml.as_bytes());
-                    report = report.with_extension_config(
-                        &config.extensions,
-                        config_dir,
-                        Some(&revision),
-                    );
-                }
+                report = with_doctor_extension_inventory(report, &yaml, config_dir);
                 match extract_serve_and_catalog(&yaml, config_dir) {
                     Ok(Some((serve, catalog))) => {
                         report = report.with_serve_config(&serve, &catalog);
@@ -2434,6 +2427,27 @@ fn handle_doctor_subcommand(args: &DoctorArgs) -> anyhow::Result<i32> {
         }
     }
     Ok(exit)
+}
+
+fn with_doctor_extension_inventory(
+    report: sbproxy_core::doctor::DoctorReport,
+    yaml: &str,
+    config_dir: &std::path::Path,
+) -> sbproxy_core::doctor::DoctorReport {
+    if let Ok(compiled) = sbproxy_config::compile_config(yaml) {
+        if let Ok(candidate) =
+            sbproxy_core::pipeline::CompiledPipeline::from_config_for_validation_at(
+                compiled, config_dir,
+            )
+        {
+            return report.with_extension_candidate(&candidate);
+        }
+    }
+    if let Ok(config) = serde_yaml::from_str::<sbproxy_config::ConfigFile>(yaml) {
+        let revision = sbproxy_core::identity::config_revision(yaml.as_bytes());
+        return report.with_extension_config(&config.extensions, config_dir, Some(&revision));
+    }
+    report
 }
 
 /// Render the `startup gate` block `doctor --strict` appends, one line
@@ -9637,6 +9651,75 @@ mod tests {
 
         assert!(catalog.get("exact").is_some());
         let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[test]
+    fn doctor_extension_inventory_uses_candidate_attachment_scope() {
+        let directory = temp_env_path("doctor-extension-inventory");
+        let _ = std::fs::remove_dir_all(&directory);
+        let bundle = directory.join("bundles").join("doctor-lifecycle");
+        std::fs::create_dir_all(&bundle).expect("create doctor lifecycle bundle");
+        std::fs::write(
+            bundle.join("entry.js"),
+            r#"export function inspect() {
+                return { version: "sbproxy-envelope/v1", decision: "continue" };
+            }
+            export function enforce() {
+                return { version: "sbproxy-envelope/v1", decision: "allow" };
+            }
+"#,
+        )
+        .expect("write doctor lifecycle artifact");
+        std::fs::write(
+            bundle.join("bundle.yaml"),
+            r#"apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: doctor-lifecycle
+version: 1.0.0
+runtime: javascript
+entry: entry.js
+hooks:
+  - kind: ai_guardrail_input
+    type: doctor_guardrail
+    export: inspect
+  - kind: policy
+    type: doctor_unattached_policy
+    export: enforce
+"#,
+        )
+        .expect("write doctor lifecycle manifest");
+        let report = with_doctor_extension_inventory(
+            sbproxy_core::doctor::DoctorReport::collect(),
+            "proxy: {}\nextensions:\n  bundles_dir: bundles\n",
+            &directory,
+        );
+
+        assert_eq!(
+            report.extensions.scope.mode,
+            sbproxy_plugin::ExtensionScopeMode::Doctor
+        );
+        assert_eq!(
+            report
+                .extensions
+                .hooks
+                .iter()
+                .find(|hook| hook.kind == sbproxy_plugin::ExtensionHookKind::AiGuardrailInput)
+                .map(|hook| (hook.id.as_str(), hook.state)),
+            Some((
+                "doctor-lifecycle:ai_guardrail_input:doctor_guardrail",
+                sbproxy_plugin::ExtensionState::Active,
+            ))
+        );
+        assert_eq!(
+            report
+                .extensions
+                .hooks
+                .iter()
+                .find(|hook| hook.kind == sbproxy_plugin::ExtensionHookKind::Policy)
+                .map(|hook| hook.state),
+            Some(sbproxy_plugin::ExtensionState::Unconsumed)
+        );
+        std::fs::remove_dir_all(directory).expect("remove doctor lifecycle fixture");
     }
 
     #[test]

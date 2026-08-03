@@ -167,9 +167,13 @@ sbproxy doctor /etc/sbproxy/sb.yml --format json \
 `validate` performs the startup construction path and exits nonzero for a bad
 source, manifest, digest, JavaScript or TypeScript export, WASM module, config
 schema, or hook collision. `doctor` reports a stopped candidate with
-`scope.mode: "doctor"`; successfully inspected hooks have the `not_evaluated`
-state. Inspect `extensions.summary.failed` in its JSON. An extension finding
-does not, by itself, change the general doctor exit code.
+`scope.mode: "doctor"`. An `active` hook was selected and wired in that
+candidate after its chain prepared successfully. It has not served traffic, and
+doctor is not reporting runtime health. Loaded hooks with no attachment are
+`unconsumed`. A `not_evaluated` hook came from the loader-level fallback because
+doctor could not finish candidate construction. Inspect
+`extensions.summary.failed` in the JSON. An extension finding does not, by
+itself, change the general doctor exit code.
 
 ### Reload and confirm the running generation
 
@@ -189,6 +193,8 @@ curl -fsS -u "oncall:${ONCALL_PASSWORD}" \
 reports the pipeline generation serving traffic. Expect `scope.mode: "running"`
 and the new config revision. `active` means the hook is attached to this
 generation. `available` or `unconsumed` means it loaded but is not attached.
+AI hooks become active when their compiled lifecycle chain attaches. Payment
+hooks stay `unconsumed` until the payment dispatcher installs successfully.
 `failed` and a nonempty `collisions` list need investigation.
 
 For a Git bundle, `bundles[].load.detail` names the redacted repository,

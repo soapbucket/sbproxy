@@ -5545,6 +5545,10 @@ mod tests {
         assert_eq!(content_type, "application/json");
         let snapshot: serde_json::Value =
             serde_json::from_str(&body).expect("extension inventory must be JSON");
+        let current = crate::reload::current_pipeline();
+        let authoritative = serde_json::to_value(&current.extension_inventory)
+            .expect("pipeline inventory must serialize");
+        assert_eq!(snapshot, authoritative);
         assert_eq!(
             snapshot["schema_version"],
             sbproxy_plugin::EXTENSION_INVENTORY_SCHEMA_VERSION

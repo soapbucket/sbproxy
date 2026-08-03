@@ -734,7 +734,7 @@ Registration sources are `link_time`, `directory`, or `git`. Runtimes are
 | `unconsumed` | Loaded successfully but not attached by this config. |
 | `failed` | Load, validation, initialization, or unresolved collision failed. |
 | `shadowed` | A higher-precedence registration won a resolved collision. |
-| `not_evaluated` | Used by doctor snapshots only. |
+| `not_evaluated` | Used by the loader-level doctor fallback when candidate attachment could not be evaluated. |
 
 The response deliberately omits executable bytes, artifact digests, source
 paths, hook attachment config, and secrets. A Git bundle's bounded
@@ -753,8 +753,11 @@ only.
 
 For preflight, run `sbproxy doctor <config> --format json` and inspect its
 top-level `extensions` field. That snapshot has `scope.mode: "doctor"` and
-marks successfully inspected hooks `not_evaluated`, because doctor does not
-start or attach a pipeline. See the
+uses `active` for hooks selected and wired in the successfully compiled stopped
+candidate. This state does not claim traffic execution, runtime health, or a
+published generation. Loaded hooks without an attachment are `unconsumed`.
+`not_evaluated` means doctor fell back to loader-level inspection because full
+candidate construction did not finish. See the
 [extension bundle runbook](operator-runbook.md#extension-bundles).
 
 ### `GET /api/openapi.json`, `GET /api/openapi.yaml`

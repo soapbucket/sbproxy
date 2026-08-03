@@ -693,13 +693,16 @@ pub enum ExtensionState {
     Installed,
     /// Loaded and available for attachment.
     Available,
-    /// Attached to the running pipeline generation.
+    /// Selected and wired in the snapshot's pipeline perspective.
+    ///
+    /// In a doctor snapshot, this is a stopped candidate attachment. In a
+    /// running snapshot, it is attached to the serving generation.
     Active,
     /// Failed to load, validate, or initialize.
     Failed,
     /// Hidden by a higher-precedence registration.
     Shadowed,
-    /// Discovered by doctor without a running-generation evaluation.
+    /// Discovered by doctor before candidate attachment could be evaluated.
     NotEvaluated,
     /// Loaded successfully but not attached by the configuration.
     Unconsumed,
@@ -709,9 +712,9 @@ pub enum ExtensionState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExtensionScopeMode {
-    /// Snapshot of the active pipeline generation.
+    /// Snapshot of the pipeline generation serving traffic.
     Running,
-    /// Diagnostic snapshot produced by doctor.
+    /// Snapshot of a stopped candidate or a loader-level doctor diagnostic.
     Doctor,
 }
 

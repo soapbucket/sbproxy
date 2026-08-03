@@ -558,12 +558,12 @@ impl DoctorReport {
         }
     }
 
-    /// Load and validate the extension bundles named by an inspected config.
+    /// Load extension bundles for a safe diagnostic when candidate construction fails.
     ///
-    /// The resulting snapshot records known validation failures, but leaves
-    /// successful lifecycle state as `not_evaluated` because doctor does not
-    /// publish or run a pipeline generation. This diagnostic does not alter
-    /// the existing doctor exit-code rules.
+    /// This loader-level fallback cannot prove pipeline attachment, so
+    /// successful hooks remain `not_evaluated`. Prefer
+    /// [`Self::with_extension_candidate`] after a validation pipeline compiles.
+    /// This diagnostic does not alter the existing doctor exit-code rules.
     pub fn with_extension_config(
         mut self,
         config: &sbproxy_config::ExtensionBundlesConfig,
@@ -572,6 +572,25 @@ impl DoctorReport {
     ) -> Self {
         self.extensions =
             crate::extension_inventory::doctor_inventory(Some(config), base_dir, config_revision);
+        self
+    }
+
+    /// Use the attachment inventory owned by a successfully compiled candidate.
+    ///
+    /// Candidate `active` means the stopped candidate selected and wired the
+    /// hook. It makes no claim about live traffic, runtime health, or a
+    /// published generation.
+    #[must_use]
+    pub fn with_extension_candidate(
+        mut self,
+        candidate: &crate::pipeline::CompiledPipeline,
+    ) -> Self {
+        debug_assert_eq!(
+            candidate.extension_inventory.scope.mode,
+            sbproxy_plugin::ExtensionScopeMode::Doctor,
+            "doctor must consume a validation candidate inventory"
+        );
+        self.extensions = candidate.extension_inventory.clone();
         self
     }
 
@@ -1982,7 +2001,7 @@ mod tests {
     }
 
     #[test]
-    fn doctor_extensions_validates_configured_bundles_without_calling_them_active() {
+    fn doctor_extensions_use_the_compiled_candidate_attachment_inventory() {
         let directory = tempfile::TempDir::new().expect("temporary extension directory");
         let bundle = directory.path().join("bundles").join("doctor-fixture");
         std::fs::create_dir_all(&bundle).expect("create bundle directory");
@@ -2006,15 +2025,29 @@ hooks:
 "#,
         )
         .expect("write bundle manifest");
-        let config = sbproxy_config::ExtensionBundlesConfig {
-            bundles_dir: Some("bundles".to_owned()),
-            sources: Vec::new(),
-        };
+        let config = sbproxy_config::compile_config(
+            r#"proxy: {}
+extensions:
+  bundles_dir: bundles
+origins:
+  doctor.test:
+    action:
+      type: static
+      body: ok
+    policies:
+      - type: doctor_fixture
+"#,
+        )
+        .expect("compile doctor candidate config");
+        let candidate = crate::pipeline::CompiledPipeline::from_config_for_validation_at(
+            config,
+            directory.path(),
+        )
+        .expect("construct stopped doctor candidate");
 
         let before = DoctorReport::collect();
         let exit_code = before.exit_code();
-        let report =
-            before.with_extension_config(&config, directory.path(), Some("doctor-revision"));
+        let report = before.with_extension_candidate(&candidate);
 
         assert_eq!(report.exit_code(), exit_code);
         let bundle = report
@@ -2029,12 +2062,16 @@ hooks:
             .iter()
             .find(|hook| hook.match_key == "doctor_fixture")
             .expect("configured hook must be reported");
-        assert_eq!(bundle.state, sbproxy_plugin::ExtensionState::NotEvaluated);
-        assert_eq!(hook.state, sbproxy_plugin::ExtensionState::NotEvaluated);
-        assert_eq!(report.extensions.summary.active, 0);
+        assert_eq!(
+            report.extensions.scope.mode,
+            sbproxy_plugin::ExtensionScopeMode::Doctor
+        );
+        assert_eq!(bundle.state, sbproxy_plugin::ExtensionState::Active);
+        assert_eq!(hook.state, sbproxy_plugin::ExtensionState::Active);
+        assert_eq!(report.extensions.summary.active, 1);
         assert_eq!(
             report.extensions.scope.config_revision.as_deref(),
-            Some("doctor-revision")
+            Some(candidate.config_revision.as_str())
         );
         assert_eq!(bundle.load.status, "validated");
     }
