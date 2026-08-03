@@ -29,11 +29,27 @@ use std::time::Duration;
 
 use sbproxy_e2e::ProxyHarness;
 
-/// A payment hash the stub node reports, as 64 lowercase hex chars.
-const PAYMENT_HASH: &str = "1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f";
+/// A syntactically valid regtest BOLT 11 prefix (bech32 charset).
+const BOLT11_PREFIX: &str = "lnbcrt100u1stubinvoice";
 
-/// A syntactically valid regtest BOLT 11 string (prefix + bech32 chars).
-const BOLT11: &str = "lnbcrt100u1stubinvoicestubinvoicestubinvoice";
+/// Mint a fresh payment hash, as 64 lowercase hex chars.
+///
+/// A real node never reuses one, and this stub must not either: the
+/// settlement store holds a unique index on a receipt's provider
+/// reference, which is what stops one provider payment being credited as
+/// two settlements. A constant hash settles the first intent in a store
+/// and then strands every later one in `needs_reconciliation` with an
+/// internal error. Every test here used to start a fresh store and
+/// settle once, so a constant was invisible until
+/// `two_settlements_in_one_store_each_get_their_own_receipt` ran.
+fn mint_payment_hash() -> String {
+    // Unique across every invoice in the whole test binary, not merely
+    // within one node: these tests run concurrently, and a per-node
+    // counter restarting at 1 would hand two of them the same hash.
+    static MINTED: AtomicUsize = AtomicUsize::new(0);
+    let nth = MINTED.fetch_add(1, Ordering::Relaxed) + 1;
+    format!("{nth:064x}")
+}
 
 /// What the stub Core Lightning node knows about its one invoice.
 #[derive(Default)]
@@ -44,6 +60,11 @@ struct NodeState {
     amount_msat: Option<u64>,
     /// Whether the payer settled it.
     paid: bool,
+    /// This invoice's payment hash, minted when it was created. A real
+    /// node never reuses one; see [`mint_payment_hash`].
+    payment_hash: Option<String>,
+    /// This invoice's BOLT 11 string, carrying the hash above.
+    bolt11: Option<String>,
 }
 
 /// A stub Core Lightning node on a Unix socket.
@@ -149,9 +170,16 @@ fn respond(
             node.amount_msat = params
                 .get("amount_msat")
                 .and_then(serde_json::Value::as_u64);
+            // A fresh invoice is unpaid. Without this a second invoice
+            // inherits the first one's `paid`, so it is born settled.
+            node.paid = false;
+            let payment_hash = mint_payment_hash();
+            let bolt11 = format!("{BOLT11_PREFIX}{payment_hash}");
+            node.payment_hash = Some(payment_hash.clone());
+            node.bolt11 = Some(bolt11.clone());
             serde_json::json!({
-                "payment_hash": PAYMENT_HASH,
-                "bolt11": BOLT11,
+                "payment_hash": payment_hash,
+                "bolt11": bolt11,
             })
         }
         "listinvoices" => {
@@ -167,10 +195,10 @@ fn respond(
             serde_json::json!({"invoices": [{
                 "label": requested,
                 "status": if node.paid { "paid" } else { "unpaid" },
-                "payment_hash": PAYMENT_HASH,
+                "payment_hash": node.payment_hash.clone().unwrap_or_default(),
                 "amount_msat": amount,
                 "amount_received_msat": if node.paid { amount } else { 0 },
-                "bolt11": BOLT11,
+                "bolt11": node.bolt11.clone().unwrap_or_default(),
             }]})
         }
         _ => serde_json::json!({}),
@@ -348,7 +376,10 @@ fn challenge_settle_allow_and_replay_refusal() {
         .expect("the 402 carries the quote token")
         .clone();
     let body = String::from_utf8(challenge.body.clone()).expect("402 body is UTF-8");
-    assert!(body.contains(BOLT11), "the 402 carries the invoice: {body}");
+    assert!(
+        body.contains(BOLT11_PREFIX),
+        "the 402 carries the invoice: {body}"
+    );
     assert!(
         body.contains("\"rail\":\"lightning\""),
         "the 402 names the rail: {body}"
@@ -614,4 +645,86 @@ fn a_reader_is_never_challenged() {
         .expect("reader request");
     assert_eq!(reader.status, 200, "a reader passes without payment");
     assert_eq!(stack.origin.hits(), 1);
+}
+
+/// Two full settlements in one store must each get their own receipt.
+///
+/// The store holds a unique index on a receipt's provider reference,
+/// which is what stops one provider payment being credited as two
+/// settlements. Nothing here exercised it: every other test starts a
+/// fresh store and settles once, so a stub node that reused a payment
+/// hash looked fine. It was not fine. The second settlement failed the
+/// receipt insert, the worker logged `could not record a reconciliation
+/// outcome category=internal`, and the intent sat in
+/// `needs_reconciliation` forever while the invoice was paid. A reader
+/// running the shipped walkthrough twice hit it on their second run.
+#[test]
+fn two_settlements_in_one_store_each_get_their_own_receipt() {
+    let stack = start_stack().expect("start settlement stack");
+
+    for round in 1..=2 {
+        let challenge = stack
+            .harness
+            .get_with_headers("/article", "blog.localhost", &[CRAWLER_UA])
+            .expect("challenge request");
+        assert_eq!(
+            challenge.status, 402,
+            "round {round}: an unpaid crawler is challenged. A 503 here means \
+             the previous round left an intent unresolved"
+        );
+        let token = challenge
+            .headers
+            .get("crawler-payment")
+            .expect("the 402 carries the quote token")
+            .clone();
+
+        stack.node.pay_invoice();
+
+        // The rail settles inline once the invoice is paid, so this needs
+        // no worker sweep. Poll only to absorb scheduling jitter.
+        let mut allowed = None;
+        for _ in 0..100 {
+            let response = stack
+                .harness
+                .get_with_headers(
+                    "/article",
+                    "blog.localhost",
+                    &[CRAWLER_UA, ("crawler-payment", token.as_str())],
+                )
+                .expect("paid retry");
+            if response.status == 200 {
+                allowed = Some(response);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            allowed.is_some(),
+            "round {round}: a paid quote must reach the origin. Stuck at 503 \
+             means the receipt insert failed and the intent is stranded"
+        );
+        assert_eq!(
+            stack.origin.hits(),
+            round,
+            "round {round}: one settled payment serves the article exactly once"
+        );
+    }
+
+    let metrics = stack
+        .harness
+        .get("/metrics", "blog.localhost")
+        .expect("GET /metrics")
+        .text()
+        .expect("metrics body is UTF-8");
+    // Two prepared challenges and two successful redeems, not one of
+    // each replayed: the receipt for the second settlement has to exist
+    // for its redeem to count.
+    assert!(
+        (settlement_total(&metrics, "redeem", "succeeded") - 2.0).abs() < f64::EPSILON,
+        "both settlements are counted: {metrics}"
+    );
+    assert!(
+        (settlement_total(&metrics, "challenge", "prepared") - 2.0).abs() < f64::EPSILON,
+        "each round is billed exactly once: {metrics}"
+    );
 }

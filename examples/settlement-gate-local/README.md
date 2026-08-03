@@ -46,6 +46,14 @@ bash examples/settlement-gate-local/bin/settle-once.sh
 
 <!-- CAPTURE: bash examples/settlement-gate-local/bin/settle-once.sh -->
 
+```text
+1 challenge, unpaid crawler   status=402 origin_hits=0
+2 retry before payment        status=503 origin_hits=0
+3 retry after payment         status=200 origin_hits=1
+4 replay of the settled quote status=402 origin_hits=1
+5 reader, never challenged    status=200 origin_hits=2
+```
+
 Step 3 retries in a loop instead of asking once, and the reason is worth reading before you write a crawler against this. Step 2 retried before the invoice was paid, which is ordinary client behavior and is also what leaves the intent in `needs_reconciliation`: the rail verified the payment and did not settle it. From there the request path never tries again, because a second attempt is how a payer gets charged twice, so paying the invoice does not on its own get the crawler in. The recovery worker clears it on its next sweep, `worker.reconcile_interval_ms` apart and 1000 ms in this config, and the retry after that reaches the origin. That is what the 503's `Retry-After: 2` is asking a client to do.
 
 The loop is bounded at 100 attempts 0.2s apart, which is twenty times the sweep interval. Running out is a failure and says so, printing the intent's durable status, because a walkthrough that prints a 503 where a 200 belongs teaches the wrong thing quietly. Every status the script prints is asserted for the same reason. `SETTLE_ATTEMPTS` and `SETTLE_INTERVAL` move the bound if you raise `reconcile_interval_ms`.
@@ -61,6 +69,10 @@ curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: blog.local' \
 
 <!-- CAPTURE: curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: blog.local' -H 'User-Agent: Mozilla/5.0' http://127.0.0.1:8080/article -->
 
+```text
+200
+```
+
 A declared crawler is priced. The policy denies with a 402, the gate intercepts it before it is written, commits a `Pending` intent, asks the node for an invoice, and renders the challenge. The signed quote token rides the header the policy configured, and the `challenge` object carries the BOLT 11 invoice the payer settles:
 
 ```bash
@@ -70,6 +82,17 @@ curl -is -H 'Host: blog.local' -H 'User-Agent: GPTBot/1.0' \
 
 <!-- CAPTURE: curl -is -H 'Host: blog.local' -H 'User-Agent: GPTBot/1.0' http://127.0.0.1:8080/article -->
 
+```text
+HTTP/1.1 402 Payment Required
+content-type: application/json
+crawler-payment: eyJhbGciOiJFZERTQSIsInR5cCI6InNicHJveHktcXVvdGUrandzIiwia2lkIjoic2Jwcm94eS1wYXltZW50cyJ9.eyJpc3MiOiJzYnByb3h5LXBheW1lbnRzIiwic3ViIjoiX19kZWZhdWx0X18iLCJhdWQiOiJsZWRnZXIiLCJpYXQiOjE3ODU3OTQ2MTUsImV4cCI6MTc4NTc5NDkxNSwibm9uY2UiOiJyZXFfMDFrejR0ZW5xNzJhOXkzNnlqaHMwajZjY3oiLCJxdW90ZV9pZCI6InF1b3RlXzAxa3o0dGVucTcyYTl5MzZ5amhzMGo2Y2N6Iiwicm91dGUiOiIvYXJ0aWNsZSIsInNoYXBlIjoicGF5bWVudC1yZXF1aXJlbWVudCIsInByaWNlIjp7ImFtb3VudF9taWNyb3MiOjEwMCwiY3VycmVuY3kiOiJCVEMifSwicmFpbCI6ImxpZ2h0bmluZyIsInJlcXVpcmVtZW50X2lkIjoicmVxXzAxa3o0dGVucTcyYTl5MzZ5amhzMGo2Y2N6IiwiZHJhZnRfZGlnZXN0IjoiX2FYSkVkYmtZcFM0UVlzb09nLUdNT3BrcW1kbzhXYndBSGlCanJwWWRqZyIsInJlcXVpcmVtZW50X2RpZ2VzdCI6Im1vUXY0WldRVUlzZVVUWFFPOEJvR05mZkdHcTg4ZXl4WEZaODBadFZWaHcifQ.bCzYFCGteQF5cT6sV3pcjJxA9hY27uDJyj72eKy8uoYQrTPW-jmoDTZr_WKM8ew-0-XmiluHDiAjM3oeBJT3Ag
+content-length: 448
+Date: Mon, 03 Aug 2026 22:03:35 GMT
+Connection: keep-alive
+
+{"amount_micros":100,"challenge":{"bolt11":"lnbcrt100u1stubinvoicestubinvoicestubinvoice","label":"sbproxy-invoice-sbpi_ppFV2kS5oWRd-WqoDUGQ-3ROCgyXYjARyFOiq2pcQ6Y","payment_hash":"1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f"},"currency":"BTC","error":"payment_required","expires_at_ms":1785794915015,"header":"crawler-payment","rail":"lightning","requirement_id":"req_01kz4tenq72a9y36yjhs0j6ccz","target":"blog.local/article"}
+```
+
 Retrying before the invoice is paid is the case the gate exists for. The quote token authenticates and names a live intent, so this is not a refusal; it is verified-but-not-settled, which is a 503 with `Retry-After` and never origin access. It is also what strands the intent in `needs_reconciliation` until the worker sweeps, so run this and the crawler's next successful request is one sweep away rather than immediate:
 
 ```bash
@@ -77,6 +100,17 @@ TOKEN=$(curl -sS -D - -o /dev/null -H 'Host: blog.local' -H 'User-Agent: GPTBot/
 ```
 
 <!-- CAPTURE: TOKEN=$(curl -sS -D - -o /dev/null -H 'Host: blog.local' -H 'User-Agent: GPTBot/1.0' http://127.0.0.1:8080/article | tr -d '\r' | awk '/^crawler-payment:/ {print $2}'); curl -is -H 'Host: blog.local' -H 'User-Agent: GPTBot/1.0' -H "crawler-payment: $TOKEN" http://127.0.0.1:8080/article -->
+
+```text
+HTTP/1.1 503 Service Unavailable
+content-type: application/json
+Retry-After: 2
+content-length: 58
+Date: Mon, 03 Aug 2026 22:03:35 GMT
+Connection: keep-alive
+
+{"error":"settlement_unavailable","retry_after_seconds":2}
+```
 
 A client that asks for a rail this route does not advertise gets a 406 naming what it could have asked for, rather than a challenge it cannot pay:
 
@@ -86,6 +120,16 @@ curl -is -H 'Host: blog.local' -H 'User-Agent: GPTBot/1.0' \
 ```
 
 <!-- CAPTURE: curl -is -H 'Host: blog.local' -H 'User-Agent: GPTBot/1.0' -H 'Accept-Payment: x402' http://127.0.0.1:8080/article -->
+
+```text
+HTTP/1.1 406 Not Acceptable
+content-type: application/json
+content-length: 189
+Date: Mon, 03 Aug 2026 22:03:35 GMT
+Connection: keep-alive
+
+{"error":"no_acceptable_rail","message":"Accept-Payment does not overlap with the settlement rails configured for this route.","supported_rails":["lightning"],"target":"blog.local/article"}
+```
 
 ## What is left behind
 
@@ -98,12 +142,22 @@ sqlite3 /tmp/sbproxy-settlement/payments.sqlite3 \
 
 <!-- CAPTURE: sqlite3 /tmp/sbproxy-settlement/payments.sqlite3 'select status, settlement_rail, amount_micros, currency from payment_intents order by created_at_ms' -->
 
+```text
+succeeded|lightning_cln|100|BTC
+pending|lightning_cln|100|BTC
+needs_reconciliation|lightning_cln|100|BTC
+```
+
 ```bash
 sqlite3 /tmp/sbproxy-settlement/payments.sqlite3 \
   'select rail, method, provider_reference from payment_receipts'
 ```
 
 <!-- CAPTURE: sqlite3 /tmp/sbproxy-settlement/payments.sqlite3 'select rail, method, provider_reference from payment_receipts' -->
+
+```text
+lightning_cln|lightning|1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f
+```
 
 The admin surface reports which rails registered and what the recovery worker has done. It deliberately carries no intent id, tenant, amount, or provider reference:
 
@@ -113,6 +167,10 @@ curl -s -u admin:demo-change-me http://127.0.0.1:9090/admin/payments/status
 
 <!-- CAPTURE: curl -s -u admin:demo-change-me http://127.0.0.1:9090/admin/payments/status -->
 
+```text
+{"configured":true,"rails":["lightning_cln"],"schema_version":1,"worker":{"challenges_expired":0,"clean_shutdown":false,"leases_moved_to_needs_reconciliation":0,"leases_returned_to_retry_wait":0,"reconciliations_succeeded":1,"reconciliations_unresolved":0,"ticks":2}}
+```
+
 The metrics carry four labels and no more: `rail`, `operation`, `outcome`, and `provider_class`.
 
 ```bash
@@ -120,6 +178,16 @@ curl -s http://127.0.0.1:8080/metrics | grep sbproxy_payment_settlement_total
 ```
 
 <!-- CAPTURE: curl -s http://127.0.0.1:8080/metrics | grep sbproxy_payment_settlement_total -->
+
+```text
+# HELP sbproxy_payment_settlement_total Payment settlement transitions, by rail, deciding step, and outcome
+# TYPE sbproxy_payment_settlement_total counter
+sbproxy_payment_settlement_total{operation="challenge",outcome="no_acceptable_rail",rail="none"} 1
+sbproxy_payment_settlement_total{operation="challenge",outcome="prepared",rail="lightning_cln"} 3
+sbproxy_payment_settlement_total{operation="redeem",outcome="proof_replayed",rail="lightning_cln"} 1
+sbproxy_payment_settlement_total{operation="redeem",outcome="succeeded",rail="lightning_cln"} 1
+sbproxy_payment_settlement_total{operation="redeem",outcome="unavailable",rail="lightning_cln"} 6
+```
 
 ## Validate without holding anything
 
@@ -130,6 +198,10 @@ sbproxy validate -f examples/settlement-gate-local/sb.yml
 ```
 
 <!-- CAPTURE: sbproxy validate -f examples/settlement-gate-local/sb.yml -->
+
+```text
+ok: examples/settlement-gate-local/sb.yml is a valid sbproxy config
+```
 
 ## What this example does not show
 

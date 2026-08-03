@@ -49,12 +49,25 @@ SAFE_LOG_CHARACTERS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:/-"
 )
 
-# A payment hash the stub node reports, as 64 lowercase hex characters,
-# and a syntactically valid regtest BOLT 11 string. The adapter checks
-# the prefix and the character set, never the signature, so a fixed
-# pair keeps the demo deterministic.
-PAYMENT_HASH = "1f" * 32
-BOLT11 = "lnbcrt100u1stubinvoicestubinvoicestubinvoice"
+# A syntactically valid regtest BOLT 11 prefix. The adapter checks the
+# prefix and the character set, never the signature.
+BOLT11_PREFIX = "lnbcrt100u1stubinvoice"
+
+
+def mint_payment_hash():
+    """A fresh payment hash per invoice, as 64 lowercase hex characters.
+
+    A real node never reuses one, and neither can this stub: the
+    settlement store holds a unique index on a receipt's provider
+    reference, which is what stops one provider payment being credited
+    as two settlements. A constant hash here therefore settled once and
+    then failed every later settlement in the same state file with an
+    internal error, stranding the intent in `needs_reconciliation`
+    forever. It looked like a proxy bug and was this fixture standing in
+    for a node badly. Every e2e test starts a fresh store and settles
+    once, so nothing caught it.
+    """
+    return secrets.token_bytes(32).hex()
 
 # The version the adapter probes for at startup. Below the configured
 # `minimum_version` the proxy refuses to serve the rail.
@@ -78,12 +91,17 @@ class NodeState:
         self.amount_msat = None
         self.paid = False
         self.hits = 0
+        self.payment_hash = None
+        self.bolt11 = None
 
     def record_invoice(self, label, amount_msat):
         with self.lock:
             self.label = label
             self.amount_msat = amount_msat
             self.paid = False
+            self.payment_hash = mint_payment_hash()
+            self.bolt11 = f"{BOLT11_PREFIX}{self.payment_hash}"
+            return self.payment_hash, self.bolt11
 
     def mark_paid(self):
         with self.lock:
@@ -95,10 +113,18 @@ class NodeState:
             self.amount_msat = None
             self.paid = False
             self.hits = 0
+            self.payment_hash = None
+            self.bolt11 = None
 
     def snapshot(self):
         with self.lock:
-            return self.label, self.amount_msat, self.paid
+            return (
+                self.label,
+                self.amount_msat,
+                self.paid,
+                self.payment_hash,
+                self.bolt11,
+            )
 
     def count_hit(self):
         with self.lock:
@@ -122,17 +148,18 @@ def rpc_response(state, method, params):
     if method == "invoice":
         label = params.get("label")
         amount_msat = params.get("amount_msat")
-        state.record_invoice(label, amount_msat)
+        payment_hash, bolt11 = state.record_invoice(label, amount_msat)
         print(
             f"cln method=invoice label={safe_log_value(label, 80)} "
-            f"amount_msat={safe_log_value(amount_msat, 24)}",
+            f"amount_msat={safe_log_value(amount_msat, 24)} "
+            f"payment_hash={safe_log_value(payment_hash, 64)}",
             flush=True,
         )
-        return {"payment_hash": PAYMENT_HASH, "bolt11": BOLT11}
+        return {"payment_hash": payment_hash, "bolt11": bolt11}
 
     if method == "listinvoices":
         requested = params.get("label", "")
-        label, amount_msat, paid = state.snapshot()
+        label, amount_msat, paid, payment_hash, bolt11 = state.snapshot()
         if label != requested:
             return {"invoices": []}
         amount = amount_msat or 0
@@ -146,10 +173,10 @@ def rpc_response(state, method, params):
                 {
                     "label": requested,
                     "status": "paid" if paid else "unpaid",
-                    "payment_hash": PAYMENT_HASH,
+                    "payment_hash": payment_hash,
                     "amount_msat": amount,
                     "amount_received_msat": amount if paid else 0,
-                    "bolt11": BOLT11,
+                    "bolt11": bolt11,
                 }
             ]
         }
@@ -289,8 +316,18 @@ def self_test():
     state = NodeState()
     assert rpc_response(state, "getinfo", {}) == {"version": NODE_VERSION}
     invoice = rpc_response(state, "invoice", {"label": "abc", "amount_msat": 1000})
-    assert invoice["bolt11"] == BOLT11
-    assert invoice["payment_hash"] == PAYMENT_HASH
+    assert invoice["bolt11"].startswith(BOLT11_PREFIX)
+    assert len(invoice["payment_hash"]) == 64
+    assert set(invoice["payment_hash"]) <= set("0123456789abcdef")
+
+    # Two invoices must never share a payment hash. The settlement store
+    # keys a receipt's provider reference uniquely, so a repeat would
+    # settle once and then strand every later intent.
+    second = rpc_response(state, "invoice", {"label": "def", "amount_msat": 1000})
+    assert second["payment_hash"] != invoice["payment_hash"]
+    assert second["bolt11"] != invoice["bolt11"]
+    # Re-record the label the rest of this self-test reads.
+    invoice = rpc_response(state, "invoice", {"label": "abc", "amount_msat": 1000})
     unknown = rpc_response(state, "listinvoices", {"label": "other"})
     assert unknown == {"invoices": []}
     unpaid = rpc_response(state, "listinvoices", {"label": "abc"})

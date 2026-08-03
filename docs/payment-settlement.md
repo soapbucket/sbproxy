@@ -248,11 +248,36 @@ no TLS and no reachable host. x402, Payment HTTP Authentication, direct
 Stripe, and LND each require an HTTPS endpoint, and no configuration
 relaxes that, so their bodies are not reproduced here.
 
+Each block below comes from its own fresh stack, and running them back to
+back against one stack does not reproduce them. The second one strands an
+intent and never pays it, and an unresolved intent withholds new
+challenges for that route, which is the rule two sections up. So the
+request after it answers 503 where the first block shows a 402, and that
+is the documented behavior rather than a broken example. Restart the
+fixture and the proxy between blocks to reproduce each one.
+
+The walkthrough script at the end of this section is the exception, and it
+is repeatable against one stack: it pays the invoice it strands, so its
+intent reaches a terminal state instead of sitting unresolved. `/__reset`
+on the fixture zeroes the invoice and the hit counter, not the proxy's
+intent store, so that is what makes the difference rather than the reset.
+
 The challenge. The policy prices the request, the gate commits a
 `Pending` intent before anything leaves the proxy, and the signed quote
 token rides the header the policy configured:
 
 <!-- CAPTURE: curl -is -H 'Host: blog.local' -H 'User-Agent: GPTBot/1.0' http://127.0.0.1:8080/article -->
+
+```text
+HTTP/1.1 402 Payment Required
+content-type: application/json
+crawler-payment: eyJhbGciOiJFZERTQSIsInR5cCI6InNicHJveHktcXVvdGUrandzIiwia2lkIjoic2Jwcm94eS1wYXltZW50cyJ9.eyJpc3MiOiJzYnByb3h5LXBheW1lbnRzIiwic3ViIjoiX19kZWZhdWx0X18iLCJhdWQiOiJsZWRnZXIiLCJpYXQiOjE3ODU3OTQ4NzksImV4cCI6MTc4NTc5NTE3OSwibm9uY2UiOiJyZXFfMDFrejR0cHJmdDBwZjYyYmszZHJkNzl0cG4iLCJxdW90ZV9pZCI6InF1b3RlXzAxa3o0dHByZnQwcGY2MmJrM2RyZDc5dHBuIiwicm91dGUiOiIvYXJ0aWNsZSIsInNoYXBlIjoicGF5bWVudC1yZXF1aXJlbWVudCIsInByaWNlIjp7ImFtb3VudF9taWNyb3MiOjEwMCwiY3VycmVuY3kiOiJCVEMifSwicmFpbCI6ImxpZ2h0bmluZyIsInJlcXVpcmVtZW50X2lkIjoicmVxXzAxa3o0dHByZnQwcGY2MmJrM2RyZDc5dHBuIiwiZHJhZnRfZGlnZXN0IjoibG13ajVDYjE3bVhkLTFuSHdTX2x4bS12d3VCUk8zTVhzd3RkeEkxc0N5TSIsInJlcXVpcmVtZW50X2RpZ2VzdCI6IkczTE1BWW51LVI2aE9zUk55U2dLdGdwTE1jYTRnRWNUYm9FRG1QTHBzNkkifQ.WAHMWK0keVNhIzPFhKsKYB8IGAtK9wrMfWiSF-IcrCc3P6jYJRwQT3UF3DhcKSM89i27KvicPVKK7xZfn1WcBw
+content-length: 490
+Date: Mon, 03 Aug 2026 22:07:59 GMT
+Connection: keep-alive
+
+{"amount_micros":100,"challenge":{"bolt11":"lnbcrt100u1stubinvoiceda627526f303639efa30246f0a15d59c4b463f2b6d2ed318d0f413f641ffe30a","label":"sbproxy-invoice-sbpi_VToGEr88GCbwAYpkLNQj9ld9tG2CBOs6-yRsutLntTk","payment_hash":"da627526f303639efa30246f0a15d59c4b463f2b6d2ed318d0f413f641ffe30a"},"currency":"BTC","error":"payment_required","expires_at_ms":1785795179994,"header":"crawler-payment","rail":"lightning","requirement_id":"req_01kz4tprft0pf62bk3drd79tpn","target":"blog.local/article"}
+```
 
 The retry before the payment settles. The token authenticates and names a
 live intent, so this is not a refusal. It is the 503 case, and it is the
@@ -262,11 +287,32 @@ loop rather than asking once:
 
 <!-- CAPTURE: TOKEN=$(curl -sS -D - -o /dev/null -H 'Host: blog.local' -H 'User-Agent: GPTBot/1.0' http://127.0.0.1:8080/article | tr -d '\r' | awk '/^crawler-payment:/ {print $2}'); curl -is -H 'Host: blog.local' -H 'User-Agent: GPTBot/1.0' -H "crawler-payment: $TOKEN" http://127.0.0.1:8080/article -->
 
+```text
+HTTP/1.1 503 Service Unavailable
+content-type: application/json
+Retry-After: 2
+content-length: 58
+Date: Mon, 03 Aug 2026 22:08:05 GMT
+Connection: keep-alive
+
+{"error":"settlement_unavailable","retry_after_seconds":2}
+```
+
 A preference list that overlaps no configured rail. The client is told
 what it could have asked for instead of being handed a challenge it
 cannot pay:
 
 <!-- CAPTURE: curl -is -H 'Host: blog.local' -H 'User-Agent: GPTBot/1.0' -H 'Accept-Payment: x402' http://127.0.0.1:8080/article -->
+
+```text
+HTTP/1.1 406 Not Acceptable
+content-type: application/json
+content-length: 189
+Date: Mon, 03 Aug 2026 22:08:10 GMT
+Connection: keep-alive
+
+{"error":"no_acceptable_rail","message":"Accept-Payment does not overlap with the settlement rails configured for this route.","supported_rails":["lightning"],"target":"blog.local/article"}
+```
 
 The whole sequence, with the origin's own hit counter after each step,
 because that counter is what proves one settled payment served the
@@ -278,6 +324,14 @@ fails with the durable intent status rather than reporting a 503 as
 though it were the answer:
 
 <!-- CAPTURE: bash examples/settlement-gate-local/bin/settle-once.sh -->
+
+```text
+1 challenge, unpaid crawler   status=402 origin_hits=0
+2 retry before payment        status=503 origin_hits=0
+3 retry after payment         status=200 origin_hits=1
+4 replay of the settled quote status=402 origin_hits=1
+5 reader, never challenged    status=200 origin_hits=2
+```
 
 The x402 `PaymentRequired` body, the `WWW-Authenticate: Payment` field,
 and the `application/problem+json` refusal are specified byte for byte in
@@ -672,6 +726,12 @@ call to it:
 
 <!-- CAPTURE: bash examples/usage-bridge-queue/bin/bill-one-call.sh -->
 
+```text
+minted a governed key naming customer=cus_demo_usage_bridge
+chat completion               status=200
+rows on the usage queue       1
+```
+
 The queue then holds one row per billable unit. `usage_reports` has no
 `quantity` column: the number is a field of the serialized event in
 `event_jcs`, so the row cannot disagree with what the worker actually
@@ -679,16 +739,30 @@ sends. `json_extract` reads it back out.
 
 <!-- CAPTURE: sqlite3 /tmp/sbproxy-usage-bridge/payments.sqlite3 "select reporter, usage_identifier, tenant_id, origin_id, status, failure_category, json_extract(event_jcs, '\$.quantity') as quantity from usage_reports order by created_at_ms" -->
 
+```text
+stripe_meter|sbu-019fc9ac14d77c538ca5e1a16134c1a1-297ee8d903db676df220fbad9f96916f|tenant-a|billing.local|terminal|rejected|1020
+```
+
 The full event the worker will hand the reporter, including the resource
 attribution and the customer the charge lands on:
 
 <!-- CAPTURE: sqlite3 /tmp/sbproxy-usage-bridge/payments.sqlite3 'select event_jcs from usage_reports order by created_at_ms limit 1' -->
+
+```text
+{"attributes":{"claim_id":"019fc9ac14d77c538ca5e1a16134c1a1","resource_name":"openai/gpt-4o-mini","resource_type":"ai_model","stripe_customer_id":"cus_demo_usage_bridge","unit":"total_tokens"},"event_name":"sbproxy_ai_tokens","occurred_at_ms":1785794925828,"origin_id":"billing.local","quantity":1020,"reporter":"stripe_meter","tenant_id":"tenant-a","usage_identifier":"sbu-019fc9ac14d77c538ca5e1a16134c1a1-297ee8d903db676df220fbad9f96916f"}
+```
 
 Two counters describe the bridge, both labeled by tenant because a billing
 number that merged every tenant into one series answers a question nobody
 asks:
 
 <!-- CAPTURE: curl -s http://127.0.0.1:8080/metrics | grep sbproxy_usage_bridge -->
+
+```text
+# HELP sbproxy_usage_bridge_enqueued_total Billable units the request path queued for a usage reporter, by tenant, reporter, resource type, and whether the row was new
+# TYPE sbproxy_usage_bridge_enqueued_total counter
+sbproxy_usage_bridge_enqueued_total{reporter="stripe_meter",resource_type="ai_model",result="queued",tenant_id="tenant-a"} 1
+```
 
 `sbproxy_usage_bridge_enqueued_total` splits on `result`. A `duplicate` is
 the idempotency contract working and is expected on a retry; a series that

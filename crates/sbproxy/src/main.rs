@@ -1430,6 +1430,16 @@ fn main() {
     let global_check = cli.check;
     match cli.cmd {
         Some(Cmd::Validate(args)) => {
+            // `-f/--config` is a global, so it lands in `cli.globals`
+            // rather than in this subcommand's positional. Without this
+            // fallback `sbproxy validate -f sb.yml` parses fine and then
+            // reports a missing path, which is what every `validate -f`
+            // line in the examples and in docs/payment-settlement.md was
+            // doing. The positional still wins when both are given.
+            let args = ValidateArgs {
+                config_path: args.config_path.or(global_config_path.clone()),
+                ..args
+            };
             run_subcommand("validate", 2, handle_validate_subcommand(&args));
         }
         Some(Cmd::Plan(args)) => {
@@ -12408,6 +12418,51 @@ hooks:
             },
             no_fetch: false,
         }
+    }
+
+    /// `validate -f <path>` and `validate --config <path>` must reach the
+    /// handler with a path.
+    ///
+    /// Both forms are advertised: the field's own doc comment says
+    /// "Equivalent to `-f <path>`", the missing-path error prints
+    /// `sbproxy validate --config <path>` as a usage line, and fifteen
+    /// lines across `examples/` and `docs/payment-settlement.md` invoke
+    /// the flag form. None of them worked, because `-f/--config` is a
+    /// global and parses into `cli.globals` rather than into this
+    /// subcommand's positional, so clap accepted the command line and
+    /// the handler then reported a missing path. Nothing caught it:
+    /// every existing test here constructs `ValidateArgs` directly and
+    /// so never goes through clap.
+    #[test]
+    fn validate_accepts_the_config_flag_it_documents() {
+        for argv in [
+            ["sbproxy", "validate", "-f", "sb.yml"],
+            ["sbproxy", "validate", "--config", "sb.yml"],
+        ] {
+            let cli = parse(&argv);
+            let Some(Cmd::Validate(args)) = cli.cmd else {
+                panic!("{argv:?} must parse as the validate subcommand");
+            };
+            assert_eq!(
+                args.config_path.or(cli.globals.config),
+                Some(PathBuf::from("sb.yml")),
+                "{argv:?} must resolve a config path for the handler"
+            );
+        }
+    }
+
+    /// A positional path wins over the global flag when both are given,
+    /// so `-f` cannot silently retarget an explicit argument.
+    #[test]
+    fn validate_positional_path_wins_over_the_config_flag() {
+        let cli = parse(&["sbproxy", "validate", "positional.yml", "-f", "flag.yml"]);
+        let Some(Cmd::Validate(args)) = cli.cmd else {
+            panic!("must parse as the validate subcommand");
+        };
+        assert_eq!(
+            args.config_path.or(cli.globals.config),
+            Some(PathBuf::from("positional.yml"))
+        );
     }
 
     #[test]
