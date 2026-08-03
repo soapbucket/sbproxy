@@ -44,8 +44,6 @@ pub(crate) struct ProxyWasmHttpState {
     request_body_bypass: bool,
     response_body_bypass: bool,
     pending_local_response: Option<ProxyWasmLocalResponse>,
-    response_body_override: Option<Bytes>,
-    response_body_override_emitted: bool,
     response_stream_failed: bool,
 }
 
@@ -235,8 +233,6 @@ impl ProxyWasmFilterChain {
             request_body_bypass: false,
             response_body_bypass: false,
             pending_local_response: None,
-            response_body_override: None,
-            response_body_override_emitted: false,
             response_stream_failed: false,
         })
     }
@@ -411,17 +407,6 @@ impl ProxyWasmHttpState {
         self.pending_local_response = Some(internal_failure_response());
     }
 
-    fn activate_response_local(
-        &mut self,
-        header: &mut ResponseHeader,
-        local_response: ProxyWasmLocalResponse,
-    ) -> Result<(), ProxyWasmHttpFailure> {
-        apply_local_response_header(header, &local_response)?;
-        self.response_body_override = Some(local_response.body);
-        self.response_body_override_emitted = false;
-        Ok(())
-    }
-
     pub(crate) fn filter_request_body(
         &mut self,
         body: &mut Option<Bytes>,
@@ -483,15 +468,6 @@ impl ProxyWasmHttpState {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<(), ProxyWasmHttpFailure> {
-        if let Some(override_body) = self.response_body_override.as_ref() {
-            if self.response_body_override_emitted {
-                *body = None;
-            } else {
-                *body = Some(override_body.clone());
-                self.response_body_override_emitted = true;
-            }
-            return Ok(());
-        }
         if self.response_body_bypass || self.max_buffer_bytes == 0 {
             return Ok(());
         }
@@ -1059,12 +1035,15 @@ pub(crate) fn filter_response_headers(
         state.set_internal_failure_response();
         return Err(pingora_filter_error(&failure));
     }
-    if let Some(local_response) = state.take_pending_local_response() {
-        if let Err(failure) = state.activate_response_local(header, local_response) {
-            trace_filter_failure("response_local", &failure);
-            state.set_internal_failure_response();
-            return Err(pingora_filter_error(&failure));
-        }
+    if let Some(status) = state
+        .pending_local_response
+        .as_ref()
+        .map(|response| response.status)
+    {
+        return Err(pingora_error::Error::explain(
+            pingora_error::ErrorType::HTTPStatus(status),
+            "proxy_wasm:local_response",
+        ));
     }
     Ok(())
 }
@@ -1123,6 +1102,12 @@ pub(crate) fn take_pending_local_response(
         .and_then(|state| state.lock().take_pending_local_response())
 }
 
+pub(crate) fn has_pending_local_response(ctx: &crate::context::RequestContext) -> bool {
+    ctx.proxy_wasm
+        .as_ref()
+        .is_some_and(|state| state.lock().pending_local_response.is_some())
+}
+
 pub(crate) fn response_stream_failed(ctx: &crate::context::RequestContext) -> bool {
     ctx.proxy_wasm
         .as_ref()
@@ -1140,9 +1125,25 @@ pub(crate) async fn send_local_response(
     session: &mut pingora_proxy::Session,
     local_response: &ProxyWasmLocalResponse,
 ) -> pingora_error::Result<()> {
-    let mut header = ResponseHeader::build(local_response.status, None)?;
-    apply_local_response_header(&mut header, local_response)
-        .map_err(|failure| pingora_filter_error(&failure))?;
+    write_local_response(session, local_response).await
+}
+
+pub(crate) async fn send_terminal_local_response(
+    session: &mut pingora_proxy::Session,
+    local_response: &ProxyWasmLocalResponse,
+) -> pingora_error::Result<()> {
+    if terminal_local_response_closes_downstream(session.req_header().version) {
+        session.set_keepalive(None);
+    }
+    write_local_response(session, local_response).await
+}
+
+async fn write_local_response(
+    session: &mut pingora_proxy::Session,
+    local_response: &ProxyWasmLocalResponse,
+) -> pingora_error::Result<()> {
+    let header =
+        local_response_header(local_response).map_err(|failure| pingora_filter_error(&failure))?;
     let body_is_empty = local_response.body.is_empty();
     session
         .write_response_header(Box::new(header), body_is_empty)
@@ -1153,6 +1154,19 @@ pub(crate) async fn send_local_response(
             .await?;
     }
     Ok(())
+}
+
+fn local_response_header(
+    local_response: &ProxyWasmLocalResponse,
+) -> Result<ResponseHeader, ProxyWasmHttpFailure> {
+    let mut header = ResponseHeader::build(local_response.status, None)
+        .map_err(|_| ProxyWasmHttpFailure::new("host", "invalid_local_status"))?;
+    apply_local_response_header(&mut header, local_response)?;
+    Ok(header)
+}
+
+fn terminal_local_response_closes_downstream(version: http::Version) -> bool {
+    matches!(version, http::Version::HTTP_10 | http::Version::HTTP_11)
 }
 
 impl ProxyWasmHttpState {
@@ -1899,11 +1913,7 @@ proxy: {}
             ],
             body: bytes::Bytes::from_static(b"limited"),
         };
-        let mut header =
-            pingora_http::ResponseHeader::build(200, None).expect("build local response header");
-
-        super::apply_local_response_header(&mut header, &local)
-            .expect("apply guest local response");
+        let header = super::local_response_header(&local).expect("build local response header");
 
         assert_eq!(header.status.as_u16(), 429);
         assert_eq!(
@@ -1918,6 +1928,12 @@ proxy: {}
         assert_eq!(header.headers.get("grpc-status").unwrap(), "7");
         assert_eq!(header.headers.get("content-length").unwrap(), "7");
         assert!(!header.headers.contains_key("connection"));
+        assert!(super::terminal_local_response_closes_downstream(
+            http::Version::HTTP_11
+        ));
+        assert!(!super::terminal_local_response_closes_downstream(
+            http::Version::HTTP_2
+        ));
     }
 
     #[test]

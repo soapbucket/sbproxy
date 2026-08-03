@@ -10,6 +10,9 @@ use sbproxy_e2e::{MockUpstream, ProxyHarness};
 
 const FILTER_WASM: &[u8] =
     include_bytes!("../../crates/sbproxy-extension/src/bundle/testdata/proxy_wasm/http.wasm");
+const HEADER_RESPONSE_WASM: &[u8] = include_bytes!(
+    "../../crates/sbproxy-extension/src/bundle/testdata/proxy_wasm/header-response.wasm"
+);
 
 const MANIFEST: &str = r#"apiVersion: sbproxy.dev/v1alpha1
 kind: Bundle
@@ -23,6 +26,20 @@ hooks:
     type: fixture_http_filter
     execution:
       body_mode: streamed
+"#;
+
+const HEADER_RESPONSE_MANIFEST: &str = r#"apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: header-response-filter
+version: 1.0.0
+runtime: proxy_wasm
+abi: 0.2.1
+entry: filter.wasm
+hooks:
+  - kind: proxy_wasm
+    type: header_response_filter
+    execution:
+      body_mode: none
 "#;
 
 struct GatedChunkedUpstream {
@@ -63,6 +80,49 @@ impl Drop for GatedChunkedUpstream {
     }
 }
 
+struct HeaderResponseUpstream {
+    port: u16,
+    release: Sender<()>,
+    join: Option<JoinHandle<std::io::Result<()>>>,
+}
+
+impl HeaderResponseUpstream {
+    fn start() -> std::io::Result<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let (release, released) = mpsc::channel();
+        let join = thread::spawn(move || serve_header_responses(listener, released));
+        Ok(Self {
+            port,
+            release,
+            join: Some(join),
+        })
+    }
+
+    fn base_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    fn release_stalled_body(&self) {
+        let _ = self.release.send(());
+    }
+}
+
+impl Drop for HeaderResponseUpstream {
+    fn drop(&mut self) {
+        self.release_stalled_body();
+        for _ in 0..5 {
+            if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", self.port)) {
+                let _ = stream
+                    .write_all(b"GET /shutdown HTTP/1.1\r\nHost: local-response.localhost\r\n\r\n");
+            }
+        }
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
 fn serve_gated_response(listener: TcpListener, released: Receiver<()>) -> std::io::Result<()> {
     let (mut stream, _) = listener.accept()?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -93,6 +153,49 @@ fn serve_gated_response(listener: TcpListener, released: Receiver<()>) -> std::i
     stream.flush()
 }
 
+fn serve_header_responses(listener: TcpListener, released: Receiver<()>) -> std::io::Result<()> {
+    for _ in 0..5 {
+        let (mut stream, _) = listener.accept()?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..read]);
+        }
+        let request_line = request
+            .split(|byte| *byte == b'\n')
+            .next()
+            .and_then(|line| std::str::from_utf8(line).ok())
+            .unwrap_or_default();
+
+        let response = if request_line.contains(" /no-content ") {
+            b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".as_slice()
+        } else if request_line.contains(" /not-modified ") {
+            b"HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n".as_slice()
+        } else if request_line.contains(" /zero ") {
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice()
+        } else {
+            b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\n".as_slice()
+        };
+        stream.write_all(response)?;
+        stream.flush()?;
+
+        if request_line.contains(" /stalled ") {
+            released
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            let _ = stream.write_all(b"origin");
+            let _ = stream.flush();
+        }
+    }
+    Ok(())
+}
+
 fn config(upstream: &MockUpstream, gated: &GatedChunkedUpstream) -> String {
     format!(
         r#"proxy:
@@ -121,6 +224,27 @@ origins:
 "#,
         upstream.base_url(),
         gated.base_url(),
+    )
+}
+
+fn header_response_config(upstream: &HeaderResponseUpstream) -> String {
+    format!(
+        r#"proxy:
+  http_bind_port: 0
+extensions:
+  bundles_dir: bundles
+origins:
+  local-response.localhost:
+    action:
+      type: proxy
+      url: "{}"
+    filters:
+      - type: header_response_filter
+        config:
+          enabled: true
+        failure_posture: closed
+"#,
+        upstream.base_url(),
     )
 }
 
@@ -218,4 +342,62 @@ fn installed_proxy_wasm_filter_participates_in_http_exchange() {
         .expect("stream client thread should not panic")
         .expect("read complete transformed stream");
     assert!(complete.starts_with(b"filtered"));
+}
+
+#[test]
+fn response_header_local_response_does_not_wait_for_an_origin_body() {
+    let upstream = HeaderResponseUpstream::start().expect("start header-response upstream");
+    let files = [
+        (
+            "bundles/header-response-filter/bundle.yaml",
+            HEADER_RESPONSE_MANIFEST.as_bytes(),
+        ),
+        (
+            "bundles/header-response-filter/filter.wasm",
+            HEADER_RESPONSE_WASM,
+        ),
+    ];
+    let proxy =
+        ProxyHarness::start_with_workspace_bytes(&header_response_config(&upstream), &files)
+            .expect("start proxy with response-header filter");
+
+    for path in ["/no-content", "/not-modified", "/zero"] {
+        let response = proxy
+            .get(path, "local-response.localhost")
+            .unwrap_or_else(|error| panic!("receive local response for {path}: {error:#}"));
+        assert_eq!(response.status, 403, "path {path}");
+        assert_eq!(response.body, b"local", "path {path}");
+        assert_eq!(
+            response.headers.get("connection").map(String::as_str),
+            Some("close"),
+            "path {path}"
+        );
+    }
+
+    let head = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .expect("build bounded HEAD client")
+        .head(format!("{}/head", proxy.base_url()))
+        .header("host", "local-response.localhost")
+        .send()
+        .expect("receive immediate local response for HEAD");
+    assert_eq!(head.status(), 403);
+    assert!(head.bytes().expect("read HEAD response").is_empty());
+
+    let stalled = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .expect("build bounded stalled-body client")
+        .get(format!("{}/stalled", proxy.base_url()))
+        .header("host", "local-response.localhost")
+        .send()
+        .and_then(|response| {
+            let status = response.status();
+            response.bytes().map(|body| (status, body))
+        });
+    upstream.release_stalled_body();
+    let (status, body) = stalled.expect("local response must not wait for the stalled origin body");
+    assert_eq!(status, 403);
+    assert_eq!(body.as_ref(), b"local");
 }

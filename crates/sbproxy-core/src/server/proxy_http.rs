@@ -5475,6 +5475,11 @@ impl ProxyHttp for SbProxy {
         // Default fork behavior: peer context plus the
         // reused-connection retry decision.
         let mut e = e.more_context(format!("Peer: {peer}"));
+        if crate::proxy_wasm_http::has_pending_local_response(ctx) {
+            finish_terminal_load_balancer_attempt(ctx, None);
+            e.set_retry(false);
+            return e;
+        }
         e.retry
             .decide_reuse(client_reused && !session.as_ref().retry_buffer_truncated());
 
@@ -5530,7 +5535,8 @@ impl ProxyHttp for SbProxy {
     {
         if let Some(local_response) = crate::proxy_wasm_http::take_pending_local_response(ctx) {
             let status = local_response.status;
-            let _ = crate::proxy_wasm_http::send_local_response(session, &local_response).await;
+            let _ = crate::proxy_wasm_http::send_terminal_local_response(session, &local_response)
+                .await;
             ctx.response_status = Some(status);
             return FailToProxy {
                 error_code: status,
