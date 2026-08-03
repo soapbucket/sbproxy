@@ -1315,6 +1315,9 @@ fn validate_headers(
 
 fn serialize_headers(headers: &[(String, String)]) -> Result<Vec<u8>, ProxyWasmCallFailure> {
     validate_headers(headers, usize::MAX)?;
+    if headers.is_empty() {
+        return Ok(Vec::new());
+    }
     let count = u32::try_from(headers.len()).map_err(|_| ProxyWasmCallFailure::OutputLimit)?;
     let mut output = Vec::new();
     output.extend_from_slice(&count.to_le_bytes());
@@ -2159,6 +2162,17 @@ mod tests {
                 tracing::Level::ERROR,
             ]
         );
+    }
+
+    #[test]
+    fn empty_header_maps_emit_the_spec_form_and_accept_sdk_input() {
+        assert_eq!(serialize_headers(&[]).unwrap(), Vec::<u8>::new());
+        for serialized in [&[][..], &[0][..], &[0, 0, 0, 0][..]] {
+            assert_eq!(
+                parse_headers(serialized).unwrap(),
+                Vec::<(String, String)>::new()
+            );
+        }
     }
 
     #[test]
