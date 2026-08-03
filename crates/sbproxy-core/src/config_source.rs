@@ -197,6 +197,36 @@ fn build_fetch_context(source: &ConfigSource) -> anyhow::Result<FetchContext> {
     Ok(fetch_ctx)
 }
 
+/// Build the Git fetch context for configured extension bundle sources.
+///
+/// This deliberately reuses [`resolve_secret_reference`] instead of giving
+/// the bundle loader another secret authority. Errors identify the source
+/// index and redacted repository, but never repeat the reference or value.
+pub(crate) fn build_extension_fetch_context(
+    config: &sbproxy_config::ExtensionBundlesConfig,
+) -> anyhow::Result<FetchContext> {
+    let mut fetch_ctx = FetchContext::with_git_binary();
+    for (index, source) in config.sources.iter().enumerate() {
+        let sbproxy_config::BundleSourceConfig::Git {
+            repo,
+            credential: Some(reference),
+            ..
+        } = source
+        else {
+            continue;
+        };
+        let resolved = resolve_secret_reference(reference, "extensions.sources[].credential")
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "extensions.sources[{index}].credential for {} could not be resolved",
+                    sbproxy_config::redact_repo(repo)
+                )
+            })?;
+        fetch_ctx.credentials.insert(repo.clone(), resolved);
+    }
+    Ok(fetch_ctx)
+}
+
 /// Resolve one secret reference into its value.
 ///
 /// Routes through the process secret resolver when one is installed, so
@@ -910,6 +940,63 @@ mod tests {
         assert_eq!(resolved.text, yaml);
         assert!(!resolved.is_remote());
         assert_eq!(resolved.base_origin(), BaseOrigin::Local);
+    }
+
+    #[test]
+    fn bundle_credentials_resolve_through_the_existing_secret_authority() {
+        let directory = tempfile::tempdir().expect("temporary secret directory");
+        let secret_path = directory.path().join("git-token");
+        std::fs::write(&secret_path, "bundle-private-token\n").expect("write secret fixture");
+        let repo = "https://example.test/private-bundles.git";
+        let config = sbproxy_config::ExtensionBundlesConfig {
+            bundles_dir: None,
+            sources: vec![sbproxy_config::BundleSourceConfig::Git {
+                repo: repo.to_string(),
+                revision: "a".repeat(40),
+                path: "bundles".to_string(),
+                credential: Some(format!("file:{}", secret_path.display())),
+                verify_signature: false,
+                timeout_secs: 60,
+                refresh_interval_secs: 60,
+            }],
+        };
+
+        let context = build_extension_fetch_context(&config).expect("credential resolves");
+
+        assert_eq!(
+            context.credentials.get(repo).map(String::as_str),
+            Some("bundle-private-token")
+        );
+        let debug = format!("{context:?}");
+        assert!(!debug.contains("bundle-private-token"), "{debug}");
+        assert!(
+            !debug.contains(&secret_path.to_string_lossy().to_string()),
+            "{debug}"
+        );
+    }
+
+    #[test]
+    fn bundle_credential_resolution_errors_do_not_repeat_secret_material() {
+        let secret_material = "literal-private-token-that-must-not-leak";
+        let config = sbproxy_config::ExtensionBundlesConfig {
+            bundles_dir: None,
+            sources: vec![sbproxy_config::BundleSourceConfig::Git {
+                repo: "https://example.test/private-bundles.git".to_string(),
+                revision: "a".repeat(40),
+                path: "bundles".to_string(),
+                credential: Some(secret_material.to_string()),
+                verify_signature: false,
+                timeout_secs: 60,
+                refresh_interval_secs: 60,
+            }],
+        };
+
+        let error = build_extension_fetch_context(&config)
+            .expect_err("a literal is not a resolvable secret reference");
+        let displayed = error.to_string();
+
+        assert!(displayed.contains("extensions.sources[0].credential"));
+        assert!(!displayed.contains(secret_material), "{displayed}");
     }
 
     #[test]

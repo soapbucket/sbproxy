@@ -1,6 +1,6 @@
 # Admin API reference
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-03*
 
 The embedded admin server publishes the full control-plane HTTP surface for
 operator tooling: liveness probes, session login, key and credential
@@ -737,8 +737,12 @@ Registration sources are `link_time`, `directory`, or `git`. Runtimes are
 | `not_evaluated` | Used by doctor snapshots only. |
 
 The response deliberately omits executable bytes, artifact digests, source
-paths, hook attachment config, and secrets. This route serves operational
-metadata only.
+paths, hook attachment config, and secrets. A Git bundle's bounded
+`load.detail` includes its redacted repository, requested reference, verified
+commit, and latest refresh health. A failed refresh reports that the last
+verified generation is still serving, without copying the rejected error,
+credential reference, or resolved value. This route serves operational metadata
+only.
 
 | Status | When |
 |---|---|

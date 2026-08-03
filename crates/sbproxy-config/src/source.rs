@@ -54,6 +54,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use serde_yaml::Value as YamlValue;
 use tempfile::TempDir;
 use thiserror::Error;
@@ -286,13 +287,16 @@ impl ResolvedDocument {
 
 /// One fetch the loader asks a [`Cloner`] to perform.
 ///
-/// `Debug` is implemented by hand rather than derived: `repo` carries the
-/// interpolated credential, and a derived `Debug` would put it in a log
-/// line the first time anyone added one.
+/// `Debug` is implemented by hand rather than derived so the separate
+/// credential can never enter a log line.
 pub struct FetchRequest<'a> {
-    /// Repository URL, with the credential already interpolated when
-    /// one was supplied. Never logged; use [`redact_repo`] first.
+    /// Repository URL with any configured userinfo removed.
     pub repo: &'a str,
+    /// Resolved credential carried separately from `repo`.
+    pub credential: Option<&'a str>,
+    /// Username selected from configured URL userinfo, when present.
+    /// This is not secret and is only used to form ephemeral HTTP auth.
+    pub credential_username: Option<&'a str>,
     /// Branch, tag, or full commit sha, or `None` for the default
     /// branch.
     pub revision: Option<&'a str>,
@@ -315,6 +319,7 @@ impl std::fmt::Debug for FetchRequest<'_> {
             .debug_struct("FetchRequest")
             .field("repo", &redact_repo(self.repo))
             .field("revision", &self.revision)
+            .field("has_credential", &self.credential.is_some())
             .field("timeout", &self.timeout)
             .field("verify_signature", &self.verify_signature)
             .finish_non_exhaustive()
@@ -368,6 +373,7 @@ impl GitBinaryCloner {
         working_dir: Option<&Path>,
         scratch: &Path,
         timeout: Duration,
+        http_auth: Option<&GitHttpAuth>,
     ) -> Result<GitOutput, ConfigSourceError> {
         let log_path = scratch.join("git-stderr.log");
         let out_path = scratch.join("git-stdout.log");
@@ -391,6 +397,14 @@ impl GitBinaryCloner {
         command.env_remove("GIT_ASKPASS");
         command.env_remove("SSH_ASKPASS");
         command.env("GCM_INTERACTIVE", "never");
+        if let Some(auth) = http_auth {
+            // Git reads these as command-scoped configuration. Unlike an
+            // authenticated remote URL, the header never enters argv or
+            // `.git/config`, and it disappears with the child process.
+            command.env("GIT_CONFIG_COUNT", "1");
+            command.env("GIT_CONFIG_KEY_0", "http.extraHeader");
+            command.env("GIT_CONFIG_VALUE_0", &auth.header);
+        }
         command.stdin(Stdio::null());
         command.stdout(Stdio::from(stdout_file));
         command.stderr(Stdio::from(stderr_file));
@@ -471,7 +485,7 @@ impl GitBinaryCloner {
         scratch: &Path,
         timeout: Duration,
     ) -> Result<String, ConfigSourceError> {
-        let output = self.run(&["rev-parse", "HEAD"], Some(dest), scratch, timeout)?;
+        let output = self.run(&["rev-parse", "HEAD"], Some(dest), scratch, timeout, None)?;
         if !output.success {
             return Err(ConfigSourceError::Clone(format!(
                 "git rev-parse HEAD failed: {}",
@@ -485,6 +499,31 @@ impl GitBinaryCloner {
             ));
         }
         Ok(commit)
+    }
+}
+
+/// Ephemeral HTTP authorization passed to Git through command-scoped
+/// environment configuration.
+struct GitHttpAuth {
+    header: String,
+    encoded: String,
+}
+
+impl GitHttpAuth {
+    fn new(username: Option<&str>, credential: Option<&str>, repo: &str) -> Option<Self> {
+        let credential = credential?;
+        if !repo.starts_with("https://") && !repo.starts_with("http://") {
+            return None;
+        }
+        let username = username
+            .filter(|value| !value.is_empty())
+            .unwrap_or("x-access-token");
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{credential}"));
+        Some(Self {
+            header: format!("Authorization: Basic {encoded}"),
+            encoded,
+        })
     }
 }
 
@@ -543,50 +582,18 @@ pub fn redact_repo(repo: &str) -> String {
     }
 }
 
-/// Interpolate a resolved credential into an `https` repository URL.
-///
-/// Returns the URL unchanged for a source with no credential, and for
-/// an `ssh` or `git` transport, where the credential is the SSH key the
-/// host already holds rather than anything this loader can inject.
-fn repo_with_credential(repo: &str, credential: Option<&str>) -> String {
-    let Some(credential) = credential else {
-        return repo.to_string();
-    };
-    if !repo.starts_with("https://") && !repo.starts_with("http://") {
-        return repo.to_string();
-    }
-    let (scheme, rest) = repo.split_once("://").unwrap_or(("https", repo));
-    // A URL that already carries userinfo keeps it: the operator wrote
-    // a username in the URL on purpose, and the credential is the
-    // password half.
-    match rest.split_once('@') {
-        Some((user, host_and_path)) if !user.contains('/') => {
-            format!(
-                "{scheme}://{}:{}@{host_and_path}",
-                encode_userinfo(user),
-                encode_userinfo(credential)
-            )
-        }
-        _ => format!(
-            "{scheme}://x-access-token:{}@{rest}",
-            encode_userinfo(credential)
-        ),
-    }
-}
-
-/// Percent-encode the characters that would otherwise end the userinfo
-/// component of a URL early.
-fn encode_userinfo(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(byte as char);
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
+/// Username from configured URL userinfo, before [`redact_repo`] removes it.
+fn repo_username(repo: &str) -> Option<String> {
+    let scheme_end = repo.find("://")? + 3;
+    let authority_end = repo[scheme_end..]
+        .find('/')
+        .map_or(repo.len(), |offset| scheme_end + offset);
+    let authority = &repo[scheme_end..authority_end];
+    let userinfo = authority.rsplit_once('@')?.0;
+    let username = userinfo
+        .split_once(':')
+        .map_or(userinfo, |(username, _)| username);
+    (!username.is_empty()).then(|| username.to_string())
 }
 
 /// Strip anything that looks like a credential out of captured `git`
@@ -651,10 +658,15 @@ impl Cloner for GitBinaryCloner {
         let dest = request.dest;
         let dest_str = dest.to_string_lossy().to_string();
         let pinned = request.revision.is_some_and(is_full_commit_sha);
+        let http_auth = GitHttpAuth::new(
+            request.credential_username,
+            request.credential,
+            request.repo,
+        );
 
         if pinned {
             let sha = request.revision.unwrap_or_default();
-            self.fetch_pinned_sha(request, &dest_str, sha)?;
+            self.fetch_pinned_sha(request, &dest_str, sha, http_auth.as_ref())?;
         } else {
             let mut args: Vec<&str> = vec!["clone", "--quiet", "--depth", "1"];
             if let Some(reference) = request.revision {
@@ -664,7 +676,13 @@ impl Cloner for GitBinaryCloner {
             args.push("--");
             args.push(request.repo);
             args.push(&dest_str);
-            let output = self.run(&args, None, request.scratch, request.timeout)?;
+            let output = self.run(
+                &args,
+                None,
+                request.scratch,
+                request.timeout,
+                http_auth.as_ref(),
+            )?;
             if !output.success {
                 return Err(ConfigSourceError::Clone(format!(
                     "git clone of {} failed: {}",
@@ -709,6 +727,7 @@ impl GitBinaryCloner {
         request: &FetchRequest<'_>,
         dest_str: &str,
         sha: &str,
+        http_auth: Option<&GitHttpAuth>,
     ) -> Result<(), ConfigSourceError> {
         let dest = request.dest;
         let scratch = request.scratch;
@@ -721,6 +740,7 @@ impl GitBinaryCloner {
             None,
             scratch,
             request.timeout,
+            None,
         )?;
         if !init.success {
             return Err(ConfigSourceError::Clone(format!(
@@ -733,6 +753,7 @@ impl GitBinaryCloner {
             Some(dest),
             scratch,
             remaining(started),
+            None,
         )?;
         if !add_remote.success {
             return Err(ConfigSourceError::Clone(format!(
@@ -748,6 +769,7 @@ impl GitBinaryCloner {
             Some(dest),
             scratch,
             remaining(started),
+            http_auth,
         )?;
         if !shallow.success {
             // Fall back to fetching every ref, then look for the commit
@@ -758,6 +780,7 @@ impl GitBinaryCloner {
                 Some(dest),
                 scratch,
                 remaining(started),
+                http_auth,
             )?;
             if !full.success {
                 return Err(ConfigSourceError::Clone(format!(
@@ -772,6 +795,7 @@ impl GitBinaryCloner {
                 Some(dest),
                 scratch,
                 remaining(started),
+                None,
             )?;
             if !checkout.success {
                 return Err(ConfigSourceError::RevisionMismatch(format!(
@@ -789,6 +813,7 @@ impl GitBinaryCloner {
             Some(dest),
             scratch,
             remaining(started),
+            None,
         )?;
         if !checkout.success {
             return Err(ConfigSourceError::Clone(format!(
@@ -819,6 +844,7 @@ impl GitBinaryCloner {
                     Some(dest),
                     scratch,
                     request.timeout,
+                    None,
                 )?;
                 if tag.success {
                     return Ok(());
@@ -830,6 +856,7 @@ impl GitBinaryCloner {
             Some(dest),
             scratch,
             request.timeout,
+            None,
         )?;
         if commit_check.success {
             return Ok(());
@@ -1054,9 +1081,17 @@ where
         ))
         .into());
     }
-    let authenticated_repo = repo_with_credential(request.repo, resolved_credential);
+    let clean_repo = redact_repo(request.repo);
+    let credential_username = repo_username(request.repo);
+    let http_auth = GitHttpAuth::new(
+        credential_username.as_deref(),
+        resolved_credential,
+        &clean_repo,
+    );
     let fetch = FetchRequest {
-        repo: &authenticated_repo,
+        repo: &clean_repo,
+        credential: resolved_credential,
+        credential_username: credential_username.as_deref(),
         revision: request.revision,
         timeout: request.timeout,
         verify_signature: request.verify_signature,
@@ -1067,7 +1102,9 @@ where
         .fetch_context
         .cloner
         .fetch(&fetch)
-        .map_err(|error| sanitize_materialization_error(error, resolved_credential))
+        .map_err(|error| {
+            sanitize_materialization_error(error, resolved_credential, http_auth.as_ref())
+        })
         .map_err(E::from)?;
     callback(MaterializedGitTree {
         root: &dest,
@@ -1078,8 +1115,17 @@ where
 fn sanitize_materialization_error(
     error: ConfigSourceError,
     resolved_credential: Option<&str>,
+    http_auth: Option<&GitHttpAuth>,
 ) -> ConfigSourceError {
-    fn clean(mut detail: String, credential: Option<&str>) -> String {
+    fn clean(
+        mut detail: String,
+        credential: Option<&str>,
+        http_auth: Option<&GitHttpAuth>,
+    ) -> String {
+        if let Some(auth) = http_auth {
+            detail = detail.replace(&auth.header, "[redacted]");
+            detail = detail.replace(&auth.encoded, "[redacted]");
+        }
         if let Some(credential) = credential.filter(|value| !value.is_empty()) {
             detail = detail.replace(credential, "[redacted]");
         }
@@ -1088,28 +1134,28 @@ fn sanitize_materialization_error(
 
     match error {
         ConfigSourceError::Clone(detail) => {
-            ConfigSourceError::Clone(clean(detail, resolved_credential))
+            ConfigSourceError::Clone(clean(detail, resolved_credential, http_auth))
         }
         ConfigSourceError::Read(detail) => {
-            ConfigSourceError::Read(clean(detail, resolved_credential))
+            ConfigSourceError::Read(clean(detail, resolved_credential, http_auth))
         }
         ConfigSourceError::Merge(detail) => {
-            ConfigSourceError::Merge(clean(detail, resolved_credential))
+            ConfigSourceError::Merge(clean(detail, resolved_credential, http_auth))
         }
         ConfigSourceError::MissingGitBinary(detail) => {
-            ConfigSourceError::MissingGitBinary(clean(detail, resolved_credential))
+            ConfigSourceError::MissingGitBinary(clean(detail, resolved_credential, http_auth))
         }
         ConfigSourceError::Timeout(detail) => {
-            ConfigSourceError::Timeout(clean(detail, resolved_credential))
+            ConfigSourceError::Timeout(clean(detail, resolved_credential, http_auth))
         }
         ConfigSourceError::RevisionMismatch(detail) => {
-            ConfigSourceError::RevisionMismatch(clean(detail, resolved_credential))
+            ConfigSourceError::RevisionMismatch(clean(detail, resolved_credential, http_auth))
         }
         ConfigSourceError::Signature(detail) => {
-            ConfigSourceError::Signature(clean(detail, resolved_credential))
+            ConfigSourceError::Signature(clean(detail, resolved_credential, http_auth))
         }
         ConfigSourceError::Invalid(detail) => {
-            ConfigSourceError::Invalid(clean(detail, resolved_credential))
+            ConfigSourceError::Invalid(clean(detail, resolved_credential, http_auth))
         }
         ConfigSourceError::RecursionLimit => ConfigSourceError::RecursionLimit,
     }
@@ -1429,7 +1475,7 @@ mod tests {
         // Maps `repo` URL -> list of (relative path, file contents).
         // Captured calls (repo, revision) for assertion.
         repos: HashMapOfRepos,
-        calls: Mutex<Vec<(String, Option<String>)>>,
+        calls: Mutex<Vec<(String, Option<String>, Option<String>)>>,
     }
 
     type HashMapOfRepos = std::collections::HashMap<String, Vec<(&'static str, &'static str)>>;
@@ -1448,6 +1494,7 @@ mod tests {
             self.calls.lock().expect("calls lock").push((
                 request.repo.to_string(),
                 request.revision.map(str::to_string),
+                request.credential.map(str::to_string),
             ));
             let layout = self.repos.get(request.repo).ok_or_else(|| {
                 ConfigSourceError::Clone(format!("unknown fixture repo: {}", request.repo))
@@ -1652,17 +1699,17 @@ mod tests {
     }
 
     #[test]
-    fn credential_is_injected_as_userinfo_and_percent_encoded() {
-        let url = repo_with_credential("https://github.com/acme/c.git", Some("tok/en+x"));
-        assert!(url.contains("x-access-token:tok%2Fen%2Bx@"), "{url}");
-        // ssh is untouched: the credential there is the host's key.
+    fn credential_becomes_ephemeral_http_authorization() {
+        let auth = GitHttpAuth::new(None, Some("tok/en+x"), "https://github.com/acme/c.git")
+            .expect("https credential gets auth");
+        assert!(auth.header.starts_with("Authorization: Basic "));
+        assert!(!auth.header.contains("tok/en+x"));
+        assert!(GitHttpAuth::new(None, Some("tok"), "git@github.com:acme/c.git").is_none());
+        assert!(GitHttpAuth::new(None, None, "https://github.com/acme/c.git").is_none());
+
         assert_eq!(
-            repo_with_credential("git@github.com:acme/c.git", Some("tok")),
-            "git@github.com:acme/c.git"
-        );
-        assert_eq!(
-            repo_with_credential("https://github.com/acme/c.git", None),
-            "https://github.com/acme/c.git"
+            repo_username("https://git-user@example.test/private.git").as_deref(),
+            Some("git-user")
         );
     }
 
@@ -1750,6 +1797,139 @@ mod tests {
         };
         let err = load(&source, "", &ctx).expect_err("missing resolved credential");
         assert!(matches!(err, ConfigSourceError::Invalid(_)), "{err:?}");
+    }
+
+    #[test]
+    fn a_resolved_credential_stays_separate_from_the_repository_url() {
+        let repo = "https://example.test/private.git";
+        let secret = "ghp_private_token_value";
+        let mut repos: HashMapOfRepos = std::collections::HashMap::new();
+        repos.insert(repo.into(), vec![("sb.yml", "proxy: {}\n")]);
+        let (ctx, cloner) = ctx_with(FixtureCloner::new(repos));
+        let ctx = ctx.with_credential(repo, secret);
+        let source = ConfigSource::Git {
+            repo: repo.into(),
+            revision: None,
+            path: "sb.yml".into(),
+            credential: Some("env:SB_GIT_TOKEN".into()),
+            verify_signature: false,
+            timeout_secs: 60,
+            refresh_interval_secs: 60,
+        };
+
+        load(&source, "", &ctx).expect("private source loads");
+
+        let calls = cloner.calls.lock().expect("calls lock");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, repo);
+        assert_eq!(calls[0].2.as_deref(), Some(secret));
+        assert!(!calls[0].0.contains(secret));
+    }
+
+    struct CredentialEchoCloner;
+
+    impl Cloner for CredentialEchoCloner {
+        fn fetch(&self, request: &FetchRequest<'_>) -> Result<ResolvedRevision, ConfigSourceError> {
+            use base64::Engine as _;
+
+            let credential = request.credential.expect("test credential");
+            let debug = format!("{request:?}");
+            assert!(!debug.contains(credential), "{debug}");
+            let encoded = base64::engine::general_purpose::STANDARD
+                .encode(format!("x-access-token:{credential}"));
+            Err(ConfigSourceError::Clone(format!(
+                "remote rejected {credential} in Authorization: Basic {encoded}"
+            )))
+        }
+    }
+
+    #[test]
+    fn raw_and_encoded_credentials_are_removed_from_cloner_errors() {
+        use base64::Engine as _;
+
+        let repo = "https://example.test/private.git";
+        let secret = "ghp_private_token_value";
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{secret}"));
+        let ctx =
+            FetchContext::with_cloner(Box::new(CredentialEchoCloner)).with_credential(repo, secret);
+
+        let error = materialize_git_tree(
+            GitTreeRequest {
+                repo,
+                revision: Some(&"a".repeat(40)),
+                credential: Some("env:SB_GIT_TOKEN"),
+                verify_signature: false,
+                timeout: Duration::from_secs(60),
+                fetch_context: &ctx,
+            },
+            |_| Ok::<_, ConfigSourceError>(()),
+        )
+        .expect_err("fixture cloner fails");
+        let displayed = error.to_string();
+
+        assert!(!displayed.contains(secret), "{displayed}");
+        assert!(!displayed.contains(&encoded), "{displayed}");
+        assert!(displayed.contains("[redacted]"), "{displayed}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_http_auth_never_enters_arguments_or_persisted_remote_metadata() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("temporary test directory");
+        let git = directory.path().join("git-fixture");
+        let audit = directory.path().join("git-fixture.audit");
+        std::fs::write(
+            &git,
+            r#"#!/bin/sh
+audit="$0.audit"
+printf '%s\t%s\t%s\n' "$*" "$GIT_CONFIG_KEY_0" "$GIT_CONFIG_VALUE_0" >> "$audit"
+case "$1" in
+  --version) exit 0 ;;
+  init) mkdir -p "$3/.git"; : > "$3/.git/config" ;;
+  remote) printf '[remote "origin"]\n\turl = %s\n' "$4" > .git/config ;;
+  rev-parse) printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n' ;;
+esac
+exit 0
+"#,
+        )
+        .expect("write git fixture");
+        let mut permissions = std::fs::metadata(&git)
+            .expect("git fixture metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&git, permissions).expect("make git fixture executable");
+
+        let repo = "https://example.test/private.git";
+        let secret = "ghp_private_token_value";
+        let ctx = FetchContext::with_git_binary_at(&git).with_credential(repo, secret);
+        let persisted = materialize_git_tree(
+            GitTreeRequest {
+                repo,
+                revision: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                credential: Some("env:SB_GIT_TOKEN"),
+                verify_signature: false,
+                timeout: Duration::from_secs(10),
+                fetch_context: &ctx,
+            },
+            |tree| {
+                std::fs::read_to_string(tree.root().join(".git/config"))
+                    .map_err(|error| ConfigSourceError::Read(error.to_string()))
+            },
+        )
+        .expect("fixture fetch succeeds");
+        let audit = std::fs::read_to_string(audit).expect("read git audit");
+
+        assert!(persisted.contains(repo), "{persisted}");
+        assert!(!persisted.contains(secret), "{persisted}");
+        for line in audit.lines() {
+            let arguments = line.split('\t').next().unwrap_or_default();
+            assert!(!arguments.contains(secret), "{arguments}");
+        }
+        assert!(audit.contains("http.extraHeader"), "{audit}");
+        assert!(audit.contains("Authorization: Basic "), "{audit}");
     }
 
     #[test]

@@ -23,6 +23,7 @@ use crate::types::{
 ///
 /// The action, auth, policies, and transforms fields use `serde_json::Value`
 /// as placeholders until the module crate defines concrete enum types.
+#[derive(Clone)]
 pub struct CompiledOrigin {
     /// Hostname this origin matches (e.g. `api.example.com`).
     pub hostname: CompactString,
@@ -211,7 +212,7 @@ pub struct CompiledOrigin {
 }
 
 /// The complete compiled config: all origins plus host-based routing.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct CompiledConfig {
     /// Extension bundle discovery configuration preserved for the pipeline
     /// candidate loader. This crate does not resolve paths or fetch sources.

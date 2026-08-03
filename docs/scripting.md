@@ -967,6 +967,29 @@ extensions:
 
 A relative `bundles_dir` uses the directory containing `sb.yml` as its base. The loader visits each child directory, reads its `bundle.yaml`, then reads the declared entry artifact without following a path outside that bundle. The runnable layout is in [examples/extension-bundles](../examples/extension-bundles/).
 
+Git sources use the same bundle layout from a verified checkout:
+
+```yaml
+extensions:
+  sources:
+    - type: git
+      repo: https://github.com/acme/sbproxy-extensions.git
+      revision: production
+      path: bundles
+      credential: secret://primary/extension-git-token
+      verify_signature: true
+      timeout_secs: 60
+      refresh_interval_secs: 60
+```
+
+`revision` must be a full 40- or 64-character commit SHA, or a reference whose tag or commit Git can verify when `verify_signature: true`. Every Git bundle must also declare its entry artifact's `sha256`. A relative `path` stays inside the verified checkout.
+
+`credential` is a secret reference, not a token literal. It accepts the same `env:NAME`, `${NAME}`, `file:/path`, `secret://`, and provider-backed references as the rest of the config. SBproxy resolves it through the process secret resolver and gives Git command-scoped HTTP authorization. The resolved value is not added to the repository URL, Git arguments, checkout metadata, logs, errors, or extension inventory. SSH repositories continue to use the host's SSH credentials.
+
+`refresh_interval_secs` accepts `0` or 1 through 86400. Zero fetches at startup and on ordinary reload only. Positive values start one jittered refresh loop at the shortest enabled interval across all Git bundle sources. An unchanged set of verified commits skips publication. A changed source builds and validates the complete registry, then uses the normal atomic reload transaction. Fetch, digest, export, runtime, or lifecycle failure leaves the last verified generation serving.
+
+`GET /api/extensions` keeps the redacted repository, requested reference, verified commit, and latest refresh health in each Git bundle's bounded `load.detail`. It never includes the credential reference or resolved value.
+
 ### 12.1 Bundle manifest
 
 This JavaScript bundle exports one action and one transform:

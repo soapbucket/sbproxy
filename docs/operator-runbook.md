@@ -1,6 +1,6 @@
 # Operator runbook
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-03*
 
 This runbook is the dashboard/action companion to
 [`quickstart-operator.md`](quickstart-operator.md). Use the quickstart for first
@@ -124,6 +124,36 @@ Calculate the value after the artifact is final, then put that exact value in
 produces a flat `.js` artifact instead, point `entry` at the `.js` file and hash
 that final file.
 
+### Follow a verified Git release
+
+Use a private Git source when your release system already publishes immutable
+bundle trees there:
+
+```yaml
+extensions:
+  sources:
+    - type: git
+      repo: https://github.com/acme/sbproxy-extensions.git
+      revision: production
+      path: bundles
+      credential: env:SB_EXTENSION_GIT_TOKEN
+      verify_signature: true
+      timeout_secs: 60
+      refresh_interval_secs: 60
+```
+
+Use a full commit SHA for a fixed release. A pinned SHA never changes on a
+refresh cycle, so update the configured SHA and reload to move it. Use a signed
+reference when this node should follow verified releases automatically. Set
+`refresh_interval_secs: 0` to fetch only at startup and ordinary reload, or 1
+through 86400 for timed refresh. Multiple Git sources refresh together at the
+shortest enabled interval.
+
+The credential must be a secret reference. SBproxy resolves it through the
+configured process secret backend and keeps the value out of the remote URL,
+Git arguments, checkout metadata, logs, errors, and inventory. Configure SSH
+keys on the host when `repo` uses an SSH transport.
+
 ### Validate before reload
 
 Run both views before publishing:
@@ -161,6 +191,12 @@ and the new config revision. `active` means the hook is attached to this
 generation. `available` or `unconsumed` means it loaded but is not attached.
 `failed` and a nonempty `collisions` list need investigation.
 
+For a Git bundle, `bundles[].load.detail` names the redacted repository,
+requested reference, verified commit, and latest refresh health. After a failed
+refresh it says the node is serving the last verified generation and counts
+consecutive failures. It does not copy the rejected error or any secret
+material into inventory.
+
 Bundle loading is part of the candidate transaction. A bad digest, missing
 export, invalid WASM artifact, unsupported Proxy-Wasm import, or colliding hook
 name refuses the candidate. The old pipeline and old bundle registry continue
@@ -171,7 +207,8 @@ serving together. In-flight requests stay pinned to their original generation.
 Start with the bounded phase in the error or inventory record:
 
 - `source`: the release directory, bundle directory, or entry is missing,
-  unreadable, or outside its allowed root.
+  unreadable, outside its allowed root, or the Git source or credential could
+  not be resolved.
 - `manifest`: `bundle.yaml` is malformed or violates the runtime and hook
   contract.
 - `digest`: the entry bytes do not match `sha256`. Recompute the final artifact;

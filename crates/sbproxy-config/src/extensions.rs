@@ -29,6 +29,8 @@ pub const MAX_BUNDLE_HOOKS: usize = 128;
 pub const MAX_SCHEMA_PROPERTIES_PER_HOOK: usize = 64;
 /// Largest JSON nesting depth accepted in one hook schema.
 pub const MAX_SCHEMA_DEPTH: usize = 32;
+/// Largest enabled Git bundle refresh cadence, in seconds.
+pub const MAX_BUNDLE_REFRESH_SECS: u64 = 86_400;
 
 /// Top-level extension bundle discovery configuration from `sb.yml`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
@@ -77,6 +79,7 @@ impl ExtensionBundlesConfig {
                     path,
                     verify_signature,
                     timeout_secs,
+                    refresh_interval_secs,
                     ..
                 } => {
                     if repo.trim().is_empty() {
@@ -104,11 +107,30 @@ impl ExtensionBundlesConfig {
                             "extension Git timeout_secs must be between 1 and 3600, got {timeout_secs}"
                         )));
                     }
+                    if *refresh_interval_secs > MAX_BUNDLE_REFRESH_SECS {
+                        return Err(ExtensionConfigError::Invalid(format!(
+                            "extension Git refresh_interval_secs must be 0 or between 1 and {MAX_BUNDLE_REFRESH_SECS}, got {refresh_interval_secs}"
+                        )));
+                    }
                 }
             }
         }
 
         Ok(())
+    }
+
+    /// Return the shortest enabled Git source refresh cadence.
+    ///
+    /// All Git sources form one immutable candidate, so they refresh together
+    /// at the shortest positive interval any source requested. Zero disables
+    /// timed refresh for that source.
+    #[must_use]
+    pub fn refresh_interval(&self) -> Option<std::time::Duration> {
+        self.sources
+            .iter()
+            .filter_map(BundleSourceConfig::refresh_interval)
+            .filter(|interval| !interval.is_zero())
+            .min()
     }
 }
 
