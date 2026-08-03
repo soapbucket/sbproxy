@@ -1,0 +1,15 @@
+# Deliberately broken bundle source for the failed doctor snapshot.
+extensions:
+  bundles_dir: ../fixtures/extensions/broken
+
+proxy:
+  http_bind_port: 18081
+
+origins:
+  "extensions.local":
+    action:
+      type: static
+      status: 200
+      content_type: application/json
+      json_body:
+        status: ready

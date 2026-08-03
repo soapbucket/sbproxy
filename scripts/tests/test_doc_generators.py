@@ -312,6 +312,20 @@ class RecordedTapeCompatibilityTests(unittest.TestCase):
                 self.assertIn("$SBPROXY_REC_LOG", contents)
 
 
+class AdminScreenshotCaptureTests(unittest.TestCase):
+    def test_extension_route_can_be_captured_without_rewriting_other_assets(
+        self,
+    ) -> None:
+        script = (REPOSITORY / "scripts" / "capture-admin-screenshots.mjs").read_text()
+
+        self.assertIn(
+            '{ path: "/admin/ui/extensions", file: "admin-extensions.png" }',
+            script,
+        )
+        self.assertIn("ADMIN_SCREENSHOTS", script)
+        self.assertIn("selectedRoutes", script)
+
+
 class ConformanceRunnerSafetyTests(unittest.TestCase):
     def test_occupied_callback_port_is_rejected_without_http_probe(self) -> None:
         requests: list[str] = []

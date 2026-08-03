@@ -1,0 +1,16 @@
+apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: operator-guard
+version: 1.4.2
+runtime: javascript
+entry: entry.js
+sha256: 59a8f51e4a5cd79d2eeb80b6bcf9a902227a9e9ae0b23e8c7acd28032dc9a164
+hooks:
+  - kind: policy
+    type: operator_guard
+    export: enforce
+    execution:
+      body_mode: none
+sandbox:
+  budget_ms: 40
+  max_buffer_bytes: 65536

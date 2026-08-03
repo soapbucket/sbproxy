@@ -11,6 +11,7 @@
 //   sbproxy serve <a config with admin enabled>
 //   ADMIN_URL=http://127.0.0.1:9090 ADMIN_USER=admin ADMIN_PASS=admin \
 //     node scripts/capture-admin-screenshots.mjs
+//   ADMIN_SCREENSHOTS=admin-extensions.png node scripts/capture-admin-screenshots.mjs
 //
 // Pages render whatever the running gateway has. A gateway with no traffic
 // produces a wall of empty states, which is worse documentation than the
@@ -40,6 +41,7 @@ const routes = [
   { path: "/admin/ui/keys", file: "admin-keys.png" },
   { path: "/admin/ui/credentials", file: "admin-credentials.png" },
   { path: "/admin/ui/config", file: "admin-config.png" },
+  { path: "/admin/ui/extensions", file: "admin-extensions.png" },
   { path: "/admin/ui/logs", file: "admin-logs.png" },
   { path: "/admin/ui/metrics", file: "admin-metrics.png" },
   { path: "/admin/ui/spend", file: "admin-spend.png" },
@@ -60,6 +62,28 @@ const routes = [
   { path: "/admin/ui/get-started", file: "admin-get-started.png" },
   { path: "/admin/ui/jobs", file: "admin-jobs.png" },
 ];
+
+const requestedFiles = process.env.ADMIN_SCREENSHOTS
+  ? new Set(
+      process.env.ADMIN_SCREENSHOTS.split(",")
+        .map((file) => file.trim())
+        .filter(Boolean),
+    )
+  : null;
+const knownFiles = new Set([
+  "admin-login.png",
+  "admin-session-detail.png",
+  ...routes.map((route) => route.file),
+]);
+if (requestedFiles) {
+  const unknownFiles = [...requestedFiles].filter((file) => !knownFiles.has(file));
+  if (unknownFiles.length) {
+    throw new Error(`Unknown ADMIN_SCREENSHOTS file: ${unknownFiles.join(", ")}`);
+  }
+}
+const selectedRoutes = requestedFiles
+  ? routes.filter((route) => requestedFiles.has(route.file))
+  : routes;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -85,8 +109,10 @@ fs.mkdirSync(outDir, { recursive: true });
 
 await page.goto(`${base}/admin/ui/`, { waitUntil: "domcontentloaded" });
 await sleep(1000);
-await page.screenshot({ path: path.join(outDir, "admin-login.png") });
-console.log("wrote admin-login.png");
+if (!requestedFiles || requestedFiles.has("admin-login.png")) {
+  await page.screenshot({ path: path.join(outDir, "admin-login.png") });
+  console.log("wrote admin-login.png");
+}
 
 // Fill login form if present
 const passInput = await page.$('input[type="password"]');
@@ -105,7 +131,7 @@ if (passInput) {
   await sleep(1000);
 }
 
-for (const r of routes) {
+for (const r of selectedRoutes) {
   await page.goto(`${base}${r.path}`, { waitUntil: "domcontentloaded" });
   await sleep(900);
   await page.screenshot({ path: path.join(outDir, r.file) });
@@ -114,23 +140,29 @@ for (const r of routes) {
 
 // Session detail needs a real session id, so discover one from the ring
 // rather than hard-coding an id that goes stale the next time this runs.
-const sessionId = await page.evaluate(async () => {
-  const res = await fetch("/api/requests?limit=200", { credentials: "same-origin" });
-  if (!res.ok) return null;
-  const rows = await res.json();
-  const list = Array.isArray(rows) ? rows : (rows.requests ?? []);
-  // Prefer a multi-request session: a one-call detail page shows nothing
-  // of the causal ordering the page exists to show.
-  const counts = new Map();
-  for (const r of list) {
-    if (typeof r.session_id === "string" && r.session_id) {
-      counts.set(r.session_id, (counts.get(r.session_id) ?? 0) + 1);
-    }
-  }
-  let best = null;
-  for (const [id, n] of counts) if (!best || n > best[1]) best = [id, n];
-  return best?.[0] ?? null;
-});
+const captureSessionDetail =
+  !requestedFiles || requestedFiles.has("admin-session-detail.png");
+const sessionId = captureSessionDetail
+  ? await page.evaluate(async () => {
+      const res = await fetch("/api/requests?limit=200", {
+        credentials: "same-origin",
+      });
+      if (!res.ok) return null;
+      const rows = await res.json();
+      const list = Array.isArray(rows) ? rows : (rows.requests ?? []);
+      // Prefer a multi-request session: a one-call detail page shows nothing
+      // of the causal ordering the page exists to show.
+      const counts = new Map();
+      for (const r of list) {
+        if (typeof r.session_id === "string" && r.session_id) {
+          counts.set(r.session_id, (counts.get(r.session_id) ?? 0) + 1);
+        }
+      }
+      let best = null;
+      for (const [id, n] of counts) if (!best || n > best[1]) best = [id, n];
+      return best?.[0] ?? null;
+    })
+  : null;
 
 if (sessionId) {
   await page.goto(`${base}/admin/ui/sessions/${sessionId}`, {
@@ -139,7 +171,7 @@ if (sessionId) {
   await sleep(900);
   await page.screenshot({ path: path.join(outDir, "admin-session-detail.png") });
   console.log("wrote admin-session-detail.png");
-} else {
+} else if (captureSessionDetail) {
   console.log("skipped admin-session-detail.png (no captured session in the ring)");
 }
 
