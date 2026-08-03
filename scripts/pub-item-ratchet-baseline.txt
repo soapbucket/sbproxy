@@ -168,7 +168,34 @@
 # cloud_completions and cloud_spent_micros rather than nowhere. The
 # ratchet's first option again, a production call site rather than a
 # narrowing.
-284
+
+# Raised to 287 on WOR-2203, 2026-08-03, for four items the extension
+# bundle epic adds. None is narrowable and none is write-only code.
+#
+# `BUNDLE_API_VERSION` and `BUNDLE_KIND` (sbproxy-config/src/extensions.rs)
+# are the manifest's `apiVersion` and `kind` literals. sbproxy-config is
+# one of the three public crates, these two are the contract a bundle
+# author writes at the top of every `bundle.yaml`, and the tests that pin
+# them assert against the same constants a caller reads.
+#
+# `AiExtensionHookRegistration` (sbproxy-plugin/src/extensions.rs) is the
+# link-time registration type for an AI hook. Its consumer is
+# `crates/sbproxy-plugin/tests/ai_extension_contract.rs`, a separate
+# integration-test crate, so `pub` is the only visibility that resolves.
+# The AI chain reaches instances of it through
+# `collect_linked_ai_extension_hooks` without naming the type, which is
+# why the scan sees no production reference.
+#
+# `ExtensionHookDeclaration` (sbproxy-plugin/src/extensions.rs) is the
+# same shape: production code walks `declaration.hooks` without spelling
+# the element type, and the only cross-file mention is in
+# sbproxy-core's inventory test module.
+#
+# The delta is +4 and not +5 because `SourceConfig::with_credential`
+# (sbproxy-config/src/source.rs) gained a production caller in the same
+# epic: private Git bundle sources now resolve credentials through it on
+# the refresh path.
+287
 #
 #
 # Lowered to 286 on WOR-2225, 2026-08-02, answering three more of the

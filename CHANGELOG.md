@@ -12,6 +12,35 @@ the next version cut.
 
 ### Added
 
+- **Extension bundles: install TypeScript, JavaScript, or WebAssembly
+  behavior from a directory and attach it in `sb.yml`.** The plugin trait
+  surface and its registry already existed, but only `AuthProvider` was
+  reachable from configuration: `compile_policy`, `compile_transform`,
+  and `compile_action` never fell back to the registry for an unknown
+  `type:`, so `Transform::Plugin` had full timeout- and panic-guarded
+  dispatch machinery that no config could reach. A bundle is a directory
+  holding a `bundle.yaml` manifest and one entry artifact. TypeScript is
+  stripped to ES2020 once while the candidate loads; JavaScript loads
+  directly; dependencies must arrive as one prebuilt flat `.js` file,
+  because nothing here installs packages or resolves modules at runtime.
+  Four runtimes are available: `javascript`, `wasm` on sbproxy's own
+  envelope ABI, and `proxy_wasm` against the real Proxy-Wasm 0.2.1 host
+  ABI, which is the one Envoy, Kong, and APISIX SDKs already target.
+  Hooks cover `policy`, `transform`, and `action` on the HTTP path, the
+  AI seams (`ai_tool_call`, input and output guardrails, stream events,
+  and close), and a rail-neutral payment lifecycle whose first complete
+  adapter is x402. The manifest bounds wall time, memory, stack,
+  buffered input, output, and WASM fuel, and `permissions` must stay
+  empty: bundle code gets no filesystem or network capability. `sha256`
+  pins the exact bytes of the entry artifact, and a mismatch refuses
+  startup, validation, doctor, or reload before the candidate can become
+  active. Reload swaps bundles as one pipeline generation, so a rejected
+  candidate never leaves half its hooks attached. `GET
+  /admin/extensions` and `sbproxy doctor` both report what is installed,
+  what is attached, and where each hook sits in its chain. Worked
+  examples are in [examples/extension-bundles](examples/extension-bundles/),
+  and the reference is section 12 of [docs/scripting.md](docs/scripting.md).
+
 - **A configured usage reporter now receives live proxy traffic.**
   `proxy.payments.usage_reporters.stripe_meter` shipped with a reporter,
   a durable queue, and a worker that drains it, and with nothing that
@@ -112,6 +141,23 @@ the next version cut.
   send boundary, with explicit closed or `allow_unreserved` backend failure
   behavior.
 
+### Changed
+
+- **`sbproxy-plugin` is 0.3.0, and `ActionOutcome` is the reason.** The
+  enum gained a data-bearing `Response { status, headers, body }` variant
+  so a handler can hand the host a complete response as data rather than
+  writing one through host state, which is what lets ordinary response
+  middleware and the bundle action contract see it. That drops the enum's
+  `Copy` impl and makes any exhaustive match on the 0.2 variants
+  non-exhaustive. The crate stayed at 0.2.0 through that change, so an
+  out-of-tree plugin hit a breaking change with no version to notice it
+  by; 0.x breaking changes bump the minor, and this one now does. Both
+  0.2 variants still exist and still mean what they meant, so migrating
+  is adding a `Response { .. }` arm and replacing any implicit copy with
+  a clone or a move. The migration note is on `ActionOutcome`'s rustdoc,
+  and a test now pins which traits the enum carries so a later change
+  cannot move the contract silently again.
+
 ### Removed
 
 - **The in-process embedded engine (`engine: embedded`, WOR-1658).**
@@ -124,6 +170,48 @@ the next version cut.
   to parse.
 
 ### Fixed
+
+- **A bundle hook can no longer end a request with a status that is not
+  final, or attach a body to one that forbids it.** Extension-produced
+  responses accepted anything from 100 through 599. A 1xx is
+  informational, so it asks the host to keep going, but both surfaces
+  that can return one (a dynamic action's result and Proxy-Wasm's
+  `proxy_send_local_response`) have already stopped dispatch by the time
+  they see it, which left the caller waiting on a final status that could
+  never arrive. A 204 or 304 could also carry a guest body, which
+  desynchronizes an HTTP/1 connection and is a protocol error on HTTP/2.
+  Both surfaces now share one rule applied before any byte reaches the
+  wire, and a rejected body is refused rather than silently dropped, so a
+  bundle that believes it is returning content cannot look like it works.
+  Every rejection message is a fixed string plus the status, so no
+  guest-supplied bytes reach host logs.
+
+- **A bundle's declared `failure_posture` is now the posture the pipeline
+  applies.** The manifest accepted the key for policy, transform, and
+  action hooks, and compilation dropped it. A buffered dynamic policy
+  that failed was denied regardless of what its manifest said, and a
+  transform never received the value at all, because `Transform::Plugin`
+  carried no bundle metadata the way the action and policy wrappers
+  already did. Resolution now follows one precedence: an explicit
+  `failure_posture` or `fail_on_error` on the attachment, then the
+  manifest, then the attachment default. Silence on the attachment is
+  distinguished from an explicit `open`, which is the whole fix, because
+  `TransformConfig::failure_posture()` returns `Open` for both. A genuine
+  host invariant violation is still a 500 whatever the posture says.
+  Action hooks are unchanged and still fail closed: the manifest already
+  refuses any other posture for them, since they are terminal.
+
+- **Extension inventory reports the chain order the proxy runs, not an
+  alphabetical one.** Positions were derived by sorting hook identities
+  and counting, so two Proxy-Wasm filters listed `zeta` then `alpha` came
+  back as `alpha` at position 0 and `zeta` at 1, the reverse of their
+  execution order, and ordered AI and payment chains could all report as
+  position 0. Positions now come from the same enumeration the compiler
+  walks and from each chain's real dispatch order. A hook attached at
+  more than one site deterministically reports the earliest one in
+  document order. Attachment and position are also separate facts now: a
+  hook the chain cannot name stays attached and reports no position,
+  rather than being given one that is wrong.
 
 - **The AI gateway's circuit breaker and outlier detection now run.**
   `resilience.circuit_breaker` and `resilience.outlier_detection` parsed,

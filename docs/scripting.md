@@ -1034,11 +1034,19 @@ permissions: []
 - `entry` is a file inside the bundle directory. JavaScript accepts `.js` or `.ts`; both WASM runtimes accept `.wasm`.
 - `hooks` declares at least one typed hook. A JavaScript hook names its ES module export. WASM hooks omit `export`.
 - `config_schema` is an optional Draft 7 JSON Schema for one attachment. Defaults are applied before the hook starts, and invalid attachment config refuses the candidate.
-- `failure_posture` defaults to `closed`. `open`, `degraded`, and `observe` are only valid where that hook contract defines them.
+- `failure_posture` defaults to `closed`. `open`, `degraded`, and `observe` are only valid where that hook contract defines them. An `action` hook is terminal and accepts only `closed`, because there is nothing to fall through to when it fails.
 - `sandbox` bounds wall time, memory, stack, buffered input, output, and WASM fuel. The values shown are the defaults.
 - `permissions` must remain empty in this release. Bundle code receives no filesystem or network capability.
 
 Hook types cannot replace a built-in or linked registration of the same kind. Duplicate claims fail candidate construction instead of choosing a winner by load order.
+
+Where a hook's `failure_posture` applies, an attachment in `sb.yml` can override it. The precedence has three steps, and it matters that the middle one exists:
+
+1. An explicit `failure_posture` (or the legacy `fail_on_error`) written on the attachment. The operator wiring the bundle into an origin outranks whoever wrote the bundle.
+2. The bundle manifest's own `failure_posture`.
+3. The attachment's default, which for a `transforms:` entry is `open`.
+
+Writing nothing on the attachment is not the same as writing `open` there. A bundle that ships `failure_posture: closed` keeps it unless you say otherwise, which is what makes step two worth having: the bundle author's judgement about their own hook is the fallback, not the wrapper's default.
 
 ### 12.2 Exact SHA-256 validation
 
@@ -1065,6 +1073,13 @@ JavaScript and TypeScript entries are ES modules with named exports. The host pa
 | `action` | `request` plus `config` | A bounded local `response` with status, headers, and `body_base64` |
 
 Every input and result carries `"version": "sbproxy-envelope/v1"`. Unknown result fields, invalid headers, invalid base64, or an out-of-range status fail the invocation.
+
+A hook that ends the request has to return a status the client can act on, so two further rules apply to any response a bundle produces, including a Proxy-Wasm local response:
+
+- The status must be final, in the range 200 to 599. An informational 1xx says "keep going", but the host has already stopped dispatch by the time it sees the result, so the caller would wait for a final status that never arrives. A 1xx is refused before any byte is written.
+- A 204 or a 304 must carry an empty body. Those statuses carry no content by definition, and framing a body under one desynchronizes an HTTP/1 connection. A guest body there is refused rather than dropped, because dropping it would leave a bundle that believes it is returning content looking like it works.
+
+Both refusals name the status and nothing else. No guest-supplied bytes reach the error, so a bundle cannot use a rejection to place content in the operator's logs.
 
 An action bundle finishes the request locally. Its attachment has no upstream configuration, so returning `outcome: "proxy"` fails with `unsupported_action_outcome`. Configure a concrete `type: proxy` or `type: load_balancer` action when the origin should forward traffic. For extension logic around a forwarded stream, attach a Proxy-Wasm filter to that concrete action.
 
