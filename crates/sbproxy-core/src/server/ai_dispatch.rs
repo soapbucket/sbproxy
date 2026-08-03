@@ -1961,8 +1961,15 @@ async fn resolve_request_virtual_key(
                     "native provider key not governed: key store unavailable and \
                      failure_posture admitted the request"
                 );
+                // Record the provider for observability, but deliberately do
+                // not stamp `InboundKeyMode::Native`. That mode is what makes
+                // the rest of dispatch treat this as a recognized native
+                // credential, which then requires a matching
+                // `accept_native_credentials_for` destination binding and
+                // refuses without one. This request is proceeding *ungoverned*
+                // by an operator's explicit posture, so claiming the mode would
+                // reintroduce the same 403 one gate later.
                 ctx.native_key_provider = Some(provider);
-                ctx.inbound_key_mode = crate::context::InboundKeyMode::Native;
                 return Ok(None);
             }
             ctx.native_key_provider = Some(provider);
