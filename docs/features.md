@@ -147,7 +147,7 @@ See [providers.md](providers.md) for the full provider matrix.
 
 ### Routing strategies
 
-The `routing.strategy` field controls how requests are distributed across providers. Sixteen strategies ship, from the simple (`round_robin`, `weighted`, `fallback_chain`, `random`, `sticky`) through load- and cost-driven (`lowest_latency`, `least_connections`, `cost_optimized`, `token_rate`, `least_token_usage`, `prefix_affinity`, `peak_ewma`) to the quality- and outcome-driven set (`race`, `cascade`, `cost_quality`, `outcome_aware`). [ai-gateway.md](ai-gateway.md#routing-strategies) documents each one; `outcome_aware`, which routes on realized cost-per-success, has its own page in [ai-outcome-aware-routing.md](ai-outcome-aware-routing.md).
+The `routing.strategy` field controls how requests are distributed across providers. Fifteen strategies ship, from the simple (`round_robin`, `weighted`, `fallback_chain`, `random`, `sticky`) through load- and cost-driven (`lowest_latency`, `least_connections`, `cost_optimized`, `least_token_usage`, `prefix_affinity`, `peak_ewma`) to the quality- and outcome-driven set (`race`, `cascade`, `cost_quality`, `outcome_aware`). [ai-gateway.md](ai-gateway.md#routing-strategies) documents each one; `outcome_aware`, which routes on realized cost-per-success, has its own page in [ai-outcome-aware-routing.md](ai-outcome-aware-routing.md).
 
 ```yaml
 action:

@@ -3807,7 +3807,12 @@ pub(super) async fn handle_ai_proxy(
                 provider_order = eligible;
             }
         }
-        provider_order = router.eligible_candidate_indices(&config.providers, &provider_order);
+        // Resilience narrows the permitted set, and hands it back when
+        // it would narrow it to nothing. The 503 below is then reserved
+        // for the case it always described: policy, model, or the
+        // enabled switch left this request no provider at all. See
+        // `Router::routable_candidate_indices` (WOR-2233).
+        provider_order = router.routable_candidate_indices(&config.providers, &provider_order);
         if provider_order.is_empty() {
             send_error(session, 503, "no healthy eligible AI provider").await?;
             return Ok(());
@@ -6040,9 +6045,14 @@ pub(super) async fn handle_ai_proxy(
 
     // Intersect the request's final policy/model candidate set with live
     // resilience state before any strategy can choose or order providers.
-    // This strict path never revives an unhealthy, ejected, or breaker-blocked
-    // provider when the intersection is empty.
-    provider_order = router.eligible_candidate_indices(&config.providers, &provider_order);
+    // Policy, model eligibility, and `enabled` are hard; the three
+    // resilience axes are advisory and give the set back rather than
+    // combining into an outage none of them can cause alone, which is
+    // what the load balancer's identical filter does and what
+    // `docs/configuration.md` has always promised (WOR-2233). The
+    // strategy step below re-applies the strict filter, so in the
+    // revived case it selects nothing and the order stands as authored.
+    provider_order = router.routable_candidate_indices(&config.providers, &provider_order);
     if provider_order.is_empty() {
         send_error(session, 503, "no healthy eligible AI provider").await?;
         return Ok(());

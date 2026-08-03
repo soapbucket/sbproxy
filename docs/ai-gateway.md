@@ -202,23 +202,20 @@ routing:
   strategy: random
 ```
 
-### token_rate
+### token_rate (refused)
 
-Routes to the provider with the most remaining token-per-minute capacity. Pair with per-provider token limits so the router can score headroom.
+`token_rate` ranks providers by remaining tokens-per-minute headroom against a declared per-provider limit, and no configuration field declares one. With every limit at zero the score reduces to observed usage alone, which is `least_token_usage` under a different name. A config that selects it is now refused at load rather than served as a strategy other than the one it asks for.
 
-```yaml
-routing:
-  strategy: token_rate
-```
+If you have `strategy: token_rate` today, `least_token_usage` is the strategy you have actually been getting; switching to it keeps your routing unchanged. For capacity-aware routing that scores real numbers, `headroom` and `reset_aware` read the rate-limit headers providers return.
 
 ### headroom
 
 Routes to the provider with the lowest request-quota pressure from fresh
 provider rate-limit headers (`1 - remaining/limit`). Ties keep enabled-list
 order. Unknown or stale snapshots are advisory only: they sort after known
-fresh observations and never invent a capacity guarantee. Prefer pairing
-with live header updates on the dispatch path; local `token_rate` counters
-remain a separate strategy.
+fresh observations and never invent a capacity guarantee. It scores what a
+provider reports about itself, which is why it is the capacity-aware
+strategy to reach for.
 
 ```yaml
 routing:
@@ -255,10 +252,10 @@ See [examples/ai-race](../examples/ai-race/sb.yml). Billing implications, stream
 ### least_token_usage
 
 Routes to the provider with the lowest absolute observed token throughput in
-the current 60-second window, regardless of any configured limit. Unlike
-`token_rate`, which scores remaining headroom against a declared per-provider
-TPM cap, this scores raw observed throughput, so it suits self-hosted vLLM or
-SGLang pools that do not pre-declare a token cap. Untried providers sort lowest
+the current 60-second window, regardless of any configured limit. It scores
+raw observed throughput rather than headroom against a declared cap, so it
+suits self-hosted vLLM or SGLang pools that do not pre-declare a token cap,
+and it is the strategy `token_rate` collapsed into. Untried providers sort lowest
 and are explored first. The same recent-token state breaks ties for
 `prefix_affinity`.
 
@@ -394,6 +391,8 @@ resilience:
     unhealthy_threshold: 3
     healthy_threshold: 2
 ```
+
+Each signal also recovers on its own terms, and none of them writes to another. A breaker admits a probe once `open_duration_secs` has passed and closes after `success_threshold` probes succeed. An outlier ejection lapses after `ejection_duration_secs`. A probe verdict flips back after `healthy_threshold` consecutive passes, whether or not the provider is receiving traffic. A provider that failed on two signals returns when both have cleared, and no signal can hold it out on another's behalf.
 
 See [examples/ai-resilience](../examples/ai-resilience/sb.yml). Field reference in [configuration.md#resilience-resilience](configuration.md#resilience-resilience).
 

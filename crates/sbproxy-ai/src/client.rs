@@ -1590,7 +1590,18 @@ impl AiClient {
     ) -> Result<reqwest::Response> {
         use futures::stream::{FuturesUnordered, StreamExt};
 
-        let candidates = router.eligible_indices(&config.providers);
+        let mut candidates = router.eligible_indices(&config.providers);
+        if candidates.is_empty() {
+            // WOR-2233: the race leg gets the same rule as every other
+            // selection path. With every provider ejected the three
+            // axes have nothing left to prefer, so racing the enabled
+            // set beats refusing a request they could not individually
+            // refuse.
+            candidates = router.routable_candidate_indices(
+                &config.providers,
+                &(0..config.providers.len()).collect::<Vec<_>>(),
+            );
+        }
         if candidates.is_empty() {
             return Err(anyhow::anyhow!("no eligible providers for race"));
         }
