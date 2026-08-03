@@ -156,7 +156,7 @@ pub struct PaymentTerms {
     pub amount: Option<f64>,
     /// Currency code for a priced type; `None` for `free`.
     pub currency: Option<String>,
-    /// Optional `<standard>` URL — the reuse framework an
+    /// Optional `<standard>` URL, the reuse framework an
     /// attribution payment points to (CC-BY, etc.). Per RSL 1.0
     /// schema, the `<standard>` child sits inside `<payment>`.
     pub standard: Option<String>,

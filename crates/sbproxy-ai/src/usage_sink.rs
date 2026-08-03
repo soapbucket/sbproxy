@@ -818,7 +818,7 @@ enum ObjectStoreKind {
 ///
 /// Builds the backend from the process environment (`AWS_*` /
 /// `GOOGLE_APPLICATION_CREDENTIALS`, etc.) on each put. An empty bucket,
-/// missing credentials, or a put failure logs and returns — never panics
+/// missing credentials, or a put failure logs and returns, never panics
 /// or propagates to the request hot path.
 #[derive(Debug)]
 pub struct ObjectStoreSink {

@@ -48,7 +48,7 @@ pub struct ProxyProtocolHeader {
 /// - The line does not start with `"PROXY "`.
 /// - The protocol is not `TCP4` or `TCP6`.
 /// - IP addresses cannot be parsed.
-/// - Ports are outside the valid range (1–65535) or cannot be parsed.
+/// - Ports are outside the valid range (1 to 65535) or cannot be parsed.
 /// - The number of fields is not exactly 6.
 pub fn parse_proxy_protocol_v1(line: &str) -> Result<ProxyProtocolHeader> {
     // Strip the \r\n terminator (or just \n, or nothing).

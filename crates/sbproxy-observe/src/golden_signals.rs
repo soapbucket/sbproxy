@@ -18,7 +18,7 @@ pub struct GoldenSignals {
     pub request_rate: f64,
     /// Error rate as a fraction (0.0 = no errors, 1.0 = all errors).
     pub error_rate: f64,
-    /// Saturation as a fraction of active vs. max connections (0.0 – 1.0).
+    /// Saturation as a fraction of active vs. max connections (0.0 to 1.0).
     pub saturation: f64,
 }
 

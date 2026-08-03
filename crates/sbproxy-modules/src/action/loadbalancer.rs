@@ -59,7 +59,7 @@ pub enum DeploymentMode {
     /// (targets with `group = "canary"`); remaining traffic uses primary targets.
     #[serde(rename = "canary")]
     Canary {
-        /// Percentage of requests routed to canary targets (0–100).
+        /// Percentage of requests routed to canary targets (0 to 100).
         weight: u8,
     },
 }
@@ -2712,7 +2712,7 @@ mod tests {
             }
         }
         // With weight=20, approximately 20% should go to canary.
-        // Allow some tolerance: 15–25%.
+        // Allow some tolerance: 15 to 25%.
         assert!(
             (15..=25).contains(&canary_count),
             "canary should receive ~20% of traffic, got {}%",

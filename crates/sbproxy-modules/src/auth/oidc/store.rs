@@ -81,7 +81,7 @@ impl SessionRecord {
     }
 }
 
-/// Server-side session store. Synchronous on purpose — the redb
+/// Server-side session store. Synchronous on purpose, the redb
 /// backend is sync-internal and the per-request lookup is on the
 /// hot path. An async backend (Redis, DynamoDB) wraps this trait.
 pub trait SessionStore: Send + Sync {

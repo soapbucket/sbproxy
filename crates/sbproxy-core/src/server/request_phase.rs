@@ -2135,12 +2135,12 @@ pub(super) async fn request_filter(
     // When the origin opts in (`web_bot_auth_publish.enabled: true`),
     // serve two unauthenticated GET endpoints:
     //
-    // * `/.well-known/http-message-signatures-directory` — JWKS doc
+    // * `/.well-known/http-message-signatures-directory`, JWKS doc
     //   carrying SBproxy's own Ed25519 signing-key public key.
     //   Verifiers (Cloudflare, AWS WAF, third-party origins) fetch
     //   this to verify the signatures SBproxy attaches to outbound
     //   requests.
-    // * `/.well-known/web-bot-auth/agent-card` — discovery doc
+    // * `/.well-known/web-bot-auth/agent-card`, discovery doc
     //   pointing verifiers at the directory; carries operator name +
     //   description + contact URL.
     //
@@ -4781,8 +4781,8 @@ fn decode_form_component(s: &str) -> String {
 /// Returns a fresh header vec; non-License headers (and origins
 /// without OLP enabled) pass through unchanged. The added params:
 ///
-/// * `realm="<hostname>"` — the protected resource identifier.
-/// * `token_url="<scheme>://<host>/.well-known/olp/token"` — the
+/// * `realm="<hostname>"`: the protected resource identifier.
+/// * `token_url="<scheme>://<host>/.well-known/olp/token"`: the
 ///   POST endpoint shipped in #336. Scheme is derived from the
 ///   request's `host` header convention: `https` when the host
 ///   header carries a port (`api.example.com:8443`) we still use
