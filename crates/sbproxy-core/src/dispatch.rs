@@ -362,9 +362,15 @@ async fn dispatch_action(
                 .context("building plugin action request")?;
             *request.headers_mut() = headers.clone();
             let outcome = handler
+                .handler()
                 .handle(&mut request, &mut ())
                 .await
-                .with_context(|| format!("plugin action {:?} failed", handler.handler_type()))?;
+                .with_context(|| {
+                    format!(
+                        "plugin action {:?} failed",
+                        handler.handler().handler_type()
+                    )
+                })?;
             match outcome {
                 ActionOutcome::Response {
                     status,
@@ -753,11 +759,13 @@ mod tests {
     }
 
     fn plugin_action_response(status: u16, headers: Vec<(String, String)>, body: Bytes) -> Action {
-        Action::Plugin(Box::new(OutcomeAction(ActionOutcome::Response {
-            status,
-            headers,
-            body,
-        })))
+        Action::Plugin(sbproxy_modules::PluginAction::linked(Box::new(
+            OutcomeAction(ActionOutcome::Response {
+                status,
+                headers,
+                body,
+            }),
+        )))
     }
 
     async fn dispatch_plugin_action(action: &Action) -> Result<HttpResponse> {

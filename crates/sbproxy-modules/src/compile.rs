@@ -124,7 +124,7 @@ fn compile_action_for_origin_with_runtime(
         )?))),
         "noop" => Ok(Action::Noop),
         other => match sbproxy_plugin::build_action_plugin(other, config.clone()) {
-            Some(Ok(handler)) => Ok(Action::Plugin(handler)),
+            Some(Ok(handler)) => Ok(Action::Plugin(crate::PluginAction::linked(handler))),
             Some(Err(error)) => {
                 Err(error).with_context(|| format!("action plugin {other:?} factory failed"))
             }
@@ -309,7 +309,7 @@ fn compile_policy_with_optional_registry(
             crate::policy::AgentBudgetPolicy::from_config(config.clone())?,
         ))),
         other => match sbproxy_plugin::build_policy_plugin(other, config.clone()) {
-            Some(Ok(enforcer)) => Ok(Policy::Plugin(enforcer)),
+            Some(Ok(enforcer)) => Ok(Policy::Plugin(crate::PluginPolicy::linked(enforcer))),
             Some(Err(error)) => {
                 Err(error).with_context(|| format!("policy plugin {other:?} factory failed"))
             }
@@ -472,7 +472,10 @@ fn compile_bundle_policy(hook: &LoadedBundleHook, config: serde_json::Value) -> 
             anyhow::bail!("Proxy-Wasm bundles cannot provide policy hooks")
         }
     };
-    Ok(Policy::Plugin(handler))
+    Ok(Policy::Plugin(crate::PluginPolicy::dynamic(
+        handler,
+        dynamic_hook_metadata(hook)?,
+    )))
 }
 
 fn compile_bundle_transform(
@@ -501,7 +504,22 @@ fn compile_bundle_action(hook: &LoadedBundleHook, config: serde_json::Value) -> 
             anyhow::bail!("Proxy-Wasm bundles cannot provide action hooks")
         }
     };
-    Ok(Action::Plugin(handler))
+    Ok(Action::Plugin(crate::PluginAction::dynamic(
+        handler,
+        dynamic_hook_metadata(hook)?,
+    )))
+}
+
+fn dynamic_hook_metadata(hook: &LoadedBundleHook) -> Result<crate::DynamicHookMetadata> {
+    let maximum = usize::try_from(hook.manifest().sandbox.max_buffer_bytes)
+        .context("bundle sandbox max_buffer_bytes does not fit this platform")?;
+    Ok(crate::DynamicHookMetadata::new(
+        hook.manifest().name.clone(),
+        hook.hook().type_name.clone(),
+        hook.hook().execution.body_mode,
+        maximum,
+        hook.manifest().failure_posture,
+    ))
 }
 
 #[cfg(test)]
@@ -512,7 +530,7 @@ mod tests {
     use std::sync::Arc;
 
     use bytes::{Bytes, BytesMut};
-    use sbproxy_config::ExtensionBundlesConfig;
+    use sbproxy_config::{BundleBodyMode, ExtensionBundlesConfig, FailureMode};
     use sbproxy_extension::bundle::DynamicBundleRegistry;
     use sbproxy_plugin::{
         ActionHandler, ActionOutcome, ActionPluginRegistration, PluginResult, PolicyDecision,
@@ -695,6 +713,15 @@ hooks:
         let Policy::Plugin(policy) = policy else {
             panic!("dynamic policy should use plugin dispatch");
         };
+        let (policy, policy_metadata) = policy.into_parts();
+        let policy_metadata = policy_metadata
+            .as_ref()
+            .expect("dynamic policy should retain bundle execution metadata");
+        assert_eq!(policy_metadata.bundle_id(), "compile-fixture");
+        assert_eq!(policy_metadata.hook_type(), "dynamic_compile_policy");
+        assert_eq!(policy_metadata.body_mode(), BundleBodyMode::Buffered);
+        assert_eq!(policy_metadata.max_buffer_bytes(), 1_048_576);
+        assert_eq!(policy_metadata.failure_posture(), FailureMode::Closed);
         let decision = policy
             .enforce(&http::Request::new(Bytes::new()), &mut ())
             .await
@@ -728,8 +755,17 @@ hooks:
         let Action::Plugin(action) = action else {
             panic!("dynamic action should use plugin dispatch");
         };
+        let action_metadata = action
+            .dynamic_hook()
+            .expect("dynamic action should retain bundle execution metadata");
+        assert_eq!(action_metadata.bundle_id(), "compile-fixture");
+        assert_eq!(action_metadata.hook_type(), "dynamic_compile_action");
+        assert_eq!(action_metadata.body_mode(), BundleBodyMode::Buffered);
+        assert_eq!(action_metadata.max_buffer_bytes(), 1_048_576);
+        assert_eq!(action_metadata.failure_posture(), FailureMode::Closed);
         let mut request = http::Request::new(Bytes::new());
         let outcome = action
+            .handler()
             .handle(&mut request, &mut ())
             .await
             .expect("dynamic action should run");
@@ -762,6 +798,11 @@ hooks:
         let Policy::Plugin(static_policy) = static_policy else {
             panic!("linked policy should use plugin dispatch");
         };
+        let (static_policy, static_metadata) = static_policy.into_parts();
+        assert!(
+            static_metadata.is_none(),
+            "linked policy should retain legacy body handling"
+        );
         let decision = static_policy
             .enforce(&http::Request::new(Bytes::new()), &mut ())
             .await

@@ -11,6 +11,7 @@
 use std::sync::Arc;
 
 use sbproxy_modules::policy::Policy;
+use sbproxy_modules::DynamicHookMetadata;
 use sbproxy_observe::events::PolicySurface;
 use sbproxy_plugin::PolicyEnforcer;
 
@@ -39,6 +40,8 @@ pub struct CompiledEnforcer {
     pub surface: PolicySurface,
     /// The dispatchable enforcer.
     pub enforcer: Box<dyn PolicyEnforcer>,
+    /// Dynamic bundle execution metadata, absent for built-ins and linked plugins.
+    pub dynamic_hook: Option<DynamicHookMetadata>,
 }
 
 /// Compile every [`Policy`] in `policies` into a
@@ -97,10 +100,14 @@ fn compile_one(policy: Policy, metric_policy: &str) -> anyhow::Result<CompiledEn
         Policy::A2A(p) => builtin(A2AEnforcer(Arc::new(p))),
         Policy::SemanticConstraint(p) => builtin(SemanticConstraintEnforcer(Arc::new(p))),
         Policy::AgentBudget(p) => builtin(AgentBudgetEnforcer(p)),
-        Policy::Plugin(enforcer) => CompiledEnforcer {
-            surface: PolicySurface::Plugin,
-            enforcer,
-        },
+        Policy::Plugin(plugin) => {
+            let (enforcer, dynamic_hook) = plugin.into_parts();
+            CompiledEnforcer {
+                surface: PolicySurface::Plugin,
+                enforcer,
+                dynamic_hook,
+            }
+        }
     };
     Ok(compiled)
 }
@@ -109,6 +116,7 @@ fn builtin<E: PolicyEnforcer>(enforcer: E) -> CompiledEnforcer {
     CompiledEnforcer {
         surface: PolicySurface::BuiltIn,
         enforcer: Box::new(enforcer),
+        dynamic_hook: None,
     }
 }
 
@@ -148,7 +156,7 @@ mod tests {
 
     #[test]
     fn plugin_variant_hands_back_enforcer() {
-        let policy = Policy::Plugin(Box::new(FakePlugin));
+        let policy = Policy::Plugin(sbproxy_modules::PluginPolicy::linked(Box::new(FakePlugin)));
         let compiled = compile_one(policy, "test-route").expect("policy compiles");
         assert_eq!(compiled.enforcer.policy_type(), "fake_plugin");
         assert_eq!(compiled.surface, PolicySurface::Plugin);
@@ -266,7 +274,7 @@ mod tests {
                 sbproxy_modules::policy::WafPolicy::from_config(serde_json::json!({}))
                     .expect("waf default"),
             ),
-            Policy::Plugin(Box::new(FakePlugin)),
+            Policy::Plugin(sbproxy_modules::PluginPolicy::linked(Box::new(FakePlugin))),
             Policy::Csrf(
                 CsrfPolicy::from_config(serde_json::json!({"secret_key": "s"}))
                     .expect("csrf default"),

@@ -463,17 +463,37 @@ fn manifest_enforces_hook_count_identifiers_and_failure_posture() {
     );
     assert!(manifest_error(&too_many_hooks).contains("128 hooks"));
 
-    for kind in ["transform", "action"] {
-        for posture in ["observe", "degraded"] {
-            let yaml = JAVASCRIPT_MANIFEST
-                .replace("kind: policy", &format!("kind: {kind}"))
-                .replace(
-                    "failure_posture: closed",
-                    &format!("failure_posture: {posture}"),
-                );
-            let error = manifest_error(&yaml);
-            assert!(error.contains(kind) && error.contains(posture), "{error}");
-        }
+    for posture in ["observe", "degraded"] {
+        let yaml = JAVASCRIPT_MANIFEST
+            .replace("kind: policy", "kind: transform")
+            .replace(
+                "failure_posture: closed",
+                &format!("failure_posture: {posture}"),
+            );
+        let error = manifest_error(&yaml);
+        assert!(
+            error.contains("transform") && error.contains(posture),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn action_hooks_require_closed_failure_posture() {
+    for posture in ["open", "degraded", "observe"] {
+        let yaml = JAVASCRIPT_MANIFEST
+            .replace("kind: policy", "kind: action")
+            .replace(
+                "failure_posture: closed",
+                &format!("failure_posture: {posture}"),
+            );
+
+        let error = manifest_error(&yaml);
+
+        assert!(
+            error.contains("action hooks are terminal and require failure_posture closed"),
+            "unexpected {posture} posture error: {error}"
+        );
     }
 }
 

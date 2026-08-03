@@ -37,8 +37,9 @@ pub use websocket::*;
 
 use std::collections::HashMap;
 
-use sbproxy_plugin::ActionHandler;
 use serde::{Deserialize, Deserializer};
+
+use crate::PluginAction;
 
 /// Memoize an upstream `(host, port, tls)` parse (WOR-1698).
 ///
@@ -111,7 +112,7 @@ pub enum Action {
     /// Placeholder for future variants - keeps the enum populated.
     Noop,
     /// Third-party plugin (only case using dynamic dispatch).
-    Plugin(Box<dyn ActionHandler>),
+    Plugin(PluginAction),
 }
 
 /// Proxy action config - reverse-proxies requests to an upstream URL.
@@ -948,7 +949,7 @@ impl Action {
             Self::A2a(_) => "a2a",
             Self::Mcp(_) => "mcp",
             Self::Noop => "noop",
-            Self::Plugin(p) => p.handler_type(),
+            Self::Plugin(p) => p.handler().handler_type(),
         }
     }
 }

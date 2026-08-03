@@ -3327,20 +3327,14 @@ fn emit_policy_verdict(
 /// existing built-in arms can keep their `Session` view while
 /// plugin enforcers see the standard `http` types.
 ///
-/// # The body is always empty
-///
-/// The snapshot carries the request line and headers only. Its body is
-/// unconditionally `bytes::Bytes::new()`, because the request filter
-/// runs before any body byte has been read.
-///
-/// This is load bearing for anyone writing an enforcer. A check gated
-/// on `req.body()` does not run, ever, and it fails silently: the
-/// enforcer returns `Allow`, its metrics stay flat, and unit tests that
-/// call the underlying check directly keep passing. The A2A 1.0
-/// push-notification SSRF check shipped that way and never fired once
-/// in production. If a policy needs the body, it belongs at the body
-/// phase; see `crate::server::a2a_body_phase` for the pattern.
-fn build_plugin_request_snapshot(session: &Session) -> Option<http::Request<bytes::Bytes>> {
+/// Header-phase callers pass an empty body. Dynamic policies that declare
+/// buffered access are deferred until end-of-stream and pass the complete,
+/// cap-checked body. Dynamic `none` policies and linked plugins retain the
+/// header-only snapshot.
+fn build_plugin_request_snapshot(
+    session: &Session,
+    body: bytes::Bytes,
+) -> Option<http::Request<bytes::Bytes>> {
     let req = session.req_header();
     let method = req.method.as_str();
     let path_and_query = req
@@ -3349,7 +3343,7 @@ fn build_plugin_request_snapshot(session: &Session) -> Option<http::Request<byte
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| "/".to_string());
     let builder = http::Request::builder().method(method).uri(path_and_query);
-    let mut built = builder.body(bytes::Bytes::new()).ok()?;
+    let mut built = builder.body(body).ok()?;
     *built.headers_mut() = req.headers.clone();
     Some(built)
 }
@@ -3546,6 +3540,13 @@ async fn check_policies(
     // "allow" (None) before materialising the request snapshot. The
     // caller records the `record_policy(.., "all", "allow")` metric on
     // the None path, so the empty-chain metric still fires.
+    ctx.dynamic_request_body_plan =
+        crate::request_body_plan::DynamicRequestBodyPlan::from_policy_metadata(
+            enforcers
+                .iter()
+                .enumerate()
+                .map(|(index, compiled)| (index, compiled.dynamic_hook.as_ref())),
+        );
     if enforcers.is_empty() {
         return None;
     }
@@ -3555,7 +3556,7 @@ async fn check_policies(
     // they need (client_ip, hostname, rate_limit_info) lives on
     // `RequestContext` and is threaded through the `&mut Any`
     // downcast inside each `enforce()` body.
-    let req_snapshot = match build_plugin_request_snapshot(session) {
+    let req_snapshot = match build_plugin_request_snapshot(session, bytes::Bytes::new()) {
         Some(r) => r,
         None => {
             // Fail-closed: a request that cannot be materialised
@@ -3569,6 +3570,13 @@ async fn check_policies(
     let mut confirm_state = crate::policy_dispatch::ConfirmReducerState::default();
 
     for compiled in enforcers {
+        if compiled
+            .dynamic_hook
+            .as_ref()
+            .is_some_and(|hook| hook.body_mode() == sbproxy_config::BundleBodyMode::Buffered)
+        {
+            continue;
+        }
         // WOR-1697: `policy_type()` is a `&'static str`; keep the borrow
         // instead of allocating a String per enforcer. `emit_policy_verdict`
         // takes `&str` and owns its own copy only where it needs one.
@@ -3600,6 +3608,139 @@ async fn check_policies(
         emit_policy_verdict(verdict_ctx, policy_id, surface, translated.verdict, started);
         // WOR-2094: mirror every verdict onto the request context so the
         // admin ring row can explain what applied, not just what denied.
+        ctx.record_policy_decision(policy_id, translated.verdict.as_label());
+        if let Some(deny) = translated.deny {
+            ctx.deny_reason = Some(format!("{policy_id}: {}", deny.1));
+            return Some(deny);
+        }
+    }
+
+    let declared_body_len = session
+        .req_header()
+        .headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok());
+    if let Some(declared_body_len) = declared_body_len {
+        match ctx
+            .dynamic_request_body_plan
+            .before_growth(declared_body_len, None)
+        {
+            Ok(skipped) => {
+                for skipped_hook in skipped {
+                    let hook = skipped_hook.metadata();
+                    let posture = hook.failure_posture();
+                    tracing::warn!(
+                        target: "sbproxy::extension",
+                        bundle = hook.bundle_id(),
+                        hook = hook.hook_type(),
+                        policy_index = skipped_hook.policy_index(),
+                        received = declared_body_len,
+                        cap = skipped_hook.cap(),
+                        failure_posture = posture.as_label(),
+                        "skipping buffered dynamic policy from declared request body length"
+                    );
+                    if posture.guarantee_waived() || posture.records_counterfactual() {
+                        ctx.record_policy_decision(hook.hook_type(), posture.as_label());
+                    }
+                }
+            }
+            Err(overflow) => {
+                let hook = overflow.metadata();
+                tracing::debug!(
+                    target: "sbproxy::extension",
+                    bundle = hook.bundle_id(),
+                    hook = hook.hook_type(),
+                    policy_index = ?overflow.policy_index(),
+                    received = declared_body_len,
+                    cap = overflow.cap(),
+                    "buffered dynamic policy rejected declared request body length"
+                );
+                return Some((413, "request entity too large".to_string(), "plugin"));
+            }
+        }
+    }
+
+    ctx.dynamic_request_body_plan
+        .set_other_buffering_required(ctx.validate_request_body);
+    if ctx.dynamic_request_body_plan.has_active_buffered_policies() {
+        ctx.validate_request_body = true;
+    }
+
+    None
+}
+
+/// Run dynamic bundle policies that declared buffered request-body access.
+///
+/// The header phase deliberately skips these enforcers. This body-phase
+/// dispatcher supplies one complete immutable body only after the shared
+/// request buffer reaches end-of-stream.
+async fn check_buffered_dynamic_policies(
+    enforcers: &[crate::builtin_enforcers::CompiledEnforcer],
+    session: &Session,
+    ctx: &mut RequestContext,
+    body: bytes::Bytes,
+    verdict_ctx: &PolicyVerdictCtx,
+) -> Option<(u16, String, &'static str)> {
+    use sbproxy_observe::events::VerdictTag;
+
+    let active_indexes = ctx.dynamic_request_body_plan.active_policy_indexes();
+    if active_indexes.is_empty() {
+        return None;
+    }
+    let req_snapshot = match build_plugin_request_snapshot(session, body) {
+        Some(request) => request,
+        None => return Some((500, "policy: bad request".to_string(), "plugin")),
+    };
+    let mut confirm_state = crate::policy_dispatch::ConfirmReducerState::default();
+
+    for index in active_indexes {
+        let Some(compiled) = enforcers.get(index) else {
+            return Some((500, "policy plan changed".to_string(), "plugin"));
+        };
+        let Some(metadata) = compiled.dynamic_hook.as_ref() else {
+            continue;
+        };
+        if metadata.body_mode() != sbproxy_config::BundleBodyMode::Buffered {
+            continue;
+        }
+
+        let policy_id = compiled.enforcer.policy_type();
+        let started = std::time::Instant::now();
+        let ctx_any: &mut dyn std::any::Any = ctx;
+        let decision = match compiled.enforcer.enforce(&req_snapshot, ctx_any).await {
+            Ok(decision) => decision,
+            Err(error) => {
+                tracing::warn!(
+                    target: "sbproxy::policy",
+                    error = %error,
+                    policy = %policy_id,
+                    "buffered dynamic policy enforce() returned error; treating as deny"
+                );
+                emit_policy_verdict(
+                    verdict_ctx,
+                    policy_id,
+                    compiled.surface,
+                    VerdictTag::Deny,
+                    started,
+                );
+                ctx.record_policy_decision(policy_id, VerdictTag::Deny.as_label());
+                ctx.deny_reason = Some(format!("{policy_id}: enforce error"));
+                return Some((500, "policy error".to_string(), "plugin"));
+            }
+        };
+        let translated = crate::policy_dispatch::translate_plugin_decision(
+            decision,
+            &mut ctx.policy_response_headers,
+            &mut confirm_state,
+        );
+        emit_policy_verdict(
+            verdict_ctx,
+            policy_id,
+            compiled.surface,
+            translated.verdict,
+            started,
+        );
         ctx.record_policy_decision(policy_id, translated.verdict.as_label());
         if let Some(deny) = translated.deny {
             ctx.deny_reason = Some(format!("{policy_id}: {}", deny.1));

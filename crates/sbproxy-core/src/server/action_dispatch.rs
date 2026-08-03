@@ -834,14 +834,216 @@ pub(super) async fn handle_action(
             let method = request_header.method.clone();
             let uri = request_header.uri.clone();
             let headers = request_header.headers.clone();
-            let mut request_body = bytes::BytesMut::new();
-            while let Some(chunk) = session.read_request_body().await? {
-                request_body.extend_from_slice(&chunk);
-            }
+            let dynamic_hook = handler.dynamic_hook().cloned();
+            let request_body = if let Some(action_hook) = dynamic_hook.as_ref() {
+                let action_buffers = match action_hook.body_mode() {
+                    sbproxy_config::BundleBodyMode::None => false,
+                    sbproxy_config::BundleBodyMode::Buffered => true,
+                    sbproxy_config::BundleBodyMode::Streamed => {
+                        tracing::error!(
+                            target: "sbproxy::extension",
+                            bundle = action_hook.bundle_id(),
+                            hook = action_hook.hook_type(),
+                            "non-Proxy-Wasm dynamic action declared streamed body access"
+                        );
+                        ctx.response_status = Some(500);
+                        send_error(session, 500, "unsupported plugin action body mode").await?;
+                        return Ok(true);
+                    }
+                };
+                let declared_body_len = headers
+                    .get(http::header::CONTENT_LENGTH)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<usize>().ok());
+
+                if let Some(declared_body_len) = declared_body_len {
+                    if let Some(cap) = ctx.body_size_limit {
+                        if declared_body_len > cap {
+                            debug!(
+                                received = declared_body_len,
+                                cap,
+                                "request_limit rejected plugin action body from declared length"
+                            );
+                            ctx.response_status = Some(413);
+                            send_error(session, 413, "request entity too large").await?;
+                            return Ok(true);
+                        }
+                    }
+                    let skipped = match ctx
+                        .dynamic_request_body_plan
+                        .before_growth(declared_body_len, action_buffers.then_some(action_hook))
+                    {
+                        Ok(skipped) => skipped,
+                        Err(overflow) => {
+                            let hook = overflow.metadata();
+                            debug!(
+                                target: "sbproxy::extension",
+                                bundle = hook.bundle_id(),
+                                hook = hook.hook_type(),
+                                policy_index = ?overflow.policy_index(),
+                                received = declared_body_len,
+                                cap = overflow.cap(),
+                                "dynamic hook rejected plugin action body from declared length"
+                            );
+                            ctx.response_status = Some(413);
+                            send_error(session, 413, "request entity too large").await?;
+                            return Ok(true);
+                        }
+                    };
+                    for skipped_hook in skipped {
+                        let hook = skipped_hook.metadata();
+                        let posture = hook.failure_posture();
+                        tracing::warn!(
+                            target: "sbproxy::extension",
+                            bundle = hook.bundle_id(),
+                            hook = hook.hook_type(),
+                            policy_index = skipped_hook.policy_index(),
+                            received = declared_body_len,
+                            cap = skipped_hook.cap(),
+                            failure_posture = posture.as_label(),
+                            "skipping buffered dynamic policy from declared plugin action body length"
+                        );
+                        if posture.guarantee_waived() || posture.records_counterfactual() {
+                            ctx.record_policy_decision(hook.hook_type(), posture.as_label());
+                        }
+                    }
+                }
+
+                let mut buffered = bytes::BytesMut::new();
+                let mut must_read = action_buffers
+                    || ctx.dynamic_request_body_plan.has_active_buffered_policies()
+                    || ctx.body_size_limit.is_some();
+                while must_read {
+                    let Some(chunk) = session.read_request_body().await? else {
+                        break;
+                    };
+                    ctx.request_body_bytes =
+                        ctx.request_body_bytes.saturating_add(chunk.len() as u64);
+                    if let Some(cap) = ctx.body_size_limit {
+                        ctx.body_bytes_seen = ctx.body_bytes_seen.saturating_add(chunk.len());
+                        if ctx.body_bytes_seen > cap {
+                            debug!(
+                                received = ctx.body_bytes_seen,
+                                cap, "request_limit rejected streaming plugin action body"
+                            );
+                            ctx.response_status = Some(413);
+                            send_error(session, 413, "request entity too large").await?;
+                            return Ok(true);
+                        }
+                    }
+
+                    let needs_buffer = action_buffers
+                        || ctx.dynamic_request_body_plan.has_active_buffered_policies();
+                    if needs_buffer {
+                        let proposed_len = buffered.len().saturating_add(chunk.len());
+                        let skipped = match ctx
+                            .dynamic_request_body_plan
+                            .before_growth(proposed_len, action_buffers.then_some(action_hook))
+                        {
+                            Ok(skipped) => skipped,
+                            Err(overflow) => {
+                                let hook = overflow.metadata();
+                                debug!(
+                                    target: "sbproxy::extension",
+                                    bundle = hook.bundle_id(),
+                                    hook = hook.hook_type(),
+                                    policy_index = ?overflow.policy_index(),
+                                    received = proposed_len,
+                                    cap = overflow.cap(),
+                                    "dynamic hook blocked plugin action body before allocation"
+                                );
+                                ctx.response_status = Some(413);
+                                send_error(session, 413, "request entity too large").await?;
+                                return Ok(true);
+                            }
+                        };
+                        for skipped_hook in skipped {
+                            let hook = skipped_hook.metadata();
+                            let posture = hook.failure_posture();
+                            tracing::warn!(
+                                target: "sbproxy::extension",
+                                bundle = hook.bundle_id(),
+                                hook = hook.hook_type(),
+                                policy_index = skipped_hook.policy_index(),
+                                received = proposed_len,
+                                cap = skipped_hook.cap(),
+                                failure_posture = posture.as_label(),
+                                "skipping buffered dynamic policy whose plugin action body exceeded its cap"
+                            );
+                            if posture.guarantee_waived() || posture.records_counterfactual() {
+                                ctx.record_policy_decision(hook.hook_type(), posture.as_label());
+                            }
+                        }
+                        if action_buffers
+                            || ctx.dynamic_request_body_plan.has_active_buffered_policies()
+                        {
+                            buffered.extend_from_slice(&chunk);
+                        }
+                    }
+
+                    must_read = action_buffers
+                        || ctx.dynamic_request_body_plan.has_active_buffered_policies()
+                        || ctx.body_size_limit.is_some();
+                }
+                let buffered = buffered.freeze();
+
+                if ctx.dynamic_request_body_plan.has_active_buffered_policies() {
+                    let Some(origin_idx) = origin_idx else {
+                        ctx.response_status = Some(500);
+                        send_error(session, 500, "plugin policy plan has no origin").await?;
+                        return Ok(true);
+                    };
+                    let Some(enforcers) = pipeline.enforcers.get(origin_idx) else {
+                        ctx.response_status = Some(500);
+                        send_error(session, 500, "plugin policy plan has no enforcers").await?;
+                        return Ok(true);
+                    };
+                    let workspace_id = pipeline.config.origins[origin_idx].workspace_id.to_string();
+                    let verdict_ctx = PolicyVerdictCtx {
+                        request_id: ctx.request_id.to_string(),
+                        tenant_id: workspace_id.clone(),
+                        workspace_id,
+                    };
+                    if let Some((status, message, policy_type)) = check_buffered_dynamic_policies(
+                        enforcers,
+                        session,
+                        ctx,
+                        buffered.clone(),
+                        &verdict_ctx,
+                    )
+                    .await
+                    {
+                        let policy_type = effective_policy_type(ctx, policy_type);
+                        sbproxy_observe::metrics::record_policy(
+                            ctx.hostname.as_str(),
+                            policy_type,
+                            "deny",
+                        );
+                        ctx.record_policy_decision(policy_type, "deny");
+                        ctx.response_status = Some(status);
+                        send_error(session, status, &message).await?;
+                        return Ok(true);
+                    }
+                }
+
+                if action_buffers {
+                    buffered
+                } else {
+                    Bytes::new()
+                }
+            } else {
+                // Linked plugins predate body planning and retain their
+                // complete-body behavior until they adopt bundle metadata.
+                let mut request_body = bytes::BytesMut::new();
+                while let Some(chunk) = session.read_request_body().await? {
+                    request_body.extend_from_slice(&chunk);
+                }
+                request_body.freeze()
+            };
             let mut request = http::Request::builder()
                 .method(method)
                 .uri(uri)
-                .body(request_body.freeze())
+                .body(request_body)
                 .map_err(|error| {
                     Error::because(
                         ErrorType::InternalError,
@@ -850,9 +1052,13 @@ pub(super) async fn handle_action(
                     )
                 })?;
             *request.headers_mut() = headers;
-            let outcome = handler.handle(&mut request, ctx).await.map_err(|error| {
-                Error::because(ErrorType::InternalError, "plugin action failed", error)
-            })?;
+            let outcome = handler
+                .handler()
+                .handle(&mut request, ctx)
+                .await
+                .map_err(|error| {
+                    Error::because(ErrorType::InternalError, "plugin action failed", error)
+                })?;
             match outcome {
                 sbproxy_plugin::ActionOutcome::Proxy => Err(Error::explain(
                     ErrorType::InternalError,
@@ -1133,11 +1339,13 @@ mod plugin_action_tests {
     }
 
     fn response_action(status: u16, headers: Vec<(String, String)>, body: Bytes) -> Action {
-        Action::Plugin(Box::new(OutcomeAction(ActionOutcome::Response {
-            status,
-            headers,
-            body,
-        })))
+        Action::Plugin(sbproxy_modules::PluginAction::linked(Box::new(
+            OutcomeAction(ActionOutcome::Response {
+                status,
+                headers,
+                body,
+            }),
+        )))
     }
 
     async fn exchange(
