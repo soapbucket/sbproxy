@@ -2,8 +2,8 @@ use std::collections::BTreeSet;
 
 use sbproxy_config::{
     compile_config, reserved_builtin_hook_names, BundleBodyMode, BundleHookKind, BundleManifest,
-    BundleRuntime, BundleSourceConfig, FailureMode, BUNDLE_API_VERSION, BUNDLE_KIND,
-    MAX_BUNDLE_MANIFEST_BYTES,
+    BundleRuntime, BundleSourceConfig, EnforcementMode, FailureMode, BUNDLE_API_VERSION,
+    BUNDLE_KIND, MAX_BUNDLE_MANIFEST_BYTES,
 };
 
 const JAVASCRIPT_MANIFEST: &str = r#"
@@ -118,6 +118,7 @@ fn manifest_parses_the_versioned_javascript_contract_and_defaults() {
     assert_eq!(manifest.runtime, BundleRuntime::Javascript);
     assert_eq!(manifest.failure_posture, FailureMode::Closed);
     assert_eq!(manifest.hooks[0].kind, BundleHookKind::Policy);
+    assert_eq!(manifest.hooks[0].enforcement_mode, EnforcementMode::Block);
     assert_eq!(
         manifest.hooks[0].execution.body_mode,
         BundleBodyMode::Buffered
@@ -125,6 +126,34 @@ fn manifest_parses_the_versioned_javascript_contract_and_defaults() {
     assert_eq!(manifest.sandbox.max_buffer_bytes, 1_048_576);
     assert_eq!(manifest.sandbox.max_output_bytes, 1_048_576);
     assert_eq!(manifest.sandbox.max_fuel, 100_000_000);
+}
+
+#[test]
+fn proxy_wasm_accepts_streamed_ai_events_with_observe_mode() {
+    let manifest = parse_manifest(
+        r#"
+apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: stream-observer
+version: 1.0.0
+runtime: proxy_wasm
+abi: 0.2.1
+entry: observer.wasm
+hooks:
+  - kind: ai_stream_event
+    type: stream_observer
+    enforcement_mode: observe
+    execution:
+      body_mode: streamed
+"#,
+    );
+
+    assert_eq!(manifest.hooks[0].kind, BundleHookKind::AiStreamEvent);
+    assert_eq!(manifest.hooks[0].enforcement_mode, EnforcementMode::Observe);
+    assert_eq!(
+        manifest.hooks[0].execution.body_mode,
+        BundleBodyMode::Streamed
+    );
 }
 
 #[test]

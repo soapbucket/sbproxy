@@ -5,6 +5,10 @@
 //! a pipeline generation can describe dynamically loaded bundles without
 //! borrowing loader state.
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{PluginError, PluginResult};
@@ -263,6 +267,9 @@ fn validate_payment_value(field: &str, value: &str) -> PluginResult<()> {
     Ok(())
 }
 
+/// Schema version carried by every provider-neutral AI extension event.
+pub const AI_EXTENSION_EVENT_SCHEMA_VERSION: u16 = 1;
+
 /// Runtime used to execute an extension bundle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -315,6 +322,239 @@ pub enum ExtensionHookKind {
     AiClose,
     /// Payment lifecycle event hook.
     Payment,
+}
+
+/// Whether a successful AI hook verdict can stop the current operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AiExtensionEnforcement {
+    /// Await the hook and apply a block verdict before releasing bytes.
+    Block,
+    /// Deliver the event through the bounded observation lane.
+    Observe,
+}
+
+/// Provider-neutral role attached to an AI extension message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AiExtensionRole {
+    /// System instruction.
+    System,
+    /// End-user input.
+    User,
+    /// Model output carried into a later turn.
+    Assistant,
+    /// Tool result carried into a later turn.
+    Tool,
+}
+
+/// Bounded text view of one canonical AI message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiExtensionMessage {
+    /// Canonical speaker role.
+    pub role: AiExtensionRole,
+    /// Text content after provider-format normalization.
+    pub content: String,
+    /// Optional speaker name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Tool call satisfied by a tool-result message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+/// One complete model-emitted tool call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiExtensionToolCall {
+    /// Stable position in the model response.
+    pub index: usize,
+    /// Provider-issued call identifier, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Tool name.
+    pub name: String,
+    /// Complete raw JSON arguments assembled from every streamed fragment.
+    pub arguments_json: String,
+}
+
+/// Selected normalized chunks available to streamed AI hooks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AiExtensionStreamChunk {
+    /// Start of one model response.
+    MessageStart,
+    /// One text delta in response order.
+    ContentDelta {
+        /// Canonical content-block index.
+        index: usize,
+        /// Decoded text for this delta.
+        text: String,
+    },
+    /// Provider-normalized token usage.
+    Usage {
+        /// Prompt tokens, when the provider reported them.
+        prompt_tokens: u64,
+        /// Completion tokens, when the provider reported them.
+        completion_tokens: u64,
+        /// Total tokens, when the provider reported them.
+        total_tokens: u64,
+    },
+    /// Terminal model event.
+    MessageStop {
+        /// Provider-neutral finish reason.
+        finish_reason: String,
+    },
+}
+
+/// Event payload delivered to an AI extension hook.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum AiExtensionEventPayload {
+    /// Canonical request messages before upstream model dispatch.
+    GuardrailInput {
+        /// Evaluation stage, such as `original` or `rag_augmented`.
+        stage: String,
+        /// Messages in canonical arrival order.
+        messages: Vec<AiExtensionMessage>,
+    },
+    /// Canonical assistant text from a buffered response.
+    GuardrailOutput {
+        /// Provider-normalized assistant text.
+        content: String,
+    },
+    /// One complete tool call, assembled before evaluation.
+    ToolCall {
+        /// Complete tool-call facts.
+        call: AiExtensionToolCall,
+    },
+    /// One selected normalized stream chunk.
+    Stream {
+        /// Provider-neutral chunk.
+        chunk: AiExtensionStreamChunk,
+    },
+    /// Aggregate metadata emitted exactly once when a stream closes.
+    Close {
+        /// Provider-neutral terminal reason, when observed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        finish_reason: Option<String>,
+        /// Total decoded content bytes seen by the host.
+        content_bytes: u64,
+        /// Number of decoded content deltas seen by the host.
+        content_delta_count: u64,
+        /// Number of complete tool calls seen by the host.
+        tool_call_count: u64,
+        /// Prompt tokens, when reported.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_tokens: Option<u64>,
+        /// Completion tokens, when reported.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        completion_tokens: Option<u64>,
+    },
+}
+
+/// Versioned provider-neutral event shared by linked and bundled AI hooks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiExtensionEvent {
+    /// Event schema version.
+    pub schema_version: u16,
+    /// Monotonic sequence within one request.
+    pub sequence: u64,
+    /// Safe request correlation identifier, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// Resolved model identifier, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Event-specific payload.
+    #[serde(flatten)]
+    pub payload: AiExtensionEventPayload,
+}
+
+impl AiExtensionEvent {
+    /// Return the hook kind that receives this event.
+    #[must_use]
+    pub const fn hook_kind(&self) -> ExtensionHookKind {
+        match self.payload {
+            AiExtensionEventPayload::GuardrailInput { .. } => ExtensionHookKind::AiGuardrailInput,
+            AiExtensionEventPayload::GuardrailOutput { .. } => ExtensionHookKind::AiGuardrailOutput,
+            AiExtensionEventPayload::ToolCall { .. } => ExtensionHookKind::AiToolCall,
+            AiExtensionEventPayload::Stream { .. } => ExtensionHookKind::AiStreamEvent,
+            AiExtensionEventPayload::Close { .. } => ExtensionHookKind::AiClose,
+        }
+    }
+}
+
+/// Verdict returned by an awaited AI extension hook.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+pub enum AiExtensionDecision {
+    /// Release the operation or stream bytes.
+    Release,
+    /// Refuse the operation before the corresponding bytes leave the proxy.
+    Block {
+        /// HTTP status used when the call site has a response surface.
+        status: u16,
+        /// Stable bounded reason code for metrics and logs.
+        code: String,
+        /// Bounded client-safe message.
+        message: String,
+    },
+    /// Record a match without refusing the operation.
+    Flag {
+        /// Stable bounded reason code for metrics and logs.
+        code: String,
+        /// Bounded diagnostic message.
+        message: String,
+    },
+}
+
+/// Awaited link-time Rust hook for provider-neutral AI events.
+pub trait AiExtensionHook: Send + Sync + 'static {
+    /// Inspect one event and return a release, block, or flag decision.
+    fn handle<'a>(
+        &'a self,
+        event: &'a AiExtensionEvent,
+    ) -> Pin<Box<dyn Future<Output = PluginResult<AiExtensionDecision>> + Send + 'a>>;
+}
+
+/// Link-time registration for one executable AI hook.
+pub struct AiExtensionHookRegistration {
+    /// Stable hook identifier matching its declaration inventory record.
+    pub id: &'static str,
+    /// AI event kind accepted by the hook.
+    pub kind: ExtensionHookKind,
+    /// Whether the hook enforces inline or observes through a bounded queue.
+    pub enforcement: AiExtensionEnforcement,
+    /// Factory for the linked hook implementation.
+    pub factory: fn() -> Arc<dyn AiExtensionHook>,
+}
+
+inventory::collect!(AiExtensionHookRegistration);
+
+/// Collect linked AI hook registrations of one kind in stable ID order.
+///
+/// ## Errors
+///
+/// Returns [`PluginError::Config`] when two registrations of the selected
+/// kind share an ID.
+pub fn collect_linked_ai_extension_hooks(
+    kind: ExtensionHookKind,
+) -> PluginResult<Vec<&'static AiExtensionHookRegistration>> {
+    let mut registrations = inventory::iter::<AiExtensionHookRegistration>
+        .into_iter()
+        .filter(|registration| registration.kind == kind)
+        .collect::<Vec<_>>();
+    registrations.sort_by_key(|registration| registration.id);
+    if let Some(duplicate) = registrations
+        .windows(2)
+        .find(|pair| pair[0].id == pair[1].id)
+    {
+        return Err(PluginError::Config(format!(
+            "duplicate AI extension hook id: {}",
+            duplicate[0].id
+        )));
+    }
+    Ok(registrations)
 }
 
 /// How hooks sharing a match key participate in dispatch.

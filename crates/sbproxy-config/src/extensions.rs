@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::FailureMode;
+use crate::{EnforcementMode, FailureMode};
 
 /// API version accepted in extension bundle manifests.
 pub const BUNDLE_API_VERSION: &str = "sbproxy.dev/v1alpha1";
@@ -266,6 +266,9 @@ pub struct BundleHook {
     /// Optional Draft 7 JSON Schema for per-attachment configuration.
     #[serde(default)]
     pub config_schema: Option<Value>,
+    /// Whether a successful AI hook verdict blocks or only observes.
+    #[serde(default)]
+    pub enforcement_mode: EnforcementMode,
     /// Body access requirements used by pipeline planning.
     #[serde(default)]
     pub execution: BundleExecution,
@@ -567,8 +570,13 @@ impl BundleManifest {
                 }
                 validate_wasm_entry(&self.entry)?;
                 for hook in &self.hooks {
-                    if hook.kind != BundleHookKind::ProxyWasm {
-                        return invalid("runtime proxy_wasm may declare only proxy_wasm hooks");
+                    if !matches!(
+                        hook.kind,
+                        BundleHookKind::ProxyWasm | BundleHookKind::AiStreamEvent
+                    ) {
+                        return invalid(
+                            "runtime proxy_wasm may declare proxy_wasm or ai_stream_event hooks",
+                        );
                     }
                     if hook.export.is_some() {
                         return invalid(format!(
@@ -581,6 +589,11 @@ impl BundleManifest {
                             "Proxy-Wasm hook `{}` must use plugin configuration instead of config_schema",
                             hook.type_name
                         ));
+                    }
+                    if hook.kind == BundleHookKind::AiStreamEvent
+                        && hook.execution.body_mode != BundleBodyMode::Streamed
+                    {
+                        return invalid("ai_stream_event hooks require body_mode streamed");
                     }
                 }
             }
