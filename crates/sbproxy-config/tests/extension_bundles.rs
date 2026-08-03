@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 use sbproxy_config::{
     compile_config, reserved_builtin_hook_names, BundleBodyMode, BundleHookKind, BundleManifest,
@@ -107,6 +108,66 @@ proxy: {}
     };
 
     assert!(error.contains("bundle_dri"), "{error}");
+}
+
+#[test]
+fn bundle_refresh_uses_the_shortest_enabled_git_interval() {
+    let compiled = compile_config(
+        r#"
+extensions:
+  sources:
+    - type: git
+      repo: https://example.test/frozen.git
+      revision: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      path: bundles
+      refresh_interval_secs: 0
+    - type: directory
+      path: local-bundles
+    - type: git
+      repo: https://example.test/release.git
+      revision: signed-release
+      path: bundles
+      verify_signature: true
+      refresh_interval_secs: 45
+    - type: git
+      repo: https://example.test/slower.git
+      revision: signed-release
+      path: bundles
+      verify_signature: true
+      refresh_interval_secs: 300
+proxy: {}
+"#,
+    )
+    .expect("extension config compiles");
+
+    assert_eq!(
+        compiled.extension_bundles.refresh_interval(),
+        Some(Duration::from_secs(45))
+    );
+}
+
+#[test]
+fn bundle_refresh_interval_is_bounded() {
+    let error = match compile_config(
+        r#"
+extensions:
+  sources:
+    - type: git
+      repo: https://example.test/release.git
+      revision: signed-release
+      path: bundles
+      verify_signature: true
+      refresh_interval_secs: 86401
+proxy: {}
+"#,
+    ) {
+        Ok(_) => panic!("an unbounded refresh sleep must be rejected"),
+        Err(error) => error,
+    };
+
+    let displayed = format!("{error:#}");
+    assert!(displayed.contains("refresh_interval_secs"), "{displayed}");
+    assert!(displayed.contains("86400"), "{displayed}");
 }
 
 #[test]

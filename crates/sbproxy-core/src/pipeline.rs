@@ -1630,11 +1630,28 @@ impl CompiledPipeline {
     /// [`crate::reload::load_pipeline`], so a lifecycle hook can still reject
     /// this candidate without leaving work behind.
     pub fn from_config_at(config: CompiledConfig, base_dir: &Path) -> anyhow::Result<Self> {
-        let extension_registry = DynamicBundleRegistry::load(
+        let fetch_context =
+            crate::config_source::build_extension_fetch_context(&config.extension_bundles)?;
+        let extension_registry = DynamicBundleRegistry::load_with_context(
             &config.extension_bundles,
             base_dir,
             &reserved_extension_hook_names()?,
+            &fetch_context,
         )?;
+        Self::from_config_with_mode_and_registry(
+            config,
+            PipelineConstructionMode::Runtime,
+            extension_registry,
+            false,
+        )
+    }
+
+    /// Construct a runtime pipeline around an already validated immutable
+    /// bundle registry candidate.
+    pub(crate) fn from_config_at_with_extension_registry(
+        config: CompiledConfig,
+        extension_registry: Arc<DynamicBundleRegistry>,
+    ) -> anyhow::Result<Self> {
         Self::from_config_with_mode_and_registry(
             config,
             PipelineConstructionMode::Runtime,
@@ -1669,8 +1686,14 @@ impl CompiledPipeline {
         base_dir: &Path,
     ) -> anyhow::Result<Self> {
         let reserved_names = reserved_extension_hook_names()?;
-        let extension_registry =
-            DynamicBundleRegistry::load(&config.extension_bundles, base_dir, &reserved_names)?;
+        let fetch_context =
+            crate::config_source::build_extension_fetch_context(&config.extension_bundles)?;
+        let extension_registry = DynamicBundleRegistry::load_with_context(
+            &config.extension_bundles,
+            base_dir,
+            &reserved_names,
+            &fetch_context,
+        )?;
         Self::from_config_with_mode_and_registry(
             config,
             PipelineConstructionMode::Validation,

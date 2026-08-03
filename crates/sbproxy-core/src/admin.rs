@@ -2751,7 +2751,9 @@ pub fn handle_admin_request(
             );
         }
         let pipeline = crate::reload::current_pipeline();
-        return match serde_json::to_string(&pipeline.extension_inventory) {
+        let inventory =
+            crate::extension_refresh::inventory_with_health(&pipeline.extension_inventory);
+        return match serde_json::to_string(&inventory) {
             Ok(body) => (200, "application/json", body),
             Err(error) => (
                 500,

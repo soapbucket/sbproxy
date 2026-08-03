@@ -124,7 +124,24 @@ pub(crate) fn doctor_inventory(
                     );
                 }
             };
-            match DynamicBundleRegistry::load(config, base_dir, &reserved) {
+            let fetch_context = match crate::config_source::build_extension_fetch_context(config) {
+                Ok(context) => context,
+                Err(error) => {
+                    return failed_doctor_inventory(
+                        declarations,
+                        empty_preliminary(ExtensionScopeMode::Doctor),
+                        "source",
+                        &error.to_string(),
+                        config_revision,
+                    );
+                }
+            };
+            match DynamicBundleRegistry::load_with_context(
+                config,
+                base_dir,
+                &reserved,
+                &fetch_context,
+            ) {
                 Ok(registry) => registry.inventory().clone(),
                 Err(error) => {
                     let rendered = error.to_string();

@@ -547,6 +547,65 @@ pub(crate) fn try_reload_from_config_yaml(
     reload_from_config_yaml_locked(config_path, yaml).map(TryReloadOutcome::Applied)
 }
 
+/// What one non-blocking extension bundle refresh attempt did.
+#[derive(Debug)]
+pub(crate) enum TryBundleRefreshOutcome {
+    /// A changed, fully validated bundle candidate followed the ordinary
+    /// reload transaction to publication.
+    Applied(ReloadOutcome),
+    /// Every Git source resolved to the commit already serving.
+    NotModified,
+    /// Another reload owns the shared transaction lock.
+    Busy,
+}
+
+/// Refresh Git-backed extension bundles without overlapping another reload.
+///
+/// The currently published compiled config is cloned only after this call owns
+/// the reload lock. The complete registry candidate is then fetched and
+/// validated before its source fingerprint is compared. A changed candidate
+/// enters the same prepare-and-publish transaction as file watch, SIGHUP, and
+/// admin reloads.
+pub(crate) fn try_refresh_extension_bundles(
+    config_path: &str,
+) -> anyhow::Result<TryBundleRefreshOutcome> {
+    let _reload_guard = match CONFIG_RELOAD_LOCK.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::WouldBlock) => return Ok(TryBundleRefreshOutcome::Busy),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+    };
+
+    let current = reload::current_pipeline_full();
+    let compiled = current.config.clone();
+    let current_fingerprint = current.extension_registry().revision_fingerprint();
+    let config_dir = std::path::Path::new(config_path)
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let fetch_context =
+        crate::config_source::build_extension_fetch_context(&compiled.extension_bundles)?;
+    let candidate = sbproxy_extension::bundle::DynamicBundleRegistry::load_with_context(
+        &compiled.extension_bundles,
+        config_dir,
+        &crate::extension_inventory::reserved_extension_hook_names()?,
+        &fetch_context,
+    )?;
+    let candidate_fingerprint = candidate.revision_fingerprint();
+
+    match crate::extension_refresh::apply_if_changed(
+        &current_fingerprint,
+        &candidate_fingerprint,
+        || reload_compiled_config_locked(config_path, compiled, Some(candidate), None),
+    )? {
+        crate::extension_refresh::CandidateDecision::Applied(outcome) => {
+            Ok(TryBundleRefreshOutcome::Applied(outcome))
+        }
+        crate::extension_refresh::CandidateDecision::NotModified => {
+            Ok(TryBundleRefreshOutcome::NotModified)
+        }
+    }
+}
+
 /// Hold the reload lock so a test can prove that a caller which must not
 /// block on it does not.
 ///
@@ -572,6 +631,17 @@ fn reload_from_config_yaml_locked(config_path: &str, yaml: &str) -> anyhow::Resu
     // re-fetch.
     let resolved = crate::config_source::resolve(yaml)?;
     let compiled = sbproxy_config::compile_config(&resolved.text)?;
+    reload_compiled_config_locked(config_path, compiled, None, Some(yaml))
+}
+
+/// Prepare and publish one already compiled configuration. Callers hold
+/// `CONFIG_RELOAD_LOCK` and may supply an already validated bundle candidate.
+fn reload_compiled_config_locked(
+    config_path: &str,
+    compiled: sbproxy_config::CompiledConfig,
+    extension_registry: Option<std::sync::Arc<sbproxy_extension::bundle::DynamicBundleRegistry>>,
+    drift_yaml: Option<&str>,
+) -> anyhow::Result<ReloadOutcome> {
     let config_dir = std::path::Path::new(config_path)
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -634,7 +704,12 @@ fn reload_from_config_yaml_locked(config_path: &str, yaml: &str) -> anyhow::Resu
         }
     };
 
-    let mut new_pipeline = CompiledPipeline::from_config_at(compiled, config_dir)?;
+    let mut new_pipeline = match extension_registry {
+        Some(registry) => {
+            CompiledPipeline::from_config_at_with_extension_registry(compiled, registry)?
+        }
+        None => CompiledPipeline::from_config_at(compiled, config_dir)?,
+    };
     preflight_default_safety_centroids(&new_pipeline)?;
     // A settlement runtime that will not start fails the reload before the
     // pipeline is swapped, so the previous generation keeps serving with its
@@ -783,15 +858,18 @@ fn reload_from_config_yaml_locked(config_path: &str, yaml: &str) -> anyhow::Resu
     crate::cluster::start_meter_dissemination();
 
     reload::load_pipeline(new_pipeline);
+    crate::extension_refresh::clear_health();
 
     // Move the drift baseline here, in the one place every reload path
     // converges, rather than in the individual callers. Only startup and
     // `POST /admin/reload` used to record it, so after a file-watcher or
     // SIGHUP reload `GET /admin/drift` compared the running config against
     // a pre-reload hash and reported drift that did not exist.
-    crate::admin::record_loaded_config_content_hash(&crate::identity::config_revision(
-        yaml.as_bytes(),
-    ));
+    if let Some(yaml) = drift_yaml {
+        crate::admin::record_loaded_config_content_hash(&crate::identity::config_revision(
+            yaml.as_bytes(),
+        ));
+    }
 
     if outcome.is_fully_applied() {
         tracing::info!("config reloaded successfully");
@@ -1270,6 +1348,10 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // the local file captured above.
     let (_effective_yaml, compiled, config_subscriber) =
         crate::config_subscriber::fold_boot_bundle(config_path, yaml, compiled)?;
+    let extension_refresh_poller = crate::extension_refresh::BundleRefreshPoller::from_config(
+        config_path,
+        &compiled.extension_bundles,
+    );
 
     if let Some(al) = compiled.access_log.as_ref() {
         log_capture_header_warnings(al);
@@ -1538,6 +1620,11 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // when the config has no `source:` block or set
     // `refresh_interval_secs: 0`.
     crate::config_source::spawn(source_poller);
+
+    // Refresh Git-backed extension bundles through the same non-blocking,
+    // atomic candidate transaction. No-op when every source sets
+    // `refresh_interval_secs: 0` or no Git source is configured.
+    crate::extension_refresh::spawn(extension_refresh_poller);
 
     // Start the config-authority publisher: load the signing key, open
     // the durable revision store, and bind the bundle listener. Fatal on
@@ -3465,6 +3552,119 @@ hooks:
 
         assert!(error.to_string().contains("export"), "{error:#}");
         assert!(Arc::ptr_eq(&current, &after_failure));
+    }
+
+    #[test]
+    fn extension_refresh_failure_preserves_the_current_pipeline_pointer() {
+        let directory = tempfile::tempdir().expect("temporary config directory");
+        let bundle = directory.path().join("bundles").join("refresh-fixture");
+        std::fs::create_dir_all(&bundle).expect("create bundle directory");
+        std::fs::write(
+            bundle.join("bundle.yaml"),
+            r#"apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: refresh-fixture
+version: 1.0.0
+runtime: javascript
+entry: entry.js
+hooks:
+  - kind: policy
+    type: refresh_fixture_policy
+    export: run
+"#,
+        )
+        .expect("write bundle manifest");
+        std::fs::write(
+            bundle.join("entry.js"),
+            "export function run() { return { version: 'sbproxy-envelope/v1', decision: 'allow' }; }",
+        )
+        .expect("write valid bundle artifact");
+        let config_path = directory.path().join("sb.yml");
+        let yaml = "proxy: {}\nextensions:\n  bundles_dir: bundles\n";
+        reload_from_config_yaml(config_path.to_str().expect("UTF-8 config path"), yaml)
+            .expect("first candidate should publish");
+        let current = crate::reload::current_pipeline_full();
+
+        std::fs::write(bundle.join("entry.js"), "export function anotherName() {}")
+            .expect("replace bundle artifact with an invalid export");
+        let error = try_refresh_extension_bundles(config_path.to_str().expect("UTF-8 config path"))
+            .expect_err("invalid refresh candidate must fail");
+        let after_failure = crate::reload::current_pipeline_full();
+
+        assert!(error.to_string().contains("export"), "{error:#}");
+        assert!(Arc::ptr_eq(&current, &after_failure));
+    }
+
+    #[test]
+    fn extension_refresh_skips_an_unchanged_candidate() {
+        reload_from_config_yaml("sb.yml", "proxy: {}\n").expect("baseline candidate publishes");
+        let current = crate::reload::current_pipeline_full();
+
+        let outcome = try_refresh_extension_bundles("sb.yml").expect("refresh evaluates");
+        let after = crate::reload::current_pipeline_full();
+
+        assert!(matches!(outcome, TryBundleRefreshOutcome::NotModified));
+        assert!(Arc::ptr_eq(&current, &after));
+    }
+
+    #[test]
+    fn extension_refresh_skips_instead_of_overlapping_an_active_reload() {
+        let guard = hold_config_reload_lock_for_test();
+
+        let outcome = try_refresh_extension_bundles("sb.yml").expect("busy is not a failure");
+
+        assert!(matches!(outcome, TryBundleRefreshOutcome::Busy));
+        drop(guard);
+    }
+
+    #[test]
+    fn changed_extension_refresh_candidate_uses_the_atomic_reload_transaction() {
+        let directory = tempfile::tempdir().expect("temporary config directory");
+        let bundle = directory.path().join("bundles").join("changed-fixture");
+        std::fs::create_dir_all(&bundle).expect("create bundle directory");
+        let write_release = |version: &str, marker: &str| {
+            std::fs::write(
+                bundle.join("bundle.yaml"),
+                format!(
+                    "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: changed-fixture\nversion: {version}\nruntime: javascript\nentry: entry.js\nhooks:\n  - kind: policy\n    type: changed_fixture_policy\n    export: run\n"
+                ),
+            )
+            .expect("write bundle manifest");
+            std::fs::write(
+                bundle.join("entry.js"),
+                format!(
+                    "export function run() {{ return {{ version: 'sbproxy-envelope/v1', decision: 'allow', marker: '{marker}' }}; }}"
+                ),
+            )
+            .expect("write bundle artifact");
+        };
+        write_release("1.0.0", "one");
+        let config_path = directory.path().join("sb.yml");
+        let config_path = config_path.to_str().expect("UTF-8 config path");
+        let yaml = "proxy: {}\nextensions:\n  bundles_dir: bundles\n";
+        reload_from_config_yaml(config_path, yaml).expect("first generation publishes");
+        let first = crate::reload::current_pipeline_full();
+        assert_eq!(first.extension_inventory().bundles[0].version, "1.0.0");
+
+        write_release("2.0.0", "two");
+        let compiled = sbproxy_config::compile_config(yaml).expect("config compiles");
+        let candidate = sbproxy_extension::bundle::DynamicBundleRegistry::load(
+            &compiled.extension_bundles,
+            directory.path(),
+            &crate::extension_inventory::reserved_extension_hook_names()
+                .expect("reserved names resolve"),
+        )
+        .expect("changed registry candidate validates");
+        let guard = CONFIG_RELOAD_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reload_compiled_config_locked(config_path, compiled, Some(candidate), None)
+            .expect("changed registry publishes");
+        drop(guard);
+
+        let second = crate::reload::current_pipeline_full();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(second.extension_inventory().bundles[0].version, "2.0.0");
     }
 
     #[test]

@@ -668,14 +668,18 @@ fn git_source_uses_verified_materializer_and_safe_provenance() {
     let context = FetchContext::with_cloner(Box::new(TreeCloner {
         source: repository.path().to_owned(),
         calls: calls.clone(),
-    }));
+    }))
+    .with_credential(
+        "https://secret@example.test/repo.git",
+        "resolved-private-token",
+    );
     let config = ExtensionBundlesConfig {
         bundles_dir: None,
         sources: vec![BundleSourceConfig::Git {
             repo: "https://secret@example.test/repo.git".to_owned(),
             revision: "release-v1".to_owned(),
             path: "extensions".to_owned(),
-            credential: None,
+            credential: Some("env:EXTENSION_PRIVATE_TOKEN".to_owned()),
             verify_signature: true,
             timeout_secs: 17,
             refresh_interval_secs: 0,
@@ -706,6 +710,20 @@ fn git_source_uses_verified_materializer_and_safe_provenance() {
         registry.inventory().hooks[0].kind,
         ExtensionHookKind::Policy
     );
+    assert_eq!(registry.revision_fingerprint(), COMMIT);
+    assert_eq!(registry.git_revisions().len(), 1);
+    assert_eq!(registry.git_revisions()[0].commit, COMMIT);
+    assert_eq!(
+        registry.inventory().bundles[0].load.detail.as_deref(),
+        Some("https://example.test/repo.git at release-v1 (aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)")
+    );
+    let inventory = serde_json::to_string(registry.inventory()).expect("serialize inventory");
+    assert!(!inventory.contains("secret"), "{inventory}");
+    assert!(
+        !inventory.contains("EXTENSION_PRIVATE_TOKEN"),
+        "{inventory}"
+    );
+    assert!(!inventory.contains("resolved-private-token"), "{inventory}");
 }
 
 #[test]

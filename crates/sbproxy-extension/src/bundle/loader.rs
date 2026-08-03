@@ -10,7 +10,7 @@ use jsonschema::{Draft, JSONSchema};
 use sbproxy_config::{
     is_full_commit_sha, materialize_git_tree, redact_repo, BundleBodyMode, BundleHook,
     BundleHookKind, BundleManifest, BundleManifestError, BundleRuntime, BundleSourceConfig,
-    ConfigSourceError, ExtensionBundlesConfig, FetchContext, GitTreeRequest,
+    ConfigSourceError, ExtensionBundlesConfig, FetchContext, GitTreeRequest, ResolvedRevision,
     MAX_BUNDLE_MANIFEST_BYTES,
 };
 use sbproxy_plugin::{
@@ -126,6 +126,7 @@ pub(crate) fn sanitize_detail(detail: &str, maximum: usize) -> String {
 pub struct DynamicBundleRegistry {
     hooks: BTreeMap<(BundleHookKind, String), Arc<LoadedBundleHook>>,
     inventory: ExtensionInventorySnapshot,
+    git_revisions: Vec<ResolvedRevision>,
 }
 
 impl std::fmt::Debug for DynamicBundleRegistry {
@@ -134,6 +135,7 @@ impl std::fmt::Debug for DynamicBundleRegistry {
             .debug_struct("DynamicBundleRegistry")
             .field("hooks", &self.hooks.len())
             .field("inventory", &self.inventory)
+            .field("git_revisions", &self.git_revisions)
             .finish()
     }
 }
@@ -227,6 +229,7 @@ impl DynamicBundleRegistry {
                         fetch_context,
                     };
                     materialize_git_tree(request, |tree| {
+                        candidate.git_revisions.push(tree.revision().clone());
                         let checkout = SourceRoot::open(tree.root(), "Git checkout")?;
                         let source_root = checkout.open_subdir(
                             Path::new(path),
@@ -255,6 +258,23 @@ impl DynamicBundleRegistry {
     #[must_use]
     pub const fn inventory(&self) -> &ExtensionInventorySnapshot {
         &self.inventory
+    }
+
+    /// Return safe verified Git revisions in source declaration order.
+    #[must_use]
+    pub fn git_revisions(&self) -> &[ResolvedRevision] {
+        &self.git_revisions
+    }
+
+    /// Identity used to skip a reload when every Git source resolved to the
+    /// commit already serving.
+    #[must_use]
+    pub fn revision_fingerprint(&self) -> String {
+        self.git_revisions
+            .iter()
+            .map(|revision| revision.commit.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
     }
 }
 
@@ -300,6 +320,7 @@ struct Candidate<'a> {
     hooks: BTreeMap<(BundleHookKind, String), Arc<LoadedBundleHook>>,
     bundles: Vec<ExtensionBundleRecord>,
     inventory_hooks: Vec<ExtensionHookRecord>,
+    git_revisions: Vec<ResolvedRevision>,
 }
 
 impl<'a> Candidate<'a> {
@@ -309,6 +330,7 @@ impl<'a> Candidate<'a> {
             hooks: BTreeMap::new(),
             bundles: Vec::new(),
             inventory_hooks: Vec::new(),
+            git_revisions: Vec::new(),
         }
     }
 
@@ -455,6 +477,18 @@ impl<'a> Candidate<'a> {
         };
 
         let source = provenance.source();
+        let load_detail = match &provenance {
+            BundleProvenance::Directory { .. } => None,
+            BundleProvenance::Git {
+                repo,
+                reference,
+                commit,
+                ..
+            } => Some(sanitize_detail(
+                &format!("{repo} at {reference} ({commit})"),
+                512,
+            )),
+        };
         let runtime = inventory_runtime(manifest.runtime);
         let mut hook_ids = Vec::with_capacity(prepared.len());
         for (key, hook, validator) in prepared {
@@ -496,7 +530,7 @@ impl<'a> Candidate<'a> {
             load: ExtensionLoadRecord {
                 phase: "candidate_load".to_owned(),
                 status: "ok".to_owned(),
-                detail: None,
+                detail: load_detail,
             },
         });
         Ok(())
@@ -530,6 +564,7 @@ impl<'a> Candidate<'a> {
         Ok(DynamicBundleRegistry {
             hooks: self.hooks,
             inventory,
+            git_revisions: self.git_revisions,
         })
     }
 }

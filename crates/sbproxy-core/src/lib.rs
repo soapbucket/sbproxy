@@ -121,6 +121,7 @@ pub mod dispatch;
 /// Host capability diagnostics behind `sbproxy doctor`.
 pub mod doctor;
 pub(crate) mod extension_inventory;
+pub(crate) mod extension_refresh;
 /// WOR-1835: disseminate + merge approximate governance counters over the
 /// mesh, so cross-node key budgets work without an external database.
 pub mod governance_cluster;
