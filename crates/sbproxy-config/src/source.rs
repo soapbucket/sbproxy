@@ -1473,12 +1473,20 @@ mod tests {
     /// the destination when the loader asks for it.
     struct FixtureCloner {
         // Maps `repo` URL -> list of (relative path, file contents).
-        // Captured calls (repo, revision) for assertion.
         repos: HashMapOfRepos,
-        calls: Mutex<Vec<(String, Option<String>, Option<String>)>>,
+        // Captured calls, for assertion.
+        calls: Mutex<Vec<CapturedClone>>,
     }
 
     type HashMapOfRepos = std::collections::HashMap<String, Vec<(&'static str, &'static str)>>;
+
+    /// One recorded clone: the repo asked for, the revision requested, and
+    /// the credential reference resolved for it.
+    ///
+    /// Named rather than an inline tuple because the credential element took
+    /// it past clippy's `type_complexity` threshold, and because three
+    /// same-shaped `Option<String>` positions are worth labelling.
+    type CapturedClone = (String, Option<String>, Option<String>);
 
     impl FixtureCloner {
         fn new(repos: HashMapOfRepos) -> Self {
