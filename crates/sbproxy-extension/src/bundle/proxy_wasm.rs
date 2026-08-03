@@ -1,6 +1,6 @@
 //! Proxy-Wasm 0.2.1 HTTP filter host.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use bytes::Bytes;
 use sbproxy_config::{BundleBodyMode, BundleHookKind, BundleRuntime};
@@ -661,9 +661,9 @@ impl ProxyWasmSession {
         let header_count = self
             .store
             .data()
-            .current_map
-            .as_ref()
-            .map_or(0, |(_, headers)| headers.len());
+            .header_maps
+            .get(&map_id)
+            .map_or(0, Vec::len);
         let header_count =
             i32::try_from(header_count).map_err(|_| ProxyWasmCallFailure::InvalidHostData)?;
         let (raw_action, called) = self.call_action3(
@@ -678,10 +678,11 @@ impl ProxyWasmSession {
         self.check_host_failure()?;
         let headers = self
             .store
-            .data_mut()
-            .current_map
-            .take()
-            .map_or_else(Vec::new, |(_, headers)| headers);
+            .data()
+            .header_maps
+            .get(&map_id)
+            .cloned()
+            .unwrap_or_default();
         validate_headers(&headers, self.limits.max_output_bytes)?;
         let local_response = self.store.data_mut().local_response.take();
         let action = effective_action(self.store.data_mut(), raw_action)?;
@@ -983,7 +984,8 @@ struct ProxyWasmHostState {
     active_context: u32,
     context_finalization: [ContextFinalization; 2],
     current_buffer: Option<(i32, Vec<u8>)>,
-    current_map: Option<(i32, Vec<(String, String)>)>,
+    header_maps: BTreeMap<i32, Vec<(String, String)>>,
+    writable_map: Option<i32>,
     local_response: Option<ProxyWasmLocalResponse>,
     continue_requested: bool,
     close_requested: bool,
@@ -1009,7 +1011,8 @@ impl ProxyWasmHostState {
             active_context: 0,
             context_finalization: [ContextFinalization::Live; 2],
             current_buffer: None,
-            current_map: None,
+            header_maps: BTreeMap::new(),
+            writable_map: None,
             local_response: None,
             continue_requested: false,
             close_requested: false,
@@ -1021,7 +1024,7 @@ impl ProxyWasmHostState {
         self.limits.memory_denied = false;
         self.limits.table_denied = false;
         self.current_buffer = None;
-        self.current_map = None;
+        self.writable_map = None;
         self.local_response = None;
         self.continue_requested = false;
         self.close_requested = false;
@@ -1033,7 +1036,8 @@ impl ProxyWasmHostState {
     }
 
     fn set_map(&mut self, map_id: i32, value: Vec<(String, String)>) {
-        self.current_map = Some((map_id, value));
+        self.header_maps.insert(map_id, value);
+        self.writable_map = Some(map_id);
     }
 
     fn context_finalization(&self, context_id: u32) -> Option<ContextFinalization> {
@@ -1214,19 +1218,30 @@ fn current_map<'a>(
     caller: &'a Caller<'_, ProxyWasmHostState>,
     map_id: i32,
 ) -> Result<&'a [(String, String)], i32> {
-    match caller.data().current_map.as_ref() {
-        Some((current_id, value)) if *current_id == map_id => Ok(value),
-        Some(_) => Err(STATUS_BAD_ARGUMENT),
-        None => Err(STATUS_NOT_FOUND),
+    if caller.data().active_context != HTTP_CONTEXT_ID {
+        return Err(STATUS_NOT_FOUND);
     }
+    caller
+        .data()
+        .header_maps
+        .get(&map_id)
+        .map(Vec::as_slice)
+        .ok_or(STATUS_NOT_FOUND)
 }
 
 fn current_map_mut<'a>(
     caller: &'a mut Caller<'_, ProxyWasmHostState>,
     map_id: i32,
 ) -> Result<&'a mut Vec<(String, String)>, i32> {
-    match caller.data_mut().current_map.as_mut() {
-        Some((current_id, value)) if *current_id == map_id => Ok(value),
+    if caller.data().active_context != HTTP_CONTEXT_ID {
+        return Err(STATUS_NOT_FOUND);
+    }
+    match caller.data().writable_map {
+        Some(current_id) if current_id == map_id => caller
+            .data_mut()
+            .header_maps
+            .get_mut(&map_id)
+            .ok_or(STATUS_NOT_FOUND),
         Some(_) => Err(STATUS_BAD_ARGUMENT),
         None => Err(STATUS_NOT_FOUND),
     }
@@ -1391,7 +1406,10 @@ fn read_guest_header(
 }
 
 fn enforce_map_output_limit(caller: &mut Caller<'_, ProxyWasmHostState>) -> Result<(), i32> {
-    let Some((_, headers)) = caller.data().current_map.as_ref() else {
+    let Some(map_id) = caller.data().writable_map else {
+        return Err(STATUS_NOT_FOUND);
+    };
+    let Some(headers) = caller.data().header_maps.get(&map_id) else {
         return Err(STATUS_NOT_FOUND);
     };
     if validate_headers(headers, caller.data().max_output_bytes).is_err() {
@@ -1929,6 +1947,7 @@ mod tests {
         let bytes: &[u8] = match fixture {
             "deferred-done" => include_bytes!("testdata/proxy_wasm/deferred-done.wasm"),
             "http" => include_bytes!("testdata/proxy_wasm/http.wasm"),
+            "log-headers" => include_bytes!("testdata/proxy_wasm/log-headers.wasm"),
             "loop" => include_bytes!("testdata/proxy_wasm/loop.wasm"),
             "memory" => include_bytes!("testdata/proxy_wasm/memory.wasm"),
             "output-limit" => include_bytes!("testdata/proxy_wasm/output-limit.wasm"),
@@ -1988,6 +2007,22 @@ mod tests {
                 "root_delete"
             ]
         );
+    }
+
+    #[test]
+    fn on_log_can_read_retained_request_and_response_headers() {
+        let mut session = runtime("log-headers", limits())
+            .start_session(b"{}")
+            .unwrap();
+
+        session
+            .on_request_headers(vec![("x-request".into(), "request-value".into())], false)
+            .unwrap();
+        session
+            .on_response_headers(vec![("x-response".into(), "response-value".into())], true)
+            .unwrap();
+
+        session.finish().unwrap();
     }
 
     #[test]
