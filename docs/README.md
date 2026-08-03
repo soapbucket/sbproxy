@@ -35,6 +35,12 @@ SBproxy is an open source Enterprise AI Gateway for API, MCP and agent, and AI m
 - [use-case-connect-cline.md](use-case-connect-cline.md) - connect Cline to a governed gateway.
 - [use-case-connect-copilot.md](use-case-connect-copilot.md) - connect GitHub Copilot BYOK to a governed gateway.
 - [use-case-production-ops.md](use-case-production-ops.md) - move from a laptop deployment to operational ownership.
+- [use-case-local-first.md](use-case-local-first.md) - prove a GPU you already bought pays for itself.
+- [use-case-serve-on-l4.md](use-case-serve-on-l4.md) - serve Qwen, GLM, or Gemma on a single cloud L4.
+- [use-case-air-gapped.md](use-case-air-gapped.md) - keep weights, prompts, and verdicts inside your network.
+- [use-case-guardrails-everywhere.md](use-case-guardrails-everywhere.md) - one guardrail mesh over local and hosted models alike.
+- [use-case-mcp-federation.md](use-case-mcp-federation.md) - federate sprawling internal MCP servers behind one governed gateway.
+- [use-case-meter-crawlers.md](use-case-meter-crawlers.md) - charge AI crawlers for the content they read.
 
 ## Route AI, APIs, and tools
 

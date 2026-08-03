@@ -119,6 +119,9 @@ fn write_secret_file(dir: &Path, name: &str, value: &str) -> PathBuf {
 
 /// A fresh, clearly test-only key: 32 bytes from the OS entropy pool, hex
 /// encoded. Generated, never vendored, never reused.
+///
+/// This is 64 characters, which `challenge_binding_key` accepts because it
+/// runs the resolved value through HKDF and so takes any length.
 fn fresh_test_key() -> String {
     let mut bytes = [0_u8; 32];
     std::fs::File::open("/dev/urandom")
@@ -126,6 +129,25 @@ fn fresh_test_key() -> String {
         .read_exact(&mut bytes)
         .expect("read urandom");
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// A test-only recovery key that is exactly 32 bytes *as resolved*.
+///
+/// `recovery_encryption.key` is the one settlement secret that is used as raw
+/// AES-256-GCM key material rather than as HKDF input, so it must resolve to
+/// exactly 32 bytes and nothing decodes it first. [`fresh_test_key`] cannot
+/// serve here: its 64 hex characters resolve to 64 bytes and the proxy exits
+/// during payments initialization with "resolved to 64 bytes, but
+/// AES-256-GCM requires exactly 32". Because that happens after the HTTP
+/// listener binds, the harness's readiness probe passes and the failure
+/// surfaces as an unrelated admin-port timeout.
+///
+/// It is also why this is a fixed ASCII string rather than random bytes:
+/// `file:` references resolve through `read_to_string().trim()`, so raw
+/// entropy cannot round-trip through a file. That constraint makes the field
+/// awkward to supply with real key material, which is tracked separately.
+fn recovery_test_key() -> String {
+    "sbproxy-usage-bridge-e2e-rcvry32".to_owned()
 }
 
 /// The `proxy.payments` half of the document, parameterised on the two
@@ -137,6 +159,7 @@ fn fresh_test_key() -> String {
 fn payments_block(
     state_path: &Path,
     binding_key: &Path,
+    recovery_key: &Path,
     stripe_key: &Path,
     reporter: &str,
 ) -> String {
@@ -162,10 +185,13 @@ fn payments_block(
 {reporter}"#,
         state_path = state_path.display(),
         binding_key = binding_key.display(),
-        // One file serves as both secrets. Both are 32 bytes of hex, both
-        // are test-only, and the recovery cipher checks the resolved length
-        // rather than the path it came from.
-        recovery_key = binding_key.display(),
+        // Two files, not one. These secrets have different contracts:
+        // `challenge_binding_key` is HKDF input and takes any length, while
+        // `recovery_encryption.key` is raw AES-256-GCM key material and must
+        // resolve to exactly 32 bytes. Sharing one file meant the recovery
+        // key inherited the binding key's 64 hex characters, and the proxy
+        // exited during payments initialization every time.
+        recovery_key = recovery_key.display(),
         stripe_key = stripe_key.display(),
     )
 }
@@ -200,10 +226,17 @@ fn start(reporter: &str) -> Stack {
     let state_path = dir.path().join("payments.sqlite3");
     let key_store = dir.path().join("keys.redb");
     let binding_key = write_secret_file(dir.path(), "binding.key", &fresh_test_key());
+    let recovery_key = write_secret_file(dir.path(), "recovery.key", &recovery_test_key());
     let stripe_key = write_secret_file(dir.path(), "stripe.key", "sk_test_usage_bridge_e2e");
     let upstream = MockUpstream::start(chat_reply()).expect("mock model provider");
 
-    let payments = payments_block(&state_path, &binding_key, &stripe_key, reporter);
+    let payments = payments_block(
+        &state_path,
+        &binding_key,
+        &recovery_key,
+        &stripe_key,
+        reporter,
+    );
     let yaml = format!(
         r#"
 proxy:
@@ -247,7 +280,9 @@ origins:
 
     let proxy =
         ProxyHarness::start_payments_with_yaml_and_env(&yaml, &[]).expect("start payments proxy");
-    ProxyHarness::wait_for_port(admin_port, Duration::from_secs(10)).expect("admin port to bind");
+    proxy
+        .wait_for_secondary_port(admin_port, Duration::from_secs(10))
+        .expect("admin port to bind");
 
     Stack {
         proxy,

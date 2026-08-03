@@ -1,0 +1,23 @@
+# Recording config for docs/tapes/extension-inventory.tape.
+extensions:
+  bundles_dir: ../fixtures/extensions/valid
+
+proxy:
+  http_bind_port: 18080
+  admin:
+    enabled: true
+    bind: 127.0.0.1
+    port: 19090
+    username: admin
+    password: ${SB_ADMIN_PASSWORD:-demo-admin-password}
+
+origins:
+  "extensions.local":
+    action:
+      type: static
+      status: 200
+      content_type: application/json
+      json_body:
+        status: ready
+    policies:
+      - type: operator_guard

@@ -1,5 +1,5 @@
 # Metrics stability
-*Last modified: 2026-07-27*
+*Last modified: 2026-08-02*
 
 *Generated from the executable metric registry. Do not hand-edit; run `cargo run -q -p sbproxy-observe --bin generate-metrics-stability > docs/metrics-stability.md`.*
 
@@ -23,7 +23,7 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 
 `alpha` names may be renamed, relabeled, or removed in any release.
 
-## Catalogue
+## Catalog
 
 | Metric | Type | Support | Compat | Labels | Description |
 | --- | --- | --- | --- | --- | --- |
@@ -61,19 +61,19 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `mesh_transport_rpc_duration_seconds` | Histogram | `stable` | `beta` | `op` | Successful cross-node cache RPC duration, by operation. Healthy same-zone means sit well under 5ms; a mean near 40ms is the delayed-ACK/Nagle transport stall signature and warrants an alert. |
 | `mesh_transport_rpc_errors_total` | Counter | `stable` | `beta` | `kind` | Cross-node cache RPC failures, by transport phase. |
 | `sbproxy_a2a_chain_depth` | Histogram | `stable` | `beta` | `route`, `spec` | Distribution of A2A chain depth observed at the proxy. |
-| `sbproxy_a2a_denied_total` | Counter | `stable` | `beta` | `route`, `reason` | A2A hops denied by the a2a policy, labelled by route and reason. |
-| `sbproxy_a2a_hops_total` | Counter | `stable` | `beta` | `route`, `spec`, `decision` | A2A hops observed by the proxy, labelled by route, spec, and policy decision. |
-| `sbproxy_a2a_methods_total` | Counter | `stable` | `beta` | `route`, `method` | A2A 1.0 JSON-RPC methods observed by the proxy, labelled by route and method. |
+| `sbproxy_a2a_denied_total` | Counter | `stable` | `beta` | `route`, `reason` | A2A hops denied by the a2a policy, labeled by route and reason. |
+| `sbproxy_a2a_hops_total` | Counter | `stable` | `beta` | `route`, `spec`, `decision` | A2A hops observed by the proxy, labeled by route, spec, and policy decision. |
+| `sbproxy_a2a_methods_total` | Counter | `stable` | `beta` | `route`, `method` | A2A 1.0 JSON-RPC methods observed by the proxy, labeled by route and method. |
 | `sbproxy_acme_renewal_duration_seconds` | Histogram | `stable` | `beta` | `result` | ACME renewal full-flow duration, by outcome. |
 | `sbproxy_acme_renewals_total` | Counter | `stable` | `beta` | `result` | ACME certificate renewal attempts, by outcome. |
 | `sbproxy_active_connections` | Gauge | `stable` | `stable` | none | Current active connections. |
-| `sbproxy_agent_budget_decisions_total` | Counter | `stable` | `beta` | `agent_id`, `outcome` | agent_budget policy verdicts, labelled by agent and outcome. |
+| `sbproxy_agent_budget_decisions_total` | Counter | `stable` | `beta` | `agent_id`, `outcome` | agent_budget policy verdicts, labeled by agent and outcome. |
 | `sbproxy_agent_detect_inference_seconds` | Histogram | `stable` | `stable` | none | Agent-detect scorer inference latency in seconds. |
 | `sbproxy_agent_detect_score` | Histogram | `stable` | `stable` | none | Agent-detect scorer output score, scaled 0-100. |
 | `sbproxy_agent_detect_total` | Counter | `stable` | `stable` | `agent_id`, `provenance` | Agent-detect scorer verdicts by agent id and provenance. |
 | `sbproxy_agent_skill_digest_mismatch_total` | Counter | `stable` | `beta` | `skill` | Agent Skills artifact digest mismatches detected at serve time. |
 | `sbproxy_ai_audio_seconds_attributed_total` | Counter | `stable` | `beta` | `provider`, `model`, `surface`, `project`, `feature`, `team`, `agent_type`, `environment`, `tenant_id`, `api_key_id` | AI audio seconds consumed (realtime + audio surfaces), partitioned by attribution tag. |
-| `sbproxy_ai_budget_utilization_ratio` | Gauge | `stable` | `stable` | `scope` | Budget utilization as ratio 0-1. |
+| `sbproxy_ai_budget_utilization_ratio` | Gauge | `stable` | `stable` | `scope` | Budget utilization as a fraction of the limit; above 1 is over budget. |
 | `sbproxy_ai_cache_results_total` | Counter | `stable` | `stable` | `provider`, `cache_type`, `result` | AI response cache results. |
 | `sbproxy_ai_cascade_tier_outcomes_total` | Counter | `stable` | `beta` | `tier`, `outcome` | Cascade routing tier outcomes (accepted | retry | cost_cap). |
 | `sbproxy_ai_compression_duration_seconds` | Histogram | `stable` | `beta` | `tenant_id`, `api_key_id`, `lever`, `outcome`, `backend` | AI context compression lever duration in seconds. |
@@ -128,7 +128,7 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_ai_semantic_cache_similarity` | Histogram | `stable` | `beta` | `provider` | Cosine similarity of semantic-cache hits. |
 | `sbproxy_ai_shadow_dropped_total` | Counter | `stable` | `beta` | `reason` | Configured shadow requests skipped or dropped before dispatch, by closed reason. |
 | `sbproxy_ai_shadow_inflight` | Gauge | `stable` | `beta` | none | Currently in-flight shadow request tasks supervised by the AI client. |
-| `sbproxy_ai_shadow_timeout_total` | Counter | `stable` | `beta` | none | Shadow tasks cancelled after their wall-clock supervisor timeout. |
+| `sbproxy_ai_shadow_timeout_total` | Counter | `stable` | `beta` | none | Shadow tasks canceled after their wall-clock supervisor timeout. |
 | `sbproxy_ai_stream_guardrail_skipped_total` | Counter | `stable` | `beta` | `guardrail` | Output guardrails skipped on streaming responses via stream_policy: off. |
 | `sbproxy_ai_stream_guardrail_violations_total` | Counter | `stable` | `beta` | `guardrail` | Streaming output guardrail violations, by guardrail type. |
 | `sbproxy_ai_surface_request_duration_seconds` | Histogram | `stable` | `stable` | `surface`, `method` | AI request latency partitioned by classified surface. |
@@ -172,7 +172,7 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_errors_total` | Counter | `stable` | `beta` | `hostname`, `error_type` | Total errors. |
 | `sbproxy_governance_fail_open_total` | Counter | `stable` | `beta` | `key_id` | Governed admissions that bypassed reservation because the governance backend was unavailable and failure_mode is allow_unreserved. |
 | `sbproxy_grpc_status_total` | Counter | `stable` | `beta` | `code` | Observed gRPC status codes, by canonical name. |
-| `sbproxy_hooks_channel_dropped_total` | Counter | `config_only` (nothing emits this yet) | `beta` | `reason` | Bounded channel sends dropped on the hot path, labelled by drop reason. |
+| `sbproxy_hooks_channel_dropped_total` | Counter | `stable` | `beta` | `reason` | Bounded channel sends dropped on the hot path, labeled by drop reason. |
 | `sbproxy_http_framing_blocks_total` | Counter | `stable` | `beta` | `reason`, `tenant` | Requests rejected by the http_framing policy (request smuggling defense). |
 | `sbproxy_idempotency_cache_duration_seconds` | Histogram | `stable` | `beta` | `backend` | Idempotency cache lookup duration, by backend. |
 | `sbproxy_idempotency_cache_results_total` | Counter | `stable` | `beta` | `backend`, `result` | Idempotency cache outcomes, by backend and result. |
@@ -185,8 +185,10 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_judge_latency_seconds` | Histogram | `stable` | `beta` | `provider`, `cached` | Judge backend round-trip latency. |
 | `sbproxy_jwks_unknown_kid_refetch_total` | Counter | `stable` | `beta` | `result` | JWKS refreshes triggered by tokens whose kid was absent from the local cache. |
 | `sbproxy_key_policy_stored_rejections_total` | Counter | `stable` | `alpha` | `reason` | Stored key records rejected while lowering to an effective policy, by reason. |
+| `sbproxy_label_cardinality_budget` | Gauge | `stable` | `beta` | `label` | Cap the accepted unique values for a label name are counted against. Denominator for sbproxy_label_cardinality_unique_values. |
 | `sbproxy_label_cardinality_overflow_per_tenant_total` | Counter | `stable` | `beta` | `metric`, `label`, `tenant_id` | Per-tenant overflow demotions (`sbproxy_label_cardinality_overflow_total` with the tenant_id label). |
 | `sbproxy_label_cardinality_overflow_total` | Counter | `stable` | `beta` | `metric`, `label` | Number of label values demoted to __other__ because the per-label budget was exhausted. |
+| `sbproxy_label_cardinality_unique_values` | Gauge | `stable` | `beta` | `label` | Unique values a label name has accepted so far. Divided by sbproxy_label_cardinality_budget it gives how close the label is to collapsing new values into __other__, which is a warning the overflow counter can only give after the fact. |
 | `sbproxy_ledger_redeem_duration_seconds` | Histogram | `stable` | `beta` | `host`, `outcome` | Wall-clock latency of a single ledger token redemption. |
 | `sbproxy_managed_replica_attempts_total` | Counter | `stable` | `beta` | `provider`, `deployment`, `route_class`, `outcome` | Managed model replica attempts by provider, deployment, route class, and bounded outcome. |
 | `sbproxy_managed_replica_failovers_total` | Counter | `stable` | `beta` | `provider`, `deployment`, `reason` | Safe pre-output managed replica handovers by provider, deployment, and bounded reason. |
@@ -256,7 +258,7 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_plugin_init_total` | Counter | `stable` | `beta` | `kind`, `plugin`, `result` | Plugin factory init attempts, by kind, plugin name, and outcome. |
 | `sbproxy_plugin_registered_total` | Counter | `stable` | `beta` | `kind`, `plugin` | Known plugin registrations, by kind and plugin name. |
 | `sbproxy_policy_audit_events_dropped_total` | Counter | `stable` | `beta` | `tenant` | Policy verdict audit events dropped because the bus queue was full. |
-| `sbproxy_policy_audit_events_total` | Counter | `stable` | `beta` | `verdict`, `surface`, `policy_id` | Policy decisions emitted on the audit event bus, labelled by verdict, surface, and policy_id. |
+| `sbproxy_policy_audit_events_total` | Counter | `stable` | `beta` | `verdict`, `surface`, `policy_id` | Policy decisions emitted on the audit event bus, labeled by verdict, surface, and policy_id. |
 | `sbproxy_policy_decision_duration_seconds` | Histogram | `stable` | `beta` | `surface` | Wall-clock latency of policy decisions. |
 | `sbproxy_policy_evaluation_duration_seconds` | Histogram | `stable` | `beta` | `origin`, `verdict` | Wall-clock latency of one full policy-chain evaluation. |
 | `sbproxy_policy_triggers_total` | Counter | `stable` | `stable` | `origin`, `policy_type`, `action`, `agent_id`, `agent_class` | Policy enforcement results. |

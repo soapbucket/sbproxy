@@ -16,6 +16,18 @@
         }
       ]
     },
+    "extensions": {
+      "description": "Extension bundle discovery sources. Paths stay unresolved in this parsed representation and are interpreted only by the runtime loader.",
+      "default": {
+        "bundles_dir": null,
+        "sources": []
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/ExtensionBundlesConfig"
+        }
+      ]
+    },
     "proxy": {
       "description": "Server-wide settings parsed from the top-level `proxy:` block.",
       "default": {
@@ -179,10 +191,10 @@
   },
   "definitions": {
     "ConfigSource": {
-      "description": "Where to load a `sb.yml` config text from.\n\nThe default (no `source:` field at all) means the file is the config: the surrounding `ConfigFile` is treated as inline content and consumed directly. When `source:` is present, the compiler resolves it to a config text string before parsing.\n\nThree kinds are recognised today:\n\n* `local` keeps the historical behaviour - the inline file is the config. This is the form that round-trips when an operator writes `source: { kind: local }` explicitly. * `git` points at a remote git repository, an optional revision (branch, tag, or commit), and a path within the repository to the actual config file. * `git_overlay` composes one base source with one or more overlay sources, merging each in order. A `db` form is reserved for a later iteration but is intentionally not part of this primitive yet.\n\nA git source is transport trust: HTTPS plus whatever the git host authenticated, and nothing more. Pin `revision` to a full commit sha and set `verify_signature` to close most of that gap; see [`crate::source`] for the resolution contract.",
+      "description": "Where to load a `sb.yml` config text from.\n\nThe default (no `source:` field at all) means the file is the config: the surrounding `ConfigFile` is treated as inline content and consumed directly. When `source:` is present, the compiler resolves it to a config text string before parsing.\n\nThree kinds are recognized today:\n\n* `local` keeps the historical behavior - the inline file is the config. This is the form that round-trips when an operator writes `source: { kind: local }` explicitly. * `git` points at a remote git repository, an optional revision (branch, tag, or commit), and a path within the repository to the actual config file. * `git_overlay` composes one base source with one or more overlay sources, merging each in order. A `db` form is reserved for a later iteration but is intentionally not part of this primitive yet.\n\nA git source is transport trust: HTTPS plus whatever the git host authenticated, and nothing more. Pin `revision` to a full commit sha and set `verify_signature` to close most of that gap; see [`crate::source`] for the resolution contract.",
       "oneOf": [
         {
-          "description": "The inline file is the config; nothing is fetched. This is the historical behaviour and the implied default when `source:` is omitted.",
+          "description": "The inline file is the config; nothing is fetched. This is the historical behavior and the implied default when `source:` is omitted.",
           "type": "object",
           "required": [
             "kind"
@@ -287,6 +299,113 @@
               "items": {
                 "$ref": "#/definitions/ConfigSource"
               }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ExtensionBundlesConfig": {
+      "description": "Top-level extension bundle discovery configuration from `sb.yml`.",
+      "type": "object",
+      "properties": {
+        "bundles_dir": {
+          "description": "Short local-directory form. Relative paths remain relative here and are interpreted by the runtime that loads the configuration.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sources": {
+          "description": "Additional bundle sources, consumed in declaration order.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/BundleSourceConfig"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "BundleSourceConfig": {
+      "description": "One ordered source of extension bundle directories.",
+      "oneOf": [
+        {
+          "description": "A directory on the local filesystem.",
+          "type": "object",
+          "required": [
+            "path",
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "directory"
+              ]
+            },
+            "path": {
+              "description": "Directory containing bundle subdirectories.",
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "A directory materialized from a pinned or signed Git revision.",
+          "type": "object",
+          "required": [
+            "path",
+            "repo",
+            "revision",
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "git"
+              ]
+            },
+            "repo": {
+              "description": "Repository URL accepted by the system Git client.",
+              "type": "string"
+            },
+            "revision": {
+              "description": "Full commit SHA or signed tag selected for this source.",
+              "type": "string"
+            },
+            "path": {
+              "description": "Bundle directory inside the repository.",
+              "type": "string"
+            },
+            "credential": {
+              "description": "Optional secret reference used to authenticate the fetch.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "verify_signature": {
+              "description": "Require a valid signature on the selected tag or commit.",
+              "default": false,
+              "type": "boolean"
+            },
+            "timeout_secs": {
+              "description": "Hard timeout for one fetch, in seconds.",
+              "default": 60,
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "refresh_interval_secs": {
+              "description": "Refresh cadence in seconds. Zero resolves only during ordinary startup and reload operations.",
+              "default": 60,
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
             }
           },
           "additionalProperties": false
@@ -541,7 +660,7 @@
           }
         },
         "correlation_id": {
-          "description": "Correlation-ID propagation policy. By default, the proxy honours any inbound `X-Request-Id` header, generates one if absent, forwards the value to the upstream, and echoes it in the downstream response. Set fields here to change the header name or disable.",
+          "description": "Correlation-ID propagation policy. By default, the proxy honors any inbound `X-Request-Id` header, generates one if absent, forwards the value to the upstream, and echoes it in the downstream response. Set fields here to change the header name or disable.",
           "default": {
             "echo_response": true,
             "enabled": true,
@@ -624,7 +743,7 @@
           "additionalProperties": true
         },
         "http_client_timeouts": {
-          "description": "Tunable client-side timeouts for the proxy's outbound HTTP helpers (forward-auth, callbacks, mirrors, SWR refreshes, bot- auth directory). Defaults match the prior hardcoded literals so existing configs see no behaviour change. See [`HttpClientTimeoutsConfig`] for the field list.",
+          "description": "Tunable client-side timeouts for the proxy's outbound HTTP helpers (forward-auth, callbacks, mirrors, SWR refreshes, bot- auth directory). Defaults match the prior hardcoded literals so existing configs see no behavior change. See [`HttpClientTimeoutsConfig`] for the field list.",
           "default": {
             "bot_auth_directory_client_secs": 5,
             "callback_client_secs": 10,
@@ -663,7 +782,7 @@
           ]
         },
         "tenants": {
-          "description": "WOR-1053: declared tenants. Each entry carries an `id` referenced by `origin.tenant_id`. Future PRs add per-tenant `credentials`, `policies`, and `vault` blocks; PR1 lands the scope so the rest of the credentials epic can land against a stable tenant resolver.\n\nWhen empty, every origin resolves to the synthetic `__default__` tenant. Existing single-tenant configs see no behaviour change. An origin that names a tenant not declared here fails config compile.",
+          "description": "WOR-1053: declared tenants. Each entry carries an `id` referenced by `origin.tenant_id`. Future PRs add per-tenant `credentials`, `policies`, and `vault` blocks; PR1 lands the scope so the rest of the credentials epic can land against a stable tenant resolver.\n\nWhen empty, every origin resolves to the synthetic `__default__` tenant. Existing single-tenant configs see no behavior change. An origin that names a tenant not declared here fails config compile.",
           "default": [],
           "type": "array",
           "items": {
@@ -679,7 +798,7 @@
           }
         },
         "payments": {
-          "description": "Durable payment settlement. When absent, the proxy keeps its existing non-settlement crawl-ledger behaviour exactly. When present, a paid request reaches the origin only after its durable intent has committed `Succeeded`.\n\nThe block is always parsed, on every build, so `sbproxy validate` reads the same document everywhere. The consumer compares [`crate::payments::PaymentsConfig::required_features`] against its own compiled feature set and fails startup naming the missing feature, so a configured rail that was not compiled in never reaches a first request.",
+          "description": "Durable payment settlement. When absent, the proxy keeps its existing non-settlement crawl-ledger behavior exactly. When present, a paid request reaches the origin only after its durable intent has committed `Succeeded`.\n\nThe block is always parsed, on every build, so `sbproxy validate` reads the same document everywhere. The consumer compares [`crate::payments::PaymentsConfig::required_features`] against its own compiled feature set and fails startup naming the missing feature, so a configured rail that was not compiled in never reaches a first request.",
           "default": null,
           "anyOf": [
             {
@@ -1031,7 +1150,7 @@
           }
         },
         "disable": {
-          "description": "Names of built-in rules to opt out of even when included by `rules:` or by the default-all behaviour. The matching name is case-sensitive. At a tenant or origin scope the list is SUBTRACTED from the resolved set (parent inheritance plus this scope's `rules:` additions).",
+          "description": "Names of built-in rules to opt out of even when included by `rules:` or by the default-all behavior. The matching name is case-sensitive. At a tenant or origin scope the list is SUBTRACTED from the resolved set (parent inheritance plus this scope's `rules:` additions).",
           "default": [],
           "type": "array",
           "items": {
@@ -1067,7 +1186,7 @@
           ]
         },
         "output": {
-          "description": "Where the line goes. `output: { type: stdout }` keeps the legacy stdout behaviour; `file` reuses the access-log rotation stack; `otlp` lands under WOR-1046.",
+          "description": "Where the line goes. `output: { type: stdout }` keeps the legacy stdout behavior; `file` reuses the access-log rotation stack; `otlp` lands under WOR-1046.",
           "allOf": [
             {
               "$ref": "#/definitions/ObservabilitySinkOutput"
@@ -1184,7 +1303,7 @@
               ]
             },
             "endpoint": {
-              "description": "OTLP collector endpoint (e.g. `http://otel-collector:4318/v1/logs` for HTTP/proto, `http://otel-collector:4317` for gRPC). The path component is honoured for HTTP transport; the gRPC variant uses the host:port only.",
+              "description": "OTLP collector endpoint (e.g. `http://otel-collector:4318/v1/logs` for HTTP/proto, `http://otel-collector:4317` for gRPC). The path component is honored for HTTP transport; the gRPC variant uses the host:port only.",
               "type": "string"
             },
             "transport": {
@@ -1196,7 +1315,7 @@
               ]
             },
             "timeout_secs": {
-              "description": "Per-export timeout in seconds. Defaults to 10 seconds when omitted; honoured by the underlying OTLP exporter's HTTP / gRPC client.",
+              "description": "Per-export timeout in seconds. Defaults to 10 seconds when omitted; honored by the underlying OTLP exporter's HTTP / gRPC client.",
               "default": null,
               "type": [
                 "integer",
@@ -1490,7 +1609,7 @@
           ]
         },
         "prompt_persistence_encryption": {
-          "description": "At-rest encryption for [`Self::prompt_persistence_path`]. Absent or disabled stores prompt records as plaintext JSON, which is the pre-existing behaviour and stays the default so an upgrade cannot orphan an existing file.",
+          "description": "At-rest encryption for [`Self::prompt_persistence_path`]. Absent or disabled stores prompt records as plaintext JSON, which is the pre-existing behavior and stays the default so an upgrade cannot orphan an existing file.",
           "default": null,
           "anyOf": [
             {
@@ -1557,7 +1676,7 @@
       "additionalProperties": false
     },
     "PromptPersistenceEncryptionConfig": {
-      "description": "At-rest encryption settings for the prompt-persistence redb file.\n\nPersisted `NamedPrompt` records are sealed with AES-256-GCM before they reach redb. Keys stay readable because hydration is a prefix scan over `prompts:<host>:<name>`, and the key is authenticated as associated data so a sealed value cannot be moved to another host or prompt name.\n\nSame reference syntax and the same no-plaintext-fallback rule as [`ResponseCacheEncryptionConfig`]: a key that is missing, unresolvable, or shorter than 16 bytes aborts startup. That is deliberately stricter than the surrounding prompt-persistence behaviour, where an unreadable file only degrades to ephemeral mutations. An unreadable file loses saved prompts; a key the operator asked for and cannot supply would silently write secrets in the clear.\n\nDerived under its own HKDF purpose, so pointing this and the response cache at one operator secret still yields two unrelated keys.",
+      "description": "At-rest encryption settings for the prompt-persistence redb file.\n\nPersisted `NamedPrompt` records are sealed with AES-256-GCM before they reach redb. Keys stay readable because hydration is a prefix scan over `prompts:<host>:<name>`, and the key is authenticated as associated data so a sealed value cannot be moved to another host or prompt name.\n\nSame reference syntax and the same no-plaintext-fallback rule as [`ResponseCacheEncryptionConfig`]: a key that is missing, unresolvable, or shorter than 16 bytes aborts startup. That is deliberately stricter than the surrounding prompt-persistence behavior, where an unreadable file only degrades to ephemeral mutations. An unreadable file loses saved prompts; a key the operator asked for and cannot supply would silently write secrets in the clear.\n\nDerived under its own HKDF purpose, so pointing this and the response cache at one operator secret still yields two unrelated keys.",
       "type": "object",
       "properties": {
         "enabled": {
@@ -5026,7 +5145,7 @@
           "items": true
         },
         "inject_mcp": {
-          "description": "Federated MCP catalogue reference injected for this key.",
+          "description": "Federated MCP catalog reference injected for this key.",
           "default": null
         },
         "bypass_prompt_injection": {
@@ -5496,7 +5615,7 @@
           }
         },
         "per_origin_keys": {
-          "description": "What happens when an origin that caches does not declare its own key under `origins.<host>.response_cache.encryption`.\n\nDefaults to [`PerOriginKeyMode::Inherit`], which is the backwards-compatible behaviour and is safe on its own terms: the origin is bound into the associated data either way, so an entry sealed for one origin never opens as another even when both inherit this key. Set [`PerOriginKeyMode::Required`] when the deployment's threat model needs every tenant to hold key material nobody else holds.",
+          "description": "What happens when an origin that caches does not declare its own key under `origins.<host>.response_cache.encryption`.\n\nDefaults to [`PerOriginKeyMode::Inherit`], which is the backwards-compatible behavior and is safe on its own terms: the origin is bound into the associated data either way, so an entry sealed for one origin never opens as another even when both inherit this key. Set [`PerOriginKeyMode::Required`] when the deployment's threat model needs every tenant to hold key material nobody else holds.",
           "default": "inherit",
           "allOf": [
             {
@@ -5787,7 +5906,7 @@
       "additionalProperties": false
     },
     "HttpClientTimeoutsConfig": {
-      "description": "Tunable client-side timeouts for the proxy's outbound HTTP helpers.\n\nSeveral internal code paths build pooled `reqwest::Client` instances to call out to operator-controlled services: forward-auth services, callback / webhook receivers, mirror destinations, stale-while- revalidate refreshes against origin upstreams, and Web Bot Auth directory lookups. Each helper used to bake a `Duration::from_secs` literal into a `LazyLock`-built client, which meant operators had to fork the binary to extend a timeout for a slow auth service or shorten one for an aggressive deadline budget.\n\nAll fields default to the prior hardcoded values so existing configs see no behaviour change. Operators only set a field here to nudge a specific timeout.\n\nExample:\n\n```yaml proxy: http_client_timeouts: forward_auth_client_secs: 60 callback_client_secs: 15 ```",
+      "description": "Tunable client-side timeouts for the proxy's outbound HTTP helpers.\n\nSeveral internal code paths build pooled `reqwest::Client` instances to call out to operator-controlled services: forward-auth services, callback / webhook receivers, mirror destinations, stale-while- revalidate refreshes against origin upstreams, and Web Bot Auth directory lookups. Each helper used to bake a `Duration::from_secs` literal into a `LazyLock`-built client, which meant operators had to fork the binary to extend a timeout for a slow auth service or shorten one for an aggressive deadline budget.\n\nAll fields default to the prior hardcoded values so existing configs see no behavior change. Operators only set a field here to nudge a specific timeout.\n\nExample:\n\n```yaml proxy: http_client_timeouts: forward_auth_client_secs: 60 callback_client_secs: 15 ```",
       "type": "object",
       "properties": {
         "forward_auth_client_secs": {
@@ -6440,7 +6559,7 @@
           }
         },
         "inject_mcp": {
-          "description": "WOR-1646: inject a federated MCP gateway's live catalogue as this credential's tool surface. Raw passthrough of the `InjectMcpRef` shape (`{ref, format, filter}`) on the underlying `VirtualKeyConfig`; resolved at request time."
+          "description": "WOR-1646: inject a federated MCP gateway's live catalog as this credential's tool surface. Raw passthrough of the `InjectMcpRef` shape (`{ref, format, filter}`) on the underlying `VirtualKeyConfig`; resolved at request time."
         }
       },
       "additionalProperties": false
@@ -6490,7 +6609,7 @@
           ]
         },
         "claim": {
-          "description": "Match an exact key=value entry on `Principal.attrs.claims`. Serialised as a flat map for readability.",
+          "description": "Match an exact key=value entry on `Principal.attrs.claims`. Serialized as a flat map for readability.",
           "default": {},
           "type": "object",
           "additionalProperties": {
@@ -6697,7 +6816,7 @@
           ]
         },
         "cardinality": {
-          "description": "WOR-1067: per-tenant cardinality budget. Caps the unique label value count across `sbproxy_requests_total` and friends for just this tenant so a noisy tenant cannot demote labels for every other tenant. Omitting the block leaves this tenant on the proxy-wide budget (today's behaviour).",
+          "description": "WOR-1067: per-tenant cardinality budget. Caps the unique label value count across `sbproxy_requests_total` and friends for just this tenant so a noisy tenant cannot demote labels for every other tenant. Omitting the block leaves this tenant on the proxy-wide budget (today's behavior).",
           "anyOf": [
             {
               "$ref": "#/definitions/TenantCardinalityConfig"
@@ -6743,7 +6862,7 @@
       "additionalProperties": false
     },
     "TenantObservabilityRedactConfig": {
-      "description": "Tenant-scope `redact:` sub-block. Today only `pii:` is honoured; the field-key and pattern overrides remain proxy-scope only because they touch the rendered JSON, which is tenant-agnostic in the emitter.",
+      "description": "Tenant-scope `redact:` sub-block. Today only `pii:` is honored; the field-key and pattern overrides remain proxy-scope only because they touch the rendered JSON, which is tenant-agnostic in the emitter.",
       "type": "object",
       "properties": {
         "fields": {
@@ -6782,7 +6901,7 @@
       "additionalProperties": false
     },
     "TenantCardinalityConfig": {
-      "description": "WOR-1067: per-tenant cardinality budget. The runtime installs one dedicated label-value tracker per declared tenant; overflows on tenant B do not touch tenant A's accepted-value set. The `__default__` tenant continues to use the proxy-wide `CardinalityLimiter` (in `sbproxy-observe`) so single-tenant deployments stay bit-for-bit identical to pre-WOR-1067 behaviour.",
+      "description": "WOR-1067: per-tenant cardinality budget. The runtime installs one dedicated label-value tracker per declared tenant; overflows on tenant B do not touch tenant A's accepted-value set. The `__default__` tenant continues to use the proxy-wide `CardinalityLimiter` (in `sbproxy-observe`) so single-tenant deployments stay bit-for-bit identical to pre-WOR-1067 behavior.",
       "type": "object",
       "properties": {
         "max_series": {
@@ -7513,6 +7632,14 @@
           "type": "array",
           "items": true
         },
+        "filters": {
+          "description": "Proxy-Wasm HTTP filters evaluated in declaration order.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ProxyWasmFilterAttachment"
+          }
+        },
         "request_modifiers": {
           "description": "Request modifiers (header rewrites, path edits, etc.).",
           "default": [],
@@ -7803,7 +7930,7 @@
           }
         },
         "default_content_shape": {
-          "description": "Per-origin default content shape used when the agent's `Accept` header is `*/*` or absent. Threaded into the synthesised `auto_content_negotiate` config by [`crate::compile_origin`]. Recognised values: `markdown`, `json`, `html`, `pdf`, `other`. Unset falls back to `html`.",
+          "description": "Per-origin default content shape used when the agent's `Accept` header is `*/*` or absent. Threaded into the synthesised `auto_content_negotiate` config by [`crate::compile_origin`]. Recognized values: `markdown`, `json`, `html`, `pdf`, `other`. Unset falls back to `html`.",
           "default": null,
           "type": [
             "string",
@@ -7819,7 +7946,7 @@
           ]
         },
         "token_bytes_ratio": {
-          "description": "Per-origin override for the Markdown projection's tokens-per-byte ratio. Threads into the synthesised `html_to_markdown` transform's `token_bytes_ratio` field and the projection fallback path so the `x-markdown-tokens` response header and the JSON envelope's `token_estimate` field both honour the override. Unset falls back to `DEFAULT_TOKEN_BYTES_RATIO` (0.25).",
+          "description": "Per-origin override for the Markdown projection's tokens-per-byte ratio. Threads into the synthesised `html_to_markdown` transform's `token_bytes_ratio` field and the projection fallback path so the `x-markdown-tokens` response header and the JSON envelope's `token_estimate` field both honor the override. Unset falls back to `DEFAULT_TOKEN_BYTES_RATIO` (0.25).",
           "default": null,
           "type": [
             "number",
@@ -7896,6 +8023,36 @@
           "anyOf": [
             {
               "$ref": "#/definitions/OriginObservabilityConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ProxyWasmFilterAttachment": {
+      "description": "One Proxy-Wasm HTTP filter attached to an origin.",
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "description": "Stable hook type declared by an installed Proxy-Wasm bundle.",
+          "type": "string"
+        },
+        "config": {
+          "description": "Plugin configuration exposed through `proxy_get_buffer_bytes`.",
+          "default": {}
+        },
+        "failure_posture": {
+          "description": "Optional origin-specific override for the bundle failure posture.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/FailureMode"
             },
             {
               "type": "null"
@@ -9065,7 +9222,7 @@
           "type": "boolean"
         },
         "signing_key": {
-          "description": "Ed25519 signing key, hex-encoded 32-byte seed. Operators generate one with `openssl rand -hex 32` or read it from a secret store. The secret-resolver pass honours provider-specific references at config-load time, mirroring how other key-material fields work.",
+          "description": "Ed25519 signing key, hex-encoded 32-byte seed. Operators generate one with `openssl rand -hex 32` or read it from a secret store. The secret-resolver pass honors provider-specific references at config-load time, mirroring how other key-material fields work.",
           "type": "string"
         },
         "key_id": {
@@ -9112,7 +9269,7 @@
       "additionalProperties": false
     },
     "OlpIntrospectConfig": {
-      "description": "WOR-808 PR9: RFC 7662 OAuth Token Introspection + RFC 7009 Token Revocation configuration for the OLP issuer.\n\nWhen this block is present the proxy exposes:\n\n* `POST /.well-known/olp/introspect`: RFC 7662 §2 introspection. Returns `{ \"active\": true, ... }` for valid + un-revoked tokens issued by this origin's signing key, mirroring every OLP claim. Returns `{ \"active\": false }` for any token that does not verify, has expired, or has been revoked (§2.2 forbids leaking the reason). * `POST /.well-known/olp/revoke`: RFC 7009 §2. Writes the token's `jti` to the configured revocation store with a TTL that matches the token's remaining lifetime, so subsequent introspections return `active: false`.\n\nBoth endpoints share one `auth` policy because the same actor that can ask \"is this token active\" should also be able to assert \"this token is no longer trusted.\" Rate-limiting on `active: false` responses (RFC 7662 §2.1 scan-attack defence) and DPoP-bound confirmation checks ship in a follow-up PR.",
+      "description": "WOR-808 PR9: RFC 7662 OAuth Token Introspection + RFC 7009 Token Revocation configuration for the OLP issuer.\n\nWhen this block is present the proxy exposes:\n\n* `POST /.well-known/olp/introspect`: RFC 7662 §2 introspection. Returns `{ \"active\": true, ... }` for valid + un-revoked tokens issued by this origin's signing key, mirroring every OLP claim. Returns `{ \"active\": false }` for any token that does not verify, has expired, or has been revoked (§2.2 forbids leaking the reason). * `POST /.well-known/olp/revoke`: RFC 7009 §2. Writes the token's `jti` to the configured revocation store with a TTL that matches the token's remaining lifetime, so subsequent introspections return `active: false`.\n\nBoth endpoints share one `auth` policy because the same actor that can ask \"is this token active\" should also be able to assert \"this token is no longer trusted.\" Rate-limiting on `active: false` responses (RFC 7662 §2.1 scan-attack defense) and DPoP-bound confirmation checks ship in a follow-up PR.",
       "type": "object",
       "properties": {
         "enabled": {
@@ -9356,7 +9513,7 @@
           ]
         },
         "signing_key_hex": {
-          "description": "Optional 32-byte Ed25519 private seed, hex-encoded (64 hex chars). When set, the directory and agent-card HTTP responses are self-signed per RFC 9421 over `(\"content-digest\")` with `tag=\"web-bot-auth\"` and `keyid=key_id`. Verifiers can then confirm the body they fetched was emitted by the holder of the key the directory advertises, closing the trust loop without relying solely on TLS. Absent leaves the responses unsigned; the Web Bot Auth IETF draft permits both shapes and verifiers MAY treat unsigned directories as lower-trust. The secret-resolver pass honours secret references at config load so the raw seed never has to live in the YAML.",
+          "description": "Optional 32-byte Ed25519 private seed, hex-encoded (64 hex chars). When set, the directory and agent-card HTTP responses are self-signed per RFC 9421 over `(\"content-digest\")` with `tag=\"web-bot-auth\"` and `keyid=key_id`. Verifiers can then confirm the body they fetched was emitted by the holder of the key the directory advertises, closing the trust loop without relying solely on TLS. Absent leaves the responses unsigned; the Web Bot Auth IETF draft permits both shapes and verifiers MAY treat unsigned directories as lower-trust. The secret-resolver pass honors secret references at config load so the raw seed never has to live in the YAML.",
           "default": null,
           "type": [
             "string",
@@ -10021,7 +10178,7 @@
           ]
         },
         "slow_request_threshold_ms": {
-          "description": "Log every request at or above this latency, regardless of `sample_rate`. `None` preserves sampler-only behaviour.",
+          "description": "Log every request at or above this latency, regardless of `sample_rate`. `None` preserves sampler-only behavior.",
           "default": null,
           "type": [
             "number",
@@ -10213,7 +10370,7 @@
           "type": "boolean"
         },
         "bot_auth_keyid_enabled": {
-          "description": "Honour the verified Web Bot Auth `keyid` as resolver step 1. Default `true`. Off forces the resolver to fall through to rDNS / UA matching even when bot-auth verified the request.",
+          "description": "Honor the verified Web Bot Auth `keyid` as resolver step 1. Default `true`. Off forces the resolver to fall through to rDNS / UA matching even when bot-auth verified the request.",
           "default": true,
           "type": "boolean"
         },

@@ -1377,7 +1377,15 @@ mod tests {
 
     #[test]
     fn registry_sampler_reads_request_latency_and_rate_limit_rejections() {
-        crate::metrics::record_request("alert-sampler.example", "GET", 503, 0.321, 0, 0);
+        crate::metrics::record_request_with_labels(
+            "alert-sampler.example",
+            "GET",
+            503,
+            0.321,
+            0,
+            0,
+            crate::agent_labels::AgentLabels::unset(),
+        );
         crate::metrics::record_rate_limit_decision("/alert-sampler", "allow");
         crate::metrics::record_rate_limit_decision("/alert-sampler", "throttle_route");
 

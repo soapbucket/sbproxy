@@ -42,6 +42,9 @@ proxy:
       pepper: e2e-test-pepper
       master_key: e2e-test-master
     failure_mode_allow: false
+    inbound:
+      native_key_policy:
+        allowed_providers: [openai]
 origins:
   "ai.localhost":
     action:
@@ -51,6 +54,7 @@ origins:
           api_key: sk-dummy
           base_url: "http://127.0.0.1:{dead_port}"
           allow_private_base_url: true
+          accept_native_credentials_for: openai
           default_model: gpt-4o-mini
           models:
             - gpt-4o-mini
@@ -155,6 +159,13 @@ fn key_lifecycle_mint_use_revoke_rotate() {
     // upstream (dead here, hence 502) instead of being swallowed by the
     // key gate. Store-down behavior for the same shape is covered by the
     // fail-closed outage test below.
+    //
+    // Forwarding requires both native opt-ins the config declares above:
+    // `inbound.native_key_policy.allowed_providers` admits the provider
+    // proxy-wide, and the provider's `accept_native_credentials_for` names it
+    // as a destination allowed to receive a caller's credential. Without
+    // either, native governance refuses this shape with a 403 before dispatch
+    // rather than passing it through.
     assert_eq!(
         ai_request(&base, "sk-bogus-secretsecret"),
         502,

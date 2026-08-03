@@ -326,6 +326,10 @@ pub struct RequestContext {
     /// risks a panic or a cross-origin config read; the request simply
     /// completes on the config it started with.
     pub pipeline: std::sync::Arc<crate::pipeline::CompiledPipeline>,
+    /// Live Proxy-Wasm HTTP sessions for the pipeline generation pinned to
+    /// this request. The mutex supplies the `Sync` bound required by Pingora;
+    /// request phases still access it serially through their mutable context.
+    pub(crate) proxy_wasm: Option<parking_lot::Mutex<crate::proxy_wasm_http::ProxyWasmHttpState>>,
 
     // --- Auth state ---
     /// Authentication result, populated by the auth phase.
@@ -413,6 +417,8 @@ pub struct RequestContext {
     /// accumulates the body into `request_body_buf` and runs every
     /// matching validator once the stream ends.
     pub validate_request_body: bool,
+    /// Dynamic bundle policies waiting for a complete request body.
+    pub(crate) dynamic_request_body_plan: crate::request_body_plan::DynamicRequestBodyPlan,
     /// Buffered request body, populated only when `validate_request_body`
     /// is true.
     pub request_body_buf: Option<BytesMut>,
@@ -1180,6 +1186,15 @@ pub struct RequestContext {
     pub native_key_provider: Option<String>,
     /// Secret-free inbound key classification for metrics and audit.
     pub inbound_key_mode: InboundKeyMode,
+    /// Set when the key store could not be read and
+    /// `key_management.failure_posture` admitted the request anyway.
+    ///
+    /// Read by the native-provider-key gate, which must not refuse a request
+    /// an admitting posture already let through: `docs/degradation.md` states
+    /// that `degraded` and `open` fall through to the origin's own auth, and
+    /// the native gate needs no key store to reach a verdict, so without this
+    /// it denied during exactly the outage the posture exists for.
+    pub key_store_admitted_by_posture: bool,
     /// Governed key-policy revision applied to this request, in the
     /// `r{rev}:{digest}` / `c:{rev}:{digest}` vocabulary the
     /// `sbproxy.policy_version` span attribute uses. `None` when no
@@ -1533,6 +1548,7 @@ impl RequestContext {
             tenant_id: CompactString::const_new("__default__"),
             origin_idx: None,
             pipeline: crate::reload::current_pipeline_full(),
+            proxy_wasm: None,
             lb_attempt: None,
             retry_count: 0,
             retry_backoff_ms: None,
@@ -1551,6 +1567,7 @@ impl RequestContext {
             concurrent_limit_denial_body: None,
             agent_budget_guards: Vec::new(),
             validate_request_body: false,
+            dynamic_request_body_plan: crate::request_body_plan::DynamicRequestBodyPlan::default(),
             request_body_buf: None,
             threat_scan_pending: false,
             transcode_active: false,
@@ -1703,6 +1720,7 @@ impl RequestContext {
             native_key_policy_record: None,
             inbound_key_header: None,
             native_key_provider: None,
+            key_store_admitted_by_posture: false,
             inbound_key_mode: InboundKeyMode::None,
             ai_policy_version: None,
             policy_decisions: Vec::new(),

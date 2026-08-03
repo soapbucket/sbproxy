@@ -90,6 +90,40 @@ fn admin_openapi_endpoint_returns_emitted_spec() {
     );
 }
 
+#[test]
+fn admin_extensions_endpoint_is_authenticated_versioned_and_read_only() {
+    let admin_port = pick_admin_port();
+    let _proxy = ProxyHarness::start_with_yaml(&config_yaml(admin_port)).expect("start proxy");
+    ProxyHarness::wait_for_port(admin_port, std::time::Duration::from_secs(5))
+        .expect("admin port to bind");
+    let auth = format!("Basic {}", base64_encode("admin:secret"));
+
+    let (status, _) = admin_get(admin_port, "/api/extensions", None);
+    assert_eq!(status, 401);
+
+    let (status, body) = admin_get(admin_port, "/api/extensions", Some(&auth));
+    assert_eq!(status, 200);
+    let snapshot: serde_json::Value =
+        serde_json::from_str(&body).expect("extension inventory must be JSON");
+    assert_eq!(snapshot["schema_version"], 1);
+    assert_eq!(snapshot["scope"]["mode"], "running");
+    assert_eq!(snapshot["summary"]["bundles"], 0);
+    assert_eq!(snapshot["summary"]["hooks"], 0);
+    assert_eq!(snapshot["bundles"], serde_json::json!([]));
+    assert_eq!(snapshot["hooks"], serde_json::json!([]));
+    assert_eq!(snapshot["collisions"], serde_json::json!([]));
+
+    let response = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .expect("admin client")
+        .post(format!("http://127.0.0.1:{admin_port}/api/extensions"))
+        .header("authorization", auth)
+        .send()
+        .expect("admin POST");
+    assert_eq!(response.status().as_u16(), 405);
+}
+
 /// Tiny base64 encoder so the test stays single-purpose without
 /// pulling in another dep. Standard alphabet, no padding logic
 /// needed for the short strings we encode.

@@ -11,8 +11,16 @@ use tracing::{debug, error, warn};
 
 use crate::reload;
 use sbproxy_modules::{Action, Auth};
+use sbproxy_plugin::ActionOutcome;
 use sbproxy_tls::challenges::ACME_CHALLENGE_PREFIX;
 use sbproxy_tls::h3_listener::HttpResponse;
+
+pub(crate) fn unsupported_plugin_action_proxy_message() -> String {
+    format!(
+        "{}: plugin action cannot proxy without a configured upstream",
+        sbproxy_plugin::UNSUPPORTED_ACTION_OUTCOME_CODE
+    )
+}
 
 // --- Public dispatch API ---
 
@@ -346,11 +354,111 @@ async fn dispatch_action(
             warn!("H3: mcp action not yet supported in H3 dispatch");
             Ok(text_response(501, &h3_unsupported_message("mcp")))
         }
-        Action::Plugin(_) => {
-            warn!("H3: plugin action not supported in H3 dispatch");
-            Ok(text_response(501, &h3_unsupported_message("plugin")))
+        Action::Plugin(handler) => {
+            let mut request = http::Request::builder()
+                .method(method.clone())
+                .uri(uri.clone())
+                .body(body.unwrap_or_default())
+                .context("building plugin action request")?;
+            *request.headers_mut() = headers.clone();
+            let outcome = handler
+                .handler()
+                .handle(&mut request, &mut ())
+                .await
+                .with_context(|| {
+                    format!(
+                        "plugin action {:?} failed",
+                        handler.handler().handler_type()
+                    )
+                })?;
+            match outcome {
+                ActionOutcome::Response {
+                    status,
+                    headers,
+                    body,
+                } => validate_plugin_action_response(status, headers, body),
+                ActionOutcome::Proxy => {
+                    Err(anyhow::anyhow!(unsupported_plugin_action_proxy_message()))
+                }
+                ActionOutcome::Responded => {
+                    warn!("H3: legacy plugin responded outcome cannot write through H3 dispatch");
+                    Ok(text_response(
+                        501,
+                        &h3_unsupported_message("legacy plugin response"),
+                    ))
+                }
+            }
         }
     }
+}
+
+const MAX_PLUGIN_ACTION_RESPONSE_HEADERS: usize = 64;
+const MAX_PLUGIN_ACTION_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
+
+pub(crate) fn validate_plugin_action_response(
+    status: u16,
+    mut headers: Vec<(String, String)>,
+    body: Bytes,
+) -> Result<HttpResponse> {
+    // A dynamic action's return value ends dispatch, so an informational
+    // status or a body under a bodyless status has to be caught here
+    // rather than at the transport, which would already be committed to
+    // whatever framing the status implied (WOR-2274).
+    sbproxy_extension::bundle::validate_extension_response(status, body.len())?;
+    if headers.len() > MAX_PLUGIN_ACTION_RESPONSE_HEADERS {
+        anyhow::bail!(
+            "plugin action response has {} headers; maximum is {}",
+            headers.len(),
+            MAX_PLUGIN_ACTION_RESPONSE_HEADERS
+        );
+    }
+    for (name, value) in &headers {
+        http::HeaderName::from_bytes(name.as_bytes())
+            .with_context(|| format!("invalid plugin action response header name {name:?}"))?;
+        http::HeaderValue::from_str(value)
+            .with_context(|| format!("invalid plugin action response header {name:?}"))?;
+    }
+    let connection_fields: Vec<String> = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("connection"))
+        .flat_map(|(_, value)| value.split(','))
+        .map(|name| name.trim().to_ascii_lowercase())
+        .filter(|name| !name.is_empty())
+        .collect();
+    headers.retain(|(name, _)| {
+        !is_transport_owned_or_hop_by_hop_response_header(name)
+            && !connection_fields
+                .iter()
+                .any(|connection_name| connection_name.eq_ignore_ascii_case(name))
+    });
+    if body.len() > MAX_PLUGIN_ACTION_RESPONSE_BODY_BYTES {
+        anyhow::bail!(
+            "plugin action response body exceeds 1 MiB (1048576 bytes): {} bytes",
+            body.len()
+        );
+    }
+    Ok(HttpResponse {
+        status,
+        headers,
+        body: Some(body),
+    })
+}
+
+fn is_transport_owned_or_hop_by_hop_response_header(name: &str) -> bool {
+    [
+        "connection",
+        "content-length",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ]
+    .iter()
+    .any(|blocked| name.eq_ignore_ascii_case(blocked))
 }
 
 /// Build the standard 501 body for action types that the H3 dispatch path
@@ -569,6 +677,51 @@ fn text_response(status: u16, body: &str) -> HttpResponse {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn javascript_proxy_action_fixture() -> (tempfile::TempDir, Action) {
+    let directory = tempfile::TempDir::new().expect("temporary JavaScript bundle directory");
+    let bundle = directory.path().join("guest-proxy-action");
+    std::fs::create_dir_all(&bundle).expect("create JavaScript bundle directory");
+    std::fs::write(
+        bundle.join("entry.js"),
+        r#"export function run() {
+            return { version: "sbproxy-envelope/v1", outcome: "proxy" };
+        }"#,
+    )
+    .expect("write JavaScript bundle entry");
+    std::fs::write(
+        bundle.join("bundle.yaml"),
+        r#"apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: guest-proxy-action
+version: 1.0.0
+runtime: javascript
+entry: entry.js
+hooks:
+  - kind: action
+    type: guest_proxy_action
+    export: run
+"#,
+    )
+    .expect("write JavaScript bundle manifest");
+    let config = sbproxy_config::ExtensionBundlesConfig {
+        bundles_dir: Some(directory.path().display().to_string()),
+        sources: Vec::new(),
+    };
+    let registry = sbproxy_extension::bundle::DynamicBundleRegistry::load(
+        &config,
+        directory.path(),
+        &std::collections::BTreeSet::new(),
+    )
+    .expect("load JavaScript bundle");
+    let action = sbproxy_modules::compile_action_with_registry(
+        &serde_json::json!({"type": "guest_proxy_action"}),
+        registry.as_ref(),
+    )
+    .expect("compile JavaScript bundle action");
+    (directory, action)
+}
+
 // --- not() helper (std::ops::Not for bool) ---
 trait BoolNot {
     fn not(self) -> bool;
@@ -583,7 +736,246 @@ impl BoolNot for bool {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
+
+    use sbproxy_plugin::{ActionHandler, ActionOutcome, PluginResult};
+
     use super::*;
+
+    struct OutcomeAction(ActionOutcome);
+
+    impl ActionHandler for OutcomeAction {
+        fn handler_type(&self) -> &str {
+            "plugin_action_fixture"
+        }
+
+        fn handle(
+            &self,
+            _req: &mut http::Request<Bytes>,
+            _ctx: &mut dyn std::any::Any,
+        ) -> Pin<Box<dyn Future<Output = PluginResult<ActionOutcome>> + Send + '_>> {
+            let outcome = self.0.clone();
+            Box::pin(async move { Ok(outcome) })
+        }
+    }
+
+    fn plugin_action_response(status: u16, headers: Vec<(String, String)>, body: Bytes) -> Action {
+        Action::Plugin(sbproxy_modules::PluginAction::linked(Box::new(
+            OutcomeAction(ActionOutcome::Response {
+                status,
+                headers,
+                body,
+            }),
+        )))
+    }
+
+    async fn dispatch_plugin_action(action: &Action) -> Result<HttpResponse> {
+        dispatch_action(
+            action,
+            &http::Method::POST,
+            &"/jobs".parse().expect("fixture URI"),
+            &http::HeaderMap::new(),
+            Some(Bytes::from_static(b"payload")),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn plugin_action_h3_dispatches_structured_response() {
+        let action = plugin_action_response(
+            202,
+            vec![("content-type".into(), "text/plain".into())],
+            Bytes::from_static(b"queued"),
+        );
+
+        let response = dispatch_plugin_action(&action)
+            .await
+            .expect("valid plugin response");
+
+        assert_eq!(response.status, 202);
+        assert_eq!(
+            response.headers,
+            vec![("content-type".to_string(), "text/plain".to_string())]
+        );
+        assert_eq!(response.body.as_deref(), Some(&b"queued"[..]));
+    }
+
+    #[tokio::test]
+    async fn plugin_action_h3_rejects_proxy_without_an_upstream() {
+        let action = Action::Plugin(sbproxy_modules::PluginAction::linked(Box::new(
+            OutcomeAction(ActionOutcome::Proxy),
+        )));
+
+        let error = match dispatch_plugin_action(&action).await {
+            Ok(_) => panic!("a plugin action cannot continue without an upstream"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("unsupported_action_outcome"),
+            "error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn javascript_action_h3_rejects_proxy_without_an_upstream() {
+        let (_directory, action) = javascript_proxy_action_fixture();
+
+        let error = match dispatch_plugin_action(&action).await {
+            Ok(_) => panic!("a JavaScript action cannot continue without an upstream"),
+            Err(error) => error,
+        };
+
+        assert!(
+            format!("{error:#}").contains("unsupported_action_outcome"),
+            "error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_action_h3_strips_transport_owned_and_hop_by_hop_headers() {
+        let action = plugin_action_response(
+            200,
+            vec![
+                ("content-length".into(), "999".into()),
+                ("x-safe-first".into(), "one".into()),
+                ("connection".into(), "x-plugin-hop".into()),
+                ("x-plugin-hop".into(), "remove-me".into()),
+                ("keep-alive".into(), "timeout=5".into()),
+                ("proxy-authenticate".into(), "Basic".into()),
+                ("proxy-authorization".into(), "Basic secret".into()),
+                ("proxy-connection".into(), "keep-alive".into()),
+                ("transfer-encoding".into(), "chunked".into()),
+                ("te".into(), "trailers".into()),
+                ("trailer".into(), "x-checksum".into()),
+                ("upgrade".into(), "websocket".into()),
+                ("content-type".into(), "text/plain".into()),
+                ("x-safe-last".into(), "two".into()),
+            ],
+            Bytes::from_static(b"actual"),
+        );
+
+        let response = dispatch_plugin_action(&action)
+            .await
+            .expect("valid plugin response");
+
+        assert_eq!(
+            response.headers,
+            vec![
+                ("x-safe-first".to_string(), "one".to_string()),
+                ("content-type".to_string(), "text/plain".to_string()),
+                ("x-safe-last".to_string(), "two".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_action_h3_rejects_status_below_100() {
+        let action = plugin_action_response(99, Vec::new(), Bytes::new());
+
+        let error = dispatch_plugin_action(&action)
+            .await
+            .err()
+            .expect("status below 100 must be rejected");
+
+        assert!(error.to_string().contains("status"), "error: {error:#}");
+    }
+
+    #[tokio::test]
+    async fn plugin_action_h3_rejects_informational_status() {
+        // A 1xx is not a final response, but dispatch has already been
+        // torn down by the time the outcome arrives, so the client would
+        // wait forever for a final status that never comes (WOR-2274).
+        for status in [100, 101, 103] {
+            let action = plugin_action_response(status, Vec::new(), Bytes::new());
+
+            let error = dispatch_plugin_action(&action)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("status {status} must be rejected"));
+
+            assert!(
+                error.to_string().contains("informational"),
+                "status {status} error: {error:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_action_h3_rejects_a_body_under_a_bodyless_status() {
+        for status in [204, 304] {
+            let action = plugin_action_response(status, Vec::new(), Bytes::from_static(b"nope"));
+
+            let error = dispatch_plugin_action(&action)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("status {status} with a body must be rejected"));
+
+            assert!(
+                error.to_string().contains("forbids a response body"),
+                "status {status} error: {error:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_action_h3_allows_a_bodyless_status_with_no_body() {
+        let action = plugin_action_response(204, Vec::new(), Bytes::new());
+
+        let response = dispatch_plugin_action(&action)
+            .await
+            .expect("204 with an empty body is well formed");
+
+        assert_eq!(response.status, 204);
+    }
+
+    #[tokio::test]
+    async fn plugin_action_h3_rejects_crlf_header_value() {
+        let action = plugin_action_response(
+            200,
+            vec![("x-safe".into(), "ok\r\nx-injected: bad".into())],
+            Bytes::new(),
+        );
+
+        let error = dispatch_plugin_action(&action)
+            .await
+            .err()
+            .expect("CR/LF header values must be rejected");
+
+        assert!(error.to_string().contains("header"), "error: {error:#}");
+    }
+
+    #[tokio::test]
+    async fn plugin_action_h3_rejects_more_than_64_headers() {
+        let headers = (0..65)
+            .map(|index| (format!("x-fixture-{index}"), "value".to_string()))
+            .collect();
+        let action = plugin_action_response(200, headers, Bytes::new());
+
+        let error = dispatch_plugin_action(&action)
+            .await
+            .err()
+            .expect("header count must be bounded");
+
+        assert!(error.to_string().contains("64"), "error: {error:#}");
+    }
+
+    #[tokio::test]
+    async fn plugin_action_h3_rejects_body_above_one_mib() {
+        let action =
+            plugin_action_response(200, Vec::new(), Bytes::from(vec![b'x'; 1024 * 1024 + 1]));
+
+        let error = dispatch_plugin_action(&action)
+            .await
+            .err()
+            .expect("response body must be bounded");
+
+        assert!(
+            error.to_string().contains("1048576") || error.to_string().contains("1 MiB"),
+            "error: {error:#}"
+        );
+    }
 
     // --- Health check ---
 

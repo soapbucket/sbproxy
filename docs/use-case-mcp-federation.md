@@ -2,7 +2,7 @@
 
 *Last modified: 2026-07-28*
 
-Every team that wires an agent up to a tool ends up standing up its own MCP server: one for the GitHub org, one for the internal database, one for the ticket tracker. Six months later there are a dozen of them, each with its own auth story, its own idea of who is allowed to call `delete_repo`, and no shared record of what any agent actually did. SBproxy's MCP gateway collapses that sprawl into one endpoint: it aggregates the tool catalogues of every upstream server behind a single virtual MCP server, gates every `tools/call` with default-deny RBAC keyed on the caller's identity, and can turn a REST API with no MCP support at all into governed tools with nothing but an OpenAPI spec. This guide builds that gateway end to end, with real curls against a real (if intentionally tiny) upstream.
+Every team that wires an agent up to a tool ends up standing up its own MCP server: one for the GitHub org, one for the internal database, one for the ticket tracker. Six months later there are a dozen of them, each with its own auth story, its own idea of who is allowed to call `delete_repo`, and no shared record of what any agent actually did. SBproxy's MCP gateway collapses that sprawl into one endpoint: it aggregates the tool catalogs of every upstream server behind a single virtual MCP server, gates every `tools/call` with default-deny RBAC keyed on the caller's identity, and can turn a REST API with no MCP support at all into governed tools with nothing but an OpenAPI spec. This guide builds that gateway end to end, with real curls against a real (if intentionally tiny) upstream.
 
 ## What you will build
 
@@ -125,7 +125,7 @@ $ curl -sS -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8080 \
 202
 ```
 
-List the federated catalogue. Only `gh.search_repos` shows up: the `db` upstream's `tools/list` fetch fails against the unreachable placeholder, and federation drops the failed server rather than failing the whole call.
+List the federated catalog. Only `gh.search_repos` shows up: the `db` upstream's `tools/list` fetch fails against the unreachable placeholder, and federation drops the failed server rather than failing the whole call.
 
 ```console
 $ curl -s -X POST http://127.0.0.1:8080 \
@@ -176,7 +176,7 @@ $ curl -s -X POST http://127.0.0.1:8080 \
 {"code":-32603,"message":"tool call failed: unknown tool: db.query"}
 ```
 
-To make `db` real, point its `origin` at a running MCP server. A bare hostname normalises to `https://<host>/mcp`, or you can give a full URL, including `http://127.0.0.1:<port>/mcp` for something running locally. You can also convert it to a second `type: openapi` server the way `gh` is done here, pointed at any REST API you own with a `spec` or `spec_path`. Neither change touches `rbac_policies` or the `tool_allowlist` guardrail; both keep applying.
+To make `db` real, point its `origin` at a running MCP server. A bare hostname normalizes to `https://<host>/mcp`, or you can give a full URL, including `http://127.0.0.1:<port>/mcp` for something running locally. You can also convert it to a second `type: openapi` server the way `gh` is done here, pointed at any REST API you own with a `spec` or `spec_path`. Neither change touches `rbac_policies` or the `tool_allowlist` guardrail; both keep applying.
 
 ## You are done when
 
@@ -188,7 +188,7 @@ To make `db` real, point its `origin` at a running MCP server. A bare hostname n
 ## Next steps
 
 - [tool-versioning.md](tool-versioning.md) - once `db` is real, add the rollout plane and compatibility oracle so a breaking change to `search_repos` fails a version-bump check instead of breaking every agent that calls it at once.
-- [`examples/mcp-progressive-discovery`](../examples/mcp-progressive-discovery) - once the federated catalogue grows past a handful of tools, advertise `search` / `execute` meta-tools instead of the full list so it does not eat the model's context window.
+- [`examples/mcp-progressive-discovery`](../examples/mcp-progressive-discovery) - once the federated catalog grows past a handful of tools, advertise `search` / `execute` meta-tools instead of the full list so it does not eat the model's context window.
 - [`examples/mcp-rbac-quotas`](../examples/mcp-rbac-quotas) - per-tool sliding-window quotas on top of the same default-deny RBAC used here.
 - [mcp.md](mcp.md) - the full wire format: sessions, OAuth discovery, resources, and the session ledger for behavioral eval.
 - [mcp-archestra-guardrails.md](mcp-archestra-guardrails.md) - egress policy, session risk, and quarantine for tool output, including the OpenAPI-backed REST egress this guide left at its allow-all default.

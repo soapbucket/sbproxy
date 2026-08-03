@@ -240,6 +240,22 @@ pub async fn build_payments_runtime(
     config: &PaymentsConfig,
     clustered: bool,
 ) -> Result<PaymentsRuntime, PaymentsRuntimeError> {
+    build_payments_runtime_with_observer(config, clustered, None).await
+}
+
+/// Build a settlement runtime with one compiled pipeline's payment observer.
+///
+/// The observer is captured by the immutable billing service generation, so
+/// reload cannot route a payment event through hooks from another pipeline.
+///
+/// # Errors
+///
+/// Returns the same failures as [`build_payments_runtime`].
+pub async fn build_payments_runtime_with_observer(
+    config: &PaymentsConfig,
+    clustered: bool,
+    payment_observer: Option<Arc<dyn sbproxy_billing::PaymentLifecycleObserver>>,
+) -> Result<PaymentsRuntime, PaymentsRuntimeError> {
     // One configured secret, two derived keys. `challenge_binding_key` is
     // the operator's single settlement secret; the Payment Auth challenge id
     // is a MAC under it and quote tokens are signed under a key derived from
@@ -304,6 +320,7 @@ pub async fn build_payments_runtime(
     let inputs = PaymentsRuntimeInputs {
         signer: requirement_signer,
         gate: Some(gate),
+        payment_observer,
         recovery_key: match &config.recovery_encryption {
             Some(recovery) => Some(Zeroizing::new(
                 resolve_secret(&recovery.key, "recovery_encryption.key")?
@@ -366,6 +383,28 @@ pub fn install(
 ) -> Result<Arc<PaymentsRuntime>, PaymentsRuntimeError> {
     payments_worker_runtime()
         .block_on(build_payments_runtime(config, clustered))
+        .map(Arc::new)
+}
+
+/// Build and publish settlement with one compiled pipeline's payment hooks.
+///
+/// The observer and its terminal drain are created on the process-lifetime
+/// payment runtime. This keeps the drain alive after the synchronous boot
+/// caller returns and avoids depending on a caller-owned Tokio runtime.
+///
+/// # Errors
+///
+/// Returns whatever [`build_payments_runtime_with_observer`] returns.
+pub fn install_with_payment_dispatcher(
+    config: &PaymentsConfig,
+    clustered: bool,
+    dispatcher: Arc<dyn crate::payment_extensions::PaymentEventDispatcher>,
+) -> Result<Arc<PaymentsRuntime>, PaymentsRuntimeError> {
+    payments_worker_runtime()
+        .block_on(async {
+            let observer = crate::payment_extensions::PaymentExtensionObserver::new(dispatcher);
+            build_payments_runtime_with_observer(config, clustered, Some(observer)).await
+        })
         .map(Arc::new)
 }
 
@@ -485,6 +524,9 @@ pub struct PaymentsRuntimeInputs {
     /// it, and tests that exercise topology or lifecycle rules build
     /// candidates without a real signer.
     pub gate: Option<SettlementGateSeam>,
+    /// Generation-scoped payment extension observer, when the compiled
+    /// pipeline carries payment hooks.
+    pub payment_observer: Option<Arc<dyn sbproxy_billing::PaymentLifecycleObserver>>,
     /// The resolved recovery encryption key, when configuration set one.
     pub recovery_key: Option<Zeroizing<Vec<u8>>>,
     /// The resolved Stripe secret key, when a Stripe rail is configured.
@@ -605,6 +647,9 @@ impl PaymentsRuntimeCandidate {
             })?;
         if let Some(clock) = &inputs.clock {
             builder = builder.clock(Arc::clone(clock));
+        }
+        if let Some(observer) = &inputs.payment_observer {
+            builder = builder.payment_observer(Arc::clone(observer));
         }
         if let Some(recovery) = &config.recovery_encryption {
             let key = inputs
@@ -1713,16 +1758,113 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RejectPaymentObserver {
+        events: Mutex<
+            Vec<(
+                sbproxy_billing::PaymentLifecyclePhase,
+                sbproxy_billing::PaymentLifecycleOutcome,
+            )>,
+        >,
+    }
+
+    #[async_trait::async_trait]
+    impl sbproxy_billing::PaymentLifecycleObserver for RejectPaymentObserver {
+        async fn started(
+            &self,
+            event: &sbproxy_billing::PaymentLifecycleEvent,
+        ) -> sbproxy_billing::PaymentLifecycleDecision {
+            self.events.lock().push((event.phase(), event.outcome()));
+            sbproxy_billing::PaymentLifecycleDecision::Reject
+        }
+
+        fn terminal(&self, event: sbproxy_billing::PaymentLifecycleEvent) {
+            self.events.lock().push((event.phase(), event.outcome()));
+        }
+    }
+
+    fn observer_test_draft() -> sbproxy_billing::PaymentRequirementDraft {
+        let mut draft = sbproxy_billing::PaymentRequirementDraft {
+            requirement_id: "req-0123456789abcdef".to_owned(),
+            protocol: sbproxy_billing::PaymentProtocol::X402V2,
+            advertised_rail: sbproxy_billing::AdvertisedRail::X402,
+            settlement_rail: sbproxy_billing::SettlementRail::X402,
+            method: "exact".to_owned(),
+            intent: "exact".to_owned(),
+            network: Some("base-sepolia".to_owned()),
+            asset: Some("usdc".to_owned()),
+            pay_to: Some("recipient-fixture".to_owned()),
+            amount: sbproxy_billing::Money::new(10_000, "USD").unwrap(),
+            settlement_amount: String::new(),
+            settlement_decimals: 6,
+            terms: sbproxy_billing::RequirementTerms::X402Exact {
+                facilitator_url: "https://facilitator.example/api".to_owned(),
+                max_timeout_seconds: 60,
+                extra: std::collections::BTreeMap::new(),
+            },
+            quote_id: "quote-1".to_owned(),
+            tenant_id: "tenant-1".to_owned(),
+            origin_id: "origin-1".to_owned(),
+            route: "/paid".to_owned(),
+            expires_at_ms: 9_000_000_000_000,
+            request_digest: None,
+        };
+        draft.canonicalize().unwrap();
+        draft
+    }
+
     fn test_inputs() -> PaymentsRuntimeInputs {
         PaymentsRuntimeInputs {
             signer: Arc::new(StubSigner),
             gate: None,
+            payment_observer: None,
             recovery_key: None,
             stripe_api_key: None,
             cln_rune: None,
             clock: None,
             clustered: false,
         }
+    }
+
+    #[tokio::test]
+    async fn candidate_installs_the_generation_payment_observer() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut config = sample_config();
+        config.state_path = directory
+            .path()
+            .join("settlement.sqlite3")
+            .to_string_lossy()
+            .into_owned();
+        let observer = Arc::new(RejectPaymentObserver::default());
+        let mut inputs = test_inputs();
+        inputs.payment_observer = Some(observer.clone());
+        let candidate = PaymentsRuntimeCandidate::build(&config, &inputs).expect("candidate");
+
+        let error = expect_error(
+            candidate
+                .service
+                .prepare_requirement(sbproxy_billing::service::RequirementInput {
+                    draft: observer_test_draft(),
+                    request_idempotency_key: "request-key".to_owned(),
+                })
+                .await,
+            "the generation observer rejects before runtime payment work",
+        );
+
+        assert_eq!(error, sbproxy_billing::BillingError::ExtensionRejected);
+        assert_eq!(
+            *observer.events.lock(),
+            [
+                (
+                    sbproxy_billing::PaymentLifecyclePhase::Challenge,
+                    sbproxy_billing::PaymentLifecycleOutcome::Started,
+                ),
+                (
+                    sbproxy_billing::PaymentLifecyclePhase::Challenge,
+                    sbproxy_billing::PaymentLifecycleOutcome::Rejected,
+                ),
+            ]
+        );
     }
 
     /// A clustered node refuses to build a settlement runtime, and refuses

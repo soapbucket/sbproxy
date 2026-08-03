@@ -2262,15 +2262,16 @@ fn handle_validate_subcommand(args: &ValidateArgs) -> anyhow::Result<i32> {
                     anyhow::anyhow!("config '{path_str}': {e} (this would fail at boot)")
                 })?;
             }
-            let pipeline =
-                sbproxy_core::pipeline::CompiledPipeline::from_config_for_validation(compiled)
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "config '{path_str}' compiled, but a module failed to construct \
-                         (this would fail at boot):\n{e:#}"
-                        )
-                    })?;
             let config_dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+            let pipeline = sbproxy_core::pipeline::CompiledPipeline::from_config_for_validation_at(
+                compiled, config_dir,
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "config '{path_str}' compiled, but a module failed to construct \
+                         (this would fail at boot):\n{e:#}"
+                )
+            })?;
             sbproxy_core::model_runtime::validate_model_runtime(&pipeline, config_dir).map_err(
                 |e| {
                     anyhow::anyhow!(
@@ -2356,6 +2357,7 @@ fn handle_doctor_subcommand(args: &DoctorArgs) -> anyhow::Result<i32> {
         match std::fs::read_to_string(&path) {
             Ok(yaml) => {
                 let config_dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+                report = with_doctor_extension_inventory(report, &yaml, config_dir);
                 match extract_serve_and_catalog(&yaml, config_dir) {
                     Ok(Some((serve, catalog))) => {
                         report = report.with_serve_config(&serve, &catalog);
@@ -2425,6 +2427,27 @@ fn handle_doctor_subcommand(args: &DoctorArgs) -> anyhow::Result<i32> {
         }
     }
     Ok(exit)
+}
+
+fn with_doctor_extension_inventory(
+    report: sbproxy_core::doctor::DoctorReport,
+    yaml: &str,
+    config_dir: &std::path::Path,
+) -> sbproxy_core::doctor::DoctorReport {
+    if let Ok(compiled) = sbproxy_config::compile_config(yaml) {
+        if let Ok(candidate) =
+            sbproxy_core::pipeline::CompiledPipeline::from_config_for_validation_at(
+                compiled, config_dir,
+            )
+        {
+            return report.with_extension_candidate(&candidate);
+        }
+    }
+    if let Ok(config) = serde_yaml::from_str::<sbproxy_config::ConfigFile>(yaml) {
+        let revision = sbproxy_core::identity::config_revision(yaml.as_bytes());
+        return report.with_extension_config(&config.extensions, config_dir, Some(&revision));
+    }
+    report
 }
 
 /// Render the `startup gate` block `doctor --strict` appends, one line
@@ -5535,7 +5558,12 @@ fn configured_artifact_protection(
     let yaml = std::fs::read_to_string(config_path)
         .map_err(|error| anyhow::anyhow!("read config '{}': {error}", config_path.display()))?;
     let compiled = sbproxy_config::compile_config(&yaml)?;
-    let pipeline = sbproxy_core::pipeline::CompiledPipeline::from_config(compiled)?;
+    let config_dir = config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let pipeline = sbproxy_core::pipeline::CompiledPipeline::from_config_for_validation_at(
+        compiled, config_dir,
+    )?;
     let mut protection = sbproxy_model_host::CacheProtection::default();
 
     if let Some(control) = pipeline.config.server.model_host.as_ref() {
@@ -8388,15 +8416,18 @@ fn pull_refusal_hint(result: sbproxy_core::config_subscriber::CycleResult) -> &'
 fn merged_plan_report(
     local_yaml: &str,
     merged_yaml: &str,
+    config_dir: &std::path::Path,
 ) -> anyhow::Result<sbproxy_config::PlanReport> {
     let baseline = serde_yaml::from_str::<sbproxy_config::ConfigFile>(local_yaml)
         .map_err(|error| anyhow::anyhow!("parse the local document as ConfigFile: {error}"))?;
     let compiled = sbproxy_config::compile_config(merged_yaml)
         .map_err(|error| anyhow::anyhow!("the merged document does not compile:\n{error:#}"))?;
     let construction_error =
-        sbproxy_core::pipeline::CompiledPipeline::from_config_for_validation(compiled)
-            .err()
-            .map(|error| format!("{error:#}"));
+        sbproxy_core::pipeline::CompiledPipeline::from_config_for_validation_at(
+            compiled, config_dir,
+        )
+        .err()
+        .map(|error| format!("{error:#}"));
     let proposed = serde_yaml::from_str::<sbproxy_config::ConfigFile>(merged_yaml)
         .map_err(|error| anyhow::anyhow!("parse the merged document as ConfigFile: {error}"))?;
     let mut report = sbproxy_config::plan(&baseline, &proposed);
@@ -8525,7 +8556,8 @@ fn handle_config_pull(
             return Ok(3);
         }
     };
-    let report = match merged_plan_report(&local_yaml, candidate.merged_yaml()) {
+    let config_dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let report = match merged_plan_report(&local_yaml, candidate.merged_yaml(), config_dir) {
         Ok(report) => report,
         Err(error) => {
             eprintln!(
@@ -9021,10 +9053,13 @@ fn load_and_validate_with(
     // can fold it into their findings report: `plan` renders it next
     // to the other semantic findings and exits 3, the same channel
     // the validate-rule findings use.
+    let config_dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     let construction_error =
-        sbproxy_core::pipeline::CompiledPipeline::from_config_for_validation(compiled)
-            .err()
-            .map(|e| format!("{e:#}"));
+        sbproxy_core::pipeline::CompiledPipeline::from_config_for_validation_at(
+            compiled, config_dir,
+        )
+        .err()
+        .map(|e| format!("{e:#}"));
     let config = serde_yaml::from_str::<sbproxy_config::ConfigFile>(&yaml)
         .map_err(|e| anyhow::anyhow!("failed to parse '{path_str}' as ConfigFile: {e}"))?;
     Ok((config, construction_error))
@@ -9616,6 +9651,75 @@ mod tests {
 
         assert!(catalog.get("exact").is_some());
         let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[test]
+    fn doctor_extension_inventory_uses_candidate_attachment_scope() {
+        let directory = temp_env_path("doctor-extension-inventory");
+        let _ = std::fs::remove_dir_all(&directory);
+        let bundle = directory.join("bundles").join("doctor-lifecycle");
+        std::fs::create_dir_all(&bundle).expect("create doctor lifecycle bundle");
+        std::fs::write(
+            bundle.join("entry.js"),
+            r#"export function inspect() {
+                return { version: "sbproxy-envelope/v1", decision: "continue" };
+            }
+            export function enforce() {
+                return { version: "sbproxy-envelope/v1", decision: "allow" };
+            }
+"#,
+        )
+        .expect("write doctor lifecycle artifact");
+        std::fs::write(
+            bundle.join("bundle.yaml"),
+            r#"apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: doctor-lifecycle
+version: 1.0.0
+runtime: javascript
+entry: entry.js
+hooks:
+  - kind: ai_guardrail_input
+    type: doctor_guardrail
+    export: inspect
+  - kind: policy
+    type: doctor_unattached_policy
+    export: enforce
+"#,
+        )
+        .expect("write doctor lifecycle manifest");
+        let report = with_doctor_extension_inventory(
+            sbproxy_core::doctor::DoctorReport::collect(),
+            "proxy: {}\nextensions:\n  bundles_dir: bundles\n",
+            &directory,
+        );
+
+        assert_eq!(
+            report.extensions.scope.mode,
+            sbproxy_plugin::ExtensionScopeMode::Doctor
+        );
+        assert_eq!(
+            report
+                .extensions
+                .hooks
+                .iter()
+                .find(|hook| hook.kind == sbproxy_plugin::ExtensionHookKind::AiGuardrailInput)
+                .map(|hook| (hook.id.as_str(), hook.state)),
+            Some((
+                "doctor-lifecycle:ai_guardrail_input:doctor_guardrail",
+                sbproxy_plugin::ExtensionState::Active,
+            ))
+        );
+        assert_eq!(
+            report
+                .extensions
+                .hooks
+                .iter()
+                .find(|hook| hook.kind == sbproxy_plugin::ExtensionHookKind::Policy)
+                .map(|hook| hook.state),
+            Some(sbproxy_plugin::ExtensionState::Unconsumed)
+        );
+        std::fs::remove_dir_all(directory).expect("remove doctor lifecycle fixture");
     }
 
     #[test]
@@ -12318,6 +12422,167 @@ mod tests {
             0
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn temp_extension_config(
+        entry_source: &str,
+        action_type: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let path = temp_config("");
+        let bundle_directory_name = format!(
+            "{}-bundles",
+            path.file_stem()
+                .expect("temporary config has a file stem")
+                .to_string_lossy()
+        );
+        let bundle_root = path
+            .parent()
+            .expect("temporary config has a parent")
+            .join(&bundle_directory_name)
+            .join("validate-action");
+        std::fs::create_dir_all(&bundle_root).expect("create validation bundle directory");
+        std::fs::write(bundle_root.join("entry.js"), entry_source)
+            .expect("write validation bundle entry");
+        std::fs::write(
+            bundle_root.join("bundle.yaml"),
+            r#"apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: validate-action
+version: 1.0.0
+runtime: javascript
+entry: entry.js
+hooks:
+  - kind: action
+    type: validate_action
+    export: run
+"#,
+        )
+        .expect("write validation bundle manifest");
+        std::fs::write(
+            &path,
+            format!(
+                "extensions:\n  bundles_dir: {bundle_directory_name}\norigins:\n  extension.local:\n    action:\n      type: {action_type}\n"
+            ),
+        )
+        .expect("write extension config");
+
+        let bundle_directory = bundle_root
+            .parent()
+            .expect("bundle root has a parent directory")
+            .to_path_buf();
+        (path, bundle_directory)
+    }
+
+    fn temp_model_cli_extension_config() -> (std::path::PathBuf, std::path::PathBuf) {
+        let path = temp_config("");
+        let bundle_directory_name = format!(
+            "{}-bundles",
+            path.file_stem()
+                .expect("temporary config has a file stem")
+                .to_string_lossy()
+        );
+        let bundle_directory = path
+            .parent()
+            .expect("temporary config has a parent")
+            .join(&bundle_directory_name);
+        let bundle_root = bundle_directory.join("model-cli-chain");
+        std::fs::create_dir_all(&bundle_root).expect("create model CLI bundle directory");
+        std::fs::write(
+            bundle_root.join("entry.js"),
+            r#"export function respond() {
+  return { version: "sbproxy-envelope/v1", outcome: "response", status: 204, headers: [], body_base64: "" };
+}
+export function allow() {
+  return { version: "sbproxy-envelope/v1", decision: "allow" };
+}
+export function transform() {
+  return { version: "sbproxy-envelope/v1", body_base64: "" };
+}
+"#,
+        )
+        .expect("write model CLI bundle entry");
+        std::fs::write(
+            bundle_root.join("bundle.yaml"),
+            r#"apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: model-cli-chain
+version: 1.0.0
+runtime: javascript
+entry: entry.js
+hooks:
+  - kind: action
+    type: model_cli_action
+    export: respond
+  - kind: policy
+    type: model_cli_policy
+    export: allow
+  - kind: transform
+    type: model_cli_transform
+    export: transform
+"#,
+        )
+        .expect("write model CLI bundle manifest");
+        std::fs::write(
+            &path,
+            format!(
+                "extensions:\n  bundles_dir: {bundle_directory_name}\norigins:\n  model-cli.local:\n    action:\n      type: model_cli_action\n    policies:\n      - type: model_cli_policy\n    transforms:\n      - type: model_cli_transform\n"
+            ),
+        )
+        .expect("write model CLI extension config");
+        (path, bundle_directory)
+    }
+
+    #[test]
+    fn validate_loads_dynamic_action_bundle_relative_to_config() {
+        let (path, bundle_directory) = temp_extension_config(
+            r#"export function run() {
+                return {
+                    version: "sbproxy-envelope/v1",
+                    outcome: "response",
+                    status: 204,
+                    headers: [],
+                    body_base64: ""
+                };
+            }"#,
+            "validate_action",
+        );
+
+        let outcome = handle_validate_subcommand(&validate_args(&path, false));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(bundle_directory);
+        assert_eq!(outcome.expect("dynamic action config should validate"), 0);
+    }
+
+    #[test]
+    fn model_cli_artifact_protection_loads_the_relative_dynamic_chain() {
+        let (path, bundle_directory) = temp_model_cli_extension_config();
+        let worker = sbproxy_model_host::WorkerProfile {
+            accelerator: sbproxy_model_host::AcceleratorKind::Cpu,
+            compute_capability: None,
+            memory_bytes: u64::MAX,
+            engines: std::collections::BTreeSet::new(),
+        };
+
+        let outcome =
+            configured_artifact_protection(&path, &sbproxy_model_host::Catalog::builtin(), &worker);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(bundle_directory);
+        outcome.expect("model pull and remove should load the configured extension chain");
+    }
+
+    #[test]
+    fn validate_rejects_invalid_unreferenced_extension_bundle() {
+        let (path, bundle_directory) =
+            temp_extension_config("export function anotherName() {}", "static");
+
+        let error = handle_validate_subcommand(&validate_args(&path, false))
+            .expect_err("an invalid configured bundle must fail validation even when unreferenced");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(bundle_directory);
+        assert!(format!("{error:#}").contains("export"), "{error:#}");
     }
 
     #[test]

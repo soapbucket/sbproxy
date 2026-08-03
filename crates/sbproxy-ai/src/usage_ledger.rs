@@ -178,6 +178,8 @@ mod tests {
             a2a_context_id: None,
             a2a_identity_verified: None,
             workflow_id: None,
+            logical_model: None,
+            served_model: None,
         }
     }
 

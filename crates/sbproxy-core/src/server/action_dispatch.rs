@@ -6,6 +6,7 @@
 //! `use` aliases, so the moved code needs no rewiring.
 
 use super::*;
+use sbproxy_config::types::FailureMode;
 
 /// Handle non-proxy actions directly in request_filter.
 /// Returns Ok(true) if the action was handled (short-circuit), Ok(false) for Proxy.
@@ -828,10 +829,919 @@ pub(super) async fn handle_action(
             Ok(true)
         }
 
-        Action::Plugin(_) => {
-            send_error(session, 501, "plugin actions not yet supported").await?;
-            Ok(true)
+        Action::Plugin(handler) => {
+            let request_header = session.req_header();
+            let method = request_header.method.clone();
+            let uri = request_header.uri.clone();
+            let headers = request_header.headers.clone();
+            let dynamic_hook = handler.dynamic_hook().cloned();
+            let request_body = if let Some(action_hook) = dynamic_hook.as_ref() {
+                let action_buffers = match action_hook.body_mode() {
+                    sbproxy_config::BundleBodyMode::None => false,
+                    sbproxy_config::BundleBodyMode::Buffered => true,
+                    sbproxy_config::BundleBodyMode::Streamed => {
+                        tracing::error!(
+                            target: "sbproxy::extension",
+                            bundle = action_hook.bundle_id(),
+                            hook = action_hook.hook_type(),
+                            "non-Proxy-Wasm dynamic action declared streamed body access"
+                        );
+                        ctx.response_status = Some(500);
+                        send_error(session, 500, "unsupported plugin action body mode").await?;
+                        return Ok(true);
+                    }
+                };
+                let declared_body_len = headers
+                    .get(http::header::CONTENT_LENGTH)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<usize>().ok());
+
+                if let Some(declared_body_len) = declared_body_len {
+                    if let Some(cap) = ctx.body_size_limit {
+                        if declared_body_len > cap {
+                            debug!(
+                                received = declared_body_len,
+                                cap,
+                                "request_limit rejected plugin action body from declared length"
+                            );
+                            ctx.response_status = Some(413);
+                            send_error(session, 413, "request entity too large").await?;
+                            return Ok(true);
+                        }
+                    }
+                    let skipped = match ctx
+                        .dynamic_request_body_plan
+                        .before_growth(declared_body_len, action_buffers.then_some(action_hook))
+                    {
+                        Ok(skipped) => skipped,
+                        Err(overflow) => {
+                            let hook = overflow.metadata();
+                            debug!(
+                                target: "sbproxy::extension",
+                                bundle = hook.bundle_id(),
+                                hook = hook.hook_type(),
+                                policy_index = ?overflow.policy_index(),
+                                received = declared_body_len,
+                                cap = overflow.cap(),
+                                "dynamic hook rejected plugin action body from declared length"
+                            );
+                            ctx.response_status = Some(413);
+                            send_error(session, 413, "request entity too large").await?;
+                            return Ok(true);
+                        }
+                    };
+                    for skipped_hook in skipped {
+                        let hook = skipped_hook.metadata();
+                        let posture = hook.failure_posture();
+                        tracing::warn!(
+                            target: "sbproxy::extension",
+                            bundle = hook.bundle_id(),
+                            hook = hook.hook_type(),
+                            policy_index = skipped_hook.policy_index(),
+                            received = declared_body_len,
+                            cap = skipped_hook.cap(),
+                            failure_posture = posture.as_label(),
+                            "skipping buffered dynamic policy from declared plugin action body length"
+                        );
+                        if posture.guarantee_waived() || posture.records_counterfactual() {
+                            ctx.record_policy_decision(hook.hook_type(), posture.as_label());
+                        }
+                    }
+                }
+
+                let mut buffered = bytes::BytesMut::new();
+                let mut must_read = action_buffers
+                    || ctx.dynamic_request_body_plan.has_active_buffered_policies()
+                    || ctx.body_size_limit.is_some();
+                while must_read {
+                    let Some(chunk) = session.read_request_body().await? else {
+                        break;
+                    };
+                    ctx.request_body_bytes =
+                        ctx.request_body_bytes.saturating_add(chunk.len() as u64);
+                    if let Some(cap) = ctx.body_size_limit {
+                        ctx.body_bytes_seen = ctx.body_bytes_seen.saturating_add(chunk.len());
+                        if ctx.body_bytes_seen > cap {
+                            debug!(
+                                received = ctx.body_bytes_seen,
+                                cap, "request_limit rejected streaming plugin action body"
+                            );
+                            ctx.response_status = Some(413);
+                            send_error(session, 413, "request entity too large").await?;
+                            return Ok(true);
+                        }
+                    }
+
+                    let needs_buffer = action_buffers
+                        || ctx.dynamic_request_body_plan.has_active_buffered_policies();
+                    if needs_buffer {
+                        let proposed_len = buffered.len().saturating_add(chunk.len());
+                        let skipped = match ctx
+                            .dynamic_request_body_plan
+                            .before_growth(proposed_len, action_buffers.then_some(action_hook))
+                        {
+                            Ok(skipped) => skipped,
+                            Err(overflow) => {
+                                let hook = overflow.metadata();
+                                debug!(
+                                    target: "sbproxy::extension",
+                                    bundle = hook.bundle_id(),
+                                    hook = hook.hook_type(),
+                                    policy_index = ?overflow.policy_index(),
+                                    received = proposed_len,
+                                    cap = overflow.cap(),
+                                    "dynamic hook blocked plugin action body before allocation"
+                                );
+                                ctx.response_status = Some(413);
+                                send_error(session, 413, "request entity too large").await?;
+                                return Ok(true);
+                            }
+                        };
+                        for skipped_hook in skipped {
+                            let hook = skipped_hook.metadata();
+                            let posture = hook.failure_posture();
+                            tracing::warn!(
+                                target: "sbproxy::extension",
+                                bundle = hook.bundle_id(),
+                                hook = hook.hook_type(),
+                                policy_index = skipped_hook.policy_index(),
+                                received = proposed_len,
+                                cap = skipped_hook.cap(),
+                                failure_posture = posture.as_label(),
+                                "skipping buffered dynamic policy whose plugin action body exceeded its cap"
+                            );
+                            if posture.guarantee_waived() || posture.records_counterfactual() {
+                                ctx.record_policy_decision(hook.hook_type(), posture.as_label());
+                            }
+                        }
+                        if action_buffers
+                            || ctx.dynamic_request_body_plan.has_active_buffered_policies()
+                        {
+                            buffered.extend_from_slice(&chunk);
+                        }
+                    }
+
+                    must_read = action_buffers
+                        || ctx.dynamic_request_body_plan.has_active_buffered_policies()
+                        || ctx.body_size_limit.is_some();
+                }
+                let buffered = buffered.freeze();
+
+                if ctx.dynamic_request_body_plan.has_active_buffered_policies() {
+                    let Some(origin_idx) = origin_idx else {
+                        ctx.response_status = Some(500);
+                        send_error(session, 500, "plugin policy plan has no origin").await?;
+                        return Ok(true);
+                    };
+                    let Some(enforcers) = pipeline.enforcers.get(origin_idx) else {
+                        ctx.response_status = Some(500);
+                        send_error(session, 500, "plugin policy plan has no enforcers").await?;
+                        return Ok(true);
+                    };
+                    let workspace_id = pipeline.config.origins[origin_idx].workspace_id.to_string();
+                    let verdict_ctx = PolicyVerdictCtx {
+                        request_id: ctx.request_id.to_string(),
+                        tenant_id: workspace_id.clone(),
+                        workspace_id,
+                    };
+                    if let Some((status, message, policy_type)) = check_buffered_dynamic_policies(
+                        enforcers,
+                        session,
+                        ctx,
+                        buffered.clone(),
+                        &verdict_ctx,
+                    )
+                    .await
+                    {
+                        let policy_type = effective_policy_type(ctx, policy_type);
+                        sbproxy_observe::metrics::record_policy(
+                            ctx.hostname.as_str(),
+                            policy_type,
+                            "deny",
+                        );
+                        ctx.record_policy_decision(policy_type, "deny");
+                        ctx.response_status = Some(status);
+                        send_error(session, status, &message).await?;
+                        return Ok(true);
+                    }
+                }
+
+                if action_buffers {
+                    buffered
+                } else {
+                    Bytes::new()
+                }
+            } else {
+                // Linked plugins predate body planning and retain their
+                // complete-body behavior until they adopt bundle metadata.
+                let mut request_body = bytes::BytesMut::new();
+                while let Some(chunk) = session.read_request_body().await? {
+                    request_body.extend_from_slice(&chunk);
+                }
+                request_body.freeze()
+            };
+            let mut request = http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(request_body)
+                .map_err(|error| {
+                    Error::because(
+                        ErrorType::InternalError,
+                        "failed to build plugin action request",
+                        error,
+                    )
+                })?;
+            *request.headers_mut() = headers;
+            let outcome = handler
+                .handler()
+                .handle(&mut request, ctx)
+                .await
+                .map_err(|error| {
+                    Error::because(ErrorType::InternalError, "plugin action failed", error)
+                })?;
+            match outcome {
+                sbproxy_plugin::ActionOutcome::Proxy => Err(Error::explain(
+                    ErrorType::InternalError,
+                    crate::dispatch::unsupported_plugin_action_proxy_message(),
+                )),
+                sbproxy_plugin::ActionOutcome::Responded => Ok(true),
+                sbproxy_plugin::ActionOutcome::Response {
+                    status,
+                    headers,
+                    body,
+                } => {
+                    let response =
+                        crate::dispatch::validate_plugin_action_response(status, headers, body)
+                            .map_err(|error| {
+                                Error::because(
+                                    ErrorType::InternalError,
+                                    "invalid plugin action response",
+                                    error,
+                                )
+                            })?;
+                    ctx.response_status = Some(response.status);
+                    let body = apply_plugin_action_response_transforms(
+                        response.body.unwrap_or_default(),
+                        &response.headers,
+                        pipeline,
+                        origin_idx,
+                        ctx,
+                    );
+                    let transformed_status =
+                        ctx.response_status_override.unwrap_or(response.status);
+                    let (status, headers, body) = apply_plugin_action_response_modifiers(
+                        session,
+                        transformed_status,
+                        response.headers,
+                        body,
+                        pipeline,
+                        origin_idx,
+                        ctx,
+                    );
+                    let (content_type, extras) = split_plugin_action_response_headers(headers);
+                    ctx.response_status = Some(status);
+                    send_response_with_extras(
+                        session,
+                        status,
+                        &content_type,
+                        body.as_ref(),
+                        &extras,
+                    )
+                    .await?;
+                    Ok(true)
+                }
+            }
         }
+    }
+}
+
+fn apply_plugin_action_response_transforms(
+    body: Bytes,
+    headers: &[(String, String)],
+    pipeline: &CompiledPipeline,
+    origin_idx: Option<usize>,
+    ctx: &mut RequestContext,
+) -> Bytes {
+    let Some(origin_idx) = origin_idx else {
+        return body;
+    };
+    let Some(transforms) = pipeline.transforms.get(origin_idx) else {
+        return body;
+    };
+    if transforms.is_empty() {
+        return body;
+    }
+
+    let content_type = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| value.as_str());
+    let ratio = resolved_token_bytes_ratio(pipeline.config.origins.get(origin_idx));
+    let mut body = bytes::BytesMut::from(body.as_ref());
+    for compiled_transform in transforms {
+        if body.len() > compiled_transform.max_body_size {
+            warn!(
+                transform = compiled_transform.transform.transform_type(),
+                body_bytes = body.len(),
+                max_body_size = compiled_transform.max_body_size,
+                "plugin action transform skipped because the response body exceeds its limit"
+            );
+            continue;
+        }
+        let needs_synth_projection = matches!(
+            compiled_transform.transform,
+            sbproxy_modules::Transform::CitationBlock(_)
+                | sbproxy_modules::Transform::JsonEnvelope(_)
+        );
+        if needs_synth_projection {
+            synthesise_markdown_projection_if_missing(ctx, &body, ratio);
+        }
+        if let Err(error) =
+            apply_transform_with_ctx(compiled_transform, &mut body, content_type, ctx)
+        {
+            let transform_name = compiled_transform.transform.transform_type();
+            // Same carve-out the upstream response path applies: a
+            // bundle transform's declared posture decides its own
+            // failure, and a host invariant violation never does
+            // (WOR-2268).
+            let is_typed_transform_error =
+                crate::server::transform_error_is_unconditional_500(compiled_transform, &error);
+            if is_typed_transform_error {
+                tracing::error!(
+                    hostname = %ctx.hostname,
+                    transform = transform_name,
+                    error = %error,
+                    "plugin action transform invariant violated, returning a generic response"
+                );
+                ctx.response_status_override = Some(500);
+                ctx.transform_error_attribution = Some(transform_name.to_string());
+                body.clear();
+                body.extend_from_slice(b"{\"error\":\"internal server error\"}");
+                break;
+            }
+            match compiled_transform.failure_posture {
+                FailureMode::Closed => {
+                    warn!(
+                        hostname = %ctx.hostname,
+                        transform = transform_name,
+                        error = %error,
+                        failure_posture = FailureMode::Closed.as_label(),
+                        "plugin action transform failed; replacing the response body"
+                    );
+                    body.clear();
+                    body.extend_from_slice(b"{\"error\":\"internal server error\"}");
+                    break;
+                }
+                FailureMode::Open => {
+                    warn!(
+                        hostname = %ctx.hostname,
+                        transform = transform_name,
+                        error = %error,
+                        "plugin action transform failed, continuing with the next transform"
+                    );
+                }
+                FailureMode::Degraded | FailureMode::Observe => {
+                    warn!(
+                        hostname = %ctx.hostname,
+                        transform = transform_name,
+                        error = %error,
+                        failure_posture = compiled_transform.failure_posture.as_label(),
+                        "plugin action transform failed; posture admits the original body"
+                    );
+                }
+            }
+        }
+    }
+    body.freeze()
+}
+
+fn apply_plugin_action_response_modifiers(
+    session: &Session,
+    mut status: u16,
+    mut headers: Vec<(String, String)>,
+    mut body: Bytes,
+    pipeline: &CompiledPipeline,
+    origin_idx: Option<usize>,
+    ctx: &RequestContext,
+) -> (u16, Vec<(String, String)>, Bytes) {
+    let Some(origin) = origin_idx.and_then(|idx| pipeline.config.origins.get(idx)) else {
+        return (status, headers, body);
+    };
+    let template_context = build_request_template_context(session, ctx, origin);
+    let mut response_headers = serde_json::Map::new();
+    for (name, value) in &headers {
+        insert_json_header(&mut response_headers, name, value);
+    }
+    for modifier in &origin.response_modifiers {
+        if let Some(body_modifier) = &modifier.body {
+            if let Some(json) = &body_modifier.replace_json {
+                body = Bytes::from(json.to_string());
+            } else if let Some(text) = &body_modifier.replace {
+                body = Bytes::from(text.clone());
+            }
+        }
+        if let Some(status_modifier) = &modifier.status {
+            status = status_modifier.code;
+        }
+        if let Some(header_modifier) = &modifier.headers {
+            for name in &header_modifier.remove {
+                headers.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+                response_headers.remove(name);
+            }
+            for (name, value) in &header_modifier.set {
+                let resolved = template_context.resolve(value);
+                set_plugin_action_response_header(&mut headers, name, &resolved);
+                insert_json_header(&mut response_headers, name, &resolved);
+            }
+            for (name, value) in &header_modifier.add {
+                let resolved = template_context.resolve(value);
+                headers.push((name.clone(), resolved.clone()));
+                insert_json_header(&mut response_headers, name, &resolved);
+            }
+        }
+        if let Some(script) = &modifier.lua_script {
+            match lua_response_modifier(script, status, &response_headers, ctx) {
+                Ok(modified) => {
+                    for (name, value) in modified {
+                        set_plugin_action_response_header(&mut headers, &name, &value);
+                        insert_json_header(&mut response_headers, name, value);
+                    }
+                }
+                Err(error) => {
+                    warn!(error = %error, "Lua response modifier on plugin action failed");
+                }
+            }
+        }
+        if let Some(script) = &modifier.js_script {
+            match js_response_modifier(script, status, &response_headers, ctx) {
+                Ok(modified) => {
+                    for (name, value) in modified {
+                        set_plugin_action_response_header(&mut headers, &name, &value);
+                        insert_json_header(&mut response_headers, name, value);
+                    }
+                }
+                Err(error) => {
+                    warn!(error = %error, "JavaScript response modifier on plugin action failed");
+                }
+            }
+        }
+    }
+    (status, headers, body)
+}
+
+fn set_plugin_action_response_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
+    headers.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+    headers.push((name.to_string(), value.to_string()));
+}
+
+fn split_plugin_action_response_headers(
+    headers: Vec<(String, String)>,
+) -> (String, Vec<(String, String)>) {
+    let mut content_type = "application/octet-stream".to_string();
+    let mut extras = Vec::with_capacity(headers.len());
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("content-type") {
+            content_type = value;
+        } else if !name.eq_ignore_ascii_case("content-length")
+            && !name.eq_ignore_ascii_case("transfer-encoding")
+            && !name.eq_ignore_ascii_case("connection")
+        {
+            extras.push((name, value));
+        }
+    }
+    (content_type, extras)
+}
+
+#[cfg(test)]
+mod plugin_action_tests {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::time::Duration;
+
+    use pingora_core::protocols::l4::stream::Stream;
+    use sbproxy_plugin::{ActionHandler, ActionOutcome, PluginResult};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
+
+    struct OutcomeAction(ActionOutcome);
+
+    impl ActionHandler for OutcomeAction {
+        fn handler_type(&self) -> &str {
+            "plugin_action_fixture"
+        }
+
+        fn handle(
+            &self,
+            _req: &mut http::Request<Bytes>,
+            _ctx: &mut dyn std::any::Any,
+        ) -> Pin<Box<dyn Future<Output = PluginResult<ActionOutcome>> + Send + '_>> {
+            let outcome = self.0.clone();
+            Box::pin(async move { Ok(outcome) })
+        }
+    }
+
+    fn response_action(status: u16, headers: Vec<(String, String)>, body: Bytes) -> Action {
+        Action::Plugin(sbproxy_modules::PluginAction::linked(Box::new(
+            OutcomeAction(ActionOutcome::Response {
+                status,
+                headers,
+                body,
+            }),
+        )))
+    }
+
+    async fn exchange(
+        action: &Action,
+        pipeline: &CompiledPipeline,
+        origin_idx: Option<usize>,
+    ) -> (pingora_error::Result<bool>, Vec<u8>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind downstream fixture");
+        let address = listener.local_addr().expect("downstream address");
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect downstream fixture");
+            stream
+                .write_all(
+                    b"POST /jobs HTTP/1.1\r\nHost: plugin.test\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .expect("write request");
+            stream.shutdown().await.expect("half-close request");
+            let mut response = Vec::new();
+            stream
+                .read_to_end(&mut response)
+                .await
+                .expect("read response");
+            response
+        });
+        let (stream, _) = listener.accept().await.expect("accept downstream");
+        let mut session = Session::new_h1(Box::new(Stream::from(stream)));
+        session
+            .as_downstream_mut()
+            .read_request()
+            .await
+            .expect("parse downstream request");
+        let mut ctx = RequestContext::new();
+
+        let result = handle_action(action, &mut session, pipeline, origin_idx, &mut ctx).await;
+        drop(session);
+        let response = tokio::time::timeout(Duration::from_secs(2), client)
+            .await
+            .expect("downstream response timeout")
+            .expect("downstream client task");
+        (result, response)
+    }
+
+    #[tokio::test]
+    async fn plugin_action_http1_dispatches_structured_response() {
+        let action = response_action(
+            202,
+            vec![("content-type".into(), "text/plain".into())],
+            Bytes::from_static(b"queued"),
+        );
+        let pipeline = CompiledPipeline::empty_for_test();
+
+        let (result, wire) = exchange(&action, &pipeline, None).await;
+
+        assert!(result.expect("valid plugin response must dispatch"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        assert!(response.starts_with("HTTP/1.1 202"), "response: {response}");
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("content-type: text/plain"),
+            "response: {response}"
+        );
+        assert!(response.ends_with("\r\n\r\nqueued"), "response: {response}");
+    }
+
+    #[tokio::test]
+    async fn plugin_action_http1_rejects_proxy_without_an_upstream() {
+        let action = Action::Plugin(sbproxy_modules::PluginAction::linked(Box::new(
+            OutcomeAction(ActionOutcome::Proxy),
+        )));
+        let pipeline = CompiledPipeline::empty_for_test();
+
+        let (result, wire) = exchange(&action, &pipeline, None).await;
+
+        let error = result.expect_err("a plugin action cannot continue without an upstream");
+        assert!(
+            error.to_string().contains("unsupported_action_outcome"),
+            "error: {error}"
+        );
+        assert!(wire.is_empty(), "contract failure wrote bytes: {wire:?}");
+    }
+
+    #[tokio::test]
+    async fn javascript_action_http1_rejects_proxy_without_an_upstream() {
+        let (_directory, action) = crate::dispatch::javascript_proxy_action_fixture();
+        let pipeline = CompiledPipeline::empty_for_test();
+
+        let (result, wire) = exchange(&action, &pipeline, None).await;
+
+        let error = result.expect_err("a JavaScript action cannot continue without an upstream");
+        assert!(
+            format!("{error:?}").contains("unsupported_action_outcome"),
+            "error: {error:?}"
+        );
+        assert!(wire.is_empty(), "contract failure wrote bytes: {wire:?}");
+    }
+
+    #[tokio::test]
+    async fn plugin_action_http1_strips_transport_owned_and_hop_by_hop_headers() {
+        let action = response_action(
+            200,
+            vec![
+                ("content-length".into(), "999".into()),
+                ("x-safe-first".into(), "one".into()),
+                ("connection".into(), "x-plugin-hop".into()),
+                ("x-plugin-hop".into(), "remove-me".into()),
+                ("keep-alive".into(), "timeout=5".into()),
+                ("proxy-authenticate".into(), "Basic".into()),
+                ("proxy-authorization".into(), "Basic secret".into()),
+                ("proxy-connection".into(), "keep-alive".into()),
+                ("transfer-encoding".into(), "chunked".into()),
+                ("te".into(), "trailers".into()),
+                ("trailer".into(), "x-checksum".into()),
+                ("upgrade".into(), "websocket".into()),
+                ("content-type".into(), "text/plain".into()),
+                ("x-safe-last".into(), "two".into()),
+            ],
+            Bytes::from_static(b"actual"),
+        );
+        let pipeline = CompiledPipeline::empty_for_test();
+
+        let (result, wire) = exchange(&action, &pipeline, None).await;
+
+        assert!(result.expect("valid plugin response must dispatch"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        let response_lower = response.to_ascii_lowercase();
+        assert!(
+            !response_lower.contains("content-length: 999"),
+            "response: {response}"
+        );
+        for header in [
+            "x-plugin-hop:",
+            "keep-alive:",
+            "proxy-authenticate:",
+            "proxy-authorization:",
+            "proxy-connection:",
+            "transfer-encoding:",
+            "te:",
+            "trailer:",
+            "upgrade:",
+        ] {
+            assert!(
+                !response_lower.lines().any(|line| line.starts_with(header)),
+                "response: {response}"
+            );
+        }
+        assert!(
+            response_lower.contains("content-type: text/plain"),
+            "response: {response}"
+        );
+        let first = response_lower
+            .find("x-safe-first: one")
+            .expect("first safe header");
+        let last = response_lower
+            .find("x-safe-last: two")
+            .expect("last safe header");
+        assert!(first < last, "response: {response}");
+        assert!(response.ends_with("\r\n\r\nactual"), "response: {response}");
+    }
+
+    #[tokio::test]
+    async fn plugin_action_http1_applies_ordinary_response_modifiers() {
+        let config = sbproxy_config::compile_config(
+            r#"
+origins:
+  "plugin.test":
+    action:
+      type: static
+      body: placeholder
+    response_modifiers:
+      - status:
+          code: 203
+        headers:
+          set:
+            x-plugin-modified: applied
+        body:
+          replace: modified
+"#,
+        )
+        .expect("fixture config");
+        let pipeline = CompiledPipeline::from_config(config).expect("fixture pipeline");
+        let action = response_action(
+            202,
+            vec![("content-type".into(), "text/plain".into())],
+            Bytes::from_static(b"queued"),
+        );
+
+        let (result, wire) = exchange(&action, &pipeline, Some(0)).await;
+
+        assert!(result.expect("valid plugin response must dispatch"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        assert!(response.starts_with("HTTP/1.1 203"), "response: {response}");
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("x-plugin-modified: applied"),
+            "response: {response}"
+        );
+        assert!(
+            response.ends_with("\r\n\r\nmodified"),
+            "response: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_action_http1_applies_configured_transforms() {
+        let config = sbproxy_config::compile_config(
+            r#"
+origins:
+  "plugin.test":
+    action:
+      type: static
+      body: placeholder
+    transforms:
+      - type: replace_strings
+        replacements:
+          - find: queued
+            replace: transformed
+"#,
+        )
+        .expect("fixture config");
+        let pipeline = CompiledPipeline::from_config(config).expect("fixture pipeline");
+        let action = response_action(
+            202,
+            vec![("content-type".into(), "text/plain".into())],
+            Bytes::from_static(b"queued"),
+        );
+
+        let (result, wire) = exchange(&action, &pipeline, Some(0)).await;
+
+        assert!(result.expect("valid plugin response must dispatch"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        assert!(
+            response.ends_with("\r\n\r\ntransformed"),
+            "response: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_action_http1_honors_closed_transform_failures() {
+        let config = sbproxy_config::compile_config(
+            r#"
+origins:
+  "plugin.test":
+    action:
+      type: static
+      body: placeholder
+    transforms:
+      - type: json
+        set:
+          safe: true
+        failure_posture: closed
+"#,
+        )
+        .expect("fixture config");
+        let pipeline = CompiledPipeline::from_config(config).expect("fixture pipeline");
+        let action = response_action(
+            200,
+            vec![("content-type".into(), "application/json".into())],
+            Bytes::from_static(b"not-json"),
+        );
+
+        let (result, wire) = exchange(&action, &pipeline, Some(0)).await;
+
+        assert!(result.expect("closed transform failure must dispatch a safe response"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        assert!(
+            response.ends_with("\r\n\r\n{\"error\":\"internal server error\"}"),
+            "response: {response}"
+        );
+        assert!(!response.contains("not-json"), "response: {response}");
+    }
+
+    #[tokio::test]
+    async fn plugin_action_http1_honors_open_transform_failures() {
+        let config = sbproxy_config::compile_config(
+            r#"
+origins:
+  "plugin.test":
+    action:
+      type: static
+      body: placeholder
+    transforms:
+      - type: json
+        set:
+          safe: true
+        failure_posture: open
+"#,
+        )
+        .expect("fixture config");
+        let pipeline = CompiledPipeline::from_config(config).expect("fixture pipeline");
+        let action = response_action(
+            200,
+            vec![("content-type".into(), "application/json".into())],
+            Bytes::from_static(b"not-json"),
+        );
+
+        let (result, wire) = exchange(&action, &pipeline, Some(0)).await;
+
+        assert!(result.expect("open transform failure must admit the original response"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        assert!(
+            response.ends_with("\r\n\r\nnot-json"),
+            "response: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_action_http1_skips_transform_over_its_body_limit() {
+        let config = sbproxy_config::compile_config(
+            r#"
+origins:
+  "plugin.test":
+    action:
+      type: static
+      body: placeholder
+    transforms:
+      - type: replace_strings
+        replacements:
+          - find: queued
+            replace: transformed
+        max_body_size: 3
+"#,
+        )
+        .expect("fixture config");
+        let pipeline = CompiledPipeline::from_config(config).expect("fixture pipeline");
+        let action = response_action(
+            200,
+            vec![("content-type".into(), "text/plain".into())],
+            Bytes::from_static(b"queued"),
+        );
+
+        let (result, wire) = exchange(&action, &pipeline, Some(0)).await;
+
+        assert!(result.expect("oversized action response must remain dispatchable"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        assert!(response.ends_with("\r\n\r\nqueued"), "response: {response}");
+    }
+
+    #[tokio::test]
+    async fn plugin_action_http1_interpolates_response_modifier_headers() {
+        let config = sbproxy_config::compile_config(
+            r#"
+origins:
+  "plugin.test":
+    action:
+      type: static
+      body: placeholder
+    response_modifiers:
+      - headers:
+          set:
+            x-plugin-set: "{{request.method}} {{request.path}}"
+          add:
+            x-plugin-add: "path={{request.path}}"
+"#,
+        )
+        .expect("fixture config");
+        let pipeline = CompiledPipeline::from_config(config).expect("fixture pipeline");
+        let action = response_action(200, Vec::new(), Bytes::from_static(b"ok"));
+
+        let (result, wire) = exchange(&action, &pipeline, Some(0)).await;
+
+        assert!(result.expect("valid plugin response must dispatch"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        let response_lower = response.to_ascii_lowercase();
+        assert!(
+            response_lower.contains("x-plugin-set: post /jobs"),
+            "response: {response}"
+        );
+        assert!(
+            response_lower.contains("x-plugin-add: path=/jobs"),
+            "response: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_action_http1_validates_before_writing_response() {
+        let action = response_action(
+            200,
+            vec![("x-safe".into(), "ok\r\nx-injected: bad".into())],
+            Bytes::from_static(b"must not be written"),
+        );
+        let pipeline = CompiledPipeline::empty_for_test();
+
+        let (result, wire) = exchange(&action, &pipeline, None).await;
+
+        assert!(result.is_err(), "invalid plugin response must fail");
+        assert!(wire.is_empty(), "invalid response wrote bytes: {wire:?}");
     }
 }
 
@@ -2754,6 +3664,11 @@ fn emit_mcp_tool_attribution(
             .trace_id
             .clone()
             .filter(|id| !id.is_empty()),
+        // A tool call belongs to neither serving lane, so it names
+        // neither. The `model` above is the owning MCP server, which is
+        // not a model any lane could have served (WOR-2223).
+        logical_model: None,
+        served_model: None,
     };
     for sink in &mcp.usage_sinks {
         sink.record(&event);

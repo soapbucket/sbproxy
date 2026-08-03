@@ -349,6 +349,111 @@ export interface StatsResponse {
   [k: string]: unknown;
 }
 
+export type ExtensionRuntime = "rust" | "javascript" | "wasm" | "proxy_wasm";
+
+export type ExtensionHookKind =
+  | "action"
+  | "auth"
+  | "policy"
+  | "transform"
+  | "enricher"
+  | "startup"
+  | "identity"
+  | "ml_classifier"
+  | "anomaly_detector"
+  | "mcp"
+  | "proxy_wasm_filter"
+  | "ai_tool_call"
+  | "ai_guardrail_input"
+  | "ai_guardrail_output"
+  | "ai_stream_event"
+  | "ai_close"
+  | "payment";
+
+export type ExtensionDispatch = "exclusive" | "chain";
+export type ExtensionBodyMode = "none" | "buffered" | "streamed";
+export type ExtensionRegistrationSource = "link_time" | "directory" | "git";
+export type ExtensionState =
+  | "installed"
+  | "available"
+  | "active"
+  | "failed"
+  | "shadowed"
+  | "not_evaluated"
+  | "unconsumed";
+export type ExtensionScopeMode = "running" | "doctor";
+
+export interface ExtensionInventoryScope {
+  mode: ExtensionScopeMode;
+  proxy_version: string;
+  config_revision: string | null;
+}
+
+export interface ExtensionInventorySummary {
+  bundles: number;
+  hooks: number;
+  active: number;
+  available: number;
+  failed: number;
+  collisions: number;
+}
+
+export interface ExtensionLoadRecord {
+  phase: string;
+  status: string;
+  detail: string | null;
+}
+
+export interface ExtensionBundleRecord {
+  id: string;
+  name: string;
+  version: string;
+  package: string | null;
+  source: ExtensionRegistrationSource;
+  runtime: ExtensionRuntime;
+  state: ExtensionState;
+  hook_ids: string[];
+  load: ExtensionLoadRecord;
+}
+
+export interface ExtensionExecution {
+  phase: string;
+  body_mode: ExtensionBodyMode;
+  timeout_ms: number | null;
+  max_buffer_bytes: number | null;
+}
+
+export interface ExtensionHookRecord {
+  id: string;
+  bundle_id: string;
+  kind: ExtensionHookKind;
+  registration: ExtensionRegistrationSource;
+  dispatch: ExtensionDispatch;
+  match_key: string;
+  position: number | null;
+  state: ExtensionState;
+  detail: string | null;
+  runtime: ExtensionRuntime;
+  execution: ExtensionExecution;
+  capabilities: string[];
+}
+
+export interface ExtensionCollision {
+  match_key: string;
+  registrations: string[];
+  winner: string | null;
+  resolution: string;
+}
+
+export interface ExtensionInventorySnapshot {
+  schema_version: number;
+  scope: ExtensionInventoryScope;
+  summary: ExtensionInventorySummary;
+  bundles: ExtensionBundleRecord[];
+  hooks: ExtensionHookRecord[];
+  collisions: ExtensionCollision[];
+}
+
 export interface DeviceVram {
   index?: number;
   name?: string;
@@ -2319,6 +2424,7 @@ export const api = {
   },
   health: () => getJson<HealthResponse>("/health"),
   stats: () => getJson<StatsResponse>("/api/stats"),
+  extensions: () => getJson<ExtensionInventorySnapshot>("/api/extensions"),
   modelHostStatus: () => getJson<ModelHostStatus>("/admin/model-host/status"),
   modelHostCatalog: () =>
     getJson<CatalogResponse>("/admin/model-host/catalog"),

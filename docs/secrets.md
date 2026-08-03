@@ -16,7 +16,7 @@ The resolver is built once, at startup, and it owns live connections to whatever
 
 A reload whose `proxy.secrets` block differs from the one the process started with is **refused**, with an error saying a restart is required. The previous config keeps serving and nothing from the candidate is applied. This includes adding a backend, removing one, renaming one, repointing a Vault address, and changing the rotation or fallback settings.
 
-Earlier versions accepted the reload and silently ignored the change. That was worse than refusing: the new backend never existed, so the first reference to it failed at handler construction with an error that named the reference rather than the real cause, and the reload that introduced it had already reported success. If you are used to that behaviour, the refusal is the fix, not a regression.
+Earlier versions accepted the reload and silently ignored the change. That was worse than refusing: the new backend never existed, so the first reference to it failed at handler construction with an error that named the reference rather than the real cause, and the reload that introduced it had already reported success. If you are used to that behavior, the refusal is the fix, not a regression.
 
 Everything else in a config still hot-reloads normally. Only the `proxy.secrets` block carries this restriction, and only when it actually changes; reloading an unchanged block is a no-op. The values behind a reference are re-resolved on every reload, so rotating a secret **in** Vault or Secrets Manager needs no restart. It is only changing where SBproxy looks that does.
 
@@ -68,7 +68,7 @@ proxy:
 
 | Field | Type | Description |
 |---|---|---|
-| `addr` | string | Vault server URL. Trailing slash is normalised. |
+| `addr` | string | Vault server URL. Trailing slash is normalized. |
 | `mount` | string | KV mount path. Tenant-isolated deployments scope this to a per-tenant directory. |
 | `engine` | enum | `v1` or `v2`. KV v2 is the default for new Vault deployments. |
 | `cache_ttl_secs` | integer | TTL in seconds on cached reads. Default is 300. |
@@ -328,13 +328,13 @@ k8ssecret://primary/<namespace>/<secret>[/<key>]
 
 Valid shapes:
 
-| Reference path | Behaviour |
+| Reference path | Behavior |
 |---|---|
 | `<secret>` | Returns the whole secret as a JSON map of key to decoded value. |
 | `<secret>/<key>` | Returns a single field from the configured namespace. |
 | `<namespace>/<secret>[/<key>]` | Uses an explicit namespace. It must match the backend's configured namespace. |
 
-Both `data` and `stringData` fields are honoured. `data` keys are base64-decoded automatically. UTF-8 is required; binary fields surface as decode errors.
+Both `data` and `stringData` fields are honored. `data` keys are base64-decoded automatically. UTF-8 is required; binary fields surface as decode errors.
 
 ## File And Static Map Backends
 

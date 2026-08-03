@@ -105,7 +105,7 @@ impl CertStore {
 
     /// Persist JSON-encoded [`CertMeta`] for a hostname.
     ///
-    /// WOR-1024: side-effect — stamps
+    /// WOR-1024: side-effect, stamps
     /// `sbproxy_cert_expiry_seconds{host}` with the seconds-until-expiry
     /// derived from `meta.expires_at`. Negative values mean the cert
     /// is already expired; an alert at `< 7 days` catches a stalled

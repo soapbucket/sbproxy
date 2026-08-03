@@ -1,0 +1,10 @@
+apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: fixture-policy
+version: 1.0.0
+runtime: javascript
+entry: entry.js
+hooks:
+  - kind: policy
+    type: fixture_policy
+    export: run

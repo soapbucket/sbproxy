@@ -1259,6 +1259,31 @@ fn now_unix_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// What a request debits from the budget, when that differs from what it
+/// reports.
+///
+/// These are separate questions and conflating them cost the cap its teeth.
+/// Enforcement has to act on the best available number, including an estimate
+/// when a provider returns a 2xx with no `usage` block. Reporting must carry
+/// measured usage only, so a spend report never blends estimated and measured
+/// tokens (WOR-1146). One writer serving both meant the writer was built from
+/// measured usage and structurally could not see an estimate, so a usage-less
+/// response debited nothing at all.
+///
+/// Naming the two cases at the call site is deliberate. An `Option<u64>` whose
+/// `None` means "work it out yourself" is how the estimate went missing in the
+/// first place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenDebit {
+    /// Debit the tokens the event's own measured usage carries.
+    Measured,
+    /// Debit this estimate; the response carried no parseable usage.
+    ///
+    /// The estimate never enters the [`AiBillingEvent`], which is serialized
+    /// onto the observability bus and into spend reports.
+    Estimated(u64),
+}
+
 /// Apply an [`AiBillingEvent`] to a [`BudgetTracker`].
 ///
 /// Token-based usage (`Tokens`) is debited against every scope key on
@@ -1266,12 +1291,20 @@ fn now_unix_secs() -> i64 {
 /// rerank, per-call) are accepted but only contribute to the request
 /// counter today; per-unit budget enforcement for those surfaces
 /// lands when the enforceable-unit budget shapes ship.
-pub fn record_billing_event(tracker: &BudgetTracker, event: &AiBillingEvent) {
-    let token_total: u64 = match &event.usage {
-        // `input` is the true total prompt (cached/creation are subsets),
-        // so total tokens is still input + output (WOR-1708).
-        AiUsage::Tokens { input, output, .. } => input.saturating_add(*output),
-        _ => 0,
+///
+/// `debit` decides the token amount. This stays the single place a request's
+/// budget is debited: WOR-2212 collapsed two debit sites into this one after
+/// every request spent its budget twice, and passing the amount in preserves
+/// that rather than reintroducing a second writer.
+pub fn record_billing_event(tracker: &BudgetTracker, event: &AiBillingEvent, debit: TokenDebit) {
+    let token_total: u64 = match debit {
+        TokenDebit::Estimated(tokens) => tokens,
+        TokenDebit::Measured => match &event.usage {
+            // `input` is the true total prompt (cached/creation are subsets),
+            // so total tokens is still input + output (WOR-1708).
+            AiUsage::Tokens { input, output, .. } => input.saturating_add(*output),
+            _ => 0,
+        },
     };
     for key in &event.scope_keys {
         tracker.record_usage(key, token_total, event.cost_usd);
@@ -2393,7 +2426,7 @@ mod tests {
         .with_cost(0.01)
         .with_scope_keys(vec!["ws:acme".to_string(), "user:alice".to_string()]);
 
-        record_billing_event(&tracker, &event);
+        record_billing_event(&tracker, &event, TokenDebit::Measured);
 
         let ws = tracker.get_usage("ws:acme");
         let user = tracker.get_usage("user:alice");
@@ -2511,6 +2544,61 @@ mod tests {
     }
 
     #[test]
+    fn an_estimated_debit_enforces_while_the_event_still_reports_per_call() {
+        // The shape a usage-less 2xx produces: the response carried no usage,
+        // so the event reports `PerCall` and contributes no tokens, while
+        // enforcement still has to move the tracker or `max_tokens` is not a
+        // cap for any provider that omits `usage`.
+        let tracker = BudgetTracker::new();
+        let event = AiBillingEvent::new(
+            AiSurface::ChatCompletions,
+            "openai",
+            Some("gpt-4o".to_string()),
+            AiUsage::PerCall,
+        )
+        .with_cost(0.0)
+        .with_scope_keys(vec!["ws:acme".to_string()]);
+
+        record_billing_event(&tracker, &event, TokenDebit::Estimated(1_020));
+
+        assert_eq!(
+            tracker.get_usage("ws:acme").tokens,
+            1_020,
+            "an estimated debit must reach the tracker"
+        );
+        assert_eq!(
+            event.usage,
+            AiUsage::PerCall,
+            "the event must keep reporting what was measured, not the estimate"
+        );
+    }
+
+    #[test]
+    fn one_call_debits_each_scope_key_exactly_once() {
+        // WOR-2212 collapsed two debit sites into one after every request
+        // spent its budget twice. Passing the amount in rather than adding a
+        // second writer is what preserves that, so assert the property
+        // directly: one call moves each key once, by the amount given.
+        let tracker = BudgetTracker::new();
+        let event = AiBillingEvent::new(
+            AiSurface::ChatCompletions,
+            "openai",
+            Some("gpt-4o".to_string()),
+            AiUsage::PerCall,
+        )
+        .with_cost(0.0)
+        .with_scope_keys(vec!["ws:acme".to_string(), "model:gpt-4o".to_string()]);
+
+        record_billing_event(&tracker, &event, TokenDebit::Estimated(50));
+
+        for key in ["ws:acme", "model:gpt-4o"] {
+            let usage = tracker.get_usage(key);
+            assert_eq!(usage.tokens, 50, "{key} must be debited once");
+            assert_eq!(usage.request_count, 1, "{key} must count one request");
+        }
+    }
+
+    #[test]
     fn record_billing_event_non_token_usage_records_zero_tokens() {
         // Image / audio / character / rerank / per-call events still
         // tick the request_count and accumulate any per-call cost, but
@@ -2528,7 +2616,7 @@ mod tests {
         .with_cost(0.04)
         .with_scope_keys(vec!["ws:acme".to_string()]);
 
-        record_billing_event(&tracker, &event);
+        record_billing_event(&tracker, &event, TokenDebit::Measured);
         let usage = tracker.get_usage("ws:acme");
         assert_eq!(usage.tokens, 0, "image events do not contribute tokens");
         assert!((usage.cost_usd - 0.04).abs() < 1e-9);

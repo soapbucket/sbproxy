@@ -1182,6 +1182,14 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         );
     }
 
+    // WOR-2227: a secret reference whose authority is not declared under
+    // `proxy.secrets.backends` used to compile, validate, and plan clean,
+    // then die at boot inside whichever module first tried to resolve it.
+    // Three shipped examples were broken that way. Checked here rather
+    // than at resolve time so `sbproxy validate`, `sbproxy plan`, and the
+    // example sweeps all inherit it without touching a backend.
+    crate::secret_refs::check_secret_backend_references(&yaml, config_file.proxy.secrets.as_ref())?;
+
     {
         let mut names = std::collections::HashSet::with_capacity(config_file.flags.len());
         for flag in &config_file.flags {
@@ -1535,7 +1543,13 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
     // back to every interface.
     config_file.proxy.validate_bind_address()?;
 
+    config_file
+        .extensions
+        .validate()
+        .context("config compile: invalid extension bundle source")?;
+
     Ok(CompiledConfig {
+        extension_bundles: config_file.extensions,
         origins,
         host_map,
         server: config_file.proxy,
@@ -2105,6 +2119,9 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
     for transform in &mut config.transforms {
         interpolate_config_vars(transform, &config.variables);
     }
+    for filter in &mut config.filters {
+        interpolate_config_vars(&mut filter.config, &config.variables);
+    }
     for fwd_rule in &mut config.forward_rules {
         // Forward rules are typed in `RawOriginConfig` but the interpolator
         // walks `serde_json::Value` recursively. Round-trip through JSON so
@@ -2443,6 +2460,7 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
         auth_config: config.authentication,
         policy_configs: config.policies,
         transform_configs: config.transforms,
+        filters: config.filters,
         cors: config.cors,
         hsts: config.hsts,
         compression: config.compression,

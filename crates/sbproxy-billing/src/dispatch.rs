@@ -31,10 +31,14 @@
 //! as though funds may have moved.
 
 use std::future::Future;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use crate::error::BillingError;
+use crate::lifecycle::{
+    PaymentLifecycleDecision, PaymentLifecycleEvent, PaymentLifecycleObserver,
+    PaymentLifecycleOutcome, PaymentLifecyclePhase,
+};
 use crate::store::{BillingClock, PreparedAttempt, ProviderAttempt, SharedSettlementStore};
 use crate::types::SettlementRail;
 
@@ -151,6 +155,13 @@ pub struct DispatchContext {
     clock: Arc<dyn BillingClock>,
     subject: DispatchSubject,
     outcome: AtomicU8,
+    payment_lifecycle: Option<PaymentLifecycleDispatch>,
+    settle_started: AtomicBool,
+}
+
+struct PaymentLifecycleDispatch {
+    observer: Arc<dyn PaymentLifecycleObserver>,
+    event: PaymentLifecycleEvent,
 }
 
 impl DispatchContext {
@@ -161,6 +172,19 @@ impl DispatchContext {
         attempt: PreparedAttempt,
     ) -> Self {
         Self::new(store, clock, DispatchSubject::Attempt(attempt))
+    }
+
+    /// Builds a payment gate with generation-scoped lifecycle observation.
+    pub fn for_payment_attempt(
+        store: SharedSettlementStore,
+        clock: Arc<dyn BillingClock>,
+        attempt: PreparedAttempt,
+        observer: Arc<dyn PaymentLifecycleObserver>,
+        event: PaymentLifecycleEvent,
+    ) -> Self {
+        let mut context = Self::new(store, clock, DispatchSubject::Attempt(attempt));
+        context.payment_lifecycle = Some(PaymentLifecycleDispatch { observer, event });
+        context
     }
 
     /// Builds a gate for one usage report.
@@ -183,7 +207,43 @@ impl DispatchContext {
             clock,
             subject,
             outcome: AtomicU8::new(OUTCOME_NEVER_DISPATCHED),
+            payment_lifecycle: None,
+            settle_started: AtomicBool::new(false),
         }
+    }
+
+    /// Inspect a lifecycle `started` event before its protected effect.
+    pub async fn payment_started(&self, phase: PaymentLifecyclePhase) -> PaymentLifecycleDecision {
+        if phase == PaymentLifecyclePhase::Settle {
+            self.settle_started.store(true, Ordering::Release);
+        }
+        let Some(lifecycle) = &self.payment_lifecycle else {
+            return PaymentLifecycleDecision::Continue;
+        };
+        let event = lifecycle
+            .event
+            .clone()
+            .with_phase(phase)
+            .with_outcome(PaymentLifecycleOutcome::Started);
+        lifecycle.observer.started(&event).await
+    }
+
+    /// Observe one terminal lifecycle event without awaiting extension work.
+    pub fn payment_terminal(&self, phase: PaymentLifecyclePhase, outcome: PaymentLifecycleOutcome) {
+        if let Some(lifecycle) = &self.payment_lifecycle {
+            lifecycle.observer.terminal(
+                lifecycle
+                    .event
+                    .clone()
+                    .with_phase(phase)
+                    .with_outcome(outcome),
+            );
+        }
+    }
+
+    /// Report whether this adapter emitted `settle.started`.
+    pub fn settlement_lifecycle_started(&self) -> bool {
+        self.settle_started.load(Ordering::Acquire)
     }
 
     /// Returns the subject being guarded.

@@ -15,7 +15,7 @@ Reach for the multi-tenant shape when one or more of the following is true:
 * **Per-tenant attribution.** Spend rolls up to the tenant's owning project / cost-center for invoicing.
 * **Per-tenant observability sinks.** Tenant A pushes logs to their own Loki under their AWS account; tenant B pushes to a Datadog tenant they own.
 
-A single-tenant deployment does not need to opt in to any of this. Every origin without an explicit `tenant_id` resolves to the synthetic `__default__` tenant; existing configs see no behaviour change.
+A single-tenant deployment does not need to opt in to any of this. Every origin without an explicit `tenant_id` resolves to the synthetic `__default__` tenant; existing configs see no behavior change.
 
 ## Three scopes
 
@@ -101,7 +101,7 @@ The resolution context is `(tenant_id, origin_idx, principal)`. A request that f
 ## Isolation guarantees
 
 * **Compile-time tenant validation.** An origin that names an undeclared tenant fails config compile so an operator's typo surfaces at startup rather than at request time.
-* **Vault namespace + mount prefix.** Each vault backend enforces a configured path prefix; references that escape the prefix are rejected at URL composition. Pair with the underlying vault's ACL (Vault policies, AWS IAM, Kubernetes RBAC) for defence in depth.
+* **Vault namespace + mount prefix.** Each vault backend enforces a configured path prefix; references that escape the prefix are rejected at URL composition. Pair with the underlying vault's ACL (Vault policies, AWS IAM, Kubernetes RBAC) for defense in depth.
 * **Tenant-scoped credentials.** A credential declared at tenant scope only applies to requests whose resolved `tenant_id` matches; the broader proxy scope does not see it.
 * **Access log + audit log carry `tenant_id`.** Every emitted row is filterable by tenant downstream.
 * **Per-tenant cardinality budgets.** A noisy tenant cannot exhaust the shared metric label space; once a tenant's budget is hit, the cardinality limiter demotes that tenant's new label values to the `__other__` catch-all rather than minting new series. The metric update still happens.
@@ -130,7 +130,7 @@ proxy:
           max_series: 1000   # tighter cap for a tenant known to send wide cardinality
 ```
 
-Omitting the block leaves the tenant on the proxy-wide per-label default (1000 unique values per label). The synthetic `__default__` tenant continues to share the proxy-wide budget so single-tenant deployments stay bit-for-bit identical to the earlier single-budget behaviour.
+Omitting the block leaves the tenant on the proxy-wide per-label default (1000 unique values per label). The synthetic `__default__` tenant continues to share the proxy-wide budget so single-tenant deployments stay bit-for-bit identical to the earlier single-budget behavior.
 
 Overflows fire the `sbproxy_label_cardinality_overflow_per_tenant_total{metric, label, tenant_id}` counter so dashboards can spot which tenant is approaching its cap. The proxy-wide `sbproxy_label_cardinality_overflow_total{metric, label}` counter keeps counting the same demotions without the tenant dimension.
 

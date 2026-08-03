@@ -9,6 +9,7 @@ name: CI
 #                           generated-artifact freshness checks
 #   lint           (~4 min) fmt, clippy, rustdoc
 #   obs-budgets    (~5 min) e2e cardinality + redaction, observability paths only
+#   payments      (~13 min) clippy + tests under the settlement feature union
 #   ui             (~40 s)  node typecheck + vitest
 #   supply-chain   (~50 s)  cargo-deny
 #   embed-admin-ui (~6 min) SPA build + the release binary's feature union
@@ -208,6 +209,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: gate helper self-tests
+        run: |
+          bash scripts/tests/workspace_bin_test.sh
+          bash scripts/tests/runner_disk_test.sh
+
       # clippy-driver and rustdoc write artifacts the `test` lane cannot link
       # against, so this job keeps its own cache entry rather than fighting
       # the test lane over one key. That mutual uselessness is also why these
@@ -305,6 +311,114 @@ jobs:
       # two targets out of the 170 under e2e/tests.
       - name: observability budgets (cardinality + redaction)
         run: cargo test --workspace --locked --test cardinality --test redaction
+
+  payments:
+    name: payments (settlement features)
+    needs: changes
+    # The broad `code` filter, deliberately, and not a narrow allowlist of the
+    # payment paths. What this lane guards is a feature UNION, and a union
+    # breaks from outside the files it covers: `sbproxy-billing` reaches the
+    # network through `sbproxy-httpkit`, its types are shared with the crawl
+    # policy in `sbproxy-modules`, and the runtime is assembled in
+    # `sbproxy-core`'s lifecycle. A filter listing only crates/sbproxy-billing
+    # would have shown green for every one of those. A lane that does not fire
+    # on the change that breaks it is worse than no lane, because it reports
+    # success while doing nothing, which is the exact failure WOR-2222 is
+    # about.
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      # WOR-2222: before this lane existed, no cargo invocation anywhere in
+      # this repository, in scripts/check.sh, or in any other workflow ever
+      # enabled a payment feature. The only `--all-features` in the repo is
+      # cargo-deny's, and cargo-deny reads metadata instead of compiling. So
+      # the whole settlement path built nowhere: sbproxy-core's inline settle
+      # gate, the recovery worker and reconciliation sweep in
+      # billing_runtime, the usage bridge's runtime half, and every one of
+      # sbproxy-billing's feature-gated modules, which is most of that crate.
+      # Roughly 217 tests, including eleven of its twelve integration test
+      # files, compiled into nothing and reported as passing.
+      #
+      # One feature selection, named once and used verbatim by both cargo
+      # calls below. Two literals that drifted by a single rail would resolve
+      # two feature unions inside one job, which is the recompile this file's
+      # whole shape exists to avoid.
+      #
+      # Selected through the `sbproxy` binary's flags rather than
+      # `sbproxy-core`'s, so the union is the one a real payments release
+      # produces: everything the `test` lane already resolves (rag-full,
+      # agent-class, inprocess-*, tls-fingerprint, gpu-*) plus settlement.
+      # That makes this union a strict superset of the `test` lane's. Picking
+      # `-p sbproxy-core` instead, as the smallest thing that covers the gated
+      # modules, would resolve FEWER features than CI does and report
+      # dead-code failures CI never sees, and it would miss sbproxy-billing's
+      # test targets entirely. See CLAUDE.md, "A per-crate lint can fail while
+      # the workspace lint passes".
+      #
+      # All six rails at once, `payment-lightning-lnd` included. Every rail
+      # implies `payments`, so naming the rails is enough. The resolved
+      # dependency graph under this union is identical to the default one,
+      # crate for crate and version for version: rusqlite, tokio, rand,
+      # reqwest, and aes-gcm are all already pulled in by something else in
+      # the workspace. The extra rails therefore cost compile units, not a
+      # wider supply chain.
+      PAYMENT_FEATURES: sbproxy/payment-mpp,sbproxy/payment-stripe,sbproxy/payment-x402,sbproxy/payment-lightning-cln,sbproxy/payment-lightning-lnd
+    steps:
+      - uses: actions/checkout@v5
+
+      # Its own job with its own cache key, per the one-package-selection rule
+      # in CLAUDE.md. The package selection here matches the `test` lane's
+      # exactly and only the feature union differs, but a different union is a
+      # different fingerprint, so folding these two steps into that job would
+      # recompile the graph on the critical path for every PR.
+      - uses: ./.github/actions/rust-setup
+        with:
+          cache-key: payments
+
+      - uses: taiki-e/install-action@nextest
+
+      # clippy runs first because it compiles every target in the selection,
+      # so a type error or a lint in code nothing has ever built is reported
+      # before the run pays for codegen. clippy-driver's artifacts cannot be
+      # linked by the test step below, which is why this job compiles the
+      # graph twice and why the two steps are worth the runner minutes: this
+      # is the only place either pass happens for payment-gated code.
+      #
+      # -D warnings also promotes the `#![warn(missing_docs)]` at the top of
+      # sbproxy-billing to an error, so undocumented public items in the
+      # gated modules fail here rather than at the next release.
+      - name: clippy (payment settlement features)
+        run: |
+          cargo clippy --workspace --exclude sbproxy-e2e --all-targets --locked \
+            --features "${PAYMENT_FEATURES}" -- -D warnings
+
+      # Narrow the tests, never the packages. The build stays
+      # `--workspace --exclude sbproxy-e2e` so the feature union is the one
+      # clippy just checked, and the filterset selects the three crates that
+      # carry payment-gated code. Re-running the other ~8500 workspace tests
+      # under a union that differs only in payment features would buy a second
+      # roll against the same known flakes and nothing else.
+      #
+      # `package(...)` rather than a list of module or binary names on
+      # purpose: a payment test added to a module nobody remembered to add to
+      # a hand-maintained list would silently not run, which is the shape of
+      # the bug this lane exists to prevent.
+      #
+      # The price of that choice is that sbproxy-core's whole suite runs here
+      # too, including `model_host_reload`, which is a known flake. Excluding
+      # it by name would be safe (an exclusion cannot hide a new payment test
+      # the way a stale inclusion list can) and it is already covered by the
+      # `test` lane, so subtract it here if the reruns become a tax. It is not
+      # subtracted today because one maintained list in this lane invites the
+      # next one.
+      - name: test (payment-gated crates)
+        run: |
+          cargo nextest run --workspace --exclude sbproxy-e2e --locked --profile ci \
+            --features "${PAYMENT_FEATURES}" \
+            -E 'package(sbproxy-billing) + package(sbproxy-core) + package(sbproxy-modules)'
 
   ui:
     name: ui
@@ -450,10 +564,18 @@ jobs:
   # branch protection needs no change while the work underneath it fans out
   # across parallel jobs. A lane skipped by its path filter is not a failure;
   # anything else is.
+  #
+  # `payments` is in this list rather than left advisory. An advisory lane on
+  # the settlement path is a lane whose red is a notification, and the reason
+  # WOR-2222 exists is that nobody was watching a signal that was never sent
+  # in the first place. A second one that can be scrolled past is not an
+  # improvement. The cost of being wrong in the two directions is not
+  # symmetric either: a false red here is a rerun, while a false green ships
+  # code that moves money.
   required:
     name: build / test
     if: always()
-    needs: [changes, test, lint, obs-budgets, ui, supply-chain, embed-admin-ui]
+    needs: [changes, test, lint, obs-budgets, payments, ui, supply-chain, embed-admin-ui]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

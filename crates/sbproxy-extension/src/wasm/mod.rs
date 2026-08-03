@@ -31,13 +31,21 @@
 
 use anyhow::Result;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::io::{self, Write};
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
+use std::time::{Duration, Instant};
 use wasi_common::pipe::{ReadPipe, WritePipe};
 use wasi_common::sync::WasiCtxBuilder;
 use wasi_common::WasiCtx;
-use wasmtime::{Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder};
+use wasmtime::{
+    Config, Engine, ExternType, InstancePre, Linker, Module, ResourceLimiter, Store, StoreLimits,
+    StoreLimitsBuilder, Trap,
+};
+use wasmtime_wasi::p1::WasiP1Ctx;
+use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe, SinkOutputStream};
 
 /// Per-invocation cap on captured WASM stderr, in bytes.
 const STDERR_CAPTURE_LIMIT: usize = 1024 * 1024;
@@ -109,6 +117,9 @@ pub struct WasmConfig {
     pub module_path: Option<String>,
     /// Raw bytes of a compiled WASM module (e.g. loaded from a config store).
     pub module_bytes: Option<Vec<u8>>,
+    /// Optional lowercase SHA-256 assertion for the selected module bytes.
+    #[serde(default)]
+    pub sha256: Option<String>,
     /// Hostnames the module would be permitted to contact via WASI
     /// networking. Reserved for future use; currently unused because
     /// WASI sockets are not wired in.
@@ -158,6 +169,159 @@ struct HostState {
     limits: StoreLimits,
 }
 
+/// Resource limits for one envelope WASM bundle.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WasmBundleLimits {
+    pub(crate) budget: Duration,
+    pub(crate) memory_bytes: usize,
+    pub(crate) stack_bytes: usize,
+    pub(crate) fuel: u64,
+    pub(crate) max_input_bytes: usize,
+    pub(crate) max_output_bytes: usize,
+}
+
+/// Stable load-time failure for an envelope WASM bundle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WasmLoadFailure {
+    InvalidModule,
+    InvalidImports,
+    InvalidStart,
+    RuntimeUnavailable,
+}
+
+impl WasmLoadFailure {
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::InvalidModule => "invalid_module",
+            Self::InvalidImports => "invalid_imports",
+            Self::InvalidStart => "invalid_start",
+            Self::RuntimeUnavailable => "runtime_unavailable",
+        }
+    }
+}
+
+/// Stable per-call failure for an envelope WASM bundle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WasmCallFailure {
+    InputLimit,
+    Cancelled,
+    Timeout,
+    FuelLimit,
+    MemoryLimit,
+    TableLimit,
+    StackLimit,
+    OutputLimit,
+    GuestTrap,
+    HostFailure,
+}
+
+impl WasmCallFailure {
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::InputLimit => "input_limit",
+            Self::Cancelled => "cancelled",
+            Self::Timeout => "timeout",
+            Self::FuelLimit => "instruction_cap",
+            Self::MemoryLimit => "memory_cap",
+            Self::TableLimit => "table_cap",
+            Self::StackLimit => "stack_cap",
+            Self::OutputLimit => "output_limit",
+            Self::GuestTrap => "guest_exception",
+            Self::HostFailure => "runtime_unavailable",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct WasmExecutionControl {
+    deadline: Instant,
+    cancelled: AtomicBool,
+}
+
+impl WasmExecutionControl {
+    pub(crate) fn new(deadline: Instant) -> Self {
+        Self {
+            deadline,
+            cancelled: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn stop_reason(&self) -> Option<WasmCallFailure> {
+        if self.cancelled.load(Ordering::Acquire) {
+            Some(WasmCallFailure::Cancelled)
+        } else if Instant::now() >= self.deadline {
+            Some(WasmCallFailure::Timeout)
+        } else {
+            None
+        }
+    }
+}
+
+struct TrackingLimits {
+    inner: StoreLimits,
+    memory_denied: bool,
+    table_denied: bool,
+}
+
+impl ResourceLimiter for TrackingLimits {
+    fn memory_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        let result = self.inner.memory_growing(current, desired, maximum);
+        if !matches!(result, Ok(true)) {
+            self.memory_denied = true;
+        }
+        result
+    }
+
+    fn memory_grow_failed(&mut self, error: wasmtime::Error) -> wasmtime::Result<()> {
+        self.memory_denied = true;
+        self.inner.memory_grow_failed(error)
+    }
+
+    fn table_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        let result = self.inner.table_growing(current, desired, maximum);
+        if !matches!(result, Ok(true)) {
+            self.table_denied = true;
+        }
+        result
+    }
+
+    fn table_grow_failed(&mut self, error: wasmtime::Error) -> wasmtime::Result<()> {
+        self.table_denied = true;
+        self.inner.table_grow_failed(error)
+    }
+
+    fn instances(&self) -> usize {
+        self.inner.instances()
+    }
+
+    fn tables(&self) -> usize {
+        self.inner.tables()
+    }
+
+    fn memories(&self) -> usize {
+        self.inner.memories()
+    }
+}
+
+struct EnvelopeHostState {
+    wasi: WasiP1Ctx,
+    limits: TrackingLimits,
+}
+
 /// Sandboxed WASM execution engine.
 ///
 /// One `WasmRuntime` is created per configured module. The wasmtime
@@ -166,8 +330,11 @@ struct HostState {
 /// `_start` invocation.
 pub struct WasmRuntime {
     config: WasmConfig,
-    engine: Engine,
+    engine: Arc<Engine>,
     module: Option<Module>,
+    bundle_instance_pre: Option<InstancePre<EnvelopeHostState>>,
+    bundle_limits: Option<WasmBundleLimits>,
+    last_retained_stdout_bytes: AtomicUsize,
 }
 
 impl std::fmt::Debug for WasmRuntime {
@@ -176,6 +343,7 @@ impl std::fmt::Debug for WasmRuntime {
             .field("module_loaded", &self.module.is_some())
             .field("max_memory_pages", &self.config.max_pages())
             .field("timeout_ms", &self.config.timeout().as_millis())
+            .field("envelope", &self.bundle_limits.is_some())
             .finish()
     }
 }
@@ -189,32 +357,36 @@ impl WasmRuntime {
     /// error so callers can surface the missing-module condition
     /// without having to special-case it themselves.
     pub fn new(config: WasmConfig) -> Result<Self> {
-        let engine = build_engine()?;
+        validate_optional_sha256_syntax(config.sha256.as_deref())?;
+        let engine = build_engine(None)?;
 
         // wasmtime's own `Error` type does not implement `std::error::Error`,
         // so anyhow's `.context` adapter cannot attach. Format the wasmtime
         // error and rebuild via `anyhow::anyhow!` to keep messages chainable
         // through the rest of the proxy's error stack.
-        let module = if let Some(bytes) = config.module_bytes.as_ref() {
-            match Module::from_binary(&engine, bytes) {
-                Ok(m) => {
-                    sbproxy_observe::metrics::record_script_compile("wasm", "ok");
-                    Some(m)
-                }
-                Err(e) => {
-                    sbproxy_observe::metrics::record_script_compile("wasm", "parse_error");
-                    return Err(anyhow::anyhow!("compiling WASM bytes: {e:?}"));
-                }
-            }
+        let selected = if let Some(bytes) = config.module_bytes.as_ref() {
+            Some((bytes.clone(), None))
         } else if let Some(path) = config.module_path.as_ref() {
-            match Module::from_file(&engine, path) {
+            let bytes = std::fs::read(path)
+                .map_err(|error| anyhow::anyhow!("loading WASM from {path}: {error}"))?;
+            Some((bytes, Some(path.as_str())))
+        } else {
+            None
+        };
+        let module = if let Some((bytes, path)) = selected {
+            verify_optional_sha256(config.sha256.as_deref(), &bytes)?;
+            match Module::from_binary(&engine, &bytes) {
                 Ok(m) => {
                     sbproxy_observe::metrics::record_script_compile("wasm", "ok");
                     Some(m)
                 }
                 Err(e) => {
                     sbproxy_observe::metrics::record_script_compile("wasm", "parse_error");
-                    return Err(anyhow::anyhow!("loading WASM from {path}: {e:?}"));
+                    return if let Some(path) = path {
+                        Err(anyhow::anyhow!("loading WASM from {path}: {e:?}"))
+                    } else {
+                        Err(anyhow::anyhow!("compiling WASM bytes: {e:?}"))
+                    };
                 }
             }
         } else {
@@ -225,12 +397,54 @@ impl WasmRuntime {
             config,
             engine,
             module,
+            bundle_instance_pre: None,
+            bundle_limits: None,
+            last_retained_stdout_bytes: AtomicUsize::new(0),
+        })
+    }
+
+    pub(crate) fn from_bundle_bytes(
+        bytes: &[u8],
+        limits: WasmBundleLimits,
+    ) -> std::result::Result<Self, WasmLoadFailure> {
+        let engine = build_engine(Some(limits.stack_bytes))
+            .map_err(|_| WasmLoadFailure::RuntimeUnavailable)?;
+        let module = match Module::from_binary(&engine, bytes) {
+            Ok(module) => {
+                sbproxy_observe::metrics::record_script_compile("wasm", "ok");
+                module
+            }
+            Err(_) => {
+                sbproxy_observe::metrics::record_script_compile("wasm", "parse_error");
+                return Err(WasmLoadFailure::InvalidModule);
+            }
+        };
+        let instance_pre = prepare_bundle_instance(&engine, &module)?;
+        Ok(Self {
+            config: WasmConfig {
+                module_path: None,
+                module_bytes: None,
+                sha256: None,
+                allowed_hosts: Vec::new(),
+                max_memory_pages: None,
+                timeout_ms: None,
+                max_fuel: None,
+            },
+            engine,
+            module: Some(module),
+            bundle_instance_pre: Some(instance_pre),
+            bundle_limits: Some(limits),
+            last_retained_stdout_bytes: AtomicUsize::new(0),
         })
     }
 
     /// Returns `true` when a module has been loaded.
     pub fn is_available(&self) -> bool {
         self.module.is_some()
+    }
+
+    pub(crate) fn bundle_budget(&self) -> Option<Duration> {
+        self.bundle_limits.map(|limits| limits.budget)
     }
 
     /// Invoke the module's `_start` function, passing `input` on stdin
@@ -347,6 +561,211 @@ impl WasmRuntime {
             .into_inner();
         Ok(buf)
     }
+
+    #[cfg(test)]
+    pub(crate) fn execute_bounded(
+        &self,
+        input: &[u8],
+    ) -> std::result::Result<Vec<u8>, WasmCallFailure> {
+        let deadline = Instant::now()
+            .checked_add(
+                self.bundle_limits
+                    .map(|limits| limits.budget)
+                    .ok_or(WasmCallFailure::HostFailure)?,
+            )
+            .ok_or(WasmCallFailure::HostFailure)?;
+        self.execute_bounded_until(input, Arc::new(WasmExecutionControl::new(deadline)))
+    }
+
+    pub(crate) fn execute_bounded_until(
+        &self,
+        input: &[u8],
+        execution: Arc<WasmExecutionControl>,
+    ) -> std::result::Result<Vec<u8>, WasmCallFailure> {
+        self.bundle_limits.ok_or(WasmCallFailure::HostFailure)?;
+        self.execute_bounded_inner(input, execution)
+    }
+
+    fn execute_bounded_inner(
+        &self,
+        input: &[u8],
+        execution: Arc<WasmExecutionControl>,
+    ) -> std::result::Result<Vec<u8>, WasmCallFailure> {
+        if let Some(reason) = execution.stop_reason() {
+            return Err(reason);
+        }
+        let limits = self.bundle_limits.ok_or(WasmCallFailure::HostFailure)?;
+        if input.len() > limits.max_input_bytes {
+            return Err(WasmCallFailure::InputLimit);
+        }
+        let instance_pre = self
+            .bundle_instance_pre
+            .as_ref()
+            .ok_or(WasmCallFailure::HostFailure)?;
+        let capacity = limits
+            .max_output_bytes
+            .checked_add(1)
+            .ok_or(WasmCallFailure::HostFailure)?;
+        let stdout = MemoryOutputPipe::new(capacity);
+        let mut wasi_builder = wasmtime_wasi::WasiCtxBuilder::new();
+        wasi_builder
+            .stdin(MemoryInputPipe::new(input.to_vec()))
+            .stdout(stdout.clone())
+            .stderr(SinkOutputStream);
+        let wasi = wasi_builder.build_p1();
+        let limits_tracker = TrackingLimits {
+            inner: envelope_store_limits(limits),
+            memory_denied: false,
+            table_denied: false,
+        };
+        let mut store = Store::new(
+            &self.engine,
+            EnvelopeHostState {
+                wasi,
+                limits: limits_tracker,
+            },
+        );
+        store.limiter(|state| &mut state.limits);
+        store
+            .set_fuel(limits.fuel)
+            .map_err(|_| WasmCallFailure::HostFailure)?;
+        store.set_epoch_deadline(1);
+        let callback_execution = Arc::clone(&execution);
+        store.epoch_deadline_callback(move |_store| {
+            Ok(match callback_execution.stop_reason() {
+                Some(_) => wasmtime::UpdateDeadline::Interrupt,
+                None => wasmtime::UpdateDeadline::Continue(1),
+            })
+        });
+
+        let call_result = (|| -> wasmtime::Result<()> {
+            let instance = instance_pre.instantiate(&mut store)?;
+            let start = instance.get_typed_func::<(), ()>(&mut store, "_start")?;
+            start.call(&mut store, ())
+        })();
+
+        let memory_denied = store.data().limits.memory_denied;
+        let table_denied = store.data().limits.table_denied;
+        drop(store);
+        let output = stdout
+            .try_into_inner()
+            .ok_or(WasmCallFailure::HostFailure)?
+            .freeze();
+        self.last_retained_stdout_bytes
+            .store(output.len(), Ordering::Relaxed);
+        if output.len() > limits.max_output_bytes {
+            return Err(WasmCallFailure::OutputLimit);
+        }
+        if memory_denied {
+            return Err(WasmCallFailure::MemoryLimit);
+        }
+        if table_denied {
+            return Err(WasmCallFailure::TableLimit);
+        }
+
+        match call_result {
+            Ok(()) => Ok(output.to_vec()),
+            Err(error) if is_successful_exit(&error) => Ok(output.to_vec()),
+            Err(error) if matches!(error.downcast_ref::<Trap>(), Some(Trap::Interrupt)) => {
+                Err(execution.stop_reason().unwrap_or(WasmCallFailure::Timeout))
+            }
+            Err(error) => Err(classify_call_error(&error)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_retained_stdout_bytes(&self) -> usize {
+        self.last_retained_stdout_bytes.load(Ordering::Relaxed)
+    }
+}
+
+fn prepare_bundle_instance(
+    engine: &Engine,
+    module: &Module,
+) -> std::result::Result<InstancePre<EnvelopeHostState>, WasmLoadFailure> {
+    // This allowlist is deliberately smaller than WASIp1. `fd_read` is backed
+    // only by MemoryInputPipe, `fd_write` only by MemoryOutputPipe or the sink,
+    // and `proc_exit` immediately raises I32Exit. None can wait on host I/O.
+    // In particular, poll_oneoff and every filesystem or socket operation are
+    // rejected before the module reaches an executor worker.
+    const NONBLOCKING_WASI_IMPORTS: &[&str] = &["fd_read", "fd_write", "proc_exit"];
+    if module.imports().any(|import| {
+        import.module() != "wasi_snapshot_preview1"
+            || !NONBLOCKING_WASI_IMPORTS.contains(&import.name())
+    }) {
+        return Err(WasmLoadFailure::InvalidImports);
+    }
+
+    match module.get_export("_start") {
+        Some(ExternType::Func(function))
+            if function.params().len() == 0 && function.results().len() == 0 => {}
+        _ => return Err(WasmLoadFailure::InvalidStart),
+    }
+
+    let mut linker = Linker::new(engine);
+    wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |state: &mut EnvelopeHostState| {
+        &mut state.wasi
+    })
+    .map_err(|_| WasmLoadFailure::RuntimeUnavailable)?;
+    linker
+        .instantiate_pre(module)
+        .map_err(|_| WasmLoadFailure::InvalidImports)
+}
+
+fn envelope_store_limits(limits: WasmBundleLimits) -> StoreLimits {
+    StoreLimitsBuilder::new()
+        .memory_size(limits.memory_bytes)
+        .memories(1)
+        .instances(1)
+        .tables(8)
+        .table_elements(10_000)
+        .trap_on_grow_failure(true)
+        .build()
+}
+
+fn is_successful_exit(error: &wasmtime::Error) -> bool {
+    error
+        .downcast_ref::<wasmtime_wasi::I32Exit>()
+        .is_some_and(|exit| exit.0 == 0)
+}
+
+fn classify_call_error(error: &wasmtime::Error) -> WasmCallFailure {
+    match error.downcast_ref::<Trap>() {
+        Some(Trap::Interrupt) => WasmCallFailure::Timeout,
+        Some(Trap::OutOfFuel) => WasmCallFailure::FuelLimit,
+        Some(Trap::StackOverflow) => WasmCallFailure::StackLimit,
+        Some(_) => WasmCallFailure::GuestTrap,
+        None if error.downcast_ref::<wasmtime_wasi::I32Exit>().is_some() => {
+            WasmCallFailure::GuestTrap
+        }
+        None => WasmCallFailure::HostFailure,
+    }
+}
+
+fn validate_optional_sha256_syntax(digest: Option<&str>) -> Result<()> {
+    if digest.is_some_and(|digest| {
+        digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    }) {
+        return Err(anyhow::anyhow!(
+            "WASM module sha256 must contain exactly 64 lowercase hexadecimal characters"
+        ));
+    }
+    Ok(())
+}
+
+fn verify_optional_sha256(digest: Option<&str>, bytes: &[u8]) -> Result<()> {
+    if let Some(expected) = digest {
+        let actual = hex::encode(Sha256::digest(bytes));
+        if actual != expected {
+            return Err(anyhow::anyhow!(
+                "WASM module sha256 does not match configured digest"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A `principal` builder for WASM deliberately does not exist here.
@@ -441,39 +860,78 @@ pub fn build_request_input_with_agent_class(
 /// what isolates calls. Returning a fresh `Engine` per `WasmRuntime`
 /// would burn cold-start cycles for no benefit.
 ///
-/// `OnceLock::get_or_init` is used with `.expect` because Engine
-/// creation only fails if the host's wasmtime configuration itself
-/// is broken (e.g. unsupported architecture). That is a startup-time
-/// invariant, not a runtime condition.
-fn build_engine() -> Result<Engine> {
-    static ENGINE: OnceLock<Arc<Engine>> = OnceLock::new();
-    let engine = ENGINE.get_or_init(|| {
-        let mut config = Config::new();
-        config.epoch_interruption(true);
-        // Fuel gives a deterministic, instruction-granular budget that
-        // complements the 1 ms epoch tick. Each `Store` sets its
-        // per-invocation budget via `set_fuel` from `WasmConfig::fuel()`.
-        config.consume_fuel(true);
-        let engine = Engine::new(&config).expect("creating wasmtime engine");
-        let engine = Arc::new(engine);
+pub(crate) fn build_engine(stack_bytes: Option<usize>) -> Result<Arc<Engine>> {
+    static ENGINES: LazyLock<Mutex<BTreeMap<Option<usize>, Weak<Engine>>>> =
+        LazyLock::new(|| Mutex::new(BTreeMap::new()));
+    let mut engines = ENGINES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(engine) = engines.get(&stack_bytes).and_then(Weak::upgrade) {
+        return Ok(engine);
+    }
 
-        // Background thread bumps the epoch once per millisecond so
-        // `set_epoch_deadline(N)` enforces an N-millisecond budget.
-        // The thread runs for the lifetime of the process; there is
-        // no clean shutdown signal because the engine itself is a
-        // singleton.
-        let ticker = engine.clone();
-        std::thread::Builder::new()
-            .name("sbproxy-wasm-epoch".into())
-            .spawn(move || loop {
-                std::thread::sleep(Duration::from_millis(1));
-                ticker.increment_epoch();
-            })
-            .expect("spawning wasm epoch ticker");
+    let mut config = Config::new();
+    config.epoch_interruption(true);
+    config.consume_fuel(true);
+    if let Some(stack_bytes) = stack_bytes {
+        config.max_wasm_stack(stack_bytes);
+    }
+    let engine = Arc::new(
+        Engine::new(&config)
+            .map_err(|error| anyhow::anyhow!("creating wasmtime engine: {error:?}"))?,
+    );
+    register_epoch_engine(&engine)?;
+    engines.insert(stack_bytes, Arc::downgrade(&engine));
+    Ok(engine)
+}
 
-        engine
-    });
-    Ok((**engine).clone())
+fn register_epoch_engine(engine: &Arc<Engine>) -> Result<()> {
+    static TICKED_ENGINES: OnceLock<Arc<Mutex<Vec<Weak<Engine>>>>> = OnceLock::new();
+    let ticked_engines = if let Some(engines) = TICKED_ENGINES.get() {
+        Arc::clone(engines)
+    } else {
+        let engines = Arc::new(Mutex::new(Vec::<Weak<Engine>>::new()));
+        start_epoch_ticker(Arc::clone(&engines), |ticker_engines| {
+            std::thread::Builder::new()
+                .name("sbproxy-wasm-epoch".into())
+                .spawn(move || run_epoch_ticker(ticker_engines))
+                .map(|_| ())
+        })
+        .map_err(|_| anyhow::anyhow!("starting wasmtime epoch ticker"))?;
+        TICKED_ENGINES
+            .set(Arc::clone(&engines))
+            .map_err(|_| anyhow::anyhow!("registering wasmtime epoch ticker"))?;
+        engines
+    };
+    ticked_engines
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(Arc::downgrade(engine));
+    Ok(())
+}
+
+fn start_epoch_ticker<F>(engines: Arc<Mutex<Vec<Weak<Engine>>>>, spawn: F) -> io::Result<()>
+where
+    F: FnOnce(Arc<Mutex<Vec<Weak<Engine>>>>) -> io::Result<()>,
+{
+    spawn(engines)
+}
+
+fn run_epoch_ticker(engines: Arc<Mutex<Vec<Weak<Engine>>>>) -> ! {
+    loop {
+        std::thread::sleep(Duration::from_millis(1));
+        let mut engines = engines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        engines.retain(|engine| {
+            if let Some(engine) = engine.upgrade() {
+                engine.increment_epoch();
+                true
+            } else {
+                false
+            }
+        });
+    }
 }
 
 #[cfg(test)]
@@ -486,11 +944,33 @@ mod tests {
     /// from `examples/wasm/echo-rust/`; the resulting `.wasm` is
     /// embedded so unit tests do not need a wasm32-wasi toolchain.
     const ECHO_WASM: &[u8] = include_bytes!("testdata/echo.wasm");
+    const POLL_ONEOFF_WASM: &[u8] = include_bytes!("../bundle/testdata/wasm/poll-oneoff.wasm");
+    const CORE_START_TRAP_WASM: &[u8] =
+        include_bytes!("../bundle/testdata/wasm/core-start-trap.wasm");
+    const BAD_START_SIGNATURE_WASM: &[u8] =
+        include_bytes!("../bundle/testdata/wasm/bad-start-signature.wasm");
+    const PROC_EXIT_ZERO_WASM: &[u8] =
+        include_bytes!("../bundle/testdata/wasm/proc-exit-zero.wasm");
+    const PROC_EXIT_NONZERO_WASM: &[u8] =
+        include_bytes!("../bundle/testdata/wasm/proc-exit-nonzero.wasm");
+    const SENTINEL_TRAP_WASM: &[u8] = include_bytes!("../bundle/testdata/wasm/sentinel-trap.wasm");
+
+    fn envelope_limits() -> WasmBundleLimits {
+        WasmBundleLimits {
+            budget: Duration::from_millis(50),
+            memory_bytes: 16 * 1024 * 1024,
+            stack_bytes: 512 * 1024,
+            fuel: 100_000_000,
+            max_input_bytes: 1024 * 1024,
+            max_output_bytes: 1024 * 1024,
+        }
+    }
 
     fn config_with(bytes: &[u8]) -> WasmConfig {
         WasmConfig {
             module_path: None,
             module_bytes: Some(bytes.to_vec()),
+            sha256: None,
             allowed_hosts: vec![],
             max_memory_pages: None,
             timeout_ms: None,
@@ -547,6 +1027,7 @@ mod tests {
         let runtime = WasmRuntime::new(WasmConfig {
             module_path: None,
             module_bytes: None,
+            sha256: None,
             allowed_hosts: vec![],
             max_memory_pages: None,
             timeout_ms: None,
@@ -587,6 +1068,155 @@ mod tests {
             msg.contains("compiling WASM bytes"),
             "expected compile context in error, got: {msg}"
         );
+    }
+
+    #[test]
+    fn envelope_wasm_rejects_blocking_wasi_poll_at_load_time() {
+        let result = WasmRuntime::from_bundle_bytes(POLL_ONEOFF_WASM, envelope_limits());
+        assert!(matches!(result, Err(WasmLoadFailure::InvalidImports)));
+    }
+
+    #[test]
+    fn envelope_wasm_load_validation_does_not_execute_the_core_start() {
+        let runtime = WasmRuntime::from_bundle_bytes(CORE_START_TRAP_WASM, envelope_limits())
+            .expect("link validation must not instantiate the module");
+        assert_eq!(
+            runtime.execute_bounded(b"{}"),
+            Err(WasmCallFailure::GuestTrap)
+        );
+    }
+
+    #[test]
+    fn envelope_wasm_checks_the_start_signature_without_instantiating() {
+        let result = WasmRuntime::from_bundle_bytes(BAD_START_SIGNATURE_WASM, envelope_limits());
+        assert!(matches!(result, Err(WasmLoadFailure::InvalidStart)));
+    }
+
+    #[test]
+    fn envelope_wasm_accepts_proc_exit_zero_output() {
+        let runtime = WasmRuntime::from_bundle_bytes(PROC_EXIT_ZERO_WASM, envelope_limits())
+            .expect("proc_exit is an allowed immediate import");
+        assert_eq!(
+            runtime.execute_bounded(b"{}").unwrap(),
+            br#"{"version":"sbproxy-envelope/v1","decision":"allow"}"#
+        );
+    }
+
+    #[test]
+    fn envelope_wasm_rejects_nonzero_proc_exit() {
+        let runtime = WasmRuntime::from_bundle_bytes(PROC_EXIT_NONZERO_WASM, envelope_limits())
+            .expect("proc_exit is an allowed immediate import");
+        assert_eq!(
+            runtime.execute_bounded(b"{}"),
+            Err(WasmCallFailure::GuestTrap)
+        );
+    }
+
+    #[test]
+    fn envelope_wasm_discards_stdout_when_the_guest_errors() {
+        let runtime = WasmRuntime::from_bundle_bytes(SENTINEL_TRAP_WASM, envelope_limits())
+            .expect("fd_write is an allowed in-memory import");
+        let result = runtime.execute_bounded(b"{}");
+        assert_eq!(result, Err(WasmCallFailure::GuestTrap));
+        assert!(!format!("{result:?}").contains("private-sentinel-output"));
+    }
+
+    #[test]
+    fn matching_sha256_accepts_module_bytes() {
+        let digest = hex::encode(sha2::Sha256::digest(ECHO_WASM));
+        let mut config = config_with(ECHO_WASM);
+        config.sha256 = Some(digest);
+        let runtime = WasmRuntime::new(config).expect("matching digest should compile");
+        assert_eq!(
+            runtime.execute("transform", b"verified").unwrap(),
+            b"verified"
+        );
+    }
+
+    #[test]
+    fn module_bytes_keep_precedence_when_sha256_and_path_are_both_present() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("ignored.wasm");
+        std::fs::write(&path, b"not wasm").unwrap();
+        let mut config = config_with(ECHO_WASM);
+        config.module_path = Some(path.display().to_string());
+        config.sha256 = Some(hex::encode(sha2::Sha256::digest(ECHO_WASM)));
+
+        let runtime = WasmRuntime::new(config).expect("module bytes should retain precedence");
+        assert_eq!(runtime.execute("transform", b"bytes").unwrap(), b"bytes");
+    }
+
+    #[test]
+    fn matching_sha256_accepts_module_path() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("echo.wasm");
+        std::fs::write(&path, ECHO_WASM).unwrap();
+        let digest = hex::encode(sha2::Sha256::digest(ECHO_WASM));
+        let runtime = WasmRuntime::new(WasmConfig {
+            module_path: Some(path.display().to_string()),
+            module_bytes: None,
+            sha256: Some(digest),
+            allowed_hosts: vec![],
+            max_memory_pages: None,
+            timeout_ms: None,
+            max_fuel: None,
+        })
+        .expect("matching path digest should compile captured bytes");
+        assert_eq!(
+            runtime.execute("transform", b"verified").unwrap(),
+            b"verified"
+        );
+    }
+
+    #[test]
+    fn sha256_mismatch_precedes_compilation_without_leaking_values_or_path() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("private-module.wasm");
+        std::fs::write(&path, b"not wasm").unwrap();
+        let expected = "0".repeat(64);
+        let actual = hex::encode(sha2::Sha256::digest(b"not wasm"));
+        let error = WasmRuntime::new(WasmConfig {
+            module_path: Some(path.display().to_string()),
+            module_bytes: None,
+            sha256: Some(expected.clone()),
+            allowed_hosts: vec![],
+            max_memory_pages: None,
+            timeout_ms: None,
+            max_fuel: None,
+        })
+        .unwrap_err();
+        let message = error.to_string();
+        assert_eq!(
+            message,
+            "WASM module sha256 does not match configured digest"
+        );
+        assert!(!message.contains(&expected));
+        assert!(!message.contains(&actual));
+        assert!(!message.contains(&path.display().to_string()));
+        assert!(!message.contains("compiling"));
+    }
+
+    #[test]
+    fn sha256_requires_exact_lowercase_hex_syntax() {
+        for digest in ["a".repeat(63), "A".repeat(64), "g".repeat(64)] {
+            let mut config = config_with(ECHO_WASM);
+            config.sha256 = Some(digest);
+            let error = WasmRuntime::new(config).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "WASM module sha256 must contain exactly 64 lowercase hexadecimal characters"
+            );
+        }
+    }
+
+    #[test]
+    fn epoch_ticker_spawn_failure_returns_an_error() {
+        let engines = Arc::new(Mutex::new(Vec::<Weak<Engine>>::new()));
+        let error = start_epoch_ticker(engines, |_engines| {
+            Err(io::Error::other("synthetic thread failure"))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
     }
 
     #[test]

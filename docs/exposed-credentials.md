@@ -135,7 +135,7 @@ Switch `action: block` once those response loops are wired up and the false-posi
 
 - Static lists scale to a few million entries before memory becomes a concern.
 - SHA-1 is the choice for compatibility with public exposure datasets. It is not a security boundary; the policy assumes the configured list is itself non-sensitive (or stored as hashes).
-- The match is exact. We do not normalise (lowercase, NFC, trim) the password before hashing.
+- The match is exact. We do not normalize (lowercase, NFC, trim) the password before hashing.
 
 ## See also
 

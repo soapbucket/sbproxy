@@ -36,7 +36,7 @@ proxy:
 
   payments:
     state_path: /var/lib/sbproxy/payments.sqlite3
-    challenge_binding_key: secret://env/SBPROXY_PAYMENT_BINDING_KEY
+    challenge_binding_key: env:SBPROXY_PAYMENT_BINDING_KEY
     authorization_timeout_ms: 2000
     max_body_bytes: 1048576
 
@@ -47,7 +47,7 @@ proxy:
     # Auth form, so they are only ever stored encrypted.
     recovery_encryption:
       key_id: payments-2026-08
-      key: secret://env/SBPROXY_PAYMENT_RECOVERY_KEY
+      key: env:SBPROXY_PAYMENT_RECOVERY_KEY
       # Hard expiry, 1 through 23 hours. The ceiling sits one hour below
       # Stripe's documented idempotency-key retention so a same-key
       # recovery cannot race the provider forgetting the request.
@@ -74,7 +74,7 @@ proxy:
     rails:
       stripe:
         # Named, never inlined.
-        api_key: secret://env/STRIPE_SECRET_KEY
+        api_key: env:STRIPE_SECRET_KEY
         # The only version accepted. A silent follow of the account's
         # dashboard default would authorize requests against a
         # PaymentIntent contract nobody reviewed.

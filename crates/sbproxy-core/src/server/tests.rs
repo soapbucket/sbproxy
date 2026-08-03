@@ -1291,7 +1291,7 @@ async fn plugin_receives_method_path_query_and_headers() {
     }
 
     impl AuthProvider for RecordingProviderShim {
-        fn auth_type(&self) -> &'static str {
+        fn auth_type(&self) -> &str {
             self.inner.auth_type()
         }
 

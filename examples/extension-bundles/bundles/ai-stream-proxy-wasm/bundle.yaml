@@ -1,0 +1,26 @@
+apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: ai-stream-proxy-wasm
+version: 1.0.0
+runtime: proxy_wasm
+abi: 0.2.1
+entry: filter.wasm
+sha256: c7c8363f34758576cf6c11ac162f1dd9be4200ce7f69868f65df5dc333cc32f5
+hooks:
+  - kind: ai_stream_event
+    type: example_ai_stream
+    execution:
+      body_mode: streamed
+  - kind: proxy_wasm
+    type: example_http_filter
+    execution:
+      body_mode: streamed
+failure_posture: closed
+sandbox:
+  budget_ms: 50
+  memory_mb: 16
+  stack_kb: 512
+  max_buffer_bytes: 1048576
+  max_output_bytes: 1048576
+  max_fuel: 100000000
+permissions: []

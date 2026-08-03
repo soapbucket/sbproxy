@@ -12,7 +12,7 @@ speaks JSON. The proxy emits the line via the `access_log` tracing target
 so log routers can split access logs from application logs without
 additional plumbing.
 
-## Default behaviour
+## Default behavior
 
 Off. SBproxy emits no access-log lines unless the top-level `access_log`
 block is present and `enabled: true`. Metrics, traces, and the audit log
@@ -357,7 +357,7 @@ A worked example covering all three scopes is in
 
 Every line is passed through the same secret redactor that protects
 metric labels and audit events. Bearer tokens, API keys with
-recognisable prefixes (`sk-`, `pk-`, `ghp_`, ...), and JWT-shaped
+recognizable prefixes (`sk-`, `pk-`, `ghp_`, ...), and JWT-shaped
 strings are replaced with `[REDACTED]` before the line reaches stdout.
 Apply additional masking at your log shipper if your origin embeds
 custom secrets in URLs or other places the line carries verbatim.

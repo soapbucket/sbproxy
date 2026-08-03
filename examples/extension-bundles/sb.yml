@@ -1,0 +1,53 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Run from the repository root:
+#   sbproxy serve -f examples/extension-bundles/sb.yml
+#
+# The TypeScript policy denies the first request and admits the second:
+#   curl -i -H 'Host: javascript.extension.local' http://127.0.0.1:8080/
+#   curl -i -H 'Host: javascript.extension.local' \
+#     -H 'X-Extension-Example: present' http://127.0.0.1:8080/
+#
+# The envelope WASM action returns 202 with a short body:
+#   curl -i -H 'Host: wasm.extension.local' http://127.0.0.1:8080/
+#
+# The Proxy-Wasm HTTP filter stamps a response from the public echo service:
+#   curl -i -H 'Host: filtered.extension.local' \
+#     http://127.0.0.1:8080/echo
+
+proxy:
+  http_bind_port: 8080
+  admin:
+    enabled: true
+    bind: 127.0.0.1
+    port: 9090
+    username: admin
+    password: worked-example
+
+extensions:
+  # Relative bundle paths resolve from the directory containing this file.
+  bundles_dir: bundles
+
+origins:
+  "javascript.extension.local":
+    action:
+      type: hello_javascript
+      response_header: x-extension-runtime
+    policies:
+      - type: require_example_header
+        header_name: x-extension-example
+    transforms:
+      - type: example_javascript_transform
+
+  "wasm.extension.local":
+    action:
+      type: queued_envelope
+
+  "filtered.extension.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    filters:
+      - type: example_http_filter
+        config:
+          label: worked-example
+        failure_posture: closed

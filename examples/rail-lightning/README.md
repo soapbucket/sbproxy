@@ -1,21 +1,25 @@
 # Lightning settlement on your own node
 
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-02*
 
 An article route priced at 2100 satoshis, settling over a Lightning node
 you run. Core Lightning and LND are alternative backends for one
 advertised `lightning` rail, and this example is mostly about making that
 choice explicit rather than accidental.
 
-There is no hermetic Lightning stub in this repository, so the runnable
-part of this example is config validation. Serving it needs a reachable
-node.
+Core Lightning is the live backend. The LND block ships commented out,
+because no build registers an adapter for that rail yet and a config
+naming it stops at startup. The section below on choosing between them
+says what changes when it lands.
+
+There is no hermetic Lightning stub in this repository, so serving this
+example needs a reachable node.
 
 ## What is in the bundle
 
 | File | Role |
 |---|---|
-| `sb.yml` | Both backends configured, with `lightning_backend` selecting one |
+| `sb.yml` | The Core Lightning backend, with the LND block alongside it in comments |
 | `smoke.json` | Liveness manifest for `scripts/examples-smoke.sh` |
 
 ## Validate it
@@ -27,6 +31,33 @@ sbproxy validate -f examples/rail-lightning/sb.yml
 
 Validation resolves no rune, opens no socket, and dials no node.
 
+The feature list has to match the blocks the file configures. A rail that
+is configured and not compiled fails startup by name, so uncommenting
+`lightning_lnd` means adding `payment-lightning-lnd` to that build line
+too. Validation does not check this: it is a startup check, because a
+binary is what has features and a config file is not.
+
+## Serve it
+
+```bash
+export SBPROXY_PAYMENT_BINDING_KEY="$(openssl rand -hex 32)"
+export CLN_RUNE=...
+sbproxy serve -f examples/rail-lightning/sb.yml
+```
+
+Every credential field in `sb.yml` names a secret rather than carrying
+one. `env:NAME` reads the environment at startup and `file:/path` reads a
+file, and neither needs any other configuration. A provider URI such as
+`secret://<backend>/<name>` also resolves, but only against a backend
+declared under `proxy.secrets.backends`; writing one without that block
+validates fine and then fails startup on the field that names it.
+
+Startup dials the CLN socket and checks the version through `getinfo`, so
+a config pointed at a socket that is not there stops at boot rather than
+at the first paid request. That is also why the probe below is the first
+thing worth running: a proxy that answered the boot is a proxy that
+reached the node.
+
 ## One rail, two backends
 
 `lightning` is what a route advertises. `lightning_cln` and
@@ -34,9 +65,10 @@ Validation resolves no rune, opens no socket, and dials no node.
 settlement rail, so an advertised `lightning` rail has to resolve to one
 of them.
 
-With one backend block configured, the selector is inferred. With both
-configured, drop `lightning_backend` and a route that advertises
-`lightning` is refused at load:
+With one backend block configured, the selector is inferred, which is why
+`lightning_backend: cln` is redundant in the file as it ships. Uncomment
+the LND block and it stops being redundant: with both configured and no
+selector, a route that advertises `lightning` is refused at load:
 
 ```text
 proxy.payments.rails configures both lightning_cln and lightning_lnd; set
@@ -56,8 +88,19 @@ migration looks like halfway through.
 | Credential | A rune | A hex-encoded macaroon |
 | Minimum version | v26.06 | Pinned to `v0.20.1-beta` protobufs |
 | Extra file needed | None | The node's TLS certificate |
+| Ships usable today | Yes | No, the gRPC transport is a separate slice |
 
-Neither backend is preferred. Pick the node you already operate.
+Neither backend is preferred once both work. Until then, LND is
+configurable and not servable: the settler and its contract tests are
+done, but nothing gives it a channel to talk through, so a config that
+names the rail is refused at startup rather than at a payer's expense:
+
+```text
+proxy.payments.rails.lightning_lnd is configured and the
+`payment-lightning-lnd` cargo feature is compiled in, but no adapter
+registered for it; refusing to publish a runtime that would answer a
+payer's credential with an unsupported rail
+```
 
 ## Core Lightning needs v26.06 or newer
 
@@ -80,12 +123,16 @@ A connection missing any one of them cannot be established, so all three
 are required at load rather than discovered at first payment. The endpoint
 must be absolute and TLS-bearing, the certificate path must be absolute,
 and the macaroon must be a secret reference. The macaroon is attached as
-call metadata and redacted everywhere else.
+call metadata and redacted everywhere else. Those rules already hold for
+the commented block, which is why it is worth keeping in the file: the
+shape does not change when the transport lands.
 
 ## Currency, and why the route is priced in BTC
 
-Both rails declare `quote_currency: BTC`, so the route is priced in BTC.
-The proxy performs no currency conversion, and one challenge cannot mix
+The live rail declares `quote_currency: BTC`, so the route is priced in
+BTC. The commented LND block declares the same, so the price does not
+move when that backend goes live. The proxy performs no currency
+conversion, and one challenge cannot mix
 currencies, because that would offer the payer two different prices for
 one resource. Add a USD rail to this route and it is refused by name:
 

@@ -19,7 +19,7 @@
 
 #![cfg(feature = "runtime")]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sbproxy_billing::error::BillingError;
@@ -32,6 +32,10 @@ use sbproxy_billing::types::{
     PaymentRequirementDraft, SettlementRail,
 };
 use sbproxy_billing::worker::{SettlementWorker, WorkerConfig};
+use sbproxy_billing::{
+    NoOpPaymentLifecycleObserver, PaymentLifecycleDecision, PaymentLifecycleEvent,
+    PaymentLifecycleObserver, PaymentLifecycleOutcome, PaymentLifecyclePhase,
+};
 
 mod common;
 
@@ -68,6 +72,11 @@ struct World {
 impl World {
     /// Builds a world whose challenge is created, finalized, and signed.
     async fn new() -> Self {
+        Self::with_payment_observer(Arc::new(NoOpPaymentLifecycleObserver)).await
+    }
+
+    /// Builds a world with an explicit payment lifecycle observer.
+    async fn with_payment_observer(observer: Arc<dyn PaymentLifecycleObserver>) -> Self {
         let directory = tempfile::tempdir().expect("temp dir");
         let path = directory.path().join("settlement.sqlite3");
         let clock = TestClock::new(START_MS);
@@ -89,6 +98,7 @@ impl World {
                 .adapters(registry)
                 .clock(Arc::clone(&clock) as Arc<dyn BillingClock>)
                 .signer(Arc::new(common::FixtureSigner))
+                .payment_observer(observer)
                 .build(),
         );
 
@@ -206,6 +216,52 @@ impl World {
     }
 }
 
+#[derive(Default)]
+struct ReconciliationObserver {
+    events: Mutex<Vec<(PaymentLifecyclePhase, PaymentLifecycleOutcome)>>,
+}
+
+#[derive(Default)]
+struct RejectReconciliationObserver {
+    events: Mutex<Vec<(PaymentLifecyclePhase, PaymentLifecycleOutcome)>>,
+}
+
+#[async_trait::async_trait]
+impl PaymentLifecycleObserver for ReconciliationObserver {
+    async fn started(&self, event: &PaymentLifecycleEvent) -> PaymentLifecycleDecision {
+        self.events
+            .lock()
+            .unwrap()
+            .push((event.phase(), event.outcome()));
+        PaymentLifecycleDecision::Continue
+    }
+
+    fn terminal(&self, event: PaymentLifecycleEvent) {
+        self.events
+            .lock()
+            .unwrap()
+            .push((event.phase(), event.outcome()));
+    }
+}
+
+#[async_trait::async_trait]
+impl PaymentLifecycleObserver for RejectReconciliationObserver {
+    async fn started(&self, event: &PaymentLifecycleEvent) -> PaymentLifecycleDecision {
+        self.events
+            .lock()
+            .unwrap()
+            .push((event.phase(), event.outcome()));
+        PaymentLifecycleDecision::Reject
+    }
+
+    fn terminal(&self, event: PaymentLifecycleEvent) {
+        self.events
+            .lock()
+            .unwrap()
+            .push((event.phase(), event.outcome()));
+    }
+}
+
 #[tokio::test]
 async fn a_rail_that_cannot_answer_leaves_the_attempt_outstanding() {
     // x402 has no versioned query extension, so its adapter answers
@@ -238,6 +294,113 @@ async fn a_rail_that_cannot_answer_leaves_the_attempt_outstanding() {
     assert_eq!(status.reconciliations_succeeded, 0);
     assert_eq!(world.status().await, IntentStatus::NeedsReconciliation);
     assert!(!world.has_access_receipt().await);
+}
+
+#[tokio::test]
+async fn reconciliation_emits_unsupported_after_durable_record() {
+    let observer = Arc::new(ReconciliationObserver::default());
+    let world = World::with_payment_observer(observer.clone()).await;
+    let prepared = world.dispatched_attempt().await;
+    world
+        .store
+        .mark_needs_reconciliation(
+            prepared.attempt_id(),
+            prepared.lease_token(),
+            sbproxy_billing::SafeFailure::category(
+                sbproxy_billing::FailureCategory::Ambiguous,
+                true,
+            ),
+        )
+        .await
+        .unwrap();
+    let attempt = world
+        .store
+        .claim_reconciliation(world.clock.now_ms(), 30_000, 1)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    world.state.set_query_plan(QueryPlan::Unsupported);
+
+    let outcome = world
+        .service
+        .reconcile_attempt(attempt)
+        .await
+        .expect("reconciliation records");
+
+    assert!(matches!(
+        outcome,
+        sbproxy_billing::ReconciliationOutcome::Unresolved(ref failure)
+            if failure.category == sbproxy_billing::FailureCategory::Unsupported
+    ));
+    assert_eq!(world.status().await, IntentStatus::NeedsReconciliation);
+    assert_eq!(
+        *observer.events.lock().unwrap(),
+        [
+            (
+                PaymentLifecyclePhase::Reconcile,
+                PaymentLifecycleOutcome::Started,
+            ),
+            (
+                PaymentLifecyclePhase::Reconcile,
+                PaymentLifecycleOutcome::Unsupported,
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn reconciliation_started_rejection_prevents_provider_query() {
+    let observer = Arc::new(RejectReconciliationObserver::default());
+    let world = World::with_payment_observer(observer.clone()).await;
+    let prepared = world.dispatched_attempt().await;
+    world
+        .store
+        .mark_needs_reconciliation(
+            prepared.attempt_id(),
+            prepared.lease_token(),
+            sbproxy_billing::SafeFailure::category(
+                sbproxy_billing::FailureCategory::Ambiguous,
+                true,
+            ),
+        )
+        .await
+        .unwrap();
+    let attempt = world
+        .store
+        .claim_reconciliation(world.clock.now_ms(), 30_000, 1)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    world.state.set_query_plan(QueryPlan::Settled);
+
+    let outcome = world
+        .service
+        .reconcile_attempt(attempt)
+        .await
+        .expect("rejection records");
+
+    assert!(matches!(
+        outcome,
+        sbproxy_billing::ReconciliationOutcome::Unresolved(ref failure)
+            if failure.category == sbproxy_billing::FailureCategory::Rejected
+    ));
+    assert_eq!(world.state.query_calls(), 0);
+    assert_eq!(world.status().await, IntentStatus::NeedsReconciliation);
+    assert_eq!(
+        *observer.events.lock().unwrap(),
+        [
+            (
+                PaymentLifecyclePhase::Reconcile,
+                PaymentLifecycleOutcome::Started,
+            ),
+            (
+                PaymentLifecyclePhase::Reconcile,
+                PaymentLifecycleOutcome::Rejected,
+            ),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -324,7 +487,8 @@ async fn a_proven_failure_refuses_the_request_and_keeps_refusing_it() {
 
 #[tokio::test]
 async fn only_a_provider_proof_settles_and_a_later_retry_observes_it() {
-    let world = World::new().await;
+    let observer = Arc::new(ReconciliationObserver::default());
+    let world = World::with_payment_observer(observer.clone()).await;
     world.dispatched_attempt().await;
     let worker = world.worker();
 
@@ -359,6 +523,27 @@ async fn only_a_provider_proof_settles_and_a_later_retry_observes_it() {
         "the settled receipt came from reconciliation, not from a second charge",
     );
     assert_eq!(world.state.provider_writes(), 0, "a query is never a write");
+    assert_eq!(
+        *observer.events.lock().unwrap(),
+        [
+            (
+                PaymentLifecyclePhase::Reconcile,
+                PaymentLifecycleOutcome::Started,
+            ),
+            (
+                PaymentLifecyclePhase::Reconcile,
+                PaymentLifecycleOutcome::Ambiguous,
+            ),
+            (
+                PaymentLifecyclePhase::Reconcile,
+                PaymentLifecycleOutcome::Started,
+            ),
+            (
+                PaymentLifecyclePhase::Reconcile,
+                PaymentLifecycleOutcome::Succeeded,
+            ),
+        ]
+    );
 }
 
 #[tokio::test]

@@ -32,7 +32,9 @@ use prometheus::{
 
 /// Count of peers evicted from the membership list + hash ring.
 ///
-/// Labels: `reason` (`probe_timeout` | `dead_timeout` | `graceful_leave`).
+/// Labels: `reason`. Two values are emitted today, `probe_timeout` and
+/// `dead_timeout`. `graceful_leave` is reserved and nothing emits it;
+/// see [`EVICT_REASON_GRACEFUL_LEAVE`] for why.
 pub static MESH_PEER_EVICTED: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         Opts::new("mesh_peer_evicted_total", "Peers evicted from the mesh"),
@@ -650,8 +652,21 @@ pub const EVICT_REASON_PROBE_TIMEOUT: &str = "probe_timeout";
 /// `reason` label for [`MESH_PEER_EVICTED`]: crossed the SWIM
 /// `dead_timeout` without any heartbeat.
 pub const EVICT_REASON_DEAD_TIMEOUT: &str = "dead_timeout";
-/// `reason` label for [`MESH_PEER_EVICTED`]: peer sent a graceful
-/// `LeaveRequest`.
+/// `reason` label for [`MESH_PEER_EVICTED`]: reserved for a peer that
+/// announced its own departure. Nothing emits it, because graceful leave
+/// is not implemented.
+///
+/// No leave message exists on the wire. `GossipMsg` carries `Heartbeat`,
+/// `Join`, `Ping`, `Ack`, `PingReq`, and `IndirectAck`; `MeshMessage`
+/// carries `MembershipUpdate`, `Ping`, and `Pong`. None of them says "I
+/// am going away", and no shutdown path sends one, so a node that exits
+/// cleanly is indistinguishable from a node that died: its peers notice
+/// only when the failure detector does, and evict it under
+/// `probe_timeout` or `dead_timeout` a suspect window later.
+///
+/// The constant stays so the label value is reserved rather than reused
+/// by something else. Do not alert on it and do not read its permanent
+/// zero as "no peer has ever left cleanly".
 pub const EVICT_REASON_GRACEFUL_LEAVE: &str = "graceful_leave";
 
 /// `state` label for [`MESH_PEER_COUNT`]: peer is alive.

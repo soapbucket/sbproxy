@@ -9,13 +9,140 @@ use std::pin::Pin;
 
 use crate::PluginResult;
 
-/// Outcome of an action handler - either proxied upstream or responded directly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Stable error code for an action result the selected host action cannot honor.
+pub const UNSUPPORTED_ACTION_OUTCOME_CODE: &str = "unsupported_action_outcome";
+
+/// Outcome of a dynamically dispatched action handler.
+///
+/// # Migrating from 0.2
+///
+/// This enum changed shape in `sbproxy-plugin` 0.3. Two things break for
+/// an out-of-tree plugin written against 0.2:
+///
+/// 1. **It is no longer `Copy`.** The [`Self::Response`] variant owns a
+///    header vector and a body, so the enum owns heap data. Code that
+///    relied on an implicit copy needs a `.clone()` or a move. It is
+///    still `Clone`, `Debug`, `PartialEq`, and `Eq`.
+/// 2. **An exhaustive `match` stops compiling.** Adding an arm for
+///    `Response { .. }` is the whole fix.
+///
+/// The two 0.2 variants still exist and still mean what they meant, so a
+/// handler that only ever returned [`Self::Responded`] keeps compiling
+/// once the two points above are addressed. Nothing needs rewriting to
+/// use the new variant.
+///
+/// Prefer [`Self::Response`] in new code. It hands the host a complete
+/// response as data, which is what lets ordinary response middleware,
+/// transforms, and the bundle action contract see it. The older
+/// [`Self::Responded`] says only "I wrote something through host state",
+/// which no bundle runtime can express, and [`Self::Proxy`] is rejected
+/// outright by the current host action.
+///
+/// ```
+/// use sbproxy_plugin::ActionOutcome;
+///
+/// // 0.2 style: still valid.
+/// let legacy = ActionOutcome::Responded;
+/// assert_eq!(legacy.response_status(), None);
+///
+/// // 0.3 style: the host can read the response without host state.
+/// let structured = ActionOutcome::Response {
+///     status: 200,
+///     headers: vec![("content-type".to_owned(), "text/plain".to_owned())],
+///     body: bytes::Bytes::from_static(b"ok"),
+/// };
+/// assert_eq!(structured.response_status(), Some(200));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionOutcome {
-    /// Request should be proxied to the upstream returned by upstream_peer.
+    /// Legacy request to continue to an upstream.
+    ///
+    /// Retained for linked-plugin source compatibility. The current
+    /// `Action::Plugin` host action has no upstream configuration, so dispatch
+    /// rejects this outcome with [`UNSUPPORTED_ACTION_OUTCOME_CODE`]. Routing
+    /// belongs to a concrete host action such as `proxy` or `load_balancer`.
     Proxy,
-    /// Response was written directly (static, redirect, echo, etc.).
+    /// Legacy signal that the handler wrote a response through host state.
+    ///
+    /// This variant carries no response bytes and is not part of the bundle
+    /// action contract. New implementations should return [`Self::Response`].
     Responded,
+    /// Handler supplied a complete response for ordinary response middleware.
+    Response {
+        /// HTTP response status code.
+        status: u16,
+        /// Response header name and value pairs in source order.
+        headers: Vec<(String, String)>,
+        /// Complete response body.
+        body: bytes::Bytes,
+    },
+}
+
+impl ActionOutcome {
+    /// Return the supplied response status for a structured response outcome.
+    pub const fn response_status(&self) -> Option<u16> {
+        match self {
+            Self::Response { status, .. } => Some(*status),
+            Self::Proxy | Self::Responded => None,
+        }
+    }
+}
+
+/// Compile-time coverage for the 0.3 `ActionOutcome` contract.
+///
+/// The 0.2 shape was reachable by accident: nothing in the workspace
+/// asserted which traits the enum carries, so it lost `Copy` in a commit
+/// that never mentioned versioning. These assertions fail the build if a
+/// later change quietly moves the contract again, which is the whole
+/// point of having bumped the minor for it (WOR-2276).
+#[cfg(test)]
+mod action_outcome_contract {
+    use super::ActionOutcome;
+
+    const fn assert_clone<T: Clone>() {}
+    const fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn the_supported_api_keeps_its_derived_traits() {
+        assert_clone::<ActionOutcome>();
+        assert_send_sync::<ActionOutcome>();
+    }
+
+    #[test]
+    fn every_variant_is_constructible_and_matched_exhaustively() {
+        // An exhaustive match with no wildcard: adding a variant fails
+        // this test to compile, which is the signal to bump the minor
+        // and write the migration note before shipping it.
+        for outcome in [
+            ActionOutcome::Proxy,
+            ActionOutcome::Responded,
+            ActionOutcome::Response {
+                status: 204,
+                headers: Vec::new(),
+                body: bytes::Bytes::new(),
+            },
+        ] {
+            let status = match &outcome {
+                ActionOutcome::Proxy => None,
+                ActionOutcome::Responded => None,
+                ActionOutcome::Response { status, .. } => Some(*status),
+            };
+            assert_eq!(status, outcome.response_status());
+        }
+    }
+
+    #[test]
+    fn a_structured_response_owns_its_bytes() {
+        let outcome = ActionOutcome::Response {
+            status: 200,
+            headers: vec![("x-a".to_owned(), "b".to_owned())],
+            body: bytes::Bytes::from_static(b"body"),
+        };
+        // Cloning rather than copying is the 0.2 -> 0.3 break; proving
+        // equality across the clone pins that `Clone` is a real deep
+        // copy and not something a later refactor can drop.
+        assert_eq!(outcome.clone(), outcome);
+    }
 }
 
 /// Origin of a subject resolved by an auth provider.
@@ -204,17 +331,17 @@ impl PolicyDecision {
 
 /// Third-party action handler (dynamic dispatch).
 ///
-/// Implementations handle incoming requests and decide whether to proxy
-/// them upstream or respond directly.
+/// Implementations handle incoming requests and supply a complete local
+/// response. Upstream routing belongs to a concrete host action.
 pub trait ActionHandler: Send + Sync + 'static {
     /// Returns the handler type identifier (e.g. "my-custom-action").
-    fn handler_type(&self) -> &'static str;
+    fn handler_type(&self) -> &str;
 
     /// Handle an incoming request.
     ///
-    /// On success the future resolves to an [`ActionOutcome`] telling the
-    /// pipeline whether the request was proxied upstream or already
-    /// responded to directly.
+    /// On success the future resolves to an [`ActionOutcome`]. New handlers
+    /// return [`ActionOutcome::Response`] so ordinary response middleware can
+    /// process the status, headers, and body.
     ///
     /// ## Errors
     ///
@@ -242,7 +369,7 @@ pub trait ActionHandler: Send + Sync + 'static {
 /// or custom auth system.
 pub trait AuthProvider: Send + Sync + 'static {
     /// Returns the auth type identifier (e.g. "my-custom-auth").
-    fn auth_type(&self) -> &'static str;
+    fn auth_type(&self) -> &str;
 
     /// Classify the meaning of a denied authentication decision.
     ///
@@ -298,7 +425,7 @@ pub trait AuthProvider: Send + Sync + 'static {
 /// Implementations enforce custom policies (rate limiting, geo-blocking, etc.).
 pub trait PolicyEnforcer: Send + Sync + 'static {
     /// Returns the policy type identifier (e.g. "my-custom-policy").
-    fn policy_type(&self) -> &'static str;
+    fn policy_type(&self) -> &str;
 
     /// Enforce the policy against an incoming request.
     ///
@@ -375,7 +502,7 @@ impl<'a> TransformContext<'a> {
 /// (e.g. custom encoding, field masking).
 pub trait TransformHandler: Send + Sync + 'static {
     /// Returns the transform type identifier (e.g. "my-custom-transform").
-    fn transform_type(&self) -> &'static str;
+    fn transform_type(&self) -> &str;
 
     /// Apply the transform to a body buffer.
     ///
@@ -409,7 +536,7 @@ pub trait TransformHandler: Send + Sync + 'static {
 /// Request enricher - adds data to request context (GeoIP, UA parsing, etc.).
 pub trait RequestEnricher: Send + Sync + 'static {
     /// Returns the enricher name (e.g. "geoip", "ua-parser").
-    fn name(&self) -> &'static str;
+    fn name(&self) -> &str;
 
     /// Enrich the request context with additional data.
     ///
@@ -438,6 +565,16 @@ pub trait RequestEnricher: Send + Sync + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn action_response_keeps_status_headers_and_body() {
+        let outcome = ActionOutcome::Response {
+            status: 202,
+            headers: vec![("content-type".into(), "text/plain".into())],
+            body: bytes::Bytes::from_static(b"queued"),
+        };
+        assert_eq!(outcome.response_status(), Some(202));
+    }
 
     /// Confirm carries reason + optional webhook + optional expiry.
     /// A past `expires_at` must compare as already elapsed; the

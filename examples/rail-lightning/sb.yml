@@ -5,11 +5,16 @@
 # once. `rails.lightning_backend` is what resolves the ambiguity. With
 # exactly one backend block configured the selector is inferred; with both
 # configured and no selector, a route that advertises `lightning` is a
-# load error rather than a coin flip.
+# load error rather than a coin flip. Only the Core Lightning block is
+# live here; see the note above `lightning_lnd` below for why.
 #
 # The route is priced in BTC because the rails are. A single challenge
 # cannot mix currencies, since the proxy performs no conversion, so a USD
 # route and a BTC rail need separately priced routes.
+#
+# Build it (a rail that is configured but not compiled fails startup by
+# name, so the feature list has to match the blocks below):
+#   cargo build -p sbproxy --release --features payments,payment-lightning-cln
 #
 # Validate it without holding any of its secrets:
 #   sbproxy validate -f examples/rail-lightning/sb.yml
@@ -31,7 +36,13 @@ proxy:
 
   payments:
     state_path: /var/lib/sbproxy/payments.sqlite3
-    challenge_binding_key: secret://env/SBPROXY_PAYMENT_BINDING_KEY
+    # Every credential below is named, never inlined. `env:NAME` reads the
+    # environment at startup and `file:/path` reads a file, neither needing
+    # any other configuration. A provider URI such as
+    # `secret://<backend>/<name>` also works, but only with a matching
+    # backend declared under proxy.secrets.backends; without one the proxy
+    # refuses to boot.
+    challenge_binding_key: env:SBPROXY_PAYMENT_BINDING_KEY
     authorization_timeout_ms: 2000
     max_body_bytes: 1048576
 
@@ -42,8 +53,10 @@ proxy:
 
     rails:
       # Which backend an advertised `lightning` rail settles through.
-      # Required here because both blocks below are configured. Naming a
-      # backend whose block is absent is also a load error.
+      # Redundant while only `lightning_cln` is live (one configured block
+      # infers the selector), and stated anyway because uncommenting the
+      # `lightning_lnd` block below makes it required. Naming a backend
+      # whose block is absent is a load error.
       lightning_backend: cln
 
       lightning_cln:
@@ -51,7 +64,7 @@ proxy:
         socket_path: /run/lightning/lightning-rpc
         # Named, never inlined. The rune is attached to the JSON-RPC
         # request and redacted everywhere else.
-        rune: secret://env/CLN_RUNE
+        rune: env:CLN_RUNE
         # Cannot be set lower. The adapter reads the documented `xpay`
         # label and `listinvoices` status that v26.06 defines, and startup
         # checks the live version through getinfo.
@@ -63,17 +76,31 @@ proxy:
         # Invoice lifetime, 30 through 86400 seconds.
         invoice_expiry_seconds: 300
 
-      lightning_lnd:
-        # Absolute and TLS-bearing. All three of endpoint, certificate,
-        # and macaroon are required, because a connection missing any one
-        # cannot be established and finding that out at first payment
-        # would fail a paid request instead of a boot.
-        endpoint: https://lnd.internal:10009
-        tls_certificate_path: /run/secrets/lnd/tls.cert
-        macaroon: secret://env/LND_MACAROON_HEX
-        quote_currency: BTC
-        settlement_decimals: 11
-        invoice_expiry_seconds: 300
+      # The LND backend ships commented out because no build can serve it
+      # yet. The settler and its contract tests are done, but the generated
+      # gRPC client is a separate slice, so nothing registers an adapter for
+      # this rail and a config that names it fails startup:
+      #
+      #   proxy.payments.rails.lightning_lnd is configured and the
+      #   `payment-lightning-lnd` cargo feature is compiled in, but no
+      #   adapter registered for it
+      #
+      # Refusing at startup is deliberate. The alternative is a proxy that
+      # advertises a Lightning challenge it has no way to settle.
+      #
+      # Uncomment this block, and add `payment-lightning-lnd` to the build,
+      # once that transport lands. Absolute and TLS-bearing: all three of
+      # endpoint, certificate, and macaroon are required, because a
+      # connection missing any one cannot be established and finding that
+      # out at first payment would fail a paid request instead of a boot.
+      #
+      # lightning_lnd:
+      #   endpoint: https://lnd.internal:10009
+      #   tls_certificate_path: /run/secrets/lnd/tls.cert
+      #   macaroon: env:LND_MACAROON_HEX
+      #   quote_currency: BTC
+      #   settlement_decimals: 11
+      #   invoice_expiry_seconds: 300
 
 origins:
   "blog.test.sbproxy.dev":

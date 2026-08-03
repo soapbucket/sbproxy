@@ -11,6 +11,7 @@
 pub mod action;
 pub mod auth;
 pub mod compile;
+mod extension_hook;
 pub mod olp;
 pub mod policy;
 pub mod projections;
@@ -31,6 +32,7 @@ pub use auth::a2a::{
 };
 pub use auth::{ApiKeyAuth, Auth};
 pub use compile::*;
+pub use extension_hook::{DynamicHookMetadata, PluginAction, PluginPolicy, PluginTransform};
 pub use policy::{
     classification_cache_stats, evaluate_body, evaluate_body_with_audit, parse_aipref,
     reset_classification_cache, A2AInjectionAction, AgentBudgetDecision, AgentBudgetExceedReason,

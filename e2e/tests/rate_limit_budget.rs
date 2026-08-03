@@ -328,21 +328,25 @@ fn soft_tier_emits_metric_without_429() {
     let harness = ProxyHarness::start_with_yaml(&cfg).expect("start proxy");
     ProxyHarness::wait_for_port(admin_port, Duration::from_secs(5)).expect("admin port");
 
-    // Sustained=10, soft_threshold=8, burst=20. We want to sit in
-    // the (soft, sustained] range without crossing into burst. A
-    // hand-paced loop at ~9 rps stays inside the band for 1 second.
-    let start = std::time::Instant::now();
+    // Sustained=10, soft_threshold=8, burst=20, and the config runs the
+    // manual clock so the whole file's cool-down sweep is deterministic.
+    // That makes the band a request count, not a rate: the registry's
+    // 1-second soft window rolls on a change in the clock's whole seconds
+    // and this clock only moves when the admin endpoint advances it, so the
+    // 8th request ever is the one that reaches the threshold and the 21st
+    // is the one that drains the burst bucket. Any count in [8, 20] sits in
+    // the band, so send a fixed 10 and let the assertions mean what they
+    // say. A wall-clock-paced loop would be pacing against a clock that is
+    // not running: it landed on 7 requests under suite load and 8 in
+    // isolation, so the soft tier was never reached on a loaded machine.
+    const REQUESTS: u32 = 10;
     let mut all_200 = true;
-    let mut sent = 0u32;
-    while start.elapsed() < Duration::from_millis(900) {
+    for _ in 0..REQUESTS {
         let resp = harness.get("/anything", "rl.localhost").expect("send");
         if resp.status != 200 {
             all_200 = false;
         }
-        sent += 1;
-        std::thread::sleep(Duration::from_millis(110));
     }
-    assert!(sent >= 5, "should have issued at least 5 requests");
     assert!(all_200, "soft tier must NOT 429 the client");
 
     // Soft-tier metric MUST have been emitted at least once.

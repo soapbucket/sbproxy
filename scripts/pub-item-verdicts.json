@@ -59,41 +59,13 @@
       "verdict": "keep",
       "reason": "Its doc states the purpose: unit tests in other crates assert that a helper stamped an exemplar onto a metric without reaching into the private store. Only this crate's own test modules use it today, so cfg(test) pub(crate) would compile and would quietly remove the cross-crate seam the doc promises."
     },
-    "crates/sbproxy-ai/src/api_routes.rs::parse_endpoint": {
-      "verdict": "escalated",
-      "reason": "The OpenAI-compatible endpoint parser has no production caller. sbproxy-core/src/server/ai_dispatch.rs:2320 classifies the request path with an inline `path == \"/v1/chat/completions\"` comparison instead, so two answers to 'which endpoint is this' exist and only one runs. Question for the AI gateway owner: is the inline comparison the intended classifier, in which case parse_endpoint and the AiEndpoint enum go, or should dispatch route through this parser so every endpoint shape is recognised in one place? Thirteen tests and a public enum ride on the answer."
-    },
-    "crates/sbproxy-ai/src/routing.rs::set_provider_health": {
-      "verdict": "escalated",
-      "reason": "Its doc says the background health-check task sets this flag, and no such caller exists anywhere in the workspace, so the active-probe health axis is written but never driven. The router still reads self.health on the routing path, so the default values are load bearing and this is not a plain deletion. Question for the AI gateway owner: was the active-probe task ever wired, or is passive ejection (record_failure plus check_ejections) the whole health story?"
-    },
-    "crates/sbproxy-core/src/compression_runtime.rs::select_default": {
-      "verdict": "escalated",
-      "reason": "Resolves the route's default compression runtime and panics if the compiled default is missing, so it reads as the invariant check for a compiled set. Every caller is a test, including the one in server/ai_dispatch.rs. Question for the compression owner: does the dispatch path resolve the default some other way, in which case two definitions of 'the default' can disagree silently, or should it call this?"
-    },
-    "crates/sbproxy-core/src/key_plane.rs::install_key_plane": {
-      "verdict": "escalated",
-      "reason": "The production install path stores straight into the slot at key_plane.rs:940 and bypasses this wrapper; every caller of the wrapper is a test. Two ways to install the live key plane is the kind of split where one of them skips a future invariant. Question for the key-plane owner: should the production path call install_key_plane, or should the wrapper go and the tests store directly?"
-    },
     "crates/sbproxy-mesh/src/metrics.rs::EVICT_REASON_GRACEFUL_LEAVE": {
-      "verdict": "escalated",
-      "reason": "The reason label for a peer that sent a graceful LeaveRequest. Its two siblings, probe_timeout and dead_timeout, are passed by production eviction sites; this one is passed only from peer_eviction.rs's own test. There is no LeaveRequest handler in the crate at all, only doc comments naming it. Question for the mesh owner: is graceful leave unimplemented, or handled somewhere that forgets to record the eviction reason? Deleting the constant would hide the gap rather than answer it."
-    },
-    "crates/sbproxy-model-host/src/hybrid.rs::record_cloud": {
-      "verdict": "escalated",
-      "reason": "The half of the hybrid savings split that accounts for a completion that spilled to cloud. Its sibling record_local has production callers and this one does not, so cloud_completions and cloud_spent_micros stay at zero in a live report and the reported saving only ever grows. Question for the model-host owner: is the cloud-spill path meant to be reported, and if so where should it call this?"
-    },
-    "crates/sbproxy-observe/src/cardinality.rs::unique_count": {
-      "verdict": "escalated",
-      "reason": "Reads how many unique values a label has been allowed to take, which is the number that says whether the limiter is about to start collapsing values into `other`. Only this crate's tests read it, so an operator cannot see how close a label is to its cap before the collapse happens. Question for the observability owner: should this reach an admin or metrics surface? Narrowing it is the wrong direction if the answer is yes."
-    },
-    "crates/sbproxy-observe/src/metrics.rs::record_request": {
-      "verdict": "escalated",
-      "reason": "The legacy request-counter entry point. Its own doc says call sites with resolved AgentLabels should prefer record_request_with_labels, and no production caller is left, so that migration is finished and only its tests still exercise it. Question for the observability owner: can it go? Deleting it means porting five test call sites onto the labelled entry point, which changes what those tests assert about the empty-string sentinel."
+      "verdict": "keep",
+      "reason": "Answered on WOR-2225: graceful leave is unimplemented, not mishandled. There is no leave message anywhere on the wire (GossipMsg carries Heartbeat, Join, Ping, Ack, PingReq, IndirectAck; MeshMessage carries MembershipUpdate, Ping, Pong) and no shutdown path sends one, so a node that exits cleanly is evicted by the failure detector under probe_timeout or dead_timeout like any corpse. Building it is a wire change plus a lifecycle hook, not a bug fix. The constant is kept so the label value stays reserved, and the doc comments that used to promise a LeaveRequest handler now say it does not exist."
     },
     "crates/sbproxy-transport/src/grpc/frame.rs::decode_all_raw": {
-      "verdict": "escalated",
-      "reason": "A trailer-tolerant frame walker written for gRPC-Web bodies. grpc/mod.rs re-exports decode_all, decode_one, and encode_message but not this one, and the gRPC-Web path at grpc/web.rs:80 calls the strict decode_all in production while only its tests call this. Question for the transport owner: does the gRPC-Web response path need to tolerate the 0x80 trailer flag, in which case web.rs should call this, or is the strict decoder correct and this is dead?"
+      "verdict": "keep",
+      "reason": "Answered on WOR-2225: the strict decoder is correct where it is called, and this one is not dead code so much as code for a direction that is not wired yet. grpc/web.rs:80 is the request path, and gRPC-Web only folds trailers into the body because a browser cannot read them off a response; a request has no trailers to fold, since gRPC carries none in that direction at all. So decode_all rejecting 0x80 there is the spec-correct behaviour, and it errors rather than misparsing. This walker is the response-direction counterpart, which the proxy does not need while it is the gRPC-Web server rather than a client of one. Tests now pin the split in both directions so the question does not get reopened."
     }
   }
 }

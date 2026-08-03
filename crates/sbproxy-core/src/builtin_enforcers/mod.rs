@@ -12,8 +12,8 @@
 //! `compile_builtin_enforcers` is the single dispatch point used by
 //! `server.rs::check_policies` to turn an origin's `Vec<Policy>`
 //! into the `Vec<Box<dyn PolicyEnforcer>>` the request loop drives.
-//! `Policy::Plugin(_)` is handed back unchanged so plugin authors
-//! keep going through the same path as the built-ins.
+//! `Policy::Plugin(_)` keeps its original trait object while dynamic
+//! bundle execution metadata is retained beside the compiled enforcer.
 //!
 //! See `docs/adr-policy-engine-unification.md` and
 //! `docs/phase0-oss-implementation-plan.md` Item 1 for the larger

@@ -83,6 +83,15 @@ Adding a key to `types.rs` without wiring it now fails with the complete dotted
 schema path. Adding a reviewed `ConfigOnly` entry makes the exception explicit
 and stale entries fail when their schema path is removed or renamed.
 
+One class of key is outside that walk. Everything under `action:` is an untyped
+value in the generated schema, because action types are plugin-extensible and
+each module parses its own block. The scan therefore cannot see a module's
+fields, and the registry cannot hold an entry for one. Modules with a
+config-only field warn for it themselves at config-compile time, using the same
+message and the same `config_key` field the registry uses, so an operator reads
+one boot log rather than two. `origins.*.action.sticky` is the only such field
+today; it is listed in the table below alongside the registry's own.
+
 ### Current config-only compatibility fields
 
 | Field or subtree | What happens today |
@@ -90,6 +99,7 @@ and stale entries fail when their schema path is removed or renamed.
 | `agent_classes.hosted_feed.url`, `.bootstrap_keys` | The resolver uses builtin or inline catalogs; it does not fetch or verify a hosted feed. |
 | `audit.sink` | Admin-action rows always use the in-memory ring and tracing mirror; this selector has no effect. |
 | `origins.*.agent_skills[].max_clock_skew_secs` | Reserved for signed artifact freshness headers that are not emitted yet. |
+| `origins.*.action.sticky` | The load balancer issues no affinity cookie; nothing writes `Set-Cookie`. Traffic distributes by `algorithm` as if the block were absent. Use the `cookie_hash`, `header_hash`, or `ip_hash` algorithm for session affinity. |
 | `origins.*.connection_pool` | Pingora's built-in upstream pool is used; these per-origin limits are not applied. |
 | `origins.*.compression.level` | Compression libraries use their runtime defaults; this parsed level is not applied. |
 | `origins.*.cors.enable` | The presence of `cors:` enables CORS; the legacy boolean value is ignored. |

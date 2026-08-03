@@ -1,0 +1,31 @@
+apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: hello-javascript
+version: 1.0.0
+runtime: javascript
+entry: entry.js
+sha256: 42c3e04fdb8ad0d2539fb743311d49bf498394c46c73df0999ff0b2e07061fb4
+hooks:
+  - kind: action
+    type: hello_javascript
+    export: respond
+    config_schema:
+      type: object
+      additionalProperties: false
+      properties:
+        response_header:
+          type: string
+          default: x-extension-runtime
+      required: [response_header]
+  - kind: transform
+    type: example_javascript_transform
+    export: transformResponse
+failure_posture: closed
+sandbox:
+  budget_ms: 50
+  memory_mb: 16
+  stack_kb: 512
+  max_buffer_bytes: 1048576
+  max_output_bytes: 1048576
+  max_fuel: 100000000
+permissions: []

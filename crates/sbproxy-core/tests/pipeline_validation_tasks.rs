@@ -4,10 +4,9 @@
 //! Validation-mode pipeline construction must not spawn background tasks.
 //!
 //! A validation pipeline is built to answer "would this config construct?"
-//! and is then dropped. Health-check probes spawned during construction
-//! outlive that drop, hold an `Arc` on the discarded pipeline, and keep
-//! issuing real requests at the operator's upstreams. Any caller that
-//! validates repeatedly accumulates them without bound.
+//! and is then dropped. It must not start health-check work or issue real
+//! requests at the operator's upstreams. Runtime pipelines still activate the
+//! same probes once they reach their intended publication boundary.
 //!
 //! These tests are behavioural rather than structural: they point a health
 //! check at a real listener and count the connections that arrive.
@@ -104,6 +103,42 @@ async fn runtime_construction_still_spawns_health_probes() {
          validation-mode test above would then pass vacuously"
     );
     drop(pipeline);
+}
+
+#[test]
+fn published_path_relative_pipeline_starts_probes_without_a_caller_runtime() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
+    listener
+        .set_nonblocking(true)
+        .expect("make probe listener nonblocking");
+    let port = listener.local_addr().expect("listener addr").port();
+    let compiled = sbproxy_config::compile_config(&health_checked_yaml(port)).expect("compile");
+    let pipeline = CompiledPipeline::from_config_at(compiled, std::path::Path::new("."))
+        .expect("construct path-relative runtime candidate");
+
+    sbproxy_core::reload::load_pipeline(pipeline);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let observed_probe = loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                drop(stream);
+                break true;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => panic!("accept health probe: {error}"),
+        }
+    };
+    sbproxy_core::reload::load_pipeline(CompiledPipeline::default());
+
+    assert!(
+        observed_probe,
+        "the synchronous startup publication path did not activate health probes"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

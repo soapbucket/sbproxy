@@ -397,7 +397,7 @@ mod tests {
 
     #[test]
     fn verify_repr_digest_with_same_value_passes() {
-        // WOR-805 PR2: the policy itself is header-agnostic — it
+        // WOR-805 PR2: the policy itself is header-agnostic, it
         // takes a header value and a body. The body-filter wire site
         // looks up `Content-Digest` first, then `Repr-Digest`, so a
         // request that only carries the latter is verified through

@@ -386,7 +386,7 @@ pub struct McpTokenCompactionConfig {
 /// secondary LLM judge (`ToolOutputJudge`) before any served
 /// ledger/outcome or compaction. Fail closed on timeout, malformed
 /// judge response, or egress denial. Reason codes are digest/closed
-/// vocabulary only — never matched text or raw tool output.
+/// vocabulary only, never matched text or raw tool output.
 #[derive(Debug, Clone, Deserialize)]
 pub struct McpDualLlmQuarantineConfig {
     /// Master switch.
@@ -459,7 +459,7 @@ pub struct McpFederatedServerConfig {
     pub timeout: Option<Duration>,
     /// Opt into run-as-user upstream Authorization minting (WOR-1792).
     /// When true, `upstream_auth` is required and credentials are
-    /// attached as HTTP Authorization headers — never as tool args.
+    /// attached as HTTP Authorization headers, never as tool args.
     /// Defaults off. `stdio` + run-as-user is a config error.
     #[serde(default)]
     pub run_as_user_auth: bool,

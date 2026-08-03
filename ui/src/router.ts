@@ -33,6 +33,12 @@ const routes = [
     meta: { title: "Config", documentation: "configuration" },
   },
   {
+    path: "/extensions",
+    name: "extensions",
+    component: () => import("./views/ExtensionsView.vue"),
+    meta: { title: "Extensions", documentation: "admin-ui" },
+  },
+  {
     path: "/logs",
     name: "logs",
     component: () => import("./views/LogsView.vue"),

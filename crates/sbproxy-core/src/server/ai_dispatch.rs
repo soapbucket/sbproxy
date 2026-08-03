@@ -77,6 +77,18 @@ mod native_destination_tests {
 enum DynamicKeyOutcome {
     /// Not a virtual-key-shaped token (or no token); let other auth handle it.
     NotApplicable,
+    /// The key store could not be read and `key_management.failure_posture`
+    /// chose to admit the request anyway.
+    ///
+    /// Distinct from [`Self::NotApplicable`] because the two mean opposite
+    /// things to a later gate. `NotApplicable` says nothing was decided here.
+    /// This says a posture deliberately let the request through without
+    /// per-key policy, budget, or attribution, which is the contract
+    /// `docs/degradation.md` states for `degraded` and `open`: fall through to
+    /// the origin's own auth. Collapsing the two let the native-provider-key
+    /// gate refuse a request the posture had already admitted, so a documented
+    /// degradation path returned 403 during exactly the outage it exists for.
+    AdmittedByFailurePosture,
     /// Resolved to a usable stored record. Canonical policy lowering happens
     /// once after authentication and before any dispatch branch.
     Resolved(Box<sbproxy_keystore::record::KeyRecord>),
@@ -260,6 +272,16 @@ fn effective_policy_to_virtual_key(
 enum ResolvedPolicyOrigin {
     Stored,
     Configured,
+    /// Synthesized from `inbound.native_key_policy` for a caller-owned
+    /// provider credential.
+    ///
+    /// Separate from [`Self::Stored`] because a native record is lowered
+    /// through the same path as a minted one and would otherwise be
+    /// indistinguishable from it. That mattered: it carries an effective
+    /// policy, so `require_governed_key: true` was satisfied by any caller
+    /// presenting their own `sk-...` key, which voids the premise of the
+    /// setting on every policy-configured origin.
+    Native,
 }
 
 struct ResolvedRequestKey {
@@ -520,13 +542,35 @@ impl ResolvedRequestKey {
         record: &sbproxy_keystore::record::KeyRecord,
         origin_tenant_id: &str,
     ) -> std::result::Result<Self, StoredPolicyError> {
+        Self::from_record_with_origin(record, origin_tenant_id, ResolvedPolicyOrigin::Stored)
+    }
+
+    /// Lower a record that was synthesized for a caller-owned native
+    /// credential rather than minted by this proxy.
+    fn from_native_record(
+        record: &sbproxy_keystore::record::KeyRecord,
+        origin_tenant_id: &str,
+    ) -> std::result::Result<Self, StoredPolicyError> {
+        Self::from_record_with_origin(record, origin_tenant_id, ResolvedPolicyOrigin::Native)
+    }
+
+    fn from_record_with_origin(
+        record: &sbproxy_keystore::record::KeyRecord,
+        origin_tenant_id: &str,
+        policy_origin: ResolvedPolicyOrigin,
+    ) -> std::result::Result<Self, StoredPolicyError> {
         let effective_policy = key_record_to_effective_policy(record, origin_tenant_id)?;
         let virtual_key = effective_policy_to_virtual_key(&effective_policy);
         Ok(Self {
             virtual_key,
             effective_policy: Some(effective_policy),
-            policy_origin: ResolvedPolicyOrigin::Stored,
+            policy_origin,
         })
+    }
+
+    /// Whether this key was presented by the caller rather than minted here.
+    const fn is_native(&self) -> bool {
+        matches!(self.policy_origin, ResolvedPolicyOrigin::Native)
     }
 
     fn from_configured(
@@ -688,7 +732,19 @@ fn governed_key_requirement(
     required: bool,
     resolved: Option<&ResolvedRequestKey>,
 ) -> std::result::Result<(), (u16, &'static str)> {
-    if required && resolved.and_then(ResolvedRequestKey::policy).is_none() {
+    if !required {
+        return Ok(());
+    }
+    // A caller-owned native credential is not a governed key. It carries an
+    // effective policy so the rest of the pipeline has something to read, but
+    // that policy was synthesized from `native_key_policy`, not minted and
+    // revisioned by this proxy, so accepting it here would let any caller
+    // presenting their own provider key satisfy a setting whose whole purpose
+    // is to require one this proxy governs.
+    if resolved.is_some_and(ResolvedRequestKey::is_native) {
+        return Err((401, "governed credential required"));
+    }
+    if resolved.and_then(ResolvedRequestKey::policy).is_none() {
         return Err((401, "governed credential required"));
     }
     Ok(())
@@ -717,6 +773,10 @@ fn peer_policy_revision(
         ResolvedPolicyOrigin::Configured => {
             format!("c:{config_revision}:{digest_prefix}")
         }
+        // A native policy is not a revisioned artifact this proxy published,
+        // so it is labelled by its source rather than given a revision that
+        // would imply an authority behind it.
+        ResolvedPolicyOrigin::Native => format!("native:{config_revision}:{digest_prefix}"),
     })
 }
 
@@ -1659,7 +1719,7 @@ fn dynamic_key_store_outage(
             "key store unavailable; passing through"
         );
     }
-    DynamicKeyOutcome::NotApplicable
+    DynamicKeyOutcome::AdmittedByFailurePosture
 }
 
 /// WOR-1555: map a verified OIDC/JWT identity to a stored virtual-key record's
@@ -1808,6 +1868,9 @@ async fn resolve_request_virtual_key(
                         .map(Some);
                 }
                 DynamicKeyOutcome::NotApplicable => {}
+                DynamicKeyOutcome::AdmittedByFailurePosture => {
+                    ctx.key_store_admitted_by_posture = true;
+                }
                 DynamicKeyOutcome::Deny(status, message) => {
                     stamp_minted_key_mode(ctx);
                     ctx.inbound_key_header = Some(header.clone());
@@ -1839,6 +1902,9 @@ async fn resolve_request_virtual_key(
                     .map(Some);
             }
             DynamicKeyOutcome::NotApplicable => {}
+            DynamicKeyOutcome::AdmittedByFailurePosture => {
+                ctx.key_store_admitted_by_posture = true;
+            }
             DynamicKeyOutcome::Deny(status, message) => return Err((status, message)),
         }
     }
@@ -1875,7 +1941,7 @@ async fn resolve_request_virtual_key(
                 ctx.hostname.as_str(),
                 &provider,
             ));
-            let resolved = lower_stored_request_key(&record, origin_tenant_id)?;
+            let resolved = lower_native_request_key(&record, origin_tenant_id)?;
             ctx.native_key_policy_record = Some(record);
             ctx.native_key_provider = Some(provider);
             ctx.inbound_key_mode = crate::context::InboundKeyMode::Native;
@@ -1883,6 +1949,29 @@ async fn resolve_request_virtual_key(
         }
         crate::inbound_key::NativeKeyPolicyDecision::PolicyMissing { provider }
         | crate::inbound_key::NativeKeyPolicyDecision::ProviderDenied { provider } => {
+            // An admitting `key_management.failure_posture` already decided
+            // this request proceeds without per-key governance, and this gate
+            // needs no key store to reach a verdict, so denying here would
+            // override a decision that was made deliberately and contradict
+            // the fall-through `docs/degradation.md` promises for `degraded`
+            // and `open`. The request continues to the origin's own auth.
+            if ctx.key_store_admitted_by_posture {
+                tracing::warn!(
+                    provider = %provider,
+                    "native provider key not governed: key store unavailable and \
+                     failure_posture admitted the request"
+                );
+                // Record the provider for observability, but deliberately do
+                // not stamp `InboundKeyMode::Native`. That mode is what makes
+                // the rest of dispatch treat this as a recognized native
+                // credential, which then requires a matching
+                // `accept_native_credentials_for` destination binding and
+                // refuses without one. This request is proceeding *ungoverned*
+                // by an operator's explicit posture, so claiming the mode would
+                // reintroduce the same 403 one gate later.
+                ctx.native_key_provider = Some(provider);
+                return Ok(None);
+            }
             ctx.native_key_provider = Some(provider);
             ctx.inbound_key_mode = crate::context::InboundKeyMode::Native;
             crate::trust_tier::finalize(ctx, AuthTrustOutcome::Missing.is_suspicious());
@@ -1944,6 +2033,24 @@ fn lower_stored_request_key(
 /// Dynamic bearer and OIDC mapping can resolve after the pre-auth sweep. The
 /// upstream phase still needs the original record's credential binding, so
 /// retain it on the request context only after policy validation succeeds.
+/// Lower a synthesized native-credential record.
+///
+/// Separate from [`lower_stored_request_key`] only in the policy origin it
+/// stamps, which is what keeps a caller-owned key from satisfying
+/// `require_governed_key`.
+fn lower_native_request_key(
+    record: &sbproxy_keystore::record::KeyRecord,
+    origin_tenant_id: &str,
+) -> std::result::Result<ResolvedRequestKey, (u16, String)> {
+    ResolvedRequestKey::from_native_record(record, origin_tenant_id).map_err(|error| {
+        warn!(
+            reason = error.safe_reason(),
+            "AI proxy: native credential policy rejected"
+        );
+        (403, "credential policy is invalid".to_string())
+    })
+}
+
 fn lower_and_preserve_stored_request_key(
     ctx: &mut RequestContext,
     record: Box<sbproxy_keystore::record::KeyRecord>,
@@ -3241,6 +3348,7 @@ pub(super) async fn handle_ai_proxy(
             &ctx.rollup_properties,
             billing_agent.identity(),
             &ai_span,
+            sbproxy_ai::budget::TokenDebit::Measured,
         );
         return relay_ai_response(
             session,
@@ -3520,6 +3628,7 @@ pub(super) async fn handle_ai_proxy(
             &ctx.rollup_properties,
             billing_agent.identity(),
             &ai_span,
+            sbproxy_ai::budget::TokenDebit::Measured,
         );
         return relay_ai_response_with_idempotency(
             session,
@@ -3807,7 +3916,12 @@ pub(super) async fn handle_ai_proxy(
                 provider_order = eligible;
             }
         }
-        provider_order = router.eligible_candidate_indices(&config.providers, &provider_order);
+        // Resilience narrows the permitted set, and hands it back when
+        // it would narrow it to nothing. The 503 below is then reserved
+        // for the case it always described: policy, model, or the
+        // enabled switch left this request no provider at all. See
+        // `Router::routable_candidate_indices` (WOR-2233).
+        provider_order = router.routable_candidate_indices(&config.providers, &provider_order);
         if provider_order.is_empty() {
             send_error(session, 503, "no healthy eligible AI provider").await?;
             return Ok(());
@@ -4067,6 +4181,7 @@ pub(super) async fn handle_ai_proxy(
                 &ctx.rollup_properties,
                 billing_agent.identity(),
                 &ai_span,
+                sbproxy_ai::budget::TokenDebit::Measured,
             );
             if cost_micros > 0 {
                 ctx.ai_cost_usd_micros = Some(cost_micros);
@@ -4108,6 +4223,7 @@ pub(super) async fn handle_ai_proxy(
             &ctx.rollup_properties,
             billing_agent.identity(),
             &ai_span,
+            sbproxy_ai::budget::TokenDebit::Measured,
         );
         if let Some(block) = multipart_external_output_guardrail_block(
             status,
@@ -4925,6 +5041,11 @@ pub(super) async fn handle_ai_proxy(
             return Ok(());
         }
     };
+    let mut ai_extensions = crate::ai_extensions::AiRequestExtensions::start(
+        pipeline.ai_extension_chain().as_ref(),
+        ctx.request_id.as_str(),
+        &model,
+    );
 
     // --- Input guardrails: check messages before forwarding ---
     // `mut` is exercised only when the rag feature compiles the augmented
@@ -4946,6 +5067,15 @@ pub(super) async fn handle_ai_proxy(
             labels,
         } => {
             ctx.ai_guardrail_labels = labels;
+            if let Some(extensions) = ai_extensions.as_mut() {
+                if let Err(block) = extensions
+                    .guard_input(InputGuardrailStage::Original.label(), &body)
+                    .await
+                {
+                    send_ai_extension_block_response(session, ctx, &ai_span, block).await?;
+                    return Ok(());
+                }
+            }
             flagged_count
         }
         InputGuardrailDecision::Block {
@@ -5106,6 +5236,21 @@ pub(super) async fn handle_ai_proxy(
                             } => {
                                 guardrail_flagged_count = flagged_count;
                                 ctx.ai_guardrail_labels = labels;
+                                if let Some(extensions) = ai_extensions.as_mut() {
+                                    if let Err(block) = extensions
+                                        .guard_input(
+                                            InputGuardrailStage::RagAugmented.label(),
+                                            &body,
+                                        )
+                                        .await
+                                    {
+                                        send_ai_extension_block_response(
+                                            session, ctx, &ai_span, block,
+                                        )
+                                        .await?;
+                                        return Ok(());
+                                    }
+                                }
                             }
                             InputGuardrailDecision::Block {
                                 name,
@@ -5425,6 +5570,31 @@ pub(super) async fn handle_ai_proxy(
             .await
             {
                 send_guardrail_block_response(session, ctx, &ai_span, 403, block).await?;
+            } else if (200..300).contains(&response.status) {
+                if let Some(extensions) = ai_extensions.as_mut() {
+                    if let Err(block) = extensions.guard_output(&response.body).await {
+                        send_ai_extension_block_response(session, ctx, &ai_span, block).await?;
+                        return Ok(());
+                    }
+                }
+                {
+                    let replay_body = if ai_idempotency_body_is_wire(&response.headers) {
+                        response.body
+                    } else {
+                        sbproxy_ai::format::rewrap_success_response_for_inbound(
+                            response.status,
+                            ctx.ai_inbound_format.as_deref(),
+                            &response.body,
+                        )
+                    };
+                    write_ai_cached_response(
+                        session,
+                        response.status,
+                        &response.headers,
+                        &replay_body,
+                    )
+                    .await?;
+                }
             } else {
                 let replay_body = if ai_idempotency_body_is_wire(&response.headers) {
                     response.body
@@ -5731,6 +5901,18 @@ pub(super) async fn handle_ai_proxy(
                                 send_guardrail_block_response(session, ctx, &ai_span, 403, block)
                                     .await?;
                                 return Ok(());
+                            }
+                            if (200..300).contains(&hit.response.status) {
+                                if let Some(extensions) = ai_extensions.as_mut() {
+                                    if let Err(block) = extensions.guard_output(body.as_ref()).await
+                                    {
+                                        send_ai_extension_block_response(
+                                            session, ctx, &ai_span, block,
+                                        )
+                                        .await?;
+                                        return Ok(());
+                                    }
+                                }
                             }
                             // Re-run the allowlist over the decoded record so
                             // a tampered distributed value cannot turn an
@@ -6040,9 +6222,14 @@ pub(super) async fn handle_ai_proxy(
 
     // Intersect the request's final policy/model candidate set with live
     // resilience state before any strategy can choose or order providers.
-    // This strict path never revives an unhealthy, ejected, or breaker-blocked
-    // provider when the intersection is empty.
-    provider_order = router.eligible_candidate_indices(&config.providers, &provider_order);
+    // Policy, model eligibility, and `enabled` are hard; the three
+    // resilience axes are advisory and give the set back rather than
+    // combining into an outage none of them can cause alone, which is
+    // what the load balancer's identical filter does and what
+    // `docs/configuration.md` has always promised (WOR-2233). The
+    // strategy step below re-applies the strict filter, so in the
+    // revived case it selects nothing and the order stands as authored.
+    provider_order = router.routable_candidate_indices(&config.providers, &provider_order);
     if provider_order.is_empty() {
         send_error(session, 503, "no healthy eligible AI provider").await?;
         return Ok(());
@@ -6291,6 +6478,7 @@ pub(super) async fn handle_ai_proxy(
                         &ctx.rollup_properties,
                         billing_agent.identity(),
                         &ai_span,
+                        sbproxy_ai::budget::TokenDebit::Measured,
                     );
                     if cost_micros > 0 {
                         ctx.ai_cost_usd_micros = Some(cost_micros);
@@ -7308,6 +7496,7 @@ pub(super) async fn handle_ai_proxy(
                         .and(guardrail_pipeline.clone())
                         .filter(|pipeline| pipeline.has_output()),
                     output_external,
+                    ai_extensions,
                 )
                 .await;
             }
@@ -7426,6 +7615,7 @@ pub(super) async fn handle_ai_proxy(
                 // WOR-1874: guardrail-column stamping on streaming
                 // blocks.
                 Some(ctx),
+                ai_extensions,
             )
             .await
         } else {
@@ -7485,6 +7675,7 @@ pub(super) async fn handle_ai_proxy(
                 // streaming relay because it can send bytes before a post-call
                 // guardrail has a complete response to inspect.
                 output_external,
+                ai_extensions,
             )
             .await
         }
@@ -8052,6 +8243,71 @@ async fn send_guardrail_block_response(
     send_response(session, status, "application/json", &body).await
 }
 
+async fn send_ai_extension_block_response(
+    session: &mut Session,
+    ctx: &mut RequestContext,
+    ai_span: &tracing::Span,
+    block: crate::ai_extensions::AiExtensionBlock,
+) -> Result<()> {
+    warn!(
+        extension_code = %block.code,
+        "AI proxy: extension hook blocked an event"
+    );
+    sbproxy_ai::tracing_spans::record_error(
+        ai_span,
+        sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+        &block.message,
+    );
+    mark_guardrail_block(ctx, block.code.clone());
+    let body = ErrorEnvelope::new("guardrail_violation", &block.message)
+        .code(&block.code)
+        .request_id(ctx.request_id.as_str())
+        .to_bytes();
+    send_response(session, block.status, "application/json", &body).await
+}
+
+async fn send_ai_stream_extension_block_before_headers(
+    session: &mut Session,
+    pending_header: &mut Option<Box<pingora_http::ResponseHeader>>,
+    ctx: &mut Option<&mut RequestContext>,
+    ai_span: &tracing::Span,
+    block: &crate::ai_extensions::AiExtensionBlock,
+) -> Result<bool> {
+    if pending_header.take().is_none() {
+        return Ok(false);
+    }
+    if let Some(context) = ctx.as_deref_mut() {
+        send_ai_extension_block_response(session, context, ai_span, block.clone()).await?;
+    } else {
+        let body = ErrorEnvelope::new("guardrail_violation", &block.message)
+            .code(&block.code)
+            .to_bytes();
+        send_response(session, block.status, "application/json", &body).await?;
+    }
+    Ok(true)
+}
+
+async fn send_ai_stream_guardrail_block_before_headers(
+    session: &mut Session,
+    pending_header: &mut Option<Box<pingora_http::ResponseHeader>>,
+    ctx: &mut Option<&mut RequestContext>,
+    ai_span: &tracing::Span,
+    block: sbproxy_ai::guardrails::GuardrailBlock,
+) -> Result<bool> {
+    if pending_header.take().is_none() {
+        return Ok(false);
+    }
+    if let Some(context) = ctx.as_deref_mut() {
+        send_guardrail_block_response(session, context, ai_span, 403, block).await?;
+    } else {
+        let body = ErrorEnvelope::new("guardrail_violation", &block.reason)
+            .code(&block.name)
+            .to_bytes();
+        send_response(session, 403, "application/json", &body).await?;
+    }
+    Ok(true)
+}
+
 /// Relay a non-streaming AI response and, when `embed_miss` is present,
 /// admit that response into the semantic cache.
 ///
@@ -8081,6 +8337,7 @@ pub(super) async fn relay_ai_response_with_cache(
     idem_capture: Option<AiIdempotencyCapture>,
     output_guardrails: Option<std::sync::Arc<sbproxy_ai::guardrails::GuardrailPipeline>>,
     output_external: &[sbproxy_ai::external_guardrail::ExternalGuardrailConfig],
+    mut ai_extensions: Option<crate::ai_extensions::AiRequestExtensions>,
 ) -> Result<()> {
     let status = resp.status().as_u16();
 
@@ -8278,6 +8535,20 @@ pub(super) async fn relay_ai_response_with_cache(
         }
         let body_bytes = envelope.to_bytes();
         return send_response(session, 403, "application/json", &body_bytes).await;
+    }
+    if (200..300).contains(&status) {
+        if let Some(extensions) = ai_extensions.as_mut() {
+            if let Err(block) = extensions.guard_output(&resp_body).await {
+                if let Some(request_ctx) = ctx.as_mut() {
+                    return send_ai_extension_block_response(session, request_ctx, &ai_span, block)
+                        .await;
+                }
+                let body = ErrorEnvelope::new("guardrail_violation", &block.message)
+                    .code(&block.code)
+                    .to_bytes();
+                return send_response(session, block.status, "application/json", &body).await;
+            }
+        }
     }
 
     // --- WOR-2099: semantic cache write on miss ---
@@ -8479,6 +8750,22 @@ pub(super) async fn relay_ai_response_with_cache(
             } else {
                 sbproxy_ai::budget::AiUsage::PerCall
             };
+            // Enforcement debits the estimate; the event above keeps the
+            // measured (0,0). WOR-1146 computed this estimate and WOR-2212
+            // then consolidated the debit onto the billing event, which is
+            // built from measured usage by design, so on any single-node
+            // deployment the estimate was computed and discarded and a
+            // usage-less 2xx debited nothing at all. `max_tokens` stopped
+            // being a cap for any provider that omits `usage`.
+            let budget_debit = if budget_prompt_tokens != prompt_tokens
+                || budget_completion_tokens != completion_tokens
+            {
+                sbproxy_ai::budget::TokenDebit::Estimated(
+                    budget_prompt_tokens.saturating_add(budget_completion_tokens),
+                )
+            } else {
+                sbproxy_ai::budget::TokenDebit::Measured
+            };
             let cost = sbproxy_ai::budget::estimate_cost_for_usage(args.model, &usage);
             let scope_keys = args.keys.iter().map(|(_, k)| k.clone()).collect::<Vec<_>>();
             let cost_micros = emit_ai_billing_event(
@@ -8495,6 +8782,7 @@ pub(super) async fn relay_ai_response_with_cache(
                 &args.rollup_properties,
                 args.agent_identity(),
                 &ai_span,
+                budget_debit,
             );
             refresh_budget_utilization(args.config, args.keys);
             if cost_micros > 0 {
@@ -8565,6 +8853,7 @@ pub(super) async fn relay_ai_response_with_cache(
                     &ctx.rollup_properties,
                     agent.identity(),
                     &ai_span,
+                    sbproxy_ai::budget::TokenDebit::Measured,
                 );
                 if cost_micros > 0 {
                     ctx.ai_cost_usd_micros = Some(cost_micros);
@@ -9186,26 +9475,32 @@ fn process_guard_events(
 ) -> (
     Option<sbproxy_ai::guardrails::GuardrailBlock>,
     Vec<sbproxy_ai::format::HubChunk>,
+    Vec<(usize, sbproxy_ai::guardrails::stream::CompletedToolCall)>,
 ) {
     use sbproxy_ai::format::{ContentPartDelta, HubChunk};
     use sbproxy_ai::guardrails::stream::ToolCallVerdict;
     use sbproxy_ai::guardrails::{AgentAlignmentMode, GuardrailBlock};
 
     let mut released: Vec<HubChunk> = Vec::new();
+    let mut completed: Vec<(usize, sbproxy_ai::guardrails::stream::CompletedToolCall)> = Vec::new();
 
     fn handle_verdicts(
         verdicts: Vec<ToolCallVerdict>,
+        event_index: usize,
         held: &mut std::collections::BTreeMap<usize, Vec<HubChunk>>,
         released: &mut Vec<HubChunk>,
+        completed: &mut Vec<(usize, sbproxy_ai::guardrails::stream::CompletedToolCall)>,
     ) -> Option<GuardrailBlock> {
         for v in verdicts {
             match v {
                 ToolCallVerdict::Clean(call) => {
+                    completed.push((event_index, call.clone()));
                     if let Some(frames) = held.remove(&call.index) {
                         released.extend(frames);
                     }
                 }
                 ToolCallVerdict::Violation { call, reason, mode } => {
+                    completed.push((event_index, call.clone()));
                     sbproxy_ai::ai_metrics::record_stream_guardrail_violation("agent_alignment");
                     match mode {
                         AgentAlignmentMode::Block => {
@@ -9231,7 +9526,7 @@ fn process_guard_events(
         None
     }
 
-    for ev in events {
+    for (event_index, ev) in events.iter().enumerate() {
         match ev {
             HubChunk::ContentDelta {
                 index,
@@ -9239,7 +9534,7 @@ fn process_guard_events(
                 ..
             } => {
                 if let Some(block) = sessn.on_content_delta_at(*index, t) {
-                    return (Some(block), released);
+                    return (Some(block), released, completed);
                 }
             }
             HubChunk::ToolCallDelta { index, delta } => {
@@ -9247,14 +9542,18 @@ fn process_guard_events(
                     held.entry(*index).or_default().push(ev.clone());
                 }
                 let verdicts = sessn.on_tool_call_delta(*index, delta);
-                if let Some(b) = handle_verdicts(verdicts, held, &mut released) {
-                    return (Some(b), released);
+                if let Some(b) =
+                    handle_verdicts(verdicts, event_index, held, &mut released, &mut completed)
+                {
+                    return (Some(b), released, completed);
                 }
             }
             HubChunk::MessageStop { .. } => {
                 let verdicts = sessn.finish_tool_calls();
-                if let Some(b) = handle_verdicts(verdicts, held, &mut released) {
-                    return (Some(b), released);
+                if let Some(b) =
+                    handle_verdicts(verdicts, event_index, held, &mut released, &mut completed)
+                {
+                    return (Some(b), released, completed);
                 }
             }
             _ => {}
@@ -9263,12 +9562,41 @@ fn process_guard_events(
 
     if finish {
         let verdicts = sessn.finish_tool_calls();
-        if let Some(b) = handle_verdicts(verdicts, held, &mut released) {
-            return (Some(b), released);
+        if let Some(b) =
+            handle_verdicts(verdicts, events.len(), held, &mut released, &mut completed)
+        {
+            return (Some(b), released, completed);
         }
     }
 
-    (None, released)
+    (None, released, completed)
+}
+
+async fn dispatch_ai_hub_events(
+    extensions: &mut crate::ai_extensions::AiRequestExtensions,
+    events: &[sbproxy_ai::format::HubChunk],
+    completed: &[(usize, sbproxy_ai::guardrails::stream::CompletedToolCall)],
+) -> Result<(), crate::ai_extensions::AiExtensionBlock> {
+    let mut completed_index = 0;
+    for (event_index, event) in events.iter().enumerate() {
+        while completed
+            .get(completed_index)
+            .is_some_and(|(at, _)| *at == event_index)
+        {
+            extensions
+                .tool_calls(std::slice::from_ref(&completed[completed_index].1))
+                .await?;
+            completed_index += 1;
+        }
+        extensions
+            .stream_chunks(std::slice::from_ref(event))
+            .await?;
+    }
+    while let Some((_, call)) = completed.get(completed_index) {
+        extensions.tool_calls(std::slice::from_ref(call)).await?;
+        completed_index += 1;
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -9831,6 +10159,7 @@ pub(super) async fn relay_ai_stream(
     // a streaming guardrail block stamps the guardrail columns the
     // access log and admin request ring read at request end.
     mut ctx: Option<&mut RequestContext>,
+    mut ai_extensions: Option<crate::ai_extensions::AiRequestExtensions>,
 ) -> Result<()> {
     let status = resp.status().as_u16();
     record_ai_provider_response_failure(&ai_span, router_sink.provider_name, status, None);
@@ -9914,9 +10243,20 @@ pub(super) async fn relay_ai_stream(
                 )
             })?;
     }
-    session
-        .write_response_header(Box::new(header), false)
-        .await?;
+    let delay_stream_header = ai_extensions
+        .as_ref()
+        .is_some_and(crate::ai_extensions::AiRequestExtensions::delays_first_downstream_byte);
+    let mut pending_stream_header = Some(Box::new(header));
+    if !delay_stream_header {
+        session
+            .write_response_header(
+                pending_stream_header
+                    .take()
+                    .expect("stream response header must be present"),
+                false,
+            )
+            .await?;
+    }
 
     // Stream chunks from the upstream response to the client.
     //
@@ -9962,9 +10302,31 @@ pub(super) async fn relay_ai_stream(
     // for the rest) and judges streamed tool calls as they complete.
     // Built before the translator because an agent-alignment guard in
     // Block mode forces the decode-and-re-emit path.
-    let mut guard_session = output_guardrails.as_ref().map(|p| {
-        sbproxy_ai::guardrails::stream::StreamGuardSession::new(p.clone(), principal.as_ref())
-    });
+    let needs_ai_stream_decode = ai_extensions
+        .as_ref()
+        .is_some_and(crate::ai_extensions::AiRequestExtensions::needs_stream_decode);
+    let needs_ai_tool_assembly = ai_extensions
+        .as_ref()
+        .is_some_and(crate::ai_extensions::AiRequestExtensions::needs_tool_assembly);
+    let enforces_ai_stream_events = ai_extensions
+        .as_ref()
+        .is_some_and(crate::ai_extensions::AiRequestExtensions::enforces_stream_events);
+    let mut guard_session = output_guardrails
+        .as_ref()
+        .map(|pipeline| {
+            sbproxy_ai::guardrails::stream::StreamGuardSession::new(
+                pipeline.clone(),
+                principal.as_ref(),
+            )
+        })
+        .or_else(|| {
+            needs_ai_tool_assembly.then(|| {
+                sbproxy_ai::guardrails::stream::StreamGuardSession::new(
+                    std::sync::Arc::new(sbproxy_ai::guardrails::GuardrailPipeline::default()),
+                    principal.as_ref(),
+                )
+            })
+        });
     if let (Some(p), Some(s)) = (output_guardrails.as_ref(), guard_session.as_ref()) {
         if s.skipped_count() > 0 {
             for (g, pol) in p.output_with_policies() {
@@ -9976,7 +10338,10 @@ pub(super) async fn relay_ai_stream(
     }
     let holds_tool_frames = guard_session
         .as_ref()
-        .is_some_and(|s| s.holds_tool_frames());
+        .is_some_and(|s| s.holds_tool_frames())
+        || ai_extensions
+            .as_ref()
+            .is_some_and(crate::ai_extensions::AiRequestExtensions::holds_tool_frames);
     let response_holdback_guardrail = guard_session
         .as_ref()
         .and_then(|session| session.response_holdback_guardrail())
@@ -9994,17 +10359,18 @@ pub(super) async fn relay_ai_stream(
     // OpenAI out stays a zero-cost pass-through, except when tool-call
     // hold-back (Block-mode alignment) forces re-emission.
     let (mut native_translator, inbound_emitter) =
-        build_stream_translator(&format_args, holds_tool_frames);
+        build_stream_translator(&format_args, holds_tool_frames || enforces_ai_stream_events);
     // Decode-only extractor for the passthrough path: feeds the
     // guardrail session and nothing else; outbound bytes stay the raw
     // upstream frames.
-    let mut guard_decoder = if guard_session.is_some() && native_translator.is_none() {
-        Some(sbproxy_ai::format::NativeStreamTranslator::new(
-            sbproxy_ai::format::NativeStreamFormat::OpenAiChat,
-        ))
-    } else {
-        None
-    };
+    let mut guard_decoder =
+        if (guard_session.is_some() || needs_ai_stream_decode) && native_translator.is_none() {
+            Some(sbproxy_ai::format::NativeStreamTranslator::new(
+                sbproxy_ai::format::NativeStreamFormat::OpenAiChat,
+            ))
+        } else {
+            None
+        };
     // Raw-fallback bookkeeping: if a substantial run of bytes flows
     // and the decoder never yields a single event, the provider is not
     // emitting OpenAI-shaped SSE; degrade that stream to raw-frame
@@ -10053,6 +10419,8 @@ pub(super) async fn relay_ai_stream(
     // already-written chunk cannot be recalled, but the rest of the
     // violating output does not reach the client.
     let mut output_guard_blocked = false;
+    let mut extension_response_sent = false;
+    let mut pending_builtin_block: Option<sbproxy_ai::guardrails::GuardrailBlock> = None;
     'relay: loop {
         match stream.next().await {
             Some(Ok(chunk)) => {
@@ -10079,6 +10447,9 @@ pub(super) async fn relay_ai_stream(
                     }
                     while let Ok(v) = ch.rx.try_recv() {
                         if !v.allow {
+                            let reason = v.reason.clone().unwrap_or_else(|| {
+                                "stream safety rejected response chunk".to_owned()
+                            });
                             warn!(
                                 reason = ?v.reason,
                                 "stream safety verdict rejected a chunk; terminating stream (fail closed)"
@@ -10086,10 +10457,18 @@ pub(super) async fn relay_ai_stream(
                             sbproxy_ai::tracing_spans::record_error(
                                 &ai_span,
                                 sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
-                                v.reason
-                                    .as_deref()
-                                    .unwrap_or("stream safety rejected response chunk"),
+                                &reason,
                             );
+                            if let Some(c) = ctx.as_deref_mut() {
+                                mark_guardrail_block(c, "stream_safety".to_owned());
+                            }
+                            if pending_stream_header.is_some() {
+                                pending_builtin_block =
+                                    Some(sbproxy_ai::guardrails::GuardrailBlock {
+                                        name: "stream_safety".to_owned(),
+                                        reason,
+                                    });
+                            }
                             safety_blocked = true;
                             break 'relay;
                         }
@@ -10155,15 +10534,19 @@ pub(super) async fn relay_ai_stream(
                         if let Some(c) = ctx.as_deref_mut() {
                             mark_guardrail_block(c, block.name.clone());
                         }
+                        if pending_stream_header.is_some() {
+                            pending_builtin_block = Some(block);
+                        }
                         output_guard_blocked = true;
                         break 'relay;
                     }
                 }
 
                 let mut released_tool_chunks: Vec<sbproxy_ai::format::HubChunk> = Vec::new();
+                let mut completed_tool_calls = Vec::new();
                 if let Some(sessn) = guard_session.as_mut() {
                     let pending_block = if let Some(events) = decoded.as_deref() {
-                        let (block, released) = process_guard_events(
+                        let (block, released, completed) = process_guard_events(
                             sessn,
                             events,
                             &mut held_tool_chunks,
@@ -10171,6 +10554,7 @@ pub(super) async fn relay_ai_stream(
                             false,
                         );
                         released_tool_chunks = released;
+                        completed_tool_calls = completed;
                         block
                     } else if guard_raw_mode {
                         // Last-resort coverage: match the raw frame
@@ -10198,6 +10582,44 @@ pub(super) async fn relay_ai_stream(
                         // access log and admin request ring.
                         if let Some(c) = ctx.as_deref_mut() {
                             mark_guardrail_block(c, block.name.clone());
+                        }
+                        if pending_stream_header.is_some() {
+                            pending_builtin_block = Some(block);
+                        }
+                        output_guard_blocked = true;
+                        break 'relay;
+                    }
+                }
+                if let (Some(extensions), Some(events)) =
+                    (ai_extensions.as_mut(), decoded.as_deref())
+                {
+                    if let Err(block) =
+                        dispatch_ai_hub_events(extensions, events, &completed_tool_calls).await
+                    {
+                        warn!(
+                            extension_code = %block.code,
+                            "AI proxy: extension hook blocked a streamed event"
+                        );
+                        sbproxy_ai::tracing_spans::record_error(
+                            &ai_span,
+                            sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                            &block.message,
+                        );
+                        if send_ai_stream_extension_block_before_headers(
+                            session,
+                            &mut pending_stream_header,
+                            &mut ctx,
+                            &ai_span,
+                            &block,
+                        )
+                        .await?
+                        {
+                            extension_response_sent = true;
+                            output_guard_blocked = true;
+                            break 'relay;
+                        }
+                        if let Some(context) = ctx.as_deref_mut() {
+                            mark_guardrail_block(context, block.code);
                         }
                         output_guard_blocked = true;
                         break 'relay;
@@ -10275,6 +10697,9 @@ pub(super) async fn relay_ai_stream(
                         if let Some(trace) = trace_stream_content.as_mut() {
                             trace.feed(&ready);
                         }
+                        if let Some(header) = pending_stream_header.take() {
+                            session.write_response_header(header, false).await?;
+                        }
                         session.write_response_body(Some(ready), false).await?;
                     }
                     Ok(None) => {}
@@ -10292,6 +10717,9 @@ pub(super) async fn relay_ai_stream(
                         );
                         if let Some(c) = ctx.as_deref_mut() {
                             mark_guardrail_block(c, block.name.clone());
+                        }
+                        if pending_stream_header.is_some() {
+                            pending_builtin_block = Some(block);
                         }
                         output_guard_blocked = true;
                         break 'relay;
@@ -10341,9 +10769,10 @@ pub(super) async fn relay_ai_stream(
                 // false so the recorder emits End { complete: false }
                 // (never cache-admitted).
                 let mut close_released: Vec<sbproxy_ai::format::HubChunk> = Vec::new();
+                let mut completed_tool_calls = Vec::new();
                 let mut close_block = None;
                 if let Some(sessn) = guard_session.as_mut() {
-                    let (b, r) = process_guard_events(
+                    let (b, r, completed) = process_guard_events(
                         sessn,
                         &tail_events,
                         &mut held_tool_chunks,
@@ -10352,6 +10781,7 @@ pub(super) async fn relay_ai_stream(
                     );
                     close_block = b;
                     close_released = r;
+                    completed_tool_calls = completed;
                     if close_block.is_none() {
                         close_block = sessn.on_close();
                     }
@@ -10373,8 +10803,46 @@ pub(super) async fn relay_ai_stream(
                     if let Some(c) = ctx.as_deref_mut() {
                         mark_guardrail_block(c, block.name.clone());
                     }
+                    if pending_stream_header.is_some() {
+                        pending_builtin_block = Some(block);
+                    }
                     output_guard_blocked = true;
                     break;
+                }
+                if let Some(extensions) = ai_extensions.as_mut() {
+                    let decision =
+                        dispatch_ai_hub_events(extensions, &tail_events, &completed_tool_calls)
+                            .await
+                            .and(extensions.close().await);
+                    if let Err(block) = decision {
+                        warn!(
+                            extension_code = %block.code,
+                            "AI proxy: extension hook blocked stream close"
+                        );
+                        sbproxy_ai::tracing_spans::record_error(
+                            &ai_span,
+                            sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                            &block.message,
+                        );
+                        if send_ai_stream_extension_block_before_headers(
+                            session,
+                            &mut pending_stream_header,
+                            &mut ctx,
+                            &ai_span,
+                            &block,
+                        )
+                        .await?
+                        {
+                            extension_response_sent = true;
+                            output_guard_blocked = true;
+                            break 'relay;
+                        }
+                        if let Some(context) = ctx.as_deref_mut() {
+                            mark_guardrail_block(context, block.code);
+                        }
+                        output_guard_blocked = true;
+                        break;
+                    }
                 }
                 if let Some(emitter) = inbound_emitter
                     .as_ref()
@@ -10411,6 +10879,9 @@ pub(super) async fn relay_ai_stream(
                                     if let Some(trace) = trace_stream_content.as_mut() {
                                         trace.feed(&ready);
                                     }
+                                    if let Some(header) = pending_stream_header.take() {
+                                        session.write_response_header(header, false).await?;
+                                    }
                                     session.write_response_body(Some(ready), false).await?;
                                 }
                                 Ok(None) => {}
@@ -10430,6 +10901,9 @@ pub(super) async fn relay_ai_stream(
                                     );
                                     if let Some(c) = ctx.as_deref_mut() {
                                         mark_guardrail_block(c, block.name.clone());
+                                    }
+                                    if pending_stream_header.is_some() {
+                                        pending_builtin_block = Some(block);
                                     }
                                     output_guard_blocked = true;
                                     break 'relay;
@@ -10453,6 +10927,9 @@ pub(super) async fn relay_ai_stream(
                             if let Some(trace) = trace_stream_content.as_mut() {
                                 trace.feed(&ready);
                             }
+                            if let Some(header) = pending_stream_header.take() {
+                                session.write_response_header(header, false).await?;
+                            }
                             session.write_response_body(Some(ready), false).await?;
                         }
                         Ok(None) => {}
@@ -10470,6 +10947,9 @@ pub(super) async fn relay_ai_stream(
                             );
                             if let Some(c) = ctx.as_deref_mut() {
                                 mark_guardrail_block(c, block.name.clone());
+                            }
+                            if pending_stream_header.is_some() {
+                                pending_builtin_block = Some(block);
                             }
                             output_guard_blocked = true;
                             break 'relay;
@@ -10493,12 +10973,18 @@ pub(super) async fn relay_ai_stream(
                     if let Some(c) = ctx.as_deref_mut() {
                         mark_guardrail_block(c, block.name.clone());
                     }
+                    if pending_stream_header.is_some() {
+                        pending_builtin_block = Some(block);
+                    }
                     output_guard_blocked = true;
                     break;
                 }
                 for ready in response_body_holdback.release() {
                     if let Some(trace) = trace_stream_content.as_mut() {
                         trace.feed(&ready);
+                    }
+                    if let Some(header) = pending_stream_header.take() {
+                        session.write_response_header(header, false).await?;
                     }
                     session.write_response_body(Some(ready), false).await?;
                 }
@@ -10508,10 +10994,57 @@ pub(super) async fn relay_ai_stream(
         }
     }
 
+    if let Some(block) = pending_builtin_block.take() {
+        if send_ai_stream_guardrail_block_before_headers(
+            session,
+            &mut pending_stream_header,
+            &mut ctx,
+            &ai_span,
+            block,
+        )
+        .await?
+        {
+            extension_response_sent = true;
+        }
+    }
+
+    if let Some(extensions) = ai_extensions.as_mut() {
+        if let Err(block) = extensions.close().await {
+            warn!(
+                extension_code = %block.code,
+                "AI proxy: extension hook blocked stream close"
+            );
+            sbproxy_ai::tracing_spans::record_error(
+                &ai_span,
+                sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                &block.message,
+            );
+            if send_ai_stream_extension_block_before_headers(
+                session,
+                &mut pending_stream_header,
+                &mut ctx,
+                &ai_span,
+                &block,
+            )
+            .await?
+            {
+                extension_response_sent = true;
+            } else if let Some(context) = ctx.as_deref_mut() {
+                mark_guardrail_block(context, block.code);
+            }
+            output_guard_blocked = true;
+        }
+    }
+
     // Signal end of stream to the client. A failure here leaves
     // `upstream_complete` false, which the budget branch below reports as
     // a partial delivery.
-    session.write_response_body(None, true).await?;
+    if !extension_response_sent {
+        if let Some(header) = pending_stream_header.take() {
+            session.write_response_header(header, false).await?;
+        }
+        session.write_response_body(None, true).await?;
+    }
 
     if safety_blocked {
         // WOR-1144: the stream was cut short by an output-safety verdict.
@@ -10607,6 +11140,7 @@ pub(super) async fn relay_ai_stream(
                     &args.rollup_properties,
                     args.agent_identity(),
                     &ai_span,
+                    sbproxy_ai::budget::TokenDebit::Measured,
                 );
                 refresh_budget_utilization(args.config, args.keys);
                 // WOR-1835: governed-key settlement. `ai_admission` never
@@ -10902,6 +11436,7 @@ fn shadow_surface_is_eligible(surface: &sbproxy_ai::handler::AiSurface) -> bool 
 
 #[cfg(test)]
 mod external_guardrail_context_tests {
+    use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -10912,6 +11447,9 @@ mod external_guardrail_context_tests {
     use sbproxy_ai::external_guardrail::{
         run_input_external_guardrails, run_output_external_guardrails, ExternalGuardrailConfig,
     };
+    use sbproxy_config::ExtensionBundlesConfig;
+    use sbproxy_extension::bundle::{AiExtensionChain, DynamicBundleRegistry};
+    use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[derive(Clone)]
@@ -11482,6 +12020,34 @@ mod external_guardrail_context_tests {
         .expect("OpenAI proxy config")
     }
 
+    fn pipeline_with_ai_javascript(
+        manifest: &str,
+        javascript: &str,
+    ) -> (TempDir, crate::pipeline::CompiledPipeline) {
+        let directory = TempDir::new().expect("extension fixture directory");
+        let bundle = directory.path().join("fixture");
+        std::fs::create_dir(&bundle).expect("create extension fixture");
+        std::fs::write(bundle.join("bundle.yaml"), manifest).expect("write extension manifest");
+        std::fs::write(bundle.join("entry.js"), javascript).expect("write extension program");
+        let registry = DynamicBundleRegistry::load(
+            &ExtensionBundlesConfig {
+                bundles_dir: Some(directory.path().display().to_string()),
+                sources: Vec::new(),
+            },
+            directory.path(),
+            &BTreeSet::new(),
+        )
+        .expect("load extension fixture");
+        let pipeline = crate::pipeline::CompiledPipeline {
+            ai_extension_chain: Arc::new(
+                AiExtensionChain::from_registry(registry.as_ref())
+                    .expect("prepare AI extension chain"),
+            ),
+            ..Default::default()
+        };
+        (directory, pipeline)
+    }
+
     fn anthropic_proxy_config(upstream_url: &str) -> sbproxy_ai::AiHandlerConfig {
         sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
             "providers": [{
@@ -11562,6 +12128,19 @@ mod external_guardrail_context_tests {
             "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
         }))
         .expect("canonical response JSON")
+    }
+
+    fn openai_tool_call_stream() -> Vec<u8> {
+        concat!(
+            "data: {\"id\":\"chatcmpl-tool\",\"object\":\"chat.completion.chunk\",",
+            "\"created\":1,\"model\":\"requested-model\",\"choices\":[{\"index\":0,",
+            "\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",",
+            "\"function\":{\"name\":\"dangerous_lookup\",\"arguments\":\"{\\\"id\\\":42}\"}}]},",
+            "\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .as_bytes()
+        .to_vec()
     }
 
     fn provider_error_body() -> serde_json::Value {
@@ -11991,6 +12570,143 @@ mod external_guardrail_context_tests {
                 .is_some_and(|input| input.contains("malformed forwarded sentinel")),
             "the canonical extractor must not discard forwarded malformed entries: {payload}"
         );
+    }
+
+    #[tokio::test]
+    async fn bundled_ai_output_block_replaces_the_buffered_provider_response() {
+        let (upstream_url, upstream_hits) = upstream_bytes_fixture(
+            canonical_chat_response("provider-private-output"),
+            "application/json",
+        )
+        .await;
+        let config = openai_proxy_config(&upstream_url);
+        let (_directory, pipeline) = pipeline_with_ai_javascript(
+            "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: output-block\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nhooks:\n  - kind: ai_guardrail_output\n    type: block_output\n    export: inspect\n",
+            r#"export function inspect(input) { if (input.event.content !== "provider-private-output") throw new Error("wrong output"); return {version:"sbproxy-envelope/v1",decision:"block",status:451,code:"fixture_output",message:"output refused by fixture"}; }"#,
+        );
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("bundled output refusal is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response UTF-8");
+        assert!(response.starts_with("HTTP/1.1 451"), "{response}");
+        assert!(response.contains("fixture_output"), "{response}");
+        assert!(!response.contains("provider-private-output"), "{response}");
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn bundled_ai_tool_block_arrives_before_any_stream_bytes() {
+        let (upstream_url, upstream_hits) =
+            upstream_bytes_fixture(openai_tool_call_stream(), "text/event-stream").await;
+        let config = openai_proxy_config(&upstream_url);
+        let (_directory, pipeline) = pipeline_with_ai_javascript(
+            "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: tool-block\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nhooks:\n  - kind: ai_tool_call\n    type: block_tool\n    export: inspect\n",
+            r#"export function inspect(input) { const call=input.event.call; if (call.name !== "dangerous_lookup" || call.arguments_json !== "{\"id\":42}") throw new Error("wrong tool call"); return {version:"sbproxy-envelope/v1",decision:"block",status:409,code:"fixture_tool",message:"tool refused by fixture"}; }"#,
+        );
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("bundled tool refusal is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response UTF-8");
+        assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+        assert!(response.contains("fixture_tool"), "{response}");
+        assert!(!response.contains("text/event-stream"), "{response}");
+        assert!(!response.contains("dangerous_lookup"), "{response}");
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn built_in_stream_block_replaces_a_pending_extension_delayed_header() {
+        let upstream_stream = concat!(
+            "data: {\"id\":\"chatcmpl-block\",\"object\":\"chat.completion.chunk\",",
+            "\"created\":1,\"model\":\"requested-model\",\"choices\":[{\"index\":0,",
+            "\"delta\":{\"content\":\"provider-private-prefix blockedword\"},\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .as_bytes()
+        .to_vec();
+        let (upstream_url, upstream_hits) =
+            upstream_bytes_fixture(upstream_stream, "text/event-stream").await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key"
+            }],
+            "guardrails": {
+                "output": [{"type": "toxicity", "keywords": ["blockedword"]}]
+            }
+        }))
+        .expect("OpenAI proxy config with output guardrail");
+        let (_directory, pipeline) = pipeline_with_ai_javascript(
+            "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: header-delay\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nhooks:\n  - kind: ai_tool_call\n    type: inspect_tool\n    export: inspect\n",
+            r#"export function inspect() { return {version:"sbproxy-envelope/v1",decision:"release"}; }"#,
+        );
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("built-in streamed output refusal is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response UTF-8");
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert!(response.contains("guardrail_violation"), "{response}");
+        assert!(response.contains("toxicity"), "{response}");
+        assert!(!response.contains("text/event-stream"), "{response}");
+        assert!(!response.contains("provider-private-prefix"), "{response}");
+        assert!(!response.contains("data:"), "{response}");
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -13893,7 +14609,19 @@ mod compression_selection_tests {
             .compression_runtimes
             .get_set(0)
             .expect("compiled compression runtime set");
-        let selected = runtime_set.select_default();
+        // Resolve the way a request with no selector does, rather than
+        // reaching for the default directly: the intent this produces is
+        // what dispatch binds, so a change to either half shows up here.
+        let intent = resolve_compression_selection_intent(None, None, None)
+            .expect("no selector is always a valid route default");
+        assert_eq!(intent.source, CompressionSelectionSource::RouteDefault);
+        let bound = bind_compression_selection(intent, Some(runtime_set.as_ref()))
+            .expect("the route default binds");
+        assert!(
+            !bound.invalid_operator_selector,
+            "the route default is never an invalid operator selection"
+        );
+        let selected = bound.selected.expect("route-default pipeline");
         let runtime = selected.runtime().expect("route-default runtime");
         let has_captured_session = false;
 
@@ -13904,6 +14632,76 @@ mod compression_selection_tests {
 
         assert!(!semantic_cache_read_enabled);
         assert!(!semantic_cache_write_enabled);
+    }
+
+    /// WOR-2225: the route default has one resolver.
+    ///
+    /// A request that names no selector resolves the default through
+    /// `resolve_compression_selection_intent` and `bind_compression_selection`;
+    /// `CompressionRuntimeSet::select_default` is the name for the same
+    /// answer. They used to be independent readings of "the default" and
+    /// nothing checked that they agreed, so a change to either could have
+    /// left the request path on one pipeline while every test asserted
+    /// against the other. Comparing the pinned runtime by pointer and the
+    /// behaviour fingerprint by value fails if they ever diverge.
+    ///
+    /// The `off` half is the control: it proves the comparison has teeth
+    /// by showing a different selector does resolve somewhere else.
+    #[test]
+    fn the_route_default_dispatch_binds_is_the_set_default() {
+        let config = serde_json::json!({
+            "origins": {
+                "ai.example.com": {
+                    "action": {
+                        "type": "ai_proxy",
+                        "providers": [{"name": "openai", "api_key": "test-key"}],
+                        "compression": {
+                            "levers": [{
+                                "type": "rag_select",
+                                "min_tokens": 512,
+                                "max_chunks": 8
+                            }]
+                        }
+                    }
+                }
+            }
+        });
+        let compiled =
+            sbproxy_config::compile_config(&config.to_string()).expect("route default compiles");
+        let pipeline = crate::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+            .expect("runtime compiles without Redis");
+        let runtime_set = pipeline
+            .compression_runtimes
+            .get_set(0)
+            .expect("compiled compression runtime set");
+
+        let intent = resolve_compression_selection_intent(None, None, None)
+            .expect("no selector is always a valid route default");
+        let bound = bind_compression_selection(intent, Some(runtime_set.as_ref()))
+            .expect("the route default binds");
+        let dispatched = bound.selected.expect("route-default pipeline");
+        let named = runtime_set.select_default();
+
+        assert!(
+            std::sync::Arc::ptr_eq(
+                dispatched.runtime().expect("dispatched runtime"),
+                named.runtime().expect("named runtime"),
+            ),
+            "dispatch must bind the same compiled default pipeline select_default names"
+        );
+        assert_eq!(
+            dispatched.behavior_fingerprint(),
+            named.behavior_fingerprint()
+        );
+
+        let off = runtime_set
+            .select(&CompressionSelector::Off)
+            .expect("off is always compiled");
+        assert!(
+            off.runtime().is_none(),
+            "off must not resolve to the default pipeline"
+        );
+        assert_ne!(off.behavior_fingerprint(), named.behavior_fingerprint());
     }
 
     #[test]
@@ -14903,6 +15701,54 @@ mod dynamic_key_resolution_tests {
     }
 
     #[test]
+    fn a_caller_owned_native_key_is_not_a_governed_credential() {
+        // The record a native policy synthesizes carries an effective policy,
+        // so the `policy().is_none()` test alone admitted it and any caller
+        // presenting their own `sk-...` satisfied `require_governed_key`. The
+        // origin discriminator is what refuses it.
+        let policy = sbproxy_config::NativeKeyPolicyConfig {
+            allowed_providers: vec!["openai".to_owned()],
+            ..Default::default()
+        };
+        let record =
+            crate::inbound_key::native_policy_record(&policy, "tenant-a", "api.example", "openai");
+        let native = ResolvedRequestKey::from_native_record(&record, "tenant-a")
+            .expect("native record lowers");
+
+        assert!(
+            native.policy().is_some(),
+            "the native record must still carry a policy, or this test proves nothing"
+        );
+        assert!(native.is_native());
+        assert_eq!(
+            governed_key_requirement(true, Some(&native)),
+            Err((401, "governed credential required")),
+            "a caller-owned native key must not satisfy require_governed_key"
+        );
+        // Without the requirement it still passes, because the native key is
+        // a legitimate credential; it is only not a *governed* one.
+        assert!(governed_key_requirement(false, Some(&native)).is_ok());
+    }
+
+    #[test]
+    fn a_native_policy_revision_is_labelled_by_source_not_given_a_revision() {
+        let policy = sbproxy_config::NativeKeyPolicyConfig {
+            allowed_providers: vec!["openai".to_owned()],
+            ..Default::default()
+        };
+        let record =
+            crate::inbound_key::native_policy_record(&policy, "tenant-a", "api.example", "openai");
+        let native = ResolvedRequestKey::from_native_record(&record, "tenant-a")
+            .expect("native record lowers");
+        let version = peer_policy_revision(Some(&native), "cfgrev").expect("native version");
+
+        assert!(
+            version.starts_with("native:cfgrev:"),
+            "a synthesized policy must not claim a published revision: {version}"
+        );
+    }
+
+    #[test]
     fn disabled_configured_key_never_resolves_and_required_mode_denies_it() {
         let disabled: sbproxy_ai::identity::VirtualKeyConfig =
             serde_json::from_value(serde_json::json!({
@@ -15045,6 +15891,7 @@ mod dynamic_key_resolution_tests {
         match o {
             DynamicKeyOutcome::Resolved(_) => "resolved",
             DynamicKeyOutcome::NotApplicable => "not-applicable",
+            DynamicKeyOutcome::AdmittedByFailurePosture => "admitted-by-failure-posture",
             DynamicKeyOutcome::Deny(_, _) => "deny",
         }
     }

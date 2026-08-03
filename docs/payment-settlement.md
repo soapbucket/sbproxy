@@ -86,6 +86,26 @@ A `NeedsReconciliation` intent is never retried by the request path. A
 second attempt is how a payer gets charged twice, so the client waits for
 the recovery worker instead.
 
+That rule outranks the challenge's expiry, and it has to. Nothing expires
+an intent in this state: the challenge sweep only touches `Pending`, and
+it skips any intent whose provider write is still outstanding. So a
+`NeedsReconciliation` intent whose challenge has aged out means the
+provider has been unreachable for a while and nothing more. It keeps
+answering 503 with `Retry-After`, because the payer whose funds may
+already have moved is owed a resolution rather than a fresh bill.
+
+The same reasoning applies one step earlier. While an intent for a route
+sits in `NeedsReconciliation`, no new challenge is issued for that route:
+the request gets 503 with `Retry-After` instead of a 402. Nothing durable
+records who is paying, so this holds for every payer of that route, not
+only the one whose payment is stuck. It is a deliberate trade. On a rail
+with an authoritative status query the wait is one worker sweep. On a
+rail without one, x402 v2 today, it lasts until an operator resolves the
+intent with the facilitator, and the route earns nothing in the meantime.
+Alert on it: the refusal is counted as
+`sbproxy_payment_settlement_total{operation="challenge",
+outcome="unresolved_payment"}` and logged at warn with the intent id.
+
 An ordinary client reaches that state by being early. A crawler that
 retries before its invoice is paid is answered 503, and that same 503
 leaves its intent in `NeedsReconciliation`, because the rail verified the
@@ -130,11 +150,15 @@ explained in the reference below.
    Stripe has no `Accept-Payment` token and is selected only when the
    client expresses no preference, because that mode is an operator
    opt-in rather than a negotiated one.
-3. The matched price compiles into one normalized requirement, and a
+3. If an intent for this route is already in `NeedsReconciliation`, the
+   gate stops here and answers 503 with `Retry-After`. That payment may
+   have moved a payer's money, and a fresh invoice for the same content
+   would be a second bill for it.
+4. The matched price compiles into one normalized requirement, and a
    durable `Pending` intent is committed before the 402 leaves the
    proxy. A crash after this point leaves a record, never a dangling
    provider object.
-4. The 402 is rendered in the rail's own wire shape. Whatever the rail,
+5. The 402 is rendered in the rail's own wire shape. Whatever the rail,
    the signed quote token rides the policy's configured challenge
    header (`crawler-payment` by default), and the retry re-presents it
    there verbatim.
@@ -316,13 +340,13 @@ holds none of the credentials.
 proxy:
   payments:
     state_path: /var/lib/sbproxy/payments.sqlite3
-    challenge_binding_key: secret://env/SBPROXY_PAYMENT_BINDING_KEY
+    challenge_binding_key: env:SBPROXY_PAYMENT_BINDING_KEY
     authorization_timeout_ms: 2000
     max_body_bytes: 1048576
     failure_mode: closed
     recovery_encryption:
       key_id: payments-2026-07
-      key: secret://env/SBPROXY_PAYMENT_RECOVERY_KEY
+      key: env:SBPROXY_PAYMENT_RECOVERY_KEY
       max_age_hours: 23
     worker:
       reconcile_interval_ms: 1000
@@ -355,7 +379,7 @@ proxy:
           open_ms: 5000
           half_open_max: 1
       stripe:
-        api_key: secret://env/STRIPE_SECRET_KEY
+        api_key: env:STRIPE_SECRET_KEY
         api_version: 2026-06-24.dahlia
         account_context: platform
         business_network_id: profile_test_example
@@ -367,7 +391,7 @@ proxy:
           capture_method: manual
       lightning_cln:
         socket_path: /run/lightning/lightning-rpc
-        rune: secret://env/CLN_RUNE
+        rune: env:CLN_RUNE
         minimum_version: "26.06"
         quote_currency: BTC
         settlement_decimals: 11
@@ -375,7 +399,7 @@ proxy:
       lightning_lnd:
         endpoint: https://lnd.internal:10009
         tls_certificate_path: /run/secrets/lnd/tls.cert
-        macaroon: secret://env/LND_MACAROON_HEX
+        macaroon: env:LND_MACAROON_HEX
         quote_currency: BTC
         settlement_decimals: 11
         invoice_expiry_seconds: 300
@@ -396,7 +420,7 @@ error rather than a silently ignored setting.
 | Field | Default | What it does, and what changes if you move it |
 |---|---|---|
 | `state_path` | required | Absolute path to the SQLite file that owns intents, attempts, proofs, and receipts. It is the authority: a request is allowed because a row here says so. A relative path is rejected. |
-| `challenge_binding_key` | required | Names the key that binds a challenge to the proxy that issued it. Must be a reference such as `secret://env/NAME`, `env:NAME`, or `file:/path`; an inline key is rejected. Rotating it invalidates every outstanding challenge. |
+| `challenge_binding_key` | required | Names the key that binds a challenge to the proxy that issued it. Must be a reference such as `env:NAME`, `file:/path`, or `secret://<backend>/<name>` with that backend declared under `proxy.secrets.backends`; an inline key is rejected. Rotating it invalidates every outstanding challenge. |
 | `authorization_timeout_ms` | `2000` | Total budget for the one synchronous provider interaction a paid request gets. Accepted range is 1 through 2000. Lowering it makes the proxy give up sooner, which moves more outcomes into `RetryWait` or `NeedsReconciliation` rather than letting a payer wait. 2000 is also the hard ceiling, because a longer wait turns a paid request into an availability problem for the origin behind it. |
 | `max_body_bytes` | `1048576` | Largest request body the payment path buffers. A paid request with a body is read once in full so its digest can be bound to the challenge, so this caps what one request pins in memory. A larger body is answered 413 before any challenge or provider work. Range is 1 through 1048576. |
 | `failure_mode` | `closed` | What happens to a payable request when settlement infrastructure cannot answer. Infrastructure failures only; a payment refusal always fails closed whatever this says. See the posture table in the request-path section above. |
@@ -517,7 +541,7 @@ boot.
 
 | Field | Default | What it does |
 |---|---|---|
-| `event_name` | required | The meter event name registered in the Stripe dashboard. Every row this reporter queues carries it, and Stripe rejects one it does not recognise. |
+| `event_name` | required | The meter event name registered in the Stripe dashboard. Every row this reporter queues carries it, and Stripe rejects one it does not recognize. |
 | `customer_field` | required | Which entry in the authenticated credential's `metadata` map holds the Stripe customer id. Read from the credential and never from a request header: a caller who could name the account their usage bills to could name somebody else's. A request whose principal carries no such entry queues nothing, because a meter event with nobody to bill is one Stripe refuses anyway. |
 | `source` | required | Which request-path record is authoritative for this meter event: `http`, `ai`, or `mcp`. There is no default, on purpose. See "Which source is authoritative" below. |
 | `unit` | required | The quantity this meter event bills. For `ai`, one of `prompt_tokens`, `completion_tokens`, `total_tokens`. For `mcp`, `tool_call`. For `http`, one of your own `proxy.attestation` unit names, and only billable units carrying that name are reported. One unit rather than a list, because a Stripe meter event carries one number and two units summed is a figure nobody can take apart. |
@@ -660,7 +684,7 @@ attribution and the customer the charge lands on:
 
 <!-- CAPTURE: sqlite3 /tmp/sbproxy-usage-bridge/payments.sqlite3 'select event_jcs from usage_reports order by created_at_ms limit 1' -->
 
-Two counters describe the bridge, both labelled by tenant because a billing
+Two counters describe the bridge, both labeled by tenant because a billing
 number that merged every tenant into one series answers a question nobody
 asks:
 
@@ -707,15 +731,30 @@ Every credential field names a secret. An inline value is rejected at
 load with the offending field path.
 
 ```yaml
-challenge_binding_key: secret://env/SBPROXY_PAYMENT_BINDING_KEY
+challenge_binding_key: env:SBPROXY_PAYMENT_BINDING_KEY
 api_key: env:STRIPE_SECRET_KEY
 macaroon: file:/run/secrets/lnd/macaroon.hex
 ```
 
+`env:NAME` and `file:/path` need no other configuration: the proxy
+resolves both itself at startup. A provider URI such as
+`secret://<backend>/<name>` resolves through a backend declared under
+`proxy.secrets.backends`, and a config that writes one without declaring
+that backend does not boot. Validation does not catch it, because
+validation resolves no secrets; the failure is a startup failure naming
+the field.
+
 Do not write `${STRIPE_SECRET_KEY}` in a payments field. Environment
 interpolation runs before parsing, so the field would arrive holding the
-literal credential and be rejected as inline. See
-[secrets.md](secrets.md) for the backends behind each scheme.
+literal credential and be rejected as inline.
+
+`secret://env/NAME` is not the environment form either. In a
+`secret://<backend>/<name>` reference the authority is the name of a
+backend declared under `proxy.secrets.backends`, so that spelling asks
+for a backend literally called `env`. The config is rejected at load with
+the field path. Use `env:NAME` or `file:/path`, neither of which needs a
+`proxy.secrets` block at all. See [secrets.md](secrets.md) for the
+backends behind each scheme.
 
 ## Startup and health
 
@@ -793,13 +832,19 @@ path, and it does not retry the settle on its own.
 
 Resolving reconciliation never rescues the request that failed. That
 response has already been sent. A later retry from the client observes
-`Succeeded` and is allowed through.
+`Succeeded` and is allowed through, and the route it was blocking becomes
+challengeable again in the same moment.
 
 ## Metrics and logs
 
 Payment metrics carry four labels and no more: `rail`, `operation`,
-`outcome`, and `provider_class`. The allowed outcomes are `succeeded`,
-`terminal`, `retry_wait`, and `needs_reconciliation`.
+`outcome`, and `provider_class`. The recovery sweep's outcomes are
+`succeeded`, `terminal`, `retry_wait`, and `needs_reconciliation`. The
+request-path gate reports `operation="challenge"` with `prepared`,
+`no_acceptable_rail`, or `unresolved_payment`, and `operation="redeem"`
+with `succeeded`, `unavailable`, or one of the closed payment problem
+codes. Every one of those is a fixed word; none of them is derived from a
+provider response.
 
 No quote id, challenge id, tenant id, address, provider reference,
 PaymentIntent id, invoice, single-use token, credential, client secret,

@@ -23,6 +23,21 @@ path = "junit.xml"
 # when a developer runs the full workspace through nextest.
 max-threads = 1
 
+# The override has to be repeated per profile. nextest resolves scalar settings
+# like `retries` by falling back to `default`, but `overrides` is a per-profile
+# array and does not merge, so a profile that omits this runs the e2e package at
+# full parallelism no matter what `default` says.
+#
+# That is not hypothetical. `scripts/check.sh` runs the test lane with
+# `--profile ci`, and the required PR lane excludes `sbproxy-e2e`, so the only
+# way to reach e2e through the gate is `SBPROXY_CHECK_E2E=1`, which nobody had
+# paired with `--profile ci` until WOR-2203. The first run that did launched
+# roughly 790 proxy processes concurrently against a config comment promising
+# they were serialized.
 [[profile.default.overrides]]
+filter = 'package(sbproxy-e2e)'
+test-group = 'sbproxy-e2e'
+
+[[profile.ci.overrides]]
 filter = 'package(sbproxy-e2e)'
 test-group = 'sbproxy-e2e'

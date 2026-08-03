@@ -1280,8 +1280,14 @@ fn handle_reload(state: &AdminState) -> (u16, &'static str, String) {
         Ok(outcome) => outcome,
         Err(error) => {
             sbproxy_observe::metrics::record_config_reload("failure");
-            tracing::error!(error = %error, "admin reload: shared reload transaction failed");
-            let msg = sanitise_path_in_error(&error.to_string(), &path);
+            // `{error:#}`, not `{error}`. The alternate form walks the whole
+            // anyhow chain; the plain one renders only the outermost context,
+            // which is where a reload failure loses its own cause. An
+            // embedded keystore that could not be re-opened reported "open
+            // embedded keystore at '<path>'" and dropped the reason, so the
+            // operator saw a path they could read and nothing to act on.
+            tracing::error!(error = ?error, "admin reload: shared reload transaction failed");
+            let msg = sanitise_path_in_error(&format!("{error:#}"), &path);
             return (
                 500,
                 "application/json",
@@ -1724,7 +1730,13 @@ fn handle_config_write(
     // Construct for validation only: this pipeline is dropped immediately,
     // and the runtime constructor would spawn health-check probes that
     // outlive it and keep hitting the operator's upstreams.
-    if let Err(e) = crate::pipeline::CompiledPipeline::from_config_for_validation(compiled) {
+    let config_dir = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    if let Err(e) =
+        crate::pipeline::CompiledPipeline::from_config_for_validation_at(compiled, config_dir)
+    {
         return (
             400,
             "application/json",
@@ -2733,6 +2745,26 @@ pub fn handle_admin_request(
                 500,
                 "application/json",
                 format!(r#"{{"error":"serialization failed: {e}"}}"#),
+            ),
+        };
+    }
+    if path_only == "/api/extensions" {
+        if !method.eq_ignore_ascii_case("GET") {
+            return (
+                405,
+                "application/json",
+                r#"{"error":"method not allowed"}"#.to_string(),
+            );
+        }
+        let pipeline = crate::reload::current_pipeline();
+        let inventory =
+            crate::extension_refresh::inventory_with_health(&pipeline.extension_inventory);
+        return match serde_json::to_string(&inventory) {
+            Ok(body) => (200, "application/json", body),
+            Err(error) => (
+                500,
+                "application/json",
+                format!(r#"{{"error":"serialization failed: {error}"}}"#),
             ),
         };
     }
@@ -5494,6 +5526,74 @@ mod tests {
         response
     }
 
+    #[test]
+    fn admin_extensions_endpoint_requires_auth_and_only_answers_get() {
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+
+        let (status, _, _) = handle_admin_request("GET", "/api/extensions", &state, None, None);
+        assert_eq!(status, 401);
+
+        let (status, _, _) =
+            handle_admin_request("POST", "/api/extensions", &state, Some(&auth), None);
+        assert_eq!(status, 405);
+    }
+
+    #[test]
+    fn admin_extensions_endpoint_returns_the_versioned_running_snapshot() {
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+
+        let (status, content_type, body) =
+            handle_admin_request("GET", "/api/extensions", &state, Some(&auth), None);
+
+        assert_eq!(status, 200);
+        assert_eq!(content_type, "application/json");
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&body).expect("extension inventory must be JSON");
+        let current = crate::reload::current_pipeline();
+        let authoritative = serde_json::to_value(&current.extension_inventory)
+            .expect("pipeline inventory must serialize");
+        assert_eq!(snapshot, authoritative);
+        assert_eq!(
+            snapshot["schema_version"],
+            sbproxy_plugin::EXTENSION_INVENTORY_SCHEMA_VERSION
+        );
+        assert_eq!(snapshot["scope"]["mode"], "running");
+        assert!(snapshot["bundles"].is_array());
+        assert!(snapshot["hooks"].is_array());
+        assert!(snapshot["collisions"].is_array());
+    }
+
+    #[tokio::test]
+    async fn admin_extensions_endpoint_allows_a_read_only_operator() {
+        let state = AdminState::new(AdminConfig {
+            username: "admin".to_string(),
+            password: "secret".to_string(),
+            operators: vec![AdminOperator {
+                username: "reader".to_string(),
+                password_hash: sbproxy_keystore::crypto::hash_secret(
+                    "reader-secret",
+                    &crate::key_plane::default_admin_operator_pepper(),
+                ),
+                role: AdminRole::ReadOnly,
+                tenant: None,
+            }],
+            ..AdminConfig::default()
+        });
+        let (token, _) = state
+            .session_signer
+            .mint("reader", AdminRole::ReadOnly, 3600, unix_now());
+
+        let response = send_admin_request(
+            state,
+            format!("GET /api/extensions HTTP/1.1\r\nCookie: sb_admin_session={token}\r\n\r\n"),
+        )
+        .await;
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    }
+
     #[tokio::test]
     async fn alerts_test_route_keeps_read_only_and_browser_csrf_gates() {
         let read_only_state = AdminState::new(AdminConfig {
@@ -7253,6 +7353,7 @@ origins:
                 auth_config: None,
                 policy_configs: vec![policy_cfg],
                 transform_configs: Vec::new(),
+                filters: Vec::new(),
                 cors: None,
                 hsts: None,
                 compression: None,
@@ -7301,6 +7402,7 @@ origins:
         host_map.insert(CompactString::new("alpha.example"), 0);
         host_map.insert(CompactString::new("beta.example"), 1);
         let cfg = sbproxy_config::CompiledConfig {
+            extension_bundles: Default::default(),
             origins: vec![
                 make_origin("alpha.example", "kid-alpha"),
                 make_origin("beta.example", "kid-beta"),
