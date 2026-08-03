@@ -1,0 +1,20 @@
+apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: queued-envelope-wasm
+version: 1.0.0
+runtime: wasm
+abi: sbproxy-envelope/v1
+entry: action.wasm
+sha256: 89c6591953b9606219aa2ea7d9fa177dc744d819f43e58b5cd4647c5588a38e9
+hooks:
+  - kind: action
+    type: queued_envelope
+failure_posture: closed
+sandbox:
+  budget_ms: 50
+  memory_mb: 16
+  stack_kb: 512
+  max_buffer_bytes: 1048576
+  max_output_bytes: 1048576
+  max_fuel: 100000000
+permissions: []

@@ -1,0 +1,22 @@
+apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: payment-events
+version: 1.0.0
+runtime: javascript
+entry: events.js
+sha256: b4b0a71ddb30076f1113898bc0fe8d34e329c10c1d0577eeeddae04aaf18ec90
+hooks:
+  - kind: payment
+    type: example_payment_events
+    export: inspectPayment
+    execution:
+      body_mode: none
+failure_posture: closed
+sandbox:
+  budget_ms: 50
+  memory_mb: 16
+  stack_kb: 512
+  max_buffer_bytes: 1048576
+  max_output_bytes: 1048576
+  max_fuel: 100000000
+permissions: []

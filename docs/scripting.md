@@ -1082,9 +1082,8 @@ Attach HTTP filters to an origin in request order:
 origins:
   "filtered.extension.local":
     action:
-      type: static
-      status: 200
-      body: "passed the filter\n"
+      type: proxy
+      url: https://api.example.com
     filters:
       - type: example_http_filter
         config:
@@ -1093,6 +1092,8 @@ origins:
 ```
 
 `filters` is an ordered list of `type`, `config`, and an optional `failure_posture` override. Body access comes from each manifest hook, not from the attachment. The chain buffers only when at least one attached filter declares `buffered`, using the smallest configured input limit among filters that consume a body. `none` plus `streamed` still streams, while a `none`-only chain passes bodies through untouched.
+
+An origin with filters must use a proxy action. If it has forward rules, every action those rules can select must also be a proxy action. A filtered origin cannot configure `fallback_origin`. Candidate validation rejects any other combination before publication.
 
 The host implements a bounded HTTP subset of Proxy-Wasm. Unsupported imports fail candidate load. A callback that returns `Pause` without resolving it is treated as a filter failure, so a guest cannot leave a request stalled. The attachment or bundle failure posture decides whether traffic is admitted or refused after that failure.
 
