@@ -563,7 +563,7 @@ impl GuardrailPipeline {
 /// in choice-index order, OpenAI Responses contributes its assistant
 /// message output items, and Anthropic Messages contributes its text
 /// content blocks.
-fn assistant_response_text(content: &str) -> Option<String> {
+pub fn assistant_response_text(content: &str) -> Option<String> {
     fn append_content(value: &serde_json::Value, out: &mut String) -> bool {
         match value {
             serde_json::Value::String(text) => {

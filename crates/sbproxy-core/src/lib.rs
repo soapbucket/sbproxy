@@ -52,6 +52,8 @@ pub mod admin_ui;
 /// and the per-request context. Feature-gated by `agent-class`.
 #[cfg(feature = "agent-class")]
 pub mod agent_class;
+/// Generation-pinned dispatch for provider-neutral AI extension events.
+pub mod ai_extensions;
 /// Boot wiring for the alert evaluation loop (dispatcher + engine + drain).
 pub mod alerting;
 /// Lowering `proxy.attestation` into the metering vocabulary the

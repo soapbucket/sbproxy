@@ -1195,6 +1195,8 @@ pub struct CompiledPipeline {
     /// Dynamic hooks loaded and compiled with this pipeline generation.
     #[allow(dead_code)]
     pub(crate) extension_registry: Arc<DynamicBundleRegistry>,
+    /// Awaited AI hook chain prepared with this exact generation.
+    pub(crate) ai_extension_chain: Arc<sbproxy_extension::bundle::AiExtensionChain>,
     /// Running-state inventory derived from this generation's attachments.
     #[allow(dead_code)]
     pub(crate) extension_inventory: ExtensionInventorySnapshot,
@@ -1558,10 +1560,15 @@ impl Default for CompiledPipeline {
         let router = HostRouter::new(&config);
         let sensitive_header_names = compile_sensitive_header_names(&config);
         let extension_registry = empty_extension_registry();
+        let ai_extension_chain = Arc::new(
+            sbproxy_extension::bundle::AiExtensionChain::from_registry(extension_registry.as_ref())
+                .expect("linked AI extension registrations must be valid"),
+        );
         let extension_inventory = running_extension_inventory(&extension_registry, &config, "");
         Self {
             config,
             extension_registry,
+            ai_extension_chain,
             extension_inventory,
             key_plane: None,
             sensitive_header_names,
@@ -1639,9 +1646,14 @@ fn parse_outbound_credential_config(
 
 impl CompiledPipeline {
     /// Dynamic bundle registry pinned to this pipeline generation.
-    #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn extension_registry(&self) -> &Arc<DynamicBundleRegistry> {
         &self.extension_registry
+    }
+
+    /// Awaited AI hook chain pinned to this pipeline generation.
+    pub(crate) fn ai_extension_chain(&self) -> &Arc<sbproxy_extension::bundle::AiExtensionChain> {
+        &self.ai_extension_chain
     }
 
     /// Authoritative extension inventory for this pipeline generation.
@@ -2281,12 +2293,17 @@ impl CompiledPipeline {
         // access-log path evaluates rather than parsing per record and
         // malformed source rejects the candidate config.
         let custom_log_programs = crate::server::custom_log::compile_cel_programs(&config)?;
+        let ai_extension_chain =
+            Arc::new(sbproxy_extension::bundle::AiExtensionChain::from_registry(
+                extension_registry.as_ref(),
+            )?);
         let extension_inventory =
             running_extension_inventory(extension_registry.as_ref(), &config, &config_revision);
 
         let pipeline = Self {
             config,
             extension_registry,
+            ai_extension_chain,
             extension_inventory,
             key_plane,
             sensitive_header_names,

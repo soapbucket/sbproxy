@@ -8,6 +8,8 @@ use sbproxy_plugin::{
 };
 use tokio::sync::mpsc;
 
+use sbproxy_extension::bundle::PaymentExtensionChain;
+
 use sbproxy_billing::{
     PaymentLifecycleDecision, PaymentLifecycleEvent, PaymentLifecycleObserver,
     PaymentLifecycleOutcome, PaymentLifecyclePhase,
@@ -18,15 +20,61 @@ const DEFAULT_TERMINAL_EVENT_CAPACITY: usize = 1_024;
 
 /// Non-blocking sender for terminal payment extension events.
 #[derive(Debug, Clone)]
-pub(crate) struct TerminalEventQueue {
-    sender: mpsc::Sender<PaymentExtensionEvent>,
+struct TerminalEventQueue {
+    sender: mpsc::Sender<QueuedPaymentEvent>,
+}
+
+#[derive(Debug)]
+struct QueuedPaymentEvent {
+    event: PaymentExtensionEvent,
+    terminal: bool,
 }
 
 /// Runtime-specific dispatch for one payment extension event.
 #[async_trait::async_trait]
 pub trait PaymentEventDispatcher: Send + Sync {
-    /// Dispatch one event through the generation's deterministic hook chain.
-    async fn dispatch(&self, event: &PaymentExtensionEvent) -> PaymentExtensionDecision;
+    /// Await enforcing hooks before a payment operation starts.
+    async fn enforce_started(&self, event: &PaymentExtensionEvent) -> PaymentExtensionDecision;
+
+    /// Observe a started event without affecting the payment operation.
+    async fn observe_started(&self, event: &PaymentExtensionEvent);
+
+    /// Observe a terminal event after the authoritative outcome is known.
+    async fn observe_terminal(&self, event: &PaymentExtensionEvent);
+}
+
+/// Concrete generation-pinned dispatcher for dynamic payment bundles.
+pub struct BundlePaymentEventDispatcher {
+    chain: PaymentExtensionChain,
+}
+
+impl BundlePaymentEventDispatcher {
+    /// Wrap one immutable extension chain for the billing observer.
+    #[must_use]
+    pub const fn new(chain: PaymentExtensionChain) -> Self {
+        Self { chain }
+    }
+}
+
+#[async_trait::async_trait]
+impl PaymentEventDispatcher for BundlePaymentEventDispatcher {
+    async fn enforce_started(&self, event: &PaymentExtensionEvent) -> PaymentExtensionDecision {
+        match self.chain.enforce_started(event).await {
+            Ok(decision) => decision,
+            Err(error) => {
+                tracing::warn!(error = %error, "closed payment extension hook failed");
+                PaymentExtensionDecision::Reject
+            }
+        }
+    }
+
+    async fn observe_started(&self, event: &PaymentExtensionEvent) {
+        self.chain.observe_started(event).await;
+    }
+
+    async fn observe_terminal(&self, event: &PaymentExtensionEvent) {
+        self.chain.observe_terminal(event).await;
+    }
 }
 
 /// Billing observer that enforces `started` events and queues terminal events.
@@ -58,7 +106,8 @@ impl PaymentLifecycleObserver for PaymentExtensionObserver {
         let Some(event) = extension_event(event) else {
             return PaymentLifecycleDecision::Continue;
         };
-        match self.dispatcher.dispatch(&event).await {
+        self.terminal.publish_started(event.clone());
+        match self.dispatcher.enforce_started(&event).await {
             PaymentExtensionDecision::Continue => PaymentLifecycleDecision::Continue,
             PaymentExtensionDecision::Reject => PaymentLifecycleDecision::Reject,
         }
@@ -66,14 +115,29 @@ impl PaymentLifecycleObserver for PaymentExtensionObserver {
 
     fn terminal(&self, event: PaymentLifecycleEvent) {
         if let Some(event) = extension_event(&event) {
-            self.terminal.publish(event);
+            self.terminal.publish_terminal(event);
         }
     }
 }
 
 impl TerminalEventQueue {
-    /// Enqueue an event when capacity is available, dropping it otherwise.
-    pub(crate) fn publish(&self, event: PaymentExtensionEvent) {
+    /// Enqueue a started observation when capacity is available.
+    fn publish_started(&self, event: PaymentExtensionEvent) {
+        self.publish(QueuedPaymentEvent {
+            event,
+            terminal: false,
+        });
+    }
+
+    /// Enqueue a terminal observation when capacity is available.
+    fn publish_terminal(&self, event: PaymentExtensionEvent) {
+        self.publish(QueuedPaymentEvent {
+            event,
+            terminal: true,
+        });
+    }
+
+    fn publish(&self, event: QueuedPaymentEvent) {
         if let Err(error) = self.sender.try_send(event) {
             let reason = match error {
                 mpsc::error::TrySendError::Full(_) => "channel_full",
@@ -85,19 +149,23 @@ impl TerminalEventQueue {
 }
 
 /// Construct the generation-scoped terminal event queue.
-pub(crate) fn terminal_event_channel(
+fn terminal_event_channel(
     capacity: usize,
-) -> (TerminalEventQueue, mpsc::Receiver<PaymentExtensionEvent>) {
+) -> (TerminalEventQueue, mpsc::Receiver<QueuedPaymentEvent>) {
     let (sender, receiver) = mpsc::channel(capacity);
     (TerminalEventQueue { sender }, receiver)
 }
 
 async fn drain_terminal_events(
     dispatcher: Arc<dyn PaymentEventDispatcher>,
-    mut receiver: mpsc::Receiver<PaymentExtensionEvent>,
+    mut receiver: mpsc::Receiver<QueuedPaymentEvent>,
 ) {
-    while let Some(event) = receiver.recv().await {
-        let _ignored = dispatcher.dispatch(&event).await;
+    while let Some(queued) = receiver.recv().await {
+        if queued.terminal {
+            dispatcher.observe_terminal(&queued.event).await;
+        } else {
+            dispatcher.observe_started(&queued.event).await;
+        }
     }
 }
 
@@ -172,13 +240,13 @@ mod tests {
         let first = event("req_first");
         let dropped = event("req_dropped");
 
-        queue.publish(first.clone());
-        queue.publish(dropped);
+        queue.publish_terminal(first.clone());
+        queue.publish_terminal(dropped);
 
-        assert_eq!(receiver.recv().await, Some(first));
+        assert_eq!(receiver.recv().await.unwrap().event, first);
         assert!(receiver.try_recv().is_err());
 
         drop(receiver);
-        queue.publish(event("req_closed"));
+        queue.publish_terminal(event("req_closed"));
     }
 }

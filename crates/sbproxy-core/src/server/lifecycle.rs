@@ -943,8 +943,18 @@ fn attach_payments_runtime(pipeline: &mut CompiledPipeline) -> anyhow::Result<()
         return Ok(());
     };
     let clustered = pipeline.config.server.cluster.is_some();
-    let runtime = crate::billing_runtime::install(&payments, clustered)
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let extension_chain = sbproxy_extension::bundle::PaymentExtensionChain::from_registry(
+        pipeline.extension_registry().as_ref(),
+    )?;
+    let runtime = if extension_chain.is_empty() {
+        crate::billing_runtime::install(&payments, clustered)
+    } else {
+        let dispatcher = std::sync::Arc::new(
+            crate::payment_extensions::BundlePaymentEventDispatcher::new(extension_chain),
+        );
+        crate::billing_runtime::install_with_payment_dispatcher(&payments, clustered, dispatcher)
+    }
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
     tracing::info!(
         rails = ?runtime.rails(),
         schema_version = runtime.status().schema_version,
