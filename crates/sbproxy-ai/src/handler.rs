@@ -644,8 +644,14 @@ fn default_outlier_eject() -> u64 {
     30
 }
 
-/// Active probe of an AI provider. The probe is a `GET /models`
-/// (or `path` if overridden); a 2xx response counts as success.
+/// Active probe of an AI provider, driven by [`crate::health_probe`].
+///
+/// The probe is a `GET /models` (or `path` if overridden) carrying the
+/// provider's own credential. Any answer that is not a 5xx counts as
+/// success, because these base URLs come from the vendor catalog rather
+/// than from an endpoint the operator controls: a 401, a 404, or a 429
+/// says something about the probe or the account, not about whether the
+/// provider is serving.
 #[derive(Debug, Deserialize, Clone)]
 pub struct AiHealthCheckConfig {
     /// Path probed on each provider's base URL. Defaults to `/models`.

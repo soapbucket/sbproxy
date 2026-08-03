@@ -9,16 +9,15 @@
 //!   or forward-rule action target names a hostname that is not
 //!   present under `origins.*` in the same proposed config.
 //! * [`missing-secret`](validate#missing-secrets): a removed
-//!   `secret:<name>` reference or legacy logical-name
-//!   `secret://<name>` reference whose name does not appear under
+//!   `secret:<name>` reference whose name does not appear under
 //!   `proxy.secrets.map` in the proposed config. This diagnostic
 //!   support does not make the removed colon form runtime-valid.
-//!   Provider-specific references such as `vault://`,
-//!   `awssm://`, `gcpsm://`, `azurekv://`, `k8ssecret://`,
-//!   `secretfile://`, and
-//!   `secret://<backend>/...` resolve through configured vault
-//!   backends rather than `proxy.secrets.map`, so this rule does not
-//!   treat them as map keys.
+//!   Every URI-shaped reference (`secret://`, `secretfile://`,
+//!   `vault://`, `awssm://`, `gcpsm://`, `azurekv://`,
+//!   `k8ssecret://`) belongs to `compile_config`, which fails the
+//!   load when the authority is not declared under
+//!   `proxy.secrets.backends` with a matching backend type
+//!   (WOR-2227). Plan time adds nothing there and does not look.
 //! * [`unknown-type`](validate#unknown-types): an `action`,
 //!   `authentication`, `policies[*]`, or `transforms[*]` `type:`
 //!   discriminator that names a module not registered in the OSS
@@ -408,9 +407,8 @@ fn is_hostname_like(host: &str) -> bool {
 // --- Missing-secret check ------------------------------------------
 
 /// Walk a JSON value tree and emit a finding for each removed
-/// `secret:<name>` or legacy logical-name `secret://<name>` map
-/// reference whose name is not in `secret_keys`. References embedded
-/// in arbitrary string fields (e.g. `auth.secret:
+/// `secret:<name>` map reference whose name is not in `secret_keys`.
+/// References embedded in arbitrary string fields (e.g. `auth.secret:
 /// "secret:my_jwt"`) are caught for migration diagnostics.
 ///
 /// When the proxy has no `secrets:` block at all
@@ -480,43 +478,40 @@ fn walk_secrets(
     }
 }
 
-/// Pull every removed `secret:<name>` or legacy logical-name
-/// `secret://<name>` map reference out of a free-form string. Returns
-/// the bare logical name for each match. Multiple references in one
-/// string (e.g. an interpolated template) are all returned.
+/// Pull every removed `secret:<name>` map reference out of a free-form
+/// string. Returns the bare logical name for each match. Multiple
+/// references in one string (e.g. an interpolated template) are all
+/// returned.
 fn extract_secret_refs(input: &str) -> Vec<String> {
+    const PREFIX: &str = "secret:";
     let mut out = Vec::new();
-    for prefix in ["secret://", "secret:"] {
-        let mut start = 0;
-        while let Some(idx) = input[start..].find(prefix) {
-            let abs = start + idx;
-            let after = &input[abs + prefix.len()..];
-            if prefix == "secret:" && after.starts_with("//") {
-                start = abs + prefix.len();
-                continue;
-            }
-            // The reference ends at the first whitespace or quote /
-            // closing brace, mirroring how the runtime resolver
-            // tokenises template values.
-            let end = after
-                .find(|c: char| c.is_whitespace() || c == '"' || c == '}' || c == '\'')
-                .unwrap_or(after.len());
-            let name = &after[..end];
-            if !name.is_empty() {
-                if prefix == "secret://" && name.contains('/') {
-                    start = abs + prefix.len() + end;
-                    continue;
-                }
-                // Strip the canonical `system:` / `origin:host:` /
-                // `shared:` scope so the validation key matches the
-                // logical name in `proxy.secrets.map`.
-                out.push(strip_scope_prefix(name));
-            }
-            start = abs + prefix.len() + end;
+    let mut start = 0;
+    while let Some(idx) = input[start..].find(PREFIX) {
+        let abs = start + idx;
+        let after = &input[abs + PREFIX.len()..];
+        // `secret://<backend>/<key>` is a provider URI, not a logical
+        // name. `compile_config` rejects one whose backend is not
+        // declared under `proxy.secrets.backends` (WOR-2227), so a
+        // second, weaker check against the inert `map` here would only
+        // report the same configs twice and the broken ones never.
+        if after.starts_with("//") {
+            start = abs + PREFIX.len();
+            continue;
         }
-        if !out.is_empty() {
-            return out;
+        // The reference ends at the first whitespace or quote /
+        // closing brace, mirroring how the runtime resolver
+        // tokenises template values.
+        let end = after
+            .find(|c: char| c.is_whitespace() || c == '"' || c == '}' || c == '\'')
+            .unwrap_or(after.len());
+        let name = &after[..end];
+        if !name.is_empty() {
+            // Strip the canonical `system:` / `origin:host:` /
+            // `shared:` scope so the validation key matches the
+            // logical name in `proxy.secrets.map`.
+            out.push(strip_scope_prefix(name));
         }
+        start = abs + PREFIX.len() + end;
     }
     out
 }
@@ -844,8 +839,12 @@ origins:
         assert_eq!(warns[0].severity, Severity::Warn);
     }
 
+    /// Every `secret://` shape is `compile_config`'s business now
+    /// (WOR-2227): it checks the authority against
+    /// `proxy.secrets.backends` and fails the load. Plan time keeps
+    /// only the removed colon form, so the two checks do not overlap.
     #[test]
-    fn secret_uri_style_reference_is_flagged() {
+    fn secret_uri_forms_are_left_to_the_load_time_backend_check() {
         let yaml = r#"
 proxy:
   secrets:
@@ -862,12 +861,10 @@ origins:
 "#;
         let cfg = parse(yaml);
         let findings = validate(&cfg, &ValidationOptions::default());
-        let missing: Vec<_> = findings
-            .iter()
-            .filter(|f| f.rule_id == "missing-vault-key")
-            .collect();
-        assert_eq!(missing.len(), 1, "got findings: {findings:?}");
-        assert!(missing[0].message.contains("missing_key"));
+        assert!(
+            findings.iter().all(|f| f.rule_id != "missing-vault-key"),
+            "got findings: {findings:?}"
+        );
     }
 
     #[test]

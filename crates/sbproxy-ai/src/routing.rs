@@ -331,8 +331,11 @@ pub struct Router {
     /// index so reload-time provider list changes don't reset state).
     outlier: Option<Arc<OutlierDetector>>,
     /// Per-provider active-probe health. `0` = unknown, `1` =
-    /// healthy, `2` = unhealthy. Updated by background probe tasks
-    /// when an `health_check` config is present.
+    /// healthy, `2` = unhealthy. Written by the probe tasks
+    /// [`crate::health_probe`] spawns when the handler config carries a
+    /// `resilience.health_check` block, and by nothing else. A pool
+    /// with no probe configured stays at `unknown`, which reads as
+    /// healthy so this axis simply abstains.
     health: Vec<AtomicU8>,
     /// Header-derived quota snapshots for headroom / reset-aware scoring.
     quota: ProviderRateLimitTracker,
@@ -492,8 +495,13 @@ impl Router {
         }
     }
 
-    /// Set a provider's active-probe health flag (used by the
-    /// background health-check task).
+    /// Set a provider's active-probe health flag.
+    ///
+    /// The probe loop in [`crate::health_probe`] is the only production
+    /// caller. This axis is that module's to own: the breaker and the
+    /// outlier detector keep their own state and are intersected with
+    /// this one at selection time, rather than all three writing a
+    /// single flag with three different recovery rules.
     pub fn set_provider_health(&self, provider_idx: usize, healthy: bool) {
         if let Some(slot) = self.health.get(provider_idx) {
             slot.store(if healthy { 1 } else { 2 }, Ordering::Relaxed);

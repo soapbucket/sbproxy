@@ -1,8 +1,8 @@
 # AI gateway resilience primitives
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-08-02*
 
-Three independent resilience signals run on the AI provider pool. Any one can eject a provider from the routing list. (1) `circuit_breaker` is the classic Closed -> Open -> HalfOpen state machine; five consecutive 5xx or transport errors flip a provider Open for 30s and two successful HalfOpen probes close it again. (2) `outlier_detection` watches a 60-second sliding window; once a provider hits 50% failure rate over five or more requests it is ejected for 30s. (3) `health_check` makes a passive HTTP probe to `/models` every 30s; three consecutive failures eject and two consecutive successes reinstate. When every provider is ejected the router falls back to the unfiltered enabled list rather than refusing the request, so a misconfigured threshold never causes a total outage.
+Three independent resilience signals run on the AI provider pool. Any one can eject a provider from the routing list. (1) `circuit_breaker` is the classic Closed -> Open -> HalfOpen state machine; five consecutive 5xx or transport errors flip a provider Open for 30s and two successful HalfOpen probes close it again. (2) `outlier_detection` watches a 60-second sliding window; once a provider hits 50% failure rate over five or more requests it is ejected for 30s. (3) `health_check` makes an active HTTP probe to `/models` every 30s, carrying the provider's own credential; three consecutive failures eject and two consecutive successes reinstate. Only a 5xx or an unanswered request counts as a probe failure, so a 401 or a 404 from a vendor that does not serve `/models` cannot eject a provider that is otherwise healthy. When every provider is ejected the router falls back to the unfiltered enabled list rather than refusing the request, so a misconfigured threshold never causes a total outage.
 
 ## Run
 

@@ -337,7 +337,7 @@ error rather than a silently ignored setting.
 | Field | Default | What it does, and what changes if you move it |
 |---|---|---|
 | `state_path` | required | Absolute path to the SQLite file that owns intents, attempts, proofs, and receipts. It is the authority: a request is allowed because a row here says so. A relative path is rejected. |
-| `challenge_binding_key` | required | Names the key that binds a challenge to the proxy that issued it. Must be a reference such as `env:NAME`, `env:NAME`, or `file:/path`; an inline key is rejected. Rotating it invalidates every outstanding challenge. |
+| `challenge_binding_key` | required | Names the key that binds a challenge to the proxy that issued it. Must be a reference such as `env:NAME`, `file:/path`, or `secret://<backend>/<name>` with that backend declared under `proxy.secrets.backends`; an inline key is rejected. Rotating it invalidates every outstanding challenge. |
 | `authorization_timeout_ms` | `2000` | Total budget for the one synchronous provider interaction a paid request gets. Accepted range is 1 through 2000. Lowering it makes the proxy give up sooner, which moves more outcomes into `RetryWait` or `NeedsReconciliation` rather than letting a payer wait. 2000 is also the hard ceiling, because a longer wait turns a paid request into an availability problem for the origin behind it. |
 | `max_body_bytes` | `1048576` | Largest request body the payment path buffers. A paid request with a body is read once in full so its digest can be bound to the challenge, so this caps what one request pins in memory. A larger body is answered 413 before any challenge or provider work. Range is 1 through 1048576. |
 | `failure_mode` | `closed` | What happens to a payable request when settlement infrastructure cannot answer. Infrastructure failures only; a payment refusal always fails closed whatever this says. See the posture table in the request-path section above. |
@@ -638,8 +638,15 @@ the field.
 
 Do not write `${STRIPE_SECRET_KEY}` in a payments field. Environment
 interpolation runs before parsing, so the field would arrive holding the
-literal credential and be rejected as inline. See
-[secrets.md](secrets.md) for the backends behind each scheme.
+literal credential and be rejected as inline.
+
+`secret://env/NAME` is not the environment form either. In a
+`secret://<backend>/<name>` reference the authority is the name of a
+backend declared under `proxy.secrets.backends`, so that spelling asks
+for a backend literally called `env`. The config is rejected at load with
+the field path. Use `env:NAME` or `file:/path`, neither of which needs a
+`proxy.secrets` block at all. See [secrets.md](secrets.md) for the
+backends behind each scheme.
 
 ## Startup and health
 
