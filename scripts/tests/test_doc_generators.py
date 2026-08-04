@@ -721,5 +721,209 @@ class SyncDocConfigsTests(unittest.TestCase):
         self.assertNotIn("stale: true", contents)
 
 
+class DocCaptureCheckerTests(unittest.TestCase):
+    """Unit coverage for scripts/check-doc-captures.py.
+
+    Parsing, normalization, and the empty-capture rule need no binary and
+    no stack, so they are covered here rather than only in the opt-in lane
+    that replays commands for real. The checker's own discovery bug (an
+    anchored pattern searched with `re.MULTILINE` passed as the start
+    POSITION, which reported zero captures across two documents that had
+    eighteen) is exactly the class this catches.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        repo_root = Path(__file__).resolve().parent.parent.parent
+        sys.path.insert(0, str(repo_root / "scripts"))
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "check_doc_captures", repo_root / "scripts" / "check-doc-captures.py"
+        )
+        assert spec and spec.loader
+        module = importlib.util.module_from_spec(spec)
+        # Registered before exec: @dataclass resolves annotations through
+        # sys.modules[cls.__module__], so a module loaded by path alone
+        # raises AttributeError on the first dataclass it defines.
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        cls.mod = module
+
+    def _doc(self, body: str) -> Path:
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".md", delete=False, encoding="utf-8"
+        )
+        handle.write(textwrap.dedent(body))
+        handle.close()
+        self.addCleanup(os.unlink, handle.name)
+        return Path(handle.name)
+
+    def test_marker_and_block_are_paired(self) -> None:
+        path = self._doc(
+            """\
+            # Doc
+
+            <!-- CAPTURE: echo hello -->
+
+            ```text
+            hello
+            ```
+            """
+        )
+        captures = self.mod.parse_captures(path)
+        self.assertEqual(len(captures), 1)
+        self.assertEqual(captures[0].command, "echo hello")
+        self.assertEqual(captures[0].body, "hello")
+
+    def test_prose_between_marker_and_fence_means_no_block(self) -> None:
+        """A block three paragraphs down is a formatting bug, not the output.
+
+        Searching past prose would silently pair a marker with whatever
+        fence came next, which is how a capture ends up compared against
+        an unrelated YAML sample.
+        """
+        path = self._doc(
+            """\
+            <!-- CAPTURE: echo hello -->
+
+            Some prose.
+
+            ```text
+            hello
+            ```
+            """
+        )
+        captures = self.mod.parse_captures(path)
+        self.assertEqual(len(captures), 1)
+        self.assertIsNone(captures[0].body)
+
+    def test_an_empty_block_is_a_finding(self) -> None:
+        path = self._doc(
+            """\
+            <!-- CAPTURE: echo -n '' -->
+
+            ```text
+            ```
+            """
+        )
+        captures = self.mod.parse_captures(path)
+        self.assertEqual(captures[0].body, "")
+        results = self.mod.check_document(
+            path, binary=None, logs=Path("/tmp"), only_stackless=True
+        )
+        self.assertEqual([r.status for r in results], ["empty"])
+
+    def test_volatile_fields_normalize_so_two_real_runs_compare_equal(self) -> None:
+        first = (
+            "HTTP/1.1 402 Payment Required\n"
+            "Date: Mon, 03 Aug 2026 22:08:10 GMT\n"
+            "content-length: 189\n"
+            "intent=sbpi_bJHUW8b9B_Re9FNzFOBTbjLCayknSRoXNdleBqkMHT4\n"
+        )
+        second = (
+            "HTTP/1.1 402 Payment Required\n"
+            "Date: Tue, 04 Aug 2026 01:11:02 GMT\n"
+            "content-length: 204\n"
+            "intent=sbpi_QQQQQQQQQ_ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ\n"
+        )
+        self.assertEqual(self.mod.normalize(first), self.mod.normalize(second))
+
+    def test_normalization_does_not_hide_a_real_difference(self) -> None:
+        """The point of normalizing rather than skipping.
+
+        A block carrying a volatile field must still fail on the part of
+        the output that actually changed, or the check covers nothing.
+        """
+        documented = "HTTP/1.1 402 Payment Required\nDate: Mon, 03 Aug 2026 22:08:10 GMT\n"
+        actual = "HTTP/1.1 503 Service Unavailable\nDate: Tue, 04 Aug 2026 01:11:02 GMT\n"
+        self.assertNotEqual(self.mod.normalize(documented), self.mod.normalize(actual))
+
+    def test_stack_need_is_detected_from_the_command(self) -> None:
+        self.assertTrue(self.mod.needs_stack("curl -s http://127.0.0.1:8080/metrics"))
+        self.assertTrue(
+            self.mod.needs_stack("sqlite3 /tmp/sbproxy-settlement/payments.sqlite3 'select 1'")
+        )
+        self.assertTrue(self.mod.needs_stack("bash examples/x/bin/run.sh"))
+        self.assertFalse(self.mod.needs_stack("sbproxy validate -f examples/x/sb.yml"))
+
+    def _cap(self, command: str):
+        return self.mod.Capture(
+            path=Path("x"), line=1, command=command, body="", body_span=None
+        )
+
+    def test_sections_route_each_half_of_a_page_to_its_own_fixture(self) -> None:
+        """One page can talk to two fixtures with opposite freshness needs.
+
+        Both spellings of the metering half must route to it. The commands
+        use the directory name in one place and the metric prefix in
+        another, and matching only the directory name sent the metrics
+        query to the settlement proxy, which answered with nothing while
+        the doc showed three counter lines.
+        """
+        config = self.mod.MANIFEST["docs/payment-settlement.md"]
+        settlement = self.mod.section_for(
+            self._cap("curl -is http://127.0.0.1:8080/article"), config
+        )
+        self.assertEqual(settlement["stack"], "settlement")
+        self.assertTrue(settlement["fresh_each"], "independent wire shapes need a fresh stack")
+
+        for command in (
+            "bash examples/usage-bridge-queue/bin/bill-one-call.sh",
+            "curl -s http://127.0.0.1:8080/metrics | grep sbproxy_usage_bridge",
+            "sqlite3 /tmp/sbproxy-usage-bridge/payments.sqlite3 'select 1'",
+        ):
+            section = self.mod.section_for(self._cap(command), config)
+            self.assertEqual(
+                section["stack"], "usage_bridge", f"{command!r} must reach the metering stack"
+            )
+            self.assertFalse(
+                section["fresh_each"], "a sequence must share one stack or it reads an empty queue"
+            )
+
+    def test_a_signed_token_and_a_payment_hash_normalize(self) -> None:
+        """Volatile per-request values must not read as drift.
+
+        The quote token is a JWS whose issued-at, expiry, nonce and digests
+        all move per request, and a Lightning payment hash is unique per
+        invoice since #926.
+        """
+        jws = (
+            "eyJhbGciOiJFZERTQSIsInR5cCI6ImpXcyJ9."
+            "eyJpc3MiOiJzYnByb3h5LXBheW1lbnRzIiwiaWF0IjoxNzg1Nzk0ODc5fQ."
+            "WAHMWK0keVNhIzPFhKsKYB8IGAtK9wrMfWiSF-IcrCc"
+        )
+        other = (
+            "eyJhbGciOiJFZERTQSIsInR5cCI6ImpXcyJ9."
+            "eyJpc3MiOiJzYnByb3h5LXBheW1lbnRzIiwiaWF0IjoxNzg1ODA4NjI1fQ."
+            "tLyhWo3brLkGZeL4hyMZmj-mPFSl7IwLuaYtgsaU098"
+        )
+        self.assertEqual(
+            self.mod.normalize(f"crawler-payment: {jws}"),
+            self.mod.normalize(f"crawler-payment: {other}"),
+        )
+        self.assertEqual(
+            self.mod.normalize('"payment_hash":"' + "1f" * 32 + '"'),
+            self.mod.normalize('"payment_hash":"' + "9a" * 32 + '"'),
+        )
+        self.assertEqual(
+            self.mod.normalize("requirement_id: req_01kz4tprft0pf62bk3drd79tpn"),
+            self.mod.normalize("requirement_id: req_01kz57t7yk9kyh51ksvgd96j15"),
+        )
+
+    def test_every_manifest_section_names_a_known_stack(self) -> None:
+        repo_root = Path(__file__).resolve().parent.parent.parent
+        for rel, config in self.mod.MANIFEST.items():
+            self.assertTrue((repo_root / rel).exists(), f"{rel} is in the manifest but is gone")
+            sections = config.get("sections") or []
+            self.assertTrue(sections, f"{rel} has no sections")
+            for section in sections:
+                self.assertIn(section["stack"], self.mod.STACK_STARTERS)
+            self.assertFalse(
+                sections[-1].get("match"),
+                f"{rel}'s last section must be the catch-all, or captures fall through unrouted",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

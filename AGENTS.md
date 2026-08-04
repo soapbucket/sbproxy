@@ -21,6 +21,7 @@ ten-minute build.
 | Doc drift | `bash scripts/check-doc-drift.sh` |
 | Tapes + GIF wiring | `make tapes-check` |
 | Doc configs | `python3 scripts/sync-doc-configs.py --check` |
+| Documented output | `python3 scripts/check-doc-captures.py --check --stackless-only` |
 | Installer | `sh scripts/tests/install_verify.sh` |
 | Format | `cargo fmt --all -- --check` |
 | Nested lockfiles | `bash scripts/check-nested-lockfiles.sh` |
@@ -96,6 +97,7 @@ full release/e2e runs.
 | `SBPROXY_ALLOW_DIRTY_TREE=1` | do not fail on an uncommitted working tree |
 | `SBPROXY_ALLOW_CARGO_TEST_FALLBACK=1` | permit the serial `cargo test` fallback |
 | `SBPROXY_CHECK_PRIVATE_DOCS=1` | extra rustdoc pass over private items |
+| `SBPROXY_CHECK_CAPTURES=1` | replay every documented command and diff it against the block the doc shows |
 
 Anything the runner could not run is reprinted as a `SKIPPED PHASES`
 block just before the final result, so "All checks passed" cannot hide a

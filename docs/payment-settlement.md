@@ -737,6 +737,11 @@ The queue then holds one row per billable unit. `usage_reports` has no
 `event_jcs`, so the row cannot disagree with what the worker actually
 sends. `json_extract` reads it back out.
 
+Give the worker a moment before reading, or you will see the row on its
+way rather than at rest. The request path writes `queued` and returns; the
+recovery worker moves it on one sweep later, 1000 ms in this config. The
+row below is the resting state, so run this a few seconds after the call.
+
 <!-- CAPTURE: sqlite3 /tmp/sbproxy-usage-bridge/payments.sqlite3 "select reporter, usage_identifier, tenant_id, origin_id, status, failure_category, json_extract(event_jcs, '\$.quantity') as quantity from usage_reports order by created_at_ms" -->
 
 ```text

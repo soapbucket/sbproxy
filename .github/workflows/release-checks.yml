@@ -43,6 +43,39 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # Inserted ahead of the heavier lanes deliberately: it costs a couple of
+  # minutes and it answers a question the rest of CI cannot, so a stale
+  # doc should not wait behind a 60-minute single-threaded test run.
+  doc-captures:
+    name: documented output still reproduces
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/rust-setup
+
+      - name: install protoc and libclang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libclang-dev sqlite3
+
+      # The settlement captures talk to a stub Core Lightning node, so the
+      # binary has to carry the rail's feature. No payment feature is in
+      # any default set.
+      - name: build a payments-featured binary
+        run: cargo build --release -p sbproxy --features payment-lightning-cln,payment-stripe --locked
+
+      # Replays every CAPTURE marker in document order against a fixture
+      # this script starts, and diffs the result against the block the doc
+      # shows. Volatile fields (dates, intent ids, ports) are normalized on
+      # both sides rather than skipped, so a block containing one is still
+      # compared on the part that matters.
+      - name: replay documented commands
+        env:
+          SBPROXY_CAPTURE_BIN: target/release/sbproxy
+        run: python3 scripts/check-doc-captures.py --check
+
   test-isolation:
     name: test isolation (single-threaded)
     runs-on: ubuntu-latest

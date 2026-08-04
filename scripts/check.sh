@@ -232,6 +232,25 @@ PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/sync-doc-configs.py" --check
 step "examples catalog is current"
 PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/gen-examples-catalog.py" --check
 
+# Captures are the output blocks a doc shows under a CAPTURE marker. The
+# structural half runs here always: every marker has a block, and no
+# block is empty. Both are cheap and both have caught real defects, since
+# all five empty blocks in the WOR-2158 batch were product bugs rather
+# than formatting slips.
+#
+# Replaying the commands is opt-in, because it starts fixtures and needs a
+# payments-featured binary. Without SBPROXY_CHECK_CAPTURES=1 the script
+# prints how many captures it did NOT verify, so a structural pass cannot
+# read as "the docs still produce this". See WOR-2297.
+step "documented command output"
+if [ "${SBPROXY_CHECK_CAPTURES:-0}" = "1" ]; then
+  PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/check-doc-captures.py" --check
+else
+  PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/check-doc-captures.py" \
+    --check --stackless-only
+  note_skip "replaying documented commands (set SBPROXY_CHECK_CAPTURES=1, with a payments-featured binary in SBPROXY_CAPTURE_BIN, to re-run each captured command and diff it against the block the doc shows)"
+fi
+
 # CI: ci.yml test lane. No network, no cargo.
 step "install.sh verifies its download"
 sh "$ROOT/scripts/tests/install_verify.sh"
