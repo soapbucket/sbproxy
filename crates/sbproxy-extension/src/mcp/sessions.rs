@@ -32,8 +32,8 @@ pub struct SessionRisk {
 }
 
 impl SessionRisk {
-    /// The Archestra "lethal trifecta": tool access plus private data
-    /// plus external communication in one active session.
+    /// The "lethal trifecta": tool access plus private data plus
+    /// external communication in one active session.
     pub fn is_lethal_trifecta(self) -> bool {
         self.tool_access && self.private_data && self.external_comm
     }

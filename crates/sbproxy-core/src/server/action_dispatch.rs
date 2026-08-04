@@ -4184,7 +4184,7 @@ mod govern_security_tests {
 
     #[test]
     fn docs_do_not_claim_substring_denylist_is_dual_llm_quarantine() {
-        let guardrails = include_str!("../../../../docs/mcp-archestra-guardrails.md");
+        let guardrails = include_str!("../../../../docs/mcp-gateway-guardrails.md");
         let mcp = include_str!("../../../../docs/mcp.md");
         assert!(
             !guardrails.contains("scans MCP text result blocks for"),

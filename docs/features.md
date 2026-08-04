@@ -84,7 +84,7 @@ Federate multiple MCP servers behind a single SBproxy endpoint. Agents can seaml
 
 ### Security & RBAC
 Restrict which agents can call which tools. SBproxy's MCP implementation includes robust Role-Based Access Control (RBAC), quotas, and guardrails specifically designed for tool execution.
-* **Docs:** [Migration: MCP RBAC](migration-mcp-rbac.md), [MCP Archestra Guardrails](mcp-archestra-guardrails.md)
+* **Docs:** [Migration: MCP RBAC](migration-mcp-rbac.md), [MCP Gateway Guardrails](mcp-gateway-guardrails.md)
 * **Examples:** [MCP RBAC Quotas](../examples/mcp-rbac-quotas/)
 
 ### Tool Versioning & Discovery

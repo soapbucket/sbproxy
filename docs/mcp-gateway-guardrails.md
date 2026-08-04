@@ -1,10 +1,11 @@
-# MCP Archestra guardrails
-*Last modified: 2026-07-19*
+# MCP gateway guardrails
+*Last modified: 2026-08-04*
 
-SBproxy carries a small set of MCP gateway mechanisms borrowed from the
-Archestra teardown. They are implemented inside the sbproxy repository
-and are configured on the `mcp` action. The Terraform provider is not
-implemented.
+SBproxy's MCP gateway carries a small set of guardrail mechanisms for
+tool traffic: egress control, session risk accumulation, output
+quarantine, stdio supervision, run-as-user auth, and result
+compaction. They are implemented inside the sbproxy repository and are
+configured on the `mcp` action.
 
 ## Mechanisms
 

@@ -191,5 +191,5 @@ To make `db` real, point its `origin` at a running MCP server. A bare hostname n
 - [`examples/mcp-progressive-discovery`](../examples/mcp-progressive-discovery) - once the federated catalog grows past a handful of tools, advertise `search` / `execute` meta-tools instead of the full list so it does not eat the model's context window.
 - [`examples/mcp-rbac-quotas`](../examples/mcp-rbac-quotas) - per-tool sliding-window quotas on top of the same default-deny RBAC used here.
 - [mcp.md](mcp.md) - the full wire format: sessions, OAuth discovery, resources, and the session ledger for behavioral eval.
-- [mcp-archestra-guardrails.md](mcp-archestra-guardrails.md) - egress policy, session risk, and quarantine for tool output, including the OpenAPI-backed REST egress this guide left at its allow-all default.
+- [mcp-gateway-guardrails.md](mcp-gateway-guardrails.md) - egress policy, session risk, and quarantine for tool output, including the OpenAPI-backed REST egress this guide left at its allow-all default.
 - [configuration.md](configuration.md) - the full configuration schema.

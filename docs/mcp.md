@@ -186,7 +186,7 @@ success.
 | `progressive_discovery` | bool | `false` | Advertise `search` / `execute` meta-tools instead of the full catalog (see [`examples/mcp-progressive-discovery`](../examples/mcp-progressive-discovery)). |
 | `oauth` | object | unset | RFC 9728 auth discovery (see the OAuth section below and [`examples/mcp-oauth-discovery`](../examples/mcp-oauth-discovery)). |
 | `sessions` | object | unset | Streamable HTTP session management: `{enabled, ttl}` (see [`examples/mcp-sessions`](../examples/mcp-sessions)). |
-| `egress` | object | unset | Default OpenAPI REST egress policy. See [mcp-archestra-guardrails.md](mcp-archestra-guardrails.md). |
+| `egress` | object | unset | Default OpenAPI REST egress policy. See [mcp-gateway-guardrails.md](mcp-gateway-guardrails.md). |
 | `token_compaction` | object | unset | Opt-in compaction for large MCP text result blocks. |
 | `dual_llm_quarantine` | object | unset | Opt-in dual-LLM judge quarantine for untrusted MCP text result blocks (`enabled`, `endpoint`, optional `model` / `timeout`). Fail closed; reason-code only. |
 | `refresh_interval` | duration | `60s` | How often the background task re-fetches upstream catalogs. Inbound requests always serve the cached snapshot; this is the only steady-state fan-out. |
@@ -211,7 +211,7 @@ success.
 | `command` / `args` | string / list | unset | Required command and optional arguments for `transport: stdio`. |
 | `egress` | object | inherited | Per-server OpenAPI REST egress policy. |
 | `run_as_user_auth` | bool | `false` | Mint per-caller upstream `Authorization` via `upstream_auth` (never tool args). |
-| `upstream_auth` | object | unset | Required when `run_as_user_auth` is true. See [mcp-archestra-guardrails.md](mcp-archestra-guardrails.md). |
+| `upstream_auth` | object | unset | Required when `run_as_user_auth` is true. See [mcp-gateway-guardrails.md](mcp-gateway-guardrails.md). |
 
 A `rbac` value that does not match a key in `rbac_policies` is a hard
 config error (see `McpAction::from_parsed` in
