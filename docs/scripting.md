@@ -948,6 +948,19 @@ For packaging and distributing JavaScript, TypeScript, and WASM behaviors as reu
 
 For full details on the extension architecture, candidate loading, and manifest reference, see the dedicated [Extension bundles](extension-bundles.md) guide.
 
+## Examples in Practice
+
+To see custom scripting and transforms in action, refer to these runnable examples:
+
+| Example | What it is | How to use it | Outcome |
+|---------|------------|---------------|---------|
+| [`transform-javascript`](../examples/transform-javascript/) | Advanced payload rewriting via JavaScript. | Attach `engine: javascript` in your `transforms:` block. | Complete, sandboxed V8 execution for deep body surgery. |
+| [`transform-json`](../examples/transform-json/) | Fast structural JSON edits. | Use the native `json:` transform steps. | Cleanly add, remove, or rename JSON fields without a full JS runtime. |
+| [`transform-json-schema`](../examples/transform-json-schema/) | Inbound JSON validation. | Apply a `json_schema` policy. | Blocks invalid or malformed JSON payloads before they hit upstream. |
+| [`transform-markdown`](../examples/transform-markdown/) | HTML to Markdown conversion. | Use `engine: markdown`. | Drastically reduces the token count of scraped web content before feeding it to LLMs. |
+| [`transform-template`](../examples/transform-template/) | Dynamic payload rendering. | Use the `template` transform with Go templates. | Inject proxy state or dynamic values into outgoing payloads. |
+| [`variables-template`](../examples/variables-template/) | Context variable injection. | Access `ctx` inside template transforms. | Passes unique proxy variables (like Request IDs) seamlessly to upstreams. |
+
 ## See also
 
 - [configuration.md](configuration.md) - general configuration model and the full `sb.yml` field reference.

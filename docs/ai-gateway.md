@@ -2254,6 +2254,20 @@ A `SIGHUP`, an admin-API reload, or an in-place edit of `sb.yml` (when the file 
 
 The process-wide AI budget tracker is deliberately left alone on reload. Budget windows are wall-clock-relative (daily, monthly, custom), so the per-scope token and cost accumulators must outlive a config reload. Wiping the tracker would silently roll counters back to zero and let already-spent budget through a second time. To clear a budget intentionally, restart the process or call the per-scope reset path on the admin surface.
 
+## Examples in Practice
+
+To help you get started with the AI gateway, we provide several runnable examples demonstrating these concepts:
+
+| Example | What it is | How to use it | Outcome |
+|---------|------------|---------------|---------|
+| [`ai-bedrock-direct`](../examples/ai-bedrock-direct/) | Direct integration with AWS Bedrock. | Configure `type: bedrock` with AWS credentials. | Exposes Bedrock securely via the standard OpenAI-compatible API. |
+| [`ai-gemini-direct`](../examples/ai-gemini-direct/) | Direct integration with Google Gemini. | Configure `type: gemini` with a Gemini API key. | Seamless integration with Gemini models without client SDK changes. |
+| [`ai-model-group`](../examples/ai-model-group/) | Model pooling. | Use `model_group` in routing config. | Requests load-balance automatically across multiple underlying models. |
+| [`ai-streaming`](../examples/ai-streaming/) | Streaming LLM completions. | Send requests with `stream: true`. | SBproxy streams Server-Sent Events (SSE) securely back to the client. |
+| [`ai-routing-fallback`](../examples/ai-routing-fallback/) | High-availability failover. | Configure `fallbacks:` for a provider. | 5xx errors from the primary provider are transparently retried. |
+| [`ai-cost-optimized`](../examples/ai-cost-optimized/) | Cost-optimized routing. | Set `strategy: cost_optimized`. | Traffic is routed to the cheapest capable model for the given prompt length. |
+| [`ai-attribution-tags`](../examples/ai-attribution-tags/) | Request tagging for cost attribution. | Pass `tags:` in request headers or config. | Emitted metrics and logs include the tags for fine-grained cost allocation. |
+
 ## See also
 
 - [providers.md](providers.md) - full provider table and per-provider model lists.

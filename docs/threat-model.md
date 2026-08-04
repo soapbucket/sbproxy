@@ -127,3 +127,17 @@ of each implementation wave.
 - New outbound calls have timeouts and failure modes.
 - New dashboards link to a runbook section.
 - New closed-enum values use the fast-track ADR template when eligible.
+
+## Examples in Practice
+
+To explore SBproxy's security model in action, see the following examples:
+
+| Example | What it is | How to use it | Outcome |
+|---------|------------|---------------|---------|
+| [`csrf`](../examples/csrf/) | Cross-Site Request Forgery protection. | Configure CSRF token validation policies. | Blocks unauthorized state-changing requests from browsers. |
+| [`defense-in-depth`](../examples/defense-in-depth/) | Layered security. | Combine WAF, rate limits, and authentication. | Comprehensive, multi-tiered protection for sensitive endpoints. |
+| [`dlp-catalog`](../examples/dlp-catalog/) | Data Loss Prevention. | Use `dlp` policies for PII detection. | Automatically detects and masks sensitive data before egress. |
+| [`hsts`](../examples/hsts/) | Strict Transport Security. | Set `hsts: true` in your server block. | Forces client browsers to use secure TLS connections. |
+| [`page-shield`](../examples/page-shield/) | Monitor third-party scripts. | Inject Content Security Policy (CSP) rules. | Mitigates risks like Magecart attacks on frontend assets. |
+| [`security-headers`](../examples/security-headers/) | Standard secure headers. | Apply the `security_headers` configuration preset. | Hardens browser interactions out-of-the-box. |
+| [`sri`](../examples/sri/) | Subresource Integrity. | Inject SRI hashes into HTML bodies. | Ensures CDN assets haven't been maliciously altered. |

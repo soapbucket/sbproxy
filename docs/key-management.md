@@ -1229,3 +1229,17 @@ The secret-free `EffectiveKeyPolicy` schema is version 2. Version 2 carries
 and effective-policy preview. Readers still accept a version 1 policy that
 lacks the field and treat it as unset, so rolling upgrades do not invent a
 selector for an older record.
+
+## Examples in Practice
+
+To see various authentication schemes configured in practice, refer to these runnable examples:
+
+| Example | What it is | How to use it | Outcome |
+|---------|------------|---------------|---------|
+| [`auth-api-key`](../examples/auth-api-key/) | Simple API Key auth. | Validate keys against a static list or external Vault. | Rapidly secure internal or simple B2B APIs. |
+| [`auth-basic`](../examples/auth-basic/) | Standard HTTP Basic Auth. | Use `auth: basic` with hashed credentials. | Secure legacy clients that only support Basic Auth. |
+| [`auth-bearer`](../examples/auth-bearer/) | Bearer token validation. | Check generic bearer tokens against a known authority. | Standard, stateless client authentication. |
+| [`auth-bearer-dpop`](../examples/auth-bearer-dpop/) | Bearer tokens with DPoP. | Enforce Demonstrating Proof-of-Possession (DPoP). | Prevents token theft by binding tokens to a client's private key. |
+| [`auth-cap`](../examples/auth-cap/) | CAP Auth. | Use `auth: cap` for capability-based authorization. | Granular, cryptographically secure capability delegation. |
+| [`keys-inbound-headers`](../examples/keys-inbound-headers/) | Key resolution from headers. | Map custom headers (e.g. `X-My-Key`) to auth principals. | Flexible integrations with existing client code. |
+| [`sessions`](../examples/sessions/) | Stateful browser sessions. | Manage secure HTTP-only cookies and CSRF. | Full lifecycle management for web applications behind SBproxy. |

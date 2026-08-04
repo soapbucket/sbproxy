@@ -580,6 +580,16 @@ Chains are per node. Two nodes serving the same tenant each write their own sequ
 
 The refusal to estimate is a billing decision, not a reporting limitation. A partial total labeled partial is a fact; a partial total padded to look complete is an invoice line nobody can reproduce from any chain, and being reproducible from the chain is the only property that makes any number on this page worth writing down.
 
+## Examples in Practice
+
+Here are several runnable examples demonstrating metering and rate limiting capabilities:
+
+| Example | What it is | How to use it | Outcome |
+|---------|------------|---------------|---------|
+| [`ai-model-rate-limits`](../examples/ai-model-rate-limits/) | Hard rate limits per AI model. | Configure token-bucket limits using the `ai_model` key. | Prevents a single hungry model from exhausting system resources. |
+| [`ai-per-surface-rate-limits`](../examples/ai-per-surface-rate-limits/) | Rate limiting by logical workflow. | Group AI requests into surfaces (e.g., chat, agent) and limit them. | Protects critical workflows from being starved by background tasks. |
+| [`ai-waste-signals`](../examples/ai-waste-signals/) | Detecting and logging wasted compute. | Track client disconnects via waste signals. | Gives visibility into costs incurred by aborted or abandoned LLM generations. |
+
 ## See also
 
 - [ai-usage-ledger.md](ai-usage-ledger.md) - the same chain construction recording LLM spend, with its own `sbproxy ai ledger verify` CLI. Note that CLI verifies the usage ledger's payload format, not the receipt chain; receipts verify through `POST /api/meter/verify` or the buyer script above.
