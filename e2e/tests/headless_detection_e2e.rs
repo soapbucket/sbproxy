@@ -3,11 +3,16 @@
 //!
 //! Pins the contract from  § "Worked
 //! example: headless Puppeteer detection". The detector reads
-//! `request.tls_fingerprint.ja4` and consults the reference catalogue at
-//! `crates/sbproxy-classifiers/data/tls-fingerprints.json`. A match
-//! produces `HeadlessSignal::Detected { library, confidence }` and feeds
-//! the G1.4 resolver chain so a headless agent class lands on the
+//! `request.tls_fingerprint.ja4` and consults a fingerprint catalogue. A
+//! match produces `HeadlessSignal::Detected { library, confidence }` and
+//! feeds the G1.4 resolver chain so a headless agent class lands on the
 //! request context.
+//!
+//! Each test writes its own catalogue and points
+//! `tls_fingerprint.catalog_file` at it. The embedded default names the
+//! agent classes and carries no fingerprints (WOR-2296), so a positive
+//! match is only reachable through an operator-supplied file, which is
+//! also how an operator reaches it in production.
 //!
 //! The active tests use trusted sidecar JA4 injection because the e2e
 //! harness is plaintext. Native TLS ClientHello coverage is tracked by
@@ -15,19 +20,56 @@
 
 use sbproxy_e2e::ProxyHarness;
 
-const PUPPETEER_JA4: &str = "t13d1516h2_8daaf6152771_b1ff8ab2d16f";
+/// A synthetic JA4 standing in for a catalogued headless client.
+///
+/// Synthetic on purpose. The shipped catalogue carries no fingerprints,
+/// because a real JA4 is a measurement of one client build and the
+/// published collections of them are separately licensed (WOR-2296).
+/// These tests exercise the matching mechanism, and a made-up value
+/// exercises it exactly as well as a real one while keeping borrowed
+/// data out of the repository.
+const PUPPETEER_JA4: &str = "t13d1517h2_aaaaaaaaaaaa_aaaaaaaaaaaa";
 const UNKNOWN_BROWSER_JA4: &str = "t13d0000h2_000000000000_000000000000";
+
+/// Write a catalogue naming [`PUPPETEER_JA4`] as `headless-puppeteer`
+/// and return its path.
+///
+/// The operator `catalog_file` seam is what makes these tests possible:
+/// the embedded catalogue is empty, so a test that wanted a positive
+/// match used to depend on fingerprints being shipped for it.
+fn puppeteer_catalog() -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("tls-fingerprints.json");
+    std::fs::write(
+        &path,
+        format!(
+            r#"{{
+  "version": 2,
+  "updated_at": "2026-08-04T00:00:00Z",
+  "entries": [
+    {{ "agent_class": "headless-puppeteer", "ja4": ["{PUPPETEER_JA4}"] }}
+  ]
+}}"#
+        ),
+    )
+    .expect("write catalogue");
+    let rendered = path.display().to_string();
+    (dir, rendered)
+}
 
 // --- Test 1: Puppeteer JA4 -> HeadlessSignal::Detected ---
 
 #[test]
 fn puppeteer_ja4_detected_with_library_label() {
-    let yaml = r#"
+    let (_catalog_dir, catalog_file) = puppeteer_catalog();
+    let yaml = format!(
+        r#"
 proxy:
   http_bind_port: 0
 features:
   tls_fingerprint:
     enabled: true
+    catalog_file: '{catalog_file}'
     trustworthy_client_cidrs:
       - 127.0.0.0/8
 origins:
@@ -49,8 +91,9 @@ origins:
           - op: set
             name: x-headless-detected
             value_expr: 'request.headless_signal.detected ? "yes" : "no"'
-"#;
-    let harness = ProxyHarness::start_with_yaml(yaml).expect("start proxy");
+"#
+    );
+    let harness = ProxyHarness::start_with_yaml(&yaml).expect("start proxy");
     let resp = harness
         .get_with_headers(
             "/",
@@ -61,7 +104,7 @@ origins:
     assert_eq!(
         resp.headers.get("x-headless-library").map(String::as_str),
         Some("puppeteer"),
-        "Puppeteer JA4 must map to library = puppeteer in the reference catalogue"
+        "the catalogued JA4 must map to library = puppeteer"
     );
     assert_eq!(
         resp.headers.get("x-headless-detected").map(String::as_str),
@@ -124,12 +167,15 @@ origins:
 
 #[test]
 fn confidence_halved_when_not_trustworthy() {
-    let yaml = r#"
+    let (_catalog_dir, catalog_file) = puppeteer_catalog();
+    let yaml = format!(
+        r#"
 proxy:
   http_bind_port: 0
 features:
   tls_fingerprint:
     enabled: true
+    catalog_file: '{catalog_file}'
     untrusted_client_cidrs:
       - 127.0.0.0/8
 origins:
@@ -145,8 +191,9 @@ origins:
           - op: set
             name: x-headless-confidence
             value_expr: 'string(request.headless_signal.confidence)'
-"#;
-    let harness = ProxyHarness::start_with_yaml(yaml).expect("start proxy");
+"#
+    );
+    let harness = ProxyHarness::start_with_yaml(&yaml).expect("start proxy");
     let resp = harness
         .get_with_headers(
             "/",
@@ -170,12 +217,15 @@ origins:
 
 #[test]
 fn headless_verdict_resolves_to_headless_browser_class() {
-    let yaml = r#"
+    let (_catalog_dir, catalog_file) = puppeteer_catalog();
+    let yaml = format!(
+        r#"
 proxy:
   http_bind_port: 0
 features:
   tls_fingerprint:
     enabled: true
+    catalog_file: '{catalog_file}'
     trustworthy_client_cidrs:
       - 127.0.0.0/8
 origins:
@@ -194,8 +244,9 @@ origins:
           - op: set
             name: x-agent-source
             value_expr: 'request.agent_id_source'
-"#;
-    let harness = ProxyHarness::start_with_yaml(yaml).expect("start proxy");
+"#
+    );
+    let harness = ProxyHarness::start_with_yaml(&yaml).expect("start proxy");
     let resp = harness
         .get_with_headers(
             "/",

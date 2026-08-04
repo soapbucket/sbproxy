@@ -1,43 +1,35 @@
 {
-  "version": 1,
-  "updated_at": "2026-05-01T00:00:00Z",
-  "notes": "Wave 5 G5.3 / G5.4 seed catalogue. Sources: FoxIO JA4+ fingerprint databases (https://github.com/FoxIO-LLC/ja4/tree/main/technical_details/fingerprint_databases) and Cloudflare-published agent registry. Update cadence: monthly via builder task that fetches upstream feeds, validates schema, opens PR. Hot-reloadable via SIGHUP per A5.1.",
+  "version": 2,
+  "updated_at": "2026-08-04T00:00:00Z",
+  "notes": "Agent classes this proxy can reason about, with no fingerprints attached. A JA3 / JA4 / JA4H value is a measurement of one specific client build, and the published collections of those measurements carry their own licenses, so this file previously redistributed third-party licensed data inside an Apache-2.0 binary (WOR-2296). It now ships empty on purpose. An empty array means tls_fingerprint_matches() answers true, which is the conservative direction: detection is inert until an operator supplies values, and no client is accused of spoofing on the strength of a fingerprint we guessed at. Populate your own with proxy.extensions.tls_fingerprint.catalog_file, which replaces this file wholesale. request.tls.ja4 carries the value this proxy computed for the live handshake, so one known-good client through a CEL transform or an access-log field is one catalogue line. See docs/headless-detection.md.",
   "entries": [
     {
       "agent_class": "openai-gptbot",
       "ja3": [],
-      "ja4": [
-        "t13d1715h2_5b57614c22b0_3d5424432f57",
-        "t13d1517h2_8daaf6152771_b186095e22b6"
-      ],
+      "ja4": [],
       "ja4h": [],
-      "notes": "Best-effort GPTBot JA4 from FoxIO 2026-04 feed; treat as advisory until enterprise feed (G5.6) lands."
+      "notes": "Measure it yourself: serve a URL OpenAI's crawler already fetches and read request.tls.ja4 from the access log."
     },
     {
       "agent_class": "anthropic-claudebot",
       "ja3": [],
       "ja4": [],
       "ja4h": [],
-      "notes": "Anthropic ClaudeBot has no published JA4 as of 2026-04. Empty array means tls_fingerprint_matches() returns true (conservative default per A5.1)."
+      "notes": "Anthropic publishes no JA4. Same approach as above."
     },
     {
       "agent_class": "headless-puppeteer",
       "ja3": [],
-      "ja4": [
-        "t13d1516h2_8daaf6152771",
-        "t13d1516h2_8daaf6152771_b1ff8ab2d16f"
-      ],
+      "ja4": [],
       "ja4h": [],
-      "notes": "Puppeteer 22.x via Chromium 124. ADR worked example value; matches FoxIO published headless DB entry."
+      "notes": "Headless fingerprints track the bundled Chromium build, so a value is only true for the version you measured. Capture per Puppeteer release you care about rather than pinning one and trusting it."
     },
     {
       "agent_class": "headless-playwright",
       "ja3": [],
-      "ja4": [
-        "t13d1517h2_8daaf6152771_b186095e22b6"
-      ],
+      "ja4": [],
       "ja4h": [],
-      "notes": "Playwright 1.42 via Chromium 124. Best-effort; FoxIO database entry."
+      "notes": "Same per-build caveat as Puppeteer."
     }
   ]
 }

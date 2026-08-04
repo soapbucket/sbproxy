@@ -16,8 +16,10 @@ agent-class = []
 # Pulls the headless-browser detector
 # (`headless_detect.rs`) into the security pipeline. The detector
 # reads `RequestContext.tls_fingerprint.ja4` and compares it against
-# the vendored TLS-fingerprint catalogue. Off-by-default for library
-# consumers.
+# a TLS-fingerprint catalogue. The embedded catalogue names the agent
+# classes and carries no fingerprints, so the detector is inert until an
+# operator supplies `catalog_file` (WOR-2296). Off-by-default for
+# library consumers.
 tls-fingerprint = []
 
 [dependencies]
