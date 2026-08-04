@@ -92,11 +92,24 @@ pub fn decode_all(data: &[u8]) -> anyhow::Result<Vec<Frame>> {
 /// Split `data` into the byte ranges of each length-prefixed frame
 /// without interpreting the flag byte.
 ///
-/// Unlike [`decode_all`] this tolerates the gRPC-Web trailer flag
-/// (`0x80`), so it can walk a complete gRPC-Web response body (message
-/// frames followed by a trailer frame). Each returned slice is one full
-/// frame including its 5-byte header. Trailing bytes that do not form a
-/// complete frame are dropped.
+/// This is the response-direction walker. Unlike [`decode_all`] it
+/// tolerates the gRPC-Web trailer flag (`0x80`), so it can walk a
+/// complete gRPC-Web response body (message frames followed by a trailer
+/// frame). Each returned slice is one full frame including its 5-byte
+/// header. Trailing bytes that do not form a complete frame are dropped.
+///
+/// The strictness split between the two is protocol, not oversight.
+/// gRPC-Web folds trailers into the body because a browser cannot read
+/// HTTP trailers off a *response*; a request has none to fold, since
+/// gRPC carries no trailers in that direction at all. So the request
+/// bridge validates with the strict [`decode_all`], which rejects `0x80`
+/// outright, and a client that puts a trailer frame in a request body is
+/// malformed rather than merely unusual.
+///
+/// Nothing in the request pipeline calls this today. The proxy is the
+/// gRPC-Web server on this path: it emits response bodies rather than
+/// parsing them. A production caller appears when the reverse bridge
+/// does, meaning a gRPC-Web upstream answering a native gRPC client.
 pub fn decode_all_raw(data: &[u8]) -> Vec<&[u8]> {
     let mut frames = Vec::new();
     let mut offset = 0;
@@ -179,5 +192,43 @@ mod tests {
         let mut buf = encode_message(b"ok");
         buf.extend_from_slice(b"\x00\x00"); // incomplete second header
         assert!(decode_all(&buf).is_err());
+    }
+
+    /// One message frame followed by a gRPC-Web trailer frame, the shape
+    /// a complete gRPC-Web response body has.
+    fn body_with_trailer_frame() -> Vec<u8> {
+        let block = b"grpc-status: 0\r\n";
+        let mut buf = encode_message(b"msg");
+        buf.push(0x80);
+        buf.extend_from_slice(&(block.len() as u32).to_be_bytes());
+        buf.extend_from_slice(block);
+        buf
+    }
+
+    #[test]
+    fn decode_all_rejects_the_grpc_web_trailer_flag() {
+        // The two walkers disagree about `0x80` deliberately, so pin the
+        // disagreement. `decode_all` guards the request bridge, and a
+        // gRPC-Web request body has no trailer frame to carry, so the
+        // flag is malformed input there and must not be tolerated. If
+        // this test ever passes, the request path has started accepting
+        // a frame it cannot forward to a native gRPC upstream.
+        let err = decode_all(&body_with_trailer_frame()).expect_err("trailer flag must not decode");
+        assert!(
+            err.to_string().contains("0x80"),
+            "the error must name the offending flag byte: {err}"
+        );
+    }
+
+    #[test]
+    fn decode_all_raw_walks_past_the_trailer_flag() {
+        // The response-direction counterpart on identical bytes: both
+        // frames come back, trailer header intact.
+        let buf = body_with_trailer_frame();
+        let frames = decode_all_raw(&buf);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0][0], FLAG_UNCOMPRESSED);
+        assert_eq!(frames[1][0], 0x80);
+        assert_eq!(&frames[1][FRAME_HEADER_LEN..], b"grpc-status: 0\r\n");
     }
 }

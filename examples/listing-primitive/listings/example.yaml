@@ -4,6 +4,12 @@
 # `example-api` Listing. The pinning mode is `pin`, so the Listing
 # always serves the revision tagged by the short SHA in
 # `revision.value`.
+#
+# `spec.skills[]` is the half of a Listing that is on the data path
+# today: the projection layer serves this manifest at
+# /.well-known/agent-skills/example-api/index.json on every origin the
+# Listing publishes, and re-hosts each artifact body at the path its
+# `url` names.
 apiVersion: sbproxy.dev/v1
 kind: Listing
 metadata:
@@ -20,13 +26,54 @@ spec:
         mode: pin
         value: "abc1234"
   auth:
-    strategies: [jwt]
+    # The underlying origin declares no authentication, so nothing
+    # constrains this list. Where the Resource does declare one, its type
+    # has to appear here or the plan reports `listing-auth-mismatch`.
+    strategies: [api_key]
   accessPlan:
     free:
       rate: "100/min"
     paid:
       price_micros: 1000
       currency: USD
+  skills:
+    - name: place-order
+      type: skill-md
+      description: "Place an order against the orders API."
+      # The url the manifest advertises. It must be fully-qualified or
+      # resolve under skills/ in the Repo; anything else is a
+      # `listing-skill-url-out-of-tree` error.
+      url: /skills/place-order.md
+      visibility: public
+      # The artifact body, inline. `path:` reads a file instead, but a
+      # relative path resolves against the process working directory
+      # rather than against this manifest, so an inline body is what
+      # makes this example run identically from anywhere. A
+      # fully-qualified url with neither `body` nor `path` is fetched
+      # once at config load and emitted without being re-hosted.
+      body: |
+        # Place an order
+
+        Create an order against the orders API published by the
+        `example-api` Listing.
+
+        ## When to use this
+
+        The caller has a customer id, one or more line items, and needs
+        an order record created. Read-only questions about an existing
+        order belong to the lookup skill, not this one.
+
+        ## Steps
+
+        1. `POST /orders` with a JSON body carrying `customer_id` and
+           `items[]`.
+        2. Read `order_id` out of the 201 response.
+        3. Poll `GET /orders/{order_id}` until `status` leaves `pending`.
+
+        ## Limits
+
+        The free access plan allows 100 requests per minute. Above that
+        the gateway answers 429 and the order is not created.
   publish:
     visibility: public
     docsUrl: "/docs/example-api"

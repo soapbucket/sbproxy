@@ -59,7 +59,7 @@ origins:
         deny_message: "automation suspected"
 ```
 
-Pair with `request.agent.score` and the JA4 verdict for a layered defence: a benign request scoring low on every dimension passes; a stealth headless that defeats one layer still trips the others.
+Pair with `request.agent.score` and the JA4 verdict for a layered defense: a benign request scoring low on every dimension passes; a stealth headless that defeats one layer still trips the others.
 
 `onnx_model_path` loads an in-process CatBoost ONNX scorer at startup.
 When both `rule_pack_path` and `onnx_model_path` are set, exact

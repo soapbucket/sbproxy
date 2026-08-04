@@ -84,7 +84,7 @@ origins:
       routing: fallback_chain
 ```
 
-Routing strategies (10): round_robin, weighted, fallback_chain, random, lowest_latency, least_connections, cost_optimized, token_rate, sticky, race.
+Routing strategies (10): round_robin, weighted, fallback_chain, random, lowest_latency, least_connections, cost_optimized, least_token_usage, sticky, race.
 
 Guardrails: pii, injection, jailbreak, toxicity, content_safety, schema, regex.
 
@@ -116,7 +116,7 @@ Origin fields:
 | Type | Description |
 |------|-------------|
 | proxy | Reverse proxy to upstream URL |
-| ai_proxy | AI gateway with 200+ models across 72 native providers (bring your own keys), 15 routing strategies (round_robin, weighted, fallback_chain, random, lowest_latency, least_connections, cost_optimized, token_rate, least_token_usage, prefix_affinity, peak_ewma, sticky, race, cascade, cost_quality), guardrails, budgets |
+| ai_proxy | AI gateway with 200+ models across 72 native providers (bring your own keys), 15 routing strategies (round_robin, weighted, fallback_chain, random, lowest_latency, least_connections, cost_optimized, least_token_usage, prefix_affinity, peak_ewma, sticky, race, cascade, cost_quality, outcome_aware), guardrails, budgets |
 | static | Static response (JSON or text) |
 | redirect | HTTP redirect (301/302/307/308) |
 | echo | Echo request as JSON (debugging) |

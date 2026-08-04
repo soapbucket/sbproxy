@@ -37,7 +37,7 @@ Omitting it keeps the serial chain.
 
 | Key | Default | What changes if you set it |
 |---|---|---|
-| `block_threshold` | `1` | How many security detectors must flag before the request is rejected. `1` is the serial block-on-any behavior. `2` needs a quorum, so one noisy detector cannot hard-block on its own. `0` never blocks on the count, which leaves the mesh as a pure labelling pass for the policy plane. |
+| `block_threshold` | `1` | How many security detectors must flag before the request is rejected. `1` is the serial block-on-any behavior. `2` needs a quorum, so one noisy detector cannot hard-block on its own. `0` never blocks on the count, which leaves the mesh as a pure labeling pass for the policy plane. |
 | `redact_on_flag` | `false` | When a detector flags but the count is under the threshold, `true` masks the prompt with the origin's PII redactor and forwards it. `false` forwards the prompt untouched. |
 | `latency_budget_ms` | unset | Wall-clock budget for optional detectors. Once it is spent the cascade stops launching them. Unset runs every detector. Enforcing safety classifiers run regardless of the budget. |
 | `cache` | `false` | `true` caches each verdict so a repeated prompt skips the detectors. |
@@ -112,7 +112,7 @@ never called:
 }
 ```
 
-Error-envelope keys are serialised in alphabetical order, not in the order
+Error-envelope keys are serialized in alphabetical order, not in the order
 they are described here.
 
 The status is `400`. Three things in that body are worth reading. `code` is

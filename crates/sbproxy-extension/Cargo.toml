@@ -24,10 +24,18 @@ mlua.workspace = true
 
 # JavaScript scripting engine
 rquickjs.workspace = true
+swc_common.workspace = true
+swc_ecma_ast.workspace = true
+swc_ecma_codegen.workspace = true
+swc_ecma_parser.workspace = true
+swc_ecma_transforms_base.workspace = true
+swc_ecma_transforms_typescript.workspace = true
+swc_ecma_visit.workspace = true
 
 # WebAssembly scripting engine (wasmtime + WASI).
 wasmtime.workspace = true
 wasi-common.workspace = true
+wasmtime-wasi.workspace = true
 
 # Serialization
 serde = { workspace = true }
@@ -57,6 +65,10 @@ base64.workspace = true
 # Crypto
 sha2.workspace = true
 hex.workspace = true
+
+# Capability-based bundle traversal prevents path replacement between
+# containment checks and reads.
+cap-std.workspace = true
 
 # MCP tool-versioning compatibility oracle (mcp/compat): semver comparison for
 # the version-bump linter, JCS canonicalization for the contract digest, and
@@ -89,6 +101,8 @@ arc-swap.workspace = true
 
 # Logging
 tracing.workspace = true
+jsonschema.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile = "3"

@@ -173,6 +173,33 @@ pub struct LlmUsageEvent {
     /// it as a grouping key rather than as an assertion of fact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_id: Option<String>,
+    /// The model the caller asked for, before per-provider mapping
+    /// (WOR-2223).
+    ///
+    /// [`Self::model`] is the name the lane that answered bills under,
+    /// which after a `model_map` rename is a different string. Both are
+    /// needed to read a hybrid deployment: `model` says what was
+    /// charged, this says which of the operator's lanes the request
+    /// belonged to. A spilled completion and the local completions it
+    /// displaced share this value and nothing else.
+    ///
+    /// `None` on surfaces that never resolve a caller-facing model, and
+    /// on records that are not one caller's completion (a shadow eval,
+    /// an MCP tool call).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_model: Option<String>,
+    /// The `serve:` entry that answered this request on a locally hosted
+    /// engine (WOR-2223), or `None` when the request left the box.
+    ///
+    /// The lane discriminator, and the reason it is a separate field
+    /// from the two model names above rather than derived from them. A
+    /// fallback provider that forwards the requested model id unchanged
+    /// bills under the same string the local lane serves, so a lane
+    /// decision made by comparing names credits a cloud completion as a
+    /// local saving. Presence here is set at route time by the code that
+    /// resolved a local engine, and nothing else can produce it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_model: Option<String>,
 }
 
 /// A destination for completed-call usage events.
@@ -791,7 +818,7 @@ enum ObjectStoreKind {
 ///
 /// Builds the backend from the process environment (`AWS_*` /
 /// `GOOGLE_APPLICATION_CREDENTIALS`, etc.) on each put. An empty bucket,
-/// missing credentials, or a put failure logs and returns — never panics
+/// missing credentials, or a put failure logs and returns, never panics
 /// or propagates to the request hot path.
 #[derive(Debug)]
 pub struct ObjectStoreSink {
@@ -1069,6 +1096,8 @@ mod tests {
             a2a_context_id: None,
             a2a_identity_verified: None,
             workflow_id: None,
+            logical_model: None,
+            served_model: None,
         }
     }
 

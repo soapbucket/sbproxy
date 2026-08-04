@@ -3,12 +3,11 @@
 //! Extensions call the `register_startup_hook!` macro at module scope with a
 //! factory function; the macro submits a [`StartupHookFactory`] to the
 //! `inventory` registry. At runtime [`collect_startup_hook`] walks the
-//! registry and returns the first (typically only) registered factory's
-//! output. Builds without an extension register nothing and `collect_startup_hook`
-//! returns `None`.
+//! registry and returns the only registered factory's output. Builds without
+//! an extension register nothing and `collect_startup_hook` returns `None`.
 //!
-//! Only one startup hook per binary is meaningful. If multiple extensions
-//! register one, the first discovered wins and the rest are silently dropped.
+//! Only one startup hook per binary is meaningful. Multiple registrations
+//! reject pipeline construction instead of making link order observable.
 
 use std::sync::Arc;
 
@@ -48,12 +47,77 @@ macro_rules! register_startup_hook {
 
 /// Collect the single registered startup hook.
 ///
-/// Returns `None` if no extension registered one
-/// or the first factory's output otherwise. Call once during process
-/// startup and stash the `Arc` on the pipeline.
+/// Returns `None` if no extension registered one or the factory's output
+/// otherwise. Call for each candidate and stash the `Arc` on the pipeline.
+///
 pub fn collect_startup_hook() -> Option<Arc<dyn PipelineLifecycleHook>> {
-    inventory::iter::<StartupHookFactory>
-        .into_iter()
-        .next()
-        .map(|f| (f.factory)())
+    try_collect_startup_hook().expect("linked pipeline startup hooks must be unique")
+}
+
+/// Collect the startup hook while reporting registration collisions.
+///
+/// # Errors
+///
+/// Returns an error when more than one linked startup hook is registered.
+pub fn try_collect_startup_hook() -> anyhow::Result<Option<Arc<dyn PipelineLifecycleHook>>> {
+    collect_startup_hook_from(inventory::iter::<StartupHookFactory>)
+}
+
+fn collect_startup_hook_from<'a>(
+    factories: impl IntoIterator<Item = &'a StartupHookFactory>,
+) -> anyhow::Result<Option<Arc<dyn PipelineLifecycleHook>>> {
+    let mut factories = factories.into_iter();
+    let first = factories.next();
+    if factories.next().is_some() {
+        anyhow::bail!("multiple linked pipeline startup hooks are registered");
+    }
+    Ok(first.map(|factory| (factory.factory)()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FixtureHook;
+
+    #[async_trait::async_trait]
+    impl PipelineLifecycleHook for FixtureHook {
+        async fn on_startup(
+            &self,
+            _pipeline: &mut crate::pipeline::CompiledPipeline,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn on_reload(
+            &self,
+            _pipeline: &mut crate::pipeline::CompiledPipeline,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn fixture_hook() -> Arc<dyn PipelineLifecycleHook> {
+        Arc::new(FixtureHook)
+    }
+
+    #[test]
+    fn startup_hook_collision_rejects_the_candidate() {
+        let first = StartupHookFactory {
+            factory: fixture_hook,
+        };
+        let second = StartupHookFactory {
+            factory: fixture_hook,
+        };
+
+        let error = match collect_startup_hook_from([&first, &second]) {
+            Ok(_) => panic!("two linked startup hooks must reject the candidate"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "multiple linked pipeline startup hooks are registered"
+        );
+    }
 }

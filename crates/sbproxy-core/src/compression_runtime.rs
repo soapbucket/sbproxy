@@ -516,6 +516,16 @@ struct CompiledCompressionPipeline {
     requires_semantic_cache_bypass: bool,
 }
 
+impl CompiledCompressionPipeline {
+    /// Pin this compiled pipeline to one request.
+    fn selected(&self) -> SelectedCompressionRuntime {
+        SelectedCompressionRuntime {
+            runtime: self.runtime.clone(),
+            behavior_fingerprint: self.behavior_fingerprint.clone(),
+        }
+    }
+}
+
 /// Immutable default and named compression pipelines for one AI origin.
 pub struct CompressionRuntimeSet {
     default: CompiledCompressionPipeline,
@@ -780,23 +790,32 @@ impl CompressionRuntimeSet {
         })
     }
 
-    /// Resolve a validated selector. `None` means an undeclared profile.
+    /// Resolve a validated selector. `None` means an undeclared profile,
+    /// which is the only arm that can miss: `build` compiles the default
+    /// and off pipelines unconditionally.
     pub fn select(&self, selector: &CompressionSelector) -> Option<SelectedCompressionRuntime> {
-        let compiled = match selector {
-            CompressionSelector::On => &self.default,
-            CompressionSelector::Off => &self.off,
-            CompressionSelector::Profile(name) => self.profiles.get(name)?,
-        };
-        Some(SelectedCompressionRuntime {
-            runtime: compiled.runtime.clone(),
-            behavior_fingerprint: compiled.behavior_fingerprint.clone(),
-        })
+        match selector {
+            // Routed through `select_default` rather than reading the
+            // field, so the request path and the tests resolve the route
+            // default through the same function and cannot drift apart.
+            CompressionSelector::On => Some(self.select_default()),
+            CompressionSelector::Off => Some(self.off.selected()),
+            CompressionSelector::Profile(name) => self
+                .profiles
+                .get(name)
+                .map(CompiledCompressionPipeline::selected),
+        }
     }
 
     /// Resolve the route default.
-    pub fn select_default(&self) -> SelectedCompressionRuntime {
-        self.select(&CompressionSelector::On)
-            .expect("the compiled default pipeline is always present")
+    ///
+    /// Infallible: `build` stores the compiled default in a non-optional
+    /// field, so there is no missing case. This used to unwrap
+    /// `select(On)` with an `expect` describing that invariant, which
+    /// read as a runtime check but could never fire, and a panic here
+    /// would sit on the request path.
+    pub(crate) fn select_default(&self) -> SelectedCompressionRuntime {
+        self.default.selected()
     }
 
     /// Whether new request-selectable or explicitly budgeted behavior must
@@ -1228,7 +1247,7 @@ impl InternalSummarizer for RuntimeInternalSummarizer {
             .await?;
 
         if let Some(budget) = self.budget.as_ref() {
-            crate::server::ai_support::record_budget_usage(
+            crate::server::ai_support::debit_budget_without_billing_event(
                 budget,
                 &budget_keys,
                 request.model,

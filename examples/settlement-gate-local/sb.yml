@@ -1,0 +1,177 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# settlement-gate-local - the settlement origin gate, end to end, with no
+# payment provider and no network.
+#
+# Two blocks do the work and they own different things:
+#
+#   ai_crawl_control - which requests are payable and what they cost.
+#   proxy.payments   - how a payment settles: rails, credentials, durable
+#                      state, timeouts, failure posture.
+#
+# The gate is the seam between them. It turns the policy's 402 into a
+# durable intent, and it lets a request reach the origin only when a
+# committed row says the payment settled.
+#
+# Lightning is the one rail that runs hermetically. Core Lightning is not
+# an HTTP endpoint, it is a Unix socket speaking newline-delimited
+# JSON-RPC, so `fixture.py` can stand in for a node with no TLS, no
+# certificate, and no reachable host. The x402, Stripe, and LND rails all
+# require an HTTPS endpoint no local fixture can be.
+#
+# The fixture also writes the two secret files named below (a fresh
+# 32-byte binding key and a throwaway rune) and serves the origin on
+# 127.0.0.1:18080, counting every article it actually serves. That count
+# is the load-bearing observable: one settled payment serves the content
+# exactly once.
+#
+# This config needs a binary built with the payments features. The
+# default build has none of them, and a configured rail whose feature is
+# missing is a startup failure naming the feature:
+#
+#   CARGO_TARGET_DIR=target/payments cargo build --release -p sbproxy \
+#     --features payment-lightning-cln
+#
+# Run:
+#   python3 examples/settlement-gate-local/fixture.py &
+#   target/payments/release/sbproxy serve -f examples/settlement-gate-local/sb.yml
+#
+# Test (a reader, never charged):
+#   curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: blog.local' \
+#     -H 'User-Agent: Mozilla/5.0' http://127.0.0.1:8080/article
+#
+# Test (a declared crawler, challenged with an invoice):
+#   curl -is -H 'Host: blog.local' -H 'User-Agent: GPTBot/1.0' \
+#     http://127.0.0.1:8080/article
+#
+# Test (the whole sequence, with the origin hit count after each step):
+#   bash examples/settlement-gate-local/bin/settle-once.sh
+
+# sbproxy-docs:begin
+proxy:
+  http_bind_port: 8080
+
+  # Only because the demo origin runs on this machine: the SSRF guard
+  # refuses private upstream addresses unless allowlisted. A production
+  # config pointing at a real origin does not need this block.
+  extensions:
+    upstream:
+      allow_private_cidrs:
+        - '127.0.0.1/32'
+
+  # The operator surface. `/admin/payments/status` reports the rails that
+  # registered and what the recovery worker has done, and deliberately
+  # carries no intent id, tenant, amount, or provider reference.
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    # Demo password for local runs. Change before any non-loopback bind.
+    password: demo-change-me
+
+  payments:
+    # Authoritative state, and an absolute path is required. A paid
+    # request reaches the origin because a committed row in this file
+    # says the payment settled, so back it up like any other ledger.
+    # /tmp keeps the demo self-contained; production wants
+    # /var/lib/sbproxy/payments.sqlite3 on durable storage.
+    state_path: /tmp/sbproxy-settlement/payments.sqlite3
+
+    # Names the key that binds a challenge to the proxy that issued it.
+    # Must be a reference; an inline value is rejected at load with the
+    # field path. `file:/path` reads a file and `env:NAME` reads the
+    # environment, neither needing any other configuration. A provider
+    # URI such as `secret://<backend>/<name>` also works, but only with a
+    # matching backend under proxy.secrets.backends; without one the
+    # proxy refuses to boot. The fixture writes this file, 0600, with a
+    # fresh 32-byte value per run.
+    challenge_binding_key: file:/tmp/sbproxy-settlement/binding.key
+
+    # Total budget for the one synchronous provider interaction a paid
+    # request is allowed. 2000 ms is both the default and the ceiling.
+    authorization_timeout_ms: 2000
+
+    # Largest request body the payment path buffers, in bytes. A body is
+    # read once in full to bind a digest to the challenge, so this caps
+    # what one paid request can pin in memory. 1048576 is the default
+    # and the ceiling.
+    max_body_bytes: 1048576
+
+    # What happens to a payable request when the settlement
+    # infrastructure cannot answer: the store errors, a challenge cannot
+    # be prepared, the signer refuses. Infrastructure only. A rejected,
+    # expired, replayed, or unsettled payment stays away from the origin
+    # whatever this says. `closed` is the default and refuses with 503;
+    # `open`, `degraded`, and `observe` admit the request unpaid, each
+    # leaving a different record behind.
+    failure_mode: closed
+
+    worker:
+      # The background worker recovers. It expires unredeemed
+      # challenges, takes back leases whose holder went away, and asks
+      # providers about writes left outstanding. It never settles a
+      # payment. These three are the defaults, written out because
+      # /admin/payments/status reports what they have done.
+      reconcile_interval_ms: 1000
+      max_reconcile_batch: 32
+      shutdown_timeout_ms: 5000
+
+    rails:
+      lightning_cln:
+        # Absolute path to the node's lightning-rpc Unix socket. Here it
+        # is the stub the fixture binds.
+        socket_path: /tmp/sbproxy-settlement/lightning-rpc
+
+        # Named, never inlined. The rune is attached to each JSON-RPC
+        # request and redacted everywhere else. The stub never checks
+        # it; its value only has to exist.
+        rune: file:/tmp/sbproxy-settlement/cln.rune
+
+        # Cannot be set lower. The adapter reads the `listinvoices`
+        # status that v26.06 defines, and startup checks the live
+        # version through `getinfo` before registering the rail. The
+        # stub answers v26.06 for exactly this probe.
+        minimum_version: "26.06"
+
+        # The currency the route prices in, and the decimal depth of the
+        # settlement unit. 11 prices BTC down to the millisatoshi. The
+        # proxy performs no currency conversion, so every rail a route
+        # advertises has to declare the same quote_currency as the
+        # policy's price, and a mismatch is a load error by name.
+        quote_currency: BTC
+        settlement_decimals: 11
+
+        # How long a generated invoice stays payable. 300 is the
+        # default; the challenge expires with it.
+        invoice_expiry_seconds: 300
+
+origins:
+  "blog.local":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18080
+
+    policies:
+      - type: ai_crawl_control
+        # Fallback price for a payable route with no matching tier. In
+        # the rail's quote_currency, so BTC here.
+        price: 0.0001
+        currency: BTC
+
+        # The request header the policy names in the challenge and reads
+        # a redemption back from. The retry re-presents the quote token
+        # here verbatim.
+        header: crawler-payment
+
+        # Case-insensitive User-Agent substrings that mark a crawler.
+        # Anything outside this list is a reader and is never charged.
+        crawler_user_agents:
+          - GPTBot
+          - ClaudeBot
+          - CCBot
+          - PerplexityBot
+
+        # Routes that stay free no matter who asks.
+        free_paths:
+          - /robots.txt
+          - /health
+# sbproxy-docs:end

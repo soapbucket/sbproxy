@@ -45,6 +45,7 @@
 use std::io::Read as _;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use reqwest::blocking::Client;
@@ -60,6 +61,14 @@ const CUSTOMER: &str = "cus_wor2169e2e";
 
 /// The Stripe meter event name the reporter is configured with.
 const EVENT_NAME: &str = "sbproxy_ai_tokens";
+
+/// `examples/usage-bridge-queue/`, resolved from the crate that is running.
+fn example_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("e2e crate lives under workspace root")
+        .join("examples/usage-bridge-queue")
+}
 
 fn http_client() -> Client {
     Client::builder()
@@ -110,6 +119,9 @@ fn write_secret_file(dir: &Path, name: &str, value: &str) -> PathBuf {
 
 /// A fresh, clearly test-only key: 32 bytes from the OS entropy pool, hex
 /// encoded. Generated, never vendored, never reused.
+///
+/// This is 64 characters, which `challenge_binding_key` accepts because it
+/// runs the resolved value through HKDF and so takes any length.
 fn fresh_test_key() -> String {
     let mut bytes = [0_u8; 32];
     std::fs::File::open("/dev/urandom")
@@ -117,6 +129,25 @@ fn fresh_test_key() -> String {
         .read_exact(&mut bytes)
         .expect("read urandom");
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// A test-only recovery key that is exactly 32 bytes *as resolved*.
+///
+/// `recovery_encryption.key` is the one settlement secret that is used as raw
+/// AES-256-GCM key material rather than as HKDF input, so it must resolve to
+/// exactly 32 bytes and nothing decodes it first. [`fresh_test_key`] cannot
+/// serve here: its 64 hex characters resolve to 64 bytes and the proxy exits
+/// during payments initialization with "resolved to 64 bytes, but
+/// AES-256-GCM requires exactly 32". Because that happens after the HTTP
+/// listener binds, the harness's readiness probe passes and the failure
+/// surfaces as an unrelated admin-port timeout.
+///
+/// It is also why this is a fixed ASCII string rather than random bytes:
+/// `file:` references resolve through `read_to_string().trim()`, so raw
+/// entropy cannot round-trip through a file. That constraint makes the field
+/// awkward to supply with real key material, which is tracked separately.
+fn recovery_test_key() -> String {
+    "sbproxy-usage-bridge-e2e-rcvry32".to_owned()
 }
 
 /// The `proxy.payments` half of the document, parameterised on the two
@@ -128,6 +159,7 @@ fn fresh_test_key() -> String {
 fn payments_block(
     state_path: &Path,
     binding_key: &Path,
+    recovery_key: &Path,
     stripe_key: &Path,
     reporter: &str,
 ) -> String {
@@ -153,10 +185,13 @@ fn payments_block(
 {reporter}"#,
         state_path = state_path.display(),
         binding_key = binding_key.display(),
-        // One file serves as both secrets. Both are 32 bytes of hex, both
-        // are test-only, and the recovery cipher checks the resolved length
-        // rather than the path it came from.
-        recovery_key = binding_key.display(),
+        // Two files, not one. These secrets have different contracts:
+        // `challenge_binding_key` is HKDF input and takes any length, while
+        // `recovery_encryption.key` is raw AES-256-GCM key material and must
+        // resolve to exactly 32 bytes. Sharing one file meant the recovery
+        // key inherited the binding key's 64 hex characters, and the proxy
+        // exited during payments initialization every time.
+        recovery_key = recovery_key.display(),
         stripe_key = stripe_key.display(),
     )
 }
@@ -191,10 +226,17 @@ fn start(reporter: &str) -> Stack {
     let state_path = dir.path().join("payments.sqlite3");
     let key_store = dir.path().join("keys.redb");
     let binding_key = write_secret_file(dir.path(), "binding.key", &fresh_test_key());
+    let recovery_key = write_secret_file(dir.path(), "recovery.key", &recovery_test_key());
     let stripe_key = write_secret_file(dir.path(), "stripe.key", "sk_test_usage_bridge_e2e");
     let upstream = MockUpstream::start(chat_reply()).expect("mock model provider");
 
-    let payments = payments_block(&state_path, &binding_key, &stripe_key, reporter);
+    let payments = payments_block(
+        &state_path,
+        &binding_key,
+        &recovery_key,
+        &stripe_key,
+        reporter,
+    );
     let yaml = format!(
         r#"
 proxy:
@@ -238,7 +280,9 @@ origins:
 
     let proxy =
         ProxyHarness::start_payments_with_yaml_and_env(&yaml, &[]).expect("start payments proxy");
-    ProxyHarness::wait_for_port(admin_port, Duration::from_secs(10)).expect("admin port to bind");
+    proxy
+        .wait_for_secondary_port(admin_port, Duration::from_secs(10))
+        .expect("admin port to bind");
 
     Stack {
         proxy,
@@ -425,6 +469,98 @@ fn a_served_ai_request_queues_one_billable_unit() {
         row.usage_identifier.len() <= 200,
         "Stripe bounds an identifier at 200 characters: {}",
         row.usage_identifier
+    );
+}
+
+#[test]
+fn the_examples_own_walkthrough_still_runs() {
+    // Everything above drives the proxy directly, which is why all of it
+    // stayed green while the example next to it rotted (WOR-2220). The
+    // example's entry point fed a non-2xx admin body to a JSON parser and
+    // reported a missing `token` field instead of the HTTP status that
+    // explained it, and the README's documented query selected a `quantity`
+    // column that `usage_reports` does not have. Nothing ran either one:
+    // `scripts/examples-smoke.sh` gates on a `docker-compose.yml`, and this
+    // example ships none because the shared image compiles the default
+    // feature set while the meter needs `payment-stripe`.
+    //
+    // So this test runs the shipped script and the README's own sqlite3
+    // commands rather than reimplementing them. A walkthrough that stops
+    // working is a failure here.
+    let stack = start(&reporter_block("ai", "total_tokens", "degraded"));
+    let example = example_dir();
+    let state = stack.state_path.display().to_string();
+
+    let output = Command::new("bash")
+        .arg(example.join("bin/bill-one-call.sh"))
+        .env("ADMIN", format!("http://127.0.0.1:{}", stack.admin_port))
+        .env("ADMIN_AUTH", "admin:secret")
+        .env("PROXY", stack.proxy.base_url())
+        .env("HOST", AI_HOST)
+        .env("MODEL", "gpt-client")
+        .env("CUSTOMER", CUSTOMER)
+        .env("STATE", &state)
+        .output()
+        .expect("run examples/usage-bridge-queue/bin/bill-one-call.sh");
+
+    let status = output.status;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        status.success(),
+        "bin/bill-one-call.sh is the example's own entry point and has to run \
+         clean: {status}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // Reported by the walkthrough itself, so a script that stops billing
+    // fails here rather than printing a reassuring zero.
+    let reported = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("rows on the usage queue"))
+        .map(str::trim)
+        .next();
+    assert_eq!(
+        reported,
+        Some("1"),
+        "one call, one billable unit:\nstdout:\n{stdout}"
+    );
+
+    // Every sqlite3 command the README promises output for, run against the
+    // file this stack actually wrote. Parsed out of the CAPTURE markers so
+    // the assertion cannot drift from the text the reader is given.
+    let readme = std::fs::read_to_string(example.join("README.md"))
+        .expect("read examples/usage-bridge-queue/README.md");
+    let mut ran = 0_usize;
+    for line in readme.lines() {
+        let documented = match line
+            .strip_prefix("<!-- CAPTURE: ")
+            .and_then(|rest| rest.strip_suffix(" -->"))
+        {
+            Some(command) if command.starts_with("sqlite3 ") => command,
+            _ => continue,
+        };
+        let command = documented.replace("/tmp/sbproxy-usage-bridge/payments.sqlite3", &state);
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(&command)
+            .output()
+            .expect("run a documented sqlite3 command");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "the README documents this command and promises its output:\n  \
+             {documented}\n{stderr}"
+        );
+        assert!(
+            !output.stdout.is_empty(),
+            "this documented command returned nothing, so the block under it \
+             in the README would be empty:\n  {documented}"
+        );
+        ran += 1;
+    }
+    assert!(
+        ran >= 2,
+        "the README's sqlite3 walkthrough commands went missing; ran {ran}"
     );
 }
 

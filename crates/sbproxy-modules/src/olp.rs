@@ -302,7 +302,7 @@ pub struct OlpJwk {
     pub x: String,
     /// Key id matching the JWS header `kid`.
     pub kid: String,
-    /// `verify` only — the public-key JWK does not sign.
+    /// `verify` only, the public-key JWK does not sign.
     #[serde(rename = "use")]
     pub use_: String,
     /// Algorithm the key is intended for.
@@ -590,7 +590,7 @@ impl RevocationStore for KvRevocationStore {
         })
         .to_string();
         // Backends that lack TTL support (in-memory) fall back to a
-        // plain put — the entry will live for process lifetime, which
+        // plain put, the entry will live for process lifetime, which
         // is fine for dev / CI use.
         match self
             .store

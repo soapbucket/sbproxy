@@ -1,6 +1,6 @@
 # Admin API guide
 
-*Last modified: 2026-07-28*
+*Last modified: 2026-08-03*
 
 This is the task-oriented "how do I call it" guide to the embedded admin
 server: enabling it, authenticating, and a curl cookbook for the routes
@@ -220,6 +220,26 @@ curl -fsS "${SB_ADMIN_URL}/healthz"
 
 curl -fsS "${SB_ADMIN_URL}/health" | jq '{status,version,checks}'
 ```
+
+**Extension inventory for the running generation.** A `read_only` operator can
+call this route. It reports safe bundle and hook metadata, never entry bytes,
+source paths, attachment config, or secrets:
+
+```bash
+curl -fsS -u "oncall:${ONCALL_PASSWORD}" \
+  "${SB_ADMIN_URL}/api/extensions" \
+  | jq '{scope, summary, bundles, hooks, collisions}'
+```
+
+Look for `scope.mode: "running"`, the expected `config_revision`, zero failures
+and collisions, and `active` on hooks attached to this pipeline. Use
+`sbproxy doctor <config> --format json` before reload for the stopped candidate
+view. In that view, `active` means the candidate selected and wired the hook. It
+does not claim traffic ran or that runtime health checks passed. Loaded hooks
+without an attachment are `unconsumed`; `not_evaluated` appears when doctor
+falls back to bundle loading because full candidate construction failed. The
+running view marks AI hooks active with their compiled chain and payment hooks
+active only after the payment dispatcher installs.
 
 **Mint a key** (the plaintext token is returned once, on creation;
 save it now):

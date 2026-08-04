@@ -1,0 +1,91 @@
+{
+  "data_plane_port": 8080,
+  "admin_port": 8080,
+  "health_path": "/health",
+  "cases": [
+    {
+      "name": "an ordinary request well under the cap keeps its model",
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": {
+          "Host": "ai.local",
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "model": "gpt-4o",
+          "messages": [{"role": "user", "content": "spend=1"}]
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "type": "jsonShape",
+          "shape": {"model": "gpt-4o", "choices": [{"message": {"content": "fixture response"}}]}
+        }
+      }
+    },
+    {
+      "name": "one call bills past the cap, and is itself allowed",
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": {
+          "Host": "ai.local",
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "model": "gpt-4o",
+          "messages": [{"role": "user", "content": "spend=100000000"}]
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "type": "jsonShape",
+          "shape": {"model": "gpt-4o"}
+        }
+      }
+    },
+    {
+      "name": "the next request is refused at the cap",
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": {
+          "Host": "ai.local",
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "model": "gpt-4o",
+          "messages": [{"role": "user", "content": "spend=1"}]
+        }
+      },
+      "expect": {
+        "status": 402,
+        "body": {
+          "type": "jsonShape",
+          "shape": {"error": {"type": "budget_exceeded", "scope": "workspace"}}
+        }
+      }
+    }
+  ],
+  "audit_check": false,
+  "_notes": [
+    "The cases run in order against one process and the budget tracker",
+    "is in-memory, so case 2 is what makes case 3 true. The runner never",
+    "restarts the proxy between cases, which is exactly the property this",
+    "example needs.",
+    "",
+    "The warn and downgrade bands are deliberately not asserted here.",
+    "Landing between 0.8 and 0.95, or between 0.95 and 1.0, needs a spend",
+    "computed from the live gauge rather than a constant, and smoke.json",
+    "holds constants. bin/soft-landing.sh measures the gauge first and",
+    "then places each band exactly; that is the walkthrough the README",
+    "and docs/ai-predictive-budget.md quote.",
+    "",
+    "The three cases above hold whatever the price table says, because",
+    "case 2 asks for a hundred million tokens and no configured rate",
+    "leaves that under a $1000 cap."
+  ]
+}

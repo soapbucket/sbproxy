@@ -193,7 +193,7 @@ origins:
       # IP allow-list keeps the workload from reaching arbitrary
       # destinations. The default below admits everything; in
       # production narrow this to the LLM provider CIDRs you
-      # have authorised.
+      # have authorized.
       - type: ip_filter
         whitelist:
           - 0.0.0.0/0
@@ -219,7 +219,7 @@ The knobs, in order:
   instead of hammering a closed window.
 * `ip_filter` bounds where the workload can connect. The
   shipped `0.0.0.0/0` whitelist admits everything; narrow it to
-  the provider CIDRs you have authorised before production.
+  the provider CIDRs you have authorized before production.
 
 ## Calling it
 
@@ -377,7 +377,7 @@ curl -s http://127.0.0.1:15001/metrics | grep sbproxy_requests
 
 ## Failure modes and degraded operation
 
-| Failure | Sidecar behaviour | Operator action |
+| Failure | Sidecar behavior | Operator action |
 |---|---|---|
 | Workload sends traffic before sbproxy is ready | Connections are refused until the listener binds (subsecond); the workload should retry on startup | none; standard startup retry logic covers it |
 | sbproxy container crashes | Pod restarts; init container reinstalls redirect on fresh netns | check `kubectl logs -p` for the cause |

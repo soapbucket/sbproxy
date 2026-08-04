@@ -29,11 +29,27 @@ use std::time::Duration;
 
 use sbproxy_e2e::ProxyHarness;
 
-/// A payment hash the stub node reports, as 64 lowercase hex chars.
-const PAYMENT_HASH: &str = "1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f";
+/// A syntactically valid regtest BOLT 11 prefix (bech32 charset).
+const BOLT11_PREFIX: &str = "lnbcrt100u1stubinvoice";
 
-/// A syntactically valid regtest BOLT 11 string (prefix + bech32 chars).
-const BOLT11: &str = "lnbcrt100u1stubinvoicestubinvoicestubinvoice";
+/// Mint a fresh payment hash, as 64 lowercase hex chars.
+///
+/// A real node never reuses one, and this stub must not either: the
+/// settlement store holds a unique index on a receipt's provider
+/// reference, which is what stops one provider payment being credited as
+/// two settlements. A constant hash settles the first intent in a store
+/// and then strands every later one in `needs_reconciliation` with an
+/// internal error. Every test here used to start a fresh store and
+/// settle once, so a constant was invisible until
+/// `two_settlements_in_one_store_each_get_their_own_receipt` ran.
+fn mint_payment_hash() -> String {
+    // Unique across every invoice in the whole test binary, not merely
+    // within one node: these tests run concurrently, and a per-node
+    // counter restarting at 1 would hand two of them the same hash.
+    static MINTED: AtomicUsize = AtomicUsize::new(0);
+    let nth = MINTED.fetch_add(1, Ordering::Relaxed) + 1;
+    format!("{nth:064x}")
+}
 
 /// What the stub Core Lightning node knows about its one invoice.
 #[derive(Default)]
@@ -44,6 +60,11 @@ struct NodeState {
     amount_msat: Option<u64>,
     /// Whether the payer settled it.
     paid: bool,
+    /// This invoice's payment hash, minted when it was created. A real
+    /// node never reuses one; see [`mint_payment_hash`].
+    payment_hash: Option<String>,
+    /// This invoice's BOLT 11 string, carrying the hash above.
+    bolt11: Option<String>,
 }
 
 /// A stub Core Lightning node on a Unix socket.
@@ -149,9 +170,16 @@ fn respond(
             node.amount_msat = params
                 .get("amount_msat")
                 .and_then(serde_json::Value::as_u64);
+            // A fresh invoice is unpaid. Without this a second invoice
+            // inherits the first one's `paid`, so it is born settled.
+            node.paid = false;
+            let payment_hash = mint_payment_hash();
+            let bolt11 = format!("{BOLT11_PREFIX}{payment_hash}");
+            node.payment_hash = Some(payment_hash.clone());
+            node.bolt11 = Some(bolt11.clone());
             serde_json::json!({
-                "payment_hash": PAYMENT_HASH,
-                "bolt11": BOLT11,
+                "payment_hash": payment_hash,
+                "bolt11": bolt11,
             })
         }
         "listinvoices" => {
@@ -167,10 +195,10 @@ fn respond(
             serde_json::json!({"invoices": [{
                 "label": requested,
                 "status": if node.paid { "paid" } else { "unpaid" },
-                "payment_hash": PAYMENT_HASH,
+                "payment_hash": node.payment_hash.clone().unwrap_or_default(),
                 "amount_msat": amount,
                 "amount_received_msat": if node.paid { amount } else { 0 },
-                "bolt11": BOLT11,
+                "bolt11": node.bolt11.clone().unwrap_or_default(),
             }]})
         }
         _ => serde_json::json!({}),
@@ -348,7 +376,10 @@ fn challenge_settle_allow_and_replay_refusal() {
         .expect("the 402 carries the quote token")
         .clone();
     let body = String::from_utf8(challenge.body.clone()).expect("402 body is UTF-8");
-    assert!(body.contains(BOLT11), "the 402 carries the invoice: {body}");
+    assert!(
+        body.contains(BOLT11_PREFIX),
+        "the 402 carries the invoice: {body}"
+    );
     assert!(
         body.contains("\"rail\":\"lightning\""),
         "the 402 names the rail: {body}"
@@ -392,6 +423,44 @@ fn challenge_settle_allow_and_replay_refusal() {
         "the refusal names the replay: {replay_body}"
     );
     assert_eq!(stack.origin.hits(), 1, "a replay never touches the origin");
+
+    // 4. WOR-2219: the whole money path leaves an operational trace.
+    //
+    // The three assertions above are exactly the shape of test that let
+    // `sbproxy_payment_settlement_total` sit at zero through a complete
+    // settled payment: the durable rows were right, the status codes were
+    // right, and nothing looked at the metric an operator alerts on.
+    let metrics = stack
+        .harness
+        .get("/metrics", "blog.localhost")
+        .expect("GET /metrics")
+        .text()
+        .expect("metrics body is UTF-8");
+    let counted = |operation: &str, outcome: &str| {
+        metrics.lines().any(|line| {
+            line.starts_with("sbproxy_payment_settlement_total{")
+                // The rail is the one that settles, not the one advertised:
+                // the 402 above says `lightning` and this says
+                // `lightning_cln`, which is what keeps this family in one
+                // vocabulary with the reconciliation sweep.
+                && line.contains("rail=\"lightning_cln\"")
+                && line.contains(&format!("operation=\"{operation}\""))
+                && line.contains(&format!("outcome=\"{outcome}\""))
+                && !line.ends_with(" 0")
+        })
+    };
+    assert!(
+        counted("challenge", "prepared"),
+        "the 402 prepared a durable challenge and nothing counted it:\n{metrics}"
+    );
+    assert!(
+        counted("redeem", "succeeded"),
+        "a settled payment reached the origin and nothing counted it:\n{metrics}"
+    );
+    assert!(
+        counted("redeem", "proof_replayed"),
+        "the replay refusal left no trace on the settlement counter:\n{metrics}"
+    );
 }
 
 #[test]
@@ -431,6 +500,138 @@ fn an_unpaid_retry_never_reaches_the_origin() {
     );
 }
 
+/// The value of one `sbproxy_payment_settlement_total` series in a scrape,
+/// or zero when nothing has created it.
+fn settlement_total(metrics: &str, operation: &str, outcome: &str) -> f64 {
+    metrics
+        .lines()
+        .find(|line| {
+            line.starts_with("sbproxy_payment_settlement_total{")
+                && line.contains("rail=\"lightning_cln\"")
+                && line.contains(&format!("operation=\"{operation}\""))
+                && line.contains(&format!("outcome=\"{outcome}\""))
+        })
+        .and_then(|line| line.rsplit(' ').next())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_default()
+}
+
+#[test]
+fn an_early_retry_then_payment_is_never_billed_twice() {
+    // WOR-2230, and the sequence this suite never ran: retry, then pay, then
+    // retry. `challenge_settle_allow_and_replay_refusal` pays before its
+    // first retry, so its intent is never stranded, and
+    // `an_unpaid_retry_never_reaches_the_origin` stops at the 503. Between
+    // them they left the whole reconciliation path uncovered, which is how a
+    // double charge survived in it.
+    let stack = start_stack().expect("start settlement stack");
+
+    let challenge = stack
+        .harness
+        .get_with_headers("/article", "blog.localhost", &[CRAWLER_UA])
+        .expect("challenge request");
+    assert_eq!(challenge.status, 402, "unpaid crawl is challenged");
+    let token = challenge
+        .headers
+        .get("crawler-payment")
+        .expect("the 402 carries the quote token")
+        .clone();
+
+    // 1. Retry a little early, before paying. Ordinary crawler behaviour.
+    //    The rail verifies the invoice, finds it unpaid, and the intent
+    //    strands in `NeedsReconciliation` with a dispatch outstanding.
+    let early = stack
+        .harness
+        .get_with_headers(
+            "/article",
+            "blog.localhost",
+            &[CRAWLER_UA, ("crawler-payment", token.as_str())],
+        )
+        .expect("early retry");
+    assert_eq!(early.status, 503, "an unpaid retry strands the intent");
+    assert_eq!(stack.origin.hits(), 0);
+
+    // 2. The crawler pays. The money is really gone.
+    stack.node.pay_invoice();
+
+    // 3. Retry until the strand resolves. The request path never retries a
+    //    stranded intent, so what unblocks this is the recovery worker
+    //    proving the invoice paid, not a second settle from here.
+    let mut last = 0_u16;
+    for _ in 0..80 {
+        let retry = stack
+            .harness
+            .get_with_headers(
+                "/article",
+                "blog.localhost",
+                &[CRAWLER_UA, ("crawler-payment", token.as_str())],
+            )
+            .expect("retry after paying");
+        last = retry.status;
+        if last != 503 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    assert_eq!(
+        last, 200,
+        "a payment the worker proved settled has to serve the content it bought",
+    );
+    assert_eq!(stack.origin.hits(), 1, "the origin served exactly once");
+
+    // 4. One payment, one invoice. This is the assertion the bug was about:
+    //    a second prepared challenge here is a second bill for an article
+    //    the crawler already paid for.
+    let metrics = stack
+        .harness
+        .get("/metrics", "blog.localhost")
+        .expect("GET /metrics")
+        .text()
+        .expect("metrics body is UTF-8");
+    assert!(
+        (settlement_total(&metrics, "challenge", "prepared") - 1.0).abs() < f64::EPSILON,
+        "exactly one challenge may ever be prepared for one paid article:\n{metrics}"
+    );
+}
+
+#[test]
+fn a_configured_rail_seeds_its_settlement_series() {
+    // Boot, scrape, no traffic. An operator who cannot find the family at
+    // all has no way to tell a quiet deployment from one whose settlement
+    // path reports nothing, and the second reads as the first for as long
+    // as nobody pays. The seed is what makes the absence mean
+    // misconfiguration.
+    let stack = start_stack().expect("start settlement stack");
+
+    let metrics = stack
+        .harness
+        .get("/metrics", "blog.localhost")
+        .expect("GET /metrics")
+        .text()
+        .expect("metrics body is UTF-8");
+    let seeded = |operation: &str, outcome: &str| {
+        metrics.lines().any(|line| {
+            line.starts_with("sbproxy_payment_settlement_total{")
+                && line.contains("rail=\"lightning_cln\"")
+                && line.contains(&format!("operation=\"{operation}\""))
+                && line.contains(&format!("outcome=\"{outcome}\""))
+        })
+    };
+    assert!(
+        seeded("challenge", "prepared"),
+        "a configured rail must draw a flat line before its first challenge:\n{metrics}"
+    );
+    assert!(
+        seeded("redeem", "succeeded"),
+        "a configured rail must draw a flat line before its first settlement:\n{metrics}"
+    );
+    assert_eq!(
+        stack.origin.hits(),
+        0,
+        "the seed comes from startup, not from a request"
+    );
+}
+
 #[test]
 fn a_reader_is_never_challenged() {
     let stack = start_stack().expect("start settlement stack");
@@ -444,4 +645,86 @@ fn a_reader_is_never_challenged() {
         .expect("reader request");
     assert_eq!(reader.status, 200, "a reader passes without payment");
     assert_eq!(stack.origin.hits(), 1);
+}
+
+/// Two full settlements in one store must each get their own receipt.
+///
+/// The store holds a unique index on a receipt's provider reference,
+/// which is what stops one provider payment being credited as two
+/// settlements. Nothing here exercised it: every other test starts a
+/// fresh store and settles once, so a stub node that reused a payment
+/// hash looked fine. It was not fine. The second settlement failed the
+/// receipt insert, the worker logged `could not record a reconciliation
+/// outcome category=internal`, and the intent sat in
+/// `needs_reconciliation` forever while the invoice was paid. A reader
+/// running the shipped walkthrough twice hit it on their second run.
+#[test]
+fn two_settlements_in_one_store_each_get_their_own_receipt() {
+    let stack = start_stack().expect("start settlement stack");
+
+    for round in 1..=2 {
+        let challenge = stack
+            .harness
+            .get_with_headers("/article", "blog.localhost", &[CRAWLER_UA])
+            .expect("challenge request");
+        assert_eq!(
+            challenge.status, 402,
+            "round {round}: an unpaid crawler is challenged. A 503 here means \
+             the previous round left an intent unresolved"
+        );
+        let token = challenge
+            .headers
+            .get("crawler-payment")
+            .expect("the 402 carries the quote token")
+            .clone();
+
+        stack.node.pay_invoice();
+
+        // The rail settles inline once the invoice is paid, so this needs
+        // no worker sweep. Poll only to absorb scheduling jitter.
+        let mut allowed = None;
+        for _ in 0..100 {
+            let response = stack
+                .harness
+                .get_with_headers(
+                    "/article",
+                    "blog.localhost",
+                    &[CRAWLER_UA, ("crawler-payment", token.as_str())],
+                )
+                .expect("paid retry");
+            if response.status == 200 {
+                allowed = Some(response);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            allowed.is_some(),
+            "round {round}: a paid quote must reach the origin. Stuck at 503 \
+             means the receipt insert failed and the intent is stranded"
+        );
+        assert_eq!(
+            stack.origin.hits(),
+            round,
+            "round {round}: one settled payment serves the article exactly once"
+        );
+    }
+
+    let metrics = stack
+        .harness
+        .get("/metrics", "blog.localhost")
+        .expect("GET /metrics")
+        .text()
+        .expect("metrics body is UTF-8");
+    // Two prepared challenges and two successful redeems, not one of
+    // each replayed: the receipt for the second settlement has to exist
+    // for its redeem to count.
+    assert!(
+        (settlement_total(&metrics, "redeem", "succeeded") - 2.0).abs() < f64::EPSILON,
+        "both settlements are counted: {metrics}"
+    );
+    assert!(
+        (settlement_total(&metrics, "challenge", "prepared") - 2.0).abs() < f64::EPSILON,
+        "each round is billed exactly once: {metrics}"
+    );
 }

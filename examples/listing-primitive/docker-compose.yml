@@ -1,0 +1,31 @@
+# Stack for the `listing-primitive` example. One container: both origins
+# answer from the proxy itself, so there is no upstream and no fixture.
+#
+# The `listings/` mount is load bearing. Listings load from the directory
+# holding the served sb.yml, so a config mounted at /etc/sbproxy/sb.yml
+# needs its manifests at /etc/sbproxy/listings/ or the registry loads
+# empty and every Listing surface 404s.
+#
+# Bring up:    docker compose up -d --wait
+# Tear down:   docker compose down -v
+
+services:
+  sbproxy:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.cloudbuild
+    image: sbproxy-listing-primitive:local
+    command: ["serve", "-f", "/etc/sbproxy/sb.yml"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./sb.yml:/etc/sbproxy/sb.yml:ro
+      - ./listings:/etc/sbproxy/listings:ro
+    environment:
+      - SB_LOG_LEVEL=info
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:8080/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s

@@ -1695,9 +1695,12 @@ impl SseUsageScanner {
 /// moderations, reranking, files, batches, fine-tuning) ship today
 /// as `PerCall` events with `cost_usd = 0.0`; per-unit pricing for
 /// images, audio seconds, and rerank documents lands when the
-/// pricing tables ship. Chat completions continue to bill through
-/// `record_budget_usage` until the chat usage-extraction is reworked
-/// to emit the new event shape.
+/// pricing tables ship.
+///
+/// This is the **only** writer into the in-process `BudgetTracker`
+/// (WOR-2212). Every dispatch path that spends budget reaches it, and
+/// a second writer beside it is the bug that made a configured budget
+/// enforce at half its value for as long as one existed.
 /// Map an HTTP status code to a stable RFC 9209 `Proxy-Status`
 /// `error` token. Returns `None` for status codes that don't have
 /// a canonical proxy-error mapping (the header is still emitted
@@ -1873,6 +1876,7 @@ pub(super) fn emit_ai_billing_event(
     rollup_properties: &std::collections::BTreeMap<String, String>,
     agent: sbproxy_ai::budget::AgentIdentity<'_>,
     ai_span: &tracing::Span,
+    debit: sbproxy_ai::budget::TokenDebit,
 ) -> u64 {
     let cost_usd_micros = cost_usd_to_micros(cost_usd);
     // Feed the per-attribution spend metrics from the single billing
@@ -2000,7 +2004,7 @@ pub(super) fn emit_ai_billing_event(
             // every sink reading the event off the bus sees the same
             // identity the budget keys were derived from.
             .with_agent(agent);
-    sbproxy_ai::budget::record_billing_event(&BUDGET_TRACKER, &event);
+    sbproxy_ai::budget::record_billing_event(&BUDGET_TRACKER, &event, debit);
     // WOR-1809: debug, not info. This fires per billing scope, so one
     // completion can emit a burst of identical lines; the ledger sinks
     // and metrics are the durable record, the log line is a trace.
@@ -2109,6 +2113,15 @@ fn usage_event_from_context(
             .trace_id
             .clone()
             .filter(|id| !id.is_empty()),
+        // WOR-2223: the two halves of the hybrid lane split. The failover
+        // loop rewrites `ai_model` to whatever the provider that answered
+        // bills under, so by the time this runs a spilled completion no
+        // longer names the lane it came from; `ai_logical_model` still
+        // does. `ai_serve_model` is set only by the code that resolved a
+        // local engine and is cleared at the top of every attempt, so it
+        // is present exactly when the request never left the box.
+        logical_model: ctx.ai_logical_model.clone(),
+        served_model: ctx.ai_serve_model.clone(),
     }
 }
 
@@ -2128,17 +2141,35 @@ pub(super) fn shadow_usage_record_from_context(
 /// realized cost-per-success. No-op unless the origin opted in (the
 /// strategy is `outcome_aware`) and the request actually reached a
 /// provider, so a pre-dispatch block records nothing.
-pub(super) fn record_routing_feedback(ctx: &crate::context::RequestContext) {
+///
+/// `status` must be the request's **final** status, which on the AI path
+/// means the one `final_response_status` resolves rather than
+/// `ctx.response_status` (WOR-2213). `ai_proxy` writes its response
+/// inside `request_filter` and returns `Ok(true)`, so Pingora's
+/// `response_filter`, the only thing that sets `ctx.response_status` for
+/// proxied traffic, never runs for AI requests. Reading that field here
+/// meant every completed AI request recorded `success = false`, every
+/// provider's score reached `f64::INFINITY`, and `best_among` pinned on
+/// `enabled[0]` forever: the strategy could not shift traffic at all,
+/// which is the entire thing it exists to do.
+pub(super) fn record_routing_feedback(ctx: &crate::context::RequestContext, status: u16) {
     if !ctx.ai_record_routing_feedback {
         return;
     }
     let Some(provider) = ctx.ai_provider.as_deref() else {
         return;
     };
-    let status = ctx.response_status.unwrap_or(0);
     let success = (200..300).contains(&status);
     // A provider-side refusal / content-filter, distinct from our own
     // guardrail or policy blocks (those never set a provider).
+    //
+    // Only `content_filter` is produced today (`ai_dispatch.rs:7090`).
+    // Nothing anywhere assigns `refusal`, so that arm cannot fire, and
+    // the refusal rate this feeds is really a content-filter rate. The
+    // arm stays because whether a provider refusal should be a distinct
+    // signal from a content filter is a design question rather than a
+    // typo, but a reader should not take its presence as evidence that
+    // refusals are being counted.
     let refused = matches!(
         ctx.ai_outcome.as_deref(),
         Some("content_filter") | Some("refusal")
@@ -2370,7 +2401,25 @@ pub(super) fn inprocess_embed(
     }
 }
 
-pub(crate) fn record_budget_usage(
+/// Debit a scope directly, for the one caller that spends without
+/// emitting a billing event.
+///
+/// `compression_runtime`'s internal summarization calls a provider on
+/// the operator's account and never builds an `AiBillingEvent`, so
+/// `record_billing_event` never sees it. Without this it would spend
+/// real money against no budget at all.
+///
+/// **Do not call this from a dispatch path.** Anything that reaches
+/// [`emit_ai_billing_event`] is already debited by
+/// `record_billing_event`, and adding a second debit beside it is
+/// exactly WOR-2212: every AI request spent its budget twice, so a
+/// configured `$100/day` cap stopped traffic at `$50` of real spend,
+/// and nothing looked wrong because the gauge, the admin key detail,
+/// and every budget assertion all read the same doubled tracker.
+///
+/// The right long-term shape is for the compression path to emit a
+/// billing event like everything else, at which point this goes away.
+pub(crate) fn debit_budget_without_billing_event(
     cfg: &sbproxy_ai::BudgetConfig,
     keys: &[(usize, String)],
     model: &str,
@@ -2382,8 +2431,31 @@ pub(crate) fn record_budget_usage(
     }
     let total_tokens = prompt_tokens + completion_tokens;
     let cost = sbproxy_ai::estimate_cost(model, prompt_tokens, completion_tokens);
-    for (limit_idx, key) in keys {
+    for (_, key) in keys {
         BUDGET_TRACKER.record_usage(key, total_tokens, cost);
+    }
+    refresh_budget_utilization(cfg, keys);
+}
+
+/// Republish the budget-utilization gauge for each scope this request
+/// touched.
+///
+/// **This does not debit anything.** `record_billing_event`, reached
+/// through [`emit_ai_billing_event`], is the single writer into
+/// `BUDGET_TRACKER` (WOR-2212). This function used to debit as well,
+/// five hundred lines above the billing event that debited the same
+/// cost against the same scope keys, so every AI request spent its
+/// budget twice and a configured `$100/day` cap stopped traffic at
+/// `$50` of real spend.
+///
+/// Nothing looked wrong because the gauge, the admin key detail, and
+/// every budget assertion all read the same doubled tracker and
+/// therefore agreed with each other.
+///
+/// Call this **after** the billing event, so the gauge reflects the
+/// debit rather than lagging it by one request.
+pub(crate) fn refresh_budget_utilization(cfg: &sbproxy_ai::BudgetConfig, keys: &[(usize, String)]) {
+    for (limit_idx, key) in keys {
         let limit = &cfg.limits[*limit_idx];
         let usage = BUDGET_TRACKER.get_usage(key);
         if let Some(ratio) = limit_utilization(usage.tokens, usage.cost_usd, limit) {
@@ -3998,6 +4070,91 @@ mod governed_usage_attribution_tests {
         assert_ne!(event.key_id.as_deref(), Some("mutable display name"));
     }
 
+    /// A value recorder over an in-memory ledger priced against
+    /// `gpt-4o-mini` for the served model `qwen3-14b`, the shape
+    /// `examples/use-case-local-first` configures.
+    fn value_recorder() -> (
+        std::sync::Arc<sbproxy_ai::value_ledger::ValueLedger>,
+        sbproxy_ai::value_ledger::ValueSink,
+    ) {
+        let price = sbproxy_model_host::CloudPrice {
+            prompt_micros_per_mtok: 3_000_000,
+            completion_micros_per_mtok: 15_000_000,
+        };
+        let ledger = std::sync::Arc::new(
+            sbproxy_ai::value_ledger::ValueLedger::open("").expect("memory ledger"),
+        );
+        let references = std::collections::BTreeMap::from([(
+            "qwen3-14b".to_string(),
+            ("gpt-4o-mini".to_string(), price),
+        )]);
+        let sink = sbproxy_ai::value_ledger::ValueSink::new(ledger.clone(), references);
+        (ledger, sink)
+    }
+
+    /// A finished 1000-prompt / 500-completion request, with the lane
+    /// fields the dispatch loop leaves behind.
+    fn completed_ctx(
+        logical_model: &str,
+        served_model: Option<&str>,
+        billed_model: &str,
+    ) -> crate::context::RequestContext {
+        let mut ctx = crate::context::RequestContext::new();
+        ctx.response_status = Some(200);
+        ctx.ai_tokens_in = Some(1000);
+        ctx.ai_tokens_out = Some(500);
+        ctx.ai_logical_model = Some(logical_model.to_string());
+        ctx.ai_serve_model = served_model.map(str::to_string);
+        ctx.ai_model = Some(billed_model.to_string());
+        ctx
+    }
+
+    #[test]
+    fn a_spilled_completion_records_cloud_spend_against_the_served_model() {
+        // WOR-2223: the whole path, from the context the failover loop
+        // leaves behind to the numbers the admin value route serves. The
+        // recorder had a caller for the local lane and none for the cloud
+        // lane, so every deployment reported gross savings as a hybrid
+        // split. One spill has to move both cloud numbers.
+        let (ledger, sink) = value_recorder();
+        // The local engine could not take the request, so the loop
+        // advanced: no serve marker, and `ai_model` is now the fallback
+        // provider's mapping rather than the id the caller sent.
+        let ctx = completed_ctx("qwen3-14b", None, "gpt-4o-mini");
+
+        let event = usage_event_from_context(&ctx, "openai".to_string());
+        assert_eq!(event.logical_model.as_deref(), Some("qwen3-14b"));
+        assert_eq!(event.served_model, None);
+        sbproxy_ai::usage_sink::UsageSink::record(&sink, &event);
+
+        let report = ledger.report();
+        assert_eq!(report.total_cloud_completions, 1);
+        assert_eq!(report.total_cloud_spent_micros, 10_500);
+        assert_eq!(report.total_local_completions, 0);
+        assert_eq!(report.total_saved_micros, 0);
+        assert_eq!(
+            report.models[0].model, "qwen3-14b",
+            "the spend belongs to the lane it displaced, not to the provider's billing id"
+        );
+    }
+
+    #[test]
+    fn a_locally_served_completion_still_records_the_saving() {
+        // The other half of the same discriminator: with the serve marker
+        // present the identical token counts are a saving, not spend.
+        let (ledger, sink) = value_recorder();
+        let ctx = completed_ctx("qwen3-14b", Some("qwen3-14b"), "qwen3-14b");
+
+        let event = usage_event_from_context(&ctx, "local".to_string());
+        sbproxy_ai::usage_sink::UsageSink::record(&sink, &event);
+
+        let report = ledger.report();
+        assert_eq!(report.total_local_completions, 1);
+        assert_eq!(report.total_saved_micros, 10_500);
+        assert_eq!(report.total_cloud_completions, 0);
+        assert_eq!(report.total_cloud_spent_micros, 0);
+    }
+
     #[test]
     fn shadow_usage_record_reuses_configured_sinks_only() {
         let mut ctx = crate::context::RequestContext::new();
@@ -4168,5 +4325,195 @@ mod budget_window_tests {
         }
         let flood = serde_json::json!({"choices": [{"message": {"tool_calls": many}}]});
         assert_eq!(extract_tool_calls(&flood).len(), AI_TOOL_CALL_EVENTS_MAX);
+    }
+
+    // --- WOR-2212: one request, one debit ---
+
+    use super::{debit_budget_without_billing_event, refresh_budget_utilization};
+    use crate::server::BUDGET_TRACKER;
+
+    /// One api-key-scoped token cap, spelled out because neither
+    /// `BudgetConfig` nor `BudgetLimit` implements `Default`.
+    fn api_key_token_cap(max_tokens: u64) -> BudgetConfig {
+        BudgetConfig {
+            limits: vec![BudgetLimit {
+                scope: BudgetScope::ApiKey,
+                max_tokens: Some(max_tokens),
+                max_cost_usd: None,
+                period: None,
+                downgrade_to: None,
+            }],
+            on_exceed: OnExceedAction::default(),
+            soft_landing: None,
+        }
+    }
+
+    /// The regression guard for the double debit.
+    ///
+    /// `refresh_budget_utilization` used to be `record_budget_usage`,
+    /// which debited the tracker *and* refreshed the gauge, while sitting
+    /// five hundred lines above a billing event that debited the same
+    /// cost against the same scope keys. Every AI request therefore spent
+    /// its budget twice and a configured `$100/day` cap stopped traffic
+    /// at `$50` of real spend.
+    ///
+    /// Nothing looked wrong because the gauge, the admin key detail, and
+    /// every budget assertion read the same doubled tracker and so agreed
+    /// with each other. The only assertion that catches it is one that
+    /// compares the tracker against an independently known number, which
+    /// is what this does: refresh the gauge and require the tracker not
+    /// to have moved at all.
+    #[test]
+    fn refreshing_the_gauge_does_not_debit_the_tracker() {
+        let key = format!("wor2212:{}:gauge-refresh", std::process::id());
+        let cfg = api_key_token_cap(1_000);
+        let keys = vec![(0usize, key.clone())];
+
+        // A known starting point that this test owns outright.
+        BUDGET_TRACKER.record_usage(&key, 100, 0.25);
+        let before = BUDGET_TRACKER.get_usage(&key);
+
+        // Refreshing the gauge is a read. Doing it repeatedly must not
+        // accumulate anything, which is the property the old shape broke.
+        for _ in 0..5 {
+            refresh_budget_utilization(&cfg, &keys);
+        }
+
+        let after = BUDGET_TRACKER.get_usage(&key);
+        assert_eq!(
+            after.tokens, before.tokens,
+            "refreshing the utilization gauge must not debit tokens"
+        );
+        assert!(
+            (after.cost_usd - before.cost_usd).abs() < 1e-9,
+            "refreshing the utilization gauge must not debit cost"
+        );
+        assert_eq!(
+            after.request_count, before.request_count,
+            "refreshing the utilization gauge must not count a request"
+        );
+    }
+
+    /// The compression path spends without a billing event, so it keeps
+    /// its own debit. This pins that it still debits, because the fix for
+    /// the double debit was to remove a debit and it would be easy to
+    /// remove this one too.
+    #[test]
+    fn the_billing_event_free_path_still_debits_exactly_once() {
+        let key = format!("wor2212:{}:no-billing-event", std::process::id());
+        let cfg = api_key_token_cap(10_000);
+        let keys = vec![(0usize, key.clone())];
+
+        let before = BUDGET_TRACKER.get_usage(&key);
+        debit_budget_without_billing_event(&cfg, &keys, "gpt-4o", 300, 200);
+        let after = BUDGET_TRACKER.get_usage(&key);
+
+        assert_eq!(
+            after.tokens - before.tokens,
+            500,
+            "one call must debit its tokens once, not twice and not zero times"
+        );
+    }
+
+    // --- WOR-2213: the routing feedback sees the real status ---
+
+    use super::record_routing_feedback;
+
+    /// The regression guard for outcome-aware routing never working.
+    ///
+    /// `record_routing_feedback` read `ctx.response_status`, which only
+    /// Pingora's `response_filter` sets. `ai_proxy` answers inside
+    /// `request_filter` and returns `Ok(true)`, so that filter never runs
+    /// for AI traffic and the field is always `None` there. Every
+    /// completed AI request therefore recorded `success = false`, every
+    /// provider's score reached `f64::INFINITY`, and `best_among` pinned
+    /// on the first enabled provider forever.
+    ///
+    /// The context here is shaped exactly like the AI path leaves it:
+    /// `response_status` unset, with the true status arriving as the
+    /// argument the way `logging` now passes it.
+    #[test]
+    fn a_successful_ai_call_records_a_success_despite_an_unset_response_status() {
+        let provider = format!("wor2213-ok-{}", std::process::id());
+        let ctx = crate::context::RequestContext {
+            ai_record_routing_feedback: true,
+            ai_provider: Some(provider.clone()),
+            ai_cost_usd_micros: Some(10_000),
+            ..Default::default()
+        };
+        // Exactly what the AI path leaves behind: nothing.
+        assert!(
+            ctx.response_status.is_none(),
+            "this test is meaningless if the AI path sets response_status"
+        );
+
+        record_routing_feedback(&ctx, 200);
+
+        let store = sbproxy_ai::routing_feedback::FeedbackStore::global();
+        assert_eq!(store.samples(&provider), 1, "the outcome must be recorded");
+        let score = store.score(&provider).expect("a recorded provider scores");
+        assert!(
+            score.is_finite(),
+            "a 200 must score finite; INFINITY means the success was read as a failure \
+             and routing can never move off the first provider"
+        );
+    }
+
+    /// The other half: a real failure must still score as one, so the
+    /// fix cannot be "call everything a success".
+    #[test]
+    fn a_failed_ai_call_still_records_a_failure() {
+        let provider = format!("wor2213-fail-{}", std::process::id());
+        let ctx = crate::context::RequestContext {
+            ai_record_routing_feedback: true,
+            ai_provider: Some(provider.clone()),
+            ..Default::default()
+        };
+
+        record_routing_feedback(&ctx, 503);
+
+        let store = sbproxy_ai::routing_feedback::FeedbackStore::global();
+        assert_eq!(store.samples(&provider), 1);
+        assert_eq!(
+            store.score(&provider),
+            Some(f64::INFINITY),
+            "a provider that only ever fails must score INFINITY"
+        );
+    }
+
+    /// The property the doc actually promises: traffic moves toward the
+    /// provider that is succeeding. Nothing asserted this before, which
+    /// is how a strategy that could not move shipped.
+    #[test]
+    fn a_failing_provider_loses_to_a_healthy_one() {
+        let healthy = format!("wor2213-healthy-{}", std::process::id());
+        let failing = format!("wor2213-failing-{}", std::process::id());
+        let store = sbproxy_ai::routing_feedback::FeedbackStore::global();
+
+        for _ in 0..5 {
+            let ok = crate::context::RequestContext {
+                ai_record_routing_feedback: true,
+                ai_provider: Some(healthy.clone()),
+                ai_cost_usd_micros: Some(20_000),
+                ..Default::default()
+            };
+            record_routing_feedback(&ok, 200);
+
+            let bad = crate::context::RequestContext {
+                ai_record_routing_feedback: true,
+                ai_provider: Some(failing.clone()),
+                ai_cost_usd_micros: Some(1),
+                ..Default::default()
+            };
+            record_routing_feedback(&bad, 500);
+        }
+
+        let healthy_score = store.score(&healthy).expect("healthy scored");
+        let failing_score = store.score(&failing).expect("failing scored");
+        assert!(
+            healthy_score < failing_score,
+            "the succeeding provider must win even though it costs more \
+             (healthy {healthy_score}, failing {failing_score})"
+        );
     }
 }

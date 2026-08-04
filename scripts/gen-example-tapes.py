@@ -37,8 +37,17 @@ HEADLINE = {"ai-gateway-quickstart", "ai-routing-fallback",
             "semantic-cache-openai", "ai-guardrails"}
 
 # Markers that mean the example needs a service we can't spin up in a tape.
+#
+# `vector_store` / `qdrant` are here because record-tapes.sh starts the
+# proxy and nothing else. A retrieval example points at a fixture process
+# on a compose hostname, so the recording would show the gateway failing
+# to reach it. ai-rag-local was generated a tape on that basis and the
+# recording was never run, which left a cassette naming a GIF that does
+# not exist. scripts/check-doc-assets.py is the backstop; this is the
+# reason the tape should not be written in the first place.
 EXTERNAL = re.compile(
     r"\b(redis|memcached|sidecar|classifier|vault://|onnx|\.onnx|"
+    r"vector_store|qdrant|"
     r"tls:|mtls|mutual_tls|client_cert|cert_file|key_file)\b", re.I)
 
 # Substitutions applied only to generated tape command text.

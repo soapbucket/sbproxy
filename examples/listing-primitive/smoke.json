@@ -1,0 +1,97 @@
+{
+  "data_plane_port": 8080,
+  "admin_port": 8080,
+  "health_path": "/health",
+  "cases": [
+    {
+      "name": "the Resource the example-api Listing publishes",
+      "request": {
+        "method": "GET",
+        "path": "/orders",
+        "headers": {"Host": "api.example.com"}
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "type": "jsonShape",
+          "shape": {"service": "orders"}
+        }
+      }
+    },
+    {
+      "name": "the per-Listing agent-skills manifest is served",
+      "request": {
+        "method": "GET",
+        "path": "/.well-known/agent-skills/example-api/index.json",
+        "headers": {"Host": "api.example.com"}
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "type": "jsonShape",
+          "shape": {
+            "$schema": "https://schemas.agentskills.io/discovery/0.2.0/schema.json",
+            "entries": [{"name": "place-order", "type": "skill-md"}]
+          }
+        }
+      }
+    },
+    {
+      "name": "the artifact body is re-hosted under the Listing's own prefix",
+      "request": {
+        "method": "GET",
+        "path": "/.well-known/agent-skills/example-api/skills/place-order.md",
+        "headers": {"Host": "api.example.com"}
+      },
+      "expect": {
+        "status": 200,
+        "headers": {"content-type": "text/markdown"}
+      }
+    },
+    {
+      "name": "the aggregated manifest unions every Listing on this hostname",
+      "request": {
+        "method": "GET",
+        "path": "/.well-known/agent-skills/index.json",
+        "headers": {"Host": "api.example.com"}
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "type": "jsonShape",
+          "shape": {"entries": [{"name": "place-order"}]}
+        }
+      }
+    },
+    {
+      "name": "a Listing does not advertise onto an origin it does not publish",
+      "request": {
+        "method": "GET",
+        "path": "/.well-known/agent-skills/index.json",
+        "headers": {"Host": "internal.example.com"}
+      },
+      "expect": {"status": 404}
+    }
+  ],
+  "audit_check": false,
+  "_notes": [
+    "Case 3 uses the Listing-prefixed artifact path rather than the",
+    "path-absolute url the manifest advertises. Those are not the same",
+    "URL: the per-Listing artifact handler keys on the path after",
+    "/.well-known/agent-skills/<listing>/, while render_manifest resolves",
+    "a path-absolute url against the request authority. Only the",
+    "top-level `agent_skills:` block re-hosts artifacts at the bare",
+    "/skills/... path.",
+    "",
+    "Case 5 runs against an origin with jwt authentication and still",
+    "expects 404 rather than 401, because the well-known projection",
+    "handler answers before the auth chain runs.",
+    "",
+    "The plan-time half of the primitive is not expressible here. The",
+    "smoke runner drives HTTP and `sbproxy plan` is a CLI command; the",
+    "README and docs/listings.md capture it directly instead.",
+    "",
+    "audit_check stays false until the OSS /api/audit/recent endpoint",
+    "lands."
+  ]
+}

@@ -154,6 +154,7 @@ mod tests {
                 auth_config: None,
                 policy_configs: Vec::new(),
                 transform_configs: Vec::new(),
+                filters: Vec::new(),
                 cors: None,
                 hsts: None,
                 compression: None,
@@ -198,6 +199,7 @@ mod tests {
             });
         }
         CompiledConfig {
+            extension_bundles: Default::default(),
             origins,
             host_map,
             server: sbproxy_config::ProxyServerConfig::default(),

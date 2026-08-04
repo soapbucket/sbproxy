@@ -77,6 +77,8 @@ use sbproxy_observe::metrics::{
 };
 use sbproxy_observe::telemetry;
 
+use crate::settlement_gate::{OP_CHALLENGE, OP_REDEEM, OUTCOME_PREPARED, OUTCOME_SUCCEEDED};
+
 #[cfg(feature = "payment-stripe")]
 use sbproxy_billing::recovery_crypto::RecoveryCipher;
 
@@ -238,6 +240,22 @@ pub async fn build_payments_runtime(
     config: &PaymentsConfig,
     clustered: bool,
 ) -> Result<PaymentsRuntime, PaymentsRuntimeError> {
+    build_payments_runtime_with_observer(config, clustered, None).await
+}
+
+/// Build a settlement runtime with one compiled pipeline's payment observer.
+///
+/// The observer is captured by the immutable billing service generation, so
+/// reload cannot route a payment event through hooks from another pipeline.
+///
+/// # Errors
+///
+/// Returns the same failures as [`build_payments_runtime`].
+pub async fn build_payments_runtime_with_observer(
+    config: &PaymentsConfig,
+    clustered: bool,
+    payment_observer: Option<Arc<dyn sbproxy_billing::PaymentLifecycleObserver>>,
+) -> Result<PaymentsRuntime, PaymentsRuntimeError> {
     // One configured secret, two derived keys. `challenge_binding_key` is
     // the operator's single settlement secret; the Payment Auth challenge id
     // is a MAC under it and quote tokens are signed under a key derived from
@@ -302,6 +320,7 @@ pub async fn build_payments_runtime(
     let inputs = PaymentsRuntimeInputs {
         signer: requirement_signer,
         gate: Some(gate),
+        payment_observer,
         recovery_key: match &config.recovery_encryption {
             Some(recovery) => Some(Zeroizing::new(
                 resolve_secret(&recovery.key, "recovery_encryption.key")?
@@ -364,6 +383,28 @@ pub fn install(
 ) -> Result<Arc<PaymentsRuntime>, PaymentsRuntimeError> {
     payments_worker_runtime()
         .block_on(build_payments_runtime(config, clustered))
+        .map(Arc::new)
+}
+
+/// Build and publish settlement with one compiled pipeline's payment hooks.
+///
+/// The observer and its terminal drain are created on the process-lifetime
+/// payment runtime. This keeps the drain alive after the synchronous boot
+/// caller returns and avoids depending on a caller-owned Tokio runtime.
+///
+/// # Errors
+///
+/// Returns whatever [`build_payments_runtime_with_observer`] returns.
+pub fn install_with_payment_dispatcher(
+    config: &PaymentsConfig,
+    clustered: bool,
+    dispatcher: Arc<dyn crate::payment_extensions::PaymentEventDispatcher>,
+) -> Result<Arc<PaymentsRuntime>, PaymentsRuntimeError> {
+    payments_worker_runtime()
+        .block_on(async {
+            let observer = crate::payment_extensions::PaymentExtensionObserver::new(dispatcher);
+            build_payments_runtime_with_observer(config, clustered, Some(observer)).await
+        })
         .map(Arc::new)
 }
 
@@ -483,6 +524,9 @@ pub struct PaymentsRuntimeInputs {
     /// it, and tests that exercise topology or lifecycle rules build
     /// candidates without a real signer.
     pub gate: Option<SettlementGateSeam>,
+    /// Generation-scoped payment extension observer, when the compiled
+    /// pipeline carries payment hooks.
+    pub payment_observer: Option<Arc<dyn sbproxy_billing::PaymentLifecycleObserver>>,
     /// The resolved recovery encryption key, when configuration set one.
     pub recovery_key: Option<Zeroizing<Vec<u8>>>,
     /// The resolved Stripe secret key, when a Stripe rail is configured.
@@ -589,6 +633,7 @@ impl PaymentsRuntimeCandidate {
         for rail in ALL_RAILS {
             record_payment_rail_enabled(rail.as_str(), rails.contains(&rail));
         }
+        seed_settlement_series(&rails);
 
         let mut builder = BillingService::builder(store)
             .adapters(registry)
@@ -602,6 +647,9 @@ impl PaymentsRuntimeCandidate {
             })?;
         if let Some(clock) = &inputs.clock {
             builder = builder.clock(Arc::clone(clock));
+        }
+        if let Some(observer) = &inputs.payment_observer {
+            builder = builder.payment_observer(Arc::clone(observer));
         }
         if let Some(recovery) = &config.recovery_encryption {
             let key = inputs
@@ -895,7 +943,7 @@ async fn reconcile_with(
                 })?;
 
             let verdict = ReconciliationVerdict::from_outcome(&outcome);
-            record_payment_settlement(rail.as_str(), operation.as_str(), verdict.as_str());
+            record_payment_settlement(rail.as_str(), operation.as_str(), verdict.as_str(), 1);
             reports.push(ReconciliationReport {
                 rail,
                 operation,
@@ -1412,6 +1460,28 @@ fn worker_config(config: &PaymentsConfig) -> WorkerConfig {
     }
 }
 
+/// Create the settlement series for every rail this build registered.
+///
+/// The same `inc_by(0)` trick `record_worker_delta` uses below, for the
+/// same reason and one step earlier: a counter family that springs into
+/// existence on its first payment cannot tell an operator whether nothing
+/// has settled yet or this deployment records nothing at all, and the
+/// second is a bug the first one hides. Seeded from the registered rails
+/// rather than from `ALL_RAILS`, so the presence of a series still answers
+/// "is this rail configured" the way `sbproxy_payment_rail_enabled` does.
+///
+/// Only the two series an operator alerts on are seeded: challenges
+/// prepared, and payments that bought origin access. The refusal
+/// vocabulary is left to appear when a refusal happens, because a flat zero
+/// line for every payment problem code is noise, and a refusal that has
+/// never occurred is not a question anybody asks.
+fn seed_settlement_series(rails: &[SettlementRail]) {
+    for rail in rails {
+        record_payment_settlement(rail.as_str(), OP_CHALLENGE, OUTCOME_PREPARED, 0);
+        record_payment_settlement(rail.as_str(), OP_REDEEM, OUTCOME_SUCCEEDED, 0);
+    }
+}
+
 /// Convert the worker's cumulative counters into metric deltas.
 ///
 /// The worker counts durable rows, not events, so this diffs snapshots.
@@ -1558,6 +1628,44 @@ mod tests {
     }
 
     #[test]
+    fn seeding_creates_a_settlement_series_for_every_registered_rail() {
+        // The defect this guards is an absence, so the assertion is about a
+        // series existing rather than about a value. Without the seed, a
+        // scrape cannot separate "nothing has settled yet" from "this
+        // deployment records no settlements at all", and the second is a
+        // bug that hides behind the first for as long as traffic is quiet.
+        seed_settlement_series(&[SettlementRail::LightningCln]);
+
+        let seeded = |operation: &str, outcome: &str| {
+            prometheus::gather()
+                .into_iter()
+                .find(|family| family.name() == "sbproxy_payment_settlement_total")
+                .is_some_and(|family| {
+                    family.get_metric().iter().any(|metric| {
+                        let labelled = |name: &str, want: &str| {
+                            metric
+                                .get_label()
+                                .iter()
+                                .any(|label| label.name() == name && label.value() == want)
+                        };
+                        labelled("rail", "lightning_cln")
+                            && labelled("operation", operation)
+                            && labelled("outcome", outcome)
+                    })
+                })
+        };
+
+        assert!(
+            seeded("challenge", "prepared"),
+            "a configured rail draws a flat line for challenges before its first one",
+        );
+        assert!(
+            seeded("redeem", "succeeded"),
+            "a configured rail draws a flat line for settlements before its first one",
+        );
+    }
+
+    #[test]
     fn the_worker_cadence_comes_from_configuration_and_the_batches_do_not() {
         let mut config = sample_config();
         config.worker.reconcile_interval_ms = 250;
@@ -1650,16 +1758,113 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RejectPaymentObserver {
+        events: Mutex<
+            Vec<(
+                sbproxy_billing::PaymentLifecyclePhase,
+                sbproxy_billing::PaymentLifecycleOutcome,
+            )>,
+        >,
+    }
+
+    #[async_trait::async_trait]
+    impl sbproxy_billing::PaymentLifecycleObserver for RejectPaymentObserver {
+        async fn started(
+            &self,
+            event: &sbproxy_billing::PaymentLifecycleEvent,
+        ) -> sbproxy_billing::PaymentLifecycleDecision {
+            self.events.lock().push((event.phase(), event.outcome()));
+            sbproxy_billing::PaymentLifecycleDecision::Reject
+        }
+
+        fn terminal(&self, event: sbproxy_billing::PaymentLifecycleEvent) {
+            self.events.lock().push((event.phase(), event.outcome()));
+        }
+    }
+
+    fn observer_test_draft() -> sbproxy_billing::PaymentRequirementDraft {
+        let mut draft = sbproxy_billing::PaymentRequirementDraft {
+            requirement_id: "req-0123456789abcdef".to_owned(),
+            protocol: sbproxy_billing::PaymentProtocol::X402V2,
+            advertised_rail: sbproxy_billing::AdvertisedRail::X402,
+            settlement_rail: sbproxy_billing::SettlementRail::X402,
+            method: "exact".to_owned(),
+            intent: "exact".to_owned(),
+            network: Some("base-sepolia".to_owned()),
+            asset: Some("usdc".to_owned()),
+            pay_to: Some("recipient-fixture".to_owned()),
+            amount: sbproxy_billing::Money::new(10_000, "USD").unwrap(),
+            settlement_amount: String::new(),
+            settlement_decimals: 6,
+            terms: sbproxy_billing::RequirementTerms::X402Exact {
+                facilitator_url: "https://facilitator.example/api".to_owned(),
+                max_timeout_seconds: 60,
+                extra: std::collections::BTreeMap::new(),
+            },
+            quote_id: "quote-1".to_owned(),
+            tenant_id: "tenant-1".to_owned(),
+            origin_id: "origin-1".to_owned(),
+            route: "/paid".to_owned(),
+            expires_at_ms: 9_000_000_000_000,
+            request_digest: None,
+        };
+        draft.canonicalize().unwrap();
+        draft
+    }
+
     fn test_inputs() -> PaymentsRuntimeInputs {
         PaymentsRuntimeInputs {
             signer: Arc::new(StubSigner),
             gate: None,
+            payment_observer: None,
             recovery_key: None,
             stripe_api_key: None,
             cln_rune: None,
             clock: None,
             clustered: false,
         }
+    }
+
+    #[tokio::test]
+    async fn candidate_installs_the_generation_payment_observer() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut config = sample_config();
+        config.state_path = directory
+            .path()
+            .join("settlement.sqlite3")
+            .to_string_lossy()
+            .into_owned();
+        let observer = Arc::new(RejectPaymentObserver::default());
+        let mut inputs = test_inputs();
+        inputs.payment_observer = Some(observer.clone());
+        let candidate = PaymentsRuntimeCandidate::build(&config, &inputs).expect("candidate");
+
+        let error = expect_error(
+            candidate
+                .service
+                .prepare_requirement(sbproxy_billing::service::RequirementInput {
+                    draft: observer_test_draft(),
+                    request_idempotency_key: "request-key".to_owned(),
+                })
+                .await,
+            "the generation observer rejects before runtime payment work",
+        );
+
+        assert_eq!(error, sbproxy_billing::BillingError::ExtensionRejected);
+        assert_eq!(
+            *observer.events.lock(),
+            [
+                (
+                    sbproxy_billing::PaymentLifecyclePhase::Challenge,
+                    sbproxy_billing::PaymentLifecycleOutcome::Started,
+                ),
+                (
+                    sbproxy_billing::PaymentLifecyclePhase::Challenge,
+                    sbproxy_billing::PaymentLifecycleOutcome::Rejected,
+                ),
+            ]
+        );
     }
 
     /// A clustered node refuses to build a settlement runtime, and refuses

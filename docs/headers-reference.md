@@ -135,7 +135,7 @@ Proxy-Status: sbproxy; received-status=502; error="tls_protocol_error"
 Proxy-Status: sbproxy; received-status=502; error="connection_terminated"
 ```
 
-The error token catalogue mirrors RFC 9209 section 2.3.4
+The error token catalog mirrors RFC 9209 section 2.3.4
 (`connection_refused`, `connection_timeout`, `tls_protocol_error`,
 `connection_terminated`, `http_request_error`).
 

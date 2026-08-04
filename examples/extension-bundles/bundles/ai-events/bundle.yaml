@@ -1,0 +1,29 @@
+apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: ai-events
+version: 1.0.0
+runtime: javascript
+entry: events.js
+sha256: 8f3e0a8fd83b2a0bae798036e5579a9e9e093dcc801c0fff7ab07e792290ad7e
+hooks:
+  - kind: ai_guardrail_input
+    type: example_ai_input
+    export: inspectInput
+  - kind: ai_tool_call
+    type: example_ai_tool
+    export: inspectTool
+  - kind: ai_guardrail_output
+    type: example_ai_output
+    export: inspectOutput
+  - kind: ai_close
+    type: example_ai_close
+    export: inspectClose
+failure_posture: closed
+sandbox:
+  budget_ms: 50
+  memory_mb: 16
+  stack_kb: 512
+  max_buffer_bytes: 1048576
+  max_output_bytes: 1048576
+  max_fuel: 100000000
+permissions: []

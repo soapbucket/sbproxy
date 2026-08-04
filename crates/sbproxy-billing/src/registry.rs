@@ -141,6 +141,15 @@ pub trait PaymentMethodAdapter: Send + Sync {
     /// Returns the rail this adapter settles.
     fn rail(&self) -> SettlementRail;
 
+    /// Reports whether the adapter emits its own authorization lifecycle.
+    ///
+    /// Most rails expose one settlement stage and use the service-owned
+    /// lifecycle. A multi-stage protocol overrides this when it must place
+    /// hooks between verification and the protected settlement write.
+    fn manages_authorization_lifecycle(&self) -> bool {
+        false
+    }
+
     /// Creates the provider object the challenge needs.
     ///
     /// This must not capture funds, call the origin, deliver the resource,

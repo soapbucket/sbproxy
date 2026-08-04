@@ -139,6 +139,10 @@ pub enum BillingError {
     #[error("payment provider rejected the payment")]
     ProviderRejected,
 
+    /// A payment extension rejected the operation before its protected effect.
+    #[error("payment extension rejected the operation")]
+    ExtensionRejected,
+
     /// The rail reached a verified but not settled state.
     #[error("payment was verified but not settled")]
     NotSettled,
@@ -199,7 +203,9 @@ impl BillingError {
             Self::ProviderTimeout => FailureCategory::Timeout,
             Self::ProviderUnavailable | Self::StoreUnavailable => FailureCategory::Unavailable,
             Self::ProviderMalformed | Self::CorruptRecord => FailureCategory::Malformed,
-            Self::ProviderRejected | Self::NotSettled => FailureCategory::Rejected,
+            Self::ProviderRejected | Self::ExtensionRejected | Self::NotSettled => {
+                FailureCategory::Rejected
+            }
             Self::NeedsReconciliation | Self::AlreadyDispatched => FailureCategory::Ambiguous,
             Self::IntentExpired | Self::RecoveryEnvelopeExpired => FailureCategory::Expired,
             Self::UnsupportedRail

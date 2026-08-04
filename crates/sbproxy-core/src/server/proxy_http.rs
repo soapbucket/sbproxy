@@ -2411,6 +2411,11 @@ impl ProxyHttp for SbProxy {
             commit_realtime_quota_attempt(ctx).await?;
         }
 
+        // Body-transforming Proxy-Wasm filters own the outbound message
+        // framing. Apply that only to Pingora's upstream copy so an HTTP/1.0
+        // downstream request keeps its original protocol semantics.
+        crate::proxy_wasm_http::filter_upstream_request_headers(upstream_request, ctx)?;
+
         Ok(())
     }
 
@@ -2479,6 +2484,8 @@ impl ProxyHttp for SbProxy {
         // A no-op unless this origin writes receipts and declares
         // origin-header rules.
         crate::meter_runtime::capture_origin_headers(ctx, upstream_response);
+
+        crate::proxy_wasm_http::filter_response_headers(session, upstream_response, ctx)?;
 
         // --- WOR-808: RSL `Link: rel="license"` discovery header ---
         //
@@ -3644,6 +3651,8 @@ impl ProxyHttp for SbProxy {
     where
         Self::CTX: Send + Sync,
     {
+        crate::proxy_wasm_http::filter_request_body(body, end_of_stream, ctx)?;
+
         // For validated GraphQL POSTs, replace the inbound replay stream
         // before every downstream consumer. This is deliberately first:
         // request limits, body policies, idempotency, and byte accounting must
@@ -4009,7 +4018,10 @@ impl ProxyHttp for SbProxy {
         // response phase, signal the validator failure via
         // `validator_failed`, and emit `None` so the upstream is not
         // contacted.
-        if ctx.validate_request_body {
+        'request_validation: {
+            if !ctx.validate_request_body {
+                break 'request_validation;
+            }
             // Mirror of THREAT_SCAN_HARD_CAP above: the validator
             // accumulator is the other buffer-then-release dance in
             // this filter and gets the same bound, so a client that
@@ -4020,13 +4032,76 @@ impl ProxyHttp for SbProxy {
             // contact the upstream.
             const VALIDATE_BODY_HARD_CAP: usize = 8 * 1024 * 1024;
 
-            let buf = ctx
-                .request_body_buf
-                .get_or_insert_with(bytes::BytesMut::new);
             let incoming_len = body.as_ref().map_or(0, Bytes::len);
-            if buf.len().saturating_add(incoming_len) > VALIDATE_BODY_HARD_CAP {
+            let buffered_len = ctx
+                .request_body_buf
+                .as_ref()
+                .map_or(0, |buffer| buffer.len());
+            let proposed_len = buffered_len.saturating_add(incoming_len);
+            let skipped = match ctx
+                .dynamic_request_body_plan
+                .before_growth(proposed_len, None)
+            {
+                Ok(skipped) => skipped,
+                Err(overflow) => {
+                    let hook = overflow.metadata();
+                    debug!(
+                        bundle = hook.bundle_id(),
+                        hook = hook.hook_type(),
+                        policy_index = ?overflow.policy_index(),
+                        received = proposed_len,
+                        cap = overflow.cap(),
+                        "buffered dynamic policy blocked request body before allocation"
+                    );
+                    ctx.validator_failed = Some((
+                        413,
+                        error_json_body("request entity too large"),
+                        "application/json".to_string(),
+                    ));
+                    *body = None;
+                    return Err(pingora_error::Error::explain(
+                        pingora_error::ErrorType::HTTPStatus(413),
+                        "dynamic policy request body exceeded buffering cap",
+                    ));
+                }
+            };
+            for skipped_hook in skipped {
+                let hook = skipped_hook.metadata();
+                let posture = hook.failure_posture();
+                tracing::warn!(
+                    target: "sbproxy::extension",
+                    bundle = hook.bundle_id(),
+                    hook = hook.hook_type(),
+                    policy_index = skipped_hook.policy_index(),
+                    received = proposed_len,
+                    cap = skipped_hook.cap(),
+                    failure_posture = posture.as_label(),
+                    "skipping buffered dynamic policy whose request body exceeded its cap"
+                );
+                if posture.guarantee_waived() || posture.records_counterfactual() {
+                    ctx.record_policy_decision(hook.hook_type(), posture.as_label());
+                }
+            }
+
+            if !ctx.dynamic_request_body_plan.has_active_buffered_policies()
+                && !ctx.dynamic_request_body_plan.other_buffering_required()
+            {
+                let mut collected = ctx.request_body_buf.take().unwrap_or_default();
+                if let Some(chunk) = body.take() {
+                    collected.extend_from_slice(&chunk);
+                }
+                ctx.validate_request_body = false;
+                if !collected.is_empty() {
+                    *body = Some(collected.freeze());
+                } else if !end_of_stream {
+                    hold_request_body_chunk(body);
+                }
+                break 'request_validation;
+            }
+
+            if proposed_len > VALIDATE_BODY_HARD_CAP {
                 debug!(
-                    received = buf.len().saturating_add(incoming_len),
+                    received = proposed_len,
                     cap = VALIDATE_BODY_HARD_CAP,
                     "request body validation blocked request: body exceeds buffering cap"
                 );
@@ -4041,11 +4116,14 @@ impl ProxyHttp for SbProxy {
                     "request body validation exceeded buffering cap",
                 ));
             }
+            let buf = ctx
+                .request_body_buf
+                .get_or_insert_with(bytes::BytesMut::new);
             if let Some(chunk) = body.take() {
                 buf.extend_from_slice(&chunk);
             }
             if end_of_stream {
-                let collected = ctx.request_body_buf.take().unwrap_or_default();
+                let collected = ctx.request_body_buf.take().unwrap_or_default().freeze();
                 // A verified header signature that covers content-digest is
                 // provisional until the complete pre-transform body arrives.
                 // Authenticate that body before any validator can short
@@ -4068,6 +4146,38 @@ impl ProxyHttp for SbProxy {
                     ));
                 }
                 let pipeline = ctx.pipeline.clone();
+                if let Some(origin_idx) = ctx.origin_idx {
+                    let workspace_id = pipeline.config.origins[origin_idx].workspace_id.to_string();
+                    let verdict_ctx = PolicyVerdictCtx {
+                        request_id: ctx.request_id.to_string(),
+                        tenant_id: workspace_id.clone(),
+                        workspace_id,
+                    };
+                    if let Some((status, message, policy_type)) = check_buffered_dynamic_policies(
+                        &pipeline.enforcers[origin_idx],
+                        session,
+                        ctx,
+                        collected.clone(),
+                        &verdict_ctx,
+                    )
+                    .await
+                    {
+                        let policy_type = effective_policy_type(ctx, policy_type);
+                        sbproxy_observe::metrics::record_policy(
+                            ctx.hostname.as_str(),
+                            policy_type,
+                            "deny",
+                        );
+                        ctx.record_policy_decision(policy_type, "deny");
+                        let body_str = error_json_body(&message);
+                        ctx.validator_failed =
+                            Some((status, body_str, "application/json".to_string()));
+                        return Err(pingora_error::Error::explain(
+                            pingora_error::ErrorType::HTTPStatus(status),
+                            "request body failed dynamic policy",
+                        ));
+                    }
+                }
                 let content_type = session
                     .req_header()
                     .headers
@@ -4440,7 +4550,7 @@ impl ProxyHttp for SbProxy {
                 // Validation passed - release the buffered body as one
                 // chunk so the upstream sees the full payload.
                 let frozen = if !collected.is_empty() {
-                    let bytes = collected.freeze();
+                    let bytes = collected.clone();
                     *body = Some(bytes.clone());
                     Some(bytes)
                 } else {
@@ -4641,6 +4751,8 @@ impl ProxyHttp for SbProxy {
             *body = None;
             return Ok(None);
         }
+
+        crate::proxy_wasm_http::filter_response_body(body, end_of_stream, ctx)?;
 
         // Track outbound body bytes for the access log. Counts what
         // the client receives, including transformed / fallback /
@@ -5110,10 +5222,22 @@ impl ProxyHttp for SbProxy {
                             // onto the response as
                             // `x-sbproxy-transform-error` so the caller
                             // and operator can correlate.
+                            //
+                            // WOR-2268 carves one case out of that rule. A
+                            // dynamic bundle transform declares its own
+                            // posture in its manifest, and the operator
+                            // installing it is making the same call WOR-168
+                            // reserved for the host: a guest that times out
+                            // or panics is exactly what `failure_posture`
+                            // was written to describe. An invariant
+                            // violation is still the host's own bug and
+                            // still a 500 either way.
                             let transform_name = compiled_transform.transform.transform_type();
-                            let is_typed_transform_error = e
-                                .downcast_ref::<sbproxy_modules::transform::TransformError>()
-                                .is_some();
+                            let is_typed_transform_error =
+                                crate::server::transform_error_is_unconditional_500(
+                                    compiled_transform,
+                                    &e,
+                                );
                             if is_typed_transform_error {
                                 tracing::error!(
                                     hostname = %ctx.hostname,
@@ -5469,6 +5593,11 @@ impl ProxyHttp for SbProxy {
         // Default fork behavior: peer context plus the
         // reused-connection retry decision.
         let mut e = e.more_context(format!("Peer: {peer}"));
+        if crate::proxy_wasm_http::has_pending_local_response(ctx) {
+            finish_terminal_load_balancer_attempt(ctx, None);
+            e.set_retry(false);
+            return e;
+        }
         e.retry
             .decide_reuse(client_reused && !session.as_ref().retry_buffer_truncated());
 
@@ -5522,6 +5651,24 @@ impl ProxyHttp for SbProxy {
     where
         Self::CTX: Send + Sync,
     {
+        if let Some(local_response) = crate::proxy_wasm_http::take_pending_local_response(ctx) {
+            let status = local_response.status;
+            let _ = crate::proxy_wasm_http::send_terminal_local_response(session, &local_response)
+                .await;
+            ctx.response_status = Some(status);
+            return FailToProxy {
+                error_code: status,
+                can_reuse_downstream: false,
+            };
+        }
+
+        if crate::proxy_wasm_http::response_stream_failed(ctx) {
+            return FailToProxy {
+                error_code: 500,
+                can_reuse_downstream: false,
+            };
+        }
+
         // Quota settlement is intentionally the final realtime outbound seam.
         // Preserve its exact response and bypass origin fallback if it fails
         // after Pingora has selected an upstream.
@@ -5708,6 +5855,8 @@ impl ProxyHttp for SbProxy {
     where
         Self::CTX: Send + Sync,
     {
+        crate::proxy_wasm_http::finish(ctx);
+
         // A body-bound BotAuth signature is provisional during the header
         // and policy phases. If a short circuit prevented the body verifier
         // from running, close the observation conservatively without
@@ -5774,6 +5923,9 @@ impl ProxyHttp for SbProxy {
                     verified: ctx.a2a.as_ref().is_some_and(|a2a| a2a.identity_verified),
                 },
                 &span,
+                // The realtime close path reports the usage it measured over
+                // the session; there is no estimate to substitute here.
+                sbproxy_ai::budget::TokenDebit::Measured,
             );
             info!(
                 ai.surface = rd.surface_label,
@@ -5807,7 +5959,10 @@ impl ProxyHttp for SbProxy {
 
         // WOR-1541: fold the realized outcome into the routing feedback
         // store (no-op unless the origin uses outcome-aware routing).
-        record_routing_feedback(ctx);
+        // WOR-2213: `status_u16`, not `ctx.response_status`. The AI
+        // path never reaches the `response_filter` that sets that field,
+        // so reading it recorded a failure for every successful call.
+        record_routing_feedback(ctx, status_u16);
 
         // WOR-2145: cut the attested consumption receipt.
         //

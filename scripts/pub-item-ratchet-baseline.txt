@@ -130,4 +130,160 @@
 # question for whoever owns the subsystem, because the answer changes
 # behaviour rather than visibility. Do not expect this number to fall much
 # further without the settlement crate's origin gate work landing.
-289
+
+# Lowered to 288 on WOR-2211, 2026-08-02, answering one of those escalated
+# questions. `Unit::provenance_is_consistent` (sbproxy-meter/src/event.rs)
+# checked that a unit's declared source agrees with the evidence it
+# carries, its own doc said the check was worth running on anything
+# deserialised, and no decode path ran it. The escalation asked whether the
+# wire decode should call it and reject on false. It should, and now does:
+# `ReceiptUnit::provenance_is_consistent` lifts each wire unit back into
+# the meter's vocabulary and asks this method, the ledger's replay and
+# verification both ask the payload through
+# `LedgerPayload::provenance_conflict`, and the two admin read paths ask
+# the claims directly. This is the ratchet's first option, wiring the item
+# to a production call site, rather than a narrowing.
+
+# Lowered to 287 on WOR-2224, 2026-08-02, answering another one.
+# `Router::set_provider_health` (sbproxy-ai/src/routing.rs) is the writer
+# for the active-probe axis that `provider_eligible` intersects on every
+# AI routing decision. The escalation asked whether the probe task was
+# ever wired or whether passive ejection was the whole story. It was never
+# wired: the axis, the `AiHealthCheckConfig` struct, and the
+# `resilience.health_check` config block all landed together in the
+# original AI-resilience commit and the task that was supposed to drive
+# them was never written, so every provider sat at the `unknown` default
+# while docs, `docs/configuration.md`, and `examples/ai-resilience` all
+# described a working probe. The new `sbproxy-ai/src/health_probe.rs`
+# spawns it from the pipeline's existing background-task seam. This is the
+#
+# Lowered to 287 on WOR-2223, 2026-08-02, answering another one.
+# `LaneSplit::record_cloud` (sbproxy-model-host/src/hybrid.rs) is the
+# cloud half of the hybrid savings split, and the escalation asked where
+# the cloud-spill path should call it. The answer is the same place the
+# local half is recorded: `ValueSink`, the usage sink that prices every
+# finished completion of a model with a configured `reference`. It now
+# reads the serving lane off the usage event instead of assuming local,
+# so a completion that spilled to a cloud provider lands in
+# cloud_completions and cloud_spent_micros rather than nowhere. The
+# ratchet's first option again, a production call site rather than a
+# narrowing.
+
+# Raised on WOR-2203, 2026-08-03, for four items the extension bundle
+# epic adds. None is narrowable and none is write-only code. The
+# final number is at the bottom of this file: it was recomputed after
+# merging main, and is neither this branch's count nor main's.
+#
+# `BUNDLE_API_VERSION` and `BUNDLE_KIND` (sbproxy-config/src/extensions.rs)
+# are the manifest's `apiVersion` and `kind` literals. sbproxy-config is
+# one of the three public crates, these two are the contract a bundle
+# author writes at the top of every `bundle.yaml`, and the tests that pin
+# them assert against the same constants a caller reads.
+#
+# `AiExtensionHookRegistration` (sbproxy-plugin/src/extensions.rs) is the
+# link-time registration type for an AI hook. Its consumer is
+# `crates/sbproxy-plugin/tests/ai_extension_contract.rs`, a separate
+# integration-test crate, so `pub` is the only visibility that resolves.
+# The AI chain reaches instances of it through
+# `collect_linked_ai_extension_hooks` without naming the type, which is
+# why the scan sees no production reference.
+#
+# `ExtensionHookDeclaration` (sbproxy-plugin/src/extensions.rs) is the
+# same shape: production code walks `declaration.hooks` without spelling
+# the element type, and the only cross-file mention is in
+# sbproxy-core's inventory test module.
+#
+# The delta is +4 and not +5 because `SourceConfig::with_credential`
+# (sbproxy-config/src/source.rs) gained a production caller in the same
+# epic: private Git bundle sources now resolve credentials through it on
+# the refresh path.
+#
+# Merged origin/main on 2026-08-03: main had lowered this to 282 while
+# this branch had raised it to 287. Neither number is the answer. The
+# count below is recomputed against the merged tree, because a baseline
+# that keeps either side's number silently gives back whatever the other
+# side changed. This is the seventh conflict in this file; the loud
+# multi-line guard in check-pub-item-ratchet.sh landed with it.
+#
+# Raised to 288 on WOR-2245, 2026-08-03. Recomputed against the merged tree
+# rather than taking either side of the conflict: this branch carried 290 from
+# an older main and main carried 285, and neither described the merge. Eighth
+# conflict in this file.
+#
+# The delta is the module-coverage API this branch adds to
+# `sbproxy-capability/src/config_scan.rs`: `ModuleCoverageState`,
+# `ModuleCoverage`, `verify_module_dispatch_coverage`, and
+# `verify_config_readers_with_modules`. These are the surface the build guard
+# and its own integration tests call, and `config_scan`'s tests live in a
+# separate test crate, so `pub` is the only visibility that resolves. They
+# cannot be narrowed for the same reason most of the items already in this
+# number cannot.
+288
+#
+#
+# Lowered to 286 on WOR-2225, 2026-08-02, answering three more of the
+# escalated questions. Each one asked the same thing: two implementations
+# of one job exist and only one runs, so which is the real one.
+#
+# `parse_endpoint` (sbproxy-ai/src/api_routes.rs) is deleted, along with
+# the `AiEndpoint` enum and `provider_supports_endpoint`. It was the
+# predecessor of `classify_surface`, which the request path has always
+# called and which recognises a strict superset of its vocabulary. Its
+# capability matrix had also gone stale against the live one, advertising
+# Google image, audio, and reranking surfaces that have no translator.
+#
+# `select_default` (sbproxy-core/src/compression_runtime.rs) is narrowed to
+# `pub(crate)`. There were never two definitions of the route default:
+# this was `select(On)` with an `expect` around it, and dispatch reaches
+# the default through `select(On)` as one arm of the general selector path.
+# `select` now delegates to it, so the two cannot come apart, and the
+# `expect` is gone rather than pushed onto the request path.
+#
+# `install_key_plane` (sbproxy-core/src/key_plane.rs) is now
+# `#[cfg(test)] pub(crate) install_key_plane_for_test`, and the dead
+# `uninstall_key_plane` beside it is deleted. The production path,
+# `activate_key_plane`, was not skipping an invariant this wrapper held:
+# the wrapper was a bare slot write and `activate_key_plane` does the
+# readiness retraction, the invalidation subscriber, and the shared budget
+# handoff on top of it.
+#
+# 286 rather than 285 because the WOR-2225 regression test in
+# `server/ai_dispatch.rs` compares behaviour fingerprints, and
+# `SelectedCompressionRuntime::behavior_fingerprint` had no reference
+# outside its own file at all before that. It moves from the wider
+# unreferenced list into the tests-only slice without anything about it
+# changing. It is worth a look on its own: the fingerprint is computed for
+# every compiled pipeline and nothing in production reads it.
+#
+# Lowered to 286 on WOR-2225, 2026-08-02, answering two more of the
+# escalated questions. Both are real, neither is a narrowing.
+#
+# `CardinalityLimiter::unique_count` (sbproxy-observe/src/cardinality.rs)
+# gained a production caller. It reads how many unique values a label has
+# accepted, which is the number that says whether the limiter is about to
+# start folding values into `__other__`, and until now only the crate's own
+# tests read it. In a multi-tenant deployment that collapse merges tenants
+# into one series, so a per-tenant panel keeps drawing and starts answering
+# a different question, and the only tell is spotting `__other__` in a
+# query. `metrics::refresh_cardinality_gauges` now publishes it per label
+# at scrape time as `sbproxy_label_cardinality_unique_values`, alongside
+# `sbproxy_label_cardinality_budget` for the denominator.
+#
+# `metrics::record_request` (sbproxy-observe/src/metrics.rs) was deleted.
+# It was the legacy request counter, a shim that called
+# `record_request_with_labels` with `AgentLabels::unset()`, and the
+# migration it was waiting on finished: no production caller was left. Its
+# five test call sites moved to the labelled entry point passing
+# `AgentLabels::unset()` explicitly, so no coverage went with it. The one
+# assertion worth keeping, that an unresolved request lands on the
+# empty-string sentinel series rather than a positive `human` or `unknown`
+# verdict, is still made; it now names `AgentLabels::unset()` as the thing
+# under test, which is what it was pinning all along.
+#
+# The two escalations left in scripts/pub-item-verdicts.json that this
+# sweep also answered did not move the number.
+# `EVICT_REASON_GRACEFUL_LEAVE` (sbproxy-mesh) and `decode_all_raw`
+# (sbproxy-transport) are both still tests-only and both correctly so:
+# the first reserves a label value for a feature that does not exist, the
+# second is the response-direction frame walker for a bridge direction the
+# proxy does not run. Their verdicts moved from `escalated` to `keep`.

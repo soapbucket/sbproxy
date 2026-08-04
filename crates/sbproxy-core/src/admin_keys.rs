@@ -2096,7 +2096,7 @@ mod tests {
             governance_store,
             None,
         ));
-        crate::key_plane::install_key_plane(plane);
+        crate::key_plane::install_key_plane_for_test(plane);
     }
 
     fn install_test_plane_with_store(store: Arc<MemoryKeyStore>) {
@@ -2106,7 +2106,7 @@ mod tests {
         let plane = Arc::new(crate::key_plane::KeyPlane::from_parts(
             crypto, cache, false, false, None,
         ));
-        crate::key_plane::install_key_plane(plane);
+        crate::key_plane::install_key_plane_for_test(plane);
     }
 
     fn install_test_plane() {

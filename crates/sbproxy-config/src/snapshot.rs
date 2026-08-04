@@ -15,14 +15,15 @@ use crate::types::{
     AccessLogConfig, AgentClassesConfig, AgentSkillEntry, AgentsJsonConfig, CompressionConfig,
     CorsConfig, ErrorPageEntry, HstsConfig, IdempotencyConfig, MessageSignaturesConfig,
     MirrorConfig, OlpConfig, OriginAttestationConfig, ProblemDetailsConfig, ProxyServerConfig,
-    ProxyStatusConfig, RequestModifierConfig, ResponseCacheConfig, ResponseModifierConfig,
-    SessionConfig, WebBotAuthPublishConfig,
+    ProxyStatusConfig, ProxyWasmFilterAttachment, RequestModifierConfig, ResponseCacheConfig,
+    ResponseModifierConfig, SessionConfig, WebBotAuthPublishConfig,
 };
 
 /// Fully compiled, immutable origin ready for request processing.
 ///
 /// The action, auth, policies, and transforms fields use `serde_json::Value`
 /// as placeholders until the module crate defines concrete enum types.
+#[derive(Clone)]
 pub struct CompiledOrigin {
     /// Hostname this origin matches (e.g. `api.example.com`).
     pub hostname: CompactString,
@@ -46,6 +47,8 @@ pub struct CompiledOrigin {
     pub policy_configs: Vec<serde_json::Value>,
     /// Transform configurations (JSON shape, encoding, etc.) as JSON until module-layer compilation.
     pub transform_configs: Vec<serde_json::Value>,
+    /// Proxy-Wasm HTTP filter attachments in declaration order.
+    pub filters: Vec<ProxyWasmFilterAttachment>,
 
     /// CORS configuration applied before the action runs.
     pub cors: Option<CorsConfig>,
@@ -209,8 +212,11 @@ pub struct CompiledOrigin {
 }
 
 /// The complete compiled config: all origins plus host-based routing.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct CompiledConfig {
+    /// Extension bundle discovery configuration preserved for the pipeline
+    /// candidate loader. This crate does not resolve paths or fetch sources.
+    pub extension_bundles: crate::extensions::ExtensionBundlesConfig,
     /// All compiled origins, in the order they were registered.
     pub origins: Vec<CompiledOrigin>,
     /// Maps hostname to index into `origins`.

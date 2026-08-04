@@ -131,7 +131,7 @@ Wait a second between those two and the first one returns `200` again, because
 the bucket has refilled one token. The buckets are per agent, not per client
 address: both requests came from the same machine.
 
-A request with no recognised agent resolves no `agent_id` at all, and
+A request with no recognized agent resolves no `agent_id` at all, and
 `on_anonymous: skip` means the policy does not enforce against it. Set
 `on_anonymous: shared` to collapse that traffic into one fallback bucket
 instead.
@@ -139,7 +139,7 @@ instead.
 ## Observability
 
 * `sbproxy_policy_triggers_total{origin, policy_type="agent_budget", action="block"}` increments on `deny` denials.
-* `sbproxy_ai_budget_utilization_ratio{origin, agent_id}` gauge reports the current utilisation per agent.
+* `sbproxy_ai_budget_utilization_ratio{origin, agent_id}` gauge reports the current utilization per agent.
 * Access log: `policy_action` set to the verdict; `agent_id`, `agent_class`, `agent_vendor` carry the resolved agent identity.
 
 ## Why per-agent

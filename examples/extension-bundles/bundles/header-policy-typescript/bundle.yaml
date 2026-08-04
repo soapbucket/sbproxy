@@ -1,0 +1,28 @@
+apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: header-policy-typescript
+version: 1.0.0
+runtime: javascript
+entry: entry.ts
+sha256: 7b6939508700df95f16018a8aae4526af13a00fad37d53736ae8e7f683bdc2b5
+hooks:
+  - kind: policy
+    type: require_example_header
+    export: requireHeader
+    config_schema:
+      type: object
+      additionalProperties: false
+      properties:
+        header_name:
+          type: string
+          default: x-extension-example
+      required: [header_name]
+failure_posture: closed
+sandbox:
+  budget_ms: 50
+  memory_mb: 16
+  stack_kb: 512
+  max_buffer_bytes: 1048576
+  max_output_bytes: 1048576
+  max_fuel: 100000000
+permissions: []

@@ -384,15 +384,24 @@ pub fn current_key_plane() -> Option<Arc<KeyPlane>> {
     plane_slot().load_full()
 }
 
-/// Install (or replace) the live key plane.
-pub fn install_key_plane(plane: Arc<KeyPlane>) {
+/// Publish a bare key plane for a test that only needs the admin routes to
+/// find one.
+///
+/// [`activate_key_plane`] is the only way a running proxy installs or
+/// removes a plane, and it does more than write this slot: it clears the
+/// mesh readiness view when the committed generation is not mesh-backed,
+/// starts the cross-replica invalidation subscriber, and hands a Redis key
+/// store to the shared budget counters. A test that wants none of that
+/// still needs the slot populated, so this writes it and nothing else.
+///
+/// Gated to `cfg(test)` and named for it, because a second entry point
+/// spelled `install_key_plane` reads like the production installer and is
+/// the shape where a later invariant lands on one path only. There is no
+/// uninstall counterpart: [`TestPlaneGuard`] clears the slot on drop, so a
+/// test cannot leave one behind for the next one to find.
+#[cfg(test)]
+pub(crate) fn install_key_plane_for_test(plane: Arc<KeyPlane>) {
     plane_slot().store(Some(plane));
-}
-
-/// Remove the live key plane when dynamic key management is disabled or
-/// removed during reload.
-pub fn uninstall_key_plane() {
-    plane_slot().store(None);
 }
 
 /// A dedicated, process-lifetime runtime that hosts key-plane async work
@@ -439,6 +448,23 @@ fn resolve_secret_material(reference: &str) -> Result<Vec<u8>> {
     }
     if let Some(path) = reference.strip_prefix("file:") {
         return std::fs::read(path).with_context(|| format!("read crypto material file '{path}'"));
+    }
+    // A provider URI this site cannot resolve is an error, never key material.
+    //
+    // Without this, a mistyped or unsupported reference became the secret: set
+    // `key_management.crypto.pepper` to `awssm://prod/pepper` and the pepper
+    // was the 19-character ASCII string `awssm://prod/pepper`, published in our
+    // own docs and identical for every deployment that pasted it. A pepper's
+    // whole job is to make a leaked `password_hash` non-crackable offline, so
+    // the failure was silent and total. WOR-1767 established this rule for the
+    // central resolver; this site predates it.
+    if sbproxy_vault::looks_like_secret_reference_uri(reference) {
+        anyhow::bail!(
+            "key_management.crypto references the secret '{reference}' but this field \
+             resolves only `env:` and `file:`, so it cannot read a secrets backend even \
+             when one is declared. Inject the value into the environment or a file and \
+             reference it as `env:NAME` or `file:/path`."
+        );
     }
     Ok(reference.as_bytes().to_vec())
 }
@@ -491,6 +517,45 @@ pub fn hash_admin_operator_password(password: &str, pepper: &[u8]) -> String {
     sbproxy_keystore::crypto::hash_secret(password, pepper)
 }
 
+/// Warn when provider hints will recognize a native credential that nothing
+/// admits, so enabling `key_management` cannot silently start refusing all
+/// caller-supplied provider keys.
+///
+/// `provider_hints` defaults to a non-empty set and `native_key_policy`
+/// defaults to absent, so this combination is what an operator gets by simply
+/// switching `key_management.enabled` on. The result is a 403 on every native
+/// credential, which is deliberate and fail-closed, but was previously
+/// silent: nothing in validation or at boot said the recognition was armed
+/// with no policy behind it.
+///
+/// The message names both opt-ins. Admission needs the proxy-wide policy
+/// *and* a per-provider `accept_native_credentials_for` destination binding,
+/// and a config carrying only the first is the more confusing state of the
+/// two because the policy looks finished.
+fn warn_on_ungoverned_provider_hints(cfg: &KeyManagementConfig) {
+    let inbound = &cfg.inbound;
+    if inbound.provider_hints.is_empty() || inbound.native_key_policy.is_some() {
+        return;
+    }
+    let mut providers: Vec<&str> = inbound
+        .provider_hints
+        .iter()
+        .map(|hint| hint.provider.as_str())
+        .collect();
+    providers.sort_unstable();
+    providers.dedup();
+    tracing::warn!(
+        providers = providers.join(", "),
+        "key_management.inbound.provider_hints recognizes native provider \
+         credentials but no inbound.native_key_policy admits any of them, so \
+         every one is refused with 403. Declare \
+         inbound.native_key_policy.allowed_providers, and on each ai_proxy \
+         provider that may receive a caller credential set \
+         accept_native_credentials_for; or set provider_hints: [] to stop \
+         recognizing them."
+    );
+}
+
 /// Build the `KeyCrypto` handle from config, generating ephemeral secrets
 /// with a warning when the operator did not pin them.
 fn build_crypto(cfg: &KeyManagementConfig) -> Result<KeyCrypto> {
@@ -527,9 +592,14 @@ fn build_store(cfg: &KeyManagementConfig) -> Result<Arc<dyn KeyStore>> {
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("create keystore directory '{}'", parent.display()))?;
             }
-            let store = EmbeddedKeyStore::open(&cfg.store.path)
+            // `open_shared`, not `open`: reload builds this candidate while
+            // the live generation still holds its handle, and redb locks the
+            // database file exclusively. An unconditional re-open failed
+            // every reload of a config carrying an embedded keystore, which
+            // is the default backend, and left the node on the old config.
+            let store: Arc<dyn KeyStore> = EmbeddedKeyStore::open_shared(&cfg.store.path)
                 .with_context(|| format!("open embedded keystore at '{}'", cfg.store.path))?;
-            Ok(Arc::new(store))
+            Ok(store)
         }
         KeyStoreBackend::Redis => {
             let url = cfg
@@ -883,6 +953,7 @@ pub(crate) fn prepare_key_plane(
     let Some(cfg) = cfg.filter(|cfg| cfg.enabled) else {
         return Ok(None);
     };
+    warn_on_ungoverned_provider_hints(cfg);
     let (governance_store, approximate_store) = build_governance_store(&cfg.governance)?;
     let crypto = build_crypto(cfg)?;
     let store = build_store(cfg)?;
@@ -1044,6 +1115,44 @@ pub(crate) fn test_plane_guard() -> TestPlaneGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_provider_uri_never_becomes_crypto_material() {
+        // `key_management.crypto.pepper` set to a provider URI used to become
+        // the URI text itself as the pepper: source-visible, identical for
+        // every deployment that copied the line, and silently defeating the
+        // one property a pepper exists to provide.
+        for reference in [
+            "vault://hashi/pepper",
+            "awssm://prod/pepper",
+            "gcpsm://prod/pepper",
+            "azurekv://prod/pepper",
+            "k8ssecret://ns/pepper",
+            "secretfile://file/pepper",
+            "secret://local/pepper",
+        ] {
+            let error = resolve_secret_material(reference)
+                .expect_err("a provider URI must never become crypto material");
+            assert!(
+                error.to_string().contains("resolves only"),
+                "{reference} must be refused with the supported forms named, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn inline_crypto_material_and_env_still_resolve() {
+        // The guard must reject references it cannot resolve without
+        // rejecting a legitimate inline secret, which is the documented way
+        // to pin a pepper in a test or a single-node deployment.
+        let inline = "a-literal-pepper-value";
+        assert_eq!(
+            resolve_secret_material(inline).expect("inline material is allowed"),
+            inline.as_bytes().to_vec()
+        );
+        // A bare word that merely contains a colon is not a provider URI.
+        assert!(resolve_secret_material("not:a-scheme").is_ok());
+    }
     use sbproxy_config::types::{
         KeyCryptoConfig, KeySeedConfig, KeyStoreConfig, SecretsManagerProvider,
         SecretsManagerStoreConfig,

@@ -2,15 +2,14 @@
 # Shared helper for the generated-artifact freshness checks.
 #
 # Those checks each run a small generator binary and diff its output against a
-# committed file. The obvious way to invoke one is `cargo run -p <crate>
-# --bin <name>`, and locally that is the right call.
+# committed file. A standalone check can invoke one with `cargo run -p
+# <crate> --bin <name>` because no workspace build is available to reuse.
 #
-# In CI it is not. Under resolver = "2" cargo computes the feature union from
-# the set of *selected* packages, so `-p sbproxy-config` resolves a narrower
-# feature set than the `--workspace` build that just ran, every fingerprint
-# differs, and cargo rebuilds the dependency graph to run a binary that is
-# already sitting in target/debug. Four checks doing this cost about two
-# minutes per run.
+# After a workspace build, re-entering Cargo is wasteful. Under resolver = "2"
+# Cargo computes the feature union from the selected packages, so a narrow
+# `-p sbproxy-config` invocation can rebuild the dependency graph to run a
+# binary already sitting in target/debug. Four checks doing this cost about
+# two minutes per run.
 #
 # When SBPROXY_PREBUILT_BINS=1 is set, run the already-built binary instead.
 # The caller is responsible for having built it with a workspace-wide
@@ -33,4 +32,17 @@ run_workspace_bin() {
     fi
 
     cargo run --quiet "$@"
+}
+
+# Run generated-artifact checks against binaries from the workspace build.
+# Each script still owns its Cargo invocation, so a missing binary falls back
+# through run_workspace_bin and any Cargo failure stops the gate.
+run_generated_artifact_checks() {
+    local workspace_root="$1"
+    shift
+
+    local check
+    for check in "$@"; do
+        SBPROXY_PREBUILT_BINS=1 bash "${workspace_root}/scripts/${check}" || return $?
+    done
 }

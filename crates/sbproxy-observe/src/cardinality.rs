@@ -254,12 +254,42 @@ impl CardinalityLimiter {
     }
 
     /// Return the current count of unique accepted values for a label.
+    ///
+    /// This is the number that says whether a label is about to start
+    /// collapsing into `__other__`. Published per label at scrape time by
+    /// `metrics::refresh_cardinality_gauges`.
     pub fn unique_count(&self, label_name: &str) -> usize {
         let guard = self
             .seen
             .lock()
             .expect("cardinality limiter mutex poisoned");
         guard.get(label_name).map(|s| s.len()).unwrap_or(0)
+    }
+
+    /// Every label name the limiter is currently tracking under the
+    /// proxy-wide budget.
+    ///
+    /// A label appears only once a non-empty value has been sanitized
+    /// under it, so a label nothing uses costs no time series. The
+    /// per-tenant sets are deliberately not included: they are keyed by
+    /// `(tenant, label)`, so publishing them would multiply the series
+    /// count by the tenant budget.
+    pub fn tracked_labels(&self) -> Vec<String> {
+        let guard = self
+            .seen
+            .lock()
+            .expect("cardinality limiter mutex poisoned");
+        guard.keys().cloned().collect()
+    }
+
+    /// The effective cap `label_name` is counted against, including the
+    /// `hostname` override.
+    ///
+    /// Published beside [`unique_count`](Self::unique_count) so an
+    /// operator can read headroom off a dashboard instead of reading the
+    /// budget table out of the source.
+    pub fn cap_for_label(&self, label_name: &str) -> usize {
+        self.config.cap_for_label(label_name)
     }
 
     /// Reset all tracking. Primarily useful in tests.

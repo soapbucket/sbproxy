@@ -1,10 +1,10 @@
 # Admin API reference
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-03*
 
 The embedded admin server publishes the full control-plane HTTP surface for
 operator tooling: liveness probes, session login, key and credential
-lifecycle, the request log and its live stream, recent sessions, alert
+lifecycle, the running extension inventory, the request log and its live stream, recent sessions, alert
 operations, per-target health, spend and audit, config read/write and hot reload/drift, model-host catalog and
 deployment lifecycle, the response/semantic/key-policy caches, cluster
 status and the replicated-state substrate, prompts, the chat playground, and
@@ -25,7 +25,7 @@ built-in dashboard over this same API, see [admin-ui.md](admin-ui.md).
 - [Probe routes](#probe-routes-unauthenticated) (unauthenticated)
 - [Session routes](#session-routes) - login, logout, whoami
 - [API keys and credentials](#api-keys-and-credentials) - full virtual-key and upstream-credential lifecycle
-- [Read routes](#read-routes-authenticated) - request log + stream, alerts, health, spend, audit, rate-limit budget, UI settings, OpenAPI
+- [Read routes](#read-routes-authenticated) - request log + stream, extension inventory, alerts, health, spend, audit, rate-limit budget, UI settings, OpenAPI
 - [AI compression session state](#ai-compression-session-state)
 - [Config and control routes](#config-and-control-routes-authenticated) - reload, drift, config read/write, log level
 - [Model host admin](#model-host-admin) - catalog, deployments, lifecycle, artifact cache
@@ -156,7 +156,7 @@ flips the top-level status to `unready` and the response to `503`.
 
 Kubernetes-style readiness probe. Returns `200` once all required
 components are ready to serve traffic, `503` while any required
-component is still initialising or has failed. K8s polls this to
+component is still initializing or has failed. K8s polls this to
 gate traffic shifting during rolling restarts.
 
 ### `GET /livez`, `GET /live`
@@ -623,7 +623,7 @@ diagnose why a load balancer is short on candidates.
 | `origins[].origin_id` | string | Stable identifier for this origin within its workspace. |
 | `origins[].targets[].index` | int | Position in the configured target list. |
 | `origins[].targets[].url` | string | Upstream URL. |
-| `origins[].targets[].eligible` | bool | True when `healthy && !outlier_ejected && circuit_breaker_state != "open"`; matches what `select_target` honours. |
+| `origins[].targets[].eligible` | bool | True when `healthy && !outlier_ejected && circuit_breaker_state != "open"`; matches what `select_target` honors. |
 | `origins[].targets[].healthy` | bool | Latest active-health-check verdict. |
 | `origins[].targets[].outlier_ejected` | bool | True when the outlier detector has temporarily ejected this target. |
 | `origins[].targets[].circuit_breaker_state` | string \| null | `"closed"`, `"open"`, `"half_open"`, or null when the breaker is unconfigured. |
@@ -648,6 +648,117 @@ Prometheus `/metrics` endpoint, served on the data-plane port and
 mirrored on the admin port so ops can scrape via the
 access-controlled admin listener (see
 [metrics-stability.md](metrics-stability.md)).
+
+### `GET /api/extensions`
+
+Returns the versioned extension inventory pinned to the pipeline generation
+currently serving traffic. The request does not reread `sb.yml` or the bundle
+directories, so a rejected reload does not change this view.
+Both `admin` and `read_only` operators may call the route.
+
+A shortened response with one directory bundle looks like this:
+
+```json
+{
+  "schema_version": 1,
+  "scope": {
+    "mode": "running",
+    "proxy_version": "1.9.0",
+    "config_revision": "abc123..."
+  },
+  "summary": {
+    "bundles": 1,
+    "hooks": 1,
+    "active": 1,
+    "available": 0,
+    "failed": 0,
+    "collisions": 0
+  },
+  "bundles": [
+    {
+      "id": "hello-javascript",
+      "name": "hello-javascript",
+      "version": "1.0.0",
+      "package": "entry.js",
+      "source": "directory",
+      "runtime": "javascript",
+      "state": "active",
+      "hook_ids": ["hello-javascript:action:hello_javascript"],
+      "load": {"phase": "candidate_load", "status": "ok", "detail": null}
+    }
+  ],
+  "hooks": [
+    {
+      "id": "hello-javascript:action:hello_javascript",
+      "bundle_id": "hello-javascript",
+      "kind": "action",
+      "registration": "directory",
+      "dispatch": "exclusive",
+      "match_key": "hello_javascript",
+      "position": 0,
+      "state": "active",
+      "detail": null,
+      "runtime": "javascript",
+      "execution": {
+        "phase": "request",
+        "body_mode": "buffered",
+        "timeout_ms": 50,
+        "max_buffer_bytes": 1048576
+      },
+      "capabilities": []
+    }
+  ],
+  "collisions": []
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `schema_version` | Version of this response contract. |
+| `scope.mode` | Always `running` on this endpoint. `doctor` is the stopped diagnostic mode. |
+| `scope.proxy_version` | Proxy binary version that built the snapshot. |
+| `scope.config_revision` | Config revision of the serving generation. Use it to correlate reload and request data. |
+| `summary` | Counts of bundles, hooks, active hooks, available hooks, failures, and collisions. `failed` counts failed bundles plus failed hooks. |
+| `bundles[]` | Stable identity, version, entry filename, registration source, runtime, lifecycle state, hook IDs, and bounded load result. |
+| `hooks[]` | Stable identity, hook kind, attachment key, dispatch shape, chain position, state, runtime, execution plan, and declared capabilities. |
+| `collisions[]` | Match key, claiming registration IDs, optional winner, and a bounded resolution. A healthy dynamic candidate normally has none. |
+
+Registration sources are `link_time`, `directory`, or `git`. Runtimes are
+`rust`, `javascript`, `wasm`, or `proxy_wasm`. Hook states are:
+
+| State | Meaning in the running view |
+|---|---|
+| `installed` | Linked into the binary, without a more specific running attachment observation. |
+| `available` | Loaded and ready for attachment. |
+| `active` | Attached to this pipeline generation. `position` is present when the hook participates in a resolved chain. |
+| `unconsumed` | Loaded successfully but not attached by this config. |
+| `failed` | Load, validation, initialization, or unresolved collision failed. |
+| `shadowed` | A higher-precedence registration won a resolved collision. |
+| `not_evaluated` | Used by the loader-level doctor fallback when candidate attachment could not be evaluated. |
+
+The response deliberately omits executable bytes, artifact digests, source
+paths, hook attachment config, and secrets. A Git bundle's bounded
+`load.detail` includes its redacted repository, requested reference, verified
+commit, and latest refresh health. A failed refresh reports that the last
+verified generation is still serving, without copying the rejected error,
+credential reference, or resolved value. This route serves operational metadata
+only.
+
+| Status | When |
+|---|---|
+| `200` | Running snapshot serialized successfully. |
+| `401` | Missing or invalid admin authentication. |
+| `405` | Method other than GET. |
+| `500` | The in-memory snapshot could not be serialized. |
+
+For preflight, run `sbproxy doctor <config> --format json` and inspect its
+top-level `extensions` field. That snapshot has `scope.mode: "doctor"` and
+uses `active` for hooks selected and wired in the successfully compiled stopped
+candidate. This state does not claim traffic execution, runtime health, or a
+published generation. Loaded hooks without an attachment are `unconsumed`.
+`not_evaluated` means doctor fell back to loader-level inspection because full
+candidate construction did not finish. See the
+[extension bundle runbook](operator-runbook.md#extension-bundles).
 
 ### `GET /api/openapi.json`, `GET /api/openapi.yaml`
 
@@ -1533,8 +1644,15 @@ for the full request schema and validation order.
 }
 ```
 
-Empty (all-zero) until a locally served or compressed request
-completes successfully. `compression` is sorted by model and lever;
+Empty (all-zero) until a request that is served locally, spills to a
+cloud provider, or is compressed completes successfully. A model's
+`local_completions` / `saved_micros` and its `cloud_completions` /
+`cloud_spent_micros` are the two halves of one split, priced against the
+same configured `reference`, so the saved figure is gross and the
+difference is net. Both halves are keyed on the model the caller asked
+for rather than the id the answering provider billed under. See
+[model-host.md](model-host.md#value-delivered) for the lane rules.
+`compression` is sorted by model and lever;
 `compression_totals` aggregates by lever name. A known target-model
 tokenizer produces `model_tokenizer` precision; the UTF-8
 byte-length fallback produces `heuristic`. Both are sbproxy estimates,
@@ -1936,7 +2054,7 @@ persist to the operator-configured redb file when
 
 The full set of POST shapes and request schemas is documented in
 [ai-gateway.md](./ai-gateway.md) under "Stored prompts". This
-reference only catalogues the route surface; the request/response
+reference only catalogs the route surface; the request/response
 contracts live with the feature.
 
 ---
@@ -1988,6 +2106,11 @@ curl -s -u admin:secret \
 # Watch per-target health.
 curl -s -u admin:secret \
   http://127.0.0.1:9090/api/health/targets | jq '.origins[].targets'
+
+# Inspect extensions attached to the serving generation.
+curl -s -u admin:secret \
+  http://127.0.0.1:9090/api/extensions \
+  | jq '{scope,summary,bundles,hooks,collisions}'
 
 # Show the full cluster roster and unhealthy-node alerts.
 curl -s -u admin:secret \

@@ -5,32 +5,78 @@
 # origin, an MCP server, or a docs surface). Listings live in
 # `listings/*.yaml` alongside the rest of the proxy config so they are
 # version-controlled with the Repo and validated through the same plan
-# pipeline.
+# pipeline that diffs the config itself.
 #
-# This example pairs the standard sb.yml with one Listing manifest under
-# `listings/example.yaml`. The Listing pins the underlying origin to a
-# specific commit SHA via `revision.mode: pin`. See `docs/listings.md`
-# for the full reference and the other two pinning modes
-# (`track-branch`, `tag`).
+# This example pairs two origins with two Listings so both halves of the
+# surface are reachable:
+#
+#   listings/example.yaml        publishes `api.example.com` as
+#                                `example-api`, pinned to a commit SHA,
+#                                and carries one agent skill
+#   listings/internal-tools.yaml publishes `internal.example.com` as
+#                                `internal-tools`, tracking a branch,
+#                                advertising the auth strategy that
+#                                origin actually accepts
+#
+# Two things are worth separating. Plan-time, `sbproxy plan` loads the
+# directory and folds every Listing finding into the same validation
+# stream as the rest of the diff. Serve-time, a Listing that carries
+# `spec.skills[]` is on the data path: the projection layer serves its
+# manifest at `/.well-known/agent-skills/<listing-name>/index.json` and
+# re-hosts each artifact body on the origins the Listing publishes.
+# Everything else about a Listing is input for a future Catalog surface
+# and is not served today.
+#
+# Both origins answer from the proxy itself, so this example needs no
+# upstream and no fixture. The one skill carries its body inline rather
+# than pointing at a file, because a relative artifact path resolves
+# against the process working directory rather than against the manifest,
+# and an example that only works from one directory is a trap.
 #
 # Run:
 #   make run CONFIG=examples/listing-primitive/sb.yml
 #
-# Test the underlying origin:
-#   curl -H 'Host: api.example.com' http://127.0.0.1:8080/echo
+# Plan it (loads listings/ from the directory holding this file):
+#   sbproxy plan -f examples/listing-primitive/sb.yml
 #
-# The Listing itself is not served on the data path in OSS; it is the
-# input the future hosted-Catalog surface and the
-# Listing-scoped agent-skills extension build on.
+# Test the underlying origin:
+#   curl -s -H 'Host: api.example.com' http://127.0.0.1:8080/orders
+#
+# Test the per-Listing agent-skills manifest:
+#   curl -s -H 'Host: api.example.com' http://127.0.0.1:8080/.well-known/agent-skills/example-api/index.json
+#
+# Test the re-hosted artifact body:
+#   curl -s -H 'Host: api.example.com' http://127.0.0.1:8080/skills/place-order.md
 
+# sbproxy-docs:begin
 proxy:
   http_bind_port: 8080
 
 origins:
+  # The Resource `example-api` publishes. A `static` action keeps the
+  # example self-contained: the Listing surface is the subject here, and
+  # what the origin does behind it is beside the point.
   "api.example.com":
     action:
-      type: proxy
-      url: https://test.sbproxy.dev
+      type: static
+      status: 200
+      content_type: application/json
+      body: |
+        {"service":"orders","note":"the Resource the example-api Listing publishes"}
+
+  # A second Resource, with authentication, so the Listing that publishes
+  # it has an auth type to be compatible with. `spec.auth.strategies` on
+  # that Listing must include `jwt` or the plan reports
+  # `listing-auth-mismatch`.
+  "internal.example.com":
+    action:
+      type: static
+      status: 200
+      content_type: application/json
+      body: |
+        {"service":"internal-tools"}
     authentication:
       type: jwt
+      # Demo value. Resolve this from a secret backend in production.
       secret: hardcoded-not-a-ref
+# sbproxy-docs:end

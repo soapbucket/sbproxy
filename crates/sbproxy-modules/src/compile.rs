@@ -6,6 +6,10 @@
 
 use anyhow::{Context, Result};
 use sbproxy_config::extract_type;
+use sbproxy_extension::bundle::{
+    build_javascript_action, build_javascript_policy, build_javascript_transform,
+    build_wasm_action, build_wasm_policy, build_wasm_transform, BundleRegistry, LoadedBundleHook,
+};
 
 use crate::action::{
     A2aAction, Action, AiProxyAction, BeaconAction, EchoAction, GraphQLAction, GrpcAction,
@@ -33,17 +37,42 @@ use crate::transform::{
 
 /// Compile a JSON action config into an Action enum variant.
 pub fn compile_action(config: &serde_json::Value) -> Result<Action> {
-    compile_action_for_origin_with_runtime(config, "", true)
+    compile_action_for_origin_with_runtime(config, "", true, None)
+}
+
+/// Compile an action with dynamic bundle lookup after built-ins and linked plugins.
+pub fn compile_action_with_registry(
+    config: &serde_json::Value,
+    registry: &dyn BundleRegistry,
+) -> Result<Action> {
+    let type_name = extract_type(config)?;
+    if registry.action(&type_name).is_none() {
+        return compile_action(config);
+    }
+    compile_action_for_origin_with_runtime(config, "", true, Some(registry))
 }
 
 /// Compile a JSON action for validation without constructing runtime clients.
 pub fn compile_action_for_validation(config: &serde_json::Value) -> Result<Action> {
-    compile_action_for_origin_with_runtime(config, "", false)
+    compile_action_for_origin_with_runtime(config, "", false, None)
 }
 
 /// Compile an action with the stable identity of its owning origin.
 pub fn compile_action_for_origin(config: &serde_json::Value, origin_id: &str) -> Result<Action> {
-    compile_action_for_origin_with_runtime(config, origin_id, true)
+    compile_action_for_origin_with_runtime(config, origin_id, true, None)
+}
+
+/// Compile an origin action with dynamic bundle lookup after built-ins and linked plugins.
+pub fn compile_action_for_origin_with_registry(
+    config: &serde_json::Value,
+    origin_id: &str,
+    registry: &dyn BundleRegistry,
+) -> Result<Action> {
+    let type_name = extract_type(config)?;
+    if registry.action(&type_name).is_none() {
+        return compile_action_for_origin(config, origin_id);
+    }
+    compile_action_for_origin_with_runtime(config, origin_id, true, Some(registry))
 }
 
 /// Compile an origin action for validation without constructing runtime clients.
@@ -51,13 +80,14 @@ pub fn compile_action_for_origin_for_validation(
     config: &serde_json::Value,
     origin_id: &str,
 ) -> Result<Action> {
-    compile_action_for_origin_with_runtime(config, origin_id, false)
+    compile_action_for_origin_with_runtime(config, origin_id, false, None)
 }
 
 fn compile_action_for_origin_with_runtime(
     config: &serde_json::Value,
     origin_id: &str,
     prepare_runtime: bool,
+    registry: Option<&dyn BundleRegistry>,
 ) -> Result<Action> {
     let type_name = extract_type(config)?;
     match type_name.as_str() {
@@ -93,7 +123,17 @@ fn compile_action_for_origin_with_runtime(
             config.clone(),
         )?))),
         "noop" => Ok(Action::Noop),
-        _ => anyhow::bail!("unknown action type: {}", type_name),
+        other => match sbproxy_plugin::build_action_plugin(other, config.clone()) {
+            Some(Ok(handler)) => Ok(Action::Plugin(crate::PluginAction::linked(handler))),
+            Some(Err(error)) => {
+                Err(error).with_context(|| format!("action plugin {other:?} factory failed"))
+            }
+            None => match registry.and_then(|registry| registry.action(other)) {
+                Some(hook) => compile_bundle_action(hook, attachment_config(config, &[]))
+                    .with_context(|| format!("action bundle {other:?} initialization failed")),
+                None => anyhow::bail!("unknown action type: {}", other),
+            },
+        },
     }
 }
 
@@ -158,6 +198,25 @@ pub fn compile_auth(config: &serde_json::Value) -> Result<Auth> {
 
 /// Compile a single JSON policy config into a Policy enum variant.
 pub fn compile_policy(config: &serde_json::Value) -> Result<Policy> {
+    compile_policy_with_optional_registry(config, None)
+}
+
+/// Compile a policy with dynamic bundle lookup after built-ins and linked plugins.
+pub fn compile_policy_with_registry(
+    config: &serde_json::Value,
+    registry: &dyn BundleRegistry,
+) -> Result<Policy> {
+    let type_name = extract_type(config)?;
+    if registry.policy(&type_name).is_none() {
+        return compile_policy(config);
+    }
+    compile_policy_with_optional_registry(config, Some(registry))
+}
+
+fn compile_policy_with_optional_registry(
+    config: &serde_json::Value,
+    registry: Option<&dyn BundleRegistry>,
+) -> Result<Policy> {
     let type_name = extract_type(config)?;
     match type_name.as_str() {
         "rate_limit_budget" => Ok(Policy::RateLimitBudget(
@@ -249,12 +308,41 @@ pub fn compile_policy(config: &serde_json::Value) -> Result<Policy> {
         "agent_budget" => Ok(Policy::AgentBudget(std::sync::Arc::new(
             crate::policy::AgentBudgetPolicy::from_config(config.clone())?,
         ))),
-        _ => anyhow::bail!("unknown policy type: {}", type_name),
+        other => match sbproxy_plugin::build_policy_plugin(other, config.clone()) {
+            Some(Ok(enforcer)) => Ok(Policy::Plugin(crate::PluginPolicy::linked(enforcer))),
+            Some(Err(error)) => {
+                Err(error).with_context(|| format!("policy plugin {other:?} factory failed"))
+            }
+            None => match registry.and_then(|registry| registry.policy(other)) {
+                Some(hook) => compile_bundle_policy(hook, attachment_config(config, &[]))
+                    .with_context(|| format!("policy bundle {other:?} initialization failed")),
+                None => anyhow::bail!("unknown policy type: {}", other),
+            },
+        },
     }
 }
 
 /// Compile a JSON transform config into a Transform enum variant.
 pub fn compile_transform(config: &serde_json::Value) -> Result<Transform> {
+    compile_transform_with_optional_registry(config, None)
+}
+
+/// Compile a transform with dynamic bundle lookup after built-ins and linked plugins.
+pub fn compile_transform_with_registry(
+    config: &serde_json::Value,
+    registry: &dyn BundleRegistry,
+) -> Result<Transform> {
+    let type_name = extract_type(config)?;
+    if registry.transform(&type_name).is_none() {
+        return compile_transform(config);
+    }
+    compile_transform_with_optional_registry(config, Some(registry))
+}
+
+fn compile_transform_with_optional_registry(
+    config: &serde_json::Value,
+    registry: Option<&dyn BundleRegistry>,
+) -> Result<Transform> {
     let type_name = extract_type(config)?;
     match type_name.as_str() {
         "json" => Ok(Transform::Json(JsonTransform::from_config(config.clone())?)),
@@ -337,13 +425,394 @@ pub fn compile_transform(config: &serde_json::Value) -> Result<Transform> {
             A2aAgentCardRewriter::from_config(config.clone())?,
         )),
         "noop" => Ok(Transform::Noop),
-        _ => anyhow::bail!("unknown transform type: {}", type_name),
+        other => match sbproxy_plugin::build_transform_plugin(other, config.clone()) {
+            Some(Ok(handler)) => Ok(Transform::Plugin(crate::PluginTransform::linked(handler))),
+            Some(Err(error)) => {
+                Err(error).with_context(|| format!("transform plugin {other:?} factory failed"))
+            }
+            None => match registry.and_then(|registry| registry.transform(other)) {
+                Some(hook) => compile_bundle_transform(
+                    hook,
+                    attachment_config(
+                        config,
+                        &[
+                            "content_types",
+                            "fail_on_error",
+                            "failure_posture",
+                            "max_body_size",
+                            "disabled",
+                        ],
+                    ),
+                )
+                .with_context(|| format!("transform bundle {other:?} initialization failed")),
+                None => anyhow::bail!("unknown transform type: {}", other),
+            },
+        },
     }
+}
+
+fn attachment_config(config: &serde_json::Value, wrapper_fields: &[&str]) -> serde_json::Value {
+    let mut attachment = config.clone();
+    if let Some(object) = attachment.as_object_mut() {
+        object.remove("type");
+        for field in wrapper_fields {
+            object.remove(*field);
+        }
+    }
+    attachment
+}
+
+fn compile_bundle_policy(hook: &LoadedBundleHook, config: serde_json::Value) -> Result<Policy> {
+    let handler: Box<dyn sbproxy_plugin::PolicyEnforcer> = match hook.manifest().runtime {
+        sbproxy_config::BundleRuntime::Javascript => {
+            Box::new(build_javascript_policy(hook, config)?)
+        }
+        sbproxy_config::BundleRuntime::Wasm => Box::new(build_wasm_policy(hook, config)?),
+        sbproxy_config::BundleRuntime::ProxyWasm => {
+            anyhow::bail!("Proxy-Wasm bundles cannot provide policy hooks")
+        }
+    };
+    Ok(Policy::Plugin(crate::PluginPolicy::dynamic(
+        handler,
+        dynamic_hook_metadata(hook)?,
+    )))
+}
+
+fn compile_bundle_transform(
+    hook: &LoadedBundleHook,
+    config: serde_json::Value,
+) -> Result<Transform> {
+    let handler: Box<dyn sbproxy_plugin::TransformHandler> = match hook.manifest().runtime {
+        sbproxy_config::BundleRuntime::Javascript => {
+            Box::new(build_javascript_transform(hook, config)?)
+        }
+        sbproxy_config::BundleRuntime::Wasm => Box::new(build_wasm_transform(hook, config)?),
+        sbproxy_config::BundleRuntime::ProxyWasm => {
+            anyhow::bail!("Proxy-Wasm bundles cannot provide transform hooks")
+        }
+    };
+    Ok(Transform::Plugin(crate::PluginTransform::dynamic(
+        handler,
+        dynamic_hook_metadata(hook)?,
+    )))
+}
+
+fn compile_bundle_action(hook: &LoadedBundleHook, config: serde_json::Value) -> Result<Action> {
+    let handler: Box<dyn sbproxy_plugin::ActionHandler> = match hook.manifest().runtime {
+        sbproxy_config::BundleRuntime::Javascript => {
+            Box::new(build_javascript_action(hook, config)?)
+        }
+        sbproxy_config::BundleRuntime::Wasm => Box::new(build_wasm_action(hook, config)?),
+        sbproxy_config::BundleRuntime::ProxyWasm => {
+            anyhow::bail!("Proxy-Wasm bundles cannot provide action hooks")
+        }
+    };
+    Ok(Action::Plugin(crate::PluginAction::dynamic(
+        handler,
+        dynamic_hook_metadata(hook)?,
+    )))
+}
+
+fn dynamic_hook_metadata(hook: &LoadedBundleHook) -> Result<crate::DynamicHookMetadata> {
+    let maximum = usize::try_from(hook.manifest().sandbox.max_buffer_bytes)
+        .context("bundle sandbox max_buffer_bytes does not fit this platform")?;
+    Ok(crate::DynamicHookMetadata::new(
+        hook.manifest().name.clone(),
+        hook.hook().type_name.clone(),
+        hook.hook().execution.body_mode,
+        maximum,
+        hook.manifest().failure_posture,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+
+    use bytes::{Bytes, BytesMut};
+    use sbproxy_config::{BundleBodyMode, ExtensionBundlesConfig, FailureMode};
+    use sbproxy_extension::bundle::DynamicBundleRegistry;
+    use sbproxy_plugin::{
+        ActionHandler, ActionOutcome, ActionPluginRegistration, PluginResult, PolicyDecision,
+        PolicyEnforcer, PolicyPluginRegistration, TransformContext, TransformHandler,
+        TransformPluginRegistration,
+    };
+    use tempfile::TempDir;
+
     use super::*;
+
+    struct CompileFixturePolicy;
+
+    impl PolicyEnforcer for CompileFixturePolicy {
+        fn policy_type(&self) -> &str {
+            "compile_fixture_policy"
+        }
+
+        fn enforce(
+            &self,
+            _req: &http::Request<Bytes>,
+            _ctx: &mut dyn std::any::Any,
+        ) -> Pin<Box<dyn Future<Output = PluginResult<PolicyDecision>> + Send + '_>> {
+            Box::pin(async { Ok(PolicyDecision::Allow) })
+        }
+    }
+
+    struct CompileFixtureTransform;
+
+    impl TransformHandler for CompileFixtureTransform {
+        fn transform_type(&self) -> &str {
+            "compile_fixture_transform"
+        }
+
+        fn apply<'a>(
+            &'a self,
+            body: &'a mut BytesMut,
+            _content_type: Option<&'a str>,
+            _ctx: &'a TransformContext<'a>,
+        ) -> Pin<Box<dyn Future<Output = PluginResult<()>> + Send + 'a>> {
+            Box::pin(async move {
+                body.clear();
+                body.extend_from_slice(b"typed transform ran");
+                Ok(())
+            })
+        }
+    }
+
+    struct CompileFixtureAction;
+
+    impl ActionHandler for CompileFixtureAction {
+        fn handler_type(&self) -> &str {
+            "compile_fixture_action"
+        }
+
+        fn handle(
+            &self,
+            _req: &mut http::Request<Bytes>,
+            _ctx: &mut dyn std::any::Any,
+        ) -> Pin<Box<dyn Future<Output = PluginResult<ActionOutcome>> + Send + '_>> {
+            Box::pin(async {
+                Ok(ActionOutcome::Response {
+                    status: 204,
+                    headers: Vec::new(),
+                    body: Bytes::new(),
+                })
+            })
+        }
+    }
+
+    inventory::submit! {
+        PolicyPluginRegistration {
+            name: "compile_fixture_policy",
+            factory: |_config| Ok(Box::new(CompileFixturePolicy)),
+        }
+    }
+
+    inventory::submit! {
+        TransformPluginRegistration {
+            name: "compile_fixture_transform",
+            factory: |_config| Ok(Box::new(CompileFixtureTransform)),
+        }
+    }
+
+    inventory::submit! {
+        ActionPluginRegistration {
+            name: "compile_fixture_action",
+            factory: |_config| Ok(Box::new(CompileFixtureAction)),
+        }
+    }
+
+    struct DynamicCompileFixture {
+        _directory: TempDir,
+        registry: Arc<DynamicBundleRegistry>,
+    }
+
+    fn dynamic_compile_fixture() -> DynamicCompileFixture {
+        let directory = TempDir::new().expect("temporary bundle directory");
+        let bundle = directory.path().join("compile-fixture");
+        std::fs::create_dir_all(&bundle).expect("create bundle directory");
+        std::fs::write(
+            bundle.join("entry.js"),
+            r#"
+                export function policy() {
+                    return { version: "sbproxy-envelope/v1", decision: "allow" };
+                }
+                export function denyPolicy() {
+                    return { version: "sbproxy-envelope/v1", decision: "deny", status: 403 };
+                }
+                export function transform() {
+                    return { version: "sbproxy-envelope/v1", body_base64: "cmV3cml0dGVu" };
+                }
+                export function action(input) {
+                    return {
+                        version: "sbproxy-envelope/v1",
+                        outcome: "response",
+                        status: input.config.status,
+                        headers: [],
+                        body_base64: "ZHluYW1pYyBhY3Rpb24="
+                    };
+                }
+            "#,
+        )
+        .expect("write JavaScript entry");
+        std::fs::write(
+            bundle.join("bundle.yaml"),
+            r#"apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: compile-fixture
+version: 1.0.0
+runtime: javascript
+entry: entry.js
+hooks:
+  - kind: policy
+    type: dynamic_compile_policy
+    export: policy
+  - kind: policy
+    type: compile_fixture_policy
+    export: denyPolicy
+  - kind: transform
+    type: dynamic_compile_transform
+    export: transform
+  - kind: action
+    type: dynamic_compile_action
+    export: action
+    config_schema:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          type: integer
+          default: 207
+  - kind: action
+    type: noop
+    export: action
+"#,
+        )
+        .expect("write bundle manifest");
+        let config = ExtensionBundlesConfig {
+            bundles_dir: Some(directory.path().display().to_string()),
+            sources: Vec::new(),
+        };
+        let registry = DynamicBundleRegistry::load(&config, directory.path(), &BTreeSet::new())
+            .expect("load dynamic compile fixture");
+        DynamicCompileFixture {
+            _directory: directory,
+            registry,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn extension_registry_compiles_dynamic_policy_transform_and_action() {
+        let fixture = dynamic_compile_fixture();
+
+        let policy = compile_policy_with_registry(
+            &serde_json::json!({"type": "dynamic_compile_policy"}),
+            fixture.registry.as_ref(),
+        )
+        .expect("dynamic policy should compile");
+        let Policy::Plugin(policy) = policy else {
+            panic!("dynamic policy should use plugin dispatch");
+        };
+        let (policy, policy_metadata) = policy.into_parts();
+        let policy_metadata = policy_metadata
+            .as_ref()
+            .expect("dynamic policy should retain bundle execution metadata");
+        assert_eq!(policy_metadata.bundle_id(), "compile-fixture");
+        assert_eq!(policy_metadata.hook_type(), "dynamic_compile_policy");
+        assert_eq!(policy_metadata.body_mode(), BundleBodyMode::Buffered);
+        assert_eq!(policy_metadata.max_buffer_bytes(), 1_048_576);
+        assert_eq!(policy_metadata.failure_posture(), FailureMode::Closed);
+        let decision = policy
+            .enforce(&http::Request::new(Bytes::new()), &mut ())
+            .await
+            .expect("dynamic policy should run");
+        assert_eq!(decision, PolicyDecision::Allow);
+
+        let transform = compile_transform_with_registry(
+            &serde_json::json!({"type": "dynamic_compile_transform"}),
+            fixture.registry.as_ref(),
+        )
+        .expect("dynamic transform should compile");
+        let Transform::Plugin(transform) = transform else {
+            panic!("dynamic transform should use plugin dispatch");
+        };
+        let mut body = BytesMut::from(&b"original"[..]);
+        transform
+            .handler()
+            .apply(
+                &mut body,
+                Some("text/plain"),
+                &TransformContext::new("fixture.example"),
+            )
+            .await
+            .expect("dynamic transform should run");
+        assert_eq!(&body[..], b"rewritten");
+
+        let action = compile_action_with_registry(
+            &serde_json::json!({"type": "dynamic_compile_action"}),
+            fixture.registry.as_ref(),
+        )
+        .expect("dynamic action should compile with its schema default");
+        let Action::Plugin(action) = action else {
+            panic!("dynamic action should use plugin dispatch");
+        };
+        let action_metadata = action
+            .dynamic_hook()
+            .expect("dynamic action should retain bundle execution metadata");
+        assert_eq!(action_metadata.bundle_id(), "compile-fixture");
+        assert_eq!(action_metadata.hook_type(), "dynamic_compile_action");
+        assert_eq!(action_metadata.body_mode(), BundleBodyMode::Buffered);
+        assert_eq!(action_metadata.max_buffer_bytes(), 1_048_576);
+        assert_eq!(action_metadata.failure_posture(), FailureMode::Closed);
+        let mut request = http::Request::new(Bytes::new());
+        let outcome = action
+            .handler()
+            .handle(&mut request, &mut ())
+            .await
+            .expect("dynamic action should run");
+        assert_eq!(
+            outcome,
+            ActionOutcome::Response {
+                status: 207,
+                headers: Vec::new(),
+                body: Bytes::from_static(b"dynamic action"),
+            }
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn extension_registry_keeps_builtin_and_static_precedence() {
+        let fixture = dynamic_compile_fixture();
+
+        let builtin = compile_action_with_registry(
+            &serde_json::json!({"type": "noop"}),
+            fixture.registry.as_ref(),
+        )
+        .expect("built-in action should compile");
+        assert!(matches!(builtin, Action::Noop));
+
+        let static_policy = compile_policy_with_registry(
+            &serde_json::json!({"type": "compile_fixture_policy"}),
+            fixture.registry.as_ref(),
+        )
+        .expect("linked static policy should compile");
+        let Policy::Plugin(static_policy) = static_policy else {
+            panic!("linked policy should use plugin dispatch");
+        };
+        let (static_policy, static_metadata) = static_policy.into_parts();
+        assert!(
+            static_metadata.is_none(),
+            "linked policy should retain legacy body handling"
+        );
+        let decision = static_policy
+            .enforce(&http::Request::new(Bytes::new()), &mut ())
+            .await
+            .expect("linked static policy should run");
+        assert_eq!(decision, PolicyDecision::Allow);
+    }
 
     // --- compile_action tests ---
 
@@ -609,6 +1078,15 @@ mod tests {
     }
 
     #[test]
+    fn compile_action_builds_typed_static_plugin() {
+        let action = compile_action(&serde_json::json!({"type": "compile_fixture_action"}))
+            .expect("typed action registration must be reachable from config");
+
+        assert_eq!(action.action_type(), "compile_fixture_action");
+        assert!(matches!(action, Action::Plugin(_)));
+    }
+
+    #[test]
     fn compile_action_mcp() {
         // Note: WOR-42 makes per-server `rbac` and `timeout` hard
         // config errors until the federation dispatcher actually
@@ -749,6 +1227,15 @@ mod tests {
     fn compile_policy_unknown_type() {
         let json = serde_json::json!({"type": "nonexistent_policy"});
         assert!(compile_policy(&json).is_err());
+    }
+
+    #[test]
+    fn compile_policy_builds_typed_static_plugin() {
+        let policy = compile_policy(&serde_json::json!({"type": "compile_fixture_policy"}))
+            .expect("typed policy registration must be reachable from config");
+
+        assert_eq!(policy.policy_type(), "compile_fixture_policy");
+        assert!(matches!(policy, Policy::Plugin(_)));
     }
 
     #[test]
@@ -946,6 +1433,21 @@ mod tests {
         let json = serde_json::json!({"type": "noop"});
         let transform = compile_transform(&json).unwrap();
         assert_eq!(transform.transform_type(), "noop");
+    }
+
+    #[test]
+    fn compile_transform_builds_and_runs_typed_static_plugin() {
+        let transform =
+            compile_transform(&serde_json::json!({"type": "compile_fixture_transform"}))
+                .expect("typed transform registration must be reachable from config");
+        let mut body = BytesMut::from(&b"original"[..]);
+
+        transform
+            .apply(&mut body, Some("text/plain"))
+            .expect("compiled typed transform must run without generic registration");
+
+        assert_eq!(transform.transform_type(), "compile_fixture_transform");
+        assert_eq!(&body[..], b"typed transform ran");
     }
 
     #[test]

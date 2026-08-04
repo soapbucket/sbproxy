@@ -34,6 +34,7 @@ use std::sync::Arc;
 
 use crate::dispatch::DispatchContext;
 use crate::error::BillingError;
+use crate::lifecycle::{PaymentLifecycleDecision, PaymentLifecycleOutcome, PaymentLifecyclePhase};
 use crate::registry::{
     AuthoritativePayment, ChallengeMaterial, ChallengePreparation, PaymentMethodAdapter,
     ProviderQueryResult,
@@ -265,6 +266,10 @@ impl<T: FacilitatorTransport> PaymentMethodAdapter for X402Adapter<T> {
         SettlementRail::X402
     }
 
+    fn manages_authorization_lifecycle(&self) -> bool {
+        true
+    }
+
     /// Creates nothing.
     ///
     /// x402 has no provider object behind a challenge: the obligation is the
@@ -351,6 +356,14 @@ struct ContextGate<'a> {
 
 #[async_trait::async_trait]
 impl SettleDispatchGate for ContextGate<'_> {
+    async fn payment_started(&self, phase: PaymentLifecyclePhase) -> PaymentLifecycleDecision {
+        self.dispatch.payment_started(phase).await
+    }
+
+    fn payment_terminal(&self, phase: PaymentLifecyclePhase, outcome: PaymentLifecycleOutcome) {
+        self.dispatch.payment_terminal(phase, outcome);
+    }
+
     async fn stamp_settle_dispatch(&self) -> Result<(), BillingError> {
         self.dispatch.stamp_write().await
     }

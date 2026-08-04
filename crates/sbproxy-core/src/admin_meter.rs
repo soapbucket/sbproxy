@@ -91,6 +91,25 @@
 //! two provenances into one number: that fold is exactly what
 //! `sbproxy_meter` exists to refuse, and undoing it at the point an
 //! operator looks at the figures would defeat the whole design.
+//!
+//! # A receipt that contradicts itself is refused here too (WOR-2211)
+//!
+//! The summary and receipts routes walk the chain file themselves rather
+//! than going through `sbproxy_meter::verify_ledger`, which is what makes
+//! paging and tenant scoping possible and what means neither inherits the
+//! coherence refusal the ledger performs on its own decode paths. Both
+//! therefore ask
+//! `sbproxy_modules::policy::receipt_token::ReceiptClaims::provenance_conflict`
+//! on every entry, against the same rule, and stop at the first receipt
+//! whose declared provenance disagrees with the evidence it carries.
+//!
+//! Stopping rather than skipping. Past that entry the totals on this page
+//! are assembled from a chain that carries a claim nobody can settle from,
+//! and a page that quietly omitted the bad line while continuing to add up
+//! the rest would render a plausible number over a broken record. It is
+//! reported through the same `damaged_at_seq` and `damage_reason` fields an
+//! unreadable line uses, because an operator's next step is the same in
+//! both cases: go and look at that sequence number.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::BufRead;
@@ -101,7 +120,7 @@ use std::time::Duration;
 use sbproxy_meter::coverage::ClusterUsageSummary;
 use sbproxy_meter::ledger::{verify_ledger, LedgerEntry};
 use sbproxy_meter::segment::ChainSegment;
-use sbproxy_modules::policy::receipt_token::ReceiptClaims;
+use sbproxy_modules::policy::receipt_token::{ReceiptClaims, ReceiptUnit};
 use serde::Serialize;
 
 use crate::admin::AdminPrincipal;
@@ -342,6 +361,18 @@ fn replay_chain(path: &Path, scope: Option<&str>) -> ChainReplay {
                 return replay;
             }
         };
+        // Before the entry counts toward anything. A unit whose declared
+        // provenance contradicts its evidence is the one thing this walk
+        // must not fold into a total: `group_by=source` is an operator
+        // surface, so folding it would file a number the upstream asserted
+        // under the provenance the proxy vouches for, which is the exact
+        // trust the source column exists to express.
+        if let Some(unit) = entry.event.0.provenance_conflict() {
+            refuse_incoherent_receipt(&entry.event.0, unit, entry.seq, "summary");
+            replay.damaged_at_seq = Some(entry.seq);
+            replay.damage_reason = Some(incoherence_reason(unit, entry.seq));
+            return replay;
+        }
         // Chain facts advance whoever the entry belongs to. A scoped
         // operator still gets a truthful chain length, because a head that
         // moved only for other tenants is still a head that moved.
@@ -445,6 +476,17 @@ fn read_page(path: &Path, scope: Option<&str>, since_seq: u64, limit: usize) -> 
                 return page;
             }
         };
+        // Checked before `since_seq` and before the tenant filter, and both
+        // orderings are deliberate. An incoherent entry is a chain fact,
+        // and this module keeps chain facts outside the tenant boundary:
+        // paging past one because it belongs to somebody else would hand a
+        // scoped operator a page that looks clean over a chain that is not.
+        if let Some(unit) = entry.event.0.provenance_conflict() {
+            refuse_incoherent_receipt(&entry.event.0, unit, entry.seq, "receipts");
+            page.damaged_at_seq = Some(entry.seq);
+            page.damage_reason = Some(incoherence_reason(unit, entry.seq));
+            return page;
+        }
         seen = seen.saturating_add(1);
         if entry.seq < since_seq {
             continue;
@@ -475,6 +517,47 @@ fn read_page(path: &Path, scope: Option<&str>, since_seq: u64, limit: usize) -> 
 /// Whether a receipt's tenant survives the caller's scope.
 fn tenant_in_scope(tenant: &str, scope: Option<&str>) -> bool {
     scope.is_none_or(|scoped| scoped == tenant)
+}
+
+/// Count and log one receipt this surface refused for contradicting itself.
+///
+/// Both walks in this module read the chain file directly rather than
+/// through `sbproxy_meter::verify_ledger`, so neither inherits the refusal
+/// the ledger performs on its own decode paths. They share this instead of
+/// each growing their own, because two copies of a refusal are how one of
+/// them ends up counting a different thing from the other.
+///
+/// Attribution is the tenant the contradictory line was charged to, which
+/// is the same dimension every other `sbproxy_meter_*` family carries. The
+/// posture is decided inside `observe_incoherent_receipt`; see its
+/// documentation for why a reader does not get to relax it.
+fn refuse_incoherent_receipt(claims: &ReceiptClaims, unit: &ReceiptUnit, seq: u64, route: &str) {
+    sbproxy_meter::metrics::observe_incoherent_receipt(&claims.subject.tenant);
+    tracing::warn!(
+        route,
+        seq,
+        tenant_id = %claims.subject.tenant,
+        claim_id = %claims.claim_id,
+        unit = %unit.name,
+        declared_source = %unit.source,
+        evidence_source = unit.evidence_source(),
+        "admin-meter: refused a chained receipt that contradicts its own provenance"
+    );
+}
+
+/// The one-line reason a refused receipt puts on the wire.
+///
+/// Names the sequence number and the two provenances and nothing else. The
+/// tenant, the claim id, and the unit name are all on the log line above
+/// and stay off this one: a chain-level fault is reported to every operator
+/// including a tenant-scoped one, so the reason string has to be readable
+/// by somebody who is not allowed to know whose receipt it was.
+fn incoherence_reason(unit: &ReceiptUnit, seq: u64) -> String {
+    format!(
+        "receipt at seq {seq} declares source `{}` while carrying evidence for `{}`",
+        unit.source,
+        unit.evidence_source()
+    )
 }
 
 // --- Tenant scope ---
@@ -1588,5 +1671,242 @@ mod tests {
             decoded_query_param("/api/meter/summary?tenant=acme%2Deu", "tenant").as_deref(),
             Some("acme-eu"),
         );
+    }
+
+    // --- Provenance coherence (WOR-2211) ---
+    //
+    // Every test below starts from a chain file on disk and reads it back
+    // through the same functions the three routes call. That is the point
+    // of them being here rather than beside
+    // `ReceiptUnit::provenance_is_consistent`: a unit test calling the
+    // check directly is exactly what already existed, and what failed to
+    // notice that nothing called it.
+    //
+    // The incoherent fixture is written through the real `UsageLedger`, not
+    // edited into the file afterwards. An edited line fails on its digest
+    // before anything looks at its provenance, so it would prove nothing
+    // about this check. Written through the ledger, the entry is genuinely
+    // hash-chained, which is the situation the check exists for: authentic,
+    // unmodified, and still not settleable.
+
+    /// A receipt whose single unit claims the proxy counted a number the
+    /// origin supplied.
+    ///
+    /// The laundering direction, not an arbitrary mismatch. `measured` sits
+    /// at the top of the trust order because nothing outside the proxy
+    /// contributed to it, so it is the label a fabricated number wants.
+    fn laundered_claims(seq: u64, tenant: &str) -> ReceiptClaims {
+        ReceiptClaims {
+            seq,
+            prev: GENESIS_HASH.to_string(),
+            node_id: "node-a".to_string(),
+            claim_id: format!("{tenant}-claim-{seq}"),
+            agreement_id: "agr-2026-04".to_string(),
+            subject: ReceiptSubject {
+                tenant: tenant.to_string(),
+                key_id: None,
+                agent: None,
+            },
+            route: "search".to_string(),
+            request_digest: None,
+            response_digest: None,
+            units: vec![ReceiptUnit {
+                name: "result_row".to_string(),
+                count: 40_000,
+                source: "measured".to_string(),
+                evidence: ReceiptEvidence::OriginHeader {
+                    header: "X-Rows-Returned".to_string(),
+                    raw: Some("40000".to_string()),
+                },
+            }],
+            outcome: "delivered".to_string(),
+            config_revision: "9f2c41a0be77".to_string(),
+        }
+    }
+
+    /// Write a chain whose second entry is authentic and incoherent.
+    fn write_laundered_chain(path: &Path) {
+        let ledger = UsageLedger::<ChainedReceipt>::open(path, None).expect("open chain");
+        ledger.append(&ChainedReceipt(claims(0, "acme", "search_call", 3)));
+        ledger.append(&ChainedReceipt(laundered_claims(1, "acme")));
+        ledger.append(&ChainedReceipt(claims(2, "acme", "egress_kib", 12)));
+    }
+
+    #[test]
+    fn the_summary_walk_refuses_a_receipt_that_contradicts_its_own_provenance() {
+        let path = temp_chain("incoherent-summary");
+        write_laundered_chain(&path);
+
+        let replay = replay_chain(&path, None);
+
+        assert_eq!(
+            replay.entries, 1,
+            "the walk stops at the contradiction rather than folding it in"
+        );
+        assert_eq!(replay.damaged_at_seq, Some(1));
+        let reason = replay.damage_reason.as_deref().expect("a reason");
+        assert!(
+            reason.contains("measured") && reason.contains("origin_header"),
+            "the reason must name both provenances, not just say invalid: {reason}"
+        );
+        assert!(
+            !reason.contains("acme"),
+            "a chain-level fault is reported to every operator, so it must not name a tenant: \
+             {reason}"
+        );
+        assert!(
+            replay
+                .totals
+                .keys()
+                .all(|(_, unit, _)| unit != "result_row"),
+            "the laundered 40,000 rows must not reach a total under any provenance: {:?}",
+            replay.totals
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_receipts_page_refuses_a_receipt_that_contradicts_its_own_provenance() {
+        let path = temp_chain("incoherent-page");
+        write_laundered_chain(&path);
+
+        let page = read_page(&path, None, 0, 50);
+
+        assert_eq!(page.damaged_at_seq, Some(1));
+        assert!(page.damage_reason.is_some());
+        assert!(
+            page.receipts.iter().all(|row| row.seq != 1),
+            "a contradictory receipt must not be served as an ordinary one"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_scoped_page_stops_on_another_tenants_contradiction_rather_than_paging_past_it() {
+        // Chain-level facts sit outside the tenant boundary on purpose. A
+        // scoped operator who was handed a clean-looking page over a chain
+        // carrying a laundered entry would have been told something false
+        // about the chain, not merely denied somebody else's receipt.
+        let path = temp_chain("incoherent-scoped");
+        let ledger = UsageLedger::<ChainedReceipt>::open(&path, None).expect("open chain");
+        ledger.append(&ChainedReceipt(claims(0, "acme", "search_call", 3)));
+        ledger.append(&ChainedReceipt(laundered_claims(1, "globex")));
+        drop(ledger);
+
+        let page = read_page(&path, Some("acme"), 0, 50);
+
+        assert_eq!(page.damaged_at_seq, Some(1));
+        let reason = page.damage_reason.as_deref().expect("a reason");
+        assert!(
+            !reason.contains("globex"),
+            "the reason reaches an operator scoped to another tenant: {reason}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn verification_refuses_an_authentic_receipt_that_contradicts_itself() {
+        // Nothing was tampered with here: the digest recomputes and the
+        // links hold. The verdict is about the claim, and that distinction
+        // is what the reason string has to carry.
+        let path = temp_chain("incoherent-verify");
+        write_laundered_chain(&path);
+
+        let result = verify_ledger::<ChainedReceipt>(&path, None).expect("chain is readable");
+
+        assert!(!result.ok);
+        assert_eq!(result.broken_seq, Some(1));
+        let reason = result.reason.as_deref().expect("a reason");
+        assert!(
+            reason.contains("measured") && reason.contains("origin_header"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("authentic"),
+            "an operator has to be told this is not a tampering verdict: {reason}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_chain_carrying_a_contradictory_receipt_will_not_reopen() {
+        // The write side of the refusal. `UsageLedger::open` is strict
+        // where verification is tolerant, so the meter stops chaining onto
+        // a document it has already decided it cannot settle from, and
+        // `proxy.attestation.failure_mode` decides what that does to
+        // traffic through the branch a full disk already goes down.
+        let path = temp_chain("incoherent-reopen");
+        write_laundered_chain(&path);
+
+        assert!(
+            UsageLedger::<ChainedReceipt>::open(&path, None).is_err(),
+            "a chain with a contradictory entry must not be appended to"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_coherent_chain_still_decodes_on_every_route() {
+        // The other half, and the one that stops the fix being "refuse
+        // everything". All three routes plus the reopen path, over a chain
+        // carrying one unit of each provenance.
+        let path = temp_chain("coherent-all-routes");
+        let mut receipt = claims(0, "acme", "egress_kib", 12);
+        receipt.units = vec![
+            ReceiptUnit {
+                name: "egress_kib".to_string(),
+                count: 12,
+                source: "measured".to_string(),
+                evidence: ReceiptEvidence::Measured {
+                    bytes_in: 512,
+                    bytes_out: 12_043,
+                    duration_ms: 91,
+                },
+            },
+            ReceiptUnit {
+                name: "search_call".to_string(),
+                count: 1,
+                source: "route_weight".to_string(),
+                evidence: ReceiptEvidence::RouteWeight {
+                    config_revision: "9f2c41a0be77".to_string(),
+                },
+            },
+            ReceiptUnit {
+                name: "result_row".to_string(),
+                count: 40,
+                source: "origin_header".to_string(),
+                evidence: ReceiptEvidence::OriginHeader {
+                    header: "X-Rows-Returned".to_string(),
+                    raw: Some("40".to_string()),
+                },
+            },
+        ];
+        {
+            let ledger = UsageLedger::<ChainedReceipt>::open(&path, None).expect("open chain");
+            ledger.append(&ChainedReceipt(receipt));
+        }
+
+        let replay = replay_chain(&path, None);
+        assert_eq!(replay.entries, 1);
+        assert_eq!(replay.damage_reason, None);
+        assert_eq!(
+            replay.totals.len(),
+            3,
+            "one line per provenance, none of them refused: {:?}",
+            replay.totals
+        );
+
+        let page = read_page(&path, None, 0, 50);
+        assert_eq!(page.receipts.len(), 1);
+        assert_eq!(page.damage_reason, None);
+
+        let result = verify_ledger::<ChainedReceipt>(&path, None).expect("chain is readable");
+        assert!(result.ok, "{result:?}");
+
+        assert!(
+            UsageLedger::<ChainedReceipt>::open(&path, None).is_ok(),
+            "a coherent chain still reopens for appending"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

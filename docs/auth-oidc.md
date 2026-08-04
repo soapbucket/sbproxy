@@ -127,7 +127,7 @@ in the cookie this browser was given.
 Logout is worth exercising in both directions, because the interesting case is
 the one that is refused. The example allowlists
 `https://app.example.com/goodbye` and sets `post_logout_redirect_default` to
-`https://app.example.com/`. An allowlisted target is honoured verbatim:
+`https://app.example.com/`. An allowlisted target is honored verbatim:
 
 ```bash
 curl -sS -i -H 'Host: app.example.com' \
@@ -160,7 +160,7 @@ will pass for the wrong reason. Matching is an exact string comparison, so
 `https://app.example.com/goodbye/` are different entries.
 
 In both cases `set-cookie` clears the session with `Max-Age=0` before the
-redirect, so the cookie is dropped whether or not the IdP honours the
+redirect, so the cookie is dropped whether or not the IdP honors the
 end-session call. `id_token_hint` is sent empty because the session cookie
 does not carry the original ID token; an OP that requires the hint rejects the
 redirect, which is why most deployments do not depend on it.
@@ -229,10 +229,10 @@ handler:
 3. Otherwise, 302's the browser to `post_logout_redirect_default`
    (or, if the caller supplied a `post_logout_redirect_uri` query
    parameter that appears in `post_logout_redirect_allowlist`,
-   honours that value verbatim).
+   honors that value verbatim).
 
 The allowlist is the open-redirect gate. Without it, leaving the
-endpoint to honour arbitrary query parameters is unsafe.
+endpoint to honor arbitrary query parameters is unsafe.
 
 ## Discovery
 
@@ -285,7 +285,7 @@ config; the providers are independent.
   tokens behind a server-side session store.
 * **DPoP-bound sessions.** The session cookie today is a sealed
   bearer; DPoP binding to a client-held key is a follow-up.
-* **MFA enforcement / step-up.** The provider honours whatever
+* **MFA enforcement / step-up.** The provider honors whatever
   the IdP does on the auth side; in-proxy step-up is not in
   scope.
 

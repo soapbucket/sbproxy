@@ -1,0 +1,38 @@
+# A deliberately broken Listing, kept out of `listings/` so it is not
+# loaded by this example and does not fail the repository's Listing
+# sweep, which requires every shipped `listings/` directory to validate
+# clean.
+#
+# `bin/plan-error.sh` copies this into a throwaway Repo beside a copy of
+# sb.yml and runs `sbproxy plan` against it, so the error findings in
+# docs/listings.md are real output rather than a transcription.
+#
+# Three findings, one manifest:
+#
+#   orphan-listing-resource        `origins/nope.example.com` is not in
+#                                  the config
+#   invalid-listing-resource-kind  `service/` is not one of origins,
+#                                  mcp, or docs
+#   listing-skill-url-out-of-tree  the skill url does not resolve under
+#                                  skills/
+apiVersion: sbproxy.dev/v1
+kind: Listing
+metadata:
+  name: broken-listing
+spec:
+  type: api
+  status: published
+  resources:
+    - ref: origins/nope.example.com
+      revision:
+        mode: pin
+        value: "deadbee"
+    - ref: service/not-a-kind
+      revision:
+        mode: tag
+        value: v1.0.0
+  skills:
+    - name: out-of-tree
+      type: skill-md
+      description: "A skill body the Repo does not own."
+      url: /etc/passwd

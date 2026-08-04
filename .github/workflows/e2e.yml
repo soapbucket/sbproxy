@@ -97,7 +97,6 @@ jobs:
     # Serialize the issue lookup/create critical section across runs.
     concurrency:
       group: sbproxy-e2e-failure-notification
-      queue: max
       cancel-in-progress: false
     # Keep write authority out of the job that builds and executes the
     # repository. This job needs only enough access to report a failure.

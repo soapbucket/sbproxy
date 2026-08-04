@@ -51,7 +51,32 @@ if [ ! -f "$BASELINE_FILE" ]; then
   exit 1
 fi
 
-BASELINE="$(grep -v '^#' "$BASELINE_FILE" | tr -d '[:space:]')"
+# Read the value as lines, not as one squashed string. The old form
+# piped every non-comment line through `tr -d '[:space:]'`, so a merge
+# that kept both sides' numbers produced "284286", which still matches
+# the integer test and becomes a baseline no real count can exceed. The
+# check then passes forever while silently giving back every narrowing
+# anyone lands. This file has hit six merge conflicts, so that is not a
+# hypothetical (WOR-2252).
+BASELINE_LINES=()
+while IFS= read -r line; do
+  BASELINE_LINES+=("$line")
+done < <(grep -vE '^[[:space:]]*#' "$BASELINE_FILE" | grep -vE '^[[:space:]]*$')
+
+if [ "${#BASELINE_LINES[@]}" -ne 1 ]; then
+  echo "baseline file must hold exactly one non-comment line, found ${#BASELINE_LINES[@]}: $BASELINE_FILE" >&2
+  if [ "${#BASELINE_LINES[@]}" -gt 1 ]; then
+    echo >&2
+    echo "More than one number usually means a merge kept both sides. Pick" >&2
+    echo "the recomputed count, not either branch's, and delete the rest:" >&2
+    printf '  %s\n' "${BASELINE_LINES[@]}" >&2
+    echo >&2
+    echo "  python3 scripts/scan-pub-item-usage.py --count tests-only" >&2
+  fi
+  exit 1
+fi
+
+BASELINE="$(printf '%s' "${BASELINE_LINES[0]}" | tr -d '[:space:]')"
 if ! [[ "$BASELINE" =~ ^[0-9]+$ ]]; then
   echo "baseline file does not contain a single integer: $BASELINE_FILE" >&2
   exit 1

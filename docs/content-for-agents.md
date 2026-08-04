@@ -125,11 +125,11 @@ origins:
 
 With `default_content_shape: markdown`, an `Accept: */*` request resolves to Markdown for both pricing and transformation. An agent that sends no `Accept` header at all gets the Markdown projection.
 
-The recognised values for `default_content_shape` are `markdown`, `json`, `html`, `pdf`, and `other`. Absence equals `html`.
+The recognized values for `default_content_shape` are `markdown`, `json`, `html`, `pdf`, and `other`. Absence equals `html`.
 
 ### Q-value tie-break
 
-Pass 2 is q-value-aware. When two recognised media types tie at the same q-value, the proxy resolves them in canonical preference order: `markdown` beats `json` beats `html` beats `pdf`. This is fixed by the proxy and not configurable, because the canonical order is a transformation-capability constraint, not a pricing decision.
+Pass 2 is q-value-aware. When two recognized media types tie at the same q-value, the proxy resolves them in canonical preference order: `markdown` beats `json` beats `html` beats `pdf`. This is fixed by the proxy and not configurable, because the canonical order is a transformation-capability constraint, not a pricing decision.
 
 The pricing pass remains declaration-order first-match. Operators express pricing intent through the order of tiers in the `ai_crawl_control` policy; agents express transformation preference through q-values. The two surfaces are deliberately independent.
 
@@ -249,7 +249,7 @@ Served at `/.well-known/tdmrep.json`. W3C TDMRep CG-FINAL format: a bare JSON ar
 ]
 ```
 
-When the origin asserts a recognised `Content-Signal` (`ai-train`, `ai-input`, or `search`), each priced route in the policy emits an entry with `tdm-reservation: 1` and a `tdm-policy` pointing at the companion `/licenses.xml` document on the same origin. When the signal is absent, the array is empty (the response middleware instead stamps a `TDM-Reservation: 1` header on every response, so the right is reserved at the header layer rather than asserted in the body).
+When the origin asserts a recognized `Content-Signal` (`ai-train`, `ai-input`, or `search`), each priced route in the policy emits an entry with `tdm-reservation: 1` and a `tdm-policy` pointing at the companion `/licenses.xml` document on the same origin. When the signal is absent, the array is empty (the response middleware instead stamps a `TDM-Reservation: 1` header on every response, so the right is reserved at the header layer rather than asserted in the body).
 
 The wire format follows the prose spec at https://www.w3.org/community/reports/tdmrep/CG-FINAL-tdmrep-20240510/. The W3C TDMRep CG-FINAL is prose-only; there is no canonical JSON Schema published upstream.
 
@@ -350,7 +350,7 @@ A v2 ships with a dual-emit window: the proxy emits both v1 and v2 envelopes dep
 
 ### PII redaction
 
-The redaction middleware (in `sbproxy-security::pii`) runs over the entire serialised envelope body. The `content_md` field is the primary redaction target; `title`, `url`, `license`, and the metadata fields are proxy-generated and not subject to content redaction. `schema_org` is upstream pass-through and is redacted along with `content_md` because the operator's PII policy may not be aware of every field the upstream embeds.
+The redaction middleware (in `sbproxy-security::pii`) runs over the entire serialized envelope body. The `content_md` field is the primary redaction target; `title`, `url`, `license`, and the metadata fields are proxy-generated and not subject to content redaction. `schema_org` is upstream pass-through and is redacted along with `content_md` because the operator's PII policy may not be aware of every field the upstream embeds.
 
 This is fail-safe over precision. A future revision can add a per-origin `pii_exclude_fields` config to exempt specific JSON paths from redaction.
 
@@ -370,7 +370,7 @@ Four response-body transforms are added to the response pipeline in this order:
    Body...
    ```
 
-4. **`json_envelope`**: wraps the (possibly citation-prepended) Markdown body in the JSON envelope. Runs only when the resolved transformation shape is `Json`. The serialised envelope flows through the redaction pipeline before reaching the wire.
+4. **`json_envelope`**: wraps the (possibly citation-prepended) Markdown body in the JSON envelope. Runs only when the resolved transformation shape is `Json`. The serialized envelope flows through the redaction pipeline before reaching the wire.
 
 The order is fixed in the compiled chain. Boilerplate stripping runs before HTML to Markdown so the markup transform sees the article-only DOM. Citation block runs after markup so the prepend operates on the Markdown body, not the HTML body. JSON envelope runs last so it wraps the citation-augmented Markdown.
 
@@ -504,7 +504,7 @@ The `aipref:` request header expresses an opt-out preference at the resource lev
 aipref: train=no, search=yes, ai-input=yes
 ```
 
-The header is a comma-separated list of `key=value` pairs. SBproxy recognises three keys: `train`, `search`, `ai-input`. Values are `yes` or `no`; unknown values default to `yes` (permissive).
+The header is a comma-separated list of `key=value` pairs. SBproxy recognizes three keys: `train`, `search`, `ai-input`. Values are `yes` or `no`; unknown values default to `yes` (permissive).
 
 ### Default-permissive
 

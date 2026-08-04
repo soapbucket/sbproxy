@@ -73,8 +73,8 @@ Resolution walks a ladder, most specific first:
    `principals` rows; an empty selector list pins everyone. This is the rung
    that works with every current MCP client, because the operator controls
    it.
-4. **Alias**: the version-suffixed catalogue name (`search_v1`), for clients
-   that pick tools from the catalogue and cannot send `_meta`.
+4. **Alias**: the version-suffixed catalog name (`search_v1`), for clients
+   that pick tools from the catalog and cannot send `_meta`.
 5. **Default**: the tool's `default:` version, else its highest.
 
 Ranges are standard semver requirements (`^1`, `~1.4`, `>=1, <2`). Every
@@ -124,7 +124,7 @@ contract break is the exact thing this plane exists to prevent.
 ### Sunset
 
 A version with a `sunset: YYYY-MM-DD` date is annotated as deprecated in the
-catalogue (description suffix plus `_meta`), and every call it serves is
+catalog (description suffix plus `_meta`), and every call it serves is
 counted and logged. Past the date, `after_sunset: warn` (the default) keeps
 serving; `after_sunset: block` fails calls with the sunset in the error.
 
@@ -222,14 +222,14 @@ tool_versioning:
 
 Judge calls are counted on the `sbproxy_judge_calls_total` family next to the
 policy judge's spend, and each judge carries a token-equivalent budget so a
-churning catalogue cannot drain it. A judge failure falls back to the
+churning catalog cannot drain it. A judge failure falls back to the
 deterministic dimensions and records a `judge_error` verdict; a split jury
 records `needs_confirmation` and leaves traffic alone even in block mode.
 
 ## The live gate
 
 The `tool_versioning` block on the `mcp` action wires the oracle into the
-gateway. At every catalogue refresh that actually changed the contract set,
+gateway. At every catalog refresh that actually changed the contract set,
 the gateway diffs the live tools against the lockfile and lints each declared
 bump:
 
@@ -257,7 +257,7 @@ version.
 The lockfile is read at refresh time, never at config compile. An unreadable
 or invalid lockfile fails open: nothing is blocked, the gateway logs a loud
 error, and the metric records `outcome="lockfile_error"`. Tools present in the
-lockfile but missing from the live catalogue are reported as
+lockfile but missing from the live catalog are reported as
 `outcome="removed_tool"` and never block anything else.
 
 See `examples/mcp-tool-versioning/` for a runnable configuration, including

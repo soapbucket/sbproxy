@@ -13,8 +13,8 @@
 //! 1. [`build_refresh_token_form`] composes the
 //!    `application/x-www-form-urlencoded` body the proxy POSTs to
 //!    `token_endpoint` to refresh the access token.
-//! 2. [`should_refresh_now`] decides — given the current time, the
-//!    access-token expiry, and a configurable safety skew — whether
+//! 2. [`should_refresh_now`] decides, given the current time, the
+//!    access-token expiry, and a configurable safety skew, whether
 //!    the proxy should fire a refresh before serving the next request
 //!    or wait until the next one. Done as a free function so the
 //!    request-time hot path has a single, branchless call rather

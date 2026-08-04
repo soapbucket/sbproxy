@@ -8,7 +8,7 @@
 # Two passes happen inside scripts/docs-ci.sh:
 #
 #   1. Link check via lychee (broken external + relative links).
-#   2. Code-block exec via rust-script for ```rust,executable fences.
+#   2. Code-block syntax checks via rustc and bash.
 #
 # We cache the lychee `.lycheecache/` directory between runs so the
 # external HTTP HEAD checks do not hammer upstream sites on every push.
@@ -33,6 +33,7 @@ on:
       - 'scripts/gen-example-tapes.py'
       - 'scripts/record-tapes.sh'
       - 'scripts/wire-example-gifs.py'
+      - 'scripts/check-doc-assets.py'
       - 'scripts/tests/test_doc_generators.py'
       - 'scripts/regen-llms-full.sh'
       - '.lycheeignore'
@@ -90,9 +91,6 @@ jobs:
       - name: install nextest
         uses: taiki-e/install-action@nextest
 
-      - name: install rust-script
-        run: cargo install rust-script --locked
-
       - name: run docs-ci
         env:
           # Honor CI=true inside the script so it can switch to
@@ -117,6 +115,14 @@ jobs:
 
       - name: generated tapes and GIF wiring are current
         run: make tapes-check
+
+      # The step above never opens docs/assets/, and wire-example-gifs.py
+      # only inserts an image that is already on disk, so neither can see a
+      # tape whose recording was never run or a README embed pointing at
+      # the GIF it would have produced. This lane is the one a docs-only PR
+      # reaches; ci.yml's lint lane runs the same script for code PRs.
+      - name: every promised doc asset exists
+        run: python3 scripts/check-doc-assets.py
 
       # WOR-528: catch the four spec-citation regressions called out in
       # the 2026-05-15 Public RFCs audit before they ship.

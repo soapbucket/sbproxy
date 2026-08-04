@@ -87,7 +87,7 @@ semantics, and telemetry in
 
 For latency-sensitive traffic, the `race` routing strategy fans a single
 request out to every eligible provider concurrently and keeps the first 2xx
-response, dropping (cancelling) the losers. It trades extra upstream calls
+response, dropping (canceling) the losers. It trades extra upstream calls
 for a lower tail latency: a slow or stuck provider no longer holds up the
 request, because a peer answers first.
 

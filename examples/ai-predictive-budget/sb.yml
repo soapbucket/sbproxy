@@ -1,20 +1,42 @@
 # yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # AI gateway: predictive budgets with soft-landing.
 #
-# A fixed-window budget blocks at 100% of the cap, a hard cliff. Soft-
-# landing degrades gracefully as a scope approaches its limit: warn past
-# `warn_at`, downgrade to a cheaper model past `downgrade_at`, and only then
-# hard-block at the cap. The downgrade is recorded on the usage record (and
-# the verifiable ledger) via a `budget_soft_landing` tag, and the live
-# fraction is exposed to the AI policy plane as `ai.budget.fraction`.
+# A fixed-window budget is a cliff: requests pass until the cap, then
+# block at 100%. Soft landing degrades on the way up instead. Past
+# `warn_at` a request is allowed and a warning is logged; past
+# `downgrade_at` its model is rewritten to a cheaper one before dispatch
+# and the spend record is tagged; at the cap the hard `on_exceed` action
+# takes over, so the two never fight.
 #
-# Here the workspace has a $10/day cap. At 80% spent, requests warn; at 95%
-# they downgrade to gpt-4o-mini; at 100% they block.
+# All three thresholds are functions of accumulated spend, and spend comes
+# from each completed call's own `usage` object. That is why this example
+# ships a fixture: the request names the tokens it wants billed
+# (`spend=850` in the message body), so the workspace fraction can be
+# placed anywhere on the curve without waiting on real traffic or a
+# provider account. The fixture also echoes the dispatched model back,
+# which is what makes the downgrade visible from the client.
 #
-# Setup:
-#   export OPENAI_API_KEY=sk-...
-#   make run CONFIG=examples/ai-predictive-budget/sb.yml
+# The budget tracker is in-memory and per process. It survives a reload
+# on purpose and is cleared only by a restart, so each walk of the ladder
+# below wants a fresh process.
+#
+# Run:
+#   cd examples/ai-predictive-budget
+#   docker compose up -d --wait
+#
+# Test (one ordinary request, well under the cap):
+#   curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Host: ai.local'
+#     -H 'Content-Type: application/json'
+#     -d '{"model":"gpt-4o","messages":[{"role":"user","content":"spend=1"}]}'
+#     | jq -r '.model'
+#
+# Test (the live fraction the thresholds are compared against):
+#   curl -s http://127.0.0.1:8080/metrics | grep sbproxy_ai_budget_utilization_ratio
+#
+# Test (the whole ladder: below warn, warn, downgrade, blocked):
+#   bash examples/ai-predictive-budget/bin/soft-landing.sh
 
+# sbproxy-docs:begin
 proxy:
   http_bind_port: 8080
 
@@ -27,19 +49,85 @@ origins:
       providers:
         - name: openai
           provider_type: openai
-          api_key: ${OPENAI_API_KEY}
+          # The fixture ignores the credential; OpenAI-shaped provider
+          # config carries one. Against the real provider this would be
+          # ${OPENAI_API_KEY}.
+          api_key: ${FIXTURE_API_KEY:-fixture-local-token}
+          base_url: http://127.0.0.1:18080/v1
+          allow_private_base_url: true
           default_model: gpt-4o
           models:
             - gpt-4o
             - gpt-4o-mini
 
+      # Operator price table, overriding the built-in catalog for these
+      # two models only. It sits beside `budget:` rather than inside it,
+      # because it governs cost reporting generally and the budget is one
+      # consumer. Real gpt-4o is $2.50 per million input tokens; pricing
+      # it at $1.00 per token here means one demo request moves the
+      # fraction a readable amount. `output_per_million` is 0.0 because
+      # the fixture reports no completion tokens, so every dollar in this
+      # example comes from the prompt side and the arithmetic has one
+      # input. `cache_read_per_million` and `cache_write_per_million`
+      # default to 0.0 and are omitted.
+      #
+      # Without this block the built-in catalog applies, and a model the
+      # catalog does not know is priced pessimistically at $5.00 per
+      # million in each direction rather than silently at zero.
+      model_prices:
+        gpt-4o:
+          input_per_million: 1000000.0
+          output_per_million: 0.0
+        gpt-4o-mini:
+          input_per_million: 60000.0
+          output_per_million: 0.0
+
+      # Where the `budget_soft_landing` tag lands. The tag is on the usage
+      # record, not on the response and not in metrics, so a sink is the
+      # only way to see which requests were degraded. `ledger` is the
+      # tamper-evident variant; `webhook`, `s3`, and the vendor sinks take
+      # the same event.
+      usage_sinks:
+        - type: jsonl_file
+          path: /tmp/sbproxy-predictive-budget-usage.jsonl
+
       budget:
         limits:
+          # `workspace` keys on the request Host, so every request to this
+          # origin shares one window. The other scopes are `api_key`,
+          # `user`, `model`, `origin`, `tag`, and `agent`. Avoid `model`
+          # with soft landing: the downgrade rewrites the model and the
+          # scope key is recomputed against it, so crossing
+          # `downgrade_at` would move spend into a fresh empty bucket and
+          # the cap would never fire.
           - scope: workspace
-            max_cost_usd: 10.0
-            period: daily
+            max_cost_usd: 1000.0
+            # `total` never rolls over, which keeps the walk below
+            # reproducible. `daily` is a fixed bucket aligned to UTC
+            # midnight rather than a rolling 24 hours, so a demo that
+            # straddles 00:00 UTC would silently reset. `weekly`,
+            # `monthly`, and LiteLLM-style durations (`30d`, `1h`) also
+            # parse.
+            period: total
+
+        # What happens at 100%. `block` refuses with 402; `log` allows and
+        # records; `downgrade` rewrites the model and needs a target to
+        # resolve or it refuses with 402 anyway.
         on_exceed: block
+
+        # Opt-in. Without this block the hard-block behaviour above is
+        # unchanged, which is the whole compatibility story: soft landing
+        # adds a band, it does not move the cap.
         soft_landing:
+          # Past 80% of the tightest active window, allow and log a
+          # warning. Default 0.8.
           warn_at: 0.8
+          # Past 95%, rewrite the model before dispatch. Default 0.95.
           downgrade_at: 0.95
+          # The rewrite target. Optional: without it the per-limit
+          # `downgrade_to` applies, and without that the cheapest model
+          # across the configured providers. It has to be a model the
+          # providers serve, and a rewrite to the model already requested
+          # is a no-op with no log line and no tag.
           downgrade_to: gpt-4o-mini
+# sbproxy-docs:end

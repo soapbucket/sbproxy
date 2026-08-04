@@ -17,10 +17,15 @@
 //! This struct lives in `sbproxy-core` to avoid a circular dependency:
 //! config -> modules -> config would be circular, but core depends on both.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::builtin_enforcers::{compile_builtin_enforcers, CompiledEnforcer};
+use crate::extension_inventory::{
+    compiled_inventory, reserved_extension_hook_names, CompiledExtensionAttachments,
+};
 use crate::router::HostRouter;
 use compact_str::CompactString;
 use sbproxy_cache::{
@@ -29,12 +34,16 @@ use sbproxy_cache::{
     RedisReserve,
 };
 use sbproxy_config::{CompiledConfig, Parameter, RequestModifierConfig};
+use sbproxy_extension::bundle::{BundleRegistry, DynamicBundleRegistry};
 use sbproxy_modules::compile::{
-    compile_action_for_origin, compile_action_for_origin_for_validation, compile_auth,
-    compile_policy, compile_transform,
+    compile_action_for_origin, compile_action_for_origin_for_validation,
+    compile_action_for_origin_with_registry, compile_action_with_registry, compile_auth,
+    compile_policy, compile_policy_with_registry, compile_transform,
+    compile_transform_with_registry,
 };
 use sbproxy_modules::transform::{CompiledTransform, TransformConfig};
 use sbproxy_modules::{Action, Auth, BotDetection, Policy, ThreatProtection};
+use sbproxy_plugin::{ExtensionInventorySnapshot, ExtensionScopeMode};
 
 // --- Forward Rule types ---
 
@@ -1184,6 +1193,16 @@ pub struct CompiledIdempotency {
 pub struct CompiledPipeline {
     /// The underlying compiled config (origins, host_map, server settings).
     pub config: CompiledConfig,
+    /// Dynamic hooks loaded and compiled with this pipeline generation.
+    #[allow(dead_code)]
+    pub(crate) extension_registry: Arc<DynamicBundleRegistry>,
+    /// Awaited AI hook chain prepared with this exact generation.
+    pub(crate) ai_extension_chain: Arc<sbproxy_extension::bundle::AiExtensionChain>,
+    /// Prepared payment hook chain selected by this generation's config.
+    #[cfg(feature = "payments")]
+    pub(crate) payment_extension_chain: Option<sbproxy_extension::bundle::PaymentExtensionChain>,
+    /// Candidate or running inventory derived from this generation's attachments.
+    pub(crate) extension_inventory: ExtensionInventorySnapshot,
     /// Dynamic key plane built from the same immutable config generation.
     ///
     /// Request contexts pin the pipeline at ingress, so keeping the plane here
@@ -1200,6 +1219,10 @@ pub struct CompiledPipeline {
     pub router: HostRouter,
     /// Compiled action for each origin (parallel to config.origins).
     pub actions: Vec<Action>,
+    /// Compiled Proxy-Wasm filter chain for each origin.
+    pub(crate) proxy_wasm_filters: Vec<Option<crate::proxy_wasm_http::ProxyWasmFilterChain>>,
+    /// Guards the one-time activation of this generation's background tasks.
+    pub(crate) background_tasks_started: AtomicBool,
     /// Immutable per-origin AI compression dependencies and policies.
     pub compression_runtimes: crate::compression_runtime::CompressionRuntimeRegistry,
     /// Immutable route-scoped RAG runtimes keyed by origin and optional
@@ -1411,17 +1434,53 @@ fn compile_sensitive_header_names(config: &CompiledConfig) -> HashSet<String> {
     names
 }
 
+fn empty_extension_registry() -> Arc<DynamicBundleRegistry> {
+    DynamicBundleRegistry::load(
+        &sbproxy_config::ExtensionBundlesConfig::default(),
+        Path::new("."),
+        &BTreeSet::new(),
+    )
+    .expect("an empty extension bundle configuration is valid")
+}
+
+fn configured_type(value: &serde_json::Value) -> Option<&str> {
+    value.get("type").and_then(serde_json::Value::as_str)
+}
+
 impl Default for CompiledPipeline {
     fn default() -> Self {
         let config = CompiledConfig::default();
         let router = HostRouter::new(&config);
         let sensitive_header_names = compile_sensitive_header_names(&config);
+        let extension_registry = empty_extension_registry();
+        let ai_extension_chain = Arc::new(
+            sbproxy_extension::bundle::AiExtensionChain::from_registry(extension_registry.as_ref())
+                .expect("linked AI extension registrations must be valid"),
+        );
+        let extension_inventory = compiled_inventory(
+            &extension_registry,
+            &config,
+            "",
+            CompiledExtensionAttachments {
+                scope: ExtensionScopeMode::Running,
+                ai_chain: ai_extension_chain.as_ref(),
+                payment_chain: None,
+            },
+        )
+        .expect("linked extension inventory must be valid");
         Self {
             config,
+            extension_registry,
+            ai_extension_chain,
+            #[cfg(feature = "payments")]
+            payment_extension_chain: None,
+            extension_inventory,
             key_plane: None,
             sensitive_header_names,
             router,
             actions: Vec::new(),
+            proxy_wasm_filters: Vec::new(),
+            background_tasks_started: AtomicBool::new(false),
             compression_runtimes: crate::compression_runtime::CompressionRuntimeRegistry::default(),
             #[cfg(feature = "rag")]
             rag_runtimes: crate::rag_runtime::RagRuntimeRegistry::default(),
@@ -1472,6 +1531,24 @@ enum PipelineConstructionMode {
     Validation,
 }
 
+/// Process-lifetime runtime for tasks owned by published pipeline generations.
+///
+/// The synchronous startup path publishes its pipeline before Pingora creates
+/// a service runtime. Keeping these tasks here gives startup and reload the
+/// same lifetime and prevents a temporary hook or validation runtime from
+/// becoming their accidental owner.
+fn pipeline_background_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("sbproxy-pipeline-tasks")
+            .enable_all()
+            .build()
+            .expect("build pipeline background-task runtime")
+    })
+}
+
 fn parse_outbound_credential_config(
     origin_id: &str,
     config: &serde_json::Value,
@@ -1493,6 +1570,61 @@ fn parse_outbound_credential_config(
 }
 
 impl CompiledPipeline {
+    /// Dynamic bundle registry pinned to this pipeline generation.
+    #[allow(dead_code)]
+    pub(crate) fn extension_registry(&self) -> &Arc<DynamicBundleRegistry> {
+        &self.extension_registry
+    }
+
+    /// Awaited AI hook chain pinned to this pipeline generation.
+    pub(crate) fn ai_extension_chain(&self) -> &Arc<sbproxy_extension::bundle::AiExtensionChain> {
+        &self.ai_extension_chain
+    }
+
+    /// Prepared payment hook chain pinned to this pipeline generation.
+    #[cfg(feature = "payments")]
+    pub(crate) fn payment_extension_chain(
+        &self,
+    ) -> Option<&sbproxy_extension::bundle::PaymentExtensionChain> {
+        self.payment_extension_chain.as_ref()
+    }
+
+    /// Prepare this running generation's inventory for successful payment attachment.
+    #[cfg(feature = "payments")]
+    pub(crate) fn inventory_with_payment_extensions_attached(
+        &self,
+    ) -> anyhow::Result<ExtensionInventorySnapshot> {
+        Ok(compiled_inventory(
+            self.extension_registry.as_ref(),
+            &self.config,
+            &self.config_revision,
+            CompiledExtensionAttachments {
+                scope: ExtensionScopeMode::Running,
+                ai_chain: self.ai_extension_chain.as_ref(),
+                payment_chain: self
+                    .payment_extension_chain
+                    .as_ref()
+                    .filter(|chain| !chain.is_empty()),
+            },
+        )?)
+    }
+
+    /// Publish a precomputed inventory after payment dispatch attaches.
+    #[cfg(feature = "payments")]
+    pub(crate) fn mark_payment_extensions_attached(
+        &mut self,
+        inventory: ExtensionInventorySnapshot,
+    ) {
+        debug_assert_eq!(inventory.scope.mode, ExtensionScopeMode::Running);
+        self.extension_inventory = inventory;
+    }
+
+    /// Authoritative extension inventory for this pipeline generation.
+    #[cfg(test)]
+    pub(crate) const fn extension_inventory(&self) -> &ExtensionInventorySnapshot {
+        &self.extension_inventory
+    }
+
     /// Dynamic key plane for this exact pipeline generation.
     pub fn key_plane(&self) -> Option<&Arc<crate::key_plane::KeyPlane>> {
         self.key_plane.as_ref()
@@ -1546,6 +1678,42 @@ impl CompiledPipeline {
         Self::from_config_with_mode(config, PipelineConstructionMode::Runtime)
     }
 
+    /// Compile a runtime pipeline with bundle paths relative to its config document.
+    ///
+    /// Background tasks stay dormant until the pipeline reaches
+    /// [`crate::reload::load_pipeline`], so a lifecycle hook can still reject
+    /// this candidate without leaving work behind.
+    pub fn from_config_at(config: CompiledConfig, base_dir: &Path) -> anyhow::Result<Self> {
+        let fetch_context =
+            crate::config_source::build_extension_fetch_context(&config.extension_bundles)?;
+        let extension_registry = DynamicBundleRegistry::load_with_context(
+            &config.extension_bundles,
+            base_dir,
+            &reserved_extension_hook_names()?,
+            &fetch_context,
+        )?;
+        Self::from_config_with_mode_and_registry(
+            config,
+            PipelineConstructionMode::Runtime,
+            extension_registry,
+            false,
+        )
+    }
+
+    /// Construct a runtime pipeline around an already validated immutable
+    /// bundle registry candidate.
+    pub(crate) fn from_config_at_with_extension_registry(
+        config: CompiledConfig,
+        extension_registry: Arc<DynamicBundleRegistry>,
+    ) -> anyhow::Result<Self> {
+        Self::from_config_with_mode_and_registry(
+            config,
+            PipelineConstructionMode::Runtime,
+            extension_registry,
+            false,
+        )
+    }
+
     /// Compile every module for validation, without side effects that
     /// outlive the returned pipeline.
     ///
@@ -1563,12 +1731,48 @@ impl CompiledPipeline {
     /// than installs, so repeated calls are safe, but a caller cannot treat
     /// this as a pure function.
     pub fn from_config_for_validation(config: CompiledConfig) -> anyhow::Result<Self> {
-        Self::from_config_with_mode(config, PipelineConstructionMode::Validation)
+        Self::from_config_for_validation_at(config, Path::new("."))
+    }
+
+    /// Compile every module for validation with bundle paths relative to its config document.
+    pub fn from_config_for_validation_at(
+        config: CompiledConfig,
+        base_dir: &Path,
+    ) -> anyhow::Result<Self> {
+        let reserved_names = reserved_extension_hook_names()?;
+        let fetch_context =
+            crate::config_source::build_extension_fetch_context(&config.extension_bundles)?;
+        let extension_registry = DynamicBundleRegistry::load_with_context(
+            &config.extension_bundles,
+            base_dir,
+            &reserved_names,
+            &fetch_context,
+        )?;
+        Self::from_config_with_mode_and_registry(
+            config,
+            PipelineConstructionMode::Validation,
+            extension_registry,
+            false,
+        )
     }
 
     fn from_config_with_mode(
         config: CompiledConfig,
         mode: PipelineConstructionMode,
+    ) -> anyhow::Result<Self> {
+        Self::from_config_with_mode_and_registry(
+            config,
+            mode,
+            empty_extension_registry(),
+            matches!(mode, PipelineConstructionMode::Runtime),
+        )
+    }
+
+    fn from_config_with_mode_and_registry(
+        config: CompiledConfig,
+        mode: PipelineConstructionMode,
+        extension_registry: Arc<DynamicBundleRegistry>,
+        start_background_tasks: bool,
     ) -> anyhow::Result<Self> {
         // WOR-2084: async twin of the shared L2 store. The rate-limit
         // policy's hot path awaits `AsyncKVStore::incr_with_ttl`
@@ -1588,6 +1792,7 @@ impl CompiledPipeline {
 
         let sensitive_header_names = compile_sensitive_header_names(&config);
         let mut actions = Vec::with_capacity(config.origins.len());
+        let mut proxy_wasm_filters = Vec::with_capacity(config.origins.len());
         let mut auths = Vec::with_capacity(config.origins.len());
         let mut policies = Vec::with_capacity(config.origins.len());
         let mut enforcers: Vec<Vec<CompiledEnforcer>> = Vec::with_capacity(config.origins.len());
@@ -1609,6 +1814,15 @@ impl CompiledPipeline {
                 None,
             );
             let action = match mode {
+                _ if configured_type(&origin.action_config)
+                    .is_some_and(|name| extension_registry.action(name).is_some()) =>
+                {
+                    compile_action_for_origin_with_registry(
+                        &origin.action_config,
+                        &action_identity,
+                        extension_registry.as_ref(),
+                    )?
+                }
                 PipelineConstructionMode::Runtime => {
                     compile_action_for_origin(&origin.action_config, &action_identity)?
                 }
@@ -1617,6 +1831,22 @@ impl CompiledPipeline {
                     &action_identity,
                 )?,
             };
+            let proxy_wasm_filter = if origin.filters.is_empty() {
+                None
+            } else {
+                if !matches!(&action, Action::Proxy(_)) {
+                    anyhow::bail!(
+                        "origin `{}`: Proxy-Wasm filters require a proxy action",
+                        origin.origin_id
+                    );
+                }
+                Some(crate::proxy_wasm_http::ProxyWasmFilterChain::compile(
+                    origin.origin_id.as_str(),
+                    &origin.filters,
+                    extension_registry.as_ref(),
+                )?)
+            };
+            proxy_wasm_filters.push(proxy_wasm_filter);
             actions.push(action);
 
             // Compile auth (optional per origin).
@@ -1638,12 +1868,14 @@ impl CompiledPipeline {
                 config.l2_store.clone(),
                 l2_async_store.clone(),
                 origin.origin_id.as_str(),
+                extension_registry.as_ref(),
             )?;
             let policies_for_enforcers = compile_origin_policy_chain(
                 &origin.policy_configs,
                 config.l2_store.clone(),
                 l2_async_store.clone(),
                 origin.origin_id.as_str(),
+                extension_registry.as_ref(),
             )?;
             // WOR-2164: enforcers that compile static CEL (the rate
             // limiter's `key:`) reject the candidate config here, so
@@ -1679,7 +1911,14 @@ impl CompiledPipeline {
                     if wrapper.disabled {
                         return None;
                     }
-                    let transform = match compile_transform(cfg) {
+                    let compiled = if configured_type(cfg)
+                        .is_some_and(|name| extension_registry.transform(name).is_some())
+                    {
+                        compile_transform_with_registry(cfg, extension_registry.as_ref())
+                    } else {
+                        compile_transform(cfg)
+                    };
+                    let transform = match compiled {
                         Ok(t) => t,
                         // WOR-2179: name the origin, the same way the
                         // policy chain does, so an operator can find the
@@ -1693,7 +1932,7 @@ impl CompiledPipeline {
                             ))))
                         }
                     };
-                    let failure_posture = wrapper.failure_posture();
+                    let failure_posture = effective_transform_posture(&wrapper, &transform);
                     Some(Ok(CompiledTransform {
                         transform,
                         content_types: wrapper.content_types,
@@ -1710,11 +1949,31 @@ impl CompiledPipeline {
                 origin.workspace_id.as_str(),
                 origin.origin_id.as_str(),
                 mode,
+                extension_registry.as_ref(),
             )?;
+            if !origin.filters.is_empty() {
+                if let Some((rule_index, _)) = origin_fwd_rules
+                    .iter()
+                    .enumerate()
+                    .find(|(_, rule)| !matches!(&rule.action, Action::Proxy(_)))
+                {
+                    anyhow::bail!(
+                        "origin `{}`: Proxy-Wasm filters require forward rule {rule_index} to use a proxy action",
+                        origin.origin_id
+                    );
+                }
+            }
             forward_rules.push(origin_fwd_rules);
 
             // Compile fallback origin (optional per origin).
-            let fallback = compile_fallback(&origin.fallback_origin, mode)?;
+            let fallback =
+                compile_fallback(&origin.fallback_origin, mode, extension_registry.as_ref())?;
+            if !origin.filters.is_empty() && fallback.is_some() {
+                anyhow::bail!(
+                    "origin `{}`: Proxy-Wasm filters do not support fallback_origin responses",
+                    origin.origin_id
+                );
+            }
             fallbacks.push(fallback);
 
             // Compile bot detection (optional per origin).
@@ -2081,13 +2340,51 @@ impl CompiledPipeline {
         // access-log path evaluates rather than parsing per record and
         // malformed source rejects the candidate config.
         let custom_log_programs = crate::server::custom_log::compile_cel_programs(&config)?;
+        let ai_extension_chain =
+            Arc::new(sbproxy_extension::bundle::AiExtensionChain::from_registry(
+                extension_registry.as_ref(),
+            )?);
+        let payment_extension_chain = config
+            .server
+            .payments
+            .as_ref()
+            .map(|_| {
+                sbproxy_extension::bundle::PaymentExtensionChain::from_registry(
+                    extension_registry.as_ref(),
+                )
+            })
+            .transpose()?;
+        let scope = match mode {
+            PipelineConstructionMode::Runtime => ExtensionScopeMode::Running,
+            PipelineConstructionMode::Validation => ExtensionScopeMode::Doctor,
+        };
+        let extension_inventory = compiled_inventory(
+            extension_registry.as_ref(),
+            &config,
+            &config_revision,
+            CompiledExtensionAttachments {
+                scope,
+                ai_chain: ai_extension_chain.as_ref(),
+                payment_chain: matches!(mode, PipelineConstructionMode::Validation)
+                    .then(|| payment_extension_chain.as_ref())
+                    .flatten()
+                    .filter(|chain| !chain.is_empty()),
+            },
+        )?;
 
         let pipeline = Self {
             config,
+            extension_registry,
+            ai_extension_chain,
+            #[cfg(feature = "payments")]
+            payment_extension_chain,
+            extension_inventory,
             key_plane,
             sensitive_header_names,
             router,
             actions,
+            proxy_wasm_filters,
+            background_tasks_started: AtomicBool::new(false),
             compression_runtimes,
             #[cfg(feature = "rag")]
             rag_runtimes,
@@ -2132,14 +2429,11 @@ impl CompiledPipeline {
         // we are not running inside a Tokio runtime (e.g. unit tests),
         // the call is a no-op.
         //
-        // Validation-mode pipelines are thrown away by the caller, so
-        // spawning here would leak one probe task per health-checked
-        // target on every validation. The tasks hold an Arc on the
-        // dropped pipeline and keep issuing real outbound requests, so
-        // a caller that validates repeatedly (the admin config write
-        // path, a config authority validating each publish) would
-        // accumulate probes against the operator's upstreams forever.
-        if matches!(mode, PipelineConstructionMode::Runtime) {
+        // Validation-mode pipelines are thrown away by the caller, so they
+        // must never issue probes against the operator's upstreams. Runtime
+        // candidates built relative to a config path are activated only by
+        // the publication boundary after lifecycle hooks have accepted them.
+        if start_background_tasks {
             pipeline.start_background_tasks();
         }
         Ok(pipeline)
@@ -2147,17 +2441,45 @@ impl CompiledPipeline {
 
     /// Start background tasks owned by the pipeline.
     ///
-    /// Currently this only covers the active health-check probes on
-    /// `Action::LoadBalancer` targets, but it is the seam any future
-    /// pipeline-scoped task (e.g. periodic cache eviction sweeps,
-    /// dynamic blocklist refresh) will plug into.
+    /// Currently this covers the active health-check probes on
+    /// `Action::LoadBalancer` targets and on `Action::AiProxy` provider
+    /// pools, but it is the seam any future pipeline-scoped task (e.g.
+    /// periodic cache eviction sweeps, dynamic blocklist refresh) will
+    /// plug into.
     fn start_background_tasks(&self) {
-        if tokio::runtime::Handle::try_current().is_err() {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        self.start_background_tasks_on(&handle);
+    }
+
+    /// Activate tasks for a pipeline that has passed every publication gate.
+    ///
+    /// Startup compilation runs before Pingora creates its service runtimes,
+    /// so published tasks live on a dedicated process-lifetime runtime rather
+    /// than whichever short-lived runtime happened to construct the pipeline.
+    pub(crate) fn activate_background_tasks(&self) {
+        self.start_background_tasks_on(pipeline_background_runtime().handle());
+    }
+
+    fn start_background_tasks_on(&self, handle: &tokio::runtime::Handle) {
+        if self.background_tasks_started.swap(true, Ordering::AcqRel) {
             return;
         }
         for action in &self.actions {
-            if let sbproxy_modules::Action::LoadBalancer(lb) = action {
-                lb.spawn_health_probes();
+            match action {
+                sbproxy_modules::Action::LoadBalancer(lb) => {
+                    lb.spawn_health_probes_on(handle);
+                }
+                // The AI provider pool carries the same active-probe
+                // axis, and its router consults the flag on every
+                // routing decision. Without this arm the pool's
+                // `resilience.health_check` block parses and is then
+                // never acted on (WOR-2224).
+                sbproxy_modules::Action::AiProxy(ai) => {
+                    sbproxy_ai::health_probe::spawn_provider_health_probes_on(&ai.config, handle);
+                }
+                _ => {}
             }
         }
     }
@@ -2269,6 +2591,7 @@ fn compile_origin_policy_chain(
     l2_store: Option<Arc<dyn sbproxy_platform::storage::KVStore>>,
     l2_async_store: Option<Arc<dyn sbproxy_platform::storage::AsyncKVStore>>,
     origin_id: &str,
+    extension_registry: &dyn BundleRegistry,
 ) -> anyhow::Result<Vec<Policy>> {
     let mut chain: Vec<Policy> = policy_configs
         .iter()
@@ -2278,8 +2601,14 @@ fn compile_origin_policy_chain(
             // module's own error names the policy type and, for CEL,
             // quotes the bad expression).
             use anyhow::Context as _;
-            compile_policy(cfg)
-                .with_context(|| format!("origin `{origin_id}`: invalid policy config"))
+            let compiled = if configured_type(cfg)
+                .is_some_and(|name| extension_registry.policy(name).is_some())
+            {
+                compile_policy_with_registry(cfg, extension_registry)
+            } else {
+                compile_policy(cfg)
+            };
+            compiled.with_context(|| format!("origin `{origin_id}`: invalid policy config"))
         })
         .collect::<anyhow::Result<_>>()?;
     if l2_store.is_some() {
@@ -2365,11 +2694,12 @@ fn compile_forward_rules(
     workspace_id: &str,
     origin_id: &str,
     mode: PipelineConstructionMode,
+    extension_registry: &dyn BundleRegistry,
 ) -> anyhow::Result<Vec<CompiledForwardRule>> {
     let mut compiled = Vec::with_capacity(raw_rules.len());
     for (rule_index, rule_val) in raw_rules.iter().enumerate() {
         let rule_id = routing_action_identity(workspace_id, origin_id, Some(rule_index));
-        let fwd = compile_single_forward_rule(rule_val, &rule_id, mode)?;
+        let fwd = compile_single_forward_rule(rule_val, &rule_id, mode, extension_registry)?;
         compiled.push(fwd);
     }
     Ok(compiled)
@@ -2408,6 +2738,7 @@ fn compile_single_forward_rule(
     val: &serde_json::Value,
     rule_id: &str,
     mode: PipelineConstructionMode,
+    extension_registry: &dyn BundleRegistry,
 ) -> anyhow::Result<CompiledForwardRule> {
     let rules_arr = val
         .get("rules")
@@ -2442,6 +2773,11 @@ fn compile_single_forward_rule(
         .get("action")
         .ok_or_else(|| anyhow::anyhow!("forward rule origin missing 'action'"))?;
     let action = match mode {
+        _ if configured_type(action_config)
+            .is_some_and(|name| extension_registry.action(name).is_some()) =>
+        {
+            compile_action_for_origin_with_registry(action_config, rule_id, extension_registry)?
+        }
         PipelineConstructionMode::Runtime => compile_action_for_origin(action_config, rule_id)?,
         PipelineConstructionMode::Validation => {
             compile_action_for_origin_for_validation(action_config, rule_id)?
@@ -2585,6 +2921,7 @@ fn compile_query_matcher(val: Option<&serde_json::Value>) -> anyhow::Result<Opti
 fn compile_fallback(
     raw: &Option<serde_json::Value>,
     mode: PipelineConstructionMode,
+    extension_registry: &dyn BundleRegistry,
 ) -> anyhow::Result<Option<CompiledFallback>> {
     let val = match raw {
         Some(v) => v,
@@ -2618,10 +2955,16 @@ fn compile_fallback(
     let action_config = origin_obj
         .get("action")
         .ok_or_else(|| anyhow::anyhow!("fallback origin missing 'action'"))?;
-    let action = match mode {
-        PipelineConstructionMode::Runtime => compile_action_for_origin(action_config, "")?,
-        PipelineConstructionMode::Validation => {
-            compile_action_for_origin_for_validation(action_config, "")?
+    let action = if configured_type(action_config)
+        .is_some_and(|name| extension_registry.action(name).is_some())
+    {
+        compile_action_with_registry(action_config, extension_registry)?
+    } else {
+        match mode {
+            PipelineConstructionMode::Runtime => compile_action_for_origin(action_config, "")?,
+            PipelineConstructionMode::Validation => {
+                compile_action_for_origin_for_validation(action_config, "")?
+            }
         }
     };
 
@@ -2716,11 +3059,139 @@ fn normalize_request_modifier(val: &serde_json::Value) -> RequestModifierConfig 
     serde_json::from_value(val.clone()).unwrap_or_else(|_| default_request_modifier())
 }
 
+/// Resolve the posture the response pipeline applies when this transform
+/// fails.
+///
+/// Precedence, highest first:
+///
+/// 1. An explicit `failure_posture` or `fail_on_error` on the attachment.
+///    The operator wiring the transform into an origin overrides whoever
+///    wrote the bundle.
+/// 2. The bundle manifest's declared posture, for a dynamic bundle hook.
+/// 3. The attachment default, which is [`FailureMode::Open`].
+///
+/// Two and three have to be distinguished by whether the operator wrote
+/// anything, not by the resolved value: `TransformConfig::failure_posture`
+/// returns `Open` both for an explicit `open` and for silence, and reading
+/// silence as `open` is what dropped the manifest posture on the floor
+/// (WOR-2268).
+fn effective_transform_posture(
+    wrapper: &sbproxy_modules::transform::TransformConfig,
+    transform: &sbproxy_modules::Transform,
+) -> sbproxy_config::FailureMode {
+    if wrapper.has_explicit_failure_posture() {
+        return wrapper.failure_posture();
+    }
+    match transform {
+        sbproxy_modules::Transform::Plugin(plugin) => plugin
+            .dynamic_hook()
+            .map(|hook| hook.failure_posture())
+            .unwrap_or_else(|| wrapper.failure_posture()),
+        _ => wrapper.failure_posture(),
+    }
+}
+
+#[cfg(test)]
+mod transform_posture_tests {
+    use super::effective_transform_posture;
+    use sbproxy_config::{BundleBodyMode, FailureMode};
+    use sbproxy_modules::transform::TransformConfig;
+    use sbproxy_modules::{DynamicHookMetadata, PluginTransform, Transform};
+    use sbproxy_plugin::{TransformContext, TransformHandler};
+
+    struct StubTransform;
+
+    impl TransformHandler for StubTransform {
+        fn transform_type(&self) -> &str {
+            "stub_bundle_transform"
+        }
+
+        fn apply<'a>(
+            &'a self,
+            _body: &'a mut bytes::BytesMut,
+            _content_type: Option<&'a str>,
+            _ctx: &'a TransformContext,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = sbproxy_plugin::PluginResult<()>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn wrapper(json: serde_json::Value) -> TransformConfig {
+        serde_json::from_value(json).expect("transform wrapper fixture")
+    }
+
+    fn dynamic_transform(posture: FailureMode) -> Transform {
+        Transform::Plugin(PluginTransform::dynamic(
+            Box::new(StubTransform),
+            DynamicHookMetadata::new(
+                "stub-bundle",
+                "stub_bundle_transform",
+                BundleBodyMode::Buffered,
+                1024,
+                posture,
+            ),
+        ))
+    }
+
+    #[test]
+    fn a_silent_attachment_inherits_the_manifest_posture() {
+        let posture = effective_transform_posture(
+            &wrapper(serde_json::json!({"type": "stub_bundle_transform"})),
+            &dynamic_transform(FailureMode::Closed),
+        );
+        assert_eq!(posture, FailureMode::Closed);
+    }
+
+    #[test]
+    fn an_explicit_attachment_posture_overrides_the_manifest() {
+        let posture = effective_transform_posture(
+            &wrapper(
+                serde_json::json!({"type": "stub_bundle_transform", "failure_posture": "open"}),
+            ),
+            &dynamic_transform(FailureMode::Closed),
+        );
+        assert_eq!(posture, FailureMode::Open);
+    }
+
+    #[test]
+    fn the_legacy_boolean_also_counts_as_explicit() {
+        let posture = effective_transform_posture(
+            &wrapper(serde_json::json!({"type": "stub_bundle_transform", "fail_on_error": true})),
+            &dynamic_transform(FailureMode::Open),
+        );
+        assert_eq!(posture, FailureMode::Closed);
+    }
+
+    #[test]
+    fn a_linked_plugin_keeps_the_attachment_default() {
+        let linked = Transform::Plugin(PluginTransform::linked(Box::new(StubTransform)));
+        let posture = effective_transform_posture(
+            &wrapper(serde_json::json!({"type": "stub_bundle_transform"})),
+            &linked,
+        );
+        assert_eq!(posture, FailureMode::Open);
+    }
+
+    #[test]
+    fn a_built_in_transform_is_unaffected() {
+        let posture = effective_transform_posture(
+            &wrapper(serde_json::json!({"type": "noop"})),
+            &Transform::Noop,
+        );
+        assert_eq!(posture, FailureMode::Open);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use compact_str::CompactString;
+    use sbproxy_extension::bundle::BundleRegistry;
+    use sbproxy_plugin::{ExtensionHookKind, ExtensionState};
     use std::collections::HashMap;
+    use tempfile::TempDir;
 
     #[test]
     fn routing_state_namespace_is_workspace_and_rule_scoped() {
@@ -2743,6 +3214,7 @@ mod tests {
         let mut host_map = HashMap::new();
         host_map.insert(CompactString::new(hostname), 0);
         CompiledConfig {
+            extension_bundles: Default::default(),
             origins: vec![sbproxy_config::CompiledOrigin {
                 hostname: CompactString::new(hostname),
                 origin_id: CompactString::new(hostname),
@@ -2752,6 +3224,7 @@ mod tests {
                 auth_config: auth,
                 policy_configs: policies,
                 transform_configs: Vec::new(),
+                filters: Vec::new(),
                 cors: None,
                 hsts: None,
                 compression: None,
@@ -2805,6 +3278,312 @@ mod tests {
             session_ledger: None,
             flags: Vec::new(),
         }
+    }
+
+    fn write_dynamic_action_bundle(root: &std::path::Path, version: &str, marker: &str) {
+        let bundle = root.join("bundles").join("generation-action");
+        std::fs::create_dir_all(&bundle).expect("create extension bundle directory");
+        std::fs::write(
+            bundle.join("entry.js"),
+            format!(
+                r#"export function run() {{
+                    return {{
+                        version: "sbproxy-envelope/v1",
+                        outcome: "response",
+                        status: 204,
+                        headers: [],
+                        body_base64: ""
+                    }};
+                }}
+                // {marker}
+"#
+            ),
+        )
+        .expect("write extension artifact");
+        std::fs::write(
+            bundle.join("bundle.yaml"),
+            format!(
+                r#"apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: generation-action
+version: {version}
+runtime: javascript
+entry: entry.js
+hooks:
+  - kind: action
+    type: generation_action
+    export: run
+"#
+            ),
+        )
+        .expect("write extension manifest");
+    }
+
+    fn dynamic_action_config() -> CompiledConfig {
+        let mut config = make_config(
+            "extension.example",
+            serde_json::json!({"type": "generation_action"}),
+            None,
+            Vec::new(),
+        );
+        config.extension_bundles.bundles_dir = Some("bundles".to_owned());
+        config
+    }
+
+    fn write_lifecycle_inventory_bundle(root: &std::path::Path) {
+        let bundle = root.join("bundles").join("lifecycle-inventory");
+        std::fs::create_dir_all(&bundle).expect("create lifecycle bundle directory");
+        std::fs::write(
+            bundle.join("entry.js"),
+            r#"export function inspect() {
+                return { version: "sbproxy-envelope/v1", decision: "continue" };
+            }
+            export function enforce() {
+                return { version: "sbproxy-envelope/v1", decision: "allow" };
+            }
+"#,
+        )
+        .expect("write lifecycle bundle artifact");
+        std::fs::write(
+            bundle.join("bundle.yaml"),
+            r#"apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: lifecycle-inventory
+version: 1.0.0
+runtime: javascript
+entry: entry.js
+hooks:
+  - kind: ai_guardrail_input
+    type: candidate_guardrail
+    export: inspect
+  - kind: payment
+    type: candidate_payment
+    export: inspect
+    execution:
+      body_mode: none
+  - kind: policy
+    type: unattached_policy
+    export: enforce
+"#,
+        )
+        .expect("write lifecycle bundle manifest");
+    }
+
+    fn lifecycle_inventory_config(root: &std::path::Path) -> CompiledConfig {
+        let mut config = make_config(
+            "extension.example",
+            serde_json::json!({"type": "static", "body": "ok"}),
+            None,
+            Vec::new(),
+        );
+        config.extension_bundles.bundles_dir = Some("bundles".to_owned());
+        config.server.payments = Some(sbproxy_config::PaymentsConfig {
+            state_path: root.join("payments.sqlite3").display().to_string(),
+            challenge_binding_key: "secretfile:///unused-candidate-secret".to_owned(),
+            authorization_timeout_ms: 2_000,
+            max_body_bytes: 65_536,
+            failure_mode: sbproxy_config::FailureMode::Closed,
+            recovery_encryption: None,
+            worker: sbproxy_config::PaymentsWorkerConfig::default(),
+            protocols: sbproxy_config::PaymentProtocolsConfig::default(),
+            rails: sbproxy_config::PaymentRailsConfig::default(),
+            usage_reporters: sbproxy_config::UsageReportersConfig::default(),
+        });
+        config
+    }
+
+    #[test]
+    fn extension_inventory_validation_candidate_proves_lifecycle_attachments() {
+        let directory = TempDir::new().expect("temporary config directory");
+        write_lifecycle_inventory_bundle(directory.path());
+
+        let pipeline = CompiledPipeline::from_config_for_validation_at(
+            lifecycle_inventory_config(directory.path()),
+            directory.path(),
+        )
+        .expect("validation candidate should prepare lifecycle hooks");
+        let inventory = pipeline.extension_inventory();
+
+        assert_eq!(inventory.scope.mode, ExtensionScopeMode::Doctor);
+        let state = |kind, match_key| {
+            inventory
+                .hooks
+                .iter()
+                .find(|hook| hook.kind == kind && hook.match_key == match_key)
+                .map(|hook| (hook.id.as_str(), hook.state))
+                .expect("lifecycle hook should be inventoried")
+        };
+        assert_eq!(
+            state(ExtensionHookKind::AiGuardrailInput, "candidate_guardrail"),
+            (
+                "lifecycle-inventory:ai_guardrail_input:candidate_guardrail",
+                ExtensionState::Active,
+            )
+        );
+        assert_eq!(
+            state(ExtensionHookKind::Payment, "candidate_payment"),
+            (
+                "lifecycle-inventory:payment:candidate_payment",
+                ExtensionState::Active,
+            )
+        );
+        assert_eq!(
+            state(ExtensionHookKind::Policy, "unattached_policy").1,
+            ExtensionState::Unconsumed
+        );
+    }
+
+    #[test]
+    fn extension_inventory_running_leaves_unconfigured_payment_hook_unconsumed() {
+        let directory = TempDir::new().expect("temporary config directory");
+        write_lifecycle_inventory_bundle(directory.path());
+        let mut config = make_config(
+            "extension.example",
+            serde_json::json!({"type": "static", "body": "ok"}),
+            None,
+            Vec::new(),
+        );
+        config.extension_bundles.bundles_dir = Some("bundles".to_owned());
+
+        let pipeline = CompiledPipeline::from_config_at(config, directory.path())
+            .expect("runtime candidate should prepare configured lifecycle paths");
+        let inventory = pipeline.extension_inventory();
+
+        assert_eq!(inventory.scope.mode, ExtensionScopeMode::Running);
+        assert_eq!(
+            inventory
+                .hooks
+                .iter()
+                .find(|hook| hook.kind == ExtensionHookKind::AiGuardrailInput)
+                .map(|hook| hook.state),
+            Some(ExtensionState::Active)
+        );
+        assert_eq!(
+            inventory
+                .hooks
+                .iter()
+                .find(|hook| hook.kind == ExtensionHookKind::Payment)
+                .map(|hook| hook.state),
+            Some(ExtensionState::Unconsumed)
+        );
+    }
+
+    #[test]
+    fn extension_inventory_pipeline_loads_relative_bundle_and_owns_running_snapshot() {
+        let directory = TempDir::new().expect("temporary config directory");
+        write_dynamic_action_bundle(directory.path(), "1.0.0", "generation one");
+
+        let pipeline = CompiledPipeline::from_config_at(dynamic_action_config(), directory.path())
+            .expect("pipeline should load its relative bundle directory");
+
+        assert_eq!(pipeline.actions[0].action_type(), "generation_action");
+        assert!(pipeline
+            .extension_registry()
+            .action("generation_action")
+            .is_some());
+        assert_eq!(pipeline.extension_inventory().summary.active, 1);
+        assert_eq!(pipeline.extension_inventory().summary.available, 0);
+        assert_eq!(
+            pipeline
+                .extension_inventory()
+                .scope
+                .config_revision
+                .as_deref(),
+            Some(pipeline.config_revision.as_str())
+        );
+        assert_eq!(
+            pipeline.extension_inventory().hooks[0].state,
+            ExtensionState::Active
+        );
+        assert_eq!(
+            pipeline.extension_inventory().bundles[0].state,
+            ExtensionState::Active
+        );
+    }
+
+    #[test]
+    fn extension_inventory_pipeline_rejects_a_bundle_that_claims_a_builtin_name() {
+        let directory = TempDir::new().expect("temporary config directory");
+        let bundle = directory.path().join("bundles").join("collision");
+        std::fs::create_dir_all(&bundle).expect("create extension bundle directory");
+        std::fs::write(
+            bundle.join("entry.js"),
+            "export function run() { return { version: 'sbproxy-envelope/v1', outcome: 'response', status: 204, headers: [], body_base64: '' }; }",
+        )
+        .expect("write extension artifact");
+        std::fs::write(
+            bundle.join("bundle.yaml"),
+            r#"apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: collision
+version: 1.0.0
+runtime: javascript
+entry: entry.js
+hooks:
+  - kind: action
+    type: noop
+    export: run
+"#,
+        )
+        .expect("write extension manifest");
+        let mut config = make_config(
+            "extension.example",
+            serde_json::json!({"type": "noop"}),
+            None,
+            Vec::new(),
+        );
+        config.extension_bundles.bundles_dir = Some("bundles".to_owned());
+
+        let error = match CompiledPipeline::from_config_at(config, directory.path()) {
+            Ok(_) => panic!("a built-in hook name must stay reserved"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("reserved"), "{error:#}");
+    }
+
+    #[test]
+    fn reload_keeps_the_prior_extension_generation_alive_for_a_pinned_request() {
+        let first_directory = TempDir::new().expect("first config directory");
+        write_dynamic_action_bundle(first_directory.path(), "1.0.0", "generation one");
+        let first =
+            CompiledPipeline::from_config_at(dynamic_action_config(), first_directory.path())
+                .expect("first extension generation should compile");
+        let first_registry = Arc::downgrade(first.extension_registry());
+        crate::reload::load_pipeline(first);
+        let pinned_request = crate::reload::current_pipeline_full();
+
+        let second_directory = TempDir::new().expect("second config directory");
+        write_dynamic_action_bundle(second_directory.path(), "2.0.0", "generation two");
+        let second =
+            CompiledPipeline::from_config_at(dynamic_action_config(), second_directory.path())
+                .expect("second extension generation should compile");
+        crate::reload::load_pipeline(second);
+        let next_request = crate::reload::current_pipeline_full();
+
+        assert!(!Arc::ptr_eq(&pinned_request, &next_request));
+        assert!(std::str::from_utf8(
+            pinned_request
+                .extension_registry()
+                .action("generation_action")
+                .expect("first hook remains reachable")
+                .artifact(),
+        )
+        .expect("fixture source is UTF-8")
+        .contains("generation one"));
+        assert!(std::str::from_utf8(
+            next_request
+                .extension_registry()
+                .action("generation_action")
+                .expect("second hook is reachable")
+                .artifact(),
+        )
+        .expect("fixture source is UTF-8")
+        .contains("generation two"));
+        assert!(first_registry.upgrade().is_some());
+
+        drop(pinned_request);
+        assert!(first_registry.upgrade().is_none());
     }
 
     #[test]
@@ -2896,6 +3675,7 @@ mod tests {
         let mut host_map = HashMap::new();
         host_map.insert(CompactString::new(hostname), 0);
         CompiledConfig {
+            extension_bundles: Default::default(),
             origins: vec![sbproxy_config::CompiledOrigin {
                 hostname: CompactString::new(hostname),
                 origin_id: CompactString::new(hostname),
@@ -2905,6 +3685,7 @@ mod tests {
                 auth_config: None,
                 policy_configs: Vec::new(),
                 transform_configs: transforms,
+                filters: Vec::new(),
                 cors: None,
                 hsts: None,
                 compression: None,
@@ -3652,6 +4433,13 @@ origins:
         let yaml = r#"
 proxy:
   http_bind_port: 18080
+  # `compile_config` refuses a `secret://<backend>/...` naming a backend
+  # that is not declared, and this case is about the DPoP rule, not that
+  # one, so the backend is declared. Nothing resolves it here.
+  secrets:
+    backends:
+      - type: local
+        name: prod
 origins:
   "dpop-lb.test":
     action:

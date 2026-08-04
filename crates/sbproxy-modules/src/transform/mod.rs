@@ -83,7 +83,7 @@ pub enum TransformError {
     #[error("transform plugin {plugin}: {detail}")]
     Plugin {
         /// Plugin name (`TransformHandler::transform_type()`).
-        plugin: &'static str,
+        plugin: String,
         /// Either "timed out after Nms" or "panicked".
         detail: String,
     },
@@ -174,7 +174,12 @@ pub enum Transform {
     /// No transformation applied.
     Noop,
     /// Third-party plugin (only case using dynamic dispatch).
-    Plugin(Box<dyn TransformHandler>),
+    ///
+    /// Carries the bundle's manifest metadata when a dynamic bundle
+    /// supplied the handler, so the response pipeline can read the
+    /// declared failure posture. A linked plugin has no manifest and
+    /// leaves it unset.
+    Plugin(crate::PluginTransform),
 }
 
 impl Transform {
@@ -207,7 +212,7 @@ impl Transform {
             Self::CelScript(_) => "cel",
             Self::A2aAgentCardRewrite(_) => "a2a_agent_card_rewrite",
             Self::Noop => "noop",
-            Self::Plugin(p) => p.transform_type(),
+            Self::Plugin(p) => p.handler().transform_type(),
         }
     }
 
@@ -255,7 +260,7 @@ impl Transform {
             // response-filter wiring.
             Self::A2aAgentCardRewrite(t) => t.apply(body),
             Self::Noop => Ok(()),
-            Self::Plugin(handler) => dispatch_plugin(handler.as_ref(), body, content_type),
+            Self::Plugin(handler) => dispatch_plugin(handler.handler(), body, content_type),
         }
     }
 }
@@ -315,14 +320,7 @@ fn dispatch_plugin_within(
     content_type: Option<&str>,
     timeout: std::time::Duration,
 ) -> anyhow::Result<()> {
-    let plugin_name = handler.transform_type();
-    if sbproxy_plugin::get_plugin(sbproxy_plugin::PluginKind::Transform, plugin_name).is_none() {
-        anyhow::bail!(
-            "transform plugin {:?} is not registered in the inventory registry",
-            plugin_name
-        );
-    }
-    let plugin_name_static: &'static str = plugin_name;
+    let plugin_name = handler.transform_type().to_string();
     let ctx = TransformContext::empty();
     use futures::FutureExt;
     let future = std::panic::AssertUnwindSafe(async {
@@ -345,7 +343,7 @@ fn dispatch_plugin_within(
             Ok(rt) => rt.block_on(future),
             Err(e) => {
                 return Err(anyhow::Error::new(TransformError::Plugin {
-                    plugin: plugin_name_static,
+                    plugin: plugin_name.clone(),
                     detail: format!("could not build dispatch runtime: {e}"),
                 }));
             }
@@ -359,12 +357,12 @@ fn dispatch_plugin_within(
         Ok(Ok(apply_result)) => apply_result.map_err(anyhow::Error::from),
         // tokio::time::timeout fired before the plugin finished.
         Ok(Err(_elapsed)) => Err(anyhow::Error::new(TransformError::Plugin {
-            plugin: plugin_name_static,
+            plugin: plugin_name.clone(),
             detail: format!("timed out after {}ms", timeout.as_millis()),
         })),
         // The plugin (or the surrounding future) panicked.
         Err(_panic) => Err(anyhow::Error::new(TransformError::Plugin {
-            plugin: plugin_name_static,
+            plugin: plugin_name,
             detail: "panicked".to_string(),
         })),
     }
@@ -479,6 +477,18 @@ impl TransformConfig {
     pub fn failure_posture(&self) -> FailureMode {
         self.failure_posture
             .unwrap_or_else(|| FailureMode::from_fail_closed(self.fail_on_error.unwrap_or(false)))
+    }
+
+    /// True when the operator wrote a posture on this attachment.
+    ///
+    /// [`Self::failure_posture`] cannot answer this, because its default
+    /// and an explicit `failure_posture: open` are the same value. A
+    /// bundle transform needs the difference: its manifest posture
+    /// applies unless the attachment overrides it, and an attachment
+    /// that says nothing must not be read as saying `open` (WOR-2268).
+    #[must_use]
+    pub fn has_explicit_failure_posture(&self) -> bool {
+        self.failure_posture.is_some() || self.fail_on_error.is_some()
     }
 
     /// Reject a failure axis that says two things at once, or that says
@@ -1490,7 +1500,7 @@ mod tests {
         let handler = RecordingTransformHandler {
             calls: calls.clone(),
         };
-        let t = Transform::Plugin(Box::new(handler));
+        let t = Transform::Plugin(crate::PluginTransform::linked(Box::new(handler)));
         let mut body = BytesMut::from(&b"original"[..]);
         t.apply(&mut body, Some("text/plain")).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -1498,7 +1508,7 @@ mod tests {
     }
 
     #[test]
-    fn plugin_apply_errors_when_not_registered() {
+    fn typed_plugin_apply_does_not_require_generic_registration() {
         struct UnregisteredHandler;
         impl TransformHandler for UnregisteredHandler {
             fn transform_type(&self) -> &'static str {
@@ -1516,10 +1526,12 @@ mod tests {
             }
         }
 
-        let t = Transform::Plugin(Box::new(UnregisteredHandler));
+        let t = Transform::Plugin(crate::PluginTransform::linked(Box::new(
+            UnregisteredHandler,
+        )));
         let mut body = BytesMut::from(&b"x"[..]);
-        let err = t.apply(&mut body, None).unwrap_err();
-        assert!(err.to_string().contains("unregistered-transform"));
+        t.apply(&mut body, None)
+            .expect("the compiled typed handler is the registration proof");
     }
 
     // --- WOR-168 plugin dispatch reliability tests ---
@@ -1565,7 +1577,7 @@ mod tests {
             }
         }
 
-        let t = Transform::Plugin(Box::new(PanickingHandler));
+        let t = Transform::Plugin(crate::PluginTransform::linked(Box::new(PanickingHandler)));
         let mut body = BytesMut::from(&b"x"[..]);
         let err = t.apply(&mut body, None).unwrap_err();
         let typed = err.downcast_ref::<TransformError>().expect(
@@ -1573,7 +1585,7 @@ mod tests {
         );
         match typed {
             TransformError::Plugin { plugin, detail } => {
-                assert_eq!(*plugin, "test-panicking-transform");
+                assert_eq!(plugin, "test-panicking-transform");
                 assert!(detail.contains("panic"), "detail: {detail}");
             }
             other => panic!("expected Plugin error variant, got {:?}", other),
@@ -1645,7 +1657,7 @@ mod tests {
             .expect("slow plugin must surface as TransformError::Plugin");
         match typed {
             TransformError::Plugin { plugin, detail } => {
-                assert_eq!(*plugin, "test-slow-transform");
+                assert_eq!(plugin, "test-slow-transform");
                 assert!(detail.contains("timed out"), "detail: {detail}");
             }
             other => panic!("expected Plugin error variant, got {:?}", other),

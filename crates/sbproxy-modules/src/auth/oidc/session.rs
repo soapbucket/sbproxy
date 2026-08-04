@@ -3,12 +3,12 @@
 //!
 //! Two cookies, two payload shapes:
 //!
-//! * `SessionClaims` — what the long-lived `__Host-sbproxy_session`
+//! * `SessionClaims`: what the long-lived `__Host-sbproxy_session`
 //!   cookie carries after a successful login. Holds the OIDC ID
 //!   token's `sub`, `iss`, `aud`, and an absolute `exp` so the proxy
 //!   can short-circuit auth on subsequent requests without an IdP
 //!   round-trip.
-//! * `TxClaims` — what the short-lived `__Host-sbproxy_oidc_tx`
+//! * `TxClaims`: what the short-lived `__Host-sbproxy_oidc_tx`
 //!   cookie carries during the auth-code dance. Holds the `state`
 //!   (CSRF), `nonce` (ID-token replay defence), `pkce_verifier` (RFC
 //!   7636), and the `return_to` URL the caller wanted.
@@ -29,12 +29,12 @@ use serde::{Deserialize, Serialize};
 /// short-circuit the auth check.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionClaims {
-    /// OIDC `sub` claim from the ID token — the authenticated user.
+    /// OIDC `sub` claim from the ID token, the authenticated user.
     pub sub: String,
-    /// OIDC `iss` claim — pinned at issue time so a key rotation that
+    /// OIDC `iss` claim, pinned at issue time so a key rotation that
     /// changes `iss` invalidates old sessions cleanly.
     pub iss: String,
-    /// OIDC `aud` claim — the proxy's `client_id` at the IdP. Pinned
+    /// OIDC `aud` claim, the proxy's `client_id` at the IdP. Pinned
     /// for the same reason as `iss`.
     pub aud: String,
     /// Absolute expiry, unix seconds. The proxy checks this on every

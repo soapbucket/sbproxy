@@ -30,11 +30,35 @@
 //! - `name` - stable identifier.
 //! - `type` - closed enum `{skill-md, archive}`.
 //! - `description` - human-readable capability summary.
-//! - `url` - relative, path-absolute, or fully-qualified. The proxy
-//!   resolves relative refs against the request authority per
-//!   RFC 3986 at serve time so the manifest's URLs stay portable.
+//! - `url` - relative, path-absolute, or fully-qualified. Relative
+//!   (`skills/foo.md`) and path-absolute (`/skills/foo.md`) both name
+//!   an artifact the proxy re-hosts, and both spellings mean the same
+//!   artifact. A fully-qualified ref (`https://cdn.example.com/...`)
+//!   is emitted verbatim and is not re-hosted.
 //! - `digest` - SHA-256 of the artifact body, recomputed at
 //!   config-load time and again on every artifact GET.
+//!
+//! ## Where a re-hosted artifact is served
+//!
+//! The two spellings above are resolved at render time against the
+//! base path the surface serving the manifest actually answers on,
+//! not against the manifest URL's own directory. There are two bases:
+//!
+//! - The top-level `agent_skills:` block serves its artifacts at the
+//!   root, so `/skills/foo.md` and `skills/foo.md` both render as
+//!   `<scheme>://<authority>/skills/foo.md`.
+//! - A Listing serves its artifacts under its own well-known segment,
+//!   so both spellings render as
+//!   `<scheme>://<authority>/.well-known/agent-skills/<listing>/skills/foo.md`.
+//!
+//! Resolving against the manifest's own directory per RFC 3986 §5.3
+//! would be the textbook answer, but it names a path no handler
+//! answers, and the manifest is a machine-readable contract: an agent
+//! that follows the link has no way to discover the real path when the
+//! advertised one is wrong. [`ManifestEntry::serve_base`] carries the
+//! base per entry so the aggregated manifest, which mixes both
+//! surfaces in one document, still advertises a servable URL for every
+//! entry it lists.
 //!
 //! ## Integrity contract
 //!
@@ -109,12 +133,28 @@ pub struct ManifestEntry {
     pub kind: String,
     /// Human-readable description.
     pub description: String,
-    /// URL the agent fetches to retrieve the artifact. Path-absolute
-    /// or fully-qualified; the data-plane handler resolves relative
-    /// refs against the request authority before re-emitting.
+    /// URL exactly as the YAML declared it: relative, path-absolute,
+    /// or fully-qualified. [`render_manifest`] resolves this against
+    /// [`Self::serve_base`] and the request authority before shipping
+    /// it; the data-plane handler matches an incoming artifact request
+    /// back to this raw value to pick the response content type.
     pub url: String,
     /// SHA-256 digest as `sha256:<lowercase-hex>` per the v0.2.0 spec.
     pub digest: String,
+    /// Path prefix the surface owning this entry serves its artifacts
+    /// under, with no trailing slash.
+    ///
+    /// Empty for the top-level `agent_skills:` block, which re-hosts
+    /// artifacts at the root. `/.well-known/agent-skills/<listing>`
+    /// for an entry that came from a Listing's `spec.skills[]`.
+    ///
+    /// The base lives on the entry rather than on the index because
+    /// the aggregated `/.well-known/agent-skills/index.json` merges
+    /// both surfaces into one document, so a single per-manifest base
+    /// would be wrong for half the entries it lists. Not serialised:
+    /// it is an input to the rendered `url`, not a manifest field.
+    #[serde(skip)]
+    pub serve_base: String,
     /// Visibility gate, inherited from the YAML config. Filtered at
     /// serve time so the manifest body shipped to anonymous callers
     /// never contains authenticated-only entries.
@@ -248,6 +288,11 @@ pub fn build_index(entries: &[AgentSkillEntry], workspace_root: &Path) -> AgentS
             description: entry.description.clone(),
             url: url_field,
             digest: digest_field,
+            // Root base: correct for the top-level `agent_skills:`
+            // block, which re-hosts at the bare path.
+            // `render_listing_indices` overwrites this for entries it
+            // takes ownership of.
+            serve_base: String::new(),
             visibility,
         });
     }
@@ -334,10 +379,11 @@ fn canonical_path_key(url: &str) -> Option<String> {
 /// `/.well-known/agent-skills/index.json` with `Content-Type:
 /// application/json`.
 ///
-/// `request_authority` is the request `Host` header (no scheme), used
-/// to resolve relative URLs per RFC 3986. Path-absolute and fully-
-/// qualified URLs pass through unchanged; relative refs (e.g.
-/// `skills/foo.md`) are resolved against the request authority.
+/// `request_authority` is the request `Host` header (no scheme). Every
+/// re-hosted entry resolves to `<scheme>://<authority>` plus the
+/// entry's [`ManifestEntry::serve_base`] plus its path, so the URL the
+/// manifest advertises is the URL the data-plane handler answers.
+/// Fully-qualified URLs pass through unchanged.
 pub fn render_manifest(
     index: &AgentSkillsIndex,
     authenticated: bool,
@@ -352,7 +398,8 @@ pub fn render_manifest(
             SkillVisibility::Authenticated => authenticated,
         })
         .map(|e| {
-            let resolved_url = resolve_url(&e.url, request_authority, request_scheme);
+            let resolved_url =
+                resolve_url(&e.url, &e.serve_base, request_authority, request_scheme);
             serde_json::json!({
                 "name": e.name,
                 "type": e.kind,
@@ -371,35 +418,40 @@ pub fn render_manifest(
     serde_json::to_string_pretty(&manifest).unwrap_or_else(|_| String::from("{\"entries\":[]}"))
 }
 
-/// Resolve a manifest URL against the request authority per RFC 3986.
+/// Resolve one manifest URL to the address the proxy will answer.
 ///
-/// - Fully-qualified URLs (`https://...`) pass through unchanged.
-/// - Path-absolute URLs (`/skills/foo.md`) keep their path but are
-///   prefixed with `<scheme>://<authority>` when an authority is
-///   provided.
-/// - Relative URLs (`skills/foo.md`) become path-absolute under the
-///   `/.well-known/agent-skills/` base and then resolve against the
-///   authority.
+/// - Fully-qualified URLs (`https://...`) pass through unchanged. The
+///   proxy does not re-host them, so there is nothing to resolve.
+/// - Everything else names a re-hosted artifact. Relative
+///   (`skills/foo.md`) and path-absolute (`/skills/foo.md`) are the
+///   same artifact and resolve identically: leading slash normalised
+///   on, `serve_base` prefixed, then the scheme and authority.
 ///
-/// When `request_authority` is `None` the URL is returned as-is so
-/// the manifest still validates against the v0.2.0 schema (the spec
-/// permits relative refs at rest).
-fn resolve_url(url: &str, authority: Option<&str>, scheme: &str) -> String {
+/// `serve_base` is the path prefix the surface serving this manifest
+/// re-hosts under, with no trailing slash: empty for the top-level
+/// `agent_skills:` block, `/.well-known/agent-skills/<listing>` for a
+/// Listing. It is what keeps the advertised URL and the handler's
+/// route in agreement, and it is deliberately per-entry so the
+/// aggregated manifest can mix both surfaces in one document.
+///
+/// When `request_authority` is `None` the result is path-absolute
+/// rather than the raw config value. The v0.2.0 schema permits a
+/// path-absolute ref, and emitting the raw value would hand a client
+/// a relative ref it would resolve against the manifest's own
+/// directory, which is the one answer no handler serves.
+fn resolve_url(url: &str, serve_base: &str, authority: Option<&str>, scheme: &str) -> String {
     if url.starts_with("http://") || url.starts_with("https://") {
         return url.to_string();
     }
-    let Some(auth) = authority else {
-        return url.to_string();
+    let path = if url.starts_with('/') {
+        format!("{serve_base}{url}")
+    } else {
+        format!("{serve_base}/{url}")
     };
-    if url.starts_with('/') {
-        return format!("{scheme}://{auth}{url}");
+    match authority {
+        Some(auth) => format!("{scheme}://{auth}{path}"),
+        None => path,
     }
-    // Relative reference: resolve against the well-known base. The
-    // base is the directory of the manifest, so `skills/foo.md`
-    // becomes `/.well-known/agent-skills/skills/foo.md`. This matches
-    // RFC 3986 Section 5.3 with `Reference Resolution` against the
-    // manifest URL.
-    format!("{scheme}://{auth}/.well-known/agent-skills/{url}")
 }
 
 /// Compute SHA-256 of a body, returning the lowercase hex string.
@@ -504,6 +556,12 @@ pub struct ListingScopedIndex {
 /// `spec.resources[].ref` entries (kinds `origins/<hostname>`); other
 /// resource kinds are recorded but do not contribute hostnames for
 /// the OSS surface today.
+///
+/// Every entry's [`ManifestEntry::serve_base`] is stamped with this
+/// Listing's well-known segment, because that is where the data-plane
+/// handler re-hosts a Listing's artifacts. Without it the manifest
+/// would advertise the bare path, which only the top-level
+/// `agent_skills:` block answers (WOR-2217).
 pub fn render_listing_indices(
     registry: &ListingRegistry,
     workspace_root: &Path,
@@ -513,9 +571,13 @@ pub fn render_listing_indices(
         if loaded.listing.spec.skills.is_empty() {
             continue;
         }
-        let idx = build_index(&loaded.listing.spec.skills, workspace_root);
+        let mut idx = build_index(&loaded.listing.spec.skills, workspace_root);
         if idx.entries.is_empty() && idx.artifacts.is_empty() {
             continue;
+        }
+        let serve_base = listing_serve_base(&loaded.listing.metadata.name);
+        for entry in &mut idx.entries {
+            entry.serve_base.clone_from(&serve_base);
         }
         let hostnames = listing_origin_hostnames(loaded);
         out.insert(
@@ -528,6 +590,17 @@ pub fn render_listing_indices(
         );
     }
     out
+}
+
+/// Path prefix a Listing re-hosts its skill artifacts under, with no
+/// trailing slash.
+///
+/// This is the single source of truth for the route shape shared by
+/// the manifest renderer and the data-plane handler: the handler
+/// strips `/.well-known/agent-skills/`, takes the next segment as the
+/// Listing name, and looks the remainder up in the artifact cache.
+fn listing_serve_base(listing_name: &str) -> String {
+    format!("/.well-known/agent-skills/{listing_name}")
 }
 
 /// Extract the origin hostnames a Listing publishes from its
@@ -569,6 +642,12 @@ fn split_ref(reference: &str) -> Option<(&str, &str)> {
 /// Visibility is preserved on every merged entry; the higher-level
 /// [`render_manifest`] still filters anonymous callers down to
 /// `Public` entries.
+///
+/// So is [`ManifestEntry::serve_base`], which is what lets one merged
+/// document advertise a servable URL for entries owned by two
+/// different surfaces. A per-origin entry and a Listing entry that
+/// declare the same `url` are distinct addresses after rendering,
+/// because their bases differ.
 pub fn aggregate_for_hostname(
     per_origin: Option<&AgentSkillsIndex>,
     listings: &HashMap<String, ListingScopedIndex>,
@@ -915,24 +994,58 @@ mod tests {
     }
 
     #[test]
-    fn relative_url_resolves_against_authority() {
-        let resolved = resolve_url("skills/foo.md", Some("h.example.com"), "https");
+    fn both_url_spellings_resolve_to_the_same_address_on_the_origin_base() {
+        // WOR-2217: `skills/foo.md` and `/skills/foo.md` name one
+        // artifact, and the top-level `agent_skills:` block re-hosts
+        // it at the bare path. Previously the relative spelling
+        // rendered under `/.well-known/agent-skills/`, which the
+        // per-origin artifact handler never answers.
+        let relative = resolve_url("skills/foo.md", "", Some("h.example.com"), "https");
+        let absolute = resolve_url("/skills/foo.md", "", Some("h.example.com"), "https");
+        assert_eq!(relative, "https://h.example.com/skills/foo.md");
+        assert_eq!(absolute, "https://h.example.com/skills/foo.md");
+    }
+
+    #[test]
+    fn both_url_spellings_resolve_under_the_listing_base() {
+        // WOR-2217: a Listing re-hosts under its own well-known
+        // segment, so both spellings have to land there. The
+        // path-absolute spelling used to render as a bare
+        // `https://h.example.com/skills/foo.md` that nothing served.
+        let base = listing_serve_base("example-api");
+        let relative = resolve_url("skills/foo.md", &base, Some("h.example.com"), "https");
+        let absolute = resolve_url("/skills/foo.md", &base, Some("h.example.com"), "https");
         assert_eq!(
-            resolved,
-            "https://h.example.com/.well-known/agent-skills/skills/foo.md"
+            relative,
+            "https://h.example.com/.well-known/agent-skills/example-api/skills/foo.md"
+        );
+        assert_eq!(relative, absolute);
+    }
+
+    #[test]
+    fn missing_authority_still_yields_a_path_absolute_url() {
+        // No `Host` header to build an absolute URL from. Emit a
+        // path-absolute ref (permitted by the v0.2.0 schema) rather
+        // than the raw relative value, which a client would resolve
+        // against the manifest's own directory and miss.
+        let base = listing_serve_base("example-api");
+        assert_eq!(
+            resolve_url("skills/foo.md", &base, None, "https"),
+            "/.well-known/agent-skills/example-api/skills/foo.md"
+        );
+        assert_eq!(
+            resolve_url("/skills/foo.md", "", None, "https"),
+            "/skills/foo.md"
         );
     }
 
     #[test]
-    fn path_absolute_url_resolves_against_authority() {
-        let resolved = resolve_url("/skills/foo.md", Some("h.example.com"), "https");
-        assert_eq!(resolved, "https://h.example.com/skills/foo.md");
-    }
-
-    #[test]
     fn fully_qualified_url_pass_through_in_resolve() {
+        // Not re-hosted, so the serve base must not be applied even
+        // when the entry came from a Listing.
         let resolved = resolve_url(
             "https://cdn.example.com/x.md",
+            &listing_serve_base("example-api"),
             Some("h.example.com"),
             "https",
         );
@@ -1315,6 +1428,181 @@ spec:
         assert!(merged.entries.is_empty());
     }
 
+    // --- WOR-2217: every advertised URL must be servable -------------
+
+    /// Assert the property the manifest actually promises: every URL
+    /// it advertises for a re-hosted artifact resolves to something
+    /// the data-plane handler can answer.
+    ///
+    /// The handler routes an artifact request by stripping the
+    /// surface's serve base off the request path and looking the
+    /// remainder up in `artifacts` (the per-Listing and per-origin
+    /// fan-outs in `sbproxy-core`'s `request_phase`). So "servable"
+    /// at this layer means the advertised path is exactly
+    /// `serve_base` plus a key the index actually holds. Asserting on
+    /// the string [`resolve_url`] returns would not catch this: the
+    /// pre-fix code returned a well-formed URL that simply pointed at
+    /// nothing.
+    fn assert_every_advertised_url_is_servable(index: &AgentSkillsIndex, authority: &str) {
+        let body = render_manifest(index, true, Some(authority), "https");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("manifest is JSON");
+        let entries = v["entries"].as_array().expect("entries array");
+        assert!(
+            !entries.is_empty(),
+            "manifest advertised no entries, so this assertion would pass vacuously"
+        );
+        for e in entries {
+            let name = e["name"].as_str().expect("entry name");
+            let url = e["url"].as_str().expect("entry url");
+            let prefix = format!("https://{authority}");
+            let Some(path) = url.strip_prefix(prefix.as_str()) else {
+                // Fully-qualified on some other authority: not
+                // re-hosted, so there is no local path to check.
+                assert!(
+                    url.starts_with("http://") || url.starts_with("https://"),
+                    "entry '{name}' advertises {url}, which is neither on this authority nor \
+                     fully-qualified"
+                );
+                continue;
+            };
+            let entry = index
+                .entries
+                .iter()
+                .find(|me| me.name == name)
+                .unwrap_or_else(|| panic!("rendered entry '{name}' has no source ManifestEntry"));
+            let key = path
+                .strip_prefix(entry.serve_base.as_str())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "entry '{name}' advertises {url}, whose path {path} does not start with \
+                         the serve base {:?} the handler strips",
+                        entry.serve_base
+                    )
+                });
+            assert!(
+                index.artifacts.contains_key(key),
+                "entry '{name}' advertises {url}; the handler would look {key:?} up in the \
+                 artifact cache and find nothing. Cached keys: {:?}",
+                index.artifacts.keys().collect::<Vec<_>>()
+            );
+            assert!(
+                index.digests.contains_key(key),
+                "entry '{name}' advertises {url} but the index holds no digest for {key:?}, so \
+                 the runtime hash check could not run"
+            );
+        }
+    }
+
+    #[test]
+    fn top_level_manifest_urls_are_all_servable() {
+        // Both spellings in one index. The relative form used to
+        // render under `/.well-known/agent-skills/`, a path the
+        // per-origin artifact fan-out never answers.
+        let abs = make_entry("abs", "skill-md", "/skills/abs.md", "# abs\n");
+        let rel = make_entry("rel", "skill-md", "skills/rel.md", "# rel\n");
+        let idx = build_index(&[abs, rel], Path::new("."));
+        assert_eq!(idx.entries.len(), 2);
+        assert_every_advertised_url_is_servable(&idx, "api.example.com");
+    }
+
+    #[test]
+    fn per_listing_manifest_urls_are_all_servable() {
+        // The exact shape WOR-2217 reported: a Listing skill with a
+        // path-absolute url advertised `https://api.example.com/
+        // skills/place-order.md`, which only the top-level
+        // `agent_skills:` block re-hosts.
+        let y = listing_yaml(
+            "example-api",
+            "api.example.com",
+            "/skills/place-order.md",
+            "public",
+        );
+        let registry = registry_from_yaml(&[y]);
+        let listings = render_listing_indices(&registry, Path::new("."));
+        let scoped = listings.get("example-api").expect("listing index");
+        assert_every_advertised_url_is_servable(&scoped.index, "api.example.com");
+
+        // Pin the address too, so a regression in the base is
+        // legible in the diff rather than only in a failure message.
+        let body = render_manifest(&scoped.index, true, Some("api.example.com"), "https");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v["entries"][0]["url"],
+            "https://api.example.com/.well-known/agent-skills/example-api/skills/place-order.md"
+        );
+    }
+
+    #[test]
+    fn per_listing_manifest_urls_are_servable_for_the_relative_spelling() {
+        // The relative spelling was broken for Listings too: it
+        // rendered without the `<listing>` segment the handler
+        // requires.
+        let y = listing_yaml(
+            "example-api",
+            "api.example.com",
+            "skills/place-order.md",
+            "public",
+        );
+        let registry = registry_from_yaml(&[y]);
+        let listings = render_listing_indices(&registry, Path::new("."));
+        let scoped = listings.get("example-api").expect("listing index");
+        assert_every_advertised_url_is_servable(&scoped.index, "api.example.com");
+    }
+
+    #[test]
+    fn aggregated_manifest_urls_are_all_servable_across_both_surfaces() {
+        // One document, two serve bases. This is the case a single
+        // per-manifest base could not have fixed.
+        let origin_entry = make_entry(
+            "origin-skill",
+            "skill-md",
+            "/skills/origin.md",
+            "origin body",
+        );
+        let origin_idx = build_index(std::slice::from_ref(&origin_entry), Path::new("."));
+        let y = listing_yaml(
+            "example-api",
+            "api.example.com",
+            "/skills/listing.md",
+            "public",
+        );
+        let registry = registry_from_yaml(&[y]);
+        let listings = render_listing_indices(&registry, Path::new("."));
+        let merged = aggregate_for_hostname(Some(&origin_idx), &listings, "api.example.com");
+        assert_eq!(merged.entries.len(), 2);
+        assert_every_advertised_url_is_servable(&merged, "api.example.com");
+    }
+
+    #[test]
+    fn same_url_on_both_surfaces_renders_two_distinct_addresses() {
+        // A Listing and the top-level block may both declare
+        // `/skills/shared.md`. After resolution they are different
+        // URLs, so neither shadows the other's artifact.
+        let origin_entry = make_entry("origin-shared", "skill-md", "/skills/shared.md", "origin");
+        let origin_idx = build_index(std::slice::from_ref(&origin_entry), Path::new("."));
+        let y = listing_yaml(
+            "example-api",
+            "api.example.com",
+            "/skills/shared.md",
+            "public",
+        );
+        let registry = registry_from_yaml(&[y]);
+        let listings = render_listing_indices(&registry, Path::new("."));
+        let merged = aggregate_for_hostname(Some(&origin_idx), &listings, "api.example.com");
+        let body = render_manifest(&merged, true, Some("api.example.com"), "https");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let urls: Vec<&str> = v["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["url"].as_str().unwrap())
+            .collect();
+        assert!(urls.contains(&"https://api.example.com/skills/shared.md"));
+        assert!(urls.contains(
+            &"https://api.example.com/.well-known/agent-skills/example-api/skills/shared.md"
+        ));
+    }
+
     #[test]
     fn render_indices_skips_origins_without_skills() {
         // Build a CompiledConfig with one origin that has skills and
@@ -1329,6 +1617,7 @@ spec:
             auth_config: None,
             policy_configs: Vec::new(),
             transform_configs: Vec::new(),
+            filters: Vec::new(),
             cors: None,
             hsts: None,
             compression: None,
@@ -1380,6 +1669,7 @@ spec:
             auth_config: None,
             policy_configs: Vec::new(),
             transform_configs: Vec::new(),
+            filters: Vec::new(),
             cors: None,
             hsts: None,
             compression: None,
@@ -1426,6 +1716,7 @@ spec:
         host_map.insert(CompactString::new("with.example.com"), 0);
         host_map.insert(CompactString::new("without.example.com"), 1);
         let cfg = CompiledConfig {
+            extension_bundles: Default::default(),
             origins: vec![with_skills, without],
             host_map,
             server: sbproxy_config::ProxyServerConfig::default(),

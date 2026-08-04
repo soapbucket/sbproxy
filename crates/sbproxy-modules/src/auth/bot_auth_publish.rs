@@ -189,7 +189,7 @@ impl SignatureAgentCard {
 /// Returns the three response headers a Web Bot Auth verifier needs
 /// to confirm the body came from the holder of the published key:
 /// `Content-Digest`, `Signature-Input`, and `Signature`. The covered
-/// component set is intentionally minimal — only `content-digest` —
+/// component set is intentionally minimal, only `content-digest`,
 /// so the helper works equally well for the JWKS directory and the
 /// agent card without depending on response-side derived components
 /// (`@status` is not yet supported by the shared signature-base

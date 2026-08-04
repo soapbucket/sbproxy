@@ -556,7 +556,7 @@ guardrails:
 The same guardrail screens gateway-retrieved context, because the augmented
 guardrail pass runs after injection. The runnable
 [`examples/ai-context-poisoning/`](../examples/ai-context-poisoning/) config
-demonstrates a clean and a poisoned tool result; the rule catalogue and
+demonstrates a clean and a poisoned tool result; the rule catalog and
 per-family tables are in the [AI gateway guide](ai-gateway.md#context-poisoning-guardrail).
 
 ### Watching the marked path

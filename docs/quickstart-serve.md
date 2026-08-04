@@ -2,7 +2,7 @@
 
 *Last modified: 2026-07-28*
 
-`sbproxy run` is the first local-model command to try. It chooses a catalogued artifact, verifies it, starts a managed local deployment, and prints an OpenAI-compatible endpoint. It is meant for one model on one machine. The completion command below uses `curl` and `jq`.
+`sbproxy run` is the first local-model command to try. It chooses a cataloged artifact, verifies it, starts a managed local deployment, and prints an OpenAI-compatible endpoint. It is meant for one model on one machine. The completion command below uses `curl` and `jq`.
 
 Check the host before downloading a model:
 

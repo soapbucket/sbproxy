@@ -454,11 +454,10 @@ adapters (Hugging Face TGI, LM Studio, llama.cpp).
 | `lowest_latency`    | Provider with the lowest observed latency (microseconds, atomic counter). |
 | `least_connections` | Provider with the fewest in-flight requests. |
 | `cost_optimized`    | Lowest score of `connections * 1000 + weight`. Utilization dominates; weight breaks ties in favor of cheaper providers. |
-| `token_rate`        | Provider with the most remaining tokens-per-minute headroom. |
 | `least_token_usage` | Provider with the lowest recorded token throughput. |
 | `prefix_affinity`   | Hash the prompt prefix to a provider so shared-prefix sessions land on the same upstream cache. |
 | `sticky`            | Pin a session key to one provider. Falls back to round robin without a session key. |
-| `race`              | Fan out to every healthy provider in parallel; first non-error response wins, the rest are cancelled. |
+| `race`              | Fan out to every healthy provider in parallel; first non-error response wins, the rest are canceled. |
 | `peak_ewma`         | Power-of-two-choices over time-decayed peak latency and in-flight load: sample two eligible providers, route to the lower effective cost. |
 | `cascade`           | Tiered dispatch from cheapest to most expensive (provider, model) pairs; a response below the tier's quality threshold retries on the next tier. |
 | `cost_quality`      | Score the prompt's difficulty and route simple prompts to a cheap model, hard prompts to a frontier model, on a `cost_threshold` dial. |
@@ -629,7 +628,7 @@ and B3 single / multi-header formats, generates a child span ID for each
 upstream call, and echoes the propagation headers back to the downstream
 client. OTLP export is shipped and wired: configure the
 `proxy.observability.telemetry` block (endpoint, transport, sampling) and the
-binary initialises the OTLP trace and metrics pipelines at startup via
+binary initializes the OTLP trace and metrics pipelines at startup via
 `sbproxy-observe::telemetry`. An OTLP logs sink is also available for shipping
 structured logs to the same collector. See [observability.md](observability.md).
 

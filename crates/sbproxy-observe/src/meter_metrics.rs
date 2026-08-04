@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Soap Bucket LLC
 
-//! Operating the meter: six `sbproxy_meter_*` families, on the OTLP push
+//! Operating the meter: seven `sbproxy_meter_*` families, on the OTLP push
 //! path and the Prometheus scrape at once.
 //!
 //! # Metrics are not the billing record
@@ -37,7 +37,7 @@
 //!
 //! # Push is primary, scrape is secondary
 //!
-//! Both surfaces are wired and both carry the same six families. They are
+//! Both surfaces are wired and both carry the same seven families. They are
 //! not equally trustworthy under load: `/metrics` is known to degrade at
 //! peak volume, and billing visibility that vanishes exactly when volume is
 //! highest is worse than no dashboard at all, because its absence reads as
@@ -75,7 +75,7 @@ const UNATTRIBUTED_TENANT: &str = "unknown";
 
 // --- Prometheus families ---
 //
-// All six live on the `ProxyMetrics` registry rather than the process
+// All seven live on the `ProxyMetrics` registry rather than the process
 // default, so `render()` emits each exactly once. A family on both
 // registries is emitted twice, and the Prometheus text format rejects a
 // repeated `# TYPE` for the whole scrape rather than for the one family.
@@ -126,6 +126,32 @@ fn chain_gap_total() -> &'static IntCounterVec {
             &["tenant_id", "failure_mode"],
         )
         .expect("meter chain gap counter constructs");
+        let _ = metrics().registry.register(Box::new(counter.clone()));
+        counter
+    })
+}
+
+/// `sbproxy_meter_incoherent_receipts_total{tenant_id, failure_mode}`.
+///
+/// The same label set as `sbproxy_meter_chain_gap_total`, so an operator
+/// who has written one alert has written the other, and a separate family
+/// rather than a third `failure_mode` value on that one. The two describe
+/// different holes: a chain gap is a record that was owed and never
+/// written, and this is a record that was written, is authentically signed,
+/// and cannot be believed. A dashboard that could not tell them apart would
+/// send somebody to check disk space over a laundered provenance claim.
+fn incoherent_receipts_total() -> &'static IntCounterVec {
+    static FAMILY: OnceLock<IntCounterVec> = OnceLock::new();
+    FAMILY.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "sbproxy_meter_incoherent_receipts_total",
+                "Receipts refused on decode because a unit's declared provenance contradicts \
+                 its evidence, by tenant and the posture in force.",
+            ),
+            &["tenant_id", "failure_mode"],
+        )
+        .expect("meter incoherent receipts counter constructs");
         let _ = metrics().registry.register(Box::new(counter.clone()));
         counter
     })
@@ -223,6 +249,18 @@ fn otel_chain_gap() -> &'static Counter<u64> {
             .u64_counter("sbproxy.meter.chain_gap")
             .with_description("Records the meter owed and could not write.")
             .with_unit("{record}")
+            .build()
+    })
+}
+
+/// OTel counter mirroring `sbproxy_meter_incoherent_receipts_total`.
+fn otel_incoherent_receipts() -> &'static Counter<u64> {
+    static INSTRUMENT: OnceLock<Counter<u64>> = OnceLock::new();
+    INSTRUMENT.get_or_init(|| {
+        global::meter("sbproxy")
+            .u64_counter("sbproxy.meter.incoherent_receipts")
+            .with_description("Receipts refused on decode for contradicting their own provenance.")
+            .with_unit("{receipt}")
             .build()
     })
 }
@@ -327,6 +365,26 @@ fn record_meter_chain_gap(tenant_id: &str, failure_mode: FailurePosture) {
         .with_label_values(&[tenant_id.as_str(), failure_mode.as_str()])
         .inc();
     otel_chain_gap().add(
+        1,
+        &[
+            opentelemetry::KeyValue::new("tenant_id", tenant_id),
+            opentelemetry::KeyValue::new("failure_mode", failure_mode.as_str()),
+        ],
+    );
+}
+
+/// Count one receipt refused on decode for contradicting itself.
+///
+/// Refusals, not distinct receipts: one bad entry in a chain file is
+/// refused again on every read that reaches it. The condition is permanent
+/// until somebody acts on it, so an alert that went quiet while the entry
+/// was still there would be worse than one that keeps firing.
+fn record_meter_incoherent_receipt(tenant_id: &str, failure_mode: FailurePosture) {
+    let tenant_id = tenant(tenant_id);
+    incoherent_receipts_total()
+        .with_label_values(&[tenant_id.as_str(), failure_mode.as_str()])
+        .inc();
+    otel_incoherent_receipts().add(
         1,
         &[
             opentelemetry::KeyValue::new("tenant_id", tenant_id),
@@ -517,6 +575,10 @@ impl MeterObserver for MeterMetrics {
         record_meter_chain_gap(tenant_id, failure_mode);
     }
 
+    fn incoherent_receipt(&self, tenant_id: &str, failure_mode: FailurePosture) {
+        record_meter_incoherent_receipt(tenant_id, failure_mode);
+    }
+
     fn chain_head(&self, seq: u64) {
         set_meter_chain_seq(seq);
     }
@@ -666,6 +728,7 @@ mod tests {
         record_meter_units("scrape-tenant", "api_call", UnitSource::Measured, 1);
         record_meter_receipt("scrape-tenant", BillableOutcome::Delivered, Billable::Yes);
         record_meter_chain_gap("scrape-tenant", FailurePosture::Degraded);
+        record_meter_incoherent_receipt("scrape-tenant", FailurePosture::Closed);
         record_meter_divergence("scrape-tenant");
         set_meter_chain_seq(41);
         record_meter_append_duration(0.002);
@@ -675,6 +738,7 @@ mod tests {
             "sbproxy_meter_units_total",
             "sbproxy_meter_receipts_total",
             "sbproxy_meter_chain_gap_total",
+            "sbproxy_meter_incoherent_receipts_total",
             "sbproxy_meter_divergence_total",
             "sbproxy_meter_chain_seq",
             "sbproxy_meter_append_duration_seconds",
@@ -737,6 +801,7 @@ mod tests {
         record_meter_units("otlp-tenant", "api_call", UnitSource::Measured, 7);
         record_meter_receipt("otlp-tenant", BillableOutcome::CacheHit, Billable::No);
         record_meter_chain_gap("otlp-tenant", FailurePosture::Open);
+        record_meter_incoherent_receipt("otlp-tenant", FailurePosture::Closed);
         record_meter_divergence("otlp-tenant");
         set_meter_chain_seq(9);
         record_meter_append_duration(0.001);
@@ -760,6 +825,7 @@ mod tests {
             "sbproxy.meter.units",
             "sbproxy.meter.receipts",
             "sbproxy.meter.chain_gap",
+            "sbproxy.meter.incoherent_receipts",
             "sbproxy.meter.divergence",
             "sbproxy.meter.chain_seq",
             "sbproxy.meter.append.duration",

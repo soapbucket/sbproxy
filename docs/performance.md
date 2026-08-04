@@ -48,7 +48,7 @@ Matrix-v7 publishable run, c3-standard-8 GCE instances, LTO-enabled release buil
 
 Be honest with yourself about coverage:
 
-- **Two scenarios are upstream-bound, not proxy-bound.** AI streaming (196 rps) and AI failover (11,460 rps) reflect upstream behaviour, not Pingora's ceiling.
+- **Two scenarios are upstream-bound, not proxy-bound.** AI streaming (196 rps) and AI failover (11,460 rps) reflect upstream behavior, not Pingora's ceiling.
 - **Localhost numbers in older docs are lower.** Single-laptop runs hit ephemeral-port exhaustion around 150 concurrent connections and conflate proxy work with the load generator's CPU. Use the c3 numbers above as the trustworthy floor; expect higher on bigger hardware.
 - **Hardware matters.** c3-standard-8 is a Sapphire Rapids instance with dedicated cores. Burstable VMs (e2, t-series) or AMD Milan (n2d) will land lower; recent EPYC and bare metal will land higher.
 - **Configuration matters.** Logging at `debug`, full-body logging, or expensive Lua transforms can each cut throughput in half.
@@ -209,4 +209,4 @@ For your own dashboards, the metrics that move first:
 - `sbproxy_config_reload_total`. A spike means your reload tooling is flapping.
 - `sbproxy_silent_degradations_total`. Best-effort operations that failed and would otherwise be invisible. Should stay near zero; alert on growth.
 
-See [metrics-stability.md](metrics-stability.md) for the full catalogue and stability tier of every metric.
+See [metrics-stability.md](metrics-stability.md) for the full catalog and stability tier of every metric.

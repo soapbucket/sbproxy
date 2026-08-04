@@ -135,7 +135,7 @@ ORDER BY (toDate(timestamp), request_id)
 TTL toDate(timestamp) + INTERVAL 30 DAY;
 ```
 
-Joining `prompt_audit` to `access_log` on `request_id` lets analysts trace a flagged response back to the redacted prompt without ever surfacing PII. The reversible-PII pass on the AI origin keeps the original out of every persisted artefact; only `<placeholder:...>` shapes ever land here. See the "Reversible PII redaction" section in `docs/observability.md` for the opt-in.
+Joining `prompt_audit` to `access_log` on `request_id` lets analysts trace a flagged response back to the redacted prompt without ever surfacing PII. The reversible-PII pass on the AI origin keeps the original out of every persisted artifact; only `<placeholder:...>` shapes ever land here. See the "Reversible PII redaction" section in `docs/observability.md` for the opt-in.
 
 ## Sample query 1: monthly project cost rollup
 

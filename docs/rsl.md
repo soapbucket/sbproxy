@@ -279,10 +279,10 @@ curl -sS -H 'Host: shop.localhost' http://127.0.0.1:8080/licenses.xml
 ```
 
 The `payment` element carries the `ai_crawl_control` price verbatim, so the
-licence document and the 402 challenge quote the same number by construction
+license document and the 402 challenge quote the same number by construction
 rather than by being kept in sync by hand. `permits type="usage"` is the
 `content_signal` mapped through the table above, and the `urn` ends in the
-licence's index within the origin.
+license's index within the origin.
 
 The same configuration produces a TDM reservation, served as JSON:
 
@@ -358,7 +358,7 @@ If the served document does not match what is documented here, open an issue aga
 ## Companion documents
 
 - [content-for-agents.md](content-for-agents.md): the broader user guide. Covers content negotiation, transforms, the JSON envelope, the other projections (robots.txt, llms.txt, tdmrep.json), and aipref signals.
-- [ai-crawl-control.md](ai-crawl-control.md): the `ai_crawl_control` policy reference (tiers, pricing, paywall behaviour).
+- [ai-crawl-control.md](ai-crawl-control.md): the `ai_crawl_control` policy reference (tiers, pricing, paywall behavior).
 
 External references:
 

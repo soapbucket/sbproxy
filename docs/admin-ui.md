@@ -244,7 +244,7 @@ rather than a round trip and a `400`.
 fields are `serde_json::Value` in the config types (`origins[].action`,
 `policies`, `transforms`, `authentication`), so the schema describes no
 shape for them and no form can. Those drop to a YAML box scoped to that
-one node, labelled with why. The detection is by shape rather than by a
+one node, labeled with why. The detection is by shape rather than by a
 list of known paths, so a fifth opaque field added later falls back the
 same way instead of rendering as a section with no settings in it.
 
