@@ -4,7 +4,16 @@
 
 # SBproxy
 
-*Last modified: 2026-07-28*
+*Last modified: 2026-08-03*
+
+<p align="center">
+  <a href="https://github.com/soapbucket/sbproxy/actions/workflows/ci.yml"><img src="https://github.com/soapbucket/sbproxy/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+  <a href="https://github.com/soapbucket/sbproxy/releases/latest"><img src="https://img.shields.io/github/v/release/soapbucket/sbproxy?color=157A5B" alt="Latest release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="Apache 2.0 license"></a>
+  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-1.82%2B-orange.svg" alt="Rust 1.82 or newer"></a>
+  <a href="https://hub.docker.com/r/soapbucket/sbproxy"><img src="https://img.shields.io/docker/v/soapbucket/sbproxy?label=docker&amp;color=2496ED" alt="Docker image"></a>
+  <a href="https://sbproxy.dev"><img src="https://img.shields.io/badge/docs-sbproxy.dev-16150F.svg" alt="Documentation"></a>
+</p>
 
 SBproxy is an open source Enterprise AI Gateway for API, MCP and agent, and AI model traffic. Every feature in this repository ships under Apache-2.0.
 
@@ -74,16 +83,6 @@ target/release/sbproxy --version
 ## Documentation and examples
 
 [Documentation index](docs/README.md) groups the guides by first run, traffic type, operations, and reference material. The [`examples/`](examples/) directory contains complete configurations. For the configuration schema, use [configuration.md](docs/configuration.md); for the command surface, use [manual.md](docs/manual.md).
-
-## Acknowledgments
-
-SBproxy is built on the work of several open source projects. Thanks to:
-
-- [Pingora](https://github.com/cloudflare/pingora) - the HTTP proxy framework this gateway's data plane runs on.
-- [vLLM](https://github.com/vllm-project/vllm) and [llama.cpp](https://github.com/ggml-org/llama.cpp) - the inference engines the model host drives.
-- [OWASP Core Rule Set](https://github.com/coreruleset/coreruleset) - the WAF rule set the `waf` policy is built against.
-- [LiteLLM](https://github.com/BerriAI/litellm) - `model_prices_and_context_window.json`, the pricing and context-window dataset the AI gateway consumes for cost accounting.
-- [quick-xml](https://github.com/tafia/quick-xml) and [wasmtime](https://github.com/bytecodealliance/wasmtime) - the XML parser and the WebAssembly runtime behind the scripting surface.
 
 ## Contributing and license
 
