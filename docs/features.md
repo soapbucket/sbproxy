@@ -31,8 +31,8 @@ A built-in Web Application Firewall (WAF) running OWASP Core Rule Set (CRS) scre
 * **Examples:** [WAF](../examples/waf/), [DDoS Protection](../examples/ddos-protection/), [Rate Limiting](../examples/rate-limiting/), [IP Filter](../examples/ip-filter/)
 
 ### Scripting & Custom Transforms
-When declarative config isn't enough, inject custom logic via Lua, JavaScript, WebAssembly (WASM), or CEL expressions. You can rewrite headers, transform payloads, and implement bespoke policies.
-* **Docs:** [Scripting Guide](scripting.md), [Custom Engines](custom-engines.md), [WASM Development](wasm-development.md)
+When declarative config isn't enough, inject custom logic via Lua, JavaScript, WebAssembly (WASM), or CEL expressions. You can rewrite headers, transform payloads, and implement bespoke policies. Package complex behaviors with Extension Bundles.
+* **Docs:** [Scripting Guide](scripting.md), [Extension Bundles](extension-bundles.md), [Custom Engines](custom-engines.md), [WASM Development](wasm-development.md)
 * **Examples:** [CEL Policy](../examples/cel-policy/), [Transform Lua](../examples/transform-lua/), [WASM Transform](../examples/wasm-transform/)
 
 ### OpenAPI & Admin APIs
@@ -58,12 +58,12 @@ Go beyond round-robin with LLM-aware routing strategies like lowest latency, lea
 
 ### Budgets & Metering
 Enforce hard or soft budgets on AI spend by workspace, user, or key. SBproxy calculates token counts and USD costs locally, emitting metrics for attribution and saving tamper-evident logs.
-* **Docs:** [AI Predictive Budget](ai-predictive-budget.md), [AI Usage Ledger](ai-usage-ledger.md), [Metering](metering.md)
+* **Docs:** [AI Predictive Budget](ai-predictive-budget.md), [AI Usage Ledger](ai-usage-ledger.md), [Value Ledger Economics](value-ledger-economics.md), [Metering](metering.md)
 * **Examples:** [AI Budget](../examples/ai-budget/), [AI Usage Ledger](../examples/ai-usage-ledger/), [Metering Verify](../examples/metering-verify/)
 
 ### Guardrails & Policy
 Apply input/output guardrails using local classifiers or external APIs to detect toxicity, jailbreaks, and PII. You can use the Guardrail Mesh to fuse multiple safety verdicts and write complex rules with the AI CEL policy plane.
-* **Docs:** [Guardrails](guardrails.md), [AI Guardrail Mesh](ai-guardrail-mesh.md), [AI Policy CEL](ai-policy-cel.md), [Prompt Injection](prompt-injection-v2.md)
+* **Docs:** [Guardrails](guardrails.md), [AI Guardrail Mesh](ai-guardrail-mesh.md), [AI Policy CEL](ai-policy-cel.md), [Prompt Injection](prompt-injection-v2.md), [Classifier Sidecar](classifier-sidecar.md)
 * **Examples:** [AI Guardrails](../examples/ai-guardrails/), [AI Safety Classifiers](../examples/ai-safety-classifiers/), [AI Regex DLP](../examples/ai-regex-dlp/)
 
 ### Context Compression & Caching
