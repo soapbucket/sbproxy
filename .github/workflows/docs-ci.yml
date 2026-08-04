@@ -132,11 +132,24 @@ jobs:
       # WOR-1826 asked every branch to regenerate docs/llms-full.txt so
       # the corpus never drifted from the docs. That worked, and it also
       # meant two concurrent doc PRs always conflicted on a 2 MB
-      # generated file. WOR-2119 moved the regeneration to
-      # llms-full-refresh.yml, which owns the file on main; a branch
-      # that hand-carries it is back to conflicting with every other
-      # branch, so reject it here and say what to run instead.
-      - name: llms-full.txt is left to CI
+      # generated file. WOR-2119 answered that by having a workflow push
+      # the file to main after every merge, and rejecting any branch
+      # that carried it.
+      #
+      # That push is gone. `main` requires a pull request now, so the
+      # workflow's direct push was refused on every run and the corpus
+      # went stale while CI stayed green. Rather than hand a bypass
+      # credential to a docs generator, regeneration moved to release
+      # prep: a release cannot be cut with a stale corpus, enforced by
+      # release-checks.yml, and the file is allowed to go stale in
+      # between.
+      #
+      # So this step no longer forbids the file. It requires that a
+      # branch carrying it carries the generator's own output, which is
+      # what stops a hand edit. Conflicts are back in principle, but
+      # only between branches that opt into regenerating, and ordinary
+      # doc PRs have no reason to.
+      - name: llms-full.txt is current if carried
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -150,17 +163,22 @@ jobs:
             echo "docs/llms-full.txt untouched by this branch"
             exit 0
           fi
+          # `--check` reuses the committed `Generated:` timestamp, so a
+          # current corpus does not read as stale on its header alone.
+          if bash scripts/regen-llms-full.sh --check; then
+            echo "docs/llms-full.txt matches the generator"
+            exit 0
+          fi
           # Workflow commands are read from stdout, so the annotation
           # has to go there rather than stderr to reach the PR.
           cat <<'MSG'
-          ::error::this branch commits docs/llms-full.txt, which CI now owns.
+          ::error::docs/llms-full.txt does not match the generator.
 
-          Drop it from the branch:
+          This branch changes the corpus, so it has to be generated
+          output rather than a hand edit. Regenerate it:
 
-            git checkout origin/main -- docs/llms-full.txt
-            git commit -m 'chore: drop generated llms-full.txt from the branch'
+            bash scripts/regen-llms-full.sh
 
-          The llms-full-refresh workflow regenerates it on main after
-          this PR merges. Edit the source docs/*.md; never the corpus.
+          Edit the source docs/*.md; never the corpus itself.
           MSG
           exit 1

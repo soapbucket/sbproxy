@@ -4,10 +4,25 @@
 //!
 //! Reads a request's JA4 fingerprint (captured by
 //! `sbproxy-tls::parse_client_hello` at handshake time) and compares
-//! it against the vendored TLS-fingerprint catalogue
-//! (`crates/sbproxy-classifiers/data/tls-fingerprints.json`). On a
-//! match, it returns [`HeadlessSignal::Detected`] with the library
-//! name (`puppeteer`, `playwright`, ...) and a confidence score.
+//! it against a TLS-fingerprint catalogue. On a match, it returns
+//! [`HeadlessSignal::Detected`] with the library name (`puppeteer`,
+//! `playwright`, ...) and a confidence score.
+//!
+//! # The catalogue ships empty
+//!
+//! `crates/sbproxy-classifiers/data/tls-fingerprints.json` names the
+//! agent classes and carries no fingerprints. A JA4 value is a
+//! measurement of one specific client build, and the published
+//! collections of those measurements carry their own license terms, so a
+//! populated default meant redistributing licensed third-party data
+//! inside an Apache-2.0 binary (WOR-2296).
+//!
+//! An absent or empty class answers `true`, the conservative direction,
+//! so a stock build never contradicts a client on fingerprint grounds.
+//! Operators supply measured values with
+//! `proxy.extensions.tls_fingerprint.catalog_file`, which replaces the
+//! embedded catalogue wholesale rather than merging into it. See
+//! `docs/headless-detection.md` for how to capture one.
 //!
 //! # Trustworthy gating
 //!
@@ -18,10 +33,10 @@
 //! signal advisory rather than load-bearing for hard policy
 //! decisions made by trustworthy=false traffic.
 //!
-//! # Agent classes added
+//! # Agent classes
 //!
-//! The catalog ships three entries that the resolver chain emits
-//! when this detector matches:
+//! These are the classes the resolver chain emits when this detector
+//! matches, given a catalogue that names them:
 //!
 //! - `headless-browser` (generic fallthrough)
 //! - `headless-puppeteer`
@@ -58,7 +73,7 @@ pub enum HeadlessSignal {
 
 // --- Catalog loader ---
 
-/// One entry in the vendored TLS-fingerprint catalogue.
+/// One entry in a TLS-fingerprint catalogue.
 ///
 /// Mirrors the JSON schema for the reference fingerprint catalogue.
 /// Every field defaults to empty so partial entries (e.g.
@@ -94,8 +109,8 @@ struct CatalogFile {
 /// Loaded TLS-fingerprint catalogue with prebuilt JA4 -> entry index
 /// for O(1) detector lookups.
 ///
-/// Built once at startup (or on SIGHUP reload) from the vendored
-/// JSON file. The proxy holds it behind an `Arc` so the
+/// Built once at startup (or on SIGHUP reload) from the embedded
+/// default or an operator's `catalog_file`. The proxy holds it behind an `Arc` so the
 /// detector hot path borrows without cloning.
 #[derive(Debug, Clone)]
 pub struct TlsFingerprintCatalog {
@@ -105,9 +120,11 @@ pub struct TlsFingerprintCatalog {
     by_ja4: HashMap<String, usize>,
 }
 
-/// Embedded default catalogue. Consumed at startup; operators can
-/// override via the `tls_fingerprint.catalog_path` config or replace
-/// at build time.
+/// Embedded default catalogue. It names the agent classes and carries
+/// **no fingerprints**: see the file's own `notes` and WOR-2296 for why
+/// a populated default was removed. Operators supply their own with
+/// `proxy.extensions.tls_fingerprint.catalog_file`, which replaces this
+/// wholesale rather than merging into it.
 pub(crate) const DEFAULT_TLS_FINGERPRINT_JSON: &str =
     include_str!("../../sbproxy-classifiers/data/tls-fingerprints.json");
 
@@ -117,6 +134,26 @@ impl TlsFingerprintCatalog {
         let file: CatalogFile =
             serde_json::from_str(json).context("failed to parse tls-fingerprints.json")?;
         Self::from_entries(file.entries)
+    }
+
+    /// Read a catalogue from an operator-supplied file.
+    ///
+    /// The error names the path, because the alternative is a boot log
+    /// that says a catalogue failed to parse without saying which of the
+    /// embedded default and the operator's file it meant.
+    pub fn from_path(path: &std::path::Path) -> Result<Self> {
+        let json = std::fs::read_to_string(path).with_context(|| {
+            format!(
+                "failed to read TLS fingerprint catalogue {}",
+                path.display()
+            )
+        })?;
+        Self::from_json(&json).with_context(|| {
+            format!(
+                "failed to parse TLS fingerprint catalogue {}",
+                path.display()
+            )
+        })
     }
 
     /// Build a catalogue from a parsed entry list. Validates that
@@ -403,6 +440,88 @@ mod tests {
         assert_eq!(cat.len(), 1);
         let r = detect(&cat, Some("t13d1516h2_8daaf6152771"), true);
         assert!(matches!(r, HeadlessSignal::Detected { .. }));
+    }
+
+    /// The embedded catalogue must carry no fingerprints.
+    ///
+    /// This is the guard on WOR-2296 rather than a test of behavior. The
+    /// file used to ship JA4 values copied from a third-party
+    /// fingerprint database, under a license that reserved the
+    /// commercial redistribution our Apache-2.0 grant hands out. Nothing
+    /// about a populated catalogue looks wrong in review, which is how
+    /// it survived: the fix only holds if re-adding a value fails the
+    /// build and makes someone say where it came from.
+    ///
+    /// Measured your own? It belongs in an operator `catalog_file`, or
+    /// in a fixture next to the test that needs it, not here.
+    #[test]
+    fn the_embedded_catalogue_ships_no_fingerprints() {
+        let file: CatalogFile =
+            serde_json::from_str(DEFAULT_TLS_FINGERPRINT_JSON).expect("embedded catalogue parses");
+        assert!(
+            !file.entries.is_empty(),
+            "the embedded catalogue still names the agent classes; only the \
+             fingerprints are removed"
+        );
+        for entry in &file.entries {
+            assert!(
+                entry.ja3.is_empty() && entry.ja4.is_empty() && entry.ja4h.is_empty(),
+                "agent class `{}` carries embedded fingerprints. A JA3/JA4/JA4H \
+                 value is a measurement of one client build and the published \
+                 collections of them are separately licensed, so the shipped \
+                 default stays empty (WOR-2296). Put measured values in an \
+                 operator catalog_file.",
+                entry.agent_class
+            );
+        }
+    }
+
+    #[test]
+    fn from_path_reads_an_operator_catalogue_and_matches_against_it() {
+        let path = std::env::temp_dir().join(format!(
+            "sbproxy-tls-fingerprints-{}-{}.json",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(
+            &path,
+            r#"{
+                "version": 2,
+                "updated_at": "2026-08-04T00:00:00Z",
+                "entries": [
+                    {
+                        "agent_class": "headless-puppeteer",
+                        "ja4": ["t13d1517h2_aaaaaaaaaaaa_aaaaaaaaaaaa"]
+                    }
+                ]
+            }"#,
+        )
+        .expect("write catalogue");
+
+        let cat = TlsFingerprintCatalog::from_path(&path).expect("load catalogue");
+        assert_eq!(cat.len(), 1);
+        // The operator's file is the whole catalogue, not a layer over
+        // the embedded one: a class the embedded file names is unknown
+        // here because this file does not name it.
+        assert!(cat
+            .lookup_ja4("t13d1517h2_aaaaaaaaaaaa_aaaaaaaaaaaa")
+            .is_some());
+        assert!(cat.lookup_ja4("t13d1516h2_8daaf6152771").is_none());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A boot log that says a catalogue failed to load without saying
+    /// which file it meant sends the operator to the wrong place.
+    #[test]
+    fn from_path_error_names_the_file() {
+        let path = std::env::temp_dir().join("sbproxy-tls-fingerprints-does-not-exist.json");
+        let err = TlsFingerprintCatalog::from_path(&path).expect_err("missing file must error");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("sbproxy-tls-fingerprints-does-not-exist.json"),
+            "error must name the path, got: {rendered}"
+        );
     }
 
     #[test]

@@ -326,6 +326,76 @@ generated with: cargo metadata --format-version 1
 
 ===========================================================================
 
+EMBEDDED ADMIN CONSOLE ASSETS
+
+The `embed-admin-ui` cargo feature compiles `ui/dist` into the binary with
+`include_dir!`, and every release artifact enables it. The web fonts and
+JavaScript below are therefore redistributed inside the binary even though
+they are build output and are not committed to this repository.
+
+===========================================================================
+
+Instrument Sans
+Copyright 2022 The Instrument Sans Project Authors
+Licensed under the SIL Open Font License, Version 1.1
+https://github.com/Instrument/instrument-sans
+
+Bundled as woff and woff2 faces via the `@fontsource/instrument-sans` npm
+package so an air-gapped deployment needs no font CDN.
+
+===========================================================================
+
+JetBrains Mono
+Copyright 2020 The JetBrains Mono Project Authors
+Licensed under the SIL Open Font License, Version 1.1
+https://github.com/JetBrains/JetBrainsMono
+
+Bundled as woff and woff2 faces via the `@fontsource/jetbrains-mono` npm
+package, for the same reason.
+
+===========================================================================
+
+yaml
+Copyright Eemeli Aro
+Licensed under the ISC License
+https://github.com/eemeli/yaml
+
+Part of the admin console's JavaScript bundle. Named here because the
+package ships no license banner of its own, so nothing in the built
+bundle carries its notice.
+
+===========================================================================
+
+Vue and Vue Router
+Copyright 2018-present Yuxi (Evan) You and Vue contributors
+Copyright 2019-present Eduardo San Martin Morote
+Licensed under the MIT License
+https://github.com/vuejs/core and https://github.com/vuejs/router
+
+Part of the admin console's JavaScript bundle. The bundler preserves
+their own `@license MIT` banners in the output; listed here as well so
+this file is a complete account of what ships.
+
+===========================================================================
+
+WEB APPLICATION FIREWALL RULE CORPUS
+
+===========================================================================
+
+OWASP CRS
+Copyright 2026 OWASP CRS project
+Licensed under the Apache License, Version 2.0
+https://github.com/coreruleset/coreruleset
+
+`crates/sbproxy-modules/src/policy/waf/coreruleset/owasp-crs-bundle.json`
+takes its rule id space, category numbering, and paranoia model from the
+OWASP Core Rule Set. The rule patterns themselves are authored here
+rather than copied: upstream ships ModSecurity `.conf` files and uses
+libinjection operators where this bundle uses regular expressions. Listed
+because the naming asserts the provenance either way.
+
+===========================================================================
+
 CHANGES TO THIRD-PARTY CODE
 
 This project uses Pingora as a dependency via Cargo (crates.io v0.8.0).

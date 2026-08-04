@@ -65,6 +65,64 @@ Pair with `request.agent.score` and the JA4 verdict for a layered defense: a ben
 When both `rule_pack_path` and `onnx_model_path` are set, exact
 rule-pack identity matches win and the ONNX scorer runs on rule misses.
 
+## The fingerprint catalogue ships empty
+
+`tls_fingerprint_matches(ja4, agent_class_id)` reads a catalogue of known
+JA3 / JA4 / JA4H values per agent class. That catalogue contains the class
+names and **no fingerprints**.
+
+The reason is licensing rather than laziness. A JA4 value is a measurement
+of one specific client build, and the published collections of those
+measurements come with their own license terms. Shipping a populated
+default meant redistributing somebody else's licensed data inside an
+Apache-2.0 binary, which is a promise we cannot keep on data we do not
+own.
+
+An empty class answers `true`, which is the conservative direction. A
+stock build therefore never contradicts a client on fingerprint grounds:
+detection is inert rather than wrong, and no legitimate crawler is
+accused of spoofing because we guessed at its hash.
+
+Supply your own file to turn it on:
+
+```yaml
+proxy:
+  extensions:
+    tls_fingerprint:
+      enabled: true
+      catalog_file: /etc/sbproxy/tls-fingerprints.json
+```
+
+It replaces the embedded catalogue wholesale rather than merging into it,
+so the file you wrote is the whole truth and nothing ships underneath it
+that you did not put there. The schema is
+`crates/sbproxy-classifiers/data/tls-fingerprints.json`.
+
+### Capturing a value
+
+The proxy already computes the fingerprint of every live handshake and
+exposes it as `request.tls.ja4`, so a known-good client is one catalogue
+line. Stamp it into a response header with a CEL transform and read it
+back:
+
+```yaml
+transforms:
+  - type: cel
+    response_headers:
+      x-ja4: request.tls.ja4
+```
+
+Then send one request from the client you want to catalogue and record
+what comes back. An access-log field works equally well for collecting
+values from real traffic over time.
+
+Two things worth knowing before you trust a value. A headless
+fingerprint tracks the bundled Chromium build, so a hash captured from
+Puppeteer 22 says nothing about Puppeteer 23; capture per release you
+care about. And a value is only as trustworthy as the client that
+produced it, so capture from a client you control rather than from
+traffic you are trying to classify.
+
 ## Scope and limitations
 
 This module is the deterministic, request-side half of the headless-detection design. Two further layers compose on top in follow-ups:

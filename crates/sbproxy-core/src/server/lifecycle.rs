@@ -333,14 +333,34 @@ fn install_detection_singletons(compiled: &sbproxy_config::CompiledConfig) {
     // --- Wave 5 / G5.4: TLS-fingerprint catalogue ---
     //
     // The catalogue lives behind an arc-swap so reloads can refresh it
-    // without dropping in-flight detector reads. The embedded JSON ships
-    // with the seed entries from A5.1; the builder task (B5.x) refreshes
-    // the file via a monthly PR. Failures degrade gracefully: an empty
-    // catalogue means the detector never matches, the safe default.
+    // without dropping in-flight detector reads. Failures degrade
+    // gracefully: an empty catalogue matches everything, which is the
+    // conservative direction, so nothing is accused of spoofing because
+    // a file was unreadable.
+    //
+    // The embedded default names the agent classes and carries no
+    // fingerprints (WOR-2296), so out of the box this installs a
+    // catalogue that answers `true` for everything. An operator's
+    // `catalog_file` replaces it wholesale rather than merging, so the
+    // file they wrote is the whole truth.
     #[cfg(feature = "tls-fingerprint")]
     {
         use std::sync::Arc as TlsFingerprintArc;
-        match sbproxy_security::TlsFingerprintCatalog::default_embedded() {
+        // A malformed `tls_fingerprint` block is already refused earlier
+        // in config load when the operator asked for capture, so this
+        // falling back to the default is the disabled-or-absent case
+        // rather than a swallowed error.
+        let operator_catalog =
+            crate::pipeline::TlsFingerprintConfig::from_extensions(&compiled.server.extensions)
+                .ok()
+                .and_then(|cfg| cfg.catalog_file);
+        let loaded = match operator_catalog {
+            Some(path) => {
+                sbproxy_security::TlsFingerprintCatalog::from_path(std::path::Path::new(&path))
+            }
+            None => sbproxy_security::TlsFingerprintCatalog::default_embedded(),
+        };
+        match loaded {
             Ok(catalog) => {
                 // Also install the CEL matcher adapter so
                 // `tls_fingerprint_matches(ja4, agent_class_id)`
@@ -359,7 +379,7 @@ fn install_detection_singletons(compiled: &sbproxy_config::CompiledConfig) {
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "failed to load embedded TLS fingerprint catalogue; headless detection disabled"
+                    "failed to load TLS fingerprint catalogue; headless detection disabled"
                 );
             }
         }

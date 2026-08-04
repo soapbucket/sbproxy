@@ -170,3 +170,44 @@ jobs:
 
       - name: run acme integration tests
         run: cargo test -p sbproxy-tls --test acme_integration --locked -- --ignored
+
+  llms-full-corpus:
+    name: llms-full.txt is current
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+
+      # `docs/llms-full.txt` is generated, committed, and published as
+      # sbproxy.dev/llms-full.txt. Nothing regenerates it on merge any
+      # more: main requires a pull request, so the workflow that used to
+      # push it there was refused on every run, and the alternative was
+      # giving a docs generator a credential that bypasses branch
+      # protection. It is regenerated during release prep instead.
+      #
+      # Which makes this the gate that keeps "regenerate before you tag"
+      # from being folklore. On a `v*` tag it fails the release lane. On
+      # the nightly run it is the early warning that the corpus has
+      # drifted since the last release, which is exactly the rot this
+      # workflow's header says it exists to catch. Being stale mid-cycle
+      # is expected and is not itself a problem; being stale at a tag is.
+      - name: corpus matches the docs it is generated from
+        run: |
+          set -euo pipefail
+          if bash scripts/regen-llms-full.sh --check; then
+            exit 0
+          fi
+          cat <<'MSG'
+          ::error::docs/llms-full.txt is stale.
+
+          Regenerate it and commit the result before tagging:
+
+            bash scripts/regen-llms-full.sh
+            git add docs/llms-full.txt
+            git commit -m 'chore(docs): regenerate llms-full.txt'
+
+          The corpus ships as sbproxy.dev/llms-full.txt, so a release
+          cut from here publishes documentation that does not match the
+          docs in the same tag.
+          MSG
+          exit 1

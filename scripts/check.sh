@@ -134,13 +134,16 @@ if grep -rn 'WOR-XXX' crates/ --include='*.rs' --include='*.toml'; then
 fi
 printf 'no WOR-XXX placeholders under crates/\n'
 
-# CI: docs-ci.yml, "llms-full.txt is left to CI". CI asks the API for
-# the PR's file list because its checkout is shallow. Locally the same
-# question is a diff against the MERGE BASE with origin/main. It has to
-# be the merge base and not origin/main's tip: main regenerates this
-# file on every merge, so diffing against the tip would fail every
-# branch the moment main moved ahead.
-step "docs/llms-full.txt is left to CI"
+# CI: docs-ci.yml, "llms-full.txt is current if carried". A branch may
+# carry the corpus, and the rule is that it has to be what the generator
+# produces rather than a hand edit. Nothing rejects the file any more:
+# WOR-2119 kept it off branches because a workflow pushed it to main
+# after every merge, and that push cannot exist now that main requires a
+# pull request. Regeneration moved to release prep instead.
+#
+# `--check` reuses the committed `Generated:` line, so the timestamp in
+# the header does not make a current file look stale.
+step "docs/llms-full.txt is current if carried"
 if [ "$GIT_AVAILABLE" != "1" ]; then
   note_skip "docs/llms-full.txt guard (not inside a git work tree)"
 else
@@ -148,15 +151,14 @@ else
   if [ -z "$LLMS_BASE" ]; then
     note_skip "docs/llms-full.txt guard (no merge base with origin/main; run 'git fetch origin main' first)"
   elif git diff --quiet "$LLMS_BASE" -- docs/llms-full.txt; then
-    printf 'docs/llms-full.txt is unchanged since the merge base with origin/main\n'
+    printf 'docs/llms-full.txt untouched by this branch\n'
+  elif bash scripts/regen-llms-full.sh --check; then
+    printf 'docs/llms-full.txt matches the generator\n'
   else
-    printf '\nThis branch changes docs/llms-full.txt, which CI now owns.\n' >&2
-    printf '\nllms-full-refresh.yml regenerates it on main after the merge, so a\n' >&2
-    printf 'branch that carries it fails the docs lane and conflicts with every\n' >&2
-    printf 'other doc branch on a 2 MB generated file. Drop it:\n\n' >&2
-    printf '  git checkout origin/main -- docs/llms-full.txt\n' >&2
-    printf "  git commit -m 'chore: drop generated llms-full.txt from the branch'\n\n" >&2
-    printf 'Edit the source docs/*.md instead; never the corpus.\n' >&2
+    printf '\nThis branch changes docs/llms-full.txt and it does not match the\n' >&2
+    printf 'generator, so it is a hand edit or a stale regeneration.\n\n' >&2
+    printf '  bash scripts/regen-llms-full.sh\n\n' >&2
+    printf 'Edit the source docs/*.md and regenerate; never edit the corpus.\n' >&2
     exit 1
   fi
 fi

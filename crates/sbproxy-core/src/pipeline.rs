@@ -911,6 +911,30 @@ pub struct TlsFingerprintConfig {
     /// sidecar reported it as trustworthy.
     #[serde(default)]
     pub untrusted_client_cidrs: Vec<String>,
+    /// Path to a JA3 / JA4 / JA4H catalogue, in the schema of
+    /// `crates/sbproxy-classifiers/data/tls-fingerprints.json`. When
+    /// set, it replaces the embedded catalogue entirely rather than
+    /// merging with it, so an operator's file is the whole truth and
+    /// nothing ships underneath it that they did not put there.
+    ///
+    /// This exists because the embedded catalogue carries **no
+    /// fingerprints**. A JA4 value is a measurement of a specific
+    /// client, and the published databases of those measurements come
+    /// with their own licenses, so shipping a populated default meant
+    /// redistributing somebody else's licensed data inside an
+    /// Apache-2.0 binary (WOR-2296). Capturing the values is the
+    /// operator's job now, and the trade is deliberate: an empty
+    /// catalogue answers every `tls_fingerprint_matches` with `true`,
+    /// which is the conservative direction. Detection is inert until a
+    /// file is supplied; nothing is falsely accused of spoofing.
+    ///
+    /// Populate it from your own traffic. `request.tls.ja4` carries the
+    /// value this proxy computed for the live handshake, so a CEL
+    /// transform that stamps it into a response header, or an access-log
+    /// field, turns a known-good client into one catalogue line. See
+    /// `docs/headless-detection.md`.
+    #[serde(default)]
+    pub catalog_file: Option<String>,
     /// Pre-parsed [`Self::trustworthy_client_cidrs`] (WOR-1698/WOR-1699),
     /// compiled once at config load so the per-request fingerprint path
     /// does a membership check without re-parsing CIDR strings. Populated
