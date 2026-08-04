@@ -114,7 +114,7 @@ The fail-closed contract is deliberate: a misconfigured or unreachable judge can
 
 ## NL-to-Cedar decision
 
-SBproxy does not offer NL-to-Cedar compilation or a compiled-policy store. The inactive components had no runtime consumer and were removed in WOR-1986. `semantic_constraint` remains supported because it evaluates its configured judge directly. Reintroduce a compiler only with a concrete runtime consumer, evaluator or durable-store contract, and an explicit configuration lifecycle.
+SBproxy does not offer NL-to-Cedar compilation or a compiled-policy store. The inactive components had no runtime consumer and were removed. `semantic_constraint` remains supported because it evaluates its configured judge directly. Reintroduce a compiler only with a concrete runtime consumer, evaluator or durable-store contract, and an explicit configuration lifecycle.
 
 ## request_validator
 

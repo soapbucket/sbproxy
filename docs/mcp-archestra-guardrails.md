@@ -1,7 +1,7 @@
 # MCP Archestra guardrails
 *Last modified: 2026-07-19*
 
-WOR-1787 adds a small set of MCP gateway mechanisms borrowed from the
+SBproxy carries a small set of MCP gateway mechanisms borrowed from the
 Archestra teardown. They are implemented inside the sbproxy repository
 and are configured on the `mcp` action. The Terraform provider is not
 implemented.

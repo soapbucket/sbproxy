@@ -44,7 +44,7 @@ A `disabled` field is retained in the schema but cannot activate runtime behavio
 
 - An omitted block or its disabled value remains valid for config compatibility.
 - Attempting to enable unavailable behavior fails config compilation instead of being ignored.
-- Currently applies to the `http3` block. Native HTTP/3 support is tracked in WOR-1969.
+- Currently applies to the `http3` block. Native HTTP/3 support is not implemented.
 
 ### `config-only`
 
@@ -171,7 +171,7 @@ tier definitions above only where a field is listed explicitly.
 
 ### `proxy.http3` - Http3Config
 
-HTTP/3 is not served by this build. The block is retained for forward compatibility: omission or `enabled: false` compiles, while `enabled: true` fails config compilation with a reference to WOR-1969.
+HTTP/3 is not served by this build. The block is retained for forward compatibility: omission or `enabled: false` compiles, while `enabled: true` fails config compilation and says so plainly.
 
 | Field | Type | Default | Stability | Notes |
 |---|---|---|---|---|

@@ -160,7 +160,7 @@ the next version cut.
 
 ### Removed
 
-- **The in-process embedded engine (`engine: embedded`, WOR-1658).**
+- **The in-process embedded engine (`engine: embedded`).**
   Never on by default (it required a build with `--features embedded`) and
   never certified: no dedicated tests, no CI lane, and no capability-ledger
   entry. llama.cpp already covers the CPU/Metal, zero-external-binary case
@@ -471,7 +471,7 @@ the next version cut.
   Safe future sleep/wake wiring needs bounded asynchronous transition polling,
   retained process ownership and accounting after cleanup failures, a bounded
   host-RAM policy, isolated container development endpoints, and end-to-end
-  fake-engine coverage (WOR-1987).
+  fake-engine coverage.
 
 ### Changed
 

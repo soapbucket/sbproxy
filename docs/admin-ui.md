@@ -791,11 +791,11 @@ operator workflow in this table.
 
 | Capability without a dedicated view | Available today | Disposition |
 |---|---|---|
-| MCP servers, tools, versions, risk, and quarantine | Config, Logs, Metrics, and session linkage | Fold server/tool inventory and bounded failure reasons into the Agent and Tool Traffic follow-up, WOR-2079. |
-| A2A hops and denials; Agent Skills integrity | Config plus raw metrics and audit events | Fold runtime health into WOR-2079. Keep declarative Agent Skills authoring in Config. |
-| Agent identity and trust; AI crawler verification; RSL/CAP payment outcomes; Web Bot Auth | Overview health, Config, Logs, Metrics, Spend, and the bundled Grafana AI-traffic dashboard | Fold the embedded-console traffic and paid/blocked summaries into WOR-2079. Keep RSL terms and crawler policy authoring in Config. |
-| Outbound credentials and DPoP proofs | Credentials, Config, and redacted Logs | Keep proof policy declarative. Credential health remains a candidate under the broader console-coverage epic, WOR-1958. |
-| CEL, Lua, JavaScript, and WASM policy execution | Config, Audit, and Logs | Keep authoring in Config; the existing WOR-199 follow-up owns replay-diff visualization. |
+| MCP servers, tools, versions, risk, and quarantine | Config, Logs, Metrics, and session linkage | Planned, not shipped: server and tool inventory plus bounded failure reasons fold into the agent and tool traffic view. |
+| A2A hops and denials; Agent Skills integrity | Config plus raw metrics and audit events | Planned, not shipped: runtime health folds into the same agent and tool traffic view. Declarative Agent Skills authoring stays in Config. |
+| Agent identity and trust; AI crawler verification; RSL/CAP payment outcomes; Web Bot Auth | Overview health, Config, Logs, Metrics, Spend, and the bundled Grafana AI-traffic dashboard | Planned, not shipped: embedded-console traffic and the paid and blocked summaries fold into the agent and tool traffic view. RSL terms and crawler policy authoring stay in Config. |
+| Outbound credentials and DPoP proofs | Credentials, Config, and redacted Logs | Proof policy stays declarative. Credential health is a candidate for the broader console-coverage work rather than a commitment. |
+| CEL, Lua, JavaScript, and WASM policy execution | Config, Audit, and Logs | Authoring stays in Config. Replay-diff visualization is a separate planned follow-up. |
 
 The same audit found three documentation-only gaps, Get started, Jobs,
 and Operators, which the sections above close. Every new component

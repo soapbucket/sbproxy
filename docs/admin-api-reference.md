@@ -1716,8 +1716,8 @@ Use it instead of polling to follow a long load to completion.
 
 ## Cache admin
 
-Two independent operator surfaces on the admin server (WOR-1754 /
-WOR-1755), unrelated to the model-host artifact cache above:
+Two independent operator surfaces on the admin server, unrelated to the
+model-host artifact cache above:
 
 | Method | Path | Purpose |
 |---|---|---|

@@ -1605,7 +1605,7 @@ Pingora's runtime defaults.
 HTTP/3 is not served by this build. No QUIC listener is started and no
 `Alt-Svc` header is advertised. The `proxy.http3` shape is retained for
 forward compatibility, but config compilation rejects `enabled: true`
-with a reference to WOR-1969. HTTP/2 is the highest version served. The
+and says so plainly. HTTP/2 is the highest version served. The
 reserved shape is:
 
 ```yaml

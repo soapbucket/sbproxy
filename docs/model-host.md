@@ -1151,7 +1151,7 @@ Keep-alive starts after the last request permit is released. Active or queued
 work pauses expiry. A draining deployment rejects new work and waits up to the
 configured shutdown deadline for active requests.
 
-Policy-driven eviction stops the engine process. WOR-1987 removed an unwired
+Policy-driven eviction stops the engine process. An earlier release removed an unwired
 sleep/wake HTTP client and a policy-only KV tiering abstraction; neither was a
 supported model-host capability. The engine-native `swap_space_gib` and
 `cpu_offload_gib` settings remain available. A future sleep/wake implementation

@@ -291,7 +291,7 @@ Check:
 Cause: HTTP/3 is not served by this build. The proxy does not start a QUIC listener and does not advertise `Alt-Svc`, so HTTP/2 is the highest version served. Clients that try HTTP/3 fall back to HTTP/2, which is expected.
 
 Check:
-- Config compilation rejects `proxy.http3.enabled: true` and references WOR-1969. Remove the block or set `enabled: false`.
+- Config compilation rejects `proxy.http3.enabled: true`. Remove the block or set `enabled: false`.
 - If you need a UDP/QUIC path today, terminate HTTP/3 at an upstream edge or CDN and forward HTTP/2 to SBproxy.
 
 ## A local model will not serve

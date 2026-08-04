@@ -1470,7 +1470,7 @@ Non-POST responses do not yet settle stored-key token and cost counters.
 Method-aware dispatch is what makes `DELETE /v1/assistants/{id}`,
 `POST /v1/threads/{id}/runs/{id}/cancel`, and the other non-POST verbs work
 end-to-end when their credential policy is satisfiable. Strict settlement for
-these methods is deferred to WOR-1845.
+these methods is not implemented yet.
 
 ### Multipart bodies
 
@@ -1486,7 +1486,7 @@ idempotency, cache, or provider dispatch.
 
 Provider format translation does not run for multipart. Multipart responses do
 not currently settle stored-key token-per-minute or lifetime token and cost
-counters; that work is deferred to WOR-1845.
+counters; that work is not implemented yet.
 
 ### Per-surface configuration
 

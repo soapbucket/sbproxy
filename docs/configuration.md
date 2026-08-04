@@ -396,7 +396,7 @@ proxy:
 
 ### HTTP/3 fields
 
-HTTP/3 is not served by this build. The `http3` shape is retained for forward compatibility: omitting the block or setting `enabled: false` compiles, while `enabled: true` fails config compilation with an actionable error referencing WOR-1969. The remaining fields are reserved and have no runtime effect while the block is disabled.
+HTTP/3 is not served by this build. The `http3` shape is retained for forward compatibility: omitting the block or setting `enabled: false` compiles, while `enabled: true` fails config compilation with an actionable error. The remaining fields are reserved and have no runtime effect while the block is disabled.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|

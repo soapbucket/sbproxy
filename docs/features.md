@@ -2350,4 +2350,4 @@ This flag only affects the plain `http_bind_port` listener. TLS-fronted HTTP/2 o
 
 ### HTTP/3 limitations
 
-HTTP/3 is not served by this build. No QUIC listener is started, and config compilation rejects `proxy.http3.enabled: true` instead of accepting an inert setting. Omission and `enabled: false` remain valid for forward compatibility. Because there is no H3 dispatch path today, the per-action and per-auth limitations that previously applied over HTTP/3 do not apply: all traffic is served over HTTP/1.1 and HTTP/2, where every action and auth module is supported. Native support is tracked in WOR-1969.
+HTTP/3 is not served by this build. No QUIC listener is started, and config compilation rejects `proxy.http3.enabled: true` instead of accepting an inert setting. Omission and `enabled: false` remain valid for forward compatibility. Because there is no H3 dispatch path today, the per-action and per-auth limitations that previously applied over HTTP/3 do not apply: all traffic is served over HTTP/1.1 and HTTP/2, where every action and auth module is supported. Native support is not implemented.
