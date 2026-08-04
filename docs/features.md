@@ -13,27 +13,27 @@ At its core, SBproxy is an extremely capable, hot-reloadable reverse proxy desig
 ### Core Proxy & Routing
 SBproxy routes traffic based on exact hostnames and dynamic forward rules. It supports complex deployment patterns like blue-green and canary rollouts.
 * **Docs:** [Configuration Schema](configuration.md), [Routing & Fallback](routing-strategies.md)
-* **Examples:** [Basic Proxy](../examples/basic-proxy/), [Forward Rules](../examples/forward-rules/), [Host Override](../examples/host-override/)
+* **Examples:** [Basic Proxy](../examples/basic-proxy/), [Forward Rules](../examples/forward-rules/), [Host Override](../examples/host-override/), [gRPC H2C](../examples/grpc-h2c/), [Error Pages](../examples/error-pages/), [Headers & CORS](../examples/headers-and-cors/), [Compression](../examples/compression/)
 
 ### Load Balancing & Health Checks
 Traffic can be distributed across upstream targets using 7 algorithms (including round-robin, least connections, and consistent hashing). Active health checks proactively remove failing targets from the pool.
 * **Docs:** [Performance & Load Balancing](performance.md), [Architecture](architecture.md)
-* **Examples:** [Load Balancer](../examples/load-balancer/), [Active Health Checks](../examples/active-health-checks/), [Circuit Breaker](../examples/circuit-breaker/)
+* **Examples:** [Load Balancer](../examples/load-balancer/), [Active Health Checks](../examples/active-health-checks/), [Circuit Breaker](../examples/circuit-breaker/), [LB Deployment](../examples/load-balancer-deployment/)
 
 ### Authentication & Authorization
 Protect your endpoints with 7 built-in authentication types: API Keys, Basic Auth, Bearer tokens, JWT (with JWKS), Forward Auth, Digest, and mTLS. You can also enforce fine-grained access control.
 * **Docs:** [OIDC Auth](auth-oidc.md), [Object Authz](object-authz.md), [Key Management](key-management.md), [Web Bot Auth](web-bot-auth.md)
-* **Examples:** [Auth JWT](../examples/auth-jwt/), [Auth Forward](../examples/auth-forward/), [mTLS Client Auth](../examples/mtls-client-auth/)
+* **Examples:** [Auth JWT](../examples/auth-jwt/), [Auth Forward](../examples/auth-forward/), [mTLS Client Auth](../examples/mtls-client-auth/), [API Key](../examples/auth-api-key/), [Basic Auth](../examples/auth-basic/), [Bearer Token](../examples/auth-bearer/), [Bearer DPoP](../examples/auth-bearer-dpop/), [CAP Auth](../examples/auth-cap/), [Inbound Keys](../examples/keys-inbound-headers/), [Sessions](../examples/sessions/)
 
 ### Security & Guardrails
 A built-in Web Application Firewall (WAF) running OWASP Core Rule Set (CRS) screens requests before they hit your upstream. SBproxy also mitigates DDoS attacks, HTTP request smuggling, and enforces token-bucket rate limiting.
 * **Docs:** [Threat Model](threat-model.md), [Exposed Credentials](exposed-credentials.md), [Security Model Host](security-model-host.md)
-* **Examples:** [WAF](../examples/waf/), [DDoS Protection](../examples/ddos-protection/), [Rate Limiting](../examples/rate-limiting/), [IP Filter](../examples/ip-filter/)
+* **Examples:** [WAF](../examples/waf/), [DDoS Protection](../examples/ddos-protection/), [Rate Limiting](../examples/rate-limiting/), [IP Filter](../examples/ip-filter/), [CSRF](../examples/csrf/), [Defense in Depth](../examples/defense-in-depth/), [DLP Catalog](../examples/dlp-catalog/), [HSTS](../examples/hsts/), [Page Shield](../examples/page-shield/), [Security Headers](../examples/security-headers/), [SRI](../examples/sri/), [Request Limit](../examples/request-limit/)
 
 ### Scripting & Custom Transforms
 When declarative config isn't enough, inject custom logic via Lua, JavaScript, WebAssembly (WASM), or CEL expressions. You can rewrite headers, transform payloads, and implement bespoke policies. Package complex behaviors with Extension Bundles.
 * **Docs:** [Scripting Guide](scripting.md), [Extension Bundles](extension-bundles.md), [Custom Engines](custom-engines.md), [WASM Development](wasm-development.md)
-* **Examples:** [CEL Policy](../examples/cel-policy/), [Transform Lua](../examples/transform-lua/), [WASM Transform](../examples/wasm-transform/)
+* **Examples:** [CEL Policy](../examples/cel-policy/), [Transform Lua](../examples/transform-lua/), [WASM Transform](../examples/wasm-transform/), [Javascript](../examples/transform-javascript/), [JSON](../examples/transform-json/), [JSON Projection](../examples/transform-json-projection/), [JSON Schema](../examples/transform-json-schema/), [Markdown](../examples/transform-markdown/), [Payload Limit](../examples/transform-payload-limit/), [Replace Strings](../examples/transform-replace-strings/), [Template](../examples/transform-template/), [Variables](../examples/variables-template/), [Encoding](../examples/transform-encoding/), [Storage Action](../examples/storage-action/)
 
 ### OpenAPI & Admin APIs
 Dynamically emit OpenAPI specs for your routes, and validate incoming traffic against them. The Admin API allows real-time metric querying and configuration updates.
@@ -49,17 +49,17 @@ The `ai_proxy` action turns SBproxy into an OpenAI-compatible API gateway capabl
 ### Provider Integration & Model Routing
 Send standard chat completion requests to the proxy, and it routes them based on the model name. You can configure multiple providers and utilize fallback chains to ensure high availability.
 * **Docs:** [AI Gateway](ai-gateway.md), [Providers List](providers.md), [Local Inference](local-inference.md), [Model Host](model-host.md)
-* **Examples:** [AI Multi-Provider](../examples/ai-multi-provider/), [AI OpenRouter](../examples/ai-openrouter/), [AI Local Serving](../examples/ai-local-serving/)
+* **Examples:** [AI Multi-Provider](../examples/ai-multi-provider/), [AI OpenRouter](../examples/ai-openrouter/), [AI Local Serving](../examples/ai-local-serving/), [Bedrock Direct](../examples/ai-bedrock-direct/), [Gemini Direct](../examples/ai-gemini-direct/), [Model Group](../examples/ai-model-group/), [Streaming](../examples/ai-streaming/)
 
 ### Smart Routing & Resilience
 Go beyond round-robin with LLM-aware routing strategies like lowest latency, least token usage, cost-optimized, cascade, or outcome-aware routing. The gateway categorizes upstream failures and retries intelligently.
 * **Docs:** [AI LLM Aware Resilience](ai-llm-aware-resilience.md), [AI Outcome Aware Routing](ai-outcome-aware-routing.md), [AI Load Balancer Benchmark](ai-lb-benchmark.md)
-* **Examples:** [AI Cascade Routing](../examples/ai-cascade-routing/), [AI Outcome Aware Routing](../examples/ai-outcome-aware-routing/), [AI Resilience](../examples/ai-resilience/)
+* **Examples:** [AI Cascade Routing](../examples/ai-cascade-routing/), [AI Outcome Aware Routing](../examples/ai-outcome-aware-routing/), [AI Resilience](../examples/ai-resilience/), [Cost Optimized](../examples/ai-cost-optimized/), [Routing Fallback](../examples/ai-routing-fallback/)
 
 ### Budgets & Metering
 Enforce hard or soft budgets on AI spend by workspace, user, or key. SBproxy calculates token counts and USD costs locally, emitting metrics for attribution and saving tamper-evident logs.
 * **Docs:** [AI Predictive Budget](ai-predictive-budget.md), [AI Usage Ledger](ai-usage-ledger.md), [Value Ledger Economics](value-ledger-economics.md), [Metering](metering.md)
-* **Examples:** [AI Budget](../examples/ai-budget/), [AI Usage Ledger](../examples/ai-usage-ledger/), [Metering Verify](../examples/metering-verify/)
+* **Examples:** [AI Budget](../examples/ai-budget/), [AI Usage Ledger](../examples/ai-usage-ledger/), [Metering Verify](../examples/metering-verify/), [Model Rate Limits](../examples/ai-model-rate-limits/), [Surface Rate Limits](../examples/ai-per-surface-rate-limits/), [Waste Signals](../examples/ai-waste-signals/), [Attribution Tags](../examples/ai-attribution-tags/)
 
 ### Guardrails & Policy
 Apply input/output guardrails using local classifiers or external APIs to detect toxicity, jailbreaks, and PII. You can use the Guardrail Mesh to fuse multiple safety verdicts and write complex rules with the AI CEL policy plane.
@@ -69,7 +69,7 @@ Apply input/output guardrails using local classifiers or external APIs to detect
 ### Context Compression & Caching
 Reduce token costs and latency by stripping redundant context from prompts or using semantic caching to serve identical queries directly from the proxy edge.
 * **Docs:** [AI Context Compression](ai-context-compression.md), [Cache Reserve](cache-reserve.md)
-* **Examples:** [AI Context Compression Redis](../examples/ai-context-compression-redis/), [Semantic Cache Local](../examples/semantic-cache-local/), [Response Caching](../examples/response-caching/)
+* **Examples:** [AI Context Compression Redis](../examples/ai-context-compression-redis/), [Semantic Cache Local](../examples/semantic-cache-local/), [Response Caching](../examples/response-caching/), [Context Compression Mesh](../examples/ai-context-compression-mesh/), [Origin Keys Cache](../examples/response-cache-per-origin-keys/)
 
 ---
 
