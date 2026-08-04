@@ -12,6 +12,16 @@ the next version cut.
 
 ### Added
 
+### Changed
+
+### Removed
+
+### Fixed
+
+## [1.10.0] - 2026-08-04
+
+### Added
+
 - **Extension bundles: install TypeScript, JavaScript, or WebAssembly
   behavior from a directory and attach it in `sb.yml`.** The plugin trait
   surface and its registry already existed, but only `AuthProvider` was
