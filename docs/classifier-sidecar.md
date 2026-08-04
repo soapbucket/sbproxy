@@ -74,4 +74,4 @@ When SBproxy encounters an AI request with a sidecar-backed guardrail, it automa
 3. Invokes `Classify` with the text payload.
 4. Uses your sidecar's returned verdict and threshold score to either `release` or `block` the request.
 
-See [ai-guardrails.md](ai-guardrails.md) and [prompt-injection-v2.md](prompt-injection-v2.md) for more details on wiring guardrails into your AI pipelines.
+See [guardrails.md](guardrails.md) and [prompt-injection-v2.md](prompt-injection-v2.md) for more details on wiring guardrails into your AI pipelines.
