@@ -225,3 +225,16 @@ curl -s -H 'Host: lora.local' -H 'X-LoRA-Adapter: nobody-has-this' http://127.0.
 ```
 
 `docker compose down -v` tears it down.
+
+## Examples in Practice
+
+To see various routing strategies in action, consult these runnable examples:
+
+| Example | What it is | How to use it | Outcome |
+|---------|------------|---------------|---------|
+| [`load-balancer-deployment`](../examples/load-balancer-deployment/) | Advanced LB topologies. | Configure `upstream` blocks. | Sophisticated load balancing across clusters. |
+| [`error-pages`](../examples/error-pages/) | Custom error pages. | Set `error_pages` mapping in config. | Friendly, branded HTML responses on 503s or 404s. |
+| [`grpc-h2c`](../examples/grpc-h2c/) | gRPC over cleartext HTTP/2. | Set `protocol: h2c`. | Seamless gRPC proxying without TLS termination overhead. |
+| [`headers-and-cors`](../examples/headers-and-cors/) | Manage CORS and HTTP headers. | Use `cors:` and `headers:` blocks. | Secure, standard-compliant browser API access. |
+| [`request-limit`](../examples/request-limit/) | Concurrency limits. | Configure `concurrent_requests` cap. | Sheds load dynamically during traffic spikes to protect upstream servers. |
+| [`response-cache-per-origin-keys`](../examples/response-cache-per-origin-keys/) | Cache isolation by origin. | Add origin variables to your cache key. | Prevents cache poisoning across multitenant platforms. |
