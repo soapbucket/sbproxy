@@ -11,7 +11,7 @@
   <a href="https://github.com/soapbucket/sbproxy/releases/latest"><img src="https://img.shields.io/github/v/release/soapbucket/sbproxy?color=157A5B" alt="Latest release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="Apache 2.0 license"></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-1.82%2B-orange.svg" alt="Rust 1.82 or newer"></a>
-  <a href="https://hub.docker.com/r/soapbucket/sbproxy"><img src="https://img.shields.io/docker/v/soapbucket/sbproxy?label=docker&amp;color=2496ED" alt="Docker image"></a>
+  <a href="https://hub.docker.com/r/soapbucket/sbproxy"><img src="https://img.shields.io/badge/docker-soapbucket%2Fsbproxy-2496ED.svg" alt="Docker image"></a>
   <a href="https://sbproxy.dev"><img src="https://img.shields.io/badge/docs-sbproxy.dev-16150F.svg" alt="Documentation"></a>
 </p>
 
