@@ -77,7 +77,15 @@ jobs:
     # "version `GLIBC_2.39' not found". The `container` value is empty
     # for macOS, which GitHub treats as "no container".
     container: ${{ matrix.container }}
-    timeout-minutes: 60
+    # Was 60. aarch64-apple-darwin's rust-cache entry has never
+    # successfully saved this cut (cache only saves on job success, and
+    # this job kept timing out / getting cancelled first for unrelated
+    # reasons), so every attempt has paid a cold-cache fat-LTO build in
+    # full and landed right at the old limit ("No cache found." in the
+    # job log, ~60min wall time). certify-model-host-apple-silicon
+    # already gives the same fat-LTO-on-macOS profile 75min for exactly
+    # this reason; matching it here rather than tuning to the minute.
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
