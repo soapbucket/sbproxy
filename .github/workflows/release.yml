@@ -97,12 +97,22 @@ jobs:
             runner: ubuntu-latest
             platform: linux_amd64
             container: rust:1.97-bookworm
+            lto: fat
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             platform: linux_arm64
             container: rust:1.97-bookworm
+            # [profile.release]'s fat LTO SIGKILLs this target even at
+            # CARGO_BUILD_JOBS=1 (fully serialized - one rustc process
+            # at a time), so this is not a parallelism/contention problem:
+            # the single fat-LTO link itself needs more memory than this
+            # runner has, for this dependency graph's size. Thin LTO still
+            # gets most of the cross-crate optimization at a fraction of
+            # the peak memory of merging the whole graph into one unit.
+            lto: thin
           - target: aarch64-apple-darwin
             runner: macos-latest
+            lto: fat
             platform: darwin_arm64
           # darwin_amd64 (Intel Mac) is not built. The GitHub macos-13
           # runner pools have multi-hour queue times that stalled
@@ -164,6 +174,11 @@ jobs:
           npm run build
 
       - name: build release binary
+        # CARGO_PROFILE_RELEASE_LTO overrides [profile.release]'s
+        # workspace-wide `lto = "fat"` per matrix leg (see the `lto: thin`
+        # comment on the aarch64-unknown-linux-gnu entry above).
+        env:
+          CARGO_PROFILE_RELEASE_LTO: ${{ matrix.lto }}
         run: cargo build --release --locked --target ${{ matrix.target }} --bin sbproxy --features embed-admin-ui
 
       # Contract: linux binaries must not require a glibc newer than the
