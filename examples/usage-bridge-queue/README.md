@@ -54,8 +54,10 @@ sqlite3 /tmp/sbproxy-usage-bridge/payments.sqlite3 \
   "select reporter, usage_identifier, tenant_id, origin_id, status, failure_category, json_extract(event_jcs, '\$.quantity') as quantity from usage_reports order by created_at_ms"
 ```
 
+<!-- CAPTURE: sqlite3 /tmp/sbproxy-usage-bridge/payments.sqlite3 "select reporter, usage_identifier, tenant_id, origin_id, status, failure_category, json_extract(event_jcs, '\$.quantity') as quantity from usage_reports order by created_at_ms" -->
+
 ```
-stripe_meter|sbu-019fc4332bc872f0bbfbb36cb735cc14-edba0b3d3dfd9c8ddd3718560501eb69|tenant-a|billing.local|queued||1020
+stripe_meter|sbu-<USAGE>|tenant-a|billing.local|terminal|rejected|1020
 ```
 
 The full event the worker will hand the reporter, including the resource attribution and the customer the charge lands on:
@@ -64,6 +66,8 @@ The full event the worker will hand the reporter, including the resource attribu
 sqlite3 /tmp/sbproxy-usage-bridge/payments.sqlite3 \
   'select event_jcs from usage_reports order by created_at_ms limit 1'
 ```
+
+<!-- CAPTURE: sqlite3 /tmp/sbproxy-usage-bridge/payments.sqlite3 'select event_jcs from usage_reports order by created_at_ms limit 1' -->
 
 ```
 {"attributes":{"claim_id":"019fc4332bc872f0bbfbb36cb735cc14","resource_name":"openai/gpt-4o-mini","resource_type":"ai_model","stripe_customer_id":"cus_demo_usage_bridge","unit":"total_tokens"},"event_name":"sbproxy_ai_tokens","occurred_at_ms":1785703115773,"origin_id":"billing.local","quantity":1020,"reporter":"stripe_meter","tenant_id":"tenant-a","usage_identifier":"sbu-019fc4332bc872f0bbfbb36cb735cc14-edba0b3d3dfd9c8ddd3718560501eb69"}
