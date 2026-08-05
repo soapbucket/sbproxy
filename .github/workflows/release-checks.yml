@@ -101,7 +101,10 @@ jobs:
   test-isolation:
     name: test isolation (single-threaded)
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Was 60; the added payments-featured build step (thin LTO, but
+    # still a release build on top of the two debug ones and the full
+    # workspace test compile) needs more headroom.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
 
@@ -130,6 +133,19 @@ jobs:
       # "no-default-features sbproxy binary missing".
       - name: build no-default-features sbproxy binary (needed by e2e harness)
         run: CARGO_TARGET_DIR=target/no-default-features cargo build -p sbproxy --no-default-features --locked
+
+      # settlement_gate.rs and usage_bridge.rs spawn a payments-featured
+      # binary via ProxyHarness::start_payments_with_yaml_and_env; without
+      # this, every test in both files fails with "payments-featured
+      # sbproxy binary missing" (WOR-2222 - this lane never built one
+      # either, same gap e2e.yml had). CARGO_PROFILE_RELEASE_LTO=thin
+      # matches release.yml's aarch64 fix - this is still a fat-LTO
+      # [profile.release] build by default, no reason to risk the same
+      # OOM here untested.
+      - name: build payments-featured sbproxy binary (needed by e2e harness)
+        env:
+          CARGO_PROFILE_RELEASE_LTO: thin
+        run: CARGO_TARGET_DIR=target/payments cargo build --release -p sbproxy --features payment-x402,payment-mpp,payment-stripe,payment-lightning-cln --locked
 
       # Cheap insurance: if line-tables-only above is not enough, this
       # is the evidence the next fix needs instead of another guess.
