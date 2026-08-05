@@ -28,12 +28,27 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
+  # The payments-featured binary below builds with this workspace's
+  # [profile.release] (fat LTO, codegen-units=1), the same memory-hungry
+  # configuration that has SIGKILLed a release build on a constrained
+  # runner. Capping parallelism trades wall-clock time for not needing
+  # a retry.
+  CARGO_BUILD_JOBS: 2
+  # settlement_gate.rs and usage_bridge.rs each start a 4-process
+  # cluster; give proxy startup more room than a quiet dev machine
+  # needs when the runner is also compiling the payments binary above.
+  # SBPROXY_E2E_STARTUP_TIMEOUT_SECS is the harness's own documented
+  # override for "an unusually slow host" (e2e/src/lib.rs).
+  SBPROXY_E2E_STARTUP_TIMEOUT_SECS: '60'
 
 jobs:
   e2e:
     name: e2e (workspace)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # 45min covered two debug binaries + the suite; the payments release
+    # binary below is fat-LTO (release.yml's build jobs need up to 60min
+    # for the same profile), so this needs real headroom too.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v5
 
@@ -65,6 +80,15 @@ jobs:
       # finds it.
       - name: build no-default-features sbproxy binary (e2e harness)
         run: CARGO_TARGET_DIR=target/no-default-features cargo build -p sbproxy --no-default-features --locked
+
+      # settlement_gate.rs and usage_bridge.rs spawn a payments-featured
+      # binary via ProxyHarness::start_payments_with_yaml_and_env; without
+      # this, every test in both files fails with "payments-featured
+      # sbproxy binary missing" (WOR-2222 - this lane never built one).
+      # The command and target dir match e2e/src/lib.rs's own error
+      # message exactly.
+      - name: build payments-featured sbproxy binary (e2e harness)
+        run: CARGO_TARGET_DIR=target/payments cargo build --release -p sbproxy --features payment-x402,payment-mpp,payment-stripe,payment-lightning-cln --locked
 
       # Run single-threaded. Each e2e test spawns its own proxy process
       # with a full multi-core tokio runtime, so the default test-thread
