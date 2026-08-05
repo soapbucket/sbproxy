@@ -50,6 +50,19 @@ env:
   # full ~60 min job. Same fix already validated for this symptom in
   # the local gate script.
   CARGO_BUILD_JOBS: 2
+  # Confirmed by direct evidence (a run that got past both binary
+  # builds this time): the job runs out of DISK, not memory - "No
+  # space left on device" linking the first debug binary alone, with
+  # 88 GiB free at job start. CARGO_BUILD_JOBS controls parallelism,
+  # not total artifact size, so it cannot fix this on its own.
+  # `cargo test --workspace` then compiles one binary per integration
+  # test file across ~30 crates on top of that; full DWARF debug info
+  # for a dependency graph this size (wasmtime, tract, rquickjs, the
+  # AWS SDKs, ...) is the largest single contributor to target/'s
+  # size. line-tables-only keeps file:line for panic backtraces
+  # (relied on throughout this project's own CI triage) while dropping
+  # the per-variable DWARF data responsible for most of that weight.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   # Inserted ahead of the heavier lanes deliberately: it costs a couple of
@@ -117,6 +130,13 @@ jobs:
       # "no-default-features sbproxy binary missing".
       - name: build no-default-features sbproxy binary (needed by e2e harness)
         run: CARGO_TARGET_DIR=target/no-default-features cargo build -p sbproxy --no-default-features --locked
+
+      # Cheap insurance: if line-tables-only above is not enough, this
+      # is the evidence the next fix needs instead of another guess.
+      - name: report disk usage before the full test compile
+        run: |
+          df -h /
+          du -sh target target/no-default-features 2>/dev/null || true
 
       - name: test (single thread)
         # --no-fail-fast: without it, cargo stops launching further test
