@@ -29,11 +29,16 @@ env:
   CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
   # The payments-featured binary below builds with this workspace's
-  # [profile.release] (fat LTO, codegen-units=1). CARGO_BUILD_JOBS=2
-  # still SIGKILLed this exact profile on release.yml's constrained
-  # aarch64-linux runner, so this matches the stronger fix there
-  # (JOBS=1, not 2) rather than risk the same OOM here.
-  CARGO_BUILD_JOBS: 1
+  # [profile.release] (fat LTO, codegen-units=1). release.yml's
+  # aarch64-unknown-linux-gnu leg SIGKILLed under this profile even at
+  # CARGO_BUILD_JOBS=1, but that runner is a smaller/constrained class
+  # (ubuntu-24.04-arm). This job runs on ubuntu-latest, the same class
+  # as release.yml's x86_64-unknown-linux-gnu leg, which has always
+  # built this exact profile fine at full parallelism. A previous fix
+  # here defensively capped this job at CARGO_BUILD_JOBS=1 too, which
+  # instead fully serialized it for no reason and pushed it right up
+  # against its own timeout (confirmed: cancelled building this exact
+  # step at precisely 75min). Left at cargo's default.
   # settlement_gate.rs and usage_bridge.rs each start a 4-process
   # cluster; give proxy startup more room than a quiet dev machine
   # needs when the runner is also compiling the payments binary above.
