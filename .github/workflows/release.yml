@@ -64,17 +64,6 @@ env:
   RUST_BACKTRACE: 1
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  # The release binary links with fat LTO (-C lto=fat -C codegen-units=1),
-  # the most memory-hungry configuration cargo has. Left at cargo's
-  # default (one rustc per core), aarch64-unknown-linux-gnu's smaller
-  # hosted runner has SIGKILLed the build outright (OOM) rather than
-  # slowing down - CARGO_BUILD_JOBS=2 still SIGKILLed on the same target,
-  # so this matches the local gate script's stronger fix for the same
-  # symptom (CARGO_BUILD_JOBS=1 for `cargo build -p sbproxy` under fat
-  # LTO, not just 2). x86_64-linux and aarch64-darwin already build fine
-  # at this parallelism; the extra wall-clock time here is cheaper than
-  # another ~60 min retry.
-  CARGO_BUILD_JOBS: 1
 
 jobs:
   build:
@@ -98,6 +87,12 @@ jobs:
             platform: linux_amd64
             container: rust:1.97-bookworm
             lto: fat
+            # No cap: this target has always built fine at cargo's
+            # default (one rustc per core). A previous fix here
+            # accidentally capped every target at 1 workflow-wide,
+            # which serialized this build and aarch64-apple-darwin's
+            # for no reason and pushed the latter over its timeout.
+            build_jobs: 16
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             platform: linux_arm64
@@ -109,10 +104,16 @@ jobs:
             # runner has, for this dependency graph's size. Thin LTO still
             # gets most of the cross-crate optimization at a fraction of
             # the peak memory of merging the whole graph into one unit.
+            # build_jobs stays 1 regardless: even with thin LTO, this is
+            # still the smallest/most memory-constrained of the three
+            # runners, and 1 costs only wall-clock time here.
             lto: thin
+            build_jobs: 1
           - target: aarch64-apple-darwin
             runner: macos-latest
             lto: fat
+            # No cap - see x86_64-unknown-linux-gnu above.
+            build_jobs: 16
             platform: darwin_arm64
           # darwin_amd64 (Intel Mac) is not built. The GitHub macos-13
           # runner pools have multi-hour queue times that stalled
@@ -177,8 +178,11 @@ jobs:
         # CARGO_PROFILE_RELEASE_LTO overrides [profile.release]'s
         # workspace-wide `lto = "fat"` per matrix leg (see the `lto: thin`
         # comment on the aarch64-unknown-linux-gnu entry above).
+        # CARGO_BUILD_JOBS is per matrix leg too, not workflow-wide: only
+        # aarch64-unknown-linux-gnu needs the parallelism cap.
         env:
           CARGO_PROFILE_RELEASE_LTO: ${{ matrix.lto }}
+          CARGO_BUILD_JOBS: ${{ matrix.build_jobs }}
         run: cargo build --release --locked --target ${{ matrix.target }} --bin sbproxy --features embed-admin-ui
 
       # Contract: linux binaries must not require a glibc newer than the
