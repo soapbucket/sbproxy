@@ -29,11 +29,11 @@ env:
   CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
   # The payments-featured binary below builds with this workspace's
-  # [profile.release] (fat LTO, codegen-units=1), the same memory-hungry
-  # configuration that has SIGKILLed a release build on a constrained
-  # runner. Capping parallelism trades wall-clock time for not needing
-  # a retry.
-  CARGO_BUILD_JOBS: 2
+  # [profile.release] (fat LTO, codegen-units=1). CARGO_BUILD_JOBS=2
+  # still SIGKILLed this exact profile on release.yml's constrained
+  # aarch64-linux runner, so this matches the stronger fix there
+  # (JOBS=1, not 2) rather than risk the same OOM here.
+  CARGO_BUILD_JOBS: 1
   # settlement_gate.rs and usage_bridge.rs each start a 4-process
   # cluster; give proxy startup more room than a quiet dev machine
   # needs when the runner is also compiling the payments binary above.

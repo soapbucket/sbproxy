@@ -68,11 +68,13 @@ env:
   # the most memory-hungry configuration cargo has. Left at cargo's
   # default (one rustc per core), aarch64-unknown-linux-gnu's smaller
   # hosted runner has SIGKILLed the build outright (OOM) rather than
-  # slowing down. Capping parallelism trades some wall-clock time for
-  # not needing a retry, which costs a full ~60 min job. Same fix
-  # already validated for this exact symptom in the local gate script
-  # (CARGO_BUILD_JOBS=1 for `cargo build -p sbproxy` under fat LTO).
-  CARGO_BUILD_JOBS: 2
+  # slowing down - CARGO_BUILD_JOBS=2 still SIGKILLed on the same target,
+  # so this matches the local gate script's stronger fix for the same
+  # symptom (CARGO_BUILD_JOBS=1 for `cargo build -p sbproxy` under fat
+  # LTO, not just 2). x86_64-linux and aarch64-darwin already build fine
+  # at this parallelism; the extra wall-clock time here is cheaper than
+  # another ~60 min retry.
+  CARGO_BUILD_JOBS: 1
 
 jobs:
   build:
