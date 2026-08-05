@@ -119,7 +119,15 @@ jobs:
         run: CARGO_TARGET_DIR=target/no-default-features cargo build -p sbproxy --no-default-features --locked
 
       - name: test (single thread)
-        run: cargo test --workspace --locked -- --test-threads=1
+        # --no-fail-fast: without it, cargo stops launching further test
+        # binaries the moment one fails, so a single failing test hides
+        # every result after it alphabetically. That produced a string
+        # of tag-time runs where "the failing test" looked different
+        # every retry - it was really the earliest alphabetical failure
+        # each time, masking whatever came later (including a real,
+        # deterministic bug this same investigation found and fixed in
+        # the semantic cache).
+        run: cargo test --workspace --locked --no-fail-fast -- --test-threads=1
 
   acme-pebble:
     name: acme integration (pebble)

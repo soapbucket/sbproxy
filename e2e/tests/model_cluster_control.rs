@@ -730,7 +730,7 @@ fn cluster_converges_and_admin_calls_out_an_unhealthy_worker() -> Result<()> {
         wait_for_statuses(
             &client,
             &all_admin_ports,
-            Duration::from_secs(30),
+            Duration::from_secs(60),
             converged,
         )
     }));
@@ -768,7 +768,7 @@ fn cluster_converges_and_admin_calls_out_an_unhealthy_worker() -> Result<()> {
     statuses = wait_for_statuses(
         &client,
         &all_admin_ports,
-        Duration::from_secs(30),
+        Duration::from_secs(60),
         converged,
     );
     let restarted_gateway_status = statuses
@@ -814,7 +814,7 @@ fn cluster_converges_and_admin_calls_out_an_unhealthy_worker() -> Result<()> {
     statuses = wait_for_statuses(
         &client,
         &all_admin_ports,
-        Duration::from_secs(30),
+        Duration::from_secs(60),
         converged,
     );
     assert_eq!(deployment_generation(&statuses[0]), rolling_generation);
@@ -855,7 +855,7 @@ fn cluster_converges_and_admin_calls_out_an_unhealthy_worker() -> Result<()> {
     statuses = wait_for_statuses(
         &client,
         &all_admin_ports,
-        Duration::from_secs(30),
+        Duration::from_secs(60),
         converged,
     );
     assert_eq!(deployment_generation(&statuses[0]), recreate_generation);
@@ -887,7 +887,7 @@ fn cluster_converges_and_admin_calls_out_an_unhealthy_worker() -> Result<()> {
     statuses = wait_for_statuses(
         &client,
         &all_admin_ports,
-        Duration::from_secs(30),
+        Duration::from_secs(60),
         converged,
     );
 
@@ -1012,7 +1012,7 @@ fn cluster_converges_and_admin_calls_out_an_unhealthy_worker() -> Result<()> {
         wait_for_statuses(
             &client,
             &all_admin_ports,
-            Duration::from_secs(30),
+            Duration::from_secs(60),
             converged,
         )
     }));

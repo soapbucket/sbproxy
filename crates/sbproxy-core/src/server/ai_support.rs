@@ -3192,6 +3192,18 @@ pub(super) struct SemanticPromptInput {
 pub(super) fn extract_semantic_prompt(body: &serde_json::Value) -> SemanticPromptInput {
     let mut normalized = body.clone();
     let text = replace_semantic_query_slot(&mut normalized);
+    // `max_tokens` is required by the Anthropic Messages wire format and
+    // optional (provider-defaulted) on OpenAI Chat Completions, so its
+    // mere presence differs by inbound surface even for an otherwise
+    // identical prompt. Left in the digest, no Anthropic-native request
+    // could ever hit an entry an OpenAI-native request populated, which
+    // defeats the canonical-response cache this namespace is built
+    // around (see `format::rewrap_success_response_for_inbound`). It is
+    // a generation knob, not part of the prompt's identity, so it is
+    // excluded here rather than fenced on.
+    if let Some(object) = normalized.as_object_mut() {
+        object.remove("max_tokens");
+    }
     let mut digest = SemanticFieldDigest::new(SEMANTIC_REQUEST_CONTEXT_DOMAIN);
     digest_canonical_json(&mut digest, &normalized);
     SemanticPromptInput {

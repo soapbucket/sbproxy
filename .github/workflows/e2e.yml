@@ -74,7 +74,12 @@ jobs:
       # release-checks.yml runs the same suite green; match it here.
       - name: e2e
         if: github.event_name == 'push'
-        run: cargo test -p sbproxy-e2e --locked -- --test-threads=1
+        # --no-fail-fast: without it, cargo stops launching further test
+        # binaries the moment one fails, so a single failing test hides
+        # every result after it alphabetically - the run then looks
+        # like a different flake every retry when it's really the same
+        # earliest-alphabetical failure masking whatever comes later.
+        run: cargo test -p sbproxy-e2e --locked --no-fail-fast -- --test-threads=1
 
       - name: e2e (weekly/manual, Redis required)
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
@@ -86,7 +91,12 @@ jobs:
           # Dependency-complete CI must never turn governance_strict into a
           # successful skip merely because redis-server disappeared.
           SBPROXY_E2E_REQUIRE_REDIS: '1'
-        run: cargo test -p sbproxy-e2e --locked -- --test-threads=1
+        # --no-fail-fast: without it, cargo stops launching further test
+        # binaries the moment one fails, so a single failing test hides
+        # every result after it alphabetically - the run then looks
+        # like a different flake every retry when it's really the same
+        # earliest-alphabetical failure masking whatever comes later.
+        run: cargo test -p sbproxy-e2e --locked --no-fail-fast -- --test-threads=1
 
   notify-failure:
     name: failure notification (GitHub issue)

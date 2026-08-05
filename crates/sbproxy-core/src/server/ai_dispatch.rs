@@ -2734,6 +2734,24 @@ async fn evaluate_ai_input_guardrails(
     }
 }
 
+/// Collapse a request's `AiSurface` label to the compatibility class the
+/// semantic cache namespaces on.
+///
+/// `chat_completions`, `messages`, and `responses` all wrap the same
+/// canonical chat response and are exactly the surfaces
+/// `format::rewrap_success_response_for_inbound` knows how to translate
+/// between, so they share one class: a prompt cached from an OpenAI
+/// `/v1/chat/completions` call must be replayable to an Anthropic
+/// `/v1/messages` caller and vice versa. Every other surface (embeddings,
+/// images, audio, moderations, ...) keeps its own label; those respond
+/// with fundamentally different bodies and must never share an entry.
+fn semantic_cache_surface_class(surface_label: &'static str) -> &'static str {
+    match surface_label {
+        "chat_completions" | "messages" | "responses" => "chat",
+        other => other,
+    }
+}
+
 pub(super) async fn handle_ai_proxy(
     session: &mut Session,
     config: &AiHandlerConfig,
@@ -5829,7 +5847,7 @@ pub(super) async fn handle_ai_proxy(
                     let response_policy_digest = semantic_response_policy_digest(
                         selection.static_action_policy_digest,
                         peer_policy_revision.as_str(),
-                        surface_label,
+                        semantic_cache_surface_class(surface_label),
                     );
                     let credential_identity = semantic_credential_identity(session, &ctx.principal);
                     Some(sbproxy_ai::SemanticNamespace::derive(
@@ -5839,7 +5857,7 @@ pub(super) async fn handle_ai_proxy(
                             tenant_id: ctx.tenant_id.as_str(),
                             credential_identity: credential_identity.as_str(),
                             requested_model: model.as_str(),
-                            api_surface: surface_label,
+                            api_surface: semantic_cache_surface_class(surface_label),
                             request_context_digest: &semantic_prompt.request_context_digest,
                             embedding_identity: cache.embedding_identity(),
                             embedding_dimensions: query_vec.len(),
