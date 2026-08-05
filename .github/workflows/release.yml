@@ -64,6 +64,15 @@ env:
   RUST_BACKTRACE: 1
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  # The release binary links with fat LTO (-C lto=fat -C codegen-units=1),
+  # the most memory-hungry configuration cargo has. Left at cargo's
+  # default (one rustc per core), aarch64-unknown-linux-gnu's smaller
+  # hosted runner has SIGKILLed the build outright (OOM) rather than
+  # slowing down. Capping parallelism trades some wall-clock time for
+  # not needing a retry, which costs a full ~60 min job. Same fix
+  # already validated for this exact symptom in the local gate script
+  # (CARGO_BUILD_JOBS=1 for `cargo build -p sbproxy` under fat LTO).
+  CARGO_BUILD_JOBS: 2
 
 jobs:
   build:

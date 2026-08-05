@@ -41,6 +41,15 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
+  # test-isolation builds two debug binaries and then compiles every
+  # workspace test target in the same job. At cargo's default
+  # parallelism (one rustc per core) this has died silently mid-run
+  # with no uploaded logs, the signature of the runner itself being
+  # OOM-killed rather than a clean test failure. Capping parallelism
+  # trades some wall-clock time for not needing a retry, which costs a
+  # full ~60 min job. Same fix already validated for this symptom in
+  # the local gate script.
+  CARGO_BUILD_JOBS: 2
 
 jobs:
   # Inserted ahead of the heavier lanes deliberately: it costs a couple of
@@ -83,26 +92,17 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: free disk space
-        uses: jlumbroso/free-disk-space@v1.3.1
+      # Replaces the old standalone free-disk-space + rust-toolchain +
+      # rust-cache steps. This job builds two debug binaries and then
+      # compiles every workspace test target, and has died silently
+      # mid-run (no uploaded logs) at the runner's default disk
+      # cleanup, the signature of the runner running out of room or
+      # memory rather than a clean failure. The shared action logs
+      # `df -h` before and after its cleanup, so a repeat at least
+      # leaves diagnostic evidence instead of a blank job.
+      - uses: ./.github/actions/rust-setup
         with:
-          tool-cache: false
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: false
-          swap-storage: false
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: test-isolation
-
-      - name: install protoc and libclang
-        # libclang-dev is needed for rquickjs-sys's bindgen build script.
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libclang-dev clang
+          cache-key: test-isolation
 
       # Build the standalone sbproxy binary BEFORE running tests. The
       # e2e harness in `e2e/src/lib.rs` spawns `target/debug/sbproxy` at
