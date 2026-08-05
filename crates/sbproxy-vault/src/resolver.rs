@@ -4,7 +4,7 @@
 //! `${ENV_VAR}`, and `file:/path/to/file` patterns embedded in config
 //! string values.  Plain strings are passed through unchanged.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 
@@ -15,14 +15,27 @@ use crate::vault_ref::{
 };
 
 /// Process-wide secret resolver, installed once at binary boot (WOR-1767).
-static PROCESS_RESOLVER: OnceLock<Arc<SecretResolver>> = OnceLock::new();
+///
+/// The `Mutex<Option<..>>` layer (rather than a bare `OnceLock<Arc<..>>`)
+/// exists solely so [`reset_process_resolver_for_test`] can clear it; the
+/// production `install`/`get` contract below is unchanged by it.
+static PROCESS_RESOLVER: OnceLock<Mutex<Option<Arc<SecretResolver>>>> = OnceLock::new();
+
+fn process_resolver_cell() -> &'static Mutex<Option<Arc<SecretResolver>>> {
+    PROCESS_RESOLVER.get_or_init(|| Mutex::new(None))
+}
 
 /// Install the process-wide secret resolver used to resolve provider-URI
 /// references (`secret://`, `secretfile://`, `vault://`, ...) in config
 /// values at handler-build time (WOR-1767). Call once at boot, before the
 /// server compiles its config. A second call is ignored.
 pub fn install_process_resolver(resolver: Arc<SecretResolver>) {
-    let _ = PROCESS_RESOLVER.set(resolver);
+    let mut slot = process_resolver_cell()
+        .lock()
+        .expect("process resolver mutex");
+    if slot.is_none() {
+        *slot = Some(resolver);
+    }
 }
 
 /// The process-wide secret resolver, if one was installed. Returns `None`
@@ -30,7 +43,25 @@ pub fn install_process_resolver(resolver: Arc<SecretResolver>) {
 /// subcommands, unit tests), where secret references are left as-is and
 /// caught by plan-time validation instead.
 pub fn process_resolver() -> Option<Arc<SecretResolver>> {
-    PROCESS_RESOLVER.get().cloned()
+    process_resolver_cell()
+        .lock()
+        .expect("process resolver mutex")
+        .clone()
+}
+
+/// Test-only: clears the installed process resolver.
+///
+/// `cargo test` (unlike `cargo nextest`) runs every test in a binary in one
+/// process, so `install_process_resolver`'s first-wins latch survives past
+/// whichever test installed it first (WOR-2298). A test that depends on
+/// `process_resolver()` returning `None`, or on installing its own fixture
+/// data, must call this first rather than relying on process-per-test
+/// isolation it is not guaranteed under every test runner.
+#[cfg(any(test, feature = "test-support"))]
+pub fn reset_process_resolver_for_test() {
+    *process_resolver_cell()
+        .lock()
+        .expect("process resolver mutex") = None;
 }
 
 /// Resolves secret references from any string value in config.

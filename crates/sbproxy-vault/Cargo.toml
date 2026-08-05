@@ -68,3 +68,10 @@ k8s-openapi = { version = "0.23", default-features = false, features = ["v1_30"]
 [dev-dependencies]
 tempfile = "3"
 filetime = "0.2"
+
+[features]
+# Exposes reset_process_resolver_for_test, used by downstream crates
+# whose own tests install a fixture resolver into the process-wide
+# resolver latch (WOR-2298). Enabled only as a dev-dependency feature,
+# never in a normal `[dependencies]` entry.
+test-support = []

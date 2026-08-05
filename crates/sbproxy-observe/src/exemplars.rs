@@ -375,6 +375,26 @@ pub fn last_recorded_for_test(metric: &'static str, labels: &[(&str, &str)]) -> 
     g.get(&key).cloned()
 }
 
+/// Test-only: clears the entire exemplar store.
+///
+/// `record` only overwrites the buckets a given value actually falls into
+/// (Prometheus's cumulative-bucket convention), so a smaller value
+/// recorded by an earlier test in the same process can leave a stale
+/// exemplar sitting in a lower bucket that a later test's own, larger
+/// recording never touches. `last_recorded_for_test` then returns that
+/// stale entry instead of what the calling test just recorded (WOR-2298).
+/// Plain `cargo test` shares one process across every test in a binary,
+/// unlike `cargo nextest`'s per-test process, so a test asserting an exact
+/// recorded value must clear the store first rather than relying on
+/// process isolation it is not guaranteed under every test runner.
+#[cfg(test)]
+pub(crate) fn reset_store_for_test() {
+    store()
+        .lock()
+        .expect("exemplar store mutex poisoned")
+        .clear();
+}
+
 // --- Tests ---
 
 #[cfg(test)]

@@ -183,6 +183,9 @@ flate2 = "1"
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
+# WOR-2298: reset_process_resolver_for_test, so aiproxy's fixture-resolver
+# tests are not order-dependent on cargo test's single-process test run.
+sbproxy-vault = { path = "../sbproxy-vault", features = ["test-support"] }
 smallvec.workspace = true
 tempfile = "3"
 prost11 = { package = "prost", version = "0.11" }

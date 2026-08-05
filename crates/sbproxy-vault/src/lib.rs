@@ -40,6 +40,8 @@ pub use k8s::{
 pub use local::LocalVault;
 pub use manager::{VaultBackend, VaultManager};
 pub use metadata::{SecretMeta, SecretMetadataTracker};
+#[cfg(any(test, feature = "test-support"))]
+pub use resolver::reset_process_resolver_for_test;
 pub use resolver::{install_process_resolver, process_resolver, SecretResolver};
 pub use rotation::RotationManager;
 pub use scope::{auto_scope, parse_scope, validate_access, SecretScope};

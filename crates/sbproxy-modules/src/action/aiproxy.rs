@@ -398,9 +398,14 @@ mod tests {
 
     #[test]
     fn rag_secret_references_stay_intact_without_a_process_resolver() {
-        // Runs in its own nextest process, so no fixture resolver has been
-        // installed when this constructs. References must pass through for
-        // validate and plan rather than failing or half-resolving.
+        // Under nextest this test gets its own process and no fixture
+        // resolver has ever been installed. Plain `cargo test` (the
+        // release-checks single-threaded lane) runs every test in this
+        // file in one process instead, so a sibling test's
+        // install_fixture_resolver() call would otherwise latch a resolver
+        // in ahead of this one (WOR-2298). Reset explicitly so this
+        // construction sees no resolver regardless of test order.
+        sbproxy_vault::reset_process_resolver_for_test();
         let mut action = AiProxyAction::from_config(rag_action_config(
             "secret://fixture-rag/embedding",
             "secret://fixture-rag/vector",

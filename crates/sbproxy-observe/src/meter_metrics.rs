@@ -216,11 +216,40 @@ fn append_duration_seconds() -> &'static PromHistogram {
 // meter and every record below costs a vtable hop and nothing else, so a
 // process that never enabled OTLP keeps the Prometheus surface at full
 // fidelity and pays almost nothing for the one it did not ask for.
+//
+// Each instrument sits behind `OnceLock<Mutex<Option<..>>>` rather than a
+// bare `OnceLock<..>` solely so `reset_otel_instruments_for_test` can clear
+// it (WOR-2298): plain `cargo test` runs every test in this file in one
+// process, so a handle bound to whatever meter provider was global when it
+// was first built would otherwise survive past the test that built it,
+// unlike under `cargo nextest`'s one-process-per-test isolation this
+// module was originally written to assume.
+
+fn otel_instrument<T: Clone>(
+    cell: &'static OnceLock<Mutex<Option<T>>>,
+    build: impl FnOnce() -> T,
+) -> T {
+    let mut guard = cell
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("otel instrument mutex");
+    if guard.is_none() {
+        *guard = Some(build());
+    }
+    guard.clone().expect("initialized immediately above")
+}
+
+static OTEL_UNITS: OnceLock<Mutex<Option<Counter<u64>>>> = OnceLock::new();
+static OTEL_RECEIPTS: OnceLock<Mutex<Option<Counter<u64>>>> = OnceLock::new();
+static OTEL_CHAIN_GAP: OnceLock<Mutex<Option<Counter<u64>>>> = OnceLock::new();
+static OTEL_INCOHERENT_RECEIPTS: OnceLock<Mutex<Option<Counter<u64>>>> = OnceLock::new();
+static OTEL_DIVERGENCE: OnceLock<Mutex<Option<Counter<u64>>>> = OnceLock::new();
+static OTEL_CHAIN_SEQ: OnceLock<Mutex<Option<Gauge<u64>>>> = OnceLock::new();
+static OTEL_APPEND_DURATION: OnceLock<Mutex<Option<Histogram<f64>>>> = OnceLock::new();
 
 /// OTel counter mirroring `sbproxy_meter_units_total`.
-fn otel_units() -> &'static Counter<u64> {
-    static INSTRUMENT: OnceLock<Counter<u64>> = OnceLock::new();
-    INSTRUMENT.get_or_init(|| {
+fn otel_units() -> Counter<u64> {
+    otel_instrument(&OTEL_UNITS, || {
         global::meter("sbproxy")
             .u64_counter("sbproxy.meter.units")
             .with_description("Units the meter counted, by tenant, unit name, and provenance.")
@@ -230,9 +259,8 @@ fn otel_units() -> &'static Counter<u64> {
 }
 
 /// OTel counter mirroring `sbproxy_meter_receipts_total`.
-fn otel_receipts() -> &'static Counter<u64> {
-    static INSTRUMENT: OnceLock<Counter<u64>> = OnceLock::new();
-    INSTRUMENT.get_or_init(|| {
+fn otel_receipts() -> Counter<u64> {
+    otel_instrument(&OTEL_RECEIPTS, || {
         global::meter("sbproxy")
             .u64_counter("sbproxy.meter.receipts")
             .with_description("Metered attempts, by tenant, outcome, and billing answer.")
@@ -242,9 +270,8 @@ fn otel_receipts() -> &'static Counter<u64> {
 }
 
 /// OTel counter mirroring `sbproxy_meter_chain_gap_total`.
-fn otel_chain_gap() -> &'static Counter<u64> {
-    static INSTRUMENT: OnceLock<Counter<u64>> = OnceLock::new();
-    INSTRUMENT.get_or_init(|| {
+fn otel_chain_gap() -> Counter<u64> {
+    otel_instrument(&OTEL_CHAIN_GAP, || {
         global::meter("sbproxy")
             .u64_counter("sbproxy.meter.chain_gap")
             .with_description("Records the meter owed and could not write.")
@@ -254,9 +281,8 @@ fn otel_chain_gap() -> &'static Counter<u64> {
 }
 
 /// OTel counter mirroring `sbproxy_meter_incoherent_receipts_total`.
-fn otel_incoherent_receipts() -> &'static Counter<u64> {
-    static INSTRUMENT: OnceLock<Counter<u64>> = OnceLock::new();
-    INSTRUMENT.get_or_init(|| {
+fn otel_incoherent_receipts() -> Counter<u64> {
+    otel_instrument(&OTEL_INCOHERENT_RECEIPTS, || {
         global::meter("sbproxy")
             .u64_counter("sbproxy.meter.incoherent_receipts")
             .with_description("Receipts refused on decode for contradicting their own provenance.")
@@ -266,9 +292,8 @@ fn otel_incoherent_receipts() -> &'static Counter<u64> {
 }
 
 /// OTel counter mirroring `sbproxy_meter_divergence_total`.
-fn otel_divergence() -> &'static Counter<u64> {
-    static INSTRUMENT: OnceLock<Counter<u64>> = OnceLock::new();
-    INSTRUMENT.get_or_init(|| {
+fn otel_divergence() -> Counter<u64> {
+    otel_instrument(&OTEL_DIVERGENCE, || {
         global::meter("sbproxy")
             .u64_counter("sbproxy.meter.divergence")
             .with_description("Windows in which counted units and chained units disagreed.")
@@ -278,9 +303,8 @@ fn otel_divergence() -> &'static Counter<u64> {
 }
 
 /// OTel gauge mirroring `sbproxy_meter_chain_seq`.
-fn otel_chain_seq() -> &'static Gauge<u64> {
-    static INSTRUMENT: OnceLock<Gauge<u64>> = OnceLock::new();
-    INSTRUMENT.get_or_init(|| {
+fn otel_chain_seq() -> Gauge<u64> {
+    otel_instrument(&OTEL_CHAIN_SEQ, || {
         global::meter("sbproxy")
             .u64_gauge("sbproxy.meter.chain_seq")
             .with_description("Head sequence number of the meter's signed chain.")
@@ -290,15 +314,43 @@ fn otel_chain_seq() -> &'static Gauge<u64> {
 }
 
 /// OTel histogram mirroring `sbproxy_meter_append_duration_seconds`.
-fn otel_append_duration() -> &'static Histogram<f64> {
-    static INSTRUMENT: OnceLock<Histogram<f64>> = OnceLock::new();
-    INSTRUMENT.get_or_init(|| {
+fn otel_append_duration() -> Histogram<f64> {
+    otel_instrument(&OTEL_APPEND_DURATION, || {
         global::meter("sbproxy")
             .f64_histogram("sbproxy.meter.append.duration")
             .with_description("Time to append one entry to the meter's signed chain, in seconds.")
             .with_unit("s")
             .build()
     })
+}
+
+/// Test-only: clears every cached OTel instrument handle so the next call
+/// rebuilds against whatever meter provider is currently global.
+///
+/// Call this AFTER `global::set_meter_provider(..)`, not before: an
+/// instrument built earlier in the same process (plain `cargo test` shares
+/// one process across every test in this file) stays bound to the
+/// provider that was global when it was first built, and installing a new
+/// provider does not retroactively rebind it (WOR-2298).
+#[cfg(test)]
+fn reset_otel_instruments_for_test() {
+    for cell in [
+        &OTEL_UNITS,
+        &OTEL_RECEIPTS,
+        &OTEL_CHAIN_GAP,
+        &OTEL_INCOHERENT_RECEIPTS,
+        &OTEL_DIVERGENCE,
+    ] {
+        if let Some(m) = cell.get() {
+            *m.lock().expect("otel instrument mutex") = None;
+        }
+    }
+    if let Some(m) = OTEL_CHAIN_SEQ.get() {
+        *m.lock().expect("otel instrument mutex") = None;
+    }
+    if let Some(m) = OTEL_APPEND_DURATION.get() {
+        *m.lock().expect("otel instrument mutex") = None;
+    }
 }
 
 // --- Recorders ---
@@ -763,6 +815,13 @@ mod tests {
 
     #[test]
     fn the_append_histogram_carries_a_trace_exemplar() {
+        // A smaller value recorded by a sibling test earlier in this same
+        // process can leave a stale exemplar in a lower bucket that this
+        // recording never touches (buckets are cumulative), which
+        // `last_recorded_for_test` would then return instead of the 0.004
+        // recorded below. Clear first so this assertion holds regardless
+        // of what ran before it in the shared process (WOR-2298).
+        crate::exemplars::reset_store_for_test();
         record_meter_append_duration(0.004);
 
         let recorded =
@@ -788,15 +847,19 @@ mod tests {
         // A `PeriodicReader` would need a runtime and a live collector; a
         // manual reader is the same pipeline with the timer taken out.
         //
-        // This test assumes a process to itself, which `cargo nextest`
-        // gives every test and which this workspace's gate mandates: the
-        // instrument handles are `OnceLock`s, so a sibling test that built
-        // them first would have bound them to the no-op meter.
+        // Under nextest this test gets a process to itself, so the
+        // instrument handles below always bind fresh. Plain `cargo test`
+        // (the release-checks single-threaded lane) runs every test in
+        // this file in one process instead, so a sibling test that
+        // recorded first would have already bound them to the no-op
+        // meter; reset after installing the new provider so the record
+        // calls below rebuild against it instead (WOR-2298).
         let reader = SharedReader(Arc::new(ManualReader::builder().build()));
         let provider = SdkMeterProvider::builder()
             .with_reader(reader.clone())
             .build();
         global::set_meter_provider(provider);
+        reset_otel_instruments_for_test();
 
         record_meter_units("otlp-tenant", "api_call", UnitSource::Measured, 7);
         record_meter_receipt("otlp-tenant", BillableOutcome::CacheHit, Billable::No);
