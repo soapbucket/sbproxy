@@ -937,7 +937,7 @@ origins:
 | `observability` | object | | Per-origin `log.redact.pii` override, composed with tenant or proxy scope. |
 | `force_ssl` | bool | false | Redirect plain HTTP requests to HTTPS. |
 | `allowed_methods` | list | empty (allow all) | Whitelist of HTTP methods. |
-| `forward_rules` | list | | Path / header / IP rules that route to inline child origins. |
+| `forward_rules` | list | | Path, header, query, and body match rules that route to inline child origins. |
 | `fallback_origin` | object | | Inline origin served when the primary upstream errors or returns a configured status. See [Fallback origin](#fallback-origin). |
 | `response_cache` | object | | Per-origin response cache. |
 | `variables` | map | | Static template variables. |
@@ -2824,13 +2824,14 @@ The `a2a.*` keys apply only when an `a2a` policy is configured on the same origi
 
 ### waf
 
-Web Application Firewall. Built-in patterns cover SQL injection, XSS, and path traversal. Custom rules can extend behavior.
+Web Application Firewall. Built-in patterns cover SQL injection, XSS, and path traversal. Setting `owasp_crs.managed_bundle: true` additionally evaluates the vendored 12-rule CRS-derived bundle that ships in the binary. Custom rules can extend behavior.
 
 ```yaml
 policies:
   - type: waf
     owasp_crs:
       enabled: true
+      managed_bundle: true
     action_on_match: block
     test_mode: false
     failure_posture: closed
@@ -2840,7 +2841,7 @@ policies:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `type` | string | required | Must be `waf` |
-| `owasp_crs` | object | | OWASP Core Rule Set configuration. |
+| `owasp_crs` | object | | CRS-style rule configuration. `enabled: true` turns on the built-in patterns; `managed_bundle: true` additionally compiles the vendored 12-rule bundle (independent toggles, either runs without the other); `paranoia_level` sets rule strictness (1-4, default 1) when the top-level `paranoia` field is absent. |
 | `action_on_match` | string | "block" | Action when a rule matches: `block`, `log`. |
 | `test_mode` | bool | false | If true, log matches but do not block. |
 | `failure_posture` | string | `closed` | What happens to a request the WAF could not fully evaluate: `closed` refuses with 403, `open` admits and claims nothing, `degraded` admits while recording that the WAF guarantee was not made. `observe` is rejected at config load. The shared vocabulary is defined in [degradation.md](degradation.md). |

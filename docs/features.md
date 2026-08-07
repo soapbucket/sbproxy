@@ -8,7 +8,7 @@ This document breaks down SBproxy's capabilities into five core domains: **API**
 
 ## 1. API: Traditional Reverse Proxy & Gateway
 
-At its core, SBproxy is an extremely capable, hot-reloadable reverse proxy designed for zero-downtime operations and advanced traffic shaping.
+At its core, SBproxy is an extremely capable reverse proxy with advanced traffic shaping and zero-downtime configuration reload: a candidate config is validated, constructed with rollback on failure, and committed atomically, while in-flight requests finish on the config snapshot they started with. Binary upgrades use rolling restarts; see [Upgrade](upgrade.md).
 
 ### Core Proxy & Routing
 SBproxy routes traffic based on exact hostnames and dynamic forward rules. It supports complex deployment patterns like blue-green and canary rollouts.
@@ -26,7 +26,7 @@ Protect your endpoints with 7 built-in authentication types: API Keys, Basic Aut
 * **Examples:** [Auth JWT](../examples/auth-jwt/), [Auth Forward](../examples/auth-forward/), [mTLS Client Auth](../examples/mtls-client-auth/), [API Key](../examples/auth-api-key/), [Basic Auth](../examples/auth-basic/), [Bearer Token](../examples/auth-bearer/), [Bearer DPoP](../examples/auth-bearer-dpop/), [CAP Auth](../examples/auth-cap/), [Inbound Keys](../examples/keys-inbound-headers/), [Sessions](../examples/sessions/)
 
 ### Security & Guardrails
-A built-in Web Application Firewall (WAF) running OWASP Core Rule Set (CRS) screens requests before they hit your upstream. SBproxy also mitigates DDoS attacks, HTTP request smuggling, and enforces token-bucket rate limiting.
+A built-in Web Application Firewall (WAF) screens requests before they hit your upstream. It ships a curated, CRS-derived baseline of 16 rules: 4 built-in patterns plus a 12-rule managed bundle with CRS-style IDs and paranoia levels. The rule set extends through a signed remote rule feed, verified with HMAC-SHA256, cached on disk, and rejected when older than a configured staleness bound, and repeat offenders can be blocked persistently through strike-based blocking. Operators who need full OWASP CRS coverage (anomaly scoring, transformation pipelines, body processors) should put ModSecurity, Coraza, or a CDN WAF in front and keep SBproxy's WAF as a baseline layer. SBproxy also mitigates DDoS attacks and HTTP request smuggling, and enforces token-bucket rate limiting.
 * **Docs:** [Threat Model](threat-model.md), [Exposed Credentials](exposed-credentials.md), [Security Model Host](security-model-host.md)
 * **Examples:** [WAF](../examples/waf/), [DDoS Protection](../examples/ddos-protection/), [Rate Limiting](../examples/rate-limiting/), [IP Filter](../examples/ip-filter/), [CSRF](../examples/csrf/), [Defense in Depth](../examples/defense-in-depth/), [DLP Catalog](../examples/dlp-catalog/), [HSTS](../examples/hsts/), [Page Shield](../examples/page-shield/), [Security Headers](../examples/security-headers/), [SRI](../examples/sri/), [Request Limit](../examples/request-limit/)
 
