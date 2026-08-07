@@ -107,7 +107,7 @@ Point a framework you already run at the gateway: chat completions through the O
 - [migration-credentials.md](migration-credentials.md) - migrating the legacy `virtual_keys:` shape to the unified `credentials:` block.
 - [migration-mcp-rbac.md](migration-mcp-rbac.md) - upgrading MCP `ToolAccessPolicy` to the principal-aware ACL and the default-deny flip.
 - [migration-litellm.md](migration-litellm.md) - moving a LiteLLM proxy to SBproxy with `config import-litellm` and the field-by-field mapping.
-- [secrets.md](secrets.md) - vault backend setup for HashiCorp Vault, AWS Secrets Manager, and Kubernetes Secrets.
+- [secrets.md](secrets.md) - the secret-reference vocabulary (env vars, files, provider URIs) resolved everywhere in config, plus backend setup for HashiCorp Vault, AWS Secrets Manager, GCP Secret Manager, Azure Key Vault, and Kubernetes Secrets.
 - [multi-tenant.md](multi-tenant.md) - when to use the multi-tenant shape, the three scopes, isolation guarantees, the synthetic `__default__` tenant.
 - [operator-runbook.md](operator-runbook.md) - dashboard triage and rollback actions.
 - [threat-model.md](threat-model.md) - trust boundaries and per-wave review checklist.

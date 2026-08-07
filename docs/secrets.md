@@ -1,14 +1,16 @@
 # Secret Backends
 
-*Last modified: 2026-07-31*
+*Last modified: 2026-08-07*
 
-SBproxy resolves secret material through provider-specific reference schemes. The scheme names the provider type, the authority names the configured backend instance, and the path is interpreted by that provider:
+SBproxy resolves every secret-bearing config value through one reference grammar, checked by one function. A provider credential under `credentials:`, a `source:` block's `credential` field, the `pepper` and `master_key` under `key_management.crypto`, and the value each provider URI on this page resolves to are all meant to go through that same grammar, in the same order, with the same failure behavior. There is nothing field-specific to learn: a form that works in one secret-bearing field works in all of them.
+
+Three shapes read a value directly (an environment variable, a file, or a value already in hand); a fourth shape is a provider URI that names a configured backend:
 
 ```text
 <scheme>://<backend-name>/<provider-path>[?version=<n>][&key=<json-field>]
 ```
 
-Backend instances are declared once, at proxy scope, under `proxy.secrets.backends:`. There is no per-tenant or per-origin backend list. A reference resolves against the backend whose `name` matches the authority segment and whose provider type matches the scheme; to keep tenants on separate stores, declare one named backend per store and reference the right name from each origin.
+The scheme names the provider type, the authority names the configured backend instance, and the path is interpreted by that provider. Backend instances are declared once, at proxy scope, under `proxy.secrets.backends:`. There is no per-tenant or per-origin backend list. A reference resolves against the backend whose `name` matches the authority segment and whose provider type matches the scheme; to keep tenants on separate stores, declare one named backend per store and reference the right name from each origin. See [Reference Forms](#reference-forms) below for the complete grammar, and the sections after that for configuring each backend type.
 
 ## Backends are process-owned: changing them needs a restart
 
@@ -20,7 +22,16 @@ Earlier versions accepted the reload and silently ignored the change. That was w
 
 Everything else in a config still hot-reloads normally. Only the `proxy.secrets` block carries this restriction, and only when it actually changes; reloading an unchanged block is a no-op. The values behind a reference are re-resolved on every reload, so rotating a secret **in** Vault or Secrets Manager needs no restart. It is only changing where SBproxy looks that does.
 
-## Scheme Table
+## Reference Forms
+
+Four shapes make up the current vocabulary. Anything that does not match one of them is a literal value, passed through unchanged.
+
+1. **`${VAR_NAME}`** - whole-value environment variable substitution. The entire value must be exactly `${VAR_NAME}`; an env-style token embedded inside a larger string, like `"Bearer ${TOKEN}"`, is left alone as a literal and logs a warning, because only a whole-value wrapper expands.
+2. **`env:VAR_NAME`** - the same environment variable lookup, spelled as an explicit prefix instead of a `${}` wrapper. Fails the same way as `${VAR_NAME}` for the same missing variable; use whichever spelling reads better in context.
+3. **`file:/path/to/secret`** - read the file at the given path and use its trimmed contents as the value.
+4. **A provider URI**, `<scheme>://<backend-name>/<provider-path>[?version=<n>][&key=<json-field>]` - resolved against a named backend declared under `proxy.secrets.backends:`. A miss (unknown backend, missing key, unreachable store) is a hard error; the reference is never sent upstream verbatim.
+
+### Provider URI Schemes
 
 | Scheme | Provider type | Example |
 |---|---|---|
@@ -32,18 +43,31 @@ Everything else in a config still hot-reloads normally. Only the `proxy.secrets`
 | `secretfile://` | Local YAML or JSON secret file | `secretfile://local/openai-prod?key=api_key` |
 | `secret://` | Local static secret map | `secret://local/openai-prod` |
 
-Environment variables keep the existing `${ENV_NAME}` form. Do not use an env URI. The legacy non-vault forms also remain valid:
+`secret://` selects the local static-map provider, the same provider a backend configures with `type: local` (see [File And Static Map Backends](#file-and-static-map-backends) below). It has no relationship to environment variables: `secret://env/some-key` looks up a key named `some-key` in a backend named `env`, which is not the `env:` environment-variable form above. There is no `env://` URI scheme; write `${VAR_NAME}` or `env:VAR_NAME` for environment variables instead.
 
-```text
-${ENV_NAME}
-file:/path/to/secret
-```
+### Deprecated Forms
 
-The Go-era `secret:<name>` colon form is removed: it now fails config load with a pointer at the `secret://<backend>/<name>` replacement, and the `proxy.secrets.map` key that served it parses but has no effect. The old umbrella form, `vault://<alias>/...`, is still accepted with a warning as of SBproxy 1.5.0; a removal release has not been announced. To rewrite known aliases, run:
+Two older shapes still work, each logging a one-time warning, and neither is what to write in new config:
+
+* **`vault://env/NAME`** resolves `NAME` from the environment, identically to `${NAME}` or `env:NAME`. It predates the provider-specific schemes above; replace it with `${NAME}` or `env:NAME`.
+* **`vault://<alias>/...`** for `alias` in `aws`, `k8s`, `file`, `hashi` rewrites to the matching provider-specific scheme (`awssm://`, `k8ssecret://`, `secretfile://`, `vault://`) with `<alias>` carried over as the backend name. Still accepted with a warning as of SBproxy 1.5.0; a removal release has not been announced.
+
+Run this to rewrite known legacy aliases across a config file:
 
 ```bash
 sbproxy config migrate sb.yml --out sb.migrated.yml
 ```
+
+### Removed Forms
+
+The Go-era `secret:<name>` colon form (no `//`) is gone. It is not a fallback and does not pass through: writing it fails config load with a message pointing at the replacement, `secret://<backend>/<name>` with a backend declared under `proxy.secrets.backends`. The `proxy.secrets.map` key that used to serve this form still parses but has no effect. Do not confuse the removed colon form with `secret://`, the URI scheme documented above, which is current and correct.
+
+> **Implementation note.** The vocabulary above is transcribed from `crates/sbproxy-vault/src/resolver.rs`'s `SecretResolver::resolve`, the target every secret-bearing field is meant to route through. Most already do: provider credentials, the `source:` block's `credential` field, and at-rest key material under `key_management.crypto` all resolve through it. Two call sites are narrower today, for different reasons:
+>
+> * A backend's own construction fields (a Vault `auth.token`, AWS static keys, and similar, in the `proxy.secrets.backends:` entries below) only expand whole-value `${VAR}` and fall back to the literal string on a missing variable instead of erroring. This is a bootstrapping constraint, not a migration gap: these values configure the backend that `SecretResolver` will use, so they cannot depend on it existing yet.
+> * `proxy.cluster.security.shared_key` accepts only `env:NAME`, `file:PATH`, or an inline value of at least 16 bytes, and rejects every provider URI scheme outright, including `vault://`. This one is deliberate: a provider URI is long enough to clear the inline-entropy floor, so accepting it as a literal would silently install a well-known string, published in a doc like this one, as the cluster's shared key.
+>
+> If you find some other field silently accepting a different syntax than what is documented here, treat that as a bug worth filing rather than a feature of that field.
 
 ## HashiCorp Vault
 
@@ -409,7 +433,7 @@ $b = [byte[]]::new(32)
 ($b | ForEach-Object ToString x2) -join ''
 ```
 
-Do not derive these values from passwords, hostnames, or anything guessable, and do not reuse one value across the three roles. Generate each one once, store it in your secret manager or an environment variable, and reference it from the config (`env:NAME`, `file:PATH`, or a backend URI from the scheme table above).
+Do not derive these values from passwords, hostnames, or anything guessable, and do not reuse one value across the three roles. Generate each one once, store it in your secret manager or an environment variable, and reference it from the config (`env:NAME`, `file:PATH`, or a backend URI from the [Provider URI Schemes](#provider-uri-schemes) table above).
 
 Two of the three have a better alternative than hand-generation:
 
