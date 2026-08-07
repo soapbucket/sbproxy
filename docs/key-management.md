@@ -1,6 +1,6 @@
 # SBproxy dynamic key management
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-06*
 
 A virtual key is a live, governed resource, not a line of YAML. With the
 `key_management:` block enabled, you mint, revoke, and rotate inbound keys at
@@ -153,6 +153,28 @@ Recognized native credentials require an explicit
 absent or the recognized provider is not listed, SBproxy returns 403 before
 dispatch. A credential matching no hint remains unattributed and follows the
 origin's ordinary auth behavior.
+
+`provider_hints` ships non-empty by default and `native_key_policy` defaults
+to absent, so turning on `key_management.enabled` alone is enough to arm this
+403 with nothing behind it to admit the traffic it now recognizes. Boot, and
+every SIGHUP reload, emits a WARN naming the recognized providers whenever
+that combination is detected, so the gap is visible before the first caller
+hits it. `sbproxy validate` does not catch this: validation mode checks the
+config schema and stops there, skipping key-plane construction entirely, so
+only a live boot or reload surfaces the warning. Fix it by declaring the
+allowlist:
+
+```yaml
+inbound:
+  native_key_policy:
+    allowed_providers: [openai]
+```
+
+and, on each `ai_proxy` provider that may receive a caller credential:
+
+```yaml
+accept_native_credentials_for: openai
+```
 
 The same block is lowered to a secret-free KeyRecord-shaped default. Every
 traffic type gets provider admission, audit attribution, a stable

@@ -14,6 +14,15 @@ the next version cut.
 
 ### Changed
 
+- **Boot and every SIGHUP reload now warn when `key_management.inbound.provider_hints`
+  recognizes a native provider credential that no `inbound.native_key_policy`
+  admits.** `provider_hints` ships non-empty by default and
+  `native_key_policy` defaults to absent, so simply enabling
+  `key_management` was enough to silently refuse every native provider key
+  with a 403, with nothing at boot or in `sbproxy validate` to say so. The
+  new WARN names the recognized providers so the gap is visible before a
+  caller hits it.
+
 ### Removed
 
 ### Fixed

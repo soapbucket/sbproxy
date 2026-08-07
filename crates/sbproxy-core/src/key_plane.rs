@@ -1154,9 +1154,10 @@ mod tests {
         assert!(resolve_secret_material("not:a-scheme").is_ok());
     }
     use sbproxy_config::types::{
-        KeyCryptoConfig, KeySeedConfig, KeyStoreConfig, SecretsManagerProvider,
-        SecretsManagerStoreConfig,
+        KeyCryptoConfig, KeySeedConfig, KeyStoreConfig, NativeKeyPolicyConfig,
+        SecretsManagerProvider, SecretsManagerStoreConfig,
     };
+    use std::sync::Mutex;
 
     fn temp_db() -> String {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -1672,6 +1673,141 @@ mod tests {
             hash_admin_operator_password("pw", pepper),
             sbproxy_keystore::crypto::hash_secret("pw", pepper)
         );
+    }
+
+    #[derive(Clone)]
+    struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    struct SharedLogGuard(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLogWriter {
+        type Writer = SharedLogGuard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedLogGuard(Arc::clone(&self.0))
+        }
+    }
+
+    impl std::io::Write for SharedLogGuard {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log capture").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// WOR-2293: `provider_hints` defaults to non-empty and `native_key_policy`
+    /// defaults to absent, so simply switching `key_management.enabled` on
+    /// arms recognition of native provider credentials with nothing behind it
+    /// to admit them. Every one of those recognized credentials is refused
+    /// with 403, and until this warning existed nothing said so at boot or
+    /// reload. Driven through `prepare_key_plane` (not the private warning
+    /// function) so the assertion also proves the call site is still wired.
+    #[test]
+    fn ungoverned_provider_hints_warn_when_prepared() {
+        let _guard = test_plane_guard();
+        let path = temp_db();
+        let cfg = base_cfg(&path);
+        assert!(
+            !cfg.inbound.provider_hints.is_empty(),
+            "the default config must still recognize native provider credentials"
+        );
+        assert!(
+            cfg.inbound.native_key_policy.is_none(),
+            "the default config must still leave native_key_policy unset"
+        );
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(SharedLogWriter(Arc::clone(&captured)))
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            prepare_key_plane(Some(&cfg)).expect("prepare candidate plane");
+        });
+
+        let output =
+            String::from_utf8(captured.lock().expect("log capture").clone()).expect("UTF-8 log");
+        assert!(
+            output.contains("provider_hints recognizes native provider"),
+            "{output}"
+        );
+        assert!(output.contains("openai"), "{output}");
+        assert!(output.contains("anthropic"), "{output}");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Regression guard: once an operator adds the admitting policy block,
+    /// the warning must stop firing even though `provider_hints` is still
+    /// non-empty.
+    #[test]
+    fn native_key_policy_silences_the_ungoverned_provider_hints_warning() {
+        let _guard = test_plane_guard();
+        let path = temp_db();
+        let mut cfg = base_cfg(&path);
+        cfg.inbound.native_key_policy = Some(NativeKeyPolicyConfig {
+            allowed_providers: vec!["openai".into()],
+            ..Default::default()
+        });
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(SharedLogWriter(Arc::clone(&captured)))
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            prepare_key_plane(Some(&cfg)).expect("prepare candidate plane");
+        });
+
+        let output =
+            String::from_utf8(captured.lock().expect("log capture").clone()).expect("UTF-8 log");
+        assert!(
+            output.is_empty(),
+            "declaring inbound.native_key_policy must silence the warning: {output}"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `provider_hints: []` is the documented way to stop recognizing native
+    /// provider credentials entirely, and must not warn either.
+    #[test]
+    fn empty_provider_hints_do_not_warn() {
+        let _guard = test_plane_guard();
+        let path = temp_db();
+        let mut cfg = base_cfg(&path);
+        cfg.inbound.provider_hints = vec![];
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(SharedLogWriter(Arc::clone(&captured)))
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            prepare_key_plane(Some(&cfg)).expect("prepare candidate plane");
+        });
+
+        let output =
+            String::from_utf8(captured.lock().expect("log capture").clone()).expect("UTF-8 log");
+        assert!(
+            output.is_empty(),
+            "provider_hints: [] must disable the warning along with recognition: {output}"
+        );
+
+        std::fs::remove_file(&path).ok();
     }
 }
 
