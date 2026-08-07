@@ -90,6 +90,8 @@ permissions: []
 - `entry` is a file inside the bundle directory. JavaScript accepts `.js` or `.ts`; both WASM runtimes accept `.wasm`.
 - `hooks` declares at least one typed hook. A JavaScript hook names its ES module export. WASM hooks omit `export`.
 - `config_schema` is an optional Draft 7 JSON Schema for one attachment. Defaults are applied before the hook starts, and invalid attachment config refuses the candidate.
+- `secret_vars` names `config_schema` properties that hold a secret. Each is resolved through the same [reference forms](secrets.md) any other secret-bearing field accepts (`${VAR}`, `env:NAME`, `file:`, or a provider URI) before the hook ever runs; an unresolvable reference refuses the candidate. A property not listed here is never inspected for a reference, so resolution is always something a bundle author declared, not something the config compiler guessed at.
+- `masked_vars` names `config_schema` properties to keep out of logs, errors, and diagnostics without resolving them, for a sensitive literal that is not a secret reference (a tenant ID, an internal hostname). Both lists require the named property to exist in `config_schema`, and a property cannot appear in both.
 - `failure_posture` defaults to `closed`. `open`, `degraded`, and `observe` are only valid where that hook contract defines them. An `action` hook is terminal and accepts only `closed`, because there is nothing to fall through to when it fails.
 - `sandbox` bounds wall time, memory, stack, buffered input, output, and WASM fuel. The values shown are the defaults.
 - `permissions` must remain empty in this release. Bundle code receives no filesystem or network capability.

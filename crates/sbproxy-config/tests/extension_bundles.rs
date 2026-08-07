@@ -633,3 +633,116 @@ proxy: {}
 
     assert!(error.contains("failure_mode"), "{error}");
 }
+
+// --- WOR-2289: hook-level secret_vars / masked_vars declarations ---
+//
+// `secret_vars`/`masked_vars` are BundleHook-level fields, siblings of
+// `config_schema` at 4-space indent under the hook list item; a
+// property they name lives at 8-space, nested under config_schema's
+// own `properties:` (6-space). Every fixture below is spelled out in
+// full rather than spliced onto JAVASCRIPT_MANIFEST, so the indent is
+// never in question.
+
+const HOOK_WITH_SECRET_AND_MASKED_VARS: &str = r#"
+apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: rate-limit-by-plan
+version: 0.3.1
+runtime: javascript
+entry: src/index.ts
+hooks:
+  - kind: policy
+    type: rate_limit_by_plan
+    export: enforce
+    config_schema:
+      type: object
+      additionalProperties: false
+      properties:
+        hmac_key: { type: string }
+        tenant_id: { type: string }
+    secret_vars: [hmac_key]
+    masked_vars: [tenant_id]
+failure_posture: closed
+sandbox:
+  budget_ms: 50
+  memory_mb: 16
+  stack_kb: 512
+permissions: []
+"#;
+
+#[test]
+fn secret_vars_and_masked_vars_parse_and_are_available_on_the_hook() {
+    let manifest = parse_manifest(HOOK_WITH_SECRET_AND_MASKED_VARS);
+
+    let hook = &manifest.hooks[0];
+    assert_eq!(hook.secret_vars, vec!["hmac_key".to_owned()]);
+    assert_eq!(hook.masked_vars, vec!["tenant_id".to_owned()]);
+}
+
+#[test]
+fn a_manifest_with_no_secret_vars_or_masked_vars_still_parses() {
+    let manifest = parse_manifest(JAVASCRIPT_MANIFEST);
+
+    let hook = &manifest.hooks[0];
+    assert!(hook.secret_vars.is_empty());
+    assert!(hook.masked_vars.is_empty());
+}
+
+#[test]
+fn secret_vars_naming_an_undeclared_property_is_rejected() {
+    let yaml = replace_once(
+        HOOK_WITH_SECRET_AND_MASKED_VARS,
+        "secret_vars: [hmac_key]",
+        "secret_vars: [does_not_exist]",
+    );
+
+    let error = manifest_error(&yaml);
+
+    assert!(error.contains("does_not_exist"), "{error}");
+    assert!(error.contains("config_schema property"), "{error}");
+}
+
+#[test]
+fn masked_vars_naming_an_undeclared_property_is_rejected() {
+    let yaml = replace_once(
+        HOOK_WITH_SECRET_AND_MASKED_VARS,
+        "masked_vars: [tenant_id]",
+        "masked_vars: [does_not_exist]",
+    );
+
+    let error = manifest_error(&yaml);
+
+    assert!(error.contains("does_not_exist"), "{error}");
+    assert!(error.contains("config_schema property"), "{error}");
+}
+
+#[test]
+fn secret_vars_without_a_config_schema_is_rejected() {
+    let yaml = replace_once(
+        JAVASCRIPT_MANIFEST,
+        "    export: enforce\n",
+        "    export: enforce\n    secret_vars: [hmac_key]\n",
+    );
+
+    let error = manifest_error(&yaml);
+
+    assert!(error.contains("hmac_key"), "{error}");
+    assert!(error.contains("config_schema property"), "{error}");
+}
+
+#[test]
+fn a_var_cannot_be_in_both_secret_vars_and_masked_vars() {
+    let yaml = replace_once(
+        HOOK_WITH_SECRET_AND_MASKED_VARS,
+        "masked_vars: [tenant_id]",
+        "masked_vars: [hmac_key]",
+    );
+
+    let error = manifest_error(&yaml);
+
+    assert!(error.contains("hmac_key"), "{error}");
+    assert!(
+        error.contains("both secret_vars and masked_vars"),
+        "{error}"
+    );
+}

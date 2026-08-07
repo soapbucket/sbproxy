@@ -783,6 +783,60 @@ fn is_swept_header(k: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// WOR-2289: field-key denylist additions declared by the currently
+/// loaded extension bundles (a hook manifest's `secret_vars` and
+/// `masked_vars`). Same shape as [`SWEPT_HEADERS`]: a bundle candidate
+/// load replaces the whole set, so a reload that drops a bundle also
+/// drops the names it declared. Additive on top of the built-in
+/// baseline and every operator-configured scope; there is no config
+/// key that can disable it, matching the guarantee `OpRedactState`
+/// makes for its own `fields`.
+static BUNDLE_SECRET_FIELD_NAMES: OnceLock<std::sync::RwLock<std::sync::Arc<Vec<String>>>> =
+    OnceLock::new();
+
+fn bundle_secret_field_names_slot() -> &'static std::sync::RwLock<std::sync::Arc<Vec<String>>> {
+    BUNDLE_SECRET_FIELD_NAMES
+        .get_or_init(|| std::sync::RwLock::new(std::sync::Arc::new(Vec::new())))
+}
+
+/// Replace the set of bundle-declared secret/masked var names treated
+/// as key-bearing for redaction.
+///
+/// Call once per bundle candidate load with the union of every loaded
+/// hook's `secret_vars` and `masked_vars`. A name here is redacted by
+/// key in every structured sink, regardless of tenant or origin scope,
+/// the same way a `secret_vars` value is always resolved and always
+/// masked regardless of which attachment used it.
+pub fn set_bundle_secret_field_names(names: Vec<String>) {
+    let lowered: Vec<String> = names
+        .into_iter()
+        .map(|n| n.trim().to_ascii_lowercase())
+        .filter(|n| !n.is_empty())
+        .collect();
+    if let Ok(mut slot) = bundle_secret_field_names_slot().write() {
+        *slot = std::sync::Arc::new(lowered);
+    }
+}
+
+/// The currently registered bundle secret/masked field names, for
+/// diagnostics and tests.
+pub fn bundle_secret_field_names() -> std::sync::Arc<Vec<String>> {
+    bundle_secret_field_names_slot()
+        .read()
+        .map(|slot| slot.clone())
+        .unwrap_or_else(|_| std::sync::Arc::new(Vec::new()))
+}
+
+/// Whether `k` is a var name a loaded bundle declared `secret_vars` or
+/// `masked_vars`, and therefore carries a live secret or a value an
+/// extension author explicitly chose not to log.
+fn is_bundle_secret_field(k: &str) -> bool {
+    bundle_secret_field_names_slot()
+        .read()
+        .map(|slot| slot.iter().any(|n| n == k))
+        .unwrap_or(false)
+}
+
 /// Recursively walk a JSON value and redact any field whose key is on
 /// the denylist. Replacements use the typed `[REDACTED:FOO]` marker
 /// (schema v2).
@@ -871,6 +925,13 @@ fn match_denylist(key: &str, sink: Sink, extra_fields: &[String]) -> Option<&'st
     }
     if k == "envelope_payload_raw" {
         return Some("[REDACTED:ENVELOPE_PAYLOAD_RAW]");
+    }
+    // WOR-2289: a var a loaded bundle declared `secret_vars` or
+    // `masked_vars` in its manifest. Checked by key so this fires
+    // even for a field no other rule here anticipates, regardless of
+    // which sink or scope is rendering it.
+    if is_bundle_secret_field(&k) {
+        return Some("[REDACTED:BUNDLE_SECRET_VAR]");
     }
     // External-only: JA3 / JA4 fingerprints are kept on internal
     // sinks but redacted outbound.
@@ -1658,6 +1719,57 @@ mod tests {
         redact_value(&mut value, Sink::AccessLog, &[]);
         assert_eq!(value["x-tool-auth"], "[REDACTED:API_KEY]");
         set_swept_header_names(Vec::new());
+    }
+
+    // --- WOR-2289: bundle secret_vars/masked_vars field-key redaction ---
+
+    #[test]
+    fn a_bundle_declared_secret_var_name_is_redacted_without_editing_any_denylist() {
+        // The trap this closes, mirroring the sweep-header test above:
+        // an extension author's `customer_reference` var name matches
+        // none of the built-in suffix rules (it is not `*_key`,
+        // `*_secret`, or `*_token`), so before a bundle could register
+        // its own names, a field with that exact key sailed through
+        // unredacted the moment anything logged it by key.
+        let mut before = serde_json::json!({"customer_reference": "sbp_secret_value"});
+        redact_value(&mut before, Sink::AccessLog, &[]);
+        assert_eq!(
+            before["customer_reference"], "sbp_secret_value",
+            "precondition: nothing else redacts this name"
+        );
+
+        set_bundle_secret_field_names(vec!["customer_reference".to_string()]);
+        let mut after = serde_json::json!({"customer_reference": "sbp_secret_value"});
+        redact_value(&mut after, Sink::AccessLog, &[]);
+        assert_eq!(after["customer_reference"], "[REDACTED:BUNDLE_SECRET_VAR]");
+        set_bundle_secret_field_names(Vec::new());
+    }
+
+    #[test]
+    fn bundle_secret_field_names_are_matched_case_insensitively() {
+        set_bundle_secret_field_names(vec!["  Tenant_ID  ".to_string()]);
+        assert_eq!(*bundle_secret_field_names(), vec!["tenant_id".to_string()]);
+        let mut value = serde_json::json!({"tenant_id": "acme-corp"});
+        redact_value(&mut value, Sink::AccessLog, &[]);
+        assert_eq!(value["tenant_id"], "[REDACTED:BUNDLE_SECRET_VAR]");
+        set_bundle_secret_field_names(Vec::new());
+    }
+
+    #[test]
+    fn registering_a_new_bundle_candidate_replaces_the_previous_names() {
+        set_bundle_secret_field_names(vec!["old_secret_var".to_string()]);
+        set_bundle_secret_field_names(vec!["new_secret_var".to_string()]);
+
+        let mut value =
+            serde_json::json!({"old_secret_var": "still-here", "new_secret_var": "live"});
+        redact_value(&mut value, Sink::AccessLog, &[]);
+
+        assert_eq!(
+            value["old_secret_var"], "still-here",
+            "a reload that drops a bundle must also drop the names it declared"
+        );
+        assert_eq!(value["new_secret_var"], "[REDACTED:BUNDLE_SECRET_VAR]");
+        set_bundle_secret_field_names(Vec::new());
     }
 
     #[test]

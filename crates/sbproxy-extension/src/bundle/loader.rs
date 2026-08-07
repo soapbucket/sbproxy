@@ -561,6 +561,20 @@ impl<'a> Candidate<'a> {
         inventory
             .sort_stably()
             .map_err(|_| BundleLoadError::new("inventory", "duplicate stable inventory id"))?;
+        // WOR-2289: register this candidate's declared secret/masked var
+        // names with the process-wide log redactor. A name here is
+        // redacted by key in every structured sink regardless of scope,
+        // matching that `secret_vars`/`masked_vars` are always resolved
+        // and always masked regardless of which attachment used them.
+        // Replaces whatever the previous candidate registered, so a
+        // reload that drops a bundle also drops its names.
+        let secret_field_names: Vec<String> = self
+            .hooks
+            .values()
+            .flat_map(|hook| hook.hook.secret_vars.iter().chain(&hook.hook.masked_vars))
+            .cloned()
+            .collect();
+        sbproxy_observe::logging::set_bundle_secret_field_names(secret_field_names);
         Ok(DynamicBundleRegistry {
             hooks: self.hooks,
             inventory,

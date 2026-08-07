@@ -288,6 +288,21 @@ pub struct BundleHook {
     /// Optional Draft 7 JSON Schema for per-attachment configuration.
     #[serde(default)]
     pub config_schema: Option<Value>,
+    /// Top-level `config_schema` property names that hold a secret.
+    /// Resolved through the central secret resolver before the guest
+    /// runs; an unresolvable reference refuses the candidate. Always
+    /// masked wherever the config is rendered. Every name must also
+    /// appear in `config_schema`'s top-level `properties`, and a name
+    /// cannot appear in both `secret_vars` and `masked_vars`.
+    #[serde(default)]
+    pub secret_vars: Vec<String>,
+    /// Top-level `config_schema` property names to mask wherever the
+    /// config is rendered, without resolving them through the secret
+    /// resolver. For a literal value (a tenant id, an internal
+    /// hostname) that is sensitive but not a secret reference. Subject
+    /// to the same `properties` membership rule as `secret_vars`.
+    #[serde(default)]
+    pub masked_vars: Vec<String>,
     /// Whether a successful AI hook verdict blocks or only observes.
     #[serde(default)]
     pub enforcement_mode: EnforcementMode,
@@ -529,6 +544,7 @@ impl BundleManifest {
             if let Some(schema) = &hook.config_schema {
                 validate_schema(schema)?;
             }
+            validate_secret_and_masked_vars(hook)?;
         }
 
         self.validate_runtime_contract()
@@ -762,6 +778,42 @@ fn validate_limit(field: &str, value: u64, maximum: u64) -> Result<(), BundleMan
         return invalid(format!(
             "{field} must be between 1 and {maximum}, got {value}"
         ));
+    }
+    Ok(())
+}
+
+/// Validate a hook's `secret_vars`/`masked_vars` declarations: every
+/// name must be a top-level `config_schema` property, and a name
+/// cannot appear in both lists (WOR-2289). Declaring either list with
+/// no `config_schema` is invalid, since there is no property for the
+/// name to refer to.
+fn validate_secret_and_masked_vars(hook: &BundleHook) -> Result<(), BundleManifestError> {
+    if hook.secret_vars.is_empty() && hook.masked_vars.is_empty() {
+        return Ok(());
+    }
+    let properties = hook
+        .config_schema
+        .as_ref()
+        .and_then(|schema| schema.get("properties"))
+        .and_then(Value::as_object);
+    for name in hook.secret_vars.iter().chain(&hook.masked_vars) {
+        let declared = properties.is_some_and(|properties| properties.contains_key(name));
+        if !declared {
+            return invalid(format!(
+                "{} hook `{}` declares secret_vars/masked_vars `{name}`, which is not a config_schema property",
+                hook_kind_label(hook.kind),
+                hook.type_name
+            ));
+        }
+    }
+    for name in &hook.secret_vars {
+        if hook.masked_vars.contains(name) {
+            return invalid(format!(
+                "{} hook `{}` lists `{name}` in both secret_vars and masked_vars; a var cannot be both",
+                hook_kind_label(hook.kind),
+                hook.type_name
+            ));
+        }
     }
     Ok(())
 }

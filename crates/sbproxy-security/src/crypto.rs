@@ -72,6 +72,13 @@ pub enum HkdfPurpose {
     /// and purpose separation is what keeps one derived key from opening
     /// the other's records.
     PromptPersistenceAtRest,
+    /// WOR-2289: short published fingerprint for a resolved bundle
+    /// `secret_vars`/`masked_vars` value, shown in a masked debug
+    /// rendering so an operator can tell values apart without ever
+    /// logging the value itself. Distinct purpose keeps this published
+    /// fingerprint from being a derivation of the same keyspace as any
+    /// encryption or signing key derived from the same material.
+    BundleSecretVarFingerprint,
 }
 
 impl HkdfPurpose {
@@ -91,6 +98,9 @@ impl HkdfPurpose {
             HkdfPurpose::MeshWire => b"sbproxy.hkdf.mesh-wire.v1",
             HkdfPurpose::ResponseCacheAtRest => b"sbproxy.hkdf.response-cache-at-rest.v1",
             HkdfPurpose::PromptPersistenceAtRest => b"sbproxy.hkdf.prompt-persistence-at-rest.v1",
+            HkdfPurpose::BundleSecretVarFingerprint => {
+                b"sbproxy.hkdf.bundle-secret-var-fingerprint.v1"
+            }
         }
     }
 }

@@ -7420,6 +7420,7 @@ dependencies = [
  "wasmtime",
  "wasmtime-wasi",
  "yaml_serde",
+ "zeroize",
 ]
 
 [[package]]

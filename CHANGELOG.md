@@ -12,6 +12,18 @@ the next version cut.
 
 ### Added
 
+- **Extension bundle manifests can declare `secret_vars` and
+  `masked_vars` on a hook.** A `secret_vars` property is resolved
+  through the same secret reference forms (`${VAR}`, `env:NAME`,
+  `file:`, or a provider URI) any other secret-bearing field accepts,
+  once, when the bundle candidate loads; a `masked_vars` property is
+  never resolved but is still kept out of logs, errors, and
+  diagnostics. Neither list can name a property `config_schema` does
+  not declare, and a property cannot appear in both. Masked values
+  render with their length and an HKDF-derived fingerprint rather than
+  a bare placeholder, so an operator can tell two values apart without
+  the value ever being logged.
+
 ### Changed
 
 ### Removed
