@@ -365,11 +365,84 @@ impl QueryMatch {
     }
 }
 
+/// The comparison a [`BodyMatch`] applies to the value its pointer resolved to.
+pub enum BodyCompare {
+    /// The resolved value, rendered as text, must equal this exactly.
+    Equals(String),
+    /// The resolved value, rendered as text, must start with this.
+    Prefix(String),
+    /// The pointer must resolve to any JSON value at all. An object or an
+    /// array counts, which is how `pointer: /tools` asks whether the request
+    /// declares tools without naming one.
+    Present,
+}
+
+/// Match a field inside a JSON request body, addressed by JSON Pointer.
+///
+/// This is the only matcher whose input is not already in hand when routing
+/// starts, so it is the only one with a size limit and the only one that can
+/// be asked to decide with nothing to decide on. Both cases resolve the same
+/// way: the matcher misses. It never fails the request, because a body the
+/// proxy could not read is not evidence that the operator's rule should have
+/// fired, and it is not evidence of a client error either.
+///
+/// [`Self::matches`] therefore returns `false` for a body that was never
+/// buffered, a body past `max_bytes`, a body that is not JSON, a body that
+/// does not parse, a pointer that resolves to nothing, and a container
+/// compared against a configured string. Routing then continues to the next
+/// entry, the next rule, and finally the origin's own action, which is the
+/// header-only route the request would have taken anyway.
+pub struct BodyMatch {
+    /// Decoded RFC 6901 reference tokens, split once at config-load time so
+    /// the request path never re-parses the pointer string.
+    pub pointer: Vec<String>,
+    /// The comparison to apply to the resolved value.
+    pub compare: BodyCompare,
+    /// Largest body this matcher reads, in bytes. Never above
+    /// [`sbproxy_config::BODY_MATCH_MAX_BYTES`].
+    pub max_bytes: usize,
+}
+
+impl BodyMatch {
+    /// Test the matcher against the buffered request body.
+    ///
+    /// `body` is `None` when the request had no body, when the origin's
+    /// buffering was skipped because the declared `Content-Length` already
+    /// exceeded the cap, or when the replay buffer filled before the body
+    /// ended. All three are misses.
+    #[must_use]
+    pub fn matches(&self, body: Option<&[u8]>) -> bool {
+        let Some(bytes) = body else {
+            return false;
+        };
+        if bytes.len() > self.max_bytes {
+            return false;
+        }
+        let Some(target) = crate::json_pointer::resolve(bytes, &self.pointer) else {
+            return false;
+        };
+        match (&self.compare, target) {
+            (BodyCompare::Present, _) => true,
+            (BodyCompare::Equals(expected), crate::json_pointer::PointerTarget::Scalar(got)) => {
+                got == *expected
+            }
+            (BodyCompare::Prefix(expected), crate::json_pointer::PointerTarget::Scalar(got)) => {
+                got.starts_with(expected.as_str())
+            }
+            // A configured string cannot equal an object or an array.
+            (
+                BodyCompare::Equals(_) | BodyCompare::Prefix(_),
+                crate::json_pointer::PointerTarget::Container,
+            ) => false,
+        }
+    }
+}
+
 /// One AND-grouped match entry inside a forward rule's `rules:` list.
 ///
-/// Every present matcher (`path`, `header`, `query`) must succeed for the
-/// entry to fire. The enclosing list of entries is ORed: any matching entry
-/// triggers the rule.
+/// Every present matcher (`path`, `header`, `query`, `body`) must succeed for
+/// the entry to fire. The enclosing list of entries is ORed: any matching
+/// entry triggers the rule.
 pub struct MatcherEntry {
     /// Path matcher (any of prefix / exact / template / regex).
     pub path: Option<PathMatch>,
@@ -377,21 +450,47 @@ pub struct MatcherEntry {
     pub header: Option<HeaderMatch>,
     /// Query parameter matcher.
     pub query: Option<QueryMatch>,
+    /// JSON request-body field matcher. Evaluated last because it is the
+    /// only matcher that reads bytes the request phase had to buffer.
+    pub body: Option<BodyMatch>,
 }
 
 impl MatcherEntry {
-    /// Evaluate this entry against the incoming request.
+    /// Evaluate this entry against the incoming request, with no body.
     ///
-    /// Returns the captured path params (possibly empty) when every present
-    /// matcher passes. Returns `None` when any present matcher fails or when
-    /// the entry has no matchers at all.
+    /// Callers that only need to know which action a request will land on,
+    /// and that run before or without body buffering, use this. An entry
+    /// carrying a body matcher cannot pass here, which keeps those callers
+    /// conservative: they fall back to the origin's own action rather than
+    /// claim a body-gated rule they have not proved.
     pub fn match_request(
         &self,
         path: &str,
         query: Option<&str>,
         headers: &http::HeaderMap,
     ) -> Option<HashMap<String, String>> {
-        let any_present = self.path.is_some() || self.header.is_some() || self.query.is_some();
+        self.match_request_with_body(path, query, headers, None)
+    }
+
+    /// Evaluate this entry against the incoming request and its buffered body.
+    ///
+    /// Returns the captured path params (possibly empty) when every present
+    /// matcher passes. Returns `None` when any present matcher fails or when
+    /// the entry has no matchers at all.
+    ///
+    /// `body` is `Some` only for origins that declare a body matcher; every
+    /// other origin passes `None` and never pays for buffering or parsing.
+    pub fn match_request_with_body(
+        &self,
+        path: &str,
+        query: Option<&str>,
+        headers: &http::HeaderMap,
+        body: Option<&[u8]>,
+    ) -> Option<HashMap<String, String>> {
+        let any_present = self.path.is_some()
+            || self.header.is_some()
+            || self.query.is_some()
+            || self.body.is_some();
         if !any_present {
             return None;
         }
@@ -410,8 +509,30 @@ impl MatcherEntry {
                 return None;
             }
         }
+        if let Some(b) = &self.body {
+            if !b.matches(body) {
+                return None;
+            }
+        }
         Some(captured)
     }
+}
+
+/// Largest request body any body matcher across `rules` will read, or `None`
+/// when not one of them declares a body matcher.
+///
+/// This is the gate on the whole buffering seam. `None` means the request
+/// phase never enables replay buffering, never drains the downstream body
+/// early, and never parses anything, which is what keeps body-field routing
+/// off the hot path of every origin that does not ask for it.
+#[must_use]
+pub fn forward_rule_body_cap(rules: &[CompiledForwardRule]) -> Option<usize> {
+    rules
+        .iter()
+        .flat_map(|rule| rule.matchers.iter())
+        .filter_map(|entry| entry.body.as_ref())
+        .map(|body| body.max_bytes)
+        .max()
 }
 
 /// A compiled forward rule: match conditions + inline origin action + request modifiers.
@@ -2778,11 +2899,13 @@ fn compile_single_forward_rule(
         let path = compile_path_matcher(rule)?;
         let header = compile_header_matcher(non_null(rule.get("header")))?;
         let query = compile_query_matcher(non_null(rule.get("query")))?;
-        if path.is_some() || header.is_some() || query.is_some() {
+        let body = compile_body_matcher(non_null(rule.get("body")))?;
+        if path.is_some() || header.is_some() || query.is_some() || body.is_some() {
             matchers.push(MatcherEntry {
                 path,
                 header,
                 query,
+                body,
             });
         }
     }
@@ -2926,6 +3049,66 @@ fn compile_query_matcher(val: Option<&serde_json::Value>) -> anyhow::Result<Opti
         }));
     }
     Ok(Some(QueryMatch::Present { name }))
+}
+
+/// Compile the `body:` block of a single matcher entry. Accepts
+/// `{ pointer, value }` (exact), `{ pointer, prefix }` (value prefix), or
+/// just `{ pointer }` (presence-only), plus an optional `max_bytes`.
+///
+/// The pointer is split into its reference tokens here so the request path
+/// never re-parses it, and an unusable pointer fails config load with a clear
+/// message instead of quietly never matching.
+fn compile_body_matcher(val: Option<&serde_json::Value>) -> anyhow::Result<Option<BodyMatch>> {
+    let Some(obj) = val else {
+        return Ok(None);
+    };
+    let pointer_str = obj
+        .get("pointer")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("forward-rule body matcher missing 'pointer'"))?;
+    let pointer = crate::json_pointer::compile_pointer(pointer_str)
+        .map_err(|e| anyhow::anyhow!("forward-rule body matcher: {e}"))?;
+
+    let max_bytes = match obj.get("max_bytes").and_then(serde_json::Value::as_u64) {
+        Some(configured) => {
+            if configured == 0 {
+                anyhow::bail!(
+                    "forward-rule body matcher on '{pointer_str}' sets `max_bytes: 0`, \
+                     which can never match any body. Remove the matcher instead."
+                );
+            }
+            if configured > sbproxy_config::BODY_MATCH_MAX_BYTES {
+                anyhow::bail!(
+                    "forward-rule body matcher on '{pointer_str}' sets `max_bytes: {configured}`, \
+                     above the {} byte replay buffer that holds a body read during route \
+                     selection. Bytes past that are not retained and could not be forwarded \
+                     upstream, so the larger cap could not be honored. Lower it to {} or less.",
+                    sbproxy_config::BODY_MATCH_MAX_BYTES,
+                    sbproxy_config::BODY_MATCH_MAX_BYTES,
+                );
+            }
+            configured
+        }
+        None => sbproxy_config::BODY_MATCH_MAX_BYTES,
+    };
+    // The ceiling above is `u64` to match the schema; the cast is lossless on
+    // every target the proxy builds for, all of which have a 32-bit or wider
+    // `usize`, and the ceiling itself is 65536.
+    let max_bytes = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+
+    let compare = if let Some(value) = obj.get("value").and_then(|v| v.as_str()) {
+        BodyCompare::Equals(value.to_string())
+    } else if let Some(prefix) = obj.get("prefix").and_then(|v| v.as_str()) {
+        BodyCompare::Prefix(prefix.to_string())
+    } else {
+        BodyCompare::Present
+    };
+
+    Ok(Some(BodyMatch {
+        pointer,
+        compare,
+        max_bytes,
+    }))
 }
 
 /// Compile a fallback origin from its JSON representation (if present).
@@ -4548,6 +4731,328 @@ mod normalize_tests {
             headers.set.get("X-Routed-To").map(|s| s.as_str()),
             Some("api-backend")
         );
+    }
+}
+
+/// WOR-2306: body-field route matching.
+#[cfg(test)]
+mod body_matcher_tests {
+    use super::*;
+
+    /// A representative chat-completion request. `model` is a body field in
+    /// this shape, which is the whole reason the matcher exists.
+    const CHAT_BODY: &[u8] = br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true,"tools":[{"name":"search"}]}"#;
+
+    fn compiled(json: serde_json::Value) -> BodyMatch {
+        compile_body_matcher(Some(&json))
+            .expect("body matcher compiles")
+            .expect("body matcher is present")
+    }
+
+    fn body_only_entry(json: serde_json::Value) -> MatcherEntry {
+        MatcherEntry {
+            path: None,
+            header: None,
+            query: None,
+            body: Some(compiled(json)),
+        }
+    }
+
+    fn rule_with(matchers: Vec<MatcherEntry>) -> CompiledForwardRule {
+        CompiledForwardRule {
+            matchers,
+            action: Action::Noop,
+            request_modifiers: Vec::new(),
+            parameters: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn an_equals_matcher_hits_the_model_it_names() {
+        let matcher = compiled(serde_json::json!({"pointer": "/model", "value": "gpt-4o"}));
+        assert!(matcher.matches(Some(CHAT_BODY)));
+    }
+
+    #[test]
+    fn an_equals_matcher_misses_a_different_model() {
+        let matcher = compiled(serde_json::json!({"pointer": "/model", "value": "gpt-4o-mini"}));
+        assert!(!matcher.matches(Some(CHAT_BODY)));
+    }
+
+    #[test]
+    fn a_prefix_matcher_groups_a_model_family() {
+        let hit = compiled(serde_json::json!({"pointer": "/model", "prefix": "gpt-"}));
+        assert!(hit.matches(Some(CHAT_BODY)));
+        let miss = compiled(serde_json::json!({"pointer": "/model", "prefix": "claude-"}));
+        assert!(!miss.matches(Some(CHAT_BODY)));
+    }
+
+    #[test]
+    fn value_wins_over_prefix_when_both_are_configured() {
+        // Mirrors the header matcher, where `value` also wins.
+        let matcher = compiled(serde_json::json!({
+            "pointer": "/model",
+            "value": "gpt-4o",
+            "prefix": "claude-",
+        }));
+        assert!(matcher.matches(Some(CHAT_BODY)));
+    }
+
+    #[test]
+    fn a_presence_matcher_fires_on_a_container_field() {
+        let matcher = compiled(serde_json::json!({"pointer": "/tools"}));
+        assert!(matcher.matches(Some(CHAT_BODY)));
+    }
+
+    #[test]
+    fn a_boolean_compares_against_its_text_form() {
+        let matcher = compiled(serde_json::json!({"pointer": "/stream", "value": "true"}));
+        assert!(matcher.matches(Some(CHAT_BODY)));
+    }
+
+    #[test]
+    fn a_missing_field_misses() {
+        let matcher = compiled(serde_json::json!({"pointer": "/provider", "value": "openai"}));
+        assert!(!matcher.matches(Some(CHAT_BODY)));
+        let present = compiled(serde_json::json!({"pointer": "/provider"}));
+        assert!(!present.matches(Some(CHAT_BODY)));
+    }
+
+    #[test]
+    fn a_container_never_equals_a_configured_string() {
+        // The wrong-type case: `/tools` resolves, but to an array, so a
+        // string comparison against it cannot succeed and must not error.
+        let equals = compiled(serde_json::json!({"pointer": "/tools", "value": "search"}));
+        assert!(!equals.matches(Some(CHAT_BODY)));
+        let prefix = compiled(serde_json::json!({"pointer": "/tools", "prefix": "se"}));
+        assert!(!prefix.matches(Some(CHAT_BODY)));
+    }
+
+    #[test]
+    fn a_non_json_body_misses_without_erroring() {
+        let matcher = compiled(serde_json::json!({"pointer": "/model", "value": "gpt-4o"}));
+        assert!(!matcher.matches(Some(b"model=gpt-4o&stream=true")));
+        assert!(!matcher.matches(Some(b"<request><model>gpt-4o</model></request>")));
+        assert!(!matcher.matches(Some(&[0x1f, 0x8b, 0x08, 0x00])));
+        assert!(!matcher.matches(Some(b"")));
+    }
+
+    #[test]
+    fn a_malformed_json_body_misses_without_erroring() {
+        let matcher = compiled(serde_json::json!({"pointer": "/model", "value": "gpt-4o"}));
+        assert!(!matcher.matches(Some(br#"{"model":"gpt-4o""#)));
+        assert!(!matcher.matches(Some(br#"{"model":}"#)));
+        assert!(!matcher.matches(Some(br#"{"model":"gpt-4o",}"#)));
+    }
+
+    #[test]
+    fn a_body_over_the_cap_misses_rather_than_failing() {
+        let matcher = compiled(serde_json::json!({
+            "pointer": "/model",
+            "value": "gpt-4o",
+            "max_bytes": 32,
+        }));
+        assert!(
+            CHAT_BODY.len() > 32,
+            "the fixture has to exceed the cap for this to test anything"
+        );
+        assert!(!matcher.matches(Some(CHAT_BODY)));
+
+        // The same matcher against a body inside its cap still hits, so the
+        // cap is what rejected the larger one and not the pointer.
+        assert!(matcher.matches(Some(br#"{"model":"gpt-4o"}"#)));
+    }
+
+    #[test]
+    fn an_unbuffered_body_misses() {
+        // `None` is what the request phase passes when the body was never
+        // read: no body at all, a Content-Length already past the cap, or a
+        // replay buffer that filled before the body ended.
+        let matcher = compiled(serde_json::json!({"pointer": "/model", "value": "gpt-4o"}));
+        assert!(!matcher.matches(None));
+        let present = compiled(serde_json::json!({"pointer": "/model"}));
+        assert!(!present.matches(None));
+    }
+
+    #[test]
+    fn the_body_matcher_ands_with_the_other_matchers() {
+        let entry = MatcherEntry {
+            path: Some(PathMatch::Prefix("/v1/chat".to_string())),
+            header: Some(HeaderMatch::Equals {
+                name: http::HeaderName::from_static("x-tier"),
+                value: "gold".to_string(),
+            }),
+            query: None,
+            body: Some(compiled(
+                serde_json::json!({"pointer": "/model", "value": "gpt-4o"}),
+            )),
+        };
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-tier", http::HeaderValue::from_static("gold"));
+
+        assert!(entry
+            .match_request_with_body("/v1/chat/completions", None, &headers, Some(CHAT_BODY))
+            .is_some());
+        // Body agrees, path does not.
+        assert!(entry
+            .match_request_with_body("/v1/embeddings", None, &headers, Some(CHAT_BODY))
+            .is_none());
+        // Path and header agree, body does not.
+        assert!(entry
+            .match_request_with_body(
+                "/v1/chat/completions",
+                None,
+                &headers,
+                Some(br#"{"model":"claude-sonnet-4"}"#),
+            )
+            .is_none());
+        // Everything else agrees but no body was buffered.
+        assert!(entry
+            .match_request_with_body("/v1/chat/completions", None, &headers, None)
+            .is_none());
+    }
+
+    #[test]
+    fn a_header_only_entry_is_unaffected_by_the_new_argument() {
+        let entry = MatcherEntry {
+            path: Some(PathMatch::Prefix("/v1".to_string())),
+            header: None,
+            query: None,
+            body: None,
+        };
+        let headers = http::HeaderMap::new();
+        assert!(entry.match_request("/v1/chat", None, &headers).is_some());
+        assert!(entry
+            .match_request_with_body("/v1/chat", None, &headers, Some(CHAT_BODY))
+            .is_some());
+    }
+
+    #[test]
+    fn an_origin_without_a_body_matcher_never_buffers() {
+        // `forward_rule_body_cap` is the single gate the request phase reads
+        // before it enables replay buffering or drains the downstream body.
+        // `None` here is the proof that an origin routing on path, header,
+        // and query pays nothing for a feature it did not ask for: no
+        // buffering, no drain, no parse.
+        let rules = vec![
+            rule_with(vec![MatcherEntry {
+                path: Some(PathMatch::Prefix("/v1".to_string())),
+                header: None,
+                query: None,
+                body: None,
+            }]),
+            rule_with(vec![MatcherEntry {
+                path: None,
+                header: None,
+                query: Some(QueryMatch::Present {
+                    name: "debug".to_string(),
+                }),
+                body: None,
+            }]),
+        ];
+        assert_eq!(forward_rule_body_cap(&rules), None);
+        assert_eq!(forward_rule_body_cap(&[]), None);
+    }
+
+    #[test]
+    fn the_cap_for_an_origin_is_the_largest_any_of_its_matchers_asks_for() {
+        let rules = vec![
+            rule_with(vec![body_only_entry(serde_json::json!({
+                "pointer": "/model",
+                "value": "gpt-4o",
+                "max_bytes": 4096,
+            }))]),
+            rule_with(vec![body_only_entry(serde_json::json!({
+                "pointer": "/model",
+                "value": "claude-sonnet-4",
+                "max_bytes": 16384,
+            }))]),
+        ];
+        assert_eq!(forward_rule_body_cap(&rules), Some(16384));
+    }
+
+    #[test]
+    fn the_default_cap_is_the_replay_buffer_size() {
+        let matcher = compiled(serde_json::json!({"pointer": "/model"}));
+        assert_eq!(
+            matcher.max_bytes,
+            usize::try_from(sbproxy_config::BODY_MATCH_MAX_BYTES).expect("cap fits in usize")
+        );
+    }
+
+    // `.err().expect(..)` rather than `.expect_err(..)` throughout this
+    // group, for the same reason the `CompiledPipeline` tests further down
+    // do it: `BodyMatch` withholds `Debug` on purpose, since it holds a
+    // compiled matcher whose contents are config detail rather than
+    // something worth printing, and `expect_err` requires `Debug` on the
+    // `Ok` type. The test bends, not the production type (WOR-2193).
+    #[test]
+    fn a_cap_above_the_replay_buffer_is_refused_at_config_load() {
+        let error = compile_body_matcher(Some(&serde_json::json!({
+            "pointer": "/model",
+            "max_bytes": 1_048_576,
+        })))
+        .err()
+        .expect("a cap the replay buffer cannot hold must not compile");
+        let message = format!("{error:#}");
+        assert!(message.contains("65536"), "{message}");
+        assert!(message.contains("replay buffer"), "{message}");
+    }
+
+    #[test]
+    fn a_zero_cap_is_refused_at_config_load() {
+        let error = compile_body_matcher(Some(&serde_json::json!({
+            "pointer": "/model",
+            "max_bytes": 0,
+        })))
+        .err()
+        .expect("a cap of zero can never match and must not compile");
+        assert!(format!("{error:#}").contains("never match"), "{error:#}");
+    }
+
+    #[test]
+    fn an_unusable_pointer_fails_config_load() {
+        let error = compile_body_matcher(Some(&serde_json::json!({"pointer": "model"})))
+            .err()
+            .expect("a bare field name is not a JSON Pointer");
+        assert!(format!("{error:#}").contains("RFC 6901"), "{error:#}");
+
+        let error = compile_body_matcher(Some(&serde_json::json!({"value": "gpt-4o"})))
+            .err()
+            .expect("a body matcher without a pointer must not compile");
+        assert!(
+            format!("{error:#}").contains("missing 'pointer'"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn a_full_forward_rule_carries_its_body_matcher_through_compilation() {
+        let rule = serde_json::json!({
+            "rules": [{
+                "path": {"prefix": "/v1/chat"},
+                "body": {"pointer": "/model", "prefix": "gpt-"},
+            }],
+            "origin": {
+                "action": {"type": "proxy", "url": "https://openai.test"}
+            }
+        });
+        let registry = empty_extension_registry();
+        let compiled_rule = compile_single_forward_rule(
+            &rule,
+            "openai-lane",
+            PipelineConstructionMode::Validation,
+            registry.as_ref(),
+        )
+        .expect("the forward rule compiles");
+        assert_eq!(
+            forward_rule_body_cap(std::slice::from_ref(&compiled_rule)),
+            Some(usize::try_from(sbproxy_config::BODY_MATCH_MAX_BYTES).expect("cap fits"))
+        );
+        let headers = http::HeaderMap::new();
+        assert!(compiled_rule.matchers[0]
+            .match_request_with_body("/v1/chat/completions", None, &headers, Some(CHAT_BODY))
+            .is_some());
     }
 }
 

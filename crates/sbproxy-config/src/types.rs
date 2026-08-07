@@ -7061,7 +7061,7 @@ pub struct SessionConfig {
 /// Compiled at config-load time. The runtime walks the `rules` of each
 /// forward rule against the incoming request and uses the first matching
 /// entry's `origin`. Within a single entry the present matchers (path,
-/// header, query) are ANDed; across entries they are ORed.
+/// header, query, body) are ANDed; across entries they are ORed.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RawForwardRule {
@@ -7124,9 +7124,9 @@ pub enum ParameterLocation {
 
 /// One match entry inside a forward rule's `rules:` list.
 ///
-/// Each entry may carry any combination of `path`, `header`, and `query`
-/// matchers. Within a single entry the matchers are ANDed: every present
-/// matcher must succeed for the entry to fire. Across entries in the
+/// Each entry may carry any combination of `path`, `header`, `query`, and
+/// `body` matchers. Within a single entry the matchers are ANDed: every
+/// present matcher must succeed for the entry to fire. Across entries in the
 /// same rule the semantics are OR: any matching entry triggers the rule.
 /// The shorthand `match: <prefix>` is equivalent to `path: { prefix: ... }`.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -7144,6 +7144,9 @@ pub struct ForwardRuleMatcher {
     /// Query parameter matcher.
     #[serde(default)]
     pub query: Option<QueryMatcher>,
+    /// JSON request-body field matcher.
+    #[serde(default)]
+    pub body: Option<BodyMatcher>,
 }
 
 /// Match a request header by exact value or value prefix.
@@ -7177,6 +7180,64 @@ pub struct QueryMatcher {
     /// Required exact value. When `None`, presence of the parameter is enough.
     #[serde(default)]
     pub value: Option<String>,
+}
+
+/// Default value and hard ceiling for `BodyMatcher::max_bytes`, in bytes.
+///
+/// 65536 is the size of the replay buffer the proxy fills when it reads a
+/// request body during route selection. Bytes beyond it are not retained, so a
+/// matcher configured to read further would be asking to inspect bytes that
+/// cannot also be forwarded upstream. Config compilation refuses a larger
+/// value rather than accepting one that silently cannot be honored.
+pub const BODY_MATCH_MAX_BYTES: u64 = 65_536;
+
+/// Match a field inside a JSON request body, addressed by RFC 6901 JSON Pointer.
+///
+/// This exists because the field an operator most wants to route on is often
+/// in the body rather than the URL. `model`, `stream`, and `tools` are body
+/// fields in the OpenAI, Anthropic, and Bedrock request shapes, so without
+/// this matcher two models cannot be given different rate limits, different
+/// upstream credentials, or different guardrail chains without collapsing
+/// them onto one origin.
+///
+/// Exactly one of `value` or `prefix` should be set. When both are present
+/// `value` wins (exact comparison). When neither is set the matcher succeeds
+/// whenever the pointer resolves to any JSON value at all, including `null`,
+/// an object, or an array, which is how you route on "this request uses
+/// tools" without naming a tool.
+///
+/// Numbers and booleans are compared against their JSON text form, so
+/// `pointer: /stream` with `value: "true"` matches `{"stream": true}`.
+///
+/// Selecting a route on a body field means the body has to be buffered before
+/// the route is known, so this matcher is the one part of routing with a size
+/// limit. `max_bytes` caps it, defaulting to 65536 and never exceeding it,
+/// because 65536 is the fixed size of the replay buffer that lets the
+/// buffered bytes still be forwarded upstream byte for byte.
+///
+/// Five things make this matcher miss rather than fail the request: a body
+/// larger than `max_bytes`, a body that is not JSON, a body that does not
+/// parse, a pointer that resolves to nothing, and a pointer that resolves to
+/// an object or array while `value` or `prefix` asked for a scalar. In every
+/// one of those cases the entry does not fire and routing carries on to the
+/// next entry, then the next rule, then the origin's own action, which is the
+/// same header-only routing that would have happened without the matcher.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BodyMatcher {
+    /// RFC 6901 JSON Pointer to the field, for example `/model` or
+    /// `/messages/0/role`. An empty pointer addresses the whole document.
+    pub pointer: String,
+    /// Required exact value.
+    #[serde(default)]
+    pub value: Option<String>,
+    /// Required value prefix. Ignored when `value` is set.
+    #[serde(default)]
+    pub prefix: Option<String>,
+    /// Largest request body this matcher will read, in bytes. Defaults to
+    /// 65536. Config compilation refuses a larger value.
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
 }
 
 /// A path matcher inside a forward rule.

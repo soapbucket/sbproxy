@@ -385,6 +385,72 @@ async fn resolve_impersonation_ticket(
     })
 }
 
+/// Whether the request already declares more body than the body-matching
+/// cap will hold (WOR-2306).
+///
+/// Checked before any buffering is armed, so a large upload is never
+/// partially retained just to be refused by the matcher afterwards. A
+/// request with no `Content-Length`, or an unparseable one, is not
+/// "exceeding" anything knowable here; a chunked body that overruns is
+/// caught by the read loop instead, and both end the same way.
+fn declared_body_exceeds_cap(session: &Session, cap: usize) -> bool {
+    session
+        .req_header()
+        .headers
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|text| text.parse::<usize>().ok())
+        .is_some_and(|declared| declared > cap)
+}
+
+/// Read up to `cap` bytes of the request body so a forward rule can match
+/// on a field inside it (WOR-2306).
+///
+/// `cap` is `None` for every origin that declares no body matcher, and that
+/// is the entire hot-path story: the function returns without touching the
+/// session, so an origin that does not use this feature pays one branch and
+/// never buffers, reads, or parses anything.
+///
+/// Reading here is only safe because `request_filter` armed replay
+/// buffering before any of this ran. Every chunk consumed is retained and
+/// replayed upstream, so selecting a route on the body does not consume the
+/// body.
+///
+/// # Misses rather than failures
+///
+/// A body larger than the cap returns `None`, which makes the matcher fall
+/// through to header-only matching rather than refusing the request. That
+/// is deliberate: the cap exists to bound this process's memory, and a
+/// request being too big to *route on* is not the same as a request being
+/// too big to *serve*. Failing here would turn a routing convenience into a
+/// new way to reject traffic that has always been fine.
+///
+/// The remaining bytes are left in the stream on that path. The ordinary
+/// proxy loop reads and forwards them exactly as it would for any origin
+/// with no body matcher at all.
+///
+/// A transport error is still an error, since that request is not going to
+/// be served either way.
+async fn read_body_for_route_matching(
+    session: &mut Session,
+    cap: Option<usize>,
+) -> Result<Option<Vec<u8>>> {
+    let Some(cap) = cap else {
+        return Ok(None);
+    };
+
+    let mut buffered: Vec<u8> = Vec::new();
+    while let Some(chunk) = session.read_request_body().await? {
+        // `saturating_add` because both operands are attacker-influenced
+        // and a wrap here would turn the cap into a bypass.
+        if buffered.len().saturating_add(chunk.len()) > cap {
+            return Ok(None);
+        }
+        buffered.extend_from_slice(&chunk);
+    }
+    Ok(Some(buffered))
+}
+
 /// Handle an incoming request before proxying. See the trait method
 /// `<SbProxy as ProxyHttp>::request_filter` for the phase contract.
 pub(super) async fn request_filter(
@@ -1358,6 +1424,38 @@ pub(super) async fn request_filter(
     {
         session.as_mut().enable_retry_buffering();
     }
+
+    // WOR-2306: arm body-field route matching.
+    //
+    // Route selection runs on headers, which is why it can run this early:
+    // the headers are already here. A forward rule that matches on a JSON
+    // body field inverts that, because the route now depends on bytes that
+    // have not arrived. Replay buffering is what makes reading them safe.
+    // With it on, every chunk the request phase consumes is retained and
+    // replayed upstream, so choosing a route on the body does not consume
+    // the body. It has to be enabled here, at the origin boundary and ahead
+    // of any body-consuming middleware, because it cannot retroactively
+    // capture bytes another reader has already taken.
+    //
+    // `forward_rule_body_cap` returns `None` for every origin that declares
+    // no body matcher, and `None` is the whole hot-path story: no buffering
+    // is armed, the drain below is skipped, and nothing is parsed.
+    //
+    // A `Content-Length` already past the cap short-circuits here rather
+    // than filling 64 KiB the matcher would then refuse. Both that case and
+    // a chunked body that overruns the buffer end the same way, at the
+    // matcher, as a miss.
+    let body_route_cap: Option<usize> =
+        match crate::pipeline::forward_rule_body_cap(&pipeline.forward_rules[origin_idx]) {
+            Some(cap)
+                if !session.as_mut().is_body_empty()
+                    && !declared_body_exceeds_cap(session, cap) =>
+            {
+                session.as_mut().enable_retry_buffering();
+                Some(cap)
+            }
+            _ => None,
+        };
 
     // WOR-1053: stamp the matched origin's tenant on the request
     // context so downstream auth / policy / vault resolution can
@@ -3944,7 +4042,14 @@ pub(super) async fn request_filter(
         }
     }
 
-    // --- Forward rules: path/header/query routing to inline origins ---
+    // --- Forward rules: path/header/query/body routing to inline origins ---
+    // WOR-2306: the body the matchers below read, drained here because this
+    // is the last moment before a route is chosen and the first moment worth
+    // paying for. Everything above this line can short-circuit the request
+    // (auth, rate limits, a cache hit), and none of those outcomes needs the
+    // body. `None` for every origin that declared no body matcher.
+    let matched_body = read_body_for_route_matching(session, body_route_cap).await?;
+
     let fwd_rules = &pipeline.forward_rules[origin_idx];
     if !fwd_rules.is_empty() {
         // WOR-1697: only snapshot the path/query strings when there are
@@ -3952,12 +4057,17 @@ pub(super) async fn request_filter(
         let request_path = session.req_header().uri.path().to_string();
         let request_query = session.req_header().uri.query().map(|q| q.to_string());
         for (rule_idx, fwd_rule) in fwd_rules.iter().enumerate() {
-            // Each `MatcherEntry` ANDs path/header/query; entries in the
-            // list are ORed. `match_request` returns the captured path
-            // params (possibly empty) when the entry fires.
+            // Each `MatcherEntry` ANDs path/header/query/body; entries in
+            // the list are ORed. `match_request_with_body` returns the
+            // captured path params (possibly empty) when the entry fires.
             let request_headers = &session.req_header().headers;
             let captured = fwd_rule.matchers.iter().find_map(|m| {
-                m.match_request(&request_path, request_query.as_deref(), request_headers)
+                m.match_request_with_body(
+                    &request_path,
+                    request_query.as_deref(),
+                    request_headers,
+                    matched_body.as_deref(),
+                )
             });
             if let Some(params) = captured {
                 debug!(

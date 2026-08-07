@@ -132,6 +132,9 @@ pub mod hooks;
 pub mod identity;
 /// Extraction of a minted virtual key from configured inbound headers.
 pub mod inbound_key;
+/// WOR-2306: resolve one RFC 6901 JSON Pointer against a request body
+/// without materializing the document, for body-field route matching.
+pub mod json_pointer;
 /// Fleet capability gate for record fields older nodes silently drop.
 pub mod key_capability;
 /// WOR-1546: dynamic key plane assembly + process-global handle.

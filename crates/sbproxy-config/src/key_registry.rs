@@ -259,6 +259,30 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "origins.*.forward_rules[].parameters[].schema",
         "sbproxy_openapi::build",
     ),
+    // The body matcher is compiled from the untyped `serde_json::Value` the
+    // forward rule carries, so `compile_body_matcher` reads `pointer`,
+    // `value`, `prefix`, and `max_bytes` off the JSON object rather than off
+    // a typed `BodyMatcher`. The scanner looks for a read of the config
+    // struct's field and cannot follow that hop, which is why these four are
+    // pinned by hand rather than resolved automatically. The reads are at
+    // `sbproxy_core::pipeline::compile_body_matcher`; `max_bytes` is read a
+    // second time by `forward_rule_body_cap` to decide whether to buffer.
+    stable(
+        "origins.*.forward_rules[].rules[].body.max_bytes",
+        "sbproxy_core::pipeline::compile_body_matcher",
+    ),
+    stable(
+        "origins.*.forward_rules[].rules[].body.pointer",
+        "sbproxy_core::pipeline::compile_body_matcher",
+    ),
+    stable(
+        "origins.*.forward_rules[].rules[].body.prefix",
+        "sbproxy_core::pipeline::compile_body_matcher",
+    ),
+    stable(
+        "origins.*.forward_rules[].rules[].body.value",
+        "sbproxy_core::pipeline::compile_body_matcher",
+    ),
     stable(
         "origins.*.forward_rules[].rules[].header.name",
         "sbproxy_core::pipeline::compile_single_forward_rule",

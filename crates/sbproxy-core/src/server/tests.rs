@@ -178,6 +178,7 @@ fn swr_revalidation_uses_the_matching_forward_action_and_vary_headers() {
                 path: Some(crate::pipeline::PathMatch::Prefix("/forward".to_string())),
                 header: None,
                 query: None,
+                body: None,
             }],
             action: sbproxy_modules::compile_action(&serde_json::json!({
                 "type": "proxy",
