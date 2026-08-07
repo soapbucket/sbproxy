@@ -2213,8 +2213,10 @@ The two constraints are independent:
 * **mTLS-bound** (RFC 8705) binds the token to the SHA-256
   thumbprint of the TLS client cert the resource server saw
   on the connection. The token's `cnf.x5t#S256` claim carries
-  the thumbprint; the proxy compares against the inbound
-  client cert.
+  the thumbprint; the proxy compares it against the
+  base64url-encoded (no padding) SHA-256 of the DER encoding
+  of the client certificate presented on the inbound
+  connection.
 
 ```yaml
 authentication:
