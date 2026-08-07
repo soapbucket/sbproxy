@@ -174,6 +174,15 @@ fi
 step "pub items whose only consumer is a test (ratchet)"
 bash "$ROOT/scripts/check-pub-item-ratchet.sh"
 
+# Each of these ends the process on a path a caller cannot catch, which in a
+# proxy means a dropped request rather than an error a client can act on.
+# Clippy's equivalent lints cannot express this: the lint lane runs with
+# -D warnings, so warn and deny are one level and there is no ratchet to
+# hold, and all three fire in test code where they are the correct thing to
+# write. See the script header.
+step "unwrap/expect/panic in production code (ratchet)"
+bash "$ROOT/scripts/check-unwrap-ratchet.sh"
+
 # CI: docs-ci.yml, "spec citation hygiene".
 step "spec citation hygiene"
 bash "$ROOT/scripts/check-spec-citations.sh"

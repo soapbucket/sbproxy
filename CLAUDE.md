@@ -17,6 +17,7 @@ ten-minute build.
 |---|---|
 | Tracker placeholders | `grep -rn 'WOR-XXX' crates/ --include='*.rs' --include='*.toml'` (any hit fails) |
 | pub-item ratchet | `bash scripts/check-pub-item-ratchet.sh` |
+| unwrap/expect/panic ratchet | `bash scripts/check-unwrap-ratchet.sh` |
 | Spec citations | `bash scripts/check-spec-citations.sh` |
 | Env mutation | `bash scripts/check-env-mutation.sh` |
 | Doc drift | `bash scripts/check-doc-drift.sh` |

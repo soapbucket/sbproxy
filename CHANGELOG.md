@@ -12,6 +12,14 @@ the next version cut.
 
 ### Added
 
+- **A ratchet on `.unwrap()`, `.expect(..)`, and `panic!` in production
+  code.** Each ends the process on a path a caller cannot catch, which in a
+  proxy means a dropped request rather than an error a client can act on. The
+  count is allowed to fall and never to rise, so existing sites can be cleaned
+  up opportunistically while no new ones land. `panic!` is tracked separately
+  with a baseline of zero, since production code has none today and that is
+  worth locking rather than trading against an unwrap someone removed.
+
 - **Extension bundle manifests can declare `secret_vars` and
   `masked_vars` on a hook.** A `secret_vars` property is resolved
   through the same secret reference forms (`${VAR}`, `env:NAME`,
