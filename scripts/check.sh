@@ -181,6 +181,16 @@ bash "$ROOT/scripts/check-spec-citations.sh"
 step "no process-global env mutation outside test helpers"
 bash "$ROOT/scripts/check-env-mutation.sh"
 
+# WOR-2287: guardrail for the WOR-2282 secret-resolver convergence. Pure
+# python source scan, no CI job of its own yet (not currently mirrored in
+# .github/workflows/ci.yml), so this local gate is presently the only
+# place it runs. Refuses a hand-rolled env:/file:/provider-URI scheme
+# match outside crates/sbproxy-vault/src/, and a secret-shaped function
+# whose fallback hands a parameter back unchanged without first calling a
+# reference-shape guard -- the bug class WOR-2283 fixed.
+step "secret-resolver drift (no new ad-hoc secret parsers)"
+python3 "$ROOT/scripts/check-secret-resolver-drift.py"
+
 # These helpers steer the gate around expensive or destructive work, so run
 # their branch tests before any Cargo build or CI-equivalent cleanup.
 step "gate helper self-tests"
