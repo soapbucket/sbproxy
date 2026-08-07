@@ -3310,13 +3310,41 @@ async fn mcp_prepare_run_as_user_auth(
 }
 
 /// Resolve a credential reference for MCP run-as-user minting.
-/// Supports `env:VAR` and bare environment variable names. Unknown
-/// refs fail closed (`SecretLookup`).
+///
+/// Delegates to the installed process secret resolver (WOR-2285) when one is
+/// present, so `env:VAR`, `file:PATH`, `${VAR}`, and every provider URI
+/// resolve the same way they do everywhere else in the config. The resolver
+/// has no notion of a bare, unprefixed variable name though, and this call
+/// site has always accepted one as shorthand for `env:VAR`; that one case is
+/// handled directly, before and after a resolver is installed, so the
+/// shorthand keeps working either way. Unknown refs fail closed: the return
+/// type stays `Result<String, ()>` because every caller only distinguishes
+/// success from `UpstreamAuthError::SecretLookup`, never inspects the error
+/// itself.
 fn mcp_secret_lookup(credential_ref: &str) -> Result<String, ()> {
+    if is_bare_credential_name(credential_ref) {
+        return std::env::var(credential_ref).map_err(|_| ());
+    }
+    if let Some(resolver) = sbproxy_vault::process_resolver() {
+        return resolver.resolve(credential_ref).map_err(|_| ());
+    }
     if let Some(name) = credential_ref.strip_prefix("env:") {
         return std::env::var(name).map_err(|_| ());
     }
     std::env::var(credential_ref).map_err(|_| ())
+}
+
+/// True when `reference` carries none of the forms the process secret
+/// resolver recognizes (`env:`, `file:`, a whole-value `${VAR}` wrapper, or
+/// a provider-URI scheme such as `vault://`), so it is a bare variable name
+/// rather than a reference the resolver would otherwise mis-resolve or
+/// reject.
+fn is_bare_credential_name(reference: &str) -> bool {
+    !(reference.starts_with("env:")
+        || reference.starts_with("file:")
+        || reference.starts_with("secret:")
+        || (reference.starts_with("${") && reference.ends_with('}'))
+        || reference.contains("://"))
 }
 
 /// WOR-1795: opt-in compaction for verbose MCP text result blocks.
@@ -3968,6 +3996,84 @@ mod mcp_audit_redaction_tests {
         assert!(bounded.len() <= MCP_AUDIT_FIELD_MAX_BYTES + "...[truncated]".len());
         assert!(bounded.ends_with("...[truncated]"));
         assert!(std::str::from_utf8(bounded.as_bytes()).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod mcp_secret_lookup_tests {
+    use super::{is_bare_credential_name, mcp_secret_lookup};
+    use std::sync::Arc;
+
+    #[test]
+    fn bare_name_and_env_prefix_still_resolve_without_a_resolver() {
+        sbproxy_vault::reset_process_resolver_for_test();
+        let env = crate::test_env::EnvVarGuard::set(&[(
+            "SB_TEST_MCP_SECRET_BARE",
+            Some("bare-name-value"),
+        )]);
+        assert_eq!(
+            mcp_secret_lookup("SB_TEST_MCP_SECRET_BARE").expect("bare name resolves"),
+            "bare-name-value"
+        );
+        assert_eq!(
+            mcp_secret_lookup("env:SB_TEST_MCP_SECRET_BARE").expect("env: prefix resolves"),
+            "bare-name-value"
+        );
+        drop(env);
+        assert!(mcp_secret_lookup("SB_TEST_MCP_SECRET_BARE").is_err());
+    }
+
+    #[test]
+    fn installed_resolver_delegates_provider_uri_while_bare_name_keeps_using_env() {
+        // WOR-2285: this call site used to hand-parse only `env:` and a
+        // bare variable name, so a provider URI or `file:` reference
+        // always failed. With a resolver installed it must delegate, while
+        // the bare-name shorthand (which the resolver itself does not
+        // support) keeps working through the direct env lookup.
+        sbproxy_vault::reset_process_resolver_for_test();
+        let env = crate::test_env::EnvVarGuard::set(&[(
+            "SB_TEST_MCP_SECRET_RESOLVER_BARE",
+            Some("bare-value-with-resolver"),
+        )]);
+
+        let vault = sbproxy_vault::LocalVault::new();
+        vault
+            .set_secret("svc-token", "vault-delegated-token")
+            .expect("fixture secret");
+        let mut manager = sbproxy_vault::VaultManager::new();
+        manager.register("fixture", Box::new(vault));
+        sbproxy_vault::install_process_resolver(Arc::new(
+            sbproxy_vault::SecretResolver::new().with_manager(Arc::new(manager)),
+        ));
+
+        assert_eq!(
+            mcp_secret_lookup("secret://fixture/svc-token")
+                .expect("provider URI delegates once a resolver is installed"),
+            "vault-delegated-token"
+        );
+        assert_eq!(
+            mcp_secret_lookup("env:SB_TEST_MCP_SECRET_RESOLVER_BARE")
+                .expect("env: still resolves through the resolver"),
+            "bare-value-with-resolver"
+        );
+        assert_eq!(
+            mcp_secret_lookup("SB_TEST_MCP_SECRET_RESOLVER_BARE")
+                .expect("bare name still resolves through the env fallback"),
+            "bare-value-with-resolver"
+        );
+
+        drop(env);
+        sbproxy_vault::reset_process_resolver_for_test();
+    }
+
+    #[test]
+    fn is_bare_credential_name_classifies_every_recognized_prefix() {
+        assert!(is_bare_credential_name("API_KEY"));
+        assert!(!is_bare_credential_name("env:API_KEY"));
+        assert!(!is_bare_credential_name("file:/etc/secret"));
+        assert!(!is_bare_credential_name("${API_KEY}"));
+        assert!(!is_bare_credential_name("vault://backend/name"));
+        assert!(!is_bare_credential_name("secret://local/name"));
     }
 }
 

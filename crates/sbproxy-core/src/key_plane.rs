@@ -437,10 +437,22 @@ where
     })
 }
 
-/// Resolve a crypto secret reference into raw bytes. Supports `env:NAME`,
-/// `file:PATH`, and inline values. Vault scheme references are not resolved
-/// here; use `env:`/`file:` to point at a vault-injected value.
+/// Resolve a crypto secret reference into raw bytes.
+///
+/// Delegates to the installed process secret resolver (WOR-2285), so
+/// `env:NAME`, `file:PATH`, `${VAR}`, and every provider URI resolve the
+/// same way they do everywhere else in the config. Without a resolver
+/// installed (`sbproxy validate`, unit tests, a run whose config declares no
+/// `proxy.secrets` backends), only `env:NAME`, `file:PATH`, and an inline
+/// literal value resolve; a provider URI is refused rather than becoming key
+/// material.
 fn resolve_secret_material(reference: &str) -> Result<Vec<u8>> {
+    if let Some(resolver) = sbproxy_vault::process_resolver() {
+        return Ok(resolver
+            .resolve(reference)
+            .with_context(|| format!("key_management.crypto references '{reference}'"))?
+            .into_bytes());
+    }
     if let Some(name) = reference.strip_prefix("env:") {
         return Ok(std::env::var(name)
             .with_context(|| format!("environment variable '{name}' for key crypto"))?
@@ -449,7 +461,8 @@ fn resolve_secret_material(reference: &str) -> Result<Vec<u8>> {
     if let Some(path) = reference.strip_prefix("file:") {
         return std::fs::read(path).with_context(|| format!("read crypto material file '{path}'"));
     }
-    // A provider URI this site cannot resolve is an error, never key material.
+    // A provider URI this site cannot resolve without an installed resolver
+    // is an error, never key material.
     //
     // Without this, a mistyped or unsupported reference became the secret: set
     // `key_management.crypto.pepper` to `awssm://prod/pepper` and the pepper
@@ -457,13 +470,13 @@ fn resolve_secret_material(reference: &str) -> Result<Vec<u8>> {
     // own docs and identical for every deployment that pasted it. A pepper's
     // whole job is to make a leaked `password_hash` non-crackable offline, so
     // the failure was silent and total. WOR-1767 established this rule for the
-    // central resolver; this site predates it.
+    // central resolver; this site predates it, and now delegates to that same
+    // resolver above instead of re-implementing a subset of its parsing.
     if sbproxy_vault::looks_like_secret_reference_uri(reference) {
         anyhow::bail!(
-            "key_management.crypto references the secret '{reference}' but this field \
-             resolves only `env:` and `file:`, so it cannot read a secrets backend even \
-             when one is declared. Inject the value into the environment or a file and \
-             reference it as `env:NAME` or `file:/path`."
+            "key_management.crypto references the secret '{reference}' but no secret backend \
+             is installed to resolve it; declare one under proxy.secrets.backends. Without one, \
+             this field resolves only `env:NAME`, `file:PATH`, and inline literal values."
         );
     }
     Ok(reference.as_bytes().to_vec())
@@ -1152,6 +1165,43 @@ mod tests {
         );
         // A bare word that merely contains a colon is not a provider URI.
         assert!(resolve_secret_material("not:a-scheme").is_ok());
+    }
+
+    #[test]
+    fn installed_resolver_delegates_env_and_provider_uri_forms() {
+        // WOR-2285: this site used to hand-roll env:/file: parsing and
+        // refuse every provider URI outright, even with a resolver
+        // installed. It must now delegate to the process resolver, so
+        // `env:NAME` and a provider URI both resolve through the one
+        // shared code path the rest of the config uses.
+        sbproxy_vault::reset_process_resolver_for_test();
+        let env = crate::test_env::EnvVarGuard::set(&[(
+            "SB_TEST_KEY_PLANE_PEPPER",
+            Some("env-delegated-pepper"),
+        )]);
+
+        let vault = sbproxy_vault::LocalVault::new();
+        vault
+            .set_secret("pepper", "vault-delegated-pepper")
+            .expect("fixture secret");
+        let mut manager = sbproxy_vault::VaultManager::new();
+        manager.register("fixture", Box::new(vault));
+        sbproxy_vault::install_process_resolver(Arc::new(
+            sbproxy_vault::SecretResolver::new().with_manager(Arc::new(manager)),
+        ));
+
+        assert_eq!(
+            resolve_secret_material("env:SB_TEST_KEY_PLANE_PEPPER").expect("env:NAME delegates"),
+            b"env-delegated-pepper".to_vec()
+        );
+        assert_eq!(
+            resolve_secret_material("secret://fixture/pepper")
+                .expect("provider URI delegates once a resolver is installed"),
+            b"vault-delegated-pepper".to_vec()
+        );
+
+        drop(env);
+        sbproxy_vault::reset_process_resolver_for_test();
     }
     use sbproxy_config::types::{
         KeyCryptoConfig, KeySeedConfig, KeyStoreConfig, SecretsManagerProvider,

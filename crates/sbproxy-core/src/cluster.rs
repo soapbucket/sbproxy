@@ -1454,8 +1454,20 @@ fn resolve_model_plane_security(
     Ok(Some(Arc::new(security)))
 }
 
+/// Resolve a cluster shared-key reference into its UTF-8 material.
+///
+/// Delegates to the installed process secret resolver (WOR-2285), so
+/// `env:NAME`, `file:PATH`, `${VAR}`, and every provider URI resolve the
+/// same way they do everywhere else in the config. Without a resolver
+/// installed, only `env:NAME`, `file:PATH`, and an inline literal value
+/// resolve; a provider URI is refused rather than becoming the shared key.
 fn resolve_secret_material(reference: &str) -> Result<String> {
-    let bytes = if let Some(name) = reference.strip_prefix("env:") {
+    let bytes = if let Some(resolver) = sbproxy_vault::process_resolver() {
+        resolver
+            .resolve(reference)
+            .with_context(|| format!("resolve cluster shared key reference {reference:?}"))?
+            .into_bytes()
+    } else if let Some(name) = reference.strip_prefix("env:") {
         std::env::var(name)
             .with_context(|| format!("read cluster secret environment variable {name:?}"))?
             .into_bytes()
@@ -1470,10 +1482,13 @@ fn resolve_secret_material(reference: &str) -> Result<String> {
         //
         // Checked before the length floor on purpose. A floor is not a
         // substitute for a scheme check, because a provider URI is long enough
-        // to pass it.
+        // to pass it. Only reached without an installed resolver; with one,
+        // the branch above already resolved it through the same backend
+        // manager every other secret reference in the config uses.
         anyhow::bail!(
-            "cluster peer secrets do not resolve provider URIs like '{reference}'; \
-             inject the secret with env: or file:"
+            "cluster peer secrets do not resolve provider URIs like '{reference}' without an \
+             installed secret backend; declare one under proxy.secrets.backends, or inject the \
+             secret with env: or file:"
         );
     } else {
         reference.as_bytes().to_vec()
@@ -1857,6 +1872,43 @@ mod tests {
             resolve_secret_material("short").is_err(),
             "the length floor still applies to inline material"
         );
+    }
+
+    #[test]
+    fn installed_resolver_delegates_env_and_provider_uri_forms() {
+        // WOR-2285: this site used to hand-roll env:/file: parsing and
+        // refuse every provider URI outright, even with a resolver
+        // installed. It must now delegate to the process resolver, so
+        // `env:NAME` and a provider URI both resolve through the one
+        // shared code path the rest of the config uses.
+        sbproxy_vault::reset_process_resolver_for_test();
+        let env = crate::test_env::EnvVarGuard::set(&[(
+            "SB_TEST_CLUSTER_SHARED_KEY",
+            Some("env-delegated-cluster-shared-key"),
+        )]);
+
+        let vault = sbproxy_vault::LocalVault::new();
+        vault
+            .set_secret("cluster-key", "vault-delegated-cluster-shared-key")
+            .expect("fixture secret");
+        let mut manager = sbproxy_vault::VaultManager::new();
+        manager.register("fixture", Box::new(vault));
+        sbproxy_vault::install_process_resolver(Arc::new(
+            sbproxy_vault::SecretResolver::new().with_manager(Arc::new(manager)),
+        ));
+
+        assert_eq!(
+            resolve_secret_material("env:SB_TEST_CLUSTER_SHARED_KEY").expect("env:NAME delegates"),
+            "env-delegated-cluster-shared-key"
+        );
+        assert_eq!(
+            resolve_secret_material("secret://fixture/cluster-key")
+                .expect("provider URI delegates once a resolver is installed"),
+            "vault-delegated-cluster-shared-key"
+        );
+
+        drop(env);
+        sbproxy_vault::reset_process_resolver_for_test();
     }
 
     #[derive(Debug)]

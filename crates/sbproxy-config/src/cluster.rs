@@ -603,6 +603,18 @@ fn validate_security(security: &ClusterSecurityConfig) -> Result<(), ClusterConf
     Ok(())
 }
 
+/// Validate-time shape check for `security.shared_key`.
+///
+/// Consistent with the runtime check in sbproxy-core's
+/// `cluster::resolve_secret_material` (WOR-2285): both refuse *every*
+/// provider-URI scheme, not just `vault://`. The old version here named
+/// `vault://` alone, so `awssm://prod/cluster-key` (24 ASCII bytes) fell
+/// through to the length floor below and passed validation as if it were 24
+/// bytes of inline entropy; the runtime check already caught every scheme,
+/// so this was only an inconsistent error message, not a live bypass.
+/// `crate::types::is_secret_reference` is reused rather than a hardcoded
+/// scheme allowlist, because the authoritative scheme list lives in the
+/// vault crate and this crate deliberately has no dependency on it.
 fn validate_shared_key_reference(reference: &str) -> Result<(), ClusterConfigError> {
     let reference = reference.trim();
     if reference.contains("${") {
@@ -610,13 +622,14 @@ fn validate_shared_key_reference(reference: &str) -> Result<(), ClusterConfigErr
             "security.shared_key contains an unresolved environment reference",
         ));
     }
-    if reference.starts_with("vault://") {
-        return Err(ClusterConfigError::invalid(
-            "security.shared_key does not resolve vault:// directly; inject it with env: or file:",
-        ));
-    }
     if reference.starts_with("env:") || reference.starts_with("file:") {
         return Ok(());
+    }
+    if crate::types::is_secret_reference(reference) {
+        return Err(ClusterConfigError::invalid(
+            "security.shared_key does not resolve a secret-backend URI directly; inject it \
+             with env: or file:",
+        ));
     }
     if reference.len() < 16 {
         return Err(ClusterConfigError::invalid(
@@ -1277,5 +1290,76 @@ mod keystore_sharing_tests {
             ),
             V::Fine
         );
+    }
+}
+
+#[cfg(test)]
+mod shared_key_reference_tests {
+    use super::validate_shared_key_reference;
+
+    #[test]
+    fn every_provider_uri_is_refused_not_just_vault() {
+        // WOR-2285: the old check named `vault://` alone, so the other six
+        // schemes fell through to the length floor and passed validation as
+        // if they were inline entropy. Each of these is long enough to
+        // clear the 16-byte floor, which is why a length check was never a
+        // substitute for a scheme check.
+        for reference in [
+            "vault://hashi/cluster-key",
+            "awssm://aws/cluster-key",
+            "gcpsm://gcp/cluster-key",
+            "azurekv://az/cluster-key",
+            "k8ssecret://k8s/cluster-key",
+            "secretfile://file/cluster-key",
+            "secret://local/cluster-key",
+        ] {
+            let error = validate_shared_key_reference(reference)
+                .expect_err("a provider URI must never pass validation as inline material");
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains("does not resolve a secret-backend URI directly"),
+                "{reference} must be refused as a reference, got: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_provider_uri_is_refused_before_the_length_floor_can_pass_it() {
+        // 24 characters, so it clears the >= 16 floor. The point of the test
+        // is the ordering: the scheme check has to run first or the floor
+        // silently blesses the URI, exactly as it used to for every scheme
+        // but `vault://`.
+        let reference = "awssm://prod/cluster-key";
+        assert!(
+            reference.len() >= 16,
+            "fixture must be able to pass the floor"
+        );
+        let error = validate_shared_key_reference(reference).expect_err("must be refused");
+        assert!(
+            !error.to_string().contains("at least 16 bytes"),
+            "must fail on the scheme, not the length: {error}"
+        );
+    }
+
+    #[test]
+    fn env_file_and_inline_forms_still_validate() {
+        assert!(validate_shared_key_reference("env:CLUSTER_SHARED_KEY").is_ok());
+        assert!(validate_shared_key_reference("file:/etc/sbproxy/cluster-key").is_ok());
+        assert!(
+            validate_shared_key_reference("an-inline-cluster-key-of-sufficient-length").is_ok()
+        );
+        assert!(
+            validate_shared_key_reference("too-short").is_err(),
+            "the length floor still applies to inline material"
+        );
+    }
+
+    #[test]
+    fn an_unresolved_environment_placeholder_is_refused() {
+        let error = validate_shared_key_reference("${CLUSTER_SHARED_KEY}")
+            .expect_err("a literal, unresolved ${VAR} must not become the key");
+        assert!(error
+            .to_string()
+            .contains("unresolved environment reference"));
     }
 }

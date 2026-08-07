@@ -276,3 +276,7 @@ tracing-subscriber.workspace = true
 rcgen.workspace = true
 tempfile = "3"
 loom = "0.7"
+# WOR-2298: reset_process_resolver_for_test, so the WOR-2285 secret-resolver
+# delegation tests in key_plane.rs and cluster.rs are not order-dependent on
+# cargo test's single-process fallback run.
+sbproxy-vault = { path = "../sbproxy-vault", features = ["test-support"] }
