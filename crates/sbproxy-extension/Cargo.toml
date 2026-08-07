@@ -10,6 +10,10 @@ sbproxy-plugin.workspace = true
 sbproxy-util.workspace = true
 sbproxy-config.workspace = true
 sbproxy-security.workspace = true
+# WOR-2289: central secret resolver for bundle attachment config vars
+# (`env:`, `${VAR}`, `file:`, and provider-URI references), following
+# the same delegation pattern as `sbproxy-core::config_source`.
+sbproxy-vault.workspace = true
 # WOR-152 PR β: MCP federation records
 # `sbproxy_mcp_policy_hook_invocations_total` on every pre-tool-call
 # verdict. The helper lives in sbproxy-observe alongside the other
@@ -106,3 +110,7 @@ jsonschema.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
+# WOR-2298: reset_process_resolver_for_test, so bundle config-var secret
+# resolution tests are not order-dependent on cargo test's single-process
+# test run (see sbproxy-modules/Cargo.toml for the same pattern).
+sbproxy-vault = { path = "../sbproxy-vault", features = ["test-support"] }

@@ -385,6 +385,45 @@ fn proxy_wasm_and_ai_lookups_map_kinds_and_sort_ai_hooks() {
     }));
 }
 
+/// WOR-2289: a Proxy-Wasm filter's config vars go through the same
+/// `envelope::resolve_config_secrets` call as the JavaScript and
+/// envelope-WASM runtimes (proved directly, with every reference form,
+/// in `envelope`'s own tests). This proves the wiring: a `file:`
+/// reference in the filter's config does not fail the build the way an
+/// unresolvable one would.
+#[test]
+fn proxy_wasm_filter_config_resolves_a_file_secret_reference() {
+    let temp = TempDir::new().unwrap();
+    let proxy_dir = temp.path().join("proxy-filter");
+    std::fs::create_dir(&proxy_dir).unwrap();
+    std::fs::write(
+        proxy_dir.join("bundle.yaml"),
+        "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: proxy-filter\nversion: 1.0.0\nruntime: proxy_wasm\nabi: 0.2.1\nentry: filter.wasm\nhooks:\n  - kind: proxy_wasm\n    type: fixture_proxy_filter\n",
+    )
+    .unwrap();
+    std::fs::write(
+        proxy_dir.join("filter.wasm"),
+        include_bytes!("testdata/proxy_wasm/minimal.wasm"),
+    )
+    .unwrap();
+
+    let secret_dir = TempDir::new().unwrap();
+    let secret_path = secret_dir.path().join("token");
+    std::fs::write(&secret_path, "DISTINCTIVE_PROXY_WASM_SECRET_2d6f").unwrap();
+
+    let registry =
+        DynamicBundleRegistry::load(&local_config(temp.path()), temp.path(), &BTreeSet::new())
+            .unwrap();
+    let proxy = registry.proxy_wasm_filter("fixture_proxy_filter").unwrap();
+
+    let filter = build_proxy_wasm_filter(
+        proxy,
+        serde_json::json!({ "token": format!("file:{}", secret_path.display()) }),
+    )
+    .unwrap();
+    assert_eq!(filter.type_name(), "fixture_proxy_filter");
+}
+
 #[test]
 fn invalid_proxy_wasm_module_rejects_the_complete_candidate() {
     let temp = TempDir::new().unwrap();

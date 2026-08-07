@@ -12,6 +12,7 @@ use wasmtime::{
 
 use crate::wasm::{build_engine, WasmBundleLimits};
 
+use super::envelope;
 use super::{BundleLoadError, LoadedBundleHook};
 
 const STATUS_OK: i32 = 0;
@@ -228,6 +229,15 @@ pub(super) fn build_proxy_wasm_filter_for_kind(
             "hook kind does not match the requested Proxy-Wasm adapter",
         ));
     }
+    // WOR-2289: resolve secret references in attachment config vars
+    // before the filter ever runs. The resolved bytes are handed
+    // straight to the guest and never kept around as a `Value`, so
+    // there is nothing left to mask afterward (unlike the JavaScript
+    // and envelope-WASM programs, which retain `config` for the
+    // hook envelope on every invocation).
+    let mut configuration = configuration;
+    envelope::resolve_config_secrets(&mut configuration)
+        .map_err(|detail| BundleLoadError::new("config", detail))?;
     let plugin_configuration = serde_json::to_vec(&configuration)
         .map_err(|_| BundleLoadError::new("proxy_wasm", "plugin configuration is invalid"))?;
     let maximum = usize::try_from(hook.manifest().sandbox.max_buffer_bytes)

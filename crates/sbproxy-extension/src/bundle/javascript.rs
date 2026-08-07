@@ -68,6 +68,11 @@ pub(super) struct JavascriptProgram {
     hook_kind: &'static str,
     type_name: Arc<str>,
     config: Arc<Value>,
+    /// Slash-joined paths in `config` whose value was resolved from a
+    /// secret reference (WOR-2289). Never printed as-is; `Debug` masks
+    /// exactly these paths so a resolved secret never reaches a log or
+    /// panic message.
+    secret_paths: Arc<std::collections::BTreeSet<String>>,
     limits: RuntimeLimits,
     executor: Arc<JavascriptExecutor>,
 }
@@ -80,6 +85,10 @@ impl std::fmt::Debug for JavascriptProgram {
             .field("export", &self.export)
             .field("hook_kind", &self.hook_kind)
             .field("type_name", &self.type_name)
+            .field(
+                "config",
+                &envelope::mask_config_secrets(&self.config, &self.secret_paths),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -547,6 +556,13 @@ pub(super) fn prepare_program(
     if let Some(schema) = hook.hook().config_schema.as_ref() {
         envelope::apply_schema_defaults(&mut config, schema);
     }
+    // WOR-2289: resolve secret references in attachment config vars
+    // before the hook ever runs. Validation runs on the resolved value
+    // (not the reference) so a schema constraint on the value's shape
+    // (a `pattern`, for instance) checks the real secret rather than
+    // the pointer to it.
+    let secret_paths = envelope::resolve_config_secrets(&mut config)
+        .map_err(|detail| BundleLoadError::new("config", detail))?;
     hook.validate_config(&config)
         .map_err(|error| BundleLoadError::new("config", error.to_string()))?;
 
@@ -563,6 +579,7 @@ pub(super) fn prepare_program(
             hook_kind: envelope::hook_kind_label(expected_kind),
             type_name: Arc::from(type_name),
             config: Arc::new(config),
+            secret_paths: Arc::new(secret_paths),
             limits,
             executor: Arc::clone(&JAVASCRIPT_EXECUTOR),
         },
@@ -1252,6 +1269,116 @@ mod tests {
         assert!(error
             .to_string()
             .starts_with("bundle.config: bundle hook configuration is invalid: value at `"));
+    }
+
+    // --- WOR-2289: bundle config var secret resolution + masking ---
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn javascript_hook_receives_a_resolved_secret_not_the_reference() {
+        let secret_dir = TempDir::new().unwrap();
+        let secret_path = secret_dir.path().join("token");
+        std::fs::write(&secret_path, "resolved-token-value").unwrap();
+
+        let fixture = fixture(
+            BundleHookKind::Policy,
+            "entry.js",
+            r#"
+                export function run(input) {
+                    if (input.config.token === "resolved-token-value") {
+                        return { version: "sbproxy-envelope/v1", decision: "allow" };
+                    }
+                    return { version: "sbproxy-envelope/v1", decision: "deny", status: 500, message: "unresolved" };
+                }
+            "#,
+            "",
+            "",
+        );
+        let adapter = build_javascript_policy(
+            fixture.hook(),
+            json!({ "token": format!("file:{}", secret_path.display()) }),
+        )
+        .unwrap();
+
+        let mut context = ();
+        let decision = adapter.enforce(&request(b""), &mut context).await.unwrap();
+        assert_eq!(decision, PolicyDecision::Allow);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn javascript_hook_treats_a_plain_literal_config_value_as_is() {
+        let fixture = fixture(
+            BundleHookKind::Policy,
+            "entry.js",
+            r#"
+                export function run(input) {
+                    if (input.config.token === "literal-value-not-a-reference") {
+                        return { version: "sbproxy-envelope/v1", decision: "allow" };
+                    }
+                    return { version: "sbproxy-envelope/v1", decision: "deny", status: 500, message: "changed" };
+                }
+            "#,
+            "",
+            "",
+        );
+        let adapter = build_javascript_policy(
+            fixture.hook(),
+            json!({ "token": "literal-value-not-a-reference" }),
+        )
+        .unwrap();
+
+        let mut context = ();
+        let decision = adapter.enforce(&request(b""), &mut context).await.unwrap();
+        assert_eq!(decision, PolicyDecision::Allow);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn javascript_hook_resolves_env_and_dollar_brace_bundle_config_secrets() {
+        // Reads an environment variable every test process already has
+        // rather than exporting a new one: sbproxy-extension has no
+        // `src/test_env.rs` guard, and `scripts/check-env-mutation.sh`
+        // rejects `std::env::set_var` outside that documented helper.
+        let expected = std::env::var("PATH").expect("PATH is set in the test environment");
+        let fixture = fixture(
+            BundleHookKind::Policy,
+            "entry.js",
+            r#"
+                export function run(input) {
+                    if (input.config.a === input.config.expected && input.config.b === input.config.expected) {
+                        return { version: "sbproxy-envelope/v1", decision: "allow" };
+                    }
+                    return { version: "sbproxy-envelope/v1", decision: "deny", status: 500, message: "mismatch" };
+                }
+            "#,
+            "",
+            "",
+        );
+        let adapter = build_javascript_policy(
+            fixture.hook(),
+            json!({ "a": "env:PATH", "b": "${PATH}", "expected": expected }),
+        )
+        .unwrap();
+
+        let mut context = ();
+        let decision = adapter.enforce(&request(b""), &mut context).await.unwrap();
+        assert_eq!(decision, PolicyDecision::Allow);
+    }
+
+    #[test]
+    fn javascript_adapter_debug_never_echoes_a_resolved_bundle_secret() {
+        let secret_dir = TempDir::new().unwrap();
+        let secret_path = secret_dir.path().join("token");
+        std::fs::write(&secret_path, "DISTINCTIVE_SECRET_7f3a").unwrap();
+
+        let fixture = fixture(BundleHookKind::Policy, "entry.js", allow_source(), "", "");
+        let adapter = build_javascript_policy(
+            fixture.hook(),
+            json!({ "token": format!("file:{}", secret_path.display()) }),
+        )
+        .unwrap();
+
+        let rendered = format!("{adapter:?}");
+        assert!(!rendered.contains("DISTINCTIVE_SECRET_7f3a"), "{rendered}");
+        assert!(rendered.contains("MASKED"), "{rendered}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

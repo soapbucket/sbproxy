@@ -7397,6 +7397,7 @@ dependencies = [
  "sbproxy-plugin",
  "sbproxy-security",
  "sbproxy-util",
+ "sbproxy-vault",
  "semver",
  "serde",
  "serde_json",

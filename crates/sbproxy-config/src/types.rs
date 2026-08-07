@@ -2096,7 +2096,13 @@ pub enum ConfigAuthorityConfigError {
 /// Mirrors the forms the process secret resolver accepts. Deliberately a
 /// shape check only: `sbproxy validate` must not need the environment
 /// variable to be exported or the secret backend to be reachable.
-pub(crate) fn is_secret_reference(value: &str) -> bool {
+///
+/// `pub`, not `pub(crate)`: this shape check is shared beyond
+/// `sbproxy-config`. `sbproxy-extension`'s bundle config vars reuse it to
+/// decide which attachment config values to resolve as secret references
+/// and which resolved values to mask in diagnostics (WOR-2289), rather
+/// than duplicating a third copy of this heuristic.
+pub fn is_secret_reference(value: &str) -> bool {
     let trimmed = value.trim();
     for prefix in ["env:", "file:"] {
         if let Some(rest) = trimmed.strip_prefix(prefix) {
