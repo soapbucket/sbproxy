@@ -41,9 +41,10 @@ Four shapes make up the current vocabulary. Anything that does not match one of 
 | `azurekv://` | Azure Key Vault | `azurekv://primary/openai-api-key?version=6a2b45c8f9e14e0d` |
 | `k8ssecret://` | Kubernetes Secret | `k8ssecret://primary/sbproxy-secrets/openai-key` |
 | `secretfile://` | Local YAML or JSON secret file | `secretfile://local/openai-prod?key=api_key` |
-| `secret://` | Local static secret map | `secret://local/openai-prod` |
+| `localsecret://` | Local static secret map | `localsecret://local/openai-prod` |
+| `secret://` | Local static secret map (deprecated alias of `localsecret://`) | `secret://local/openai-prod` |
 
-`secret://` selects the local static-map provider, the same provider a backend configures with `type: local` (see [File And Static Map Backends](#file-and-static-map-backends) below). It has no relationship to environment variables: `secret://env/some-key` looks up a key named `some-key` in a backend named `env`, which is not the `env:` environment-variable form above. There is no `env://` URI scheme; write `${VAR_NAME}` or `env:VAR_NAME` for environment variables instead.
+`localsecret://` selects the local static-map provider, the same provider a backend configures with `type: local` (see [File And Static Map Backends](#file-and-static-map-backends) below). It has no relationship to environment variables: `localsecret://env/some-key` looks up a key named `some-key` in a backend named `env`, which is not the `env:` environment-variable form above. There is no `env://` URI scheme; write `${VAR_NAME}` or `env:VAR_NAME` for environment variables instead. `secret://` resolves identically and still works, but logs a one-time deprecation warning; write `localsecret://` in new config.
 
 ### Deprecated Forms
 
@@ -60,7 +61,7 @@ sbproxy config migrate sb.yml --out sb.migrated.yml
 
 ### Removed Forms
 
-The Go-era `secret:<name>` colon form (no `//`) is gone. It is not a fallback and does not pass through: writing it fails config load with a message pointing at the replacement, `secret://<backend>/<name>` with a backend declared under `proxy.secrets.backends`. The `proxy.secrets.map` key that used to serve this form still parses but has no effect. Do not confuse the removed colon form with `secret://`, the URI scheme documented above, which is current and correct.
+The Go-era `secret:<name>` colon form (no `//`) is gone. It is not a fallback and does not pass through: writing it fails config load with a message pointing at the replacement, `localsecret://<backend>/<name>` with a backend declared under `proxy.secrets.backends`. The `proxy.secrets.map` key that used to serve this form still parses but has no effect. Do not confuse the removed colon form with `secret://`/`localsecret://`, the URI scheme documented above, which is deprecated-but-working (`secret://`) or current (`localsecret://`), not removed.
 
 > **Implementation note.** The vocabulary above is transcribed from `crates/sbproxy-vault/src/resolver.rs`'s `SecretResolver::resolve`, the target every secret-bearing field is meant to route through. Most already do: provider credentials, the `source:` block's `credential` field, and at-rest key material under `key_management.crypto` all resolve through it. Two call sites are narrower today, for different reasons:
 >
@@ -362,7 +363,7 @@ Both `data` and `stringData` fields are honored. `data` keys are base64-decoded 
 
 ## File And Static Map Backends
 
-Use `secretfile://` for a backend-configured YAML or JSON secret file. Use `secret://` for a backend-configured static secret map. The legacy `file:/path/to/secret` form remains valid. The removed `secret:<name>` form does not; migrate it to `secret://<backend>/<name>`.
+Use `secretfile://` for a backend-configured YAML or JSON secret file. Use `localsecret://` for a backend-configured static secret map (`secret://` still works, but is the deprecated spelling). The legacy `file:/path/to/secret` form remains valid. The removed `secret:<name>` form does not; migrate it to `localsecret://<backend>/<name>`.
 
 Configure these backends under `proxy.secrets.backends`. Each has a `name` used in the reference. A `local` backend's `entries` values may be `${ENV}` so real secrets stay in the environment rather than the config file. A reference in an AI provider `api_key` resolves against these at startup, and an unresolved reference stops the proxy from starting rather than being sent verbatim as a bearer token.
 
@@ -382,7 +383,7 @@ proxy:
 
 ```text
 secretfile://local/openai-prod?key=api_key
-secret://app/openai_key
+localsecret://app/openai_key
 ```
 
 ## Scope
