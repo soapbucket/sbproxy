@@ -1780,9 +1780,13 @@ mod tests {
         sbproxy_vault::reset_process_resolver_for_test();
         let secret = "secret:DISTINCTIVE_INLINE_KEY_9f2c";
 
-        let error = decode_secret(secret)
-            .err()
-            .expect("the removed colon form must not resolve");
+        // `.expect_err(...)` here, but `.err().expect(...)` in the verifier
+        // test above. The two are not interchangeable and the compiler
+        // enforces opposite directions: this Ok type is `Vec<u8>`, which
+        // implements `Debug`, so `.err().expect()` trips
+        // `clippy::err_expect`; the verifier's Ok type withholds `Debug`, so
+        // `.expect_err()` does not compile there (WOR-2193).
+        let error = decode_secret(secret).expect_err("the removed colon form must not resolve");
 
         // `{error}` renders only the OUTERMOST context, which is the one this
         // module owns. Pinning it to a fixed string proves this layer adds no
