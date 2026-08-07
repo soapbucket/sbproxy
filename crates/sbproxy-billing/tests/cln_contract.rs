@@ -514,7 +514,7 @@ fn lightning_draft() -> PaymentRequirementDraft {
             currency: "BTC".to_string(),
         },
         settlement_amount: "100000".to_string(),
-        settlement_decimals: 11, // MSAT_DECIMALS
+        settlement_decimals: 11, // millisatoshi precision
         terms: RequirementTerms::LightningInvoice {
             backend: "cln".to_string(),
             invoice_expiry_seconds: 600,
