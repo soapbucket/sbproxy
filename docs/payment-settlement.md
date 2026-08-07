@@ -1,6 +1,6 @@
 # Payment settlement
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-07*
 
 `proxy.payments` is how SBproxy charges for a request and proves it was
 paid. It is Apache-2.0, it is off unless you configure it, and it holds
@@ -218,7 +218,7 @@ and scripted rails:
 
 ```bash
 cargo nextest run -p sbproxy-core \
-  --features payment-x402,payment-mpp,payment-stripe,payment-lightning-cln \
+  --features payment-x402,payment-mpp,payment-stripe,payment-lightning-cln,payment-lightning-lnd \
   settlement_gate
 ```
 

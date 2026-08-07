@@ -1447,7 +1447,7 @@ fn infra_msg(stage: &'static str, detail: &str) -> GateFailure {
 /// Run with every payment rail feature on, which is how the gate ships:
 ///
 /// ```text
-/// cargo nextest run -p sbproxy-core --features payment-x402,payment-mpp,payment-stripe,payment-lightning-cln settlement_gate
+/// cargo nextest run -p sbproxy-core --features payment-x402,payment-mpp,payment-stripe,payment-lightning-cln,payment-lightning-lnd settlement_gate
 /// ```
 ///
 /// The rail wire contracts (x402 v2, Payment Auth draft-01, Stripe

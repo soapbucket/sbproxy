@@ -108,8 +108,10 @@ jobs:
       # needed for rquickjs-sys's bindgen build script; without it clang's
       # bundled stdbool.h is missing from the include path and the build
       # fails with `'stdbool.h' file not found`. redis-server backs the live
-      # Redis tests below, each of which owns an isolated ephemeral-port
-      # process rather than sharing mutable CI state.
+      # Redis tests below. Most of them own an isolated ephemeral-port
+      # process rather than sharing mutable CI state; the two governance
+      # suites are the documented exception and the step below explains
+      # why sharing one daemon is safe for them.
       - uses: ./.github/actions/rust-setup
         with:
           cache-key: test
@@ -144,7 +146,25 @@ jobs:
       # artifacts. Running them as `cargo test -p sbproxy-platform` instead
       # cost 2m07 of pure recompilation for a handful of assertions.
       # -j1 replaces the old `--test-threads=1`.
+      #
+      # `governance_redis` and `quota_pool_redis` (WOR-2300) are the one
+      # exception to the isolated-process rule stated at the top of this
+      # job. Unlike the suites above, which spawn their own `DisposableRedis`
+      # on an ephemeral port, those two read a `REDIS_URL` and hard-fail
+      # without one, so this step starts a single shared daemon for them.
+      # Sharing is safe here and nowhere else because both files derive
+      # every key they touch from a `unique_prefix()` helper built from the
+      # process id plus a nanosecond timestamp
+      # (crates/sbproxy-ai/tests/governance_redis.rs and
+      # crates/sbproxy-ai/tests/quota_pool_redis.rs), neither one ever issues
+      # FLUSHDB or FLUSHALL, and neither reads a key it did not write. Two
+      # tests, two runs, or two jobs therefore cannot collide on a key. The
+      # daemon runs with persistence off and a working directory outside the
+      # checkout so no dump.rdb lands in the tree and trips a later
+      # freshness check.
       - name: Redis live state (secure DSN + Lua fencing + recovery)
+        env:
+          REDIS_URL: redis://127.0.0.1:6399
         run: |
           redis-server --version
           tls_probe_output="$(redis-server --port 0 --tls-port 1 2>&1 || true)"
@@ -153,9 +173,26 @@ jobs:
             exit 1
           fi
           unset tls_probe_output
+          if ! command -v redis-cli >/dev/null 2>&1; then
+            echo "::error::redis-cli is required to probe the shared governance Redis daemon"
+            exit 1
+          fi
+          shared_redis_dir="$(mktemp -d)"
+          redis-server --port 6399 --bind 127.0.0.1 --save '' --appendonly no \
+            --dir "${shared_redis_dir}" --daemonize yes
+          for _ in $(seq 1 50); do
+            if redis-cli -p 6399 ping >/dev/null 2>&1; then
+              break
+            fi
+            sleep 0.2
+          done
+          if ! redis-cli -p 6399 ping; then
+            echo "::error::shared Redis on 6399 never became ready"
+            exit 1
+          fi
           cargo nextest run --workspace --exclude sbproxy-e2e --locked --profile ci \
             --run-ignored only -j1 \
-            -E 'binary(redis_secure) + test(compression_store::redis::tests::live_redis_) + test(storage::async_redis::tests::redis_connection_recovers_after_server_restart) + test(semantic_cache_runtime::redis::tests::live_redis_semantic_)'
+            -E 'binary(redis_secure) + test(compression_store::redis::tests::live_redis_) + test(storage::async_redis::tests::redis_connection_recovers_after_server_restart) + test(semantic_cache_runtime::redis::tests::live_redis_semantic_) + binary(governance_redis) + binary(quota_pool_redis)'
 
       # nextest does not execute doctests, so they need their own pass.
       - name: doctests

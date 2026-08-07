@@ -32,42 +32,74 @@
 #   * Delete it, but only after `--external-tree` confirms the optional
 #     out-of-tree API consumer does not name it. In-tree unreferenced does
 #     not necessarily mean unused by another checkout.
-#   * Raise the baseline below, with a sentence in the commit message
+#   * Raise the baseline, with a sentence in scripts/pub-item-ratchet-baseline.txt
 #     saying why the new item has to exist before its caller does.
 #
-# The baseline is deliberately a number in a file rather than a
-# generated artefact. Lowering it is a normal part of doing the cleanup,
-# and a reviewer should see that number move in the diff.
+# # Why the baseline is two files
+#
+# The number is a committed integer rather than something this script
+# recomputes and trusts. Lowering it is a normal part of the cleanup, and
+# a reviewer should see the number itself move in the diff; a derived
+# count moves invisibly and nobody reviews it.
+#
+# It is committed as two files, though, because a number is a terrible
+# thing to merge:
+#
+#   scripts/pub-item-ratchet-baseline.count   the integer, alone, one line
+#   scripts/pub-item-ratchet-baseline.txt     why it has moved, prose only
+#
+# The count used to live on line 221 of the prose file's 289 lines. Two
+# branches that both bumped it therefore edited non-adjacent lines, git
+# read that as two independent hunks, and merged both. The old reader
+# squashed the result into "287286", which passes the integer test and
+# becomes a ceiling no real count can ever exceed, so the check goes
+# green forever while quietly giving back every narrowing anyone lands.
+# Eight conflicts in that file, and the guard below started as the
+# detector for it (WOR-2252).
+#
+# A single-line file cannot merge that way. Two branches that both change
+# the count change the same line, so git stops and asks, and the answer
+# is always to recompute against the merged tree rather than to keep
+# either side's number:
+#
+#   python3 scripts/scan-pub-item-usage.py --count tests-only
+#
+# The prose file keeps taking the append-only notes, where a merge that
+# keeps both paragraphs is the right answer rather than a silent bug.
 
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BASELINE_FILE="$ROOT_DIR/scripts/pub-item-ratchet-baseline.txt"
+BASELINE_FILE="$ROOT_DIR/scripts/pub-item-ratchet-baseline.count"
+BASELINE_NOTES="$ROOT_DIR/scripts/pub-item-ratchet-baseline.txt"
 
 cd "$ROOT_DIR"
 
 if [ ! -f "$BASELINE_FILE" ]; then
   echo "missing baseline file: $BASELINE_FILE" >&2
+  echo "It holds the integer only; the notes live in $BASELINE_NOTES." >&2
   exit 1
 fi
 
-# Read the value as lines, not as one squashed string. The old form
-# piped every non-comment line through `tr -d '[:space:]'`, so a merge
-# that kept both sides' numbers produced "284286", which still matches
-# the integer test and becomes a baseline no real count can exceed. The
-# check then passes forever while silently giving back every narrowing
-# anyone lands. This file has hit six merge conflicts, so that is not a
-# hypothetical (WOR-2252).
+# Read the value as lines, not as one squashed string, and take the file
+# exactly as it is: no comment stripping, no blank-line stripping. The
+# count file is the integer and nothing else, so anything that makes it
+# longer than one line is a merge that kept both sides, and that has to
+# be an error rather than something this reader quietly reassembles.
+# `|| [ -n "$line" ]` catches a final line with no trailing newline,
+# which would otherwise be dropped and make a two-number file look like
+# a one-number file.
 BASELINE_LINES=()
-while IFS= read -r line; do
+while IFS= read -r line || [ -n "$line" ]; do
   BASELINE_LINES+=("$line")
-done < <(grep -vE '^[[:space:]]*#' "$BASELINE_FILE" | grep -vE '^[[:space:]]*$')
+done < "$BASELINE_FILE"
 
 if [ "${#BASELINE_LINES[@]}" -ne 1 ]; then
-  echo "baseline file must hold exactly one non-comment line, found ${#BASELINE_LINES[@]}: $BASELINE_FILE" >&2
+  echo "baseline count file must hold exactly one line, found ${#BASELINE_LINES[@]}: $BASELINE_FILE" >&2
+  echo "It carries the integer and nothing else. Notes belong in $BASELINE_NOTES." >&2
   if [ "${#BASELINE_LINES[@]}" -gt 1 ]; then
     echo >&2
-    echo "More than one number usually means a merge kept both sides. Pick" >&2
+    echo "More than one line usually means a merge kept both sides. Pick" >&2
     echo "the recomputed count, not either branch's, and delete the rest:" >&2
     printf '  %s\n' "${BASELINE_LINES[@]}" >&2
     echo >&2
@@ -78,7 +110,8 @@ fi
 
 BASELINE="$(printf '%s' "${BASELINE_LINES[0]}" | tr -d '[:space:]')"
 if ! [[ "$BASELINE" =~ ^[0-9]+$ ]]; then
-  echo "baseline file does not contain a single integer: $BASELINE_FILE" >&2
+  echo "baseline count file does not contain a single integer: $BASELINE_FILE" >&2
+  echo "Found: ${BASELINE_LINES[0]}" >&2
   exit 1
 fi
 
@@ -97,7 +130,9 @@ fi
 
 if [ "$ACTUAL" -lt "$BASELINE" ]; then
   echo "pub items with only test consumers: $ACTUAL, below the baseline of $BASELINE." >&2
-  echo "Lower the baseline in $BASELINE_FILE to $ACTUAL so the ground gained is held." >&2
+  echo "Lower the baseline to $ACTUAL so the ground gained is held:" >&2
+  echo "  printf '%s\\n' $ACTUAL > $BASELINE_FILE" >&2
+  echo "and add a note to $BASELINE_NOTES saying what gained a caller or was narrowed." >&2
   exit 1
 fi
 

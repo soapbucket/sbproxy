@@ -1,3 +1,34 @@
+# Why this file has no number in it
+#
+# The count lives beside it in scripts/pub-item-ratchet-baseline.count,
+# alone on the only line of that file. This file is the log of why the
+# count moved, and nothing else. Both are read by
+# scripts/check-pub-item-ratchet.sh.
+#
+# The split is a merge fix (WOR-2252). While the number sat on line 221
+# of a 289-line file, two branches that both bumped it wrote to
+# non-adjacent lines, git saw two independent hunks, and took both. The
+# result was a baseline file holding two numbers, which the old reader
+# squashed into one impossible integer like "287286": a ceiling no real
+# count can exceed, so the check passes forever while silently handing
+# back every narrowing anyone lands. This file has hit eight conflicts.
+#
+# A one-line file cannot merge that way. Two branches that both change
+# the count change the same line, so git stops and asks. That is the
+# entire point of the arrangement, and the answer to such a conflict is
+# always to recompute against the merged tree
+#
+#   python3 scripts/scan-pub-item-usage.py --count tests-only
+#
+# and never to keep either side's number, because neither side's number
+# describes the merge.
+#
+# The notes below are append-only and conflict freely, which is fine: a
+# conflict in prose is resolved by keeping both paragraphs, and that is
+# the right resolution for a log.
+#
+# ---------------------------------------------------------------------
+#
 # Number of `pub` items whose only consumer outside their defining file
 # is test code, as measured by scripts/scan-pub-item-usage.py.
 #
@@ -171,8 +202,9 @@
 
 # Raised on WOR-2203, 2026-08-03, for four items the extension bundle
 # epic adds. None is narrowable and none is write-only code. The
-# final number is at the bottom of this file: it was recomputed after
-# merging main, and is neither this branch's count nor main's.
+# final number (then at the bottom of this file, now in
+# scripts/pub-item-ratchet-baseline.count) was recomputed after merging
+# main, and is neither this branch's count nor main's.
 #
 # `BUNDLE_API_VERSION` and `BUNDLE_KIND` (sbproxy-config/src/extensions.rs)
 # are the manifest's `apiVersion` and `kind` literals. sbproxy-config is
@@ -200,7 +232,8 @@
 #
 # Merged origin/main on 2026-08-03: main had lowered this to 282 while
 # this branch had raised it to 287. Neither number is the answer. The
-# count below is recomputed against the merged tree, because a baseline
+# count (then below, now in the .count file) is recomputed against the
+# merged tree, because a baseline
 # that keeps either side's number silently gives back whatever the other
 # side changed. This is the seventh conflict in this file; the loud
 # multi-line guard in check-pub-item-ratchet.sh landed with it.
@@ -218,7 +251,6 @@
 # separate test crate, so `pub` is the only visibility that resolves. They
 # cannot be narrowed for the same reason most of the items already in this
 # number cannot.
-288
 #
 #
 # Lowered to 286 on WOR-2225, 2026-08-02, answering three more of the

@@ -24,7 +24,11 @@
 # Environment:
 #
 #   SBPROXY_RELEASE_TESTS=1              run test binaries in release mode
-#   SBPROXY_CHECK_E2E=1                  include the sbproxy-e2e package
+#   SBPROXY_CHECK_E2E=1                  include the sbproxy-e2e package.
+#                                        Test files needing a proxy binary
+#                                        flavor this gate does not build are
+#                                        skipped with the build command that
+#                                        would enable them (WOR-2291).
 #   SBPROXY_CHECK_PAYMENTS=1             clippy + test the settlement feature
 #                                        union (a required CI lane; see that
 #                                        phase for why it is opt-in here)
@@ -334,8 +338,116 @@ fi
 # computed from the selected packages, so a different selection silently
 # recompiles the graph.
 test_package_args=(--workspace --locked)
+
+# Test binaries filtered out because the proxy binary flavor they spawn
+# was never built. Stays empty on the default path. See the WOR-2291
+# block below.
+e2e_exclusion=''
+
 if [ "${SBPROXY_CHECK_E2E:-0}" != "1" ]; then
   test_package_args+=(--exclude sbproxy-e2e)
+else
+  # WOR-2291. Until now `SBPROXY_CHECK_E2E=1` did exactly one thing: stop
+  # passing `--exclude sbproxy-e2e`. But the `cargo build` below produces
+  # one binary, target/debug/sbproxy, and four e2e files spawn a
+  # *different* one. e2e/src/lib.rs carries three harness flavors that
+  # search three separate trees:
+  #
+  #   Default             target/{release,debug}/sbproxy
+  #   NoDefaultFeatures   target/no-default-features/{release,debug}/sbproxy
+  #   Payments            target/payments/{release,debug}/sbproxy
+  #
+  # Only the first is a by-product of this gate. headless_detection_e2e
+  # and tls_fingerprint_capture_e2e want the second; settlement_gate and
+  # usage_bridge want the third. Neither has ever been built here, so
+  # every test in those four files failed on "binary missing at ..." the
+  # moment anyone set the variable, and the gate reported it as a test
+  # failure rather than as missing setup.
+  #
+  # Building all three flavors would roughly triple the most expensive
+  # phase in this file to cover a lane most runs cannot reach, so this
+  # skips loudly instead: a flavor whose binary is not already on disk
+  # has its test binaries filtered out of the nextest run and its build
+  # command printed in the SKIPPED PHASES block. Build it once and the
+  # tests run on every later gate for free.
+  #
+  # The probe reproduces the harness's own blind spot on purpose.
+  # e2e/src/lib.rs's `workspace_root()` derives from CARGO_MANIFEST_DIR,
+  # so the harness searches <repo>/target/... no matter what
+  # CARGO_TARGET_DIR says. A probe that honored CARGO_TARGET_DIR would
+  # green-light tests for a binary the harness then cannot find, turning
+  # a clear skip into a confusing failure, so this looks exactly where
+  # the harness looks and resolves the same SBPROXY_E2E_*_BIN overrides
+  # with the same relative-path anchoring. The build commands quoted
+  # below pin CARGO_TARGET_DIR themselves, which overrides an exported
+  # one, so following them verbatim lands the binary where both this
+  # probe and the harness will find it.
+  #
+  # Filtering is by test binary and nothing else. It does not touch -j,
+  # and it does not touch the `sbproxy-e2e` test group in
+  # .config/nextest.toml, which is what keeps settlement_gate off the
+  # parallel path it is red on (WOR-2295).
+
+  # Resolve one harness flavor the way e2e/src/lib.rs does: the override
+  # variable wins when it is set and non-empty, with a relative value
+  # anchored at the workspace root; otherwise the first existing
+  # candidate wins. Prints the path only when a usable binary exists.
+  resolve_e2e_binary() {
+    local var="$1" configured candidate
+    shift
+    configured="${!var:-}"
+    if [ -n "$configured" ]; then
+      case "$configured" in
+        /*) candidate="$configured" ;;
+        *) candidate="$ROOT/$configured" ;;
+      esac
+      if [ -f "$candidate" ]; then
+        printf '%s\n' "$candidate"
+      fi
+      return 0
+    fi
+    for candidate in "$@"; do
+      if [ -f "$ROOT/$candidate" ]; then
+        printf '%s\n' "$ROOT/$candidate"
+        return 0
+      fi
+    done
+    return 0
+  }
+
+  add_e2e_exclusion() {
+    local bin
+    for bin in "$@"; do
+      if [ -z "$e2e_exclusion" ]; then
+        e2e_exclusion="binary($bin)"
+      else
+        e2e_exclusion="${e2e_exclusion} + binary($bin)"
+      fi
+    done
+  }
+
+  if [ -z "$(resolve_e2e_binary SBPROXY_E2E_PAYMENTS_BIN \
+    target/payments/release/sbproxy target/payments/debug/sbproxy)" ]; then
+    add_e2e_exclusion settlement_gate usage_bridge
+    # The feature list here is copied verbatim from e2e/src/lib.rs's own
+    # `missing_hint()` and from the build step in
+    # .github/workflows/e2e.yml, which are the two other places that name
+    # it. It is deliberately NOT the five-rail `payment_features` list
+    # further down this file: that one is the workspace feature union for
+    # the payments clippy/test lane, this one builds the `sbproxy` binary
+    # the e2e harness spawns, and the two have drifted apart on
+    # `payment-lightning-lnd`. Matching the harness matters more than
+    # matching the other list, because a developer who runs a command
+    # this gate printed must end up with the binary the gate then looks
+    # for.
+    note_skip "e2e settlement_gate + usage_bridge (no payments-featured binary under target/payments/). Build it once with: CARGO_TARGET_DIR=target/payments cargo build --release -p sbproxy --locked --features payment-x402,payment-mpp,payment-stripe,payment-lightning-cln  -- or point SBPROXY_E2E_PAYMENTS_BIN at one. The e2e lane in .github/workflows/e2e.yml builds it, so these tests do run somewhere; they did not run here."
+  fi
+
+  if [ -z "$(resolve_e2e_binary SBPROXY_E2E_NO_DEFAULT_FEATURES_BIN \
+    target/no-default-features/release/sbproxy target/no-default-features/debug/sbproxy)" ]; then
+    add_e2e_exclusion headless_detection_e2e tls_fingerprint_capture_e2e
+    note_skip "e2e headless_detection_e2e + tls_fingerprint_capture_e2e (no --no-default-features binary under target/no-default-features/). Build it once with: CARGO_TARGET_DIR=target/no-default-features cargo build -p sbproxy --no-default-features --locked  -- or point SBPROXY_E2E_NO_DEFAULT_FEATURES_BIN at one. The e2e lane in .github/workflows/e2e.yml builds it, so these tests do run somewhere; they did not run here."
+  fi
 fi
 
 nextest_args=("${test_package_args[@]}" --profile ci)
@@ -343,6 +455,9 @@ cargo_test_args=("${test_package_args[@]}")
 if [ "${SBPROXY_RELEASE_TESTS:-0}" = "1" ]; then
   nextest_args+=(--release --tests)
   cargo_test_args+=(--release --tests)
+fi
+if [ -n "$e2e_exclusion" ]; then
+  nextest_args+=(-E "not (${e2e_exclusion})")
 fi
 
 # CI: `cargo build --workspace --exclude sbproxy-e2e --locked`.
@@ -360,6 +475,14 @@ if cargo nextest --version >/dev/null 2>&1; then
   cargo nextest run "${nextest_args[@]}"
 elif [ "${SBPROXY_ALLOW_CARGO_TEST_FALLBACK:-0}" = "1" ]; then
   note_skip "nextest test lane (SBPROXY_ALLOW_CARGO_TEST_FALLBACK=1 ran serial 'cargo test' instead; this is not the lane CI runs)"
+  if [ -n "$e2e_exclusion" ]; then
+    # A filterset has no `cargo test` equivalent, and the alternative
+    # spelling (`--test <name>` for every file that is *not* excluded)
+    # would have to be hand-maintained, so a new e2e file would silently
+    # stop running. The run therefore keeps the missing-binary failures
+    # rather than hiding them behind a stale allow-list.
+    note_skip "e2e binary-flavor filtering (no nextest, and 'cargo test' cannot express a filterset, so the tests named above ran and will fail on their missing binary rather than being skipped)"
+  fi
   cargo test "${cargo_test_args[@]}"
 else
   cat >&2 <<'MSG'
