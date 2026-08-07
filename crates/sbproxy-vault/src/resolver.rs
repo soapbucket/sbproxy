@@ -1,8 +1,9 @@
 //! Universal secret resolver.
 //!
 //! Resolves provider-URI references (`secret://`, `vault://`, ...),
-//! `${ENV_VAR}`, and `file:/path/to/file` patterns embedded in config
-//! string values.  Plain strings are passed through unchanged.
+//! `${ENV_VAR}`, `env:ENV_VAR`, and `file:/path/to/file` patterns
+//! embedded in config string values.  Plain strings are passed through
+//! unchanged.
 
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -72,6 +73,7 @@ pub fn reset_process_resolver_for_test() {
 /// |---------|-----------|
 /// | `secret://`, `vault://`, `awssm://`, ... | Resolve through the provider-scheme backend manager; a miss is a hard error. |
 /// | `${VAR_NAME}` | Read the environment variable `VAR_NAME`. |
+/// | `env:VAR_NAME` | Read the environment variable `VAR_NAME`. |
 /// | `file:/some/path` | Read the file at `/some/path` (trimmed). |
 /// | anything else | Returned as-is. |
 ///
@@ -126,6 +128,12 @@ impl SecretResolver {
         // Whole-value `${VAR}` -> env var.
         if value.starts_with("${") && value.ends_with('}') {
             let var = &value[2..value.len() - 1];
+            return std::env::var(var).with_context(|| format!("env var {} not set", var));
+        }
+        // `env:NAME` -> env var. Same lookup and missing-var error behavior
+        // as the `${VAR}` form above, so either spelling fails the same way
+        // when the variable is not set.
+        if let Some(var) = value.strip_prefix("env:") {
             return std::env::var(var).with_context(|| format!("env var {} not set", var));
         }
         // `file:/path` -> file contents.
@@ -262,6 +270,60 @@ mod tests {
     fn resolve_env_var_missing_returns_error() {
         let resolver = resolver_no_backend();
         assert!(resolver.resolve("${DEFINITELY_NOT_SET_VAR_XYZ}").is_err());
+    }
+
+    // --- env: (WOR-2284) ---
+
+    #[test]
+    fn resolve_env_prefix_pattern() {
+        let _env = crate::test_env::EnvVarGuard::set(&[(
+            "TEST_RESOLVER_ENV_PREFIX",
+            Some("from_env_prefix"),
+        )]);
+        let resolver = resolver_no_backend();
+        assert_eq!(
+            resolver.resolve("env:TEST_RESOLVER_ENV_PREFIX").unwrap(),
+            "from_env_prefix"
+        );
+    }
+
+    #[test]
+    fn resolve_env_prefix_missing_returns_error() {
+        let resolver = resolver_no_backend();
+        assert!(resolver.resolve("env:DEFINITELY_NOT_SET_VAR_XYZ").is_err());
+    }
+
+    #[test]
+    fn resolve_env_prefix_missing_fails_the_same_way_as_dollar_form() {
+        // `env:NAME` and `${NAME}` must fail identically for the same
+        // missing variable, so operators see one consistent failure mode
+        // regardless of which spelling a config uses.
+        let resolver = resolver_no_backend();
+        let dollar_err = resolver
+            .resolve("${DEFINITELY_NOT_SET_VAR_XYZ}")
+            .unwrap_err();
+        let env_err = resolver
+            .resolve("env:DEFINITELY_NOT_SET_VAR_XYZ")
+            .unwrap_err();
+        assert_eq!(format!("{dollar_err:#}"), format!("{env_err:#}"));
+    }
+
+    #[test]
+    fn resolve_env_prefix_does_not_affect_other_patterns() {
+        // Strictly additive: provider URIs, ${VAR}, file:, and the legacy
+        // vault://env/NAME alias all still resolve exactly as before.
+        let _env =
+            crate::test_env::EnvVarGuard::set(&[("TEST_RESOLVER_ENV", Some("from_environment"))]);
+        let resolver = resolver_no_backend();
+        assert_eq!(
+            resolver.resolve("${TEST_RESOLVER_ENV}").unwrap(),
+            "from_environment"
+        );
+        assert!(resolver
+            .resolve("vault://primary/secret/openai?key=api_key")
+            .is_err());
+        assert!(resolver.resolve("awssm://primary/openai").is_err());
+        assert!(resolver.resolve("secret://nope/key").is_err());
     }
 
     // --- file: ---
