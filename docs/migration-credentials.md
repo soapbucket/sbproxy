@@ -10,6 +10,8 @@ This is a breaking change for any config that declared `virtual_keys:`. An opera
 
 The credentials epic unifies inbound and outbound credentials under one schema with first-class metadata, principal selectors, and multi-tenant scoping. The legacy `virtual_keys:` array could only sit at origin scope, had no selector grammar, and split attribution across two parallel paths (`ai_project`, `ai_tags`, plus the access-log `project` column) that did not survive across non-AI auth providers. The new block carries all of that on one shape and applies to every credential kind (`ai_provider`, `bearer`, `api_key`, `jwt`, `basic`, `oidc_client`, `outbound_token_exchange`, `outbound_client_credentials`).
 
+**Required: also set `require_governed_key: true`.** A `credentials:` block only takes effect once the same origin (or the tenant or proxy scope the credential lives at) also sets `action.require_governed_key: true`. Config compile enforces this pairing: an `ai_proxy` origin with `credentials:` but no `require_governed_key: true` fails to compile, naming the origin and pointing back at this doc. Without the flag, the credential would be declared but never checked, and the origin would keep accepting any bearer token, or none, exactly like it did before this migration. Add `require_governed_key: true` to the `action:` block in the same change that adds `credentials:`, not as a later follow-up.
+
 ## Manual migration
 
 Walk each origin's `action.providers[*].virtual_keys` array. Rewrite each entry as a `credentials:` entry alongside the origin's `action:` block. Field map:
@@ -68,6 +70,7 @@ origins:
   ai.local:
     action:
       type: ai_proxy
+      require_governed_key: true
       providers:
         - name: anthropic
           api_key: ${ANTHROPIC_API_KEY}

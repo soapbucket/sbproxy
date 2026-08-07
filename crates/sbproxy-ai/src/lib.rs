@@ -71,7 +71,7 @@ pub use context_overflow::{
 };
 pub use degradation::{should_degrade, DegradationConfig};
 pub use handler::*;
-pub use identity::{KeyStore, VirtualKeyConfig};
+pub use identity::VirtualKeyConfig;
 pub use ids::{ModelId, ProviderName};
 pub use key_scoping::KeyPermissions;
 pub use model_alias::{ModelAlias, ModelAliasRegistry};

@@ -1124,7 +1124,9 @@ Refresh the vendored file out of band with `scripts/refresh-model-prices.sh /etc
 
 ## Virtual API keys (`credentials:`)
 
-Issue per-team or per-app keys that the gateway validates locally. Each key can pin a provider, restrict models, set its own request rate, carry its own budget ceiling, and tag requests for downstream attribution. The shipped shape is a `credentials:` list of `type: ai_provider` entries next to the origin's `action:` block; the same block also lives at `tenants[].credentials` and `proxy.credentials` scope, with origin shadowing tenant shadowing proxy for entries that share a `name`. The legacy `virtual_keys:` key is rejected at config compile with a pointer to [migration-credentials.md](migration-credentials.md).
+Issue per-team or per-app keys that the gateway checks on every request, once the origin also turns enforcement on. A `credentials:` block by itself only declares named keys; it does not make the gateway check them. The origin (or the tenant or proxy scope the credential lives at) must also set `action.require_governed_key: true`, or config compile now rejects it: without that flag, a `credentials:` block would silently do nothing, and the origin would accept any bearer token, or none, and dispatch every request ungoverned. See `require_governed_key` below.
+
+Each key can pin a provider, restrict models, set its own request rate, carry its own budget ceiling, and tag requests for downstream attribution. The shipped shape is a `credentials:` list of `type: ai_provider` entries next to the origin's `action:` block; the same block also lives at `tenants[].credentials` and `proxy.credentials` scope, with origin shadowing tenant shadowing proxy for entries that share a `name`. The legacy `virtual_keys:` key is rejected at config compile with a pointer to [migration-credentials.md](migration-credentials.md).
 
 With key management enabled, exact configured values are resolved from every
 carrier in `key_management.inbound.headers`, including its configured scheme;
@@ -1151,6 +1153,7 @@ origins:
   "ai.example.com":
     action:
       type: ai_proxy
+      require_governed_key: true
       providers:
         - name: openai
           api_key: ${OPENAI_API_KEY}

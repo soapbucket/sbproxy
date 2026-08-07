@@ -973,6 +973,7 @@ fn openai_origin_with_configured_key(upstream_port: u16) -> String {
           allow: [gpt-configured]
     action:
       type: ai_proxy
+      require_governed_key: true
       providers:
         - name: openai
           provider_type: openai

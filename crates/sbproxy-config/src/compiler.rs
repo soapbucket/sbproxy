@@ -515,6 +515,21 @@ fn lower_credentials_into_origin_virtual_keys(file: &mut crate::types::ConfigFil
                 "origin `{hostname}` action block must be an object to receive credentials"
             )
         })?;
+
+        if action.get("type").and_then(|t| t.as_str()) == Some("ai_proxy") {
+            let governed = action
+                .get("require_governed_key")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !governed {
+                anyhow::bail!(
+                    "origin `{hostname}` declares credentials: but require_governed_key is not true; \
+                     requests presenting no credential, or any credential, would dispatch ungoverned. \
+                     Set `action.require_governed_key: true` on this origin. See docs/migration-credentials.md."
+                );
+            }
+        }
+
         let entries: Vec<serde_json::Value> = by_name
             .values()
             .map(|cred| {
@@ -3855,6 +3870,7 @@ origins:
   ai.local:
     action:
       type: ai_proxy
+      require_governed_key: true
       providers:
         - name: openai
           api_key: dummy
@@ -3913,6 +3929,7 @@ origins:
   ai.local:
     action:
       type: ai_proxy
+      require_governed_key: true
       providers:
         - name: openai
           api_key: dummy
@@ -3966,6 +3983,7 @@ origins:
   ai.local:
     action:
       type: ai_proxy
+      require_governed_key: true
       providers:
         - name: openai
           api_key: dummy
@@ -4014,6 +4032,72 @@ origins:
         );
     }
 
+    /// WOR-2299: an `ai_proxy` origin that declares `credentials:` but
+    /// does not also set `action.require_governed_key: true` must fail
+    /// compile. Without the flag the credential is materialised but
+    /// never checked, so the origin would keep accepting any bearer
+    /// token, or none, and dispatch every request ungoverned.
+    #[test]
+    fn credentials_without_require_governed_key_is_rejected() {
+        let yaml = r#"
+proxy:
+  credentials:
+    - name: ungoverned-openai
+      type: ai_provider
+      provider: openai
+      key: ${OPENAI_API_KEY}
+origins:
+  ai.local:
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: dummy
+"#;
+        let err = compile_config(yaml)
+            .err()
+            .expect("credentials without require_governed_key should fail compile");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ai.local") && msg.contains("require_governed_key"),
+            "unhelpful error: {msg}"
+        );
+    }
+
+    /// Regression guard for the check above: the same shape WITH
+    /// `require_governed_key: true` set must keep compiling. This
+    /// pins the check to `credentials:` presence, not to the origin
+    /// merely being an `ai_proxy`.
+    #[test]
+    fn credentials_with_require_governed_key_still_compiles() {
+        let yaml = r#"
+proxy:
+  credentials:
+    - name: governed-openai
+      type: ai_provider
+      provider: openai
+      key: ${OPENAI_API_KEY}
+origins:
+  ai.local:
+    action:
+      type: ai_proxy
+      require_governed_key: true
+      providers:
+        - name: openai
+          api_key: dummy
+"#;
+        let compiled =
+            compile_config(yaml).expect("credentials with require_governed_key: true must compile");
+        let origin = compiled.resolve_origin("ai.local").expect("origin exists");
+        let vks = origin
+            .action_config
+            .get("virtual_keys")
+            .and_then(|v| v.as_array())
+            .expect("virtual_keys array materialised");
+        assert_eq!(vks.len(), 1);
+        assert_eq!(vks[0]["name"], "governed-openai");
+    }
+
     /// An origin-scope credential with the same name as a
     /// proxy-scope credential shadows the proxy entry; the merged
     /// virtual_keys array carries only the origin variant.
@@ -4031,6 +4115,7 @@ origins:
   ai.local:
     action:
       type: ai_proxy
+      require_governed_key: true
       providers:
         - name: openai
           api_key: dummy
@@ -4072,6 +4157,7 @@ origins:
     tenant_id: acme-corp
     action:
       type: ai_proxy
+      require_governed_key: true
       providers:
         - name: openai
           api_key: dummy

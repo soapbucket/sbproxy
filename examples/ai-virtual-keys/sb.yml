@@ -67,6 +67,7 @@ origins:
   "ai.local":
     action:
       type: ai_proxy
+      require_governed_key: true
       routing: round_robin
 
       providers:

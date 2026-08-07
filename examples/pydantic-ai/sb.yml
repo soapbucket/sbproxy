@@ -32,6 +32,7 @@ origins:
   "127.0.0.1":
     action:
       type: ai_proxy
+      require_governed_key: true
       providers:
         - name: openai
           provider_type: openai

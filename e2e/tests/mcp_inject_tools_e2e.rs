@@ -242,6 +242,7 @@ origins:
   "ai.localhost":
     action:
       type: ai_proxy
+      require_governed_key: true
       providers:
         - name: openai
           api_key: "stub"

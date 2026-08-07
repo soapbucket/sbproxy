@@ -341,47 +341,6 @@ pub struct KeyBudget {
     pub max_cost_usd: Option<f64>,
 }
 
-/// Virtual key store - validates and looks up keys.
-pub struct KeyStore {
-    keys: HashMap<String, VirtualKeyConfig>,
-}
-
-impl KeyStore {
-    /// Build a key store from a list of virtual key configs.
-    pub fn new(configs: Vec<VirtualKeyConfig>) -> Self {
-        let keys = configs.into_iter().map(|k| (k.key.clone(), k)).collect();
-        Self { keys }
-    }
-
-    /// Look up a key and return its config if it exists and is enabled.
-    pub fn validate_key(&self, key: &str) -> Option<&VirtualKeyConfig> {
-        self.keys.get(key).filter(|k| k.enabled)
-    }
-
-    /// Check if a model is allowed for a given virtual key.
-    pub fn is_model_allowed(&self, key: &str, model: &str) -> bool {
-        match self.keys.get(key) {
-            Some(config) => {
-                if !config.blocked_models.is_empty()
-                    && config.blocked_models.iter().any(|m| m == model)
-                {
-                    return false;
-                }
-                if !config.allowed_models.is_empty() {
-                    return config.allowed_models.iter().any(|m| m == model);
-                }
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Return the number of keys in the store.
-    pub fn key_count(&self) -> usize {
-        self.keys.len()
-    }
-}
-
 /// Rate limiter per virtual key.
 pub struct KeyRateLimiter {
     state: Mutex<HashMap<String, KeyRateState>>,
@@ -567,64 +526,6 @@ mod tests {
             bypass_prompt_injection: false,
             allow_content_capture: false,
         }
-    }
-
-    // --- KeyStore tests ---
-
-    #[test]
-    fn validate_key_found() {
-        let store = KeyStore::new(vec![make_key("sk-test-1", true)]);
-        assert!(store.validate_key("sk-test-1").is_some());
-    }
-
-    #[test]
-    fn validate_key_not_found() {
-        let store = KeyStore::new(vec![make_key("sk-test-1", true)]);
-        assert!(store.validate_key("sk-unknown").is_none());
-    }
-
-    #[test]
-    fn validate_key_disabled() {
-        let store = KeyStore::new(vec![make_key("sk-disabled", false)]);
-        assert!(store.validate_key("sk-disabled").is_none());
-    }
-
-    #[test]
-    fn is_model_allowed_unrestricted() {
-        let store = KeyStore::new(vec![make_key("sk-1", true)]);
-        assert!(store.is_model_allowed("sk-1", "gpt-4"));
-        assert!(store.is_model_allowed("sk-1", "claude-3"));
-    }
-
-    #[test]
-    fn is_model_allowed_with_allowlist() {
-        let store = KeyStore::new(vec![make_key_with_models(
-            "sk-1",
-            vec!["gpt-4", "gpt-3.5-turbo"],
-            vec![],
-        )]);
-        assert!(store.is_model_allowed("sk-1", "gpt-4"));
-        assert!(store.is_model_allowed("sk-1", "gpt-3.5-turbo"));
-        assert!(!store.is_model_allowed("sk-1", "claude-3"));
-    }
-
-    #[test]
-    fn is_model_blocked() {
-        let store = KeyStore::new(vec![make_key_with_models("sk-1", vec![], vec!["gpt-4"])]);
-        assert!(!store.is_model_allowed("sk-1", "gpt-4"));
-        assert!(store.is_model_allowed("sk-1", "gpt-3.5-turbo"));
-    }
-
-    #[test]
-    fn is_model_allowed_unknown_key() {
-        let store = KeyStore::new(vec![]);
-        assert!(!store.is_model_allowed("unknown", "gpt-4"));
-    }
-
-    #[test]
-    fn key_count() {
-        let store = KeyStore::new(vec![make_key("a", true), make_key("b", true)]);
-        assert_eq!(store.key_count(), 2);
     }
 
     #[test]

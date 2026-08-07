@@ -91,6 +91,7 @@ origins:
           models: [gpt-4o]
       routing:
         strategy: fallback_chain
+      require_governed_key: true
     credentials:
       - name: primary-only
         type: ai_provider
@@ -125,6 +126,7 @@ origins:
           base_url: "{secondary_url}"
           allow_private_base_url: true
           models: [secondary-hidden]
+      require_governed_key: true
     credentials:
       - name: primary-model
         type: ai_provider
@@ -148,6 +150,7 @@ origins:
   "ai.localhost":
     action:
       type: ai_proxy
+      require_governed_key: true
       routing:
         strategy: cascade
         tiers:
