@@ -26,6 +26,27 @@ the next version cut.
 
 ### Changed
 
+- **A payment stuck in reconciliation now withholds fresh 402 challenges
+  from the payer it belongs to instead of from every payer of the route.**
+  The guard that stops a second bill for content whose first payment may
+  already have moved money was keyed on `(tenant, origin, route)` alone,
+  because no column in the settlement store said anything about who was
+  paying. One stranded payer therefore took a route's revenue to zero for
+  everybody, and on x402 there is no status query to end it, so a
+  facilitator outage could hold a hot route at 503 for its whole duration.
+  Settlement intents now carry a payer scope key, and the guard matches on
+  it. The key is a salted HKDF derivation, under its own purpose, of the
+  caller identity the request already proved: an authenticated inbound key,
+  or an agent identity from a verified Web Bot Auth `keyid` or a
+  forward-confirmed reverse DNS match. A `User-Agent` match and the client
+  IP are both excluded, the first because any client can assert one and the
+  second because egress pools and NAT make it neither stable nor unique.
+  The key never leaves the settlement database: it is not a metric label,
+  not a log or tracing field, and not part of any response. Intents written
+  by earlier builds carry no scope key and keep withholding route-wide, as
+  does any intent minted for a caller this proxy could not identify, so an
+  upgrade in flight cannot turn one of them into a double charge.
+
 - **Boot and every SIGHUP reload now warn when `key_management.inbound.provider_hints`
   recognizes a native provider credential that no `inbound.native_key_policy`
   admits.** `provider_hints` ships non-empty by default and

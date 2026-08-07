@@ -1846,6 +1846,7 @@ mod tests {
                 .prepare_requirement(sbproxy_billing::service::RequirementInput {
                     draft: observer_test_draft(),
                     request_idempotency_key: "request-key".to_owned(),
+                    payer_hash: None,
                 })
                 .await,
             "the generation observer rejects before runtime payment work",

@@ -318,6 +318,7 @@ async fn service_lifecycle_fixture(
         .prepare_requirement(RequirementInput {
             draft,
             request_idempotency_key: "request-key".to_owned(),
+            payer_hash: None,
         })
         .await
         .expect("challenge prepares");

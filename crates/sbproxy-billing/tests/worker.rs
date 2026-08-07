@@ -102,7 +102,7 @@ impl World {
         let digest = draft.digest().expect("draft digest");
         let created = self
             .store
-            .create_or_get_challenge(&draft, digest, request_key)
+            .create_or_get_challenge(&draft, digest, request_key, None)
             .await
             .expect("create challenge");
         let signed = sign_draft(&draft, Some("pi_handle"));

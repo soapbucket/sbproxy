@@ -112,6 +112,14 @@ pub struct RequirementInput {
     pub draft: PaymentRequirementDraft,
     /// The client's idempotency key for this logical request.
     pub request_idempotency_key: String,
+    /// The opaque payer scope key to store beside the intent (WOR-2238),
+    /// or `None` when the request path could not identify a payer.
+    ///
+    /// Deliberately not a field of `draft`. The draft is canonicalized,
+    /// digested, signed, and rendered onto the wire, so a payer scope key
+    /// carried there would end up in the 402 body and in the signed quote.
+    /// This field never leaves the durable store.
+    pub payer_hash: Option<String>,
 }
 
 /// A prepared 402 challenge.
@@ -422,6 +430,7 @@ impl BillingService {
         let RequirementInput {
             mut draft,
             request_idempotency_key,
+            payer_hash,
         } = input;
         draft.canonicalize()?;
         let draft_digest = draft.digest()?;
@@ -451,7 +460,12 @@ impl BillingService {
 
         let created = self
             .store
-            .create_or_get_challenge(&draft, draft_digest, &request_idempotency_key)
+            .create_or_get_challenge(
+                &draft,
+                draft_digest,
+                &request_idempotency_key,
+                payer_hash.as_deref(),
+            )
             .await?;
 
         // A challenge that was already finalized is re-issued as it stands.

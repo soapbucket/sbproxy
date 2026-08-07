@@ -21,13 +21,34 @@
 //! | `usage_reports` | Queued usage accounting, which never authorizes |
 //! | `reconciliation_log` | What a provider query proved, and when |
 //!
+//! # Migration 2
+//!
+//! One column, `payment_intents.payer_hash`, added under `user_version = 2`
+//! for WOR-2238. It is the opaque scope key
+//! [`crate::store::SettlementStore::unresolved_intent_for_route`] matches
+//! on, so an unresolved payment withholds fresh challenges from the payer it
+//! stranded instead of from every payer of the route. Nullable with no
+//! default: a row written by an older build has no payer scope, and the
+//! query treats `NULL` as "matches every payer", which is exactly the
+//! route-wide behavior those rows were written under. An upgrade therefore
+//! cannot turn an existing unresolved intent into a second bill.
+//!
 //! # What is deliberately not stored
 //!
 //! No credential, no authorization header, no client secret, no macaroon, no
-//! rune, no provider response body, and no payer identifier reaches a column.
-//! Proofs are stored as digests. Recovery material is stored as ciphertext
-//! whose plaintext excludes every key. Failures are stored as a closed
-//! category plus, at most, a character-class sanitized provider code.
+//! rune, no provider response body, and no raw payer identifier reaches a
+//! column. Proofs are stored as digests. Recovery material is stored as
+//! ciphertext whose plaintext excludes every key. Failures are stored as a
+//! closed category plus, at most, a character-class sanitized provider code.
+//!
+//! `payer_hash` is the one column that says anything at all about who is
+//! paying, and it says it in one direction only: the request path derives it
+//! through HKDF under a dedicated purpose before this crate ever sees it, so
+//! the column holds a derived scope key rather than an address, a customer,
+//! a key id, or a user agent. It exists to compare two requests to each
+//! other and for nothing else. It is never read back out of the store into a
+//! metric label, a log line, a trace field, or a response body, and no
+//! method here returns it.
 //!
 //! # Concurrency
 //!
@@ -60,7 +81,7 @@ use crate::types::{
 };
 
 /// The schema version this build understands.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Every table and index migration 1 creates.
 const MIGRATION_1: &str = r#"
@@ -234,6 +255,22 @@ CREATE INDEX IF NOT EXISTS reconciliation_log_attempt
     ON reconciliation_log (attempt_id, entry_id);
 "#;
 
+/// WOR-2238: the payer scope key the unresolved-intent guard matches on.
+///
+/// `ALTER TABLE ... ADD COLUMN` is not idempotent the way `CREATE TABLE IF
+/// NOT EXISTS` is, so unlike [`MIGRATION_1`] this batch runs exactly once,
+/// guarded by the stamped `user_version`. Nullable with no default on
+/// purpose: an existing row genuinely has no payer scope, and inventing one
+/// would be claiming an identity the request that minted it never carried.
+///
+/// No new index. The guard's predicate is an `OR` over `payer_hash IS NULL`
+/// and an equality, which no index can serve selectively, and
+/// `payment_intents_route_status` already narrows the scan to one route's
+/// unresolved rows before the payer test runs.
+const MIGRATION_2: &str = r#"
+ALTER TABLE payment_intents ADD COLUMN payer_hash TEXT;
+"#;
+
 /// Every column `payment_intents` rows are read through, in order.
 const INTENT_COLUMNS: &str = "intent_id, tenant_id, origin_id, route, quote_id, \
      request_idempotency_key, protocol, settlement_rail, status, draft_jcs, draft_digest, \
@@ -355,6 +392,16 @@ impl SqliteSettlementStore {
         connection
             .execute_batch(MIGRATION_1)
             .map_err(|_| BillingError::Storage("apply migration 1"))?;
+        // Migration 1 is idempotent and re-runs harmlessly on every open.
+        // Migration 2 is an `ALTER TABLE`, which is not, so the stamped
+        // version is what decides: a database opened at 0 (fresh) or 1
+        // (written by a build before WOR-2238) gets the column, and one
+        // already at 2 does not.
+        if version < 2 {
+            connection
+                .execute_batch(MIGRATION_2)
+                .map_err(|_| BillingError::Storage("apply migration 2"))?;
+        }
         connection
             .pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(|_| BillingError::Storage("stamp schema version"))?;
@@ -391,6 +438,7 @@ impl SettlementStore for SqliteSettlementStore {
         draft: &PaymentRequirementDraft,
         draft_digest: [u8; 32],
         request_idempotency_key: &str,
+        payer_hash: Option<&str>,
     ) -> Result<CreateIntent, BillingError> {
         if draft.digest()? != draft_digest {
             return Err(BillingError::DigestMismatch);
@@ -408,10 +456,16 @@ impl SettlementStore for SqliteSettlementStore {
         let now_ms = self.clock.now_ms();
         let draft = draft.clone();
         let request_idempotency_key = request_idempotency_key.to_string();
+        let payer_hash = payer_hash.map(str::to_string);
 
         self.call(move |connection| {
             let transaction = begin_immediate(connection)?;
             if let Some(existing) = load_intent(&transaction, &intent_id)? {
+                // Resuming leaves `payer_hash` exactly as the insert wrote
+                // it. The row's scope belongs to the payer the payment was
+                // minted for, and letting a later caller restamp it would
+                // let anyone who can reach this route move a stranded
+                // intent out from under the payer it is protecting.
                 if existing.draft_digest != draft_digest {
                     return Err(BillingError::IntentConflict);
                 }
@@ -439,9 +493,9 @@ impl SettlementStore for SqliteSettlementStore {
                         intent_id, tenant_id, origin_id, route, quote_id,
                         request_idempotency_key, protocol, advertised_rail, settlement_rail,
                         status, draft_jcs, draft_digest, amount_micros, currency,
-                        expires_at_ms, created_at_ms, updated_at_ms
+                        expires_at_ms, created_at_ms, updated_at_ms, payer_hash
                      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
-                     ?15, ?16, ?17)",
+                     ?15, ?16, ?17, ?18)",
                     params![
                         intent_id,
                         draft.tenant_id,
@@ -460,6 +514,7 @@ impl SettlementStore for SqliteSettlementStore {
                         draft.expires_at_ms,
                         now_ms,
                         now_ms,
+                        payer_hash,
                     ],
                 )
                 .map_err(|_| BillingError::Storage("insert settlement intent"))?;
@@ -1094,26 +1149,43 @@ impl SettlementStore for SqliteSettlementStore {
         tenant_id: &str,
         origin_id: &str,
         route: &str,
+        payer_hash: Option<&str>,
     ) -> Result<Option<String>, BillingError> {
         let tenant_id = tenant_id.to_string();
         let origin_id = origin_id.to_string();
         let route = route.to_string();
+        let payer_hash = payer_hash.map(str::to_string);
         self.call(move |connection| {
             // Oldest first, so the intent an operator is told about is the one
             // that has been stuck longest rather than whichever row the
             // planner reached first.
+            //
+            // The payer clause (WOR-2238) is three ways of saying "this
+            // request could be the payer whose money is stuck": the scopes
+            // match, the row predates payer scoping and belongs to nobody in
+            // particular, or this request carries no identity to compare.
+            // Only two identified and different payers fall through it.
+            //
+            // Known and out of scope here (WOR-2230's original notes, still
+            // true): this is a read with no lock, so two simultaneous
+            // tokenless requests can both pass it; `/article` and `/article/`
+            // are two routes and get two bills; and the read hits the local
+            // SQLite file, so in a multi-node deployment the guard is per
+            // store rather than per cluster.
             connection
                 .query_row(
                     "SELECT intent_id FROM payment_intents
                       WHERE tenant_id = ?1 AND origin_id = ?2 AND route = ?3
                         AND status = ?4
+                        AND (payer_hash IS NULL OR ?5 IS NULL OR payer_hash = ?5)
                       ORDER BY created_at_ms
                       LIMIT 1",
                     params![
                         tenant_id,
                         origin_id,
                         route,
-                        IntentStatus::NeedsReconciliation.as_str()
+                        IntentStatus::NeedsReconciliation.as_str(),
+                        payer_hash,
                     ],
                     |row| row.get::<_, String>(0),
                 )

@@ -548,7 +548,7 @@ async fn an_unpaid_invoice_never_stamps_a_dispatch_and_a_later_payment_still_set
     let draft = lightning_draft();
     let digest = draft.digest().expect("draft digest");
     let created = store
-        .create_or_get_challenge(&draft, digest, "cln-request-key")
+        .create_or_get_challenge(&draft, digest, "cln-request-key", None)
         .await
         .expect("create challenge");
     let signed = sign_draft(&draft, Some(FIXTURE_HASH));

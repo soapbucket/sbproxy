@@ -1,6 +1,6 @@
 # Payment settlement
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-07*
 
 `proxy.payments` is how SBproxy charges for a request and proves it was
 paid. It is Apache-2.0, it is off unless you configure it, and it holds
@@ -95,16 +95,50 @@ answering 503 with `Retry-After`, because the payer whose funds may
 already have moved is owed a resolution rather than a fresh bill.
 
 The same reasoning applies one step earlier. While an intent for a route
-sits in `NeedsReconciliation`, no new challenge is issued for that route:
-the request gets 503 with `Retry-After` instead of a 402. Nothing durable
-records who is paying, so this holds for every payer of that route, not
-only the one whose payment is stuck. It is a deliberate trade. On a rail
-with an authoritative status query the wait is one worker sweep. On a
-rail without one, x402 v2 today, it lasts until an operator resolves the
-intent with the facilitator, and the route earns nothing in the meantime.
-Alert on it: the refusal is counted as
-`sbproxy_payment_settlement_total{operation="challenge",
-outcome="unresolved_payment"}` and logged at warn with the intent id.
+sits in `NeedsReconciliation`, that route issues no new challenge to the
+payer the stuck intent belongs to: the request gets 503 with
+`Retry-After` instead of a 402.
+
+Who a payment belongs to is stamped on the intent when it is minted, as a
+salted HKDF derivation of the caller identity the request had already
+proved to the proxy. An authenticated inbound key is the first choice.
+Failing that, a resolved agent identity counts when it came from a
+verified Web Bot Auth `keyid` or a forward-confirmed reverse DNS match,
+which is the bar the `agent_class` verified header already uses. A
+`User-Agent` regex match does not count, because any client can assert
+one. The client IP does not count either: an egress pool rotates it
+between two requests seconds apart, and a NAT shares one address between
+unrelated crawlers. The derivation lives in the settlement database and
+nowhere else. It is never a metric label, never a log or tracing field,
+and never part of a response.
+
+Three situations still withhold the route from everybody, and each of
+them is the conservative answer to a question the proxy cannot settle. An
+intent written before this scoping existed carries no payer, so it could
+be anybody's payment that is stuck. An intent minted for a caller the
+proxy could not identify carries no payer for the same reason. And a
+request that arrives with no identity of its own waits on every
+unresolved intent for the route, because nothing rules out that it is the
+payer whose money is already gone.
+
+No settlement rail supplies a payer identity of its own at this point,
+which is why the scope key comes from the request rather than from the
+credential. The challenge path is by definition the path where no live
+quote token addresses a durable challenge. Lightning and direct Stripe
+carry no client credential at all, and a Lightning invoice records no
+payer even after it is paid. A Payment HTTP Authentication credential
+binds to one challenge rather than to a payer. An x402 payload digest
+identifies one payment rather than one payer, so a client that re-signed
+would read as a stranger and be handed the second bill this rule exists
+to prevent.
+
+The refusal is still worth alerting on. On a rail with an authoritative
+status query the wait is one worker sweep. On a rail without one, x402 v2
+today, it lasts until an operator resolves the intent with the
+facilitator, and that payer buys nothing in the meantime. It is counted
+as `sbproxy_payment_settlement_total{operation="challenge",
+outcome="unresolved_payment"}` and logged at warn with the intent id, the
+origin, and the route, and with nothing at all about who is paying.
 
 An ordinary client reaches that state by being early. A crawler that
 retries before its invoice is paid is answered 503, and that same 503
@@ -251,10 +285,13 @@ relaxes that, so their bodies are not reproduced here.
 Each block below comes from its own fresh stack, and running them back to
 back against one stack does not reproduce them. The second one strands an
 intent and never pays it, and an unresolved intent withholds new
-challenges for that route, which is the rule two sections up. So the
-request after it answers 503 where the first block shows a 402, and that
-is the documented behavior rather than a broken example. Restart the
-fixture and the proxy between blocks to reproduce each one.
+challenges, which is the rule two sections up. The stub crawler is
+identified by `User-Agent` alone, which is not a payer identity, so its
+stranded intent is one of the rows that withholds from every payer of the
+route. The request after it therefore answers 503 where the first block
+shows a 402, and that is the documented behavior rather than a broken
+example. Restart the fixture and the proxy between blocks to reproduce
+each one.
 
 The walkthrough script at the end of this section is the exception, and it
 is repeatable against one stack: it pays the invoice it strands, so its
@@ -927,8 +964,8 @@ provider response.
 
 No quote id, challenge id, tenant id, address, provider reference,
 PaymentIntent id, invoice, single-use token, credential, client secret,
-macaroon, rune, provider error text, or usage customer id is ever a metric
-label. Access logs may carry the rail and a one-way receipt correlation
+macaroon, rune, provider error text, payer scope key, or usage customer
+id is ever a metric label. Access logs may carry the rail and a one-way receipt correlation
 digest, and never a sensitive header or a provider body. The failure
 categories in durable records are a closed set for the same reason.
 

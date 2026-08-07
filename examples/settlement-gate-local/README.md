@@ -168,7 +168,7 @@ curl -s -u admin:demo-change-me http://127.0.0.1:9090/admin/payments/status
 <!-- CAPTURE: curl -s -u admin:demo-change-me http://127.0.0.1:9090/admin/payments/status -->
 
 ```text
-{"configured":true,"rails":["lightning_cln"],"schema_version":1,"worker":{"challenges_expired":0,"clean_shutdown":false,"leases_moved_to_needs_reconciliation":0,"leases_returned_to_retry_wait":0,"reconciliations_succeeded":1,"reconciliations_unresolved":0,"ticks":2}}
+{"configured":true,"rails":["lightning_cln"],"schema_version":2,"worker":{"challenges_expired":0,"clean_shutdown":false,"leases_moved_to_needs_reconciliation":0,"leases_returned_to_retry_wait":0,"reconciliations_succeeded":1,"reconciliations_unresolved":0,"ticks":2}}
 ```
 
 The metrics carry four labels and no more: `rail`, `operation`, `outcome`, and `provider_class`.

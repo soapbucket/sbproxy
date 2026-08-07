@@ -311,6 +311,18 @@ pub trait SettlementStore: Send + Sync {
     /// idempotency key, so a retry of the same logical request addresses the
     /// same row. Resuming requires the same draft bytes.
     ///
+    /// `payer_hash` is the opaque scope key
+    /// [`SettlementStore::unresolved_intent_for_route`] matches on, and this
+    /// is the only call that ever writes it. `None` means the request path
+    /// could not identify a payer, which is the legacy shape every row
+    /// written before WOR-2238 has. It is written on insert only: resuming
+    /// an existing intent leaves the first writer's value in place, because
+    /// the row's scope belongs to whoever the payment was minted for.
+    ///
+    /// Implementations must treat the value as opaque. It is derived, never
+    /// raw payer material, and it belongs in this table and nowhere else: it
+    /// is never a metric label, a log field, or a response body.
+    ///
     /// # Errors
     ///
     /// Returns [`BillingError::IntentConflict`] when the same idempotency
@@ -320,6 +332,7 @@ pub trait SettlementStore: Send + Sync {
         draft: &PaymentRequirementDraft,
         draft_digest: [u8; 32],
         request_idempotency_key: &str,
+        payer_hash: Option<&str>,
     ) -> Result<CreateIntent, BillingError>;
 
     /// Commits the final requirement, its digest, and the signed quote.
@@ -509,7 +522,7 @@ pub trait SettlementStore: Send + Sync {
         intent_id: &str,
     ) -> Result<Option<SettlementReceipt>, BillingError>;
 
-    /// Returns the oldest unresolved intent covering one route, if any.
+    /// Returns the oldest unresolved intent this payer must wait on, if any.
     ///
     /// Unresolved means [`IntentStatus::NeedsReconciliation`] and nothing
     /// else. Those are the intents whose funds may already have moved and
@@ -517,9 +530,25 @@ pub trait SettlementStore: Send + Sync {
     /// existence should stop a fresh bill for the same content.
     ///
     /// The request path reads this before pricing a new challenge. The key is
-    /// the content, not the payer: nothing durable identifies who is paying,
-    /// and a second challenge for a route whose first payment is unresolved is
-    /// the shape of a double charge whoever presents it.
+    /// the content plus the payer scope key the intent was minted under
+    /// (WOR-2238). A row matches when any of three things is true:
+    ///
+    /// - its stored `payer_hash` equals `payer_hash`, which is the payer
+    ///   whose own payment is stuck;
+    /// - its stored `payer_hash` is `NULL`, which is every row written
+    ///   before WOR-2238 and every row minted for a caller the request path
+    ///   could not identify. Those rows keep the original route-wide
+    ///   behavior, so an in-flight upgrade cannot regress into a double
+    ///   charge;
+    /// - the caller passed `None`, which says this request carries no payer
+    ///   identity. It could be the stranded payer arriving unidentified, and
+    ///   an unproven guess in that direction is the double charge WOR-2230
+    ///   closed, so it waits on every unresolved intent for the route.
+    ///
+    /// The narrowing is therefore strictly conservative: every pair that
+    /// blocked before this landed still blocks, and the only pairs that
+    /// stopped blocking are the ones where two different identified payers
+    /// are provably involved.
     ///
     /// # Errors
     ///
@@ -529,6 +558,7 @@ pub trait SettlementStore: Send + Sync {
         tenant_id: &str,
         origin_id: &str,
         route: &str,
+        payer_hash: Option<&str>,
     ) -> Result<Option<String>, BillingError>;
 
     /// Reserves a proof digest for one intent, or reports the replay.

@@ -43,6 +43,34 @@
 //! with `Retry-After`, counted as `operation="challenge"`,
 //! `outcome="unresolved_payment"` (WOR-2230).
 //!
+//! # Whose payment is stuck
+//!
+//! That guard started out scoped to the route alone, which meant one stuck
+//! payment took the route's revenue to zero for every payer of it. On
+//! Lightning that is one worker sweep. On x402 there is no status endpoint,
+//! so a facilitator outage could zero a hot route for its whole duration.
+//! WOR-2238 narrows it to the payer the stranded intent was minted for, by
+//! storing a payer scope key beside the intent and matching on it.
+//!
+//! The scope key is what [`payer_scope_hash`] derives, and the input is the
+//! only thing at this seam that is both stable across one payer's retries
+//! and different between two payers: the caller identity the request
+//! already proved to the proxy, in the order [`payer_principal`] resolves
+//! it. It is deliberately not rail material. No rail offers a payer
+//! identity here. This is the challenge path, so by construction no live
+//! quote token addresses a durable challenge; Lightning and direct Stripe
+//! carry no client credential at all and a Lightning invoice records no
+//! payer; Payment Auth credentials bind to one challenge rather than to a
+//! payer; and an x402 payload's canonical digest identifies one payment,
+//! not one payer, so a client that re-signs would read as a new payer and
+//! be handed the second bill this guard exists to prevent.
+//!
+//! Requests the proxy cannot identify keep the original behavior on both
+//! sides: an intent minted for one stores no scope key and blocks every
+//! payer, and a request carrying no identity waits on every unresolved
+//! intent for the route. The narrowing only ever separates two payers the
+//! proxy can actually tell apart.
+//!
 //! The retry path authenticates the presented quote token, addresses the
 //! durable intent through
 //! [`sbproxy_billing::types::derive_intent_id`] with the requirement id as
@@ -91,6 +119,7 @@ use sbproxy_modules::policy::payment_requirement::{
 };
 use sbproxy_modules::policy::quote_token::NonceCheck;
 use sbproxy_observe::metrics::record_payment_settlement;
+use sbproxy_security::crypto::{hkdf_derive_purpose, HkdfPurpose};
 
 #[cfg(feature = "payment-mpp")]
 use sbproxy_billing::payment_auth::{
@@ -128,6 +157,122 @@ const SETTLEMENT_LABEL: &str = "ai_crawl_settlement";
 /// invoice payment), short enough that an abandoned challenge expires
 /// before the recovery worker has a backlog of them.
 const CHALLENGE_TTL_MS: i64 = 300_000;
+
+/// Fixed HKDF salt for [`payer_scope_hash`].
+///
+/// Fixed rather than random because the derivation has to reproduce across
+/// requests, across restarts, and across processes sharing one settlement
+/// database: the whole point is that the same payer computes the same value
+/// tomorrow. A fixed salt plus a dedicated [`HkdfPurpose`] is the shape
+/// `SealKey::fingerprint_hex` in `sbproxy-security` uses, and it is what
+/// keeps this value from being a derivation of the same keyspace as
+/// anything that signs or encrypts.
+const PAYER_SCOPE_SALT: &[u8] = b"sbproxy.settlement.payer-scope.salt.v1";
+
+/// Length, in bytes, of a stored payer scope key.
+///
+/// Sixteen rather than the four a published fingerprint gets: this value is
+/// compared for equality to decide whether one payer waits on another's
+/// stuck payment, so a collision is a payer wrongly refused a challenge, and
+/// a deployment can hold far more distinct payers than a key ring holds
+/// keys.
+const PAYER_SCOPE_LEN: usize = 16;
+
+/// Derives the durable payer scope key for one caller.
+///
+/// HKDF under a dedicated purpose rather than a hash of the identifier, for
+/// the reason `bundle_var_fingerprint` gives: a plain hash of a short,
+/// guessable value is a value anyone holding the database can enumerate back
+/// to its input. The tenant is mixed into the keying material with a `NUL`
+/// separator, which tenant ids and caller identifiers cannot contain, so the
+/// same crawler under two tenants gets two unrelated scope keys and one
+/// tenant's database says nothing about another's traffic.
+///
+/// The result is hex so it stores as SQLite `TEXT` and compares with `=`.
+/// It goes in the settlement database and nowhere else: it is never a metric
+/// label, never a log or tracing field, and never part of a response.
+fn payer_scope_hash(tenant_id: &str, principal: &str) -> String {
+    let mut ikm = Vec::with_capacity(tenant_id.len() + principal.len() + 1);
+    ikm.extend_from_slice(tenant_id.as_bytes());
+    ikm.push(0);
+    ikm.extend_from_slice(principal.as_bytes());
+    hex::encode(hkdf_derive_purpose(
+        &ikm,
+        PAYER_SCOPE_SALT,
+        HkdfPurpose::SettlementPayerScope,
+        PAYER_SCOPE_LEN,
+    ))
+}
+
+/// Resolves the caller identity this request pays under, if any.
+///
+/// Two properties decide what is admissible here, and both are load
+/// bearing. The value has to be **stable** across one payer's retries,
+/// because an unstable key hands a stranded payer a fresh invoice, which is
+/// worse than the route-wide guard it replaces. And it has to be
+/// **distinct** between two payers, because a shared key is the route-wide
+/// guard with extra steps.
+///
+/// In precedence:
+///
+/// 1. The accountable key id: an inbound credential the proxy authenticated
+///    and reduced to a public, secret-free identifier. Stable because it
+///    identifies a key rather than a request, distinct because two callers
+///    holding different keys report different ids.
+/// 2. A resolved agent identity, but only from a source that proved
+///    something: a verified Web Bot Auth `keyid` or a forward-confirmed
+///    reverse DNS match. That is the same predicate the upstream
+///    `agent_class` verified header uses, and it excludes the `User-Agent`
+///    regex match, which any client can assert. The three reserved
+///    sentinels are excluded too: `human`, `anonymous`, and `unknown` are
+///    shared by everyone who lands in them, so they identify a bucket
+///    rather than a payer.
+/// 3. Nothing, which stores no scope key and keeps this request under the
+///    original route-wide guard.
+///
+/// The client IP is deliberately absent. It is neither stable (an egress
+/// pool rotates it between two requests seconds apart) nor distinct (a NAT
+/// shares one address between unrelated callers), so it fails both tests at
+/// once and in the direction that costs money.
+fn payer_principal(ctx: &RequestContext) -> Option<String> {
+    if let Some(key_id) = ctx.accountable_key_id() {
+        return Some(format!("key:{key_id}"));
+    }
+    verified_agent_principal(ctx)
+}
+
+/// The resolved agent identity, when the resolver actually proved one.
+///
+/// Mirrors `crate::agent_class::cap_binding_agent_id`, which rejects the
+/// fallback verdict for the same reason: the resolver always stamps some
+/// `agent_id`, so treating every stamp as an identity would put every
+/// unidentified caller in one bucket and call it a payer. This is stricter
+/// still, because a scope key decides whether a payer is refused a
+/// challenge: only the two sources the request pipeline already labels
+/// `verified` count, and the shared sentinels never do.
+#[cfg(feature = "agent-class")]
+fn verified_agent_principal(ctx: &RequestContext) -> Option<String> {
+    use sbproxy_classifiers::AgentIdSource;
+    if !matches!(
+        ctx.agent_id_source,
+        Some(AgentIdSource::BotAuth | AgentIdSource::Rdns)
+    ) {
+        return None;
+    }
+    let agent = ctx.agent_id.as_ref()?;
+    if agent.is_sentinel() || agent.as_str().is_empty() {
+        return None;
+    }
+    Some(format!("agent:{}", agent.as_str()))
+}
+
+/// A build without agent-class resolution has no agent identity to read,
+/// so every request falls through to the route-wide guard unless it
+/// authenticated an inbound credential.
+#[cfg(not(feature = "agent-class"))]
+fn verified_agent_principal(_ctx: &RequestContext) -> Option<String> {
+    None
+}
 
 /// The proof scheme for rails whose credential is the quote token itself.
 ///
@@ -180,7 +325,26 @@ const OUTCOME_NO_ACCEPTABLE_RAIL: &str = "no_acceptable_rail";
 /// Its own row rather than a share of `unavailable`, because this one says
 /// something an operator has to act on: a payment for this content is stuck,
 /// and until it resolves the route earns nothing. Alert on it.
+///
+/// This value keeps meaning exactly what it meant before WOR-2238: the whole
+/// route is withheld. Every refusal counted here before the payer scope
+/// existed was route-wide, so an alert already written against this series
+/// keeps firing for the same severity it was written for. The narrowed case
+/// got a new value rather than a share of this one, because moving the
+/// route-wide case to a new name would have silently stopped those alerts on
+/// the more expensive of the two outcomes.
 const OUTCOME_UNRESOLVED_PAYMENT: &str = "unresolved_payment";
+
+/// The `outcome` label for a challenge withheld from one payer, while the
+/// rest of the route is still being challenged and billed (WOR-2238).
+///
+/// Materially less severe than [`OUTCOME_UNRESOLVED_PAYMENT`] and worth
+/// separating for that reason alone: this one costs the revenue of a single
+/// stuck payer, that one costs the revenue of the entire route. An operator
+/// paging on the second does not want to be woken by the first.
+///
+/// Carries no payer identity, only the fact that a payer scope existed.
+const OUTCOME_UNRESOLVED_PAYMENT_SCOPED: &str = "unresolved_payment_scoped";
 
 /// The `rail` label for a challenge the gate abandoned before compiling a
 /// requirement.
@@ -227,7 +391,19 @@ pub(crate) struct GateRequest<'a> {
     /// The matched origin's stable identifier.
     pub(crate) origin_id: &'a str,
     /// The resolved agent identifier, or empty when none resolved.
+    ///
+    /// This is the pricing input: it selects a tier, and a `User-Agent`
+    /// match is good enough for that. It is deliberately not the payer
+    /// scope; see [`payer_hash`](Self::payer_hash).
     pub(crate) agent_id: &'a str,
+    /// The durable payer scope key for this request (WOR-2238), or `None`
+    /// when no caller identity resolved.
+    ///
+    /// Already derived: [`payer_scope_hash`] runs before the request
+    /// reaches the gate, so nothing downstream of here ever holds raw payer
+    /// material. `None` is the honest answer for an unidentified caller and
+    /// keeps this request under the route-wide guard.
+    pub(crate) payer_hash: Option<&'a str>,
     /// The `Accept` header, when present.
     pub(crate) accept: Option<&'a str>,
     /// The `Accept-Payment` header, when present.
@@ -374,6 +550,10 @@ pub(crate) async fn apply(
     #[cfg(not(feature = "agent-class"))]
     let agent_id = String::new();
     let path = req.uri.path().to_string();
+    // Derived before the gate runs, so the raw identifier never crosses
+    // into the settlement path and the gate only ever handles the opaque
+    // scope key.
+    let payer_hash = payer_principal(ctx).map(|principal| payer_scope_hash(&tenant, &principal));
     let accept = req
         .headers
         .get(http::header::ACCEPT)
@@ -391,6 +571,7 @@ pub(crate) async fn apply(
             tenant: &tenant,
             origin_id: &origin_id,
             agent_id: &agent_id,
+            payer_hash: payer_hash.as_deref(),
             accept,
             accept_payment,
         };
@@ -884,28 +1065,95 @@ async fn challenge_path(
     // replay, arrives here with no token at all, and a fresh invoice is a
     // second bill for the same article.
     //
-    // The key is the content, because that is the only thing durable state
-    // knows: no column identifies a payer. So this refuses every payer for the
-    // route while one payment on it is unresolved, which trades revenue for
-    // never double charging. On a healthy rail the wait is one worker tick.
-    // On a rail with no status endpoint it lasts until an operator resolves
-    // the intent with the provider, which is why it gets a loud counter and a
-    // warning rather than a quiet 503.
+    // The key is the content plus the payer scope the stranded intent was
+    // minted under (WOR-2238). Scoping it to the content alone, which is
+    // where this started, refused every payer of the route while one payment
+    // on it was unresolved: correct, and on a rail with no status endpoint it
+    // took a hot route's revenue to zero for the length of a provider outage.
+    // Two payers the proxy can tell apart no longer wait on each other. Two
+    // it cannot still do, because an unproven guess in that direction is the
+    // double charge this guard exists to prevent.
+    //
+    // On a healthy rail the wait is one worker tick. On a rail with no status
+    // endpoint it lasts until an operator resolves the intent with the
+    // provider, which is why it gets a loud counter and a warning rather than
+    // a quiet 503.
+    //
+    // Known and out of scope, both predating this: the lookup is a read with
+    // no lock, so two simultaneous tokenless requests from the same payer can
+    // still both pass it (the window is narrowed, not closed); and `/article`
+    // and `/article/` are two routes and get two bills.
     let unresolved = deps
         .service
         .store()
-        .unresolved_intent_for_route(request.tenant, request.origin_id, request.path)
+        .unresolved_intent_for_route(
+            request.tenant,
+            request.origin_id,
+            request.path,
+            request.payer_hash,
+        )
         .await
         .map_err(|error| infra("unresolved_intent_for_route", &error))?;
     if let Some(intent_id) = unresolved {
-        tracing::warn!(
-            intent_id = %intent_id,
-            origin_id = request.origin_id,
-            route = request.path,
-            "a payment for this route is unresolved; withholding a fresh challenge \
-             rather than billing again for content that may already be paid for",
+        // The intent id, the origin, and the route, and nothing about who is
+        // paying. The scope key is a durable comparison key, not a diagnostic:
+        // logging it would put a payer identifier on a settlement surface,
+        // which is the promise `sbproxy-observe`'s payment recorders keep by
+        // not taking one as a parameter at all.
+        // `scope` is the one thing an operator cannot infer from the rest of
+        // this line, and it changes what they should do. "payer" means the
+        // guard narrowed: exactly the payer whose payment is stuck is
+        // waiting, and every other caller on this route is still being
+        // challenged and billed normally. "route" means it could not identify
+        // the requester, so the whole route is withheld until the worker
+        // resolves the intent, which is the revenue-affecting case WOR-2238
+        // exists to bound. Without this field both render identically and a
+        // stalled route looks like a healthy one.
+        //
+        // It carries no payer identity: it names which of two code paths
+        // decided, not who. That keeps the promise `sbproxy-observe`'s payment
+        // recorders make by not accepting a payer at all.
+        let scoped = request.payer_hash.is_some();
+        if scoped {
+            tracing::warn!(
+                intent_id = %intent_id,
+                origin_id = request.origin_id,
+                route = request.path,
+                scope = "payer",
+                "a payment from this payer is unresolved; withholding a fresh challenge \
+                 from them rather than billing again for content they may already have \
+                 paid for. Other payers on this route are unaffected",
+            );
+        } else {
+            // The expensive case, and the one an operator has to be able to
+            // find. Nothing identified the requester, so this withholds the
+            // route from everyone until the worker resolves the intent. On a
+            // rail with no status endpoint (x402) that can last as long as a
+            // facilitator outage, and the route earns nothing for the
+            // duration. Says why it could not narrow, because the fix is to
+            // give callers an identity the gate can see, not to touch
+            // payments config.
+            tracing::warn!(
+                intent_id = %intent_id,
+                origin_id = request.origin_id,
+                route = request.path,
+                scope = "route",
+                "a payment for this route is unresolved and the requester could not be \
+                 identified, so the whole route is withheld rather than billing again \
+                 for content that may already be paid for. Narrowing this to the single \
+                 stuck payer needs the caller to present an accountable key or a \
+                 verified agent identity",
+            );
+        }
+        record_gate_settlement(
+            None,
+            OP_CHALLENGE,
+            if scoped {
+                OUTCOME_UNRESOLVED_PAYMENT_SCOPED
+            } else {
+                OUTCOME_UNRESOLVED_PAYMENT
+            },
         );
-        record_gate_settlement(None, OP_CHALLENGE, OUTCOME_UNRESOLVED_PAYMENT);
         // The same two seconds the redeem path answers a stranded payment
         // with. One number for "come back when the worker has been round".
         return Ok(ChallengeOutcome::Respond(unavailable_response(2)));
@@ -938,6 +1186,9 @@ async fn challenge_path(
         .prepare_requirement(RequirementInput {
             draft,
             request_idempotency_key: requirement_id,
+            // Stamped on the row this call inserts, so if this payment is
+            // the one that strands, the guard above knows whose it was.
+            payer_hash: request.payer_hash.map(str::to_string),
         })
         .await
         .map_err(|error| infra("prepare_requirement", &error))?;
@@ -1595,6 +1846,7 @@ mod tests {
             _draft: &PaymentRequirementDraft,
             _draft_digest: [u8; 32],
             _request_idempotency_key: &str,
+            _payer_hash: Option<&str>,
         ) -> Result<CreateIntent, BillingError> {
             Err(BillingError::Storage("induced store failure"))
         }
@@ -1695,6 +1947,7 @@ mod tests {
             _tenant_id: &str,
             _origin_id: &str,
             _route: &str,
+            _payer_hash: Option<&str>,
         ) -> Result<Option<String>, BillingError> {
             Err(BillingError::Storage("induced store failure"))
         }
@@ -1952,6 +2205,30 @@ mod tests {
         /// The same decision against a named route, for the rules that are
         /// scoped to one piece of content rather than to the deployment.
         async fn decide_path(&self, path: &str, headers: &http::HeaderMap) -> GateDecision {
+            self.decide_full(path, headers, None).await
+        }
+
+        /// The same decision made by a named payer (WOR-2238).
+        ///
+        /// Takes the principal rather than the derived key so a test reads
+        /// as "GPTBot asks again" and the derivation stays exercised on the
+        /// path the request pipeline uses.
+        async fn decide_as(
+            &self,
+            path: &str,
+            headers: &http::HeaderMap,
+            principal: &str,
+        ) -> GateDecision {
+            let hash = payer_scope_hash("tenant-1", principal);
+            self.decide_full(path, headers, Some(hash.as_str())).await
+        }
+
+        async fn decide_full(
+            &self,
+            path: &str,
+            headers: &http::HeaderMap,
+            payer_hash: Option<&str>,
+        ) -> GateDecision {
             let accept = headers
                 .get(http::header::ACCEPT)
                 .and_then(|value| value.to_str().ok());
@@ -1965,6 +2242,7 @@ mod tests {
                 tenant: "tenant-1",
                 origin_id: "origin-1",
                 agent_id: "",
+                payer_hash,
                 accept,
                 accept_payment,
             };
@@ -2422,6 +2700,220 @@ mod tests {
             other.status, 402,
             "one stuck payment must not stop the rest of the site earning",
         );
+    }
+
+    // --- WOR-2238: the wait belongs to the payer, not to the route ---
+    //
+    // The guard above is correct and, scoped to the route alone, expensive:
+    // while one payer's payment is stuck every payer of that route is refused,
+    // and on a rail with no status endpoint that lasts as long as the provider
+    // outage does. These pin the narrowing and, more importantly, the three
+    // cases where it must not narrow.
+
+    /// Strands one intent for `/article` under a named payer.
+    async fn strand_as(gate: &Gate, principal: &str) {
+        gate.script(Script::NotSettled);
+        let challenge = expect_respond(
+            gate.decide_as("/article", &crawler_headers(), principal)
+                .await,
+        );
+        assert_eq!(challenge.status, 402, "a challenge is a 402");
+
+        let mut retry = crawler_headers();
+        add_header(&mut retry, "crawler-payment", &quote_token_of(&challenge));
+        add_header(
+            &mut retry,
+            "PAYMENT-SIGNATURE",
+            &x402_credential(&challenge.response.body),
+        );
+        let response = expect_respond(gate.decide_as("/article", &retry, principal).await);
+        assert_eq!(
+            response.status, 503,
+            "verified but not settled is what strands an intent",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stranded_payer_does_not_withhold_the_route_from_another_payer() {
+        let gate = Gate::x402();
+        strand_as(&gate, "agent:gptbot").await;
+
+        // The whole point of the ticket. A second crawler has paid nothing,
+        // is owed nothing, and asking it to wait out someone else's stuck
+        // facilitator call is revenue the route simply does not earn.
+        let other = expect_respond(
+            gate.decide_as("/article", &crawler_headers(), "agent:claudebot")
+                .await,
+        );
+        assert_eq!(
+            other.status, 402,
+            "a different payer is still billable while someone else's payment is stuck",
+        );
+        assert!(
+            !other.response.body.contains("settlement_unavailable"),
+            "the second payer gets a real challenge, not a wait: {}",
+            other.response.body,
+        );
+        assert_eq!(
+            gate.settle_calls(),
+            1,
+            "issuing a challenge settles nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_payer_whose_payment_is_stuck_still_waits() {
+        let gate = Gate::x402();
+        strand_as(&gate, "agent:gptbot").await;
+
+        // WOR-2230's protection, unchanged: the payer that dropped its token
+        // comes back with nothing to present, and a fresh invoice for it
+        // would be the second bill for an article it may already have paid
+        // for.
+        let again = expect_respond(
+            gate.decide_as("/article", &crawler_headers(), "agent:gptbot")
+                .await,
+        );
+        assert_eq!(
+            again.status, 503,
+            "the payer whose money may already be gone is never billed again",
+        );
+        header_value(&again, "Retry-After");
+        assert_eq!(
+            gate.settle_calls(),
+            1,
+            "nothing was dispatched a second time"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_intent_with_no_payer_scope_still_withholds_the_whole_route() {
+        let gate = Gate::x402();
+        // `strand` mints without a payer scope, which is the shape of every
+        // row an older build wrote and of every row minted for a caller this
+        // proxy cannot identify.
+        strand(&gate).await;
+
+        let identified = expect_respond(
+            gate.decide_as("/article", &crawler_headers(), "agent:gptbot")
+                .await,
+        );
+        assert_eq!(
+            identified.status, 503,
+            "a legacy row names nobody, so it could be anybody's payment that is stuck; \
+             upgrading must not turn one into a second bill",
+        );
+
+        let anonymous = expect_respond(gate.decide_with(&crawler_headers()).await);
+        assert_eq!(
+            anonymous.status, 503,
+            "and an unidentified request keeps waiting on it too",
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unidentified_request_waits_on_an_identified_payers_stuck_payment() {
+        let gate = Gate::x402();
+        strand_as(&gate, "agent:gptbot").await;
+
+        // The conservative direction. This request carries no identity, so
+        // it cannot be proved to be someone other than the stranded payer,
+        // and guessing costs a double charge.
+        let anonymous = expect_respond(gate.decide_with(&crawler_headers()).await);
+        assert_eq!(
+            anonymous.status, 503,
+            "no identity means no proof this is a different payer",
+        );
+    }
+
+    #[test]
+    fn the_payer_scope_key_does_not_expose_its_principal() {
+        // Mirrors `the_fingerprint_is_not_a_prefix_of_a_record_key` in
+        // sbproxy-security: a stored derivation of a caller identifier must
+        // not be a way to read the identifier back.
+        let principal = "agent:gptbot";
+        let hash = payer_scope_hash("tenant-1", principal);
+
+        assert!(
+            !hash.contains(principal) && !hash.contains("gptbot"),
+            "the stored key must not carry its own input: {hash}",
+        );
+        assert!(
+            !principal.starts_with(&hash) && !hash.starts_with(principal),
+            "neither value is a prefix of the other: {hash}",
+        );
+        assert_eq!(
+            hash.len(),
+            PAYER_SCOPE_LEN * 2,
+            "the key is a fixed-width hex derivation, so its length leaks nothing \
+             about the length of the identifier behind it",
+        );
+
+        // Deterministic, which is what lets the same payer match tomorrow.
+        assert_eq!(hash, payer_scope_hash("tenant-1", principal));
+        // Distinct across payers, which is what makes the narrowing safe.
+        assert_ne!(hash, payer_scope_hash("tenant-1", "agent:claudebot"));
+        // Distinct across tenants, so one tenant's store says nothing about
+        // another's traffic.
+        assert_ne!(hash, payer_scope_hash("tenant-2", principal));
+
+        // And it is not recoverable by deriving the same material under
+        // another purpose, which is the separation the purpose enum exists
+        // for.
+        let mut ikm = Vec::new();
+        ikm.extend_from_slice(b"tenant-1");
+        ikm.push(0);
+        ikm.extend_from_slice(principal.as_bytes());
+        let other_purpose = hex::encode(hkdf_derive_purpose(
+            &ikm,
+            PAYER_SCOPE_SALT,
+            HkdfPurpose::Mac,
+            PAYER_SCOPE_LEN,
+        ));
+        assert_ne!(
+            hash, other_purpose,
+            "the same material under a different purpose must derive a different key",
+        );
+    }
+
+    #[tokio::test]
+    async fn the_payer_scope_key_never_reaches_a_settlement_metric() {
+        let gate = Gate::x402();
+        let principal = "agent:gptbot";
+        strand_as(&gate, principal).await;
+        // Both halves of the guard, so every settlement row this change can
+        // produce has been written before the scrape is inspected.
+        gate.decide_as("/article", &crawler_headers(), principal)
+            .await;
+        gate.decide_as("/article", &crawler_headers(), "agent:claudebot")
+            .await;
+
+        let hash = payer_scope_hash("tenant-1", principal);
+        for family in prometheus::gather() {
+            if !family.name().starts_with("sbproxy_payment") {
+                continue;
+            }
+            for metric in family.get_metric() {
+                for label in metric.get_label() {
+                    assert!(
+                        !label.name().contains("payer"),
+                        "{} carries a payer label",
+                        family.name(),
+                    );
+                    assert_ne!(
+                        label.value(),
+                        hash,
+                        "{} carries a payer scope key as a label value",
+                        family.name(),
+                    );
+                    assert!(
+                        !label.value().contains("gptbot"),
+                        "{} carries a payer identifier as a label value",
+                        family.name(),
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]

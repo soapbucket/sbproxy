@@ -55,7 +55,7 @@ async fn finalized_intent(
     let draft = sample_draft(tenant, requirement_id, EXPIRY_MS);
     let digest = draft.digest().expect("draft digest");
     let created = store
-        .create_or_get_challenge(&draft, digest, request_key)
+        .create_or_get_challenge(&draft, digest, request_key, None)
         .await
         .expect("create challenge");
     let signed = sign_draft(&draft, Some("pi_handle"));
@@ -111,7 +111,7 @@ async fn one_idempotency_key_creates_one_intent() {
     let digest = draft.digest().expect("draft digest");
 
     let created = first
-        .create_or_get_challenge(&draft, digest, "request-key")
+        .create_or_get_challenge(&draft, digest, "request-key", None)
         .await
         .expect("create challenge");
     assert!(created.created);
@@ -119,7 +119,7 @@ async fn one_idempotency_key_creates_one_intent() {
 
     // A second handle sees the same row rather than making another one.
     let resumed = second
-        .create_or_get_challenge(&draft, digest, "request-key")
+        .create_or_get_challenge(&draft, digest, "request-key", None)
         .await
         .expect("resume challenge");
     assert!(!resumed.created);
@@ -137,7 +137,7 @@ async fn a_reused_key_with_different_terms_is_rejected() {
     let draft = sample_draft("tenant-1", "req-1", EXPIRY_MS);
     let digest = draft.digest().expect("draft digest");
     store
-        .create_or_get_challenge(&draft, digest, "request-key")
+        .create_or_get_challenge(&draft, digest, "request-key", None)
         .await
         .expect("create challenge");
 
@@ -145,7 +145,7 @@ async fn a_reused_key_with_different_terms_is_rejected() {
     let other_digest = other.digest().expect("draft digest");
     let error = expect_error(
         store
-            .create_or_get_challenge(&other, other_digest, "request-key")
+            .create_or_get_challenge(&other, other_digest, "request-key", None)
             .await,
         "different terms under one key must fail",
     );
@@ -155,7 +155,7 @@ async fn a_reused_key_with_different_terms_is_rejected() {
     // before any row is touched.
     let error = expect_error(
         store
-            .create_or_get_challenge(&draft, other_digest, "another-key")
+            .create_or_get_challenge(&draft, other_digest, "another-key", None)
             .await,
         "a mismatched draft digest must fail",
     );
@@ -174,7 +174,7 @@ async fn one_quote_nonce_binds_one_requirement() {
     let second_draft = sample_draft("tenant-1", "req-2", EXPIRY_MS);
     let second_digest = second_draft.digest().expect("draft digest");
     let created = store
-        .create_or_get_challenge(&second_draft, second_digest, "second-key")
+        .create_or_get_challenge(&second_draft, second_digest, "second-key", None)
         .await
         .expect("create second challenge");
 
@@ -201,7 +201,7 @@ async fn finalizing_twice_requires_the_same_final_value() {
     let draft = sample_draft("tenant-1", "req-1", EXPIRY_MS);
     let digest = draft.digest().expect("draft digest");
     let created = store
-        .create_or_get_challenge(&draft, digest, "request-key")
+        .create_or_get_challenge(&draft, digest, "request-key", None)
         .await
         .expect("create challenge");
 
@@ -739,6 +739,112 @@ async fn duplicate_registrations_fail_in_separate_namespaces() {
         ),
         BillingError::AdapterNotRegistered(SettlementRail::LightningLnd)
     );
+}
+
+// --- WOR-2238: the unresolved-intent guard is scoped to a payer ---
+
+/// Drives one intent for `origin-1` `/paid` into `NeedsReconciliation`.
+///
+/// That is the only state the guard reads, and the only one nothing ever
+/// expires, so it is what the query has to be exercised against.
+async fn stranded_intent(
+    store: &SharedSettlementStore,
+    requirement_id: &str,
+    request_key: &str,
+    payer_hash: Option<&str>,
+) -> String {
+    let draft = sample_draft("tenant-1", requirement_id, EXPIRY_MS);
+    let digest = draft.digest().expect("draft digest");
+    let created = store
+        .create_or_get_challenge(&draft, digest, request_key, payer_hash)
+        .await
+        .expect("create challenge");
+    let signed = sign_draft(&draft, Some("pi_handle"));
+    store
+        .finalize_requirement(&created.intent_id, &signed)
+        .await
+        .expect("finalize requirement");
+
+    // A distinct proof per intent, so two stranded intents in one test do
+    // not collide on the per-tenant proof digest or on the provider
+    // idempotency key derived from it.
+    let proof = PaymentProof::new("Payment", format!("spt_{request_key}")).expect("proof");
+    let proof_digest = proof.digest();
+    store
+        .reserve_proof(&created.intent_id, proof_digest, START_MS)
+        .await
+        .expect("reserve");
+    let prepared = dispatched_attempt(store, &created.intent_id, &proof_digest, 0, START_MS).await;
+    store
+        .mark_needs_reconciliation(
+            prepared.attempt_id(),
+            prepared.lease_token(),
+            SafeFailure::category(FailureCategory::Ambiguous, true),
+        )
+        .await
+        .expect("reconcile");
+    created.intent_id
+}
+
+/// The guard's answer for one payer.
+async fn guard(store: &SharedSettlementStore, payer_hash: Option<&str>) -> Option<String> {
+    store
+        .unresolved_intent_for_route("tenant-1", "origin-1", "/paid", payer_hash)
+        .await
+        .expect("guard query answers")
+}
+
+#[tokio::test]
+async fn an_unresolved_intent_only_withholds_from_the_payer_it_belongs_to() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let path = directory.path().join("settlement.sqlite3");
+    let clock = TestClock::new(START_MS);
+    let store = handle(&path, &clock);
+
+    let stuck = stranded_intent(&store, "req-a", "key-a", Some("payer-a")).await;
+
+    assert_eq!(
+        guard(&store, Some("payer-a")).await,
+        Some(stuck.clone()),
+        "the payer whose money may already be gone keeps waiting",
+    );
+    assert_eq!(
+        guard(&store, Some("payer-b")).await,
+        None,
+        "a different payer owes this intent nothing and is still billable",
+    );
+    assert_eq!(
+        guard(&store, None).await,
+        Some(stuck),
+        "a request with no identity cannot be proved to be someone else",
+    );
+}
+
+#[tokio::test]
+async fn an_intent_with_no_payer_scope_withholds_from_everyone() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let path = directory.path().join("settlement.sqlite3");
+    let clock = TestClock::new(START_MS);
+    let store = handle(&path, &clock);
+
+    // `None` is what a row written before this landed carries, and what a
+    // row minted for an unidentifiable caller carries now. Both mean the
+    // store cannot say whose payment is stuck, so it has to assume anyone's.
+    let legacy = stranded_intent(&store, "req-legacy", "key-legacy", None).await;
+
+    for payer in [Some("payer-a"), Some("payer-b"), None] {
+        assert_eq!(
+            guard(&store, payer).await,
+            Some(legacy.clone()),
+            "a legacy row names nobody, so it withholds from everybody",
+        );
+    }
+
+    // A second handle on the same file re-runs the open path, which is what
+    // proves the schema-2 `ALTER TABLE` is guarded by the stamped version
+    // rather than attempted on every open.
+    let reopened = handle(&path, &clock);
+    assert_eq!(guard(&reopened, Some("payer-a")).await, Some(legacy));
 }
 
 #[cfg(feature = "recovery-crypto")]

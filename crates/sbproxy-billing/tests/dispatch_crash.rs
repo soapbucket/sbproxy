@@ -72,7 +72,7 @@ async fn crash_after_dispatch(
     let draft = sample_draft("tenant-1", "req-1", EXPIRY_MS);
     let digest = draft.digest().expect("draft digest");
     let created = store
-        .create_or_get_challenge(&draft, digest, "request-key")
+        .create_or_get_challenge(&draft, digest, "request-key", None)
         .await
         .expect("create challenge");
     let signed = sign_draft(&draft, Some("pi_handle"));

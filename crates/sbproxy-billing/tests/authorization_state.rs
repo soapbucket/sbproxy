@@ -132,7 +132,7 @@ impl World {
         let digest = draft.digest().expect("draft digest");
         let created = self
             .store
-            .create_or_get_challenge(&draft, digest, request_key)
+            .create_or_get_challenge(&draft, digest, request_key, None)
             .await
             .expect("create challenge");
         let signed = sign_draft(&draft, Some("pi_handle"));
@@ -340,6 +340,7 @@ async fn started_challenge_rejection_happens_before_intent_or_provider_write() {
         .prepare_requirement(RequirementInput {
             draft,
             request_idempotency_key: "challenge-key".to_owned(),
+            payer_hash: None,
         })
         .await
     {
@@ -378,6 +379,7 @@ async fn challenge_success_is_observed_after_durable_finalization() {
         .prepare_requirement(RequirementInput {
             draft,
             request_idempotency_key: "challenge-key".to_owned(),
+            payer_hash: None,
         })
         .await
         .expect("challenge prepares");
@@ -416,6 +418,7 @@ async fn challenge_failure_emits_terminal_without_provider_write() {
         .prepare_requirement(RequirementInput {
             draft,
             request_idempotency_key: "challenge-key".to_owned(),
+            payer_hash: None,
         })
         .await
     {
@@ -593,7 +596,7 @@ async fn an_unfinalized_or_expired_challenge_fails_before_the_provider() {
     let digest = draft.digest().expect("draft digest");
     world
         .store
-        .create_or_get_challenge(&draft, digest, "unfinalized")
+        .create_or_get_challenge(&draft, digest, "unfinalized", None)
         .await
         .expect("create challenge");
     let signed = sign_draft(&draft, Some("pi_handle"));

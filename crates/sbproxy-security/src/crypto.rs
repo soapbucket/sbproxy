@@ -79,6 +79,16 @@ pub enum HkdfPurpose {
     /// fingerprint from being a derivation of the same keyspace as any
     /// encryption or signing key derived from the same material.
     BundleSecretVarFingerprint,
+    /// WOR-2238: the durable scope key the settlement gate stores beside a
+    /// payment intent so an unresolved payment withholds fresh challenges
+    /// from the payer it stranded rather than from every payer of the
+    /// route. The input is a public caller identifier, never a credential,
+    /// and the derived value lives in the settlement database and nowhere
+    /// else: no metric label, no log line, no response body. A dedicated
+    /// purpose keeps that stored value from being a derivation of the same
+    /// keyspace as anything that signs or encrypts, so a leaked settlement
+    /// database yields no key material for another surface.
+    SettlementPayerScope,
 }
 
 impl HkdfPurpose {
@@ -101,6 +111,7 @@ impl HkdfPurpose {
             HkdfPurpose::BundleSecretVarFingerprint => {
                 b"sbproxy.hkdf.bundle-secret-var-fingerprint.v1"
             }
+            HkdfPurpose::SettlementPayerScope => b"sbproxy.hkdf.settlement-payer-scope.v1",
         }
     }
 }
