@@ -16,6 +16,12 @@ sbproxy-observe.workspace = true
 # its own. Redis-backed deployments wire RedisKVStore from the platform
 # crate; in-memory tests use the bundled InMemoryIdempotencyCache.
 sbproxy-platform.workspace = true
+# WOR-2301: the central secret resolver, so `message_signatures.key`
+# resolves an `env:NAME`, `file:PATH`, `${VAR}`, or provider-URI
+# reference through the same path every other secret-bearing config
+# field uses, instead of the reference text becoming the HMAC shared
+# secret or the Ed25519 public key.
+sbproxy-vault.workspace = true
 http.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -47,3 +53,8 @@ lru = "0.16"
 tempfile = "3"
 serde_yaml = { workspace = true }
 rand = { workspace = true }
+# WOR-2301: reset_process_resolver_for_test, so the message-signature
+# key-resolution tests in signatures.rs are not order-dependent on
+# cargo test's single-process fallback run (see sbproxy-core/Cargo.toml
+# for the same pattern).
+sbproxy-vault = { path = "../sbproxy-vault", features = ["test-support"] }

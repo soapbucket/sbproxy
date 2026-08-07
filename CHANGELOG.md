@@ -39,6 +39,20 @@ the next version cut.
 
 ### Fixed
 
+- **A secret reference in `message_signatures.key` is now resolved instead
+  of being used as the key itself.** Writing `key: vault://prod/signing-key`
+  or `key: env:SIGNING_KEY` on an origin left the reference text standing in
+  for the RFC 9421 signing key. The HMAC shared secret became the reference
+  string itself, identical on every deployment that pasted the same line, so
+  anyone who read the config could forge a signature the proxy accepted. The
+  field now resolves through the same secret resolver every other
+  secret-bearing field uses, and it resolves before the value is decoded, so
+  a stored secret yields the same key bytes as that value written inline. A
+  reference no declared backend can resolve fails the verifier build, and the
+  origin then rejects every request with a 401. Inline keys behave exactly as
+  before, and the `${VAR}` form was never affected, because config
+  interpolation replaced it before this code ran.
+
 ## [1.10.0] - 2026-08-04
 
 ### Added

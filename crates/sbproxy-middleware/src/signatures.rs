@@ -36,6 +36,7 @@
 
 use std::collections::HashMap;
 
+use anyhow::Context as _;
 use base64::Engine;
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use hmac::{Hmac, KeyInit, Mac};
@@ -94,6 +95,15 @@ pub struct MessageSignatureConfig {
     ///   string works), or hex/base64 if your keying flow encodes
     ///   them.
     /// - `ed25519`: hex- or base64-encoded raw 32-byte public key.
+    ///
+    /// The value may also be a secret reference rather than the
+    /// material itself: `env:NAME`, `file:PATH`, `${VAR}`, or a
+    /// provider URI such as `vault://prod/signing-key`. References
+    /// resolve through the process secret resolver before any
+    /// decoding happens, so the resolved value is decoded exactly as
+    /// the same value inlined here would be. A provider URI that no
+    /// installed backend can resolve is refused rather than becoming
+    /// the key (WOR-2301).
     pub key: String,
     /// Optional list of components every accepted signature must
     /// cover. Verification rejects requests whose `Signature-Input`
@@ -145,14 +155,19 @@ pub enum VerifyVerdict {
 }
 
 impl MessageSignatureVerifier {
-    /// Build a verifier, validating and decoding the key material.
+    /// Build a verifier, resolving then validating and decoding the key
+    /// material.
+    ///
+    /// Fails when `config.key` is a secret reference nothing installed can
+    /// resolve, so an unresolvable reference rejects every request for the
+    /// origin instead of becoming the key itself (WOR-2301).
     pub fn new(config: MessageSignatureConfig) -> anyhow::Result<Self> {
         let key_bytes = match config.algorithm {
             SignatureAlgorithm::HmacSha256 => {
                 // HMAC keys can be any byte sequence. Accept the
                 // configured value as-is; most operators set a
                 // base64 or hex string.
-                decode_secret(&config.key)
+                decode_secret(&config.key)?
             }
             SignatureAlgorithm::Ed25519 => {
                 let bytes = decode_public_key(&config.key)?;
@@ -703,26 +718,100 @@ fn check_freshness(input: &SignatureInputEntry, skew: u64) -> Option<String> {
 
 // --- Helpers for key decoding ---
 
-fn decode_secret(value: &str) -> Vec<u8> {
-    // Try hex first (most common machine-generated form), then
-    // base64 (also common), then fall through to raw UTF-8 bytes.
-    if let Ok(bytes) = hex::decode(value) {
-        return bytes;
+/// Resolve a configured `message_signatures.key` value into its material.
+///
+/// Delegates to the installed process secret resolver (WOR-2301), so
+/// `env:NAME`, `file:PATH`, `${VAR}`, and every provider URI resolve the
+/// same way they do everywhere else in the config. Without a resolver
+/// installed (`sbproxy validate`, unit tests, a run whose config declares no
+/// `proxy.secrets` backends), only `env:NAME`, `file:PATH`, `${VAR}`, and an
+/// inline literal value resolve; a provider URI is refused rather than
+/// becoming the key.
+fn resolve_key_material(value: &str) -> anyhow::Result<String> {
+    if let Some(resolver) = sbproxy_vault::process_resolver() {
+        return resolver
+            .resolve(value)
+            // Deliberately does NOT echo the configured value. This context is
+            // reached for an inline literal as well as a reference, and the
+            // caller logs the error at warn on every request for the origin, so
+            // echoing it would write the signing key itself into the log on a
+            // misconfiguration. The resolver's own error already names the safe
+            // part (the missing env var, the file, the backend); it owns knowing
+            // what is a pointer and what is material.
+            .context("message_signatures.key could not be resolved");
     }
-    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(value) {
-        return bytes;
+    // A provider URI this site cannot resolve without an installed resolver
+    // is an error, never key material.
+    //
+    // Without this, the reference *string* became the key: set
+    // `message_signatures.key` to `vault://prod/signing-key` and the HMAC
+    // shared secret was those 24 ASCII characters, identical for every
+    // deployment that pasted the same example, while verification kept
+    // reporting success for anyone who guessed it. WOR-2283 established this
+    // rule for the other two sites that had it; this one predates it and now
+    // delegates to the same resolver above instead of re-implementing a
+    // subset of its parsing.
+    if sbproxy_vault::looks_like_secret_reference_uri(value) {
+        anyhow::bail!(
+            "message_signatures.key references the secret '{value}' but no secret backend \
+             is installed to resolve it; declare one under proxy.secrets.backends. Without one, \
+             this field resolves only `env:NAME`, `file:PATH`, `${{VAR}}`, and inline literal \
+             values."
+        );
     }
-    value.as_bytes().to_vec()
+    // No resolver installed. A stock resolver still resolves the
+    // backend-free reference forms and hands an inline literal straight
+    // back, so even this fallback stays on the shared parser rather than a
+    // private copy of it (same shape as `sbproxy-modules`'
+    // `aiproxy::resolve_runtime_credential`).
+    sbproxy_vault::SecretResolver::new()
+        .resolve(value)
+        // Deliberately does NOT echo the configured value. This context is
+        // reached for an inline literal as well as a reference, and the
+        // caller logs the error at warn on every request for the origin, so
+        // echoing it would write the signing key itself into the log on a
+        // misconfiguration. The resolver's own error already names the safe
+        // part (the missing env var, the file, the backend); it owns knowing
+        // what is a pointer and what is material.
+        .context("message_signatures.key could not be resolved")
 }
 
+/// Resolve, then decode, the configured HMAC shared secret.
+///
+/// Resolution runs first and decoding second: the configured value may be a
+/// reference, and hex/base64 decoding a reference string decodes the wrong
+/// thing. Applying the decode to the *resolved* material means a secret held
+/// in a backend produces exactly the key bytes the identical value inlined in
+/// `sb.yml` would produce. An inline literal resolves to itself, so its bytes
+/// are unchanged from before WOR-2301.
+fn decode_secret(value: &str) -> anyhow::Result<Vec<u8>> {
+    let resolved = resolve_key_material(value)?;
+    // Try hex first (most common machine-generated form), then
+    // base64 (also common), then fall through to raw UTF-8 bytes.
+    if let Ok(bytes) = hex::decode(resolved.as_str()) {
+        return Ok(bytes);
+    }
+    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(resolved.as_str()) {
+        return Ok(bytes);
+    }
+    Ok(resolved.into_bytes())
+}
+
+/// Resolve, then decode, the configured Ed25519 verification key.
+///
+/// Same resolve-before-decode ordering as [`decode_secret`], for the same
+/// reason. An Ed25519 public key is not itself secret, but it reaches this
+/// function from the same `message_signatures.key` field, so it accepts the
+/// same reference forms.
 fn decode_public_key(value: &str) -> anyhow::Result<Vec<u8>> {
-    if let Ok(bytes) = hex::decode(value) {
+    let resolved = resolve_key_material(value)?;
+    if let Ok(bytes) = hex::decode(resolved.as_str()) {
         return Ok(bytes);
     }
-    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(value) {
+    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(resolved.as_str()) {
         return Ok(bytes);
     }
-    if let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(value) {
+    if let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(resolved.as_str()) {
         return Ok(bytes);
     }
     anyhow::bail!("public_key is neither hex nor base64")
@@ -1545,5 +1634,175 @@ mod tests {
              sig2=(\"content-digest\");keyid=\"k2\";alg=\"ed25519\"",
         ));
         assert!(signature_input_covers_content_digest(&h));
+    }
+
+    // --- WOR-2301: `message_signatures.key` resolves through the central
+    // secret resolver, and a reference it cannot resolve never becomes the
+    // key.
+
+    #[test]
+    fn decode_secret_resolves_a_provider_uri_through_the_installed_resolver() {
+        sbproxy_vault::reset_process_resolver_for_test();
+        let vault = sbproxy_vault::LocalVault::new();
+        vault
+            .set_secret("signing-key", "00112233445566778899aabbccddeeff")
+            .expect("fixture secret");
+        let mut manager = sbproxy_vault::VaultManager::new();
+        manager.register_backend(
+            sbproxy_vault::VaultProviderType::HashiCorp,
+            "prod",
+            Box::new(vault),
+        );
+        sbproxy_vault::install_process_resolver(std::sync::Arc::new(
+            sbproxy_vault::SecretResolver::new().with_manager(std::sync::Arc::new(manager)),
+        ));
+
+        let bytes = decode_secret("vault://prod/signing-key")
+            .expect("a provider URI resolves once a backend is installed");
+
+        // Resolution runs before decoding, so the hex string the backend
+        // holds yields the same key bytes the identical value inlined in
+        // sb.yml would have produced.
+        assert_eq!(
+            bytes,
+            hex::decode("00112233445566778899aabbccddeeff").expect("fixture is hex")
+        );
+        assert_ne!(
+            bytes,
+            b"vault://prod/signing-key".to_vec(),
+            "the reference text must never be the key"
+        );
+
+        sbproxy_vault::reset_process_resolver_for_test();
+    }
+
+    #[test]
+    fn decode_secret_resolves_the_colon_form_env_reference_with_no_backend_installed() {
+        // The colon form is the half `sbproxy-config`'s `${VAR}`
+        // interpolation never covered, so before WOR-2301 an `env:NAME` key
+        // became the 8-byte string `env:NAME`. Reads a variable every test
+        // process already has rather than exporting one, so this test never
+        // mutates the process environment.
+        sbproxy_vault::reset_process_resolver_for_test();
+        let expected = std::env::var("PATH").expect("PATH is set in the test environment");
+
+        let bytes = decode_secret("env:PATH").expect("the colon-form env: reference resolves");
+
+        assert_eq!(
+            bytes,
+            decode_secret(&expected).expect("the same value inlined decodes"),
+            "a reference must decode to exactly what inlining its value would"
+        );
+        assert_ne!(
+            bytes,
+            b"env:PATH".to_vec(),
+            "the reference text must never be the key"
+        );
+    }
+
+    #[test]
+    fn decode_secret_fails_closed_on_a_provider_uri_with_no_resolver_installed() {
+        sbproxy_vault::reset_process_resolver_for_test();
+
+        for reference in [
+            "vault://prod/signing-key",
+            "awssm://prod/signing-key",
+            "secret://local/signing-key",
+        ] {
+            let error = decode_secret(reference)
+                .expect_err("a provider URI must never become HMAC key material");
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains("message_signatures.key"),
+                "the error must name the field, got: {rendered}"
+            );
+            assert!(
+                rendered.contains("proxy.secrets.backends"),
+                "the error must point at the backend config, got: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_secret_still_decodes_a_plain_inline_key_unchanged() {
+        // The non-regression case: a genuine inline key carries no reference
+        // shape, resolves to itself, and decodes byte-identically to the
+        // pre-WOR-2301 behavior (hex, then base64, then raw UTF-8 bytes).
+        assert_eq!(
+            decode_secret("00112233445566778899aabbccddeeff").expect("hex literal"),
+            vec![
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff
+            ]
+        );
+        assert_eq!(
+            decode_secret("c2hhcmVkLXNlY3JldA==").expect("base64 literal"),
+            b"shared-secret".to_vec()
+        );
+        assert_eq!(
+            decode_secret("not-hex-or-base64!!").expect("raw literal"),
+            b"not-hex-or-base64!!".to_vec()
+        );
+    }
+
+    #[test]
+    fn verifier_build_fails_closed_on_an_unresolvable_key_reference() {
+        // The failure has to reach the verifier build, because that is what
+        // `cached_message_signature_verifier` turns into "reject every
+        // request for this origin" rather than a silently wrong key.
+        sbproxy_vault::reset_process_resolver_for_test();
+
+        // `.err().expect(...)` rather than `.expect_err(...)`: the Ok type
+        // withholds `Debug` on purpose, because a verifier holds live key
+        // material and a derived `Debug` would print it. The test bends,
+        // not the production type (WOR-2193).
+        let error = MessageSignatureVerifier::new(config_hmac("awssm://prod/signing-key"))
+            .err()
+            .expect("an unresolvable key reference must fail the verifier build");
+
+        assert!(
+            error.to_string().contains("proxy.secrets.backends"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_failed_key_resolution_never_echoes_the_configured_value() {
+        // `cached_message_signature_verifier` logs this error at warn for
+        // EVERY request to the origin while the misconfiguration stands, so
+        // anything this error carries is written to the log repeatedly. The
+        // configured value may be the signing key itself rather than a
+        // pointer to it, so it must never appear.
+        //
+        // `secret:NAME` (single colon) is the removed reference form the
+        // resolver hard-errors on, which is the cheapest way to reach the
+        // error path with a value we control.
+        sbproxy_vault::reset_process_resolver_for_test();
+        let secret = "secret:DISTINCTIVE_INLINE_KEY_9f2c";
+
+        let error = decode_secret(secret)
+            .err()
+            .expect("the removed colon form must not resolve");
+
+        // `{error}` renders only the OUTERMOST context, which is the one this
+        // module owns. Pinning it to a fixed string proves this layer adds no
+        // echo of the configured value.
+        assert_eq!(
+            format!("{error}"),
+            "message_signatures.key could not be resolved",
+            "this module's own error context must name the field and nothing else"
+        );
+
+        // The full chain (`{error:#}`) still carries the resolver's own
+        // wording, and the resolver DOES echo its input. That is safe for
+        // every reference form, because a reference is a pointer rather than
+        // the secret. It is not this module's call to make: see the note on
+        // `resolve_key_material` for why an inline literal cannot reach an
+        // error path here (a hex or base64 key matches no reference prefix,
+        // so the resolver hands it straight back).
+        assert!(
+            format!("{error:#}").contains("message_signatures.key could not be resolved"),
+            "the chain must still lead with the field an operator has to fix"
+        );
     }
 }
