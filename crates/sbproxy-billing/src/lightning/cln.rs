@@ -683,29 +683,49 @@ impl<T: ClnTransport> PaymentMethodAdapter for ClnSettler<T> {
         let amount_msat = msat_amount(draft)?;
         let expected_hash = request.requirement.provider_handle.clone();
 
-        // The lookup is this rail's authoritative settlement operation, so it
-        // runs inside the one write gate call. See the module documentation
-        // for why an incoming Lightning settlement is stamped at all.
-        let inner = dispatch.run_write(|| async {
-            let invoice = self.list_labeled_invoice(&label).await?;
-            match invoice.status {
-                Some(ClnInvoiceStatus::Paid) => {}
-                Some(ClnInvoiceStatus::Expired) => return Err(BillingError::ProviderRejected),
-                // Still unpaid is not a refusal and not a settlement. The
-                // worker keeps asking, and a payment that lands a moment
-                // later is proved by the same query.
-                Some(ClnInvoiceStatus::Unpaid) => return Err(BillingError::NotSettled),
-                None => return Err(BillingError::ProviderMalformed),
+        // The lookup is a clean read first: whether this invoice has moved
+        // funds is a settled fact regardless of how many times it is asked,
+        // so a merely-unpaid answer never stamps a dispatch (WOR-2229). Only
+        // an answer that ends the attempt, paid, expired, or a record this
+        // build cannot parse, runs inside the one write gate call. See the
+        // module documentation for why a Lightning settlement is stamped at
+        // all once it reaches that point.
+        let inner = async {
+            let invoice = dispatch
+                .run_query(|| self.list_labeled_invoice(&label))
+                .await?;
+            if matches!(invoice.status, Some(ClnInvoiceStatus::Unpaid)) {
+                // Still unpaid is not a refusal and not a settlement, and it
+                // costs the intent nothing to ask: no dispatch stamp means no
+                // reconciliation, so a request presented before the invoice
+                // is paid stays retryable the ordinary way instead of
+                // waiting on a worker sweep. The worker keeps asking too,
+                // and a payment that lands a moment later is proved by the
+                // same query.
+                return Err(BillingError::NotSettled);
             }
-            let hash = verify_paid_invoice(&invoice, amount_msat, expected_hash.as_deref())?;
-            SettlementReceipt::new(
-                &request.intent_id,
-                SettlementRail::LightningCln,
-                draft.method.as_str(),
-                &hash.to_hex(),
-                request.now_ms,
-            )
-        });
+            dispatch
+                .run_write(|| async {
+                    match invoice.status {
+                        Some(ClnInvoiceStatus::Paid) => {}
+                        Some(ClnInvoiceStatus::Expired) => {
+                            return Err(BillingError::ProviderRejected)
+                        }
+                        Some(ClnInvoiceStatus::Unpaid) => return Err(BillingError::NotSettled),
+                        None => return Err(BillingError::ProviderMalformed),
+                    }
+                    let hash =
+                        verify_paid_invoice(&invoice, amount_msat, expected_hash.as_deref())?;
+                    SettlementReceipt::new(
+                        &request.intent_id,
+                        SettlementRail::LightningCln,
+                        draft.method.as_str(),
+                        &hash.to_hex(),
+                        request.now_ms,
+                    )
+                })
+                .await
+        };
 
         match tokio::time::timeout(self.total_deadline, inner).await {
             Ok(result) => result,

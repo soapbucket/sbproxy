@@ -21,6 +21,19 @@ use sbproxy_billing::lightning::{
     check_bolt11, invoice_label, payment_label, LightningError, LightningTransportFailure,
     PaymentHash,
 };
+use sbproxy_billing::registry::RailRegistry;
+use sbproxy_billing::service::{AuthorizationDecision, BillingService, RedemptionRequest};
+use sbproxy_billing::sqlite::SqliteSettlementStore;
+use sbproxy_billing::store::BillingClock;
+use sbproxy_billing::types::{
+    AdvertisedRail, IntentStatus, PaymentProof, PaymentProtocol, PaymentRequirementDraft,
+    RequirementTerms, SettlementRail,
+};
+use sbproxy_billing::{Money, NoOpPaymentLifecycleObserver};
+
+mod common;
+
+use common::{sign_draft, FixtureSigner, TestClock};
 
 /// The frozen Core Lightning transcript.
 const FIXTURE: &str = include_str!("fixtures/lightning/cln_rpc.json");
@@ -445,4 +458,171 @@ fn deadlines_that_do_not_bound_their_calls_are_refused() {
     // Above the hard ceiling.
     assert!(build(400, 2_001).is_err());
     assert!(build(400, 2_000).is_ok());
+}
+
+/// A transport that answers `listinvoices` with one invoice under a given
+/// label and status, and nothing else, since this is the only method
+/// [`ClnSettler::authorize_and_settle`] calls.
+struct StatusTransport {
+    label: String,
+    status: &'static str,
+}
+
+#[async_trait::async_trait]
+impl ClnTransport for StatusTransport {
+    async fn call(
+        &self,
+        _request: &[u8],
+        _timeout: Duration,
+    ) -> Result<Vec<u8>, LightningTransportFailure> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "listinvoices",
+            "result": {
+                "invoices": [{
+                    "label": self.label,
+                    "status": self.status,
+                    "payment_hash": FIXTURE_HASH,
+                    "amount_msat": 100_000,
+                    "amount_received_msat": 100_000,
+                    "bolt11": "lnbc1u1pfixtureinvoicedatafixture",
+                }],
+            },
+        });
+        let mut bytes = serde_json::to_vec(&body).expect("the fixture body serializes");
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
+}
+
+/// Builds the durable intent every phase of
+/// [`an_unpaid_invoice_never_stamps_a_dispatch_and_a_later_payment_still_settles`]
+/// redeems against.
+fn lightning_draft() -> PaymentRequirementDraft {
+    PaymentRequirementDraft {
+        requirement_id: "requirement_0123456789".to_string(),
+        protocol: PaymentProtocol::LightningInvoice,
+        advertised_rail: AdvertisedRail::Lightning,
+        settlement_rail: SettlementRail::LightningCln,
+        method: "lightning".to_string(),
+        intent: "charge".to_string(),
+        network: Some("bitcoin".to_string()),
+        asset: None,
+        pay_to: None,
+        amount: Money {
+            amount_micros: 1,
+            currency: "BTC".to_string(),
+        },
+        settlement_amount: "100000".to_string(),
+        settlement_decimals: 11, // MSAT_DECIMALS
+        terms: RequirementTerms::LightningInvoice {
+            backend: "cln".to_string(),
+            invoice_expiry_seconds: 600,
+        },
+        quote_id: "quote-1".to_string(),
+        tenant_id: "tenant-1".to_string(),
+        origin_id: "origin-1".to_string(),
+        route: "/paid".to_string(),
+        expires_at_ms: 60_000,
+        request_digest: None,
+    }
+}
+
+/// WOR-2229: an early redemption against an unpaid invoice must not poison
+/// the intent. Before this fix, `authorize_and_settle` stamped a dispatch
+/// on the plain `listinvoices` read, so a merely-unpaid answer landed the
+/// intent in `NeedsReconciliation`, unreachable by the request path until a
+/// background worker swept it. This proves both halves: the unpaid read
+/// leaves the intent retryable, and a genuinely paid follow-up on the very
+/// next request settles without any worker involved.
+#[tokio::test]
+async fn an_unpaid_invoice_never_stamps_a_dispatch_and_a_later_payment_still_settles() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let path = directory.path().join("settlement.sqlite3");
+    let clock = TestClock::new(1_000);
+    let store = SqliteSettlementStore::open(&path)
+        .expect("open settlement store")
+        .with_clock(Arc::clone(&clock) as Arc<dyn BillingClock>)
+        .shared();
+
+    let draft = lightning_draft();
+    let digest = draft.digest().expect("draft digest");
+    let created = store
+        .create_or_get_challenge(&draft, digest, "cln-request-key")
+        .await
+        .expect("create challenge");
+    let signed = sign_draft(&draft, Some(FIXTURE_HASH));
+    store
+        .finalize_requirement(&created.intent_id, &signed)
+        .await
+        .expect("finalize");
+    let label = invoice_label(&created.intent_id).expect("label");
+
+    let redeem = |store: sbproxy_billing::store::SharedSettlementStore,
+                  clock: Arc<TestClock>,
+                  status: &'static str,
+                  label: String,
+                  signed: sbproxy_billing::types::SignedPaymentRequirement| async move {
+        let mut registry = RailRegistry::new();
+        let settler = ClnSettler::new(
+            StatusTransport { label, status },
+            None,
+            "sbproxy paid request",
+            400,
+            2_000,
+        )
+        .expect("the settler builds");
+        registry
+            .register_adapter(Arc::new(settler))
+            .expect("register adapter");
+        let service = BillingService::builder(store)
+            .adapters(registry)
+            .clock(Arc::clone(&clock) as Arc<dyn BillingClock>)
+            .payment_observer(Arc::new(NoOpPaymentLifecycleObserver))
+            .deadline(Duration::from_millis(500))
+            .expect("deadline inside the ceiling")
+            .signer(Arc::new(FixtureSigner))
+            .build();
+        service
+            .authorize(RedemptionRequest {
+                signed,
+                request_idempotency_key: "cln-request-key".to_string(),
+                proof: PaymentProof::new("Payment", "lightning-proof".to_string()).expect("proof"),
+            })
+            .await
+            .expect("authorize")
+    };
+
+    // Phase 1: the invoice is not paid yet.
+    let decision = redeem(
+        Arc::clone(&store),
+        Arc::clone(&clock),
+        "unpaid",
+        label.clone(),
+        signed.clone(),
+    )
+    .await;
+    assert!(
+        matches!(decision, AuthorizationDecision::Unavailable { .. }),
+        "an unpaid invoice must not authorize origin access, got {decision:?}"
+    );
+
+    let intent = store
+        .load_intent(&created.intent_id)
+        .await
+        .expect("read")
+        .expect("intent");
+    assert_eq!(
+        intent.status,
+        IntentStatus::RetryWait,
+        "an unpaid invoice must leave the intent retryable, not stuck in reconciliation"
+    );
+
+    // Phase 2: the same invoice is now paid, presented again on the very
+    // next request, with no worker sweep in between.
+    let decision = redeem(store, clock, "paid", label, signed).await;
+    assert!(
+        matches!(decision, AuthorizationDecision::Settled(_)),
+        "a genuinely paid invoice must settle on the next request, got {decision:?}"
+    );
 }

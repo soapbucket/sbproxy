@@ -769,36 +769,58 @@ impl<T: LndTransport> PaymentMethodAdapter for LndSettler<T> {
             .ok_or(BillingError::IntentNotFinalized)?;
         let expected = PaymentHash::parse_hex(handle)?;
 
-        // The lookup is this rail's authoritative settlement operation, so it
-        // runs inside the one write gate call. See the module documentation
-        // for why an incoming Lightning settlement is stamped at all.
-        let inner = dispatch.run_write(|| async {
-            let found = self
-                .transport
-                .lookup_invoice(expected, self.call_timeout)
-                .await
-                .map_err(transport_error)?;
-            let invoice = found.ok_or(BillingError::ProviderMalformed)?;
-            match InvoiceState::from_i32(invoice.state) {
-                Some(InvoiceState::Settled) => {}
-                Some(InvoiceState::Canceled) => return Err(BillingError::ProviderRejected),
-                // Open and Accepted both mean funds have not moved. The
-                // worker keeps asking, and a payment that lands a moment
-                // later is proved by the same lookup.
-                Some(InvoiceState::Open | InvoiceState::Accepted) => {
-                    return Err(BillingError::NotSettled)
-                }
-                None => return Err(BillingError::ProviderMalformed),
+        // The lookup is a clean read first: whether this invoice has moved
+        // funds is a settled fact regardless of how many times it is asked,
+        // so an open or accepted answer never stamps a dispatch (WOR-2229).
+        // Only an answer that ends the attempt, settled, canceled, or a
+        // record this build cannot parse, runs inside the one write gate
+        // call. See the module documentation for why a Lightning settlement
+        // is stamped at all once it reaches that point.
+        let inner = async {
+            let invoice = dispatch
+                .run_query(|| async {
+                    let found = self
+                        .transport
+                        .lookup_invoice(expected, self.call_timeout)
+                        .await
+                        .map_err(transport_error)?;
+                    found.ok_or(BillingError::ProviderMalformed)
+                })
+                .await?;
+            if matches!(
+                InvoiceState::from_i32(invoice.state),
+                Some(InvoiceState::Open | InvoiceState::Accepted)
+            ) {
+                // Open and Accepted both mean funds have not moved, and
+                // neither costs the intent anything to ask: no dispatch
+                // stamp means no reconciliation, so a request presented
+                // before the invoice settles stays retryable the ordinary
+                // way instead of waiting on a worker sweep. The worker
+                // keeps asking too, and a payment that lands a moment later
+                // is proved by the same lookup.
+                return Err(BillingError::NotSettled);
             }
-            let hash = verify_settled_invoice(&invoice, expected, value_msat)?;
-            SettlementReceipt::new(
-                &request.intent_id,
-                SettlementRail::LightningLnd,
-                draft.method.as_str(),
-                &hash.to_hex(),
-                request.now_ms,
-            )
-        });
+            dispatch
+                .run_write(|| async {
+                    match InvoiceState::from_i32(invoice.state) {
+                        Some(InvoiceState::Settled) => {}
+                        Some(InvoiceState::Canceled) => return Err(BillingError::ProviderRejected),
+                        Some(InvoiceState::Open | InvoiceState::Accepted) => {
+                            return Err(BillingError::NotSettled)
+                        }
+                        None => return Err(BillingError::ProviderMalformed),
+                    }
+                    let hash = verify_settled_invoice(&invoice, expected, value_msat)?;
+                    SettlementReceipt::new(
+                        &request.intent_id,
+                        SettlementRail::LightningLnd,
+                        draft.method.as_str(),
+                        &hash.to_hex(),
+                        request.now_ms,
+                    )
+                })
+                .await
+        };
 
         match tokio::time::timeout(self.total_deadline, inner).await {
             Ok(result) => result,
