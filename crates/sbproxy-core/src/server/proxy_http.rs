@@ -2629,6 +2629,24 @@ impl ProxyHttp for SbProxy {
             );
         }
 
+        // --- WOR-2295: e2e harness identity marker ---
+        //
+        // Only set when `SBPROXY_E2E_HARNESS_TOKEN` is present in this
+        // process's environment, which happens only under the e2e test
+        // harness, never in production (see `e2e_harness_token` in
+        // `server.rs`, reached here via `use super::*;`). Echoing the
+        // harness's own token back lets its readiness probe confirm a
+        // response came from the child it spawned, not a different,
+        // concurrently-starting test's proxy that won a same-port race
+        // during the harness's port-reservation window. This covers the
+        // normal upstream-relay response; the short-circuit responses
+        // `send_response` writes (e.g. the unmatched-Host 404 the probe
+        // itself typically hits before any origin is configured to
+        // match `127.0.0.1:<port>`) carry the same header from there.
+        if let Some(token) = e2e_harness_token() {
+            let _ = upstream_response.insert_header("x-sbproxy-e2e-harness-token", token);
+        }
+
         // --- RFC 9209 Proxy-Status header (per-origin opt-in) ---
         //
         // When the resolved origin has `proxy_status.enabled: true`,

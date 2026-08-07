@@ -1694,6 +1694,32 @@ async fn capture_fake_sink_event(session: &mut pingora_proxy::Session) {
 
 // --- Response helpers ---
 
+/// Value of `SBPROXY_E2E_HARNESS_TOKEN`, read once and cached for the
+/// life of the process.
+///
+/// Only the e2e test harness (`e2e/src/lib.rs`) sets this, on the
+/// spawned proxy child's own environment; it is never set in
+/// production. When present, both `proxy_http::response_filter` (the
+/// normal upstream-relay path) and `send_response` below (the
+/// short-circuit path used for the proxy's own synthetic responses,
+/// including the unmatched-Host 404) echo it back on every response
+/// via `x-sbproxy-e2e-harness-token` (WOR-2295). That lets a
+/// harness's readiness probe confirm a response came from the child
+/// it spawned rather than a different, concurrently-starting test's
+/// proxy that raced it for the same ephemeral port. Defined here
+/// rather than in `proxy_http` so `send_response` can reach it
+/// directly; `proxy_http` picks it up unqualified via `use super::*;`.
+fn e2e_harness_token() -> Option<&'static str> {
+    static TOKEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    TOKEN
+        .get_or_init(|| {
+            std::env::var("SBPROXY_E2E_HARNESS_TOKEN")
+                .ok()
+                .filter(|v| !v.is_empty())
+        })
+        .as_deref()
+}
+
 /// Send a complete response with status, content-type, and body, then short-circuit.
 ///
 /// Always sets Content-Length so clients know the exact response size
@@ -1717,6 +1743,13 @@ async fn send_response(
     header
         .insert_header("content-length", body.len().to_string())
         .map_err(|e| Error::because(ErrorType::InternalError, "failed to set content-length", e))?;
+    // WOR-2295: see `e2e_harness_token` above. The e2e harness's
+    // readiness probe hits precisely this path on a freshly booted
+    // proxy (its Host header matches no configured origin), so this
+    // short-circuit response is the one that most needs the token.
+    if let Some(token) = e2e_harness_token() {
+        let _ = header.insert_header("x-sbproxy-e2e-harness-token", token);
+    }
     session
         .write_response_header(Box::new(header), false)
         .await?;

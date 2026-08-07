@@ -220,6 +220,12 @@ impl Response {
 pub struct ProxyHarness {
     child: Child,
     port: u16,
+    /// Identity token handed to the spawned child via
+    /// `SBPROXY_E2E_HARNESS_TOKEN` and required back on every response
+    /// by `wait_for_ready`, so this harness can tell its own child
+    /// apart from a different, concurrently-starting test's child that
+    /// may have won a same-port race in `pick_free_port` (WOR-2295).
+    token: String,
     /// Hold the temp file alive so the proxy can keep reading it.
     ///
     /// One of `_config` (the YAML temp file) or `_workspace` (the
@@ -253,9 +259,10 @@ impl ProxyHarness {
     /// caller's `proxy.http_bind_port` (if any) is overridden with
     /// an ephemeral port chosen by the harness.
     pub fn start_with_yaml(yaml: &str) -> anyhow::Result<Self> {
-        let port = pick_free_port()?;
+        let port_reservation = pick_free_port()?;
+        let port = port_reservation.local_addr()?.port();
         let final_yaml = inject_port(yaml, port)?;
-        Self::start_with_resolved_yaml(&final_yaml, port, None)
+        Self::start_with_resolved_yaml(&final_yaml, port, None, port_reservation)
     }
 
     /// Start the proxy with a config built from a YAML string, adding
@@ -265,7 +272,8 @@ impl ProxyHarness {
     /// test can exercise an env-read path in the proxy without mutating
     /// the test runner's own process environment (WOR-646).
     pub fn start_with_yaml_and_env(yaml: &str, env: &[(&str, &str)]) -> anyhow::Result<Self> {
-        let port = pick_free_port()?;
+        let port_reservation = pick_free_port()?;
+        let port = port_reservation.local_addr()?.port();
         let final_yaml = inject_port(yaml, port)?;
         let owned: Vec<(&str, String)> = env
             .iter()
@@ -277,6 +285,7 @@ impl ProxyHarness {
             ProxyBinaryFlavor::Default,
             None,
             &owned,
+            port_reservation,
         )
     }
 
@@ -285,9 +294,10 @@ impl ProxyHarness {
         yaml: &str,
         shutdown_grace_ms: u64,
     ) -> anyhow::Result<Self> {
-        let port = pick_free_port()?;
+        let port_reservation = pick_free_port()?;
+        let port = port_reservation.local_addr()?.port();
         let final_yaml = inject_port(yaml, port)?;
-        Self::start_with_resolved_yaml(&final_yaml, port, Some(shutdown_grace_ms))
+        Self::start_with_resolved_yaml(&final_yaml, port, Some(shutdown_grace_ms), port_reservation)
     }
 
     /// Start the proxy using a binary compiled with
@@ -297,7 +307,8 @@ impl ProxyHarness {
     /// e2e suite. Build the binary into `target/no-default-features/`
     /// or set `SBPROXY_E2E_NO_DEFAULT_FEATURES_BIN`.
     pub fn start_no_default_features_with_yaml(yaml: &str) -> anyhow::Result<Self> {
-        let port = pick_free_port()?;
+        let port_reservation = pick_free_port()?;
+        let port = port_reservation.local_addr()?.port();
         let final_yaml = inject_port(yaml, port)?;
         Self::start_with_resolved_yaml_using_binary(
             &final_yaml,
@@ -305,6 +316,7 @@ impl ProxyHarness {
             ProxyBinaryFlavor::NoDefaultFeatures,
             None,
             &[],
+            port_reservation,
         )
     }
 
@@ -320,7 +332,8 @@ impl ProxyHarness {
         yaml: &str,
         envs: &[(&str, String)],
     ) -> anyhow::Result<Self> {
-        let port = pick_free_port()?;
+        let port_reservation = pick_free_port()?;
+        let port = port_reservation.local_addr()?.port();
         let final_yaml = inject_port(yaml, port)?;
         Self::start_with_resolved_yaml_using_binary(
             &final_yaml,
@@ -328,6 +341,7 @@ impl ProxyHarness {
             ProxyBinaryFlavor::Payments,
             None,
             envs,
+            port_reservation,
         )
     }
 
@@ -345,6 +359,7 @@ impl ProxyHarness {
         yaml: &str,
         port: u16,
         shutdown_grace_ms: Option<u64>,
+        port_reservation: TcpListener,
     ) -> anyhow::Result<Self> {
         Self::start_with_resolved_yaml_using_binary(
             yaml,
@@ -352,6 +367,7 @@ impl ProxyHarness {
             ProxyBinaryFlavor::Default,
             shutdown_grace_ms,
             &[],
+            port_reservation,
         )
     }
 
@@ -361,6 +377,7 @@ impl ProxyHarness {
         binary: ProxyBinaryFlavor,
         shutdown_grace_ms: Option<u64>,
         envs: &[(&str, String)],
+        port_reservation: TcpListener,
     ) -> anyhow::Result<Self> {
         let bin = proxy_binary_path_for(binary);
         if !bin.is_file() {
@@ -380,28 +397,46 @@ impl ProxyHarness {
         file.flush()?;
 
         let stderr = NamedTempFile::new()?;
+        let token = generate_harness_token();
         let mut command = Command::new(&bin);
         // Child-scoped variables: the child process gets them, the
         // test runner's own environment stays untouched (WOR-646).
         for (name, value) in envs {
             command.env(name, value);
         }
+        // WOR-2295: identity token the child echoes back on every
+        // response (see `e2e_harness_token` in sbproxy-core's
+        // server.rs), so `wait_for_ready` can tell this harness's own
+        // child apart from a different, concurrently-starting test's
+        // child that may have won a same-port race.
+        command.env("SBPROXY_E2E_HARNESS_TOKEN", &token);
         if let Some(shutdown_grace_ms) = shutdown_grace_ms {
             command
                 .arg("--shutdown-grace-ms")
                 .arg(shutdown_grace_ms.to_string());
         }
-        let child = command
+        command
             .arg("--config")
             .arg(file.path())
             .stdout(Stdio::null())
-            .stderr(Stdio::from(stderr.reopen()?))
+            .stderr(Stdio::from(stderr.reopen()?));
+
+        // Hold the port reservation open through every step above
+        // (binary lookup, config serialisation, stderr capture setup)
+        // and release it only right before spawn. This shrinks the
+        // window in which a different, concurrently-starting
+        // harness's own `pick_free_port` could be handed the same
+        // port number down to as little as this code allows without
+        // passing the bound fd through to the child (WOR-2295).
+        drop(port_reservation);
+        let child = command
             .spawn()
             .map_err(|e| anyhow::anyhow!("spawn {}: {}", bin.display(), e))?;
 
         let harness = Self {
             child,
             port,
+            token,
             _config: Some(file),
             _workspace: None,
             _stderr: stderr,
@@ -496,7 +531,8 @@ impl ProxyHarness {
         shutdown_grace_ms: Option<u64>,
         env: &[(&str, &str)],
     ) -> anyhow::Result<Self> {
-        let port = pick_free_port()?;
+        let port_reservation = pick_free_port()?;
+        let port = port_reservation.local_addr()?.port();
         let final_yaml = inject_port(yaml, port)?;
         let bin = proxy_binary_path();
         if !bin.is_file() {
@@ -520,6 +556,7 @@ impl ProxyHarness {
 
         let stderr = NamedTempFile::new()?;
         let stdout = NamedTempFile::new()?;
+        let token = generate_harness_token();
         let mut command = Command::new(&bin);
         if let Some(shutdown_grace_ms) = shutdown_grace_ms {
             command
@@ -531,17 +568,28 @@ impl ProxyHarness {
         for (name, value) in env {
             command.env(name, value);
         }
-        let child = command
+        // WOR-2295: identity token the child echoes back on every
+        // response; see `start_with_resolved_yaml_using_binary`.
+        command.env("SBPROXY_E2E_HARNESS_TOKEN", &token);
+        command
             .arg("--config")
             .arg(&cfg_path)
             .stdout(Stdio::from(stdout.reopen()?))
-            .stderr(Stdio::from(stderr.reopen()?))
+            .stderr(Stdio::from(stderr.reopen()?));
+
+        // See `pick_free_port` (WOR-2295): hold the reservation
+        // through every step above (binary lookup, workspace file
+        // writes, config serialisation, output capture setup) and
+        // release it only right before spawn.
+        drop(port_reservation);
+        let child = command
             .spawn()
             .map_err(|e| anyhow::anyhow!("spawn {}: {}", bin.display(), e))?;
 
         let harness = Self {
             child,
             port,
+            token,
             _config: None,
             _workspace: Some(tmp),
             _stderr: stderr,
@@ -623,16 +671,25 @@ impl ProxyHarness {
         })
     }
 
-    /// Poll the bound port until the proxy completes an HTTP exchange,
-    /// or the deadline expires.
+    /// Poll the bound port until the proxy completes an HTTP exchange
+    /// carrying this harness's own identity token, or the deadline
+    /// expires.
     ///
     /// We probe at the HTTP layer rather than the TCP layer because
     /// `bind()` returning is not enough: the kernel will accept TCP
     /// connections into the listen backlog before Pingora's accept
     /// loop is live. A test that fires its first HTTP request in that
     /// window observes `Connection reset by peer`. Issuing a real GET
-    /// closes the gap: any HTTP response (including 4xx for an unknown
-    /// Host) proves the server is serving.
+    /// closes that gap, but a bare "any HTTP response" check opens a
+    /// different one: under parallel test execution, a different,
+    /// concurrently-starting harness's child can win the brief window
+    /// between `pick_free_port` releasing its reservation and this
+    /// harness's own child binding the same port, and a bare response
+    /// check would happily accept that other test's proxy as "ready"
+    /// (WOR-2295). Requiring the `x-sbproxy-e2e-harness-token` header
+    /// to match the token this harness generated and handed to its own
+    /// child via `SBPROXY_E2E_HARNESS_TOKEN` closes that gap; see
+    /// `http_probe_with_token`.
     ///
     /// The probe uses a raw `TcpStream` + hand-written HTTP/1.1 GET
     /// rather than `reqwest::blocking` to stay safe inside async
@@ -642,9 +699,11 @@ impl ProxyHarness {
     /// do) panics in tokio 1.52+ with "Cannot drop a runtime in a
     /// context where blocking is not allowed".
     fn wait_for_ready(&self, timeout: Duration) -> anyhow::Result<()> {
-        http_probe(self.port, timeout).map_err(|_| {
+        http_probe_with_token(self.port, timeout, &self.token).map_err(|_| {
             anyhow::anyhow!(
-                "proxy did not respond to HTTP on 127.0.0.1:{} within {:?}",
+                "proxy did not respond to HTTP on 127.0.0.1:{} within {:?} carrying this \
+                 harness's identity token (x-sbproxy-e2e-harness-token); a different, \
+                 concurrently-started test's proxy may have won a same-port race (WOR-2295)",
                 self.port,
                 timeout
             )
@@ -878,13 +937,49 @@ fn decode(resp: reqwest::blocking::Response) -> anyhow::Result<Response> {
     })
 }
 
-/// Reserve a free TCP port by binding to `127.0.0.1:0`, capturing
-/// the port the OS handed us, and dropping the listener so the
-/// proxy can grab the same port a moment later. This is the
-/// standard Rust trick for picking a port without races.
-fn pick_free_port() -> anyhow::Result<u16> {
-    let listener = TcpListener::bind("127.0.0.1:0")?;
-    Ok(listener.local_addr()?.port())
+/// Reserve a free TCP port by binding to `127.0.0.1:0` and handing
+/// back the bound listener itself, rather than reading the port and
+/// dropping the listener immediately.
+///
+/// The classic "bind, read the port, drop" trick has a TOCTOU gap:
+/// the instant the listener drops, the port is free for *any*
+/// process to grab, not just the child this harness is about to
+/// spawn. Under parallel test execution, a different, concurrently-
+/// starting harness's own `pick_free_port` call can win that race and
+/// bind the identical port number before this harness's child does,
+/// and nothing downstream used to notice: `wait_for_ready` accepted
+/// any HTTP response on the target port as proof this harness's own
+/// child was up, so one test's requests could silently be served by a
+/// different test's proxy for the rest of the run (WOR-2295).
+///
+/// Callers should hold the returned listener open for as long as
+/// possible and drop it only immediately before spawning the child
+/// that will bind the same port, to shrink that window as close to
+/// zero as this code allows without passing the bound fd through to
+/// the child.
+fn pick_free_port() -> anyhow::Result<TcpListener> {
+    Ok(TcpListener::bind("127.0.0.1:0")?)
+}
+
+/// Build a token unique to this harness invocation.
+///
+/// Threaded to the spawned child via `SBPROXY_E2E_HARNESS_TOKEN` and
+/// required back on every response by `wait_for_ready` so a harness
+/// can tell its own child apart from a different, concurrently-
+/// starting test's child (WOR-2295). The token only needs to be
+/// unique, not unpredictable, so mixing the test-runner process id, a
+/// nanosecond timestamp, and a per-process atomic counter is enough;
+/// cryptographic randomness would add a dependency for no benefit
+/// here.
+fn generate_harness_token() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{:x}-{:x}-{:x}", std::process::id(), nanos, counter)
 }
 
 /// Poll `127.0.0.1:<port>` until a raw HTTP/1.1 GET receives any
@@ -929,6 +1024,92 @@ fn http_probe(port: u16, timeout: Duration) -> anyhow::Result<()> {
             let mut line = String::new();
             if reader.read_line(&mut line).is_ok() && line.starts_with("HTTP/") {
                 return Ok(());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    anyhow::bail!("timeout");
+}
+
+/// Poll `127.0.0.1:<port>` until a raw HTTP/1.1 GET receives a
+/// response whose `x-sbproxy-e2e-harness-token` header matches
+/// `expected_token`, or the deadline expires.
+///
+/// This is `http_probe`'s stricter sibling, used only by
+/// `wait_for_ready` for the harness's own primary port (WOR-2295). A
+/// bare "any HTTP response" check (what `http_probe` does) cannot
+/// distinguish this harness's own child from a different,
+/// concurrently-starting harness's child that won a same-port race in
+/// the brief window `pick_free_port` leaves between releasing its
+/// reservation and this process's child binding it. Requiring the
+/// child's own token on the response closes that gap. A response
+/// without the matching header is treated exactly like "not ready
+/// yet": the loop reconnects and tries again rather than reporting a
+/// false success against the wrong process.
+///
+/// The proxy only ever sets this header when `SBPROXY_E2E_HARNESS_TOKEN`
+/// is present in its own environment (see `e2e_harness_token` in
+/// `sbproxy-core`'s `server.rs`, echoed both from the normal
+/// `response_filter` path and from the `send_response` short-circuit
+/// path a bare `GET /` with an unmatched `Host` actually takes), which
+/// the harness sets on every child it spawns, so a healthy same-harness
+/// child always carries it regardless of which path answers the probe.
+///
+/// Shares `http_probe`'s raw-socket, runtime-free constraints: safe to
+/// call from inside a tokio `block_on` (the gRPC and WebSocket e2e
+/// tests do this).
+fn http_probe_with_token(port: u16, timeout: Duration, expected_token: &str) -> anyhow::Result<()> {
+    use std::io::BufRead;
+
+    let addr = format!("127.0.0.1:{port}");
+    let deadline = Instant::now() + timeout;
+    let request = format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+
+    while Instant::now() < deadline {
+        let conn_timeout = std::cmp::min(
+            Duration::from_millis(500),
+            deadline.saturating_duration_since(Instant::now()),
+        );
+        if conn_timeout.is_zero() {
+            break;
+        }
+        if let Ok(mut stream) =
+            TcpStream::connect_timeout(&addr.parse().expect("addr parse"), conn_timeout)
+        {
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+            let _ = stream.write_all(request.as_bytes());
+            let mut reader = std::io::BufReader::new(&stream);
+            let mut status_line = String::new();
+            if reader.read_line(&mut status_line).is_ok() && status_line.starts_with("HTTP/") {
+                // Read the header block (a blank line terminates it,
+                // matching every other HTTP/1.1 response) looking for
+                // this harness's own token.
+                let mut token_matches = false;
+                loop {
+                    let mut line = String::new();
+                    match reader.read_line(&mut line) {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            let trimmed = line.trim_end();
+                            if trimmed.is_empty() {
+                                break;
+                            }
+                            if let Some((name, value)) = trimmed.split_once(':') {
+                                if name
+                                    .trim()
+                                    .eq_ignore_ascii_case("x-sbproxy-e2e-harness-token")
+                                    && value.trim() == expected_token
+                                {
+                                    token_matches = true;
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if token_matches {
+                    return Ok(());
+                }
             }
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -1826,8 +2007,19 @@ mod tests {
         let a = pick_free_port().unwrap();
         let b = pick_free_port().unwrap();
         // The OS may legitimately give us the same port twice
-        // sequentially; just assert that both are non-zero.
-        assert!(a > 0 && b > 0);
+        // sequentially (these are two independent reservations, held
+        // open rather than dropped); just assert both bound to a
+        // real, non-zero port.
+        assert!(a.local_addr().unwrap().port() > 0);
+        assert!(b.local_addr().unwrap().port() > 0);
+    }
+
+    #[test]
+    fn generate_harness_token_returns_distinct_tokens() {
+        let a = generate_harness_token();
+        let b = generate_harness_token();
+        assert_ne!(a, b);
+        assert!(!a.is_empty());
     }
 
     #[test]
