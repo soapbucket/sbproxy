@@ -153,7 +153,7 @@ impl Money {
         }
         if decimals <= Self::MICRO_DECIMALS {
             let divisor = pow10(Self::MICRO_DECIMALS - decimals)?;
-            if self.amount_micros % divisor != 0 {
+            if !self.amount_micros.is_multiple_of(divisor) {
                 return Err(BillingError::AmountNotRepresentable);
             }
             Ok(self.amount_micros / divisor)
@@ -203,7 +203,7 @@ impl Money {
                 .ok_or(BillingError::AmountNotRepresentable)?
         } else {
             let divisor = pow10(decimals - Self::MICRO_DECIMALS)?;
-            if base_units % divisor != 0 {
+            if !base_units.is_multiple_of(divisor) {
                 return Err(BillingError::AmountNotRepresentable);
             }
             base_units / divisor

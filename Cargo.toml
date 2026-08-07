@@ -85,17 +85,26 @@ edition = "2021"
 #   edition 2024, and Cargo 1.82 rejects the manifest outright.
 #
 #   1.85 parses, and then cargo reports the actual constraint: 106 packages
-#   in the graph declare a floor above it. The binding one is 1.94.0, which
-#   62 packages require; the AWS SDK crates sit at 1.91.1 behind them.
+#   in the graph declare a floor above it, 62 of them at 1.94.0.
 #
-# So the declared floor was twelve releases below what the graph has needed
-# for some time, and any downstream packager who believed it would have hit
-# a wall we had no idea we had built. Holding a lower floor is not an option
-# worth costing out: it would mean pinning 62 packages backwards.
+#   1.94 satisfies every dependency and then fails on our own code, with ten
+#   `mismatched types` errors in compression_metrics.rs where inference
+#   resolves `with_label_values` differently against prometheus 0.14 than it
+#   does on 1.95.
 #
-# The lane checks this on every PR now, so the next drift is a failed job
-# rather than someone else's bug report.
-rust-version = "1.94"
+# That third step is the real finding. The dependency floor is 1.94, but the
+# workspace does not compile there, which means this code has been written
+# against whatever `stable` happened to be with nothing enforcing a floor at
+# all. 1.82 was not a considered decision that drifted; it was a number
+# nobody had checked since it was written.
+#
+# So this is set to what the code actually builds on rather than to a
+# version we would like to support. Lowering it means fixing those ten sites
+# for the benefit of a six-week-old toolchain, which is worth doing only if
+# a packager asks. The msrv lane holds the line either way: it pins this
+# exact version, so the next time someone reaches for a newer feature the
+# job fails instead of the floor quietly moving again.
+rust-version = "1.95"
 authors = ["Soap Bucket LLC"]
 license = "Apache-2.0"
 repository = "https://github.com/soapbucket/sbproxy"
