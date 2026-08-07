@@ -90,7 +90,16 @@ jobs:
       # worth knowing about. The crates where a low number would actually
       # worry me are specific: billing (money), security (crypto), vault
       # (secrets), and core's settlement and key-plane paths.
+      # `continue-on-error` on the step above stops a failed measurement from
+      # failing the job, but it does not stop this step from running, and
+      # `llvm-cov report` exits non-zero when there is no profile data to
+      # report on. So the job failed anyway on the first attempt, which made
+      # the non-blocking claim above false. `if: success()` is what actually
+      # holds it: the step is skipped when measurement did not produce data,
+      # rather than failing on its absence.
       - name: per-crate summary
+        if: success()
+        continue-on-error: true
         run: |
           cargo llvm-cov report --summary-only
           echo
@@ -99,7 +108,10 @@ jobs:
           cargo llvm-cov report --summary-only >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
+      # Only when there is something to upload. Without the guard this fails
+      # the job on a missing path, which is the same trap one step later.
       - name: upload lcov
+        if: hashFiles('lcov.info') != ''
         uses: actions/upload-artifact@v4
         with:
           name: lcov
