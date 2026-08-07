@@ -76,7 +76,16 @@ default-members = [
 [workspace.package]
 version = "1.10.0"
 edition = "2021"
-rust-version = "1.82"
+# Raised from 1.82 on 2026-08-07, because 1.82 was not true. The msrv lane
+# added alongside this change is what found it: `block-buffer 0.12.0` in the
+# dependency graph declares edition 2024, which Cargo 1.82 refuses to parse
+# at all ("feature `edition2024` is required"), so the workspace could not
+# build on its own declared floor and had not been able to for some time.
+#
+# 1.85 is where edition 2024 stabilised, so it is the lowest version this
+# graph can resolve rather than a round number. If it needs to rise again,
+# the lane will say so before a user does.
+rust-version = "1.85"
 authors = ["Soap Bucket LLC"]
 license = "Apache-2.0"
 repository = "https://github.com/soapbucket/sbproxy"

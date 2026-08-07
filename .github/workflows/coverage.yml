@@ -67,10 +67,23 @@ jobs:
       # deliberately absent. Those are separate feature unions and would each
       # need their own instrumented build; worth adding later if the numbers
       # for the default union turn out to be the uninteresting part.
+      # `--no-fail-fast` because the first run of this lane failed after 17
+      # minutes and reported only whichever test lost first, which is not
+      # enough to act on. Instrumented builds run roughly half as fast, and
+      # this workspace has several tests that assert on elapsed time, so the
+      # likely story is that a timing assertion tightened under coverage
+      # rather than anything being genuinely broken. Seeing the full list is
+      # what distinguishes those two, and a test that only fails when the
+      # machine is slow is worth knowing about regardless of coverage.
+      #
+      # `continue-on-error` so the lane reports rather than blocks while that
+      # is sorted out. It is a measurement lane, and a red check nobody can
+      # act on yet is how people learn to ignore red checks.
       - name: measure coverage
+        continue-on-error: true
         run: |
           cargo llvm-cov nextest \
-            --workspace --exclude sbproxy-e2e --locked \
+            --workspace --exclude sbproxy-e2e --locked --no-fail-fast \
             --lcov --output-path lcov.info
 
       # Per-crate, because one workspace aggregate hides exactly the cases

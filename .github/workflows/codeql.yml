@@ -44,37 +44,25 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - language: rust
-            build-mode: manual
+          # Rust is deliberately absent. The first run of this workflow
+          # failed at `initialize CodeQL` for `language: rust`, before any
+          # of our code was looked at, so the analysis is not available to
+          # this repository today rather than merely finding nothing.
+          #
+          # Left out rather than left failing: a permanently red lane is
+          # worse than an absent one, because it trains everyone to merge
+          # past a red check. Worth retrying when CodeQL's Rust support
+          # moves on, at which point this comment is the changelog.
           - language: javascript-typescript
             build-mode: none
     steps:
       - uses: actions/checkout@v4
-
-      # Rust needs the real toolchain and system packages; the TypeScript
-      # analysis reads source without building, so it skips all of this.
-      - uses: ./.github/actions/rust-setup
-        if: matrix.language == 'rust'
-        with:
-          cache-key: codeql
-          install-system-deps: 'true'
 
       - name: initialize CodeQL
         uses: github/codeql-action/init@v3
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
-
-      # `--locked` matters here for the same reason it does in the gate: a
-      # plain build silently rewrites Cargo.lock, and an analysis run is not
-      # where lockfile drift should get repaired.
-      #
-      # e2e is excluded to match the test lane's selection. It builds a
-      # harness rather than shipped code, and including it widens the feature
-      # union for no analysis gain.
-      - name: build workspace for analysis
-        if: matrix.language == 'rust'
-        run: cargo build --workspace --exclude sbproxy-e2e --locked
 
       - name: analyze
         uses: github/codeql-action/analyze@v3
