@@ -1,0 +1,82 @@
+# Static analysis for the Rust workspace and the admin console.
+#
+# Its own workflow rather than a job in ci.yml for two reasons. It wants a
+# schedule of its own, since most of what CodeQL finds on a mature tree comes
+# from rule updates rather than from the diff under review. And it builds the
+# workspace with its own instrumentation, which is a different fingerprint
+# from every cargo invocation in ci.yml; folding it in would break that
+# workflow's one-package-selection-per-job invariant and pay a full rebuild
+# on the critical path.
+#
+# The Rust analysis is community-supported rather than a first-class CodeQL
+# language, so treat a clean run as weaker evidence here than it would be for
+# the TypeScript half.
+name: codeql
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    # Weekly, off-hours. Catches newly published rules against unchanged code,
+    # which is most of the value once a tree stops moving quickly.
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      # Required to upload the SARIF result to the Security tab.
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: rust
+            build-mode: manual
+          - language: javascript-typescript
+            build-mode: none
+    steps:
+      - uses: actions/checkout@v4
+
+      # Rust needs the real toolchain and system packages; the TypeScript
+      # analysis reads source without building, so it skips all of this.
+      - uses: ./.github/actions/rust-setup
+        if: matrix.language == 'rust'
+        with:
+          cache-key: codeql
+          install-system-deps: 'true'
+
+      - name: initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+
+      # `--locked` matters here for the same reason it does in the gate: a
+      # plain build silently rewrites Cargo.lock, and an analysis run is not
+      # where lockfile drift should get repaired.
+      #
+      # e2e is excluded to match the test lane's selection. It builds a
+      # harness rather than shipped code, and including it widens the feature
+      # union for no analysis gain.
+      - name: build workspace for analysis
+        if: matrix.language == 'rust'
+        run: cargo build --workspace --exclude sbproxy-e2e --locked
+
+      - name: analyze
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:${{ matrix.language }}

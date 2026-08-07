@@ -1,0 +1,90 @@
+# Verify the workspace still compiles on the Rust version it claims to support.
+#
+# `rust-version` in the root Cargo.toml is a compatibility promise: downstream
+# packagers and anyone pinned to a distribution toolchain read it and believe
+# it. Until this lane existed nothing checked it, so the promise could drift
+# the moment any dependency or any `let ... else` crept in, and nobody would
+# learn about it until a user reported a build failure.
+#
+# Its own workflow because it installs a pinned older toolchain, which is a
+# different cache and a different fingerprint from every stable-toolchain job
+# in ci.yml.
+#
+# When this lane fails, resist bumping `rust-version` reflexively. Two honest
+# fixes exist and the right one depends on why it broke:
+#
+#   1. Raise the floor, if the feature that crossed it is worth the cost to
+#      downstream packagers. Say so in the Cargo.toml comment.
+#   2. Back out whatever crossed it, if the floor is load bearing for a
+#      packager we care about.
+#
+# Either way it should be a decision someone made on purpose, which is the
+# whole reason to check it in CI rather than discover it in an issue.
+name: msrv
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '**/Cargo.toml'
+      - 'Cargo.lock'
+      - '**/*.rs'
+      - '.github/workflows/msrv.yml'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: msrv-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: check against declared rust-version
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # Read the floor out of Cargo.toml rather than hardcoding it here, so
+      # the lane cannot silently drift away from the value it exists to
+      # protect. A workflow with its own copy of the number would pass while
+      # testing the wrong toolchain, which is worse than no lane at all.
+      - name: read declared MSRV
+        id: msrv
+        run: |
+          set -euo pipefail
+          version="$(grep -m1 '^rust-version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+          if [ -z "$version" ]; then
+            echo "::error::no rust-version found in Cargo.toml; this lane has nothing to verify"
+            exit 1
+          fi
+          echo "declared MSRV: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: install the declared toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msrv
+          save-if: ${{ github.event_name != 'pull_request' }}
+
+      - name: install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler clang libclang-dev libc6-dev
+
+      # `cargo check` rather than a full build: this lane answers "does it
+      # still compile on the old toolchain", and codegen adds minutes without
+      # adding an answer. Package selection matches the test lane so the
+      # feature union is the one CI already resolves elsewhere.
+      - name: check workspace on the declared MSRV
+        run: cargo check --workspace --exclude sbproxy-e2e --locked --all-targets

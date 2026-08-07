@@ -1,0 +1,94 @@
+# Measure test coverage and report it. Deliberately does not gate on it.
+#
+# Until this lane existed the repo published no coverage number at all, which
+# meant "is sbproxy-billing well tested?" had no answer beyond reading the
+# files. The point of this lane is to produce that answer, per crate, and let
+# it be watched.
+#
+# No percentage threshold, on purpose, and adding one should be a separate
+# decision rather than a follow-up nobody argued about:
+#
+#   - We do not know the baseline yet. A number picked before seeing the data
+#     is either trivially met, in which case it teaches nothing, or it blocks
+#     unrelated work, in which case people learn to ignore a red check.
+#   - A coverage gate that fires on a docs-only PR is how a team learns to
+#     merge past a failing lane, and that habit is more expensive than the
+#     coverage it was meant to protect.
+#
+# Watch the per-crate numbers for a few weeks first. If a floor is worth
+# adding later, a no-regression delta on the crates that handle money,
+# secrets, and crypto is a better shape than one workspace-wide percentage.
+#
+# Its own workflow with its own cache key for the reason ci.yml documents:
+# llvm-cov instruments the build, so it is a different fingerprint from the
+# plain test lane and would force a full rebuild if it shared a job.
+name: coverage
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  measure:
+    name: measure
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/rust-setup
+        with:
+          cache-key: coverage
+          components: llvm-tools-preview
+          install-system-deps: 'true'
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov,cargo-nextest
+
+      # Package selection matches the test lane exactly. e2e is excluded for
+      # the same reason it is there: it needs a built release binary and its
+      # own feature union, so including it would both fail and change the
+      # fingerprint.
+      #
+      # Coverage of the payments and no-default-features unions is
+      # deliberately absent. Those are separate feature unions and would each
+      # need their own instrumented build; worth adding later if the numbers
+      # for the default union turn out to be the uninteresting part.
+      - name: measure coverage
+        run: |
+          cargo llvm-cov nextest \
+            --workspace --exclude sbproxy-e2e --locked \
+            --lcov --output-path lcov.info
+
+      # Per-crate, because one workspace aggregate hides exactly the cases
+      # worth knowing about. The crates where a low number would actually
+      # worry me are specific: billing (money), security (crypto), vault
+      # (secrets), and core's settlement and key-plane paths.
+      - name: per-crate summary
+        run: |
+          cargo llvm-cov report --summary-only
+          echo
+          echo "### Coverage by crate" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cargo llvm-cov report --summary-only >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: upload lcov
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcov
+          path: lcov.info
+          retention-days: 14
