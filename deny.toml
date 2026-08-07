@@ -74,15 +74,10 @@ ignore = [
   # patched 0.103.13 (ISC-licensed), which is not vulnerable to any of these
   # three advisories, so the mesh path is clean regardless of these ignores.
   #
-  # RUSTSEC-2026-0098: URI name constraints ignored on CA verification.
-  "RUSTSEC-2026-0098",
-  # RUSTSEC-2026-0099: permitted DNS subtree constraints accepted on
-  # wildcard certs. We do not run a custom PKI; AWS service certs are
-  # served from public CAs that do not use this constraint.
-  "RUSTSEC-2026-0099",
-  # RUSTSEC-2026-0104: panic when parsing empty CRLs. We do not configure
-  # CRL parsing in the SDK; the default chain skips it entirely.
-  "RUSTSEC-2026-0104",
+  # The three rustls-webpki advisories this block described (RUSTSEC-2026-0098,
+  # -0099, -0104) are gone: cargo-deny reports "no crate matched advisory
+  # criteria" for all three, so the AWS SDK has since moved to a patched base
+  # exactly as the note above predicted. Entries removed 2026-08-07.
 
   # --- WOR-616: unmaintained transitive crates -----------------------------
   # The following six advisories are all `unmaintained`-class warnings (not
@@ -126,25 +121,36 @@ ignore = [
   # tensor parser on attacker-controlled .dat files. Not reachable here:
   # sbproxy never parses NNEF. tract loads only our digest-pinned ONNX
   # artifacts (classifier centroids and the in-process embedding model
-  # fail closed on digest mismatch), and the embedded engine uses
-  # mistralrs's own gguf/safetensors loaders. The in-range fix (0.21.16)
-  # is blocked by mistralrs 0.9.0's git-pinned `half` requirement;
-  # upgrade lands with the next mistralrs tag bump. Tracked internally;
-  # remove this entry on that bump.
+  # fail closed on digest mismatch).
+  #
+  # BLOCKER, re-verified 2026-08-07 (WOR-2039). The old note here said this
+  # was blocked by mistralrs 0.9.0's git-pinned `half`, and that mistralrs
+  # is gone from the tree entirely, so the note read as actionable when it
+  # was not. Someone acted on it and burned the investigation; hence this
+  # rewrite.
+  #
+  # The real blocker is now a `libm` conflict, and we introduced it
+  # ourselves. Both in-range fixes pin libm exactly:
+  #
+  #   tract-onnx 0.21.16 / 0.21.17  ->  libm =0.2.11
+  #   wasmtime 46.0.2 (WOR-2105)    ->  libm ^0.2.16
+  #
+  # so cargo cannot resolve, failing with "failed to select a version for
+  # `libm`". Reproduce with:
+  #
+  #   cargo update -p tract-onnx --precise 0.21.17
+  #
+  # The advisory's other patched ranges (>= 0.22.2, >= 0.23.1) are outside
+  # our `tract-onnx = "0.21"` caret pins in sbproxy-classifiers,
+  # sbproxy-modules, and sbproxy-agent-detect, so taking them is a
+  # semver-major bump with a real API delta, not a lockfile change.
+  #
+  # Unblocks when tract relaxes its exact libm pin on the 0.21 line, or when
+  # someone takes the 0.22/0.23 bump deliberately. Do NOT retry a plain
+  # `cargo update -p tract-onnx`: without --precise it silently downgrades
+  # unrelated packages (windows-sys 0.61 -> 0.60, itertools 0.13 -> 0.11)
+  # while leaving tract where it was.
   "RUSTSEC-2026-0217",
-
-  # RUSTSEC-2025-0057: fxhash 0.2.1, unmaintained. Path: fxhash -> bm25 ->
-  # mistralrs-core -> mistralrs -> sbproxy-model-host, i.e. only the
-  # off-by-default `embedded` inference engine tree (WOR-1658); not in the
-  # default build. Unmaintained, no maintained replacement reachable without
-  # an upstream bump; transitive; revisit when bm25 / mistralrs update.
-  "RUSTSEC-2025-0057",
-
-  # RUSTSEC-2025-0119: number_prefix 0.4.0, unmaintained. Same off-by-default
-  # mistral.rs `embedded` tree (via indicatif's progress UI under mistralrs);
-  # not in the default build. Unmaintained; transitive; revisit on an upstream
-  # bump that drops it.
-  "RUSTSEC-2025-0119",
 
   # RUSTSEC-2026-0173: proc-macro-error2 (a maintained fork of the older
   # proc-macro-error) is now itself unmaintained. Pulled in transitively as a
@@ -271,12 +277,11 @@ unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # WOR-1772: pingora is patched to our fork (dynamic rustls cert resolver).
-# WOR-1861: mistral.rs 0.9 (and its candle transitive) are only on git; the
-# 0.9 release is not yet on crates.io. Both are pulled solely by the opt-in
-# `embedded` cargo feature, never the default build. Re-pin to crates.io and
-# drop these once mistral.rs 0.9 publishes.
+#
+# The mistral.rs and candle.git entries were removed 2026-08-07: neither
+# resolves any longer (cargo-deny reports "allowed source was not
+# encountered"), because the `embedded` inference engine that pulled them is
+# no longer in the graph.
 allow-git = [
     "https://github.com/soapbucket/pingora",
-    "https://github.com/EricLBuehler/mistral.rs",
-    "https://github.com/huggingface/candle.git",
 ]
