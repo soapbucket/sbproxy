@@ -629,6 +629,18 @@ fn apply_transform_with_ctx(
             }
             t.apply(body)
         }
+        Transform::A2aAgentCardRewrite(t) => {
+            // WOR-2315: typed dispatch for the agent-card rewriter. The
+            // standard `(body, content_type)` signature cannot carry the
+            // request path the rewriter gates on, so the path is threaded
+            // in from ctx here (stamped in `request_filter` alongside
+            // `hostname`). Host precedence is the transform's documented
+            // contract: the configured `proxy_host` wins, the inbound
+            // `Host` header is the fallback so one deployment behind
+            // several hostnames routes cleanly.
+            let host = t.proxy_host.as_deref().unwrap_or(ctx.hostname.as_str());
+            t.apply_with_path(body, content_type, ctx.request_path.as_str(), host)
+        }
         // All other transform variants: standard pipeline.
         _ => compiled.transform.apply(body, content_type),
     }

@@ -44,14 +44,15 @@
 //!
 //! The standard transform `apply(body, content_type)` signature does
 //! not carry the request path. To avoid silently rewriting JSON
-//! responses on unrelated routes, the standard `apply` is a no-op:
-//! it only writes through the body when [`A2aAgentCardRewriter::apply_with_path`]
-//! is invoked with the live request path. Path-aware wiring lives in
-//! the typed-dispatch arm in `sbproxy-core::server::apply_transform_with_ctx`;
-//! see the WOR-234 follow-up for the connector.
+//! responses on unrelated routes, the rewriter only writes through the
+//! body when [`A2aAgentCardRewriter::apply_with_path`] is invoked with
+//! the live request path. That call lives in the typed-dispatch arm in
+//! `sbproxy-core::server::apply_transform_with_ctx`, which sources the
+//! path and the fallback host from the request context (WOR-2315).
 //!
-//! Until that wiring lands, the unit tests below pin the
-//! path-and-host substitution logic against fixture JSON bodies.
+//! The unit tests below pin the path-and-host substitution logic
+//! against fixture JSON bodies; the dispatch-path coverage lives with
+//! the other typed-arm tests in `sbproxy-core`.
 
 use bytes::BytesMut;
 use serde::Deserialize;
@@ -112,15 +113,6 @@ impl A2aAgentCardRewriter {
             paths
         };
         Self { paths, proxy_host }
-    }
-
-    /// Standard pipeline `apply`. This is a no-op because the request
-    /// path is not threaded through the standard signature; see the
-    /// module doc for the wiring story. The body is left untouched so
-    /// the rewriter can sit in a pipeline without surprising the
-    /// other transforms.
-    pub fn apply(&self, _body: &mut BytesMut) -> anyhow::Result<()> {
-        Ok(())
     }
 
     /// Path-aware apply.
@@ -511,15 +503,6 @@ mod tests {
             "",
         )
         .unwrap();
-        assert_eq!(&body[..], &original[..]);
-    }
-
-    #[test]
-    fn standard_apply_is_noop() {
-        let r = rewriter();
-        let original = br#"{"url":"https://test.sbproxy.dev/agents/1"}"#;
-        let mut body = BytesMut::from(&original[..]);
-        r.apply(&mut body).unwrap();
         assert_eq!(&body[..], &original[..]);
     }
 }

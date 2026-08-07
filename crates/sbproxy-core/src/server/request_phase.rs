@@ -1379,6 +1379,7 @@ pub(super) async fn request_filter(
         .unwrap_or_default();
     let hostname = hostname_owned.split(':').next().unwrap_or("");
     ctx.hostname = compact_str::CompactString::new(hostname);
+    ctx.request_path = compact_str::CompactString::new(req_for_host.uri.path());
 
     let pipeline = ctx.pipeline.clone();
     let origin_idx = match pipeline.resolve_origin(hostname) {

@@ -167,9 +167,10 @@ pub enum Transform {
     /// Rewrites the `url` / `endpoint` / `agent.url` fields
     /// on A2A agent-card responses so MCP and A2A clients route
     /// follow-up calls through the proxy instead of jumping straight
-    /// at the upstream. The standard `apply` here is a no-op; the
-    /// path-aware rewrite is invoked from a typed dispatch arm that
-    /// threads in the request path.
+    /// at the upstream. Same caveat as `CitationBlock`: the standard
+    /// body-buffer `apply` is a no-op; the typed dispatch arm in
+    /// sbproxy-core calls `apply_with_path` with the request path and
+    /// proxy host from the request context (WOR-2315).
     A2aAgentCardRewrite(A2aAgentCardRewriter),
     /// No transformation applied.
     Noop,
@@ -245,20 +246,16 @@ impl Transform {
                 // discards it.
                 t.apply(body).map(|_| ())
             }
-            // G4.10 / G4.4: these two transforms need per-request
-            // context (canonical_url, rsl_urn, citation_required) that
-            // the standard body-buffer signature can't carry. The
-            // day-5 response-filter wiring invokes the typed `apply`
-            // methods directly with the ctx fields. In the meantime
-            // they are no-ops here so the YAML schema accepts them
+            // G4.10 / G4.4 / WOR-2315: these three transforms need
+            // per-request context (canonical_url, rsl_urn,
+            // citation_required, request path) that the standard
+            // body-buffer signature can't carry. The response-filter
+            // wiring (`apply_transform_with_ctx` in sbproxy-core)
+            // invokes the typed methods directly with the ctx fields.
+            // They are no-ops here so the YAML schema accepts them
             // and the chain compiles end-to-end.
-            Self::CitationBlock(_) | Self::JsonEnvelope(_) => Ok(()),
+            Self::CitationBlock(_) | Self::JsonEnvelope(_) | Self::A2aAgentCardRewrite(_) => Ok(()),
             Self::CelScript(t) => t.apply(body),
-            // WOR-234: the standard `apply` cannot see the request
-            // path. Leave the body alone here; the path-aware
-            // rewrite runs from a typed dispatch arm in the
-            // response-filter wiring.
-            Self::A2aAgentCardRewrite(t) => t.apply(body),
             Self::Noop => Ok(()),
             Self::Plugin(handler) => dispatch_plugin(handler.handler(), body, content_type),
         }

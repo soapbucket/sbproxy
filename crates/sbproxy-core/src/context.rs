@@ -305,6 +305,11 @@ pub struct RequestContext {
     pub client_ip: Option<IpAddr>,
     /// Hostname extracted from the Host header (without port).
     pub hostname: CompactString,
+    /// Request path (no query), stamped alongside `hostname` during
+    /// `request_filter`. Read by response-side consumers that run
+    /// without the session in hand, e.g. the `a2a_agent_card_rewrite`
+    /// typed dispatch arm, which gates on agent-card discovery paths.
+    pub request_path: CompactString,
     /// WOR-1053: tenant the matched origin resolves to. Stamped on
     /// route match from `CompiledOrigin.tenant_id`; defaults to
     /// `__default__` for un-routed requests and single-tenant
@@ -1545,6 +1550,7 @@ impl RequestContext {
             request_id: CompactString::default(),
             client_ip: None,
             hostname: CompactString::default(),
+            request_path: CompactString::default(),
             tenant_id: CompactString::const_new("__default__"),
             origin_idx: None,
             pipeline: crate::reload::current_pipeline_full(),
