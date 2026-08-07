@@ -76,16 +76,26 @@ default-members = [
 [workspace.package]
 version = "1.10.0"
 edition = "2021"
-# Raised from 1.82 on 2026-08-07, because 1.82 was not true. The msrv lane
-# added alongside this change is what found it: `block-buffer 0.12.0` in the
-# dependency graph declares edition 2024, which Cargo 1.82 refuses to parse
-# at all ("feature `edition2024` is required"), so the workspace could not
-# build on its own declared floor and had not been able to for some time.
+# Raised from 1.82 on 2026-08-07, because 1.82 was not remotely true and
+# nothing had ever checked. The msrv lane added alongside this change found
+# it in two steps, and both are worth recording because the first answer was
+# not the real one:
 #
-# 1.85 is where edition 2024 stabilised, so it is the lowest version this
-# graph can resolve rather than a round number. If it needs to rise again,
-# the lane will say so before a user does.
-rust-version = "1.85"
+#   1.82 could not even parse the graph. `block-buffer 0.12.0` declares
+#   edition 2024, and Cargo 1.82 rejects the manifest outright.
+#
+#   1.85 parses, and then cargo reports the actual constraint: 106 packages
+#   in the graph declare a floor above it. The binding one is 1.94.0, which
+#   62 packages require; the AWS SDK crates sit at 1.91.1 behind them.
+#
+# So the declared floor was twelve releases below what the graph has needed
+# for some time, and any downstream packager who believed it would have hit
+# a wall we had no idea we had built. Holding a lower floor is not an option
+# worth costing out: it would mean pinning 62 packages backwards.
+#
+# The lane checks this on every PR now, so the next drift is a failed job
+# rather than someone else's bug report.
+rust-version = "1.94"
 authors = ["Soap Bucket LLC"]
 license = "Apache-2.0"
 repository = "https://github.com/soapbucket/sbproxy"
