@@ -22,7 +22,7 @@
 //! azurekv://primary/openai-key?version=abc123def456
 //! k8ssecret://primary/sbproxy-secrets/openai-key
 //! secretfile://local/openai-prod?key=api_key
-//! secret://local/openai-prod
+//! localsecret://local/openai-prod
 //! ```
 //!
 //! The parser is pure syntax: it does not verify that
@@ -36,9 +36,13 @@
 //! `${ENV_VAR}` and `file:/path/to/secret` shapes ship sibling
 //! parsers; the resolver tries each in turn. The removed
 //! `secret:<name>` form is rejected in favor of
-//! `secret://<backend>/<name>`. Reserved URI schemes such as
+//! `localsecret://<backend>/<name>`. Reserved URI schemes such as
 //! `https://` and `file://` are not treated as secret references and
 //! pass through as literals.
+//!
+//! `secret://<backend>/<name>` is a deprecated alias for
+//! `localsecret://<backend>/<name>`: it resolves identically but logs
+//! a one-time warning pointing at the current spelling.
 //!
 //! ## Multi-tenant resolution
 //!
@@ -54,8 +58,9 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::sync::{Mutex, OnceLock};
 
-/// Version where the legacy `vault://<alias>/...` compatibility shim
-/// is scheduled to be removed.
+/// Version where legacy secret-reference compatibility shims (the
+/// `vault://<alias>/...` aliases and the `secret://` scheme) are
+/// scheduled to be removed.
 pub const LEGACY_VAULT_REFERENCE_REMOVAL_VERSION: &str = "1.2.0";
 
 /// One legacy vault reference rewrite produced by the migration helper.
@@ -99,12 +104,24 @@ pub enum VaultProviderType {
     KubernetesSecret,
     /// Local file-backed secret store, selected by `secretfile://`.
     SecretFile,
-    /// Local static secret map, selected by `secret://`.
+    /// Local static secret map, selected by `localsecret://`. The
+    /// legacy `secret://` scheme names this same provider and keeps
+    /// resolving identically, but it is deprecated in favor of the
+    /// honest `localsecret://` spelling: `secret://` reads as a
+    /// generic "this is some kind of secret" wildcard when it
+    /// actually always means this one specific local-secret-store
+    /// provider.
     LocalSecret,
 }
 
 impl VaultProviderType {
     /// Convert a URI scheme into the corresponding provider type.
+    ///
+    /// `localsecret` is the canonical scheme for
+    /// [`Self::LocalSecret`]. `secret` is accepted as an equivalent,
+    /// deprecated spelling of the same provider; callers that parse
+    /// through [`VaultRef::parse`] additionally get a one-time
+    /// deprecation warning when `secret` is used.
     pub fn from_scheme(scheme: &str) -> Option<Self> {
         match scheme {
             "vault" => Some(Self::HashiCorp),
@@ -113,6 +130,7 @@ impl VaultProviderType {
             "azurekv" => Some(Self::AzureKeyVault),
             "k8ssecret" => Some(Self::KubernetesSecret),
             "secretfile" => Some(Self::SecretFile),
+            "localsecret" => Some(Self::LocalSecret),
             "secret" => Some(Self::LocalSecret),
             _ => None,
         }
@@ -127,7 +145,7 @@ impl VaultProviderType {
             Self::AzureKeyVault => "azurekv",
             Self::KubernetesSecret => "k8ssecret",
             Self::SecretFile => "secretfile",
-            Self::LocalSecret => "secret",
+            Self::LocalSecret => "localsecret",
         }
     }
 
@@ -212,6 +230,9 @@ impl VaultRef {
         if let Some(replacement) = legacy_vault_reference_replacement(input) {
             warn_legacy_vault_reference_once(input, &replacement);
             return parse_provider_specific_vault_ref(&replacement);
+        }
+        if let Some(replacement) = legacy_local_secret_scheme_notice(input) {
+            warn_legacy_vault_reference_once(input, &replacement);
         }
 
         parse_provider_specific_vault_ref(input)
@@ -353,6 +374,22 @@ pub fn legacy_vault_env_name(input: &str) -> Option<&str> {
     }
 }
 
+/// Return the canonical `localsecret://` spelling for a legacy
+/// `secret://<backend>/<path>` reference, for use in the one-time
+/// deprecation warning [`VaultRef::parse`] logs when it sees the
+/// `secret` scheme.
+///
+/// This does not change how the reference resolves: unlike
+/// [`legacy_vault_reference_replacement`], the returned string is
+/// never re-parsed in place of the original input. `secret://`
+/// continues to parse to [`VaultProviderType::LocalSecret`] exactly
+/// as it always has; this helper only computes the text to show the
+/// operator as the current spelling.
+fn legacy_local_secret_scheme_notice(input: &str) -> Option<String> {
+    let rest = input.strip_prefix("secret://")?;
+    Some(format!("localsecret://{rest}"))
+}
+
 /// Rewrite known legacy vault references in a config-like text blob.
 ///
 /// The scanner is deliberately text-preserving: it only replaces URI
@@ -420,7 +457,7 @@ pub(crate) fn warn_legacy_vault_reference_once(legacy: &str, replacement: &str) 
         legacy_reference = legacy,
         replacement = replacement,
         removal_version = LEGACY_VAULT_REFERENCE_REMOVAL_VERSION,
-        "deprecated secret reference: legacy `vault://<alias>/...` forms are accepted during the \
+        "deprecated secret reference: legacy secret-reference forms are accepted during the \
          deprecation window; migrate to the provider-specific replacement before the removal version"
     );
 }
@@ -541,6 +578,64 @@ mod tests {
         assert_eq!(static_ref.path, "openai-prod");
     }
 
+    /// `localsecret://` is the canonical scheme for
+    /// [`VaultProviderType::LocalSecret`] and parses identically to the
+    /// legacy `secret://` spelling.
+    #[test]
+    fn parses_localsecret_scheme_directly() {
+        let r = VaultRef::parse("localsecret://local/openai-prod").unwrap();
+        assert_eq!(r.provider_type, VaultProviderType::LocalSecret);
+        assert_eq!(r.backend, "local");
+        assert_eq!(r.path, "openai-prod");
+
+        let legacy = VaultRef::parse("secret://local/openai-prod").unwrap();
+        assert_eq!(legacy, r);
+    }
+
+    /// The rename only touches the local-secret scheme; every other
+    /// provider scheme still maps to its original provider type, and
+    /// `secret` / `localsecret` map to neither of them.
+    #[test]
+    fn other_provider_schemes_are_unaffected_by_the_local_secret_rename() {
+        assert_eq!(
+            VaultProviderType::from_scheme("vault"),
+            Some(VaultProviderType::HashiCorp)
+        );
+        assert_eq!(
+            VaultProviderType::from_scheme("awssm"),
+            Some(VaultProviderType::AwsSecretsManager)
+        );
+        assert_eq!(
+            VaultProviderType::from_scheme("gcpsm"),
+            Some(VaultProviderType::GcpSecretManager)
+        );
+        assert_eq!(
+            VaultProviderType::from_scheme("azurekv"),
+            Some(VaultProviderType::AzureKeyVault)
+        );
+        assert_eq!(
+            VaultProviderType::from_scheme("k8ssecret"),
+            Some(VaultProviderType::KubernetesSecret)
+        );
+        assert_eq!(
+            VaultProviderType::from_scheme("secretfile"),
+            Some(VaultProviderType::SecretFile)
+        );
+        for scheme in [
+            "vault",
+            "awssm",
+            "gcpsm",
+            "azurekv",
+            "k8ssecret",
+            "secretfile",
+        ] {
+            assert_ne!(
+                VaultProviderType::from_scheme(scheme),
+                Some(VaultProviderType::LocalSecret)
+            );
+        }
+    }
+
     /// Legacy umbrella aliases route to provider-specific schemes
     /// during the deprecation window.
     #[test]
@@ -579,6 +674,27 @@ mod tests {
             Some("OPENAI_API_KEY")
         );
         assert!(legacy_vault_env_name("vault://env/OPENAI_API_KEY?key=value").is_none());
+    }
+
+    /// `secret://` is a deprecated alias for `localsecret://`: the
+    /// notice helper flags it (the signal `VaultRef::parse` uses to
+    /// fire the one-time warning), it does not fire for the canonical
+    /// spelling or for unrelated schemes, and `secret://` still
+    /// resolves to the exact same provider, backend, and path as
+    /// `localsecret://` does.
+    #[test]
+    fn secret_scheme_is_a_deprecated_alias_for_localsecret() {
+        assert_eq!(
+            legacy_local_secret_scheme_notice("secret://local/openai-prod").as_deref(),
+            Some("localsecret://local/openai-prod")
+        );
+        assert!(legacy_local_secret_scheme_notice("localsecret://local/openai-prod").is_none());
+        assert!(legacy_local_secret_scheme_notice("secretfile://local/openai-prod").is_none());
+
+        let r = VaultRef::parse("secret://local/openai-prod").unwrap();
+        assert_eq!(r.provider_type, VaultProviderType::LocalSecret);
+        assert_eq!(r.backend, "local");
+        assert_eq!(r.path, "openai-prod");
     }
 
     #[test]

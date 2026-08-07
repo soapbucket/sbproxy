@@ -31,6 +31,7 @@ use crate::types::{SecretBackendConfig, SecretsConfig};
 /// backend named `cache` does not serve `vault://cache/...` and a
 /// `hashicorp` one does not serve `secret://cache/...`.
 const SCHEME_BACKEND_TYPES: &[(&str, &str)] = &[
+    ("localsecret", "local"),
     ("secret", "local"),
     ("secretfile", "file"),
     ("vault", "hashicorp"),
@@ -416,6 +417,15 @@ origins:
     fn declared_backend_of_the_matching_kind_compiles() {
         let yaml = ai_config(LOCAL_BACKEND, "secret://cache/openai-prod");
         compile_config(&yaml).expect("a declared local backend must serve `secret://`");
+    }
+
+    /// `localsecret://` (WOR-2286) is the honest spelling for the same
+    /// `local` backend `secret://` names; a declared local backend must
+    /// serve either scheme.
+    #[test]
+    fn declared_backend_of_the_matching_kind_serves_localsecret_too() {
+        let yaml = ai_config(LOCAL_BACKEND, "localsecret://cache/openai-prod");
+        compile_config(&yaml).expect("a declared local backend must serve `localsecret://`");
     }
 
     /// The deprecated `vault://env/NAME` alias resolves to an
