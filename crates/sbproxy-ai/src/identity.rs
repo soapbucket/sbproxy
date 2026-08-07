@@ -498,36 +498,6 @@ mod tests {
         }
     }
 
-    fn make_key_with_models(key: &str, allowed: Vec<&str>, blocked: Vec<&str>) -> VirtualKeyConfig {
-        VirtualKeyConfig {
-            key: key.to_string(),
-            key_id: None,
-            name: None,
-            allowed_models: allowed.into_iter().map(String::from).collect(),
-            blocked_models: blocked.into_iter().map(String::from).collect(),
-            allowed_providers: vec![],
-            blocked_providers: vec![],
-            principal_selectors: vec![],
-            require_pii_redaction: vec![],
-            allowed_tools: None,
-            max_requests_per_minute: None,
-            max_tokens_per_minute: None,
-            priority: None,
-            budget: None,
-            tags: vec![],
-            project: None,
-            user: None,
-            metadata: HashMap::new(),
-            route_to_model: None,
-            compression_profile: None,
-            inject_tools: vec![],
-            inject_mcp: None,
-            enabled: true,
-            bypass_prompt_injection: false,
-            allow_content_capture: false,
-        }
-    }
-
     #[test]
     fn virtual_key_with_empty_principal_selectors_matches_everyone() {
         let key = make_key("sk-1", true);
