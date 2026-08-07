@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-07*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -4181,7 +4181,7 @@ origins:
 | `verify` | bool | false | When true, enforce signature verification on inbound requests to this origin. |
 | `algorithm` | string | required | Signature algorithm: `hmac_sha256` or `ed25519`. An unrecognized value rejects all requests to the origin rather than silently bypassing the gate. |
 | `key_id` | string | required | The `keyid` value the signer is expected to advertise in `Signature-Input`. |
-| `key` | string | required | Verification key material. For `hmac_sha256`, the shared secret; for `ed25519`, the hex- or base64-encoded raw 32-byte public key. |
+| `key` | string | required | Verification key material, or a reference to it. For `hmac_sha256`, the shared secret; for `ed25519`, the hex- or base64-encoded raw 32-byte public key. Accepts every reference form the [secrets guide](secrets.md#reference-forms) defines, resolved before the value is decoded, so a stored secret yields the same key bytes as that value written inline. A reference that no declared backend can resolve rejects every request to the origin rather than becoming the key. |
 | `required_components` | list | `[]` | Canonical components every accepted signature must cover, e.g. `@method`, `@target-uri`, `content-digest`. A signature covering a strict subset is rejected. |
 | `clock_skew_seconds` | int | 30 | Tolerance applied to the signature's `created` / `expires` timestamps. |
 

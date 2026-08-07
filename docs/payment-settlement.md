@@ -252,7 +252,7 @@ and scripted rails:
 
 ```bash
 cargo nextest run -p sbproxy-core \
-  --features payment-x402,payment-mpp,payment-stripe,payment-lightning-cln \
+  --features payment-x402,payment-mpp,payment-stripe,payment-lightning-cln,payment-lightning-lnd \
   settlement_gate
 ```
 
