@@ -1387,6 +1387,10 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
     let mut host_map = std::collections::HashMap::new();
 
     for (hostname, raw_config) in config_file.origins {
+        // Wildcard keys (`*.example.com`) are validated here and stored
+        // under their literal spelling; `CompiledConfig::resolve_origin`
+        // and the core `HostRouter` give them suffix-match semantics.
+        validate_origin_host_key(&hostname)?;
         let origin = compile_origin(&hostname, raw_config)?;
         let idx = origins.len();
         host_map.insert(CompactString::new(&hostname), idx);
@@ -2187,6 +2191,47 @@ fn resolve_upstream_timeouts(
             .unwrap_or(DEFAULT_UPSTREAM_WRITE_TIMEOUT_MS)),
         idle: ms(idle_ms),
     })
+}
+
+/// Validate an `origins:` map key at config compile.
+///
+/// Exact hostnames pass through untouched. A key starting with `*.`
+/// declares a wildcard origin that matches one or more leading labels:
+/// `*.example.com` matches `a.example.com` and `a.b.example.com`, never
+/// `example.com` itself. Exact keys always beat wildcards at request
+/// time, and between wildcards the longest matching suffix wins, so a
+/// wildcard duplicating an exact key is legal rather than a conflict.
+///
+/// The `*` must be the complete first label. Mid-label forms
+/// (`a*.example.com`), inner labels (`api.*.example.com`), and a bare
+/// `*` are rejected here so a typo fails boot instead of becoming an
+/// exact key no request will ever match.
+fn validate_origin_host_key(hostname: &str) -> Result<()> {
+    if !hostname.contains('*') {
+        return Ok(());
+    }
+    if hostname == "*" || hostname == "*." {
+        anyhow::bail!(
+            "origin `{hostname}`: a bare catch-all wildcard is not supported; use a \
+             leading `*.` label with a non-empty suffix, e.g. `*.example.com`"
+        );
+    }
+    let Some(suffix) = hostname.strip_prefix("*.") else {
+        anyhow::bail!(
+            "origin `{hostname}`: `*` is only supported as the complete first label \
+             (`*.example.com`); mid-label wildcards are not supported"
+        );
+    };
+    if suffix.contains('*') {
+        anyhow::bail!(
+            "origin `{hostname}`: `*` may appear only once, as the complete first \
+             label (`*.example.com`)"
+        );
+    }
+    if suffix.split('.').any(|label| label.is_empty()) {
+        anyhow::bail!("origin `{hostname}`: wildcard suffix `{suffix}` contains an empty label");
+    }
+    Ok(())
 }
 
 /// Compile a single origin from its raw config.
@@ -4576,6 +4621,168 @@ origins:
 "#;
         let compiled = compile_config(yaml).unwrap();
         assert!(compiled.resolve_origin("nonexistent.com").is_none());
+    }
+
+    // --- wildcard origin keys ---
+
+    #[test]
+    fn wildcard_origin_matches_one_or_more_labels() {
+        let yaml = r#"
+origins:
+  "*.example.com":
+    action:
+      type: proxy
+      url: http://wild:3000
+"#;
+        let compiled = compile_config(yaml).unwrap();
+        assert!(compiled.resolve_origin("a.example.com").is_some());
+        assert!(compiled.resolve_origin("a.b.example.com").is_some());
+        // The bare suffix is not covered: `*.` requires at least one label.
+        assert!(compiled.resolve_origin("example.com").is_none());
+        assert!(compiled.resolve_origin("other.com").is_none());
+    }
+
+    #[test]
+    fn wildcard_origin_exact_key_wins() {
+        let yaml = r#"
+origins:
+  "*.example.com":
+    action:
+      type: proxy
+      url: http://wild:3000
+  api.example.com:
+    action:
+      type: proxy
+      url: http://exact:3000
+"#;
+        let compiled = compile_config(yaml).unwrap();
+        let exact = compiled.resolve_origin("api.example.com").unwrap();
+        assert_eq!(exact.hostname.as_str(), "api.example.com");
+        let wild = compiled.resolve_origin("web.example.com").unwrap();
+        assert_eq!(wild.hostname.as_str(), "*.example.com");
+    }
+
+    #[test]
+    fn wildcard_origin_longest_suffix_wins() {
+        let yaml = r#"
+origins:
+  "*.example.com":
+    action:
+      type: proxy
+      url: http://broad:3000
+  "*.tenant.example.com":
+    action:
+      type: proxy
+      url: http://narrow:3000
+"#;
+        let compiled = compile_config(yaml).unwrap();
+        let narrow = compiled.resolve_origin("a.tenant.example.com").unwrap();
+        assert_eq!(narrow.hostname.as_str(), "*.tenant.example.com");
+        // `tenant.example.com` itself only matches the broader wildcard.
+        let broad = compiled.resolve_origin("tenant.example.com").unwrap();
+        assert_eq!(broad.hostname.as_str(), "*.example.com");
+    }
+
+    #[test]
+    fn wildcard_origin_literal_key_still_resolves() {
+        // Admin surfaces look origins up by their configured key; the
+        // literal spelling must keep resolving even though no wire
+        // hostname ever contains `*`.
+        let yaml = r#"
+origins:
+  "*.example.com":
+    action:
+      type: proxy
+      url: http://wild:3000
+"#;
+        let compiled = compile_config(yaml).unwrap();
+        assert!(compiled.resolve_origin("*.example.com").is_some());
+    }
+
+    #[test]
+    fn wildcard_origin_mid_label_rejected() {
+        let yaml = r#"
+origins:
+  "a*.example.com":
+    action:
+      type: proxy
+      url: http://bad:3000
+"#;
+        let err = compile_config(yaml)
+            .err()
+            .expect("the wildcard host key must be rejected at compile")
+            .to_string();
+        assert!(
+            err.contains("complete first label"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn wildcard_origin_inner_label_rejected() {
+        let yaml = r#"
+origins:
+  "api.*.example.com":
+    action:
+      type: proxy
+      url: http://bad:3000
+"#;
+        let err = compile_config(yaml)
+            .err()
+            .expect("the wildcard host key must be rejected at compile")
+            .to_string();
+        assert!(
+            err.contains("complete first label"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn wildcard_origin_bare_star_rejected() {
+        let yaml = r#"
+origins:
+  "*":
+    action:
+      type: proxy
+      url: http://bad:3000
+"#;
+        let err = compile_config(yaml)
+            .err()
+            .expect("the wildcard host key must be rejected at compile")
+            .to_string();
+        assert!(err.contains("catch-all"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn wildcard_origin_second_star_rejected() {
+        let yaml = r#"
+origins:
+  "*.a*.example.com":
+    action:
+      type: proxy
+      url: http://bad:3000
+"#;
+        let err = compile_config(yaml)
+            .err()
+            .expect("the wildcard host key must be rejected at compile")
+            .to_string();
+        assert!(err.contains("only once"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn wildcard_origin_empty_suffix_label_rejected() {
+        let yaml = r#"
+origins:
+  "*..example.com":
+    action:
+      type: proxy
+      url: http://bad:3000
+"#;
+        let err = compile_config(yaml)
+            .err()
+            .expect("the wildcard host key must be rejected at compile")
+            .to_string();
+        assert!(err.contains("empty label"), "unexpected error: {err}");
     }
 
     #[test]

@@ -913,7 +913,10 @@ origins:
 ### Hostname matching
 
 - Exact match: `"api.example.com"` matches only `api.example.com`.
-- Wildcard match: `"*.example.com"` matches `api.example.com`, `www.example.com`, and so on. The wildcard must be the first character and only covers one subdomain level.
+- Wildcard match: a key starting with `*.` matches one or more leading labels. `"*.example.com"` matches `api.example.com` and `a.b.example.com`, but not `example.com` itself.
+- Precedence: an exact key always beats a wildcard. Between wildcards, the longest matching suffix wins, so with both `"*.tenant.example.com"` and `"*.example.com"` configured, `api.tenant.example.com` routes to the former and `api.example.com` to the latter. Declaring `"api.example.com"` alongside `"*.example.com"` is legal; the exact key takes that one hostname and the wildcard takes the rest.
+- The `*` must be the complete first label. Keys like `a*.example.com`, `api.*.example.com`, or a bare `*` fail config compile.
+- Matching compares bytes after the port is stripped from the inbound `Host` (or `:authority`) value. No case folding or IDN normalization is applied, so write keys in lowercase ASCII, which is what clients send; internationalized domains must be keyed in their punycode form.
 - Multiple origins: define as many as you need. Each has independent auth, policies, and routing.
 
 ### Origin fields

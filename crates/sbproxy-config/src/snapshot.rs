@@ -270,8 +270,42 @@ pub struct CompiledConfig {
 
 impl CompiledConfig {
     /// Look up a compiled origin by hostname.
+    ///
+    /// Exact keys are checked first, so an exact origin always beats a
+    /// wildcard. On a miss the hostname is walked one leading label at a
+    /// time and each remaining suffix is probed under its `*.` spelling,
+    /// so the longest matching suffix wins and `*.example.com` matches
+    /// `a.example.com` and `a.b.example.com` but never `example.com`
+    /// itself. Comparison is byte-exact: callers strip the port before
+    /// resolving, and no case folding or IDN normalization is applied.
     pub fn resolve_origin(&self, hostname: &str) -> Option<&CompiledOrigin> {
-        self.host_map.get(hostname).map(|&idx| &self.origins[idx])
+        if let Some(&idx) = self.host_map.get(hostname) {
+            return Some(&self.origins[idx]);
+        }
+        // Wildcard walk. This runs on cold paths only (admin surfaces,
+        // projection transforms, tests); the request path goes through
+        // the core `HostRouter`, which precomputes a suffix map instead
+        // of rebuilding `*.suffix` probe keys per label.
+        let mut rest = hostname;
+        let mut probe = String::with_capacity(hostname.len() + 2);
+        while let Some((label, suffix)) = rest.split_once('.') {
+            if label.is_empty() {
+                // A hostname with an empty label is malformed; a
+                // wildcard matches one or more real labels, never an
+                // empty one.
+                return None;
+            }
+            if !suffix.is_empty() {
+                probe.clear();
+                probe.push_str("*.");
+                probe.push_str(suffix);
+                if let Some(&idx) = self.host_map.get(probe.as_str()) {
+                    return Some(&self.origins[idx]);
+                }
+            }
+            rest = suffix;
+        }
+        None
     }
 }
 

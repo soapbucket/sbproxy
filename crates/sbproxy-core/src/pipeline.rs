@@ -2653,7 +2653,9 @@ impl CompiledPipeline {
     /// Resolve a hostname to an origin index.
     ///
     /// Uses the bloom filter to fast-reject unknown hostnames before
-    /// falling through to the HashMap lookup.
+    /// falling through to the HashMap lookup. Exact origin keys win
+    /// over `*.suffix` wildcards; between wildcards the longest
+    /// matching suffix wins.
     pub fn resolve_origin(&self, hostname: &str) -> Option<usize> {
         self.router.resolve(hostname)
     }
@@ -3850,6 +3852,47 @@ hooks:
         let pipeline = CompiledPipeline::from_config(config).unwrap();
         assert_eq!(pipeline.resolve_origin("test.example.com"), Some(0));
         assert_eq!(pipeline.resolve_origin("unknown.com"), None);
+    }
+
+    #[test]
+    fn pipeline_resolve_origin_wildcard_lands_on_origin_and_tenant() {
+        // Compile from YAML so the wildcard key passes through the real
+        // config-compile validation, then prove a wildcard-matched
+        // request resolves to the wildcard origin with its tenant
+        // stamped, exactly like an exact-matched one would.
+        let yaml = r#"
+proxy:
+  tenants:
+    - id: acme
+origins:
+  "*.acme.example.com":
+    tenant_id: acme
+    action:
+      type: proxy
+      url: http://127.0.0.1:3000
+  api.example.com:
+    action:
+      type: proxy
+      url: http://127.0.0.1:3001
+"#;
+        let config = sbproxy_config::compile_config(yaml).unwrap();
+        let pipeline = CompiledPipeline::from_config(config).unwrap();
+
+        let idx = pipeline
+            .resolve_origin("customer-a.acme.example.com")
+            .expect("wildcard-matched host resolves");
+        let origin = &pipeline.config.origins[idx];
+        assert_eq!(origin.hostname.as_str(), "*.acme.example.com");
+        assert_eq!(origin.tenant_id.as_str(), "acme");
+
+        // Deeper subdomains match too; `*.` covers one or more labels.
+        assert_eq!(pipeline.resolve_origin("a.b.acme.example.com"), Some(idx));
+
+        // Exact origins keep resolving, and the wildcard's bare suffix
+        // still falls through to a routing miss.
+        assert!(pipeline.resolve_origin("api.example.com").is_some());
+        assert_eq!(pipeline.resolve_origin("acme.example.com"), None);
+        assert_eq!(pipeline.resolve_origin("example.com"), None);
     }
 
     #[test]
