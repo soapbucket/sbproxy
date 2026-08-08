@@ -1,6 +1,6 @@
 [package]
 name = "sbproxy-k8s-operator"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 license.workspace = true
 description = "OSS Kubernetes operator scaffold for sbproxy. Reconciles SBProxy and SBProxyConfig CRDs into Deployments, Services, and ConfigMaps."
