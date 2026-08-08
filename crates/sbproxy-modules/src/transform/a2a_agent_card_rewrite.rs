@@ -2,15 +2,16 @@
 //!
 //! Rewrites the `url`, `endpoint`, and nested `agent.url` fields on
 //! JSON responses served at well-known A2A discovery paths
-//! (`/.well-known/agent.json` and `/agent-card.json` by default) so
-//! MCP and A2A clients route their subsequent calls through the proxy
-//! instead of jumping straight at the upstream.
+//! (`/.well-known/agent-card.json` per ratified A2A 1.0, plus the
+//! pre-1.0 `/.well-known/agent.json` and `/agent-card.json` aliases,
+//! by default) so MCP and A2A clients route their subsequent calls
+//! through the proxy instead of jumping straight at the upstream.
 //!
 //! ## Why this exists
 //!
 //! The A2A discovery flow goes:
 //!
-//! 1. Client fetches `https://proxy.example.com/.well-known/agent.json`.
+//! 1. Client fetches `https://proxy.example.com/.well-known/agent-card.json`.
 //! 2. Proxy forwards to the upstream agent, which returns a body whose
 //!    `url` (and friends) point at the upstream's own public hostname.
 //! 3. Without rewriting, the client takes that upstream `url` at face
@@ -28,10 +29,11 @@
 //! ```yaml
 //! transforms:
 //!   - type: a2a_agent_card_rewrite
-//!     # Optional. Defaults to the two well-known A2A discovery
-//!     # paths. When set, only responses to one of these request
-//!     # paths are rewritten.
+//!     # Optional. Defaults to the well-known A2A discovery paths.
+//!     # When set, only responses to one of these request paths are
+//!     # rewritten.
 //!     paths:
+//!       - /.well-known/agent-card.json
 //!       - /.well-known/agent.json
 //!       - /agent-card.json
 //!     # Optional. When unset, the rewriter uses the inbound `Host`
@@ -59,8 +61,20 @@ use serde::Deserialize;
 use tracing::debug;
 
 /// Canonical A2A agent-card discovery paths. Used as the default
-/// `paths` list when the operator does not override it.
-pub const DEFAULT_AGENT_CARD_PATHS: &[&str] = &["/.well-known/agent.json", "/agent-card.json"];
+/// `paths` list when the operator does not override it, and as the
+/// path gate for the configured-card serving handler in
+/// `sbproxy-core`.
+///
+/// Ratified A2A 1.0 registers `/.well-known/agent-card.json`
+/// (spec section 14.3); the pre-1.0 spec revisions used
+/// `/.well-known/agent.json`, and `/agent-card.json` is the
+/// unprefixed variant some published agents serve. All three are
+/// kept so a client pinned to any revision discovers the card.
+pub const DEFAULT_AGENT_CARD_PATHS: &[&str] = &[
+    "/.well-known/agent-card.json",
+    "/.well-known/agent.json",
+    "/agent-card.json",
+];
 
 /// YAML configuration shape for the A2A agent-card rewriter.
 ///
@@ -158,20 +172,7 @@ impl A2aAgentCardRewriter {
                 return Ok(());
             }
         };
-        let mut rewrote = false;
-        if let Some(obj) = json.as_object_mut() {
-            for field in ["url", "endpoint"] {
-                if rewrite_string_field(obj, field, host) {
-                    rewrote = true;
-                }
-            }
-            if let Some(agent) = obj.get_mut("agent").and_then(|v| v.as_object_mut()) {
-                if rewrite_string_field(agent, "url", host) {
-                    rewrote = true;
-                }
-            }
-        }
-        if !rewrote {
+        if !rewrite_card_urls(&mut json, host) {
             return Ok(());
         }
         let serialized = serde_json::to_vec(&json)?;
@@ -185,6 +186,33 @@ impl A2aAgentCardRewriter {
     fn path_matches(&self, request_path: &str) -> bool {
         self.paths.iter().any(|p| p == request_path)
     }
+}
+
+/// Rewrite the `url`, `endpoint`, and nested `agent.url` fields on a
+/// parsed agent-card JSON value so their hostnames point at `host`.
+/// Path, query, scheme, and every other field are preserved. Returns
+/// `true` when at least one field changed.
+///
+/// Shared by [`A2aAgentCardRewriter::apply_with_path`] (rewriting a
+/// card the upstream served) and the configured-card serving handler
+/// in `sbproxy-core` (stamping the proxy host onto an
+/// operator-configured card before it goes out), so the two surfaces
+/// cannot drift on which fields carry the routed URL.
+pub fn rewrite_card_urls(json: &mut serde_json::Value, host: &str) -> bool {
+    let mut rewrote = false;
+    if let Some(obj) = json.as_object_mut() {
+        for field in ["url", "endpoint"] {
+            if rewrite_string_field(obj, field, host) {
+                rewrote = true;
+            }
+        }
+        if let Some(agent) = obj.get_mut("agent").and_then(|v| v.as_object_mut()) {
+            if rewrite_string_field(agent, "url", host) {
+                rewrote = true;
+            }
+        }
+    }
+    rewrote
 }
 
 /// Rewrite a string-valued field on a JSON object to swap its host
@@ -269,6 +297,9 @@ mod tests {
     fn from_parts_applies_default_paths_when_empty() {
         let r = A2aAgentCardRewriter::from_parts(Vec::new(), None);
         assert_eq!(r.paths.len(), DEFAULT_AGENT_CARD_PATHS.len());
+        assert!(r
+            .paths
+            .contains(&"/.well-known/agent-card.json".to_string()));
         assert!(r.paths.contains(&"/.well-known/agent.json".to_string()));
         assert!(r.paths.contains(&"/agent-card.json".to_string()));
     }
@@ -293,9 +324,57 @@ mod tests {
     #[test]
     fn from_config_no_fields_falls_back_to_defaults() {
         let r = A2aAgentCardRewriter::from_config(serde_json::json!({})).unwrap();
+        assert!(r
+            .paths
+            .contains(&"/.well-known/agent-card.json".to_string()));
         assert!(r.paths.contains(&"/.well-known/agent.json".to_string()));
         assert!(r.paths.contains(&"/agent-card.json".to_string()));
         assert!(r.proxy_host.is_none());
+    }
+
+    /// The ratified A2A 1.0 discovery path is in the default gate, so
+    /// a card the upstream serves at the spec path is rewritten
+    /// without operator path config.
+    #[test]
+    fn rewrites_on_the_spec_pinned_path() {
+        let r = rewriter();
+        let mut body =
+            BytesMut::from(&br#"{"name":"agent-1","url":"https://test.sbproxy.dev/agents/1"}"#[..]);
+        r.apply_with_path(
+            &mut body,
+            Some("application/json"),
+            "/.well-known/agent-card.json",
+            "proxy.test",
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["url"], "https://proxy.test/agents/1");
+    }
+
+    /// `rewrite_card_urls` is the shared core the configured-card
+    /// serving handler calls directly: no path or content-type gate,
+    /// just the field rewrites.
+    #[test]
+    fn rewrite_card_urls_swaps_every_routed_field() {
+        let mut card = serde_json::json!({
+            "name": "agent-1",
+            "url": "https://test.sbproxy.dev/agents/1",
+            "endpoint": "https://test.sbproxy.dev/jsonrpc",
+            "agent": {"url": "https://test.sbproxy.dev/a/run"},
+            "version": "0.3.0"
+        });
+        assert!(rewrite_card_urls(&mut card, "proxy.test"));
+        assert_eq!(card["url"], "https://proxy.test/agents/1");
+        assert_eq!(card["endpoint"], "https://proxy.test/jsonrpc");
+        assert_eq!(card["agent"]["url"], "https://proxy.test/a/run");
+        assert_eq!(card["version"], "0.3.0");
+    }
+
+    #[test]
+    fn rewrite_card_urls_reports_untouched_card() {
+        let mut card = serde_json::json!({"name": "agent-1", "url": "/relative"});
+        assert!(!rewrite_card_urls(&mut card, "proxy.test"));
+        assert_eq!(card["url"], "/relative");
     }
 
     /// Test 1: JSON body with top-level `url` pointing at the upstream

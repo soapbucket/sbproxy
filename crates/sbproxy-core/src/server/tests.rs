@@ -2737,6 +2737,59 @@ fn apply_transform_a2a_card_rewrite_falls_back_to_host_header() {
     assert_eq!(parsed["url"], "https://proxy.example.com/agents/1");
 }
 
+// --- WOR-2315: configured A2A agent-card serving helpers ---
+
+#[test]
+fn render_a2a_agent_card_advertises_proxy_host() {
+    // URL self-consistency: a gateway-served card must advertise the
+    // proxy, never the upstream URL the operator pasted. Pre-WOR-2315
+    // nothing served the configured card at all; this pins the render
+    // half of the new handler.
+    let card = serde_json::json!({
+        "name": "Reservation assistant",
+        "version": "0.3.0",
+        "url": "https://test.sbproxy.dev/",
+        "capabilities": {"streaming": true}
+    });
+    let body = render_a2a_agent_card(&card, "agent.example.com");
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed["url"], "https://agent.example.com/");
+    assert_eq!(parsed["name"], "Reservation assistant");
+    assert_eq!(parsed["capabilities"]["streaming"], true);
+}
+
+#[test]
+fn render_a2a_agent_card_without_url_serves_verbatim() {
+    let card = serde_json::json!({"name": "agent-1", "skills": [{"id": "echo"}]});
+    let body = render_a2a_agent_card(&card, "agent.example.com");
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed, card);
+}
+
+#[test]
+fn a2a_card_serve_host_prefers_configured_proxy_host() {
+    // Same precedence contract as the rewrite dispatch arm: a
+    // configured proxy_host on the origin's rewrite transform wins
+    // over the inbound Host header.
+    let transforms = vec![compiled_a2a_card_rewrite(Some("proxy.test"))];
+    assert_eq!(
+        a2a_card_serve_host(&transforms, "inbound.host"),
+        "proxy.test"
+    );
+}
+
+#[test]
+fn a2a_card_serve_host_falls_back_to_inbound_host() {
+    // No rewrite transform at all, and a rewrite transform without a
+    // proxy_host, both resolve to the inbound Host header.
+    assert_eq!(a2a_card_serve_host(&[], "inbound.host"), "inbound.host");
+    let transforms = vec![compiled_a2a_card_rewrite(None)];
+    assert_eq!(
+        a2a_card_serve_host(&transforms, "inbound.host"),
+        "inbound.host"
+    );
+}
+
 // --- Wave 4 day-5 Item 5: x-markdown-tokens header ---
 
 #[test]

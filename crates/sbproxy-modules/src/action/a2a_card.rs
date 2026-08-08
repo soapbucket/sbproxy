@@ -14,11 +14,13 @@
 //!
 //! # What the gateway uses it for
 //!
-//! * **Capability discovery**. The action can be configured to serve
-//!   the card itself at `/.well-known/agent.json` so an A2A client can
-//!   probe SBproxy and get back the agent it would route to. The
-//!   serving handler is the natural place to advertise federated
-//!   capabilities; that wire lands as a follow-up.
+//! * **Config validation**. `A2aAction::from_config` parses a
+//!   configured `agent_card` through [`AgentCard`] so a card whose
+//!   typed fields are the wrong shape refuses the config at compile
+//!   time. The serving handler in `sbproxy-core` then answers the A2A
+//!   discovery paths (`/.well-known/agent-card.json` per ratified
+//!   A2A 1.0, plus the pre-1.0 aliases) with the stored card, its
+//!   routed URLs swapped to the proxy host.
 //! * **Modality negotiation**. Before forwarding the request the
 //!   gateway runs [`AgentCard::negotiate_input`] over the caller's
 //!   `Content-Type` and [`AgentCard::negotiate_output`] over the

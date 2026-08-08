@@ -1,7 +1,8 @@
 //! A2A (Agent-to-Agent) action - proxies requests to an A2A agent endpoint.
 //!
-//! Implements the Google A2A protocol by forwarding requests to an upstream
-//! agent URL. The agent card (metadata) can be cached locally for discovery.
+//! Implements the A2A protocol by forwarding requests to an upstream
+//! agent URL. A configured agent card is served by the gateway at the
+//! A2A discovery paths (see the serving handler in `sbproxy-core`).
 
 use serde::Deserialize;
 
@@ -12,7 +13,11 @@ use super::ForwardingHeaderControls;
 pub struct A2aAction {
     /// Upstream agent URL to proxy requests to.
     pub url: String,
-    /// Optional cached agent card (JSON-RPC agent metadata).
+    /// Optional agent card served by the gateway at the A2A discovery
+    /// paths. Stored verbatim so the served body matches what the
+    /// operator authored; validated through the typed
+    /// [`super::a2a_card::AgentCard`] at config compile so a malformed
+    /// card is a boot error rather than a runtime surprise.
     #[serde(default)]
     pub agent_card: Option<serde_json::Value>,
     /// Override the `Host` header sent to the upstream agent. Defaults to
@@ -26,8 +31,20 @@ pub struct A2aAction {
 
 impl A2aAction {
     /// Build an A2aAction from a generic JSON config value.
+    ///
+    /// A configured `agent_card` is parsed through the typed
+    /// [`super::a2a_card::AgentCard`] here so a card whose typed
+    /// fields are the wrong shape (a `capabilities` list instead of
+    /// an object, a non-string `url`, a non-object card) refuses the
+    /// config at compile time. Unknown fields still round-trip via
+    /// the card's `extensions`, so a full spec card keeps compiling.
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
-        Ok(serde_json::from_value(value)?)
+        let action: Self = serde_json::from_value(value)?;
+        if let Some(card) = action.agent_card.as_ref() {
+            super::a2a_card::AgentCard::from_json(card.clone())
+                .map_err(|e| anyhow::anyhow!("invalid a2a agent_card: {e}"))?;
+        }
+        Ok(action)
     }
 
     /// Parse the URL into (host, port, tls) for Pingora upstream peer.
@@ -68,7 +85,8 @@ mod tests {
             "agent_card": {
                 "name": "TestAgent",
                 "version": "1.0",
-                "capabilities": ["text"]
+                "capabilities": {"streaming": true},
+                "defaultInputModes": ["text/plain"]
             }
         });
         let action = A2aAction::from_config(json).unwrap();
@@ -76,6 +94,57 @@ mod tests {
         let card = action.agent_card.unwrap();
         assert_eq!(card["name"], "TestAgent");
         assert_eq!(card["version"], "1.0");
+    }
+
+    /// A card whose typed fields are the wrong shape is a config
+    /// compile error, not a runtime surprise. `capabilities` is a
+    /// list here where the A2A card schema wants an object.
+    #[test]
+    fn a2a_action_rejects_malformed_agent_card() {
+        let json = serde_json::json!({
+            "type": "a2a",
+            "url": "http://localhost:9000/a2a",
+            "agent_card": {
+                "name": "TestAgent",
+                "capabilities": ["text"]
+            }
+        });
+        let err = A2aAction::from_config(json).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid a2a agent_card"),
+            "error should name the agent_card: {err}"
+        );
+    }
+
+    /// A non-object card body (the operator pasted a string) is
+    /// refused for the same reason.
+    #[test]
+    fn a2a_action_rejects_non_object_agent_card() {
+        let json = serde_json::json!({
+            "type": "a2a",
+            "url": "http://localhost:9000/a2a",
+            "agent_card": "not a card"
+        });
+        assert!(A2aAction::from_config(json).is_err());
+    }
+
+    /// Unknown card fields land on the typed card's `extensions`, so
+    /// a full spec card (provider, authentication, etc.) still
+    /// compiles and round-trips verbatim.
+    #[test]
+    fn a2a_action_accepts_card_with_unknown_fields() {
+        let json = serde_json::json!({
+            "type": "a2a",
+            "url": "http://localhost:9000/a2a",
+            "agent_card": {
+                "name": "TestAgent",
+                "provider": {"organization": "Example"},
+                "supportsAuthenticatedExtendedCard": false
+            }
+        });
+        let action = A2aAction::from_config(json).unwrap();
+        let card = action.agent_card.unwrap();
+        assert_eq!(card["provider"]["organization"], "Example");
     }
 
     #[test]

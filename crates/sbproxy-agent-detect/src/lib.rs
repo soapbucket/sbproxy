@@ -12,29 +12,36 @@
 //! Rule-pack parsing follows the public [ADRF spec] published for
 //! interoperable agent fingerprint rules.
 //!
-//! This is the first slice: the crate skeleton + the public
-//! shapes + the [`AgentScorer`] trait + a default scorer that returns
-//! [`AgentProvenance::UnsignedAnonymous`] with a score of 0. The signal
-//! extractor types ([`TlsSignals`], [`HttpSignals`], [`PayloadSignals`])
-//! are intentionally placeholder shells so later slices can fill them
-//! in without changing the public API surface that downstream code
-//! starts taking dependencies on.
+//! What the crate contains today:
 //!
-//! Later slices:
+//! - **Signal shapes**, one per layer. [`TlsSignals`] mirrors the
+//!   `sbproxy-tls` fingerprint: JA4 / JA4H / JA4S strings, ALPN list,
+//!   SNI, the post-quantum key-share tell, and JA4X from the mTLS
+//!   verify path (JA4T stays reserved until a listener-level SYN
+//!   capture exists). [`HttpSignals`] carries the header-order hash,
+//!   vendor-header detection, User-Agent bucketing, and cookie
+//!   persistence built by [`http_extractors`]. [`PayloadSignals`]
+//!   carries the PII-safe body signals built by
+//!   [`payload_extractors`]: filesystem-path leak count and
+//!   stack-trace shape (the embedding-burst field is reserved for
+//!   session-window wiring).
+//! - **ADRF rule packs** ([`rules`]): the YAML parser + matcher that
+//!   turns signals into a named `agent_id`, and the hot-reload
+//!   [`RulePackLoader`] ([`loader`]) behind an `ArcSwap` with
+//!   fail-soft reload and per-outcome metrics.
+//! - **Scorers** ([`scorer`], [`onnx`]): everything on the request
+//!   path stays behind the [`AgentScorer`] trait object. Backends are
+//!   the rule-pack loader adapter, the [`OnnxCatBoostScorer`] over
+//!   JA4-shaped features, and the neutral [`DefaultScorer`] that
+//!   returns [`AgentProvenance::UnsignedAnonymous`] with a score of 0
+//!   when nothing else is configured.
+//! - **Headless / stealth-browser indicators**
+//!   ([`headless_indicators`], WOR-817): header-only heuristics whose
+//!   score and fired-indicator list ride on [`AgentDetection`] next
+//!   to the agent verdict.
 //!
-//! - **WOR-585**: ADRF YAML rule-pack format + parser + Claude Code /
-//!   Cursor / Codex CLI / Copilot / Junie fixtures.
-//! - **WOR-586**: surface JA4 / JA4H / JA4S from `sbproxy-tls` plus
-//!   ALPN + SNI capture on [`TlsSignals`].
-//! - **WOR-587**: HTTP signal extractors (header order hash, vendor
-//!   header presence, User-Agent bucketing, cookie persistence).
-//! - **WOR-588**: hot-reload of rule packs via `ArcSwap` + SIGHUP.
-//! - **WOR-589**: expose `request.agent.*` on the CEL / Lua / JS /
-//!   WASM scripting surfaces.
-//! - **WOR-590**: JA4T (TCP fingerprint) + JA4X (cert-chain fingerprint).
-//! - **WOR-591**: payload-shaped signals (filesystem-path leakage,
-//!   stack-trace shape, embedding-burst heuristic).
-//! - **WOR-592**: ONNX CatBoost scorer + Prometheus metrics.
+//! The proxy wires the scorer in `sbproxy-core`'s request phase and
+//! exposes the result to CEL / Lua / JS / WASM as `request.agent.*`.
 //!
 //! [ADRF spec]: https://github.com/soapbucket/adrf-spec
 
