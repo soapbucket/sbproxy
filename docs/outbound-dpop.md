@@ -1,6 +1,6 @@
 # Outbound DPoP
 
-*Last modified: 2026-07-26*
+*Last modified: 2026-08-08*
 
 SBproxy can use RFC 9449 Demonstrating Proof of Possession when an origin's
 `outbound_credential` acquires or carries a sender-constrained access token.
@@ -10,7 +10,9 @@ current Bearer behavior.
 ## Configure an origin
 
 Add a `dpop` block to `client_credentials`, `token_exchange`, or
-`vault_secret`:
+`vault_secret`. On `token_exchange` the `subject_token_issuers` and
+`allowed_audiences` allowlists are required and must be non-empty; see
+[configuration.md](configuration.md#outbound_credential).
 
 ```yaml
 outbound_credential:

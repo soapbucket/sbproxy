@@ -2774,9 +2774,11 @@ async fn check_auth_with_tls_outcome(
             use sbproxy_modules::auth::BotAuthVerdict;
             // Synthesize a minimal http::Request the verifier can read
             // method / target-uri / headers from. Verification runs
-            // before the body is buffered, so we pass an empty body;
-            // signatures that cover content-digest (rare for bot
-            // crawlers) will fail and surface in the verdict.
+            // before the body is buffered, so we pass an empty body and
+            // the provider uses the deferring verify form: a signature
+            // covering `content-digest` is provisional here and its body
+            // half is completed in the request body filter, against the
+            // complete pre-transform body.
             //
             // Reconstruct the path-and-query exactly as it appeared on
             // the request line so the RFC 9421 `@target-uri` / `@path`

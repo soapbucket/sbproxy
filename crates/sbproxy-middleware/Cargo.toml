@@ -35,6 +35,12 @@ hmac = { workspace = true }
 sha2 = { workspace = true }
 base64 = { workspace = true }
 ed25519-dalek = "2"
+# ECDSA P-256 verification for the RFC 9421 `ecdsa-p256-sha256`
+# algorithm. `ring` is already the workspace's crypto provider (rustls
+# installs `ring`, and sbproxy-tls / sbproxy-vault / sbproxy-modules all
+# depend on it), so this adds an edge rather than a crate: no new code
+# enters the dependency graph and NOTICE already carries the attribution.
+ring = { workspace = true }
 hex = { workspace = true }
 bytes = { workspace = true }
 # Constant-time equality for digest / signature comparison.

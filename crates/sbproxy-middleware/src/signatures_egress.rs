@@ -101,6 +101,11 @@ pub const DEFAULT_SIGNATURE_LABEL: &str = "sig1";
 /// - [`SignatureAlgorithm::HmacSha256`]: arbitrary-length shared
 ///   secret; HMAC-SHA256 hashes oversized keys and zero-pads short
 ///   ones per RFC 2104.
+/// - [`SignatureAlgorithm::EcdsaP256Sha256`]: not supported on the
+///   signing side. The proxy verifies inbound ECDSA-P256 signatures
+///   but signs outbound requests with Ed25519 or HMAC only, so
+///   [`MessageSigner::new`] rejects it rather than silently signing
+///   with something else.
 #[derive(Debug, Clone)]
 pub struct SignerConfig {
     /// `keyid` parameter advertised on every signature. The verifier
@@ -225,6 +230,17 @@ impl MessageSigner {
                     ));
                 }
                 KeyMaterial::HmacSha256(secret)
+            }
+            // Verification-only. Refusing at construction keeps the
+            // per-request path total and means a config asking for
+            // outbound ECDSA fails where an operator sees it, rather
+            // than emitting a signature under a different algorithm.
+            SignatureAlgorithm::EcdsaP256Sha256 => {
+                return Err(SignerError::InvalidKey(
+                    "ecdsa-p256-sha256 is supported for inbound verification only; sign outbound \
+                     requests with ed25519 or hmac-sha256"
+                        .to_string(),
+                ));
             }
         };
 
@@ -399,6 +415,11 @@ fn algorithm_wire_token(algorithm: SignatureAlgorithm) -> &'static str {
     match algorithm {
         SignatureAlgorithm::Ed25519 => "ed25519",
         SignatureAlgorithm::HmacSha256 => "hmac-sha256",
+        // Unreachable in practice: `MessageSigner::new` refuses this
+        // algorithm, so no signer holding it exists to reach the wire
+        // builders. The registry token is still the right answer if it
+        // ever does, and it keeps this function total.
+        SignatureAlgorithm::EcdsaP256Sha256 => "ecdsa-p256-sha256",
     }
 }
 

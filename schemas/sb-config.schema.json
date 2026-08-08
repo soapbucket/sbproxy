@@ -9252,7 +9252,7 @@
       "additionalProperties": false
     },
     "MessageSignaturesConfig": {
-      "description": "RFC 9421 HTTP Message Signatures verification configuration.\n\nWhen `verify: true`, the proxy enforces RFC 9421 signature verification on every inbound request to this origin. Requests without a valid `Signature-Input` + `Signature` header pair matching the configured `key_id` are rejected with `401 Unauthorized` and `WWW-Authenticate: Signature` before any downstream auth provider runs.\n\n`algorithm` is `hmac_sha256` or `ed25519`. `key` carries the shared secret (HMAC) or the base64/hex-encoded raw 32-byte public key (Ed25519). `required_components` is the optional set of canonical components every accepted signature must cover. `clock_skew_seconds` defaults to 30s.\n\nSpec: <https://www.rfc-editor.org/rfc/rfc9421.html>.",
+      "description": "RFC 9421 HTTP Message Signatures verification configuration.\n\nWhen `verify: true`, the proxy enforces RFC 9421 signature verification on every inbound request to this origin. Requests without a valid `Signature-Input` + `Signature` header pair matching the configured `key_id` are rejected with `401 Unauthorized` and `WWW-Authenticate: Signature` before any downstream auth provider runs.\n\n`algorithm` is `hmac_sha256`, `ed25519`, or `ecdsa_p256_sha256`. `key` carries the shared secret (HMAC), the base64/hex-encoded raw 32-byte public key (Ed25519), or the base64/hex-encoded uncompressed SEC1 public point of 65 bytes (ECDSA P-256). `required_components` is the optional set of canonical components every accepted signature must cover. `clock_skew_seconds` defaults to 30s.\n\nA signature that covers `content-digest` also has its body checked: the proxy buffers the request body, recomputes the digest, and rejects a mismatch. The body must fit the 64 KiB replay buffer, and a larger one is rejected rather than passed unverified.\n\nSpec: <https://www.rfc-editor.org/rfc/rfc9421.html>.",
       "type": "object",
       "required": [
         "algorithm",
@@ -9266,7 +9266,7 @@
           "type": "boolean"
         },
         "algorithm": {
-          "description": "Required signature algorithm (`hmac_sha256` or `ed25519`).",
+          "description": "Required signature algorithm (`hmac_sha256`, `ed25519`, or `ecdsa_p256_sha256`).",
           "type": "string"
         },
         "key_id": {
