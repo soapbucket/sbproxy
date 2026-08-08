@@ -1977,7 +1977,7 @@ Cloud backends use the standard credential discovery for their provider (`AWS_*`
 
 ### a2a
 
-Proxy requests to an Agent-to-Agent (A2A) endpoint that speaks the Google A2A protocol. The agent card metadata can be cached locally for discovery.
+Proxy requests to an Agent-to-Agent (A2A) endpoint that speaks the A2A protocol. A configured `agent_card` is served by the gateway at the A2A discovery paths (`/.well-known/agent-card.json` per A2A 1.0, plus the `/.well-known/agent.json` and `/agent-card.json` aliases) without contacting the upstream; see [a2a-gateway.md](a2a-gateway.md#serving-the-agent-card).
 
 ```yaml
 origins:
@@ -1988,13 +1988,15 @@ origins:
       agent_card:
         name: SearchAgent
         version: "1.0"
-        capabilities: [text, tool-use]
+        capabilities:
+          streaming: true
+        defaultInputModes: [application/json, text/plain]
 ```
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `url` | string | required | Upstream agent URL. |
-| `agent_card` | object | | Cached A2A agent card (free-form JSON). |
+| `agent_card` | object | | A2A agent card served at the discovery paths. Validated against the typed card schema at config compile; unknown fields round-trip verbatim. |
 
 ### mcp
 

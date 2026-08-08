@@ -62,12 +62,12 @@ pub use transform::llms_txt::{
     ParseError as LlmsTxtParseError, Section as LlmsTxtSection,
 };
 pub use transform::{
-    A2aAgentCardRewriteConfig, A2aAgentCardRewriter, BoilerplateConfig, BoilerplateTransform,
-    CelScriptTransform, CitationBlockConfig, CitationBlockTransform, CompiledTransform,
-    DiscardTransform, EncodingTransform, FormatConvertTransform, JavaScriptTransform, JsonEnvelope,
-    JsonEnvelopeTransform, JsonProjectionTransform, JsonSchemaTransform, JsonTransform,
-    LuaJsonTransform, MarkdownProjection, NormalizeTransform, PayloadLimitTransform,
-    ReplaceStringsTransform, SseChunkingTransform, TemplateTransform, Transform, TransformConfig,
-    WasmTransform, DEFAULT_AGENT_CARD_PATHS, DEFAULT_TOKEN_BYTES_RATIO, JSON_ENVELOPE_CONTENT_TYPE,
-    JSON_ENVELOPE_PROFILE, JSON_ENVELOPE_SCHEMA_VERSION,
+    rewrite_card_urls, A2aAgentCardRewriteConfig, A2aAgentCardRewriter, BoilerplateConfig,
+    BoilerplateTransform, CelScriptTransform, CitationBlockConfig, CitationBlockTransform,
+    CompiledTransform, DiscardTransform, EncodingTransform, FormatConvertTransform,
+    JavaScriptTransform, JsonEnvelope, JsonEnvelopeTransform, JsonProjectionTransform,
+    JsonSchemaTransform, JsonTransform, LuaJsonTransform, MarkdownProjection, NormalizeTransform,
+    PayloadLimitTransform, ReplaceStringsTransform, SseChunkingTransform, TemplateTransform,
+    Transform, TransformConfig, WasmTransform, DEFAULT_AGENT_CARD_PATHS, DEFAULT_TOKEN_BYTES_RATIO,
+    JSON_ENVELOPE_CONTENT_TYPE, JSON_ENVELOPE_PROFILE, JSON_ENVELOPE_SCHEMA_VERSION,
 };

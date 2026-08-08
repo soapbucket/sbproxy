@@ -1957,6 +1957,52 @@ pub(super) async fn request_filter(
         }
     }
 
+    // --- WOR-2315 wire: configured A2A agent-card serving ---
+    //
+    // Origins whose `a2a` action carries an `agent_card` serve it at
+    // the A2A discovery paths: `/.well-known/agent-card.json` per
+    // ratified A2A 1.0 (spec section 14.3), plus the pre-1.0
+    // `/.well-known/agent.json` and `/agent-card.json` aliases the
+    // `a2a_agent_card_rewrite` transform already gates on. Like the
+    // agent-web emission above, this intercepts ONLY when the origin
+    // configured a card; an `a2a` origin without one falls through so
+    // the path proxies to the upstream (where the rewrite transform
+    // can fix up a card the upstream serves itself). Served before
+    // auth for the same reason as the neighboring discovery
+    // documents: the public agent card is A2A's discovery entry
+    // point, and A2A 1.0 keeps gated detail behind the separate
+    // authenticated-extended-card surface. Non-GET requests fall
+    // through so the card serving changes no other method's behavior.
+    //
+    // The served card advertises the proxy, not the upstream: the
+    // card's routed URL fields are swapped to the host resolved by
+    // `a2a_card_serve_host` (configured `proxy_host` on the origin's
+    // rewrite transform, else the inbound `Host` header), the same
+    // precedence the rewrite transform applies to upstream-served
+    // cards.
+    {
+        let req_path = session.req_header().uri.path();
+        if session.req_header().method == http::Method::GET
+            && sbproxy_modules::DEFAULT_AGENT_CARD_PATHS.contains(&req_path)
+        {
+            if let Some(Action::A2a(a2a)) = pipeline.actions.get(origin_idx) {
+                if let Some(card) = a2a.agent_card.as_ref() {
+                    let host = a2a_card_serve_host(
+                        pipeline
+                            .transforms
+                            .get(origin_idx)
+                            .map(Vec::as_slice)
+                            .unwrap_or_default(),
+                        ctx.hostname.as_str(),
+                    );
+                    let body = render_a2a_agent_card(card, host);
+                    send_response(session, 200, "application/json", &body).await?;
+                    return Ok(true);
+                }
+            }
+        }
+    }
+
     // --- Wave 4 / G4.5..G4.8 wire: policy-graph projections ---
     //
     // Origins with an `ai_crawl_control` policy have four

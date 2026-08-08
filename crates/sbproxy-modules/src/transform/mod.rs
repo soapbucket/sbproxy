@@ -19,7 +19,7 @@ mod markup;
 mod text;
 
 pub use a2a_agent_card_rewrite::{
-    A2aAgentCardRewriteConfig, A2aAgentCardRewriter, DEFAULT_AGENT_CARD_PATHS,
+    rewrite_card_urls, A2aAgentCardRewriteConfig, A2aAgentCardRewriter, DEFAULT_AGENT_CARD_PATHS,
 };
 pub use boilerplate::{BoilerplateConfig, BoilerplateTransform};
 pub use cel_script::{
