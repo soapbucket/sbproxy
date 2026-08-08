@@ -1,14 +1,14 @@
 # SBproxy AI gateway guide
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-08*
 
 ![the same OpenAI-shape request answered by OpenAI, Claude, and Gemini, switched only by Host header](assets/ai-gateway.gif)
 
 Three providers behind one wire format ([config](../examples/ai-gateway-quickstart/)).
 
-SBproxy includes an AI gateway that sits between your application and LLM providers. You get one API endpoint with automatic failover, cost tracking, rate limits, and programmable routing across OpenAI, Anthropic, and other providers. The proxy ships with 72 native providers behind one OpenAI-compatible API, including native Anthropic, Gemini, and Bedrock translators. You bring your own provider keys and the model name passes straight through, so you reach 200+ models without waiting on us to add them.
+SBproxy includes an AI gateway that sits between your application and LLM providers. You get one API endpoint with automatic failover, cost tracking, rate limits, and programmable routing across OpenAI, Anthropic, and other providers. The proxy ships with 72 native providers behind one OpenAI-compatible API. That count is worth unpacking: 66 of the 72 catalog entries speak the OpenAI wire format and pass through unchanged, 3 (Anthropic, Gemini, Bedrock) get in-tree request and response translation, and 3 custom-format entries (SageMaker, Oracle OCI, Watsonx) are forwarded in their native shape with no translation. You bring your own provider keys and the model name passes straight through, so you reach 200+ models without waiting on us to add them.
 
-This guide owns the end-to-end picture: provider setup, wire compatibility, routing, streaming, budgets, caching, prompt controls, and per-request attribution. Coming from an agent framework? [langchain.md](langchain.md) is the shortest path: it points LangChain's model client and MCP tools at the gateway and runs a first request end to end. Seven features get a summary here and a full page of their own: the [guardrail mesh](ai-guardrail-mesh.md), [outcome-aware routing](ai-outcome-aware-routing.md), the [AI policy plane](ai-policy-cel.md), [predictive budgets with soft-landing](ai-predictive-budget.md), the [verifiable usage ledger](ai-usage-ledger.md), [LLM-aware resilience](ai-llm-aware-resilience.md), and [AI context compression](ai-context-compression.md). For those seven, the linked page is canonical; it carries the semantics, tuning advice, and reference tables.
+This guide owns the end-to-end picture: provider setup, wire compatibility, routing, streaming, budgets, caching, prompt controls, and per-request attribution. Coming from an agent framework? [langchain.md](langchain.md) is the shortest path: it points LangChain's model client and MCP tools at the gateway and runs a first request end to end. Seven features get a summary here and a full page of their own: the [guardrail mesh](ai-guardrail-mesh.md), [outcome-aware routing](ai-outcome-aware-routing.md), the [AI policy plane](ai-policy-cel.md), [budget soft-landing](ai-predictive-budget.md), the [verifiable usage ledger](ai-usage-ledger.md), [LLM-aware resilience](ai-llm-aware-resilience.md), and [AI context compression](ai-context-compression.md). For those seven, the linked page is canonical; it carries the semantics, tuning advice, and reference tables.
 
 ## Provider setup
 
@@ -35,7 +35,7 @@ origins:
 API keys support environment variable interpolation with `${VAR_NAME}` syntax. Never put raw keys in config files. `default_model` is a per-provider field, not an `action`-level one; an action-level `default_model` key is ignored. Context compression also requires the request's effective `model` to be non-empty, so hosted requests that omit it do not run the compression pipeline.
 
 ### Native providers
-72 native providers ship in-tree alongside native translators for Anthropic, Gemini, and Bedrock. You bring your own key per provider and the `model` field passes straight through, so the gateway reaches 200+ models (and any model a provider ships next) without enumerating them. Direct adapters include `openai`, `anthropic`, `gemini`, `azure`, `bedrock`, `cohere`, `mistral`, `groq`, `deepseek`, `together`, `fireworks`, `cerebras`, `sambanova`, `nvidia`, `vertex`, `databricks`, `huggingface`, `vllm`, and `openrouter`.
+72 native providers ship in-tree. The split: 66 entries are OpenAI-format passthrough, 3 (Anthropic, Gemini, Bedrock) carry in-tree translators, and 3 custom-format entries (SageMaker, Oracle OCI, Watsonx) pass through untranslated, so clients must send those three their native body shape. You bring your own key per provider and the `model` field passes straight through, so the gateway reaches 200+ models (and any model a provider ships next) without enumerating them. Direct adapters include `openai`, `anthropic`, `gemini`, `azure`, `bedrock`, `cohere`, `mistral`, `groq`, `deepseek`, `together`, `fireworks`, `cerebras`, `sambanova`, `nvidia`, `vertex`, `databricks`, `huggingface`, `vllm`, and `openrouter`. For the AWS entries, SBproxy does not mint SigV4 signatures: `bedrock` and `sagemaker` requests must arrive with an operator-provided, pre-signed `Authorization` header, which the gateway forwards verbatim.
 
 Any model a listed provider serves works without extra config. For a self-hosted or proprietary endpoint, point `vllm` or any provider at it with a custom `base_url`. `openrouter` is available as one of the providers when you want many vendors behind a single key. See `providers.md` for the full per-provider table.
 
@@ -613,7 +613,7 @@ A single built-in guardrail block on the AI handler config covers every supporte
 
 ### Gateway-side retrieval (RAG)
 
-An `ai_proxy` route can carry a `rag:` block that makes the gateway perform retrieval itself: it embeds the request's query, runs a tenant-scoped search against a configured vector store, and injects the retrieved chunks as marked system context before dispatch. The stage order is fixed: input guardrails run over the original request, then retrieval, then context injection, then the input guardrails run again over the augmented request, and only then do the AI policy plane, budgets, caching, and routing proceed. Retrieved text therefore gets the same screening as user text, and a prompt the original pass rejects never causes embedding egress. Field reference, failure policy, limits, build features, and metrics are in [rag.md](rag.md); the runnable fixture walkthrough is [`examples/ai-rag-local/`](../examples/ai-rag-local/).
+An `ai_proxy` route can carry a `rag:` block that makes the gateway perform retrieval itself: it embeds the request's query, runs a tenant-scoped search against a configured vector store, and injects the retrieved chunks as marked system context before dispatch. The stage order is fixed: input guardrails run over the original request, then retrieval, then context injection, then the input guardrails run again over the augmented request, and only then do the AI policy plane, budgets, caching, and routing proceed. Retrieved text therefore gets the same screening as user text, and a prompt the original pass rejects never causes embedding egress. Field reference, failure policy, limits, build features, and metrics are in [rag.md](rag.md); the runnable fixture walkthrough is [`examples/ai-rag-local/`](../examples/ai-rag-local/). The optional `use_stale` retrieval cache is in-memory and per route, and it deliberately has no admin listing or purge endpoint; restarting or reloading the process is what clears it.
 
 ### Safety guardrail modes
 
@@ -1074,9 +1074,9 @@ action:
   counters, so this is admission control over usage already recorded by other
   requests, not per-frame accounting.
 
-### Soft-landing (predictive budgets)
+### Soft-landing budget thresholds
 
-A hard budget is a cliff: requests pass until the cap, then block at 100%. The opt-in `soft_landing` block tapers instead. Past `warn_at` the request is allowed and a warning is logged; past `downgrade_at` the model is rewritten to a cheaper target; at the cap the hard `on_exceed` action takes over as before.
+A hard budget is a cliff: requests pass until the cap, then block at 100%. The opt-in `soft_landing` block tapers instead. It is a ladder of fixed threshold fractions checked against the current window's accumulated spend before each dispatch; nothing forecasts future spend. Past `warn_at` the request is allowed and a warning is logged; past `downgrade_at` the model is rewritten to a cheaper target; at the cap the hard `on_exceed` action takes over as before.
 
 ```yaml
 budget:
@@ -1766,7 +1766,12 @@ output throughput, and average inter-token latency are recorded in
 Provider-enforced JSON output works where the upstream supports it:
 `response_format` passes through to OpenAI-compatible upstreams (the Gemini
 translator drops it as an unsupported knob). The proxy does not re-validate
-the returned JSON, and there is no `structured_output:` config key.
+the returned JSON, and there is no `structured_output:` config key. When you
+need the gateway itself to enforce a shape, that is what the
+[schema guardrail](#schema-guardrail) is for: a `type: schema` output
+guardrail validates the response against a compiled JSON Schema and blocks
+on mismatch, independent of whatever the provider did with
+`response_format`.
 
 ## OpenAI surface-area routing
 
@@ -1993,7 +1998,7 @@ action:
       signing_seed_hex: ${LEDGER_SIGNING_SEED_HEX}   # optional; enables signing
 ```
 
-Verify the chain (and, with the seed, the signatures) with `sbproxy ai ledger verify <path>`. The entry format, dedup semantics, durability guarantees, and the verify CLI are in [ai-usage-ledger.md](ai-usage-ledger.md).
+Verify the chain (and, with the seed, the signatures) with `sbproxy ai ledger verify <path>`. The proxy writes and verifies the chain locally; publishing entries to an external transparency log is out of scope, so anchoring to one is something you build on top of the same entries. The entry format, dedup semantics, durability guarantees, and the verify CLI are in [ai-usage-ledger.md](ai-usage-ledger.md).
 
 ## Token usage metrics
 
@@ -2263,7 +2268,7 @@ To help you get started with the AI gateway, we provide several runnable example
 
 | Example | What it is | How to use it | Outcome |
 |---------|------------|---------------|---------|
-| [`ai-bedrock-direct`](../examples/ai-bedrock-direct/) | Direct integration with AWS Bedrock. | Configure `type: bedrock` with AWS credentials. | Exposes Bedrock securely via the standard OpenAI-compatible API. |
+| [`ai-bedrock-direct`](../examples/ai-bedrock-direct/) | Direct integration with AWS Bedrock. | Configure `type: bedrock`; SigV4 signing is operator-provided, and the gateway forwards the signed `Authorization` header verbatim. | Exposes Bedrock via the standard OpenAI-compatible API. |
 | [`ai-gemini-direct`](../examples/ai-gemini-direct/) | Direct integration with Google Gemini. | Configure `type: gemini` with a Gemini API key. | Seamless integration with Gemini models without client SDK changes. |
 | [`ai-model-group`](../examples/ai-model-group/) | Model pooling. | Use `model_group` in routing config. | Requests load-balance automatically across multiple underlying models. |
 | [`ai-streaming`](../examples/ai-streaming/) | Streaming LLM completions. | Send requests with `stream: true`. | SBproxy streams Server-Sent Events (SSE) securely back to the client. |

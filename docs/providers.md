@@ -1,19 +1,19 @@
 # Supported providers
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-08*
 
-SBproxy ships native adapters for 72 LLM providers behind one OpenAI-compatible API. You bring your own key per provider, and the `model` field passes straight through to the upstream, so the gateway reaches 200+ models (and whatever a provider ships next) without enumerating them. Most adapters speak the OpenAI wire format and pass through unchanged. Anthropic, Bedrock, and Gemini use in-tree translators for OpenAI-shaped chat or embedding clients; SageMaker, Oracle, Watsonx, and other `Custom` formats pass through in their native shape.
+SBproxy ships native adapters for 72 LLM providers behind one OpenAI-compatible API. The 72 breaks down as: 66 entries that speak the OpenAI wire format and pass through unchanged, 3 with in-tree request and response translators (Anthropic, Gemini, Bedrock), and 3 `Custom`-format entries (SageMaker, Oracle, Watsonx) that pass through in their native shape with no translation. You bring your own key per provider, and the `model` field passes straight through to the upstream, so the gateway reaches 200+ models (and whatever a provider ships next) without enumerating them.
 
-The catalog is plain YAML and you can extend it yourself: see [Extending the provider catalog](#extending-the-provider-catalog).
-
-This page is a catalog, not a walkthrough. The table below is hand-maintained against
+Read the table below for what it is: a catalog, not a test report. It is hand-maintained against
 `crates/sbproxy-ai/data/ai_providers.yml`, and it records what each entry says about a provider,
-not the result of calling one: base URLs and auth headers change on the provider's schedule and
+not the result of calling one. Base URLs and auth headers change on the provider's schedule and
 every row would need a live account to exercise. For a request that actually crosses the gateway,
 [ai-gateway.md](ai-gateway.md) is the reference and
 [`examples/ai-gateway-quickstart/`](../examples/ai-gateway-quickstart/) is the shortest runnable
 config. [vercel-ai-sdk.md](vercel-ai-sdk.md), [langchain.md](langchain.md),
 [pydantic-ai.md](pydantic-ai.md), and [mastra.md](mastra.md) each ship a runnable example that
 needs no provider account.
+
+The catalog is plain YAML and you can extend it yourself: see [Extending the provider catalog](#extending-the-provider-catalog).
 
 ## Native providers
 
@@ -104,7 +104,7 @@ The `cloudflare`, `vertex`, `runpod`, `azure_foundry`, and `snowflake` defaults 
 
 Override `base_url` to use a region other than us-south for watsonx, or to point Bedrock and SageMaker at a non-default region.
 
-[^sigv4]: Bedrock and SageMaker requests must be signed with SigV4 before reaching SBproxy. The gateway forwards the signed `Authorization` header verbatim.
+[^sigv4]: SBproxy does not compute AWS SigV4 signatures. Bedrock and SageMaker requests must arrive already signed, by your AWS SDK, a signing sidecar, or other operator tooling; the gateway forwards the signed `Authorization` header verbatim. Gateways that sign for you do so by holding your AWS access keys; SBproxy holds no AWS credentials on this path.
 
 [^ollama]: Ollama allows blank API keys; SBproxy forwards an empty Bearer token if `api_key` is unset.
 
