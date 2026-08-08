@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use bytes::BytesMut;
 use compact_str::CompactString;
-use sbproxy_modules::policy::{AgentBudgetGuard, ConcurrentLimitGuard};
+use sbproxy_modules::policy::{AgentBudgetGuard, AgentBudgetTokenSink, ConcurrentLimitGuard};
 use sbproxy_modules::transform::{CelHeaderMutation, MarkdownProjection};
 use sbproxy_modules::{ContentShape, RateLimitInfo};
 use sbproxy_observe::UserIdSource;
@@ -415,6 +415,13 @@ pub struct RequestContext {
     /// as `concurrent_limit_guards`: each guard tracks an in-flight
     /// agent-keyed slot and releases it when the request finishes.
     pub agent_budget_guards: Vec<AgentBudgetGuard>,
+    /// Post-response token sinks for `agent_budget` policies that
+    /// admitted this request with a `tokens_per_hour` cap. The
+    /// enforcer stashes one per policy at admission; the completion
+    /// path drains them through
+    /// [`RequestContext::charge_agent_budget_tokens`] once the
+    /// response's measured token usage is known.
+    pub agent_budget_token_sinks: Vec<AgentBudgetTokenSink>,
 
     // --- Request validator state ---
     /// Set by `check_policies` when a `RequestValidator` policy is
@@ -1552,6 +1559,23 @@ impl RequestContext {
         }
     }
 
+    /// Charge `tokens` upstream tokens against every `agent_budget`
+    /// policy that admitted this request under a `tokens_per_hour`
+    /// cap (WOR-2312).
+    ///
+    /// Drains the sinks so the request is charged exactly once even
+    /// though both completion seams call it: stream close in
+    /// `relay_ai_stream` for streamed responses, and the `logging`
+    /// phase for buffered ones. Whichever runs first with a known
+    /// token count takes the charge. Zero tokens drain the sinks
+    /// without charging anything, so a response that reported no
+    /// usage consumes nothing.
+    pub fn charge_agent_budget_tokens(&mut self, tokens: u64) {
+        for sink in std::mem::take(&mut self.agent_budget_token_sinks) {
+            sink.consume(tokens);
+        }
+    }
+
     /// Create a new, empty request context.
     pub fn new() -> Self {
         Self {
@@ -1580,6 +1604,7 @@ impl RequestContext {
             concurrent_limit_guards: Vec::new(),
             concurrent_limit_denial_body: None,
             agent_budget_guards: Vec::new(),
+            agent_budget_token_sinks: Vec::new(),
             validate_request_body: false,
             dynamic_request_body_plan: crate::request_body_plan::DynamicRequestBodyPlan::default(),
             request_body_buf: None,

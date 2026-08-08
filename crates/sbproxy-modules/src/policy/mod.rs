@@ -53,7 +53,7 @@ pub use a2a::{
 };
 pub use agent_budget::{
     AgentBudgetDecision, AgentBudgetExceedReason, AgentBudgetGuard, AgentBudgetOnAnonymous,
-    AgentBudgetOnExceed, AgentBudgetPolicy,
+    AgentBudgetOnExceed, AgentBudgetPolicy, AgentBudgetTokenSink,
 };
 pub use ai_crawl::{
     accept_implies_multi_rail, parse_accept_payment, parse_crawler_price_header,

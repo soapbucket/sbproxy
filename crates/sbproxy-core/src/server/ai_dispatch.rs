@@ -11251,6 +11251,24 @@ pub(super) async fn relay_ai_stream(
         }
     }
 
+    // WOR-2312: charge the streamed response's aggregated token usage
+    // into the agent_budget hourly window. Streaming usage is only
+    // known here, at end of stream, where the budget and router
+    // accounting above read the same parser snapshot; the context
+    // sinks drain on first charge, so the logging-phase seam (which
+    // covers buffered responses) cannot charge this stream twice. A
+    // stream with no parseable usage frame leaves the sinks for the
+    // logging phase, which drains them with zero.
+    if (200..300).contains(&status) {
+        if let Some(tokens) = usage_parser.as_ref().and_then(|parser| parser.snapshot()) {
+            if let Some(c) = ctx.as_mut() {
+                c.charge_agent_budget_tokens(
+                    (tokens.prompt_tokens as u64).saturating_add(tokens.completion_tokens as u64),
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 

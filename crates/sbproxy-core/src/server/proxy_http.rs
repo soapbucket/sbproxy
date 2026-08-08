@@ -6323,6 +6323,18 @@ impl ProxyHttp for SbProxy {
                     super::ai_dispatch::key_rate_limiter().record_tokens(bucket, used);
                 }
             }
+            // WOR-2312: charge this response's measured token usage
+            // into the agent_budget hourly window, on the same
+            // completion-time seam as the key TPM charge above, so
+            // the next request from the same agent is checked against
+            // the spent window. Streamed responses already charged at
+            // stream close in `relay_ai_stream`, where the SSE usage
+            // frame aggregates; the sinks drain on first charge, so
+            // the two seams cannot double count. A response that
+            // reported no usage drains the sinks with zero and
+            // consumes nothing.
+            let agent_budget_used = ctx.ai_tokens_in.unwrap_or(0) + ctx.ai_tokens_out.unwrap_or(0);
+            ctx.charge_agent_budget_tokens(agent_budget_used);
             if ctx.ai_tokens_in.is_none() {
                 if let Some(est) = ctx.ai_prompt_tokens_est {
                     if est > 0 {

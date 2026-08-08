@@ -17,11 +17,16 @@
 //! ## Knobs
 //!
 //! * `requests_per_minute`: token bucket refill rate, per `agent_id`.
-//! * `tokens_per_hour`: rolling LLM-token budget per `agent_id`. The
-//!   policy exposes the bookkeeping surface; upstream token accounting
-//!   is wired in via [`AgentBudgetPolicy::consume_tokens`] once the
-//!   AI-usage tracker reports actual usage. Configuring the field
-//!   without that wiring is a no-op for slice 1.
+//! * `tokens_per_hour`: rolling hourly LLM-token budget per
+//!   `agent_id`. Enforcement is two-phase because a response's token
+//!   count is only known after the response completes: admission
+//!   checks the accumulated counter before dispatch, and the gateway
+//!   charges the measured usage via
+//!   [`AgentBudgetPolicy::consume_tokens`] once the provider reports
+//!   it (buffered responses at usage extraction, streamed responses
+//!   when the end-of-stream usage frame aggregates). A request over
+//!   the cap is refused at admission with the same verdict mapping
+//!   as `requests_per_minute`.
 //! * `burst`: max simultaneous in-flight requests per `agent_id`. The
 //!   acquired permit is returned as an RAII guard so the slot
 //!   releases when the request completes.
@@ -32,13 +37,14 @@
 //!   Defaults to `skip` (no enforcement); operators that explicitly
 //!   want shared-bucket fallback set `shared`.
 //!
-//! ## Out of scope for slice 1
+//! ## Out of scope
 //!
-//! * Cluster-shared budgets. Each proxy enforces its own local view.
-//! * Upstream token accounting. The token bucket exists in the API
-//!   but is only consumed when the AI gateway calls
-//!   [`AgentBudgetPolicy::consume_tokens`]. A follow-up wires that
-//!   call into `sbproxy-ai`'s usage tracker.
+//! * Cluster-shared budgets. Each proxy enforces its own local view,
+//!   matching `requests_per_minute`, which has no shared-store path
+//!   either.
+//! * Token estimates for responses that never report usage. A
+//!   response with no parseable `usage` block, and any surface that
+//!   cannot report one, consumes zero rather than an invented count.
 
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -290,6 +296,34 @@ impl Drop for AgentBudgetGuard {
     }
 }
 
+/// Post-response half of the token budget: the policy handle plus the
+/// agent key admission resolved, stashed on the request context by the
+/// dispatcher's enforcer and drained exactly once when the response's
+/// measured token usage is known.
+///
+/// Capturing the key at admission time keeps consumption keyed exactly
+/// the way the pre-flight check was keyed, even if the context's agent
+/// resolution were to change between the two phases.
+pub struct AgentBudgetTokenSink {
+    policy: Arc<AgentBudgetPolicy>,
+    agent_id: Option<String>,
+}
+
+impl AgentBudgetTokenSink {
+    /// Bind a sink to `policy`, keyed by the `agent_id` the admission
+    /// check ran under.
+    pub fn new(policy: Arc<AgentBudgetPolicy>, agent_id: Option<String>) -> Self {
+        Self { policy, agent_id }
+    }
+
+    /// Charge `n` upstream tokens against the hourly budget under the
+    /// captured agent key. Zero is a no-op, so a response that
+    /// reported no usage consumes nothing.
+    pub fn consume(&self, n: u64) {
+        self.policy.consume_tokens(self.agent_id.as_deref(), n);
+    }
+}
+
 /// `agent_budget` policy: per-`agent_id` semantic rate limiter.
 pub struct AgentBudgetPolicy {
     /// Token-bucket refill rate in requests per minute, per agent.
@@ -430,10 +464,12 @@ impl AgentBudgetPolicy {
 
     /// Record that `n` upstream tokens were consumed by `agent_id`.
     ///
-    /// Wired into the AI gateway's usage tracker so the hourly token
-    /// budget reflects actual model usage. `None` agent ids are
-    /// ignored under `on_anonymous: skip`; under `shared` they
-    /// charge the shared bucket.
+    /// Called from the gateway's response-completion paths (via
+    /// [`AgentBudgetTokenSink`]) once the provider reports actual
+    /// usage, so the hourly budget the next admission checks reflects
+    /// real model spend. `None` agent ids are ignored under
+    /// `on_anonymous: skip`; under `shared` they charge the shared
+    /// bucket.
     pub fn consume_tokens(&self, agent_id: Option<&str>, n: u64) {
         if n == 0 || self.tokens_per_hour.is_none() {
             return;
@@ -796,9 +832,10 @@ mod tests {
 
     #[test]
     fn tokens_per_hour_is_noop_without_consumption() {
-        // Slice 1 contract: configuring tokens_per_hour without
-        // wiring `consume_tokens` is a no-op. Admission must not
-        // depend on the limit until somebody charges the bucket.
+        // Admission must not depend on the limit until somebody
+        // charges the bucket: a deployment whose responses never
+        // report usage (or that serves no AI traffic at all) keeps
+        // admitting under any cap.
         let p = policy(serde_json::json!({
             "requests_per_minute": 100,
             "tokens_per_hour": 1,
@@ -809,6 +846,109 @@ mod tests {
             let (d, _g) = p.try_admit_at(Some("agent"), start);
             assert_eq!(d, AgentBudgetDecision::Allow);
         }
+    }
+
+    #[test]
+    fn token_consumption_accumulates_until_the_cap_crosses() {
+        let p = policy(serde_json::json!({
+            "tokens_per_hour": 100,
+            "on_exceed": "deny"
+        }));
+        let start = Instant::now();
+        // Two responses inside one window add up; the check refuses
+        // only once the running total reaches the cap.
+        p.consume_tokens(Some("agent"), 60);
+        let (d, _g) = p.try_admit_at(Some("agent"), start);
+        assert_eq!(d, AgentBudgetDecision::Allow, "60 of 100 still admits");
+        p.consume_tokens(Some("agent"), 40);
+        let (d, _g) = p.try_admit_at(Some("agent"), start);
+        assert!(matches!(
+            d,
+            AgentBudgetDecision::Deny {
+                reason: AgentBudgetExceedReason::TokensPerHour
+            }
+        ));
+    }
+
+    #[test]
+    fn token_window_rolls_over_after_an_hour() {
+        let p = policy(serde_json::json!({
+            "tokens_per_hour": 100,
+            "on_exceed": "deny"
+        }));
+        let start = Instant::now();
+        p.consume_tokens(Some("agent"), 100);
+        let (d, _g) = p.try_admit_at(Some("agent"), start);
+        assert!(matches!(
+            d,
+            AgentBudgetDecision::Deny {
+                reason: AgentBudgetExceedReason::TokensPerHour
+            }
+        ));
+        // One hour later the fixed window resets and the agent gets a
+        // fresh budget.
+        let later = start + Duration::from_secs(3601);
+        let (d, _g) = p.try_admit_at(Some("agent"), later);
+        assert_eq!(d, AgentBudgetDecision::Allow);
+    }
+
+    #[test]
+    fn zero_token_responses_consume_nothing() {
+        let p = policy(serde_json::json!({
+            "tokens_per_hour": 1,
+            "on_exceed": "deny"
+        }));
+        // A surface that cannot report usage charges zero; even under
+        // a one-token cap the agent stays admitted.
+        for _ in 0..50 {
+            p.consume_tokens(Some("agent"), 0);
+        }
+        let (d, _g) = p.try_admit_at(Some("agent"), Instant::now());
+        assert_eq!(d, AgentBudgetDecision::Allow);
+    }
+
+    #[test]
+    fn requests_per_minute_is_unchanged_by_token_consumption() {
+        let p = policy(serde_json::json!({
+            "requests_per_minute": 2,
+            "tokens_per_hour": 1000,
+            "on_exceed": "deny"
+        }));
+        let start = Instant::now();
+        // Charging the hourly budget must not drain the per-minute
+        // bucket: the two sub-budgets stay independent.
+        p.consume_tokens(Some("agent"), 500);
+        let (d1, _g1) = p.try_admit_at(Some("agent"), start);
+        let (d2, _g2) = p.try_admit_at(Some("agent"), start);
+        let (d3, _g3) = p.try_admit_at(Some("agent"), start);
+        assert_eq!(d1, AgentBudgetDecision::Allow);
+        assert_eq!(d2, AgentBudgetDecision::Allow);
+        assert!(matches!(
+            d3,
+            AgentBudgetDecision::Deny {
+                reason: AgentBudgetExceedReason::RequestsPerMinute
+            }
+        ));
+    }
+
+    #[test]
+    fn token_sink_charges_the_key_it_was_built_with() {
+        let p = Arc::new(policy(serde_json::json!({
+            "tokens_per_hour": 100,
+            "on_exceed": "deny"
+        })));
+        let sink = AgentBudgetTokenSink::new(Arc::clone(&p), Some("agent".to_string()));
+        sink.consume(100);
+        let (d, _g) = p.try_admit_at(Some("agent"), Instant::now());
+        assert!(matches!(
+            d,
+            AgentBudgetDecision::Deny {
+                reason: AgentBudgetExceedReason::TokensPerHour
+            }
+        ));
+        // A different agent's budget is untouched by the charge.
+        let (d, _g) = p.try_admit_at(Some("other"), Instant::now());
+        assert_eq!(d, AgentBudgetDecision::Allow);
     }
 
     #[test]
