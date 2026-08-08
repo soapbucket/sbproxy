@@ -927,16 +927,12 @@ fn unix_now() -> u64 {
 }
 
 /// Constant-time byte slice comparison.  Returns true iff `a == b`.
-/// Avoids short-circuit on length mismatch by always visiting every byte.
+/// Delegates to `subtle` so the no-early-exit property rests on an
+/// audited implementation. Branches on length only, which is not
+/// secret for the credentials compared here.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    use subtle::ConstantTimeEq as _;
+    a.len() == b.len() && bool::from(a.ct_eq(b))
 }
 
 /// Decode a base64-encoded `user:password` string from an HTTP Basic Auth header.
@@ -7897,5 +7893,13 @@ origins:
             None,
         );
         assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn constant_time_eq_equal_unequal_and_length_mismatch() {
+        assert!(constant_time_eq(b"admin-password", b"admin-password"));
+        assert!(!constant_time_eq(b"admin-password", b"admin-passworX"));
+        assert!(!constant_time_eq(b"admin-password", b"admin-passwor"));
+        assert!(constant_time_eq(b"", b""));
     }
 }

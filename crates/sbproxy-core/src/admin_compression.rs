@@ -868,14 +868,8 @@ fn require_admin(
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut difference = 0_u8;
-    for (left, right) in left.iter().zip(right.iter()) {
-        difference |= left ^ right;
-    }
-    difference == 0
+    use subtle::ConstantTimeEq as _;
+    left.len() == right.len() && bool::from(left.ct_eq(right))
 }
 
 fn role_label(role: AdminRole) -> &'static str {
@@ -932,7 +926,7 @@ fn service_unavailable(error: &str) -> AdminCompressionResponse {
 #[cfg(test)]
 mod tests {
     use super::{
-        dispatch_with_registry, CompressionAdminRegistry, CompressionAuditError,
+        constant_time_eq, dispatch_with_registry, CompressionAdminRegistry, CompressionAuditError,
         CompressionAuditEvent, CompressionAuditSink,
     };
     use crate::admin::AdminPrincipal;
@@ -1778,5 +1772,13 @@ mod tests {
         assert_eq!(request.limit, 500);
         assert!(request.tenant_id.is_none());
         assert!(request.origin.is_none());
+    }
+
+    #[test]
+    fn constant_time_eq_equal_unequal_and_length_mismatch() {
+        assert!(constant_time_eq(b"csrf-token", b"csrf-token"));
+        assert!(!constant_time_eq(b"csrf-token", b"csrf-tokeX"));
+        assert!(!constant_time_eq(b"csrf-token", b"csrf-toke"));
+        assert!(constant_time_eq(b"", b""));
     }
 }

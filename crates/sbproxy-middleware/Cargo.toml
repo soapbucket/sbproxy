@@ -37,6 +37,8 @@ base64 = { workspace = true }
 ed25519-dalek = "2"
 hex = { workspace = true }
 bytes = { workspace = true }
+# Constant-time equality for digest / signature comparison.
+subtle = { workspace = true }
 
 # Response compression backends
 flate2 = "1"

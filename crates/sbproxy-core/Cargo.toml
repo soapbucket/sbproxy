@@ -259,6 +259,9 @@ sha2.workspace = true
 zeroize.workspace = true
 hmac.workspace = true
 hex.workspace = true
+# Constant-time equality for admin Basic Auth, session MAC, and CSRF
+# token comparison.
+subtle.workspace = true
 chrono.workspace = true
 
 # WOR-227 scaffold. Optional; only pulled in by the `embed-admin-ui`

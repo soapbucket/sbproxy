@@ -126,14 +126,8 @@ pub fn derive_key_fingerprint(secret: &str) -> String {
 /// per-user so this is acceptable.
 #[inline]
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    use subtle::ConstantTimeEq as _;
+    a.len() == b.len() && bool::from(a.ct_eq(b))
 }
 
 #[inline]
@@ -152,7 +146,9 @@ pub enum Auth {
     BasicAuth(BasicAuthProvider),
     /// Bearer token authentication.
     Bearer(BearerAuth),
-    /// JWT validation (structure + expiry, signature check deferred).
+    /// JWT validation: signature (shared-secret HMAC or JWKS public
+    /// key), expiry, and any configured issuer / audience / claim
+    /// constraints. See [`JwtAuth::check_request`].
     Jwt(JwtAuth),
     /// HTTP Digest Authentication. Implements the subset of RFC 7616
     /// the proxy actually exposes (MD5 digest with `qop=auth`) and
@@ -727,8 +723,12 @@ impl JwtAuth {
     /// Expects `Authorization: Bearer <jwt>`. Returns false on any
     /// validation failure (missing header, wrong scheme, bad signature,
     /// expired token, unmet claim, unconfigured verification key).
-    pub fn check_request(&self, headers: &http::HeaderMap) -> bool {
-        self.check_request_with_subject(headers).is_some()
+    ///
+    /// Async because an unknown JWKS `kid` triggers a rate-limited
+    /// refetch of the key set over the network; the fetch must not
+    /// park the Tokio worker the request is running on.
+    pub async fn check_request(&self, headers: &http::HeaderMap) -> bool {
+        self.check_request_with_subject(headers).await.is_some()
     }
 
     /// Validate the request's JWT and, on success, return
@@ -737,8 +737,8 @@ impl JwtAuth {
     /// carried no `sub`). Returns `None` on any validation failure.
     /// The wrapper preserves [`Self::check_request`] semantics for
     /// callers that only need a yes/no answer.
-    pub fn check_request_with_subject(&self, headers: &http::HeaderMap) -> Option<String> {
-        self.validate_request(headers).map(|(sub, _)| sub)
+    pub async fn check_request_with_subject(&self, headers: &http::HeaderMap) -> Option<String> {
+        self.validate_request(headers).await.map(|(sub, _)| sub)
     }
 
     /// Validate the request's JWT and, on success, return a
@@ -746,12 +746,13 @@ impl JwtAuth {
     /// roles pulled off `roles_claim`, and the full claims payload
     /// on `attrs.claims`. `sub` is the JWT `sub` claim (empty when
     /// the token validated but carried no `sub`).
-    pub fn check_request_with_principal(
+    pub async fn check_request_with_principal(
         &self,
         headers: &http::HeaderMap,
         tenant_id: TenantId,
     ) -> Option<Principal> {
         self.check_request_with_claims(headers, tenant_id)
+            .await
             .map(|(p, _)| p)
     }
 
@@ -760,12 +761,12 @@ impl JwtAuth {
     /// constraint verifier (RFC 9449 DPoP, RFC 8705 mTLS-bound)
     /// can read the `cnf` claim (`cnf.jkt` for DPoP, `cnf.x5t#S256`
     /// for mTLS-bound).
-    pub fn check_request_with_claims(
+    pub async fn check_request_with_claims(
         &self,
         headers: &http::HeaderMap,
         tenant_id: TenantId,
     ) -> Option<(Principal, serde_json::Value)> {
-        let (sub, claims) = self.validate_request(headers)?;
+        let (sub, claims) = self.validate_request(headers).await?;
         let mut attrs = self.attrs.to_principal_attrs();
         // First-name-wins resolution across `roles_claim`. The
         // configured names are checked in declaration order; the
@@ -807,12 +808,15 @@ impl JwtAuth {
     /// Internal validation that returns both the resolved `sub` and
     /// the full claims `Value` so the principal path can pull roles
     /// and verbatim claims off the same decoded payload.
-    fn validate_request(&self, headers: &http::HeaderMap) -> Option<(String, serde_json::Value)> {
+    async fn validate_request(
+        &self,
+        headers: &http::HeaderMap,
+    ) -> Option<(String, serde_json::Value)> {
         let auth_value = headers
             .get(http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())?;
         let token = auth_value.strip_prefix("Bearer ")?;
-        self.validate_token_extract_claims(token)
+        self.validate_token_extract_claims(token).await
     }
 
     /// Return the `jsonwebtoken` algorithms that should be accepted for
@@ -850,7 +854,10 @@ impl JwtAuth {
     /// return the resolved `sub` claim plus the full decoded claims
     /// payload on success (empty string when the token validated but
     /// carried no `sub`). Returns `None` on any validation failure.
-    fn validate_token_extract_claims(&self, token: &str) -> Option<(String, serde_json::Value)> {
+    async fn validate_token_extract_claims(
+        &self,
+        token: &str,
+    ) -> Option<(String, serde_json::Value)> {
         use jsonwebtoken::{decode, DecodingKey, Validation};
 
         let algorithms = self.allowed_algorithms();
@@ -875,12 +882,20 @@ impl JwtAuth {
             if let Some(key) = cache.lookup_decoding_key(header.kid.as_deref()) {
                 key
             } else {
-                let client = reqwest::blocking::Client::builder()
+                // Async client: this runs on a Pingora/Tokio worker, and
+                // a blocking send here would park the worker for up to
+                // the 10s timeout while the IdP dawdles. Same 10s
+                // overall timeout the blocking client used to set.
+                let client = reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(10))
                     .build()
                     .ok()?;
                 cache
-                    .lookup_decoding_key_with_unknown_kid_refresh(header.kid.as_deref(), &client)?
+                    .lookup_decoding_key_with_unknown_kid_refresh_async(
+                        header.kid.as_deref(),
+                        &client,
+                    )
+                    .await?
             }
         } else {
             return None;
@@ -1855,19 +1870,19 @@ mod tests {
             + 3600
     }
 
-    #[test]
-    fn jwt_valid_token_with_matching_secret() {
+    #[tokio::test]
+    async fn jwt_valid_token_with_matching_secret() {
         let secret = "shared-secret-abc";
         let auth = jwt_auth(Some(secret));
         let token = sign_jwt(
             &serde_json::json!({"sub": "user1", "exp": future_epoch()}),
             secret,
         );
-        assert!(auth.check_request(&jwt_headers(&token)));
+        assert!(auth.check_request(&jwt_headers(&token)).await);
     }
 
-    #[test]
-    fn jwt_rejected_when_no_secret_configured() {
+    #[tokio::test]
+    async fn jwt_rejected_when_no_secret_configured() {
         // Previously the provider accepted any well-formed JWT; with real
         // signature verification, lack of configured key material means
         // "no token is trusted". Fail-closed is the correct default.
@@ -1876,32 +1891,32 @@ mod tests {
             &serde_json::json!({"sub": "user1", "exp": future_epoch()}),
             "irrelevant",
         );
-        assert!(!auth.check_request(&jwt_headers(&token)));
+        assert!(!auth.check_request(&jwt_headers(&token)).await);
     }
 
-    #[test]
-    fn jwt_rejected_with_wrong_secret() {
+    #[tokio::test]
+    async fn jwt_rejected_with_wrong_secret() {
         let auth = jwt_auth(Some("server-secret"));
         let token = sign_jwt(
             &serde_json::json!({"sub": "user1", "exp": future_epoch()}),
             "attacker-secret",
         );
-        assert!(!auth.check_request(&jwt_headers(&token)));
+        assert!(!auth.check_request(&jwt_headers(&token)).await);
     }
 
-    #[test]
-    fn jwt_expired_token() {
+    #[tokio::test]
+    async fn jwt_expired_token() {
         let secret = "shared-secret-abc";
         let auth = jwt_auth(Some(secret));
         let token = sign_jwt(
             &serde_json::json!({"sub": "user1", "exp": 1000_u64}),
             secret,
         );
-        assert!(!auth.check_request(&jwt_headers(&token)));
+        assert!(!auth.check_request(&jwt_headers(&token)).await);
     }
 
-    #[test]
-    fn jwt_wrong_issuer() {
+    #[tokio::test]
+    async fn jwt_wrong_issuer() {
         let secret = "k";
         let mut auth = jwt_auth(Some(secret));
         auth.issuer = Some("expected-issuer".to_string());
@@ -1909,11 +1924,11 @@ mod tests {
             &serde_json::json!({"iss": "wrong-issuer", "exp": future_epoch()}),
             secret,
         );
-        assert!(!auth.check_request(&jwt_headers(&token)));
+        assert!(!auth.check_request(&jwt_headers(&token)).await);
     }
 
-    #[test]
-    fn jwt_correct_issuer() {
+    #[tokio::test]
+    async fn jwt_correct_issuer() {
         let secret = "k";
         let mut auth = jwt_auth(Some(secret));
         auth.issuer = Some("my-issuer".to_string());
@@ -1921,11 +1936,11 @@ mod tests {
             &serde_json::json!({"iss": "my-issuer", "exp": future_epoch()}),
             secret,
         );
-        assert!(auth.check_request(&jwt_headers(&token)));
+        assert!(auth.check_request(&jwt_headers(&token)).await);
     }
 
-    #[test]
-    fn jwt_wrong_audience() {
+    #[tokio::test]
+    async fn jwt_wrong_audience() {
         let secret = "k";
         let mut auth = jwt_auth(Some(secret));
         auth.audience = Some("my-api".to_string());
@@ -1933,11 +1948,11 @@ mod tests {
             &serde_json::json!({"aud": "other-api", "exp": future_epoch()}),
             secret,
         );
-        assert!(!auth.check_request(&jwt_headers(&token)));
+        assert!(!auth.check_request(&jwt_headers(&token)).await);
     }
 
-    #[test]
-    fn jwt_missing_required_claim() {
+    #[tokio::test]
+    async fn jwt_missing_required_claim() {
         let secret = "k";
         let mut claims = HashMap::new();
         claims.insert("role".to_string(), serde_json::json!("admin"));
@@ -1947,11 +1962,11 @@ mod tests {
             &serde_json::json!({"sub": "user1", "exp": future_epoch()}),
             secret,
         );
-        assert!(!auth.check_request(&jwt_headers(&token)));
+        assert!(!auth.check_request(&jwt_headers(&token)).await);
     }
 
-    #[test]
-    fn jwt_matching_required_claim() {
+    #[tokio::test]
+    async fn jwt_matching_required_claim() {
         let secret = "k";
         let mut claims = HashMap::new();
         claims.insert("role".to_string(), serde_json::json!("admin"));
@@ -1961,36 +1976,47 @@ mod tests {
             &serde_json::json!({"role": "admin", "exp": future_epoch()}),
             secret,
         );
-        assert!(auth.check_request(&jwt_headers(&token)));
+        assert!(auth.check_request(&jwt_headers(&token)).await);
     }
 
-    #[test]
-    fn jwt_malformed_not_three_parts() {
+    #[tokio::test]
+    async fn jwt_malformed_not_three_parts() {
         let auth = jwt_auth(Some("k"));
         let mut headers = http::HeaderMap::new();
         headers.insert(
             http::header::AUTHORIZATION,
             "Bearer not.a.valid.jwt.token".parse().unwrap(),
         );
-        assert!(!auth.check_request(&headers));
+        assert!(!auth.check_request(&headers).await);
     }
 
-    #[test]
-    fn jwt_malformed_bad_base64() {
+    #[tokio::test]
+    async fn jwt_malformed_bad_base64() {
         let auth = jwt_auth(Some("k"));
         let mut headers = http::HeaderMap::new();
         headers.insert(
             http::header::AUTHORIZATION,
             "Bearer !!!.!!!.!!!".parse().unwrap(),
         );
-        assert!(!auth.check_request(&headers));
+        assert!(!auth.check_request(&headers).await);
     }
 
-    #[test]
-    fn jwt_missing_header() {
+    #[tokio::test]
+    async fn jwt_missing_header() {
         let auth = jwt_auth(Some("k"));
         let headers = http::HeaderMap::new();
-        assert!(!auth.check_request(&headers));
+        assert!(!auth.check_request(&headers).await);
+    }
+
+    // --- constant_time_eq tests ---
+
+    #[test]
+    fn constant_time_eq_equal_unequal_and_length_mismatch() {
+        assert!(constant_time_eq(b"secret-token", b"secret-token"));
+        assert!(!constant_time_eq(b"secret-token", b"secret-tokeX"));
+        assert!(!constant_time_eq(b"secret-token", b"secret-toke"));
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(constant_time_eq(b"", b""));
     }
 
     // --- DigestAuth deserialization tests ---

@@ -218,6 +218,45 @@ impl JwksCache {
         self.lookup_decoding_key(Some(requested_kid))
     }
 
+    /// Async variant of
+    /// [`Self::lookup_decoding_key_with_unknown_kid_refresh`].
+    ///
+    /// Callers already on a Tokio worker (the request-path JWT
+    /// validation) must use this one: the blocking variant parks the
+    /// worker thread on the network fetch for up to the client's
+    /// timeout, stalling every other request scheduled on it.
+    pub async fn lookup_decoding_key_with_unknown_kid_refresh_async(
+        &self,
+        kid: Option<&str>,
+        client: &reqwest::Client,
+    ) -> Option<DecodingKey> {
+        let requested_kid = kid?;
+        if let Some(key) = self.lookup_decoding_key(Some(requested_kid)) {
+            return Some(key);
+        }
+        if !self.try_mark_unknown_kid_refresh() {
+            sbproxy_observe::metrics::record_jwks_unknown_kid_refetch("rate_limited");
+            return None;
+        }
+        if let Err(e) = self.refresh_with(client).await {
+            sbproxy_observe::metrics::record_jwks_unknown_kid_refetch("failure");
+            tracing::warn!(
+                jwks_url = %self.jwks_url,
+                kid = requested_kid,
+                error = %e,
+                "JWKS unknown-kid refresh failed"
+            );
+            return None;
+        }
+        sbproxy_observe::metrics::record_jwks_unknown_kid_refetch("success");
+        tracing::info!(
+            jwks_url = %self.jwks_url,
+            kid = requested_kid,
+            "JWKS refreshed after unknown kid"
+        );
+        self.lookup_decoding_key(Some(requested_kid))
+    }
+
     /// Fetch the JWKS endpoint and replace the cached keys on success.
     ///
     /// Used by the background refresh task and by the lazy fallback in
@@ -490,5 +529,57 @@ mod tests {
             .lookup_decoding_key_with_unknown_kid_refresh(Some("new-key"), &client)
             .is_some());
         handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn unknown_kid_refetches_before_lookup_fails_async() {
+        // Async sibling of `unknown_kid_refetches_before_lookup_fails`:
+        // the request-path JWT validation refetches through the async
+        // client so a slow IdP cannot park a Tokio worker.
+        use std::net::SocketAddr;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let body = serde_json::json!({
+            "keys": [rsa_jwk("new-async-key")]
+        })
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!(
+                    "skipping async JWKS unknown-kid network test: loopback bind denied: {err}"
+                );
+                return;
+            }
+            Err(err) => panic!("failed to bind async JWKS unknown-kid test listener: {err}"),
+        };
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+
+        let cache = JwksCache::new(&format!("http://{}/jwks", addr), 3600);
+        cache.set_keys(vec![rsa_jwk("old-key")]);
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        assert!(cache
+            .lookup_decoding_key_with_unknown_kid_refresh_async(Some("new-async-key"), &client)
+            .await
+            .is_some());
     }
 }

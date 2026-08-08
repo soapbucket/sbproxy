@@ -3,7 +3,6 @@
 use std::net::IpAddr;
 
 use ipnetwork::IpNetwork;
-use tracing::warn;
 
 use crate::ssrf;
 
@@ -12,7 +11,8 @@ pub fn ip_in_cidrs(ip: &IpAddr, cidrs: &[IpNetwork]) -> bool {
     cidrs.iter().any(|cidr| cidr.contains(*ip))
 }
 
-/// Parse a list of CIDR strings into IpNetwork objects, skipping invalid entries.
+/// Parse a list of CIDR strings into IpNetwork objects, rejecting the
+/// whole list when any entry is invalid.
 ///
 /// Call this once at config load and keep the result. The request path
 /// borrows the parsed set for a membership check with [`ip_in_cidrs`];
@@ -20,35 +20,31 @@ pub fn ip_in_cidrs(ip: &IpAddr, cidrs: &[IpNetwork]) -> bool {
 ///
 /// `field` is the config key the list came from (`trusted_proxies`,
 /// `upstream.allow_private_cidrs`, `trustworthy_client_cidrs`). It is
-/// recorded both in the message and as a `field` key so an operator
-/// reading the log knows which list lost a rule. Each unparseable entry
-/// is logged at WARN level so that misconfigured allow/deny lists do not
-/// silently lose rules. The function still returns only the valid
-/// entries; callers that need strict-mode behavior should validate
-/// beforehand.
+/// named in the error so an operator knows which list to fix.
+///
+/// # Errors
+///
+/// Returns an error naming the field and the offending entry when any
+/// entry does not parse. An unparseable entry used to be warn-logged
+/// and dropped, which silently narrowed the operator's allow/deny
+/// lists; failing the config compile instead means a typo cannot load
+/// a list with fewer rules than the operator wrote.
 ///
 /// ```
 /// # use sbproxy_security::parse_cidrs;
-/// let nets = parse_cidrs(["10.0.0.0/8", "nope"], "trusted_proxies");
+/// let nets = parse_cidrs(["10.0.0.0/8"], "trusted_proxies").unwrap();
 /// assert_eq!(nets.len(), 1);
+/// assert!(parse_cidrs(["nope"], "trusted_proxies").is_err());
 /// ```
-pub fn parse_cidrs<'a, I>(cidrs: I, field: &str) -> Vec<IpNetwork>
+pub fn parse_cidrs<'a, I>(cidrs: I, field: &str) -> anyhow::Result<Vec<IpNetwork>>
 where
     I: IntoIterator<Item = &'a str>,
 {
     cidrs
         .into_iter()
-        .filter_map(|s| match s.parse::<IpNetwork>() {
-            Ok(net) => Some(net),
-            Err(e) => {
-                warn!(
-                    cidr = %s,
-                    error = %e,
-                    field = %field,
-                    "ignoring invalid {field} entry"
-                );
-                None
-            }
+        .map(|s| {
+            s.parse::<IpNetwork>()
+                .map_err(|e| anyhow::anyhow!("{field}: invalid CIDR entry '{s}': {e}"))
         })
         .collect()
 }
@@ -81,25 +77,31 @@ mod tests {
 
     #[test]
     fn test_ip_in_cidrs_match() {
-        let cidrs = parse_cidrs(["10.0.0.0/8", "192.168.0.0/16"], "trusted_proxies");
+        let cidrs = parse_cidrs(["10.0.0.0/8", "192.168.0.0/16"], "trusted_proxies").unwrap();
         let ip: IpAddr = "10.1.2.3".parse().unwrap();
         assert!(ip_in_cidrs(&ip, &cidrs));
     }
 
     #[test]
     fn test_ip_in_cidrs_no_match() {
-        let cidrs = parse_cidrs(["10.0.0.0/8"], "trusted_proxies");
+        let cidrs = parse_cidrs(["10.0.0.0/8"], "trusted_proxies").unwrap();
         let ip: IpAddr = "172.16.0.1".parse().unwrap();
         assert!(!ip_in_cidrs(&ip, &cidrs));
     }
 
     #[test]
-    fn test_parse_cidrs_skips_invalid() {
-        let cidrs = parse_cidrs(
+    fn test_parse_cidrs_rejects_invalid() {
+        // Fail closed: a typo'd entry must reject the config compile,
+        // not silently drop a rule from an allow/deny list.
+        let err = parse_cidrs(
             ["10.0.0.0/8", "not-a-cidr", "192.168.1.0/24"],
             "trusted_proxies",
-        );
-        assert_eq!(cidrs.len(), 2);
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("trusted_proxies"), "names the field: {msg}");
+        assert!(msg.contains("not-a-cidr"), "names the entry: {msg}");
+        assert!(msg.contains("invalid CIDR"), "names the problem: {msg}");
     }
 
     #[test]
@@ -110,12 +112,13 @@ mod tests {
         // A real `Vec<String>`, collected rather than `vec!`d, because the
         // point of the test is the caller's owned-string shape and clippy
         // rewrites a `vec!` that is only iterated into an array.
-        let owned: Vec<String> = ["10.0.0.0/8", "bogus"]
+        let owned: Vec<String> = ["10.0.0.0/8", "192.168.1.0/24"]
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let cidrs = parse_cidrs(owned.iter().map(String::as_str), "trustworthy_client_cidrs");
-        assert_eq!(cidrs.len(), 1);
+        let cidrs =
+            parse_cidrs(owned.iter().map(String::as_str), "trustworthy_client_cidrs").unwrap();
+        assert_eq!(cidrs.len(), 2);
     }
 
     #[test]

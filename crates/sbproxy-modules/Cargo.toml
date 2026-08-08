@@ -127,6 +127,9 @@ hex.workspace = true
 # HMAC-SHA256 for the WAF rule-feed signature verification path
 # and the HTTP ledger client request signing.
 hmac.workspace = true
+# Constant-time equality for API-key / token / thumbprint comparison
+# (auth::constant_time_eq, mtls_bound, policy::content_digest).
+subtle.workspace = true
 # Ed25519 for the quote-token JWS signer / verifier.
 # Pinned to 2.x to match the resolved version in sbproxy-middleware
 # and sbproxy-observe so the workspace builds with one copy.

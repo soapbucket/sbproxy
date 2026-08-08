@@ -1089,18 +1089,20 @@ pub(crate) fn cidr_parse_count_on_this_thread() -> u64 {
 
 impl TlsFingerprintConfig {
     /// Parse the CIDR string lists into their compiled forms once, at
-    /// config load. Invalid entries are dropped with a warn (moved here
-    /// from the per-request path, WOR-1699), which is also where an
-    /// operator can still act on the message.
-    fn compile_cidrs(&mut self) {
-        fn parse(list: &[String], field: &str) -> Vec<ipnetwork::IpNetwork> {
+    /// config load (moved here from the per-request path, WOR-1699).
+    /// An invalid entry fails the config compile. It used to be dropped
+    /// with a warn, but `untrusted_client_cidrs` is a deny list, so a
+    /// typo silently weakened it while the proxy kept serving.
+    fn compile_cidrs(&mut self) -> anyhow::Result<()> {
+        fn parse(list: &[String], field: &str) -> anyhow::Result<Vec<ipnetwork::IpNetwork>> {
             CIDR_PARSE_COUNT.with(|c| c.set(c.get().saturating_add(1)));
             sbproxy_security::parse_cidrs(list.iter().map(String::as_str), field)
         }
         self.trustworthy_cidrs_compiled =
-            parse(&self.trustworthy_client_cidrs, "trustworthy_client_cidrs");
+            parse(&self.trustworthy_client_cidrs, "trustworthy_client_cidrs")?;
         self.untrusted_cidrs_compiled =
-            parse(&self.untrusted_client_cidrs, "untrusted_client_cidrs");
+            parse(&self.untrusted_client_cidrs, "untrusted_client_cidrs")?;
+        Ok(())
     }
 
     /// Build a [`TlsFingerprintConfig`] from the parsed
@@ -1114,6 +1116,11 @@ impl TlsFingerprintConfig {
     /// malformed field. A malformed block that does not declare
     /// `enabled: true` keeps the warn-and-disable path, since the
     /// disabled outcome matches the operator's stated intent.
+    ///
+    /// A block that parses but carries an unparseable CIDR entry is a
+    /// hard compile error regardless of `enabled`: the lists only exist
+    /// to gate trust, and dropping an entry silently narrows them (see
+    /// `compile_cidrs`).
     pub fn from_extensions(
         extensions: &std::collections::HashMap<String, serde_yaml::Value>,
     ) -> anyhow::Result<Self> {
@@ -1122,7 +1129,7 @@ impl TlsFingerprintConfig {
         };
         match serde_yaml::from_value::<TlsFingerprintConfig>(block.clone()) {
             Ok(mut cfg) => {
-                cfg.compile_cidrs();
+                cfg.compile_cidrs()?;
                 Ok(cfg)
             }
             Err(e) => {
@@ -2282,11 +2289,13 @@ impl CompiledPipeline {
             build_cache_reserve(&config.server.cache_reserve);
 
         // Pre-parse trusted_proxies CIDRs once at compile time so the
-        // request path can do a constant-time membership check.
+        // request path can do a constant-time membership check. An
+        // invalid entry fails the compile rather than silently
+        // shrinking the trust list.
         let trusted_proxy_cidrs: Vec<ipnetwork::IpNetwork> = sbproxy_security::parse_cidrs(
             config.server.trusted_proxies.iter().map(String::as_str),
             "trusted_proxies",
-        );
+        )?;
 
         // Hash a stable view of the loaded origin set so webhook
         // receivers can tell which config revision fired the event. We
@@ -2328,7 +2337,7 @@ impl CompiledPipeline {
         // --- SSRF private-CIDR allowlist ---
         // Operators that intentionally target a private network
         // (corporate VPN, mesh sidecar, internal registry) opt in
-        // explicitly. Invalid CIDRs are warn-logged and dropped.
+        // explicitly. An invalid CIDR fails the config compile.
         let upstream_allow_private_cidrs: Vec<ipnetwork::IpNetwork> = config
             .server
             .extensions
@@ -2341,6 +2350,7 @@ impl CompiledPipeline {
                     "upstream.allow_private_cidrs",
                 )
             })
+            .transpose()?
             .unwrap_or_default();
 
         // WOR-805: build the shared outbound Web Bot Auth signer once
@@ -5166,7 +5176,7 @@ origins: {}
             untrusted_client_cidrs: untrusted.iter().map(|s| s.to_string()).collect(),
             ..Default::default()
         };
-        cfg.compile_cidrs();
+        cfg.compile_cidrs().expect("test CIDRs parse");
         cfg
     }
 
@@ -5225,10 +5235,32 @@ origins: {}
     }
 
     #[test]
-    fn invalid_cidr_entries_are_dropped_at_load_and_leave_the_rest_standing() {
-        let cfg = tls_cfg_with(&["bogus", "10.0.0.0/8"], &[]);
-        assert_eq!(cfg.trustworthy_cidrs().len(), 1);
-        assert!(cfg.resolve_trustworthy(None, Some("10.1.2.3".parse().unwrap())));
+    fn invalid_cidr_entries_fail_the_config_compile() {
+        // These lists used to warn-and-drop an unparseable entry, which
+        // silently narrowed a deny list (`untrusted_client_cidrs`) on a
+        // typo. Fail closed: the config is refused, and the error names
+        // the field and the offending entry so the operator can fix it.
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+  extensions:
+    tls_fingerprint:
+      enabled: true
+      untrusted_client_cidrs:
+        - bogus
+        - 10.0.0.0/8
+origins: {}
+"#;
+        let compiled = sbproxy_config::compile_config(yaml).expect("compile");
+        let err = TlsFingerprintConfig::from_extensions(&compiled.server.extensions)
+            .expect_err("an unparseable CIDR entry must reject the config");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("untrusted_client_cidrs"),
+            "names the field: {msg}"
+        );
+        assert!(msg.contains("bogus"), "names the entry: {msg}");
+        assert!(msg.contains("invalid CIDR"), "names the problem: {msg}");
     }
 
     #[test]

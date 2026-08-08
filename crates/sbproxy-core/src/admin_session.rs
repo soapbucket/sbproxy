@@ -146,14 +146,8 @@ fn role_from_str(s: &str) -> Option<AdminRole> {
 
 /// Constant-time byte-slice equality.
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    use subtle::ConstantTimeEq as _;
+    a.len() == b.len() && bool::from(a.ct_eq(b))
 }
 
 #[cfg(test)]
@@ -205,5 +199,13 @@ mod tests {
             Some("tok123")
         );
         assert_eq!(cookie_value("other=1", SESSION_COOKIE), None);
+    }
+
+    #[test]
+    fn ct_eq_equal_unequal_and_length_mismatch() {
+        assert!(ct_eq(b"session-mac", b"session-mac"));
+        assert!(!ct_eq(b"session-mac", b"session-maX"));
+        assert!(!ct_eq(b"session-mac", b"session-ma"));
+        assert!(ct_eq(b"", b""));
     }
 }

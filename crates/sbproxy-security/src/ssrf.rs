@@ -26,18 +26,25 @@
 //!
 //! ### Caller status
 //!
-//! - `validate_url` / `validate_url_with_allowlist` and
-//!   `validate_url_resolved` have **no external callers** in the
-//!   workspace at the time of writing; only the `pub use` re-export in
-//!   `lib.rs` and the unit tests below reference them.
-//! - When a caller is added that performs the dial inside
-//!   `sbproxy-core/src/server.rs` (Pingora glue, currently owned by
-//!   agent A1), it MUST follow the contract above. A1 is expected to
-//!   wire dial-time re-validation as part of the H6/C2 follow-up.
-//! - When a caller is added that uses an in-process HTTP client
-//!   (e.g. `reqwest`), it should pin the address by passing the
-//!   pre-resolved `SocketAddr` directly rather than re-resolving the
-//!   hostname.
+//! - `validate_url` and `validate_url_resolved` are called from seven
+//!   places across the workspace: webhook targets in
+//!   `sbproxy-core::policy_dispatch`, A2A push targets in
+//!   `sbproxy-modules::policy::a2a`, alerting channel URLs in
+//!   `sbproxy-observe::alerting::channels`, AI provider base URLs in
+//!   `sbproxy-ai::provider`, external guardrail endpoints in
+//!   `sbproxy-ai::external_guardrail` (two call sites), and the RAG
+//!   HTTP provider base URL in `sbproxy-rag::http`.
+//!   `validate_url_with_allowlist` has no callers outside this module.
+//! - The Pingora dial path follows the contract above:
+//!   `guard_upstream` in `sbproxy-core/src/server.rs` (WOR-1689)
+//!   re-resolves the upstream host with [`resolve_host_addrs`] and
+//!   re-checks every resolved address with [`is_private_ip`]
+//!   immediately before the dial, honoring the operator's
+//!   `upstream.allow_private_cidrs` allowlist. The RAG Redis backend
+//!   pins its dial through [`resolve_host_addrs`] the same way.
+//! - A caller that uses an in-process HTTP client (e.g. `reqwest`)
+//!   should pin the address by passing the pre-resolved `SocketAddr`
+//!   directly rather than re-resolving the hostname.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;

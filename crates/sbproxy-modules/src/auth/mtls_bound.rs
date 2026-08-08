@@ -207,16 +207,10 @@ impl MtlsBoundVerifier {
 /// helper in `auth::mod`; duplicated here so the validator does not
 /// pull in the rest of that file.
 fn constant_time_eq_str(a: &str, b: &str) -> bool {
+    use subtle::ConstantTimeEq as _;
     let a = a.as_bytes();
     let b = b.as_bytes();
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    a.len() == b.len() && bool::from(a.ct_eq(b))
 }
 
 #[cfg(test)]
@@ -334,6 +328,7 @@ mod tests {
     fn constant_time_eq_str_distinguishes_lengths() {
         assert!(!constant_time_eq_str("abc", "abcd"));
         assert!(!constant_time_eq_str("abcd", "abc"));
+        assert!(!constant_time_eq_str("abc", "abd"));
         assert!(constant_time_eq_str("abc", "abc"));
     }
 }

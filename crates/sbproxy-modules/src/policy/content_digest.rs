@@ -276,14 +276,8 @@ fn compute_alg(alg: Algorithm, body: &[u8]) -> Vec<u8> {
 /// technically this is belt-and-suspenders, but the cost is zero and
 /// the existing egress signer uses the same pattern.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    use subtle::ConstantTimeEq as _;
+    a.len() == b.len() && bool::from(a.ct_eq(b))
 }
 
 #[cfg(test)]
@@ -430,5 +424,13 @@ mod tests {
             assert_eq!(ct, "application/json");
             assert!(body.contains("content_digest verification failed"));
         }
+    }
+
+    #[test]
+    fn constant_time_eq_equal_unequal_and_length_mismatch() {
+        assert!(constant_time_eq(b"digest-bytes", b"digest-bytes"));
+        assert!(!constant_time_eq(b"digest-bytes", b"digest-byteX"));
+        assert!(!constant_time_eq(b"digest-bytes", b"digest-byte"));
+        assert!(constant_time_eq(b"", b""));
     }
 }
