@@ -381,16 +381,21 @@ pub const BLAST_RADIUS_MATRIX: &[BlastRadiusRule] = &[
         radius: BlastRadius::Reload,
         reason: "L2 cache parameters re-read on reload",
     },
-    // --- Messenger driver: same story as L2 ---
+    // --- Messenger: retained slots that can no longer fire.
+    //     `compile_config` refuses `proxy.messenger_settings` outright
+    //     (WOR-2166) and WOR-2310 deleted the backends behind it, so no
+    //     config carrying these keys ever reaches a plan. The rules stay
+    //     because this matrix is append-only and the top-10 list in the
+    //     doc comment above indexes into it by position. ---
     BlastRadiusRule {
         pattern: "proxy.messenger_settings.driver",
         radius: BlastRadius::Restart,
-        reason: "messenger driver swap rebuilds the bus handle",
+        reason: "messenger_settings is refused at config compile; no bus is built",
     },
     BlastRadiusRule {
         pattern: "proxy.messenger_settings.**",
         radius: BlastRadius::Reload,
-        reason: "messenger parameters re-read on reload",
+        reason: "messenger_settings is refused at config compile; no parameters are read",
     },
     // --- Observability: hitless. The hooks read their config on
     //     every request from the arc-swapped pipeline. ---

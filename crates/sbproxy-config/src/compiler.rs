@@ -1495,8 +1495,10 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
     // single cross-replica event, for the life of the process. A knob that
     // parses, validates, and does not govern is a defect, so the config is
     // rejected instead of accepted into a snapshot where it does nothing.
-    // The bus implementations stay in `sbproxy-platform` for whoever builds
-    // the first consumer; this gate comes out with them.
+    // WOR-2310 deleted the four bus backends from `sbproxy-platform`, so this
+    // gate is permanent rather than a placeholder waiting on a first consumer.
+    // The block still parses so the failure below is an explanatory
+    // diagnostic instead of an unknown-key error.
     if let Some(settings) = &config_file.proxy.messenger_settings {
         anyhow::bail!(
             "config compile: proxy.messenger_settings is set (driver '{}'), but this build has \

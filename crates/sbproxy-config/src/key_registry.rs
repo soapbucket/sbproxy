@@ -590,12 +590,14 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "WOR-2166: the shared message bus has no runtime consumer. Nothing subscribes to a topic \
          and nothing publishes on one, so a configured bus moved no events between replicas. \
          `compile_config` rejects the whole block and points at `proxy.config_authority` for \
-         config distribution and `POST /admin/cache/purge` for cache invalidation.",
+         config distribution and `POST /admin/cache/purge` for cache invalidation. WOR-2310 \
+         deleted the backend implementations, so no driver name can ever be honored.",
     ),
     unsupported(
         "proxy.messenger_settings.params.*",
         "WOR-2166: driver parameters for the shared message bus, which has no runtime consumer. \
-         Never read: `compile_config` rejects the block before any driver is constructed.",
+         Never read: `compile_config` rejects the block, and since WOR-2310 there is no driver \
+         left to construct from them.",
     ),
     stable(
         "proxy.model_host.cache.budget_gib",
