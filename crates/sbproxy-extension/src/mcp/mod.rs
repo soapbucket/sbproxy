@@ -8,8 +8,9 @@
 //! - [`types`] - Shared JSON-RPC 2.0 and MCP protocol types.
 //! - [`streamable`] - Streamable HTTP transport for calling upstream MCP servers.
 //! - [`sse_client`] - Legacy SSE transport for calling upstream MCP servers.
-//! - [`federation`] - Aggregate tools from multiple upstream servers; the live
-//!   gateway dispatch in `sbproxy-core` calls into this.
+//! - [`federation`] - Aggregate tools, resources, and prompts from multiple
+//!   upstream servers; the live gateway dispatch in `sbproxy-core` calls
+//!   into this.
 //! - [`sessions`] - Streamable HTTP session store (`Mcp-Session-Id`).
 //! - [`discovery`] - Well-known manifest and RFC 9728 OAuth metadata builders.
 //! - [`codemode_ts`] - Cloudflare Code Mode TypeScript module emitter.
@@ -60,9 +61,9 @@ pub use cassette_drift::{
 };
 pub use egress::{EgressDenied, EgressMode, EgressPolicy, SystemHostResolver};
 pub use federation::{
-    FederatedTool, FederationIoSettings, McpCallOutcome, McpFederation, McpServerConfig,
-    NamespaceMode, OpenApiBacking, SerializedToolEntry, SerializedTools, ToolVersioningGate,
-    VersioningMode,
+    FederatedPrompt, FederatedTool, FederationIoSettings, McpCallOutcome, McpFederation,
+    McpServerConfig, NamespaceMode, OpenApiBacking, SerializedToolEntry, SerializedTools,
+    ToolVersioningGate, VersioningMode,
 };
 pub use openapi_convert::{openapi_to_mcp_tools, openapi_to_routes, OpenApiRoute};
 pub use stdio::{encode_stdio_url, StdioCommand};
