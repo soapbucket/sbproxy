@@ -2,13 +2,14 @@
 //!
 //! Implements the verification path for the most common subset of
 //! [RFC 9421](https://www.rfc-editor.org/rfc/rfc9421.html): the request
-//! verification flow with HMAC-SHA256 and Ed25519 algorithms over the
-//! standard derived components (`@method`, `@target-uri`, `@authority`,
-//! `@scheme`, `@path`, `@query`) and arbitrary HTTP header references.
-//! Signing the response and the heavier algorithms (RSA-PSS-SHA512,
-//! ECDSA-P256, ECDSA-P384) are explicit non-goals for this initial
-//! implementation; the verification API is shaped so they can be
-//! added without breaking callers.
+//! verification flow with the HMAC-SHA256, Ed25519, and
+//! ECDSA-P256-SHA256 algorithms over the standard derived components
+//! (`@method`, `@target-uri`, `@authority`, `@scheme`, `@path`,
+//! `@query`) and arbitrary HTTP header references. Signing the response
+//! and the remaining registry algorithms (RSA-PSS-SHA512, RSA-v1_5-SHA256,
+//! ECDSA-P384-SHA384) are explicit non-goals for this implementation; the
+//! verification API is shaped so they can be added without breaking
+//! callers.
 //!
 //! # Wire format recap
 //!
@@ -28,11 +29,41 @@
 //!
 //! - HMAC-SHA256 verification with shared secrets.
 //! - Ed25519 verification with raw 32-byte public keys.
+//! - ECDSA-P256-SHA256 verification with uncompressed SEC1 public
+//!   points (65 bytes, `0x04 || X || Y`).
 //! - Derived components: `@method`, `@target-uri`, `@authority`,
 //!   `@scheme`, `@path`, `@query`.
 //! - Arbitrary HTTP header references (case-insensitive name match;
 //!   multi-value headers joined with `, ` per RFC 9421 §2.1).
 //! - `created` and `expires` parameter enforcement when present.
+//! - Body coverage: a signature that covers `content-digest` is only
+//!   accepted when the `Content-Digest` header the signature attests to
+//!   also matches the bytes of the body handed to the verifier. See
+//!   "Body coverage" below.
+//!
+//! # Body coverage
+//!
+//! `content-digest` is an ordinary HTTP header reference as far as the
+//! signature base is concerned, so the cryptography binds the *header
+//! value* and nothing else. On its own that proves only that the signer
+//! wrote some digest down; anyone able to replace the body afterwards
+//! leaves the signature verifying over a message it no longer describes.
+//! RFC 9421 §2.1 is explicit that a verifier is responsible for checking
+//! the integrity of any content-related field it accepts as covered.
+//!
+//! [`MessageSignatureVerifier::verify_request`] therefore recomputes the
+//! digest over `req.body()` whenever the matched signature covers
+//! `content-digest`, and fails closed when it does not match. A caller
+//! that hands the verifier an empty body for a body-bearing request will
+//! see that failure, which is the intended direction: a signature we
+//! cannot check must not pass.
+//!
+//! One caller genuinely cannot supply the body at verification time. The
+//! Web Bot Auth path in `sbproxy-modules` verifies headers during the
+//! auth phase and completes the body binding later, in the request body
+//! filter, against the complete pre-transform body. That caller uses
+//! [`MessageSignatureVerifier::verify_request_deferring_body_binding`]
+//! and owns finishing the check; nothing else should.
 
 use std::collections::HashMap;
 
@@ -56,6 +87,14 @@ pub enum SignatureAlgorithm {
     HmacSha256,
     /// Ed25519 with a raw 32-byte public key.
     Ed25519,
+    /// ECDSA on NIST P-256 with SHA-256, the `ecdsa-p256-sha256`
+    /// entry in the RFC 9421 §6.2.2 algorithm registry.
+    ///
+    /// The public key is the uncompressed SEC1 point: 65 bytes,
+    /// `0x04 || X || Y`. The signature is the fixed-width `r || s`
+    /// concatenation the registry mandates (64 bytes), not the ASN.1
+    /// DER form some tooling emits by default.
+    EcdsaP256Sha256,
 }
 
 impl SignatureAlgorithm {
@@ -66,19 +105,22 @@ impl SignatureAlgorithm {
             (*self, value),
             (SignatureAlgorithm::HmacSha256, "hmac-sha256")
                 | (SignatureAlgorithm::Ed25519, "ed25519")
+                | (SignatureAlgorithm::EcdsaP256Sha256, "ecdsa-p256-sha256")
         )
     }
 
     /// Whether this algorithm setting pins verification to a single
     /// concrete algorithm.
     ///
-    /// Today both variants are concrete, so this always returns
+    /// Every variant today is concrete, so this always returns
     /// `true`. The function exists so that the alg-required check in
     /// [`MessageSignatureVerifier::verify_request`] remains correct
     /// if a future variant ever represents "any supported algorithm".
     pub fn is_pinned(&self) -> bool {
         match self {
-            SignatureAlgorithm::HmacSha256 | SignatureAlgorithm::Ed25519 => true,
+            SignatureAlgorithm::HmacSha256
+            | SignatureAlgorithm::Ed25519
+            | SignatureAlgorithm::EcdsaP256Sha256 => true,
         }
     }
 }
@@ -95,6 +137,8 @@ pub struct MessageSignatureConfig {
     ///   string works), or hex/base64 if your keying flow encodes
     ///   them.
     /// - `ed25519`: hex- or base64-encoded raw 32-byte public key.
+    /// - `ecdsa_p256_sha256`: hex- or base64-encoded uncompressed
+    ///   SEC1 public point, 65 bytes beginning with `0x04`.
     ///
     /// The value may also be a secret reference rather than the
     /// material itself: `env:NAME`, `file:PATH`, `${VAR}`, or a
@@ -129,10 +173,30 @@ fn default_skew_seconds() -> u64 {
 /// inbound request.
 pub struct MessageSignatureVerifier {
     config: MessageSignatureConfig,
-    /// Decoded shared secret bytes (HMAC) or raw public key bytes
-    /// (Ed25519). Decoded once at construction so the verify path
-    /// never re-parses the configured key string.
+    /// Decoded shared secret bytes (HMAC), raw public key bytes
+    /// (Ed25519), or the uncompressed SEC1 point (ECDSA P-256).
+    /// Decoded once at construction so the verify path never
+    /// re-parses the configured key string.
     key_bytes: Vec<u8>,
+}
+
+/// Whether the verifier is responsible for the body half of a signature
+/// that covers `content-digest`.
+///
+/// See the module-level "Body coverage" section for why this is a choice
+/// at all: the cryptography binds only the `Content-Digest` header value,
+/// so something has to recompute the digest over the actual bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyBinding {
+    /// The request handed to the verifier carries the complete body.
+    /// A covered `content-digest` is checked against it and a mismatch
+    /// fails the signature.
+    Enforce,
+    /// The body is not available yet and the caller completes the
+    /// binding itself once it is. Only the Web Bot Auth path, which
+    /// verifies headers in the auth phase and finishes the proof in the
+    /// request body filter, is allowed to ask for this.
+    Defer,
 }
 
 /// Verification verdict for a single request.
@@ -176,6 +240,39 @@ impl MessageSignatureVerifier {
                 }
                 bytes
             }
+            SignatureAlgorithm::EcdsaP256Sha256 => {
+                // Same decode path as Ed25519 (hex, then base64, then
+                // base64url), so an operator moves between the two
+                // algorithms by changing the key and nothing else.
+                //
+                // The shape check is stricter than Ed25519's because
+                // P-256 keys travel in three encodings. Only the
+                // uncompressed SEC1 point is accepted: a compressed
+                // point (33 bytes, `0x02`/`0x03`) and a SPKI/DER
+                // wrapper are both common exports and both would
+                // otherwise reach the verify path as an opaque byte
+                // string that fails every request with a generic
+                // crypto error. Naming them here turns a silent
+                // outage into a startup message an operator can act
+                // on.
+                let bytes = decode_public_key(&config.key)?;
+                match bytes.first() {
+                    Some(0x04) if bytes.len() == 65 => bytes,
+                    Some(0x02 | 0x03) if bytes.len() == 33 => anyhow::bail!(
+                        "ecdsa-p256-sha256 public key is a compressed SEC1 point; supply the \
+                         uncompressed form (65 bytes beginning with 0x04)"
+                    ),
+                    Some(0x30) => anyhow::bail!(
+                        "ecdsa-p256-sha256 public key looks like a DER/SPKI structure; supply the \
+                         raw uncompressed SEC1 point (65 bytes beginning with 0x04)"
+                    ),
+                    _ => anyhow::bail!(
+                        "ecdsa-p256-sha256 public key must be an uncompressed SEC1 point of 65 \
+                         bytes beginning with 0x04, got {} bytes",
+                        bytes.len()
+                    ),
+                }
+            }
         };
         Ok(Self { config, key_bytes })
     }
@@ -187,7 +284,38 @@ impl MessageSignatureVerifier {
     /// the `Signature-Input` parameters, reconstructs the canonical
     /// signature base from the live request, and runs the algorithm
     /// over `(base, raw_signature)`.
+    ///
+    /// `req` must carry the complete request body. A signature that
+    /// covers `content-digest` is additionally checked against those
+    /// bytes, so passing an empty body for a body-bearing request
+    /// fails the signature rather than passing it. See the
+    /// module-level "Body coverage" section.
     pub fn verify_request(&self, req: &http::Request<bytes::Bytes>) -> VerifyVerdict {
+        self.verify_with_body_binding(req, BodyBinding::Enforce)
+    }
+
+    /// Verify a signature without the body half of `content-digest`
+    /// coverage, leaving that check to the caller.
+    ///
+    /// Only for a caller that verifies headers before the body has
+    /// arrived and completes the binding itself afterwards, which in
+    /// this workspace means the Web Bot Auth provider: it verifies in
+    /// the auth phase and re-checks `Content-Digest` in the request
+    /// body filter against the complete pre-transform body, downgrading
+    /// or rejecting there. Anything else should call
+    /// [`Self::verify_request`], which is safe by default.
+    pub fn verify_request_deferring_body_binding(
+        &self,
+        req: &http::Request<bytes::Bytes>,
+    ) -> VerifyVerdict {
+        self.verify_with_body_binding(req, BodyBinding::Defer)
+    }
+
+    fn verify_with_body_binding(
+        &self,
+        req: &http::Request<bytes::Bytes>,
+        body_binding: BodyBinding,
+    ) -> VerifyVerdict {
         let sig_input = match header_str(req.headers(), "signature-input") {
             Some(s) => s,
             None => {
@@ -346,18 +474,98 @@ impl MessageSignatureVerifier {
                 let signature = Signature::from_bytes(&sig_arr);
                 key.verify(base.as_bytes(), &signature).is_ok()
             }
+            SignatureAlgorithm::EcdsaP256Sha256 => {
+                // RFC 9421 §3.3.5 pins the `ecdsa-p256-sha256`
+                // signature to the fixed-width `r || s` form, so a
+                // 64-byte length check is a real conformance check
+                // and not just defence against a short read. DER-
+                // encoded signatures land here as the wrong length
+                // and are named as such, because a signer emitting
+                // DER is the likeliest way this fails in the field.
+                if raw_sig.len() != 64 {
+                    return VerifyVerdict::Failed {
+                        reason: format!(
+                            "ecdsa-p256-sha256 signature must be 64 bytes of r||s, got {}",
+                            raw_sig.len()
+                        ),
+                    };
+                }
+                verify_ecdsa_p256_sha256(&self.key_bytes, base.as_bytes(), raw_sig)
+            }
         };
 
-        if ok {
-            VerifyVerdict::Ok {
-                signature_label: label,
-            }
-        } else {
-            VerifyVerdict::Failed {
+        if !ok {
+            return VerifyVerdict::Failed {
                 reason: "cryptographic verification failed".to_string(),
+            };
+        }
+
+        // Body coverage. The crypto above bound the `Content-Digest`
+        // header value; nothing so far has bound it to any bytes. Do
+        // that now, unless the caller has taken the job on itself.
+        if body_binding == BodyBinding::Enforce {
+            if let Some(reason) = check_covered_body_digest(req, input) {
+                return VerifyVerdict::Failed { reason };
             }
         }
+
+        VerifyVerdict::Ok {
+            signature_label: label,
+        }
     }
+}
+
+/// Verify that a covered `content-digest` component describes the body
+/// actually present on `req`.
+///
+/// Returns `None` when the signature does not cover `content-digest` (so
+/// there is nothing to bind) or when the header matches the body, and
+/// `Some(reason)` on any failure. Failing closed is the whole point: a
+/// signature that claims body coverage we cannot confirm must not pass.
+///
+/// The `Content-Digest` header itself is guaranteed present by the time
+/// this runs, because [`build_signature_base`] refuses to reconstruct a
+/// base for a covered header the request does not carry. The `None` arm
+/// below therefore only fires if that invariant is ever broken, and it
+/// fires closed.
+fn check_covered_body_digest(
+    req: &http::Request<bytes::Bytes>,
+    input: &SignatureInputEntry,
+) -> Option<String> {
+    let covers_digest = input
+        .components
+        .iter()
+        .any(|c| c.trim_matches('"').eq_ignore_ascii_case("content-digest"));
+    if !covers_digest {
+        return None;
+    }
+    let Some(header_value) = header_str(req.headers(), "content-digest") else {
+        return Some("signature covers content-digest but the header is absent".to_string());
+    };
+    if crate::digest::verify_content_digest(header_value, req.body()) {
+        return None;
+    }
+    // Deliberately carries no digest values and no body length. The
+    // caller logs this reason on every rejected request, and both would
+    // hand an active prober a size oracle for a body it cannot read.
+    Some("content-digest does not match the request body".to_string())
+}
+
+/// Verify an `ecdsa-p256-sha256` signature (RFC 9421 §3.3.5).
+///
+/// `public_key` is the uncompressed SEC1 point validated at verifier
+/// construction; `signature` is the fixed-width 64-byte `r || s` form.
+///
+/// Backed by `ring`, already the workspace's crypto provider. ECDSA
+/// verification touches no secret, so unlike the HMAC path there is
+/// nothing here for a timing side channel to leak; `ring` returns a
+/// plain `Result` and the boolean conversion matches how the Ed25519
+/// arm above treats `ed25519_dalek`'s.
+fn verify_ecdsa_p256_sha256(public_key: &[u8], message: &[u8], signature: &[u8]) -> bool {
+    use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_FIXED};
+    UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, public_key)
+        .verify(message, signature)
+        .is_ok()
 }
 
 // --- Header / signature-input parsing ---
@@ -1808,5 +2016,358 @@ mod tests {
             format!("{error:#}").contains("message_signatures.key could not be resolved"),
             "the chain must still lead with the field an operator has to fix"
         );
+    }
+
+    // --- ECDSA-P256-SHA256 -----------------------------------------------
+    //
+    // The fixture is a published test key rather than a freshly generated
+    // one: the private scalar is RFC 6979 appendix A.2.5's `x` for P-256,
+    // and the public point below is the `Ux`/`Uy` that appendix publishes
+    // for it. Anyone can re-derive the point from the scalar and check it
+    // against the RFC, which a randomly generated keypair would not allow.
+    //
+    // The signature is a fixed vector over the exact base string
+    // `ECDSA_KAT_BASE`, so this is a known-answer test rather than a
+    // sign-then-verify round trip: it pins the public-key encoding
+    // (uncompressed SEC1), the signature encoding (fixed-width `r || s`,
+    // never DER), and the byte-for-byte signature base all at once.
+    // ECDSA is randomized, so a re-signed fixture would differ every run
+    // and could not pin any of them.
+
+    /// Uncompressed SEC1 point, `0x04 || X || Y`.
+    const ECDSA_KAT_PUBLIC_KEY_HEX: &str = "0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa\
+                                            6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc\
+                                            64f2f1b20c2d7e9f5177a3c294d4462299";
+
+    /// A second, unrelated P-256 point (the generator doubled), used as
+    /// the wrong-key case.
+    const ECDSA_OTHER_PUBLIC_KEY_HEX: &str = "047cf27b188d034f7e8a52380304b51ac3c08969e277f21b\
+                                              35a60b48fc4766997807775510db8ed040293d9ac69f7430\
+                                              dbba7dade63ce982299e04b79d227873d1";
+
+    const ECDSA_KAT_SIGNATURE_B64: &str =
+        "3ME42scf5pJ9GBSzMWit/7nM+Zo93/IOJ0XzuauZJtIs13TcSI1A3VLwuq4RdbW/29IcT5tK9yX74XzG6NoybQ==";
+
+    const ECDSA_KAT_SIGNATURE_INPUT: &str = "sig1=(\"@method\" \"@path\" \"host\" \
+         \"content-digest\");created=1700000000;keyid=\"test-key-ecdsa-p256\";\
+         alg=\"ecdsa-p256-sha256\"";
+
+    /// The body the fixture signature covers, and the RFC 9530 §2 example
+    /// body `digest.rs` already pins its own vectors against.
+    const ECDSA_KAT_BODY: &[u8] = b"{\"hello\": \"world\"}";
+
+    const ECDSA_KAT_CONTENT_DIGEST: &str = "sha-256=:X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=:";
+
+    /// The canonical signature base the fixture signature was computed
+    /// over. Asserted against the live builder before the crypto runs, so
+    /// a change to base construction reports itself instead of surfacing
+    /// as an inscrutable verification failure.
+    const ECDSA_KAT_BASE: &str = concat!(
+        "\"@method\": POST\n",
+        "\"@path\": /v1/items\n",
+        "\"host\": api.example.com\n",
+        "\"content-digest\": sha-256=:X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=:\n",
+        "\"@signature-params\": (\"@method\" \"@path\" \"host\" \"content-digest\")",
+        ";created=1700000000;keyid=\"test-key-ecdsa-p256\";alg=\"ecdsa-p256-sha256\""
+    );
+
+    fn ecdsa_kat_config(public_key_hex: &str) -> MessageSignatureConfig {
+        MessageSignatureConfig {
+            algorithm: SignatureAlgorithm::EcdsaP256Sha256,
+            key_id: "test-key-ecdsa-p256".to_string(),
+            key: public_key_hex.to_string(),
+            required_components: Vec::new(),
+            clock_skew_seconds: 30,
+        }
+    }
+
+    fn ecdsa_kat_request(path_and_query: &str, body: &'static [u8]) -> http::Request<bytes::Bytes> {
+        http::Request::builder()
+            .method("POST")
+            .uri(path_and_query)
+            .header("host", "api.example.com")
+            .header("content-digest", ECDSA_KAT_CONTENT_DIGEST)
+            .header("signature-input", ECDSA_KAT_SIGNATURE_INPUT)
+            .header("signature", format!("sig1=:{ECDSA_KAT_SIGNATURE_B64}:"))
+            .body(bytes::Bytes::from_static(body))
+            .unwrap()
+    }
+
+    #[test]
+    fn ecdsa_p256_sha256_reconstructs_the_expected_signature_base() {
+        let req = ecdsa_kat_request("/v1/items?page=2", ECDSA_KAT_BODY);
+        let entry = parse_signature_input(ECDSA_KAT_SIGNATURE_INPUT)
+            .unwrap()
+            .pop()
+            .unwrap()
+            .1;
+        assert_eq!(build_signature_base(&req, &entry).unwrap(), ECDSA_KAT_BASE);
+    }
+
+    #[test]
+    fn ecdsa_p256_sha256_accepts_the_known_answer_vector() {
+        let verifier = MessageSignatureVerifier::new(ecdsa_kat_config(ECDSA_KAT_PUBLIC_KEY_HEX))
+            .expect("uncompressed SEC1 point is accepted");
+        match verifier.verify_request(&ecdsa_kat_request("/v1/items?page=2", ECDSA_KAT_BODY)) {
+            VerifyVerdict::Ok { signature_label } => assert_eq!(signature_label, "sig1"),
+            VerifyVerdict::Failed { reason } => panic!("expected ok, got: {reason}"),
+        }
+    }
+
+    #[test]
+    fn ecdsa_p256_sha256_rejects_a_tampered_request() {
+        // `@path` is covered, so re-pointing the request at another route
+        // must break the signature even though every header is intact.
+        let verifier =
+            MessageSignatureVerifier::new(ecdsa_kat_config(ECDSA_KAT_PUBLIC_KEY_HEX)).unwrap();
+        match verifier.verify_request(&ecdsa_kat_request("/v1/other?page=2", ECDSA_KAT_BODY)) {
+            VerifyVerdict::Ok { .. } => panic!("a tampered path must not verify"),
+            VerifyVerdict::Failed { reason } => {
+                assert!(reason.contains("cryptographic"), "got: {reason}")
+            }
+        }
+    }
+
+    #[test]
+    fn ecdsa_p256_sha256_rejects_the_wrong_key() {
+        let verifier =
+            MessageSignatureVerifier::new(ecdsa_kat_config(ECDSA_OTHER_PUBLIC_KEY_HEX)).unwrap();
+        match verifier.verify_request(&ecdsa_kat_request("/v1/items?page=2", ECDSA_KAT_BODY)) {
+            VerifyVerdict::Ok { .. } => panic!("an unrelated key must not verify"),
+            VerifyVerdict::Failed { reason } => {
+                assert!(reason.contains("cryptographic"), "got: {reason}")
+            }
+        }
+    }
+
+    #[test]
+    fn ecdsa_p256_sha256_rejects_a_body_the_content_digest_does_not_describe() {
+        // The vector covers `content-digest`, so the same signature over
+        // the same headers must stop working the moment the body changes.
+        // Nothing about the crypto changes here: only the digest binding
+        // catches it.
+        let verifier =
+            MessageSignatureVerifier::new(ecdsa_kat_config(ECDSA_KAT_PUBLIC_KEY_HEX)).unwrap();
+        let swapped = ecdsa_kat_request("/v1/items?page=2", b"{\"hello\": \"WORLD\"}");
+        match verifier.verify_request(&swapped) {
+            VerifyVerdict::Ok { .. } => panic!("a swapped body must not verify"),
+            VerifyVerdict::Failed { reason } => {
+                assert!(reason.contains("content-digest"), "got: {reason}")
+            }
+        }
+    }
+
+    #[test]
+    fn ecdsa_p256_sha256_key_must_be_an_uncompressed_sec1_point() {
+        // Compressed point: the same X with an 0x02 prefix and no Y.
+        let compressed = format!("02{}", &ECDSA_KAT_PUBLIC_KEY_HEX[2..66]);
+        let error = MessageSignatureVerifier::new(ecdsa_kat_config(&compressed))
+            .err()
+            .expect("a compressed point must be refused at construction");
+        assert!(error.to_string().contains("compressed"), "{error}");
+
+        // A DER/SPKI wrapper starts with a SEQUENCE tag.
+        let error = MessageSignatureVerifier::new(ecdsa_kat_config("3059301306072a8648ce3d0201"))
+            .err()
+            .expect("a DER structure must be refused at construction");
+        assert!(error.to_string().contains("DER/SPKI"), "{error}");
+
+        // Anything else is named by length.
+        let error = MessageSignatureVerifier::new(ecdsa_kat_config("04deadbeef"))
+            .err()
+            .expect("a short point must be refused at construction");
+        assert!(error.to_string().contains("65"), "{error}");
+    }
+
+    #[test]
+    fn ecdsa_p256_sha256_rejects_a_der_encoded_signature() {
+        // RFC 9421 §3.3.5 pins `r || s`. A DER-wrapped signature is the
+        // likeliest field mistake, and it must be named rather than
+        // rejected as a generic crypto failure.
+        let verifier =
+            MessageSignatureVerifier::new(ecdsa_kat_config(ECDSA_KAT_PUBLIC_KEY_HEX)).unwrap();
+        let der_ish = base64::engine::general_purpose::STANDARD.encode([0x30u8; 70]);
+        let req = http::Request::builder()
+            .method("POST")
+            .uri("/v1/items?page=2")
+            .header("host", "api.example.com")
+            .header("content-digest", ECDSA_KAT_CONTENT_DIGEST)
+            .header("signature-input", ECDSA_KAT_SIGNATURE_INPUT)
+            .header("signature", format!("sig1=:{der_ish}:"))
+            .body(bytes::Bytes::from_static(ECDSA_KAT_BODY))
+            .unwrap();
+        match verifier.verify_request(&req) {
+            VerifyVerdict::Ok { .. } => panic!("a 70-byte signature must not verify"),
+            VerifyVerdict::Failed { reason } => {
+                assert!(reason.contains("64 bytes of r||s"), "got: {reason}")
+            }
+        }
+    }
+
+    #[test]
+    fn ecdsa_p256_sha256_matches_only_its_registry_token() {
+        let alg = SignatureAlgorithm::EcdsaP256Sha256;
+        assert!(alg.matches_wire("ecdsa-p256-sha256"));
+        assert!(!alg.matches_wire("ed25519"));
+        assert!(!alg.matches_wire("ecdsa-p384-sha384"));
+        assert!(alg.is_pinned());
+        // And the other two must not answer to it.
+        assert!(!SignatureAlgorithm::Ed25519.matches_wire("ecdsa-p256-sha256"));
+        assert!(!SignatureAlgorithm::HmacSha256.matches_wire("ecdsa-p256-sha256"));
+    }
+
+    #[test]
+    fn config_deserializes_the_ecdsa_p256_sha256_algorithm_token() {
+        let json = r#"{
+            "algorithm": "ecdsa_p256_sha256",
+            "key_id": "proxy-key-1",
+            "key": "04aa"
+        }"#;
+        let cfg: MessageSignatureConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.algorithm, SignatureAlgorithm::EcdsaP256Sha256);
+    }
+
+    // --- Body coverage ----------------------------------------------------
+    //
+    // `content-digest` is a plain header reference in the signature base,
+    // so the cryptography alone proves only that the signer wrote a digest
+    // down. These tests pin the second half: the digest has to describe
+    // the bytes the verifier was handed.
+
+    /// The three headers a client sends for a `content-digest`-covering
+    /// HMAC signature. `digest_over` is what the signer hashed, which a
+    /// caller can deliberately make differ from the body it later serves.
+    fn hmac_body_covering_headers(secret_hex: &str, digest_over: &[u8]) -> Vec<(String, String)> {
+        let content_digest =
+            crate::digest::compute_content_digest(crate::digest::Algorithm::Sha256, digest_over);
+        let raw_input = "sig1=(\"@method\" \"@path\" \"content-digest\");created=1700000000;\
+             keyid=\"test-key\";alg=\"hmac-sha256\"";
+        let entry = parse_signature_input(raw_input).unwrap().pop().unwrap().1;
+        let for_signing = http::Request::builder()
+            .method("POST")
+            .uri("/v1/items")
+            .header("content-digest", &content_digest)
+            .body(bytes::Bytes::new())
+            .unwrap();
+        let base = build_signature_base(&for_signing, &entry).unwrap();
+        let mut mac = HmacSha256::new_from_slice(&hex::decode(secret_hex).unwrap()).unwrap();
+        mac.update(base.as_bytes());
+        let sig_b64 = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+        vec![
+            ("content-digest".to_string(), content_digest),
+            ("signature-input".to_string(), raw_input.to_string()),
+            ("signature".to_string(), format!("sig1=:{sig_b64}:")),
+        ]
+    }
+
+    fn request_carrying(
+        headers: &[(String, String)],
+        body: &'static [u8],
+    ) -> http::Request<bytes::Bytes> {
+        let mut builder = http::Request::builder().method("POST").uri("/v1/items");
+        for (name, value) in headers {
+            builder = builder.header(name.as_str(), value.as_str());
+        }
+        builder.body(bytes::Bytes::from_static(body)).unwrap()
+    }
+
+    const COVERED_BODY: &[u8] = b"{\"order\":\"1\"}";
+    const SWAPPED_BODY: &[u8] = b"{\"order\":\"9999\"}";
+
+    #[test]
+    fn content_digest_coverage_accepts_the_body_it_describes() {
+        let secret_hex = "00112233445566778899aabbccddeeff";
+        let headers = hmac_body_covering_headers(secret_hex, COVERED_BODY);
+        let verifier = MessageSignatureVerifier::new(config_hmac(secret_hex)).unwrap();
+        match verifier.verify_request(&request_carrying(&headers, COVERED_BODY)) {
+            VerifyVerdict::Ok { signature_label } => assert_eq!(signature_label, "sig1"),
+            VerifyVerdict::Failed { reason } => panic!("expected ok, got: {reason}"),
+        }
+    }
+
+    #[test]
+    fn content_digest_coverage_rejects_a_swapped_body() {
+        // Every header, including `Content-Digest`, is byte-identical to
+        // the signed request; only the body differs. The signature base
+        // is unchanged, so the crypto still passes and the digest binding
+        // is the only thing standing between this request and the
+        // upstream.
+        let secret_hex = "00112233445566778899aabbccddeeff";
+        let headers = hmac_body_covering_headers(secret_hex, COVERED_BODY);
+        let verifier = MessageSignatureVerifier::new(config_hmac(secret_hex)).unwrap();
+        match verifier.verify_request(&request_carrying(&headers, SWAPPED_BODY)) {
+            VerifyVerdict::Ok { .. } => {
+                panic!("a signature covering content-digest must not accept a different body")
+            }
+            VerifyVerdict::Failed { reason } => assert!(
+                reason.contains("content-digest does not match the request body"),
+                "got: {reason}"
+            ),
+        }
+    }
+
+    #[test]
+    fn content_digest_coverage_rejects_a_caller_that_supplies_no_body() {
+        // The shape the request pipeline used to be in: headers verified
+        // against an empty body stand-in. Passing that must be impossible,
+        // because it accepts any body at all.
+        let secret_hex = "00112233445566778899aabbccddeeff";
+        let headers = hmac_body_covering_headers(secret_hex, COVERED_BODY);
+        let verifier = MessageSignatureVerifier::new(config_hmac(secret_hex)).unwrap();
+        match verifier.verify_request(&request_carrying(&headers, b"")) {
+            VerifyVerdict::Ok { .. } => panic!("an absent body must not satisfy body coverage"),
+            VerifyVerdict::Failed { reason } => {
+                assert!(reason.contains("content-digest"), "got: {reason}")
+            }
+        }
+    }
+
+    #[test]
+    fn deferring_form_leaves_the_body_binding_to_the_caller() {
+        // The Web Bot Auth carve-out. Header verification succeeds against
+        // a body the digest does not describe, because that caller checks
+        // the body itself once the request body filter has all of it.
+        let secret_hex = "00112233445566778899aabbccddeeff";
+        let headers = hmac_body_covering_headers(secret_hex, COVERED_BODY);
+        let verifier = MessageSignatureVerifier::new(config_hmac(secret_hex)).unwrap();
+        let verdict = verifier
+            .verify_request_deferring_body_binding(&request_carrying(&headers, SWAPPED_BODY));
+        assert!(
+            matches!(verdict, VerifyVerdict::Ok { .. }),
+            "the deferring form must not check the body: {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn a_signature_covering_no_body_component_ignores_the_body_entirely() {
+        // The hot path: an origin whose signatures cover headers only must
+        // keep verifying with whatever body the caller happens to pass, so
+        // that nothing has to buffer a body to check a header signature.
+        let secret_hex = "00112233445566778899aabbccddeeff";
+        let cfg = config_hmac(secret_hex);
+        let raw_input =
+            r#"sig1=("@method" "@path");created=1700000000;keyid="test-key";alg="hmac-sha256""#;
+        let entry = parse_signature_input(raw_input).unwrap().pop().unwrap().1;
+        let for_signing = http::Request::builder()
+            .method("POST")
+            .uri("/v1/items")
+            .body(bytes::Bytes::new())
+            .unwrap();
+        let base = build_signature_base(&for_signing, &entry).unwrap();
+        let mut mac = HmacSha256::new_from_slice(&hex::decode(secret_hex).unwrap()).unwrap();
+        mac.update(base.as_bytes());
+        let sig_b64 = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+        let req = http::Request::builder()
+            .method("POST")
+            .uri("/v1/items")
+            .header("signature-input", raw_input)
+            .header("signature", format!("sig1=:{sig_b64}:"))
+            .body(bytes::Bytes::from_static(SWAPPED_BODY))
+            .unwrap();
+        let verifier = MessageSignatureVerifier::new(cfg).unwrap();
+        assert!(matches!(
+            verifier.verify_request(&req),
+            VerifyVerdict::Ok { .. }
+        ));
     }
 }

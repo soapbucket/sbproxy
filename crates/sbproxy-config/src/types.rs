@@ -9868,11 +9868,19 @@ observability:
 /// Unauthorized` and `WWW-Authenticate: Signature` before any
 /// downstream auth provider runs.
 ///
-/// `algorithm` is `hmac_sha256` or `ed25519`. `key` carries the
-/// shared secret (HMAC) or the base64/hex-encoded raw 32-byte
-/// public key (Ed25519). `required_components` is the optional set
-/// of canonical components every accepted signature must cover.
-/// `clock_skew_seconds` defaults to 30s.
+/// `algorithm` is `hmac_sha256`, `ed25519`, or `ecdsa_p256_sha256`.
+/// `key` carries the shared secret (HMAC), the base64/hex-encoded
+/// raw 32-byte public key (Ed25519), or the base64/hex-encoded
+/// uncompressed SEC1 public point of 65 bytes (ECDSA P-256).
+/// `required_components` is the optional set of canonical components
+/// every accepted signature must cover. `clock_skew_seconds`
+/// defaults to 30s.
+///
+/// A signature that covers `content-digest` also has its body
+/// checked: the proxy buffers the request body, recomputes the
+/// digest, and rejects a mismatch. The body must fit the 64 KiB
+/// replay buffer, and a larger one is rejected rather than passed
+/// unverified.
 ///
 /// Spec: <https://www.rfc-editor.org/rfc/rfc9421.html>.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -9881,7 +9889,8 @@ pub struct MessageSignaturesConfig {
     /// Whether to enforce signature verification on inbound requests.
     #[serde(default)]
     pub verify: bool,
-    /// Required signature algorithm (`hmac_sha256` or `ed25519`).
+    /// Required signature algorithm (`hmac_sha256`, `ed25519`, or
+    /// `ecdsa_p256_sha256`).
     pub algorithm: String,
     /// The `keyid` value the signer is expected to advertise.
     pub key_id: String,

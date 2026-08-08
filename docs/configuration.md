@@ -4332,11 +4332,35 @@ origins:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `verify` | bool | false | When true, enforce signature verification on inbound requests to this origin. |
-| `algorithm` | string | required | Signature algorithm: `hmac_sha256` or `ed25519`. An unrecognized value rejects all requests to the origin rather than silently bypassing the gate. |
+| `algorithm` | string | required | Signature algorithm: `hmac_sha256`, `ed25519`, or `ecdsa_p256_sha256`. An unrecognized value rejects all requests to the origin rather than silently bypassing the gate. |
 | `key_id` | string | required | The `keyid` value the signer is expected to advertise in `Signature-Input`. |
-| `key` | string | required | Verification key material, or a reference to it. For `hmac_sha256`, the shared secret; for `ed25519`, the hex- or base64-encoded raw 32-byte public key. Accepts every reference form the [secrets guide](secrets.md#reference-forms) defines, resolved before the value is decoded, so a stored secret yields the same key bytes as that value written inline. A reference that no declared backend can resolve rejects every request to the origin rather than becoming the key. |
+| `key` | string | required | Verification key material, or a reference to it. For `hmac_sha256`, the shared secret; for `ed25519`, the hex- or base64-encoded raw 32-byte public key; for `ecdsa_p256_sha256`, the hex- or base64-encoded uncompressed SEC1 public point (65 bytes starting with `04`). Accepts every reference form the [secrets guide](secrets.md#reference-forms) defines, resolved before the value is decoded, so a stored secret yields the same key bytes as that value written inline. A reference that no declared backend can resolve rejects every request to the origin rather than becoming the key. |
 | `required_components` | list | `[]` | Canonical components every accepted signature must cover, e.g. `@method`, `@target-uri`, `content-digest`. A signature covering a strict subset is rejected. |
 | `clock_skew_seconds` | int | 30 | Tolerance applied to the signature's `created` / `expires` timestamps. |
+
+### Algorithms
+
+The `alg` parameter on the wire has to be present and has to name the configured algorithm. A signature that omits `alg` is rejected: without that rule, dropping the parameter would sidestep the pin and let a signature through whichever crypto path the verifier defaulted to.
+
+| Config value | RFC 9421 registry name | Key format |
+|---|---|---|
+| `hmac_sha256` | `hmac-sha256` | Shared secret. Hex or base64 if your keying flow encodes it, otherwise raw bytes. |
+| `ed25519` | `ed25519` | Raw 32-byte public key, hex or base64. |
+| `ecdsa_p256_sha256` | `ecdsa-p256-sha256` | Uncompressed SEC1 public point, 65 bytes starting with `04`, hex or base64. |
+
+Two shapes of P-256 key are refused at startup instead of failing every request later: a compressed point (33 bytes starting with `02` or `03`) and a DER or SPKI wrapper. Convert either to the uncompressed point first. The signature itself must be the fixed-width `r || s` form the registry specifies, 64 bytes; a DER-encoded signature is rejected and says so in the log.
+
+RSA-PSS-SHA512, RSA-v1_5-SHA256, and ECDSA-P384-SHA384 are not implemented. Signing outbound requests is Ed25519 and HMAC only.
+
+### Body coverage
+
+`content-digest` is an ordinary header reference as far as the signature base is concerned, so the cryptography binds the digest value and nothing else. When a signature covers `content-digest`, the proxy also buffers the request body, recomputes the digest, and rejects the request if the two disagree. Without that second step a valid signature would keep verifying over a body someone swapped underneath it.
+
+The body is only buffered for a request whose `Signature-Input` names `content-digest`. A signature over headers alone costs nothing extra, and neither does an origin that verifies no signatures at all.
+
+Buffering is bounded by the 64 KiB replay buffer, the same ceiling GraphQL request validation works under. A body over that limit is rejected with `401`, not `413`: the request is not too large to serve, it is too large to prove, and letting it through would defeat the coverage the signer asked for. Keep body-covering signatures to small request payloads, or cover headers only.
+
+`repr-digest` is not checked against the body. Cover `content-digest` when you want the body bound.
 
 ---
 
