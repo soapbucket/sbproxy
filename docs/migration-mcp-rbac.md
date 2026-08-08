@@ -1,11 +1,12 @@
 # Migrating MCP tool access policies
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-08*
 
 This is a migration record for one breaking change, kept so an operator upgrading from a config
 written before it can find the shape their file needs to become. It is reference material: the
-before-and-after pairs below are configuration, not a walkthrough, and there is no outcome to run
-because the outcome is that your existing config keeps working.
+before-and-after pairs below are configuration, not a walkthrough, and there is no outcome to run.
+The outcome is a config that boots with the behavior described here, or the config-load error
+quoted below when a policy table is mixed with an unlabeled server.
 
 For the current policy surface as a thing you configure rather than a thing you migrate to, read
 [mcp.md](mcp.md); [`examples/mcp-rbac-quotas/`](../examples/mcp-rbac-quotas/) is the same policy
@@ -24,8 +25,30 @@ The flip is intentional. The previous default silently allowed every
 tool when the policy table was absent, when the per-server `rbac:`
 label was omitted, or when an empty allowlist was misread as
 "unrestricted". Each of those failure modes appeared in real configs
-during the v1.0 audit. The fix is to make the safe shape the default
-and force operators who need the legacy behavior to opt in.
+during the v1.0 audit. The default-deny policy closes two of them:
+an unknown caller (no matching rule) is denied, and an empty
+`allowed: []` denies everything.
+
+The omitted label is closed at config load instead. Once an action
+declares any `rbac_policies`, every entry in `federated_servers[]`
+must carry an `rbac:` label. A server without one is a hard config
+error, and the message names the server:
+
+```
+mcp action: federated_servers[] origin 'postgres.example.com' has no
+rbac label while rbac_policies are configured; add `rbac: <label>`
+(a policy with `default_allow: true` keeps deliberate allow-all)
+```
+
+There is no runtime deny path to reason about here: a config that
+mixes a policy table with an unlabeled server never boots. Allow-all
+for one upstream stays expressible, but only explicitly, by binding
+that server to a policy with `default_allow: true` (shape 1 below).
+
+The absent policy table is the one legacy shape that still works
+unchanged: an action with no `rbac_policies` at all applies no tool
+ACL to any server. That keeps non-RBAC deployments booting; migrate
+it with shape 1 when you want the ACL surface at all.
 
 ## What changed at a glance
 
@@ -34,6 +57,7 @@ and force operators who need the legacy behavior to opt in.
 | Policy schema | `key_permissions: { key: [tools] }` | `tool_access[]` with `principals[]` + `allowed[]` |
 | Default for an unknown caller | Allow | Deny |
 | Empty `allowed: []` | Allow all | Deny all |
+| Unlabeled server while `rbac_policies` exist | Silently allowed every tool | Hard config error naming the server |
 | `tools/list` | Returned full catalog | Filtered by per-server RBAC against inbound principal |
 | Per-tool quotas | Not supported | `tool_quotas[]` sliding-window, keyed on `(tenant_id, principal_id, tool_name)` |
 | Identity carrier | Resolved auth subject only | `Principal` (tenant, virtual key, team, project, role, sub) |
@@ -74,9 +98,12 @@ origins:
 ```
 
 The `default_allow: true` flag preserves the legacy behavior for
-the upstream that binds to the `legacy_open` label. New upstreams
-inherit the deny-by-default until you bind them to a policy with
-their own `allowed[]` list.
+the upstream that binds to the `legacy_open` label. Once the policy
+table exists, every server has to carry an `rbac:` label; adding a
+new upstream without one fails config load with the error shown
+above. So a new server gets either a policy with its own `allowed[]`
+list or a deliberate `legacy_open` binding, and never an accidental
+allow-all.
 
 ## 2. Legacy `key_permissions:` config
 

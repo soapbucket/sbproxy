@@ -52,7 +52,10 @@
 //! key, team, role, project, sub) to pick the matching ACL row.
 //! WOR-1065 + WOR-1066: the policy is default-deny; an operator who
 //! wants the legacy open-by-default behaviour sets
-//! `default_allow: true` on each policy. See
+//! `default_allow: true` on each policy. WOR-2314: once any
+//! `rbac_policies` are declared, every federated server must carry
+//! an `rbac:` label; an unlabeled server is a config compile error
+//! rather than a silent allow-all. See
 //! `docs/migration-mcp-rbac.md` for upgrade examples.
 //! The `timeout:` field caps each upstream `tools/call` at the
 //! request layer (not just the connection layer) via
@@ -448,7 +451,8 @@ pub struct McpFederatedServerConfig {
     /// Optional RBAC label for the upstream. References a key in the
     /// top-level `rbac_policies` map; the matching
     /// [`ToolAccessPolicy`] is consulted at request time using the
-    /// caller's auth subject as the virtual key. WOR-186.
+    /// caller's auth subject as the virtual key. WOR-186. Required on
+    /// every server once `rbac_policies` is non-empty (WOR-2314).
     #[serde(default)]
     pub rbac: Option<String>,
     /// Optional per-server request timeout. Accepts Go duration syntax
@@ -720,6 +724,24 @@ impl McpAction {
                     anyhow::bail!(
                         "mcp action: federated_servers[].rbac '{}' is not declared in rbac_policies (origin '{}')",
                         label,
+                        upstream.origin
+                    );
+                }
+            }
+        }
+
+        // WOR-2314: once any RBAC policy is declared, every federated
+        // server must carry an explicit `rbac:` label. An unlabeled
+        // server resolves no policy at dispatch time and would
+        // silently allow every tool, undoing default-deny for exactly
+        // the upstream the operator forgot to label. Deliberate
+        // allow-all stays expressible: bind the server to a policy
+        // with `default_allow: true`.
+        if !cfg.rbac_policies.is_empty() {
+            for upstream in &cfg.federated_servers {
+                if upstream.rbac.is_none() {
+                    anyhow::bail!(
+                        "mcp action: federated_servers[] origin '{}' has no rbac label while rbac_policies are configured; add `rbac: <label>` (a policy with `default_allow: true` keeps deliberate allow-all)",
                         upstream.origin
                     );
                 }
@@ -1023,10 +1045,12 @@ impl McpAction {
     }
 
     /// Resolve the [`ToolAccessPolicy`] that governs a given upstream.
-    /// Returns `None` when the upstream has no `rbac` label set;
-    /// in that case the dispatcher treats every tool as allowed,
-    /// which preserves backwards compatibility with existing configs.
-    /// WOR-186.
+    /// Config compile requires an `rbac` label on every federated
+    /// server once any `rbac_policies` are declared (WOR-2314), so
+    /// this returns `None` only for actions with no RBAC configured
+    /// at all (or an unknown server name). The dispatcher treats
+    /// `None` as allowed, which preserves the behavior of non-RBAC
+    /// deployments. WOR-186.
     pub fn policy_for_server(&self, server_name: &str) -> Option<&ToolAccessPolicy> {
         let label = self.prefix_for(server_name)?.rbac.as_deref()?;
         self.rbac_policies.get(label)
@@ -2041,6 +2065,66 @@ mod tests {
             err.contains("rbac_policies") || err.contains("read_only"),
             "error must mention the missing policy or the rbac_policies table, got: {err}",
         );
+    }
+
+    /// WOR-2314: once `rbac_policies` exist, an unlabeled federated
+    /// server is a hard config error naming that server, instead of
+    /// a silent allow-all for exactly the upstream the operator
+    /// forgot to label.
+    #[test]
+    fn rejects_unlabeled_server_when_rbac_policies_configured() {
+        let value = json!({
+            "type": "mcp",
+            "rbac_policies": {
+                "read_only": { "default_allow": false, "tool_access": [] }
+            },
+            "federated_servers": [
+                { "origin": "github.example.com", "prefix": "gh", "rbac": "read_only" },
+                { "origin": "postgres.example.com", "prefix": "db" }
+            ]
+        });
+        let err = McpAction::from_config(value).unwrap_err().to_string();
+        assert!(
+            err.contains("postgres.example.com"),
+            "error must name the unlabeled server, got: {err}",
+        );
+        assert!(
+            err.contains("rbac"),
+            "error must point at the missing rbac label, got: {err}",
+        );
+    }
+
+    /// Deliberate allow-all stays expressible under WOR-2314: bind
+    /// the server to a policy with `default_allow: true`.
+    #[test]
+    fn explicit_allow_all_label_still_compiles() {
+        let value = json!({
+            "type": "mcp",
+            "rbac_policies": {
+                "legacy_open": { "default_allow": true }
+            },
+            "federated_servers": [
+                { "origin": "github.example.com", "prefix": "gh", "rbac": "legacy_open" }
+            ]
+        });
+        let action = McpAction::from_config(value).expect("compile");
+        let policy = action.policy_for_server("gh").expect("gh policy");
+        assert!(policy.default_allow);
+    }
+
+    /// An action that declares no `rbac_policies` at all keeps the
+    /// legacy open behavior: unlabeled servers compile and resolve
+    /// no policy, and the dispatcher allows every tool (WOR-2314).
+    #[test]
+    fn unlabeled_servers_unchanged_without_rbac_policies() {
+        let value = json!({
+            "type": "mcp",
+            "federated_servers": [
+                { "origin": "github.example.com", "prefix": "gh" }
+            ]
+        });
+        let action = McpAction::from_config(value).expect("compile");
+        assert!(action.policy_for_server("gh").is_none());
     }
 
     /// A valid `timeout:` field is now stored on the action

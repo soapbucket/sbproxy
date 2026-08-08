@@ -14,7 +14,6 @@
 //! - [`discovery`] - Well-known manifest and RFC 9728 OAuth metadata builders.
 //! - [`codemode_ts`] - Cloudflare Code Mode TypeScript module emitter.
 //! - [`openapi_convert`] - Convert OpenAPI 3.x specs to MCP tools and routes.
-//! - [`rest_to_mcp`] - Expose REST APIs as MCP servers.
 //! - [`compat`] - Tool-versioning compatibility oracle.
 //! - [`access_control`] - Principal-aware tool ACLs and per-tool quotas.
 //! - [`schema_drift`] / [`cassette_drift`] - CI drift detection (drift CLI).
@@ -32,7 +31,6 @@ pub mod egress;
 pub mod federation;
 pub mod openapi_convert;
 pub mod quarantine;
-pub mod rest_to_mcp;
 /// Tool rollout plane: multiple live versions of one tool with
 /// per-consumer resolution (call `_meta`, session requirements,
 /// principal pins, catalogue aliases, default), version routing,
@@ -67,6 +65,5 @@ pub use federation::{
     VersioningMode,
 };
 pub use openapi_convert::{openapi_to_mcp_tools, openapi_to_routes, OpenApiRoute};
-pub use rest_to_mcp::{create_mcp_handler, execute_tool_as_rest, RestToMcpConfig};
 pub use stdio::{encode_stdio_url, StdioCommand};
 pub use types::*;
