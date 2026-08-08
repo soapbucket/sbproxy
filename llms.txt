@@ -132,7 +132,7 @@ Origin fields:
 | mock | Configurable JSON response with optional delay |
 | beacon | 1x1 transparent GIF |
 | noop | Empty 200 response |
-| load_balancer | 7 algorithms: round-robin, weighted-random, least-connections, IP hash, URI hash, header hash, cookie hash |
+| load_balancer | 8 algorithms: round-robin, weighted-random, least-connections, IP hash, URI hash, header hash, cookie hash, ring hash (ketama consistent hashing) |
 | websocket | WebSocket proxy |
 | grpc | gRPC and gRPC-Web proxy |
 

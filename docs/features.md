@@ -16,7 +16,7 @@ SBproxy routes traffic based on exact hostnames and dynamic forward rules. It su
 * **Examples:** [Basic Proxy](../examples/basic-proxy/), [Forward Rules](../examples/forward-rules/), [Host Override](../examples/host-override/), [gRPC H2C](../examples/grpc-h2c/), [Error Pages](../examples/error-pages/), [Headers & CORS](../examples/headers-and-cors/), [Compression](../examples/compression/)
 
 ### Load Balancing & Health Checks
-Traffic can be distributed across upstream targets using 7 algorithms (including round-robin, least connections, and consistent hashing). Active health checks proactively remove failing targets from the pool.
+Traffic can be distributed across upstream targets using 8 algorithms (including round-robin, least connections, and ketama-style consistent hashing via `ring_hash`). Active health checks proactively remove failing targets from the pool.
 * **Docs:** [Performance & Load Balancing](performance.md), [Architecture](architecture.md)
 * **Examples:** [Load Balancer](../examples/load-balancer/), [Active Health Checks](../examples/active-health-checks/), [Circuit Breaker](../examples/circuit-breaker/), [LB Deployment](../examples/load-balancer-deployment/)
 
