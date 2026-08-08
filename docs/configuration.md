@@ -26,30 +26,31 @@ For AI-specific features in depth, see [ai-gateway.md](ai-gateway.md). For CEL, 
 16. [Compression](#compression)
 17. [HSTS](#hsts)
 18. [Connection pool](#connection-pool)
-19. [Bot detection](#bot-detection)
-20. [Threat protection](#threat-protection)
-21. [Error pages](#error-pages)
-22. [Rate limit headers](#rate-limit-headers)
-23. [Message signatures](#message-signatures)
-24. [Traffic capture](#traffic-capture)
-25. [Host header semantics](#host-header-semantics)
-26. [Trusted proxies and forwarding headers](#trusted-proxies-and-forwarding-headers)
-27. [Request mirror](#request-mirror)
-28. [Upstream retries](#upstream-retries)
-29. [Active health checks](#active-health-checks)
-30. [Circuit breaker](#circuit-breaker)
-31. [Outlier detection](#outlier-detection)
-32. [Service discovery](#service-discovery)
-33. [Correlation ID](#correlation-id)
-34. [mTLS client authentication](#mtls-client-authentication)
-35. [Webhook envelope and signing](#webhook-envelope-and-signing)
-36. [Secrets](#secrets)
-37. [Environment variables](#environment-variables)
-38. [ACME / auto TLS](#acme--auto-tls)
-39. [Redis integration](#redis-integration)
-40. [Config source (GitOps)](#config-source-gitops)
-41. [Config authority](#config-authority-fleet-configuration-distribution)
-42. [Validation](#validation)
+19. [Upstream timeouts](#upstream-timeouts)
+20. [Bot detection](#bot-detection)
+21. [Threat protection](#threat-protection)
+22. [Error pages](#error-pages)
+23. [Rate limit headers](#rate-limit-headers)
+24. [Message signatures](#message-signatures)
+25. [Traffic capture](#traffic-capture)
+26. [Host header semantics](#host-header-semantics)
+27. [Trusted proxies and forwarding headers](#trusted-proxies-and-forwarding-headers)
+28. [Request mirror](#request-mirror)
+29. [Upstream retries](#upstream-retries)
+30. [Active health checks](#active-health-checks)
+31. [Circuit breaker](#circuit-breaker)
+32. [Outlier detection](#outlier-detection)
+33. [Service discovery](#service-discovery)
+34. [Correlation ID](#correlation-id)
+35. [mTLS client authentication](#mtls-client-authentication)
+36. [Webhook envelope and signing](#webhook-envelope-and-signing)
+37. [Secrets](#secrets)
+38. [Environment variables](#environment-variables)
+39. [ACME / auto TLS](#acme--auto-tls)
+40. [Redis integration](#redis-integration)
+41. [Config source (GitOps)](#config-source-gitops)
+42. [Config authority](#config-authority-fleet-configuration-distribution)
+43. [Validation](#validation)
 
 ---
 
@@ -955,7 +956,8 @@ origins:
 | `olp` | object | | RSL Open License Protocol token issuer and public-key endpoints. |
 | `web_bot_auth_publish` | object | | Publish a Web Bot Auth key directory and Signature Agent Card on this origin. |
 | `idempotency` | object | | RFC 8594 idempotency middleware. See [Idempotency](#idempotency). |
-| `connection_pool` | object | | Config-only. Pingora's built-in upstream pool settings apply. |
+| `connection_pool` | object | | Config-only except `idle_timeout_secs`, the legacy spelling of `timeouts.idle_ms`. See [Connection pool](#connection-pool). |
+| `timeouts` | object | | Upstream transport deadlines (connect, read, write, idle), in milliseconds. See [Upstream timeouts](#upstream-timeouts). |
 | `extensions` | object | | Opaque map for out-of-tree origin-level blocks. |
 | `expose_openapi` | bool | false | Publish this origin's generated OpenAPI document at its well-known paths. |
 | `stream_safety` | list | `[]` | Per-origin streaming-safety rule identifiers. |
@@ -2213,8 +2215,10 @@ The two constraints are independent:
 * **mTLS-bound** (RFC 8705) binds the token to the SHA-256
   thumbprint of the TLS client cert the resource server saw
   on the connection. The token's `cnf.x5t#S256` claim carries
-  the thumbprint; the proxy compares against the inbound
-  client cert.
+  the thumbprint; the proxy compares it against the
+  base64url-encoded (no padding) SHA-256 of the DER encoding
+  of the client certificate presented on the inbound
+  connection.
 
 ```yaml
 authentication:
@@ -3967,10 +3971,63 @@ origins:
 
 ## Connection pool
 
-`origins.*.connection_pool` is retained for config compatibility but is not
-applied by the runtime. Pingora's built-in upstream connection-pool
-behavior remains in effect regardless of the three parsed values. Do not use
-this block to enforce a connection cap, idle timeout, or maximum lifetime.
+`origins.*.connection_pool` is retained for config compatibility. One field
+is live: `idle_timeout_secs` is the legacy spelling of `timeouts.idle_ms`
+(in seconds) and feeds the same resolved idle deadline when
+`timeouts.idle_ms` is unset. Setting both fails config compile; prefer
+`timeouts.idle_ms` in new configs. The other two fields (`max_connections`,
+`max_lifetime_secs`) are not applied by the runtime, and Pingora's built-in
+upstream connection-pool behavior remains in effect for them.
+
+---
+
+## Upstream timeouts
+
+`origins.*.timeouts` sets the transport deadlines the proxy applies when it
+connects to and exchanges bytes with this origin's upstreams. Every field is
+optional and every value is in milliseconds; an omitted field keeps its
+built-in default.
+
+```yaml
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://backend.internal:8080
+    timeouts:
+      connect_ms: 2000
+      total_connect_ms: 5000
+      read_ms: 60000
+      write_ms: 30000
+      idle_ms: 30000
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `connect_ms` | int | 5000 | Deadline for one upstream TCP connect attempt. |
+| `total_connect_ms` | int | 10000 | Deadline across all connect attempts for one upstream selection, including TLS. |
+| `read_ms` | int | 30000 | Per-read socket deadline on the upstream connection. A response that stalls longer than this between reads fails with an upstream read timeout. |
+| `write_ms` | int | 30000 | Per-write socket deadline on the upstream connection. |
+| `idle_ms` | int | 90000 | How long a pooled upstream connection may sit idle before it is closed. |
+
+A `0` in any field fails config compile. A zero deadline fails the operation
+the moment it starts, which is never what was intended; omit the field to
+keep its default.
+
+When the origin's proxy action enables [service discovery](#service-discovery),
+the proxy caps the effective idle deadline at half the DNS refresh window
+(at most 10 seconds) so a pooled connection cannot outlive an IP rotation.
+That cap is a correctness bound: the proxy uses the smaller of `idle_ms` and
+the cap, so a configured value can shorten the idle deadline further but
+never extend it past the cap.
+
+Inline origins under `forward_rules` have no `timeouts` block of their own.
+Requests routed through a forward rule use the parent origin's resolved
+timeouts.
+
+`connection_pool.idle_timeout_secs` is the legacy spelling of `idle_ms`, in
+seconds. It still works when `timeouts.idle_ms` is unset; setting both fails
+config compile. See [Connection pool](#connection-pool).
 
 ---
 
