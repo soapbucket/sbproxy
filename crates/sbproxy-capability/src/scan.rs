@@ -52,21 +52,70 @@ const SANCTIONED_PREFIXES: &[&str] = &["sbproxy_", "mesh_"];
 /// The old guard looked at `dashboards/grafana/` only, which is precisely the
 /// one directory where nothing was broken.
 ///
-/// `deploy/dashboards/` is knowingly **not** here yet, and that is a deferral,
-/// not an oversight. Its eight panels select on `tenant_id` across
-/// `sbproxy_requests_total`, `sbproxy_policy_triggers_total`, and others, and
-/// no such label exists on any of them. They are not typos: the panels were
-/// written against a per-tenant label schema that was never implemented, so
-/// adding the guard there would fail the build on a question nobody has
-/// answered (whether `tenant_id` should become a real label, which is a metric
-/// schema change and a wire break). They ship via the Helm configmap and they
-/// render empty today. Tracked in WOR-1917; this comment is here so that
-/// turning the guard on for that directory is a decision someone makes, rather
-/// than something that quietly never happens.
+/// `deploy/dashboards/` was excluded for a while, on the grounds that its
+/// panels filter on `tenant_id` and no metric they query carries that label, so
+/// switching the guard on would fail the build on an open schema question
+/// (whether `tenant_id` becomes a real label, which is a wire break). That
+/// framing was wrong twice over. The panels did not merely filter on a missing
+/// label: they read seven metric names no crate declares, grouped on `route`,
+/// `rail`, `policy` and `decision`, which are not labels on anything, and
+/// computed error rates from `status_class`, the exact matcher whose absence
+/// pinned the availability SLO at 1.0 and is the reason this guard exists. And
+/// the `tenant_id` filter was never load bearing: the variable behind it is
+/// populated by `label_values(<metric>, tenant_id)`, which returns nothing, so
+/// operators got an always-empty dropdown over unfiltered data while the panel
+/// title promised one tenant's slice.
+///
+/// So the directory is in, and the queries were corrected the same way
+/// `deploy/alerts/recording-rules.yml` had already corrected its own copy of
+/// these defects: `status` is the raw code, the ledger and audit counts come
+/// from their histograms' `_count` series, and the grouping keys are the labels
+/// the metrics actually carry.
+///
+/// Nine panels could not be retargeted, because they asked for a dimension no
+/// metric in this workspace has. Grafana JSON carries no comments, so the
+/// ledger is here:
+///
+/// - `traces-overview.json` lost its three PromQL panels.
+///   `sbproxy_spans_emitted_total` and `sbproxy_traces_started_total` are
+///   declared nowhere, and nothing on the OTLP path counts spans or traces at
+///   all; `sbproxy_telemetry_dropped_total` counts drops, which is a different
+///   question. WOR-2318 owns the non-AI tracing gap, and the panels come back
+///   with the counters that feed them. The dashboard keeps its Tempo search and
+///   its `pillar` variable, which `span_drift.rs` pins to the `Pillar` enum.
+/// - `audit-log.json` lost "Audit chain-position lag"
+///   (`sbproxy_audit_chain_position_lag` is declared nowhere, and the only
+///   chain metrics in the workspace belong to the meter, a different
+///   subsystem) and "Top audit subjects" (`subject_kind` is not a label, and
+///   per-subject identity is unbounded, which is what the run-scoped label
+///   guard exists to keep off metrics; that panel's own description already
+///   said it belongs on a span).
+/// - `content-shapes.json` lost the Markdown token histogram
+///   (`sbproxy_markdown_token_estimate` is declared nowhere; the estimate is
+///   stamped on a response header and never observed) and the Content-Signal
+///   breakdown (`content_signal` is not a label on anything).
+/// - `boilerplate-stripping.json` lost its Markdown projection latency panel:
+///   the transform records stripped bytes but never times itself.
+/// - `per-agent.json` lost "Latency p95 by agent class".
+///   `sbproxy_request_duration_seconds` carries only `hostname`, and no
+///   histogram here has an agent dimension. Left in place with the agent
+///   filters silently ignored, it would have shown an operator who had narrowed
+///   to one vendor the latency of all of them.
+///
+/// Two blind spots remain, both narrower than the directory-shaped one they
+/// replace, and neither is a place a broken SLO can hide:
+///
+/// 1. Only `expr` is read, so a Grafana `templating` variable whose query is
+///    `label_values(<metric>, <label>)` is invisible here. That is how
+///    `deploy/dashboards/licensing-edits.json` still sources a dropdown from
+///    `sbproxy_audit_emit_total`, a metric that does not exist. Its panels are
+///    ClickHouse, not PromQL, so no alert or SLO depends on it.
+/// 2. A dashboard shipped outside these four directories is not scanned at all.
 const QUERY_DIRS: &[&str] = &[
     "dashboards/grafana",
     "dashboards/prometheus",
     "deploy/alerts",
+    "deploy/dashboards",
 ];
 
 /// A Rust source file with both its original and production-only views.

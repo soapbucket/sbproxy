@@ -40,33 +40,14 @@
         "options": []
       },
       {
-        "name": "tenant_id",
-        "label": "Tenant",
+        "name": "action",
+        "label": "Action",
         "type": "query",
         "datasource": {
           "type": "prometheus",
           "uid": "${prometheus_datasource}"
         },
-        "query": "label_values(sbproxy_policy_triggers_total, tenant_id)",
-        "includeAll": true,
-        "multi": true,
-        "refresh": 2,
-        "current": {
-          "selected": false,
-          "text": "All",
-          "value": "$__all"
-        },
-        "options": []
-      },
-      {
-        "name": "decision",
-        "label": "Decision",
-        "type": "query",
-        "datasource": {
-          "type": "prometheus",
-          "uid": "${prometheus_datasource}"
-        },
-        "query": "label_values(sbproxy_policy_triggers_total{tenant_id=~\"$tenant_id\"}, decision)",
+        "query": "label_values(sbproxy_policy_triggers_total, action)",
         "includeAll": true,
         "multi": true,
         "refresh": 2,
@@ -83,7 +64,7 @@
     {
       "id": 1,
       "title": "Total policy triggers per hour",
-      "description": "Sum of policy triggers in the last 1h, filtered by tenant and decision. Spike indicates traffic shift or attack.",
+      "description": "Sum of policy triggers in the last 1h, filtered by enforcement action. Spike indicates traffic shift or attack.",
       "type": "stat",
       "gridPos": {
         "h": 5,
@@ -138,7 +119,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(increase(sbproxy_policy_triggers_total{tenant_id=~\"$tenant_id\",decision=~\"$decision\"}[1h]))",
+          "expr": "sum(increase(sbproxy_policy_triggers_total{action=~\"$action\"}[1h]))",
           "legendFormat": "triggers / hr",
           "datasource": {
             "type": "prometheus",
@@ -200,8 +181,8 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (policy) (rate(sbproxy_policy_triggers_total{tenant_id=~\"$tenant_id\",decision=~\"$decision\"}[$__rate_interval]))",
-          "legendFormat": "{{policy}}",
+          "expr": "sum by (policy_type) (rate(sbproxy_policy_triggers_total{action=~\"$action\"}[$__rate_interval]))",
+          "legendFormat": "{{policy_type}}",
           "datasource": {
             "type": "prometheus",
             "uid": "${prometheus_datasource}"
@@ -211,8 +192,8 @@
     },
     {
       "id": 3,
-      "title": "Triggers by route x policy",
-      "description": "Heatmap of route x policy intersections. Hot cells flag a route that is repeatedly tripping a single policy.",
+      "title": "Triggers by origin x policy",
+      "description": "Heatmap of origin x policy intersections. Hot cells flag an origin that is repeatedly tripping a single policy.",
       "type": "heatmap",
       "gridPos": {
         "h": 10,
@@ -277,8 +258,8 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (route, policy) (rate(sbproxy_policy_triggers_total{tenant_id=~\"$tenant_id\",decision=~\"$decision\"}[$__rate_interval]))",
-          "legendFormat": "{{route}} | {{policy}}",
+          "expr": "sum by (origin, policy_type) (rate(sbproxy_policy_triggers_total{action=~\"$action\"}[$__rate_interval]))",
+          "legendFormat": "{{origin}} | {{policy_type}}",
           "datasource": {
             "type": "prometheus",
             "uid": "${prometheus_datasource}"

@@ -102,6 +102,52 @@ fn every_dashboard_and_alert_rule_reads_a_live_metric_with_labels_that_exist() {
 }
 
 #[test]
+fn every_scanned_query_directory_contributes_references() {
+    // The floor in the test above is a single workspace-wide number, and a
+    // single number cannot tell "the scanner read everything" from "the
+    // scanner read three directories and silently skipped the fourth". That
+    // is not hypothetical: `deploy/dashboards/` sat outside QUERY_DIRS while
+    // the guard passed, so eight dashboards shipped through the Helm
+    // configmap reading seven metrics no crate declares. A per-directory
+    // floor is what makes adding a directory to QUERY_DIRS and having it read
+    // nothing a failure rather than a no-op.
+    //
+    // The floors are deliberately well under the current counts (57, 31, 12,
+    // 9). They exist to catch zero, not to pin a number that every dashboard
+    // edit has to come back and update.
+    let references = scan::query_references(&repo_root());
+
+    for (dir, floor) in [
+        ("dashboards/grafana/", 20),
+        ("dashboards/prometheus/", 10),
+        ("deploy/alerts/", 5),
+        ("deploy/dashboards/", 5),
+    ] {
+        let found = references
+            .iter()
+            .filter(|reference| reference.file.starts_with(dir))
+            .count();
+
+        assert!(
+            found >= floor,
+            "the scanner found only {found} metric references under {dir}, expected at \
+             least {floor}; either the directory is missing from QUERY_DIRS or nothing \
+             in it parses as PromQL"
+        );
+    }
+
+    // One concrete pairing, so the count above cannot be satisfied by
+    // references the scanner invented from prose or panel titles.
+    assert!(
+        references.iter().any(|reference| {
+            reference.file == "deploy/dashboards/overview.json"
+                && reference.metric == "sbproxy_requests_total"
+        }),
+        "the overview dashboard's headline traffic panel was not scanned"
+    );
+}
+
+#[test]
 fn a_dead_metric_reference_needs_a_reason_and_a_ticket() {
     // The allow-list is the escape hatch, so it is the thing most likely to be
     // abused. An entry has to explain itself and name the ticket that removes
