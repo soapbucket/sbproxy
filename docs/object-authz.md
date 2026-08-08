@@ -1,5 +1,5 @@
 # object_authz policy
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-08*
 
 The `object_authz` policy enforces object- and function-level authorization at the gateway, catching the two top OWASP API risks: BOLA (API1:2023, Broken Object Level Authorization) and BFLA (API5:2023, Broken Function Level Authorization). Alias: `bola`.
 
@@ -54,9 +54,19 @@ origins:
 `principal.owner_from` picks where the policy reads the caller's identity:
 
 * `sub` (default, recommended): the verified auth subject from `ctx.auth_result`. Safe by default.
-* `header`: a request header (`principal.owner_header`, default `x-owner-id`). Only trustworthy when a trusted upstream auth layer sets it; the client must not be able to spoof it. Pair with `proxy.trusted_proxies` so external traffic cannot inject the header.
+* `header`: a request header (`principal.owner_header`, default `x-owner-id`).
+
+> **`owner_from: header` is an authorization bypass without a header-stripping ingress.**
+>
+> The whole point of a BOLA rule is that the caller cannot choose the owner it is compared against. Under `owner_from: header` the caller chooses it: whatever arrives in `x-owner-id` becomes the owner identity, so any client that can open a connection to the proxy can send `x-owner-id: victim` and read every one of that tenant's objects. The rule still runs, still logs, still reports clean. It enforces nothing.
+>
+> This is only safe when something in front of the proxy overwrites or deletes the header on every inbound request, with no path around it: an auth proxy, an ingress controller, or a service mesh sidecar that owns the listener. "The clients we know about do not send it" is not that. If you cannot point at the component doing the stripping, use `owner_from: sub`.
+>
+> Config compilation warns once per origin when it sees this setting, naming the origin and the header. The warning is not a substitute for checking; nothing at config time can see whether your ingress strips anything.
 
 Roles for `function_rules` come from the auth result. Reading them from a header (`principal.role_header`, default `x-roles`) requires the explicit `principal.trust_role_header: true` opt-in, because a direct client could otherwise send `x-roles: admin` and satisfy any role rule.
+
+Pair either header source with `proxy.trusted_proxies` so the proxy knows which peers are the ingress.
 
 ### When the rule fires
 
