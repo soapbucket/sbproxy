@@ -40,25 +40,6 @@
         "options": []
       },
       {
-        "name": "tenant_id",
-        "label": "Tenant",
-        "type": "query",
-        "datasource": {
-          "type": "prometheus",
-          "uid": "${prometheus_datasource}"
-        },
-        "query": "label_values(sbproxy_requests_total, tenant_id)",
-        "includeAll": true,
-        "multi": true,
-        "refresh": 2,
-        "current": {
-          "selected": false,
-          "text": "All",
-          "value": "$__all"
-        },
-        "options": []
-      },
-      {
         "name": "agent_class",
         "label": "Agent class",
         "type": "query",
@@ -66,7 +47,7 @@
           "type": "prometheus",
           "uid": "${prometheus_datasource}"
         },
-        "query": "label_values(sbproxy_requests_total{tenant_id=~\"$tenant_id\"}, agent_class)",
+        "query": "label_values(sbproxy_requests_total, agent_class)",
         "includeAll": true,
         "multi": true,
         "refresh": 2,
@@ -85,7 +66,7 @@
           "type": "prometheus",
           "uid": "${prometheus_datasource}"
         },
-        "query": "label_values(sbproxy_requests_total{tenant_id=~\"$tenant_id\",agent_class=~\"$agent_class\"}, agent_vendor)",
+        "query": "label_values(sbproxy_requests_total{agent_class=~\"$agent_class\"}, agent_vendor)",
         "includeAll": true,
         "multi": true,
         "refresh": 2,
@@ -115,7 +96,7 @@
     {
       "id": 1,
       "title": "Requests by agent class",
-      "description": "Rate of inbound requests per agent_class, filtered by tenant and vendor.",
+      "description": "Rate of inbound requests per agent_class, filtered by class and vendor.",
       "type": "timeseries",
       "gridPos": {
         "h": 8,
@@ -158,7 +139,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (agent_class) (rate(sbproxy_requests_total{tenant_id=~\"$tenant_id\",agent_class=~\"$agent_class\",agent_vendor=~\"$agent_vendor\"}[$__rate_interval]))",
+          "expr": "sum by (agent_class) (rate(sbproxy_requests_total{agent_class=~\"$agent_class\",agent_vendor=~\"$agent_vendor\"}[$__rate_interval]))",
           "legendFormat": "{{agent_class}}",
           "datasource": {
             "type": "prometheus",
@@ -213,7 +194,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (agent_class) (rate(sbproxy_requests_total{status_class=\"5xx\",tenant_id=~\"$tenant_id\",agent_class=~\"$agent_class\",agent_vendor=~\"$agent_vendor\"}[$__rate_interval])) / sum by (agent_class) (rate(sbproxy_requests_total{tenant_id=~\"$tenant_id\",agent_class=~\"$agent_class\",agent_vendor=~\"$agent_vendor\"}[$__rate_interval]))",
+          "expr": "sum by (agent_class) (rate(sbproxy_requests_total{status=~\"5..\",agent_class=~\"$agent_class\",agent_vendor=~\"$agent_vendor\"}[$__rate_interval])) / sum by (agent_class) (rate(sbproxy_requests_total{agent_class=~\"$agent_class\",agent_vendor=~\"$agent_vendor\"}[$__rate_interval]))",
           "legendFormat": "{{agent_class}}",
           "datasource": {
             "type": "prometheus",
@@ -224,8 +205,8 @@
     },
     {
       "id": 3,
-      "title": "Top routes for selected agents",
-      "description": "Top 20 routes for the selected agent class / vendor combo. Click a route to drill into Overview.",
+      "title": "Top origins for selected agents",
+      "description": "Top 20 origins for the selected agent class / vendor combo. Click an origin to drill into Overview.",
       "type": "table",
       "gridPos": {
         "h": 8,
@@ -257,8 +238,8 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "topk(20, sum by (route, agent_class) (rate(sbproxy_requests_total{tenant_id=~\"$tenant_id\",agent_class=~\"$agent_class\",agent_vendor=~\"$agent_vendor\"}[$__rate_interval])))",
-          "legendFormat": "{{route}} ({{agent_class}})",
+          "expr": "topk(20, sum by (hostname, agent_class) (rate(sbproxy_requests_total{agent_class=~\"$agent_class\",agent_vendor=~\"$agent_vendor\"}[$__rate_interval])))",
+          "legendFormat": "{{hostname}} ({{agent_class}})",
           "format": "table",
           "instant": true,
           "datasource": {
@@ -303,65 +284,10 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "topk(20, sum by (rail, agent_class) (rate(sbproxy_requests_total{tenant_id=~\"$tenant_id\",agent_class=~\"$agent_class\",agent_vendor=~\"$agent_vendor\"}[$__rate_interval])))",
-          "legendFormat": "{{rail}} ({{agent_class}})",
+          "expr": "topk(20, sum by (payment_rail, agent_class) (rate(sbproxy_requests_total{agent_class=~\"$agent_class\",agent_vendor=~\"$agent_vendor\"}[$__rate_interval])))",
+          "legendFormat": "{{payment_rail}} ({{agent_class}})",
           "format": "table",
           "instant": true,
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${prometheus_datasource}"
-          }
-        }
-      ]
-    },
-    {
-      "id": 5,
-      "title": "Latency p95 by agent class",
-      "description": "Per-agent_class p95 latency. Catches single-vendor regressions that get washed out in the global p95.",
-      "type": "timeseries",
-      "gridPos": {
-        "h": 8,
-        "w": 24,
-        "x": 0,
-        "y": 16
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${prometheus_datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "s",
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "lineWidth": 2,
-            "fillOpacity": 10,
-            "drawStyle": "line"
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "mean",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "histogram_quantile(0.95, sum by (le, agent_class) (rate(sbproxy_request_duration_seconds_bucket{tenant_id=~\"$tenant_id\",agent_class=~\"$agent_class\",agent_vendor=~\"$agent_vendor\"}[$__rate_interval])))",
-          "legendFormat": "{{agent_class}} p95",
           "datasource": {
             "type": "prometheus",
             "uid": "${prometheus_datasource}"

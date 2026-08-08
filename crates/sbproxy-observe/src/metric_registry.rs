@@ -3169,6 +3169,22 @@ pub const METRICS: &[MetricCapability] = &[
 /// whole difference between "known dead" as a decision and "known dead" as an
 /// accident. Everything here is a panel or rule that draws a flat zero today
 /// and will draw real data when its ticket lands.
+///
+/// Narrow in two ways worth knowing before you reach for it, because neither is
+/// visible from the type:
+///
+/// - It covers the dead-writer case only. The exemption-quality test in
+///   `metric_drift.rs` requires the name to be in [`METRICS`], so a query
+///   naming a metric no crate declares cannot be exempted. Declare it (with
+///   `Writer::Nothing` and a `dead_reason`) or fix the query.
+/// - An entry suppresses every check on that metric, in every scanned file, not
+///   just the one that prompted it. `sbproxy_requests_total` is read by five
+///   dashboards and both rule sets, so exempting it to quiet one bad label
+///   would also retire the `status_class` check whose absence pinned the
+///   availability SLO at 1.0. Prefer fixing the query.
+///
+/// Empty because closing `deploy/dashboards/` needed neither: every finding
+/// there was an undeclared name or a wrong label, and both were fixed in place.
 pub const REFERENCE_EXEMPTIONS: &[ReferenceExemption] = &[];
 
 // --- Tenant-scoping guard (multi-tenant enforcement) ---
