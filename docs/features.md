@@ -1,4 +1,5 @@
 # SBproxy Features Hub
+*Last modified: 2026-08-08*
 
 SBproxy is a high-performance reverse proxy and AI gateway built on Cloudflare's Pingora framework. It unifies traditional API proxying, AI model routing, Agent-to-Agent (A2A) communication, Model Context Protocol (MCP) tool integration, and Agent-specific workflows into a single binary.
 
@@ -57,8 +58,8 @@ Go beyond round-robin with LLM-aware routing strategies like lowest latency, lea
 * **Examples:** [AI Cascade Routing](../examples/ai-cascade-routing/), [AI Outcome Aware Routing](../examples/ai-outcome-aware-routing/), [AI Resilience](../examples/ai-resilience/), [Cost Optimized](../examples/ai-cost-optimized/), [Routing Fallback](../examples/ai-routing-fallback/)
 
 ### Budgets & Metering
-Enforce hard or soft budgets on AI spend by workspace, user, or key. SBproxy calculates token counts and USD costs locally, emitting metrics for attribution and saving tamper-evident logs.
-* **Docs:** [AI Predictive Budget](ai-predictive-budget.md), [AI Usage Ledger](ai-usage-ledger.md), [Value Ledger Economics](value-ledger-economics.md), [Metering](metering.md)
+Enforce hard or soft budgets on AI spend by workspace, user, or key. Soft-landing budgets step through fixed warn and downgrade thresholds of the current spend window before the cap blocks; the mechanism is a threshold ladder, not a spend forecaster. SBproxy calculates token counts and USD costs locally, emitting metrics for attribution and saving tamper-evident logs.
+* **Docs:** [AI Budget Soft-Landing](ai-predictive-budget.md), [AI Usage Ledger](ai-usage-ledger.md), [Value Ledger Economics](value-ledger-economics.md), [Metering](metering.md)
 * **Examples:** [AI Budget](../examples/ai-budget/), [AI Usage Ledger](../examples/ai-usage-ledger/), [Metering Verify](../examples/metering-verify/), [Model Rate Limits](../examples/ai-model-rate-limits/), [Surface Rate Limits](../examples/ai-per-surface-rate-limits/), [Waste Signals](../examples/ai-waste-signals/), [Attribution Tags](../examples/ai-attribution-tags/)
 
 ### Guardrails & Policy
