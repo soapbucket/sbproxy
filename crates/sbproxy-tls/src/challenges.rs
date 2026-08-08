@@ -25,20 +25,57 @@ fn challenge_key(token: &str) -> String {
     format!("{}{}", CHALLENGE_PREFIX, token)
 }
 
-/// How long a published key authorization stays answerable, in seconds.
+/// Longest a published key authorization stays answerable, in seconds.
 ///
-/// Ten minutes. The floor is set by our own issuance flow: after the token is
+/// Ten minutes, and it is a ceiling on the server's answer rather than the
+/// answer itself. Two pressures fix it.
+///
+/// It cannot be shorter than our own issuance flow. After the token is
 /// published, [`crate::acme::AcmeClient`] waits up to 120s for the
-/// authorization to go valid, up to 120s for the order to go ready, and up to
-/// another 120s for it to go valid after finalization, so a slow but healthy
-/// order can keep the token live for six minutes plus CSR and download time.
-/// The ceiling is set by cleanup: the issuing node deletes the key on the
-/// happy path, but a node that is killed between publishing the token and
-/// finishing the order cannot, and on a shared backend that orphan would
-/// otherwise be served forever. Ten minutes covers the slowest healthy order
-/// with slack for a CA that retries validation, and ages out an orphan fast
-/// enough that it never outlives the order it belonged to.
-const CHALLENGE_TTL_SECS: u64 = 600;
+/// authorization to go valid, up to 120s for the order to go ready, and up
+/// to another 120s for it to go valid after finalization, so a slow but
+/// healthy order can keep the token live for six minutes plus CSR and
+/// download time. Ten minutes covers that with slack for a CA that retries
+/// validation.
+///
+/// It cannot be much longer, because of cleanup. The issuing node deletes
+/// the key on the happy path, but a node killed between publishing the token
+/// and finishing the order cannot, and on a shared backend that orphan stays
+/// answerable by the whole fleet until something ages it out. Nothing ever
+/// reads it again on purpose: a retry opens a fresh order and gets a fresh
+/// token, so what survives is residue that publishes our account thumbprint
+/// at a well-known path for no benefit.
+///
+/// That second pressure is why the authorization's own `expires` is clamped
+/// instead of trusted. Let's Encrypt reports roughly seven days of life on a
+/// pending authorization. That is a correct statement about the
+/// authorization and a bad lifetime for this record: honoring it would leave
+/// an orphaned token answerable fleet-wide for a week after the order it
+/// belonged to died, which is the exact hazard this bound exists to prevent,
+/// and it buys nothing, because no healthy order needs more than the six
+/// minutes above. Seven days of answerability on a shared store is not
+/// acceptable, so the record takes the smaller of the two.
+const CHALLENGE_MAX_TTL_SECS: u64 = 600;
+
+/// Shortest a published key authorization stays answerable, in seconds.
+///
+/// One minute. The server's `expires` can be in the past, when we pick up a
+/// reused authorization late in its life, or effectively in the past because
+/// this host's clock runs ahead of the CA's. Taking either literally would
+/// publish a record that is already dead when the CA's validation fetch
+/// arrives, turning a recoverable order into a 404. Let's Encrypt fetches
+/// within seconds of the readiness POST, so a minute absorbs realistic skew
+/// without keeping a genuinely dead authorization's token around.
+const CHALLENGE_MIN_TTL_SECS: u64 = 60;
+
+/// TTL used when the authorization carries no `expires` field at all.
+///
+/// RFC 8555 §7.1.4 makes `expires` optional and requires it only for an
+/// authorization in the `valid` state, so a `pending` one may legitimately
+/// arrive without it. With no server answer there is nothing to shorten to,
+/// so this is deliberately [`CHALLENGE_MAX_TTL_SECS`]: the shortest bound
+/// that still covers the slowest healthy order.
+const CHALLENGE_DEFAULT_TTL_SECS: u64 = CHALLENGE_MAX_TTL_SECS;
 
 // --- Http01ChallengeStore ---
 
@@ -107,12 +144,25 @@ impl Http01ChallengeStore {
 
     /// Register a token and its corresponding key authorization.
     ///
+    /// `authorization_expiry` is the `expires` field of the ACME
+    /// authorization this token satisfies (RFC 8555 §7.1.4), already parsed;
+    /// pass `None` when the server omitted it or sent something unparseable.
+    /// The record's own deadline is derived from it rather than from a fixed
+    /// local guess, then clamped into a one minute to ten minute range so the
+    /// token never outlives the authorization and never lingers for days on a
+    /// shared store when an order dies mid-flight.
+    ///
     /// Fails when the shared backing store rejects the write. That is
     /// deliberate: silently keeping a token this node alone can answer is the
     /// exact failure that makes issuance behind a load balancer look like a
     /// CA problem. Failing here aborts the order instead, with a real error.
-    pub fn set(&self, token: &str, key_authorization: &str) -> Result<()> {
-        self.set_at(token, key_authorization, now_unix())
+    pub fn set(
+        &self,
+        token: &str,
+        key_authorization: &str,
+        authorization_expiry: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<()> {
+        self.set_at(token, key_authorization, authorization_expiry, now_unix())
     }
 
     /// Look up the key authorization for a token, local map first, then the
@@ -168,9 +218,16 @@ impl Http01ChallengeStore {
 
     // --- Internals (clock injected so expiry is testable without sleeping) ---
 
-    fn set_at(&self, token: &str, key_authorization: &str, now: i64) -> Result<()> {
+    fn set_at(
+        &self,
+        token: &str,
+        key_authorization: &str,
+        authorization_expiry: Option<chrono::DateTime<chrono::Utc>>,
+        now: i64,
+    ) -> Result<()> {
+        let ttl_secs = challenge_ttl_secs(authorization_expiry, now);
         let record = ChallengeRecord {
-            expires_at: now.saturating_add(CHALLENGE_TTL_SECS as i64),
+            expires_at: now.saturating_add(ttl_secs as i64),
             key_authorization: key_authorization.to_owned(),
         };
         if let Some(store) = &self.shared {
@@ -181,7 +238,7 @@ impl Http01ChallengeStore {
             // primitive and returns "not supported", in which case the
             // `expires_at` inside the record is what bounds the lifetime.
             if store
-                .put_with_ttl(key.as_bytes(), &value, CHALLENGE_TTL_SECS)
+                .put_with_ttl(key.as_bytes(), &value, ttl_secs)
                 .is_err()
             {
                 store
@@ -225,6 +282,30 @@ impl Default for Http01ChallengeStore {
 
 fn now_unix() -> i64 {
     chrono::Utc::now().timestamp()
+}
+
+/// How many seconds a published key authorization should stay answerable,
+/// given the authorization's own expiry and the current time.
+///
+/// The ACME server is the authority on how long the authorization is good
+/// for, so its answer is the input rather than a local constant. It is not
+/// the last word, though: see [`CHALLENGE_MAX_TTL_SECS`] and
+/// [`CHALLENGE_MIN_TTL_SECS`] for why the value is bounded at both ends, and
+/// [`CHALLENGE_DEFAULT_TTL_SECS`] for the omitted case.
+fn challenge_ttl_secs(
+    authorization_expiry: Option<chrono::DateTime<chrono::Utc>>,
+    now: i64,
+) -> u64 {
+    let Some(expiry) = authorization_expiry else {
+        return CHALLENGE_DEFAULT_TTL_SECS;
+    };
+    let remaining = expiry
+        .timestamp()
+        .saturating_sub(now)
+        .clamp(CHALLENGE_MIN_TTL_SECS as i64, CHALLENGE_MAX_TTL_SECS as i64);
+    // `clamp` has already pinned the value to a positive floor, so the
+    // conversion cannot fail; fall back to that floor rather than panic.
+    u64::try_from(remaining).unwrap_or(CHALLENGE_MIN_TTL_SECS)
 }
 
 /// Decode a stored record and return its key authorization only while it is
@@ -301,7 +382,7 @@ mod tests {
     #[test]
     fn test_store_set_get() {
         let store = Http01ChallengeStore::new();
-        store.set("mytoken", "mytoken.thumbprint").unwrap();
+        store.set("mytoken", "mytoken.thumbprint", None).unwrap();
         assert_eq!(store.get("mytoken").as_deref(), Some("mytoken.thumbprint"));
     }
 
@@ -314,7 +395,7 @@ mod tests {
     #[test]
     fn test_store_remove() {
         let store = Http01ChallengeStore::new();
-        store.set("tok", "tok.abc").unwrap();
+        store.set("tok", "tok.abc", None).unwrap();
         store.remove("tok");
         assert!(store.get("tok").is_none());
     }
@@ -322,8 +403,8 @@ mod tests {
     #[test]
     fn test_store_overwrite() {
         let store = Http01ChallengeStore::new();
-        store.set("tok", "first").unwrap();
-        store.set("tok", "second").unwrap();
+        store.set("tok", "first", None).unwrap();
+        store.set("tok", "second", None).unwrap();
         assert_eq!(store.get("tok").as_deref(), Some("second"));
     }
 
@@ -340,7 +421,7 @@ mod tests {
         let node_a = Http01ChallengeStore::with_store(Arc::clone(&shared));
         let node_b = Http01ChallengeStore::with_store(Arc::clone(&shared));
 
-        node_a.set("tok-abc", "tok-abc.thumbprint").unwrap();
+        node_a.set("tok-abc", "tok-abc.thumbprint", None).unwrap();
 
         assert_eq!(
             node_b.get("tok-abc").as_deref(),
@@ -356,7 +437,9 @@ mod tests {
         let node_a = Http01ChallengeStore::with_store(Arc::clone(&shared));
         let node_b = Http01ChallengeStore::with_store(Arc::clone(&shared));
 
-        node_a.set("tok-async", "tok-async.thumbprint").unwrap();
+        node_a
+            .set("tok-async", "tok-async.thumbprint", None)
+            .unwrap();
 
         assert_eq!(
             node_b.get_async("tok-async").await.as_deref(),
@@ -372,7 +455,7 @@ mod tests {
         let node_a = Http01ChallengeStore::with_store(Arc::new(MemoryKVStore::new(0)));
         let node_c = Http01ChallengeStore::with_store(Arc::new(MemoryKVStore::new(0)));
 
-        node_a.set("tok-abc", "tok-abc.thumbprint").unwrap();
+        node_a.set("tok-abc", "tok-abc.thumbprint", None).unwrap();
 
         assert!(
             node_c.get("tok-abc").is_none(),
@@ -388,7 +471,7 @@ mod tests {
         let shared: Arc<dyn KVStore> = Arc::new(MemoryKVStore::new(0));
         let node = Http01ChallengeStore::with_store(Arc::clone(&shared));
 
-        node.set("tok-abc", "tok-abc.thumbprint").unwrap();
+        node.set("tok-abc", "tok-abc.thumbprint", None).unwrap();
 
         let raw = shared
             .get(b"acme:challenge:tok-abc")
@@ -408,10 +491,10 @@ mod tests {
         let issued_at = 1_800_000_000_i64;
 
         node_a
-            .set_at("tok-abc", "tok-abc.thumbprint", issued_at)
+            .set_at("tok-abc", "tok-abc.thumbprint", None, issued_at)
             .unwrap();
 
-        let ttl = CHALLENGE_TTL_SECS as i64;
+        let ttl = CHALLENGE_DEFAULT_TTL_SECS as i64;
         assert_eq!(
             node_a.get_at("tok-abc", issued_at + ttl - 1).as_deref(),
             Some("tok-abc.thumbprint"),
@@ -432,13 +515,128 @@ mod tests {
         );
     }
 
+    // --- Http01ChallengeStore: where the deadline comes from ---
+
+    /// Unix seconds as a UTC instant, the shape an authorization's `expires`
+    /// field parses into.
+    fn utc(ts: i64) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0).expect("timestamp is in range")
+    }
+
+    /// The `expires_at` a published record actually carries on the wire.
+    fn stored_expiry(shared: &Arc<dyn KVStore>, token: &str) -> i64 {
+        let raw = shared
+            .get(challenge_key(token).as_bytes())
+            .unwrap()
+            .expect("the challenge is published");
+        let record: ChallengeRecord = serde_json::from_slice(&raw).unwrap();
+        record.expires_at
+    }
+
+    #[test]
+    fn the_deadline_comes_from_the_authorization_not_a_local_constant() {
+        // The CA is the authority on how long the authorization is good for,
+        // and the token exists only to satisfy that authorization. A server
+        // answer inside the bounds is taken verbatim; nothing here invents a
+        // number.
+        let shared: Arc<dyn KVStore> = Arc::new(MemoryKVStore::new(0));
+        let node = Http01ChallengeStore::with_store(Arc::clone(&shared));
+        let issued_at = 1_800_000_000_i64;
+        let authz_ttl = 300_i64;
+        let deadline = issued_at + authz_ttl;
+        let expiry = Some(utc(deadline));
+
+        assert_ne!(
+            authz_ttl, CHALLENGE_DEFAULT_TTL_SECS as i64,
+            "the fixture has to differ from the fallback or it proves nothing"
+        );
+
+        node.set_at("tok-authz", "tok-authz.thumbprint", expiry, issued_at)
+            .unwrap();
+
+        assert_eq!(
+            stored_expiry(&shared, "tok-authz"),
+            deadline,
+            "the record must expire with the authorization, not on a constant"
+        );
+        assert!(node.get_at("tok-authz", deadline - 1).is_some());
+        assert!(node.get_at("tok-authz", deadline).is_none());
+    }
+
+    #[test]
+    fn a_seven_day_authorization_expiry_is_clamped_to_the_ceiling() {
+        // Let's Encrypt reports roughly seven days of life on a pending
+        // authorization. That is a real value, not a malformed one, so it is
+        // bounded rather than rejected: honoring it verbatim would leave an
+        // orphaned token answerable fleet-wide for a week if the issuer dies
+        // mid-order, and no healthy order needs more than a few minutes.
+        let shared: Arc<dyn KVStore> = Arc::new(MemoryKVStore::new(0));
+        let node = Http01ChallengeStore::with_store(Arc::clone(&shared));
+        let issued_at = 1_800_000_000_i64;
+        let ceiling = CHALLENGE_MAX_TTL_SECS as i64;
+        let seven_days_out = issued_at + 7 * 24 * 60 * 60;
+        let expiry = Some(utc(seven_days_out));
+
+        node.set_at("tok-le", "tok-le.thumbprint", expiry, issued_at)
+            .unwrap();
+
+        assert_eq!(stored_expiry(&shared, "tok-le"), issued_at + ceiling);
+        assert!(
+            stored_expiry(&shared, "tok-le") < seven_days_out,
+            "a week of fleet-wide answerability is the hazard, not the answer"
+        );
+        assert!(node.get_at("tok-le", issued_at + ceiling - 1).is_some());
+        assert!(node.get_at("tok-le", issued_at + ceiling).is_none());
+    }
+
+    #[test]
+    fn an_authorization_expiring_sooner_than_the_floor_is_clamped_up() {
+        // A reused authorization picked up near or past its expiry, or a host
+        // whose clock runs ahead of the CA's, must not publish a record that
+        // is already dead when the validation fetch lands.
+        let shared: Arc<dyn KVStore> = Arc::new(MemoryKVStore::new(0));
+        let node = Http01ChallengeStore::with_store(Arc::clone(&shared));
+        let issued_at = 1_800_000_000_i64;
+        let floor = CHALLENGE_MIN_TTL_SECS as i64;
+        let nearly_over = Some(utc(issued_at + 10));
+        let already_over = Some(utc(issued_at - 3_600));
+
+        node.set_at("tok-soon", "tok-soon.thumbprint", nearly_over, issued_at)
+            .unwrap();
+        node.set_at("tok-past", "tok-past.thumbprint", already_over, issued_at)
+            .unwrap();
+
+        assert_eq!(stored_expiry(&shared, "tok-soon"), issued_at + floor);
+        assert_eq!(stored_expiry(&shared, "tok-past"), issued_at + floor);
+        assert!(node.get_at("tok-past", issued_at + floor - 1).is_some());
+        assert!(node.get_at("tok-past", issued_at + floor).is_none());
+    }
+
+    #[test]
+    fn an_authorization_with_no_expires_falls_back_to_the_default() {
+        // RFC 8555 §7.1.4 requires `expires` only on a `valid` authorization,
+        // so a `pending` one may legitimately arrive without it. With no
+        // server answer there is nothing to shorten to.
+        let shared: Arc<dyn KVStore> = Arc::new(MemoryKVStore::new(0));
+        let node = Http01ChallengeStore::with_store(Arc::clone(&shared));
+        let issued_at = 1_800_000_000_i64;
+
+        node.set_at("tok-none", "tok-none.thumbprint", None, issued_at)
+            .unwrap();
+
+        assert_eq!(
+            stored_expiry(&shared, "tok-none"),
+            issued_at + CHALLENGE_DEFAULT_TTL_SECS as i64
+        );
+    }
+
     #[test]
     fn removing_a_challenge_clears_it_for_the_whole_fleet() {
         let shared: Arc<dyn KVStore> = Arc::new(MemoryKVStore::new(0));
         let node_a = Http01ChallengeStore::with_store(Arc::clone(&shared));
         let node_b = Http01ChallengeStore::with_store(Arc::clone(&shared));
 
-        node_a.set("tok-abc", "tok-abc.thumbprint").unwrap();
+        node_a.set("tok-abc", "tok-abc.thumbprint", None).unwrap();
         assert!(node_b.get("tok-abc").is_some());
 
         node_a.remove("tok-abc");
@@ -453,7 +651,7 @@ mod tests {
         // The single-process path is unchanged: no backing store, no backend
         // read, and the challenge is still answered.
         let node = Http01ChallengeStore::new();
-        node.set("tok-abc", "tok-abc.thumbprint").unwrap();
+        node.set("tok-abc", "tok-abc.thumbprint", None).unwrap();
         assert_eq!(node.get("tok-abc").as_deref(), Some("tok-abc.thumbprint"));
         node.remove("tok-abc");
         assert!(node.get("tok-abc").is_none());

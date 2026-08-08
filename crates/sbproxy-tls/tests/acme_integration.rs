@@ -166,8 +166,10 @@ async fn test_challenge_store_with_pebble_flow() {
     let token = "test-challenge-token-12345";
     let key_auth = AcmeClient::key_authorization(token, &key_pair);
 
-    // Store the challenge response.
-    challenge_store.set(token, &key_auth).unwrap();
+    // Store the challenge response. Pebble's authorization is not fetched
+    // here, so there is no server `expires` to honor and the store falls back
+    // to its own default TTL.
+    challenge_store.set(token, &key_auth, None).unwrap();
 
     // Verify we can look it up (this is what the request filter would do).
     let response = challenge_store.get(token).unwrap();

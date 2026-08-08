@@ -1053,7 +1053,7 @@ mod tests {
         let shared: std::sync::Arc<dyn KVStore> = std::sync::Arc::new(MemoryKVStore::new(0));
         let issuing_node = Http01ChallengeStore::with_store(std::sync::Arc::clone(&shared));
         issuing_node
-            .set("mytoken", "mytoken.thumbprint123")
+            .set("mytoken", "mytoken.thumbprint123", None)
             .unwrap();
 
         let serving_node = std::sync::Arc::new(Http01ChallengeStore::with_store(shared));

@@ -877,7 +877,7 @@ mod tests {
             .expect("TLS state initializes with a file-backed cert store");
         issuer
             .challenge_store
-            .set("tok-fleet", "tok-fleet.thumbprint")
+            .set("tok-fleet", "tok-fleet.thumbprint", None)
             .expect("publish the challenge to the shared backend");
 
         let peer = Http01ChallengeStore::with_store(

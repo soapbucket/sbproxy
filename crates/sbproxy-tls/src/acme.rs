@@ -84,10 +84,45 @@ pub struct Order {
 pub struct Authorization {
     /// Current authorization status (e.g. "pending", "valid", "invalid").
     pub status: String,
+    /// When the server stops considering this authorization usable, as an
+    /// RFC 3339 timestamp.
+    ///
+    /// RFC 8555 §7.1.4 marks the field optional and requires it only for an
+    /// authorization in the `valid` state, so a `pending` one may
+    /// legitimately arrive without it. Let's Encrypt does send it on pending
+    /// authorizations, roughly seven days out.
+    ///
+    /// This is what bounds how long the HTTP-01 token stays answerable. Use
+    /// [`Self::expires_at`] rather than parsing it at each call site.
+    pub expires: Option<String>,
     /// Identifier the authorization applies to.
     pub identifier: Identifier,
     /// Challenges offered by the server to satisfy this authorization.
     pub challenges: Vec<Challenge>,
+}
+
+impl Authorization {
+    /// Parse [`Self::expires`] into a UTC instant.
+    ///
+    /// Returns `None` when the server omitted the field, and also when it
+    /// sent something that is not an RFC 3339 timestamp. Callers treat the
+    /// two the same way, because they are the same situation: there is no
+    /// server answer to honor, so a local default applies. A malformed value
+    /// is worth a log line, an omitted one is not, so only the first warns.
+    pub fn expires_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        let raw = self.expires.as_deref()?;
+        match chrono::DateTime::parse_from_rfc3339(raw) {
+            Ok(expires) => Some(expires.with_timezone(&chrono::Utc)),
+            Err(e) => {
+                warn!(
+                    expires = %raw,
+                    "ACME authorization `expires` is not an RFC 3339 timestamp, \
+                     falling back to the local challenge TTL: {e}"
+                );
+                None
+            }
+        }
+    }
 }
 
 /// ACME identifier (domain name).
@@ -877,9 +912,15 @@ impl AcmeClient {
         // replica the load balancer picks, so the token must already be
         // readable fleet-wide. A failure here aborts the order rather than
         // letting the CA validate against a 404.
+        //
+        // The record's lifetime comes from this authorization's own
+        // `expires`, so the token stops being answerable when the thing it
+        // satisfies stops being usable. The store clamps that into its own
+        // range; see `challenges::CHALLENGE_MAX_TTL_SECS`.
+        let authorization_expiry = auth.expires_at();
         let key_auth = Self::key_authorization(&token, key_pair);
         challenge_store
-            .set(&token, &key_auth)
+            .set(&token, &key_auth, authorization_expiry)
             .context("publish the http-01 key authorization")?;
         debug!(hostname, token, "http-01 challenge token registered");
 
@@ -1152,6 +1193,67 @@ mod tests {
             token: "tok".to_string(),
             status: "pending".to_string(),
         }
+    }
+
+    // --- Authorization expiry (RFC 8555 §7.1.4) ---
+
+    /// A pending authorization body with `expires` spliced in verbatim, so
+    /// the tests exercise the same serde path a real CA response takes.
+    fn authorization_body(expires_field: &str) -> String {
+        format!(
+            r#"{{
+                "status": "pending",
+                {expires_field}
+                "identifier": {{"type": "dns", "value": "api.example.com"}},
+                "challenges": []
+            }}"#
+        )
+    }
+
+    #[test]
+    fn authorization_expires_parses_off_the_wire_as_rfc3339() {
+        // The shape RFC 8555 §7.1.4 specifies and Let's Encrypt sends.
+        let body = authorization_body(r#""expires": "2026-08-15T14:09:07Z","#);
+        let auth: Authorization = serde_json::from_str(&body).unwrap();
+
+        let expires = auth.expires_at().expect("an RFC 3339 expires parses");
+        assert_eq!(expires.timestamp(), 1_786_802_947);
+    }
+
+    #[test]
+    fn authorization_expires_honors_a_numeric_utc_offset() {
+        // RFC 3339 permits an offset instead of `Z`, and reading one as UTC
+        // would shift the deadline by hours in either direction.
+        let zulu_body = authorization_body(r#""expires": "2026-08-15T14:09:07Z","#);
+        let offset_body = authorization_body(r#""expires": "2026-08-15T10:09:07-04:00","#);
+
+        let zulu: Authorization = serde_json::from_str(&zulu_body).unwrap();
+        let offset: Authorization = serde_json::from_str(&offset_body).unwrap();
+
+        assert_eq!(zulu.expires_at(), offset.expires_at());
+        assert!(zulu.expires_at().is_some());
+    }
+
+    #[test]
+    fn an_authorization_without_expires_yields_no_deadline() {
+        // The field is required only for a `valid` authorization, so a
+        // pending one may omit it and must still deserialize.
+        let body = authorization_body("");
+        let auth: Authorization = serde_json::from_str(&body).unwrap();
+
+        assert!(auth.expires.is_none());
+        assert!(auth.expires_at().is_none());
+    }
+
+    #[test]
+    fn a_malformed_expires_yields_no_deadline_rather_than_failing_the_order() {
+        // A CA that sends garbage here should cost us the server's answer,
+        // not the certificate. The store falls back to its own default.
+        let body = authorization_body(r#""expires": "next tuesday","#);
+        let auth: Authorization = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(auth.expires.as_deref(), Some("next tuesday"));
+        assert!(auth.expires_at().is_none());
     }
 
     // --- Multi-challenge selection ---
