@@ -1226,7 +1226,6 @@ origins:
 | `strategy` | string | unset | Registered routing strategy name. The compiled strategy runs before `algorithm`; unknown names fail config compilation. See [Routing strategies](routing-strategies.md). |
 | `strategy_config` | object | `{}` | Strategy-specific settings. Must be an object. |
 | `lb_method` | string | unset | Compatibility marker for plugin routing. `plugin` requires `strategy`; `algorithm` remains the fallback. |
-| `sticky` | object | | **config-only.** Parses (`cookie_name`, `ttl`) and does nothing: no affinity cookie is issued and traffic distributes by `algorithm` as if the block were absent. Setting it warns at boot. For session affinity use the `cookie_hash`, `header_hash`, or `ip_hash` algorithm. |
 | `deployment_mode` | object | `{mode: normal}` | Deployment mode. See below. |
 | `outlier_detection` | object | unset | Passive ejection policy. See [Outlier detection](#outlier-detection). |
 
@@ -1241,6 +1240,25 @@ Algorithms:
 | `uri_hash` | Hash the request URI to a target (sticky by path). |
 | `header_hash` | Hash a named request header. Configured as `algorithm: { header_hash: { header: X-User } }`. |
 | `cookie_hash` | Hash a named cookie. Configured as `algorithm: { cookie_hash: { cookie: sid } }`. |
+| `ring_hash` | Ketama-style consistent hashing over the configured targets. Configured as `algorithm: { ring_hash: { key: ip } }`; `key` accepts `ip` (default), `uri`, `{ header: X-User }`, or `{ cookie: sid }`, the same key material as the four hash algorithms above. |
+
+The four modulus hash algorithms (`ip_hash`, `uri_hash`, `header_hash`, `cookie_hash`) hash over the currently eligible targets, so adding or removing a target reshuffles most keys. `ring_hash` builds a fixed ring of 160 virtual nodes per target over the configured pool, apportioned by target `weight`: removing one of N targets remaps roughly 1/N of keys, and an unhealthy target is handled by walking to the next healthy node on the ring, so a health flap moves only the keys the flapping target owned and they return when it recovers. The ring is deterministic across processes, so every replica sharing a config file maps a given key to the same target.
+
+```yaml
+origins:
+  "api.example.com":
+    action:
+      type: load_balancer
+      algorithm:
+        ring_hash:
+          key:
+            cookie: session_id
+      targets:
+        - url: https://backend-1.internal:8080
+        - url: https://backend-2.internal:8080
+```
+
+The `sticky:` block was removed. It parsed (`cookie_name`, `ttl`) and did nothing: no affinity cookie was ever issued. A config that still sets it fails to compile with an error naming the replacement. For cookie-based session affinity, use `ring_hash` keyed on the cookie your application already issues, as above.
 
 When `strategy` is set, deployment, backup, priority, health, circuit-breaker, and outlier filters run first. The registered strategy receives only eligible targets. Returning no selection falls through to `algorithm`.
 

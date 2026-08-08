@@ -1,6 +1,6 @@
 # Config stability tiers
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-08*
 
 This page defines the stability tiers and applies them to representative or
 high-impact configuration leaves. It also lists the current reviewed
@@ -98,9 +98,10 @@ and requires a reason.
 
 A module may also warn for its own config-only field rather than route it
 through the registry, using the same message and the same `config_key` field
-the registry uses, so an operator reads one boot log rather than two.
-`origins.*.action.sticky` is the only field that does this today, and it is
-listed in the table below alongside the registry's own entries.
+the registry uses, so an operator reads one boot log rather than two. No
+module field does this today: `origins.*.action.sticky`, the one field that
+did, was removed in favor of the `ring_hash` load-balancer algorithm and is
+now refused at config compile with an error naming the replacement.
 
 ### Current config-only compatibility fields
 
@@ -110,10 +111,8 @@ listed in the table below alongside the registry's own entries.
 | `audit.sink` | Admin-action rows always use the in-memory ring and tracing mirror; this selector has no effect. |
 | `origins.*.action.resilience.circuit_breaker` | The AI router is built without per-provider breakers, so the breaker gate never fires. Setting `resilience` at all still widens cross-provider retries. |
 | `origins.*.action.resilience.outlier_detection` | The AI router is built without an outlier detector, so no provider is ejected on failure rate. Use `resilience.health_check`, which is live. |
-| `origins.*.action.sticky` (load_balancer) | No affinity cookie is issued and none is read back. Use the `ip_hash`, `header_hash`, or `cookie_hash` algorithms, which are inherently sticky. |
 | `origins.*.action.targets[].zone` (load_balancer) | Target selection is not locality aware. The label is echoed in the admin targets view and nowhere else. |
 | `origins.*.agent_skills[].max_clock_skew_secs` | Reserved for signed artifact freshness headers that are not emitted yet. |
-| `origins.*.action.sticky` | The load balancer issues no affinity cookie; nothing writes `Set-Cookie`. Traffic distributes by `algorithm` as if the block were absent. Use the `cookie_hash`, `header_hash`, or `ip_hash` algorithm for session affinity. |
 | `origins.*.connection_pool` | Pingora's built-in upstream pool is used; these per-origin limits are not applied. |
 | `origins.*.compression.level` | Compression libraries use their runtime defaults; this parsed level is not applied. |
 | `origins.*.cors.enable` | The presence of `cors:` enables CORS; the legacy boolean value is ignored. |

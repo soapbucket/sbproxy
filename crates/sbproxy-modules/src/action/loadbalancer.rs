@@ -1,7 +1,8 @@
 //! Load balancer action - distributes requests across multiple upstream targets.
 //!
 //! Supports multiple routing algorithms: round-robin, weighted random,
-//! least connections, IP hash, URI hash, header hash, and cookie hash.
+//! least connections, IP hash, URI hash, header hash, cookie hash, and
+//! ketama-style ring hash (consistent hashing).
 //! Backup targets are excluded from normal selection and reserved for fallback.
 //!
 //! Also supports blue-green and canary deployment modes, and priority-based
@@ -25,16 +26,6 @@ const MAX_TARGET_METADATA_ENTRIES: usize = 64;
 const MAX_TARGET_METADATA_KEY_BYTES: usize = 64;
 const MAX_TARGET_METADATA_SERIALIZED_BYTES: usize = 16 * 1024;
 const MAX_TARGET_METADATA_NESTING_DEPTH: usize = 8;
-
-/// Operator-facing reason attached to an authored `sticky:` block.
-///
-/// Worded like the entries in `sbproxy-config`'s `key_registry`, because
-/// an operator meets both kinds of warning in the same boot log and
-/// should not have to notice they came from different registries.
-const STICKY_CONFIG_ONLY_REASON: &str =
-    "The load balancer issues no affinity cookie and never has; nothing on the response path \
-     writes Set-Cookie. Use the cookie_hash, header_hash, or ip_hash algorithm for session \
-     affinity, each of which hashes over the healthy target slice. Classified under WOR-2246.";
 
 // --- Configuration types ---
 
@@ -70,12 +61,6 @@ pub struct LoadBalancerAction {
     pub targets: Vec<Target>,
     /// Routing algorithm used to pick a target per request.
     pub algorithm: Algorithm,
-    /// Sticky-session block exactly as authored. Parsed for
-    /// compatibility and reported by
-    /// [`LoadBalancerAction::config_only_keys`]; no selection or
-    /// response path reads it, so no affinity cookie is issued. See
-    /// [`StickyConfig`].
-    pub sticky: Option<StickyConfig>,
     /// Deployment mode (normal, blue-green, or canary).
     pub deployment_mode: DeploymentMode,
     /// Optional outlier detector that ejects targets which exceed the
@@ -94,6 +79,9 @@ pub struct LoadBalancerAction {
     pub retry: Option<crate::action::RetryConfig>,
     strategy_name: Option<&'static str>,
     strategy: Option<Arc<dyn RoutingStrategy>>,
+    /// Consistent-hash ring, built once at config compile time.
+    /// `Some` exactly when `algorithm` is [`Algorithm::RingHash`].
+    ring: Option<HashRing>,
     state: LoadBalancerState,
 }
 
@@ -117,7 +105,6 @@ impl std::fmt::Debug for LoadBalancerAction {
         f.debug_struct("LoadBalancerAction")
             .field("targets", &self.targets)
             .field("algorithm", &self.algorithm)
-            .field("sticky", &self.sticky)
             .field("deployment_mode", &self.deployment_mode)
             .field("outlier_detector", &self.outlier_detector.is_some())
             .field(
@@ -358,42 +345,51 @@ pub enum Algorithm {
         /// Name of the cookie used as the hash key.
         cookie: String,
     },
+    /// Ketama-style consistent hashing over the configured targets.
+    ///
+    /// The modulus algorithms above hash over the eligible slice, so a
+    /// pool resize or health flap reshuffles most keys. The ring is
+    /// built once over the configured targets instead, and an
+    /// ineligible target is handled by walking to the next eligible
+    /// point on the ring: removing one of N targets remaps roughly 1/N
+    /// of keys, and a health flap moves only the keys the flapping
+    /// target owned.
+    RingHash {
+        /// Where the hash key comes from. Defaults to the client IP.
+        #[serde(default)]
+        key: RingHashKey,
+    },
 }
 
-/// Sticky-session block, accepted for compatibility and inert (WOR-2246).
+/// Key source for [`Algorithm::RingHash`].
 ///
-/// This never issued a cookie. Nothing in this crate writes `Set-Cookie`,
-/// so an authored block only produced round-robin traffic that looked
-/// pinned to nobody. It stays parseable because unknown keys inside
-/// `action:` are not rejected, and deleting the struct would turn a
-/// visible warning back into a silent no-op.
-///
-/// The live way to pin a client to a target is one of the hash
-/// algorithms. Each hashes over the eligible target slice, which is
-/// computed after the outlier, active-health, and circuit-breaker
-/// filters have run, so an unhealthy target drops out of the modulus
-/// and the client moves rather than staying pinned to something broken:
-///
-/// * [`Algorithm::CookieHash`] keys on a cookie the client already
-///   holds, which is the closest equivalent to this block.
-/// * [`Algorithm::HeaderHash`] keys on a request header such as a
-///   tenant or user id.
-/// * [`Algorithm::IpHash`] keys on the client address.
-#[derive(Debug, Clone, Deserialize)]
-pub struct StickyConfig {
-    /// Cookie name that would have pinned a client to a target. Parsed,
-    /// never emitted.
-    #[serde(default = "default_cookie_name")]
-    pub cookie_name: String,
-    /// Cookie TTL in seconds that would have bounded the pin. Parsed,
-    /// never emitted.
-    #[serde(default)]
-    pub ttl: Option<u64>,
+/// Each variant reuses the exact key material of the matching modulus
+/// algorithm, so switching an existing `ip_hash`, `uri_hash`,
+/// `header_hash`, or `cookie_hash` config to the ring changes only the
+/// key-to-target mapping function, never what is hashed.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RingHashKey {
+    /// Hash the client IP (the key `ip_hash` uses).
+    #[default]
+    Ip,
+    /// Hash the path-only request URI (the key `uri_hash` uses).
+    Uri,
+    /// Hash a named request header (the key `header_hash` uses).
+    /// Configured as `key: { header: X-User }`.
+    Header(String),
+    /// Hash a named cookie value (the key `cookie_hash` uses).
+    /// Configured as `key: { cookie: session_id }`.
+    Cookie(String),
 }
 
-fn default_cookie_name() -> String {
-    "sb_sticky".to_string()
-}
+// WOR-2311: `StickyConfig` lived here, parsed for compatibility, and
+// never did anything: no affinity cookie was ever issued and nothing on
+// the response path writes `Set-Cookie` (WOR-2246 pinned the gap).
+// Deleted along with its boot warning when `ring_hash` landed as the
+// real session-affinity answer. Unknown keys under `action:` are not
+// rejected, so `from_config_for_origin` refuses an authored `sticky:`
+// explicitly rather than letting the old warning decay into silence.
 
 /// The exact YAML shape a `load_balancer` action accepts.
 ///
@@ -412,9 +408,6 @@ struct LoadBalancerConfig {
     /// registered routing strategy.
     #[serde(default = "default_algo")]
     algorithm: Algorithm,
-    /// Sticky-session block.
-    #[serde(default)]
-    sticky: Option<StickyConfig>,
     /// Sliding-window failure-rate ejection.
     #[serde(default)]
     outlier_detection: Option<OutlierDetectionConfig>,
@@ -500,6 +493,21 @@ impl LoadBalancerAction {
         } else {
             DeploymentMode::Normal
         };
+
+        // WOR-2311: `sticky:` parsed for years and did nothing: no
+        // affinity cookie was ever issued and nothing on the response
+        // path writes `Set-Cookie`. Unknown keys under `action:` are
+        // not rejected, so dropping the field alone would demote the
+        // old boot warning to silence; refusing keeps the removal
+        // loud, the way the AI handler refuses `token_rate`.
+        anyhow::ensure!(
+            value.get("sticky").is_none(),
+            "load_balancer `sticky:` was removed: it never issued an affinity cookie. For \
+             session affinity that survives pool resizes, use `algorithm: ring_hash` keyed \
+             on `cookie`, `header`, `ip`, or `uri` (a ketama ring; removing one of N \
+             targets remaps ~1/N of keys). The `cookie_hash`, `header_hash`, and `ip_hash` \
+             modulus algorithms also remain available."
+        );
 
         let config: LoadBalancerConfig = serde_json::from_value(value)?;
         anyhow::ensure!(
@@ -593,55 +601,29 @@ impl LoadBalancerAction {
                 .collect::<Vec<_>>()
         });
 
-        let action = Self {
+        // Build the ring up front so per-request selection only binary
+        // searches. The ring covers every configured target; eligibility
+        // is applied at lookup time by walking, never by rebuilding.
+        let ring = matches!(config.algorithm, Algorithm::RingHash { .. })
+            .then(|| HashRing::build(&config.targets));
+
+        Ok(Self {
             targets: config.targets,
             algorithm: config.algorithm,
-            sticky: config.sticky,
             deployment_mode,
             outlier_detector,
             circuit_breakers,
             retry: config.retry,
             strategy_name,
             strategy,
+            ring,
             state: LoadBalancerState {
                 round_robin_counter: AtomicU64::new(0),
                 connections: (0..num_targets).map(|_| AtomicU32::new(0)).collect(),
                 health: (0..num_targets).map(|_| AtomicU8::new(0)).collect(),
                 metadata,
             },
-        };
-
-        // `sbproxy-config`'s key_registry cannot reach these keys: `action:`
-        // is an untyped `serde_json::Value` in the generated schema, so the
-        // build-time reader guard never walks into a module's own config
-        // (WOR-2245). The action therefore warns for its own inert keys
-        // here, at the same compile step the registry warns at, so an
-        // operator meets one boot log rather than two classes of silence.
-        for (path, reason) in action.config_only_keys() {
-            tracing::warn!(
-                config_key = path,
-                reason,
-                "config-only key is set and does not activate runtime behavior"
-            );
-        }
-
-        Ok(action)
-    }
-
-    /// Keys this action parses for compatibility that reach no runtime
-    /// behavior, each paired with what does not happen.
-    ///
-    /// The boot warning and the regression test both read this list, so a
-    /// key cannot be reclassified in one place and left stale in the
-    /// other. Wiring one of these up means deleting its entry here, which
-    /// fails the test that pins it until the test is rewritten around the
-    /// behavior that now exists.
-    pub fn config_only_keys(&self) -> Vec<(&'static str, &'static str)> {
-        let mut keys = Vec::new();
-        if self.sticky.is_some() {
-            keys.push(("action.sticky", STICKY_CONFIG_ONLY_REASON));
-        }
-        keys
+        })
     }
 
     /// Atomically replace one target's bounded strategy metadata snapshot.
@@ -1132,6 +1114,37 @@ impl LoadBalancerAction {
                 let hash = fnv1a_hash(cookie_val.as_bytes());
                 active_targets[hash % active_targets.len()].0
             }
+            Algorithm::RingHash { key } => {
+                let cookie_val;
+                let key_material: &[u8] = match key {
+                    RingHashKey::Ip => client_ip.unwrap_or("0.0.0.0").as_bytes(),
+                    RingHashKey::Uri => uri.as_bytes(),
+                    RingHashKey::Header(header) => headers
+                        .get(header.as_str())
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .as_bytes(),
+                    RingHashKey::Cookie(cookie) => {
+                        cookie_val = extract_cookie(headers, cookie);
+                        cookie_val.as_bytes()
+                    }
+                };
+                let mut eligible = vec![false; self.targets.len()];
+                for (index, _) in active_targets {
+                    eligible[*index] = true;
+                }
+                self.ring
+                    .as_ref()
+                    .and_then(|ring| ring.select(key_material, &eligible))
+                    // Unreachable in practice: the ring exists whenever the
+                    // algorithm is ring_hash, every configured target keeps
+                    // at least one point on it, and `active_targets` is
+                    // never empty here. Modulus hashing keeps a violated
+                    // assumption from becoming a panic.
+                    .unwrap_or_else(|| {
+                        active_targets[fnv1a_hash(key_material) % active_targets.len()].0
+                    })
+            }
         }
     }
 
@@ -1254,81 +1267,128 @@ async fn run_health_probe_loop(
 // asked for, and leaving a plausible-looking helper in the module is how
 // the docs came to promise locality routing in the first place.
 
-// --- Session affinity via consistent hashing ---
+// --- Consistent-hash ring (ring_hash) ---
 
-/// A consistent-hash ring for session-affinity load balancing.
+// WOR-2311: a `ConsistentHash` scaffold stood here for the same idea,
+// reached only by its own tests and positioned over `DefaultHasher`,
+// which is randomized per process and would have made replicas disagree
+// on the ring. Replaced wholesale by `HashRing`, which the `ring_hash`
+// algorithm actually selects through.
+
+/// Ring positions apportioned across the configured targets.
 ///
-/// Each target is replicated `vnodes` times on the ring to improve
-/// distribution uniformity.
-pub struct ConsistentHash {
-    /// Sorted (hash, target_index) pairs.
-    ring: Vec<(u64, usize)>,
+/// The ring holds `targets.len() * RING_VNODES_PER_TARGET` virtual
+/// nodes in total, split across targets in proportion to their weights
+/// (the classic ketama sizing; Envoy's default minimum ring of 1024 is
+/// comparable for small pools). More vnodes flatten each target's share
+/// of the keyspace; fewer keep the sorted ring small and the binary
+/// search cheap. At 160 the per-target imbalance stays within a few
+/// percent while a 10-target pool still fits in a 1,600-entry ring.
+const RING_VNODES_PER_TARGET: usize = 160;
+
+/// A ketama-style consistent-hash ring over the configured targets.
+///
+/// Built once at config compile time and never rebuilt afterwards:
+/// eligibility (health, breakers, outliers, deployment filters) is
+/// applied at lookup time by walking clockwise past ineligible targets,
+/// so a target dropping out and returning moves only the keys that
+/// target owned. Every hash input runs through [`ring_point`], which
+/// has a fixed offset basis and no per-process seed, so every replica
+/// that shares a config file agrees on the ring.
+struct HashRing {
+    /// Sorted (ring position, target index) pairs.
+    entries: Vec<(u64, usize)>,
 }
 
-impl ConsistentHash {
-    /// Build a consistent-hash ring for `target_count` targets, each
-    /// represented by `vnodes` virtual nodes.
-    pub fn new(target_count: usize, vnodes: usize) -> Self {
-        let vnodes = vnodes.max(1);
-        let mut ring: Vec<(u64, usize)> = Vec::with_capacity(target_count * vnodes);
-        for target_idx in 0..target_count {
+impl HashRing {
+    /// Build the ring over every configured target, weighted.
+    fn build(targets: &[Target]) -> Self {
+        let total_weight: u64 = targets.iter().map(|t| u64::from(t.weight.max(1))).sum();
+        let ring_size = (targets.len() * RING_VNODES_PER_TARGET) as u64;
+        let mut entries = Vec::with_capacity(ring_size as usize);
+        for (index, target) in targets.iter().enumerate() {
+            let weight = u64::from(target.weight.max(1));
+            // Weight share of the fixed ring size, never rounded to
+            // zero: a configured target must keep at least one point on
+            // the ring or it could never be selected.
+            let vnodes = (ring_size * weight / total_weight).max(1);
             for vnode in 0..vnodes {
-                let key = format!("target-{}-vnode-{}", target_idx, vnode);
-                let hash = session_affinity_hash(&key);
-                ring.push((hash, target_idx));
+                // Position vnodes by URL rather than by index, so
+                // reordering the target list does not move the ring.
+                // Targets sharing one URL also share positions; the
+                // tie-break below hands those points to the lower index.
+                let point = ring_point(format!("{}#{vnode}", target.url).as_bytes());
+                entries.push((point, index));
             }
         }
-        ring.sort_by_key(|&(h, _)| h);
-        Self { ring }
+        // Position ties sort by target index, keeping the ring a
+        // deterministic function of the config alone.
+        entries.sort_unstable();
+        Self { entries }
     }
 
-    /// Map `key` to a target index using consistent hashing.
-    ///
-    /// Uses binary search on the sorted ring and wraps around for keys
-    /// that exceed the largest hash.
-    pub fn get(&self, key: &str) -> usize {
-        if self.ring.is_empty() {
-            return 0;
+    /// Map `key` to the first eligible target at or after its ring
+    /// position, wrapping around. Returns `None` only when no entry on
+    /// the ring belongs to an eligible target.
+    fn select(&self, key: &[u8], eligible: &[bool]) -> Option<usize> {
+        if self.entries.is_empty() {
+            return None;
         }
-        let h = session_affinity_hash(key);
-        // Find the first ring entry whose hash >= h.
-        match self.ring.binary_search_by_key(&h, |&(hash, _)| hash) {
-            Ok(idx) => self.ring[idx].1,
-            Err(idx) => {
-                if idx < self.ring.len() {
-                    self.ring[idx].1
-                } else {
-                    // Wrap around to the first entry on the ring.
-                    self.ring[0].1
-                }
-            }
-        }
+        let position = ring_point(key);
+        let start = self.entries.partition_point(|&(point, _)| point < position);
+        (0..self.entries.len()).find_map(|offset| {
+            let (_, index) = self.entries[(start + offset) % self.entries.len()];
+            eligible
+                .get(index)
+                .copied()
+                .unwrap_or(false)
+                .then_some(index)
+        })
     }
-}
-
-/// Hash a session key (e.g. a header value, cookie, or IP address) to a
-/// `u64` suitable for consistent-hash ring placement.
-///
-/// Uses `DefaultHasher` which is deterministic within a single process
-/// run.  For cross-process stability, callers should switch to a
-/// fixed-seed hasher such as FNV or xxHash.
-pub fn session_affinity_hash(key: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    key.hash(&mut hasher);
-    hasher.finish()
 }
 
 // --- Utility functions ---
 
 /// FNV-1a hash for consistent hashing of strings.
 fn fnv1a_hash(data: &[u8]) -> usize {
+    fnv1a_hash_u64(data) as usize
+}
+
+/// 64-bit FNV-1a with the standard offset basis and prime.
+///
+/// Deterministic across processes and platforms by construction, which
+/// [`HashRing`] depends on: the ring must be the same in every replica
+/// so all of them send a given key to the same target. That rules out
+/// `DefaultHasher`, whose keys are explicitly randomized per process.
+fn fnv1a_hash_u64(data: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
     for &byte in data {
-        hash ^= byte as u64;
+        hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    hash as usize
+    hash
+}
+
+/// Ring position hash: FNV-1a finished with the splitmix64 mixer.
+///
+/// FNV-1a alone is not fit for ring positions: its avalanche is weak,
+/// so the structured, near-identical inputs the ring hashes (vnode
+/// labels like `url#0`, `url#1`, and sequential client IPs) cluster
+/// into arcs, and one target can end up owning several times its fair
+/// share of the keyspace (classic ketama uses MD5 for exactly this
+/// reason). The splitmix64 finalizer disperses those clusters while
+/// staying seedless, so replicas sharing a config still agree on the
+/// ring. The modulus algorithms keep raw [`fnv1a_hash`]: their mapping
+/// is deployed behavior and `hash % len` is far less sensitive to
+/// high-bit clustering.
+fn ring_point(data: &[u8]) -> u64 {
+    let mut x = fnv1a_hash_u64(data);
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58476d1ce4e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d049bb133111eb);
+    x ^= x >> 31;
+    x
 }
 
 fn algorithm_name(algorithm: &Algorithm) -> &'static str {
@@ -1340,6 +1400,7 @@ fn algorithm_name(algorithm: &Algorithm) -> &'static str {
         Algorithm::UriHash => "uri_hash",
         Algorithm::HeaderHash { .. } => "header_hash",
         Algorithm::CookieHash { .. } => "cookie_hash",
+        Algorithm::RingHash { .. } => "ring_hash",
     }
 }
 
@@ -1630,7 +1691,6 @@ mod tests {
         }));
         assert_eq!(lb.algorithm, Algorithm::RoundRobin);
         assert_eq!(lb.targets.len(), 2);
-        assert!(lb.sticky.is_none());
     }
 
     #[test]
@@ -1703,99 +1763,69 @@ mod tests {
     }
 
     #[test]
-    fn from_config_with_sticky() {
+    fn from_config_ring_hash_defaults_to_ip_key() {
         let lb = make_lb(serde_json::json!({
             "targets": [{"url": "http://a:8080"}],
-            "sticky": {"cookie_name": "my_sticky", "ttl": 3600}
+            "algorithm": {"ring_hash": {}}
         }));
-        let sticky = lb.sticky.as_ref().unwrap();
-        assert_eq!(sticky.cookie_name, "my_sticky");
-        assert_eq!(sticky.ttl, Some(3600));
+        assert_eq!(
+            lb.algorithm,
+            Algorithm::RingHash {
+                key: RingHashKey::Ip
+            }
+        );
     }
 
     #[test]
-    fn from_config_sticky_defaults() {
+    fn from_config_ring_hash_cookie_key() {
         let lb = make_lb(serde_json::json!({
             "targets": [{"url": "http://a:8080"}],
-            "sticky": {}
+            "algorithm": {"ring_hash": {"key": {"cookie": "session_id"}}}
         }));
-        let sticky = lb.sticky.as_ref().unwrap();
-        assert_eq!(sticky.cookie_name, "sb_sticky");
-        assert!(sticky.ttl.is_none());
+        assert_eq!(
+            lb.algorithm,
+            Algorithm::RingHash {
+                key: RingHashKey::Cookie("session_id".to_string())
+            }
+        );
     }
 
-    // --- sticky: is parsed and inert (WOR-2246) ---
+    // --- sticky: is removed and refused (WOR-2311) ---
     //
-    // The two tests above assert only that the block deserializes, which
-    // is what let `docs/features.md` ship a worked example promising an
-    // affinity cookie the module never wrote. These pin the gap itself.
+    // WOR-2246 pinned `sticky:` as parsed-and-inert with a boot warning.
+    // The block is gone now, and because unknown keys under `action:`
+    // are not rejected, silence is the failure mode a plain field
+    // deletion would produce. This pins the refusal instead.
 
     #[test]
-    fn an_authored_sticky_block_is_reported_config_only() {
-        let lb = make_lb(serde_json::json!({
+    fn sticky_block_is_refused_at_config_compile_with_a_migration_path() {
+        let error = LoadBalancerAction::from_config(serde_json::json!({
             "targets": [{"url": "http://a:8080"}],
             "sticky": {"cookie_name": "_sb_backend", "ttl": 3600}
-        }));
+        }))
+        .expect_err("an authored sticky block must fail config compilation, not sit inert");
 
-        let keys = lb.config_only_keys();
-        assert_eq!(
-            keys.iter().map(|(path, _)| *path).collect::<Vec<_>>(),
-            ["action.sticky"],
-            "an authored sticky block must warn at boot, not compile silently"
-        );
-        let reason = keys[0].1;
+        let message = error.to_string();
         assert!(
-            reason.contains("WOR-"),
-            "a config-only reason must point at the work tracking it: '{reason}'"
+            message.contains("sticky"),
+            "the error must name the removed key: '{message}'"
         );
         assert!(
-            reason.contains("cookie_hash"),
-            "the reason must name the live alternative, not just say no: '{reason}'"
+            message.contains("ring_hash"),
+            "the error must name the replacement algorithm: '{message}'"
+        );
+        assert!(
+            message.contains("cookie"),
+            "the error must point cookie-affinity users at a keyed ring: '{message}'"
         );
     }
 
     #[test]
-    fn omitting_sticky_stays_quiet() {
+    fn omitting_sticky_compiles_cleanly() {
         let lb = make_lb(serde_json::json!({
             "targets": [{"url": "http://a:8080"}]
         }));
-        assert!(
-            lb.config_only_keys().is_empty(),
-            "a config that never mentioned sticky must not be warned at"
-        );
-    }
-
-    #[test]
-    fn sticky_does_not_pin_a_client_to_one_target() {
-        // The behavior `docs/features.md:277` claimed: repeated requests
-        // from one client returning to one target. Round robin is the
-        // configured algorithm and sticky does not override it, so the
-        // same client walks both targets.
-        let lb = make_lb(serde_json::json!({
-            "targets": [{"url": "http://a:8080"}, {"url": "http://b:8080"}],
-            "algorithm": "round_robin",
-            "sticky": {"cookie_name": "_sb_backend"}
-        }));
-
-        // The cookie the doc told operators to expect back, offered on
-        // every request. Nothing reads it.
-        let mut headers = http::HeaderMap::new();
-        headers.insert("cookie", http::HeaderValue::from_static("_sb_backend=0"));
-        let visited: std::collections::BTreeSet<usize> = (0..6)
-            .map(|_| {
-                lb.select_target(Some("203.0.113.7"), "/", &headers)
-                    .expect("a two-target pool always selects")
-                    .3
-            })
-            .collect();
-
-        assert_eq!(
-            visited,
-            std::collections::BTreeSet::from([0, 1]),
-            "sticky is inert: one client still round-robins across both targets"
-        );
-        // `cookie_hash_consistent` covers the other half of this: the
-        // algorithm the warning points operators at does pin.
+        assert_eq!(lb.targets.len(), 1);
     }
 
     #[test]
@@ -2861,59 +2891,198 @@ mod tests {
         );
     }
 
-    // --- ConsistentHash tests ---
+    // --- ring_hash tests ---
+
+    fn ring_lb(target_count: usize) -> LoadBalancerAction {
+        let targets: Vec<serde_json::Value> = (0..target_count)
+            .map(|index| serde_json::json!({"url": format!("http://backend-{index}:8080")}))
+            .collect();
+        make_lb(serde_json::json!({
+            "targets": targets,
+            "algorithm": {"ring_hash": {}}
+        }))
+    }
+
+    /// 1000 syntactically distinct client IPs for key sampling.
+    fn sample_ips() -> Vec<String> {
+        (0..1000u32)
+            .map(|i| format!("10.0.{}.{}", i / 256, i % 256))
+            .collect()
+    }
 
     #[test]
-    fn consistent_hash_same_key_same_target() {
-        let ch = ConsistentHash::new(5, 100);
-        let first = ch.get("user-session-abc123");
-        for _ in 0..100 {
+    fn ring_hash_same_key_selects_the_same_target() {
+        let lb = ring_lb(5);
+        let headers = empty_headers();
+        let (_, _, _, first) = lb.select_target(Some("10.0.0.1"), "/", &headers).unwrap();
+        for _ in 0..50 {
+            let (_, _, _, idx) = lb.select_target(Some("10.0.0.1"), "/", &headers).unwrap();
+            assert_eq!(idx, first, "ring_hash must be consistent for the same key");
+        }
+    }
+
+    #[test]
+    fn ring_hash_single_target_always_selected() {
+        let lb = ring_lb(1);
+        let headers = empty_headers();
+        for ip in sample_ips().iter().take(50) {
+            let (_, _, _, idx) = lb.select_target(Some(ip), "/", &headers).unwrap();
+            assert_eq!(idx, 0, "a one-target ring has one owner for every key");
+        }
+    }
+
+    #[test]
+    fn ring_hash_ring_is_identical_across_two_builds() {
+        // Two compilations of the same config must produce the same
+        // key-to-target mapping: reloads must not reshuffle sessions,
+        // and replicas sharing a config file must agree on owners.
+        let config = || {
+            serde_json::json!({
+                "targets": [
+                    {"url": "http://backend-0:8080"},
+                    {"url": "http://backend-1:8080"},
+                    {"url": "http://backend-2:8080"},
+                    {"url": "http://backend-3:8080"},
+                    {"url": "http://backend-4:8080"}
+                ],
+                "algorithm": {"ring_hash": {}}
+            })
+        };
+        let first = make_lb(config());
+        let second = make_lb(config());
+        let headers = empty_headers();
+        for ip in sample_ips().iter().take(200) {
             assert_eq!(
-                ch.get("user-session-abc123"),
-                first,
-                "same key must always return same target"
+                first.select_target(Some(ip), "/", &headers).unwrap().3,
+                second.select_target(Some(ip), "/", &headers).unwrap().3,
+                "two builds of one config must map {ip} identically"
             );
         }
     }
 
     #[test]
-    fn consistent_hash_different_keys_distribute() {
-        let ch = ConsistentHash::new(4, 100);
-        let mut seen = std::collections::HashSet::new();
-        for i in 0..200 {
-            let key = format!("session-{}", i);
-            seen.insert(ch.get(&key));
+    fn ring_hash_positions_use_the_seedless_fnv1a_hash() {
+        // `DefaultHasher` is explicitly randomized per process; a ring
+        // built over it would send the same key to different targets on
+        // different replicas. Pinning one reference value through the
+        // full position hash (FNV-1a plus the splitmix64 finalizer)
+        // means neither half can be swapped silently.
+        assert_eq!(fnv1a_hash_u64(b"ring-position-pin"), 0x07f8_8f52_a522_f2ef);
+        assert_eq!(ring_point(b"ring-position-pin"), 0x2cc5_6769_3f3d_8522);
+    }
+
+    #[test]
+    fn ring_hash_remaps_only_the_removed_targets_share_of_keys() {
+        // The property that justifies the ring: dropping one of ten
+        // targets from the config moves only the keys that target
+        // owned, roughly 1/10 of them. The modulus algorithms reshuffle
+        // most keys on the same edit.
+        let ten = ring_lb(10);
+        let nine = ring_lb(9); // same urls minus http://backend-9:8080
+        let headers = empty_headers();
+
+        let mut owned_by_removed = 0usize;
+        for ip in sample_ips() {
+            let before = ten.select_target(Some(&ip), "/", &headers).unwrap().3;
+            let after = nine.select_target(Some(&ip), "/", &headers).unwrap().3;
+            if before == 9 {
+                owned_by_removed += 1;
+            } else {
+                assert_eq!(
+                    after, before,
+                    "a key on a surviving target must not move when another target is removed"
+                );
+            }
         }
-        // With 200 keys and 4 targets we expect all targets to be used.
+
+        // Fair share of 1000 keys across 10 targets is ~100. The bound
+        // is generous because vnode shares are lumpy, but a modulus
+        // reshuffle (which moves ~90% of keys) stays far outside it.
         assert!(
-            seen.len() > 1,
-            "different keys should map to multiple targets"
+            owned_by_removed > 0,
+            "the removed target must have owned some keys"
+        );
+        assert!(
+            owned_by_removed < 250,
+            "removing 1 of 10 targets should remap ~1/10 of keys, moved {owned_by_removed} of 1000"
         );
     }
 
     #[test]
-    fn consistent_hash_single_target_always_zero() {
-        let ch = ConsistentHash::new(1, 10);
-        for i in 0..50 {
-            let key = format!("key-{}", i);
-            assert_eq!(ch.get(&key), 0, "single target must always return index 0");
+    fn ring_hash_gives_a_heavier_target_a_larger_key_share() {
+        let lb = make_lb(serde_json::json!({
+            "targets": [
+                {"url": "http://heavy:8080", "weight": 3},
+                {"url": "http://light:8080", "weight": 1}
+            ],
+            "algorithm": {"ring_hash": {}}
+        }));
+        let headers = empty_headers();
+        let mut counts = [0u32; 2];
+        for ip in sample_ips() {
+            let (_, _, _, idx) = lb.select_target(Some(&ip), "/", &headers).unwrap();
+            counts[idx] += 1;
         }
+        // Weight 3 vs 1 apportions ring points 3:1. Demand a clear
+        // majority rather than the exact ratio; vnode shares are lumpy.
+        assert!(
+            counts[0] > counts[1] * 2,
+            "weight-3 target should own roughly 3x the keys: heavy={}, light={}",
+            counts[0],
+            counts[1]
+        );
     }
 
-    // --- session_affinity_hash tests ---
-
     #[test]
-    fn session_affinity_hash_deterministic() {
-        let h1 = session_affinity_hash("192.168.1.1");
-        let h2 = session_affinity_hash("192.168.1.1");
-        assert_eq!(h1, h2);
-    }
+    fn ring_hash_walks_past_an_unhealthy_target_and_returns_after_recovery() {
+        let lb = ring_lb(3);
+        let headers = empty_headers();
 
-    #[test]
-    fn session_affinity_hash_different_keys_differ() {
-        let h1 = session_affinity_hash("session-abc");
-        let h2 = session_affinity_hash("session-xyz");
-        assert_ne!(h1, h2);
+        // Find a probe key owned by target 0 and a control key owned by
+        // another target.
+        let mut probe = None;
+        let mut control = None;
+        for ip in sample_ips() {
+            let (_, _, _, idx) = lb.select_target(Some(&ip), "/", &headers).unwrap();
+            if idx == 0 && probe.is_none() {
+                probe = Some(ip);
+            } else if idx != 0 && control.is_none() {
+                control = Some((ip, idx));
+            }
+            if probe.is_some() && control.is_some() {
+                break;
+            }
+        }
+        let probe = probe.expect("1000 keys must reach a 3-target ring's first target");
+        let (control_ip, control_idx) =
+            control.expect("1000 keys must reach the other two targets");
+
+        // The owner goes unhealthy: its keys walk to the next node on
+        // the ring, deterministically, and nobody else's keys move.
+        lb.set_target_health(0, false);
+        let (_, _, _, walked) = lb.select_target(Some(&probe), "/", &headers).unwrap();
+        assert_ne!(walked, 0, "an unhealthy owner must be walked past");
+        assert_eq!(
+            lb.select_target(Some(&probe), "/", &headers).unwrap().3,
+            walked,
+            "the walked-to target must be stable while the owner is down"
+        );
+        assert_eq!(
+            lb.select_target(Some(&control_ip), "/", &headers)
+                .unwrap()
+                .3,
+            control_idx,
+            "keys owned by healthy targets must not move during the flap"
+        );
+
+        // Health returns: the key goes home. This is what ring-walking
+        // buys over rebuilding: the flap never re-apportioned the ring.
+        lb.set_target_health(0, true);
+        assert_eq!(
+            lb.select_target(Some(&probe), "/", &headers).unwrap().3,
+            0,
+            "the key must return to its owner when health returns"
+        );
     }
 
     #[test]

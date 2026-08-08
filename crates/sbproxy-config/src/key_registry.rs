@@ -100,8 +100,10 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
     // breakers or a detector because the only installing path had no
     // callers. The handler calls `with_circuit_breakers` and
     // `with_outlier_detection` when the config asks now, so pinning them
-    // would report working features as inert. Sticky sessions are the load
-    // balancer's own warning. `routing.strategy: token_rate` is refused by
+    // would report working features as inert. Sticky sessions were removed
+    // outright (WOR-2311): the load balancer refuses an authored `sticky:`
+    // at config compile and points at the `ring_hash` algorithm.
+    // `routing.strategy: token_rate` is refused by
     // `compile_config` rather than pinned, which is the better answer and
     // the only available one: the key is `routing`, the key is read, and it
     // was one accepted *value* of it that did nothing, a shape no
@@ -134,11 +136,11 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "origins.*.action.resilience.outlier_detection.window_secs",
         AI_RESILIENCE_CONSUMER,
     ),
-    // `origins.*.action.sticky.*` is deliberately absent. The load balancer
-    // warns for it itself through `LoadBalancerAction::config_only_keys`,
-    // using this registry's own message shape, so an entry here would be a
-    // second competing classification of one field and two boot warnings for
-    // it.
+    // `origins.*.action.sticky.*` is deliberately absent. The key was
+    // removed (WOR-2311): `LoadBalancerAction::from_config_for_origin`
+    // refuses an authored block at config compile with a message naming
+    // `algorithm: ring_hash` as the replacement, so an entry here would
+    // classify a field that no longer parses.
     config_only("origins.*.action.targets[].zone", LB_ZONE_NOTE),
     config_only(
         "origins.*.agent_skills[].max_clock_skew_secs",
@@ -888,9 +890,9 @@ const MODULE_CONFIG_ROOTS: &[ModuleConfigRoot] = &[
         path: "origins.*.action",
         rust_type: "sbproxy_modules::action::loadbalancer::LoadBalancerConfig",
         enforcement: ModuleRootEnforcement::ReportOnly(
-            "target zones are dead here and are pinned above, and the load balancer warns for \
-             sticky itself; the rest of the load_balancer surface has not been triaged. \
-             WOR-2246.",
+            "target zones are dead here and are pinned above, and the load balancer refuses \
+             the removed sticky block at config compile; the rest of the load_balancer \
+             surface has not been triaged. WOR-2246.",
         ),
     },
     // Rooted at the subtree rather than at `AiHandlerConfig`, deliberately.

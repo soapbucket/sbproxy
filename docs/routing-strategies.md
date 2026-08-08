@@ -1,9 +1,9 @@
 # Routing Strategies
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-08*
 
 The `RoutingStrategy` trait is an extension point for custom upstream selection in a `load_balancer` action. It lives in `sbproxy-modules::action::routing`. The trait runs synchronously on the request hot path, receives already-projected request and target state, and returns the index of a chosen eligible target or `None` to use the configured `algorithm`.
 
-The built-in algorithms (`round_robin`, `weighted_random`, `least_connections`, `ip_hash`, `uri_hash`, `header_hash`, and `cookie_hash`) remain fallback selectors. When `strategy` names a registered strategy, the production action compiles it once and consults it before `algorithm` on every request. `lb_method: plugin` is an accepted compatibility marker and requires `strategy`; `strategy` is the field that selects and compiles the registered implementation.
+The built-in algorithms (`round_robin`, `weighted_random`, `least_connections`, `ip_hash`, `uri_hash`, `header_hash`, `cookie_hash`, and `ring_hash`) remain fallback selectors. When `strategy` names a registered strategy, the production action compiles it once and consults it before `algorithm` on every request. `lb_method: plugin` is an accepted compatibility marker and requires `strategy`; `strategy` is the field that selects and compiles the registered implementation.
 
 Before a strategy runs, the load balancer applies deployment-mode, backup, priority, active-health, circuit-breaker, and outlier-ejection filters. A strategy sees only that eligible slice. If every active target was filtered out, the load balancer uses its existing last-resort fallback rather than asking a strategy to bypass health filters.
 
