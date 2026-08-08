@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-08-07*
+*Last modified: 2026-08-08*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -3631,7 +3631,7 @@ Rotation works as it does for the response cache: move the current reference int
 
 ## Forward rules
 
-Forward rules route specific requests to different origins based on path, header, or other conditions. They are evaluated in order; the first match wins. Common uses: path-based microservice routing and version routing.
+Forward rules route specific requests to different origins based on path, header, query, or JSON body conditions. They are evaluated in order; the first match wins. Common uses: path-based microservice routing, version routing, and dispatching LLM traffic by the `model` field of the request body.
 
 Forward rules are deserialized lazily; required fields are enforced when the rule is exercised, not at config-load time.
 
@@ -3699,10 +3699,65 @@ Each forward rule has a `rules` array where each entry is a matcher. The deseria
 | `match` | string | Shorthand. Equivalent to `path: { prefix: <value> }`. |
 | `header` | object | Header matcher: `{name, value}` for an exact match or `{name, prefix}` for a value-prefix match. When both are set, `value` wins. Header names compare case-insensitively; values case-sensitively. |
 | `query` | object | Query parameter matcher: `{name, value}` for an exact match, or `{name}` alone to match on presence. |
+| `body` | object | JSON request-body field matcher: `{pointer, value}` for an exact match, `{pointer, prefix}` for a value-prefix match, or `{pointer}` alone to match on presence. `pointer` is an RFC 6901 JSON Pointer such as `/model`. See [Body matching](#body-matching). |
 
 Set exactly one of `prefix`, `exact`, `template`, or `regex` on a path matcher. If more than one is set, precedence is `template` > `regex` > `exact` > `prefix` (so `exact` beats `prefix`).
 
-When a rule has multiple matcher entries, the rule fires when any one of them matches. Any other key on a matcher entry (Go-era fields such as `methods`, `ip`, `location`, `user_agent`, `content_types`, `protocol`) is rejected at config load as an unknown key.
+Within a single matcher entry, every present matcher (`path`, `header`, `query`, `body`) must succeed for the entry to fire. When a rule has multiple matcher entries, the rule fires when any one of them matches. Any other key on a matcher entry (Go-era fields such as `methods`, `ip`, `location`, `user_agent`, `content_types`, `protocol`) is rejected at config load as an unknown key.
+
+### Body matching
+
+The `body` matcher routes on a field inside a JSON request body. The field an operator most wants to route on is often in the body rather than the URL: `model`, `stream`, and `tools` are body fields in the common LLM request shapes, so without this matcher two models cannot get different rate limits, different upstream credentials, or different guardrail chains without collapsing onto one origin.
+
+```yaml
+forward_rules:
+  - rules:
+      - body:
+          pointer: /model
+          prefix: gpt-
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `pointer` | string | required | RFC 6901 JSON Pointer to the field, e.g. `/model` or `/messages/0/role`. Must be empty or start with `/`; a bare field name such as `model` fails config load. `~1` decodes to `/` and `~0` to `~`. The empty pointer addresses the whole document. |
+| `value` | string | | The resolved value must equal this exactly. Wins over `prefix` when both are set. |
+| `prefix` | string | | The resolved value must start with this. Ignored when `value` is set. |
+| `max_bytes` | int | 65536 | Largest request body the matcher reads, in bytes. 65536 is also the hard ceiling: it is the size of the replay buffer that lets a body read during route selection still be forwarded upstream, so config load rejects a larger value. `0` is also rejected, since it could never match anything. |
+
+When neither `value` nor `prefix` is set, the matcher succeeds whenever the pointer resolves to any JSON value at all, including `null`, an object, or an array. That is how you route on "this request declares tools" (`pointer: /tools`) without naming one. Numbers and booleans compare against their JSON text form, so `pointer: /stream` with `value: "true"` matches `{"stream": true}`. A `value` or `prefix` comparison against a field that resolves to an object or array is a miss, not an error.
+
+**Buffering.** Selecting a route on a body field means the body must be read before the route is known. An origin whose forward rules declare at least one body matcher buffers up to the largest `max_bytes` among them before route selection; every buffered byte is replayed upstream unchanged, so routing on the body does not consume the body. Origins with no body matcher never buffer, read, or parse anything for this feature. There is no content-type gate: the buffered bytes are parsed as JSON regardless of the request's `Content-Type` header.
+
+**Misses, not failures.** Five conditions make a body matcher miss rather than fail the request: a body larger than `max_bytes` (whether declared by `Content-Length` up front or discovered while reading a chunked body), a body that is not JSON, a body that does not parse, a pointer that resolves to nothing, and a pointer that resolves to an object or array while `value` or `prefix` expects a scalar. In every case the entry does not fire and evaluation moves to the next entry, then the next rule, then the origin's own action, which is the same routing the request would have received without the matcher. A body matcher only ever selects a route; it never rejects a request.
+
+Within one entry the body matcher is ANDed with any `path`, `header`, and `query` matchers present, and it is evaluated last because it is the only matcher that reads buffered bytes. A worked example routing one model family to its own pool while everything else takes the origin's default action:
+
+```yaml
+origins:
+  "llm.example.com":
+    action:
+      type: proxy
+      url: https://general-pool.internal:8080
+    forward_rules:
+      # Chat requests whose body names a gpt-4o family model go to the
+      # dedicated pool. Path and body sit in one entry, so both must hold.
+      - rules:
+          - path:
+              prefix: /v1/chat/completions
+            body:
+              pointer: /model
+              prefix: gpt-4o
+        origin:
+          id: gpt-4o-pool
+          hostname: gpt-4o-pool
+          workspace_id: example
+          version: "1.0.0"
+          action:
+            type: proxy
+            url: https://gpt4o-pool.internal:8080
+```
+
+Requests to any other path, requests whose `model` names a different family, and requests whose body the matcher cannot read all proxy to `general-pool.internal`. For a runnable configuration, see [`examples/body-routing/`](../examples/body-routing/).
 
 ### Forward rule fields
 

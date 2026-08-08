@@ -1,0 +1,84 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Body-based routing: select a route on a JSON request-body field.
+#
+# A single origin on `llm.local` reads the `model` field of each JSON
+# request body and dispatches to a different inline child origin per
+# model family:
+#
+#   {"model": "gpt-..."}      -> static stub standing in for the gpt pool
+#   {"model": "claude-..."}   -> static stub standing in for the claude pool
+#   anything else             -> default action proxies to test.sbproxy.dev/anything
+#
+# The `body` matcher addresses the field with an RFC 6901 JSON Pointer
+# (`/model`) and compares the resolved value by prefix. The body is
+# buffered (up to 64 KiB) before the route is chosen and replayed
+# upstream byte for byte, so routing on it does not consume it. A body
+# that is not JSON, has no `model` field, or exceeds the cap makes the
+# matcher miss and the request falls through to the default action; a
+# body matcher only ever selects a route, it never rejects a request.
+#
+# Run:
+#   make run CONFIG=examples/body-routing/sb.yml
+#
+# Test:
+#   # `model` starts with gpt- -> the gpt pool answers.
+#   curl -s -H 'Host: llm.local' -H 'Content-Type: application/json' \
+#     -d '{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}' \
+#     http://127.0.0.1:8080/v1/chat/completions
+#
+#   # `model` starts with claude- -> the claude pool answers.
+#   curl -s -H 'Host: llm.local' -H 'Content-Type: application/json' \
+#     -d '{"model":"claude-sonnet-4","messages":[{"role":"user","content":"hi"}]}' \
+#     http://127.0.0.1:8080/v1/chat/completions
+#
+#   # Any other model, or a body the matcher cannot read, falls through
+#   # to the default action.
+#   curl -s -H 'Host: llm.local' -H 'Content-Type: application/json' \
+#     -d '{"model":"mistral-large"}' \
+#     http://127.0.0.1:8080/v1/chat/completions
+
+proxy:
+  http_bind_port: 8080
+
+origins:
+  "llm.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev/anything
+
+    forward_rules:
+      # The gpt- model family -> an inline child origin for that pool.
+      - rules:
+          - body:
+              pointer: /model
+              prefix: gpt-
+        origin:
+          id: gpt-pool
+          hostname: gpt-pool
+          workspace_id: examples
+          version: "1.0.0"
+          action:
+            type: static
+            status: 200
+            content_type: application/json
+            json_body:
+              pool: gpt
+              message: "routed on body field /model (prefix gpt-)"
+
+      # The claude- model family -> a second inline child origin.
+      - rules:
+          - body:
+              pointer: /model
+              prefix: claude-
+        origin:
+          id: claude-pool
+          hostname: claude-pool
+          workspace_id: examples
+          version: "1.0.0"
+          action:
+            type: static
+            status: 200
+            content_type: application/json
+            json_body:
+              pool: claude
+              message: "routed on body field /model (prefix claude-)"
