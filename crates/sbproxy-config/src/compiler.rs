@@ -710,6 +710,19 @@ fn yaml_origin_with_removed_rate_limit_headers(yaml: &str) -> Option<String> {
     None
 }
 
+/// Whether the document sets `model_aliases:` at the top level.
+///
+/// The AI gateway reads model aliases from the `ai_proxy` action, next to
+/// the providers they name, and the root of the file ignores unknown keys.
+/// A root-level block would therefore parse and do nothing, which the
+/// gateway documentation once showed as the intended shape. Detected on
+/// the raw YAML so the operator gets the live path rather than silence.
+fn yaml_uses_top_level_model_aliases(yaml: &str) -> bool {
+    serde_yaml::from_str::<serde_yaml::Value>(yaml)
+        .ok()
+        .is_some_and(|root| root.get("model_aliases").is_some())
+}
+
 fn yaml_uses_legacy_virtual_keys(yaml: &str) -> bool {
     for line in yaml.lines() {
         // Strip any inline comment that starts AFTER the YAML value;
@@ -1175,6 +1188,20 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
              `policies: - type: rate_limiting ... headers: {{ enabled: true, \
              include_retry_after: true }}`. See the `Rate limit headers` section of \
              `docs/configuration.md`."
+        );
+    }
+
+    // WOR-2312: reject a top-level `model_aliases:` block. Aliases are an
+    // AI-gateway key and are read from the `ai_proxy` action, where the
+    // providers they name live. At the root they would parse and do
+    // nothing, and the shape was documented that way, so it is refused
+    // with the live path rather than silently ignored.
+    if yaml_uses_top_level_model_aliases(&yaml) {
+        anyhow::bail!(
+            "config compile: `model_aliases:` is set at the top level, where nothing reads it. \
+             Model aliases belong to the AI gateway action that serves them: move the block to \
+             `origins.<hostname>.action.model_aliases` alongside that action's `providers:`. \
+             See the `Model aliases` section of `docs/ai-gateway.md`."
         );
     }
 
@@ -4437,6 +4464,54 @@ origins:
             msg.contains("virtual_keys") && msg.contains("migration"),
             "unhelpful error: {msg}"
         );
+    }
+
+    /// A top-level `model_aliases:` block is refused with the live path.
+    /// The root ignores unknown keys, so before this it parsed and did
+    /// nothing, which is the shape the gateway guide used to show.
+    #[test]
+    fn compile_rejects_top_level_model_aliases() {
+        let yaml = r#"
+model_aliases:
+  - alias: fast
+    provider: openai
+    model_id: gpt-4o-mini
+origins:
+  ai.local:
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: dummy
+"#;
+        let err = compile_config(yaml)
+            .err()
+            .expect("a top-level model_aliases: block should be rejected at compile");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("model_aliases") && msg.contains("action.model_aliases"),
+            "unhelpful error: {msg}"
+        );
+    }
+
+    /// The same aliases on the AI action compile, and reach the handler.
+    #[test]
+    fn compile_accepts_model_aliases_on_the_ai_action() {
+        let yaml = r#"
+origins:
+  ai.local:
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: dummy
+          models: [gpt-4o-mini]
+      model_aliases:
+        - alias: fast
+          provider: openai
+          model_id: gpt-4o-mini
+"#;
+        compile_config(yaml).expect("aliases on the AI action compile");
     }
 
     /// An `ai_provider` credential at proxy scope lowers onto every

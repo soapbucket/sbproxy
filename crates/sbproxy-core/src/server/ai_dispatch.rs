@@ -724,6 +724,75 @@ fn governed_effective_model(
     Ok(Some(effective.to_string()))
 }
 
+/// Resolve a requested model name against the origin's alias registry.
+///
+/// Returns the upstream model id the alias names, plus the provider it
+/// pins the request to when it names one. `None` means the caller sent a
+/// literal model id, which every plane below handles unchanged.
+///
+/// Callers must apply this before the model gates and before building the
+/// provider candidate set. An alias that resolved later would let a name
+/// slip past `blocked_models` and would leave the router choosing a
+/// vendor for a model the caller never asked for.
+fn resolve_model_alias(
+    config: &AiHandlerConfig,
+    requested: &str,
+) -> Option<(String, Option<String>)> {
+    let registry = config.model_alias_registry();
+    if registry.is_empty() || requested.is_empty() {
+        return None;
+    }
+    let alias = registry.resolve(requested)?;
+    Some((
+        alias.model_id.as_str().to_string(),
+        alias
+            .provider
+            .as_ref()
+            .map(|provider| provider.as_str().to_string()),
+    ))
+}
+
+/// Resolve a JSON request body's `model` field against the alias registry.
+///
+/// Rewrites the model string and the body together so the request that
+/// reaches the upstream, the one the budget prices, and the one the cache
+/// keys are all the same model. Returns the alias's provider pin.
+fn resolve_body_model_alias(
+    config: &AiHandlerConfig,
+    model: &mut String,
+    body: &mut serde_json::Value,
+) -> Option<String> {
+    let (resolved, pinned) = resolve_model_alias(config, model)?;
+    if let Some(object) = body.as_object_mut() {
+        object.insert(
+            "model".to_string(),
+            serde_json::Value::String(resolved.clone()),
+        );
+    }
+    *model = resolved;
+    pinned
+}
+
+/// Narrow a provider candidate set to the provider an alias pinned.
+///
+/// An alias that names a provider resolved the caller's name to that
+/// vendor's model id, so falling through to another vendor would dispatch
+/// a model id it does not serve. Returning `false` means the pin left no
+/// candidate and the caller must fail the request rather than route it
+/// somewhere the alias never named.
+#[must_use]
+fn retain_alias_pinned_providers(
+    order: &mut Vec<usize>,
+    providers: &[sbproxy_ai::ProviderConfig],
+    pinned: Option<&str>,
+) -> bool {
+    let Some(pinned) = pinned else {
+        return true;
+    };
+    order.retain(|&index| providers[index].name.as_str() == pinned);
+    !order.is_empty()
+}
+
 fn credential_requires_pii_redaction(resolved: Option<&ResolvedRequestKey>) -> bool {
     resolved.is_some_and(|resolved| !resolved.require_pii_redaction().is_empty())
 }
@@ -3443,6 +3512,7 @@ pub(super) async fn handle_ai_proxy(
         }
 
         let mut effective_model = None;
+        let mut alias_provider = None;
         if let Some(body) = body_opt.as_mut() {
             apply_json_request_pii_redaction(config, ctx, body);
             effective_model = match governed_effective_model(
@@ -3455,7 +3525,23 @@ pub(super) async fn handle_ai_proxy(
                     return Ok(());
                 }
             };
+            // WOR-2312: resolve a global alias before the model gates, so
+            // this surface reaches the same upstream model the chat path
+            // would for the same name. `governed_effective_model` above
+            // judged the credential's model policy on the name the caller
+            // sent; re-judge it on what that name resolved to, or an alias
+            // would be a way around the credential's block-list.
+            if let Some(model) = effective_model.as_mut() {
+                alias_provider = resolve_body_model_alias(config, model, body);
+            }
             if let Some(model) = effective_model.as_deref() {
+                let credential_allows = resolved_request_vk
+                    .as_ref()
+                    .is_none_or(|key| key.is_model_allowed(model));
+                if !credential_allows {
+                    send_error(session, 403, "model is not allowed for this credential").await?;
+                    return Ok(());
+                }
                 if !config.is_model_allowed(model) {
                     send_error(session, 403, "model is not allowed").await?;
                     return Ok(());
@@ -3560,6 +3646,20 @@ pub(super) async fn handle_ai_proxy(
             })
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
+        // WOR-2312: an alias that named a provider narrows the set to it.
+        if !retain_alias_pinned_providers(
+            &mut provider_candidates,
+            &config.providers,
+            alias_provider.as_deref(),
+        ) {
+            send_error(
+                session,
+                503,
+                "the model alias for this request targets a provider that is not eligible",
+            )
+            .await?;
+            return Ok(());
+        }
         if let Some(model) = effective_model.as_deref() {
             if let Some(eligible) =
                 model_eligible_providers(&provider_candidates, &config.providers, model)
@@ -3814,6 +3914,33 @@ pub(super) async fn handle_ai_proxy(
             })?;
             requested_model = Some(route_to.to_string());
         }
+        // WOR-2312: the multipart surfaces (audio transcription, image
+        // edits) resolve global aliases too, so one alias means the same
+        // model everywhere rather than only on the JSON surfaces. The
+        // rewrite runs against the body as it stands, so a governed route
+        // override composes with it, and it lands before the budget gate
+        // and both model gates below.
+        let alias_resolution = requested_model
+            .as_deref()
+            .and_then(|requested| resolve_model_alias(config, requested));
+        let mut alias_provider = None;
+        if let Some((resolved, pinned)) = alias_resolution {
+            forwarded_body = crate::model_plane::rewrite_engine_model(
+                forwarded_body.as_ref(),
+                Some(&request_content_type),
+                &resolved,
+                maximum,
+            )
+            .map_err(|error| {
+                Error::because(
+                    ErrorType::HTTPStatus(400),
+                    "invalid multipart model alias",
+                    error,
+                )
+            })?;
+            requested_model = Some(resolved);
+            alias_provider = pinned;
+        }
         if requested_model.is_none()
             && resolved_request_vk
                 .as_ref()
@@ -3927,6 +4054,20 @@ pub(super) async fn handle_ai_proxy(
             })
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
+        // WOR-2312: an alias that named a provider narrows the set to it.
+        if !retain_alias_pinned_providers(
+            &mut provider_order,
+            &config.providers,
+            alias_provider.as_deref(),
+        ) {
+            send_error(
+                session,
+                503,
+                "the model alias for this request targets a provider that is not eligible",
+            )
+            .await?;
+            return Ok(());
+        }
         if let Some(model) = requested_model.as_deref() {
             if let Some(eligible) =
                 model_eligible_providers(&provider_order, &config.providers, model)
@@ -4436,6 +4577,15 @@ pub(super) async fn handle_ai_proxy(
             );
         }
     }
+
+    // WOR-2312: a global `model_aliases:` entry resolves the caller's
+    // friendly name to an upstream model id here, ahead of the allow/block
+    // gate, the budget, the rate limiters, and provider selection. Every
+    // plane below therefore decides on the model that will actually be
+    // dispatched, so an alias can never route around a `blocked_models`
+    // entry. The alias's optional provider pin is applied to the routing
+    // set further down.
+    let alias_provider = resolve_body_model_alias(config, &mut model, &mut body);
 
     // Check model allow/block lists.
     if !model.is_empty() && !config.is_model_allowed(&model) {
@@ -6225,6 +6375,25 @@ pub(super) async fn handle_ai_proxy(
     // `ctx.principal` across the mutable primary-attempt bookkeeping below.
     let shadow_allowed_providers = allowed_providers.to_vec();
     let shadow_blocked_providers = blocked_providers.to_vec();
+
+    // WOR-2312: an alias that named a provider pins the routing set to it.
+    // This is stricter than the `models:` filter below on purpose: the
+    // alias already resolved the caller's name to that vendor's model id,
+    // so handing the request to another vendor would dispatch an id it
+    // does not serve. Failing here is the honest answer.
+    if !retain_alias_pinned_providers(
+        &mut provider_order,
+        &config.providers,
+        alias_provider.as_deref(),
+    ) {
+        send_error(
+            session,
+            503,
+            "the model alias for this request targets a provider that is not eligible",
+        )
+        .await?;
+        return Ok(());
+    }
 
     // WOR-1534: model-based provider routing. When the requested model is
     // declared in one or more providers' `models` lists, restrict the routing
@@ -12029,6 +12198,253 @@ mod external_guardrail_context_tests {
         (format!("http://{address}/v1"), hits)
     }
 
+    /// An upstream that answers one request and hands the caller the exact
+    /// bytes it received, so a test can assert on the model that reached
+    /// the wire rather than on the one the gateway said it chose.
+    async fn capturing_upstream_fixture(
+        response_body: &'static str,
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<Vec<u8>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind capturing upstream");
+        let address = listener.local_addr().expect("capturing upstream address");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&hits);
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept upstream request");
+            observed.fetch_add(1, Ordering::SeqCst);
+            let mut request = Vec::new();
+            let expected_len = loop {
+                let mut chunk = [0_u8; 4096];
+                let read = stream
+                    .read(&mut chunk)
+                    .await
+                    .expect("read upstream request");
+                assert!(read > 0, "upstream request ended before its headers");
+                request.extend_from_slice(&chunk[..read]);
+                let Some(headers_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..headers_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().expect("content length"))
+                    })
+                    .unwrap_or(0);
+                break headers_end + 4 + content_length;
+            };
+            while request.len() < expected_len {
+                let mut chunk = [0_u8; 4096];
+                let read = stream.read(&mut chunk).await.expect("read upstream body");
+                assert!(read > 0, "upstream request body ended early");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let response = format!(
+                "HTTP/1.1 200 Fixture\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write upstream response");
+            request
+        });
+        (format!("http://{address}/v1"), hits, task)
+    }
+
+    /// WOR-2312: a global alias resolves before provider selection, which
+    /// is the capability a per-provider `model_map` cannot express.
+    ///
+    /// Neither provider enumerates `models:`, so the WOR-1534 eligibility
+    /// filter treats both as wildcards and round-robin would pick the
+    /// first. Only the alias's provider pin sends this request to the
+    /// second one. The body that lands upstream also pins the precedence:
+    /// the alias resolves `fast` to `gpt-4o-mini`, then the selected
+    /// provider's `model_map` renames that to the dated snapshot.
+    #[tokio::test]
+    async fn a_pinned_model_alias_selects_the_provider_and_the_upstream_model() {
+        let (pinned_url, pinned_hits, captured) = capturing_upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+        )
+        .await;
+        let (default_url, default_hits) = upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"wrong provider"}}]}"#,
+        )
+        .await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {
+                    "name": "default-first",
+                    "provider_type": "openai",
+                    "base_url": default_url,
+                    "allow_private_base_url": true,
+                    "api_key": "fixture-key"
+                },
+                {
+                    "name": "alias-target",
+                    "provider_type": "openai",
+                    "base_url": pinned_url,
+                    "allow_private_base_url": true,
+                    "api_key": "fixture-key",
+                    "model_map": {"gpt-4o-mini": "gpt-4o-mini-2024-07-18"}
+                }
+            ],
+            "routing": "round_robin",
+            "model_aliases": [
+                {"alias": "fast", "provider": "alias-target", "model_id": "gpt-4o-mini"}
+            ]
+        }))
+        .expect("alias proxy config");
+        let request = serde_json::json!({
+            "model": "fast",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        });
+        let (mut session, client) = downstream_bytes_session(
+            "/v1/chat/completions",
+            "application/json",
+            serde_json::to_vec(&request).expect("request JSON"),
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("aliased request dispatches");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+        assert_eq!(
+            pinned_hits.load(Ordering::SeqCst),
+            1,
+            "the alias must steer the request to the provider it names"
+        );
+        assert_eq!(
+            default_hits.load(Ordering::SeqCst),
+            0,
+            "round-robin's first provider must not serve a pinned alias"
+        );
+
+        let upstream_request = captured.await.expect("capturing upstream task");
+        let text = String::from_utf8(upstream_request).expect("upstream request is UTF-8");
+        let body = text.split_once("\r\n\r\n").expect("upstream body").1;
+        let body: serde_json::Value = serde_json::from_str(body).expect("upstream JSON body");
+        assert_eq!(
+            body["model"], "gpt-4o-mini-2024-07-18",
+            "the alias resolves first, then the selected provider's model_map renames it"
+        );
+    }
+
+    /// The alias never reaches the wire on an origin with no pin either:
+    /// a bare rename still resolves before dispatch.
+    #[tokio::test]
+    async fn an_unpinned_model_alias_still_rewrites_the_dispatched_model() {
+        let (upstream_url, _hits, captured) = capturing_upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+        )
+        .await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key"
+            }],
+            "model_aliases": [{"alias": "smart", "model_id": "gpt-4o"}]
+        }))
+        .expect("alias proxy config");
+        let request = serde_json::json!({
+            "model": "smart",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        });
+        let (mut session, client) = downstream_bytes_session(
+            "/v1/chat/completions",
+            "application/json",
+            serde_json::to_vec(&request).expect("request JSON"),
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("aliased request dispatches");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+
+        let upstream_request = captured.await.expect("capturing upstream task");
+        let text = String::from_utf8(upstream_request).expect("upstream request is UTF-8");
+        let body = text.split_once("\r\n\r\n").expect("upstream body").1;
+        let body: serde_json::Value = serde_json::from_str(body).expect("upstream JSON body");
+        assert_eq!(body["model"], "gpt-4o");
+    }
+
+    /// A `blocked_models` entry names the upstream model, and the alias is
+    /// resolved before that gate, so an alias cannot be a way around it.
+    #[tokio::test]
+    async fn a_blocked_model_cannot_be_reached_through_an_alias() {
+        let (upstream_url, hits) = upstream_fixture(r#"{"choices":[]}"#).await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key"
+            }],
+            "blocked_models": ["gpt-4o"],
+            "model_aliases": [{"alias": "smart", "model_id": "gpt-4o"}]
+        }))
+        .expect("alias proxy config");
+        let request = serde_json::json!({
+            "model": "smart",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        });
+        let (mut session, client) = downstream_bytes_session(
+            "/v1/chat/completions",
+            "application/json",
+            serde_json::to_vec(&request).expect("request JSON"),
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("blocked alias is answered");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 403"), "{response:?}");
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
     fn gemini_proxy_config(upstream_url: &str) -> sbproxy_ai::AiHandlerConfig {
         sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
             "providers": [{
@@ -14274,6 +14690,79 @@ mod model_routing_tests {
     fn empty_model_is_noop() {
         let providers = vec![prov("openai", &["gpt-4o-mini"])];
         assert_eq!(model_eligible_providers(&[0], &providers, ""), None);
+    }
+
+    fn alias_config(aliases: serde_json::Value) -> sbproxy_ai::handler::AiHandlerConfig {
+        sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "openai", "api_key": "k", "provider_type": "openai"},
+                {"name": "anthropic", "api_key": "k", "provider_type": "anthropic"}
+            ],
+            "model_aliases": aliases,
+        }))
+        .expect("alias fixture")
+    }
+
+    #[test]
+    fn a_configured_alias_resolves_to_its_model_and_pin() {
+        let config = alias_config(serde_json::json!([
+            {"alias": "fast", "provider": "openai", "model_id": "gpt-4o-mini"},
+            {"alias": "smart", "model_id": "claude-sonnet-4-5"}
+        ]));
+
+        assert_eq!(
+            super::resolve_model_alias(&config, "fast"),
+            Some(("gpt-4o-mini".to_string(), Some("openai".to_string())))
+        );
+        assert_eq!(
+            super::resolve_model_alias(&config, "smart"),
+            Some(("claude-sonnet-4-5".to_string(), None))
+        );
+    }
+
+    #[test]
+    fn a_literal_model_name_is_not_an_alias() {
+        let config = alias_config(serde_json::json!([
+            {"alias": "fast", "provider": "openai", "model_id": "gpt-4o-mini"}
+        ]));
+
+        assert_eq!(super::resolve_model_alias(&config, "gpt-4o-mini"), None);
+        assert_eq!(super::resolve_model_alias(&config, ""), None);
+    }
+
+    #[test]
+    fn an_alias_pin_narrows_the_candidate_set() {
+        let providers = vec![prov("openai", &[]), prov("anthropic", &[])];
+        let mut order = vec![0, 1];
+
+        let kept = super::retain_alias_pinned_providers(&mut order, &providers, Some("anthropic"));
+        assert!(kept);
+        assert_eq!(order, vec![1]);
+    }
+
+    #[test]
+    fn no_pin_leaves_the_candidate_set_alone() {
+        let providers = vec![prov("openai", &[]), prov("anthropic", &[])];
+        let mut order = vec![0, 1];
+
+        assert!(super::retain_alias_pinned_providers(
+            &mut order, &providers, None
+        ));
+        assert_eq!(order, vec![0, 1]);
+    }
+
+    #[test]
+    fn a_pin_with_no_eligible_provider_reports_failure() {
+        // The pinned provider was filtered out upstream (disabled, or
+        // refused by the credential's provider policy). Routing the
+        // request anyway would send another vendor a model id it does
+        // not serve, so the caller has to fail the request instead.
+        let providers = vec![prov("openai", &[]), prov("anthropic", &[])];
+        let mut order = vec![0];
+
+        let kept = super::retain_alias_pinned_providers(&mut order, &providers, Some("anthropic"));
+        assert!(!kept);
+        assert!(order.is_empty());
     }
 
     fn handler_config_two_deployments() -> sbproxy_ai::handler::AiHandlerConfig {

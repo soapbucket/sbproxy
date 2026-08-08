@@ -61,6 +61,16 @@ pub struct AiHandlerConfig {
     /// Block-list of model names that takes precedence over the allow-list.
     #[serde(default)]
     pub blocked_models: Vec<ModelId>,
+    /// Global model aliases for this origin.
+    ///
+    /// Each entry binds a friendly name a caller may send as `model` to an
+    /// upstream model id, and optionally pins it to one provider. Aliases
+    /// resolve on the dispatch path before every model gate and before
+    /// provider selection, which is what separates them from a provider's
+    /// `model_map`: that map renames a model only after the router has
+    /// already chosen that provider. See [`crate::model_alias`].
+    #[serde(default)]
+    pub model_aliases: Vec<crate::model_alias::ModelAlias>,
     /// Maximum request body size in bytes accepted by the gateway.
     #[serde(default)]
     pub max_body_size: Option<usize>,
@@ -250,6 +260,11 @@ pub struct AiHandlerConfig {
     /// Lazy-built fair-share pool store (WOR-1880, WOR-1993).
     #[serde(skip)]
     quota_pool_store: OnceLock<std::sync::Arc<CachedQuotaPoolStore>>,
+    /// Alias index built from `model_aliases`. `from_config` warms it at
+    /// config load, so the request path is one map lookup and a config
+    /// that carries aliases is fully resolved before it is published.
+    #[serde(skip)]
+    model_alias_index: OnceLock<crate::model_alias::ModelAliasRegistry>,
 }
 
 fn default_usage_parser() -> String {
@@ -1141,6 +1156,17 @@ impl AiHandlerConfig {
                 }
             }
         }
+        // WOR-2312: an alias resolves before provider selection, so one
+        // that reuses a name a provider already serves would silently
+        // rewrite every request asking for the real model and nothing
+        // downstream could tell. Validate after the serve-derived `models:`
+        // lists are filled in above, so the shadow check sees the same
+        // model set the router will.
+        crate::model_alias::validate_model_aliases(&config.model_aliases, &config.providers)
+            .map_err(|error| anyhow::anyhow!("ai model_aliases: {error}"))?;
+        // Warm the index here rather than on the first request, so the
+        // whole alias plane is resolved at config load.
+        let _ = config.model_alias_registry();
         if let Some(compression) = &mut config.compression {
             compression.apply_state_defaults();
             compression.validate(&config.providers)?;
@@ -1205,6 +1231,18 @@ impl AiHandlerConfig {
         } else {
             1
         }
+    }
+
+    /// This origin's model-alias registry, built on first call.
+    ///
+    /// [`Self::from_config`] warms it, so the request path only ever hits
+    /// the cached instance. The fallback build keeps a handler assembled
+    /// some other way (a struct literal in a test) resolving the same
+    /// aliases as one that came through config load.
+    pub fn model_alias_registry(&self) -> &crate::model_alias::ModelAliasRegistry {
+        self.model_alias_index.get_or_init(|| {
+            crate::model_alias::ModelAliasRegistry::from_config(self.model_aliases.clone())
+        })
     }
 
     /// Check if a model is allowed by the allow/block lists.
@@ -1723,6 +1761,8 @@ mod tests {
             guardrails_pipeline: OnceLock::new(),
             ai_policy_compiled: OnceLock::new(),
             quota_pool_store: OnceLock::new(),
+            model_aliases: Vec::new(),
+            model_alias_index: OnceLock::new(),
         };
         assert!(config.is_model_allowed("gpt-4"));
         assert!(config.is_model_allowed("anything"));
@@ -1765,6 +1805,8 @@ mod tests {
             guardrails_pipeline: OnceLock::new(),
             ai_policy_compiled: OnceLock::new(),
             quota_pool_store: OnceLock::new(),
+            model_aliases: Vec::new(),
+            model_alias_index: OnceLock::new(),
         };
         assert!(!config.is_model_allowed("gpt-4"));
         assert!(config.is_model_allowed("gpt-3.5-turbo"));
@@ -1807,6 +1849,8 @@ mod tests {
             guardrails_pipeline: OnceLock::new(),
             ai_policy_compiled: OnceLock::new(),
             quota_pool_store: OnceLock::new(),
+            model_aliases: Vec::new(),
+            model_alias_index: OnceLock::new(),
         };
         assert!(config.is_model_allowed("gpt-4"));
         assert!(config.is_model_allowed("gpt-3.5-turbo"));
@@ -1850,6 +1894,8 @@ mod tests {
             guardrails_pipeline: OnceLock::new(),
             ai_policy_compiled: OnceLock::new(),
             quota_pool_store: OnceLock::new(),
+            model_aliases: Vec::new(),
+            model_alias_index: OnceLock::new(),
         };
         // Block list wins
         assert!(!config.is_model_allowed("gpt-4"));
@@ -1872,6 +1918,51 @@ mod tests {
         assert_eq!(config.providers[0].weight, 3);
         assert_eq!(config.allowed_models, vec!["gpt-4"]);
         assert_eq!(config.max_body_size, Some(1048576));
+    }
+
+    // WOR-2312: the alias plane is resolved at config load. A config that
+    // carries aliases publishes a warm registry, and one whose alias would
+    // shadow a real model never publishes at all.
+    #[test]
+    fn config_load_builds_the_model_alias_registry() {
+        let json = serde_json::json!({
+            "providers": [
+                {"name": "openai", "api_key": "sk-test", "models": ["gpt-4o-mini"]},
+                {"name": "anthropic", "api_key": "sk-ant", "models": ["claude-sonnet-4-5"]}
+            ],
+            "model_aliases": [
+                {"alias": "fast", "provider": "openai", "model_id": "gpt-4o-mini"},
+                {"alias": "smart", "provider": "anthropic", "model_id": "claude-sonnet-4-5"}
+            ]
+        });
+        let config = AiHandlerConfig::from_config(json).expect("aliases load");
+
+        let registry = config.model_alias_registry();
+        assert!(!registry.is_empty());
+        let fast = registry.resolve("fast").expect("fast is an alias");
+        assert_eq!(fast.model_id, "gpt-4o-mini");
+        assert_eq!(
+            fast.provider.as_ref().map(crate::ids::ProviderName::as_str),
+            Some("openai")
+        );
+        assert!(registry.resolve("gpt-4o-mini").is_none());
+    }
+
+    #[test]
+    fn config_load_rejects_an_alias_that_shadows_a_served_model() {
+        let json = serde_json::json!({
+            "providers": [
+                {"name": "openai", "api_key": "sk-test", "models": ["gpt-4o", "gpt-4o-mini"]}
+            ],
+            "model_aliases": [
+                {"alias": "gpt-4o", "provider": "openai", "model_id": "gpt-4o-mini"}
+            ]
+        });
+        let error = AiHandlerConfig::from_config(json)
+            .expect_err("a shadowing alias is rejected at config load")
+            .to_string();
+        assert!(error.contains("ai model_aliases"), "{error}");
+        assert!(error.contains("shadows a model provider"), "{error}");
     }
 
     // WOR-1683: a served provider's empty models: list derives from the

@@ -1376,36 +1376,86 @@ action:
 | `requests_per_minute` | u64 | unset | Sliding one-minute window cap on requests for the model. |
 | `tokens_per_minute` | u64 | unset | Sliding one-minute window cap on tokens for the model. |
 
-## Model aliases (design stage)
+## Model aliases
 
-Model aliases are design-stage library code: `model_alias.rs` ships a `ModelAliasRegistry` with `ModelAlias` entries, but nothing on the serving path constructs the registry, and a `model_aliases:` key in the config is ignored. To map a friendly name onto an upstream model today, use the shipped per-provider `model_map` field, which rewrites the requested model name before dispatch. The rest of this section records the registry's intended shape.
+A model alias is one friendly name your callers send as `model`, bound to the upstream model id it stands for and, when you want it, to the provider that answers it. Aliases live on the `ai_proxy` action next to the providers they name:
 
 ```yaml
-model_aliases:
-  - alias: fast
-    provider: openai
-    model_id: gpt-4o-mini
-  - alias: smart
-    provider: anthropic
-    model_id: claude-sonnet-4-20250514
-  - alias: claude-old
-    provider: anthropic
-    model_id: claude-sonnet-4-5
-    deprecated: true
-    replacement: smart
+action:
+  type: ai_proxy
+  providers:
+    - name: openai
+      api_key: ${OPENAI_API_KEY}
+      models: [gpt-4o-mini, gpt-4o]
+    - name: anthropic
+      api_key: ${ANTHROPIC_API_KEY}
+      models: [claude-sonnet-4-20250514]
+  model_aliases:
+    - alias: fast
+      provider: openai
+      model_id: gpt-4o-mini
+    - alias: smart
+      provider: anthropic
+      model_id: claude-sonnet-4-20250514
+    - alias: claude-old
+      provider: anthropic
+      model_id: claude-sonnet-4-20250514
+      deprecated: true
+      replacement: smart
 ```
 
-### `ModelAlias` fields
+A caller then asks for the name rather than the vendor's model id, and never has to know which vendor answers:
+
+```bash
+curl -s http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Host: ai.example.com' \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "smart", "messages": [{"role": "user", "content": "hello"}]}'
+```
+
+That request reaches Anthropic with `"model": "claude-sonnet-4-20250514"`. The alias itself never reaches the wire.
+
+### Aliases and `model_map`
+
+A provider's `model_map` renames a model **after** the router has already picked that provider. It is a per-provider synonym: it can turn `fast` into `gpt-4o-mini` on the way to OpenAI, but it has no say in whether the request goes to OpenAI at all. Put `fast` in two providers' maps, and the model your caller ends up with depends on which provider the routing strategy picked for that request.
+
+An alias is resolved once, before provider selection, so `model: fast` reaches the same model every time. A per-provider map has no way to promise that, which is why a name your callers depend on belongs in an alias.
+
+Both mechanisms compose, in a fixed order:
+
+1. The alias resolves the caller's name to an upstream model id, and pins the provider when it names one.
+2. Every model gate below then judges the resolved id: `allowed_models`, `blocked_models`, the credential's own model lists, the budget, and the per-model rate limits. An alias is never a way around a block list.
+3. Model-based provider routing runs on the resolved id, so a provider that declares it in `models:` is still preferred when the alias named no provider.
+4. The selected provider's `model_map`, if it has an entry for the resolved id, renames it one last time on the wire.
+
+Aliases do not chain. An alias whose `model_id` names another alias is refused at config load, so resolution is always one lookup.
+
+A pin is a hard constraint. If the provider an alias names is disabled, refused by the calling credential's provider policy, or otherwise out of the candidate set for that request, the gateway answers **503** rather than sending another vendor a model id it does not serve.
+
+### `model_aliases` fields
 
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
-| `alias` | string | required | The friendly name clients send. |
-| `provider` | string | required | Provider name to route to. |
-| `model_id` | string | required | The model ID actually sent upstream. |
-| `deprecated` | bool | `false` | When true, a warning is logged on every resolution. |
-| `replacement` | string | unset | Suggested alias to migrate to. Surfaces in the deprecation log line. |
+| `alias` | string | required | The friendly name callers send as `model`. |
+| `provider` | string | unset | Provider this alias is pinned to. When set, the routing set is narrowed to that provider before any strategy runs. When omitted, the alias is a rename and provider selection follows the usual path. |
+| `model_id` | string | required | The model id sent upstream in place of the alias. |
+| `deprecated` | bool | `false` | When true, a warning is logged on every resolution, naming the alias and its replacement. |
+| `replacement` | string | unset | Alias to migrate to. Only valid together with `deprecated`, whose log line is the only place it appears. |
 
-In the library code, resolution returns `None` for unknown names so a caller can fall back to literal model ID matching, and re-registering the same alias overwrites the previous entry. None of this runs per-request today.
+### What is refused at config load
+
+Aliases are validated when the config compiles, because every one of these is a misrouting that goes invisible once traffic is flowing:
+
+- An alias that **shadows a real model name**: a name that a provider already declares in `models:`, uses as a `model_map` key, or names as its `default_model`. Left alone, every request asking for the real model would be silently rewritten to something else.
+- A **duplicate** alias, an alias that resolves to itself, or an alias whose target is another alias.
+- A **pin at a provider that is not configured** on the origin, or at one whose declared `models:` list does not include the target.
+- A `replacement` on an alias that is not `deprecated`, or one that names an alias that does not exist.
+
+`model_aliases:` is an AI-gateway key and belongs to the action. Setting it at the top level of the config is refused with a pointer at the action path, rather than parsed and ignored.
+
+### Deprecating a name
+
+Marking an alias `deprecated` keeps it serving while making its use visible. Every resolution logs a warning that names the alias, the model it resolved to, and the `replacement` to move to, so you can watch the log go quiet before you delete the entry.
 
 ## Supported endpoints
 

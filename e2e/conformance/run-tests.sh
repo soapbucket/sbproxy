@@ -2445,6 +2445,12 @@ run_82_model_aliasing() {
         -d '{"model":"cheap","messages":[{"role":"user","content":"Hello"}]}' \
         "$PROXY_URL/v1/chat/completions"
 
+    # Global alias "house-default" resolves before provider selection
+    assert_status "Model alias - global house-default -> gpt-4o-mini" 200 \
+        -X POST -H "Host: ai-alias.test" -H "Content-Type: application/json" \
+        -d '{"model":"house-default","messages":[{"role":"user","content":"Hello"}]}' \
+        "$PROXY_URL/v1/chat/completions"
+
     # Direct model name still works
     assert_status "Model alias - direct gpt-4o-mini" 200 \
         -X POST -H "Host: ai-alias.test" -H "Content-Type: application/json" \

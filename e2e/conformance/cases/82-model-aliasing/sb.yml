@@ -1,4 +1,7 @@
-# AI proxy with model aliases via model_map
+# AI proxy with global model aliases plus the per-provider model_map.
+#
+# `model_aliases` resolves before provider selection; `model_map` renames
+# the resolved id on the way to the provider it was already routed to.
 proxy:
   http_bind_port: 18080
 
@@ -20,3 +23,7 @@ origins:
             fast: gpt-4o-mini
             smart: gpt-4o
             cheap: gpt-4o-mini
+      model_aliases:
+        - alias: house-default
+          provider: mock-openai
+          model_id: gpt-4o-mini
