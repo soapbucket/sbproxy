@@ -2,6 +2,9 @@
 //!
 //! Aggregates tools from multiple upstream MCP servers into a unified
 //! tool registry. Tool calls are routed to the correct upstream server.
+//! The same aggregate-then-route shape covers the resource surface
+//! (`resources/list` + `resources/read`) and the prompt surface
+//! (`prompts/list` + `prompts/get`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -190,6 +193,35 @@ pub struct FederatedResource {
     pub upstream_uri: String,
 }
 
+/// A prompt federated from an upstream MCP server. Mirrors
+/// [`FederatedTool`] for the `prompts/list` + `prompts/get` surface,
+/// and namespaces on exactly the same rules: `'.'` separator,
+/// [`NamespaceMode`] per server, prefix on collision. A prompt name
+/// clash across two upstreams therefore behaves like a tool name
+/// clash, which is the only way a client can route both.
+#[derive(Debug, Clone)]
+pub struct FederatedPrompt {
+    /// Advertised prompt name (may be prefixed with the server name).
+    pub name: String,
+    /// Original name the upstream advertised, so `prompts/get` reaches
+    /// it with the name it knows. Equal to `name` when no collision
+    /// (and no `namespace: always`) triggered the prefix.
+    pub upstream_name: String,
+    /// Optional display title (added by MCP 2025-06-18).
+    pub title: Option<String>,
+    /// Optional human-readable description.
+    pub description: Option<String>,
+    /// Verbatim `arguments` array from the upstream definition, when
+    /// the prompt declares one. Passed through unparsed: the gateway
+    /// does not validate prompt arguments, the owning server does.
+    pub arguments: Option<serde_json::Value>,
+    /// Name of the upstream server that owns this prompt.
+    pub server_name: String,
+    /// Opaque `_meta` block, preserved verbatim for the same reason
+    /// [`FederatedTool::meta`] is.
+    pub meta: Option<serde_json::Value>,
+}
+
 // --- McpFederation ---
 
 /// Upstream IO limits for every HTTP exchange the federation makes
@@ -261,6 +293,16 @@ pub struct McpFederation {
     /// `refresh_resources` so OpenAI Apps SDK clients can fetch
     /// UI templates declared on tools through the gateway.
     resources: ArcSwap<HashMap<String, FederatedResource>>,
+    /// prompt_name -> FederatedPrompt. Populated by `refresh_prompts`
+    /// from the upstreams that declare the `prompts` capability;
+    /// every other upstream contributes nothing.
+    prompts: ArcSwap<HashMap<String, FederatedPrompt>>,
+    /// server_name -> the `capabilities` object the upstream returned
+    /// from `initialize`, refreshed by `refresh_server_capabilities`.
+    /// One probe per upstream per cycle feeds every registry that
+    /// needs to know what an upstream supports, so adding a surface
+    /// does not add a handshake.
+    server_capabilities: ArcSwap<HashMap<String, serde_json::Value>>,
     /// WOR-818: mcpApps capability values mirrored from any
     /// upstream that advertised one. Empty when no upstream
     /// supports SEP-1865. The first non-empty value is what the
@@ -298,11 +340,19 @@ pub struct McpFederation {
     /// Content digest of the last stored resource registry (plus the
     /// mirrored mcpApps capability). Zero until the first refresh.
     resources_digest: std::sync::atomic::AtomicU64,
+    /// Content digest of the last stored prompt registry. Zero until
+    /// the first refresh. The prompt registry deliberately does not
+    /// move [`Self::generation`]: that counter keys the serialized
+    /// `tools/list` and codemode.ts caches, and a prompt change
+    /// invalidates neither. Nor is there a `prompts/list_changed`
+    /// notification to drive, because the gateway does not push one
+    /// (see the capability it advertises).
+    prompts_digest: std::sync::atomic::AtomicU64,
     /// Set once `ensure_ready` has spawned the periodic refresh task.
     refresh_task_started: std::sync::atomic::AtomicBool,
-    /// Set once the cold-start prime (one tools + resources fetch)
-    /// has run. Requests after that serve the ArcSwap snapshot and
-    /// never fan out to upstreams inline.
+    /// Set once the cold-start prime (one tools + capabilities +
+    /// resources + prompts fetch) has run. Requests after that serve
+    /// the ArcSwap snapshot and never fan out to upstreams inline.
     primed: std::sync::atomic::AtomicBool,
     /// Serialises the cold-start prime so N concurrent first
     /// requests trigger exactly one upstream fan-out.
@@ -396,6 +446,8 @@ impl McpFederation {
             servers,
             tools: ArcSwap::from_pointee(HashMap::new()),
             resources: ArcSwap::from_pointee(HashMap::new()),
+            prompts: ArcSwap::from_pointee(HashMap::new()),
+            server_capabilities: ArcSwap::from_pointee(HashMap::new()),
             mcp_apps_capability: ArcSwap::from_pointee(None),
             client,
             openapi_client,
@@ -408,6 +460,7 @@ impl McpFederation {
             resources_generation: std::sync::atomic::AtomicU64::new(0),
             tools_digest: std::sync::atomic::AtomicU64::new(0),
             resources_digest: std::sync::atomic::AtomicU64::new(0),
+            prompts_digest: std::sync::atomic::AtomicU64::new(0),
             refresh_task_started: std::sync::atomic::AtomicBool::new(false),
             primed: std::sync::atomic::AtomicBool::new(false),
             prime_lock: tokio::sync::Mutex::new(()),
@@ -634,17 +687,18 @@ impl McpFederation {
     /// (same policy as `refresh_tools`).
     pub async fn refresh_resources(&self) -> anyhow::Result<usize> {
         let mut registry: HashMap<String, FederatedResource> = HashMap::new();
-        let mut apps_cap: Option<serde_json::Value> = None;
+        // The capability snapshot published by
+        // [`Self::refresh_server_capabilities`] is the single answer to
+        // "what does this upstream support", so this pass no longer
+        // runs an `initialize` of its own. First upstream in configured
+        // order still wins, which is the order the inline probe used.
+        let capabilities = self.server_capabilities.load();
+        let apps_cap: Option<serde_json::Value> = self
+            .servers
+            .iter()
+            .find_map(|s| capabilities.get(&s.name)?.get("mcpApps").cloned());
 
         for server in &self.servers {
-            // Pull capabilities first so we always know whether the
-            // server speaks SEP-1865, even when its resources/list
-            // is empty.
-            if apps_cap.is_none() {
-                if let Ok(Some(cap)) = self.fetch_mcp_apps_capability(server).await {
-                    apps_cap = Some(cap);
-                }
-            }
             match self.fetch_resources_from_server(server).await {
                 Ok(resources) => {
                     info!(
@@ -711,13 +765,63 @@ impl McpFederation {
         Ok(count)
     }
 
-    /// Initialize the upstream and extract its `mcpApps` capability,
-    /// if any. Returns Ok(None) for upstreams that complete
-    /// initialize but do not advertise SEP-1865.
-    async fn fetch_mcp_apps_capability(
+    /// Probe every MCP upstream's `initialize` once and publish the
+    /// `capabilities` object each one advertised.
+    ///
+    /// Every registry that has to know what an upstream supports reads
+    /// this snapshot rather than handshaking for itself, so the number
+    /// of `initialize` round trips is one per upstream per refresh
+    /// cycle no matter how many surfaces the gateway federates. Call it
+    /// before [`Self::refresh_resources`] (which reads `mcpApps` out of
+    /// it) and [`Self::refresh_prompts`] (which reads `prompts`).
+    ///
+    /// OpenAPI-backed upstreams are skipped: they speak REST, not MCP,
+    /// so there is no handshake to run and no capability to read.
+    /// Per-upstream failures log and continue; an upstream missing from
+    /// the snapshot simply declares nothing.
+    ///
+    /// Returns the number of upstreams that answered.
+    pub async fn refresh_server_capabilities(&self) -> usize {
+        let mut snapshot: HashMap<String, serde_json::Value> = HashMap::new();
+        for server in &self.servers {
+            if server.openapi.is_some() {
+                continue;
+            }
+            match self.fetch_server_capabilities(server).await {
+                Ok(caps) => {
+                    snapshot.insert(server.name.clone(), caps);
+                }
+                Err(e) => {
+                    warn!(
+                        server = %server.name,
+                        error = %e,
+                        "failed to read capabilities from upstream MCP server"
+                    );
+                }
+            }
+        }
+        let count = snapshot.len();
+        self.server_capabilities.store(Arc::new(snapshot));
+        count
+    }
+
+    /// True when `server_name` declared the named capability on its
+    /// last `initialize`. An upstream that never answered, or one the
+    /// gateway never probes (OpenAPI-backed), declares nothing.
+    fn server_declares(&self, server_name: &str, capability: &str) -> bool {
+        self.server_capabilities
+            .load()
+            .get(server_name)
+            .and_then(|c| c.get(capability))
+            .is_some()
+    }
+
+    /// Initialize the upstream and return the whole `capabilities`
+    /// object it advertised, or `Value::Null` when it advertised none.
+    async fn fetch_server_capabilities(
         &self,
         server: &McpServerConfig,
-    ) -> anyhow::Result<Option<serde_json::Value>> {
+    ) -> anyhow::Result<serde_json::Value> {
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             method: "initialize".to_string(),
@@ -738,10 +842,7 @@ impl McpFederation {
             );
         }
         let result = resp.result.unwrap_or_default();
-        Ok(result
-            .get("capabilities")
-            .and_then(|c| c.get("mcpApps"))
-            .cloned())
+        Ok(result.get("capabilities").cloned().unwrap_or_default())
     }
 
     /// Fetch the resource list from one upstream server. Pure
@@ -850,6 +951,205 @@ impl McpFederation {
         if let Some(err) = resp.error {
             anyhow::bail!(
                 "resources/read error from {}: {} (code {})",
+                server.name,
+                err.message,
+                err.code
+            );
+        }
+        Ok(resp.result.unwrap_or_default())
+    }
+
+    // --- Prompts ---
+
+    /// List every federated prompt currently in the registry.
+    pub fn list_prompts(&self) -> Vec<FederatedPrompt> {
+        self.prompts.load().values().cloned().collect()
+    }
+
+    /// Look up which server owns an advertised prompt name.
+    pub fn resolve_prompt(&self, name: &str) -> Option<FederatedPrompt> {
+        self.prompts.load().get(name).cloned()
+    }
+
+    /// The `prompts` capability object the gateway may honestly
+    /// advertise on its own `initialize`, or `None` when no federated
+    /// upstream declares one.
+    ///
+    /// `listChanged` is `false` deliberately. The gateway's
+    /// server-to-client stream pushes `tools/list_changed` and
+    /// `resources/list_changed` and nothing else, so a `true` here
+    /// would be the same species of capability lie that keeps
+    /// `2025-03-26` out of
+    /// [`SUPPORTED_PROTOCOL_VERSIONS`](super::types::SUPPORTED_PROTOCOL_VERSIONS).
+    pub fn prompts_capability(&self) -> Option<serde_json::Value> {
+        let capabilities = self.server_capabilities.load();
+        let declared = self.servers.iter().any(|s| {
+            capabilities
+                .get(&s.name)
+                .and_then(|c| c.get("prompts"))
+                .is_some()
+        });
+        declared.then(|| json!({ "listChanged": false }))
+    }
+
+    /// Fetch `prompts/list` from every upstream that declares the
+    /// `prompts` capability and merge the answers into one registry,
+    /// namespaced on exactly the rules tools use.
+    ///
+    /// Three classes of upstream contribute nothing rather than
+    /// failing the whole refresh: an OpenAPI-backed server (it speaks
+    /// REST and has no prompts to have), a server that declared no
+    /// `prompts` capability (asking would earn a `-32601`), and a
+    /// server whose `prompts/list` errored or timed out. One upstream
+    /// without prompts must not blank the prompts of the upstreams
+    /// that have them, which is the policy `refresh_tools` and
+    /// `refresh_resources` already hold.
+    ///
+    /// Reads the capability snapshot published by
+    /// [`Self::refresh_server_capabilities`], so call that first.
+    ///
+    /// Returns the total number of federated prompts.
+    pub async fn refresh_prompts(&self) -> anyhow::Result<usize> {
+        let mut fetched: Vec<(String, NamespaceMode, Vec<FederatedPrompt>)> = Vec::new();
+        for server in &self.servers {
+            if server.openapi.is_some() {
+                continue;
+            }
+            if !self.server_declares(&server.name, "prompts") {
+                debug!(
+                    server = %server.name,
+                    "upstream declares no prompts capability; contributing no prompts"
+                );
+                continue;
+            }
+            match self.fetch_prompts_from_server(server).await {
+                Ok(prompts) => {
+                    info!(
+                        server = %server.name,
+                        count = prompts.len(),
+                        "fetched prompts from upstream MCP server"
+                    );
+                    fetched.push((server.name.clone(), server.namespace, prompts));
+                }
+                Err(e) => {
+                    warn!(
+                        server = %server.name,
+                        error = %e,
+                        "failed to fetch prompts from upstream MCP server"
+                    );
+                }
+            }
+        }
+
+        let registry = merge_federated_prompts(fetched);
+        let count = registry.len();
+        let digest = prompts_registry_digest(&registry);
+        if self
+            .prompts_digest
+            .swap(digest, std::sync::atomic::Ordering::AcqRel)
+            != digest
+        {
+            self.prompts.store(Arc::new(registry));
+            debug!(total_prompts = count, "MCP federation prompts refreshed");
+        } else {
+            debug!(
+                total_prompts = count,
+                "MCP federation prompts unchanged; swap skipped"
+            );
+        }
+        Ok(count)
+    }
+
+    /// Fetch the prompt list from one upstream server. Pure
+    /// pass-through: the gateway does not validate argument schemas
+    /// or template shape here, the owning server does.
+    async fn fetch_prompts_from_server(
+        &self,
+        server: &McpServerConfig,
+    ) -> anyhow::Result<Vec<FederatedPrompt>> {
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "prompts/list".to_string(),
+            params: None,
+            id: Some(json!(1)),
+        };
+        let resp = self.dispatch_request(server, &req, &[]).await?;
+        if let Some(err) = resp.error {
+            anyhow::bail!(
+                "prompts/list error from {}: {} (code {})",
+                server.name,
+                err.message,
+                err.code
+            );
+        }
+        let result = resp.result.unwrap_or_default();
+        let list = result.get("prompts").cloned().unwrap_or_default();
+        let defs: Vec<serde_json::Value> = serde_json::from_value(list).unwrap_or_default();
+        let federated = defs
+            .into_iter()
+            .filter_map(|p| {
+                let name = p.get("name")?.as_str()?.to_string();
+                Some(FederatedPrompt {
+                    upstream_name: name.clone(),
+                    name,
+                    title: p.get("title").and_then(|v| v.as_str()).map(String::from),
+                    description: p
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    arguments: p.get("arguments").cloned(),
+                    server_name: server.name.clone(),
+                    meta: p.get("_meta").cloned(),
+                })
+            })
+            .collect();
+        Ok(federated)
+    }
+
+    /// Fetch a prompt through the federation, routing by the
+    /// advertised (possibly namespaced) name.
+    ///
+    /// The upstream receives the name it advertised, so a vendor
+    /// server never has to know about the gateway's
+    /// collision-avoidance scheme. That is the contract
+    /// [`Self::read_resource`] already holds for resource URIs.
+    pub async fn get_prompt(
+        &self,
+        name: &str,
+        arguments: Option<serde_json::Value>,
+    ) -> anyhow::Result<serde_json::Value> {
+        let prompt = self
+            .resolve_prompt(name)
+            .ok_or_else(|| anyhow::anyhow!("unknown prompt: {name}"))?;
+        let server = self
+            .servers
+            .iter()
+            .find(|s| s.name == prompt.server_name)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "prompt {} maps to unknown server {}",
+                    name,
+                    prompt.server_name
+                )
+            })?;
+        let mut params = json!({ "name": prompt.upstream_name });
+        if let (Some(args), Some(obj)) = (arguments, params.as_object_mut()) {
+            obj.insert("arguments".to_string(), args);
+        }
+        // SEP-414: a `prompts/get` is work done for one inbound
+        // caller, on that caller's thread of execution, so it carries
+        // the trace context `tools/call` and `resources/read` do.
+        let trace_pairs = sbproxy_observe::telemetry::propagation_pairs();
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "prompts/get".to_string(),
+            params: Some(merge_trace_context(params, &trace_pairs)),
+            id: Some(json!(1)),
+        };
+        let resp = self.dispatch_request(server, &req, &[]).await?;
+        if let Some(err) = resp.error {
+            anyhow::bail!(
+                "prompts/get error from {}: {} (code {})",
                 server.name,
                 err.message,
                 err.code
@@ -1766,11 +2066,11 @@ impl McpFederation {
     }
 
     /// Make the federation servable: spawn the periodic refresh task
-    /// on first use and run the cold-start prime (one tools fetch +
-    /// one resources fetch) exactly once, single-flight. Requests
-    /// arriving after the prime serve the ArcSwap snapshot and never
-    /// fan out to upstreams inline; the background task is the only
-    /// steady-state refresher.
+    /// on first use and run the cold-start prime (one tools fetch, one
+    /// capability probe, one resources fetch, one prompts fetch)
+    /// exactly once, single-flight. Requests arriving after the prime
+    /// serve the ArcSwap snapshot and never fan out to upstreams
+    /// inline; the background task is the only steady-state refresher.
     ///
     /// A prime failure still marks the federation primed: serving an
     /// empty catalogue until the next interval tick beats retrying
@@ -1793,15 +2093,21 @@ impl McpFederation {
         if let Err(e) = self.refresh_tools().await {
             error!(error = %e, "MCP federation initial tool refresh failed");
         }
+        // Capabilities first: both refreshes below read the snapshot
+        // it publishes rather than handshaking for themselves.
+        self.refresh_server_capabilities().await;
         if let Err(e) = self.refresh_resources().await {
             error!(error = %e, "MCP federation initial resource refresh failed");
+        }
+        if let Err(e) = self.refresh_prompts().await {
+            error!(error = %e, "MCP federation initial prompt refresh failed");
         }
         self.primed
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    /// Start a background task to refresh the tool and resource
-    /// registries periodically.
+    /// Start a background task to refresh the tool, resource, and
+    /// prompt registries periodically.
     ///
     /// The task holds only a `Weak` reference: when a hot reload
     /// rebuilds the action and drops the last `Arc`, the task exits
@@ -1820,8 +2126,12 @@ impl McpFederation {
                 if let Err(e) = federation.refresh_tools().await {
                     error!(error = %e, "MCP federation tool refresh failed");
                 }
+                federation.refresh_server_capabilities().await;
                 if let Err(e) = federation.refresh_resources().await {
                     error!(error = %e, "MCP federation resource refresh failed");
+                }
+                if let Err(e) = federation.refresh_prompts().await {
+                    error!(error = %e, "MCP federation prompt refresh failed");
                 }
             }
         });
@@ -1976,6 +2286,70 @@ fn tools_registry_digest(registry: &HashMap<String, FederatedTool>) -> u64 {
     h.finish()
 }
 
+/// Merge per-server prompt lists into one namespaced registry.
+///
+/// Split out from [`McpFederation::refresh_prompts`] because this is
+/// the whole of the namespacing contract and it is worth testing
+/// without upstream IO: servers are folded in configured order, and
+/// each prompt takes the name [`federated_name`] resolves against the
+/// names already claimed. That is the same call `refresh_tools` makes
+/// with the same `'.'` separator, so a prompt name colliding across
+/// two upstreams disambiguates exactly the way a tool name does.
+fn merge_federated_prompts(
+    per_server: Vec<(String, NamespaceMode, Vec<FederatedPrompt>)>,
+) -> HashMap<String, FederatedPrompt> {
+    let mut registry: HashMap<String, FederatedPrompt> = HashMap::new();
+    for (server_name, namespace, prompts) in per_server {
+        for mut prompt in prompts {
+            let advertised =
+                federated_name(&server_name, namespace, '.', &prompt.upstream_name, |n| {
+                    registry.contains_key(n)
+                });
+            if advertised != prompt.upstream_name {
+                warn!(
+                    prompt = %prompt.upstream_name,
+                    server = %server_name,
+                    advertised = %advertised,
+                    "federated prompt name namespaced (collision or always-namespace)"
+                );
+            }
+            // Advertise the resolved name; `upstream_name` keeps the
+            // original so `prompts/get` still reaches the owning
+            // server with the name it published.
+            prompt.name = advertised.clone();
+            registry.insert(advertised, prompt);
+        }
+    }
+    registry
+}
+
+/// Order-independent content digest of a prompt registry, so a
+/// steady-state refresh that observes the same prompts does not churn
+/// the `ArcSwap`.
+fn prompts_registry_digest(registry: &HashMap<String, FederatedPrompt>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut keys: Vec<&String> = registry.keys().collect();
+    keys.sort();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for k in keys {
+        let p = &registry[k];
+        p.name.hash(&mut h);
+        p.upstream_name.hash(&mut h);
+        p.title.hash(&mut h);
+        p.description.hash(&mut h);
+        p.server_name.hash(&mut h);
+        match &p.arguments {
+            Some(a) => a.to_string().hash(&mut h),
+            None => 0u8.hash(&mut h),
+        }
+        match &p.meta {
+            Some(m) => m.to_string().hash(&mut h),
+            None => 0u8.hash(&mut h),
+        }
+    }
+    h.finish()
+}
+
 /// Order-independent content digest of a resource registry plus the
 /// mirrored mcpApps capability (both are stored by the same refresh,
 /// so one digest guards both swaps).
@@ -2109,6 +2483,208 @@ mod tests {
             streaming: false,
             meta: None,
         }
+    }
+
+    // --- Prompts ---
+
+    fn make_prompt(name: &str, server: &str) -> FederatedPrompt {
+        FederatedPrompt {
+            name: name.to_string(),
+            upstream_name: name.to_string(),
+            title: None,
+            description: Some(format!("Prompt {name}")),
+            arguments: None,
+            server_name: server.to_string(),
+            meta: None,
+        }
+    }
+
+    /// The whole point of prompt namespacing: two upstreams that both
+    /// publish `code_review` must both stay reachable, and the second
+    /// one gets the server-qualified name a tool collision would get.
+    #[test]
+    fn prompt_name_collision_across_servers_namespaces_like_a_tool() {
+        let registry = merge_federated_prompts(vec![
+            (
+                "gh".to_string(),
+                NamespaceMode::OnCollision,
+                vec![
+                    make_prompt("code_review", "gh"),
+                    make_prompt("triage", "gh"),
+                ],
+            ),
+            (
+                "gl".to_string(),
+                NamespaceMode::OnCollision,
+                vec![make_prompt("code_review", "gl")],
+            ),
+        ]);
+
+        assert_eq!(registry.len(), 3, "every prompt stays reachable");
+        // First server in configured order keeps the bare name.
+        assert_eq!(registry["code_review"].server_name, "gh");
+        // The collider is advertised (and keyed) server-qualified.
+        let collided = registry
+            .get("gl.code_review")
+            .expect("collision disambiguates with the server name");
+        assert_eq!(collided.server_name, "gl");
+        assert_eq!(collided.name, "gl.code_review");
+        // The upstream still hears the name it published.
+        assert_eq!(collided.upstream_name, "code_review");
+        // A non-colliding name on the same server is untouched.
+        assert_eq!(registry["triage"].name, "triage");
+    }
+
+    /// `namespace: always` prefixes every prompt up front, with the
+    /// `'.'` separator tools use rather than the `'/'` resources use.
+    #[test]
+    fn prompt_namespace_always_prefixes_without_a_collision() {
+        let registry = merge_federated_prompts(vec![(
+            "gh".to_string(),
+            NamespaceMode::Always,
+            vec![make_prompt("code_review", "gh")],
+        )]);
+        assert_eq!(registry.len(), 1);
+        let prompt = registry
+            .get("gh.code_review")
+            .expect("always-namespace prefixes every prompt");
+        assert_eq!(prompt.upstream_name, "code_review");
+    }
+
+    #[test]
+    fn resolve_prompt_round_trips_and_unknown_is_none() {
+        let fed = McpFederation::new(vec![mock_server("gh", "http://gh.test")]);
+        let mut map = HashMap::new();
+        let mut prompt = make_prompt("gh.code_review", "gh");
+        prompt.upstream_name = "code_review".to_string();
+        map.insert("gh.code_review".to_string(), prompt);
+        fed.prompts.store(Arc::new(map));
+
+        let resolved = fed
+            .resolve_prompt("gh.code_review")
+            .expect("advertised name routes");
+        assert_eq!(resolved.server_name, "gh");
+        assert_eq!(resolved.upstream_name, "code_review");
+        assert_eq!(fed.list_prompts().len(), 1);
+        // The bare upstream name is not what the gateway advertised,
+        // so it must not route either.
+        assert!(fed.resolve_prompt("code_review").is_none());
+        assert!(fed.resolve_prompt("no_such_prompt").is_none());
+    }
+
+    #[tokio::test]
+    async fn get_prompt_on_an_unknown_name_never_reaches_an_upstream() {
+        // The URL is unroutable on purpose: resolving must fail before
+        // any dial, so the error is "unknown prompt" and not a
+        // connect failure.
+        let fed = McpFederation::new(vec![mock_server("gh", "http://127.0.0.1:1/mcp")]);
+        let err = fed
+            .get_prompt("no_such_prompt", None)
+            .await
+            .expect_err("unknown prompt must not dial");
+        assert!(
+            format!("{err:#}").contains("unknown prompt"),
+            "expected an unknown-prompt error, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn prompts_capability_is_absent_until_an_upstream_declares_one() {
+        let fed = McpFederation::new(vec![
+            mock_server("gh", "http://gh.test"),
+            mock_server("docs", "http://docs.test"),
+        ]);
+        // No probe has run: nothing declared, nothing advertised.
+        assert!(fed.prompts_capability().is_none());
+
+        // An upstream that answered `initialize` with tools only is
+        // still not a reason to advertise prompts.
+        let mut caps = HashMap::new();
+        caps.insert("gh".to_string(), json!({ "tools": {} }));
+        fed.server_capabilities.store(Arc::new(caps));
+        assert!(fed.prompts_capability().is_none());
+
+        // One upstream declaring prompts is enough, and what the
+        // gateway advertises says `listChanged: false` because it
+        // pushes no prompt list notifications.
+        let mut caps = HashMap::new();
+        caps.insert("gh".to_string(), json!({ "tools": {} }));
+        caps.insert("docs".to_string(), json!({ "prompts": {} }));
+        fed.server_capabilities.store(Arc::new(caps));
+        let advertised = fed
+            .prompts_capability()
+            .expect("a declaring upstream turns the capability on");
+        assert_eq!(advertised, json!({ "listChanged": false }));
+    }
+
+    #[tokio::test]
+    async fn refresh_prompts_skips_upstreams_that_declare_no_prompts() {
+        // Both upstreams are unroutable. If `refresh_prompts` asked
+        // either of them for a prompt list it would take the connect
+        // failure path and log; the assertion that matters is that the
+        // registry stays empty and the call still succeeds, which is
+        // the "contributes nothing, does not error the whole call"
+        // contract.
+        let fed = McpFederation::new(vec![
+            mock_server("gh", "http://127.0.0.1:1/mcp"),
+            mock_server("docs", "http://127.0.0.1:1/mcp"),
+        ]);
+        let mut caps = HashMap::new();
+        caps.insert("gh".to_string(), json!({ "tools": {}, "resources": {} }));
+        fed.server_capabilities.store(Arc::new(caps));
+
+        let count = fed
+            .refresh_prompts()
+            .await
+            .expect("an upstream without prompts must not fail the refresh");
+        assert_eq!(count, 0);
+        assert!(fed.list_prompts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn refresh_prompts_never_probes_an_openapi_backed_server() {
+        // An OpenAPI-backed upstream speaks REST. Even with a prompts
+        // capability wrongly recorded against it, it must contribute
+        // nothing and take no IO: the URL here would hang the test if
+        // the refresh dialled it.
+        let backing = OpenApiBacking {
+            base_url: "http://127.0.0.1:1".to_string(),
+            tools: vec![],
+            routes: HashMap::new(),
+            headers: Vec::new(),
+            egress_policy: EgressPolicy::allow_all("test"),
+        };
+        let server = McpServerConfig {
+            name: "rest".to_string(),
+            url: "http://127.0.0.1:1".to_string(),
+            transport: "streamable_http".to_string(),
+            namespace: NamespaceMode::default(),
+            openapi: Some(backing),
+        };
+        let fed = McpFederation::new(vec![server]);
+        let mut caps = HashMap::new();
+        caps.insert("rest".to_string(), json!({ "prompts": {} }));
+        fed.server_capabilities.store(Arc::new(caps));
+
+        assert_eq!(fed.refresh_prompts().await.expect("no error"), 0);
+        assert!(fed.list_prompts().is_empty());
+        // The capability probe skips it for the same reason.
+        assert_eq!(fed.refresh_server_capabilities().await, 0);
+    }
+
+    #[tokio::test]
+    async fn refresh_prompts_leaves_the_arc_swap_alone_when_nothing_changed() {
+        let fed = McpFederation::new(vec![]);
+        assert_eq!(fed.refresh_prompts().await.expect("first"), 0);
+        let first = fed.prompts.load_full();
+        assert_eq!(fed.refresh_prompts().await.expect("second"), 0);
+        assert!(
+            Arc::ptr_eq(&first, &fed.prompts.load_full()),
+            "an unchanged prompt registry must not churn the ArcSwap"
+        );
+        // And it must not move the catalogue generation, which keys
+        // the serialized tools and codemode.ts caches.
+        assert_eq!(fed.generation(), 0);
     }
 
     // --- WOR-818 OpenAI Apps SDK / SEP-1865 ---

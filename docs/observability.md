@@ -1,5 +1,5 @@
 # Observability
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-08*
 
 SBproxy ships metrics, logs, and traces from one process. This guide covers the Wave 1 substrate: the SLO catalog, the metric label budget, the log schema and redaction policy, the trace propagation contract, the health endpoints, the dashboards, and the reference Compose stack you can boot in one command.
 
@@ -704,20 +704,46 @@ Extending that injection to every helper HTTP client the proxy owns (the ledger 
 
 ### Span naming
 
-Span names follow `sbproxy.<pillar>.<verb>`:
+The table below is generated from the span registry in
+`crates/sbproxy-observe/src/span_registry.rs`, and a drift guard fails the build
+if it stops matching. That is deliberate: this table used to list eight pillar
+names as though the proxy emitted them, and it emitted none of them.
 
-| Span | Pillar |
-|---|---|
-| `sbproxy.intake.accept` | Top-level inbound request (root) |
-| `sbproxy.policy.enforce` | Per-policy execution |
-| `sbproxy.action.challenge` | Issue 402 challenge |
-| `sbproxy.action.redeem` | Verify presented token / receipt |
-| `sbproxy.ledger.redeem` | Outbound HTTP call to ledger |
-| `sbproxy.rail.settle` | Outbound payment-rail settlement |
-| `sbproxy.transform.shape` | Content transform |
-| `sbproxy.audit.emit` | Append audit-log entry |
+<!-- BEGIN GENERATED SPAN VOCABULARY -->
+<!-- Generated from crates/sbproxy-observe/src/span_registry.rs. Do not hand-edit this block; run
+     cargo run -q -p sbproxy-observe --bin generate-span-vocabulary -->
 
-Span attributes include the OTel semantic conventions (`http.request.method`, `http.response.status_code`, `server.address`) plus the SBproxy-specific set (`sbproxy.request_id`, `sbproxy.tenant_id`, `sbproxy.route`, `sbproxy.agent_id`, `sbproxy.agent_class`, `sbproxy.rail`, `sbproxy.shape`, `sbproxy.ledger.idempotency_key`).
+Span names follow one of two conventions. SBproxy's own pillars are `sbproxy.<pillar>.<verb>`, with eight pillars: `intake`, `policy`, `action`, `transform`, `ledger`, `rail`, `audit`, and `notify`. The AI gateway spans instead follow the OpenTelemetry GenAI and OpenInference vocabularies, so LLM-native trace backends render them without remapping.
+
+The `Emitted` column is the one to read first. `yes` means production code opens the span and a drift guard proves it, by resolving the emitter against the source tree and requiring a call site outside tests. `not yet` means the name is reserved and published here and nothing opens it, so a trace query filtered on that name returns nothing. Most of the pillar vocabulary is still in that state: the request path does not open pillar spans today, and the one pillar span that is live runs on a background worker.
+
+`Name` is the compatibility promise about the span name itself, on the same three tiers the metric catalog uses. `stable` will not be renamed without a deprecation period, `beta` may be renamed in a minor release with a changelog entry, and `alpha` may be renamed or removed in any release. A name nothing emits cannot be better than `alpha`.
+
+| Span | Pillar | Emitted | Name | What it covers |
+| --- | --- | --- | --- | --- |
+| `sbproxy.intake.accept` | `intake` | not yet | `alpha` | Would cover inbound request acceptance and framing validation, as the root span of a proxied request. |
+| `sbproxy.policy.enforce` | `policy` | not yet | `alpha` | Would cover one policy evaluation: rate limit, WAF, AI crawl, and the rest of the enforcer chain. |
+| `sbproxy.action.challenge` | `action` | not yet | `alpha` | Would cover issuing a 402 payment challenge. |
+| `sbproxy.action.redeem` | `action` | not yet | `alpha` | Would cover verifying a presented token or receipt. |
+| `sbproxy.ledger.redeem` | `ledger` | not yet | `alpha` | Would cover the outbound HTTP call to the ledger. |
+| `sbproxy.rail.settle` | `rail` | not yet | `alpha` | Would cover an outbound payment-rail settlement. The rail pillar is live, but only for reconciliation. |
+| `sbproxy.rail.reconcile` | `rail` | yes | `beta` | One settlement reconciliation attempt. Opened by the background sweep and by an operator-triggered sweep, never on the request path, so it has no parent span and its latency is not a user's latency. |
+| `sbproxy.transform.shape` | `transform` | not yet | `alpha` | Would cover a content transform such as PDF extraction, OCR, or summarization. |
+| `sbproxy.audit.emit` | `audit` | not yet | `alpha` | Would cover appending one audit-log entry. |
+| `ai.request` | not pillar-shaped | yes | `stable` | One AI gateway request, from dispatch entry to the last byte of the completion. Carries the gen_ai and OpenInference attribute sets, the token split, the derived cost, and the run identity. |
+| `mcp.execute_tool` | not pillar-shaped | yes | `stable` | One MCP tool dispatch: the tool name, the server it went to, the outcome, and the per-tool cost when the price map resolves it. |
+| `ai.provider.attempt` | not pillar-shaped | yes | `alpha` | One attempt against one provider. Opened per try, so a fallback chain renders as sibling spans under the request and a retry is visible rather than folded into one long call. |
+| `sbproxy.ai.usage_sink` | not pillar-shaped | yes | `alpha` | The usage record emitted after a completion settles, so a trace backend can read spend without also being the metrics backend. |
+| `ai.provider_selection` | not pillar-shaped | not yet | `alpha` | Would cover the routing decision: which provider and model the strategy picked. |
+| `ai.guardrail_eval` | not pillar-shaped | not yet | `alpha` | Would cover one guardrail rule set being evaluated against a request or a completion. |
+| `ai.streaming` | not pillar-shaped | not yet | `alpha` | Would cover the window from the first SSE chunk to the close of a streamed completion. |
+| `sbproxy.span` | not pillar-shaped | yes | `alpha` | The tracing metadata name every pillar span is created under. The OpenTelemetry layer replaces it with the value of the span's `otel.name` field, so an OTLP backend sees the pillar name and never this one. A local console subscriber with no OTLP layer configured sees this name instead. |
+
+<!-- END GENERATED SPAN VOCABULARY -->
+
+The attribute set below is the naming contract for pillar spans as they land, not
+a description of traffic you can go and query today. Span attributes include the
+OTel semantic conventions (`http.request.method`, `http.response.status_code`, `server.address`) plus the SBproxy-specific set (`sbproxy.request_id`, `sbproxy.tenant_id`, `sbproxy.route`, `sbproxy.agent_id`, `sbproxy.agent_class`, `sbproxy.rail`, `sbproxy.shape`, `sbproxy.ledger.idempotency_key`).
 
 Per-request attributes such as `request_id` are span attributes only, never Prometheus labels; the Hard rule under the cardinality budget above is the long form. `agent_id` is the exception that proves the shape of that rule: it rides the span in full fidelity and it is also a Prometheus label, because the label carries only the sanitized, budgeted form.
 

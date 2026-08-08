@@ -108,8 +108,7 @@ sbproxy/
     sbproxy-observe/      - tracing-based structured logging,
                               Prometheus metrics, typed event bus.
     sbproxy-platform/     - Infrastructure primitives: KV store abstraction,
-                              DNS cache, messenger, health tracking,
-                              circuit breaker.
+                              DNS cache, health tracking, circuit breaker.
     sbproxy-httpkit/      - HTTP utilities: client IP extraction,
                               host:port splitting, buffer pools, body limit
                               readers.

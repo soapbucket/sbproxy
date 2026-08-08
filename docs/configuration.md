@@ -847,9 +847,10 @@ out. The body selects the scope: `{"key": "..."}` for one entry,
 [`l2_cache_settings`](#l2_cache_settings) and
 [the admin API guide](admin-api-guide.md).
 
-The bus implementations are still in the tree. They are not reachable from
-configuration and will not be until something in the proxy actually produces
-and consumes an event.
+The bus implementations have been removed from the tree. The block is still
+accepted by the parser so that a configuration carrying it gets the
+explanation above rather than an unknown-key error, but the rejection is
+permanent: there is no backend left for any driver name to select.
 
 ---
 

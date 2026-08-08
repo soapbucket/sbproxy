@@ -3220,7 +3220,7 @@ fn write_private_run_config(path: &std::path::Path, yaml: &[u8]) -> anyhow::Resu
 
 // --- `service` handler: launchd agent install/uninstall/status (macOS) ---
 //
-// `sbproxy-platform` (storage/messenger/circuit-breaker/DNS/health) has no
+// `sbproxy-platform` (storage/circuit-breaker/DNS/health) has no
 // precedent for OS service integration and nothing in its dependency graph
 // is CLI-shaped, so this lives next to `prepare_run`/`RunArgs` in the
 // binary crate instead, alongside the other host-integration code already

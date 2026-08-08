@@ -1841,6 +1841,11 @@ origins:
 ///   per-server `ToolAccessPolicy` (default-deny per WOR-1066), and
 ///   per-tool sliding-window quotas, then forwards to the owning
 ///   upstream via `McpFederation::call_tool`.
+/// * `prompts/list` aggregates the federated prompt catalogue,
+///   namespaced on the same rules tools use and filtered to the
+///   upstreams the inbound principal can reach.
+/// * `prompts/get` routes a namespaced prompt name back to its owning
+///   upstream, behind the same reachability check.
 /// * `ping` returns `"pong"`.
 ///
 /// Methods other than `POST` produce a 405. Malformed JSON-RPC bodies
@@ -2402,6 +2407,16 @@ pub(super) async fn handle_mcp_action(
             let surfaces_resources =
                 has_agent_skills || !mcp.federation.list_resources().is_empty();
             let resources = surfaces_resources.then(|| serde_json::json!({ "listChanged": true }));
+            // Prompts capability: advertised only when at least one
+            // federated upstream declared `prompts` on its own
+            // handshake. Announcing a method the gateway would answer
+            // with `-32601` is the capability lie the protocol-version
+            // list in `mcp::types` exists to prevent, and the rule is
+            // the same one here. The advertised object says
+            // `listChanged: false`, because the server-to-client
+            // stream pushes tool and resource notifications and no
+            // prompt ones.
+            let prompts = mcp.federation.prompts_capability();
             // WOR-1642: issue a session when session management is
             // enabled. The id rides back on the Mcp-Session-Id
             // response header, per the streamable HTTP transport.
@@ -2445,7 +2460,7 @@ pub(super) async fn handle_mcp_action(
                     // the notifications.
                     tools: Some(serde_json::json!({ "listChanged": true })),
                     resources,
-                    prompts: None,
+                    prompts,
                     experimental,
                     // WOR-818: mirror SEP-1865 capability from
                     // upstreams. Apps-SDK clients use this to know
@@ -2640,6 +2655,76 @@ pub(super) async fn handle_mcp_action(
                             request.id.clone(),
                             INTERNAL_ERROR,
                             &format!("resources/read failed: {e}"),
+                        )
+                    }
+                }
+            }
+        }
+        "prompts/list" => {
+            // Served from the primed snapshot, the same way
+            // `tools/list` and `resources/list` are. Upstreams that
+            // declare no prompts capability contributed nothing at
+            // refresh time, so there is nothing here to skip for them.
+            let prompts = mcp_prompts_view(mcp, &ctx.principal, &mcp.federation.list_prompts());
+            JsonRpcResponse::success(
+                request.id.clone(),
+                serde_json::json!({ "prompts": prompts }),
+            )
+        }
+        "prompts/get" => {
+            let params = request.params.take().unwrap_or(serde_json::Value::Null);
+            let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            // Resolve before dispatching so an unknown name is
+            // `-32602` (the client asked for something that is not in
+            // the catalogue) rather than the `-32603` an upstream
+            // failure would earn.
+            let owner = mcp.federation.resolve_prompt(name);
+            let reachable = owner
+                .as_ref()
+                .map(|p| mcp_prompt_server_reachable(mcp, &ctx.principal, &p.server_name))
+                .unwrap_or(false);
+            if name.is_empty() {
+                JsonRpcResponse::error(
+                    request.id.clone(),
+                    INVALID_PARAMS,
+                    "prompts/get requires a `name` param",
+                )
+            } else if !reachable {
+                if let Some(prompt) = owner.as_ref() {
+                    tracing::warn!(
+                        target: "sbproxy::mcp::rbac",
+                        prompt = %name,
+                        server = %prompt.server_name,
+                        tenant = %ctx.principal.tenant_id,
+                        principal = %ctx.principal.sub,
+                        "MCP prompts/get denied by RBAC policy",
+                    );
+                    sbproxy_observe::metrics::record_policy(
+                        ctx.hostname.as_str(),
+                        "mcp_rbac",
+                        "deny",
+                    );
+                }
+                // A denied caller and a caller naming a prompt that
+                // does not exist get the same answer. `prompts/list`
+                // already omitted the entry for this caller, and
+                // saying "denied" here would confirm to someone with
+                // no access to the upstream that it has that prompt.
+                JsonRpcResponse::error(
+                    request.id.clone(),
+                    INVALID_PARAMS,
+                    &format!("unknown prompt: {name}"),
+                )
+            } else {
+                let arguments = params.get("arguments").cloned();
+                match mcp.federation.get_prompt(name, arguments).await {
+                    Ok(value) => JsonRpcResponse::success(request.id.clone(), value),
+                    Err(e) => {
+                        warn!(error = %e, prompt = %name, "prompts/get failed");
+                        JsonRpcResponse::error(
+                            request.id.clone(),
+                            INTERNAL_ERROR,
+                            &format!("prompts/get failed: {e}"),
                         )
                     }
                 }
@@ -3855,6 +3940,107 @@ fn mcp_progressive_search(
         .collect()
 }
 
+/// Whether `principal` may reach `server_name`'s prompt surface.
+///
+/// Prompts get no config surface of their own, deliberately. A prompt
+/// is a server-authored template, and the useful question about one is
+/// already answered by the `rbac_policies` entry bound to that server:
+/// may this caller use this upstream at all? So the gate is
+/// server-level reachability, defined as "the upstream's
+/// `ToolAccessPolicy` allows this principal at least one tool the
+/// upstream currently advertises". A caller denied every tool on a
+/// server cannot read that server's prompts, which is the property
+/// worth having, and no new config key had to be invented to express
+/// it. Operators who want a caller to reach prompts without reaching
+/// any tool have the existing escape hatch: bind the server to a
+/// policy with `default_allow: true`.
+///
+/// Two edges are worth naming.
+///
+/// A server with no `rbac` label resolves no policy and is reachable,
+/// exactly as its tools are. Config compile refuses an unlabeled
+/// server once any `rbac_policies` are declared (WOR-2314), so this
+/// branch is the no-RBAC deployment rather than a forgotten label.
+///
+/// A server that advertises prompts but no tools gives the policy
+/// nothing to decide against. Its own `default_allow` is then the only
+/// honest answer, and it is the same answer the policy would give a
+/// caller matching no rule.
+///
+/// The `tool_allowlist` guardrail deliberately does not participate:
+/// it is a gateway-wide cap on what may be called, not a statement
+/// about who this caller is.
+fn mcp_prompt_server_reachable(
+    mcp: &sbproxy_modules::action::McpAction,
+    principal: &sbproxy_plugin::Principal,
+    server_name: &str,
+) -> bool {
+    let Some(policy) = mcp.policy_for_server(server_name) else {
+        return true;
+    };
+    let snapshot = mcp.federation.serialized_tools();
+    let mut saw_tool = false;
+    for entry in &snapshot.entries {
+        if entry.server_name != server_name {
+            continue;
+        }
+        saw_tool = true;
+        if matches!(
+            policy.check(principal, &entry.name),
+            sbproxy_extension::mcp::ToolAccessDecision::Allow,
+        ) {
+            return true;
+        }
+    }
+    if saw_tool {
+        false
+    } else {
+        policy.default_allow
+    }
+}
+
+/// Build the `prompts/list` payload: every federated prompt whose
+/// owning upstream the caller can reach, in the MCP wire shape.
+///
+/// Denied prompts are omitted rather than reported, which is what
+/// `tools/list` does with denied tools and for the same reason: a
+/// catalogue that names entries the caller cannot use leaks the shape
+/// of an upstream to someone with no access to it.
+fn mcp_prompts_view(
+    mcp: &sbproxy_modules::action::McpAction,
+    principal: &sbproxy_plugin::Principal,
+    prompts: &[sbproxy_extension::mcp::FederatedPrompt],
+) -> Vec<serde_json::Value> {
+    let mut out: Vec<serde_json::Value> = prompts
+        .iter()
+        .filter(|p| mcp_prompt_server_reachable(mcp, principal, &p.server_name))
+        .map(|p| {
+            let mut entry = serde_json::json!({ "name": p.name });
+            if let Some(title) = &p.title {
+                entry["title"] = serde_json::Value::String(title.clone());
+            }
+            if let Some(description) = &p.description {
+                entry["description"] = serde_json::Value::String(description.clone());
+            }
+            if let Some(arguments) = &p.arguments {
+                entry["arguments"] = arguments.clone();
+            }
+            if let Some(meta) = &p.meta {
+                entry["_meta"] = meta.clone();
+            }
+            entry
+        })
+        .collect();
+    // The registry behind this is a HashMap, so without an explicit
+    // order the same catalogue would come back shuffled per request.
+    out.sort_by(|a, b| {
+        a.get("name")
+            .and_then(|v| v.as_str())
+            .cmp(&b.get("name").and_then(|v| v.as_str()))
+    });
+    out
+}
+
 /// Serialise a JSON-RPC response and write it to the session.
 pub(super) async fn write_jsonrpc(
     session: &mut Session,
@@ -4389,6 +4575,215 @@ mod govern_security_tests {
         assert!(
             !mcp.contains("Attach bounded caller identity to outbound tool arguments"),
             "mcp.md must not claim identity is attached to tool arguments"
+        );
+    }
+}
+
+#[cfg(test)]
+mod mcp_prompts_tests {
+    use super::{mcp_prompt_server_reachable, mcp_prompts_view};
+    use sbproxy_extension::mcp::{FederatedPrompt, FederatedTool};
+    use sbproxy_modules::action::McpAction;
+    use sbproxy_plugin::{Principal, PrincipalAttrs, PrincipalSource, TenantId};
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    fn principal(sub: &str, roles: &[&str]) -> Principal {
+        Principal {
+            tenant_id: TenantId::from("acme"),
+            sub: sub.to_string(),
+            source: PrincipalSource::Jwt,
+            virtual_key: None,
+            attrs: PrincipalAttrs {
+                roles: roles.iter().map(|r| r.to_string()).collect(),
+                ..PrincipalAttrs::default()
+            },
+        }
+    }
+
+    fn tool(name: &str, server: &str) -> FederatedTool {
+        FederatedTool {
+            name: name.to_string(),
+            description: format!("Tool {name}"),
+            input_schema: json!({"type": "object", "properties": {}}),
+            server_name: server.to_string(),
+            streaming: false,
+            meta: None,
+        }
+    }
+
+    fn prompt(name: &str, server: &str) -> FederatedPrompt {
+        FederatedPrompt {
+            name: name.to_string(),
+            upstream_name: name.to_string(),
+            title: None,
+            description: Some(format!("Prompt {name}")),
+            arguments: None,
+            server_name: server.to_string(),
+            meta: None,
+        }
+    }
+
+    /// Two federated upstreams, one governed by an RBAC policy that
+    /// allows this caller nothing.
+    fn action_with_rbac() -> McpAction {
+        McpAction::from_config(json!({
+            "mode": "gateway",
+            "server_info": {"name": "prompts-rbac-fixture", "version": "1.0.0"},
+            "rbac_policies": {
+                "readers": {
+                    "default_allow": false,
+                    "tool_access": [
+                        {"principals": [{"role": "reader"}], "allowed": ["search_docs"]}
+                    ]
+                },
+                "nobody": {
+                    "default_allow": false,
+                    "tool_access": []
+                }
+            },
+            "federated_servers": [
+                {"origin": "https://gh.example.com/mcp", "prefix": "gh", "rbac": "readers"},
+                {"origin": "https://gl.example.com/mcp", "prefix": "gl", "rbac": "nobody"}
+            ]
+        }))
+        .expect("fixture config compiles")
+    }
+
+    fn action_without_rbac() -> McpAction {
+        McpAction::from_config(json!({
+            "mode": "gateway",
+            "server_info": {"name": "prompts-open-fixture", "version": "1.0.0"},
+            "federated_servers": [
+                {"origin": "https://gh.example.com/mcp", "prefix": "gh"}
+            ]
+        }))
+        .expect("fixture config compiles")
+    }
+
+    /// No `rbac_policies` at all: every upstream's prompts are
+    /// reachable, exactly as its tools are.
+    #[test]
+    fn a_gateway_without_rbac_reaches_every_upstream_prompt() {
+        let mcp = action_without_rbac();
+        let caller = principal("anyone", &[]);
+        assert!(mcp_prompt_server_reachable(&mcp, &caller, "gh"));
+
+        let prompts = vec![prompt("code_review", "gh")];
+        let view = mcp_prompts_view(&mcp, &caller, &prompts);
+        assert_eq!(view.len(), 1);
+        assert_eq!(view[0]["name"], "code_review");
+        assert_eq!(view[0]["description"], "Prompt code_review");
+    }
+
+    /// The decision the ticket turns on: a caller the policy allows at
+    /// least one tool on a server may read that server's prompts, and
+    /// a caller denied every tool on a server may not.
+    #[test]
+    fn prompt_access_follows_server_level_tool_access() {
+        let mcp = action_with_rbac();
+        mcp.federation.seed_tools_for_test(HashMap::from([
+            ("search_docs".to_string(), tool("search_docs", "gh")),
+            ("delete_repo".to_string(), tool("delete_repo", "gh")),
+            ("gl.search".to_string(), tool("gl.search", "gl")),
+        ]));
+
+        let reader = principal("u-reader", &["reader"]);
+        // `readers` allows exactly one of gh's tools, so gh is reachable.
+        assert!(mcp_prompt_server_reachable(&mcp, &reader, "gh"));
+        // `nobody` allows none of gl's, so gl is not.
+        assert!(!mcp_prompt_server_reachable(&mcp, &reader, "gl"));
+
+        // A caller matching no rule at all is denied by default-deny
+        // on both servers, so it reaches neither prompt surface.
+        let stranger = principal("u-stranger", &[]);
+        assert!(!mcp_prompt_server_reachable(&mcp, &stranger, "gh"));
+        assert!(!mcp_prompt_server_reachable(&mcp, &stranger, "gl"));
+    }
+
+    /// `prompts/list` omits the prompts of an upstream the caller
+    /// cannot reach rather than reporting them as denied, which is
+    /// what `tools/list` does with denied tools.
+    #[test]
+    fn prompts_list_hides_prompts_from_an_unreachable_upstream() {
+        let mcp = action_with_rbac();
+        mcp.federation.seed_tools_for_test(HashMap::from([
+            ("search_docs".to_string(), tool("search_docs", "gh")),
+            ("gl.search".to_string(), tool("gl.search", "gl")),
+        ]));
+
+        let reader = principal("u-reader", &["reader"]);
+        let prompts = vec![
+            prompt("code_review", "gh"),
+            prompt("gl.code_review", "gl"),
+            prompt("triage", "gh"),
+        ];
+        let view = mcp_prompts_view(&mcp, &reader, &prompts);
+        let names: Vec<&str> = view.iter().filter_map(|p| p["name"].as_str()).collect();
+        // Sorted, gh only, gl's namespaced prompt dropped.
+        assert_eq!(names, vec!["code_review", "triage"]);
+    }
+
+    /// A server that advertises prompts but no tools gives the policy
+    /// nothing to decide against, so the policy's own default answers.
+    #[test]
+    fn a_prompts_only_upstream_falls_back_to_the_policy_default() {
+        let mcp = McpAction::from_config(json!({
+            "mode": "gateway",
+            "server_info": {"name": "prompts-only-fixture", "version": "1.0.0"},
+            "rbac_policies": {
+                "open": {"default_allow": true},
+                "shut": {"default_allow": false}
+            },
+            "federated_servers": [
+                {"origin": "https://open.example.com/mcp", "prefix": "open", "rbac": "open"},
+                {"origin": "https://shut.example.com/mcp", "prefix": "shut", "rbac": "shut"}
+            ]
+        }))
+        .expect("fixture config compiles");
+        // No tools seeded anywhere: both upstreams are prompts-only.
+        let caller = principal("u-any", &[]);
+        assert!(mcp_prompt_server_reachable(&mcp, &caller, "open"));
+        assert!(!mcp_prompt_server_reachable(&mcp, &caller, "shut"));
+    }
+
+    /// Optional prompt fields are passed through verbatim and absent
+    /// ones stay absent, so a client sees what the upstream published.
+    #[test]
+    fn prompt_entries_carry_the_upstream_fields_they_had() {
+        let mcp = action_without_rbac();
+        let caller = principal("u-any", &[]);
+        let mut rich = prompt("code_review", "gh");
+        rich.title = Some("Code review".to_string());
+        rich.arguments = Some(json!([{"name": "diff", "required": true}]));
+        rich.meta = Some(json!({"vendor/x": 1}));
+        let bare = prompt("triage", "gh");
+
+        let view = mcp_prompts_view(&mcp, &caller, &[rich, bare]);
+        assert_eq!(view[0]["name"], "code_review");
+        assert_eq!(view[0]["title"], "Code review");
+        assert_eq!(view[0]["arguments"][0]["name"], "diff");
+        assert_eq!(view[0]["_meta"]["vendor/x"], 1);
+        assert_eq!(view[1]["name"], "triage");
+        assert!(
+            view[1].get("title").is_none(),
+            "an absent title must not be serialized as null"
+        );
+        assert!(view[1].get("arguments").is_none());
+        assert!(view[1].get("_meta").is_none());
+    }
+
+    /// A gateway whose upstreams declare no prompts capability must
+    /// not advertise one: `initialize` reads this straight off the
+    /// federation, and answering `prompts/list` with `-32601` after
+    /// promising `prompts` is the capability lie the protocol-version
+    /// list exists to prevent.
+    #[test]
+    fn capabilities_omit_prompts_until_an_upstream_declares_one() {
+        let mcp = action_without_rbac();
+        assert!(
+            mcp.federation.prompts_capability().is_none(),
+            "no upstream has declared prompts, so nothing may be advertised"
         );
     }
 }

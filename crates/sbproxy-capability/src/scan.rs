@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 
 use syn::parse::Parser;
 
-use crate::{MetricCapability, RegistryError, SupportLevel, Writer};
+use crate::{MetricCapability, RegistryError, SpanCapability, SpanEmitter, SupportLevel, Writer};
 
 /// Labels Prometheus itself attaches, which no metric declares.
 const IMPLICIT_LABELS: &[&str] = &["job", "instance", "le", "quantile", "__name__"];
@@ -1291,6 +1291,11 @@ pub fn verify_writers(metrics: &[MetricCapability], root: &Path) -> Vec<Registry
         .map(|source| identifier_set(&source.text))
         .collect();
 
+    // Two views of the same files, so the resolver below can be handed
+    // whichever one this metric needs without rebuilding either.
+    let plain_texts: Vec<&str> = sources.iter().map(|source| source.text.as_str()).collect();
+    let static_texts: Vec<&str> = static_views.iter().map(String::as_str).collect();
+
     for metric in metrics {
         let is_static = matches!(metric.writer, Writer::Recorder(name) if is_metric_static(name));
         let (symbol, call, define) = match metric.writer {
@@ -1306,39 +1311,19 @@ pub fn verify_writers(metrics: &[MetricCapability], root: &Path) -> Vec<Registry
         // rebinding `use`.
         let follow_aliases = matches!(metric.writer, Writer::Recorder(_)) && !is_static;
 
-        let mut calls = 0usize;
-        let mut defined = define.is_none();
-        for (index, source) in sources.iter().enumerate() {
-            let text: &str = if is_static {
-                &static_views[index]
-            } else {
-                source.text.as_str()
-            };
-            // Every needle below (`symbol(`, `.symbol`, `fn symbol(`,
-            // `static symbol:`) contains `symbol` as a whole identifier, and an
-            // alias can only be introduced by a `use` that names it. So a file
-            // whose identifier set lacks `symbol` cannot contribute a call, a
-            // definition, or an alias, and skipping it changes no outcome.
-            if !identifiers[index].contains(symbol) {
-                continue;
-            }
-            calls += count_tokens(text, &call);
-            if follow_aliases {
-                for alias in recorder_aliases(text, symbol) {
-                    calls += count_tokens(text, &format!("{alias}("));
-                }
-            }
-            if let Some(define) = &define {
-                if text.contains(define.as_str()) {
-                    defined = true;
-                    // The definition is itself a match for the call needle
-                    // (`fn name(` contains `name(`; `static NAME:` contains
-                    // the bare `NAME`). Do not let a writer count as its own
-                    // caller.
-                    calls -= count_tokens(text, define);
-                }
-            }
-        }
+        let texts: &[&str] = if is_static {
+            &static_texts
+        } else {
+            &plain_texts
+        };
+        let (defined, calls) = resolve_symbol(
+            texts,
+            &identifiers,
+            symbol,
+            &call,
+            define.as_deref(),
+            follow_aliases,
+        );
 
         if !defined {
             errors.push(RegistryError {
@@ -1405,6 +1390,323 @@ fn identifier_set(text: &str) -> BTreeSet<&str> {
         out.insert(&text[start..index]);
     }
     out
+}
+
+/// Resolve one symbol against production source: is it defined, and how
+/// many times is it called?
+///
+/// The shared core of [`verify_writers`] and [`verify_span_emitters`], so
+/// the two guards cannot disagree about what "has a production caller"
+/// means. Both of them ask the same question of a different kind of
+/// symbol, and the fiddly parts (the definition is itself a match for the
+/// call needle, an import alias hides a real call site, an identifier-set
+/// pre-filter keeps this from being a full-text search per symbol) are
+/// exactly the parts worth having in one place.
+///
+/// `texts` and `identifiers` are parallel to each other and to
+/// [`rust_sources`], and both are built once by the caller because the
+/// caller loops over a table and these do not depend on the table.
+fn resolve_symbol(
+    texts: &[&str],
+    identifiers: &[BTreeSet<&str>],
+    symbol: &str,
+    call: &str,
+    define: Option<&str>,
+    follow_aliases: bool,
+) -> (bool, usize) {
+    let mut calls = 0usize;
+    let mut defined = define.is_none();
+
+    for (index, text) in texts.iter().enumerate() {
+        // Every needle a caller passes (`symbol(`, `.symbol`, `fn symbol(`,
+        // `static symbol:`) contains `symbol` as a whole identifier, and an
+        // alias can only be introduced by a `use` that names it. So a file
+        // whose identifier set lacks `symbol` cannot contribute a call, a
+        // definition, or an alias, and skipping it changes no outcome.
+        if !identifiers[index].contains(symbol) {
+            continue;
+        }
+        calls += count_tokens(text, call);
+        if follow_aliases {
+            for alias in recorder_aliases(text, symbol) {
+                calls += count_tokens(text, &format!("{alias}("));
+            }
+        }
+        if let Some(define) = define {
+            if text.contains(define) {
+                defined = true;
+                // The definition is itself a match for the call needle
+                // (`fn name(` contains `name(`; `static NAME:` contains the
+                // bare `NAME`). Do not let a symbol count as its own caller.
+                calls -= count_tokens(text, define);
+            }
+        }
+    }
+
+    (defined, calls)
+}
+
+/// Whether `define` appears in any production file that also names `symbol`.
+///
+/// The definition half of [`resolve_symbol`] on its own, for the cases that
+/// want to know a function exists without asking who calls it.
+fn defines_symbol(
+    texts: &[&str],
+    identifiers: &[BTreeSet<&str>],
+    symbol: &str,
+    define: &str,
+) -> bool {
+    texts
+        .iter()
+        .enumerate()
+        .any(|(index, text)| identifiers[index].contains(symbol) && text.contains(define))
+}
+
+/// The macros that open a `tracing` span.
+///
+/// An allowlist for the same reason `METRIC_CTORS` is one: a name that
+/// merely appears in a string somewhere is not an emission, and the whole
+/// point of scanning rather than substring-matching is to tell those two
+/// apart.
+const SPAN_MACROS: &[&str] = &[
+    "info_span!",
+    "debug_span!",
+    "trace_span!",
+    "warn_span!",
+    "error_span!",
+];
+
+/// Every span name opened by a `tracing::*_span!` macro anywhere under
+/// `crates/`, outside test-gated regions.
+///
+/// The span analogue of [`declared_metrics`], and the direction that keeps
+/// the registry honest as the code grows: a span opened without a registry
+/// entry fails the build. Names composed at runtime (the pillar helper
+/// builds `sbproxy.<pillar>.<verb>` from its arguments) are invisible here
+/// by construction, which is why a pillar span is classified by its
+/// constructor symbol instead.
+pub fn declared_spans(root: &Path) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for source in rust_sources(root) {
+        span_names_in(&strip_comments(&source.text), &mut out);
+    }
+    out
+}
+
+/// Collect the literal span names opened in one file's production text.
+///
+/// Split from [`declared_spans`] so the parse is testable without a
+/// workspace on disk. The caller strips comments first, for the reason
+/// `declared_metrics` does: a name in a doc comment is documentation, not
+/// an emission, and treating the two alike is the substring match this
+/// module exists to replace.
+fn span_names_in(text: &str, out: &mut BTreeSet<String>) {
+    fn ident(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || byte == b'_'
+    }
+
+    let bytes = text.as_bytes();
+
+    for macro_name in SPAN_MACROS {
+        for (at, _) in text.match_indices(macro_name) {
+            // `info_span!` must be a whole token, so `my_info_span!` is
+            // somebody else's macro and not one of ours.
+            if at > 0 && ident(bytes[at - 1]) {
+                continue;
+            }
+            let mut index = at + macro_name.len();
+            while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+                index += 1;
+            }
+            if bytes.get(index) != Some(&b'(') {
+                continue;
+            }
+            index += 1;
+            while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+                index += 1;
+            }
+            // The name is the macro's first argument and it has to be a
+            // literal. A non-literal first argument does not compile as a
+            // span name, so there is nothing to miss here.
+            if bytes.get(index) != Some(&b'"') {
+                continue;
+            }
+            let start = index + 1;
+            let mut end = start;
+            while end < bytes.len() && bytes[end] != b'"' {
+                end += 1;
+            }
+            if end < bytes.len() {
+                out.insert(text[start..end].to_string());
+            }
+        }
+    }
+}
+
+/// Prove the registry covers every span the code opens.
+pub fn verify_span_coverage(spans: &[SpanCapability], root: &Path) -> Vec<RegistryError> {
+    let declared = declared_spans(root);
+    let registered: BTreeSet<&str> = spans.iter().map(|span| span.name).collect();
+    let mut errors = Vec::new();
+
+    for name in &declared {
+        if !registered.contains(name.as_str()) {
+            errors.push(RegistryError {
+                subject: name.clone(),
+                message: "is opened in code but missing from the span registry. Add an \
+                          entry saying what emits it and what we promise about the name, \
+                          the same way a new metric family must be classified."
+                    .to_string(),
+            });
+        }
+    }
+
+    errors
+}
+
+/// Prove that every span the registry calls live is opened by production
+/// code, and that every span it calls dead really is.
+///
+/// Both directions, for the reason [`verify_writers`] runs both: a span
+/// whose constructor lost its last caller looks identical to one that was
+/// never wired, and a span the registry still calls dead after somebody
+/// wired it is how the table goes stale in the flattering direction. The
+/// second half is the one `docs/observability.md` needed and did not have.
+/// It published eight `sbproxy.<pillar>.<verb>` names that no code has ever
+/// emitted, next to three AI span constructors that exist, compile, and
+/// have never been called from anything but their own tests.
+pub fn verify_span_emitters(spans: &[SpanCapability], root: &Path) -> Vec<RegistryError> {
+    let sources = rust_sources(root);
+    let texts: Vec<&str> = sources.iter().map(|source| source.text.as_str()).collect();
+    let identifiers: Vec<BTreeSet<&str>> = sources
+        .iter()
+        .map(|source| identifier_set(&source.text))
+        .collect();
+    let declared = declared_spans(root);
+    let mut errors = Vec::new();
+
+    for span in spans {
+        let subject = span.name.to_string();
+
+        match span.emitter {
+            SpanEmitter::Constructor(symbol) => {
+                let call = format!("{symbol}(");
+                let define = format!("fn {symbol}(");
+                let (defined, calls) = resolve_symbol(
+                    &texts,
+                    &identifiers,
+                    symbol,
+                    &call,
+                    Some(define.as_str()),
+                    true,
+                );
+
+                if !defined {
+                    errors.push(RegistryError {
+                        subject,
+                        message: format!(
+                            "names emitter '{symbol}', which is not a function in any \
+                             crate; the span or the registry entry is stale"
+                        ),
+                    });
+                    continue;
+                }
+
+                if calls == 0 {
+                    errors.push(RegistryError {
+                        subject,
+                        message: format!(
+                            "names emitter '{symbol}', which has no call site outside \
+                             tests. Nothing opens this span, so a trace query that \
+                             filters on the name returns nothing and a panel grouped by \
+                             it draws nothing. Wire it, delete it, or move it to \
+                             SpanEmitter::Unwired with a dead_reason."
+                        ),
+                    });
+                } else if span.support == SupportLevel::ConfigOnly {
+                    errors.push(RegistryError {
+                        subject,
+                        message: format!(
+                            "is marked config_only but emitter '{symbol}' has {calls} \
+                             live call site(s); promote it out of config_only"
+                        ),
+                    });
+                }
+            }
+
+            SpanEmitter::Literal { site } => {
+                if !declared.contains(span.name) {
+                    errors.push(RegistryError {
+                        subject: subject.clone(),
+                        message: "is classified as opened inline, but the name appears \
+                                  in no tracing span macro outside tests. The emission \
+                                  site moved, or the name changed under it."
+                            .to_string(),
+                    });
+                }
+
+                let define = format!("fn {site}(");
+                if !defines_symbol(&texts, &identifiers, site, &define) {
+                    errors.push(RegistryError {
+                        subject,
+                        message: format!(
+                            "names emission site '{site}', which is not a function in \
+                             any crate; the site was renamed or removed"
+                        ),
+                    });
+                }
+            }
+
+            SpanEmitter::Unwired(symbol) => {
+                let call = format!("{symbol}(");
+                let define = format!("fn {symbol}(");
+                let (defined, calls) = resolve_symbol(
+                    &texts,
+                    &identifiers,
+                    symbol,
+                    &call,
+                    Some(define.as_str()),
+                    true,
+                );
+
+                if !defined {
+                    errors.push(RegistryError {
+                        subject,
+                        message: format!(
+                            "is recorded as an unwired constructor '{symbol}', which no \
+                             longer exists. Delete the entry, or point it at the \
+                             constructor that replaced it."
+                        ),
+                    });
+                } else if calls > 0 {
+                    errors.push(RegistryError {
+                        subject,
+                        message: format!(
+                            "is recorded as unwired, but constructor '{symbol}' now has \
+                             {calls} production call site(s). The span is live: move it \
+                             to SpanEmitter::Constructor, drop the dead_reason, and give \
+                             it a support level that says so."
+                        ),
+                    });
+                }
+            }
+
+            SpanEmitter::Nothing => {
+                if declared.contains(span.name) {
+                    errors.push(RegistryError {
+                        subject,
+                        message: "is recorded as emitted by nothing, but the name now \
+                                  appears in a tracing span macro outside tests. \
+                                  Something emits it: classify the emitter and drop the \
+                                  dead_reason."
+                            .to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    errors
 }
 
 /// Every metric reference in every dashboard and alert-rule file.
@@ -1931,6 +2233,88 @@ writer: Writer::Recorder("record_rate_limit_suspend"),
 pub fn record_rate_limit_suspend(ws: &str) {}
 "#;
         assert!(recorder_aliases(src, "record_rate_limit_suspend").is_empty());
+    }
+
+    #[test]
+    fn a_span_macro_yields_its_literal_name() {
+        // Every shape the workspace actually writes: a bare macro, a
+        // path-qualified one, and a multi-line invocation whose name sits on
+        // its own line.
+        let src = r#"
+fn a() { let _ = info_span!("ai.request", k = 1); }
+fn b() { let _ = tracing::debug_span!("ai.provider.attempt"); }
+fn c() {
+    let _ = tracing::info_span!(
+        "sbproxy.ai.usage_sink",
+        "gen_ai.system" = provider,
+    );
+}
+"#;
+        let mut names = BTreeSet::new();
+        span_names_in(src, &mut names);
+
+        assert_eq!(
+            names,
+            ["ai.provider.attempt", "ai.request", "sbproxy.ai.usage_sink"]
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<BTreeSet<_>>()
+        );
+    }
+
+    #[test]
+    fn a_span_name_in_a_comment_or_a_lookalike_macro_is_not_an_emission() {
+        // The two ways the old substring guard passed a dead name: the doc
+        // comment that mentions it, and a macro whose name merely ends in
+        // one of ours.
+        let src = strip_comments(
+            r#"
+// info_span!("sbproxy.intake.accept") would be the shape.
+fn a() { let _ = my_info_span!("sbproxy.policy.enforce"); }
+fn b() { let _ = info_span!(name_from_config, k = 1); }
+"#,
+        );
+
+        let mut names = BTreeSet::new();
+        span_names_in(&src, &mut names);
+
+        assert!(names.is_empty(), "nothing here opens a span: {names:?}");
+    }
+
+    #[test]
+    fn resolve_symbol_does_not_let_a_definition_be_its_own_caller() {
+        // The whole reason a constructor with no callers is detectable: the
+        // `fn name(` that defines it is also a match for the `name(` needle.
+        let defining = "pub fn provider_selection_span(p: &str) -> Span { info_span!(\"x\") }";
+        let calling = "fn dispatch() { let s = provider_selection_span(\"openai\"); }";
+
+        let texts = [defining, calling];
+        let identifiers: Vec<BTreeSet<&str>> =
+            texts.iter().map(|text| identifier_set(text)).collect();
+        let define = "fn provider_selection_span(";
+        let call = "provider_selection_span(";
+
+        let (defined, calls) = resolve_symbol(
+            &texts[..1],
+            &identifiers[..1],
+            "provider_selection_span",
+            call,
+            Some(define),
+            true,
+        );
+        assert!(defined, "the definition is right there");
+        assert_eq!(calls, 0, "a definition is not a call site");
+
+        let (defined, calls) = resolve_symbol(
+            &texts,
+            &identifiers,
+            "provider_selection_span",
+            call,
+            Some(define),
+            true,
+        );
+        assert!(defined);
+        assert_eq!(calls, 1, "only the real call site counts");
     }
 
     #[test]

@@ -1248,6 +1248,12 @@ pub fn parent_span_on_remote_trace_context(
 
 /// One of the eight standard pillars. Used to build span names
 /// of the form `sbproxy.<pillar>.<verb>`.
+///
+/// The doc comment said eight and the enum had seven for as long as both
+/// existed. `deploy/dashboards/traces-overview.json` had the eighth,
+/// `notify`, hardcoded in its pillar template variable, so a panel offered
+/// operators a filter value the code could not produce. The span drift
+/// guard now pins all three lists to each other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pillar {
     /// Inbound request acceptance + framing validation.
@@ -1264,9 +1270,28 @@ pub enum Pillar {
     Rail,
     /// Audit-log emission.
     Audit,
+    /// Outbound notification delivery: alert webhooks and the sinks that
+    /// carry them off the box.
+    Notify,
 }
 
 impl Pillar {
+    /// Every pillar, in the canonical order the dashboards list them.
+    ///
+    /// A `match` keeps [`Pillar::as_str`] exhaustive, but nothing makes a
+    /// separate list of pillars complete, and two of those had already
+    /// drifted apart. This is the one the guard reads.
+    pub const ALL: &'static [Pillar] = &[
+        Pillar::Intake,
+        Pillar::Policy,
+        Pillar::Action,
+        Pillar::Transform,
+        Pillar::Ledger,
+        Pillar::Rail,
+        Pillar::Audit,
+        Pillar::Notify,
+    ];
+
     /// Return the canonical pillar slug used in span names.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -1277,6 +1302,7 @@ impl Pillar {
             Pillar::Ledger => "ledger",
             Pillar::Rail => "rail",
             Pillar::Audit => "audit",
+            Pillar::Notify => "notify",
         }
     }
 }
@@ -1825,6 +1851,22 @@ mod tests {
         assert_eq!(Pillar::Ledger.as_str(), "ledger");
         assert_eq!(Pillar::Rail.as_str(), "rail");
         assert_eq!(Pillar::Audit.as_str(), "audit");
+        assert_eq!(Pillar::Notify.as_str(), "notify");
+    }
+
+    #[test]
+    fn there_really_are_eight_pillars() {
+        // The doc comment on `Pillar` said eight while the enum had seven,
+        // and the missing one was already a filter value in the traces
+        // dashboard. `ALL` is what the span drift guard compares against
+        // the dashboard, so it has to stay complete.
+        assert_eq!(Pillar::ALL.len(), 8);
+
+        let mut slugs: Vec<&str> = Pillar::ALL.iter().map(|p| p.as_str()).collect();
+        let listed = slugs.len();
+        slugs.sort_unstable();
+        slugs.dedup();
+        assert_eq!(listed, slugs.len(), "a pillar slug is listed twice");
     }
 
     #[test]

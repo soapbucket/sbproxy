@@ -226,7 +226,7 @@ sbproxy/
                           (plugin-style registry, register-via-init pattern)
     sbproxy-plugin/     - public plugin trait surface
     sbproxy-httpkit/    - HTTP request/response helpers shared by plugin authors
-    sbproxy-platform/   - circuit breaker, dns, health, messenger, kv storage
+    sbproxy-platform/   - circuit breaker, dns, health, kv storage
                           (redb embedded KV; SQLite for relational state)
     sbproxy-cache/      - response cache, KV stores (memory/file/memcached/redis)
     sbproxy-ai/         - AI gateway path (providers, routing, guardrails,

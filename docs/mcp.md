@@ -5,9 +5,12 @@
 SBproxy ships an MCP (Model Context Protocol) gateway that speaks
 JSON-RPC 2.0 over HTTP POST. Configure the `mcp` action on an origin
 and the proxy serves the MCP method set (`initialize`, `tools/list`,
-`tools/call`, `resources/list`, `resources/read`, `ping`), federates
-one or more upstream MCP servers, and enforces gateway-level
-guardrails before any `tools/call` is forwarded.
+`tools/call`, `resources/list`, `resources/read`, `prompts/list`,
+`prompts/get`, `ping`), federates one or more upstream MCP servers,
+and enforces gateway-level guardrails before any `tools/call` is
+forwarded. The full method-by-method breakdown, including what the
+gateway deliberately does not serve, is in
+[Protocol coverage](#protocol-coverage) below.
 
 This page is operator-facing. For the higher-level pitch, see
 [`features.md`](features.md).
@@ -33,12 +36,93 @@ returns the aggregated tool catalog across every federated upstream.
 `tools/call` routes by tool name to the owning upstream.
 `resources/list` and `resources/read` pass the federated resource
 surface through (the OpenAI Apps SDK / SEP-1865 UI-template path).
-`ping` returns `"pong"`. Notifications (requests with no `id`) get a
-`202 Accepted`. Unknown methods return JSON-RPC error `-32601`
-(`method_not_found`). The gateway serves this from
+`prompts/list` and `prompts/get` do the same for the federated prompt
+surface. `ping` returns `"pong"`. Notifications (requests with no
+`id`) get a `202 Accepted`. Unknown methods return JSON-RPC error
+`-32601` (`method_not_found`). The gateway serves this from
 `crates/sbproxy-core/src/server/action_dispatch.rs`
 (`handle_mcp_action`); the wire enums are in
 `crates/sbproxy-extension/src/mcp/types.rs`.
+
+## Protocol coverage
+
+| Method | Served | Notes |
+|---|---|---|
+| `initialize` | yes | Negotiates the protocol version, advertises capabilities. |
+| `ping` | yes | Returns `"pong"`. |
+| `tools/list` | yes | Federated catalog, namespaced, RBAC-filtered per caller. |
+| `tools/call` | yes | Routed to the owning upstream behind the guardrails, RBAC, and per-tool quotas. |
+| `resources/list` | yes | Federated resource surface. |
+| `resources/read` | yes | Routed to the upstream that owns the URI. |
+| `prompts/list` | yes | Federated prompt catalog, namespaced the way tools are. |
+| `prompts/get` | yes | Routed by namespaced prompt name to the owning upstream. |
+| `completion/complete` | no | `-32601`. Argument autocompletion is not proxied. |
+| `logging/setLevel` | no | `-32601`. Gateway log level is operator config, not a client knob. |
+| `roots/list` | no | `-32601`. A client-side method; the gateway has no client of its own to ask. |
+| `sampling/createMessage` | no | `-32601`. Server-initiated, so it needs a transport story the gateway does not have yet. |
+| `elicitation/create` | no | `-32601`. Server-initiated, same reason as sampling. |
+
+### Prompt namespacing
+
+A federated prompt is namespaced on the same rules a federated tool
+is. The first upstream to publish a given prompt name keeps it bare,
+and the next upstream to publish that name is advertised as
+`<prefix>.<name>`, with the `.` separator tools use rather than the
+`/` resources use. Setting `namespace: always` on an upstream prefixes
+every prompt from it whether or not anything collided.
+
+Whatever name the gateway advertises is the name that routes, so a
+client calls `prompts/get` with the name it read out of
+`prompts/list`. The upstream still receives the name it published and
+never has to know the gateway renamed anything, which is the contract
+`resources/read` already holds for resource URIs.
+
+An upstream contributes no prompts in three cases: it declared no
+`prompts` capability during its handshake, its `prompts/list` failed,
+or it is OpenAPI-backed (`type: openapi`), which is a REST spec with
+no prompts to publish. None of the three fails the aggregate call. One
+upstream without prompts does not blank the prompts of the upstreams
+that have them, which is how the tool and resource catalogs already
+behave.
+
+### Capability advertisement
+
+`initialize` advertises `capabilities.prompts` only when at least one
+federated upstream declared that capability on its own handshake. A
+gateway federating nothing but OpenAPI servers, or nothing but MCP
+servers that serve only tools, advertises no prompts capability, and a
+client reading the handshake knows not to ask.
+
+The advertised object is `{"listChanged": false}`. The gateway's
+server-to-client stream pushes `notifications/tools/list_changed` and
+`notifications/resources/list_changed` and nothing else, so `true`
+there would promise notifications that never arrive. This is the same
+rule that keeps `2025-03-26` out of the supported version list:
+advertising something whose contract the gateway breaks is worse than
+not advertising it.
+
+### Prompt access control
+
+Prompts have no ACL of their own. `prompts/list` and `prompts/get` are
+gated by the `rbac_policies` entry already bound to the owning
+upstream, at server granularity. A caller reaches a server's prompts
+when that server's policy allows the caller at least one tool the
+server currently advertises. A caller denied every tool on an upstream
+sees none of its prompts in `prompts/list`, and a `prompts/get` naming
+one of them answers `unknown prompt` rather than confirming it exists.
+
+Two edges follow from that definition. An upstream with no `rbac`
+label resolves no policy and its prompts are readable, exactly as its
+tools are callable; config compile refuses an unlabeled upstream once
+any `rbac_policies` are declared, so this branch is the no-RBAC
+deployment rather than a forgotten label. An upstream that publishes
+prompts but no tools gives the policy nothing to decide against, so
+the policy's own `default_allow` answers, and binding that server to a
+policy with `default_allow: true` makes its prompts readable.
+
+The `tool_allowlist` guardrail does not participate. It caps what the
+gateway will call, which is a different question from who the caller
+is.
 
 ## Protocol version negotiation
 
@@ -420,10 +504,12 @@ through a YAML knob or a runtime behavior worth knowing about.
 ### JSON-RPC dispatcher
 
 Dispatches `initialize`, `tools/list`, `tools/call`, `ping`,
-`resources/list`, and `resources/read`. Notifications (no `id`) get a
-`202 Accepted`. `initialize` answers with the configured `server_info`
-plus a `capabilities` block; it negotiates the protocol version and,
-when the host origin has `agent_skills:` configured, sets
+`resources/list`, `resources/read`, `prompts/list`, and `prompts/get`.
+Notifications (no `id`) get a `202 Accepted`. `initialize` answers
+with the configured `server_info` plus a `capabilities` block; it
+negotiates the protocol version, advertises `prompts` only when a
+federated upstream declared it, and, when the host origin has
+`agent_skills:` configured, sets
 `capabilities.experimental.agentSkillsUrl` to the absolute URL of
 `/.well-known/agent-skills/index.json` (see
 [`agent-skills.md`](agent-skills.md)). The dispatcher lives in the
@@ -451,8 +537,15 @@ catalog is stored in an `ArcSwap` so refreshes do not block
 in-flight `tools/call` traffic. Source:
 `crates/sbproxy-extension/src/mcp/federation.rs:McpFederation`.
 
-Refresh failures on one upstream are logged at `error` level and the
-remaining upstreams still contribute to the merged catalog.
+The resource and prompt registries are built by the same refresh pass
+and stored the same way. Each cycle probes every MCP upstream's
+`initialize` exactly once and reuses that one answer for every
+registry that needs to know what the upstream supports, so federating
+another surface costs no extra handshake. The prompt pass then asks
+only the upstreams that declared a `prompts` capability.
+
+Refresh failures on one upstream are logged and the remaining
+upstreams still contribute to the merged catalogs.
 
 ### `streamable`: Streamable HTTP transport
 

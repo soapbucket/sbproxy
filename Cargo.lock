@@ -7751,7 +7751,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
  "bytes",
  "dashmap",
  "hex",
@@ -7764,12 +7763,9 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "sbproxy-plugin",
- "serde",
- "serde_json",
  "tempfile",
  "tokio",
  "tracing",
- "ureq",
  "url",
 ]
 
