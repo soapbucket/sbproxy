@@ -262,6 +262,10 @@ pub struct CompiledConfig {
     /// `enabled: false`) leaves the ledger off. The binary registers a
     /// ledger sink from this at startup.
     pub session_ledger: Option<crate::types::SessionLedgerConfig>,
+    /// Request-event egress config. `None` (or `sink: none`) leaves
+    /// the dispatch on the request path a no-op. The binary registers
+    /// the process-wide sink from this at startup.
+    pub request_events: Option<crate::types::RequestEventsConfig>,
     /// Process-wide flags compiled from the top-level `flags:` block.
     /// The binary atomically replaces the live CEL store from this
     /// complete snapshot at boot and after every successful reload.

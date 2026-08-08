@@ -72,6 +72,11 @@ pub struct ConfigFile {
     /// block is present and `enabled: true`.
     #[serde(default)]
     pub session_ledger: Option<SessionLedgerConfig>,
+    /// Where completed request events go. Absent, or present with the
+    /// default `sink: none`, keeps the dispatch on the request path a
+    /// no-op and every event is discarded.
+    #[serde(default)]
+    pub request_events: Option<RequestEventsConfig>,
     /// Process-wide feature flags available to CEL through
     /// `flag_enabled(name, key)`. An absent or empty list installs an
     /// empty runtime store, including on hot reload.
@@ -408,6 +413,43 @@ pub enum SessionLedgerSinkKind {
     #[default]
     Logging,
     /// Append each record as one NDJSON line to `path`.
+    File,
+}
+
+/// Request-event egress configuration.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RequestEventsConfig {
+    /// Which backend receives each completed request event.
+    #[serde(default)]
+    pub sink: RequestEventSinkKind,
+    /// NDJSON output path for the `file` sink. Required when
+    /// `sink: file`; ignored otherwise.
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+/// Request-event sink kinds.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestEventSinkKind {
+    /// Discard every event. The default, and the only behavior the
+    /// proxy had before the block existed.
+    #[default]
+    None,
+    /// Emit each event as a structured `request_event` tracing line.
+    Logging,
+    /// Append each event as one NDJSON line to `path`.
     File,
 }
 

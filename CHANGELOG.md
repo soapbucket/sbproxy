@@ -12,6 +12,22 @@ the next version cut.
 
 ### Added
 
+- **A top-level `request_events:` block, so the request events the proxy
+  already builds can leave the process.** Every terminating request was
+  populating a full event envelope (tenant, session, credential id,
+  provider, model, token counts, cost, guardrail verdict, status, geo)
+  and then handing it to an implicit no-op, because nothing in the boot
+  path ever registered a sink. Three kinds ship: `none` (the default,
+  and the behavior every earlier build had), `logging` (one JSON line
+  per event on the `request_event` tracing target), and `file` (NDJSON
+  appended to `path`). The file sink writes on its own thread behind a
+  bounded queue, so a slow disk cannot add latency to the request that
+  produced the event; a full queue discards the incoming event and
+  increments
+  `sbproxy_telemetry_dropped_total{kind="request_event",reason="queue_full"}`
+  rather than losing it quietly. A `file` sink with a missing or
+  unopenable `path` warns at startup and falls back to `logging`.
+
 - **A ratchet on `.unwrap()`, `.expect(..)`, and `panic!` in production
   code.** Each ends the process on a path a caller cannot catch, which in a
   proxy means a dropped request rather than an error a client can act on. The

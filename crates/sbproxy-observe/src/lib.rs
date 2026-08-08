@@ -99,7 +99,8 @@ pub use metrics::{metrics, sanitize_label, ProxyMetrics};
 pub use otlp_logs::{OtlpLogSink, OtlpLogSinkOptions};
 pub use request_event::{RequestEvent, UserIdSource};
 pub use request_sink::{
-    dispatch_request_event, set_request_event_sink, LoggingSink, NoopSink, RequestEventSink,
+    dispatch_request_event, set_request_event_sink, FileEventSink, LoggingSink, NoopSink,
+    RequestEventSink,
 };
 pub use session_ledger::{
     emit_tool_call, is_enabled as session_ledger_enabled, set_session_ledger_sink, Caller,

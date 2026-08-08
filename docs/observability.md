@@ -686,6 +686,24 @@ cargo test -p sbproxy-e2e --release --test redaction
 
 The test injects fixture inputs covering every member of the typed `RedactedField` enum, exercises every emitter (access, error, audit, trace), and asserts the marker appears in every sink while the original value appears in none of them. A failure is a CI block; redaction is the line we don't cross.
 
+### Request-event egress
+
+Every terminating request builds one request event: the request id, workspace and tenant, session and user, the credential id, provider and model, token counts and cost in micro-USD, guardrail category and action, status code, and request geo. Where that record goes is the top-level `request_events:` block.
+
+```yaml
+request_events:
+  sink: file                            # `none` (default), `logging`, or `file`
+  path: /var/log/sbproxy/events.ndjson  # required for `sink: file`
+```
+
+`sink: none` is the default and discards the event, which is what every build did before the block existed. `sink: logging` emits one JSON line per event on the `request_event` tracing target, so an existing log pipeline picks it up with no extra wiring. `sink: file` appends one NDJSON line per event to `path`.
+
+The file sink writes on a dedicated thread. Publishing puts the event on a bounded queue of 8192 and returns, so a slow disk cannot add latency to the request that produced the event. When that queue is full the incoming event is discarded and `sbproxy_telemetry_dropped_total{kind="request_event",reason="queue_full"}` ticks. The other reasons on that series are `writer_stopped`, `serialize_error`, and `write_error`. Nothing is discarded silently, so a gap in the file always has a counter behind it.
+
+The writer drains up to 256 events per flush, which means an abrupt kill loses at most the batch in flight. A `sink: file` with no `path`, or a `path` the proxy cannot open, logs a warning at startup and falls back to `sink: logging` instead of dropping the events.
+
+The sink is installed once at boot and a SIGHUP reload does not swap it, so changing `request_events:` needs a restart.
+
 ## Traces
 
 ### Tracer setup

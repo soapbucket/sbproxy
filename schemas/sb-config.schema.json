@@ -167,6 +167,18 @@
         }
       ]
     },
+    "request_events": {
+      "description": "Where completed request events go. Absent, or present with the default `sink: none`, keeps the dispatch on the request path a no-op and every event is discarded.",
+      "default": null,
+      "anyOf": [
+        {
+          "$ref": "#/definitions/RequestEventsConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "flags": {
       "description": "Process-wide feature flags available to CEL through `flag_enabled(name, key)`. An absent or empty list installs an empty runtime store, including on hot reload.",
       "default": [],
@@ -10717,6 +10729,56 @@
         },
         {
           "description": "Append each record as one NDJSON line to `path`.",
+          "type": "string",
+          "enum": [
+            "file"
+          ]
+        }
+      ]
+    },
+    "RequestEventsConfig": {
+      "description": "Request-event egress configuration.",
+      "type": "object",
+      "properties": {
+        "sink": {
+          "description": "Which backend receives each completed request event.",
+          "default": "none",
+          "allOf": [
+            {
+              "$ref": "#/definitions/RequestEventSinkKind"
+            }
+          ]
+        },
+        "path": {
+          "description": "NDJSON output path for the `file` sink. Required when `sink: file`; ignored otherwise.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "RequestEventSinkKind": {
+      "description": "Request-event sink kinds.",
+      "oneOf": [
+        {
+          "description": "Discard every event. The default, and the only behavior the proxy had before the block existed.",
+          "type": "string",
+          "enum": [
+            "none"
+          ]
+        },
+        {
+          "description": "Emit each event as a structured `request_event` tracing line.",
+          "type": "string",
+          "enum": [
+            "logging"
+          ]
+        },
+        {
+          "description": "Append each event as one NDJSON line to `path`.",
           "type": "string",
           "enum": [
             "file"

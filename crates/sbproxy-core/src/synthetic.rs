@@ -253,6 +253,7 @@ mod tests {
             rate_limits: None,
             audit: None,
             session_ledger: None,
+            request_events: None,
             flags: Vec::new(),
         };
         let pipeline = crate::pipeline::CompiledPipeline::from_config(compiled)

@@ -1729,6 +1729,7 @@ spec:
             rate_limits: None,
             audit: None,
             session_ledger: None,
+            request_events: None,
             flags: Vec::new(),
         };
         let map = render_indices(&cfg, Path::new("."));
