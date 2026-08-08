@@ -1,6 +1,6 @@
 # Kubernetes operator quickstart
 
-*Last modified: 2026-07-28*
+*Last modified: 2026-08-08*
 
 This is a Kubernetes follow-on, not the first SBproxy exercise. Complete [Getting started](getting-started.md) first so you have seen an origin and `sbproxy validate` work on one machine.
 
@@ -13,7 +13,9 @@ Before you begin, make sure you have:
   cluster-scoped `sbproxies.sbproxy.dev` and `sbproxyconfigs.sbproxy.dev`
   CRDs.
 - Registry access from each node to pull
-  `ghcr.io/soapbucket/sbproxy:1.9.0`.
+  `ghcr.io/soapbucket/sbproxy:1.10.0`.
+- An operator image you have built and pushed yourself. There is not a
+  published one; see "Build the operator image first" below.
 
 The operator watches its own namespace by default. Install another operator
 when you need a separate namespace boundary.
@@ -24,14 +26,35 @@ kubectl get nodes
 helm version
 ```
 
+## Build the operator image first
+
+The data plane image ships on every release. The operator image does not: the release workflow pushes `ghcr.io/soapbucket/sbproxy` and nothing else, so the chart's default `image.repository` of `ghcr.io/soapbucket/sbproxy-k8s-operator` is a path that does not resolve. Install the chart unchanged and the operator pod sits in `ImagePullBackOff`.
+
+That is the one piece of this quickstart you have to supply. Build the image from the checkout and push it where your nodes can reach it:
+
+```bash
+# A registry your cluster nodes can pull from.
+export OPERATOR_REPO=registry.example.com/soapbucket/sbproxy-k8s-operator
+export OPERATOR_TAG=1.10.0
+
+cargo build --profile release-fast -p sbproxy-k8s-operator --locked
+docker build -t "$OPERATOR_REPO:$OPERATOR_TAG" \
+  -f crates/sbproxy-k8s-operator/Dockerfile.ci .
+docker push "$OPERATOR_REPO:$OPERATOR_TAG"
+```
+
+To try the operator without a registry at all, `make k8s-operator-smoke` builds the same image, loads it into a local kind cluster, and installs this chart against it. [kubernetes.md](kubernetes.md) covers that path.
+
 ## Install the operator
 
-Run this from an SBproxy checkout. It installs the CRDs, operator Deployment, ServiceAccount, and namespaced RBAC:
+Run this from an SBproxy checkout. It installs the CRDs, operator Deployment, ServiceAccount, and namespaced RBAC, pointed at the image you just pushed:
 
 ```bash
 helm upgrade --install sbproxy ./deploy/helm/sbproxy \
   --namespace sbproxy-system \
-  --create-namespace
+  --create-namespace \
+  --set "image.repository=$OPERATOR_REPO" \
+  --set "image.tag=$OPERATOR_TAG"
 
 kubectl rollout status deployment/sbproxy-k8s-operator -n sbproxy-system
 ```
@@ -63,7 +86,7 @@ metadata:
   name: demo
   namespace: sbproxy-system
 spec:
-  image: ghcr.io/soapbucket/sbproxy:1.9.0
+  image: ghcr.io/soapbucket/sbproxy:1.10.0
   configRef: demo-config
   replicas: 1
   port: 8080

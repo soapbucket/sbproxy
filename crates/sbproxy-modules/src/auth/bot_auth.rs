@@ -451,7 +451,13 @@ impl BotAuthProvider {
             }
         };
 
-        match verifier.verify_request(req) {
+        // Deferring form: Web Bot Auth verifies headers here, in the auth
+        // phase, and completes the `content-digest` binding in the request
+        // body filter once the complete pre-transform body has arrived
+        // (`trust_tier::verify_and_finalize_body_proof`). The safe-by-default
+        // `verify_request` would reject the signature outright against the
+        // empty body this phase can offer.
+        match verifier.verify_request_deferring_body_binding(req) {
             VerifyVerdict::Ok { .. } => {
                 if let Err(reason) = self.check_nonce(advertised_nonce.as_deref()) {
                     return BotAuthVerdict::Failed {
@@ -519,7 +525,10 @@ impl BotAuthProvider {
             .by_key_id
             .get(&kid)
             .expect("checked contains_key above");
-        match verifier.verify_request(req) {
+        // Deferring form for the same reason as `verify_async` above: the
+        // body-bound half of a `content-digest`-covering signature is
+        // completed in the request body filter, not here.
+        match verifier.verify_request_deferring_body_binding(req) {
             VerifyVerdict::Ok { .. } => {
                 // WOR-502: only burn the nonce once we know the
                 // request was genuinely signed by the claimed agent,

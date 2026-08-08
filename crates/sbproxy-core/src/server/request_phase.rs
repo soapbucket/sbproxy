@@ -456,6 +456,57 @@ async fn read_body_for_route_matching(
     Ok(Some(buffered))
 }
 
+/// Drain the inbound request body so an RFC 9421 signature that covers
+/// `content-digest` can be checked against the bytes it attests to.
+///
+/// Only called for a request whose `Signature-Input` actually names a
+/// body component. Every other request keeps the previous behavior of
+/// never touching the body during the signature gate, which is the
+/// whole reason the predicate exists: signature verification must not
+/// make every request pay for buffering.
+///
+/// Reading here is only safe because replay buffering is armed first.
+/// Every chunk consumed is retained and replayed upstream, so proving
+/// the body does not consume it. This is the same drain the validated
+/// GraphQL path in `action_dispatch` performs, for the same reason and
+/// against the same buffer.
+///
+/// # The cap, and why overflow is a rejection
+///
+/// The bound is Pingora's fixed 64 KiB replay buffer, the same ceiling
+/// GraphQL validation works under. `Ok(None)` means the body outgrew it
+/// and the bytes needed to confirm the digest no longer all exist. The
+/// caller turns that into a 401 rather than a pass, because a signature
+/// claiming coverage of a body we cannot check is exactly the case the
+/// coverage was meant to defend against. It is not a 413: the request is
+/// not too large to serve, it is too large to *prove*, and an operator
+/// reading the log needs to see an authentication failure.
+async fn drain_body_for_signature_verification(
+    session: &mut Session,
+) -> Result<Option<bytes::Bytes>> {
+    if session.as_mut().is_body_empty() {
+        return Ok(Some(bytes::Bytes::new()));
+    }
+    session.as_mut().enable_retry_buffering();
+    let mut saw_bytes = false;
+    while let Some(chunk) = session.read_request_body().await? {
+        saw_bytes |= !chunk.is_empty();
+    }
+    if session.as_ref().retry_buffer_truncated() {
+        return Ok(None);
+    }
+    match session.as_ref().get_retry_buffer() {
+        Some(buffered) => Ok(Some(buffered)),
+        // `get_retry_buffer` yields `None` for an empty buffer as well
+        // as a truncated one, and `is_body_empty` above can be false for
+        // a chunked request that turns out to carry nothing. Separating
+        // those two on what was actually read keeps a legitimately empty
+        // body verifiable while a vanished one still fails closed.
+        None if !saw_bytes => Ok(Some(bytes::Bytes::new())),
+        None => Ok(None),
+    }
+}
+
 /// Handle an incoming request before proxying. See the trait method
 /// `<SbProxy as ProxyHttp>::request_filter` for the phase contract.
 pub(super) async fn request_filter(
@@ -1480,17 +1531,56 @@ pub(super) async fn request_filter(
     // enforce signature verification on every inbound request
     // before any downstream auth provider runs. Failures
     // produce a 401 with `WWW-Authenticate: Signature`.
-    // Body coverage (`content-digest`) is reserved for a
-    // follow-up; the http::Request we hand the verifier carries
-    // an empty body, so signatures over body components fail
-    // with a missing-component reason from the verifier.
+    //
+    // Body coverage is handled here rather than left to the
+    // verifier alone. `content-digest` is an ordinary header
+    // reference in the signature base, so the cryptography binds
+    // the digest *value* and nothing else; the verifier closes
+    // that by recomputing the digest over the body it is handed,
+    // which means the body has to be here. It is drained only for
+    // a request whose `Signature-Input` names the component, so a
+    // signature over headers alone still never touches the body.
+    let mut signature_prefetched_body: Option<bytes::Bytes> = None;
     {
         let pipeline_guard = ctx.pipeline.clone();
         let origin_for_sig = &pipeline_guard.config.origins[origin_idx];
         if let Some(ms_cfg) = origin_for_sig.message_signatures.as_ref() {
             if ms_cfg.verify {
                 if let Some(verifier) = cached_message_signature_verifier(ms_cfg) {
-                    let Some(req) = build_signature_verification_request(session) else {
+                    let covers_body =
+                        sbproxy_middleware::signatures::signature_input_covers_content_digest(
+                            &session.req_header().headers,
+                        );
+                    let signed_body = if covers_body {
+                        match drain_body_for_signature_verification(session).await? {
+                            Some(body) => {
+                                // Held for the body-field route matcher
+                                // further down: the session has no more
+                                // chunks to give once this drain runs.
+                                signature_prefetched_body = Some(body.clone());
+                                body
+                            }
+                            None => {
+                                warn!(
+                                    hostname = %ctx.hostname,
+                                    "message_signatures: signature covers content-digest but the body exceeds the replay buffer; returning 401"
+                                );
+                                drop(pipeline_guard);
+                                send_error(
+                                    session,
+                                    401,
+                                    "signature covers a body too large to verify",
+                                )
+                                .await?;
+                                ctx.response_status = Some(401);
+                                return Ok(true);
+                            }
+                        }
+                    } else {
+                        bytes::Bytes::new()
+                    };
+                    let Some(req) = build_signature_verification_request(session, signed_body)
+                    else {
                         warn!(
                             hostname = %ctx.hostname,
                             "message_signatures: could not rebuild request for verification; returning 401"
@@ -4112,7 +4202,17 @@ pub(super) async fn request_filter(
     // paying for. Everything above this line can short-circuit the request
     // (auth, rate limits, a cache hit), and none of those outcomes needs the
     // body. `None` for every origin that declared no body matcher.
-    let matched_body = read_body_for_route_matching(session, body_route_cap).await?;
+    // An origin that both verifies a body-covering signature and routes on a
+    // body field has already had its body drained by the signature gate, and
+    // the session has no second copy to hand out. Match on the bytes that
+    // drain captured instead, so enabling signature verification cannot
+    // silently turn every body-field route into a miss. The cap is still
+    // honored: a body the matcher may not hold is a miss here exactly as it
+    // is in `read_body_for_route_matching`.
+    let matched_body = match signature_prefetched_body.as_ref() {
+        Some(body) => body_route_cap.and_then(|cap| (body.len() <= cap).then(|| body.to_vec())),
+        None => read_body_for_route_matching(session, body_route_cap).await?,
+    };
 
     let fwd_rules = &pipeline.forward_rules[origin_idx];
     if !fwd_rules.is_empty() {

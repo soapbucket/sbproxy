@@ -1750,6 +1750,14 @@ fn parse_outbound_credential_config(
             );
         }
     }
+    // WOR-2316: token exchange delegates the caller's identity to an
+    // upstream, so its issuer and audience allowlists must be authored.
+    // An empty list used to mean "any"; it now denies, and the config
+    // that relied on the permissive default is refused here rather than
+    // failing every request at runtime.
+    parsed
+        .validate_allowlists()
+        .map_err(|error| anyhow::anyhow!("origin {origin_id}: outbound_credential: {error}"))?;
     Ok(parsed)
 }
 
@@ -4929,6 +4937,78 @@ origins:
                 "unexpected {header} validation error: {error}"
             );
         }
+    }
+
+    /// WOR-2316: token exchange is a delegation primitive, so an
+    /// unauthored allowlist must fail config compilation with the key
+    /// named rather than silently accepting any issuer or audience.
+    #[test]
+    fn validation_rejects_empty_token_exchange_allowlists() {
+        for (omitted, present) in [
+            (
+                "subject_token_issuers",
+                "      allowed_audiences: [\"https://api.example.test\"]",
+            ),
+            (
+                "allowed_audiences",
+                "      subject_token_issuers: [\"https://idp.example.test\"]",
+            ),
+        ] {
+            let yaml = format!(
+                r#"
+proxy:
+  http_bind_port: 18080
+origins:
+  "exchange.test":
+    action:
+      type: proxy
+      url: https://upstream.example.test
+    outbound_credential:
+      type: token_exchange
+      token_endpoint: https://idp.example.test/token
+      audience: https://api.example.test
+{present}
+"#
+            );
+            let config = sbproxy_config::compile_config(&yaml).unwrap();
+            let error = match CompiledPipeline::from_config_for_validation(config) {
+                Ok(_) => panic!("an empty {omitted} allowlist must be rejected"),
+                Err(error) => error,
+            };
+            let text = error.to_string();
+            assert!(
+                text.contains(omitted),
+                "error must name the empty key {omitted}, got: {text}"
+            );
+            assert!(
+                text.contains("exchange.test"),
+                "error must name the origin, got: {text}"
+            );
+        }
+    }
+
+    /// The other half of WOR-2316: an authored pair still compiles, so
+    /// the fix is "list the values", not "stop using token exchange".
+    #[test]
+    fn validation_accepts_explicit_token_exchange_allowlists() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 18080
+origins:
+  "exchange.test":
+    action:
+      type: proxy
+      url: https://upstream.example.test
+    outbound_credential:
+      type: token_exchange
+      token_endpoint: https://idp.example.test/token
+      audience: https://api.example.test
+      subject_token_issuers: ["https://idp.example.test"]
+      allowed_audiences: ["https://api.example.test"]
+"#;
+        let config = sbproxy_config::compile_config(yaml).unwrap();
+        CompiledPipeline::from_config_for_validation(config)
+            .expect("an explicitly allowlisted token exchange compiles");
     }
 }
 

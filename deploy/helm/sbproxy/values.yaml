@@ -4,10 +4,29 @@
 # itself; install with `--namespace <ns> --create-namespace`.
 namespace: sbproxy-system
 
-# Operator image. Override `tag` to pin a specific build.
+# Operator image.
+#
+# Read this before a first install: no release publishes this image. The
+# release workflow builds and pushes the data plane only
+# (`ghcr.io/soapbucket/sbproxy` and `docker.io/soapbucket/sbproxy`), so the
+# repository below names where the operator image would live, not somewhere
+# you can pull from today. Installing the chart unchanged leaves the operator
+# pod in ImagePullBackOff.
+#
+# The path that works is a local build. `make k8s-operator-smoke` builds
+# `sbproxy-operator:ci` from `crates/sbproxy-k8s-operator/Dockerfile.ci`, loads
+# it into a kind cluster, and installs this chart against it. To point the
+# chart at an image you built and pushed yourself:
+#
+#   helm install sbproxy ./deploy/helm/sbproxy \
+#     --set image.repository=<your-registry>/sbproxy-k8s-operator \
+#     --set image.tag=<your-tag>
+#
+# An empty `tag` falls back to `.Chart.AppVersion`, so the chart carries one
+# version number rather than two that drift apart. Set it to pin a build.
 image:
   repository: ghcr.io/soapbucket/sbproxy-k8s-operator
-  tag: "0.1.0"
+  tag: ""
   pullPolicy: IfNotPresent
 
 # Number of operator replicas. Two is the recommended default so leader

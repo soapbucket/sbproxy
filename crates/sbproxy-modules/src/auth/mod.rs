@@ -151,10 +151,11 @@ pub enum Auth {
     /// constraints. See [`JwtAuth::check_request`].
     Jwt(JwtAuth),
     /// HTTP Digest Authentication. Implements the subset of RFC 7616
-    /// the proxy actually exposes (MD5 digest with `qop=auth`) and
-    /// tracks the highest accepted nonce-count per nonce so a captured
-    /// `Authorization` header cannot be replayed. See [`DigestAuth`]
-    /// for the implementation details.
+    /// the proxy actually exposes (`SHA-256` by default or `MD5` when
+    /// pinned, both with `qop=auth`) and tracks the highest accepted
+    /// nonce-count per nonce so a captured `Authorization` header
+    /// cannot be replayed. See [`DigestAuth`] for the implementation
+    /// details.
     Digest(DigestAuth),
     /// Forward auth to an external service.
     ForwardAuth(ForwardAuthProvider),
@@ -926,20 +927,89 @@ impl JwtAuth {
 
 // --- DigestAuth ---
 
+/// Hash algorithm for the RFC 7616 digest computation.
+///
+/// RFC 7616 §3.3 deprecates MD5 and defines SHA-256 as the algorithm a
+/// server should offer. New configurations therefore get SHA-256; MD5
+/// stays reachable behind an explicit `algorithm: MD5` for a legacy
+/// client or an HA1 table that cannot be recomputed.
+///
+/// Deliberately not `pub`: nothing outside this module needs the type,
+/// and the operator-facing surface is the `algorithm` config key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum DigestAlgorithm {
+    /// RFC 7616 `SHA-256`.
+    #[default]
+    Sha256,
+    /// RFC 7616 `MD5`, retained for legacy deployments.
+    Md5,
+}
+
+impl DigestAlgorithm {
+    /// Token used in the `algorithm` challenge parameter and matched
+    /// against the client's echo of it.
+    fn token(self) -> &'static str {
+        match self {
+            Self::Sha256 => "SHA-256",
+            Self::Md5 => "MD5",
+        }
+    }
+
+    /// Length in hex characters of an HA1 produced by this algorithm.
+    fn ha1_hex_len(self) -> usize {
+        match self {
+            Self::Sha256 => 64,
+            Self::Md5 => 32,
+        }
+    }
+
+    /// Hex digest of `input` under this algorithm.
+    fn hex(self, input: &str) -> String {
+        match self {
+            Self::Sha256 => {
+                use sha2::Digest as _;
+                hex::encode(sha2::Sha256::digest(input.as_bytes()))
+            }
+            Self::Md5 => {
+                let mut hasher = Md5::new();
+                hasher.update(input.as_bytes());
+                hex::encode(hasher.finalize())
+            }
+        }
+    }
+
+    /// Parse an operator-supplied or client-supplied algorithm token.
+    /// `SHA-256`, `sha256`, and `MD5` are all accepted; the `-sess`
+    /// variants are not implemented and are refused rather than
+    /// silently downgraded to their session-free form.
+    fn parse(token: &str) -> Option<Self> {
+        match token.trim().to_ascii_uppercase().as_str() {
+            "SHA-256" | "SHA256" => Some(Self::Sha256),
+            "MD5" => Some(Self::Md5),
+            _ => None,
+        }
+    }
+}
+
 /// HTTP Digest Authentication provider.
 ///
-/// Implements the subset of RFC 7616 the proxy actually exposes: MD5
-/// digest with `qop=auth`. The provider also tracks, for each nonce we
-/// have seen, the highest `nc` value that produced a valid response.
-/// RFC 7616 §3.4 requires `nc` to strictly increase per nonce; any reuse
-/// means a captured `Authorization` header is being replayed. Capturing
-/// and replaying a valid header would otherwise succeed for the life of
-/// the nonce because the digest response only binds method + URI.
+/// Implements the subset of RFC 7616 the proxy actually exposes: the
+/// `SHA-256` and `MD5` algorithms with `qop=auth`, selected by the
+/// `algorithm` config key and advertised in the challenge. The provider
+/// also tracks, for each nonce we have seen, the highest `nc` value that
+/// produced a valid response. RFC 7616 §3.4 requires `nc` to strictly
+/// increase per nonce; any reuse means a captured `Authorization` header
+/// is being replayed. Capturing and replaying a valid header would
+/// otherwise succeed for the life of the nonce because the digest
+/// response only binds method + URI.
 pub struct DigestAuth {
     /// Realm string sent in the `WWW-Authenticate` challenge.
     pub realm: String,
     /// Accepted username/password pairs.
     pub users: Vec<DigestAuthUser>,
+    /// Digest algorithm this provider challenges with and verifies
+    /// against. Defaults to SHA-256 (RFC 7616 §3.3).
+    algorithm: DigestAlgorithm,
     /// `nonce -> max accepted nc` seen so far. Guarded by a `parking_lot`
     /// mutex for low contention and poison-free access. The map is
     /// bounded by `Self::MAX_TRACKED_NONCES`; when full, half the entries
@@ -953,6 +1023,7 @@ impl std::fmt::Debug for DigestAuth {
         f.debug_struct("DigestAuth")
             .field("realm", &self.realm)
             .field("users", &self.users)
+            .field("algorithm", &self.algorithm)
             .finish()
     }
 }
@@ -967,11 +1038,23 @@ impl<'de> Deserialize<'de> for DigestAuth {
             realm: String,
             #[serde(deserialize_with = "deserialize_digest_users")]
             users: Vec<DigestAuthUser>,
+            #[serde(default)]
+            algorithm: Option<String>,
         }
         let raw = Raw::deserialize(deserializer)?;
+        let algorithm = match raw.algorithm.as_deref() {
+            None => DigestAlgorithm::default(),
+            Some(token) => DigestAlgorithm::parse(token).ok_or_else(|| {
+                serde::de::Error::custom(format!(
+                    "digest auth: unsupported `algorithm` {token:?}; \
+                     supported values are SHA-256 (the default) and MD5"
+                ))
+            })?,
+        };
         Ok(DigestAuth {
             realm: raw.realm,
             users: raw.users,
+            algorithm,
             seen_nc: parking_lot::Mutex::new(HashMap::new()),
         })
     }
@@ -1016,19 +1099,68 @@ impl DigestAuth {
     const MAX_TRACKED_NONCES: usize = 4096;
 
     /// Build a DigestAuth from a generic JSON config value.
+    ///
+    /// The stored `password` for each user is the HA1 digest,
+    /// `H(username:realm:password)`, so it is algorithm-specific: 32 hex
+    /// characters under MD5 and 64 under SHA-256. A hex hash whose
+    /// length does not match the selected algorithm can never produce a
+    /// matching response, so it is refused here rather than turning
+    /// into a permanent 401 nobody can explain (WOR-2316).
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
-        Ok(serde_json::from_value(value)?)
+        let parsed: Self = serde_json::from_value(value)?;
+        let expected = parsed.algorithm.ha1_hex_len();
+        for user in &parsed.users {
+            let hash = &user.password;
+            // Only judge values that look like a hex digest. Anything
+            // else (an unresolved interpolation, a plaintext password)
+            // is a different mistake and is left to fail at request
+            // time as it always has.
+            let looks_like_hex = !hash.is_empty()
+                && hash.chars().all(|c| c.is_ascii_hexdigit())
+                && hash.len() % 2 == 0;
+            if !looks_like_hex || hash.len() == expected {
+                continue;
+            }
+            let hint = if parsed.algorithm == DigestAlgorithm::Sha256
+                && hash.len() == DigestAlgorithm::Md5.ha1_hex_len()
+            {
+                "; this is an MD5-length HA1 and `algorithm` now defaults to SHA-256. \
+                 Recompute it as SHA-256(username:realm:password), or set `algorithm: MD5` \
+                 to keep the existing table"
+            } else {
+                ""
+            };
+            anyhow::bail!(
+                "digest auth: user {:?} has a {}-character HA1 but `algorithm: {}` needs {} \
+                 hex characters{hint}",
+                user.username,
+                hash.len(),
+                parsed.algorithm.token(),
+                expected,
+            );
+        }
+        Ok(parsed)
     }
 
     /// Construct a DigestAuth with an empty replay cache. Intended for
     /// tests and programmatic construction; regular use goes through
-    /// `from_config`.
+    /// `from_config`. Uses the default (SHA-256) algorithm.
     pub fn new(realm: impl Into<String>, users: Vec<DigestAuthUser>) -> Self {
         Self {
             realm: realm.into(),
             users,
+            algorithm: DigestAlgorithm::default(),
             seen_nc: parking_lot::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Pin an explicit algorithm on a programmatically built provider.
+    /// The operator-facing path is the `algorithm` config key, so this
+    /// exists only for the tests that pin RFC 7616 vectors.
+    #[cfg(test)]
+    fn with_algorithm(mut self, algorithm: DigestAlgorithm) -> Self {
+        self.algorithm = algorithm;
+        self
     }
 
     /// Returns true if `(nonce, nc)` has not been seen before for this
@@ -1077,10 +1209,16 @@ impl DigestAuth {
     }
 
     /// Generate a WWW-Authenticate challenge header value.
+    ///
+    /// The `algorithm` parameter is how RFC 7616 §3.3 negotiates the
+    /// hash: a client that understands SHA-256 echoes it back on the
+    /// response, and one that does not fails rather than downgrading.
     pub fn challenge(&self, nonce: &str) -> String {
         format!(
-            "Digest realm=\"{}\", nonce=\"{}\", qop=\"auth\", algorithm=MD5",
-            self.realm, nonce
+            "Digest realm=\"{}\", nonce=\"{}\", qop=\"auth\", algorithm={}",
+            self.realm,
+            nonce,
+            self.algorithm.token()
         )
     }
 
@@ -1094,10 +1232,9 @@ impl DigestAuth {
     /// so the output is uniformly random and not affected by the
     /// process-local thread-rng implementation.
     ///
-    /// Note: MD5 remains here only for the digest response computation
-    /// because RFC 2617 hard-codes it (and RFC 7616's SHA-256 variant is
-    /// not yet negotiated by many clients). The nonce itself has no such
-    /// constraint, so it does not go through MD5.
+    /// The nonce is algorithm-independent: it is drawn from the CSPRNG
+    /// and never passed through the digest hash, so it is the same 16
+    /// random bytes under `SHA-256` and `MD5`.
     pub fn generate_nonce() -> String {
         use rand::RngCore;
         let mut bytes = [0u8; 16];
@@ -1130,6 +1267,20 @@ impl DigestAuth {
         let uri = params.get("uri")?.as_str();
         let response = params.get("response")?.as_str();
 
+        // RFC 7616 §3.4: the client echoes the challenge's `algorithm`.
+        // Anything other than the one we challenged with is refused,
+        // including the omitted form (which the RFC reads as MD5), so a
+        // SHA-256 realm cannot be talked down to MD5 by a client that
+        // simply drops the parameter.
+        let offered = params
+            .get("algorithm")
+            .map(|token| DigestAlgorithm::parse(token));
+        match offered {
+            Some(Some(algorithm)) if algorithm == self.algorithm => {}
+            None if self.algorithm == DigestAlgorithm::Md5 => {}
+            _ => return None,
+        }
+
         // Constant-time scan over the user table so mere existence of
         // a user does not leak via timing.
         let mut matched_user: Option<&DigestAuthUser> = None;
@@ -1150,13 +1301,14 @@ impl DigestAuth {
             }
         }
 
-        let ha2 = Self::md5_hex(&format!("{}:{}", method, uri));
+        let hash = |input: &str| self.algorithm.hex(input);
+        let ha2 = hash(&format!("{}:{}", method, uri));
         let expected = if qop == Some("auth") {
             let nc = params.get("nc").map(|s| s.as_str()).unwrap_or("");
             let cnonce = params.get("cnonce").map(|s| s.as_str()).unwrap_or("");
-            Self::md5_hex(&format!("{}:{}:{}:{}:auth:{}", ha1, nonce, nc, cnonce, ha2))
+            hash(&format!("{}:{}:{}:{}:auth:{}", ha1, nonce, nc, cnonce, ha2))
         } else {
-            Self::md5_hex(&format!("{}:{}:{}", ha1, nonce, ha2))
+            hash(&format!("{}:{}:{}", ha1, nonce, ha2))
         };
 
         if ct_str_eq(response, &expected) {
@@ -1178,13 +1330,6 @@ impl DigestAuth {
             }
         }
         params
-    }
-
-    /// Compute MD5 hex digest of a string.
-    fn md5_hex(input: &str) -> String {
-        let mut hasher = Md5::new();
-        hasher.update(input.as_bytes());
-        hex::encode(hasher.finalize())
     }
 }
 
@@ -2122,6 +2267,26 @@ mod tests {
         );
     }
 
+    /// WOR-2316: RFC 7616 §3.3 deprecates MD5, so the challenge a new
+    /// config emits must advertise SHA-256, and MD5 must stay reachable
+    /// for a legacy realm that pins it.
+    #[test]
+    fn digest_challenge_advertises_the_configured_algorithm() {
+        let modern = DigestAuth::new("test-realm", vec![]);
+        assert!(
+            modern.challenge("n").contains("algorithm=SHA-256"),
+            "the default challenge must advertise SHA-256: {}",
+            modern.challenge("n")
+        );
+
+        let legacy = DigestAuth::new("test-realm", vec![]).with_algorithm(DigestAlgorithm::Md5);
+        assert!(
+            legacy.challenge("n").contains("algorithm=MD5"),
+            "a pinned MD5 realm must advertise MD5: {}",
+            legacy.challenge("n")
+        );
+    }
+
     #[test]
     fn digest_nonce_is_unique() {
         let nonce1 = DigestAuth::generate_nonce();
@@ -2138,16 +2303,21 @@ mod tests {
         }
     }
 
+    /// The legacy fixture: an MD5 HA1 table on an MD5-pinned realm.
+    fn md5_digest_auth() -> DigestAuth {
+        DigestAuth::new("test-realm", vec![digest_test_user()]).with_algorithm(DigestAlgorithm::Md5)
+    }
+
     #[test]
     fn digest_check_request_no_auth_header() {
-        let auth = DigestAuth::new("test-realm", vec![digest_test_user()]);
+        let auth = md5_digest_auth();
         let headers = http::HeaderMap::new();
         assert!(!auth.check_request(&headers, "GET"));
     }
 
     #[test]
     fn digest_check_request_wrong_scheme() {
-        let auth = DigestAuth::new("test-realm", vec![digest_test_user()]);
+        let auth = md5_digest_auth();
         let mut headers = http::HeaderMap::new();
         headers.insert(
             http::header::AUTHORIZATION,
@@ -2159,7 +2329,7 @@ mod tests {
     #[test]
     fn digest_check_request_valid_response() {
         // HA1 = MD5(testuser:test-realm:testpass) = a08a2d645fc2bc82dfd69fd8b9c41f79
-        let auth = DigestAuth::new("test-realm", vec![digest_test_user()]);
+        let auth = md5_digest_auth();
 
         let ha1 = "a08a2d645fc2bc82dfd69fd8b9c41f79";
         let nonce = "testnonce123";
@@ -2169,10 +2339,10 @@ mod tests {
         let method = "GET";
 
         // HA2 = MD5(GET:/echo)
-        let ha2 = DigestAuth::md5_hex(&format!("{}:{}", method, uri));
+        let ha2 = DigestAlgorithm::Md5.hex(&format!("{}:{}", method, uri));
         // response = MD5(HA1:nonce:nc:cnonce:auth:HA2)
         let response =
-            DigestAuth::md5_hex(&format!("{}:{}:{}:{}:auth:{}", ha1, nonce, nc, cnonce, ha2));
+            DigestAlgorithm::Md5.hex(&format!("{}:{}:{}:{}:auth:{}", ha1, nonce, nc, cnonce, ha2));
 
         let auth_header = format!(
             "Digest username=\"testuser\", realm=\"test-realm\", nonce=\"{}\", uri=\"{}\", qop=auth, nc={}, cnonce=\"{}\", response=\"{}\"",
@@ -2185,9 +2355,69 @@ mod tests {
         assert!(auth.check_request(&headers, method));
     }
 
+    /// WOR-2316: the RFC 7616 §3.9.1 SHA-256 example, verified end to
+    /// end. HA1 is `SHA-256("Mufasa:http-auth@example.org:Circle of
+    /// Life")` and the expected response is the value the RFC prints.
+    #[test]
+    fn digest_sha256_matches_the_rfc_7616_example() {
+        let ha1 = "7987c64c30e25f1b74be53f966b49b90f2808aa92faf9a00262392d7b4794232";
+        let auth = DigestAuth::from_config(serde_json::json!({
+            "type": "digest",
+            "realm": "http-auth@example.org",
+            "algorithm": "SHA-256",
+            "users": { "Mufasa": ha1 }
+        }))
+        .expect("a SHA-256 HA1 table compiles");
+
+        let header = "Digest username=\"Mufasa\", realm=\"http-auth@example.org\", \
+             uri=\"/dir/index.html\", algorithm=SHA-256, \
+             nonce=\"7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v\", nc=00000001, \
+             cnonce=\"f2/wE4q74E6zIJEtWaHKaf5wv/H5QzzpXusqGemxURZJ\", qop=auth, \
+             response=\"753927fa0e85d155564e2e272a28d1802ca10daf4496794697cf8db5856cb6c1\"";
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::AUTHORIZATION, header.parse().unwrap());
+        assert_eq!(
+            auth.check_request_with_subject(&headers, "GET").as_deref(),
+            Some("Mufasa"),
+            "the RFC 7616 SHA-256 vector must verify"
+        );
+    }
+
+    /// A SHA-256 realm must not be talked down to MD5 by a client that
+    /// offers the weaker algorithm, or that omits the parameter (which
+    /// RFC 7616 reads as MD5).
+    #[test]
+    fn digest_sha256_realm_refuses_an_md5_downgrade() {
+        let ha1 = "7987c64c30e25f1b74be53f966b49b90f2808aa92faf9a00262392d7b4794232";
+        let auth = DigestAuth::from_config(serde_json::json!({
+            "type": "digest",
+            "realm": "http-auth@example.org",
+            "users": { "Mufasa": ha1 }
+        }))
+        .expect("SHA-256 is the default");
+
+        let sha_response = "753927fa0e85d155564e2e272a28d1802ca10daf4496794697cf8db5856cb6c1";
+        for algorithm in ["algorithm=MD5, ", ""] {
+            let header = format!(
+                "Digest username=\"Mufasa\", realm=\"http-auth@example.org\", \
+                 uri=\"/dir/index.html\", {algorithm}\
+                 nonce=\"7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v\", nc=00000001, \
+                 cnonce=\"f2/wE4q74E6zIJEtWaHKaf5wv/H5QzzpXusqGemxURZJ\", qop=auth, \
+                 response=\"{sha_response}\""
+            );
+            let mut headers = http::HeaderMap::new();
+            headers.insert(http::header::AUTHORIZATION, header.parse().unwrap());
+            assert!(
+                !auth.check_request(&headers, "GET"),
+                "a SHA-256 realm must refuse algorithm {algorithm:?}"
+            );
+        }
+    }
+
     #[test]
     fn digest_check_request_wrong_password() {
-        let auth = DigestAuth::new("test-realm", vec![digest_test_user()]);
+        let auth = md5_digest_auth();
 
         // Use a completely wrong response value.
         let auth_header = "Digest username=\"testuser\", realm=\"test-realm\", nonce=\"testnonce\", uri=\"/echo\", qop=auth, nc=00000001, cnonce=\"cn\", response=\"0000000000000000000000000000dead\"";
@@ -2204,6 +2434,7 @@ mod tests {
         let json = serde_json::json!({
             "type": "digest",
             "realm": "test-realm",
+            "algorithm": "MD5",
             "users": {
                 "testuser": "a08a2d645fc2bc82dfd69fd8b9c41f79"
             }
@@ -2215,7 +2446,45 @@ mod tests {
         assert_eq!(auth.users[0].password, "a08a2d645fc2bc82dfd69fd8b9c41f79");
     }
 
-    /// Build a valid digest `Authorization` header for `(nonce, nc)`.
+    /// WOR-2316: an MD5 HA1 table left on the new SHA-256 default can
+    /// never authenticate anyone, so config compilation refuses it and
+    /// names both ways out.
+    #[test]
+    fn digest_md5_hashes_under_the_sha256_default_fail_config() {
+        let err = DigestAuth::from_config(serde_json::json!({
+            "type": "digest",
+            "realm": "test-realm",
+            "users": { "testuser": "a08a2d645fc2bc82dfd69fd8b9c41f79" }
+        }))
+        .expect_err("an MD5-length HA1 must not compile under SHA-256")
+        .to_string();
+        assert!(
+            err.contains("testuser") && err.contains("algorithm: SHA-256"),
+            "error must name the user and the algorithm, got: {err}"
+        );
+        assert!(
+            err.contains("algorithm: MD5"),
+            "error must name the legacy escape hatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn digest_rejects_an_unsupported_algorithm() {
+        let err = DigestAuth::from_config(serde_json::json!({
+            "type": "digest",
+            "realm": "test-realm",
+            "algorithm": "SHA-512-256",
+            "users": { "testuser": "a08a2d645fc2bc82dfd69fd8b9c41f79" }
+        }))
+        .expect_err("an unimplemented algorithm must not compile")
+        .to_string();
+        assert!(
+            err.contains("SHA-512-256"),
+            "error must name the rejected value, got: {err}"
+        );
+    }
+
+    /// Build a valid MD5 digest `Authorization` header for `(nonce, nc)`.
     fn digest_auth_header(
         ha1: &str,
         method: &str,
@@ -2224,9 +2493,9 @@ mod tests {
         nc: &str,
         cnonce: &str,
     ) -> String {
-        let ha2 = DigestAuth::md5_hex(&format!("{}:{}", method, uri));
+        let ha2 = DigestAlgorithm::Md5.hex(&format!("{}:{}", method, uri));
         let response =
-            DigestAuth::md5_hex(&format!("{}:{}:{}:{}:auth:{}", ha1, nonce, nc, cnonce, ha2));
+            DigestAlgorithm::Md5.hex(&format!("{}:{}:{}:{}:auth:{}", ha1, nonce, nc, cnonce, ha2));
         format!(
             "Digest username=\"testuser\", realm=\"test-realm\", nonce=\"{}\", uri=\"{}\", qop=auth, nc={}, cnonce=\"{}\", response=\"{}\"",
             nonce, uri, nc, cnonce, response
@@ -2235,7 +2504,7 @@ mod tests {
 
     #[test]
     fn digest_replay_of_same_nonce_nc_is_rejected() {
-        let auth = DigestAuth::new("test-realm", vec![digest_test_user()]);
+        let auth = md5_digest_auth();
         let ha1 = "a08a2d645fc2bc82dfd69fd8b9c41f79";
         let header = digest_auth_header(ha1, "GET", "/echo", "replay-nonce", "00000001", "cn-a");
 
@@ -2250,7 +2519,7 @@ mod tests {
 
     #[test]
     fn digest_monotonic_nc_across_requests_is_accepted() {
-        let auth = DigestAuth::new("test-realm", vec![digest_test_user()]);
+        let auth = md5_digest_auth();
         let ha1 = "a08a2d645fc2bc82dfd69fd8b9c41f79";
 
         let header1 = digest_auth_header(ha1, "GET", "/echo", "rotating-nonce", "00000001", "cn-a");
@@ -2267,7 +2536,7 @@ mod tests {
 
     #[test]
     fn digest_out_of_order_nc_is_rejected() {
-        let auth = DigestAuth::new("test-realm", vec![digest_test_user()]);
+        let auth = md5_digest_auth();
         let ha1 = "a08a2d645fc2bc82dfd69fd8b9c41f79";
 
         let header_high =

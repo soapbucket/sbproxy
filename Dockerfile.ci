@@ -2,24 +2,24 @@
 #
 # CI smoke-test image for the sbproxy data plane.
 #
-# Optimised for the kind-based GitHub Actions workflow at
-# `.github/workflows/k8s-operator-smoke.yml`. Uses the same cargo-chef
-# layered layout as `Dockerfile.cloudbuild` so warm rebuilds (only
-# first-party source changed) finish in under 90s.
+# Optimized for the kind-based smoke test, the `k8s-operator-smoke`
+# Makefile target. That target is local-only; no CI workflow builds this
+# image. Uses the same cargo-chef layered layout as
+# `Dockerfile.cloudbuild` so warm rebuilds (only first-party source
+# changed) finish in under 90s.
 #
 # This is intentionally NOT the production / release image: the release
 # pipeline at `.github/workflows/release.yml` produces signed multi-arch
 # images via a different flow (cross-compile + cosign + SBOM). Keep the
 # two in sync only on the runtime base (distroless/cc-debian12).
 #
-# Usage in CI:
+# Usage:
 #   DOCKER_BUILDKIT=1 docker build -t sbproxy:ci -f Dockerfile.ci .
 #   DOCKER_BUILDKIT=1 docker build --build-arg CARGO_PROFILE=release -t sbproxy:release -f Dockerfile.ci .
 #
 # REQUIRES BuildKit. The cache mounts on /usr/local/cargo/{registry,git}
-# only take effect when BuildKit is the active builder. GitHub-hosted
-# runners enable BuildKit by default with docker >= 23, but if the
-# workflow ever falls back to the legacy builder, the cache mounts
+# only take effect when BuildKit is the active builder. docker >= 23
+# enables BuildKit by default, but on a legacy builder the cache mounts
 # silently no-op and the build still succeeds (just slower).
 
 # --- Stage 1: chef-base ------------------------------------------------

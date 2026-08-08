@@ -15,9 +15,11 @@
 # script against an existing kind cluster reuses it; pass NO_CLEANUP=1 to
 # leave the cluster up after success.
 #
-# Requirements: kind, helm, kubectl, curl. The CI workflow loads
-# `sbproxy:ci` and `sbproxy-operator:ci` images into the kind cluster
-# before invoking this script; locally, override with environment vars.
+# Requirements: kind, helm, kubectl, curl, plus `sbproxy:ci` and
+# `sbproxy-operator:ci` already loaded into the kind cluster. The
+# `k8s-operator-smoke` Makefile target builds and loads both, then calls
+# this script; no CI workflow runs it. Override the image names with the
+# environment vars below when driving it by hand.
 #
 # Usage:
 #   bash deploy/helm/sbproxy/test/smoke.sh
@@ -26,7 +28,7 @@
 #   CLUSTER_NAME           kind cluster name. Default: sbproxy-smoke.
 #   NAMESPACE              operator namespace. Default: sbproxy-system.
 #   SAMPLE_NS              namespace for the SBProxy CR. Default: default.
-#   PROXY_IMAGE            proxy image. Default: sbproxy:ci (CI-loaded).
+#   PROXY_IMAGE            proxy image. Default: sbproxy:ci (kind-loaded).
 #   OPERATOR_IMAGE         operator image. Default: sbproxy-operator:ci.
 #   SKIP_KIND_CREATE       set to 1 if a kind cluster is already up.
 #   NO_CLEANUP             set to 1 to leave the cluster up on success.

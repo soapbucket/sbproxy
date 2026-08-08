@@ -2593,6 +2593,45 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
         }
     }
 
+    // --- WOR-2316: warn about header-sourced object_authz ownership ---
+    //
+    // `object_authz` compares a path segment against the caller's owner
+    // identity. With `principal.owner_from: sub` that identity is the
+    // verified auth subject and the comparison means something. With
+    // `owner_from: header` it is whatever the request said, so any
+    // client that can reach the proxy directly can name itself the
+    // owner of any object and the BOLA rule passes. That is a valid
+    // deployment behind an ingress that strips the header on the way
+    // in, and an authorization bypass without one, and the config
+    // cannot tell which it is. Warn loudly and name the origin; do not
+    // reject, because the trusted-ingress shape is real.
+    for policy in &config.policies {
+        if !policy_type_is(policy, "object_authz") && !policy_type_is(policy, "bola") {
+            continue;
+        }
+        let principal = policy.get("principal");
+        let owner_from = principal
+            .and_then(|p| p.get("owner_from"))
+            .and_then(|v| v.as_str());
+        if owner_from != Some("header") {
+            continue;
+        }
+        let owner_header = principal
+            .and_then(|p| p.get("owner_header"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("x-owner-id");
+        tracing::warn!(
+            hostname = %hostname,
+            owner_header = %owner_header,
+            "object_authz reads the object owner from the `{owner_header}` request header \
+             instead of the verified auth subject. Any client that can reach this origin \
+             directly can set that header and assert ownership of any object, so the BOLA \
+             rules on origin `{hostname}` enforce nothing unless an ingress in front of the \
+             proxy strips `{owner_header}` from every inbound request. Use \
+             `principal.owner_from: sub` unless that ingress exists."
+        );
+    }
+
     // --- Wave 4 / G4.5: validate and intern the Content-Signal value ---
     //
     // The closed enum is `{ai-train, search, ai-input}` per A4.1's
@@ -3029,6 +3068,134 @@ origins:
             warnings.load(Ordering::Relaxed),
             1,
             "the static + body-reading combination must warn exactly once"
+        );
+    }
+
+    /// Counts compile-time warnings that name the header-sourced
+    /// `object_authz` owner, so the assertion cannot pass on an
+    /// unrelated warning (WOR-2316).
+    fn object_authz_header_warnings_for(yaml: &str) -> usize {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct OwnerHeaderWarnCounter(Arc<AtomicUsize>);
+
+        impl tracing::Subscriber for OwnerHeaderWarnCounter {
+            fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+                metadata.target().starts_with("sbproxy_config")
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                struct SeenOwnerHeaderMessage(bool);
+                impl tracing::field::Visit for SeenOwnerHeaderMessage {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        if field.name() == "message" {
+                            let text = format!("{value:?}");
+                            if text.contains("object_authz reads the object owner from")
+                                && text.contains("assert ownership")
+                            {
+                                self.0 = true;
+                            }
+                        }
+                    }
+                }
+                if *event.metadata().level() == tracing::Level::WARN {
+                    let mut visitor = SeenOwnerHeaderMessage(false);
+                    event.record(&mut visitor);
+                    if visitor.0 {
+                        self.0.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let warnings = Arc::new(AtomicUsize::new(0));
+        let compiled = tracing::subscriber::with_default(
+            OwnerHeaderWarnCounter(Arc::clone(&warnings)),
+            || compile_config(yaml),
+        );
+        compiled.expect("object_authz compiles either way; the header source only warns");
+        warnings.load(Ordering::Relaxed)
+    }
+
+    /// WOR-2316: sourcing the owner from a request header is an
+    /// authorization bypass unless an ingress strips that header, and
+    /// the config cannot tell whether one exists. It stays legal and
+    /// gets one loud warning naming the origin.
+    #[test]
+    fn header_sourced_object_authz_owner_warns_once_at_compile() {
+        let yaml = r#"
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://backend.internal
+    policies:
+      - type: object_authz
+        principal:
+          owner_from: header
+          owner_header: x-owner-id
+        object_rules:
+          - path: /tenants/{owner}/orders/{order_id}
+            owner_param: owner
+"#;
+        assert_eq!(
+            object_authz_header_warnings_for(yaml),
+            1,
+            "a header-sourced owner must warn exactly once"
+        );
+    }
+
+    /// The secure default must stay quiet, or the warning becomes noise
+    /// operators learn to skip past (WOR-2316).
+    #[test]
+    fn subject_sourced_object_authz_owner_does_not_warn() {
+        let yaml = r#"
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://backend.internal
+    policies:
+      - type: object_authz
+        principal:
+          owner_from: sub
+        object_rules:
+          - path: /tenants/{owner}/orders/{order_id}
+            owner_param: owner
+"#;
+        assert_eq!(
+            object_authz_header_warnings_for(yaml),
+            0,
+            "the verified-subject default must not warn"
+        );
+
+        let omitted = r#"
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://backend.internal
+    policies:
+      - type: object_authz
+        object_rules:
+          - path: /tenants/{owner}/orders/{order_id}
+            owner_param: owner
+"#;
+        assert_eq!(
+            object_authz_header_warnings_for(omitted),
+            0,
+            "an omitted principal block is the secure default and must not warn"
         );
     }
 

@@ -1760,14 +1760,15 @@ pub(super) fn map_upstream_failure(e: &Error) -> (u16, Option<&'static str>) {
 /// Build the `http::Request<bytes::Bytes>` view of the inbound
 /// Pingora session that the RFC 9421 verifier expects.
 ///
-/// Body is empty: the OSS v1 message-signatures gate verifies
-/// signatures over no-body components (`@method`, `@target-uri`,
-/// `@authority`, `@scheme`, `@path`, `@query`, plus arbitrary
-/// header references). Body coverage (`content-digest`) requires
-/// buffering the body ahead of the auth phase and lands as a
-/// follow-up.
+/// `body` is what the verifier binds a covered `content-digest`
+/// against, so it has to be the complete inbound body or nothing.
+/// The caller in `request_phase` passes `Bytes::new()` for a request
+/// whose signature covers no body component, and the drained replay
+/// buffer when it does; a partial body would be worse than no body,
+/// because it fails a signature that is in fact valid.
 pub(super) fn build_signature_verification_request(
     session: &Session,
+    body: bytes::Bytes,
 ) -> Option<http::Request<bytes::Bytes>> {
     let req_header = session.req_header();
     let method = req_header.method.clone();
@@ -1782,7 +1783,7 @@ pub(super) fn build_signature_verification_request(
     // build is effectively infallible today, but the inputs are
     // attacker-influenced. Surface a build failure as `None` (the caller
     // fails closed with a 401) rather than panicking the request.
-    match builder.body(bytes::Bytes::new()) {
+    match builder.body(body) {
         Ok(req) => Some(req),
         Err(e) => {
             tracing::error!(
@@ -1822,6 +1823,7 @@ pub(super) fn cached_message_signature_verifier(
     let algorithm = match cfg.algorithm.as_str() {
         "hmac_sha256" => sbproxy_middleware::signatures::SignatureAlgorithm::HmacSha256,
         "ed25519" => sbproxy_middleware::signatures::SignatureAlgorithm::Ed25519,
+        "ecdsa_p256_sha256" => sbproxy_middleware::signatures::SignatureAlgorithm::EcdsaP256Sha256,
         other => {
             warn!(
                 algorithm = %other,

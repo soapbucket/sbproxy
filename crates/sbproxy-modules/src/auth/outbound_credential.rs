@@ -8,7 +8,9 @@
 //!   inbound subject token for a token scoped to the upstream's
 //!   audience, enforcing the `subject_token_issuers` and
 //!   `allowed_audiences` allowlists and an `act` delegation-chain depth
-//!   cap.
+//!   cap. Both allowlists are required and must be non-empty: an empty
+//!   list denies every token rather than accepting any, and a config
+//!   that omits either one fails to compile.
 //! - **`client_credentials`**: OAuth 2.0 client-credentials grant.
 //! - **`vault_secret`**: a static secret resolved from the vault and
 //!   formatted as an authorization header.
@@ -70,13 +72,15 @@ pub struct TokenExchangeConfig {
     /// Optional requested scope.
     #[serde(default)]
     pub scope: Option<String>,
-    /// Allowlist of acceptable subject-token issuers (`iss`). Empty
-    /// means "accept any issuer" (not recommended).
+    /// Allowlist of acceptable subject-token issuers (`iss`). Required
+    /// and non-empty: an empty list denies every subject token, and
+    /// [`OutboundCredentialConfig::validate_allowlists`] refuses the
+    /// config before it can reach a running proxy.
     #[serde(default)]
     pub subject_token_issuers: Vec<String>,
-    /// Allowlist of audiences this origin may request. Empty means
-    /// "any audience" (not recommended). The configured `audience`
-    /// must appear here when the list is non-empty.
+    /// Allowlist of audiences this origin may request. Required and
+    /// non-empty on the same terms as [`Self::subject_token_issuers`];
+    /// the configured `audience` must appear here.
     #[serde(default)]
     pub allowed_audiences: Vec<String>,
     /// Maximum `act` delegation-chain depth on the subject token.
@@ -217,6 +221,44 @@ impl OutboundCredentialConfig {
         self.prepare_dpop(&|reference| resolver.resolve(reference))
     }
 
+    /// Refuse a token-exchange credential whose delegation allowlists
+    /// are empty (WOR-2316).
+    ///
+    /// Token exchange is a delegation primitive: it takes the caller's
+    /// inbound token and mints one the upstream will honor. An empty
+    /// `subject_token_issuers` used to mean "accept any issuer" and an
+    /// empty `allowed_audiences` "request any audience", so the default
+    /// shape of the feature was a proxy that would delegate anything
+    /// anywhere. The runtime now denies on an empty list, and this
+    /// check turns that denial into a config-compile error so the flip
+    /// surfaces at boot with a fix attached instead of as a wall of
+    /// 5xx once traffic arrives.
+    ///
+    /// The lists are exact-match with no wildcard entry, so "allow
+    /// everything" is deliberately not expressible: enumerate the
+    /// issuers and audiences the origin actually delegates to.
+    pub fn validate_allowlists(&self) -> anyhow::Result<()> {
+        let Self::TokenExchange(config) = self else {
+            return Ok(());
+        };
+        if config.subject_token_issuers.is_empty() {
+            bail!(
+                "token_exchange: `subject_token_issuers` is empty, which denies every subject \
+                 token. List the issuer URLs (the subject token's `iss`) this origin accepts, \
+                 for example `subject_token_issuers: [\"https://idp.example.com\"]`"
+            );
+        }
+        if config.allowed_audiences.is_empty() {
+            bail!(
+                "token_exchange: `allowed_audiences` is empty, which denies every exchange. \
+                 List the audiences this origin may request, including its own `audience` \
+                 value {:?}",
+                config.audience
+            );
+        }
+        Ok(())
+    }
+
     /// Validate DPoP configuration without dereferencing an external secret.
     pub fn validate_dpop(&self) -> anyhow::Result<()> {
         if let Self::VaultSecret(config) = self {
@@ -331,6 +373,10 @@ fn act_chain_depth(claims: &serde_json::Value) -> usize {
 /// Enforce the subject-token allowlist and delegation-depth cap before
 /// an exchange. Returns an error (fail closed) when the token's issuer
 /// is not allowlisted or the `act` chain is too deep.
+///
+/// An empty allowlist denies (WOR-2316). Config compilation rejects that
+/// shape outright, so reaching this arm means a caller built the config
+/// in code; deny rather than delegate on behalf of an unknown issuer.
 fn validate_subject_token(
     token: &str,
     allowed_issuers: &[String],
@@ -338,14 +384,15 @@ fn validate_subject_token(
 ) -> Result<()> {
     let claims = decode_jwt_payload(token).context("subject token is not a decodable JWT")?;
 
-    if !allowed_issuers.is_empty() {
-        let iss = claims
-            .get("iss")
-            .and_then(|v| v.as_str())
-            .context("subject token has no `iss` claim to allowlist")?;
-        if !allowed_issuers.iter().any(|a| a == iss) {
-            bail!("subject token issuer {iss:?} is not in subject_token_issuers");
-        }
+    if allowed_issuers.is_empty() {
+        bail!("subject_token_issuers is empty, so no subject-token issuer is accepted");
+    }
+    let iss = claims
+        .get("iss")
+        .and_then(|v| v.as_str())
+        .context("subject token has no `iss` claim to allowlist")?;
+    if !allowed_issuers.iter().any(|a| a == iss) {
+        bail!("subject token issuer {iss:?} is not in subject_token_issuers");
     }
 
     let depth = act_chain_depth(&claims);
@@ -355,9 +402,13 @@ fn validate_subject_token(
     Ok(())
 }
 
-/// Enforce the requested-audience allowlist.
+/// Enforce the requested-audience allowlist. An empty allowlist denies
+/// every audience (WOR-2316); see [`validate_subject_token`].
 fn validate_audience(audience: &str, allowed: &[String]) -> Result<()> {
-    if !allowed.is_empty() && !allowed.iter().any(|a| a == audience) {
+    if allowed.is_empty() {
+        bail!("allowed_audiences is empty, so no requested audience is accepted");
+    }
+    if !allowed.iter().any(|a| a == audience) {
         bail!("requested audience {audience:?} is not in allowed_audiences");
     }
     Ok(())
@@ -929,18 +980,30 @@ mod tests {
         // Allowlisted issuer passes.
         let ok = jwt(serde_json::json!({"iss": "https://good", "sub": "x"}));
         assert!(validate_subject_token(&ok, &["https://good".to_string()], 4).is_ok());
-        // Empty allowlist accepts any issuer.
-        assert!(validate_subject_token(&token, &[], 4).is_ok());
+    }
+
+    /// WOR-2316: an empty issuer allowlist denies instead of accepting
+    /// any issuer, so a credential built in code cannot delegate on
+    /// behalf of an issuer nobody named.
+    #[test]
+    fn empty_issuer_allowlist_denies_every_subject_token() {
+        let token = jwt(serde_json::json!({"iss": "https://anyone", "sub": "x"}));
+        let err = validate_subject_token(&token, &[], 4).unwrap_err();
+        assert!(
+            err.to_string().contains("subject_token_issuers is empty"),
+            "empty allowlist must deny and say so, got: {err}"
+        );
     }
 
     #[test]
     fn act_depth_cap_enforced() {
+        let allowed = ["https://good".to_string()];
         let token = jwt(serde_json::json!({
             "iss": "https://good",
             "act": {"act": {"act": {"sub": "deep"}}}
         }));
-        assert!(validate_subject_token(&token, &[], 2).is_err());
-        assert!(validate_subject_token(&token, &[], 3).is_ok());
+        assert!(validate_subject_token(&token, &allowed, 2).is_err());
+        assert!(validate_subject_token(&token, &allowed, 3).is_ok());
     }
 
     #[test]
@@ -948,7 +1011,78 @@ mod tests {
         let allowed = vec!["https://api.example.com".to_string()];
         assert!(validate_audience("https://api.example.com", &allowed).is_ok());
         assert!(validate_audience("https://other", &allowed).is_err());
-        assert!(validate_audience("https://anything", &[]).is_ok());
+    }
+
+    /// WOR-2316: the audience allowlist fails closed the same way.
+    #[test]
+    fn empty_audience_allowlist_denies_every_exchange() {
+        let err = validate_audience("https://anything", &[]).unwrap_err();
+        assert!(
+            err.to_string().contains("allowed_audiences is empty"),
+            "empty allowlist must deny and say so, got: {err}"
+        );
+    }
+
+    /// WOR-2316: the same empty lists are a config-compile error, so an
+    /// operator meets the change at boot with the key named.
+    #[test]
+    fn empty_token_exchange_allowlists_fail_config_validation() {
+        let missing_issuers: OutboundCredentialConfig = serde_json::from_value(serde_json::json!({
+            "type": "token_exchange",
+            "token_endpoint": "https://idp/token",
+            "audience": "https://api.example.com",
+            "allowed_audiences": ["https://api.example.com"]
+        }))
+        .expect("parses");
+        let err = missing_issuers
+            .validate_allowlists()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("subject_token_issuers"),
+            "error must name the empty key, got: {err}"
+        );
+
+        let missing_audiences: OutboundCredentialConfig =
+            serde_json::from_value(serde_json::json!({
+                "type": "token_exchange",
+                "token_endpoint": "https://idp/token",
+                "audience": "https://api.example.com",
+                "subject_token_issuers": ["https://issuer"]
+            }))
+            .expect("parses");
+        let err = missing_audiences
+            .validate_allowlists()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("allowed_audiences") && err.contains("https://api.example.com"),
+            "error must name the empty key and the configured audience, got: {err}"
+        );
+    }
+
+    /// The other two credential modes have no delegation allowlist, so
+    /// the WOR-2316 check must leave them alone.
+    #[test]
+    fn explicit_allowlists_and_other_modes_validate_clean() {
+        let explicit: OutboundCredentialConfig = serde_json::from_value(serde_json::json!({
+            "type": "token_exchange",
+            "token_endpoint": "https://idp/token",
+            "audience": "https://api.example.com",
+            "subject_token_issuers": ["https://issuer"],
+            "allowed_audiences": ["https://api.example.com"]
+        }))
+        .expect("parses");
+        explicit
+            .validate_allowlists()
+            .expect("an explicit allowlist pair compiles");
+
+        let vault: OutboundCredentialConfig = serde_json::from_value(serde_json::json!({
+            "type": "vault_secret",
+            "secret": "vault:api-key"
+        }))
+        .expect("parses");
+        vault.validate_allowlists().expect("vault_secret is exempt");
     }
 
     #[tokio::test]
@@ -986,6 +1120,8 @@ mod tests {
             token_endpoint: "https://idp/token".to_string(),
             audience: "https://api".to_string(),
             scope: None,
+            // The missing subject token is refused before the WOR-2316
+            // allowlist check runs, so the empty lists are inert here.
             subject_token_issuers: vec![],
             allowed_audiences: vec![],
             act_depth_cap: 4,
@@ -1136,6 +1272,8 @@ mod tests {
             token_endpoint: "https://evil.example/token".to_string(),
             audience: "https://api.example.com".to_string(),
             scope: None,
+            // The egress gate runs before the WOR-2316 allowlist check,
+            // which is the point of this test: refuse before any I/O.
             subject_token_issuers: vec![],
             allowed_audiences: vec![],
             act_depth_cap: 4,
@@ -1194,8 +1332,10 @@ mod tests {
             token_endpoint: format!("http://127.0.0.1:{port}/token"),
             audience: "https://api.example.com".to_string(),
             scope: None,
-            subject_token_issuers: vec![],
-            allowed_audiences: vec![],
+            // WOR-2316: empty allowlists deny, so the cache-isolation
+            // case has to name the issuer and audience it exercises.
+            subject_token_issuers: vec!["https://issuer".to_string()],
+            allowed_audiences: vec!["https://api.example.com".to_string()],
             act_depth_cap: 4,
             client_id: None,
             client_secret: None,

@@ -1049,6 +1049,56 @@ adds a durable grouping dimension and can increase rollup cardinality. These
 properties are not exported as arbitrary Prometheus labels. Query a promoted
 dimension through `GET /api/usage/spend?...&group_by=property:<key>`.
 
+### outbound_credential
+
+`outbound_credential` decides what credential SBproxy presents to the upstream, so the agent or client never holds a per-upstream secret. The `type` field picks one of three modes.
+
+| `type` | What it does |
+|--------|--------------|
+| `token_exchange` | RFC 8693: exchanges the caller's inbound token for one scoped to the upstream. |
+| `client_credentials` | OAuth 2.0 client-credentials grant against a token endpoint. |
+| `vault_secret` | A static secret resolved from the vault and formatted as a header. |
+
+`token_exchange` fields:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `token_endpoint` | string | required | Endpoint that performs the exchange. |
+| `audience` | string | required | Audience requested for the exchanged token. |
+| `scope` | string | unset | Optional requested scope. |
+| `subject_token_issuers` | list | required | Issuer URLs (`iss`) whose subject tokens this origin will exchange. |
+| `allowed_audiences` | list | required | Audiences this origin may request. Must contain `audience`. |
+| `act_depth_cap` | int | `4` | Maximum `act` delegation-chain depth on the subject token. |
+| `client_id` | string | unset | Client id for authenticating to the token endpoint. |
+| `client_secret` | string | unset | Vault reference for the client secret. |
+| `dpop` | object | unset | RFC 9449 sender constraint. See [outbound-dpop.md](outbound-dpop.md). |
+
+Both allowlists are required and both must be non-empty. Token exchange is a delegation primitive: it takes whatever identity walked in the front door and mints something an upstream will honor. An empty list is refused at config compile rather than read as "any", because "exchange any token for access to any audience" is not a default worth having. There is no wildcard entry; enumerate the issuers and audiences the origin actually delegates to.
+
+```yaml
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://backend.internal
+    outbound_credential:
+      type: token_exchange
+      token_endpoint: https://idp.example.com/token
+      audience: https://backend.internal
+      subject_token_issuers:
+        - https://idp.example.com
+      allowed_audiences:
+        - https://backend.internal
+```
+
+A config that omits either list fails to compile with the origin and the missing key named:
+
+```text
+origin api.example.com: outbound_credential: token_exchange: `subject_token_issuers` is empty,
+which denies every subject token. List the issuer URLs (the subject token's `iss`) this origin
+accepts, for example `subject_token_issuers: ["https://idp.example.com"]`
+```
+
 ---
 
 ## Actions
@@ -2259,7 +2309,9 @@ issuer starts minting `cnf.jkt` / `cnf.x5t#S256` tokens.
 
 ### digest
 
-HTTP Digest Authentication (RFC 7616). The right pick when a legacy system insists on digest auth. The stored `password` is the HA1 hash, `MD5(username:realm:password)`, not the plaintext password.
+HTTP Digest Authentication (RFC 7616). The right pick when a legacy system insists on digest auth. The stored `password` is the HA1 hash, `H(username:realm:password)`, not the plaintext password.
+
+`H` is SHA-256 unless you say otherwise. RFC 7616 §3.3 deprecates MD5, so a config that omits `algorithm` challenges with `algorithm=SHA-256` and verifies against SHA-256 HA1 hashes. MD5 stays available for a client or an HA1 table that cannot move, but you have to ask for it.
 
 ```yaml
 origins:
@@ -2279,7 +2331,39 @@ origins:
 |-------|------|---------|-------------|
 | `type` | string | required | Must be `digest`. |
 | `realm` | string | required | Realm string sent in the `WWW-Authenticate` challenge. |
+| `algorithm` | string | `SHA-256` | Digest algorithm. `SHA-256` or `MD5`. Advertised in the challenge and required to match on the response. |
 | `users` | list or map | required | Accepted users. Either a list of `{username, password}` objects, or a map of `username: ha1_hex`. |
+
+Compute the HA1 for the algorithm you configured:
+
+```bash
+# SHA-256 (the default): 64 hex characters
+printf '%s' 'alice:Legacy:s3cret' | shasum -a 256
+# MD5 (legacy): 32 hex characters
+printf '%s' 'alice:Legacy:s3cret' | md5sum
+```
+
+The hash length has to match the algorithm, and config compilation checks it. An MD5-length HA1 left on the SHA-256 default cannot ever produce a matching response, so it is refused at boot instead of turning into a 401 nobody can explain:
+
+```text
+digest auth: user "alice" has a 32-character HA1 but `algorithm: SHA-256` needs 64 hex
+characters; this is an MD5-length HA1 and `algorithm` now defaults to SHA-256. Recompute it as
+SHA-256(username:realm:password), or set `algorithm: MD5` to keep the existing table
+```
+
+To keep an existing MD5 deployment working unchanged, add one line:
+
+```yaml
+authentication:
+  type: digest
+  realm: "Legacy"
+  algorithm: MD5
+  users:
+    - username: alice
+      password: ${ALICE_MD5_HA1}
+```
+
+The algorithm is negotiated, not merely declared. The challenge carries `algorithm=`, and a response that names a different algorithm, or omits the parameter on a SHA-256 realm, is rejected. A client cannot talk a SHA-256 realm down to MD5 by dropping the parameter. Only `SHA-256` and `MD5` are implemented; the `-sess` variants and `SHA-512-256` are refused at config compile rather than silently downgraded.
 
 ### forward_auth
 
@@ -4333,11 +4417,35 @@ origins:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `verify` | bool | false | When true, enforce signature verification on inbound requests to this origin. |
-| `algorithm` | string | required | Signature algorithm: `hmac_sha256` or `ed25519`. An unrecognized value rejects all requests to the origin rather than silently bypassing the gate. |
+| `algorithm` | string | required | Signature algorithm: `hmac_sha256`, `ed25519`, or `ecdsa_p256_sha256`. An unrecognized value rejects all requests to the origin rather than silently bypassing the gate. |
 | `key_id` | string | required | The `keyid` value the signer is expected to advertise in `Signature-Input`. |
-| `key` | string | required | Verification key material, or a reference to it. For `hmac_sha256`, the shared secret; for `ed25519`, the hex- or base64-encoded raw 32-byte public key. Accepts every reference form the [secrets guide](secrets.md#reference-forms) defines, resolved before the value is decoded, so a stored secret yields the same key bytes as that value written inline. A reference that no declared backend can resolve rejects every request to the origin rather than becoming the key. |
+| `key` | string | required | Verification key material, or a reference to it. For `hmac_sha256`, the shared secret; for `ed25519`, the hex- or base64-encoded raw 32-byte public key; for `ecdsa_p256_sha256`, the hex- or base64-encoded uncompressed SEC1 public point (65 bytes starting with `04`). Accepts every reference form the [secrets guide](secrets.md#reference-forms) defines, resolved before the value is decoded, so a stored secret yields the same key bytes as that value written inline. A reference that no declared backend can resolve rejects every request to the origin rather than becoming the key. |
 | `required_components` | list | `[]` | Canonical components every accepted signature must cover, e.g. `@method`, `@target-uri`, `content-digest`. A signature covering a strict subset is rejected. |
 | `clock_skew_seconds` | int | 30 | Tolerance applied to the signature's `created` / `expires` timestamps. |
+
+### Algorithms
+
+The `alg` parameter on the wire has to be present and has to name the configured algorithm. A signature that omits `alg` is rejected: without that rule, dropping the parameter would sidestep the pin and let a signature through whichever crypto path the verifier defaulted to.
+
+| Config value | RFC 9421 registry name | Key format |
+|---|---|---|
+| `hmac_sha256` | `hmac-sha256` | Shared secret. Hex or base64 if your keying flow encodes it, otherwise raw bytes. |
+| `ed25519` | `ed25519` | Raw 32-byte public key, hex or base64. |
+| `ecdsa_p256_sha256` | `ecdsa-p256-sha256` | Uncompressed SEC1 public point, 65 bytes starting with `04`, hex or base64. |
+
+Two shapes of P-256 key are refused at startup instead of failing every request later: a compressed point (33 bytes starting with `02` or `03`) and a DER or SPKI wrapper. Convert either to the uncompressed point first. The signature itself must be the fixed-width `r || s` form the registry specifies, 64 bytes; a DER-encoded signature is rejected and says so in the log.
+
+RSA-PSS-SHA512, RSA-v1_5-SHA256, and ECDSA-P384-SHA384 are not implemented. Signing outbound requests is Ed25519 and HMAC only.
+
+### Body coverage
+
+`content-digest` is an ordinary header reference as far as the signature base is concerned, so the cryptography binds the digest value and nothing else. When a signature covers `content-digest`, the proxy also buffers the request body, recomputes the digest, and rejects the request if the two disagree. Without that second step a valid signature would keep verifying over a body someone swapped underneath it.
+
+The body is only buffered for a request whose `Signature-Input` names `content-digest`. A signature over headers alone costs nothing extra, and neither does an origin that verifies no signatures at all.
+
+Buffering is bounded by the 64 KiB replay buffer, the same ceiling GraphQL request validation works under. A body over that limit is rejected with `401`, not `413`: the request is not too large to serve, it is too large to prove, and letting it through would defeat the coverage the signer asked for. Keep body-covering signatures to small request payloads, or cover headers only.
+
+`repr-digest` is not checked against the body. Cover `content-digest` when you want the body bound.
 
 ---
 

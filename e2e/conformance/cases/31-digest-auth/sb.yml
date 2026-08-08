@@ -1,4 +1,6 @@
-# Tests HTTP Digest authentication
+# Tests HTTP Digest authentication on the legacy MD5 algorithm.
+# `algorithm` defaults to SHA-256 (RFC 7616 §3.3 deprecates MD5), so this
+# case pins MD5 explicitly to keep exercising the compatibility path.
 # Users map stores HA1 hashes: MD5(username:realm:password)
 # testuser/testpass with realm "test-realm":
 #   echo -n "testuser:test-realm:testpass" | md5
@@ -14,5 +16,6 @@ origins:
     authentication:
       type: digest
       realm: "test-realm"
+      algorithm: MD5
       users:
         testuser: "a08a2d645fc2bc82dfd69fd8b9c41f79"

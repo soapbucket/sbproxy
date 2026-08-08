@@ -1,6 +1,6 @@
 # Running sbproxy on Kubernetes
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-08*
 
 The Kubernetes operator at `crates/sbproxy-k8s-operator/` reconciles two CustomResources into a running proxy: an `SBProxy` describes the deployment shape, and an `SBProxyConfig` carries the `sb.yml` document the proxy reads on startup. The operator owns a Deployment, Service, and ConfigMap per `SBProxy`. With `spec.clustering.enabled: true` the Deployment is replaced by a StatefulSet plus a headless Service and a shared-key Secret, and the replicas form a gossip mesh; see "Clustered proxies" below. Everything else on this page applies to both shapes.
 
@@ -12,6 +12,8 @@ reference for CRDs, hot reload, leader election, and local smoke testing.
 
 The Helm chart lives at `deploy/helm/sbproxy/`. It installs the CRDs, the operator Deployment, the ServiceAccount, and the RBAC the operator needs. By default that RBAC is a namespaced Role and RoleBinding, so the operator can only touch its own namespace.
 
+Read "The operator image is not published" below before the first install. The chart's default `image.repository` is not a path you can pull from today, so the command that follows leaves the operator pod in `ImagePullBackOff` until you point it at an image you built.
+
 ```bash
 helm install sbproxy ./deploy/helm/sbproxy \
   --namespace sbproxy-system \
@@ -22,11 +24,39 @@ Key values:
 
 | Value | Meaning |
 | --- | --- |
-| `image.repository`, `image.tag` | Operator image. Pin a tag when shipping. |
+| `image.repository`, `image.tag` | Operator image. `image.tag` defaults to the chart's `appVersion`. See "The operator image is not published" below. |
 | `rbac.scope` | `namespace` (default) grants a namespaced Role and watches only the operator's own namespace. `cluster` grants a ClusterRole and watches every namespace. |
 | `watchNamespace` | Cluster scope only: narrow the watch to one namespace while keeping the cluster-wide grant. Ignored under `rbac.scope: namespace`. |
 | `logLevel` | Maps to `--log-level` and `RUST_LOG`. Try `kube=debug,sbproxy_k8s_operator=debug` while validating. |
 | `installCrds` | Set to `false` if CRDs are managed out of band (e.g. argo or flux). |
+
+### The operator image is not published
+
+No release publishes an operator image. The release workflow builds and pushes the data plane, `ghcr.io/soapbucket/sbproxy` and `docker.io/soapbucket/sbproxy`, and nothing else. The chart's default `image.repository` of `ghcr.io/soapbucket/sbproxy-k8s-operator` names where an operator image would live if one shipped; pulling it today fails.
+
+So the install above cannot be completed against a stock chart. Building the image yourself is the path that works, and it is the same path the smoke test takes.
+
+`make k8s-operator-smoke` does the whole thing locally against kind: it builds the operator binary, wraps it in `sbproxy-operator:ci`, loads that image into a kind cluster, and installs this chart pointed at it. See [Local smoke test](#local-smoke-test) for what it asserts.
+
+For a cluster of your own, build the image, push it somewhere your nodes can reach, and point the chart at it:
+
+```bash
+# A registry your cluster nodes can pull from, and a tag you choose.
+export OPERATOR_REPO=registry.example.com/soapbucket/sbproxy-k8s-operator
+export OPERATOR_TAG=1.10.0
+
+cargo build --profile release-fast -p sbproxy-k8s-operator --locked
+docker build -t "$OPERATOR_REPO:$OPERATOR_TAG" \
+  -f crates/sbproxy-k8s-operator/Dockerfile.ci .
+docker push "$OPERATOR_REPO:$OPERATOR_TAG"
+
+helm install sbproxy ./deploy/helm/sbproxy \
+  --namespace sbproxy-system --create-namespace \
+  --set "image.repository=$OPERATOR_REPO" \
+  --set "image.tag=$OPERATOR_TAG"
+```
+
+Only the operator's own image is missing. The data plane image that the `SBProxy` resources below reference is published on every release and pulls normally.
 
 ### RBAC scope
 
@@ -65,7 +95,7 @@ metadata:
   name: demo
   namespace: default
 spec:
-  image: soapbucket/sbproxy:1.6.1
+  image: soapbucket/sbproxy:1.10.0
   configRef: demo-config
   replicas: 2
   port: 8080
@@ -94,7 +124,7 @@ metadata:
   name: demo
   namespace: default
 spec:
-  image: soapbucket/sbproxy:1.6.1
+  image: soapbucket/sbproxy:1.10.0
   configRef: demo-config
   replicas: 2
   port: 8080
@@ -152,7 +182,7 @@ metadata:
   name: demo
   namespace: default
 spec:
-  image: soapbucket/sbproxy:1.6.1
+  image: soapbucket/sbproxy:1.10.0
   configRef: demo-config
   replicas: 3
   port: 8080
