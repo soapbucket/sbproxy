@@ -130,15 +130,23 @@ ignore = [
   # rewrite.
   #
   # The real blocker is now a `libm` conflict, and we introduced it
-  # ourselves. Both in-range fixes pin libm exactly:
+  # ourselves. Every in-range fix pins libm exactly, one layer below
+  # tract-onnx itself:
   #
-  #   tract-onnx 0.21.16 / 0.21.17  ->  libm =0.2.11
-  #   wasmtime 46.0.2 (WOR-2105)    ->  libm ^0.2.16
+  #   tract-data 0.21.16 / 0.21.17  ->  libm =0.2.11   (0.21.10 has no
+  #                                                     libm dep at all)
+  #   cranelift-codegen 0.133.2     ->  libm ^0.2.16
+  #     <- wasmtime 46.0.2 (WOR-2105) <- sbproxy-extension
   #
-  # so cargo cannot resolve, failing with "failed to select a version for
+  # Both are 0.2.x, so cargo must unify them on a single version and no
+  # such version exists; it fails with "failed to select a version for
   # `libm`". Reproduce with:
   #
   #   cargo update -p tract-onnx --precise 0.21.17
+  #
+  # Re-verified against the crates.io index 2026-08-08. Note the pin sits
+  # on tract-data, not tract-onnx, so grepping tract-onnx's own manifest
+  # for libm finds nothing and reads as though the conflict were fixed.
   #
   # The advisory's other patched ranges (>= 0.22.2, >= 0.23.1) are outside
   # our `tract-onnx = "0.21"` caret pins in sbproxy-classifiers,
@@ -188,6 +196,55 @@ ignore = [
   # `NsReader` (memory-exhaustion DoS).
   "RUSTSEC-2026-0195",
 ]
+
+# --- Advisories this file structurally CANNOT gate -----------------------
+#
+# cargo-deny resolves `ignore` entries against the RustSec advisory database
+# and nothing else. GitHub's advisory database is a superset: it ingests
+# every RustSec advisory, and it also carries GitHub-reviewed Rust
+# advisories that were never assigned a RUSTSEC id. Those are invisible to
+# cargo-deny, and an `ignore` entry naming one would simply never match, so
+# they are recorded here as comments instead of list entries. Dependabot is
+# the only scanner in this repository that sees them; see SUPPLY-CHAIN.md
+# section 4.3.
+#
+# Both entries below were triaged on 2026-08-08. Re-check whether RustSec
+# has since assigned an id (`ls ~/.cargo/advisory-db/crates/<crate>`); if it
+# has, the finding becomes gateable and moves into the `ignore` list above
+# with the same rationale, or gets fixed.
+#
+# GHSA-h668-6x6g-f8r5 / CVE-2026-55832 (medium): tract-onnx arbitrary file
+# read via an unsanitized ONNX `external_data` `location` field, i.e. path
+# traversal at model-load time. Vulnerable < 0.21.17; we resolve 0.21.10.
+# Blocked by exactly the libm conflict documented under RUSTSEC-2026-0217
+# above (the fix is tract-onnx 0.21.17, which drags in tract-data's
+# `libm =0.2.11`), so the two tract advisories share one unblock condition.
+# Not reachable today. tract only ever opens artifacts an operator named:
+# `agent_detect.onnx_model_path` and the classifier `model_path` are local
+# filesystem paths from `sb.yml`, and the downloaded model is the
+# sha256-pinned `all-MiniLM-L6-v2` entry in
+# crates/sbproxy-classifiers/src/known_models.rs. The digest-verified path
+# is stronger still: `OnnxEmbedder::load_from_bytes_with_options` calls
+# tract's `model_for_read`, which has no model directory to resolve
+# external tensor files against and rejects such models during parsing
+# rather than reopening a path. An attacker who could substitute the .onnx
+# file already has write access to the operator's model directory.
+#
+# GHSA-w9wp-h8wv-79jx / CVE-2026-48504 (medium): opentelemetry_sdk unbounded
+# memory allocation in W3C Baggage propagation. Vulnerable <= 0.32.0; we
+# resolve 0.27.1, so we are in range. Not reachable: the vulnerable code is
+# the Baggage propagator, and sbproxy never installs it. The only
+# `global::set_text_map_propagator` call in the workspace is
+# crates/sbproxy-observe/src/telemetry.rs, which registers
+# `TraceContextPropagator` and nothing else; MCP's `baggage` `_meta` key
+# (sbproxy-extension/src/mcp/types.rs) is a reserved name the gateway
+# recognizes but never emits or parses. Not fixable as a lockfile bump
+# either: the patched 0.32.1 is five minor releases past our `0.27` pins,
+# and crates/sbproxy-observe/Cargo.toml pins opentelemetry,
+# opentelemetry_sdk, opentelemetry-otlp, and
+# opentelemetry-semantic-conventions together on 0.27 with
+# tracing-opentelemetry 0.28 bridging them. Moving the stack is a
+# deliberate breaking upgrade of all five, not a `cargo update`.
 
 # --- Licenses -----------------------------------------------------------------
 #

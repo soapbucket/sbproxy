@@ -323,6 +323,21 @@ else
   note_skip "supply chain (cargo-deny not on PATH; advisories, bans, licenses, and sources are unchecked locally). Install with 'cargo install cargo-deny --locked'."
 fi
 
+# CI: ci.yml supply-chain lane, second step. cargo-deny cannot see the
+# admin SPA's npm graph, so a high-severity advisory there used to pass
+# every gate in this file. `--package-lock-only` resolves the tree from
+# ui/package-lock.json without installing anything, so this runs before
+# the UI phase below and does not depend on node_modules existing.
+# `--audit-level=high` matches CI; see SUPPLY-CHAIN.md section 4.3 for
+# why the threshold sits there. Unconditional, because CI requires it and
+# the UI phase below already hard-fails when npm is missing.
+step "supply chain (npm audit, admin UI)"
+if ! command -v npm >/dev/null 2>&1; then
+  printf 'npm not found on PATH; install Node.js (https://nodejs.org) to run the npm audit gate. This step is required by CI, so it cannot be skipped here.\n' >&2
+  exit 1
+fi
+(cd ui && npm audit --package-lock-only --audit-level=high)
+
 # CI: ci.yml ui lane.
 step "ui typecheck and test"
 if ! command -v npm >/dev/null 2>&1; then

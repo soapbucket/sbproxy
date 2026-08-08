@@ -25,7 +25,8 @@ ten-minute build.
 | Installer | `sh scripts/tests/install_verify.sh` |
 | Format | `cargo fmt --all -- --check` |
 | Nested lockfiles | `bash scripts/check-nested-lockfiles.sh` |
-| Supply chain | `cargo deny --all-features check` |
+| Supply chain (crates) | `cargo deny --all-features check` |
+| Supply chain (npm) | `cd ui && npm audit --package-lock-only --audit-level=high` |
 | UI | `cd ui && npm ci && npm run typecheck && npm run test -- --run` |
 | Build | `cargo build --workspace --exclude sbproxy-e2e --locked` |
 | Test | `cargo nextest run --workspace --exclude sbproxy-e2e --locked --profile ci` |

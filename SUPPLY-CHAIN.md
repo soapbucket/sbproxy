@@ -1,6 +1,6 @@
 # SBproxy Supply Chain
 
-*Last modified: 2026-07-28*
+*Last modified: 2026-08-08*
 
 The long-form companion to `SECURITY.md`, intended for security teams, procurement reviewers, and anyone whose job is to answer the question "can we trust this binary?"
 
@@ -223,6 +223,8 @@ The Rust gateway depends on a vetted set of crates. The Cargo.lock file is commi
 
 There are **no Python or Node runtime dependencies** in the gateway hot path. The Lua and JavaScript scripting modules execute user-provided code in sandboxes; they do not pull external module ecosystems at runtime.
 
+The admin dashboard is the one npm surface, and it is a build-time input rather than a runtime one. `ui/` is a Vue and Vite single-page app with its own `package-lock.json`. It compiles to static assets that the `embed-admin-ui` cargo feature bakes into the release binary, so no Node process runs in production, but npm packages do contribute bytes to a shipped artifact. Section 4.3 covers how that lockfile gets scanned.
+
 ### 4.2 Update policy
 
 - **Patch and minor security updates** to direct dependencies are automated via Renovate (configured in `.github/renovate.json`), reviewed and merged by maintainers within 7 business days, and shipped in the next patch release.
@@ -233,9 +235,47 @@ There are **no Python or Node runtime dependencies** in the gateway hot path. Th
 ### 4.3 Vendor and audit posture
 
 - We do not vendor dependencies into the repo (no `vendor/` directory) because it obscures provenance. The SBOM and Cargo.lock are the canonical record.
-- We use `cargo-deny` (configured in `deny.toml`) in CI to enforce: license allowlist, advisory-database checks (RustSec), and source allowlist.
-- The advisory gate detects unmaintained crates across the whole graph (`unmaintained = "all"`), including transitive ones. Each unmaintained finding must be triaged in the `deny.toml` `[advisories] ignore` list with a named owner, the transitive path, and a revisit trigger; a new untriaged unmaintained crate fails the gate. The current entries (six transitive `unmaintained` advisories, all carrying upstream dependency owners) are documented inline in `deny.toml`; they are not vulnerabilities and `cargo audit` reports zero vulnerabilities.
 - We do not consume crates from non-`crates.io` sources without explicit reviewer approval.
+
+#### What is scanned, by ecosystem
+
+Two ecosystems ship in the release binary, so two scanners run. Both live in the `supply chain` job in `.github/workflows/ci.yml`, and that job is deliberately unconditional: it carries no path filter, so it re-evaluates the whole dependency surface on every pull request and every push to `main`. An advisory published against a dependency nobody touched still turns the next run red.
+
+| Ecosystem | Manifest | Scanner | Database | Fails the build on |
+|---|---|---|---|---|
+| Rust crates | root `Cargo.lock` | `cargo deny check --all-features`, configured by `deny.toml` | RustSec advisory database | any advisory at any severity, any unmaintained crate anywhere in the graph, any license outside the allowlist, any source outside the allowlist |
+| npm | `ui/package-lock.json` | `npm audit --package-lock-only` | GitHub advisory database | high and critical only |
+
+The npm step runs lockfile-only, with no `npm ci` and no `node_modules`. Because `npm ci` installs exactly what the lockfile pins, auditing the lockfile and auditing the installed tree are the same audit.
+
+#### Thresholds, and why they differ
+
+The Rust gate has no severity floor. Every RustSec advisory fails, including `unmaintained` findings that are not vulnerabilities at all, and including advisories against build-time proc macros. That bar is affordable because the crate graph is one we curate directly and the finding rate is low.
+
+The npm gate is set to `high`, meaning high and critical fail while moderate and below only print. The dashboard's lockfile is 112 development dependencies against 27 production ones, nearly all of it build tooling, and a tree shaped like that carries a steady background of moderate advisories in packages that never reach a browser. Gating on moderate would make the lane a recurring chore, and a gate that gets routed around is worth less than a narrower one that gets respected.
+
+The threshold raises the bar; it does not narrow the scope. The audit still covers the development tree, because a compromised bundler or test runner is a real path into a shipped artifact.
+
+#### Ignore policy
+
+There is no blanket suppression and no severity-based exemption. A finding either fails the build or is ignored by advisory ID with a written justification. Every entry in the `deny.toml` `[advisories] ignore` list carries four things:
+
+1. The advisory ID.
+2. The full transitive path, naming the direct dependency that pulls the crate in.
+3. Why it does not apply, which is either a reachability argument about our code or a statement that no patched version resolves against our graph, with the specific conflict named.
+4. The condition that removes the entry, usually an upstream release we are waiting on.
+
+Entries are deleted once `cargo-deny` reports that no crate matches the advisory criteria, which is how we find out an upstream fixed something. Three entries were removed that way in August 2026.
+
+#### Known coverage limits
+
+Three gaps, stated here rather than left for a reviewer to discover.
+
+**GitHub's advisory database is a superset of RustSec.** It ingests every RustSec advisory and also carries GitHub-reviewed Rust advisories that were never assigned a RUSTSEC ID. `cargo-deny` reads RustSec only, so those are structurally invisible to it, and an `ignore` entry naming an ID the database does not contain would match nothing. Advisories in that category are triaged as comments alongside the ignore list in `deny.toml`, with the same four elements required of a real entry. Dependabot is what surfaces them.
+
+**Lockfiles outside the root workspace are not gated.** The repository carries several: the benchmark harnesses under `sbproxy-bench/harness/`, the synthetic bench, and a test fixture. Each is its own cargo workspace, and `cargo deny check` at the repository root reads the root workspace only. That scaffolding is built by no release job and ships in no artifact, so it is deliberately out of scope for a merge-blocking gate. Dependabot still raises alerts against those files, which is why the open alert count runs higher than the number of distinct advisories behind it. `scripts/check-nested-lockfiles.sh` keeps them resolvable; it does not scan them.
+
+**Advisory drift on an idle repository is caught by Dependabot, not by CI.** CI evaluates on push and pull request. Dependabot scans the default branch continuously and is the earlier signal when no one is committing.
 
 ---
 
