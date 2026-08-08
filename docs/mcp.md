@@ -205,7 +205,7 @@ success.
 | `type` | string | `mcp` | `mcp` speaks MCP to the origin; `openapi` derives tools from a spec and dispatches `tools/call` as REST (see the OpenAPI section below). |
 | `spec` / `spec_path` | object / string | unset | Inline OpenAPI spec or a path to one, for a `type: openapi` server. Read at config load; a bad spec fails startup. |
 | `prefix` | string | derived from host | Namespace prefix applied to every tool from this upstream. Tools become `<prefix>.<tool>`. |
-| `rbac` | string | unset | Label referencing a key in `rbac_policies`. Validated at config-load time. Enforced on every `tools/call`. |
+| `rbac` | string | unset | Label referencing a key in `rbac_policies`. Required on every server once `rbac_policies` is non-empty. Validated at config-load time. Enforced on every `tools/call`. |
 | `timeout` | duration | unset | Caps each `tools/call` dispatch. Accepts `250ms`, `10s`, `2m`. |
 | `transport` | string | `streamable_http` | `streamable_http`, `sse`, or supervised local `stdio`. |
 | `command` / `args` | string / list | unset | Required command and optional arguments for `transport: stdio`. |
@@ -215,8 +215,13 @@ success.
 | `upstream_auth` | object | unset | Required when `run_as_user_auth` is true. See [mcp-gateway-guardrails.md](mcp-gateway-guardrails.md). |
 
 A `rbac` value that does not match a key in `rbac_policies` is a hard
-config error (see `McpAction::from_parsed` in
-`crates/sbproxy-modules/src/action/mcp.rs`).
+config error, and so is a server with no `rbac` label at all while
+`rbac_policies` is non-empty; the error names the unlabeled server's
+origin. Deliberate allow-all for one upstream is still expressible:
+bind it to a policy with `default_allow: true`. An action that
+declares no `rbac_policies` keeps the open behavior for every server.
+(See `McpAction::from_parsed` in
+`crates/sbproxy-modules/src/action/mcp.rs`.)
 
 ### `guardrails[]`
 
@@ -557,7 +562,7 @@ rebuilds the action and resets the counters.
 
 Source: `crates/sbproxy-extension/src/mcp/access_control.rs:ToolAccessPolicy`.
 
-### `openapi_convert` + `rest_to_mcp`: OpenAPI-backed servers
+### `openapi_convert`: OpenAPI-backed servers
 
 `openapi_to_mcp_tools(spec)` converts an OpenAPI 3.x spec into MCP
 tool definitions and `openapi_to_routes(spec)` derives the matching

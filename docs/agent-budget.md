@@ -1,5 +1,5 @@
 # agent_budget policy
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-08*
 
 ![70 rapid requests from a Cursor user agent: 200s until the per-agent budget trips and the rest return 429](assets/agent-budget.gif)
 
@@ -21,10 +21,10 @@ origins:
       - type: agent_budget
         # Token-bucket refill rate, per agent_id.
         requests_per_minute: 60
-        # Rolling LLM-token budget per agent_id. The token bucket
-        # exists in the policy API; consumption is wired in via the
-        # AI-usage tracker. Configuring without that wiring is a no-op
-        # on the token field today.
+        # Rolling hourly LLM-token budget per agent_id. Charged from
+        # the usage the provider reports on each completed response;
+        # a request over the accumulated cap is refused up front, the
+        # same way an exceeded requests_per_minute is.
         tokens_per_hour: 100000
         # Max simultaneous in-flight requests per agent_id. RAII guard
         # releases the slot when the request completes.
@@ -136,6 +136,37 @@ A request with no recognized agent resolves no `agent_id` at all, and
 `on_anonymous: shared` to collapse that traffic into one fallback bucket
 instead.
 
+## How the token budget is enforced
+
+A response's token count is only known after the response completes, so
+`tokens_per_hour` enforcement is two-phase:
+
+1. **Check up front.** Every admission compares the agent's accumulated
+   hourly counter against the cap, at the same point
+   `requests_per_minute` is checked. A request over the cap gets the
+   same treatment as an exceeded request budget: `429` under
+   `on_exceed: deny`, with the body reading
+   `agent budget exceeded: tokens per hour`, and the same
+   pass-through-with-metric behavior under `log` and `downgrade`.
+2. **Charge after the response.** When the AI gateway extracts the
+   provider's reported usage from a completed response, the prompt and
+   completion tokens are charged against the agent's counter. Streamed
+   responses charge at end of stream, where the usage frame the
+   provider sends in its final events is aggregated.
+
+Two consequences of that shape are worth knowing:
+
+* The request that crosses the cap is served. Its usage lands on the
+  counter, and the *next* request from that agent is refused. An hourly
+  budget can therefore overshoot by at most one response.
+* A response that reports no usage consumes zero. That covers upstream
+  error responses, providers that omit the `usage` block, and surfaces
+  that never report token counts at all (non-AI traffic through the
+  same origin, for example). The budget never invents an estimate.
+
+The hourly window is fixed, not sliding: the counter resets one hour
+after the first charge that opened the window.
+
 ## Observability
 
 * `sbproxy_policy_triggers_total{origin, policy_type="agent_budget", action="block"}` increments on `deny` denials.
@@ -146,10 +177,10 @@ instead.
 
 A standard rate-limit policy keyed on IP or API key cannot distinguish "Cursor making 200 background completions while the user types" from "an attacker fanning out 200 distinct concurrent prompts". Both look identical to an IP-keyed bucket. Keying on `agent_id` (the resolved agent identity, not the network address) lets the operator size the legitimate background traffic without hardening to it, and lets the abuse path get blocked cleanly because the attacker cannot produce a fresh `agent_id` per request without re-resolving against the agent registry.
 
-## Out of scope for slice 1
+## Out of scope
 
-* Cluster-shared budgets. Each proxy enforces its own local view; an attacker spreading across replicas sees N times the per-instance budget. A cluster-shared backend (Redis or shared KV) is the obvious follow-up; for now, treat the per-instance budget as the floor.
-* Upstream token accounting. `tokens_per_hour` is wired into the policy API but only consumed when the AI gateway calls `AgentBudgetPolicy::consume_tokens`. A follow-up wires that into `sbproxy-ai`'s usage tracker.
+* Cluster-shared budgets. Each proxy enforces its own local view of both the request and the token budgets; an attacker spreading across replicas sees N times the per-instance budget. A cluster-shared backend (Redis or shared KV) is the obvious follow-up; for now, treat the per-instance budget as the floor.
+* Token estimates. Responses that report no usage consume zero, as described above; the budget does not fall back to a request-side estimate.
 
 ## See also
 
