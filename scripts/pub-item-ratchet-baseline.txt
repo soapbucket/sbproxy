@@ -319,3 +319,8 @@
 # the first reserves a label value for a feature that does not exist, the
 # second is the response-direction frame walker for a bridge direction the
 # proxy does not run. Their verdicts moved from `escalated` to `keep`.
+
+# 2026-08-07 (WOR-2316): 288 -> 287. The RFC 8705 plumbing deleted the
+# test-only `check_auth_with_tls` wrapper and gave the thumbprint path a
+# production caller in `request_filter`, so one former tests-only pub
+# item no longer exists.

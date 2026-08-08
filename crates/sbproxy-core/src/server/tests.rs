@@ -1107,8 +1107,17 @@ async fn plugin_protocol_challenge_is_neutral_independent_of_request_shape() {
         };
         let auth = sbproxy_modules::Auth::Plugin(Box::new(provider));
 
-        let (result, _principal, trust_outcome) =
-            check_auth_with_outcome(&auth, &headers, query, "GET", "/", test_tenant(), None).await;
+        let (result, _principal, trust_outcome) = check_auth_with_tls_outcome(
+            &auth,
+            &headers,
+            query,
+            "GET",
+            "/",
+            test_tenant(),
+            None,
+            None,
+        )
+        .await;
         assert!(
             matches!(
                 result,
@@ -1170,8 +1179,17 @@ async fn plugin_explicit_invalid_proof_is_suspicious_independent_of_request_shap
         };
         let auth = sbproxy_modules::Auth::Plugin(Box::new(provider));
 
-        let (result, _principal, trust_outcome) =
-            check_auth_with_outcome(&auth, &headers, query, "GET", "/", test_tenant(), None).await;
+        let (result, _principal, trust_outcome) = check_auth_with_tls_outcome(
+            &auth,
+            &headers,
+            query,
+            "GET",
+            "/",
+            test_tenant(),
+            None,
+            None,
+        )
+        .await;
         assert!(
             matches!(
                 result,
@@ -1209,7 +1227,8 @@ async fn plugin_authenticate_error_denies_with_500() {
     let headers = http::HeaderMap::new();
 
     let (result, _principal, trust_outcome) =
-        check_auth_with_outcome(&auth, &headers, None, "GET", "/", test_tenant(), None).await;
+        check_auth_with_tls_outcome(&auth, &headers, None, "GET", "/", test_tenant(), None, None)
+            .await;
     match result {
         AuthResult::Deny(status, msg) => {
             assert_eq!(status, 500);
@@ -1240,7 +1259,8 @@ async fn plugin_header_denial_5xx_is_backend_failure() {
     let headers = http::HeaderMap::new();
 
     let (result, _principal, trust_outcome) =
-        check_auth_with_outcome(&auth, &headers, None, "GET", "/", test_tenant(), None).await;
+        check_auth_with_tls_outcome(&auth, &headers, None, "GET", "/", test_tenant(), None, None)
+            .await;
     assert!(matches!(
         result,
         AuthResult::DenyWithHeaders(
@@ -3680,8 +3700,8 @@ fn resolve_shutdown_grace_malformed_seconds_falls_through_to_default() {
 
 // --- WOR-1074: DPoP + mTLS-bound wire-up into check_auth ---
 //
-// These tests cover the wiring around `check_auth_with_tls` for
-// the four absence/mismatch paths the verifiers gate on. The
+// These tests cover the wiring around `check_auth_with_tls_outcome`
+// for the four absence/mismatch paths the verifiers gate on. The
 // verifiers themselves (`DpopVerifier`, `MtlsBoundVerifier`) have
 // their own positive-path coverage in `sbproxy-modules`; here we
 // confirm the production auth path:
@@ -3712,7 +3732,7 @@ async fn bearer_with_require_dpop_denies_when_proof_missing() {
     });
     let mut headers = http::HeaderMap::new();
     headers.insert(http::header::AUTHORIZATION, "Bearer tok-1".parse().unwrap());
-    let (result, _) = super::check_auth_with_tls(
+    let (result, _, _) = super::check_auth_with_tls_outcome(
         &auth,
         &headers,
         None,
@@ -3754,7 +3774,7 @@ async fn bearer_with_require_dpop_denies_when_metadata_missing() {
     // Even a DPoP header would not help without the jkt to bind
     // against; the wire-up rejects on the missing-metadata branch.
     headers.insert("DPoP", "any.proof.bytes".parse().unwrap());
-    let (result, _) = super::check_auth_with_tls(
+    let (result, _, _) = super::check_auth_with_tls_outcome(
         &auth,
         &headers,
         None,
@@ -3804,7 +3824,7 @@ async fn jwt_with_require_dpop_denies_when_cnf_jkt_missing() {
         http::header::AUTHORIZATION,
         format!("Bearer {token}").parse().unwrap(),
     );
-    let (result, _) = super::check_auth_with_tls(
+    let (result, _, _) = super::check_auth_with_tls_outcome(
         &auth,
         &headers,
         None,
@@ -3853,7 +3873,7 @@ async fn jwt_with_require_mtls_bound_denies_when_thumbprint_mismatches() {
         http::header::AUTHORIZATION,
         format!("Bearer {token}").parse().unwrap(),
     );
-    let (result, _) = super::check_auth_with_tls(
+    let (result, _, _) = super::check_auth_with_tls_outcome(
         &auth,
         &headers,
         None,
@@ -3933,7 +3953,7 @@ async fn bearer_dpop_replayed_proof_denied_across_requests() {
     headers.insert("DPoP", proof.parse().unwrap());
 
     // First request: the proof is fresh, so the DPoP step passes.
-    let (first, _) = super::check_auth_with_tls(
+    let (first, _, _) = super::check_auth_with_tls_outcome(
         &auth,
         &headers,
         None,
@@ -3951,7 +3971,7 @@ async fn bearer_dpop_replayed_proof_denied_across_requests() {
 
     // Second request: identical proof bytes. The persistent replay
     // cache must reject it.
-    let (second, _) = super::check_auth_with_tls(
+    let (second, _, _) = super::check_auth_with_tls_outcome(
         &auth,
         &headers,
         None,
@@ -4000,9 +4020,9 @@ async fn jwt_with_require_mtls_bound_denies_when_cnf_absent() {
         http::header::AUTHORIZATION,
         format!("Bearer {token}").parse().unwrap(),
     );
-    // Production passes None today; a no-cnf token must be denied
-    // regardless of the presented thumbprint.
-    let (result, _) = super::check_auth_with_tls(
+    // A no-cnf token must be denied regardless of the presented
+    // thumbprint, so `None` is the interesting case here.
+    let (result, _, _) = super::check_auth_with_tls_outcome(
         &auth,
         &headers,
         None,
@@ -4020,6 +4040,171 @@ async fn jwt_with_require_mtls_bound_denies_when_cnf_absent() {
         ),
         other => panic!("expected 401 deny for a no-cnf token, got {other:?}"),
     }
+}
+
+// --- WOR-2316: RFC 8705 production plumbing (session digest -> verifier) ---
+//
+// Before this fix the request phase called a shim that hardcoded
+// `tls_cert_thumbprint = None`, so `require_mtls_bound = true`
+// rejected every request even when the handshake had verified the
+// matching client cert. These tests run the production pieces end to
+// end: the same `client_cert_x5t_s256` conversion the request phase
+// applies to Pingora's `SslDigest`, feeding the same
+// `check_auth_with_tls_outcome` entry the request phase calls.
+
+/// Pingora surfaces the verified client cert as the raw SHA-256 of
+/// its DER; build an `SslDigest` carrying those bytes the way a
+/// completed mTLS handshake would.
+fn ssl_digest_with_cert(cert_digest: Vec<u8>) -> pingora_core::protocols::tls::SslDigest {
+    pingora_core::protocols::tls::SslDigest::new(
+        "TLS_AES_256_GCM_SHA384",
+        "TLSv1.3",
+        None,
+        None,
+        cert_digest,
+    )
+}
+
+/// Mint an HS256 JWT (signed with `dev-secret`) whose `cnf.x5t#S256`
+/// claim binds it to `thumbprint`.
+fn mint_mtls_bound_jwt(thumbprint: &str) -> String {
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    let claims = serde_json::json!({
+        "sub": "alice",
+        "iat": 0,
+        "exp": 9_999_999_999_u64,
+        "cnf": { "x5t#S256": thumbprint },
+    });
+    encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(b"dev-secret"),
+    )
+    .unwrap()
+}
+
+fn mtls_bound_jwt_auth() -> super::Auth {
+    super::Auth::Jwt(sbproxy_modules::auth::JwtAuth {
+        secret: Some("dev-secret".to_string()),
+        require_mtls_bound: true,
+        ..Default::default()
+    })
+}
+
+#[tokio::test]
+async fn jwt_require_mtls_bound_allows_when_session_cert_matches() {
+    // 32 bytes standing in for the SHA-256 Pingora computed over the
+    // client cert DER at handshake time.
+    let digest = ssl_digest_with_cert((0u8..32).collect());
+    let thumbprint = super::request_phase::client_cert_x5t_s256(Some(&digest))
+        .expect("a non-empty cert digest yields a thumbprint");
+    // RFC 8705 section 3: `x5t#S256` is the base64url-no-pad SHA-256
+    // of the DER. Pin the exact encoding so a drive-by switch to hex
+    // or padded base64 fails here instead of 401-ing live traffic.
+    assert_eq!(thumbprint, "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8");
+
+    let auth = mtls_bound_jwt_auth();
+    let token = mint_mtls_bound_jwt(&thumbprint);
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::AUTHORIZATION,
+        format!("Bearer {token}").parse().unwrap(),
+    );
+    let (result, principal, outcome) = super::check_auth_with_tls_outcome(
+        &auth,
+        &headers,
+        None,
+        "POST",
+        "/api/foo",
+        test_tenant(),
+        Some(thumbprint.as_str()),
+        None,
+    )
+    .await;
+    assert!(
+        matches!(result, super::AuthResult::Allow { .. }),
+        "matching cert thumbprint should authenticate, got {result:?}"
+    );
+    assert!(principal.is_some(), "allow must carry a principal");
+    assert_eq!(outcome, AuthTrustOutcome::Allowed);
+}
+
+#[tokio::test]
+async fn jwt_require_mtls_bound_denies_when_session_has_no_client_cert() {
+    // Both no-cert shapes the request phase can see: a plaintext
+    // connection has no TLS digest at all; a TLS handshake without a
+    // client cert yields a digest with an empty `cert_digest`.
+    assert!(super::request_phase::client_cert_x5t_s256(None).is_none());
+    let no_cert = ssl_digest_with_cert(Vec::new());
+    assert!(super::request_phase::client_cert_x5t_s256(Some(&no_cert)).is_none());
+
+    let auth = mtls_bound_jwt_auth();
+    // The token itself is well-formed and bound to a real thumbprint;
+    // only the connection-side half of the binding is missing.
+    let token = mint_mtls_bound_jwt("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8");
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::AUTHORIZATION,
+        format!("Bearer {token}").parse().unwrap(),
+    );
+    let (result, _, outcome) = super::check_auth_with_tls_outcome(
+        &auth,
+        &headers,
+        None,
+        "POST",
+        "/api/foo",
+        test_tenant(),
+        None,
+        None,
+    )
+    .await;
+    match result {
+        super::AuthResult::Deny(401, msg) => assert!(
+            msg.contains("no client cert"),
+            "deny reason should say no client cert was presented, got: {msg}"
+        ),
+        other => panic!("expected 401 deny without a client cert, got {other:?}"),
+    }
+    assert_eq!(outcome, AuthTrustOutcome::Missing);
+}
+
+#[tokio::test]
+async fn jwt_require_mtls_bound_denies_when_session_cert_mismatches() {
+    // The handshake saw one cert; the token is bound to another.
+    let presented_digest = ssl_digest_with_cert((0u8..32).collect());
+    let presented = super::request_phase::client_cert_x5t_s256(Some(&presented_digest))
+        .expect("a non-empty cert digest yields a thumbprint");
+    let bound_digest = ssl_digest_with_cert((1u8..33).collect());
+    let bound = super::request_phase::client_cert_x5t_s256(Some(&bound_digest))
+        .expect("a non-empty cert digest yields a thumbprint");
+    assert_ne!(presented, bound);
+
+    let auth = mtls_bound_jwt_auth();
+    let token = mint_mtls_bound_jwt(&bound);
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::AUTHORIZATION,
+        format!("Bearer {token}").parse().unwrap(),
+    );
+    let (result, _, outcome) = super::check_auth_with_tls_outcome(
+        &auth,
+        &headers,
+        None,
+        "POST",
+        "/api/foo",
+        test_tenant(),
+        Some(presented.as_str()),
+        None,
+    )
+    .await;
+    match result {
+        super::AuthResult::Deny(401, msg) => assert!(
+            msg.contains("mismatch"),
+            "deny reason should mention the thumbprint mismatch, got: {msg}"
+        ),
+        other => panic!("expected 401 deny on a mismatched cert, got {other:?}"),
+    }
+    assert_eq!(outcome, AuthTrustOutcome::InvalidProof);
 }
 
 // --- WOR-1702: shared Lua engine is cached and still isolates state ---

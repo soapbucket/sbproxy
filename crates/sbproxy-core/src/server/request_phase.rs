@@ -2718,13 +2718,25 @@ pub(super) async fn request_filter(
                 crate::agent_class::cap_binding_agent_id(ctx).map(|s| s.to_string());
             #[cfg(not(feature = "agent-class"))]
             let resolved_agent_id: Option<String> = None;
-            let (auth_result, principal_opt, trust_outcome) = check_auth_with_outcome(
+            // WOR-2316: RFC 8705 mutual-TLS binding. Derive the
+            // `x5t#S256` thumbprint of the verified inbound client
+            // cert from the session's TLS digest so a provider with
+            // `require_mtls_bound = true` compares the token's
+            // `cnf.x5t#S256` claim against the cert the handshake
+            // actually saw. Stays `None` on plaintext connections and
+            // when the peer presented no client cert; the verifier
+            // fails closed on `None` for a bound token. Owned so no
+            // extra `session` borrow is held across the await.
+            let tls_cert_thumbprint: Option<String> =
+                client_cert_x5t_s256(session.digest().and_then(|d| d.ssl_digest.as_deref()));
+            let (auth_result, principal_opt, trust_outcome) = check_auth_with_tls_outcome(
                 auth,
                 req_headers,
                 query,
                 method,
                 path,
                 tenant_id,
+                tls_cert_thumbprint.as_deref(),
                 resolved_agent_id.as_deref(),
             )
             .await;
@@ -4435,6 +4447,27 @@ fn introspect_client_ip(session: &pingora_proxy::Session) -> Option<std::net::Ip
         .client_addr()
         .and_then(|a| a.as_inet())
         .map(|s| s.ip())
+}
+
+/// RFC 8705 §3: derive the `x5t#S256` confirmation-method value for
+/// the inbound TLS client certificate, the base64url-no-pad encoded
+/// SHA-256 of the end-entity DER. Pingora's `SslDigest.cert_digest`
+/// already holds that SHA-256 (the same bytes keying the mTLS
+/// cert-info cache in `sbproxy_tls::mtls`), so the only conversion at
+/// this boundary is the base64url encoding the `cnf.x5t#S256`
+/// comparison in the mTLS-bound verifier expects. Returns `None` when
+/// the connection carries no TLS digest (plaintext listener) and when
+/// the digest has an empty `cert_digest` (a TLS handshake where the
+/// peer presented no client cert, e.g. optional mTLS).
+pub(super) fn client_cert_x5t_s256(
+    ssl_digest: Option<&pingora_core::protocols::tls::SslDigest>,
+) -> Option<String> {
+    let digest = ssl_digest?;
+    if digest.cert_digest.is_empty() {
+        return None;
+    }
+    use base64::Engine;
+    Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest.cert_digest))
 }
 
 /// Single-pass handler for `POST /.well-known/olp/introspect` (RFC
