@@ -174,10 +174,11 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "origins.*.compression.min_size",
         "sbproxy_config::compiler::compile_origin",
     ),
-    config_only(
+    // Promoted from config_only when the per-origin `timeouts` block landed:
+    // the legacy idle spelling now feeds the resolved upstream idle deadline.
+    stable(
         "origins.*.connection_pool.idle_timeout_secs",
-        "Pingora owns upstream connection pooling; these per-origin limits are not applied by \
-         the OSS runtime. Classified under WOR-1976.",
+        "sbproxy_config::compiler::resolve_upstream_timeouts",
     ),
     config_only(
         "origins.*.connection_pool.max_connections",

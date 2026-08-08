@@ -7371,6 +7371,7 @@ origins:
                 olp: None,
                 web_bot_auth_publish: None,
                 idempotency: None,
+                timeouts: sbproxy_config::UpstreamTimeouts::default(),
                 bot_detection: None,
                 threat_protection: None,
                 on_request: Vec::new(),

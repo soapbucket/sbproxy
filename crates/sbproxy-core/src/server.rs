@@ -2405,42 +2405,14 @@ async fn check_auth(
     // `None` when no resolver ran.
     resolved_agent_id: Option<&str>,
 ) -> (AuthResult, Option<sbproxy_plugin::Principal>) {
-    // WOR-1074: Stage 2 calls `check_auth_with_tls` with the
-    // resolved TLS-cert thumbprint from `sbproxy_tls::mtls::ClientCertInfo`.
-    // Existing callers that have not yet been plumbed pass `None`
-    // here, which keeps the legacy behaviour: any auth provider
-    // configured with `require_mtls_bound = true` rejects when no
-    // thumbprint is available (the verifier treats `None` as
-    // "no TLS binding"). The DPoP wire-up does not need a
-    // thumbprint and works through the `None` path unchanged.
-    let (result, principal, _) = check_auth_with_outcome(
-        auth,
-        headers,
-        query,
-        method,
-        path,
-        tenant_id,
-        resolved_agent_id,
-    )
-    .await;
-    (result, principal)
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn check_auth_with_outcome(
-    auth: &Auth,
-    headers: &http::HeaderMap,
-    query: Option<&str>,
-    method: &str,
-    path: &str,
-    tenant_id: sbproxy_plugin::TenantId,
-    resolved_agent_id: Option<&str>,
-) -> (
-    AuthResult,
-    Option<sbproxy_plugin::Principal>,
-    AuthTrustOutcome,
-) {
-    check_auth_with_tls_outcome(
+    // Test convenience over `check_auth_with_tls_outcome` for cases
+    // that need neither the trust outcome nor a TLS-cert thumbprint.
+    // `None` here means "no client cert presented", so a provider
+    // configured with `require_mtls_bound = true` rejects (the
+    // verifier treats `None` as "no TLS binding"). The production
+    // caller in `request_phase` passes the session-derived
+    // thumbprint instead.
+    let (result, principal, _) = check_auth_with_tls_outcome(
         auth,
         headers,
         query,
@@ -2450,7 +2422,8 @@ async fn check_auth_with_outcome(
         None,
         resolved_agent_id,
     )
-    .await
+    .await;
+    (result, principal)
 }
 
 /// WOR-1074: build the `htu` claim value the DPoP verifier
@@ -2469,41 +2442,17 @@ fn format_htu(headers: &http::HeaderMap, path: &str) -> String {
     format!("https://{host}{path}")
 }
 
-/// WOR-1074: extended `check_auth` that threads the inbound TLS
-/// client cert's SHA-256 thumbprint through to the
-/// [`MtlsBoundVerifier`](sbproxy_modules::auth::mtls_bound::MtlsBoundVerifier) when a Bearer / JWT provider has
-/// `require_mtls_bound = true` set. Production callers eventually
-/// pass `tls_cert_thumbprint = Some(<base64url-no-pad SHA-256>)`;
-/// today the request-phase shim passes `None` so a misconfigured
-/// `require_mtls_bound = true` deployment fails closed (every
-/// request rejected) instead of silently allowing.
-#[allow(clippy::too_many_arguments)]
-#[cfg(test)]
-async fn check_auth_with_tls(
-    auth: &Auth,
-    headers: &http::HeaderMap,
-    query: Option<&str>,
-    method: &str,
-    path: &str,
-    tenant_id: sbproxy_plugin::TenantId,
-    tls_cert_thumbprint: Option<&str>,
-    // WOR-1149: resolved agent id for CAP `sub` binding (see `check_auth`).
-    resolved_agent_id: Option<&str>,
-) -> (AuthResult, Option<sbproxy_plugin::Principal>) {
-    let (result, principal, _) = check_auth_with_tls_outcome(
-        auth,
-        headers,
-        query,
-        method,
-        path,
-        tenant_id,
-        tls_cert_thumbprint,
-        resolved_agent_id,
-    )
-    .await;
-    (result, principal)
-}
-
+/// WOR-1074 + WOR-2316: the auth entry point for the request phase.
+/// Threads the inbound TLS client cert's thumbprint through to the
+/// [`MtlsBoundVerifier`](sbproxy_modules::auth::mtls_bound::MtlsBoundVerifier)
+/// when a JWT provider has `require_mtls_bound = true` set.
+///
+/// `tls_cert_thumbprint` is the base64url-no-pad SHA-256 of the
+/// end-entity DER (RFC 8705 `cnf.x5t#S256`); the production caller in
+/// `request_phase` derives it from the session's TLS digest via
+/// `client_cert_x5t_s256`. `None` means the connection presented no
+/// client cert, so a bound token is rejected (fail closed) while
+/// providers without `require_mtls_bound` are unaffected.
 #[allow(clippy::too_many_arguments)]
 async fn check_auth_with_tls_outcome(
     auth: &Auth,
