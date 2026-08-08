@@ -218,6 +218,114 @@ pub struct MetricCapability {
     pub dead_reason: Option<&'static str>,
 }
 
+/// The production site that opens a span.
+///
+/// The span analogue of [`Writer`], and it needs one more state than the
+/// metric side does. A metric is declared by the same call that registers
+/// it, so "declared" and "registered" are one thing. A span is not: a
+/// constructor can exist, compile, name a real span, and have no caller,
+/// which is a third state between live and absent. `docs/observability.md`
+/// published eight span names that no constructor exists for, while three
+/// constructors that do exist have never been called from production, so
+/// both of those states were live on `main` at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpanEmitter {
+    /// A constructor function that returns the span, with at least one
+    /// production caller. The scanner requires the symbol to be defined in
+    /// a crate and called at least once outside test-gated regions, which
+    /// is [`Writer::Recorder`]'s rule applied to a `tracing::Span`.
+    Constructor(&'static str),
+    /// The span is opened inline by a `tracing::*_span!` macro that carries
+    /// the name as a string literal, inside the named production function.
+    ///
+    /// The scanner requires both that the name appears in a span-macro
+    /// position outside test-gated regions, and that `site` is a function
+    /// defined somewhere in the workspace. Use this only where no
+    /// constructor wraps the macro; where one does, name it with
+    /// [`SpanEmitter::Constructor`] instead, because the constructor's own
+    /// body would otherwise satisfy the literal check on its own.
+    Literal {
+        /// The production function whose body opens the span.
+        site: &'static str,
+    },
+    /// A constructor exists and nothing in production calls it.
+    ///
+    /// Requires `SpanCapability::dead_reason` and forces
+    /// [`SupportLevel::ConfigOnly`]. The scanner checks this one in both
+    /// directions: the symbol has to still exist, and it has to still have
+    /// no caller, so wiring one up fails the guard until the entry is
+    /// promoted to [`SpanEmitter::Constructor`].
+    Unwired(&'static str),
+    /// Nothing anywhere opens this span. It exists in documentation only.
+    ///
+    /// Requires `SpanCapability::dead_reason` and forces
+    /// [`SupportLevel::ConfigOnly`]. The scanner requires the name to be
+    /// absent from every span-macro position in production source, so the
+    /// entry cannot survive the span being implemented.
+    Nothing,
+}
+
+impl SpanEmitter {
+    /// Whether production code opens this span today.
+    pub const fn is_live(self) -> bool {
+        matches!(self, Self::Constructor(_) | Self::Literal { .. })
+    }
+}
+
+/// One span name, and what we are willing to promise about it.
+///
+/// Modeled on [`MetricCapability`], including the two orthogonal axes.
+/// [`SupportLevel`] says whether anything emits the span;
+/// [`CompatTier`] says what we promise about the *name* if something does.
+/// Both transfer intact, because a span name is consumed exactly the way a
+/// metric name is: dashboards group by it, trace queries filter on it, and
+/// renaming one breaks every saved view that mentions it. So the same rule
+/// holds, for the same reason: a name cannot be [`CompatTier::Stable`]
+/// without being [`SupportLevel::Stable`], because a naming guarantee on a
+/// span nobody emits is a guarantee about nothing.
+///
+/// The label set is the one field that does not carry over. A metric's
+/// labels are positional and bounded, and a query that selects on a label
+/// the metric lacks silently matches everything, which is why
+/// `MetricCapability::labels` has to be exhaustive. Span attributes are
+/// neither positional nor bounded, they are already pinned for the AI
+/// spans by the semconv conformance test in
+/// `crates/sbproxy-ai/src/tracing_spans.rs`, and an attribute a span lacks
+/// simply does not render. Listing them here would be a second,
+/// weaker copy of a check that already exists.
+#[derive(Debug, Clone, Copy)]
+pub struct SpanCapability {
+    /// The span name as a trace backend sees it, for example
+    /// `sbproxy.rail.reconcile` or `ai.request`.
+    pub name: &'static str,
+    /// The pillar slug for a `sbproxy.<pillar>.<verb>` name, otherwise
+    /// `None`.
+    ///
+    /// Spans that follow a foreign convention (the OpenTelemetry GenAI
+    /// vocabulary, for one) are not pillar-shaped and say so rather than
+    /// being forced into a pillar they do not belong to.
+    pub pillar: Option<&'static str>,
+    /// The verb half of a `sbproxy.<pillar>.<verb>` name. Set exactly when
+    /// `pillar` is.
+    pub verb: Option<&'static str>,
+    /// What opens it. See [`SpanEmitter`].
+    pub emitter: SpanEmitter,
+    /// Whether anything emits it. See [`SupportLevel`].
+    pub support: SupportLevel,
+    /// What we promise about the name. See [`CompatTier`].
+    pub compat: CompatTier,
+    /// Operator-facing description, rendered into the published vocabulary.
+    pub description: &'static str,
+    /// Why the span is not emitted, and the ticket that resolves it.
+    ///
+    /// Required for [`SpanEmitter::Unwired`] and [`SpanEmitter::Nothing`],
+    /// forbidden otherwise, and it has to name a ticket. A published span
+    /// name that nothing emits is the defect this registry exists to catch,
+    /// so "known dead" has to stay a deliberate, tracked choice rather than
+    /// decaying back into "nobody noticed".
+    pub dead_reason: Option<&'static str>,
+}
+
 /// One configuration key, and whether setting it does anything.
 #[derive(Debug, Clone, Copy)]
 pub struct ConfigKeyCapability {
@@ -386,6 +494,168 @@ pub fn validate_metrics(metrics: &[MetricCapability]) -> Vec<RegistryError> {
     }
 
     errors
+}
+
+/// Enforce the span-table invariants that do not require a source scan.
+///
+/// The scan-dependent half (a live span owes a real, non-test emission
+/// site, and a dead one owes the absence of it) lives in
+/// [`scan::verify_span_emitters`], because it needs the source tree.
+///
+/// `pillars` is the canonical pillar vocabulary, which this crate cannot
+/// know: it is a leaf, and the pillar enum lives with the tracing helpers
+/// that build span names from it. Passing it in is what lets the shape rule
+/// run in both directions. A `sbproxy.<pillar>.<verb>` name has to declare
+/// the parts it is built from, and a declared pillar has to be a real one,
+/// so neither a new pillar span that slips in unclassified nor a typo in a
+/// pillar slug survives.
+pub fn validate_spans(spans: &[SpanCapability], pillars: &[&str]) -> Vec<RegistryError> {
+    let mut errors = Vec::new();
+    let mut seen: Vec<&str> = Vec::new();
+
+    for span in spans {
+        let subject = span.name.to_string();
+
+        if seen.contains(&span.name) {
+            errors.push(RegistryError {
+                subject: subject.clone(),
+                message: "declared twice in the span registry".to_string(),
+            });
+        }
+        seen.push(span.name);
+
+        match (span.emitter.is_live(), span.dead_reason) {
+            (false, None) => errors.push(RegistryError {
+                subject: subject.clone(),
+                message: "nothing emits this span, so it needs a dead_reason \
+                          naming the ticket that emits or deletes it"
+                    .to_string(),
+            }),
+            (false, Some(_)) if span.support != SupportLevel::ConfigOnly => {
+                errors.push(RegistryError {
+                    subject: subject.clone(),
+                    message: format!(
+                        "nothing emits this span, so it is config_only, not {}",
+                        span.support.as_str()
+                    ),
+                });
+            }
+            (true, Some(_)) => errors.push(RegistryError {
+                subject: subject.clone(),
+                message: "has an emitter, so it must not carry a dead_reason".to_string(),
+            }),
+            _ => {}
+        }
+
+        // A dead_reason with no ticket is a shrug. The metric registry
+        // learned this on its reference allow-list: an escape hatch that
+        // does not name the thing that closes it never gets closed.
+        if let Some(reason) = span.dead_reason {
+            if !reason.contains("WOR-") {
+                errors.push(RegistryError {
+                    subject: subject.clone(),
+                    message: format!(
+                        "has a dead_reason that names no ticket: '{reason}'. Name the \
+                         one that emits or deletes the span"
+                    ),
+                });
+            }
+        }
+
+        if span.support == SupportLevel::ConfigOnly && span.emitter.is_live() {
+            errors.push(RegistryError {
+                subject: subject.clone(),
+                message: "is config_only but names a live emitter; either promote it, \
+                          or move the emitter to Unwired or Nothing"
+                    .to_string(),
+            });
+        }
+
+        // The rule that stops a span nothing emits being published as a
+        // naming guarantee. docs/observability.md shipped eight of these.
+        if span.compat == CompatTier::Stable && span.support != SupportLevel::Stable {
+            errors.push(RegistryError {
+                subject: subject.clone(),
+                message: format!(
+                    "cannot promise a stable name for a {} span; a naming guarantee \
+                     on a span nothing emits is a guarantee about nothing",
+                    span.support.as_str()
+                ),
+            });
+        }
+
+        errors.extend(validate_span_name_shape(span, pillars));
+    }
+
+    errors
+}
+
+/// Check that a pillar-shaped entry's name really is `sbproxy.<pillar>.<verb>`.
+///
+/// Split out so the shape rule reads as one thing. The halves have to agree
+/// in both directions: a name is pillar-shaped exactly when the entry
+/// declares a real pillar and a verb, so a pillar span whose parts drifted
+/// from its name, a typo in a pillar slug, and a new pillar span that
+/// nobody classified all fail here.
+///
+/// The reverse direction is keyed on `pillars` rather than on the name's
+/// dot count, because a dot count cannot tell `sbproxy.rail.settle` from
+/// `sbproxy.ai.usage_sink`. The first is a pillar span. The second is an AI
+/// span that happens to be three segments long, and demanding a pillar for
+/// it would mean inventing one.
+fn validate_span_name_shape(span: &SpanCapability, pillars: &[&str]) -> Vec<RegistryError> {
+    let subject = span.name.to_string();
+    match (span.pillar, span.verb) {
+        (Some(pillar), Some(verb)) => {
+            let mut errors = Vec::new();
+            if !pillars.contains(&pillar) {
+                errors.push(RegistryError {
+                    subject: subject.clone(),
+                    message: format!(
+                        "declares pillar '{pillar}', which is not one of the canonical \
+                         pillars {pillars:?}"
+                    ),
+                });
+            }
+            let expected = format!("sbproxy.{pillar}.{verb}");
+            if span.name != expected {
+                errors.push(RegistryError {
+                    subject,
+                    message: format!(
+                        "declares pillar '{pillar}' and verb '{verb}', which spell \
+                         '{expected}', not its own name"
+                    ),
+                });
+            }
+            errors
+        }
+        (None, None) => {
+            let pillar_shaped = span
+                .name
+                .strip_prefix("sbproxy.")
+                .and_then(|rest| rest.split_once('.'))
+                .is_some_and(|(pillar, verb)| {
+                    pillars.contains(&pillar) && !verb.is_empty() && !verb.contains('.')
+                });
+            if pillar_shaped {
+                vec![RegistryError {
+                    subject,
+                    message: "is spelled like sbproxy.<pillar>.<verb> but declares no \
+                              pillar or verb; fill both in so the shape rule and the \
+                              published table see it as a pillar span"
+                        .to_string(),
+                }]
+            } else {
+                Vec::new()
+            }
+        }
+        _ => vec![RegistryError {
+            subject,
+            message: "sets exactly one of pillar and verb; a span name is built from \
+                      both or from neither"
+                .to_string(),
+        }],
+    }
 }
 
 /// Enforce the config-key invariants.
@@ -574,6 +844,151 @@ mod tests {
     #[test]
     fn a_live_stable_metric_validates() {
         assert_eq!(validate_metrics(&[metric("sbproxy_live_total")]), vec![]);
+    }
+
+    const PILLARS: &[&str] = &[
+        "intake",
+        "policy",
+        "action",
+        "transform",
+        "ledger",
+        "rail",
+        "audit",
+        "notify",
+    ];
+
+    fn span(name: &'static str) -> SpanCapability {
+        SpanCapability {
+            name,
+            pillar: None,
+            verb: None,
+            emitter: SpanEmitter::Constructor("thing_span"),
+            support: SupportLevel::Stable,
+            compat: CompatTier::Beta,
+            description: "A thing.",
+            dead_reason: None,
+        }
+    }
+
+    #[test]
+    fn a_span_nothing_emits_cannot_promise_a_stable_name() {
+        let dead = SpanCapability {
+            pillar: Some("intake"),
+            verb: Some("accept"),
+            emitter: SpanEmitter::Nothing,
+            support: SupportLevel::ConfigOnly,
+            compat: CompatTier::Stable,
+            dead_reason: Some("published but emitted by nothing (WOR-2318)"),
+            ..span("sbproxy.intake.accept")
+        };
+
+        let errors = validate_spans(&[dead], PILLARS);
+
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("cannot promise a stable name")),
+            "eight of these shipped in docs/observability.md: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_span_nothing_emits_must_name_the_ticket_that_resolves_it() {
+        let dead = SpanCapability {
+            emitter: SpanEmitter::Nothing,
+            support: SupportLevel::ConfigOnly,
+            dead_reason: None,
+            ..span("ai.unwired")
+        };
+
+        let errors = validate_spans(&[dead], PILLARS);
+
+        assert!(
+            errors.iter().any(|e| e.message.contains("dead_reason")),
+            "known-dead must be a deliberate, ticketed choice: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_dead_reason_without_a_ticket_is_rejected() {
+        let dead = SpanCapability {
+            emitter: SpanEmitter::Unwired("streaming_span"),
+            support: SupportLevel::ConfigOnly,
+            dead_reason: Some("nobody calls it"),
+            ..span("ai.streaming")
+        };
+
+        let errors = validate_spans(&[dead], PILLARS);
+
+        assert!(
+            errors.iter().any(|e| e.message.contains("names no ticket")),
+            "an untracked admission never gets closed: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_pillar_span_whose_parts_do_not_spell_its_name_is_rejected() {
+        let mismatched = SpanCapability {
+            pillar: Some("rail"),
+            verb: Some("settle"),
+            ..span("sbproxy.rail.reconcile")
+        };
+
+        let errors = validate_spans(&[mismatched], PILLARS);
+
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("sbproxy.rail.settle")),
+            "the name and its parts have to agree: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_pillar_slug_that_is_not_a_pillar_is_rejected() {
+        let invented = SpanCapability {
+            pillar: Some("ai"),
+            verb: Some("usage_sink"),
+            ..span("sbproxy.ai.usage_sink")
+        };
+
+        let errors = validate_spans(&[invented], PILLARS);
+
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("not one of the canonical pillars")),
+            "an invented pillar would put a span under a filter value nothing else \
+             uses: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_pillar_shaped_name_must_declare_its_pillar() {
+        let errors = validate_spans(&[span("sbproxy.audit.emit")], PILLARS);
+
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("declares no pillar or verb")),
+            "an unclassified pillar span is invisible to the shape rule: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_three_segment_name_whose_middle_is_not_a_pillar_needs_no_pillar() {
+        // `sbproxy.ai.usage_sink` is three segments and is not a pillar
+        // span. A dot-count heuristic would demand a pillar for it, and the
+        // only way to satisfy that would be to invent one.
+        assert_eq!(
+            validate_spans(&[span("sbproxy.ai.usage_sink")], PILLARS),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn a_live_span_validates() {
+        assert_eq!(validate_spans(&[span("ai.request")], PILLARS), vec![]);
     }
 
     #[test]

@@ -324,3 +324,19 @@
 # test-only `check_auth_with_tls` wrapper and gave the thumbprint path a
 # production caller in `request_filter`, so one former tests-only pub
 # item no longer exists.
+
+# 2026-08-08 (WOR-2318): 287 -> 289. The span drift guard added two pub
+# items whose only consumer is a test, and both have to exist before their
+# caller does, for the same reason `METRICS` and `validate_metrics` do.
+#
+# `span_registry::SPANS` is the executable span registry: every span name
+# this workspace opens or publishes, what emits it, and what we promise
+# about the name. `validate_spans` is its table-only invariant check, the
+# sibling of `validate_metrics`, which is tests-only for the same reason.
+# A registry is consumed by the guard that enforces it; wiring either into
+# production would mean the proxy reading its own capability table at
+# runtime, which is not what it is for.
+#
+# Both are exactly the shape this ratchet is meant to allow through with a
+# note rather than block: a table plus its checker, landing together, with
+# the check running in CI on every commit.

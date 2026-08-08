@@ -57,6 +57,9 @@ pub mod session_ledger;
 /// subscriber with a multi-writer fan-out filtered by proxy / tenant /
 /// origin scope.
 pub mod sink_dispatcher;
+/// The executable span registry: every span name, what opens it, and its
+/// stability. The traces counterpart of [`metric_registry`].
+pub mod span_registry;
 /// In-process synthetic probe state for `/readyz`.
 pub mod synthetic;
 pub mod telemetry;
