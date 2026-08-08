@@ -1147,7 +1147,7 @@ fn build_swr_revalidation_request(
             rules.iter().find(|rule| {
                 rule.matchers.iter().any(|matcher| {
                     matcher
-                        .match_request(path, query, &request.headers)
+                        .match_request(&request.method, path, query, &request.headers)
                         .is_some()
                 })
             })

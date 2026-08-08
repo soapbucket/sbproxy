@@ -175,6 +175,7 @@ fn swr_revalidation_uses_the_matching_forward_action_and_vary_headers() {
         .forward_rules
         .push(vec![crate::pipeline::CompiledForwardRule {
             matchers: vec![crate::pipeline::MatcherEntry {
+                method: None,
                 path: Some(crate::pipeline::PathMatch::Prefix("/forward".to_string())),
                 header: None,
                 query: None,

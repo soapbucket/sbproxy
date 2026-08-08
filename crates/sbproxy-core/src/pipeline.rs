@@ -365,6 +365,25 @@ impl QueryMatch {
     }
 }
 
+/// Match the request method against a precompiled set of allowed methods.
+///
+/// Methods are parsed and uppercased at config-load time, so the request
+/// path compares `http::Method` values directly; for the standard methods
+/// that is a comparison against interned statics, the cheapest test any
+/// matcher in the entry performs.
+pub struct MethodMatch {
+    /// Allowed methods, uppercased and parsed at config-load time.
+    pub methods: smallvec::SmallVec<[http::Method; 4]>,
+}
+
+impl MethodMatch {
+    /// Test the matcher against the request method.
+    #[must_use]
+    pub fn matches(&self, method: &http::Method) -> bool {
+        self.methods.contains(method)
+    }
+}
+
 /// The comparison a [`BodyMatch`] applies to the value its pointer resolved to.
 pub enum BodyCompare {
     /// The resolved value, rendered as text, must equal this exactly.
@@ -440,10 +459,13 @@ impl BodyMatch {
 
 /// One AND-grouped match entry inside a forward rule's `rules:` list.
 ///
-/// Every present matcher (`path`, `header`, `query`, `body`) must succeed for
-/// the entry to fire. The enclosing list of entries is ORed: any matching
-/// entry triggers the rule.
+/// Every present matcher (`method`, `path`, `header`, `query`, `body`) must
+/// succeed for the entry to fire. The enclosing list of entries is ORed: any
+/// matching entry triggers the rule.
 pub struct MatcherEntry {
+    /// HTTP method matcher. Evaluated first because an `http::Method`
+    /// comparison is the cheapest test in the entry and captures nothing.
+    pub method: Option<MethodMatch>,
     /// Path matcher (any of prefix / exact / template / regex).
     pub path: Option<PathMatch>,
     /// Header matcher.
@@ -465,11 +487,12 @@ impl MatcherEntry {
     /// claim a body-gated rule they have not proved.
     pub fn match_request(
         &self,
+        method: &http::Method,
         path: &str,
         query: Option<&str>,
         headers: &http::HeaderMap,
     ) -> Option<HashMap<String, String>> {
-        self.match_request_with_body(path, query, headers, None)
+        self.match_request_with_body(method, path, query, headers, None)
     }
 
     /// Evaluate this entry against the incoming request and its buffered body.
@@ -482,17 +505,26 @@ impl MatcherEntry {
     /// other origin passes `None` and never pays for buffering or parsing.
     pub fn match_request_with_body(
         &self,
+        method: &http::Method,
         path: &str,
         query: Option<&str>,
         headers: &http::HeaderMap,
         body: Option<&[u8]>,
     ) -> Option<HashMap<String, String>> {
-        let any_present = self.path.is_some()
+        let any_present = self.method.is_some()
+            || self.path.is_some()
             || self.header.is_some()
             || self.query.is_some()
             || self.body.is_some();
         if !any_present {
             return None;
+        }
+        // Method first: it captures nothing and is the cheapest test in the
+        // entry, so a wrong-method request pays for nothing else.
+        if let Some(m) = &self.method {
+            if !m.matches(method) {
+                return None;
+            }
         }
         let captured = if let Some(p) = &self.path {
             p.match_with_params(path)?
@@ -2906,12 +2938,19 @@ fn compile_single_forward_rule(
     // "field absent" so the compiler is forgiving on the wire format.
     let mut matchers: Vec<MatcherEntry> = Vec::with_capacity(rules_arr.len());
     for rule in rules_arr {
+        let method = compile_method_matcher(non_null(rule.get("method")))?;
         let path = compile_path_matcher(rule)?;
         let header = compile_header_matcher(non_null(rule.get("header")))?;
         let query = compile_query_matcher(non_null(rule.get("query")))?;
         let body = compile_body_matcher(non_null(rule.get("body")))?;
-        if path.is_some() || header.is_some() || query.is_some() || body.is_some() {
+        if method.is_some()
+            || path.is_some()
+            || header.is_some()
+            || query.is_some()
+            || body.is_some()
+        {
             matchers.push(MatcherEntry {
+                method,
                 path,
                 header,
                 query,
@@ -3059,6 +3098,52 @@ fn compile_query_matcher(val: Option<&serde_json::Value>) -> anyhow::Result<Opti
         }));
     }
     Ok(Some(QueryMatch::Present { name }))
+}
+
+/// Compile the `method:` block of a single matcher entry. Accepts a single
+/// method string or a non-empty list of them.
+///
+/// Tokens are uppercased before parsing. RFC 9110 defines method names as
+/// case-sensitive tokens, but every registered method is uppercase and
+/// clients send them that way, so authored case is treated as presentation
+/// rather than meaning: `post` compiles to the same matcher as `POST`.
+/// Validation is `http::Method::from_bytes` on the uppercased token, the
+/// same parser the proxy's HTTP layer uses, so a token the proxy would
+/// refuse on the wire fails config load with a clear error instead of
+/// silently never matching.
+fn compile_method_matcher(val: Option<&serde_json::Value>) -> anyhow::Result<Option<MethodMatch>> {
+    let Some(val) = val else {
+        return Ok(None);
+    };
+    let tokens: Vec<&str> = match val {
+        serde_json::Value::String(s) => vec![s.as_str()],
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .map(|v| {
+                v.as_str().ok_or_else(|| {
+                    anyhow::anyhow!("forward-rule method matcher entries must be strings, got {v}")
+                })
+            })
+            .collect::<anyhow::Result<_>>()?,
+        other => anyhow::bail!(
+            "forward-rule method matcher must be a string or a list of strings, got {other}"
+        ),
+    };
+    if tokens.is_empty() {
+        anyhow::bail!(
+            "forward-rule method matcher is an empty list, which can never match \
+             any request. Remove the matcher instead."
+        );
+    }
+    let methods = tokens
+        .iter()
+        .map(|token| {
+            http::Method::from_bytes(token.to_ascii_uppercase().as_bytes()).map_err(|e| {
+                anyhow::anyhow!("forward-rule method matcher has invalid method '{token}': {e}")
+            })
+        })
+        .collect::<anyhow::Result<smallvec::SmallVec<[http::Method; 4]>>>()?;
+    Ok(Some(MethodMatch { methods }))
 }
 
 /// Compile the `body:` block of a single matcher entry. Accepts
@@ -4520,13 +4605,84 @@ origins:
         assert_eq!(rule.matchers.len(), 1);
         let mut headers = http::HeaderMap::new();
         headers.insert("x-tenant", http::HeaderValue::from_static("foo"));
-        let captured = rule.matchers[0].match_request("/anything", None, &headers);
+        let captured =
+            rule.matchers[0].match_request(&http::Method::GET, "/anything", None, &headers);
         assert!(captured.is_some(), "header match should fire");
 
         let mut other = http::HeaderMap::new();
         other.insert("x-tenant", http::HeaderValue::from_static("bar"));
         assert!(rule.matchers[0]
-            .match_request("/anything", None, &other)
+            .match_request(&http::Method::GET, "/anything", None, &other)
+            .is_none());
+    }
+
+    #[test]
+    fn pipeline_compiles_method_forward_rule() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 18080
+origins:
+  "m.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    forward_rules:
+      - rules:
+          - method: post
+        origin:
+          id: writes
+          action:
+            type: proxy
+            url: http://127.0.0.1:18893
+"#;
+        let config = sbproxy_config::compile_config(yaml).unwrap();
+        let pipeline = CompiledPipeline::from_config(config).unwrap();
+        let rule = &pipeline.forward_rules[0][0];
+        assert_eq!(rule.matchers.len(), 1);
+        let headers = http::HeaderMap::new();
+        // Authored lowercase, matched against the uppercase wire method.
+        assert!(rule.matchers[0]
+            .match_request(&http::Method::POST, "/anything", None, &headers)
+            .is_some());
+        assert!(rule.matchers[0]
+            .match_request(&http::Method::GET, "/anything", None, &headers)
+            .is_none());
+    }
+
+    #[test]
+    fn pipeline_compiles_method_list_forward_rule() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 18080
+origins:
+  "ml.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    forward_rules:
+      - rules:
+          - path:
+              prefix: /api/
+            method: [POST, PUT]
+        origin:
+          id: api-writes
+          action:
+            type: proxy
+            url: http://127.0.0.1:18894
+"#;
+        let config = sbproxy_config::compile_config(yaml).unwrap();
+        let pipeline = CompiledPipeline::from_config(config).unwrap();
+        let rule = &pipeline.forward_rules[0][0];
+        let headers = http::HeaderMap::new();
+        // Method and path AND within the entry.
+        assert!(rule.matchers[0]
+            .match_request(&http::Method::PUT, "/api/x", None, &headers)
+            .is_some());
+        assert!(rule.matchers[0]
+            .match_request(&http::Method::GET, "/api/x", None, &headers)
+            .is_none());
+        assert!(rule.matchers[0]
+            .match_request(&http::Method::PUT, "/web/x", None, &headers)
             .is_none());
     }
 
@@ -4557,13 +4713,18 @@ origins:
         assert_eq!(rule.matchers.len(), 1);
         let headers = http::HeaderMap::new();
         assert!(rule.matchers[0]
-            .match_request("/anything", Some("env=staging&x=1"), &headers)
+            .match_request(
+                &http::Method::GET,
+                "/anything",
+                Some("env=staging&x=1"),
+                &headers
+            )
             .is_some());
         assert!(rule.matchers[0]
-            .match_request("/anything", Some("env=prod"), &headers)
+            .match_request(&http::Method::GET, "/anything", Some("env=prod"), &headers)
             .is_none());
         assert!(rule.matchers[0]
-            .match_request("/anything", None, &headers)
+            .match_request(&http::Method::GET, "/anything", None, &headers)
             .is_none());
     }
 
@@ -4600,15 +4761,15 @@ origins:
 
         // Both must hold.
         assert!(rule.matchers[0]
-            .match_request("/api/x", None, &beta)
+            .match_request(&http::Method::GET, "/api/x", None, &beta)
             .is_some());
         // Path matches, header wrong: AND fails.
         assert!(rule.matchers[0]
-            .match_request("/api/x", None, &not_beta)
+            .match_request(&http::Method::GET, "/api/x", None, &not_beta)
             .is_none());
         // Header matches, path wrong: AND fails.
         assert!(rule.matchers[0]
-            .match_request("/web/x", None, &beta)
+            .match_request(&http::Method::GET, "/web/x", None, &beta)
             .is_none());
     }
 
@@ -4643,8 +4804,12 @@ origins:
         );
         let mut basic = http::HeaderMap::new();
         basic.insert("authorization", http::HeaderValue::from_static("Basic xyz"));
-        assert!(rule.matchers[0].match_request("/", None, &bearer).is_some());
-        assert!(rule.matchers[0].match_request("/", None, &basic).is_none());
+        assert!(rule.matchers[0]
+            .match_request(&http::Method::GET, "/", None, &bearer)
+            .is_some());
+        assert!(rule.matchers[0]
+            .match_request(&http::Method::GET, "/", None, &basic)
+            .is_none());
     }
 
     #[test]
@@ -4763,6 +4928,7 @@ mod body_matcher_tests {
 
     fn body_only_entry(json: serde_json::Value) -> MatcherEntry {
         MatcherEntry {
+            method: None,
             path: None,
             header: None,
             query: None,
@@ -4889,6 +5055,7 @@ mod body_matcher_tests {
     #[test]
     fn the_body_matcher_ands_with_the_other_matchers() {
         let entry = MatcherEntry {
+            method: None,
             path: Some(PathMatch::Prefix("/v1/chat".to_string())),
             header: Some(HeaderMatch::Equals {
                 name: http::HeaderName::from_static("x-tier"),
@@ -4903,15 +5070,28 @@ mod body_matcher_tests {
         headers.insert("x-tier", http::HeaderValue::from_static("gold"));
 
         assert!(entry
-            .match_request_with_body("/v1/chat/completions", None, &headers, Some(CHAT_BODY))
+            .match_request_with_body(
+                &http::Method::POST,
+                "/v1/chat/completions",
+                None,
+                &headers,
+                Some(CHAT_BODY)
+            )
             .is_some());
         // Body agrees, path does not.
         assert!(entry
-            .match_request_with_body("/v1/embeddings", None, &headers, Some(CHAT_BODY))
+            .match_request_with_body(
+                &http::Method::POST,
+                "/v1/embeddings",
+                None,
+                &headers,
+                Some(CHAT_BODY)
+            )
             .is_none());
         // Path and header agree, body does not.
         assert!(entry
             .match_request_with_body(
+                &http::Method::POST,
                 "/v1/chat/completions",
                 None,
                 &headers,
@@ -4920,22 +5100,37 @@ mod body_matcher_tests {
             .is_none());
         // Everything else agrees but no body was buffered.
         assert!(entry
-            .match_request_with_body("/v1/chat/completions", None, &headers, None)
+            .match_request_with_body(
+                &http::Method::POST,
+                "/v1/chat/completions",
+                None,
+                &headers,
+                None
+            )
             .is_none());
     }
 
     #[test]
     fn a_header_only_entry_is_unaffected_by_the_new_argument() {
         let entry = MatcherEntry {
+            method: None,
             path: Some(PathMatch::Prefix("/v1".to_string())),
             header: None,
             query: None,
             body: None,
         };
         let headers = http::HeaderMap::new();
-        assert!(entry.match_request("/v1/chat", None, &headers).is_some());
         assert!(entry
-            .match_request_with_body("/v1/chat", None, &headers, Some(CHAT_BODY))
+            .match_request(&http::Method::GET, "/v1/chat", None, &headers)
+            .is_some());
+        assert!(entry
+            .match_request_with_body(
+                &http::Method::GET,
+                "/v1/chat",
+                None,
+                &headers,
+                Some(CHAT_BODY)
+            )
             .is_some());
     }
 
@@ -4948,12 +5143,14 @@ mod body_matcher_tests {
         // buffering, no drain, no parse.
         let rules = vec![
             rule_with(vec![MatcherEntry {
+                method: None,
                 path: Some(PathMatch::Prefix("/v1".to_string())),
                 header: None,
                 query: None,
                 body: None,
             }]),
             rule_with(vec![MatcherEntry {
+                method: None,
                 path: None,
                 header: None,
                 query: Some(QueryMatch::Present {
@@ -5063,8 +5260,161 @@ mod body_matcher_tests {
         );
         let headers = http::HeaderMap::new();
         assert!(compiled_rule.matchers[0]
-            .match_request_with_body("/v1/chat/completions", None, &headers, Some(CHAT_BODY))
+            .match_request_with_body(
+                &http::Method::POST,
+                "/v1/chat/completions",
+                None,
+                &headers,
+                Some(CHAT_BODY)
+            )
             .is_some());
+    }
+}
+
+/// Request-method route matching.
+#[cfg(test)]
+mod method_matcher_tests {
+    use super::*;
+
+    fn compiled(json: serde_json::Value) -> MethodMatch {
+        compile_method_matcher(Some(&json))
+            .expect("method matcher compiles")
+            .expect("method matcher is present")
+    }
+
+    fn method_only_entry(json: serde_json::Value) -> MatcherEntry {
+        MatcherEntry {
+            method: Some(compiled(json)),
+            path: None,
+            header: None,
+            query: None,
+            body: None,
+        }
+    }
+
+    #[test]
+    fn a_single_method_matches_only_itself() {
+        let matcher = compiled(serde_json::json!("POST"));
+        assert!(matcher.matches(&http::Method::POST));
+        assert!(!matcher.matches(&http::Method::GET));
+    }
+
+    #[test]
+    fn a_list_matches_any_of_its_methods() {
+        let matcher = compiled(serde_json::json!(["GET", "HEAD"]));
+        assert!(matcher.matches(&http::Method::GET));
+        assert!(matcher.matches(&http::Method::HEAD));
+        assert!(!matcher.matches(&http::Method::DELETE));
+    }
+
+    #[test]
+    fn authored_case_is_normalized_to_uppercase() {
+        let matcher = compiled(serde_json::json!(["post", "Delete"]));
+        assert!(matcher.matches(&http::Method::POST));
+        assert!(matcher.matches(&http::Method::DELETE));
+        assert!(!matcher.matches(&http::Method::GET));
+    }
+
+    #[test]
+    fn an_extension_method_is_accepted_and_uppercased() {
+        // PURGE has no `http::Method` constant but is a valid method token,
+        // which is exactly the charset `Method::from_bytes` accepts.
+        let matcher = compiled(serde_json::json!("purge"));
+        let purge = http::Method::from_bytes(b"PURGE").expect("valid token");
+        assert!(matcher.matches(&purge));
+    }
+
+    // `.err().expect(..)` rather than `.expect_err(..)` here for the same
+    // reason the body-matcher group above does it: `MethodMatch` withholds
+    // `Debug`, and `expect_err` requires `Debug` on the `Ok` type. The test
+    // bends, not the production type (WOR-2193).
+    #[test]
+    fn an_empty_list_is_refused_at_config_load() {
+        let error = compile_method_matcher(Some(&serde_json::json!([])))
+            .err()
+            .expect("an empty method list can never match and must not compile");
+        assert!(format!("{error:#}").contains("never match"), "{error:#}");
+    }
+
+    #[test]
+    fn an_invalid_token_is_refused_at_config_load() {
+        let error = compile_method_matcher(Some(&serde_json::json!("GET POST")))
+            .err()
+            .expect("a token with a space is not an HTTP method");
+        assert!(format!("{error:#}").contains("invalid method"), "{error:#}");
+    }
+
+    #[test]
+    fn a_non_string_shape_is_refused_at_config_load() {
+        assert!(compile_method_matcher(Some(&serde_json::json!(7))).is_err());
+        assert!(compile_method_matcher(Some(&serde_json::json!([7]))).is_err());
+    }
+
+    #[test]
+    fn a_method_only_entry_fires_on_its_method_alone() {
+        let entry = method_only_entry(serde_json::json!(["DELETE"]));
+        let headers = http::HeaderMap::new();
+        assert!(entry
+            .match_request(&http::Method::DELETE, "/anything", None, &headers)
+            .is_some());
+        assert!(entry
+            .match_request(&http::Method::GET, "/anything", None, &headers)
+            .is_none());
+    }
+
+    #[test]
+    fn the_method_matcher_ands_with_the_path_matcher() {
+        let entry = MatcherEntry {
+            method: Some(compiled(serde_json::json!("POST"))),
+            path: Some(PathMatch::Prefix("/api/".to_string())),
+            header: None,
+            query: None,
+            body: None,
+        };
+        let headers = http::HeaderMap::new();
+        // Both must hold.
+        assert!(entry
+            .match_request(&http::Method::POST, "/api/x", None, &headers)
+            .is_some());
+        // Path agrees, method does not.
+        assert!(entry
+            .match_request(&http::Method::GET, "/api/x", None, &headers)
+            .is_none());
+        // Method agrees, path does not.
+        assert!(entry
+            .match_request(&http::Method::POST, "/web/x", None, &headers)
+            .is_none());
+    }
+
+    #[test]
+    fn a_full_forward_rule_carries_its_method_matcher_through_compilation() {
+        let rule = serde_json::json!({
+            "rules": [{
+                "path": {"prefix": "/v1/"},
+                "method": ["post"],
+            }],
+            "origin": {
+                "action": {"type": "proxy", "url": "https://api.test"}
+            }
+        });
+        let registry = empty_extension_registry();
+        let compiled_rule = compile_single_forward_rule(
+            &rule,
+            "writes-lane",
+            PipelineConstructionMode::Validation,
+            registry.as_ref(),
+        )
+        .expect("the forward rule compiles");
+        let headers = http::HeaderMap::new();
+        // The authored lowercase `post` matches the uppercase wire method.
+        assert!(compiled_rule.matchers[0]
+            .match_request(&http::Method::POST, "/v1/items", None, &headers)
+            .is_some());
+        // A method the rule does not list falls through to the origin's
+        // own action.
+        assert!(compiled_rule.matchers[0]
+            .match_request(&http::Method::GET, "/v1/items", None, &headers)
+            .is_none());
     }
 }
 

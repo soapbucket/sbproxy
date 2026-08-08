@@ -8744,7 +8744,7 @@
       "additionalProperties": false
     },
     "RawForwardRule": {
-      "description": "One forward rule on an origin: a set of matcher entries plus the inline child origin to dispatch to when any entry hits.\n\nCompiled at config-load time. The runtime walks the `rules` of each forward rule against the incoming request and uses the first matching entry's `origin`. Within a single entry the present matchers (path, header, query, body) are ANDed; across entries they are ORed.",
+      "description": "One forward rule on an origin: a set of matcher entries plus the inline child origin to dispatch to when any entry hits.\n\nCompiled at config-load time. The runtime walks the `rules` of each forward rule against the incoming request and uses the first matching entry's `origin`. Within a single entry the present matchers (path, header, query, body, method) are ANDed; across entries they are ORed.",
       "type": "object",
       "required": [
         "origin"
@@ -8778,7 +8778,7 @@
       "additionalProperties": false
     },
     "ForwardRuleMatcher": {
-      "description": "One match entry inside a forward rule's `rules:` list.\n\nEach entry may carry any combination of `path`, `header`, `query`, and `body` matchers. Within a single entry the matchers are ANDed: every present matcher must succeed for the entry to fire. Across entries in the same rule the semantics are OR: any matching entry triggers the rule. The shorthand `match: <prefix>` is equivalent to `path: { prefix: ... }`.",
+      "description": "One match entry inside a forward rule's `rules:` list.\n\nEach entry may carry any combination of `path`, `header`, `query`, `body`, and `method` matchers. Within a single entry the matchers are ANDed: every present matcher must succeed for the entry to fire. Across entries in the same rule the semantics are OR: any matching entry triggers the rule. The shorthand `match: <prefix>` is equivalent to `path: { prefix: ... }`.",
       "type": "object",
       "properties": {
         "path": {
@@ -8831,6 +8831,18 @@
           "anyOf": [
             {
               "$ref": "#/definitions/BodyMatcher"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "method": {
+          "description": "HTTP method matcher. A single method or a list of them; the entry fires when the request method equals any listed one. Methods are normalized to uppercase at config-load time, so `post` and `POST` are the same matcher.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/MethodSpec"
             },
             {
               "type": "null"
@@ -8970,6 +8982,22 @@
         }
       },
       "additionalProperties": false
+    },
+    "MethodSpec": {
+      "description": "HTTP method spec for a [`ForwardRuleMatcher`]. Either a single method (`method: POST`) or a list (`method: [POST, PUT]`). Tokens are normalized to uppercase when the matcher compiles, so `post` and `POST` mean the same thing; an empty list or a token that is not a valid HTTP method token fails config load.",
+      "anyOf": [
+        {
+          "description": "Single HTTP method.",
+          "type": "string"
+        },
+        {
+          "description": "Multiple methods; any match counts.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      ]
     },
     "ForwardRuleOrigin": {
       "description": "Inline child origin used when a forward rule fires. Carries the action plus optional request modifiers. Compatibility metadata fields remain parseable but are not copied into the compiled child origin.",

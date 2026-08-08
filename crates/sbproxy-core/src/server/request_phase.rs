@@ -96,7 +96,7 @@ fn request_requires_graphql_replay(
             rules.iter().find(|rule| {
                 rule.matchers.iter().any(|matcher| {
                     matcher
-                        .match_request(path, query, &request.headers)
+                        .match_request(&request.method, path, query, &request.headers)
                         .is_some()
                 })
             })
@@ -125,7 +125,12 @@ fn request_uses_ai_owned_replay_paths(
             rules.iter().find(|rule| {
                 rule.matchers.iter().any(|matcher| {
                     matcher
-                        .match_request(request.uri.path(), request.uri.query(), &request.headers)
+                        .match_request(
+                            &request.method,
+                            request.uri.path(),
+                            request.uri.query(),
+                            &request.headers,
+                        )
                         .is_some()
                 })
             })
@@ -4055,7 +4060,7 @@ pub(super) async fn request_filter(
         }
     }
 
-    // --- Forward rules: path/header/query/body routing to inline origins ---
+    // --- Forward rules: method/path/header/query/body routing to inline origins ---
     // WOR-2306: the body the matchers below read, drained here because this
     // is the last moment before a route is chosen and the first moment worth
     // paying for. Everything above this line can short-circuit the request
@@ -4070,12 +4075,15 @@ pub(super) async fn request_filter(
         let request_path = session.req_header().uri.path().to_string();
         let request_query = session.req_header().uri.query().map(|q| q.to_string());
         for (rule_idx, fwd_rule) in fwd_rules.iter().enumerate() {
-            // Each `MatcherEntry` ANDs path/header/query/body; entries in
-            // the list are ORed. `match_request_with_body` returns the
-            // captured path params (possibly empty) when the entry fires.
+            // Each `MatcherEntry` ANDs method/path/header/query/body;
+            // entries in the list are ORed. `match_request_with_body`
+            // returns the captured path params (possibly empty) when the
+            // entry fires.
             let request_headers = &session.req_header().headers;
+            let request_method = &session.req_header().method;
             let captured = fwd_rule.matchers.iter().find_map(|m| {
                 m.match_request_with_body(
+                    request_method,
                     &request_path,
                     request_query.as_deref(),
                     request_headers,

@@ -300,6 +300,15 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "origins.*.forward_rules[].rules[].match",
         "sbproxy_core::pipeline::compile_single_forward_rule",
     ),
+    // Like the body matcher above, the method matcher is compiled from the
+    // untyped JSON the forward rule carries: `compile_single_forward_rule`
+    // reads `method` off the JSON object and hands it to
+    // `compile_method_matcher`, a hop the scanner cannot follow from the
+    // typed `MethodSpec` field.
+    stable(
+        "origins.*.forward_rules[].rules[].method[]",
+        "sbproxy_core::pipeline::compile_single_forward_rule",
+    ),
     stable(
         "origins.*.forward_rules[].rules[].query.name",
         "sbproxy_core::pipeline::compile_single_forward_rule",
