@@ -1,5 +1,5 @@
 # A2A gateway
-*Last modified: 2026-07-31*
+*Last modified: 2026-08-07*
 
 The `a2a` action proxies agent-to-agent requests to an upstream A2A endpoint. Pairs with MCP federation (one gateway, two protocols) and the AP2 / ACP / RAR payment surfaces.
 
@@ -9,7 +9,7 @@ Shipped today:
 
 - The `a2a` action: proxies JSON-RPC A2A traffic to the configured upstream `url`, with `host_override` and forwarding-header controls.
 - The `a2a` policy: per-hop checks on the inbound agent-to-agent envelope (chain depth, cycle detection, callee allowlist, caller deny), with per-deny-reason metrics, plus a `failure_posture` knob for requests detection cannot classify.
-- The `a2a_agent_card_rewrite` transform: parses agent-card JSON responses and substitutes upstream URLs with the proxy hostname. Its path-aware wiring into the response pipeline is still pending, so configuring it today passes bodies through unchanged.
+- The `a2a_agent_card_rewrite` transform: parses agent-card JSON responses served at the well-known discovery paths and substitutes upstream URLs with the proxy hostname, so a client that fetches the card keeps routing follow-up calls through the proxy. Configured `proxy_host` wins; otherwise the inbound `Host` header is used.
 - The typed `AgentCard` parser and the modality negotiators, as library code with no gateway call sites yet (details below).
 
 Design-stage, not in the current binary:
@@ -283,7 +283,7 @@ The action stores the card verbatim as JSON; the config accepts any card body. T
 
 ## Capability discovery (design)
 
-The design has the gateway serve the card itself at `/.well-known/agent.json` so an A2A client can probe SBproxy and get back the agent it would route to, falling through to the upstream when the operator configures no card. None of that is wired: today the well-known path is proxied to the upstream unmodified, and the only shipped code that touches it is the `a2a_agent_card_rewrite` transform described above.
+The design has the gateway serve the card itself at `/.well-known/agent.json` so an A2A client can probe SBproxy and get back the agent it would route to, falling through to the upstream when the operator configures no card. None of that is wired: today the well-known path is proxied to the upstream, and the only shipped code that touches the response is the `a2a_agent_card_rewrite` transform described above, which rewrites the card's URLs on the way back when configured.
 
 The design also surfaces `capabilities.streaming` and `capabilities.pushNotifications` under CEL so policies could reject, before forwarding, an A2A request that asks for streaming when the agent does not advertise it. Those bindings do not exist yet.
 

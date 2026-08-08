@@ -2649,6 +2649,74 @@ fn apply_transform_citation_block_skipped_when_not_required() {
     assert_eq!(&buf[..], original);
 }
 
+// --- WOR-2315: A2aAgentCardRewrite typed dispatch ---
+
+fn compiled_a2a_card_rewrite(proxy_host: Option<&str>) -> sbproxy_modules::CompiledTransform {
+    sbproxy_modules::CompiledTransform {
+        transform: sbproxy_modules::Transform::A2aAgentCardRewrite(
+            sbproxy_modules::A2aAgentCardRewriter::from_parts(
+                Vec::new(),
+                proxy_host.map(str::to_string),
+            ),
+        ),
+        content_types: vec![],
+        failure_posture: sbproxy_config::types::FailureMode::Open,
+        max_body_size: 10 * 1024 * 1024,
+    }
+}
+
+#[test]
+fn apply_transform_a2a_card_rewrite_rewrites_card_url() {
+    // The security contract: a configured a2a_agent_card_rewrite must
+    // actually rewrite an agent-card body dispatched through the
+    // pipeline, not just when apply_with_path is called directly.
+    // Pre-WOR-2315 the dispatch fell through to the standard no-op
+    // apply and the upstream URL leaked to the client.
+    let card = br#"{"name":"agent-1","url":"https://test.sbproxy.dev/agents/1"}"#;
+    let mut buf = bytes::BytesMut::from(&card[..]);
+    let mut ctx = RequestContext::new();
+    ctx.request_path = "/.well-known/agent.json".into();
+
+    let compiled = compiled_a2a_card_rewrite(Some("proxy.test"));
+    apply_transform_with_ctx(&compiled, &mut buf, Some("application/json"), &mut ctx).unwrap();
+
+    let parsed: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+    assert_eq!(parsed["url"], "https://proxy.test/agents/1");
+    assert_eq!(parsed["name"], "agent-1");
+}
+
+#[test]
+fn apply_transform_a2a_card_rewrite_skips_non_card_path() {
+    // Path gating through the dispatch arm: a JSON response on a
+    // non-card route keeps its body byte for byte.
+    let original = br#"{"url":"https://test.sbproxy.dev/agents/1"}"#;
+    let mut buf = bytes::BytesMut::from(&original[..]);
+    let mut ctx = RequestContext::new();
+    ctx.request_path = "/api/v1/things".into();
+
+    let compiled = compiled_a2a_card_rewrite(Some("proxy.test"));
+    apply_transform_with_ctx(&compiled, &mut buf, Some("application/json"), &mut ctx).unwrap();
+
+    assert_eq!(&buf[..], &original[..]);
+}
+
+#[test]
+fn apply_transform_a2a_card_rewrite_falls_back_to_host_header() {
+    // No proxy_host configured: the dispatch arm resolves the host
+    // from ctx.hostname (the inbound Host header) so one deployment
+    // behind several hostnames rewrites to the one the client used.
+    let mut buf = bytes::BytesMut::from(&br#"{"url":"https://test.sbproxy.dev/agents/1"}"#[..]);
+    let mut ctx = RequestContext::new();
+    ctx.request_path = "/agent-card.json".into();
+    ctx.hostname = "proxy.example.com".into();
+
+    let compiled = compiled_a2a_card_rewrite(None);
+    apply_transform_with_ctx(&compiled, &mut buf, Some("application/json"), &mut ctx).unwrap();
+
+    let parsed: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+    assert_eq!(parsed["url"], "https://proxy.example.com/agents/1");
+}
+
 // --- Wave 4 day-5 Item 5: x-markdown-tokens header ---
 
 #[test]

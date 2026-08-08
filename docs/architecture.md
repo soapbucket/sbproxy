@@ -1,6 +1,6 @@
 # SBproxy architecture and deployment guide
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-07*
 
 This document covers the internal architecture of SBproxy, the request lifecycle, the plugin
 system, the AI gateway, caching, events, and common deployment topologies.
@@ -183,8 +183,11 @@ compiler turns the dispatch site into a branch-predicted match. Third-party plug
 
 ## 4. Plugin system
 
-All extensible component types use a single pattern: register at compile time via the
-`inventory` crate, keyed by the type string that appears in YAML configs.
+The config compiler resolves each `type` string that appears in YAML through three
+tiers, in order: built-in modules (explicit match arms in
+`sbproxy-modules/src/compile.rs`), linked plugins (typed `inventory` registrations from
+`sbproxy-plugin`), and config-loaded extension bundles (JavaScript / WASM, see
+[extension-bundles.md](extension-bundles.md)).
 
 ### Registry traits (sbproxy-plugin)
 
@@ -200,18 +203,22 @@ pub trait ActionHandler: Send + Sync + 'static {
 // Same shape for AuthProvider, PolicyEnforcer, TransformHandler, RequestEnricher.
 ```
 
-Factory closures construct concrete handlers from a `serde_json::Value` config blob and
-return `Box<dyn Any + Send>`. The factory itself is the registration unit.
+For a linked plugin, the registration unit is a factory function that constructs a
+concrete handler from a `serde_json::Value` config blob and returns the boxed trait
+object for its kind (`Box<dyn PolicyEnforcer>`, `Box<dyn ActionHandler>`, and so on).
 
-### Registration pattern
+### Registration pattern (linked plugins)
+
+Each plugin kind has a typed registration struct: `ActionPluginRegistration`,
+`AuthPluginRegistration`, `PolicyPluginRegistration`, `TransformPluginRegistration`.
 
 ```rust,no_run
 inventory::submit! {
-    PluginRegistration {
-        kind: PluginKind::Policy,
+    PolicyPluginRegistration {
         name: "rate_limit_custom",
         factory: |raw| {
-            let cfg: MyConfig = serde_json::from_value(raw)?;
+            let cfg: MyConfig = serde_json::from_value(raw)
+                .map_err(|e| PluginError::Config(e.to_string()))?;
             Ok(Box::new(MyPolicy::new(cfg)))
         },
     }
@@ -219,18 +226,30 @@ inventory::submit! {
 ```
 
 `inventory::submit!` writes a static descriptor into a link-section that the binary
-enumerates at startup. There is no central wiring file. Adding a policy is:
+enumerates at startup. A linked plugin needs no central wiring: implement the trait,
+submit the typed registration, and compile the crate into the `sbproxy` binary.
 
-1. Implement `PolicyEnforcer` for the new struct.
-2. Drop the file in `sbproxy-modules/src/policy/`.
-3. Add an `inventory::submit!` block.
-4. Add `pub mod my_policy;` to the parent `mod.rs`.
+Register through the typed structs, never through the generic `PluginRegistration`
+(the one carrying a `PluginKind` and a `Box<dyn Any>` factory). That channel feeds
+diagnostics and the extension inventory listing only; the config compiler builds
+handlers exclusively from the typed registrations, so a plugin submitted only as a
+`PluginRegistration` compiles, shows up in listings, and never loads.
 
-The compile_config step in `sbproxy-config` looks up factories by name from the inventory
-registry. Built-in modules are exposed as enum variants (`Policy::RateLimit(...)`,
-`Policy::Plugin(Box<dyn PolicyEnforcer>)`); the compiler prefers the enum variant when
-available for cache locality and branch prediction, falling back to dynamic dispatch for
-third-party names.
+Adding a built-in (in-tree) module is different, because built-ins do have a central
+wiring file:
+
+1. Create the module file under `sbproxy-modules/src/{action,auth,policy,transform}/`
+   and implement the trait.
+2. Add `pub mod my_policy;` to the parent `mod.rs` and a variant to that kind's enum
+   (`Policy`, `Action`, `Auth`, `Transform`).
+3. Add a match arm for the config `type` string in `sbproxy-modules/src/compile.rs`.
+
+The compile step matches built-in names against those arms first, then falls through to
+`sbproxy_plugin::build_policy_plugin` (and its action / auth / transform siblings),
+which consult the typed inventory registrations, and finally to the bundle registry
+populated from config for JavaScript and WASM bundles. Built-ins are enum variants
+(`Policy::RateLimit(...)`); plugin and bundle handlers ride `Policy::Plugin(...)` and
+pay dynamic dispatch.
 
 ### Built-in vs plugin dispatch
 

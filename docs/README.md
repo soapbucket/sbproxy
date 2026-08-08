@@ -1,6 +1,6 @@
 # SBproxy documentation
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-07*
 
 SBproxy is an open source Enterprise AI Gateway for API, MCP and agent, and AI model traffic. Every feature in this repository ships under Apache-2.0.
 
@@ -58,6 +58,7 @@ Govern the AI you call, the AI that calls you, and the AI you run.
 - [security-model-host.md](security-model-host.md) - trusted config, verified artifacts, typed process launch, engine acquisition, containers, credentials, and remaining isolation work.
 - [custom-engines.md](custom-engines.md) - why there is no bring-your-own-image command template: the typed-driver seam, the OpenAI-compatible provider escape hatch, and the bar a signed engine descriptor would have to clear.
 - [ai-usage-ledger.md](ai-usage-ledger.md) - the verifiable usage ledger: hash-chained, Ed25519-signed spend receipts you can re-derive and verify.
+- [value-ledger-economics.md](value-ledger-economics.md) - the Value Ledger: local-vs-cloud lane split, reference prices, and the savings report at `/admin/model-host/value`.
 - [key-management.md](key-management.md) - dynamic virtual keys: mint, revoke, and rotate at runtime through the admin API, hashed at rest, with a fail-closed policy cache.
 - [ai-policy-cel.md](ai-policy-cel.md) - the unified CEL policy plane: one sandboxed expression over guardrails, budgets, routing, and principal that emits a closed action set.
 - [ai-guardrail-mesh.md](ai-guardrail-mesh.md) - the guardrail mesh: collect every verdict, fuse on a quorum, redact-and-continue, latency-budgeted cascade with a verdict cache.
@@ -130,7 +131,7 @@ Point a framework you already run at the gateway: chat completions through the O
 
 - [payment-settlement.md](payment-settlement.md) - `proxy.payments`: rails, durable intents, the state table that gates origin access, timeouts, reconciliation, and the exact unsupported boundaries.
 - [402-challenge.md](402-challenge.md) - the exact bytes of every payment challenge, credential, problem document, and receipt.
-- [l402.md](l402.md) - L402 (Lightning HTTP 402) macaroon bearer credential surface: issuer, verifier, attenuation, payment-hash binding.
+- [l402.md](l402.md) - L402 (Lightning HTTP 402) design notes: the protocol shape SBproxy would implement. None of it ships in the current binary; [402-challenge.md](402-challenge.md) covers the payment surface that does.
 - [admin-api-reference.md](admin-api-reference.md) - per-route schema for the embedded admin server (`/api/*`, `/admin/*`, and the unauthenticated probe routes).
 - [config-stability.md](config-stability.md) - field stability guarantees and versioning.
 - [config-authority-drills.md](config-authority-drills.md) - two-process certification drills for signed config distribution.

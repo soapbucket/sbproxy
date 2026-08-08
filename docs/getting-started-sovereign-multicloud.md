@@ -1,6 +1,6 @@
 # Getting started: Sovereign / multi-cloud deployment
 
-*Last modified: 2026-07-28*
+*Last modified: 2026-08-07*
 
 ## What you will build
 
@@ -184,5 +184,5 @@ curl -i -H 'Host: api.acme.example.com' http://127.0.0.1:8080/headers
 - [docs/multi-tenant.md](multi-tenant.md) - declared tenants, scope resolution, and per-tenant policy.
 - [docs/secrets.md](secrets.md) - proxy-scoped secret backends,
   provider-specific references, and backend access controls.
-- [docs/kubernetes.md](kubernetes.md) - generating this dataplane from a `Gateway` plus `HTTPRoute` pair.
+- [docs/kubernetes.md](kubernetes.md) - running this dataplane under the Kubernetes operator: the `SBProxy` and `SBProxyConfig` CRDs, hot reload, and clustered replicas.
 - [docs/operator-runbook.md](operator-runbook.md) - running, reloading, and observing the gateway in production.

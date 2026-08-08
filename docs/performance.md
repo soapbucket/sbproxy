@@ -1,5 +1,5 @@
 # Performance
-*Last modified: 2026-07-19*
+*Last modified: 2026-08-07*
 
 What SBproxy delivers on real hardware, with the methodology you'd need to reproduce it.
 
@@ -207,6 +207,5 @@ For your own dashboards, the metrics that move first:
 - `sbproxy_active_connections`. Sustained climb means your upstream is slower than incoming.
 - `sbproxy_cache_results_total`. Compute the hit ratio as `hit / (hit + miss)` from the `result` label. It is the number that moves p99 the most when caching is configured.
 - `sbproxy_config_reload_total`. A spike means your reload tooling is flapping.
-- `sbproxy_silent_degradations_total`. Best-effort operations that failed and would otherwise be invisible. Should stay near zero; alert on growth.
 
 See [metrics-stability.md](metrics-stability.md) for the full catalog and stability tier of every metric.
