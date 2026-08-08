@@ -6684,10 +6684,6 @@ pub struct RawOriginConfig {
     /// Threat protection (IP reputation, blocklist) configuration.
     #[serde(default)]
     pub threat_protection: Option<serde_json::Value>,
-    /// Compatibility-only origin-level rate-limit header shape. Configure the
-    /// live rate-limit policy's `headers` block instead.
-    #[serde(default)]
-    pub rate_limit_headers: Option<serde_json::Value>,
     /// Per-status custom error response bodies. Each entry covers one
     /// or more HTTP status codes and contributes a content-typed body
     /// the proxy substitutes when it generates the matching status.
@@ -7125,7 +7121,9 @@ pub struct CompressionConfig {
     /// Minimum response size, in bytes, before compression is applied.
     #[serde(default)]
     pub min_size: usize,
-    /// Compression level. Reserved; not currently honored by the runtime.
+    /// Encoder effort setting, clamped into the negotiated algorithm's
+    /// native range (gzip 0-9, brotli 0-11, zstd 1-22). Absent keeps each
+    /// library's default.
     #[serde(default)]
     pub level: Option<u32>,
 }
@@ -7584,8 +7582,8 @@ pub struct ResponseModifierConfig {
     /// Header set/add/remove operations.
     #[serde(default)]
     pub headers: Option<HeaderModifiers>,
-    /// Override the response status code. A supplied `text` value is
-    /// accepted for compatibility but ignored.
+    /// Override the response status code and, optionally via `text`, the
+    /// HTTP/1.x reason phrase.
     #[serde(default)]
     pub status: Option<StatusOverride>,
     /// Response body replacement.
@@ -7605,8 +7603,9 @@ pub struct ResponseModifierConfig {
 pub struct StatusOverride {
     /// The HTTP status code to set.
     pub code: u16,
-    /// Compatibility-only reason phrase. The runtime applies `code`
-    /// and ignores this value for every HTTP version.
+    /// Custom reason phrase emitted on the HTTP/1.x status line. Absent
+    /// means the canonical phrase for `code`. HTTP/2 has no reason phrase
+    /// on the wire, so the value is ignored there.
     #[serde(default)]
     pub text: Option<String>,
 }

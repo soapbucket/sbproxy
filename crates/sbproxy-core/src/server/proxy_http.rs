@@ -3035,9 +3035,13 @@ impl ProxyHttp for SbProxy {
                             to_append.push((key.clone(), resolved));
                         }
                     }
-                    // Status code override.
+                    // Status code override. The reason phrase travels with
+                    // its code: a later `status` block without a `text`
+                    // clears any earlier custom phrase rather than pairing
+                    // it with a code it was never written for.
                     if let Some(status_override) = &modifier.status {
                         ctx.response_status_override = Some(status_override.code);
+                        ctx.response_reason_override = status_override.text.clone();
                     }
                     // Body replacement (stored for response_body_filter).
                     if let Some(body_mod) = &modifier.body {
@@ -3218,9 +3222,11 @@ impl ProxyHttp for SbProxy {
 
         // Apply status code override from response modifiers.
         if let Some(status_code) = ctx.response_status_override {
-            if let Ok(status) = http::StatusCode::from_u16(status_code) {
-                upstream_response.set_status(status).ok();
-            }
+            apply_response_status_override(
+                upstream_response,
+                status_code,
+                ctx.response_reason_override.as_deref(),
+            );
         }
 
         // 6. CSRF cookie (set on safe method responses).
@@ -3492,6 +3498,7 @@ impl ProxyHttp for SbProxy {
                     ) {
                         ctx.compression_encoding = Some(encoding);
                         ctx.compression_min_size = comp_cfg.min_size;
+                        ctx.compression_level = comp_cfg.level;
                         ctx.compression_buf = Some(bytes::BytesMut::with_capacity(8192));
                         let _ =
                             upstream_response.insert_header("content-encoding", encoding.as_str());
@@ -5295,6 +5302,9 @@ impl ProxyHttp for SbProxy {
                                     "transform pipeline invariant violated, returning 500 with attribution"
                                 );
                                 ctx.response_status_override = Some(500);
+                                // A modifier's custom reason phrase must not
+                                // pair with the forced 500.
+                                ctx.response_reason_override = None;
                                 ctx.transform_error_attribution = Some(transform_name.to_string());
                                 buf.clear();
                                 buf.extend_from_slice(b"{\"error\":\"internal server error\"}");
@@ -5406,7 +5416,11 @@ impl ProxyHttp for SbProxy {
                         pre as u64,
                     );
                     if buf.len() >= ctx.compression_min_size {
-                        match sbproxy_middleware::compression::compress_body(&buf[..], encoding) {
+                        match sbproxy_middleware::compression::compress_body(
+                            &buf[..],
+                            encoding,
+                            ctx.compression_level,
+                        ) {
                             Ok(compressed) => {
                                 let post = compressed.len();
                                 buf.clear();
@@ -6415,10 +6429,69 @@ fn build_transcoded_json(ctx: &RequestContext, frame: &[u8]) -> Vec<u8> {
     }
 }
 
+/// Apply a response modifier's `status` override to the outgoing header.
+///
+/// The optional `reason` is the modifier's `status.text`. Pingora carries
+/// it on [`pingora_http::ResponseHeader`] and serializes it into the
+/// HTTP/1.x status line; HTTP/2 has no reason phrase on the wire, so the
+/// value is ignored there. An invalid status code leaves the header
+/// untouched, matching the pre-existing override behavior.
+fn apply_response_status_override(
+    response: &mut pingora_http::ResponseHeader,
+    status_code: u16,
+    reason: Option<&str>,
+) {
+    if let Ok(status) = http::StatusCode::from_u16(status_code) {
+        response.set_status(status).ok();
+        if reason.is_some() {
+            response.set_reason_phrase(reason).ok();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use pingora_error::ErrorSource;
+
+    /// `status.text` rides the header struct Pingora's HTTP/1.x
+    /// serializer reads the status line from, so asserting on
+    /// `get_reason_phrase` here is asserting on the wire bytes.
+    #[test]
+    fn status_override_carries_a_custom_reason_phrase() {
+        let mut response = pingora_http::ResponseHeader::build(200, None).expect("build header");
+
+        apply_response_status_override(&mut response, announcement_status(), Some("Custom Away"));
+
+        assert_eq!(response.status.as_u16(), announcement_status());
+        assert_eq!(response.get_reason_phrase(), Some("Custom Away"));
+    }
+
+    #[test]
+    fn status_override_without_text_keeps_the_canonical_reason() {
+        let mut response = pingora_http::ResponseHeader::build(200, None).expect("build header");
+
+        apply_response_status_override(&mut response, 404, None);
+
+        assert_eq!(response.status.as_u16(), 404);
+        assert_eq!(response.get_reason_phrase(), Some("Not Found"));
+    }
+
+    #[test]
+    fn status_override_with_an_invalid_code_changes_nothing() {
+        let mut response = pingora_http::ResponseHeader::build(200, None).expect("build header");
+
+        apply_response_status_override(&mut response, 99, Some("Bogus"));
+
+        assert_eq!(response.status.as_u16(), 200);
+        assert_eq!(response.get_reason_phrase(), Some("OK"));
+    }
+
+    /// 299 has no canonical reason in the `http` crate, proving the
+    /// custom phrase is the one carried rather than a canonical echo.
+    fn announcement_status() -> u16 {
+        299
+    }
 
     /// The service-discovery idle cap is a correctness bound (pooled
     /// connections must not outlive an IP rotation), so a configured idle

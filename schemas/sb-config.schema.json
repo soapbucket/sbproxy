@@ -7795,10 +7795,6 @@
           "description": "Threat protection (IP reputation, blocklist) configuration.",
           "default": null
         },
-        "rate_limit_headers": {
-          "description": "Compatibility-only origin-level rate-limit header shape. Configure the live rate-limit policy's `headers` block instead.",
-          "default": null
-        },
         "error_pages": {
           "description": "Per-status custom error response bodies. Each entry covers one or more HTTP status codes and contributes a content-typed body the proxy substitutes when it generates the matching status. Multiple entries for the same status are content-negotiated against the inbound request's `Accept` header.",
           "default": null,
@@ -8308,7 +8304,7 @@
           ]
         },
         "status": {
-          "description": "Override the response status code. A supplied `text` value is accepted for compatibility but ignored.",
+          "description": "Override the response status code and, optionally via `text`, the HTTP/1.x reason phrase.",
           "default": null,
           "anyOf": [
             {
@@ -8364,7 +8360,7 @@
           "minimum": 0.0
         },
         "text": {
-          "description": "Compatibility-only reason phrase. The runtime applies `code` and ignores this value for every HTTP version.",
+          "description": "Custom reason phrase emitted on the HTTP/1.x status line. Absent means the canonical phrase for `code`. HTTP/2 has no reason phrase on the wire, so the value is ignored there.",
           "default": null,
           "type": [
             "string",
@@ -8504,7 +8500,7 @@
           "minimum": 0.0
         },
         "level": {
-          "description": "Compression level. Reserved; not currently honored by the runtime.",
+          "description": "Encoder effort setting, clamped into the negotiated algorithm's native range (gzip 0-9, brotli 0-11, zstd 1-22). Absent keeps each library's default.",
           "default": null,
           "type": [
             "integer",

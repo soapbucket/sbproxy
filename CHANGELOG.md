@@ -64,7 +64,38 @@ the next version cut.
   new WARN names the recognized providers so the gap is visible before a
   caller hits it.
 
+- **`compression.level` is applied to the response encoders instead of being
+  parsed and dropped.** The configured value is clamped into whichever
+  algorithm the client negotiates (gzip 0-9, brotli 0-11, zstd 1-22), so one
+  number stays meaningful across the three codecs. Leaving it unset keeps the
+  previous behavior exactly: gzip and zstd library defaults, brotli
+  quality 4.
+
+- **`response_modifiers[].status.text` is emitted as the reason phrase on the
+  HTTP/1.x status line instead of being parsed and dropped.** A modifier
+  that sets `status: { code: 418, text: "I am a teapot" }` now puts that
+  phrase on the wire for proxied, static, and plugin-action responses.
+  HTTP/2 has no reason phrase on the wire, so the value is ignored there,
+  and a `status` block without a `text` keeps the canonical phrase for its
+  code.
+
+- **Config compile now warns when `invalidate_on_mutation` is combined with
+  the `file` or `memcached` response-cache store.** Both backends hash their
+  cache keys, so the prefix scan behind mutation-driven invalidation has
+  nothing to walk: a POST or DELETE evicted nothing and entries only fell
+  out by TTL, silently. The warning names each affected origin and points at
+  the `memory` and `redis` backends, which can purge by prefix, and at
+  `invalidate_on_mutation: false` for deployments that accept TTL-based
+  expiry.
+
 ### Removed
+
+- **The origin-level `rate_limit_headers:` block.** It parsed but was never
+  consumed: `X-RateLimit-*` and `Retry-After` are emitted by the
+  rate-limiting policy's own `headers` block, and were even while the
+  origin-level key was accepted. A config that still carries the block now
+  fails config compile with a pointer at the policy-level configuration
+  instead of silently doing nothing.
 
 ### Fixed
 

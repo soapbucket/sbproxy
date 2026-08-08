@@ -728,6 +728,10 @@ pub struct RequestContext {
     /// If a response modifier specifies a status code override, it is stored here
     /// so that response_filter can apply it.
     pub response_status_override: Option<u16>,
+    /// Reason phrase accompanying `response_status_override`, from the
+    /// modifier's `status.text`. Emitted on the HTTP/1.x status line;
+    /// HTTP/2 has no reason phrase on the wire, so it is ignored there.
+    pub response_reason_override: Option<String>,
     /// If a response modifier specifies a body replacement, it is stored here
     /// so that response_body_filter can swap it in.
     pub response_body_replacement: Option<bytes::Bytes>,
@@ -840,6 +844,10 @@ pub struct RequestContext {
     /// this on end-of-stream and falls back to identity when the buffered
     /// body comes in below the floor.
     pub compression_min_size: usize,
+    /// Effort setting handed to the encoder, from the origin's
+    /// `compression.level`. `None` keeps each library's default; a set
+    /// value is clamped into the negotiated algorithm's native range.
+    pub compression_level: Option<u32>,
 
     // --- Classifier verdicts (F5) ---
     /// Verdict produced by the prompt-classifier hook
@@ -1637,6 +1645,7 @@ impl RequestContext {
             graphql_request_body: None,
             graphql_validated_request_body: None,
             response_status_override: None,
+            response_reason_override: None,
             response_body_replacement: None,
             trust_headers: None,
             callback_inject_headers: None,
@@ -1656,6 +1665,7 @@ impl RequestContext {
             compression_encoding: None,
             compression_buf: None,
             compression_min_size: 0,
+            compression_level: None,
             classifier_prompt: None,
             classifier_intent: None,
             classifier_extensions: HashMap::new(),

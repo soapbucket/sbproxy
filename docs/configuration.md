@@ -950,7 +950,6 @@ origins:
 | `mirror` | object | | Shadow traffic configuration. See [Request mirror](#request-mirror). |
 | `bot_detection` | object | | Bot detection config. |
 | `threat_protection` | object | | IP reputation / blocklist config. |
-| `rate_limit_headers` | object | | Config-only. Configure headers on the live rate-limit policy. |
 | `error_pages` | list | | Custom error pages matching one status code or an explicit list of status codes. |
 | `problem_details` | object | | RFC 9457 `application/problem+json` default renderer. Composes with `error_pages`. |
 | `proxy_status` | object | | RFC 9209 `Proxy-Status` response-header configuration. |
@@ -3378,7 +3377,7 @@ origins:
 | `headers.add` | map | Append headers |
 | `headers.remove` | list | Remove headers (alias: `delete`) |
 | `status.code` | int | Override the response status code |
-| `status.text` | string | Compatibility-only reason phrase; accepted with a warning and ignored |
+| `status.text` | string | Custom reason phrase for the HTTP/1.x status line. Absent means the canonical phrase for `code`. HTTP/2 has no reason phrase on the wire, so it is ignored there. |
 | `body.replace` | string | Replace the response body with this string |
 | `body.replace_json` | object | Replace the response body with this JSON value |
 
@@ -3470,7 +3469,7 @@ Omit the block and the store is chosen the way it always was: Redis if `l2_cache
 
 Check these before picking one, because none of them are configurable away.
 
-- `file` and `memcached` hash cache keys, so neither can scan by prefix. `invalidate_on_mutation` (on by default) does nothing on them and entries fall out by TTL instead.
+- `file` and `memcached` hash cache keys, so neither can scan by prefix. `invalidate_on_mutation` (on by default) does nothing on them and entries fall out by TTL instead. Config compile warns about this combination, naming each origin that would silently lose mutation-driven invalidation; pick `memory` or `redis` if you need it, or set `invalidate_on_mutation: false` to accept TTL-based expiry and silence the warning.
 - Neither `memcached` nor `redis` can hand back an entry that is past its TTL, so `stale_while_revalidate` never fires on them. Memcached expires items server-side, and the Redis entry carries its own expiry.
 - `memcached` opens a TCP connection per operation, and its server default caps a value at 1 MiB. Larger responses are refused by the server; the write is logged and the request proceeds.
 - `memcached` and `redis` are not dialled at startup. A config compiles and the proxy boots with the server down; the first cache read is where you find out.
@@ -3967,7 +3966,7 @@ origins:
 | `enabled` | bool | true | Master switch. Alias: `enable`. |
 | `algorithms` | list | | Allowed algorithms in priority order (e.g. `["br", "gzip"]`) |
 | `min_size` | int | 0 | Minimum response size in bytes before compression is applied |
-| `level` | int | | Go-compat compression level. Not used by the Rust runtime. |
+| `level` | int | | Encoder effort, clamped into the negotiated algorithm's range (gzip 0-9, brotli 0-11, zstd 1-22). Unset keeps each library's default. |
 
 ---
 
@@ -4268,7 +4267,7 @@ Spec: <https://www.rfc-editor.org/rfc/rfc8594.html>.
 
 ## Rate limit headers
 
-The `rate_limit_headers` field at the origin level is reserved for future expansion and is not consumed by the open-source binary. To control `X-RateLimit-*` and `Retry-After` emission today, configure the `headers` block on the rate-limiting policy itself.
+Rate-limit headers are configured on the rate-limiting policy's `headers` block. That is the only surface: the policy that counts the requests is the one that knows the limit, the remaining budget, and the reset time.
 
 ```yaml
 origins:
@@ -4286,7 +4285,7 @@ origins:
 | `headers.enabled` | bool | false | When true, emit `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset` on responses. |
 | `headers.include_retry_after` | bool | false | When true, emit `Retry-After` on 429 responses. |
 
-The origin-level `rate_limit_headers` block is accepted for forward compatibility but ignored by the runtime.
+The origin-level `rate_limit_headers:` block has been removed. It parsed but was never consumed, so a config that still carries it fails config compile with a pointer at the policy-level block above. Delete the origin-level block and move the settings onto the policy.
 
 ---
 

@@ -127,30 +127,44 @@ pub fn should_compress_content_type(content_type: Option<&str>) -> bool {
 
 /// Compress `body` using the chosen [`Encoding`].
 ///
-/// Returns the original bytes unchanged for [`Encoding::Identity`]. The
-/// gzip and zstd writers use their crates' default compression level; the
-/// brotli encoder uses quality 4 (a balance between throughput and ratio
-/// that matches what most reverse proxies ship by default).
-pub fn compress_body(body: &[u8], encoding: Encoding) -> std::io::Result<Vec<u8>> {
+/// Returns the original bytes unchanged for [`Encoding::Identity`]. `level`
+/// carries the origin's `compression.level` and is clamped into each
+/// library's native range (gzip 0-9, brotli quality 0-11, zstd 1-22), so
+/// one configured value stays meaningful whichever algorithm the client
+/// negotiates. When `level` is `None` the gzip and zstd writers use their
+/// crates' default compression level and the brotli encoder uses quality 4
+/// (a balance between throughput and ratio that matches what most reverse
+/// proxies ship by default).
+pub fn compress_body(
+    body: &[u8],
+    encoding: Encoding,
+    level: Option<u32>,
+) -> std::io::Result<Vec<u8>> {
     match encoding {
         Encoding::Identity => Ok(body.to_vec()),
         Encoding::Gzip => {
-            let mut enc = flate2::write::GzEncoder::new(
-                Vec::with_capacity(body.len()),
-                flate2::Compression::default(),
-            );
+            let compression = match level {
+                Some(value) => flate2::Compression::new(value.min(9)),
+                None => flate2::Compression::default(),
+            };
+            let mut enc =
+                flate2::write::GzEncoder::new(Vec::with_capacity(body.len()), compression);
             enc.write_all(body)?;
             enc.finish()
         }
         Encoding::Brotli => {
+            let quality = level.map_or(4, |value| value.min(11));
             let mut out = Vec::with_capacity(body.len());
-            let mut writer = brotli::CompressorWriter::new(&mut out, 4096, 4, 22);
+            let mut writer = brotli::CompressorWriter::new(&mut out, 4096, quality, 22);
             writer.write_all(body)?;
             writer.flush()?;
             drop(writer);
             Ok(out)
         }
-        Encoding::Zstd => zstd::encode_all(body, 0),
+        Encoding::Zstd => {
+            let level = level.map_or(0, |value| value.clamp(1, 22)) as i32;
+            zstd::encode_all(body, level)
+        }
     }
 }
 
@@ -339,7 +353,7 @@ mod tests {
     #[test]
     fn test_compress_body_identity_passthrough() {
         let body = b"hello world";
-        let out = compress_body(body, Encoding::Identity).unwrap();
+        let out = compress_body(body, Encoding::Identity, None).unwrap();
         assert_eq!(out, body);
     }
 
@@ -347,7 +361,7 @@ mod tests {
     fn test_compress_body_gzip_roundtrip() {
         use std::io::Read;
         let body: Vec<u8> = (0..2048).map(|i| (i % 251) as u8).collect();
-        let compressed = compress_body(&body, Encoding::Gzip).unwrap();
+        let compressed = compress_body(&body, Encoding::Gzip, None).unwrap();
         assert_ne!(compressed, body, "compressed bytes should differ");
         let mut decoder = flate2::read::GzDecoder::new(&compressed[..]);
         let mut decoded = Vec::new();
@@ -359,7 +373,7 @@ mod tests {
     fn test_compress_body_brotli_roundtrip() {
         use std::io::Read;
         let body: Vec<u8> = (0..2048).map(|i| (i % 251) as u8).collect();
-        let compressed = compress_body(&body, Encoding::Brotli).unwrap();
+        let compressed = compress_body(&body, Encoding::Brotli, None).unwrap();
         assert_ne!(compressed, body);
         let mut decoder = brotli::Decompressor::new(&compressed[..], 4096);
         let mut decoded = Vec::new();
@@ -370,9 +384,96 @@ mod tests {
     #[test]
     fn test_compress_body_zstd_roundtrip() {
         let body: Vec<u8> = (0..2048).map(|i| (i % 251) as u8).collect();
-        let compressed = compress_body(&body, Encoding::Zstd).unwrap();
+        let compressed = compress_body(&body, Encoding::Zstd, None).unwrap();
         assert_ne!(compressed, body);
         let decoded = zstd::decode_all(&compressed[..]).unwrap();
         assert_eq!(decoded, body);
+    }
+
+    // --- compression level ---
+
+    /// A deterministic compressible payload with enough entropy that a
+    /// higher effort setting finds strictly more savings than a lower one.
+    /// Pure byte repetition compresses to the same handful of bytes at
+    /// every level, which would make the ordering assertions vacuous.
+    fn compressible_payload() -> Vec<u8> {
+        const WORDS: [&str; 8] = [
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+        ];
+        let mut state: u64 = 0x5DEE_CE66_D511_ED15;
+        let mut out = Vec::with_capacity(64 * 1024);
+        while out.len() < 64 * 1024 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let word = WORDS[(state >> 33) as usize % WORDS.len()];
+            out.extend_from_slice(word.as_bytes());
+            out.push(b' ');
+        }
+        out
+    }
+
+    #[test]
+    fn test_gzip_level_orders_output_size() {
+        use std::io::Read;
+        let body = compressible_payload();
+        let fast = compress_body(&body, Encoding::Gzip, Some(1)).unwrap();
+        let best = compress_body(&body, Encoding::Gzip, Some(9)).unwrap();
+        assert!(
+            best.len() < fast.len(),
+            "gzip level 9 ({} bytes) must out-compress level 1 ({} bytes)",
+            best.len(),
+            fast.len()
+        );
+        let mut decoder = flate2::read::GzDecoder::new(&best[..]);
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn test_brotli_level_orders_output_size() {
+        use std::io::Read;
+        let body = compressible_payload();
+        let fast = compress_body(&body, Encoding::Brotli, Some(1)).unwrap();
+        let best = compress_body(&body, Encoding::Brotli, Some(11)).unwrap();
+        assert!(
+            best.len() < fast.len(),
+            "brotli quality 11 ({} bytes) must out-compress quality 1 ({} bytes)",
+            best.len(),
+            fast.len()
+        );
+        let mut decoder = brotli::Decompressor::new(&best[..], 4096);
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn test_zstd_level_orders_output_size() {
+        let body = compressible_payload();
+        let fast = compress_body(&body, Encoding::Zstd, Some(1)).unwrap();
+        let best = compress_body(&body, Encoding::Zstd, Some(19)).unwrap();
+        assert!(
+            best.len() < fast.len(),
+            "zstd level 19 ({} bytes) must out-compress level 1 ({} bytes)",
+            best.len(),
+            fast.len()
+        );
+        let decoded = zstd::decode_all(&best[..]).unwrap();
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn test_out_of_range_level_clamps_instead_of_failing() {
+        let body = compressible_payload();
+        for encoding in [Encoding::Gzip, Encoding::Brotli, Encoding::Zstd] {
+            let compressed = compress_body(&body, encoding, Some(999)).unwrap();
+            assert!(
+                !compressed.is_empty() && compressed.len() < body.len(),
+                "{} must clamp an out-of-range level and still compress",
+                encoding.as_str()
+            );
+        }
     }
 }

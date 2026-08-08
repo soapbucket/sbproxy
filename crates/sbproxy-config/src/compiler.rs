@@ -691,6 +691,25 @@ fn principal_selector_is_empty(selector: &crate::types::PrincipalSelector) -> bo
         && selector.claim.is_empty()
 }
 
+/// Hostname of the first origin still carrying the removed
+/// `rate_limit_headers:` key, if any.
+///
+/// The origin-level block parsed for years and never did anything: the
+/// runtime emits rate-limit headers from the rate-limiting policy's own
+/// `headers` block. Detected on the raw YAML, before the typed parse, so
+/// the operator gets a pointer at the live surface instead of the generic
+/// unknown-key diagnostic.
+fn yaml_origin_with_removed_rate_limit_headers(yaml: &str) -> Option<String> {
+    let root: serde_yaml::Value = serde_yaml::from_str(yaml).ok()?;
+    let origins = root.get("origins")?.as_mapping()?;
+    for (hostname, origin) in origins {
+        if origin.get("rate_limit_headers").is_some() {
+            return Some(hostname.as_str().unwrap_or("<unnamed origin>").to_string());
+        }
+    }
+    None
+}
+
 fn yaml_uses_legacy_virtual_keys(yaml: &str) -> bool {
     for line in yaml.lines() {
         // Strip any inline comment that starts AFTER the YAML value;
@@ -1141,6 +1160,24 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         );
     }
 
+    // WOR-2311: reject the removed origin-level `rate_limit_headers:` key.
+    // It parsed for years and did nothing; the runtime emits
+    // `X-RateLimit-*` and `Retry-After` from the rate-limiting policy's
+    // own `headers` block. A key that parses and does not govern is a
+    // defect, so it is refused with a pointer rather than silently
+    // dropped or bounced as a generic unknown key.
+    if let Some(hostname) = yaml_origin_with_removed_rate_limit_headers(&yaml) {
+        anyhow::bail!(
+            "config compile: origin `{hostname}` sets `rate_limit_headers:`, which has been \
+             removed. The origin-level block was never consumed: `X-RateLimit-*` and \
+             `Retry-After` are emitted by the rate-limiting policy itself. Delete the block \
+             and configure the policy instead, as \
+             `policies: - type: rate_limiting ... headers: {{ enabled: true, \
+             include_retry_after: true }}`. See the `Rate limit headers` section of \
+             `docs/configuration.md`."
+        );
+    }
+
     // WOR-1140: two layers reject misspelled keys, so a typo is a hard
     // boot error rather than a silent drop that takes the field's
     // (often protection-disabling) default.
@@ -1473,6 +1510,45 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
              cache on a shared Redis tier. See `docs/configuration.md`.",
             settings.driver,
         );
+    }
+
+    // WOR-2311: prefix purge is a silent no-op on stores whose keys are
+    // hashed. The `file` backend names entries by the SHA-256 of the cache
+    // key and memcached offers no key scan, so `delete_prefix` returns 0
+    // without scanning anything. `invalidate_on_mutation` (on by default)
+    // is the feature that issues those prefix purges: on these backends a
+    // POST/PUT/PATCH/DELETE evicts nothing and cached GET variants only
+    // fall out by TTL. Warn rather than reject, matching the
+    // body-reading-policy-on-`static` precedent (WOR-2136): the cache
+    // still serves reads correctly, and the combination has always
+    // compiled.
+    if let Some(store) = &config_file.proxy.response_cache_store {
+        let hashed_backend = match &store.backend {
+            crate::types::ResponseCacheBackendConfig::File { .. } => Some("file"),
+            crate::types::ResponseCacheBackendConfig::Memcached { .. } => Some("memcached"),
+            crate::types::ResponseCacheBackendConfig::Memory
+            | crate::types::ResponseCacheBackendConfig::Redis => None,
+        };
+        if let Some(backend) = hashed_backend {
+            for origin in &origins {
+                if origin
+                    .response_cache
+                    .as_ref()
+                    .is_some_and(|cache| cache.enabled && cache.invalidate_on_mutation)
+                {
+                    tracing::warn!(
+                        hostname = %origin.hostname,
+                        backend,
+                        "response_cache.invalidate_on_mutation cannot purge by prefix on \
+                         this response_cache_store backend: its cache keys are hashed, so \
+                         mutation requests evict nothing and entries fall out by TTL only. \
+                         Use the `memory` or `redis` backend for mutation-driven \
+                         invalidation, or set `invalidate_on_mutation: false` to accept \
+                         TTL-based expiry"
+                    );
+                }
+            }
+        }
     }
 
     // WOR-805: validate the Web Bot Auth signing identity up front so a
@@ -5694,6 +5770,216 @@ origins:
 "#;
         let compiled = compile_config(yaml).expect("compile");
         assert!(compiled.resolve_origin("api.example.com").is_some());
+    }
+
+    // --- WOR-2311: origin-level rate_limit_headers is removed ---
+
+    /// The block parsed for years and was never consumed; header emission
+    /// lives on the rate-limiting policy. The rejection must name the
+    /// origin and point the operator at the policy-level `headers` block
+    /// rather than bouncing the key as a generic unknown field.
+    #[test]
+    fn removed_rate_limit_headers_key_is_rejected_with_a_pointer_at_the_policy() {
+        let yaml = r#"
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    rate_limit_headers:
+      enabled: true
+"#;
+        let msg = format!(
+            "{:#}",
+            compile_config(yaml)
+                .err()
+                .expect("the removed origin-level key must be refused")
+        );
+        assert!(
+            msg.contains("rate_limit_headers"),
+            "error must name the removed key: {msg}"
+        );
+        assert!(
+            msg.contains("api.example.com"),
+            "error must name the offending origin: {msg}"
+        );
+        assert!(
+            msg.contains("type: rate_limiting"),
+            "error must point at the policy-level configuration: {msg}"
+        );
+    }
+
+    /// The migration target named by the rejection has to compile, or the
+    /// diagnostic points at a dead end.
+    #[test]
+    fn the_policy_level_rate_limit_headers_block_still_compiles() {
+        let yaml = r#"
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    policies:
+      - type: rate_limiting
+        requests_per_minute: 600
+        headers:
+          enabled: true
+          include_retry_after: true
+"#;
+        let compiled = compile_config(yaml).expect("the policy-level headers block is live");
+        assert!(compiled.resolve_origin("api.example.com").is_some());
+    }
+
+    // --- WOR-2311: prefix purge is a no-op on hashed cache backends ---
+
+    /// Counts compile-time warnings that name the hashed-backend purge
+    /// gap, so the assertions cannot pass on an unrelated warning.
+    struct PurgeWarnCounter(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl tracing::Subscriber for PurgeWarnCounter {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target().starts_with("sbproxy_config")
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct SeenGapMessage(bool);
+            impl tracing::field::Visit for SeenGapMessage {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message"
+                        && format!("{value:?}").contains("mutation requests evict nothing")
+                    {
+                        self.0 = true;
+                    }
+                }
+            }
+            if *event.metadata().level() == tracing::Level::WARN {
+                let mut visitor = SeenGapMessage(false);
+                event.record(&mut visitor);
+                if visitor.0 {
+                    self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    fn purge_gap_warnings_for(yaml: &str) -> usize {
+        let warnings = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let compiled = tracing::subscriber::with_default(
+            PurgeWarnCounter(std::sync::Arc::clone(&warnings)),
+            || compile_config(yaml),
+        );
+        compiled.expect("the backend + invalidate_on_mutation combination compiles; it only warns");
+        warnings.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The `file` backend names entries by the SHA-256 of the cache key,
+    /// so `invalidate_on_mutation` (on by default) has nothing to scan and
+    /// evicts nothing. The operator hears that at config compile, once per
+    /// affected origin.
+    #[test]
+    fn invalidate_on_mutation_on_the_file_backend_warns_at_compile() {
+        let yaml = r#"
+proxy:
+  response_cache_store:
+    backend:
+      type: file
+      path: /var/cache/sbproxy/responses
+origins:
+  "cache.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    response_cache:
+      enabled: true
+"#;
+        assert_eq!(
+            purge_gap_warnings_for(yaml),
+            1,
+            "the file backend + default invalidate_on_mutation must warn exactly once"
+        );
+    }
+
+    #[test]
+    fn invalidate_on_mutation_on_the_memcached_backend_warns_at_compile() {
+        let yaml = r#"
+proxy:
+  response_cache_store:
+    backend:
+      type: memcached
+origins:
+  "cache.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    response_cache:
+      enabled: true
+"#;
+        assert_eq!(
+            purge_gap_warnings_for(yaml),
+            1,
+            "memcached offers no key scan, so the combination must warn exactly once"
+        );
+    }
+
+    /// The warning is scoped to the gap. A scannable backend, a disabled
+    /// cache, or an explicit opt-out of mutation invalidation stays quiet.
+    #[test]
+    fn scannable_backends_and_opted_out_origins_do_not_warn() {
+        let memory_backend = r#"
+proxy:
+  response_cache_store:
+    backend:
+      type: memory
+origins:
+  "cache.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    response_cache:
+      enabled: true
+"#;
+        assert_eq!(purge_gap_warnings_for(memory_backend), 0);
+
+        let opted_out = r#"
+proxy:
+  response_cache_store:
+    backend:
+      type: file
+      path: /var/cache/sbproxy/responses
+origins:
+  "cache.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    response_cache:
+      enabled: true
+      invalidate_on_mutation: false
+"#;
+        assert_eq!(purge_gap_warnings_for(opted_out), 0);
+
+        let cache_disabled = r#"
+proxy:
+  response_cache_store:
+    backend:
+      type: file
+      path: /var/cache/sbproxy/responses
+origins:
+  "cache.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+"#;
+        assert_eq!(purge_gap_warnings_for(cache_disabled), 0);
     }
 
     // --- Wave 4 day-4 auto-wire tests (G4.1 + G4.10 + G4.4) ---

@@ -2921,6 +2921,21 @@ pub(super) async fn send_response_with_extras(
     body: &[u8],
     extras: &[(String, String)],
 ) -> Result<()> {
+    send_response_with_extras_and_reason(session, status, None, content_type, body, extras).await
+}
+
+/// Variant of [`send_response_with_extras`] that also carries a custom
+/// reason phrase, from a response modifier's `status.text`. Pingora
+/// serializes it into the HTTP/1.x status line; HTTP/2 has no reason
+/// phrase on the wire, so `reason` is ignored there.
+pub(super) async fn send_response_with_extras_and_reason(
+    session: &mut Session,
+    status: u16,
+    reason: Option<&str>,
+    content_type: &str,
+    body: &[u8],
+    extras: &[(String, String)],
+) -> Result<()> {
     let mut header =
         pingora_http::ResponseHeader::build(status, Some(2 + extras.len())).map_err(|error| {
             Error::because(
@@ -2929,6 +2944,15 @@ pub(super) async fn send_response_with_extras(
                 error,
             )
         })?;
+    if reason.is_some() {
+        header.set_reason_phrase(reason).map_err(|error| {
+            Error::because(
+                ErrorType::InternalError,
+                "failed to set reason phrase",
+                error,
+            )
+        })?;
+    }
     header
         .insert_header("content-type", content_type)
         .map_err(|error| {

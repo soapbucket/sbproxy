@@ -165,10 +165,9 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "origins.*.agents_json.info.version",
         "sbproxy_modules::projections::agents_json::render",
     ),
-    config_only(
+    stable(
         "origins.*.compression.level",
-        "The OSS compressors use their library defaults; this compatibility value is not \
-         applied. Classified under WOR-1976.",
+        "sbproxy_config::compiler::compile_origin",
     ),
     stable(
         "origins.*.compression.min_size",
@@ -413,11 +412,6 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "origins.*.proxy_status.identity",
         "sbproxy_config::compiler::compile_origin",
     ),
-    config_only(
-        "origins.*.rate_limit_headers",
-        "The OSS runtime does not consume the origin-level block; configure headers on the live \
-         rate-limit policy instead. Classified under WOR-1976.",
-    ),
     stable(
         "origins.*.request_modifiers[].js_script",
         "sbproxy_config::compiler::compile_origin",
@@ -426,10 +420,9 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "origins.*.request_modifiers[].lua_script",
         "sbproxy_config::compiler::compile_origin",
     ),
-    config_only(
+    stable(
         "origins.*.response_modifiers[].status.text",
-        "The response path applies the configured status code but does not emit this optional \
-         reason text. Classified under WOR-1976.",
+        "sbproxy_core::server::action_dispatch::apply_plugin_action_response_modifiers",
     ),
     config_only(
         "origins.*.sessions.ttl_seconds",

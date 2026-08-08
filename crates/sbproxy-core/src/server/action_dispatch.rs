@@ -537,6 +537,7 @@ pub(super) async fn handle_action(
 
             // Apply response modifiers to static actions (body replacement, headers, Lua, status).
             let mut status_override: Option<u16> = None;
+            let mut reason_override: Option<String> = None;
             let mut extra_headers: Vec<(String, String)> = Vec::new();
             let mut response_headers = response_headers_for_static_action(&ct, &s.headers);
             // Wave 5 day-6 Item 1: drain CEL header mutations the
@@ -567,9 +568,12 @@ pub(super) async fn handle_action(
                             body_bytes = Bytes::from(text.clone());
                         }
                     }
-                    // Status override
+                    // Status override. The reason phrase travels with its
+                    // code, so a later `status` block without a `text`
+                    // clears an earlier custom phrase.
                     if let Some(status_mod) = &modifier.status {
                         status_override = Some(status_mod.code);
+                        reason_override = status_mod.text.clone();
                     }
                     // Header modifiers
                     if let Some(hm) = &modifier.headers {
@@ -623,6 +627,16 @@ pub(super) async fn handle_action(
                         Error::because(ErrorType::InternalError, "failed to build static header", e)
                     },
                 )?;
+            // `status.text` from a response modifier: emitted on the
+            // HTTP/1.x status line; HTTP/2 has no reason phrase on the
+            // wire, so Pingora ignores it there.
+            if reason_override.is_some() {
+                header
+                    .set_reason_phrase(reason_override.as_deref())
+                    .map_err(|e| {
+                        Error::because(ErrorType::InternalError, "failed to set reason phrase", e)
+                    })?;
+            }
             header
                 .insert_header("content-type", ct.as_str())
                 .map_err(|e| {
@@ -1089,7 +1103,7 @@ pub(super) async fn handle_action(
                     );
                     let transformed_status =
                         ctx.response_status_override.unwrap_or(response.status);
-                    let (status, headers, body) = apply_plugin_action_response_modifiers(
+                    let (status, reason, headers, body) = apply_plugin_action_response_modifiers(
                         session,
                         transformed_status,
                         response.headers,
@@ -1100,9 +1114,10 @@ pub(super) async fn handle_action(
                     );
                     let (content_type, extras) = split_plugin_action_response_headers(headers);
                     ctx.response_status = Some(status);
-                    send_response_with_extras(
+                    send_response_with_extras_and_reason(
                         session,
                         status,
+                        reason.as_deref(),
                         &content_type,
                         body.as_ref(),
                         &extras,
@@ -1223,9 +1238,10 @@ fn apply_plugin_action_response_modifiers(
     pipeline: &CompiledPipeline,
     origin_idx: Option<usize>,
     ctx: &RequestContext,
-) -> (u16, Vec<(String, String)>, Bytes) {
+) -> (u16, Option<String>, Vec<(String, String)>, Bytes) {
+    let mut reason: Option<String> = None;
     let Some(origin) = origin_idx.and_then(|idx| pipeline.config.origins.get(idx)) else {
-        return (status, headers, body);
+        return (status, reason, headers, body);
     };
     let template_context = build_request_template_context(session, ctx, origin);
     let mut response_headers = serde_json::Map::new();
@@ -1242,6 +1258,9 @@ fn apply_plugin_action_response_modifiers(
         }
         if let Some(status_modifier) = &modifier.status {
             status = status_modifier.code;
+            // The reason phrase travels with its code; a later `status`
+            // block without a `text` clears an earlier custom phrase.
+            reason = status_modifier.text.clone();
         }
         if let Some(header_modifier) = &modifier.headers {
             for name in &header_modifier.remove {
@@ -1286,7 +1305,7 @@ fn apply_plugin_action_response_modifiers(
             }
         }
     }
-    (status, headers, body)
+    (status, reason, headers, body)
 }
 
 fn set_plugin_action_response_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
@@ -1555,6 +1574,69 @@ origins:
         assert!(
             response.ends_with("\r\n\r\nmodified"),
             "response: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_action_http1_emits_the_status_override_reason_phrase() {
+        let config = sbproxy_config::compile_config(
+            r#"
+origins:
+  "plugin.test":
+    action:
+      type: static
+      body: placeholder
+    response_modifiers:
+      - status:
+          code: 203
+          text: Early Metadata
+"#,
+        )
+        .expect("fixture config");
+        let pipeline = CompiledPipeline::from_config(config).expect("fixture pipeline");
+        let action = response_action(
+            202,
+            vec![("content-type".into(), "text/plain".into())],
+            Bytes::from_static(b"queued"),
+        );
+
+        let (result, wire) = exchange(&action, &pipeline, Some(0)).await;
+
+        assert!(result.expect("valid plugin response must dispatch"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        assert!(
+            response.starts_with("HTTP/1.1 203 Early Metadata\r\n"),
+            "status.text must reach the HTTP/1.1 status line; response: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn static_action_http1_emits_the_status_override_reason_phrase() {
+        let config = sbproxy_config::compile_config(
+            r#"
+origins:
+  "plugin.test":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+    response_modifiers:
+      - status:
+          code: 451
+          text: Blocked By Policy
+"#,
+        )
+        .expect("fixture config");
+        let pipeline = CompiledPipeline::from_config(config).expect("fixture pipeline");
+
+        let (result, wire) = exchange(&pipeline.actions[0], &pipeline, Some(0)).await;
+
+        assert!(result.expect("static action must dispatch"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        assert!(
+            response.starts_with("HTTP/1.1 451 Blocked By Policy\r\n"),
+            "status.text must reach the HTTP/1.1 status line; response: {response}"
         );
     }
 

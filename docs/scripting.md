@@ -1,6 +1,6 @@
 # SBproxy scripting reference: CEL, Lua, JavaScript, and WASM
 
-*Last modified: 2026-08-03*
+*Last modified: 2026-08-08*
 
 SBproxy includes four scripting engines for custom logic: CEL (Common Expression Language), Lua, JavaScript, and WASM. All run in sandboxed environments with access to request context.
 
@@ -807,7 +807,7 @@ request_modifiers:
 |---|---|---|
 | `headers.set` / `headers.add` / `headers.remove` | map / map / list | Same semantics as the request side |
 | `status.code` | int | Override the response status code |
-| `status.text` | string | Compatibility-only reason phrase; accepted with a warning and ignored |
+| `status.text` | string | Custom reason phrase for the HTTP/1.x status line; ignored on HTTP/2, which has no reason phrase on the wire |
 | `body.replace` | string | Replace the response body with this string |
 | `body.replace_json` | any | Replace the response body with this JSON value |
 | `lua_script` | string | Lua `modify_response(resp, ctx)`; returned `set_headers` applied |
