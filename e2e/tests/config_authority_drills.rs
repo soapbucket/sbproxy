@@ -1095,7 +1095,7 @@ fn drill_7_a_write_to_an_authority_owned_path_is_refused_with_409() {
         BundleMode::Overlay,
         "origins:\n  \"local.localhost\":\n    action:\n      type: static\n      status_code: 200\n      content_type: text/plain\n      body: \"authority-owns-this\"\n",
     );
-    let subscriber = start_proxy(&subscriber_yaml(
+    let sub_yaml = subscriber_yaml(
         stub.port,
         &token,
         &stub.verifying_keys,
@@ -1103,8 +1103,8 @@ fn drill_7_a_write_to_an_authority_owned_path_is_refused_with_409() {
         sub_admin,
         "overlay",
         "",
-    ))
-    .expect("start subscriber");
+    );
+    let subscriber = start_proxy(&sub_yaml).expect("start subscriber");
     assert!(
         converges(CONVERGE, || serves(
             &subscriber,
@@ -1123,9 +1123,16 @@ fn drill_7_a_write_to_an_authority_owned_path_is_refused_with_409() {
         before.contains("local-only-origin"),
         "the local file should still hold its own value: {before}"
     );
+    // WOR-2316: the read is redacted, so the inlined admin password must
+    // not come back. That also means the GET body is no longer a valid
+    // edit base; the drill edits the text it wrote to disk instead.
+    assert!(
+        !before.contains(ADMIN_PASSWORD),
+        "the config read must not echo the inlined admin password: {before}"
+    );
 
     // Edit the value the authority overrides.
-    let proposed = before.replace("local-only-origin", "operator-tried-this");
+    let proposed = sub_yaml.replace("local-only-origin", "operator-tried-this");
     let reply = admin_send("PUT", sub_admin, "/admin/config", proposed.into_bytes());
     assert_eq!(
         reply.status, 409,
@@ -1164,7 +1171,7 @@ fn drill_7_a_write_to_an_authority_owned_path_is_refused_with_409() {
 
     // A write confined to a path the authority does not set still works, so
     // the guard is per-setting rather than a blanket lock.
-    let allowed = format!("{before}\n  \"second.localhost\":\n    action:\n      type: static\n      status_code: 200\n      content_type: text/plain\n      body: \"node-owns-this\"\n");
+    let allowed = format!("{sub_yaml}\n  \"second.localhost\":\n    action:\n      type: static\n      status_code: 200\n      content_type: text/plain\n      body: \"node-owns-this\"\n");
     let reply = admin_send("PUT", sub_admin, "/admin/config", allowed.into_bytes());
     assert_eq!(
         reply.status, 200,
