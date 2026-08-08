@@ -323,14 +323,8 @@ pub fn verify_content_digest(header_value: &str, body: &[u8]) -> bool {
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    use subtle::ConstantTimeEq as _;
+    a.len() == b.len() && bool::from(a.ct_eq(b))
 }
 
 // --- Tests ------------------------------------------------------------
@@ -490,5 +484,13 @@ mod tests {
     fn algorithm_token_is_canonical_lowercase() {
         assert_eq!(Algorithm::Sha256.token(), "sha-256");
         assert_eq!(Algorithm::Sha512.token(), "sha-512");
+    }
+
+    #[test]
+    fn constant_time_eq_equal_unequal_and_length_mismatch() {
+        assert!(constant_time_eq(b"integrity-tag", b"integrity-tag"));
+        assert!(!constant_time_eq(b"integrity-tag", b"integrity-taX"));
+        assert!(!constant_time_eq(b"integrity-tag", b"integrity-ta"));
+        assert!(constant_time_eq(b"", b""));
     }
 }

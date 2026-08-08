@@ -927,16 +927,12 @@ fn unix_now() -> u64 {
 }
 
 /// Constant-time byte slice comparison.  Returns true iff `a == b`.
-/// Avoids short-circuit on length mismatch by always visiting every byte.
+/// Delegates to `subtle` so the no-early-exit property rests on an
+/// audited implementation. Branches on length only, which is not
+/// secret for the credentials compared here.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    use subtle::ConstantTimeEq as _;
+    a.len() == b.len() && bool::from(a.ct_eq(b))
 }
 
 /// Decode a base64-encoded `user:password` string from an HTTP Basic Auth header.
@@ -1367,6 +1363,12 @@ fn handle_reload(state: &AdminState) -> (u16, &'static str, String) {
 /// git-sourced node it may be nothing but the `source:` pointer that
 /// selected the repository. `GET /admin/config/effective` is the endpoint
 /// that answers "what is actually running".
+///
+/// The YAML is passed through [`sbproxy_observe::redact::redact_secrets`]
+/// before it leaves this handler, so a credential inlined as plaintext is
+/// returned as `[REDACTED]` rather than handed to every operator with read
+/// access. `${VAR}` and secret-backend references are unaffected; they
+/// never held the value in the first place.
 fn handle_config_read(state: &AdminState) -> (u16, &'static str, String) {
     let path = match state.config_path.as_ref() {
         Some(p) => p,
@@ -1389,6 +1391,12 @@ fn handle_config_read(state: &AdminState) -> (u16, &'static str, String) {
             );
         }
     };
+    // WOR-2316: a secret inlined in the file as plaintext (rather than as a
+    // `${VAR}` or secret-backend reference) must not be echoed back to a
+    // read-only operator. Same pass the log pipeline runs, so the same token
+    // shapes are caught; everything the patterns do not match, comments and
+    // formatting included, is returned byte-for-byte.
+    let yaml = sbproxy_observe::redact::redact_secrets(&yaml);
     let revision = state
         .loaded_config_content_hash
         .lock()
@@ -1601,6 +1609,12 @@ fn config_write_redirect(layers: &crate::config_effective::ConfigLayers) -> Stri
 /// with nothing, and every leaf reports `local`. The endpoint is still
 /// worth calling there, because the answer "every key is yours" is what
 /// tells an editor it may offer a write at all.
+///
+/// The `yaml` field passes through
+/// [`sbproxy_observe::redact::redact_secrets`] like `GET /admin/config`
+/// does: the merged document carries any plaintext credential the local
+/// file or an authority layer inlined, so the sibling endpoint must not
+/// return what the primary one redacts.
 fn handle_config_effective(state: &AdminState) -> (u16, &'static str, String) {
     let path = match state.config_path.as_ref() {
         Some(p) => p,
@@ -1648,11 +1662,15 @@ fn handle_config_effective(state: &AdminState) -> (u16, &'static str, String) {
         .iter()
         .filter(|(_, provenance)| matches!(provenance, Provenance::Local))
         .count();
+    // WOR-2316: same pass as `GET /admin/config`, for the same reason. The
+    // provenance map holds leaf paths, never values, so only the document
+    // itself needs it.
+    let yaml = sbproxy_observe::redact::redact_secrets(&effective.yaml);
     (
         200,
         "application/json",
         serde_json::json!({
-            "yaml": effective.yaml,
+            "yaml": yaml,
             "provenance": effective.provenance,
             "layers": config_layers_json(&layers),
             "locally_owned": layers.is_local_only(),
@@ -6176,6 +6194,62 @@ mod tests {
     }
 
     #[test]
+    fn config_read_redacts_inlined_secrets() {
+        // WOR-2316: an inlined plaintext credential must not be echoed back
+        // to a read-only operator. Both redactor shapes are exercised: a
+        // token recognized by value (Anthropic key) and one recognized by
+        // its key label (`password:`).
+        let dir = tempfile::tempdir().unwrap();
+        let cfgpath = dir.path().join("sb.yml");
+        std::fs::write(
+            &cfgpath,
+            "proxy:\n  http_bind_port: 8080\nai:\n  api_key: sk-ant-api03-TESTONLYTESTONLY1234567890\n  password: hunter2hunter2\n",
+        )
+        .unwrap();
+        let state = AdminState::new(AdminConfig::default())
+            .with_config_path(cfgpath)
+            .with_loaded_config_content_hash("rev-xyz");
+        let (status, _, body) = handle_config_read(&state);
+        assert_eq!(status, 200);
+        assert!(
+            !body.contains("sk-ant-api03-TESTONLYTESTONLY1234567890"),
+            "inlined key value must not survive the read: {body}"
+        );
+        assert!(
+            !body.contains("hunter2hunter2"),
+            "inlined password value must not survive the read: {body}"
+        );
+        assert!(body.contains("[REDACTED]"), "{body}");
+        // Non-secret content and the revision are untouched.
+        assert!(body.contains("http_bind_port"));
+        assert!(body.contains("rev-xyz"));
+    }
+
+    #[test]
+    fn config_effective_redacts_inlined_secrets() {
+        // WOR-2316: the effective document is assembled from the same
+        // layers, so an inlined plaintext credential must not leak through
+        // the sibling endpoint either.
+        let _guard = config_layer_guard();
+        let (_dir, state) = owned_config_state(
+            "proxy:\n  http_bind_port: 8080\nai:\n  api_key: sk-ant-api03-TESTONLYTESTONLY1234567890\n  password: hunter2hunter2\n",
+        );
+        let (status, _, body) = handle_config_effective(&state);
+        assert_eq!(status, 200);
+        assert!(
+            !body.contains("sk-ant-api03-TESTONLYTESTONLY1234567890"),
+            "inlined key value must not survive the effective read: {body}"
+        );
+        assert!(
+            !body.contains("hunter2hunter2"),
+            "inlined password value must not survive the effective read: {body}"
+        );
+        assert!(body.contains("[REDACTED]"), "{body}");
+        // Non-secret content is untouched.
+        assert!(body.contains("http_bind_port"));
+    }
+
+    #[test]
     fn get_recent_requests_respects_limit() {
         let state = make_state();
         for i in 0..4u16 {
@@ -7375,6 +7449,7 @@ origins:
                 olp: None,
                 web_bot_auth_publish: None,
                 idempotency: None,
+                timeouts: sbproxy_config::UpstreamTimeouts::default(),
                 bot_detection: None,
                 threat_protection: None,
                 on_request: Vec::new(),
@@ -7897,5 +7972,13 @@ origins:
             None,
         );
         assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn constant_time_eq_equal_unequal_and_length_mismatch() {
+        assert!(constant_time_eq(b"admin-password", b"admin-password"));
+        assert!(!constant_time_eq(b"admin-password", b"admin-passworX"));
+        assert!(!constant_time_eq(b"admin-password", b"admin-passwor"));
+        assert!(constant_time_eq(b"", b""));
     }
 }

@@ -7899,11 +7899,23 @@
           ]
         },
         "connection_pool": {
-          "description": "Compatibility-only per-origin connection-pool shape. Pingora's built-in pool settings apply regardless of these values.",
+          "description": "Compatibility-only per-origin connection-pool shape, except for `idle_timeout_secs`, which is the legacy spelling of `timeouts.idle_ms`. Pingora's built-in pool settings apply regardless of the other values.",
           "default": null,
           "anyOf": [
             {
               "$ref": "#/definitions/ConnectionPoolConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "timeouts": {
+          "description": "Per-origin upstream transport deadlines (connect, read, write, idle). Absent fields resolve to the built-in defaults at config compile time. See [`UpstreamTimeoutsConfig`].",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UpstreamTimeoutsConfig"
             },
             {
               "type": "null"
@@ -9675,7 +9687,7 @@
       ]
     },
     "ConnectionPoolConfig": {
-      "description": "Legacy per-origin connection-pool shape.\n\nThe OSS runtime does not install these values into Pingora. They remain in the schema so existing configuration files continue to parse.",
+      "description": "Legacy per-origin connection-pool shape.\n\n`idle_timeout_secs` is live: it is the legacy spelling of the upstream idle deadline and feeds the origin's resolved [`UpstreamTimeouts`] when `timeouts.idle_ms` is not set. The other two values remain config-only compatibility values the OSS runtime does not install into Pingora.",
       "type": "object",
       "properties": {
         "max_connections": {
@@ -9686,7 +9698,7 @@
           "minimum": 0.0
         },
         "idle_timeout_secs": {
-          "description": "Maximum idle time before a connection is closed, in seconds.\n\nConfig-only compatibility value. Default: 90 s.",
+          "description": "Maximum idle time before a pooled upstream connection is closed, in seconds.\n\nLegacy spelling of `timeouts.idle_ms`; setting both fails config compile. Default: 90 s.",
           "default": 90,
           "type": "integer",
           "format": "uint32",
@@ -9697,6 +9709,63 @@
           "default": 300,
           "type": "integer",
           "format": "uint32",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "UpstreamTimeoutsConfig": {
+      "description": "Per-origin upstream timeout overrides.\n\nEvery field is optional. An absent field resolves to the matching `DEFAULT_UPSTREAM_*` constant at config compile time, so the request path always reads a concrete [`UpstreamTimeouts`]. A value of `0` fails config compile: a zero deadline fails the operation the moment it starts and is never what an operator meant.",
+      "type": "object",
+      "properties": {
+        "connect_ms": {
+          "description": "Deadline for one upstream TCP connect attempt, in milliseconds. Default: 5000 (5 s).",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "total_connect_ms": {
+          "description": "Deadline across all connect attempts for one upstream selection, including TLS, in milliseconds. Default: 10000 (10 s).",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "read_ms": {
+          "description": "Per-read socket deadline on the upstream connection, in milliseconds. Default: 30000 (30 s).",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "write_ms": {
+          "description": "Per-write socket deadline on the upstream connection, in milliseconds. Default: 30000 (30 s).",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "idle_ms": {
+          "description": "Idle time before a pooled upstream connection is closed, in milliseconds. Service discovery caps the effective value at half the DNS refresh window. Default: 90000 (90 s).",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
           "minimum": 0.0
         }
       },

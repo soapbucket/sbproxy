@@ -2620,7 +2620,10 @@ async fn check_auth_with_tls_outcome(
                 },
             ),
         },
-        Auth::Jwt(a) => match a.check_request_with_claims(headers, tenant_id.clone()) {
+        Auth::Jwt(a) => match a
+            .check_request_with_claims(headers, tenant_id.clone())
+            .await
+        {
             Some((principal, claims)) => {
                 // WOR-1074 Stage 2: DPoP first (the JWT's
                 // `cnf.jkt` claim binds the access token to a

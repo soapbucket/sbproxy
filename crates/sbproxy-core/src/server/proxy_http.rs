@@ -981,6 +981,26 @@ fn maybe_retry_upstream_timeout(
     Some(phase)
 }
 
+/// Combine the origin's configured upstream idle timeout with the
+/// service-discovery idle cap.
+///
+/// The cap (half the DNS refresh window, at most 10s) is a correctness
+/// bound, not a default: a pooled connection pinned to a rotated-away IP
+/// must age out before the next refresh. The configured idle can therefore
+/// only shrink the result, never extend past the cap, so the two combine
+/// via `min()`. Either side passes through unchanged when the other is
+/// absent.
+fn cap_idle_for_service_discovery(
+    configured: Option<std::time::Duration>,
+    sd_cap: Option<std::time::Duration>,
+) -> Option<std::time::Duration> {
+    match (configured, sd_cap) {
+        (Some(configured), Some(cap)) => Some(configured.min(cap)),
+        (None, Some(cap)) => Some(cap),
+        (configured, None) => configured,
+    }
+}
+
 #[async_trait]
 impl ProxyHttp for SbProxy {
     type CTX = RequestContext;
@@ -1017,37 +1037,6 @@ impl ProxyHttp for SbProxy {
         _session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        // tune_peer applies matched upstream transport settings to every peer
-        // we return. Pingora 0.8 ships with very conservative defaults
-        // (HTTP/1.1 only, max_h2_streams=1, no idle_timeout, no tcp_keepalive,
-        // no connect/read/write deadlines). See sbproxy-bench/docs/TUNING.md
-        // for the rationale. Numbers here are chosen to match the Go engine's
-        // http.Transport settings so benchmark comparisons measure the engine,
-        // not the defaults.
-        fn tune_peer(mut peer: HttpPeer) -> HttpPeer {
-            use std::time::Duration;
-            peer.options.connection_timeout = Some(Duration::from_secs(5));
-            peer.options.total_connection_timeout = Some(Duration::from_secs(10));
-            peer.options.read_timeout = Some(Duration::from_secs(30));
-            peer.options.write_timeout = Some(Duration::from_secs(30));
-            peer.options.idle_timeout = Some(Duration::from_secs(90));
-            peer.options.alpn = ALPN::H2H1;
-            peer.options.max_h2_streams = 256;
-            peer.options.tcp_keepalive = Some(TcpKeepalive {
-                idle: Duration::from_secs(60),
-                interval: Duration::from_secs(10),
-                count: 3,
-                #[cfg(target_os = "linux")]
-                user_timeout: Duration::from_secs(0),
-            });
-            // Larger TCP recv buffer helps large-body upstream responses
-            // (streaming AI, file proxies) avoid receive-window stalls.
-            // 1 MB matches what Go's net.Dialer advertises with the bumped
-            // tcp_rmem sysctl we set on the VMs.
-            peer.options.tcp_recv_buf = Some(1024 * 1024);
-            peer
-        }
-
         // `upstream_peer` starts a new attempt. Every ordinary retry path
         // already finishes the prior token, while this neutral guard handles
         // Pingora replacement paths that bypass those callbacks.
@@ -1070,6 +1059,41 @@ impl ProxyHttp for SbProxy {
             Error::new(ErrorType::HTTPStatus(500))
         })?;
         let load_balancer_action_key = LoadBalancerActionKey::new(origin_idx, ctx.forward_rule_idx);
+
+        // tune_peer applies the origin's upstream transport settings to every
+        // peer we return. Pingora 0.8 ships with very conservative defaults
+        // (HTTP/1.1 only, max_h2_streams=1, no idle_timeout, no tcp_keepalive,
+        // no connect/read/write deadlines). See sbproxy-bench/docs/TUNING.md
+        // for the rationale. The deadlines come from the compiled origin's
+        // resolved `timeouts` block (config `origins.*.timeouts`); the
+        // defaults match the Go engine's http.Transport settings so benchmark
+        // comparisons measure the engine, not the defaults. `config.origins`
+        // is indexed by `origin_idx` exactly like `pipeline.actions`, so a
+        // forward-rule inline origin inherits its parent origin's timeouts.
+        let upstream_timeouts = pipeline.config.origins[origin_idx].timeouts;
+        let tune_peer = |mut peer: HttpPeer| -> HttpPeer {
+            use std::time::Duration;
+            peer.options.connection_timeout = Some(upstream_timeouts.connect);
+            peer.options.total_connection_timeout = Some(upstream_timeouts.total_connect);
+            peer.options.read_timeout = Some(upstream_timeouts.read);
+            peer.options.write_timeout = Some(upstream_timeouts.write);
+            peer.options.idle_timeout = Some(upstream_timeouts.idle);
+            peer.options.alpn = ALPN::H2H1;
+            peer.options.max_h2_streams = 256;
+            peer.options.tcp_keepalive = Some(TcpKeepalive {
+                idle: Duration::from_secs(60),
+                interval: Duration::from_secs(10),
+                count: 3,
+                #[cfg(target_os = "linux")]
+                user_timeout: Duration::from_secs(0),
+            });
+            // Larger TCP recv buffer helps large-body upstream responses
+            // (streaming AI, file proxies) avoid receive-window stalls.
+            // 1 MB matches what Go's net.Dialer advertises with the bumped
+            // tcp_rmem sysctl we set on the VMs.
+            peer.options.tcp_recv_buf = Some(1024 * 1024);
+            peer
+        };
 
         // If a forward rule matched, use its action instead of the origin's.
         let effective_action: &Action = if let Some(fwd_idx) = ctx.forward_rule_idx {
@@ -1112,10 +1136,13 @@ impl ProxyHttp for SbProxy {
                             // window (or 10s, whichever is smaller). When
                             // DNS rotates an IP, the connection pool
                             // entries pinned to the stale IP age out
-                            // quickly instead of lingering for 90s. This
-                            // is a workaround for the missing pool-eviction
-                            // primitive in Pingora 0.8; it trades a small
-                            // amount of pool churn for much fresher routing.
+                            // quickly instead of lingering for the full
+                            // configured idle timeout (90s by default).
+                            // This is a workaround for the missing
+                            // pool-eviction primitive in Pingora 0.8; it
+                            // trades a small amount of pool churn for much
+                            // fresher routing. Combined with the origin's
+                            // configured idle via min() at the peer below.
                             let half_refresh = std::cmp::max(s.refresh_secs / 2, 1);
                             std::time::Duration::from_secs(std::cmp::min(half_refresh, 10))
                         });
@@ -1161,9 +1188,13 @@ impl ProxyHttp for SbProxy {
                 );
 
                 let mut peer = tune_peer(HttpPeer::new(&*addr, tls, sni));
-                if let Some(t) = sd_idle_timeout {
-                    peer.options.idle_timeout = Some(t);
-                }
+                // The service-discovery cap (half the DNS refresh window) is
+                // a correctness bound: a pooled connection must not outlive
+                // an IP rotation. The configured idle can therefore only
+                // shrink the result further; take the min of the two rather
+                // than letting either win outright.
+                peer.options.idle_timeout =
+                    cap_idle_for_service_discovery(peer.options.idle_timeout, sd_idle_timeout);
                 Ok(Box::new(peer))
             }
             Action::LoadBalancer(lb) => {
@@ -6388,6 +6419,43 @@ fn build_transcoded_json(ctx: &RequestContext, frame: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
     use pingora_error::ErrorSource;
+
+    /// The service-discovery idle cap is a correctness bound (pooled
+    /// connections must not outlive an IP rotation), so a configured idle
+    /// combines with it via min(): neither side wins outright.
+    #[test]
+    fn sd_idle_cap_takes_the_min_of_configured_and_cap() {
+        use std::time::Duration;
+
+        // Configured idle above the cap: the cap wins.
+        assert_eq!(
+            cap_idle_for_service_discovery(
+                Some(Duration::from_secs(90)),
+                Some(Duration::from_secs(5))
+            ),
+            Some(Duration::from_secs(5))
+        );
+        // Configured idle below the cap: the configured value wins.
+        assert_eq!(
+            cap_idle_for_service_discovery(
+                Some(Duration::from_secs(2)),
+                Some(Duration::from_secs(5))
+            ),
+            Some(Duration::from_secs(2))
+        );
+        // No service discovery: the configured value passes through.
+        assert_eq!(
+            cap_idle_for_service_discovery(Some(Duration::from_secs(90)), None),
+            Some(Duration::from_secs(90))
+        );
+        // No configured idle: the cap passes through.
+        assert_eq!(
+            cap_idle_for_service_discovery(None, Some(Duration::from_secs(5))),
+            Some(Duration::from_secs(5))
+        );
+        // Neither side present: stays unset.
+        assert_eq!(cap_idle_for_service_discovery(None, None), None);
+    }
 
     #[test]
     fn dpop_resource_htu_uses_final_authority_and_path_without_query() {

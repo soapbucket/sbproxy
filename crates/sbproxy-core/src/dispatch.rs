@@ -76,7 +76,7 @@ pub async fn dispatch_h3_request(
 
     // --- 4. Auth check ---
     if let Some(auth) = pipeline.auths.get(origin_idx).and_then(|a| a.as_ref()) {
-        let authorized = check_auth(auth, &headers, &uri, &method);
+        let authorized = check_auth(auth, &headers, &uri, &method).await;
         if !authorized {
             debug!(hostname = %hostname, "H3: auth failed");
             let mut resp = text_response(401, "Unauthorized");
@@ -138,7 +138,11 @@ fn handle_acme_challenge(path: &str) -> Result<HttpResponse> {
 // --- Auth checking ---
 
 /// Returns true if the request passes the configured auth check, false otherwise.
-fn check_auth(
+///
+/// Async because JWT validation can refetch a rotated JWKS key set over
+/// the network on an unknown `kid`; every other arm resolves without
+/// awaiting.
+async fn check_auth(
     auth: &Auth,
     headers: &http::HeaderMap,
     uri: &http::Uri,
@@ -149,7 +153,7 @@ fn check_auth(
         Auth::ApiKey(api_key) => api_key.check_request(headers, query),
         Auth::BasicAuth(basic) => basic.check_request(headers),
         Auth::Bearer(bearer) => bearer.check_request(headers),
-        Auth::Jwt(jwt) => jwt.check_request(headers),
+        Auth::Jwt(jwt) => jwt.check_request(headers).await,
         Auth::Digest(digest) => {
             // For H3, we cannot do the challenge-response flow in a single request.
             // Check if Authorization header is present and valid; reject otherwise.
@@ -1116,11 +1120,11 @@ mod tests {
 
     // --- ForwardAuth fail-closed regression test ---
     //
-    // Drives the synchronous `check_auth` helper directly so the assertion
+    // Drives the `check_auth` helper directly so the assertion
     // does not race with other tests sharing the global pipeline.
 
-    #[test]
-    fn check_auth_forward_auth_fails_closed_over_h3() {
+    #[tokio::test]
+    async fn check_auth_forward_auth_fails_closed_over_h3() {
         use sbproxy_modules::auth::ForwardAuthProvider;
 
         let provider = ForwardAuthProvider {
@@ -1138,7 +1142,7 @@ mod tests {
         let headers = http::HeaderMap::new();
         let uri: http::Uri = "/protected".parse().unwrap();
 
-        let authorized = check_auth(&auth, &headers, &uri, &http::Method::GET);
+        let authorized = check_auth(&auth, &headers, &uri, &http::Method::GET).await;
 
         assert!(
             !authorized,

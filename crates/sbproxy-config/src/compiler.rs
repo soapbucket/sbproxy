@@ -19,9 +19,13 @@ use crate::snapshot::{CompiledConfig, CompiledOrigin};
 use crate::types::{
     AttestationBillableConfig, AttestationConfig, AttestationLedgerConfig,
     AttestationMeasuredConfig, AttestationOriginHeaderConfig, AttestationQueueConfig,
-    AttestationRole, AttestationRouteWeightConfig, ConfigFile, EnforcementMode, FailureMode,
-    L2CacheConfig, L2CacheParams, OriginAttestationConfig, RawOriginConfig, WebBotAuthConfig,
-    ATTESTATION_SIGN_WITH_WEB_BOT_AUTH, MAX_ATTESTATION_QUEUE_ENTRIES,
+    AttestationRole, AttestationRouteWeightConfig, ConfigFile, ConnectionPoolConfig,
+    EnforcementMode, FailureMode, L2CacheConfig, L2CacheParams, OriginAttestationConfig,
+    RawOriginConfig, UpstreamTimeouts, UpstreamTimeoutsConfig, WebBotAuthConfig,
+    ATTESTATION_SIGN_WITH_WEB_BOT_AUTH, DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS,
+    DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS, DEFAULT_UPSTREAM_READ_TIMEOUT_MS,
+    DEFAULT_UPSTREAM_TOTAL_CONNECT_TIMEOUT_MS, DEFAULT_UPSTREAM_WRITE_TIMEOUT_MS,
+    MAX_ATTESTATION_QUEUE_ENTRIES,
 };
 
 const MAX_REDIS_TLS_FILE_BYTES: u64 = 1_048_576;
@@ -2101,6 +2105,90 @@ fn validate_origin_attestation(
     Ok(())
 }
 
+/// Resolve an origin's upstream timeouts into concrete durations.
+///
+/// Absent fields fall back to the `DEFAULT_UPSTREAM_*` constants so the
+/// request path never sees an `Option`. The idle deadline has one extra
+/// input: the legacy `connection_pool.idle_timeout_secs` spelling feeds the
+/// same resolved value when `timeouts.idle_ms` is unset, and authoring both
+/// (a non-default legacy value next to `idle_ms`) fails the compile so the
+/// two keys cannot silently disagree.
+///
+/// # Errors
+///
+/// Returns an error when any configured deadline is `0`: a zero deadline
+/// fails the operation the moment it starts and is never what an operator
+/// meant, so it is rejected here rather than shipped.
+fn resolve_upstream_timeouts(
+    hostname: &str,
+    timeouts: Option<&UpstreamTimeoutsConfig>,
+    connection_pool: Option<&ConnectionPoolConfig>,
+) -> Result<UpstreamTimeouts> {
+    // An explicitly typed local (all fields `None` when the block is
+    // absent) keeps the field reads below visible to the build-time
+    // config-reader guard, which cannot type closure parameters.
+    let authored: UpstreamTimeoutsConfig = timeouts.cloned().unwrap_or_default();
+
+    let configured = [
+        ("timeouts.connect_ms", authored.connect_ms),
+        ("timeouts.total_connect_ms", authored.total_connect_ms),
+        ("timeouts.read_ms", authored.read_ms),
+        ("timeouts.write_ms", authored.write_ms),
+        ("timeouts.idle_ms", authored.idle_ms),
+    ];
+    for (key, value) in configured {
+        if value == Some(0) {
+            anyhow::bail!(
+                "origin {hostname}: {key} is 0. A zero deadline fails the upstream operation \
+                 the moment it starts; omit the key to keep the built-in default instead."
+            );
+        }
+    }
+
+    let pool_idle_secs = connection_pool.map(|pool| pool.idle_timeout_secs);
+    let idle_ms = match (authored.idle_ms, pool_idle_secs) {
+        // The legacy key's serde default (90 s) is indistinguishable from an
+        // authored 90, so only a non-default legacy value can conflict.
+        (Some(_), Some(pool_secs))
+            if pool_secs != ConnectionPoolConfig::default().idle_timeout_secs =>
+        {
+            anyhow::bail!(
+                "origin {hostname}: config conflict: both `timeouts.idle_ms` and \
+                 `connection_pool.idle_timeout_secs` are set. They name the same upstream \
+                 idle deadline; remove the legacy `connection_pool.idle_timeout_secs` and \
+                 keep `timeouts.idle_ms`."
+            );
+        }
+        (Some(idle_ms), _) => idle_ms,
+        (None, Some(pool_secs)) => {
+            if pool_secs == 0 {
+                anyhow::bail!(
+                    "origin {hostname}: connection_pool.idle_timeout_secs is 0. A zero idle \
+                     deadline closes every pooled upstream connection the moment it goes \
+                     idle; omit the key to keep the built-in default instead."
+                );
+            }
+            u64::from(pool_secs).saturating_mul(1000)
+        }
+        (None, None) => DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS,
+    };
+
+    let ms = std::time::Duration::from_millis;
+    Ok(UpstreamTimeouts {
+        connect: ms(authored
+            .connect_ms
+            .unwrap_or(DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS)),
+        total_connect: ms(authored
+            .total_connect_ms
+            .unwrap_or(DEFAULT_UPSTREAM_TOTAL_CONNECT_TIMEOUT_MS)),
+        read: ms(authored.read_ms.unwrap_or(DEFAULT_UPSTREAM_READ_TIMEOUT_MS)),
+        write: ms(authored
+            .write_ms
+            .unwrap_or(DEFAULT_UPSTREAM_WRITE_TIMEOUT_MS)),
+        idle: ms(idle_ms),
+    })
+}
+
 /// Compile a single origin from its raw config.
 ///
 /// # Errors
@@ -2466,6 +2554,16 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
         .map(|s| CompactString::new(s.as_str()))
         .unwrap_or_else(|| CompactString::const_new("__default__"));
 
+    // Resolve the upstream transport deadlines to concrete durations here,
+    // once, so `upstream_peer` reads plain `Duration`s off the compiled
+    // origin instead of re-deriving defaults per request. Zero values and
+    // the legacy-key conflict are rejected inside the resolver.
+    let timeouts = resolve_upstream_timeouts(
+        hostname,
+        config.timeouts.as_ref(),
+        config.connection_pool.as_ref(),
+    )?;
+
     Ok(CompiledOrigin {
         hostname: CompactString::new(hostname),
         origin_id: CompactString::new(hostname),
@@ -2504,6 +2602,9 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
         olp: config.olp,
         web_bot_auth_publish: config.web_bot_auth_publish,
         idempotency: config.idempotency,
+        // Resolved upstream transport deadlines; see
+        // `resolve_upstream_timeouts` above.
+        timeouts,
         bot_detection: config.bot_detection,
         threat_protection: config.threat_protection,
         on_request: config.on_request,
@@ -3820,6 +3921,203 @@ origins:
         let msg = err.to_string();
         assert!(
             msg.contains("typo-corp") && msg.contains("not declared"),
+            "unhelpful error: {msg}"
+        );
+    }
+
+    /// A `timeouts:` block resolves onto the compiled origin as concrete
+    /// durations, so the request path reads them without Option juggling.
+    #[test]
+    fn compile_origin_resolves_custom_upstream_timeouts() {
+        let yaml = r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: http://localhost:3000
+    timeouts:
+      connect_ms: 1500
+      total_connect_ms: 4000
+      read_ms: 120000
+      write_ms: 45000
+      idle_ms: 20000
+"#;
+        let compiled = compile_config(yaml).unwrap();
+        let origin = compiled.resolve_origin("api.example.com").unwrap();
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(origin.timeouts.connect, ms(1500));
+        assert_eq!(origin.timeouts.total_connect, ms(4000));
+        assert_eq!(origin.timeouts.read, ms(120_000));
+        assert_eq!(origin.timeouts.write, ms(45_000));
+        assert_eq!(origin.timeouts.idle, ms(20_000));
+    }
+
+    /// Absent fields resolve to the `DEFAULT_UPSTREAM_*` constants, both
+    /// with no `timeouts:` block at all and with a partial one.
+    #[test]
+    fn compile_origin_upstream_timeouts_default_to_the_consts() {
+        let yaml = r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: http://localhost:3000
+  partial.example.com:
+    action:
+      type: proxy
+      url: http://localhost:3001
+    timeouts:
+      read_ms: 120000
+"#;
+        let compiled = compile_config(yaml).unwrap();
+        let origin = compiled.resolve_origin("api.example.com").unwrap();
+        assert_eq!(origin.timeouts, UpstreamTimeouts::default());
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(
+            origin.timeouts.connect,
+            ms(DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS)
+        );
+        assert_eq!(
+            origin.timeouts.total_connect,
+            ms(DEFAULT_UPSTREAM_TOTAL_CONNECT_TIMEOUT_MS)
+        );
+        assert_eq!(origin.timeouts.read, ms(DEFAULT_UPSTREAM_READ_TIMEOUT_MS));
+        assert_eq!(origin.timeouts.write, ms(DEFAULT_UPSTREAM_WRITE_TIMEOUT_MS));
+        assert_eq!(origin.timeouts.idle, ms(DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS));
+
+        let partial = compiled.resolve_origin("partial.example.com").unwrap();
+        assert_eq!(partial.timeouts.read, ms(120_000));
+        assert_eq!(
+            partial.timeouts.connect,
+            ms(DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS)
+        );
+        assert_eq!(partial.timeouts.idle, ms(DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS));
+    }
+
+    /// A zero deadline means instant failure and is never intended, so
+    /// every `timeouts.*_ms` key rejects `0` at compile with an error
+    /// that names the offending key.
+    #[test]
+    fn compile_origin_rejects_zero_upstream_timeouts() {
+        for key in [
+            "connect_ms",
+            "total_connect_ms",
+            "read_ms",
+            "write_ms",
+            "idle_ms",
+        ] {
+            let yaml = format!(
+                r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: http://localhost:3000
+    timeouts:
+      {key}: 0
+"#
+            );
+            let err = compile_config(&yaml)
+                .err()
+                .expect("zero timeout should fail compile");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(&format!("timeouts.{key} is 0")),
+                "error for {key} must name the key: {msg}"
+            );
+        }
+    }
+
+    /// The legacy `connection_pool.idle_timeout_secs` feeds the same
+    /// resolved idle deadline when `timeouts.idle_ms` is unset, so the
+    /// previously inert key becomes live rather than staying a trap.
+    #[test]
+    fn compile_origin_legacy_pool_idle_feeds_resolved_idle() {
+        let yaml = r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: http://localhost:3000
+    connection_pool:
+      idle_timeout_secs: 45
+"#;
+        let compiled = compile_config(yaml).unwrap();
+        let origin = compiled.resolve_origin("api.example.com").unwrap();
+        assert_eq!(origin.timeouts.idle, std::time::Duration::from_secs(45));
+    }
+
+    /// Authoring a non-default legacy idle next to `timeouts.idle_ms`
+    /// fails compile: two spellings of one deadline must not disagree
+    /// silently.
+    #[test]
+    fn compile_origin_rejects_conflicting_idle_spellings() {
+        let yaml = r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: http://localhost:3000
+    connection_pool:
+      idle_timeout_secs: 45
+    timeouts:
+      idle_ms: 20000
+"#;
+        let err = compile_config(yaml)
+            .err()
+            .expect("conflicting idle spellings should fail compile");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("config conflict")
+                && msg.contains("connection_pool.idle_timeout_secs")
+                && msg.contains("timeouts.idle_ms"),
+            "unhelpful error: {msg}"
+        );
+    }
+
+    /// A `connection_pool` block that only sets other fields does not
+    /// count as authoring the legacy idle: `timeouts.idle_ms` wins and
+    /// the compile stays green.
+    #[test]
+    fn compile_origin_idle_ms_wins_over_defaulted_pool_idle() {
+        let yaml = r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: http://localhost:3000
+    connection_pool:
+      max_connections: 64
+    timeouts:
+      idle_ms: 20000
+"#;
+        let compiled = compile_config(yaml).unwrap();
+        let origin = compiled.resolve_origin("api.example.com").unwrap();
+        assert_eq!(
+            origin.timeouts.idle,
+            std::time::Duration::from_millis(20_000)
+        );
+    }
+
+    /// The legacy idle spelling is held to the same zero rejection as
+    /// `timeouts.idle_ms` now that it is live.
+    #[test]
+    fn compile_origin_rejects_zero_legacy_pool_idle() {
+        let yaml = r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: http://localhost:3000
+    connection_pool:
+      idle_timeout_secs: 0
+"#;
+        let err = compile_config(yaml)
+            .err()
+            .expect("zero legacy idle should fail compile");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("connection_pool.idle_timeout_secs is 0"),
             "unhelpful error: {msg}"
         );
     }

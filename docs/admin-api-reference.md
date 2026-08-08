@@ -1,6 +1,6 @@
 # Admin API reference
 
-*Last modified: 2026-08-03*
+*Last modified: 2026-08-08*
 
 The embedded admin server publishes the full control-plane HTTP surface for
 operator tooling: liveness probes, session login, key and credential
@@ -1298,6 +1298,16 @@ document actually in force; the local file there may be nothing but the
 {"yaml": "proxy:\n  http_bind_port: 8080\n...", "revision": "abc123..."}
 ```
 
+The returned YAML is redacted: any value matching a known secret shape
+(API keys, tokens, `password:` and `api_key:` values) comes back as
+`[REDACTED]` instead of the plaintext. The same redaction applies to
+the `yaml` field of
+[`GET /admin/config/effective`](#get-adminconfigeffective). Comments,
+formatting, and everything the patterns do not match are returned
+byte-for-byte. A config that inlines a secret therefore cannot be
+round-tripped through this editor; move the value to a `${VAR}` or
+secret-backend reference first (see [secrets.md](secrets.md)).
+
 `PUT`/`POST` validates the submitted YAML, persists it, and hot-swaps
 the running pipeline, the same swap `POST /admin/reload` performs,
 just sourced from the request body instead of re-reading the file.
@@ -1386,7 +1396,7 @@ is the answer that tells an editor it may offer a write at all.
 
 | Field | Type | Description |
 |---|---|---|
-| `yaml` | string | The merged document. Re-serialized, so comments and original key order are not preserved even when the merge changed nothing. |
+| `yaml` | string | The merged document. Re-serialized, so comments and original key order are not preserved even when the merge changed nothing. Redacted the same way as [`GET /admin/config`](#get-put-adminconfig): values matching known secret shapes come back as `[REDACTED]`. |
 | `provenance` | object | Dotted setting path to the layer that set it. `"local"`, `"authority"`, or `{"git": {"repo", "reference", "commit"}}`. |
 | `layers.base` | object | `{"kind": "local"}`, or `{"kind": "git", ...}` with the **resolved** commit rather than the configured reference. |
 | `layers.authority` | object | The applied authority payload, or `null`. Reports what is applied, not what is configured; the two differ during exactly the incidents where it matters. |
