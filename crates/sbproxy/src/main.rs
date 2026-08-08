@@ -817,6 +817,11 @@ enum LedgerSub {
     /// given) and report the first broken link, if any. Exit 0 when the
     /// ledger verifies, 1 when it does not.
     Verify(LedgerVerifyArgs),
+    /// Aggregate a value ledger into the per-model savings report the
+    /// admin `GET /admin/model-host/value` route serves, reading the
+    /// redb file directly with no server running. A missing file is
+    /// reported as no value recorded yet, not an error. Exit 0.
+    Report(LedgerReportArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -829,6 +834,17 @@ struct LedgerVerifyArgs {
     signing_seed_hex: Option<String>,
     /// Output format. `text` (default) prints a human line; `json` emits a
     /// single structured object for CI consumption.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+#[derive(clap::Args, Debug)]
+struct LedgerReportArgs {
+    /// Path to the value ledger file (the redb database the AI handler
+    /// keeps at `<cache_dir>/value-ledger.redb`).
+    path: PathBuf,
+    /// Output format. `text` (default) prints per-model rows and totals;
+    /// `json` emits the same object `GET /admin/model-host/value` serves.
     #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
 }
@@ -8735,6 +8751,7 @@ fn handle_ai_subcommand(cmd: &AiCmd) -> anyhow::Result<i32> {
     match &cmd.sub {
         AiSub::Ledger(ledger) => match &ledger.sub {
             LedgerSub::Verify(args) => handle_ledger_verify(args),
+            LedgerSub::Report(args) => handle_ledger_report(args),
         },
         AiSub::Prompt(prompt) => match &prompt.sub {
             PromptSub::Optimize(args) => handle_prompt_optimize(args),
@@ -8877,6 +8894,124 @@ fn handle_ledger_verify(args: &LedgerVerifyArgs) -> anyhow::Result<i32> {
     }
 
     Ok(if result.ok { 0 } else { 1 })
+}
+
+/// `sbproxy ai ledger report`: aggregate a value ledger (the redb file
+/// the AI handler keeps at `<cache_dir>/value-ledger.redb`) into the same
+/// report the admin `GET /admin/model-host/value` route serves, without a
+/// running server.
+///
+/// Reads the file directly and offline, the way `ai ledger verify` reads
+/// its artifact; querying a live proxy stays the admin route's job (an
+/// admin-URL mode is a possible later extension). A missing file is the
+/// normal state before any value is recorded, so it reports an empty
+/// ledger rather than an error.
+fn handle_ledger_report(args: &LedgerReportArgs) -> anyhow::Result<i32> {
+    handle_ledger_report_to(args, &mut std::io::stdout())
+}
+
+/// The testable core of `handle_ledger_report`: writes the report to
+/// `out` instead of stdout, so tests can assert on it without capturing
+/// the process's real stdout.
+fn handle_ledger_report_to(
+    args: &LedgerReportArgs,
+    out: &mut impl std::io::Write,
+) -> anyhow::Result<i32> {
+    // `ValueLedger::open` creates a missing database, so probe first: a
+    // report must never write the file it is reporting on.
+    let report = if args.path.exists() {
+        sbproxy_ai::value_ledger::ValueLedger::open(&args.path)?.report()
+    } else {
+        sbproxy_model_host::ValueReport::default()
+    };
+
+    match args.format {
+        OutputFormat::Json => {
+            // The exact serialization the admin value route returns, so
+            // the two surfaces stay key-for-key interchangeable.
+            writeln!(out, "{}", serde_json::to_string(&report)?)?;
+        }
+        OutputFormat::Text => {
+            if report.models.is_empty() && report.compression.is_empty() {
+                writeln!(out, "ledger report: no value recorded yet")?;
+                return Ok(0);
+            }
+            if !report.models.is_empty() {
+                writeln!(
+                    out,
+                    "{:<24} {:>8} {:>8} {:>14} {:>14}",
+                    "MODEL", "LOCAL", "CLOUD", "SAVED_USD", "CLOUD_USD"
+                )?;
+                for model in &report.models {
+                    writeln!(
+                        out,
+                        "{:<24} {:>8} {:>8} {:>14} {:>14}",
+                        model.model,
+                        model.local_completions,
+                        model.cloud_completions,
+                        usd_from_micros(model.saved_micros),
+                        usd_from_micros(model.cloud_spent_micros),
+                    )?;
+                }
+                writeln!(
+                    out,
+                    "totals: {} local, {} cloud, saved USD {}, cloud spent USD {}",
+                    report.total_local_completions,
+                    report.total_cloud_completions,
+                    usd_from_micros(report.total_saved_micros),
+                    usd_from_micros(report.total_cloud_spent_micros),
+                )?;
+            }
+            if !report.compression.is_empty() {
+                if !report.models.is_empty() {
+                    writeln!(out)?;
+                }
+                writeln!(
+                    out,
+                    "{:<24} {:<20} {:>14} {:>14} PRECISION",
+                    "MODEL", "LEVER", "TOKENS_SAVED", "GROSS_USD"
+                )?;
+                for row in &report.compression {
+                    writeln!(
+                        out,
+                        "{:<24} {:<20} {:>14} {:>14} {}",
+                        row.model,
+                        row.lever,
+                        row.tokens_saved,
+                        usd_from_micros(row.gross_cost_saved_micros),
+                        row.token_count_precision.as_str(),
+                    )?;
+                }
+                writeln!(
+                    out,
+                    "compression totals: {} tokens saved, USD {} gross input cost avoided",
+                    report.total_compression_tokens_saved,
+                    usd_from_micros(report.total_compression_gross_cost_saved_micros),
+                )?;
+            }
+        }
+    }
+
+    Ok(0)
+}
+
+/// Format micro-USD as a decimal dollar string with at least two and at
+/// most six fractional digits, trailing zeros beyond the second decimal
+/// trimmed: `10_500` renders `0.0105`, `1_500_000` renders `1.50`.
+///
+/// Mirrors `format_micros_trimmed` in `sbproxy-modules`' ai_crawl money
+/// type, the workspace's micros-to-decimal convention. That helper is
+/// private to its crate and pulling it out for one caller is not a clean
+/// seam, so the convention is mirrored here instead.
+fn usd_from_micros(micros: u64) -> String {
+    let full = format!("{}.{:06}", micros / 1_000_000, micros % 1_000_000);
+    let trimmed = full.trim_end_matches('0');
+    let trimmed = trimmed.trim_end_matches('.');
+    match trimmed.split_once('.') {
+        Some((int_part, frac)) if frac.len() >= 2 => format!("{int_part}.{frac}"),
+        Some((int_part, frac)) => format!("{int_part}.{frac:0<2}"),
+        None => format!("{trimmed}.00"),
+    }
 }
 
 fn handle_admin_subcommand(
@@ -9600,6 +9735,150 @@ mod tests {
         assert_eq!(args.variant.as_deref(), Some("cpu"));
         assert!(matches!(args.engine, ModelEngineArg::LlamaCpp));
         assert!(args.offline);
+    }
+
+    /// A unique scratch path for the value-ledger report tests. Mirrors
+    /// `temp_config`'s pid-plus-counter convention rather than adding a
+    /// dev-dependency this crate does not otherwise carry.
+    fn temp_value_ledger_path(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "sbproxy-ledger-report-{tag}-{}-{n}.redb",
+            std::process::id()
+        ))
+    }
+
+    fn ledger_report_output(path: &std::path::Path, format: OutputFormat) -> (i32, String) {
+        let args = LedgerReportArgs {
+            path: path.to_path_buf(),
+            format,
+        };
+        let mut out = Vec::new();
+        let code = handle_ledger_report_to(&args, &mut out).expect("report runs");
+        (code, String::from_utf8(out).expect("utf-8 output"))
+    }
+
+    #[test]
+    fn ai_ledger_report_cli_surface_parses_path_and_format() {
+        let cli = Cli::try_parse_from([
+            "sbproxy",
+            "ai",
+            "ledger",
+            "report",
+            "value-ledger.redb",
+            "--format",
+            "json",
+        ])
+        .unwrap();
+        let Some(Cmd::Ai(AiCmd {
+            sub:
+                AiSub::Ledger(LedgerCmd {
+                    sub: LedgerSub::Report(args),
+                }),
+        })) = cli.cmd
+        else {
+            panic!("ai ledger report parsed to the wrong command");
+        };
+        assert_eq!(args.path, PathBuf::from("value-ledger.redb"));
+        assert!(matches!(args.format, OutputFormat::Json));
+    }
+
+    #[test]
+    fn ledger_report_aggregates_lanes_like_the_admin_route() {
+        let path = temp_value_ledger_path("lanes");
+        let price = sbproxy_model_host::CloudPrice {
+            prompt_micros_per_mtok: 3_000_000,
+            completion_micros_per_mtok: 15_000_000,
+        };
+        {
+            let ledger = sbproxy_ai::value_ledger::ValueLedger::open(&path).expect("open ledger");
+            ledger.record_local("qwen", 1000, 500, price); // saves 10_500
+            ledger.record_local("qwen", 1000, 500, price); // saves 10_500
+            ledger.record_cloud("qwen", 1000, 500, price); // spends 10_500
+            ledger.record_compression(
+                "gpt-4o-mini",
+                sbproxy_ai::compression::LeverKind::WindowFit,
+                500,
+                75,
+                sbproxy_model_host::TokenCountPrecision::ModelTokenizer,
+            );
+        }
+
+        let (code, json_out) = ledger_report_output(&path, OutputFormat::Json);
+        assert_eq!(code, 0);
+        let report: serde_json::Value = serde_json::from_str(&json_out).expect("report json");
+        // The same keys the admin value route serves, raw micros included.
+        // models[0] is the compression target's zeroed lane (BTreeMap order).
+        let qwen = &report["models"][1];
+        assert_eq!(qwen["model"], "qwen");
+        assert_eq!(qwen["local_completions"], 2);
+        assert_eq!(qwen["cloud_completions"], 1);
+        assert_eq!(qwen["saved_micros"], 21_000);
+        assert_eq!(qwen["cloud_spent_micros"], 10_500);
+        assert_eq!(report["total_saved_micros"], 21_000);
+        assert_eq!(report["total_cloud_spent_micros"], 10_500);
+        assert_eq!(report["compression"][0]["model"], "gpt-4o-mini");
+        assert_eq!(report["compression"][0]["lever"], "window_fit");
+        assert_eq!(report["compression"][0]["tokens_saved"], 500);
+        assert_eq!(report["compression"][0]["gross_cost_saved_micros"], 75);
+        assert_eq!(report["total_compression_tokens_saved"], 500);
+
+        let (code, text) = ledger_report_output(&path, OutputFormat::Text);
+        assert_eq!(code, 0);
+        assert!(text.contains("qwen"), "text report names the model: {text}");
+        assert!(
+            text.contains("0.021") && text.contains("0.0105"),
+            "micros render as trimmed decimal dollars: {text}"
+        );
+        assert!(
+            text.contains("0.000075"),
+            "sub-cent compression value keeps its micros precision: {text}"
+        );
+        assert!(
+            text.contains("model_tokenizer"),
+            "precision column carries the token-count signal: {text}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ledger_report_missing_or_empty_ledger_is_a_clean_zero() {
+        // Missing file: the normal state before any value is recorded.
+        let missing = temp_value_ledger_path("missing");
+        let (code, text) = ledger_report_output(&missing, OutputFormat::Text);
+        assert_eq!(code, 0, "a missing value ledger is not an error");
+        assert!(text.contains("no value recorded yet"), "text: {text}");
+        assert!(
+            !missing.exists(),
+            "reporting must not create the database it reports on"
+        );
+
+        let (code, json_out) = ledger_report_output(&missing, OutputFormat::Json);
+        assert_eq!(code, 0);
+        let report: serde_json::Value = serde_json::from_str(&json_out).expect("report json");
+        assert_eq!(report["models"], serde_json::json!([]));
+        assert_eq!(report["total_saved_micros"], 0);
+
+        // An existing ledger with no recorded lanes reads the same way.
+        let empty = temp_value_ledger_path("empty");
+        drop(sbproxy_ai::value_ledger::ValueLedger::open(&empty).expect("create empty ledger"));
+        let (code, text) = ledger_report_output(&empty, OutputFormat::Text);
+        assert_eq!(code, 0);
+        assert!(text.contains("no value recorded yet"), "text: {text}");
+        let _ = std::fs::remove_file(&empty);
+    }
+
+    #[test]
+    fn usd_from_micros_trims_to_the_workspace_money_convention() {
+        assert_eq!(usd_from_micros(0), "0.00");
+        assert_eq!(usd_from_micros(10_000), "0.01");
+        assert_eq!(usd_from_micros(10_500), "0.0105");
+        assert_eq!(usd_from_micros(75), "0.000075");
+        assert_eq!(usd_from_micros(1_500_000), "1.50");
+        assert_eq!(usd_from_micros(2_000_000), "2.00");
     }
 
     #[test]

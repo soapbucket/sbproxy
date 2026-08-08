@@ -1,10 +1,10 @@
 # Kubernetes gateway pattern
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-08*
 
 ![Kubernetes gateway pattern](../../docs/assets/k8s-gateway.gif)
 
-Realistic config when SBproxy runs behind a Kubernetes Ingress (or any cluster-edge load balancer) and proxies to backend Pods that scale up and down independently. `trusted_proxies` honours XFF only from cluster-internal source ranges and rejects spoofed XFF from anywhere else. `service_discovery` re-resolves the upstream hostname every `refresh_secs` so endpoint rotation is picked up automatically without restarting the proxy. `host_override` sends the Service hostname to the upstream when Pods route by Host header for multi-tenant or vhost dispatch. `correlation_id` threads `X-Request-Id` through the proxy, upstream, response, and webhooks so trace IDs survive the cluster boundary. `concurrent_limit` keyed by IP protects upstream Pods from a thundering herd. The Ingress, K8s Operator, and HTTPRoute fixtures from `docs/kubernetes.md` produce this exact shape on the dataplane.
+Realistic config when SBproxy runs behind a Kubernetes Ingress (or any cluster-edge load balancer) and proxies to backend Pods that scale up and down independently. `trusted_proxies` honours XFF only from cluster-internal source ranges and rejects spoofed XFF from anywhere else. `service_discovery` re-resolves the upstream hostname every `refresh_secs` so endpoint rotation is picked up automatically without restarting the proxy. `host_override` sends the Service hostname to the upstream when Pods route by Host header for multi-tenant or vhost dispatch. `correlation_id` threads `X-Request-Id` through the proxy, upstream, response, and webhooks so trace IDs survive the cluster boundary. `concurrent_limit` keyed by IP protects upstream Pods from a thundering herd. This is the dataplane shape to run behind the Ingress or Gateway described in `docs/kubernetes.md`.
 
 ## Run
 
@@ -12,7 +12,7 @@ Realistic config when SBproxy runs behind a Kubernetes Ingress (or any cluster-e
 sbproxy serve -f sb.yml
 ```
 
-In a real K8s deployment the Operator generates this YAML from a `Gateway` and `HTTPRoute` pair. The example uses `test.sbproxy.dev` as a stand-in for the cluster Service so it runs locally; the inline comments show the Service DNS name (`backend.namespace.svc.cluster.local:8080`) that production configs use for both `url` and `host_override`. The live `host_override` is `test.sbproxy.dev` because the shared test upstream routes by Host and serves no other name.
+In a real K8s deployment you author this YAML in an `SBProxyConfig` resource and the Operator mounts it into the proxy Pods (see `docs/kubernetes.md`; the Operator does not generate config from Gateway API resources). The example uses `test.sbproxy.dev` as a stand-in for the cluster Service so it runs locally; the inline comments show the Service DNS name (`backend.namespace.svc.cluster.local:8080`) that production configs use for both `url` and `host_override`. The live `host_override` is `test.sbproxy.dev` because the shared test upstream routes by Host and serves no other name.
 
 ## Try it
 
