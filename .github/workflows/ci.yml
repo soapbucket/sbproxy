@@ -11,7 +11,7 @@ name: CI
 #   obs-budgets    (~5 min) e2e cardinality + redaction, observability paths only
 #   payments      (~13 min) clippy + tests under the settlement feature union
 #   ui             (~40 s)  node typecheck + vitest
-#   supply-chain   (~50 s)  cargo-deny
+#   supply-chain   (~60 s)  cargo-deny (crates) + npm audit (admin UI)
 #   embed-admin-ui (~6 min) SPA build + the release binary's feature union
 #   build / test   (~5 s)   aggregator; the required status check
 #
@@ -542,7 +542,7 @@ jobs:
         run: cargo check --bin sbproxy --features embed-admin-ui --locked
 
   supply-chain:
-    name: supply chain (cargo-deny)
+    name: supply chain (cargo-deny + npm audit)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -557,6 +557,47 @@ jobs:
           command: check
           arguments: --all-features
           log-level: warn
+
+      # The admin SPA is a second ecosystem and cargo-deny cannot see it.
+      # `ui/` is a Vue + Vite app with its own `package-lock.json`, it is
+      # built into `ui/dist` and embedded into the release binary by the
+      # `embed-admin-ui` feature, and until this step existed nothing in
+      # this repository scanned it. The gap was not theoretical: a high
+      # severity advisory against `nanoid` (transitive, via postcss) sat
+      # open while every Rust lane was green, because no Rust tool reads a
+      # npm lockfile.
+      #
+      # This lives here rather than in the `ui` job on purpose. The `ui`
+      # job is path-filtered to `ui/**`, so it is skipped on most pull
+      # requests, and a security gate that only runs when someone happens
+      # to touch the directory is green precisely when a newly published
+      # advisory needs to turn it red. This job has no `needs: changes`
+      # and no `if:`, so both ecosystems get scanned on every run, which
+      # is the same reason cargo-deny is unconditional.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # `--package-lock-only` resolves the tree from `package-lock.json`
+      # without installing anything, so this needs no `npm ci` and no
+      # `node_modules`. `npm ci` installs exactly what the lockfile pins,
+      # so auditing the lockfile and auditing the installed tree are the
+      # same audit.
+      #
+      # Threshold: `high`, meaning high and critical fail and moderate and
+      # below only print. The tree is 112 dev dependencies against 27
+      # production ones, almost all of it build tooling (Vite, vitest,
+      # vue-tsc), and that kind of tree carries a steady background of
+      # moderate transitive advisories in tooling that never reaches a
+      # browser. Gating on moderate would make this lane a rotating chore,
+      # and a gate people route around is worse than a narrower one they
+      # respect. High and critical is the bar that catches the class of
+      # finding worth blocking a merge for, and it would have caught the
+      # nanoid advisory above. Raise it to moderate if the noise turns out
+      # to be lower than expected; do not lower it past high.
+      - name: npm audit (admin UI)
+        working-directory: ui
+        run: npm audit --package-lock-only --audit-level=high
 
   release-build:
     name: release build

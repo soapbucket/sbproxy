@@ -7491,6 +7491,7 @@ origins:
             rate_limits: None,
             audit: None,
             session_ledger: None,
+            request_events: None,
             flags: Vec::new(),
         };
         let pipeline = CompiledPipeline::from_config(cfg).expect("pipeline compiles");

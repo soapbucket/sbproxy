@@ -1699,6 +1699,8 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         audit: config_file.audit,
         // WOR-1186: session-ledger emission config.
         session_ledger: config_file.session_ledger,
+        // WOR-2318: request-event egress config.
+        request_events: config_file.request_events,
         // WOR-1971: hand the complete top-level flag set to the binary.
         flags: config_file.flags,
     })

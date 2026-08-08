@@ -304,6 +304,83 @@ fn install_session_ledger_sink(cfg: &sbproxy_config::types::SessionLedgerConfig)
     }
 }
 
+/// A constructed request-event sink, ready to hand to the setter.
+type RequestEventSinkHandle = std::sync::Arc<dyn sbproxy_observe::RequestEventSink>;
+
+/// WOR-2318: build the request-event sink the config asks for, or
+/// `None` when it asks for nothing.
+///
+/// Returned alongside the sink is the kind that was actually built,
+/// which is not always the kind that was configured: an unopenable or
+/// unnamed `path` falls back to the logging sink so a misconfigured
+/// deployment still sees its events rather than silently discarding
+/// them. Split out from [`install_request_event_sink`] so the mapping
+/// can be tested without touching the process-global slot, which is
+/// set-once and therefore untestable more than once per process.
+fn build_request_event_sink(
+    cfg: &sbproxy_config::types::RequestEventsConfig,
+) -> Option<(RequestEventSinkHandle, &'static str)> {
+    use std::sync::Arc;
+
+    use sbproxy_config::types::RequestEventSinkKind;
+    use sbproxy_observe::{FileEventSink, LoggingSink, RequestEventSink};
+
+    match cfg.sink {
+        // The historical behavior, and the default: dispatch stays a
+        // no-op and nothing is registered at all, so the request path
+        // keeps paying one atomic load and nothing else.
+        RequestEventSinkKind::None => None,
+        RequestEventSinkKind::Logging => Some((
+            Arc::new(LoggingSink) as Arc<dyn RequestEventSink>,
+            "logging",
+        )),
+        RequestEventSinkKind::File => match cfg.path.as_deref() {
+            Some(path) => match FileEventSink::create(std::path::Path::new(path)) {
+                Ok(sink) => Some((Arc::new(sink) as Arc<dyn RequestEventSink>, "file")),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        path = %path,
+                        "request event file sink could not be opened; using the logging sink",
+                    );
+                    Some((
+                        Arc::new(LoggingSink) as Arc<dyn RequestEventSink>,
+                        "logging",
+                    ))
+                }
+            },
+            None => {
+                tracing::warn!(
+                    "request_events.sink is `file` but no `path` is set; using the logging sink",
+                );
+                Some((
+                    Arc::new(LoggingSink) as Arc<dyn RequestEventSink>,
+                    "logging",
+                ))
+            }
+        },
+    }
+}
+
+/// WOR-2318: register the configured request-event sink process-wide.
+///
+/// Without this the proxy builds a fully populated `RequestEvent` for
+/// every terminating request and then hands it to the implicit no-op,
+/// so the whole capture path runs and produces nothing an operator can
+/// read.
+fn install_request_event_sink(cfg: &sbproxy_config::types::RequestEventsConfig) {
+    let Some((sink, kind)) = build_request_event_sink(cfg) else {
+        return;
+    };
+
+    match sbproxy_observe::set_request_event_sink(sink) {
+        Ok(()) => tracing::info!(sink = kind, "request event emission enabled"),
+        Err(_) => {
+            tracing::warn!("request event sink already registered; keeping the existing one")
+        }
+    }
+}
+
 /// WOR-1164: (re)install the detection-singleton globals from
 /// `compiled`. Runs at startup AND from the hot-reload path so a SIGHUP
 /// that changed `agent_classes:`, the resolver flags, or
@@ -1485,6 +1562,16 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
         if cfg.enabled {
             install_session_ledger_sink(cfg);
         }
+    }
+
+    // --- WOR-2318: register the request-event sink when configured ---
+    //
+    // Same startup-only, set-once shape as the ledger sink above. The
+    // default `sink: none` registers nothing, which keeps
+    // `dispatch_request_event` a no-op exactly as it was before the
+    // block existed.
+    if let Some(cfg) = compiled.request_events.as_ref() {
+        install_request_event_sink(cfg);
     }
 
     // WOR-1164: install the detection singletons (agent-class resolver,
@@ -4353,6 +4440,7 @@ origins:
             rate_limits: None,
             audit: None,
             session_ledger: None,
+            request_events: None,
             flags: Vec::new(),
         };
 
@@ -4681,5 +4769,143 @@ mod at_rest_posture_tests {
         let pipeline = crate::pipeline::CompiledPipeline::default();
         warn_on_distributed_semantic_backends(&pipeline);
         assert_eq!(pipeline.semantic_caches.registrations().count(), 0);
+    }
+}
+
+/// WOR-2318: the `request_events:` block, from YAML through to the sink
+/// the boot path would register.
+///
+/// These exercise [`build_request_event_sink`] rather than
+/// [`install_request_event_sink`] on purpose. The registered sink is a
+/// process-global `OnceLock`, so only one test per binary could ever
+/// observe an install, and `capture_envelope`'s tests already claim it
+/// in this crate. The builder is where every decision is made; the
+/// installer only hands its result to the setter.
+#[cfg(test)]
+mod request_event_sink_tests {
+    use super::*;
+
+    use sbproxy_config::types::{RequestEventSinkKind, RequestEventsConfig};
+    use sbproxy_observe::{RequestEvent, RequestEventSink};
+
+    fn sample_event() -> RequestEvent {
+        RequestEvent::new_started(
+            "api.example.com".to_string(),
+            ulid::Ulid::new(),
+            "ws_test".to_string(),
+        )
+    }
+
+    /// Publish one freshly minted event through a built sink and hand
+    /// back its request id, which is what the caller looks for
+    /// downstream.
+    fn publish_sample(sink: &std::sync::Arc<dyn RequestEventSink>) -> ulid::Ulid {
+        let event = sample_event();
+        let request_id = event.request_id;
+        sink.publish(event);
+        request_id
+    }
+
+    #[test]
+    fn the_config_block_round_trips_from_yaml_to_the_compiled_snapshot() {
+        let yaml = "proxy: {}\nrequest_events:\n  sink: file\n  path: /tmp/events.ndjson\n";
+        let compiled = sbproxy_config::compile_config(yaml).expect("config compiles");
+
+        let cfg = compiled
+            .request_events
+            .as_ref()
+            .expect("the block survives compilation");
+        assert_eq!(cfg.sink, RequestEventSinkKind::File);
+        assert_eq!(cfg.path.as_deref(), Some("/tmp/events.ndjson"));
+    }
+
+    #[test]
+    fn an_absent_block_compiles_to_no_request_event_config() {
+        let compiled = sbproxy_config::compile_config("proxy: {}\n").expect("config compiles");
+        assert!(compiled.request_events.is_none());
+    }
+
+    #[test]
+    fn the_bare_block_defaults_to_the_none_sink() {
+        let compiled =
+            sbproxy_config::compile_config("proxy: {}\nrequest_events: {}\n").expect("compiles");
+        let cfg = compiled.request_events.expect("the block survives");
+        assert_eq!(cfg.sink, RequestEventSinkKind::None);
+    }
+
+    #[test]
+    fn the_default_sink_kind_installs_nothing() {
+        // The pre-existing behavior: dispatch stays a no-op, so the
+        // builder must decline to produce a sink at all rather than
+        // registering something that quietly discards.
+        assert!(build_request_event_sink(&RequestEventsConfig::default()).is_none());
+    }
+
+    #[test]
+    fn a_logging_sink_is_built_when_the_config_asks_for_one() {
+        let cfg = RequestEventsConfig {
+            sink: RequestEventSinkKind::Logging,
+            path: None,
+        };
+        let (sink, kind) = build_request_event_sink(&cfg).expect("logging sink is built");
+        assert_eq!(kind, "logging");
+        // The built sink accepts a dispatched event. Tracing capture is
+        // owned by the logging tests; this proves the wiring, not the
+        // formatting.
+        publish_sample(&sink);
+    }
+
+    #[test]
+    fn a_file_sink_writes_the_published_event_to_its_configured_path() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("request-events.ndjson");
+        let cfg = RequestEventsConfig {
+            sink: RequestEventSinkKind::File,
+            path: Some(path.display().to_string()),
+        };
+
+        let (sink, kind) = build_request_event_sink(&cfg).expect("file sink is built");
+        assert_eq!(kind, "file");
+
+        let request_id = publish_sample(&sink);
+        // Dropping the last handle drains the queue, flushes, and joins
+        // the writer thread, so the read below cannot race it.
+        drop(sink);
+
+        let written = std::fs::read_to_string(&path).expect("read back the ndjson");
+        assert!(
+            written.contains(&request_id.to_string()),
+            "the event never reached the file: {written:?}"
+        );
+        assert!(written.contains("api.example.com"), "{written:?}");
+    }
+
+    #[test]
+    fn a_file_sink_without_a_path_falls_back_to_logging() {
+        let cfg = RequestEventsConfig {
+            sink: RequestEventSinkKind::File,
+            path: None,
+        };
+        let (_, kind) = build_request_event_sink(&cfg).expect("a fallback sink is still built");
+        assert_eq!(
+            kind, "logging",
+            "a misconfigured path must still leave the events somewhere an operator can read"
+        );
+    }
+
+    #[test]
+    fn a_file_sink_whose_path_cannot_be_opened_falls_back_to_logging() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        // A parent directory that does not exist: the open fails at
+        // build time rather than silently at the first request.
+        let path = dir.path().join("missing").join("events.ndjson");
+        let cfg = RequestEventsConfig {
+            sink: RequestEventSinkKind::File,
+            path: Some(path.display().to_string()),
+        };
+
+        let (_, kind) = build_request_event_sink(&cfg).expect("a fallback sink is still built");
+        assert_eq!(kind, "logging");
+        assert!(!path.exists());
     }
 }
