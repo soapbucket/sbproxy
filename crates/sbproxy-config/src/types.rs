@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::time::Duration;
 
 // --- Top-Level Config ---
 
@@ -5994,8 +5995,10 @@ fn default_idle_timeout() -> u32 {
 
 /// Legacy per-origin connection-pool shape.
 ///
-/// The OSS runtime does not install these values into Pingora. They remain in
-/// the schema so existing configuration files continue to parse.
+/// `idle_timeout_secs` is live: it is the legacy spelling of the upstream
+/// idle deadline and feeds the origin's resolved [`UpstreamTimeouts`] when
+/// `timeouts.idle_ms` is not set. The other two values remain config-only
+/// compatibility values the OSS runtime does not install into Pingora.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ConnectionPoolConfig {
@@ -6005,9 +6008,11 @@ pub struct ConnectionPoolConfig {
     #[serde(default = "default_max_connections")]
     pub max_connections: u32,
 
-    /// Maximum idle time before a connection is closed, in seconds.
+    /// Maximum idle time before a pooled upstream connection is closed, in
+    /// seconds.
     ///
-    /// Config-only compatibility value. Default: 90 s.
+    /// Legacy spelling of `timeouts.idle_ms`; setting both fails config
+    /// compile. Default: 90 s.
     #[serde(default = "default_idle_timeout_secs")]
     pub idle_timeout_secs: u32,
 
@@ -6036,6 +6041,99 @@ impl Default for ConnectionPoolConfig {
             max_connections: default_max_connections(),
             idle_timeout_secs: default_idle_timeout_secs(),
             max_lifetime_secs: default_max_lifetime_secs(),
+        }
+    }
+}
+
+// --- UpstreamTimeoutsConfig ---
+
+/// Default deadline for one upstream TCP connect attempt, in milliseconds.
+pub const DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS: u64 = 5_000;
+
+/// Default deadline across all connect attempts for one upstream selection,
+/// including TLS, in milliseconds.
+pub const DEFAULT_UPSTREAM_TOTAL_CONNECT_TIMEOUT_MS: u64 = 10_000;
+
+/// Default per-read socket deadline on an upstream connection, in
+/// milliseconds.
+pub const DEFAULT_UPSTREAM_READ_TIMEOUT_MS: u64 = 30_000;
+
+/// Default per-write socket deadline on an upstream connection, in
+/// milliseconds.
+pub const DEFAULT_UPSTREAM_WRITE_TIMEOUT_MS: u64 = 30_000;
+
+/// Default idle time before a pooled upstream connection is closed, in
+/// milliseconds.
+pub const DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS: u64 = 90_000;
+
+/// Per-origin upstream timeout overrides.
+///
+/// Every field is optional. An absent field resolves to the matching
+/// `DEFAULT_UPSTREAM_*` constant at config compile time, so the request path
+/// always reads a concrete [`UpstreamTimeouts`]. A value of `0` fails config
+/// compile: a zero deadline fails the operation the moment it starts and is
+/// never what an operator meant.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamTimeoutsConfig {
+    /// Deadline for one upstream TCP connect attempt, in milliseconds.
+    /// Default: 5000 (5 s).
+    #[serde(default)]
+    pub connect_ms: Option<u64>,
+
+    /// Deadline across all connect attempts for one upstream selection,
+    /// including TLS, in milliseconds. Default: 10000 (10 s).
+    #[serde(default)]
+    pub total_connect_ms: Option<u64>,
+
+    /// Per-read socket deadline on the upstream connection, in milliseconds.
+    /// Default: 30000 (30 s).
+    #[serde(default)]
+    pub read_ms: Option<u64>,
+
+    /// Per-write socket deadline on the upstream connection, in milliseconds.
+    /// Default: 30000 (30 s).
+    #[serde(default)]
+    pub write_ms: Option<u64>,
+
+    /// Idle time before a pooled upstream connection is closed, in
+    /// milliseconds. Service discovery caps the effective value at half the
+    /// DNS refresh window. Default: 90000 (90 s).
+    #[serde(default)]
+    pub idle_ms: Option<u64>,
+}
+
+/// Fully resolved upstream timeouts for one origin.
+///
+/// Built by the config compiler from [`UpstreamTimeoutsConfig`] plus the
+/// legacy `connection_pool.idle_timeout_secs`, with absent fields resolved
+/// to the `DEFAULT_UPSTREAM_*` constants. The request path reads these
+/// `Duration`s directly; no `Option` remains by design.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpstreamTimeouts {
+    /// Deadline for one upstream TCP connect attempt.
+    pub connect: Duration,
+    /// Deadline across all connect attempts for one upstream selection,
+    /// including TLS.
+    pub total_connect: Duration,
+    /// Per-read socket deadline on the upstream connection.
+    pub read: Duration,
+    /// Per-write socket deadline on the upstream connection.
+    pub write: Duration,
+    /// Idle time before a pooled upstream connection is closed. Service
+    /// discovery caps the effective value further at peer-selection time;
+    /// the smaller of the two always wins.
+    pub idle: Duration,
+}
+
+impl Default for UpstreamTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_millis(DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS),
+            total_connect: Duration::from_millis(DEFAULT_UPSTREAM_TOTAL_CONNECT_TIMEOUT_MS),
+            read: Duration::from_millis(DEFAULT_UPSTREAM_READ_TIMEOUT_MS),
+            write: Duration::from_millis(DEFAULT_UPSTREAM_WRITE_TIMEOUT_MS),
+            idle: Duration::from_millis(DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS),
         }
     }
 }
@@ -6645,10 +6743,16 @@ pub struct RawOriginConfig {
     /// header. See [`IdempotencyConfig`].
     #[serde(default)]
     pub idempotency: Option<IdempotencyConfig>,
-    /// Compatibility-only per-origin connection-pool shape. Pingora's built-in
-    /// pool settings apply regardless of these values.
+    /// Compatibility-only per-origin connection-pool shape, except for
+    /// `idle_timeout_secs`, which is the legacy spelling of `timeouts.idle_ms`.
+    /// Pingora's built-in pool settings apply regardless of the other values.
     #[serde(default)]
     pub connection_pool: Option<ConnectionPoolConfig>,
+    /// Per-origin upstream transport deadlines (connect, read, write, idle).
+    /// Absent fields resolve to the built-in defaults at config compile time.
+    /// See [`UpstreamTimeoutsConfig`].
+    #[serde(default)]
+    pub timeouts: Option<UpstreamTimeoutsConfig>,
     /// Opaque per-origin extensions for out-of-tree config blocks.
     ///
     /// The compiler never parses these values. Extension consumers
@@ -8759,6 +8863,96 @@ action:
 "#;
         let origin: RawOriginConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(origin.connection_pool.is_none());
+    }
+
+    // --- UpstreamTimeoutsConfig tests ---
+
+    #[test]
+    fn upstream_timeouts_deserialize_empty_is_all_unset() {
+        let yaml = r#"{}"#;
+        let cfg: UpstreamTimeoutsConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.connect_ms.is_none());
+        assert!(cfg.total_connect_ms.is_none());
+        assert!(cfg.read_ms.is_none());
+        assert!(cfg.write_ms.is_none());
+        assert!(cfg.idle_ms.is_none());
+    }
+
+    #[test]
+    fn upstream_timeouts_deserialize_explicit() {
+        let yaml = r#"
+connect_ms: 1000
+total_connect_ms: 2000
+read_ms: 3000
+write_ms: 4000
+idle_ms: 5000
+"#;
+        let cfg: UpstreamTimeoutsConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.connect_ms, Some(1000));
+        assert_eq!(cfg.total_connect_ms, Some(2000));
+        assert_eq!(cfg.read_ms, Some(3000));
+        assert_eq!(cfg.write_ms, Some(4000));
+        assert_eq!(cfg.idle_ms, Some(5000));
+    }
+
+    #[test]
+    fn upstream_timeouts_partial_deserialize() {
+        let yaml = r#"read_ms: 120000"#;
+        let cfg: UpstreamTimeoutsConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.read_ms, Some(120_000));
+        assert!(cfg.connect_ms.is_none());
+        assert!(cfg.total_connect_ms.is_none());
+        assert!(cfg.write_ms.is_none());
+        assert!(cfg.idle_ms.is_none());
+    }
+
+    #[test]
+    fn upstream_timeouts_rejects_unknown_keys() {
+        let yaml = r#"connect_timeout_ms: 1000"#;
+        let result: Result<UpstreamTimeoutsConfig, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_err(), "misspelled key must not parse");
+    }
+
+    #[test]
+    fn upstream_timeouts_resolved_defaults_match_the_consts() {
+        let resolved = UpstreamTimeouts::default();
+        assert_eq!(
+            resolved.connect,
+            Duration::from_millis(DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS)
+        );
+        assert_eq!(
+            resolved.total_connect,
+            Duration::from_millis(DEFAULT_UPSTREAM_TOTAL_CONNECT_TIMEOUT_MS)
+        );
+        assert_eq!(
+            resolved.read,
+            Duration::from_millis(DEFAULT_UPSTREAM_READ_TIMEOUT_MS)
+        );
+        assert_eq!(
+            resolved.write,
+            Duration::from_millis(DEFAULT_UPSTREAM_WRITE_TIMEOUT_MS)
+        );
+        assert_eq!(
+            resolved.idle,
+            Duration::from_millis(DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS)
+        );
+    }
+
+    #[test]
+    fn origin_config_with_timeouts() {
+        let yaml = r#"
+action:
+  type: proxy
+  url: "http://upstream.internal"
+timeouts:
+  connect_ms: 2500
+  read_ms: 60000
+"#;
+        let origin: RawOriginConfig = serde_yaml::from_str(yaml).unwrap();
+        let timeouts = origin.timeouts.expect("timeouts should be set");
+        assert_eq!(timeouts.connect_ms, Some(2500));
+        assert_eq!(timeouts.read_ms, Some(60_000));
+        assert!(timeouts.idle_ms.is_none());
     }
 
     #[test]

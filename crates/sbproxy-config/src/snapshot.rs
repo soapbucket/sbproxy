@@ -16,7 +16,7 @@ use crate::types::{
     CorsConfig, ErrorPageEntry, HstsConfig, IdempotencyConfig, MessageSignaturesConfig,
     MirrorConfig, OlpConfig, OriginAttestationConfig, ProblemDetailsConfig, ProxyServerConfig,
     ProxyStatusConfig, ProxyWasmFilterAttachment, RequestModifierConfig, ResponseCacheConfig,
-    ResponseModifierConfig, SessionConfig, WebBotAuthPublishConfig,
+    ResponseModifierConfig, SessionConfig, UpstreamTimeouts, WebBotAuthPublishConfig,
 };
 
 /// Fully compiled, immutable origin ready for request processing.
@@ -122,6 +122,13 @@ pub struct CompiledOrigin {
     /// See [`IdempotencyConfig`]. The actual cache backend is
     /// instantiated at pipeline-compile time in `sbproxy-core`.
     pub idempotency: Option<IdempotencyConfig>,
+    /// Fully resolved upstream transport deadlines for this origin's
+    /// proxied requests. Always concrete: absent YAML fields resolved
+    /// to the built-in defaults at compile time, so the request path
+    /// reads plain `Duration`s. Forward-rule inline origins inherit
+    /// these values because peer selection reads them off the parent
+    /// compiled origin. See [`UpstreamTimeouts`].
+    pub timeouts: UpstreamTimeouts,
     /// Bot detection configuration (kept as JSON for deferred compilation).
     pub bot_detection: Option<serde_json::Value>,
     /// Threat protection configuration (kept as JSON for deferred compilation).
