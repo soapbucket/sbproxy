@@ -51,7 +51,7 @@ pub async fn dispatch_h3_request(
 
     // --- 2. ACME HTTP-01 challenge interception ---
     if path.starts_with(ACME_CHALLENGE_PREFIX) {
-        return handle_acme_challenge(path);
+        return handle_acme_challenge(path).await;
     }
 
     // --- 3. Origin lookup ---
@@ -114,11 +114,14 @@ pub async fn dispatch_h3_request(
 
 // --- ACME challenge handler ---
 
-fn handle_acme_challenge(path: &str) -> Result<HttpResponse> {
+/// Async because the lookup reads through to the shared cert store when this
+/// node is not the one that published the token, which is the common case
+/// behind a load balancer (WOR-2310).
+async fn handle_acme_challenge(path: &str) -> Result<HttpResponse> {
     let token = path.strip_prefix(ACME_CHALLENGE_PREFIX).unwrap_or_default();
 
     if let Some(store) = reload::challenge_store() {
-        if let Some(key_auth) = store.get(token) {
+        if let Some(key_auth) = store.get_async(token).await {
             debug!(token = %token, "H3: serving ACME challenge response");
             return Ok(HttpResponse {
                 status: 200,
@@ -1039,12 +1042,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acme_challenge_with_store_returns_key_auth() {
+    async fn acme_challenge_is_served_by_a_node_that_did_not_publish_it() {
+        // The load balancer decides which replica the CA's validation GET
+        // lands on, and it is almost never the replica that won the issuance
+        // lease. The serving node here never called `set`; it answers only
+        // because the token was published through the shared cert store.
+        use sbproxy_platform::{KVStore, MemoryKVStore};
         use sbproxy_tls::challenges::Http01ChallengeStore;
 
-        let store = std::sync::Arc::new(Http01ChallengeStore::new());
-        store.set("mytoken", "mytoken.thumbprint123");
-        reload::set_challenge_store(std::sync::Arc::clone(&store));
+        let shared: std::sync::Arc<dyn KVStore> = std::sync::Arc::new(MemoryKVStore::new(0));
+        let issuing_node = Http01ChallengeStore::with_store(std::sync::Arc::clone(&shared));
+        issuing_node
+            .set("mytoken", "mytoken.thumbprint123")
+            .unwrap();
+
+        let serving_node = std::sync::Arc::new(Http01ChallengeStore::with_store(shared));
+        reload::set_challenge_store(serving_node);
 
         let method = http::Method::GET;
         let uri: http::Uri = "/.well-known/acme-challenge/mytoken".parse().unwrap();

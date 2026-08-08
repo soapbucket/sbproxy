@@ -1,6 +1,6 @@
 # Running sbproxy on Kubernetes
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-08*
 
 The Kubernetes operator at `crates/sbproxy-k8s-operator/` reconciles two CustomResources into a running proxy: an `SBProxy` describes the deployment shape, and an `SBProxyConfig` carries the `sb.yml` document the proxy reads on startup. The operator owns a Deployment, Service, and ConfigMap per `SBProxy`. With `spec.clustering.enabled: true` the Deployment is replaced by a StatefulSet plus a headless Service and a shared-key Secret, and the replicas form a gossip mesh; see "Clustered proxies" below. Everything else on this page applies to both shapes.
 
@@ -217,6 +217,53 @@ In production, expose the Service via an Ingress, a LoadBalancer Service, or a G
 ![a request with a spoofable X-Forwarded-For sent through the cluster-edge config, showing which forwarded headers reach the upstream](assets/k8s-gateway.gif)
 
 The dataplane shape behind an Ingress: trusted_proxies, service_discovery, host_override, and a threaded X-Request-Id ([config](../examples/k8s-gateway/)).
+
+## ACME and TLS certificates
+
+The operator runs an `SBProxyConfig` with `proxy.acme.enabled: true` without complaint, and it templates nothing into that block. What it does decide is where the proxy's state lives, and the default there is wrong for ACME in both workload shapes.
+
+### The default cert store does not survive a pod restart
+
+`acme.storage_path` defaults to `/var/lib/sbproxy/certs` with `storage_backend: redb`. Neither shape gives that path durable storage:
+
+- The plain Deployment mounts only the config ConfigMap, at `/etc/sbproxy`. Nothing is mounted at `/var/lib/sbproxy`, so the cert store lands in the container's writable layer and goes away with the pod.
+- The clustered StatefulSet mounts an `emptyDir` at `/var/lib/sbproxy` for mesh state. `emptyDir` lives exactly as long as the pod, and the operator declares no `volumeClaimTemplates`, so the cert store goes away at the same moment.
+
+Every rollout, node drain, and crash loop therefore asks the CA for a fresh certificate. Let's Encrypt caps duplicate certificates for the same hostname set at 5 per week, so a handful of restarts is enough to get the domain rate-limited for days, at which point the proxy is serving its self-signed bootstrap cert to real traffic.
+
+### Point the cert store outside the pod
+
+```yaml
+apiVersion: sbproxy.dev/v1alpha1
+kind: SBProxyConfig
+metadata:
+  name: demo-config
+  namespace: default
+spec:
+  config: |
+    proxy:
+      http_bind_port: 8080
+      acme:
+        enabled: true
+        email: ops@example.com
+        storage_backend: redis
+        storage_path: redis.default.svc.cluster.local:6379
+    origins:
+      "api.example.com":
+        action:
+          type: proxy
+          url: https://backend.internal:8080
+```
+
+`s3`, `gcs`, and `azure` work the same way with a bucket URL in `storage_path` and credentials from the pod environment. `file` works too if you can mount one RWX volume across every replica. The full table is in [configuration.md](configuration.md#certificate-store-backends).
+
+A shared backend is also what makes `spec.replicas: 2` safe, and persistence is only half the reason. The CA validates HTTP-01 by fetching `/.well-known/acme-challenge/<token>`, and the Service load-balances that request across every ready pod. One pod wins the per-hostname issuance lock and drives the order; the others answer the CA by reading the token back out of the same store. Give the replicas separate local stores and the validation request lands on a pod that has never heard of the token, which is a 404 to the CA and a failed authorization.
+
+### Let the challenge reach the pods
+
+The operator's Service exposes a single port, `spec.port` (default 8080), named `http`. The CA always fetches the challenge over plain HTTP on port 80, so whatever sits in front of the Service (an Ingress, a LoadBalancer, a Gateway) has to route port 80 for that hostname through to the proxy's port, at least for the `/.well-known/acme-challenge/` prefix. An Ingress that redirects all of port 80 to HTTPS will fail every order until you exempt that path.
+
+Two gaps to know about while you set this up. The operator does not check that your cert store is shared before it scales `spec.replicas` past 1, and it exposes no field for attaching a PersistentVolumeClaim. Set `storage_backend` yourself before you scale.
 
 ## Leader election
 

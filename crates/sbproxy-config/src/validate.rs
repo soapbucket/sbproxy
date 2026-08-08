@@ -25,6 +25,10 @@
 //!   running enterprise builds with extra plugins can extend the
 //!   catalogs through [`ValidationOptions`].
 //!
+//! Two smaller rules cover the `proxy:` and `update:` blocks:
+//! `update-zero-check-interval`, and `unknown-acme-storage-backend`
+//! for an `acme.storage_backend` the proxy has no backend for.
+//!
 //! The validator never fetches secrets, opens a network socket, or
 //! calls into the module crate. Plan-time validation is a structural
 //! pass over the parsed [`ConfigFile`] only.
@@ -309,10 +313,49 @@ pub fn validate(config: &ConfigFile, opts: &ValidationOptions) -> Vec<PlanFindin
         check_unknown_types(host, origin, opts, &mut findings);
     }
 
+    // -- acme --
+    check_acme(config.proxy.acme.as_ref(), &mut findings);
+
     // -- update-config --
     check_update_config(&config.update, &mut findings);
 
     findings
+}
+
+/// Certificate store backends the proxy can actually open, in the order the
+/// documentation lists them. Mirrors the match arms in `open_cert_backend`
+/// (`crates/sbproxy-tls/src/lib.rs`); plan-time validation cannot link the
+/// TLS crate, so the list is duplicated the same way the module catalogs
+/// above are.
+const KNOWN_ACME_STORAGE_BACKENDS: &[&str] = &[
+    "redb", "sqlite", "file", "redis", "s3", "gcs", "azure", "memory",
+];
+
+/// Flag an `acme.storage_backend` naming a store the proxy cannot open.
+///
+/// An error, not a warning. The value used to fall through to an in-memory
+/// store, which reads as a healthy proxy that quietly re-issues every
+/// certificate on every restart until the CA rate-limits the domain. The
+/// runtime now refuses the same value at startup; catching it at plan time
+/// means the operator sees a typo in the diff instead of a boot failure.
+fn check_acme(acme: Option<&crate::types::AcmeConfig>, out: &mut Vec<PlanFinding>) {
+    let Some(acme) = acme else {
+        return;
+    };
+    let backend = acme.storage_backend.as_str();
+    if KNOWN_ACME_STORAGE_BACKENDS.contains(&backend) {
+        return;
+    }
+    out.push(PlanFinding {
+        severity: Severity::Error,
+        rule_id: "unknown-acme-storage-backend".to_string(),
+        path: "proxy.acme.storage_backend".to_string(),
+        message: format!(
+            "acme.storage_backend '{backend}' is not a certificate store backend sbproxy \
+             knows how to open; use one of: {}",
+            KNOWN_ACME_STORAGE_BACKENDS.join(", ")
+        ),
+    });
 }
 
 /// Flag an `update:` block that turns on the background check but sets a
@@ -694,6 +737,62 @@ mod tests {
         assert!(!findings
             .iter()
             .any(|f| f.rule_id == "update-zero-check-interval"));
+    }
+
+    // -- unknown-acme-storage-backend --
+
+    #[test]
+    fn unknown_acme_storage_backend_is_an_error() {
+        // The value parses (it is a free-form string) and used to fall
+        // through to an in-memory cert store, so the proxy re-issued every
+        // certificate on every restart with nothing in the plan to show for
+        // it. Plan time now refuses it.
+        let cfg = parse("proxy:\n  acme:\n    enabled: true\n    storage_backend: postgres\n");
+        let findings = validate(&cfg, &ValidationOptions::default());
+        let hits: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "unknown-acme-storage-backend")
+            .collect();
+        assert_eq!(hits.len(), 1, "got findings: {findings:?}");
+        assert_eq!(hits[0].severity, Severity::Error);
+        assert_eq!(hits[0].path, "proxy.acme.storage_backend");
+        assert!(hits[0].message.contains("postgres"), "{:?}", hits[0]);
+    }
+
+    #[test]
+    fn every_backend_the_proxy_can_open_validates() {
+        // Keeps this catalog honest against `open_cert_backend`. `sqlite` is
+        // the one that matters: it was documented, parsed, and had no arm.
+        for backend in KNOWN_ACME_STORAGE_BACKENDS {
+            let cfg = parse(&format!(
+                "proxy:\n  acme:\n    enabled: true\n    storage_backend: {backend}\n"
+            ));
+            let findings = validate(&cfg, &ValidationOptions::default());
+            assert!(
+                !findings
+                    .iter()
+                    .any(|f| f.rule_id == "unknown-acme-storage-backend"),
+                "{backend} must validate: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_acme_storage_backend_validates() {
+        let cfg = parse("proxy:\n  acme:\n    enabled: true\n");
+        let findings = validate(&cfg, &ValidationOptions::default());
+        assert!(!findings
+            .iter()
+            .any(|f| f.rule_id == "unknown-acme-storage-backend"));
+    }
+
+    #[test]
+    fn no_acme_block_emits_no_backend_finding() {
+        let cfg = parse("proxy: {}\n");
+        let findings = validate(&cfg, &ValidationOptions::default());
+        assert!(!findings
+            .iter()
+            .any(|f| f.rule_id == "unknown-acme-storage-backend"));
     }
 
     // -- orphan-ref --

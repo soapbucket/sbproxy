@@ -167,7 +167,7 @@ async fn test_challenge_store_with_pebble_flow() {
     let key_auth = AcmeClient::key_authorization(token, &key_pair);
 
     // Store the challenge response.
-    challenge_store.set(token, &key_auth);
+    challenge_store.set(token, &key_auth).unwrap();
 
     // Verify we can look it up (this is what the request filter would do).
     let response = challenge_store.get(token).unwrap();

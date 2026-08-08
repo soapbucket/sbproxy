@@ -871,8 +871,16 @@ impl AcmeClient {
         let challenge_url = challenge.url.clone();
 
         // --- Step 4: register key authorization in challenge store ---
+        //
+        // This has to land before step 5. Responding to the challenge is what
+        // tells the CA to start fetching, and the fetch goes to whichever
+        // replica the load balancer picks, so the token must already be
+        // readable fleet-wide. A failure here aborts the order rather than
+        // letting the CA validate against a 404.
         let key_auth = Self::key_authorization(&token, key_pair);
-        challenge_store.set(&token, &key_auth);
+        challenge_store
+            .set(&token, &key_auth)
+            .context("publish the http-01 key authorization")?;
         debug!(hostname, token, "http-01 challenge token registered");
 
         // --- Step 5: respond to challenge ---

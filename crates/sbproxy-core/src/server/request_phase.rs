@@ -1189,10 +1189,14 @@ pub(super) async fn request_filter(
     // body capture in the fake-sink admin path below without
     // running into a use-after-borrow on the original immutable
     // borrow.
+    //
+    // The lookup reads through to the shared cert store on a miss: behind a
+    // load balancer this node is usually not the one that published the
+    // token, and a local-only lookup would 404 the CA (WOR-2310).
     let path: String = session.req_header().uri.path().to_string();
     if let Some(token) = sbproxy_tls::challenges::extract_challenge_token(&path) {
         if let Some(store) = reload::challenge_store() {
-            if let Some(key_auth) = store.get(token) {
+            if let Some(key_auth) = store.get_async(token).await {
                 debug!(token = %token, "serving ACME HTTP-01 challenge response");
                 send_response(session, 200, "text/plain", key_auth.as_bytes()).await?;
                 return Ok(true);

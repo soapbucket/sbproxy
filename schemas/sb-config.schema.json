@@ -842,7 +842,7 @@
           }
         },
         "storage_backend": {
-          "description": "Backing store for issued certificates (`redb`, `sqlite`, etc.).",
+          "description": "Backing store for issued certificates: `redb`, `sqlite`, `file`, `redis`, `s3`, `gcs`, `azure`, or `memory`. Anything else is rejected.",
           "default": "redb",
           "type": "string"
         },

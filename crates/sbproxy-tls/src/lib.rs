@@ -161,27 +161,35 @@ impl AcmeExpiryReader {
     }
 }
 
-/// Open the KVStore backing the ACME cert store, chosen by
-/// `acme.storage_backend` at `acme.storage_path` (WOR-1773).
+/// Open the KVStore backing the ACME cert store and the HTTP-01 challenge
+/// store, chosen by `acme.storage_backend` at `acme.storage_path` (WOR-1773).
 ///
-/// `redb` (the default) persists locally so a single node survives a
-/// restart without re-issuing. The pluggable backends for a fleet
-/// (shared `file`, `s3`/`gcs`, `redis`, `cluster`) land as their own
-/// backends; until then an unrecognized backend falls back to in-memory
-/// with a loud warning, so it is obvious certs are not being persisted.
-fn open_cert_backend(acme: Option<&sbproxy_config::AcmeConfig>) -> Arc<dyn KVStore> {
-    use sbproxy_platform::storage::RedbKVStore;
+/// `redb` (the default) and `sqlite` persist locally so a single node
+/// survives a restart without re-issuing. The shared backends (`file` on
+/// shared storage, `redis`, `s3`/`gcs`/`azure`) are what a fleet needs: they
+/// carry the per-hostname issuance lease and, since WOR-2310, the published
+/// HTTP-01 key authorization, so the replica the load balancer happens to
+/// hand the CA's validation request to can answer it.
+///
+/// An unrecognized backend is an error rather than a silent downgrade to
+/// in-memory. A downgrade looks like a working proxy that quietly re-issues
+/// every certificate on every restart, which surfaces as a CA rate limit
+/// days later instead of as a config mistake at boot.
+/// `check_acme` in `sbproxy-config` rejects the same value at plan time so
+/// the error normally arrives before the config is ever applied.
+fn open_cert_backend(acme: Option<&sbproxy_config::AcmeConfig>) -> Result<Arc<dyn KVStore>> {
+    use sbproxy_platform::storage::{RedbKVStore, SqliteKVStore};
     let Some(acme) = acme else {
-        return Arc::new(MemoryKVStore::new(0));
+        return Ok(Arc::new(MemoryKVStore::new(0)));
     };
-    match acme.storage_backend.as_str() {
+    let store: Arc<dyn KVStore> = match acme.storage_backend.as_str() {
         "memory" => Arc::new(MemoryKVStore::new(0)),
         "redb" => {
             let dir = acme.storage_path.trim_end_matches('/');
             if let Err(e) = std::fs::create_dir_all(dir) {
                 warn!(path = %dir, error = %e,
                     "cert store: cannot create storage dir; certs will NOT persist (in-memory fallback)");
-                return Arc::new(MemoryKVStore::new(0));
+                return Ok(Arc::new(MemoryKVStore::new(0)));
             }
             let file = format!("{dir}/certstore.redb");
             match RedbKVStore::new(&file) {
@@ -196,6 +204,28 @@ fn open_cert_backend(acme: Option<&sbproxy_config::AcmeConfig>) -> Arc<dyn KVSto
                 }
             }
         }
+        "sqlite" => {
+            // storage_path is a directory, matching `redb`, so an operator can
+            // switch the two without also moving the path.
+            let dir = acme.storage_path.trim_end_matches('/');
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                warn!(path = %dir, error = %e,
+                    "cert store: cannot create storage dir; certs will NOT persist (in-memory fallback)");
+                return Ok(Arc::new(MemoryKVStore::new(0)));
+            }
+            let file = format!("{dir}/certstore.sqlite");
+            match SqliteKVStore::new(&file) {
+                Ok(s) => {
+                    info!(path = %file, "cert store backend: sqlite (persistent)");
+                    Arc::new(s)
+                }
+                Err(e) => {
+                    warn!(path = %file, error = %e,
+                        "cert store: sqlite open failed; certs will NOT persist (in-memory fallback)");
+                    Arc::new(MemoryKVStore::new(0))
+                }
+            }
+        }
         "redis" => {
             // Connections open lazily. The distributed issuance lock
             // (SET NX PX) makes a fleet issue a cert once instead of
@@ -206,7 +236,7 @@ fn open_cert_backend(acme: Option<&sbproxy_config::AcmeConfig>) -> Arc<dyn KVSto
                     warn!(
                         "cert store: invalid Redis connection configuration; certs will NOT persist (in-memory fallback)"
                     );
-                    return Arc::new(MemoryKVStore::new(0));
+                    return Ok(Arc::new(MemoryKVStore::new(0)));
                 }
             };
             info!("cert store backend: redis (shared, cluster-safe)");
@@ -247,12 +277,13 @@ fn open_cert_backend(acme: Option<&sbproxy_config::AcmeConfig>) -> Arc<dyn KVSto
             }
         }
         other => {
-            warn!(backend = %other,
-                "cert store: '{other}' backend not recognized (use redb, file, redis, s3, gcs, \
-                 azure, or memory); certs will NOT persist (in-memory fallback)");
-            Arc::new(MemoryKVStore::new(0))
+            return Err(anyhow::anyhow!(
+                "acme.storage_backend '{other}' is not a certificate store backend sbproxy \
+                 knows how to open (use redb, sqlite, file, redis, s3, gcs, azure, or memory)"
+            ));
         }
-    }
+    };
+    Ok(store)
 }
 
 /// RAII release of the ACME per-host issuance lock (WOR-1774). Dropping
@@ -289,8 +320,14 @@ impl TlsState {
         }
 
         let resolver = Arc::new(CertResolver::new());
-        let challenge_store = Arc::new(Http01ChallengeStore::new());
-        let cert_store = Arc::new(CertStore::new(open_cert_backend(config.acme.as_ref())));
+        // One backend, two stores. The HTTP-01 challenge has to be readable
+        // by whichever replica the load balancer hands the CA's validation
+        // request to, and that is the same reachability requirement the cert
+        // itself has, so it gets the same backing store rather than a second
+        // one an operator would have to configure separately (WOR-2310).
+        let backend = open_cert_backend(config.acme.as_ref())?;
+        let challenge_store = Arc::new(Http01ChallengeStore::with_store(Arc::clone(&backend)));
+        let cert_store = Arc::new(CertStore::new(backend));
 
         // --- Manual cert files ---
         let mut ocsp_stapler: Option<Arc<OcspStapler>> = None;
@@ -764,7 +801,7 @@ mod tests {
         let sentinel = "rediss://default:sentinel-acme-password@sentinel-acme-host.invalid:6380/-1";
         let acme = acme_with_storage("redis", sentinel);
 
-        let backend = open_cert_backend(Some(&acme));
+        let backend = open_cert_backend(Some(&acme)).expect("a known backend opens");
 
         backend
             .put(b"certificate-key", b"certificate-value")
@@ -775,6 +812,81 @@ mod tests {
                 .expect("read fallback certificate state")
                 .as_deref(),
             Some(b"certificate-value".as_slice())
+        );
+    }
+
+    #[test]
+    fn sqlite_cert_backend_persists_across_reopen() {
+        // `sqlite` was advertised in the config rustdoc with no arm here, so
+        // it fell through to the in-memory fallback: the proxy looked healthy
+        // and silently re-issued every certificate on every restart until the
+        // CA rate-limited the domain. Pin that it now actually persists.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().to_str().expect("utf-8 temp path").to_string();
+        let acme = acme_with_storage("sqlite", &path);
+
+        {
+            let backend = open_cert_backend(Some(&acme)).expect("sqlite is a known backend");
+            backend
+                .put(b"acme:cert:example.com", b"CERTPEM")
+                .expect("write a cert through the sqlite backend");
+        } // dropped: simulates a process restart
+
+        let reopened = open_cert_backend(Some(&acme)).expect("sqlite reopens the same database");
+        assert_eq!(
+            reopened
+                .get(b"acme:cert:example.com")
+                .expect("read the cert back")
+                .as_deref(),
+            Some(b"CERTPEM".as_slice()),
+            "a sqlite cert store must survive a restart instead of re-issuing"
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_storage_backend_is_an_error_not_an_in_memory_downgrade() {
+        let acme = acme_with_storage("postgres", "/var/lib/sbproxy/certs");
+
+        // `Arc<dyn KVStore>` withholds `Debug`, so `expect_err` cannot
+        // name the Ok value and this has to discard it first.
+        let err = open_cert_backend(Some(&acme))
+            .err()
+            .expect("an unknown backend must not degrade to in-memory");
+
+        let message = format!("{err:#}");
+        assert!(message.contains("postgres"), "{message}");
+        assert!(message.contains("acme.storage_backend"), "{message}");
+    }
+
+    #[test]
+    fn tls_init_gives_the_challenge_store_the_cert_store_backend() {
+        // The wiring this whole fix rests on: the challenge published by the
+        // replica that won the issuance lease has to be readable by a replica
+        // that never called `set`. `file` on a shared directory stands in for
+        // the fleet here because two handles can hold it open at once.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().to_str().expect("utf-8 temp path").to_string();
+        let acme = acme_with_storage("file", &path);
+        let config = ProxyServerConfig {
+            https_bind_port: Some(8443),
+            acme: Some(acme.clone()),
+            ..Default::default()
+        };
+
+        let issuer = TlsState::init(&config, vec!["example.com".to_string()])
+            .expect("TLS state initializes with a file-backed cert store");
+        issuer
+            .challenge_store
+            .set("tok-fleet", "tok-fleet.thumbprint")
+            .expect("publish the challenge to the shared backend");
+
+        let peer = Http01ChallengeStore::with_store(
+            open_cert_backend(Some(&acme)).expect("file is a known backend"),
+        );
+        assert_eq!(
+            peer.get("tok-fleet").as_deref(),
+            Some("tok-fleet.thumbprint"),
+            "a peer replica reading the same cert store must answer the challenge"
         );
     }
 

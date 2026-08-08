@@ -5092,7 +5092,9 @@ pub struct AcmeConfig {
     /// is accepted in the list but is not yet served.
     #[serde(default = "default_challenge_types")]
     pub challenge_types: Vec<String>,
-    /// Backing store for issued certificates (`redb`, `sqlite`, etc.).
+    /// Backing store for issued certificates: `redb`, `sqlite`, `file`,
+    /// `redis`, `s3`, `gcs`, `azure`, or `memory`. Anything else is
+    /// rejected.
     #[serde(default = "default_storage_backend")]
     pub storage_backend: String,
     /// Filesystem path for the certificate store.
