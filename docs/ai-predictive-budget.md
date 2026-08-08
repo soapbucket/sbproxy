@@ -1,11 +1,18 @@
 # Predictive budgets with soft-landing
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-08*
 
 A fixed-window budget enforces a hard cliff: requests pass until the cap,
 then block at 100%. Soft-landing degrades gracefully as a scope approaches
 its limit, so spend tapers instead of stopping dead. It is an opt-in
 addition to the existing `budget` block; without it the hard-block behavior
 is unchanged.
+
+One thing this page's title oversells: nothing here forecasts spend. The
+mechanism is a ladder of fixed threshold fractions, `warn_at` and then
+`downgrade_at`, each compared against the window's current spend before a
+request is dispatched. There is no model of future usage and no
+extrapolation; a scope that is at 0.79 of its cap gets exactly the same
+treatment whether it is climbing fast or idle.
 
 ## Configuration
 
@@ -29,9 +36,9 @@ action:
 |---|---|---|
 | `limits[].scope` | required | Which window the spend accumulates in. One of `workspace`, `api_key`, `user`, `model`, `origin`, `tag`, `agent`. `workspace` keys on the request Host. Do not pair `model` with soft-landing: the downgrade rewrites the model and the scope key is recomputed against it, so crossing `downgrade_at` moves spend into a fresh empty bucket and the cap never fires. |
 | `limits[].max_cost_usd` | optional | The cost cap for the window. A limit may also carry `max_tokens`; when both are set the tightest of the two fractions wins. |
-| `limits[].period` | `total` when omitted | `daily`, `weekly`, `monthly`, `total`, `lifetime`, or a LiteLLM-style duration such as `30d` or `1h`. `daily` is a fixed bucket aligned to UTC midnight, not a rolling 24 hours, so a window that straddles 00:00 UTC resets. An unrecognised value is a load error rather than a silent fallthrough. |
+| `limits[].period` | `total` when omitted | `daily`, `weekly`, `monthly`, `total`, `lifetime`, or a LiteLLM-style duration such as `30d` or `1h`. `daily` is a fixed bucket aligned to UTC midnight, not a rolling 24 hours, so a window that straddles 00:00 UTC resets. An unrecognized value is a load error rather than a silent fallthrough. |
 | `on_exceed` | `block` | What happens at 100%. `block` refuses with 402, `log` allows and records, `downgrade` rewrites the model and refuses with 402 anyway if no target resolves. |
-| `soft_landing` | absent | Opt-in. Without it the hard-block behaviour above is unchanged. |
+| `soft_landing` | absent | Opt-in. Without it the hard-block behavior above is unchanged. |
 | `soft_landing.warn_at` | `0.8` | Past this fraction, a request is allowed and a warning is logged. |
 | `soft_landing.downgrade_at` | `0.95` | Past this fraction, the request's model is rewritten before dispatch. Nothing validates that it is above `warn_at`. |
 | `soft_landing.downgrade_to` | optional | The rewrite target. Without it the per-limit `downgrade_to` applies, and without that the cheapest model across the configured providers. It has to be a model the providers serve, and a rewrite to the model already requested is a no-op with no log line and no tag. |
