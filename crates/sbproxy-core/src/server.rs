@@ -737,6 +737,45 @@ fn projection_content_type(kind: &str) -> &'static str {
     }
 }
 
+/// Resolve the host a gateway-served A2A agent card advertises.
+///
+/// Same precedence contract as the `a2a_agent_card_rewrite` dispatch
+/// arm in [`apply_transform_with_ctx`]: a `proxy_host` configured on
+/// the origin's `a2a_agent_card_rewrite` transform wins, otherwise
+/// the inbound `Host` header (already stripped of its port on
+/// `ctx.hostname`) is used. Keeping the two surfaces on one contract
+/// means a deployment that pins `proxy_host` advertises the same
+/// hostname whether the card came from the operator's config or from
+/// the upstream via the rewriter.
+fn a2a_card_serve_host<'a>(
+    transforms: &'a [sbproxy_modules::CompiledTransform],
+    inbound_host: &'a str,
+) -> &'a str {
+    transforms
+        .iter()
+        .find_map(|compiled| match &compiled.transform {
+            sbproxy_modules::Transform::A2aAgentCardRewrite(t) => t.proxy_host.as_deref(),
+            _ => None,
+        })
+        .unwrap_or(inbound_host)
+}
+
+/// Render the operator-configured A2A agent card for serving.
+///
+/// Clones the stored card and swaps the hostnames on its `url`,
+/// `endpoint`, and nested `agent.url` fields for `host` via the
+/// rewriter's shared [`sbproxy_modules::rewrite_card_urls`] core, so
+/// a card pasted with the upstream's own URL never leaks that URL to
+/// a discovery client. Everything else serializes verbatim.
+fn render_a2a_agent_card(card: &serde_json::Value, host: &str) -> Vec<u8> {
+    let mut json = card.clone();
+    sbproxy_modules::rewrite_card_urls(&mut json, host);
+    // A `serde_json::Value` cannot fail to serialize; fall back to
+    // the stored card's own rendering on the unreachable error arm
+    // rather than panicking on the request path.
+    serde_json::to_vec(&json).unwrap_or_else(|_| card.to_string().into_bytes())
+}
+
 /// Resolve the tokens-per-byte ratio the proxy uses for a given
 /// origin's Markdown projection.
 ///
@@ -1147,7 +1186,7 @@ fn build_swr_revalidation_request(
             rules.iter().find(|rule| {
                 rule.matchers.iter().any(|matcher| {
                     matcher
-                        .match_request(path, query, &request.headers)
+                        .match_request(&request.method, path, query, &request.headers)
                         .is_some()
                 })
             })

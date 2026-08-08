@@ -1,13 +1,15 @@
-//! Host-based and header-based request routing with bloom filter pre-check.
+//! Host-based request routing with bloom filter pre-check.
 //!
 //! `HostRouter` maps incoming hostnames to origin indices in the
 //! `CompiledConfig.origins` vec. A bloom filter rejects definitely-unknown
 //! hostnames in O(1) without touching the HashMap, reducing lookup cost
 //! for attack traffic and misconfigured clients.
 //!
-//! `HeaderRoute` provides a secondary routing layer that overrides the origin
-//! based on specific request header values, enabling advanced traffic splitting
-//! without changing the DNS or hostname configuration.
+//! Origin keys starting with `*.` are wildcard entries. They live in a
+//! separate map keyed by the literal suffix after `*.` and are consulted
+//! only when the exact lookup misses, walking the inbound hostname one
+//! leading label at a time. Exact keys therefore always beat wildcards,
+//! and between wildcards the longest matching suffix wins.
 
 use std::collections::HashMap;
 
@@ -18,121 +20,113 @@ use sbproxy_config::CompiledConfig;
 /// Routes incoming requests to the correct origin by hostname.
 ///
 /// Uses a bloom filter to fast-reject hostnames that are definitely not
-/// configured, avoiding HashMap lookups for unknown hosts. The bloom filter
-/// is tuned for a ~1% false positive rate.
+/// configured exactly, avoiding HashMap lookups for unknown hosts. The
+/// bloom filter is tuned for a ~1% false positive rate and covers exact
+/// keys only: a wildcard matches by suffix, so full inbound hostnames
+/// cannot be pre-inserted for it. Configs without wildcards keep the
+/// original fast-reject behavior; with wildcards present, a miss costs
+/// one suffix-map probe per label of the inbound hostname.
 pub struct HostRouter {
     host_map: HashMap<CompactString, usize>,
+    /// Wildcard origins keyed by the literal suffix after `*.`
+    /// (`*.example.com` is stored as `example.com`).
+    wildcard_map: HashMap<CompactString, usize>,
     bloom: Bloom<str>,
 }
 
 impl HostRouter {
     /// Build a new router from a compiled config snapshot.
     ///
-    /// Constructs a bloom filter sized for the number of configured hostnames
-    /// with a ~1% false positive rate, then inserts all hostnames.
+    /// Splits the config's host map into exact entries and wildcard
+    /// suffix entries, then constructs a bloom filter sized for the
+    /// exact hostnames with a ~1% false positive rate. The literal
+    /// `*.suffix` spellings never arrive on the wire, so they stay out
+    /// of both the exact map and the bloom filter.
     pub fn new(config: &CompiledConfig) -> Self {
-        let num_items = config.host_map.len().max(1);
-        let bloom = Bloom::new_for_fp_rate(num_items, 0.01);
-        let mut router = Self {
-            host_map: config.host_map.clone(),
-            bloom,
-        };
-        for hostname in config.host_map.keys() {
-            router.bloom.set(hostname.as_str());
+        let mut host_map = HashMap::new();
+        let mut wildcard_map = HashMap::new();
+        for (hostname, &idx) in &config.host_map {
+            match hostname.strip_prefix("*.") {
+                Some(suffix) => {
+                    wildcard_map.insert(CompactString::new(suffix), idx);
+                }
+                None => {
+                    host_map.insert(hostname.clone(), idx);
+                }
+            }
         }
-        router
+        let num_items = host_map.len().max(1);
+        let mut bloom = Bloom::new_for_fp_rate(num_items, 0.01);
+        for hostname in host_map.keys() {
+            bloom.set(hostname.as_str());
+        }
+        Self {
+            host_map,
+            wildcard_map,
+            bloom,
+        }
     }
 
     /// Fast check: is this hostname POSSIBLY configured?
     ///
-    /// Returns `false` for definitely-unknown hosts (no HashMap lookup needed).
-    /// Returns `true` for known hosts and a small fraction (~1%) of unknown hosts.
+    /// Returns `false` for definitely-unknown hosts. Returns `true` for
+    /// known hosts and a small fraction (~1%) of unknown hosts. The
+    /// bloom filter covers exact keys; wildcard coverage is answered by
+    /// the suffix map directly, which has no false positives.
     pub fn maybe_exists(&self, hostname: &str) -> bool {
-        self.bloom.check(hostname)
+        self.bloom.check(hostname) || self.resolve_wildcard(hostname).is_some()
     }
 
     /// Look up origin index by hostname.
     ///
-    /// Uses bloom filter pre-check to skip HashMap lookup for unknown hosts.
-    /// Returns `None` if the hostname is not registered in this config.
+    /// Exact keys are checked first (behind the bloom pre-check), so an
+    /// exact origin always beats a wildcard. On a miss the wildcard
+    /// suffix map is walked from the most specific suffix, so the
+    /// longest matching suffix wins and `*.example.com` matches
+    /// `a.example.com` and `a.b.example.com` but never `example.com`
+    /// itself. Returns `None` if the hostname is not registered in this
+    /// config.
     pub fn resolve(&self, hostname: &str) -> Option<usize> {
-        if !self.bloom.check(hostname) {
-            return None; // Definitely not configured.
+        if self.bloom.check(hostname) {
+            if let Some(&idx) = self.host_map.get(hostname) {
+                return Some(idx);
+            }
         }
-        self.host_map.get(hostname).copied()
+        self.resolve_wildcard(hostname)
     }
 
-    /// Returns the number of registered hostnames.
-    pub fn len(&self) -> usize {
-        self.host_map.len()
-    }
-
-    /// Returns true if no hostnames are registered.
-    pub fn is_empty(&self) -> bool {
-        self.host_map.is_empty()
-    }
-}
-
-// --- Header-based routing ---
-
-/// A header-based route override.
-///
-/// After hostname routing resolves an origin, a `HeaderRoute` can override
-/// the resolved origin based on a specific request header name/value pair.
-/// This enables traffic splitting, tenant routing, and A/B testing without
-/// DNS changes.
-#[derive(Debug, Clone)]
-pub struct HeaderRoute {
-    /// The name of the HTTP header to inspect (e.g., `"X-Tenant"`).
-    pub header_name: String,
-    /// The value to match against the header (exact match).
-    pub header_value: String,
-    /// The hostname of the origin to route to when the header matches.
-    pub origin_hostname: String,
-}
-
-/// Collection of header-based route overrides.
-///
-/// Applied after hostname routing. The first matching rule wins.
-#[derive(Debug, Default)]
-pub struct HeaderRouter {
-    routes: Vec<HeaderRoute>,
-}
-
-impl HeaderRouter {
-    /// Create a new empty `HeaderRouter`.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Add a header route override.
-    pub fn add_route(&mut self, route: HeaderRoute) {
-        self.routes.push(route);
-    }
-
-    /// Check whether any header route matches the given `HeaderMap`.
-    ///
-    /// Returns the `origin_hostname` of the first matching rule, or `None`
-    /// if no rules match.
-    pub fn resolve(&self, headers: &http::HeaderMap) -> Option<&str> {
-        for route in &self.routes {
-            if let Some(val) = headers.get(route.header_name.as_str()) {
-                if val.to_str().unwrap_or("") == route.header_value {
-                    return Some(route.origin_hostname.as_str());
+    /// Walk the inbound hostname's label boundaries against the wildcard
+    /// suffix map, most specific suffix first.
+    fn resolve_wildcard(&self, hostname: &str) -> Option<usize> {
+        if self.wildcard_map.is_empty() {
+            return None;
+        }
+        let mut rest = hostname;
+        while let Some((label, suffix)) = rest.split_once('.') {
+            if label.is_empty() {
+                // A hostname with an empty label is malformed; a
+                // wildcard matches one or more real labels, never an
+                // empty one.
+                return None;
+            }
+            if !suffix.is_empty() {
+                if let Some(&idx) = self.wildcard_map.get(suffix) {
+                    return Some(idx);
                 }
             }
+            rest = suffix;
         }
         None
     }
 
-    /// Returns true if there are no header routes configured.
-    pub fn is_empty(&self) -> bool {
-        self.routes.is_empty()
+    /// Returns the number of registered hostnames, exact and wildcard.
+    pub fn len(&self) -> usize {
+        self.host_map.len() + self.wildcard_map.len()
     }
 
-    /// Returns the number of configured header routes.
-    pub fn len(&self) -> usize {
-        self.routes.len()
+    /// Returns true if no hostnames are registered.
+    pub fn is_empty(&self) -> bool {
+        self.host_map.is_empty() && self.wildcard_map.is_empty()
     }
 }
 
@@ -323,104 +317,73 @@ mod tests {
         );
     }
 
-    // --- HeaderRouter tests ---
+    // --- Wildcard routing tests ---
 
     #[test]
-    fn header_router_empty_returns_none() {
-        let router = HeaderRouter::new();
-        let headers = http::HeaderMap::new();
-        assert!(router.resolve(&headers).is_none());
-        assert!(router.is_empty());
-        assert_eq!(router.len(), 0);
+    fn wildcard_matches_one_or_more_leading_labels() {
+        let config = make_config(&["*.example.com"]);
+        let router = HostRouter::new(&config);
+
+        assert_eq!(router.resolve("a.example.com"), Some(0));
+        assert_eq!(router.resolve("a.b.example.com"), Some(0));
+        // The bare suffix is not covered: `*.` requires at least one label.
+        assert_eq!(router.resolve("example.com"), None);
     }
 
     #[test]
-    fn header_router_matches_exact_value() {
-        let mut router = HeaderRouter::new();
-        router.add_route(HeaderRoute {
-            header_name: "X-Tenant".to_string(),
-            header_value: "acme".to_string(),
-            origin_hostname: "acme.internal".to_string(),
-        });
+    fn exact_match_beats_wildcard() {
+        let config = make_config(&["*.example.com", "api.example.com"]);
+        let router = HostRouter::new(&config);
 
-        let mut headers = http::HeaderMap::new();
-        headers.insert("x-tenant", http::HeaderValue::from_static("acme"));
-
-        assert_eq!(router.resolve(&headers), Some("acme.internal"));
+        assert_eq!(router.resolve("api.example.com"), Some(1));
+        assert_eq!(router.resolve("web.example.com"), Some(0));
     }
 
     #[test]
-    fn header_router_no_match_returns_none() {
-        let mut router = HeaderRouter::new();
-        router.add_route(HeaderRoute {
-            header_name: "X-Tenant".to_string(),
-            header_value: "acme".to_string(),
-            origin_hostname: "acme.internal".to_string(),
-        });
+    fn longest_wildcard_suffix_wins() {
+        let config = make_config(&["*.example.com", "*.b.example.com"]);
+        let router = HostRouter::new(&config);
 
-        let mut headers = http::HeaderMap::new();
-        headers.insert("x-tenant", http::HeaderValue::from_static("other"));
-
-        assert!(router.resolve(&headers).is_none());
+        assert_eq!(router.resolve("a.b.example.com"), Some(1));
+        // `b.example.com` itself only matches the broader wildcard.
+        assert_eq!(router.resolve("b.example.com"), Some(0));
     }
 
     #[test]
-    fn header_router_first_match_wins() {
-        let mut router = HeaderRouter::new();
-        router.add_route(HeaderRoute {
-            header_name: "X-Env".to_string(),
-            header_value: "staging".to_string(),
-            origin_hostname: "staging.internal".to_string(),
-        });
-        router.add_route(HeaderRoute {
-            header_name: "X-Env".to_string(),
-            header_value: "staging".to_string(),
-            origin_hostname: "staging-alt.internal".to_string(),
-        });
+    fn wildcard_non_matching_host_falls_through() {
+        let config = make_config(&["*.example.com"]);
+        let router = HostRouter::new(&config);
 
-        let mut headers = http::HeaderMap::new();
-        headers.insert("x-env", http::HeaderValue::from_static("staging"));
-
-        // First rule wins.
-        assert_eq!(router.resolve(&headers), Some("staging.internal"));
+        assert_eq!(router.resolve("a.example.org"), None);
+        assert_eq!(router.resolve("com"), None);
+        assert_eq!(router.resolve(""), None);
     }
 
     #[test]
-    fn header_router_missing_header_returns_none() {
-        let mut router = HeaderRouter::new();
-        router.add_route(HeaderRoute {
-            header_name: "X-Feature-Flag".to_string(),
-            header_value: "beta".to_string(),
-            origin_hostname: "beta.internal".to_string(),
-        });
+    fn wildcard_never_matches_an_empty_label() {
+        let config = make_config(&["*.example.com"]);
+        let router = HostRouter::new(&config);
 
-        // Header is absent entirely.
-        let headers = http::HeaderMap::new();
-        assert!(router.resolve(&headers).is_none());
+        assert_eq!(router.resolve(".example.com"), None);
+        assert_eq!(router.resolve("a..example.com"), None);
     }
 
     #[test]
-    fn header_router_multiple_routes_correct_match() {
-        let mut router = HeaderRouter::new();
-        router.add_route(HeaderRoute {
-            header_name: "X-Region".to_string(),
-            header_value: "us-east".to_string(),
-            origin_hostname: "us-east.backend".to_string(),
-        });
-        router.add_route(HeaderRoute {
-            header_name: "X-Region".to_string(),
-            header_value: "eu-west".to_string(),
-            origin_hostname: "eu-west.backend".to_string(),
-        });
+    fn maybe_exists_covers_wildcard_hosts() {
+        let config = make_config(&["*.example.com"]);
+        let router = HostRouter::new(&config);
 
-        let mut headers_us = http::HeaderMap::new();
-        headers_us.insert("x-region", http::HeaderValue::from_static("us-east"));
+        assert!(router.maybe_exists("a.example.com"));
+        assert!(router.maybe_exists("a.b.example.com"));
+        assert!(!router.maybe_exists("example.org"));
+    }
 
-        let mut headers_eu = http::HeaderMap::new();
-        headers_eu.insert("x-region", http::HeaderValue::from_static("eu-west"));
+    #[test]
+    fn len_counts_exact_and_wildcard_entries() {
+        let config = make_config(&["*.example.com", "api.example.com"]);
+        let router = HostRouter::new(&config);
 
-        assert_eq!(router.resolve(&headers_us), Some("us-east.backend"));
-        assert_eq!(router.resolve(&headers_eu), Some("eu-west.backend"));
         assert_eq!(router.len(), 2);
+        assert!(!router.is_empty());
     }
 }

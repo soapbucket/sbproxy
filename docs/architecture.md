@@ -1,6 +1,6 @@
 # SBproxy architecture and deployment guide
 
-*Last modified: 2026-08-07*
+*Last modified: 2026-08-08*
 
 This document covers the internal architecture of SBproxy, the request lifecycle, the plugin
 system, the AI gateway, caching, events, and common deployment topologies.
@@ -819,10 +819,12 @@ most for AI proxy routes, which resolve provider hostnames on every request.
 
 ### Bloom filter for hostname pre-check
 
-The host router maintains an in-memory bloom filter over all configured hostnames. On
-each request, the filter is checked before any HashMap lookup. Requests for unconfigured
+The host router maintains an in-memory bloom filter over all exactly configured hostnames.
+On each request, the filter is checked before any HashMap lookup. Requests for unconfigured
 hostnames (scanners, bots, misconfigurations) are rejected in sub-microsecond time without
-touching the HashMap.
+touching the HashMap. Wildcard origin keys (`*.example.com`) live in a separate suffix map
+consulted only after the exact lookup misses, walking the inbound hostname one leading
+label at a time, so configs without wildcards keep the pure fast-reject path.
 
 ### Sharded counters for hot state
 

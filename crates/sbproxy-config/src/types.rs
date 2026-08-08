@@ -7165,7 +7165,7 @@ pub struct SessionConfig {
 /// Compiled at config-load time. The runtime walks the `rules` of each
 /// forward rule against the incoming request and uses the first matching
 /// entry's `origin`. Within a single entry the present matchers (path,
-/// header, query, body) are ANDed; across entries they are ORed.
+/// header, query, body, method) are ANDed; across entries they are ORed.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RawForwardRule {
@@ -7228,11 +7228,12 @@ pub enum ParameterLocation {
 
 /// One match entry inside a forward rule's `rules:` list.
 ///
-/// Each entry may carry any combination of `path`, `header`, `query`, and
-/// `body` matchers. Within a single entry the matchers are ANDed: every
-/// present matcher must succeed for the entry to fire. Across entries in the
-/// same rule the semantics are OR: any matching entry triggers the rule.
-/// The shorthand `match: <prefix>` is equivalent to `path: { prefix: ... }`.
+/// Each entry may carry any combination of `path`, `header`, `query`,
+/// `body`, and `method` matchers. Within a single entry the matchers are
+/// ANDed: every present matcher must succeed for the entry to fire. Across
+/// entries in the same rule the semantics are OR: any matching entry
+/// triggers the rule. The shorthand `match: <prefix>` is equivalent to
+/// `path: { prefix: ... }`.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ForwardRuleMatcher {
@@ -7251,6 +7252,89 @@ pub struct ForwardRuleMatcher {
     /// JSON request-body field matcher.
     #[serde(default)]
     pub body: Option<BodyMatcher>,
+    /// HTTP method matcher. A single method or a list of them; the entry
+    /// fires when the request method equals any listed one. Methods are
+    /// normalized to uppercase at config-load time, so `post` and `POST`
+    /// are the same matcher.
+    #[serde(default)]
+    pub method: Option<MethodSpec>,
+}
+
+/// HTTP method spec for a [`ForwardRuleMatcher`]. Either a single method
+/// (`method: POST`) or a list (`method: [POST, PUT]`). Tokens are
+/// normalized to uppercase when the matcher compiles, so `post` and `POST`
+/// mean the same thing; an empty list or a token that is not a valid HTTP
+/// method token fails config load.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum MethodSpec {
+    /// Single HTTP method.
+    Single(String),
+    /// Multiple methods; any match counts.
+    Multi(Vec<String>),
+}
+
+#[cfg(test)]
+mod forward_rule_method_tests {
+    use super::*;
+
+    #[test]
+    fn method_accepts_a_single_string() {
+        let matcher: ForwardRuleMatcher =
+            serde_json::from_value(serde_json::json!({"method": "POST"})).unwrap();
+        assert!(matches!(
+            matcher.method,
+            Some(MethodSpec::Single(ref m)) if m == "POST"
+        ));
+    }
+
+    #[test]
+    fn method_accepts_a_list() {
+        let matcher: ForwardRuleMatcher =
+            serde_json::from_value(serde_json::json!({"method": ["GET", "POST"]})).unwrap();
+        assert!(matches!(
+            matcher.method,
+            Some(MethodSpec::Multi(ref m)) if m == &["GET".to_string(), "POST".to_string()]
+        ));
+    }
+
+    #[test]
+    fn method_defaults_to_absent() {
+        let matcher: ForwardRuleMatcher =
+            serde_json::from_value(serde_json::json!({"match": "/api/"})).unwrap();
+        assert!(matcher.method.is_none());
+    }
+
+    #[test]
+    fn method_rejects_a_non_string_shape() {
+        assert!(
+            serde_json::from_value::<ForwardRuleMatcher>(serde_json::json!({"method": 7})).is_err()
+        );
+        assert!(serde_json::from_value::<ForwardRuleMatcher>(
+            serde_json::json!({"method": {"name": "POST"}})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn an_empty_list_parses_here_and_is_refused_at_compile() {
+        // Serde accepts the shape; the compile step in the pipeline is what
+        // rejects a list that could never match. This pins the split so the
+        // rejection message stays a config-load error, not a parse error.
+        let matcher: ForwardRuleMatcher =
+            serde_json::from_value(serde_json::json!({"method": []})).unwrap();
+        assert!(matches!(matcher.method, Some(MethodSpec::Multi(ref m)) if m.is_empty()));
+    }
+
+    #[test]
+    fn unknown_matcher_keys_are_still_rejected() {
+        // The Go-era plural `methods` stays an unknown key; the supported
+        // field is singular `method`.
+        let error =
+            serde_json::from_value::<ForwardRuleMatcher>(serde_json::json!({"methods": ["GET"]}))
+                .unwrap_err();
+        assert!(error.to_string().contains("unknown field"), "{error}");
+    }
 }
 
 /// Match a request header by exact value or value prefix.

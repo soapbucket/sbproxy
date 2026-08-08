@@ -913,7 +913,10 @@ origins:
 ### Hostname matching
 
 - Exact match: `"api.example.com"` matches only `api.example.com`.
-- Wildcard match: `"*.example.com"` matches `api.example.com`, `www.example.com`, and so on. The wildcard must be the first character and only covers one subdomain level.
+- Wildcard match: a key starting with `*.` matches one or more leading labels. `"*.example.com"` matches `api.example.com` and `a.b.example.com`, but not `example.com` itself.
+- Precedence: an exact key always beats a wildcard. Between wildcards, the longest matching suffix wins, so with both `"*.tenant.example.com"` and `"*.example.com"` configured, `api.tenant.example.com` routes to the former and `api.example.com` to the latter. Declaring `"api.example.com"` alongside `"*.example.com"` is legal; the exact key takes that one hostname and the wildcard takes the rest.
+- The `*` must be the complete first label. Keys like `a*.example.com`, `api.*.example.com`, or a bare `*` fail config compile.
+- Matching compares bytes after the port is stripped from the inbound `Host` (or `:authority`) value. No case folding or IDN normalization is applied, so write keys in lowercase ASCII, which is what clients send; internationalized domains must be keyed in their punycode form.
 - Multiple origins: define as many as you need. Each has independent auth, policies, and routing.
 
 ### Origin fields
@@ -938,7 +941,7 @@ origins:
 | `observability` | object | | Per-origin `log.redact.pii` override, composed with tenant or proxy scope. |
 | `force_ssl` | bool | false | Redirect plain HTTP requests to HTTPS. |
 | `allowed_methods` | list | empty (allow all) | Whitelist of HTTP methods. |
-| `forward_rules` | list | | Path, header, query, and body match rules that route to inline child origins. |
+| `forward_rules` | list | | Method, path, header, query, and body match rules that route to inline child origins. |
 | `fallback_origin` | object | | Inline origin served when the primary upstream errors or returns a configured status. See [Fallback origin](#fallback-origin). |
 | `response_cache` | object | | Per-origin response cache. |
 | `variables` | map | | Static template variables. |
@@ -1979,7 +1982,7 @@ Cloud backends use the standard credential discovery for their provider (`AWS_*`
 
 ### a2a
 
-Proxy requests to an Agent-to-Agent (A2A) endpoint that speaks the Google A2A protocol. The agent card metadata can be cached locally for discovery.
+Proxy requests to an Agent-to-Agent (A2A) endpoint that speaks the A2A protocol. A configured `agent_card` is served by the gateway at the A2A discovery paths (`/.well-known/agent-card.json` per A2A 1.0, plus the `/.well-known/agent.json` and `/agent-card.json` aliases) without contacting the upstream; see [a2a-gateway.md](a2a-gateway.md#serving-the-agent-card).
 
 ```yaml
 origins:
@@ -1990,13 +1993,15 @@ origins:
       agent_card:
         name: SearchAgent
         version: "1.0"
-        capabilities: [text, tool-use]
+        capabilities:
+          streaming: true
+        defaultInputModes: [application/json, text/plain]
 ```
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `url` | string | required | Upstream agent URL. |
-| `agent_card` | object | | Cached A2A agent card (free-form JSON). |
+| `agent_card` | object | | A2A agent card served at the discovery paths. Validated against the typed card schema at config compile; unknown fields round-trip verbatim. |
 
 ### mcp
 
@@ -3635,7 +3640,7 @@ Rotation works as it does for the response cache: move the current reference int
 
 ## Forward rules
 
-Forward rules route specific requests to different origins based on path, header, query, or JSON body conditions. They are evaluated in order; the first match wins. Common uses: path-based microservice routing, version routing, and dispatching LLM traffic by the `model` field of the request body.
+Forward rules route specific requests to different origins based on method, path, header, query, or JSON body conditions. They are evaluated in order; the first match wins. Common uses: path-based microservice routing, version routing, sending writes to a different backend than reads, and dispatching LLM traffic by the `model` field of the request body.
 
 Forward rules are deserialized lazily; required fields are enforced when the rule is exercised, not at config-load time.
 
@@ -3704,10 +3709,28 @@ Each forward rule has a `rules` array where each entry is a matcher. The deseria
 | `header` | object | Header matcher: `{name, value}` for an exact match or `{name, prefix}` for a value-prefix match. When both are set, `value` wins. Header names compare case-insensitively; values case-sensitively. |
 | `query` | object | Query parameter matcher: `{name, value}` for an exact match, or `{name}` alone to match on presence. |
 | `body` | object | JSON request-body field matcher: `{pointer, value}` for an exact match, `{pointer, prefix}` for a value-prefix match, or `{pointer}` alone to match on presence. `pointer` is an RFC 6901 JSON Pointer such as `/model`. See [Body matching](#body-matching). |
+| `method` | string or list | HTTP method matcher: a single method (`method: POST`) or a list (`method: [POST, PUT]`). The entry fires when the request method equals any listed one. Methods are normalized to uppercase at config load, so `post` and `POST` mean the same thing. An empty list or a token that is not a valid HTTP method fails config load. |
 
 Set exactly one of `prefix`, `exact`, `template`, or `regex` on a path matcher. If more than one is set, precedence is `template` > `regex` > `exact` > `prefix` (so `exact` beats `prefix`).
 
-Within a single matcher entry, every present matcher (`path`, `header`, `query`, `body`) must succeed for the entry to fire. When a rule has multiple matcher entries, the rule fires when any one of them matches. Any other key on a matcher entry (Go-era fields such as `methods`, `ip`, `location`, `user_agent`, `content_types`, `protocol`) is rejected at config load as an unknown key.
+Within a single matcher entry, every present matcher (`method`, `path`, `header`, `query`, `body`) must succeed for the entry to fire. When a rule has multiple matcher entries, the rule fires when any one of them matches. Any other key on a matcher entry (Go-era fields such as `methods`, `ip`, `location`, `user_agent`, `content_types`, `protocol`) is rejected at config load as an unknown key; note that the supported method field is the singular `method`, and the Go-era plural `methods` stays rejected.
+
+A method matcher composes with the other matchers in its entry, so routing writes away from reads takes one rule:
+
+```yaml
+forward_rules:
+  # POST/PUT/PATCH/DELETE under /api/ go to the primary; GETs keep the
+  # origin's default action.
+  - rules:
+      - path:
+          prefix: /api/
+        method: [POST, PUT, PATCH, DELETE]
+    origin:
+      id: api-primary
+      action:
+        type: proxy
+        url: https://primary.internal:8080
+```
 
 ### Body matching
 
@@ -3734,7 +3757,7 @@ When neither `value` nor `prefix` is set, the matcher succeeds whenever the poin
 
 **Misses, not failures.** Five conditions make a body matcher miss rather than fail the request: a body larger than `max_bytes` (whether declared by `Content-Length` up front or discovered while reading a chunked body), a body that is not JSON, a body that does not parse, a pointer that resolves to nothing, and a pointer that resolves to an object or array while `value` or `prefix` expects a scalar. In every case the entry does not fire and evaluation moves to the next entry, then the next rule, then the origin's own action, which is the same routing the request would have received without the matcher. A body matcher only ever selects a route; it never rejects a request.
 
-Within one entry the body matcher is ANDed with any `path`, `header`, and `query` matchers present, and it is evaluated last because it is the only matcher that reads buffered bytes. A worked example routing one model family to its own pool while everything else takes the origin's default action:
+Within one entry the body matcher is ANDed with any `method`, `path`, `header`, and `query` matchers present, and it is evaluated last because it is the only matcher that reads buffered bytes. A worked example routing one model family to its own pool while everything else takes the origin's default action:
 
 ```yaml
 origins:

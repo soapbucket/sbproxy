@@ -96,7 +96,7 @@ fn request_requires_graphql_replay(
             rules.iter().find(|rule| {
                 rule.matchers.iter().any(|matcher| {
                     matcher
-                        .match_request(path, query, &request.headers)
+                        .match_request(&request.method, path, query, &request.headers)
                         .is_some()
                 })
             })
@@ -125,7 +125,12 @@ fn request_uses_ai_owned_replay_paths(
             rules.iter().find(|rule| {
                 rule.matchers.iter().any(|matcher| {
                     matcher
-                        .match_request(request.uri.path(), request.uri.query(), &request.headers)
+                        .match_request(
+                            &request.method,
+                            request.uri.path(),
+                            request.uri.query(),
+                            &request.headers,
+                        )
                         .is_some()
                 })
             })
@@ -1954,6 +1959,52 @@ pub(super) async fn request_filter(
             }
             // Not configured for this origin: fall through to normal
             // proxying rather than 404.
+        }
+    }
+
+    // --- WOR-2315 wire: configured A2A agent-card serving ---
+    //
+    // Origins whose `a2a` action carries an `agent_card` serve it at
+    // the A2A discovery paths: `/.well-known/agent-card.json` per
+    // ratified A2A 1.0 (spec section 14.3), plus the pre-1.0
+    // `/.well-known/agent.json` and `/agent-card.json` aliases the
+    // `a2a_agent_card_rewrite` transform already gates on. Like the
+    // agent-web emission above, this intercepts ONLY when the origin
+    // configured a card; an `a2a` origin without one falls through so
+    // the path proxies to the upstream (where the rewrite transform
+    // can fix up a card the upstream serves itself). Served before
+    // auth for the same reason as the neighboring discovery
+    // documents: the public agent card is A2A's discovery entry
+    // point, and A2A 1.0 keeps gated detail behind the separate
+    // authenticated-extended-card surface. Non-GET requests fall
+    // through so the card serving changes no other method's behavior.
+    //
+    // The served card advertises the proxy, not the upstream: the
+    // card's routed URL fields are swapped to the host resolved by
+    // `a2a_card_serve_host` (configured `proxy_host` on the origin's
+    // rewrite transform, else the inbound `Host` header), the same
+    // precedence the rewrite transform applies to upstream-served
+    // cards.
+    {
+        let req_path = session.req_header().uri.path();
+        if session.req_header().method == http::Method::GET
+            && sbproxy_modules::DEFAULT_AGENT_CARD_PATHS.contains(&req_path)
+        {
+            if let Some(Action::A2a(a2a)) = pipeline.actions.get(origin_idx) {
+                if let Some(card) = a2a.agent_card.as_ref() {
+                    let host = a2a_card_serve_host(
+                        pipeline
+                            .transforms
+                            .get(origin_idx)
+                            .map(Vec::as_slice)
+                            .unwrap_or_default(),
+                        ctx.hostname.as_str(),
+                    );
+                    let body = render_a2a_agent_card(card, host);
+                    send_response(session, 200, "application/json", &body).await?;
+                    return Ok(true);
+                }
+            }
         }
     }
 
@@ -4055,7 +4106,7 @@ pub(super) async fn request_filter(
         }
     }
 
-    // --- Forward rules: path/header/query/body routing to inline origins ---
+    // --- Forward rules: method/path/header/query/body routing to inline origins ---
     // WOR-2306: the body the matchers below read, drained here because this
     // is the last moment before a route is chosen and the first moment worth
     // paying for. Everything above this line can short-circuit the request
@@ -4070,12 +4121,15 @@ pub(super) async fn request_filter(
         let request_path = session.req_header().uri.path().to_string();
         let request_query = session.req_header().uri.query().map(|q| q.to_string());
         for (rule_idx, fwd_rule) in fwd_rules.iter().enumerate() {
-            // Each `MatcherEntry` ANDs path/header/query/body; entries in
-            // the list are ORed. `match_request_with_body` returns the
-            // captured path params (possibly empty) when the entry fires.
+            // Each `MatcherEntry` ANDs method/path/header/query/body;
+            // entries in the list are ORed. `match_request_with_body`
+            // returns the captured path params (possibly empty) when the
+            // entry fires.
             let request_headers = &session.req_header().headers;
+            let request_method = &session.req_header().method;
             let captured = fwd_rule.matchers.iter().find_map(|m| {
                 m.match_request_with_body(
+                    request_method,
                     &request_path,
                     request_query.as_deref(),
                     request_headers,
