@@ -1,6 +1,6 @@
 # MCP gateway
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-08*
 
 SBproxy ships an MCP (Model Context Protocol) gateway that speaks
 JSON-RPC 2.0 over HTTP POST. Configure the `mcp` action on an origin
@@ -210,6 +210,7 @@ success.
 | `transport` | string | `streamable_http` | `streamable_http`, `sse`, or supervised local `stdio`. |
 | `command` / `args` | string / list | unset | Required command and optional arguments for `transport: stdio`. |
 | `egress` | object | inherited | Per-server OpenAPI REST egress policy. |
+| `headers` | map<string, string> | `{}` | Static headers attached to every REST request a `type: openapi` server dispatches, e.g. a shared service credential. Values pass through `${VAR}` interpolation; keep secrets in the environment. Rejected on non-`openapi` servers. |
 | `run_as_user_auth` | bool | `false` | Mint per-caller upstream `Authorization` via `upstream_auth` (never tool args). |
 | `upstream_auth` | object | unset | Required when `run_as_user_auth` is true. See [mcp-gateway-guardrails.md](mcp-gateway-guardrails.md). |
 
@@ -279,6 +280,29 @@ federated_servers:
     spec_path: "petstore.openapi.yaml"
     prefix: pets
 ```
+
+When the REST upstream wants a shared service credential, declare it
+as a static `headers:` entry on the server. The value resolves through
+`${VAR}` config interpolation at load time, rides on every dispatched
+REST request (including authorized redirect hops), and never appears
+in tool arguments. A per-caller header minted by `run_as_user_auth`
+wins over a static header of the same name, and declaring an
+`authorization` entry alongside `run_as_user_auth` is a config error.
+
+```yaml
+federated_servers:
+  - type: openapi
+    origin: "https://api.internal"
+    spec_path: "petstore.openapi.yaml"
+    prefix: pets
+    headers:
+      authorization: "Bearer ${PETS_API_TOKEN}"
+```
+
+One self-referential use of this is pointing an `openapi` server at
+the gateway's own admin API, which turns the admin surface into
+governed MCP tools; [admin-mcp.md](admin-mcp.md) walks through that
+setup end to end.
 
 ## Sessions
 

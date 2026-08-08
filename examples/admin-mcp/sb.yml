@@ -1,0 +1,218 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Manage SBproxy over MCP: the gateway's own admin API as MCP tools.
+#
+# One process, two surfaces. The admin server runs on 127.0.0.1:9090
+# as usual, and an `mcp` origin on the data plane federates a
+# `type: openapi` server whose spec describes a curated, read-only
+# subset of that same admin API. The gateway derives one MCP tool per
+# declared operation and dispatches each `tools/call` as a REST
+# request back to its own admin port, carrying the admin Basic
+# credential from the static `headers:` entry. An MCP client such as
+# Claude Code or Cursor pointed at http://localhost:8080/ can then
+# check health, read config, and inspect spend without ever holding
+# the admin credential itself.
+#
+# The spec below is hand-declared, not fetched: the document the
+# admin server emits at /api/openapi.json describes the routes the
+# gateway proxies (the data plane), not the admin control plane, so a
+# curated inline spec is the honest source for admin tools. Each
+# declared path matches docs/admin-api-reference.md.
+#
+# Credentials: the admin password and the matching Basic header value
+# both interpolate from the environment, with demo-only defaults that
+# pair with each other. For anything beyond a local demo, export both:
+#
+#   export SBPROXY_ADMIN_PASSWORD='a-real-password'
+#   export SBPROXY_ADMIN_MCP_BASIC=$(printf 'admin:%s' "$SBPROXY_ADMIN_PASSWORD" | base64)
+#
+# Safety posture: the `admin_read_only` RBAC policy plus the
+# `tool_allowlist` guardrail expose only read operations by default.
+# The spec also declares `reload_config` (POST /admin/reload) so you
+# can see the deny path: the tool is filtered out of `tools/list`, and
+# a direct `tools/call` for it is refused by the guardrail before any
+# request reaches the admin port. To opt in to mutation, switch the
+# server's `rbac:` label to `admin_operator` AND add
+# `sbproxy.reload_config` to the guardrail allowlist; both gates must
+# agree before a mutating call goes through.
+#
+# Run:
+#   make run CONFIG=examples/admin-mcp/sb.yml
+#
+# Test:
+# Start the MCP lifecycle (answered locally by the gateway):
+#   curl -s -X POST http://127.0.0.1:8080 \
+#     -H 'Host: localhost' \
+#     -H 'Content-Type: application/json' \
+#     -H 'Accept: application/json, text/event-stream' \
+#     -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl-demo","version":"1.0.0"}}}' | jq .
+#
+# Complete initialization (sessions are disabled; returns HTTP 202):
+#   curl -sS -o /dev/null -w '%{http_code}\n' \
+#     -X POST http://127.0.0.1:8080 \
+#     -H 'Host: localhost' \
+#     -H 'Content-Type: application/json' \
+#     -H 'Accept: application/json, text/event-stream' \
+#     -H 'MCP-Protocol-Version: 2025-06-18' \
+#     -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+#
+# List the admin-derived tools (sbproxy.get_health, sbproxy.get_stats, ...):
+#   curl -s -X POST http://127.0.0.1:8080 \
+#     -H 'Host: localhost' \
+#     -H 'Content-Type: application/json' \
+#     -H 'Accept: application/json, text/event-stream' \
+#     -H 'MCP-Protocol-Version: 2025-06-18' \
+#     -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | jq .
+#
+# Call one: the gateway sends GET /api/health to its own admin port
+# with the Basic credential attached, and wraps the JSON response as
+# MCP tool-result content:
+#   curl -s -X POST http://127.0.0.1:8080 \
+#     -H 'Host: localhost' \
+#     -H 'Content-Type: application/json' \
+#     -H 'Accept: application/json, text/event-stream' \
+#     -H 'MCP-Protocol-Version: 2025-06-18' \
+#     -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"sbproxy.get_health","arguments":{}}}' | jq .
+#
+# The mutating tool is declared but denied by default; the guardrail
+# refuses it before any request reaches the admin API:
+#   curl -s -X POST http://127.0.0.1:8080 \
+#     -H 'Host: localhost' \
+#     -H 'Content-Type: application/json' \
+#     -H 'Accept: application/json, text/event-stream' \
+#     -H 'MCP-Protocol-Version: 2025-06-18' \
+#     -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"sbproxy.reload_config","arguments":{}}}' | jq .
+
+# sbproxy-docs:begin
+proxy:
+  http_bind_port: 8080
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    password: ${SBPROXY_ADMIN_PASSWORD:-admin-mcp-demo}
+
+origins:
+  # Keyed on `localhost` so a local MCP client (Claude Code, Cursor)
+  # can connect to http://localhost:8080/ directly; the router strips
+  # the port from the Host header before matching.
+  "localhost":
+    action:
+      type: mcp
+      mode: gateway
+      server_info:
+        name: sbproxy-admin
+        version: "1.0.0"
+      # Default-deny RBAC. `admin_read_only` (applied below) allows
+      # only the read tools; `admin_operator` is declared for the
+      # explicit opt-in and additionally allows `reload_config`.
+      rbac_policies:
+        admin_read_only:
+          default_allow: false
+          tool_access:
+            - principals: []
+              allowed:
+                - sbproxy.get_health
+                - sbproxy.get_health_targets
+                - sbproxy.get_stats
+                - sbproxy.get_spend
+                - sbproxy.get_config
+                - sbproxy.get_drift
+        admin_operator:
+          default_allow: false
+          tool_access:
+            - principals: []
+              allowed:
+                - sbproxy.get_health
+                - sbproxy.get_health_targets
+                - sbproxy.get_stats
+                - sbproxy.get_spend
+                - sbproxy.get_config
+                - sbproxy.get_drift
+                - sbproxy.reload_config
+      federated_servers:
+        - type: openapi
+          # The gateway's own admin listener. Loopback-only by
+          # default, so the egress policy below opts in to private
+          # addresses for exactly this host.
+          origin: http://127.0.0.1:9090
+          prefix: sbproxy
+          namespace: always
+          rbac: admin_read_only
+          timeout: 10s
+          egress:
+            mode: deny_by_default
+            hosts: ["127.0.0.1"]
+            allow_private: true
+          # The admin API accepts HTTP Basic auth. The static header
+          # rides on every dispatched REST call; the MCP client never
+          # sees or supplies it. The default pairs with the demo
+          # password above; export both variables for real use.
+          headers:
+            authorization: "Basic ${SBPROXY_ADMIN_MCP_BASIC:-YWRtaW46YWRtaW4tbWNwLWRlbW8=}"
+          # Curated subset of the admin control plane, one operation
+          # per tool. Paths and methods match
+          # docs/admin-api-reference.md.
+          spec:
+            openapi: "3.0.0"
+            info:
+              title: SBproxy admin API (curated subset)
+              version: "1.0"
+            paths:
+              "/api/health":
+                get:
+                  operationId: get_health
+                  summary: Aggregate proxy liveness summary.
+              "/api/health/targets":
+                get:
+                  operationId: get_health_targets
+                  summary: >-
+                    Per-target health: probe state, outlier ejection,
+                    breaker state, in-flight connections.
+              "/api/stats":
+                get:
+                  operationId: get_stats
+                  summary: Request-log statistics summary.
+              "/api/usage/spend":
+                get:
+                  operationId: get_spend
+                  summary: Spend summary over a trailing window.
+                  parameters:
+                    - name: window
+                      in: query
+                      required: false
+                      description: "Trailing window, e.g. 1h or 24h."
+                      schema:
+                        type: string
+              "/admin/config":
+                get:
+                  operationId: get_config
+                  summary: >-
+                    Read the loaded config file. Inline plaintext
+                    secrets are redacted before the response leaves
+                    the admin server.
+              "/admin/drift":
+                get:
+                  operationId: get_drift
+                  summary: >-
+                    Compare the loaded config against the on-disk
+                    file.
+              "/admin/reload":
+                post:
+                  operationId: reload_config
+                  summary: >-
+                    Hot-reload the config from disk. Mutating; denied
+                    by the default read-only policy.
+      guardrails:
+        # Second, coarser gate on top of RBAC: even an RBAC-allowed
+        # tool must appear here to be forwarded. `reload_config` is
+        # deliberately absent; add it here AND switch `rbac:` to
+        # `admin_operator` to enable mutation.
+        - type: tool_allowlist
+          allow:
+            - sbproxy.get_health
+            - sbproxy.get_health_targets
+            - sbproxy.get_stats
+            - sbproxy.get_spend
+            - sbproxy.get_config
+            - sbproxy.get_drift
+# sbproxy-docs:end

@@ -64,7 +64,7 @@
 //! library; this module only translates YAML into library API calls
 //! and applies a small allowlist guardrail at request time.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -495,6 +495,16 @@ pub struct McpFederatedServerConfig {
     /// `egress`, then allow-all.
     #[serde(default)]
     pub egress: Option<EgressPolicy>,
+    /// Static headers attached to every REST request an `openapi`
+    /// server dispatches (WOR-2314). Values pass through `${VAR}`
+    /// config interpolation, so a shared service credential (e.g. an
+    /// admin API's Basic auth) lives in the environment, not the
+    /// file. Rejected on non-`openapi` servers so a header that would
+    /// silently never be sent fails loudly instead. Setting an
+    /// `authorization` header here alongside `run_as_user_auth` is a
+    /// config error; pick one credential source.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
 }
 
 /// One entry in the gateway-level guardrails list.
@@ -792,6 +802,27 @@ impl McpAction {
             // URL, not an MCP endpoint.
             let is_openapi = upstream.server_type.as_deref() == Some("openapi");
             let is_stdio = transport == "stdio";
+
+            // WOR-2314: static headers ride only on the OpenAPI REST
+            // dispatch. On an MCP transport they would silently never
+            // be sent, so reject rather than ignore.
+            if !upstream.headers.is_empty() && !is_openapi {
+                anyhow::bail!(
+                    "mcp action: federated_servers[].headers requires type: openapi (origin '{}')",
+                    upstream.origin
+                );
+            }
+            if upstream.run_as_user_auth
+                && upstream
+                    .headers
+                    .keys()
+                    .any(|k| k.eq_ignore_ascii_case("authorization"))
+            {
+                anyhow::bail!(
+                    "mcp action: openapi server '{}' sets both headers.authorization and run_as_user_auth; pick one",
+                    upstream.origin
+                );
+            }
             let (url, openapi) = if is_stdio {
                 let command = upstream.command.as_deref().ok_or_else(|| {
                     anyhow::anyhow!(
@@ -828,6 +859,11 @@ impl McpAction {
                             .clone()
                             .unwrap_or_else(|| action_egress.clone())
                             .with_scope(format!("server:{name}")),
+                        headers: upstream
+                            .headers
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
                     }),
                 )
             } else {
@@ -1607,6 +1643,71 @@ mod tests {
     }
 
     #[test]
+    fn openapi_server_accepts_static_headers() {
+        let value = json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "federated_servers": [{
+                "type": "openapi",
+                "origin": "http://127.0.0.1:9090",
+                "headers": {"authorization": "Basic c2VydmljZTpzZWNyZXQ="},
+                "spec": {
+                    "openapi": "3.0.0",
+                    "info": {"title": "t", "version": "1"},
+                    "paths": {"/api/health": {"get": {"operationId": "get_health"}}}
+                }
+            }]
+        });
+        let action = McpAction::from_config(value).expect("compile");
+        assert_eq!(action.prefixes.len(), 1);
+    }
+
+    #[test]
+    fn static_headers_on_mcp_server_is_config_error() {
+        let value = json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "federated_servers": [{
+                "origin": "github.example.com",
+                "headers": {"x-team": "frontend"}
+            }]
+        });
+        let err = McpAction::from_config(value).expect_err("headers need type: openapi");
+        assert!(
+            err.to_string().contains("requires type: openapi"),
+            "error must name the constraint, got: {err}"
+        );
+    }
+
+    #[test]
+    fn static_authorization_plus_run_as_user_is_config_error() {
+        let value = json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "federated_servers": [{
+                "type": "openapi",
+                "origin": "http://api.internal.example",
+                "headers": {"Authorization": "Basic c2VydmljZTpzZWNyZXQ="},
+                "run_as_user_auth": true,
+                "upstream_auth": {
+                    "type": "service_credential",
+                    "credential_ref": "vault://svc"
+                },
+                "spec": {
+                    "openapi": "3.0.0",
+                    "info": {"title": "t", "version": "1"},
+                    "paths": {"/pets": {"get": {"operationId": "listPets"}}}
+                }
+            }]
+        });
+        let err = McpAction::from_config(value).expect_err("two credential sources must fail");
+        assert!(
+            err.to_string().contains("pick one"),
+            "error must tell the operator to pick one source, got: {err}"
+        );
+    }
+
+    #[test]
     fn lethal_trifecta_guardrail_compiles_and_classifies_tools() {
         let value = json!({
             "type": "mcp",
@@ -2157,6 +2258,7 @@ mod tests {
                 server_type: None,
                 spec: None,
                 spec_path: None,
+                headers: BTreeMap::new(),
                 egress: None,
             };
             assert_eq!(entry.timeout, Some(expected), "parsed {raw}");

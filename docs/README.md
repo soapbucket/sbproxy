@@ -1,6 +1,6 @@
 # SBproxy documentation
 
-*Last modified: 2026-08-07*
+*Last modified: 2026-08-08*
 
 SBproxy is an open source Enterprise AI Gateway for API, MCP and agent, and AI model traffic. Every feature in this repository ships under Apache-2.0.
 
@@ -75,6 +75,7 @@ Govern the AI you call, the AI that calls you, and the AI you run.
 - [wasm-development.md](wasm-development.md) - writing WebAssembly modules for the `wasm` transform against the WASI preview-1 contract.
 - [mcp.md](mcp.md) - the MCP gateway: wire shape, capabilities, and `experimental.agentSkillsUrl` advertising.
 - [mcp-gateway-guardrails.md](mcp-gateway-guardrails.md) - MCP gateway guardrails: egress, session risk, quarantine, stdio, run-as-user, and compaction.
+- [admin-mcp.md](admin-mcp.md) - manage SBproxy from an MCP client: the gateway's own admin API as governed, read-only-by-default MCP tools for Claude Code or Cursor.
 - [tool-versioning.md](tool-versioning.md) - the rollout plane (publish several versions of one tool, resolve per consumer, adapt, sunset) plus the compatibility oracle: a contract digest and a semver grade per tool, with a version-bump linter that fails an under-bump.
 - [a2a-gateway.md](a2a-gateway.md) - the `a2a` action and policy: envelope trust, per-hop chain limits, push-notification target validation, typed AgentCard, and modality negotiation helpers.
 - [agent-skills.md](agent-skills.md) - Agent Skills v0.2.0 well-known projection: schema, integrity, archive safety, no-script-execution contract.

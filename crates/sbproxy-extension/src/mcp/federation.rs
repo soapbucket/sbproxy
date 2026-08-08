@@ -77,6 +77,13 @@ pub struct OpenApiBacking {
     /// Deterministic egress policy for REST calls made on behalf of
     /// this OpenAPI-backed server.
     pub egress_policy: EgressPolicy,
+    /// Static headers attached to every REST dispatch for this server
+    /// (WOR-2314), typically a shared service credential such as an
+    /// admin API's Basic auth resolved from the environment at config
+    /// load. A per-call minted header of the same name (run-as-user)
+    /// wins; names compare case-insensitively. Values may be secrets
+    /// and are never logged by this module.
+    pub headers: Vec<(String, String)>,
 }
 
 /// Configuration for one upstream MCP server.
@@ -1318,6 +1325,20 @@ impl McpFederation {
             // rather than being stripped with the Authorization.
             builder = sbproxy_observe::telemetry::inject_into_reqwest(builder);
             for (name, value) in upstream_headers {
+                builder = builder.header(name.as_str(), value.as_str());
+            }
+            // WOR-2314: static per-server headers ride on the same
+            // wire as the minted run-as-user set, re-applied per
+            // redirect attempt under the same egress authorization. A
+            // per-call header of the same name wins so run-as-user
+            // minting cannot be shadowed by config.
+            for (name, value) in &backing.headers {
+                if upstream_headers
+                    .iter()
+                    .any(|(existing, _)| existing.eq_ignore_ascii_case(name))
+                {
+                    continue;
+                }
                 builder = builder.header(name.as_str(), value.as_str());
             }
             if !query.is_empty() {
@@ -2719,6 +2740,7 @@ mod tests {
                 allow_private: false,
                 scope: "server:api".to_string(),
             },
+            headers: vec![],
         };
         let server = McpServerConfig {
             name: "api".to_string(),
@@ -2785,6 +2807,7 @@ mod tests {
                 allow_private: true,
                 scope: "server:api".to_string(),
             },
+            headers: vec![],
         };
         let server = McpServerConfig {
             name: "api".to_string(),
@@ -2866,6 +2889,7 @@ mod tests {
                 allow_private: true,
                 scope: "server:api".to_string(),
             },
+            headers: vec![],
         }
     }
 
@@ -2877,6 +2901,98 @@ mod tests {
             namespace: NamespaceMode::default(),
             openapi: Some(backing.clone()),
         }
+    }
+
+    /// One-shot loopback fixture that also captures the raw request
+    /// bytes, so header-attachment tests can assert on the wire shape.
+    /// `None` means loopback binds are denied in this sandbox and the
+    /// test should skip (same posture as `dial_fixture`).
+    fn capture_fixture(response: String) -> Option<(SocketAddr, Arc<Mutex<Vec<u8>>>)> {
+        let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(l) => l,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping static-header test: loopback bind denied: {err}");
+                return None;
+            }
+            Err(err) => panic!("bind failed: {err}"),
+        };
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&captured);
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                if let Ok(n) = s.read(&mut buf) {
+                    sink.lock().expect("test lock").extend_from_slice(&buf[..n]);
+                }
+                let _ = s.write_all(response.as_bytes());
+            }
+        });
+        Some((addr, captured))
+    }
+
+    /// WOR-2314: static per-server headers ride on the OpenAPI REST
+    /// dispatch, so an `openapi` server can carry a shared service
+    /// credential (e.g. an admin API's Basic auth).
+    #[tokio::test]
+    async fn openapi_tool_attaches_static_headers() {
+        let Some((addr, captured)) = capture_fixture(ok_response(r#"{"ok":true}"#)) else {
+            return;
+        };
+
+        let fed = McpFederation::new(vec![]);
+        let mut backing =
+            enforce_openapi_backing("127.0.0.1", addr.port(), vec!["127.0.0.1".to_string()]);
+        backing.headers = vec![(
+            "authorization".to_string(),
+            "Basic c3RhdGljOnNlY3JldA==".to_string(),
+        )];
+        let server = server_for_backing(&backing);
+
+        fed.call_openapi_tool(&server, &backing, "getPet", &json!({"id": "1"}), &[])
+            .await
+            .expect("static-header dispatch must reach the fixture");
+
+        let wire = String::from_utf8_lossy(&captured.lock().expect("test lock")).to_string();
+        assert!(
+            wire.contains("authorization: Basic c3RhdGljOnNlY3JldA=="),
+            "static header must reach the REST upstream, got: {wire}"
+        );
+    }
+
+    /// WOR-2314: a per-call minted header (run-as-user) with the same
+    /// name wins over the static config header; the request carries
+    /// exactly one value for it.
+    #[tokio::test]
+    async fn openapi_tool_per_call_header_wins_over_static() {
+        let Some((addr, captured)) = capture_fixture(ok_response(r#"{"ok":true}"#)) else {
+            return;
+        };
+
+        let fed = McpFederation::new(vec![]);
+        let mut backing =
+            enforce_openapi_backing("127.0.0.1", addr.port(), vec!["127.0.0.1".to_string()]);
+        backing.headers = vec![(
+            "Authorization".to_string(),
+            "Basic c3RhdGljOnNlY3JldA==".to_string(),
+        )];
+        let server = server_for_backing(&backing);
+
+        let minted = [("authorization".to_string(), "Bearer minted".to_string())];
+        fed.call_openapi_tool(&server, &backing, "getPet", &json!({"id": "1"}), &minted)
+            .await
+            .expect("minted-header dispatch must reach the fixture");
+
+        let wire = String::from_utf8_lossy(&captured.lock().expect("test lock")).to_string();
+        assert!(
+            wire.contains("authorization: Bearer minted"),
+            "minted header must reach the REST upstream, got: {wire}"
+        );
+        assert!(
+            !wire.contains("Basic c3RhdGljOnNlY3JldA=="),
+            "static header must not shadow or duplicate the minted one, got: {wire}"
+        );
     }
 
     /// Resolver whose per-host answers are handed out in order, holding
