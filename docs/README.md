@@ -132,6 +132,7 @@ Point a framework you already run at the gateway: chat completions through the O
 ## Reference
 
 - [payment-settlement.md](payment-settlement.md) - `proxy.payments`: rails, durable intents, the state table that gates origin access, timeouts, reconciliation, and the exact unsupported boundaries.
+- [payment-clustering.md](payment-clustering.md) - why a node running both `proxy.payments` and `proxy.cluster` refuses to start: the two serialization points, why the mesh cannot hold them, the refuse-under-partition posture, and the staged path to a shared transactional store.
 - [402-challenge.md](402-challenge.md) - the exact bytes of every payment challenge, credential, problem document, and receipt.
 - [l402.md](l402.md) - L402 (Lightning HTTP 402) design notes: the protocol shape SBproxy would implement. None of it ships in the current binary; [402-challenge.md](402-challenge.md) covers the payment surface that does.
 - [admin-api-reference.md](admin-api-reference.md) - per-route schema for the embedded admin server (`/api/*`, `/admin/*`, and the unauthenticated probe routes).
