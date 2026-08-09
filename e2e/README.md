@@ -1,5 +1,5 @@
 # sbproxy-e2e
-*Last modified: 2026-06-18*
+*Last modified: 2026-08-08*
 
 End-to-end integration tests for the OSS sbproxy binary. The crate
 ships a small `ProxyHarness` library plus per-feature integration
@@ -29,6 +29,22 @@ CARGO_TARGET_DIR=target/no-default-features cargo build -p sbproxy --no-default-
 The harness finds that binary under `target/no-default-features/` or
 uses `SBPROXY_E2E_NO_DEFAULT_FEATURES_BIN=/path/to/sbproxy` when set.
 
+`settlement_gate.rs` and `usage_bridge.rs` need a third flavor. No
+payment feature is in any default set, so those two files spawn a binary
+carrying the payment rails:
+
+```bash
+CARGO_TARGET_DIR=target/payments cargo build --release -p sbproxy \
+  --features payment-x402,payment-mpp,payment-stripe,payment-lightning-cln
+```
+
+The harness finds it under `target/payments/` or uses
+`SBPROXY_E2E_PAYMENTS_BIN=/path/to/sbproxy` when set. Without it every
+test in both files fails on "payments-featured sbproxy binary missing",
+and `scripts/check.sh` filters both out and prints the build command in
+its `SKIPPED PHASES` block rather than reporting missing setup as a test
+failure.
+
 ## Run the suite
 
 ```bash
@@ -50,7 +66,26 @@ cargo test --release -p sbproxy-e2e -- --test-threads=1
 ```
 
 The required CI gate covers the OSS workspace's unit + lib tests;
-e2e runs occasionally and locally, not on every PR.
+e2e runs on a schedule and locally, not on every PR.
+
+| Workflow | Trigger | Covers |
+|---|---|---|
+| `.github/workflows/payments-e2e.yml` | 03:40 UTC nightly, `workflow_dispatch` | `settlement_gate` + `usage_bridge` only, against the payments binary |
+| `.github/workflows/release-checks.yml` | 09:30 UTC nightly, tags, `workflow_dispatch` | the whole workspace single-threaded, e2e included |
+| `.github/workflows/e2e.yml` | 09:30 UTC Mondays, tags, `workflow_dispatch` | the whole e2e suite, Redis required |
+
+Only the first of those is named for the tests it runs, and only the
+first and the third open a GitHub issue when they go red.
+`payments-e2e.yml` exists because the exactly-once assertion in
+`challenge_settle_allow_and_replay_refusal` is a revenue property, and
+finding it broken a week later, buried in a run of roughly 8500 other
+tests, is not the same as finding it broken.
+
+Run one file serially, the way the scheduled lanes do:
+
+```bash
+cargo test -p sbproxy-e2e --locked --test settlement_gate -- --test-threads=1
+```
 
 ## What is covered
 
