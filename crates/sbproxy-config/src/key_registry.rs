@@ -89,11 +89,13 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "The OSS resolver does not fetch hosted agent-class feeds; builtin and inline catalogs \
          remain live. Retained for compatibility and tracked by WOR-1976.",
     ),
-    config_only(
-        "audit.sink",
-        "The OSS admin-action audit path always retains its bounded in-memory ring and mirrors \
-         rows to tracing; this selector is not installed. Classified under WOR-1976.",
-    ),
+    // `audit.sink`, `audit.path`, and `audit.sign_with` deliberately have
+    // no entry here. `audit.sink` was pinned `config_only` while the key
+    // selected nothing; it now selects whether the security audit trail is
+    // hash-chained and signed, and `compiler::validate_audit` plus
+    // `sbproxy_core::server::lifecycle::install_audit_chain` read all three
+    // off a typed `&AuditConfig`, which is the shape the reader guard
+    // resolves on its own (WOR-2318).
     // The eight entries below are the first from the module and AI-gateway
     // surface, which the generated schema cannot describe and which
     // `MODULE_CONFIG_ROOTS` now walks instead.

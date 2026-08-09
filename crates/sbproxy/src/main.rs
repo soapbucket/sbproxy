@@ -180,6 +180,9 @@ enum Cmd {
     Projections(ProjectionsCmd),
     /// AI gateway tools (usage ledger verification, ...).
     Ai(AiCmd),
+    /// Audit-trail tools (verify the tamper-evident security audit
+    /// chain).
+    Audit(AuditCmd),
     /// Admin-account maintenance (password hashing, ...).
     Admin(AdminCliCmd),
     /// Serve a certified catalog model in one command, with no YAML.
@@ -850,6 +853,36 @@ struct LedgerReportArgs {
 }
 
 #[derive(clap::Args, Debug)]
+struct AuditCmd {
+    #[command(subcommand)]
+    sub: AuditSub,
+}
+
+#[derive(Subcommand, Debug)]
+enum AuditSub {
+    /// Re-derive the security audit chain written by `audit.sink: chain`
+    /// and report the first record that does not check out. Exit 0 when
+    /// the trail verifies, 1 when it does not.
+    Verify(AuditVerifyArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct AuditVerifyArgs {
+    /// Path to the chain file, the one `audit.path` names.
+    path: PathBuf,
+    /// The 32-byte Ed25519 signing seed as hex. Without it only the hash
+    /// chain is checked, which catches an edit made by somebody who could
+    /// not re-link the file and misses one made by somebody who could.
+    /// Pass it to also verify every signature.
+    #[arg(long = "signing-seed-hex")]
+    signing_seed_hex: Option<String>,
+    /// Output format. `text` (default) prints a human line; `json` emits a
+    /// single structured object for CI consumption.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+#[derive(clap::Args, Debug)]
 struct AdminCliCmd {
     #[command(subcommand)]
     sub: AdminSub,
@@ -1484,6 +1517,9 @@ fn main() {
         }
         Some(Cmd::Ai(cmd)) => {
             run_subcommand("ai", 2, handle_ai_subcommand(&cmd));
+        }
+        Some(Cmd::Audit(cmd)) => {
+            run_subcommand("audit", 2, handle_audit_subcommand(&cmd));
         }
         Some(Cmd::Admin(cmd)) => {
             run_subcommand(
@@ -8747,6 +8783,66 @@ fn mask_secrets(value: &mut serde_json::Value) {
     }
 }
 
+fn handle_audit_subcommand(cmd: &AuditCmd) -> anyhow::Result<i32> {
+    match &cmd.sub {
+        AuditSub::Verify(args) => handle_audit_verify(args),
+    }
+}
+
+/// `sbproxy audit verify`: re-derive the security audit chain from
+/// genesis and report the first record that does not check out.
+///
+/// Reads the file and nothing else. No config, no admin API, no running
+/// proxy: an auditor with a copy of the chain and the public key can run
+/// this against a file the proxy that wrote it no longer has, which is
+/// the point of signing the entries rather than merely logging them.
+fn handle_audit_verify(args: &AuditVerifyArgs) -> anyhow::Result<i32> {
+    use sbproxy_observe::audit_chain::{verify_security_audit_chain, verifying_key_from_seed_hex};
+
+    let verifying_key = match args.signing_seed_hex.as_deref() {
+        Some(seed) => Some(verifying_key_from_seed_hex(seed)?),
+        None => None,
+    };
+    let result = verify_security_audit_chain(&args.path, verifying_key.as_ref())?;
+    let path_str = args.path.to_string_lossy();
+
+    match args.format {
+        OutputFormat::Json => {
+            let obj = serde_json::json!({
+                "path": path_str,
+                "entries": result.entries,
+                "ok": result.ok,
+                "broken_seq": result.broken_seq,
+                "reason": result.reason,
+                "signature_checked": verifying_key.is_some(),
+            });
+            println!("{}", serde_json::to_string(&obj)?);
+        }
+        OutputFormat::Text => {
+            if result.ok {
+                println!(
+                    "audit verify: OK ({} record{}, {})",
+                    result.entries,
+                    if result.entries == 1 { "" } else { "s" },
+                    if verifying_key.is_some() {
+                        "chain + signatures"
+                    } else {
+                        "chain only, no signing seed given"
+                    },
+                );
+            } else {
+                eprintln!(
+                    "audit verify: FAILED at record {}: {}",
+                    result.broken_seq.map(|s| s.to_string()).unwrap_or_default(),
+                    result.reason.as_deref().unwrap_or("unknown"),
+                );
+            }
+        }
+    }
+
+    Ok(if result.ok { 0 } else { 1 })
+}
+
 fn handle_ai_subcommand(cmd: &AiCmd) -> anyhow::Result<i32> {
     match &cmd.sub {
         AiSub::Ledger(ledger) => match &ledger.sub {
@@ -12415,6 +12511,92 @@ hooks:
                 assert!(args.engines);
             }
             other => panic!("expected Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn audit_verify_exits_zero_on_a_signed_trail_and_one_on_a_damaged_one() {
+        // The operator-facing half of WOR-2318, driven the way an auditor
+        // drives it: a file, a seed, and no running proxy anywhere.
+        use sbproxy_observe::audit::SecurityAuditEntry;
+        use sbproxy_observe::audit_chain::{install_security_audit_chain, SecurityAuditChain};
+
+        let dir = std::env::temp_dir().join(format!("sb-audit-cli-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("security-audit.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let seed = "ab".repeat(32);
+
+        let chain = SecurityAuditChain::open(&path, &seed, "sbproxy-audit").expect("chain opens");
+        if install_security_audit_chain(chain).is_err() {
+            // The slot is process-global and taken. Nothing here is worth
+            // asserting against somebody else's chain.
+            return;
+        }
+        for index in 0..2 {
+            SecurityAuditEntry::policy_violation(
+                "ip_filter",
+                format!("blocked-{index}"),
+                403,
+                Some("api.example.com".to_string()),
+                None,
+                None,
+                Some("GET".to_string()),
+            )
+            .emit();
+        }
+
+        let verify = |seed_hex: Option<&str>| {
+            handle_audit_verify(&AuditVerifyArgs {
+                path: path.clone(),
+                signing_seed_hex: seed_hex.map(str::to_string),
+                format: OutputFormat::Json,
+            })
+        };
+
+        assert_eq!(
+            verify(Some(&seed)).expect("the chain is readable"),
+            0,
+            "an untouched trail verifies against its key"
+        );
+
+        // Replace the trail with something that is not one. The exit code
+        // is what an auditor keys their alerting off, so it is what this
+        // asserts on.
+        std::fs::write(&path, "{\"seq\":0,\"recorded_at\":\"x\"}\n").expect("path is writable");
+        assert_eq!(
+            verify(None).expect("a damaged trail is reported, not an error"),
+            1,
+            "a file that is not a chain fails verification"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn parses_audit_verify_subcommand() {
+        let cli = parse(&[
+            "sbproxy",
+            "audit",
+            "verify",
+            "/var/lib/sbproxy/security-audit.jsonl",
+            "--signing-seed-hex",
+            "00",
+            "--format",
+            "json",
+        ]);
+        match cli.cmd {
+            Some(Cmd::Audit(cmd)) => match cmd.sub {
+                AuditSub::Verify(args) => {
+                    assert_eq!(
+                        args.path,
+                        std::path::PathBuf::from("/var/lib/sbproxy/security-audit.jsonl")
+                    );
+                    assert_eq!(args.signing_seed_hex.as_deref(), Some("00"));
+                    assert!(matches!(args.format, OutputFormat::Json));
+                }
+            },
+            other => panic!("expected Audit, got {other:?}"),
         }
     }
 

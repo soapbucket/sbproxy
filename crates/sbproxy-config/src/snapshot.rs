@@ -255,8 +255,11 @@ pub struct CompiledConfig {
     /// configured. The binary installs a process-wide budget registry
     /// from this at startup.
     pub rate_limits: Option<crate::types::RateLimitsConfig>,
-    /// WOR-1130: compatibility-only audit sink selection. The runtime
-    /// always retains rows in memory and mirrors them to tracing.
+    /// Durable form of the audit trail. `None` (or `sink: memory`) leaves
+    /// every channel on the bounded in-memory ring and its tracing
+    /// target, neither of which survives the process. `sink: chain` makes
+    /// the binary open a hash-chained, signed file at startup and feed
+    /// every `security_audit` event into it.
     pub audit: Option<crate::types::AuditConfig>,
     /// WOR-1186: session-ledger emission config. `None` (or
     /// `enabled: false`) leaves the ledger off. The binary registers a

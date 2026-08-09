@@ -19,10 +19,10 @@ use crate::snapshot::{CompiledConfig, CompiledOrigin};
 use crate::types::{
     AttestationBillableConfig, AttestationConfig, AttestationLedgerConfig,
     AttestationMeasuredConfig, AttestationOriginHeaderConfig, AttestationQueueConfig,
-    AttestationRole, AttestationRouteWeightConfig, ConfigFile, ConnectionPoolConfig,
-    EnforcementMode, FailureMode, L2CacheConfig, L2CacheParams, OriginAttestationConfig,
-    RawOriginConfig, UpstreamTimeouts, UpstreamTimeoutsConfig, WebBotAuthConfig,
-    ATTESTATION_SIGN_WITH_WEB_BOT_AUTH, DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS,
+    AttestationRole, AttestationRouteWeightConfig, AuditConfig, AuditSinkKind, ConfigFile,
+    ConnectionPoolConfig, EnforcementMode, FailureMode, L2CacheConfig, L2CacheParams,
+    OriginAttestationConfig, RawOriginConfig, UpstreamTimeouts, UpstreamTimeoutsConfig,
+    WebBotAuthConfig, ATTESTATION_SIGN_WITH_WEB_BOT_AUTH, DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS,
     DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS, DEFAULT_UPSTREAM_READ_TIMEOUT_MS,
     DEFAULT_UPSTREAM_TOTAL_CONNECT_TIMEOUT_MS, DEFAULT_UPSTREAM_WRITE_TIMEOUT_MS,
     MAX_ATTESTATION_QUEUE_ENTRIES,
@@ -1596,6 +1596,14 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         }
     }
 
+    // WOR-2318: the audit trail's durable form. Validated immediately
+    // after the identity it borrows, and here rather than at boot for the
+    // same reason attestation is: `sbproxy validate` has to reject a chain
+    // that could never be signed without creating a file to discover it.
+    if let Some(audit) = &config_file.audit {
+        validate_audit(audit, config_file.proxy.web_bot_auth.as_ref())?;
+    }
+
     // WOR-2127: consumption attestation. Validated here rather than in
     // the pipeline because `sbproxy validate` has to reject a broken
     // block without touching the filesystem, and because a proxy that
@@ -1813,6 +1821,92 @@ pub fn ensure_node_local_refs_resolved(resolved_text: &str) -> Result<()> {
          identify this node, so the literal placeholder text cannot be used as a value: export \
          the environment variable(s) on this host, or move the value into a node-local overlay"
     )
+}
+
+/// Validate the top-level `audit:` block (WOR-2318).
+///
+/// Three rules, and each one exists because the alternative is a
+/// deployment that believes it has an audit trail.
+///
+/// `sink: tracing` is refused. Emission to the `security_audit`,
+/// `config_audit`, and `key_audit` targets is unconditional and always
+/// was, so the value never selected anything: it was the documented key
+/// that did nothing which this whole change is about. Refusing rather
+/// than quietly aliasing it to `memory` follows the same call
+/// `load_balancer`'s `sticky:` and the AI router's
+/// `routing.strategy: token_rate` both took.
+///
+/// `path` and `sign_with` are required by `chain` and refused without it.
+/// A chain with no file has nothing to append to; a `path` under
+/// `sink: memory` describes a file nothing will ever write, which is the
+/// more dangerous of the two because it looks configured.
+///
+/// `sign_with` must name an identity this build can resolve, and that
+/// block must exist. An unsigned chain is tamper-evident to somebody
+/// holding an earlier copy of the file and to nobody else: whoever can
+/// rewrite the file can re-link it. The one accepted value is
+/// [`ATTESTATION_SIGN_WITH_WEB_BOT_AUTH`], which is the same identity
+/// `proxy.attestation.sign_with` names, deliberately, so a deployment
+/// that already publishes a key does not acquire a second key
+/// distribution problem by turning this on.
+fn validate_audit(audit: &AuditConfig, web_bot_auth: Option<&WebBotAuthConfig>) -> Result<()> {
+    if audit.sink == AuditSinkKind::Tracing {
+        anyhow::bail!(
+            "audit.sink `tracing` was removed: it never selected anything. Every audit channel \
+             has always emitted to its tracing target unconditionally, so `tracing` and `memory` \
+             described the same proxy. Use `memory` for that behavior under an honest name, or \
+             `chain` with a `path` and a `sign_with` for a trail that survives a restart and \
+             cannot be edited without the edit showing."
+        );
+    }
+
+    if audit.sink != AuditSinkKind::Chain {
+        if audit.path.is_some() {
+            anyhow::bail!(
+                "audit.path is set but audit.sink is not `chain`, so nothing would ever be \
+                 written to it. Set `sink: chain` or remove the path."
+            );
+        }
+        if audit.sign_with.is_some() {
+            anyhow::bail!(
+                "audit.sign_with is set but audit.sink is not `chain`, so nothing would ever be \
+                 signed. Set `sink: chain` or remove the identity."
+            );
+        }
+        return Ok(());
+    }
+
+    match audit.path.as_deref().map(str::trim) {
+        None | Some("") => anyhow::bail!(
+            "audit.sink is `chain` but audit.path is missing, so there is no file to chain \
+             into. Point it at a path on durable storage, for example \
+             `/var/lib/sbproxy/security-audit.jsonl`."
+        ),
+        Some(_) => {}
+    }
+
+    match audit.sign_with.as_deref().map(str::trim) {
+        None => anyhow::bail!(
+            "audit.sink is `chain` but audit.sign_with is missing, so every entry would be \
+             unsigned. An unsigned chain only detects an edit for somebody who already holds an \
+             earlier copy of the file; whoever can rewrite it can re-link it. Set it to \
+             `{ATTESTATION_SIGN_WITH_WEB_BOT_AUTH}`."
+        ),
+        Some(identity) if identity == ATTESTATION_SIGN_WITH_WEB_BOT_AUTH => {
+            if web_bot_auth.is_none() {
+                anyhow::bail!(
+                    "audit.sign_with names `{ATTESTATION_SIGN_WITH_WEB_BOT_AUTH}`, but that \
+                     block is not configured, so there is no key to sign the audit chain with."
+                );
+            }
+        }
+        Some(other) => anyhow::bail!(
+            "audit.sign_with `{other}` is not a signing identity this build can resolve; the \
+             only accepted value is `{ATTESTATION_SIGN_WITH_WEB_BOT_AUTH}`"
+        ),
+    }
+
+    Ok(())
 }
 
 /// Validate `proxy.attestation` before anything is built from it.
@@ -6582,6 +6676,145 @@ origins:
             Ok(_) => panic!("empty key_id must fail config load"),
             Err(e) => assert!(e.to_string().contains("key_id"), "got: {e}"),
         }
+    }
+
+    // --- WOR-2318: the audit trail's durable form ---
+
+    /// Wrap an `audit:` block in the smallest document that compiles.
+    /// `extra_proxy` is spliced under `proxy:`.
+    fn audit_yaml(audit: &str, extra_proxy: &str) -> String {
+        format!(
+            r#"
+proxy:{extra_proxy}
+audit:
+{audit}
+origins:
+  a.example.com:
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+"#
+        )
+    }
+
+    /// A `proxy:` body carrying the one signing identity `sign_with`
+    /// resolves.
+    const AUDIT_SIGNER: &str = r#"
+  web_bot_auth:
+    key_id: sbproxy-audit
+    ed25519_seed_hex: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef""#;
+
+    #[test]
+    fn audit_sink_memory_compiles_and_asks_for_nothing_else() {
+        let compiled = compile_config(&audit_yaml("  sink: memory", " {}")).expect("compile");
+        let audit = compiled.audit.expect("audit block survives compilation");
+        assert_eq!(audit.sink, AuditSinkKind::Memory);
+        assert!(audit.path.is_none());
+        assert!(audit.sign_with.is_none());
+    }
+
+    #[test]
+    fn audit_sink_tracing_is_refused_with_a_migration_path() {
+        let error = compile_config(&audit_yaml("  sink: tracing", " {}"))
+            .err()
+            .expect("a value that selects nothing must not compile");
+        let message = error.to_string();
+        assert!(
+            message.contains("tracing"),
+            "the refusal names the removed value: {message}"
+        );
+        assert!(
+            message.contains("memory") && message.contains("chain"),
+            "and names both replacements: {message}"
+        );
+    }
+
+    #[test]
+    fn audit_chain_compiles_with_a_path_and_a_resolvable_identity() {
+        let yaml = audit_yaml(
+            "  sink: chain\n  path: /var/lib/sbproxy/security-audit.jsonl\n  sign_with: proxy.web_bot_auth",
+            AUDIT_SIGNER,
+        );
+        let compiled = compile_config(&yaml).expect("compile");
+        let audit = compiled.audit.expect("audit block survives compilation");
+        assert_eq!(audit.sink, AuditSinkKind::Chain);
+        assert_eq!(
+            audit.path.as_deref(),
+            Some("/var/lib/sbproxy/security-audit.jsonl")
+        );
+    }
+
+    #[test]
+    fn audit_chain_without_a_path_is_refused() {
+        let error = compile_config(&audit_yaml(
+            "  sink: chain\n  sign_with: proxy.web_bot_auth",
+            AUDIT_SIGNER,
+        ))
+        .err()
+        .expect("a chain with no file must not compile");
+        assert!(
+            error.to_string().contains("audit.path"),
+            "the refusal names the missing key: {error}"
+        );
+    }
+
+    #[test]
+    fn audit_chain_without_a_signing_identity_is_refused() {
+        let error = compile_config(&audit_yaml(
+            "  sink: chain\n  path: /var/lib/sbproxy/security-audit.jsonl",
+            AUDIT_SIGNER,
+        ))
+        .err()
+        .expect("an unsigned chain must not compile");
+        assert!(
+            error.to_string().contains("audit.sign_with"),
+            "the refusal names the missing key: {error}"
+        );
+    }
+
+    #[test]
+    fn audit_chain_signing_identity_must_exist() {
+        let error = compile_config(&audit_yaml(
+            "  sink: chain\n  path: /var/lib/sbproxy/security-audit.jsonl\n  sign_with: proxy.web_bot_auth",
+            " {}",
+        ))
+        .err()
+        .expect("naming an absent identity must not compile");
+        assert!(
+            error.to_string().contains("not configured"),
+            "the refusal says the identity is absent: {error}"
+        );
+    }
+
+    #[test]
+    fn audit_chain_rejects_an_unknown_signing_identity() {
+        let error = compile_config(&audit_yaml(
+            "  sink: chain\n  path: /var/lib/sbproxy/security-audit.jsonl\n  sign_with: proxy.some_future_key",
+            AUDIT_SIGNER,
+        ))
+        .err()
+        .expect("an unresolvable identity must not compile");
+        assert!(
+            error.to_string().contains("proxy.web_bot_auth"),
+            "the refusal names what is on offer: {error}"
+        );
+    }
+
+    #[test]
+    fn a_path_under_the_memory_sink_is_refused_rather_than_ignored() {
+        // The dangerous shape: it looks configured and writes nothing.
+        let error = compile_config(&audit_yaml(
+            "  sink: memory\n  path: /var/lib/sbproxy/security-audit.jsonl",
+            " {}",
+        ))
+        .err()
+        .expect("a path nothing writes to must not compile");
+        assert!(
+            error.to_string().contains("audit.path"),
+            "the refusal names the key that would be ignored: {error}"
+        );
     }
 
     // --- WOR-2127: consumption attestation ---

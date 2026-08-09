@@ -11,8 +11,31 @@
 //!   forwarding to a SIEM. Designed so each channel can be routed
 //!   to a dedicated sink (security log into the SOC's alert
 //!   pipeline; config audit into the change-management log).
+//!
+//! All three channels also push a normalized copy onto
+//! [`crate::audit_ring`], which is a bounded in-memory sample and is
+//! explicitly not durable.
+//!
+//! # What is tamper-evident and what is not
+//!
+//! A tracing target is a stream, not a record: whoever can write the log
+//! file can rewrite it, and nothing downstream can tell. `security_audit`
+//! is the one channel that also has a durable, tamper-evident form
+//! (WOR-2318). With `audit.sink: chain` set, every
+//! [`SecurityAuditEntry`] is additionally appended to a SHA-256
+//! hash-chained, Ed25519-signed file that
+//! [`crate::audit_chain::verify_security_audit_chain`] and
+//! `sbproxy audit verify` re-derive from genesis. Editing one record
+//! there breaks its own digest and every link after it.
+//!
+//! `config_audit` and `key_audit` do not have that yet. Both are equally
+//! worth chaining and both are deliberately out of scope of the first
+//! pass, because the honest version of each needs its own decision about
+//! what a record may carry: `KeyAuditEntry` ships a before/after diff of
+//! a credential record, which is exactly the field that has to be proven
+//! secret-free before it is written somewhere designed to be permanent.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 
 /// A structured record of a single configuration change event.
@@ -113,7 +136,22 @@ fn now_rfc3339() -> String {
 /// vector. Operators who need the full headers should enable
 /// `request_validator` body capture or the proxy's debug body log,
 /// which has its own redaction policy.
-#[derive(Debug, Serialize)]
+///
+/// Every field here is safe to ship onward, and that is a property this
+/// type is required to keep. `api_key_id` is the public id and never the
+/// secret, `key_provider` is a label, and nothing carries a token, a
+/// header value, or a resolved config value. It matters more than it used
+/// to: with `audit.sink: chain` these bytes are appended verbatim to a
+/// durable, hash-chained file, so a field that could carry a credential
+/// would carry it into a record that is designed to be impossible to
+/// quietly remove. Adding a field means answering that question first.
+///
+/// `Deserialize` and `Clone` exist so this is a
+/// [`sbproxy_meter::ledger::LedgerPayload`]; see [`crate::audit_chain`].
+/// The consequence is that the serialized shape is on-disk contract for
+/// any deployment with the chain turned on: reordering a field or
+/// changing a `skip_serializing_if` invalidates entries already written.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SecurityAuditEntry {
     /// RFC 3339 timestamp.
     pub timestamp: String,
@@ -127,16 +165,16 @@ pub struct SecurityAuditEntry {
     /// exactly.
     pub reason: String,
     /// Origin hostname the request was destined for (when known).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
     /// Client IP address (when known).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_ip: Option<String>,
     /// Per-request correlation ID (when minted).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
     /// HTTP method.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
     /// HTTP status the proxy will return (always `400` for
     /// framing violations today).
@@ -145,18 +183,18 @@ pub struct SecurityAuditEntry {
     /// when the request never reached origin routing (early-stage
     /// framing violation, no Host header). Downstream SIEM partitions
     /// by this field for per-tenant deny dashboards.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<String>,
     /// Recognized native provider label. Never contains credential material.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_provider: Option<String>,
     /// Inbound credential mode (`none`, `minted`, or `native`).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_mode: Option<String>,
     /// Public id of the key this event is attributed to, when one
     /// resolved. The canonical accountability id, never the secret:
     /// a denial names the key that was denied.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_id: Option<String>,
 }
 
@@ -287,6 +325,14 @@ impl SecurityAuditEntry {
     /// histogram with the active trace as exemplar. The `outcome`
     /// label is `ok` on success and `serialize_error` if the JSON
     /// encode fails (the audit is dropped in that case).
+    ///
+    /// WOR-2318: when `audit.sink: chain` is configured the same entry is
+    /// also appended to the hash-chained, Ed25519-signed file at
+    /// `audit.path`. That append happens inside the measured region on
+    /// purpose, so a chain whose disk has gone slow shows up on the
+    /// histogram that already exists for exactly this question rather than
+    /// needing a second one. With no chain installed the extra cost is one
+    /// relaxed load of a `OnceLock`.
     pub fn emit(&self) {
         let started = std::time::Instant::now();
         let outcome = match serde_json::to_string(self) {
@@ -307,6 +353,10 @@ impl SecurityAuditEntry {
             self.request_id.clone(),
             Some(self.reason.clone()),
         ));
+        // WOR-2318: the durable, tamper-evident half. Ordered after the
+        // ring and the tracing line because those two are what the running
+        // system is watched through and neither should wait on a disk.
+        crate::audit_chain::append_security_audit(self);
         crate::metrics::record_audit_emit_duration(
             "security",
             outcome,

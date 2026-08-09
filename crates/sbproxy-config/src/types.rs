@@ -62,9 +62,11 @@ pub struct ConfigFile {
     /// with a soft / throttle / auto-suspend state machine.
     #[serde(default)]
     pub rate_limits: Option<RateLimitsConfig>,
-    /// WOR-1130: compatibility-only audit sink shape. The OSS runtime
-    /// always retains admin-action rows in memory and mirrors them to
-    /// tracing; selecting a sink here has no effect.
+    /// Durable form of the audit trail. Absent, or present with the
+    /// default `sink: memory`, keeps every audit channel in the bounded
+    /// in-memory ring and on its tracing target, both of which die with
+    /// the process. `sink: chain` additionally appends every
+    /// `security_audit` event to a hash-chained, signed file.
     #[serde(default)]
     pub audit: Option<AuditConfig>,
     /// WOR-1186: emit the canonical session ledger (per-tool-call run
@@ -345,17 +347,29 @@ pub enum RateLimitClockMode {
     Manual,
 }
 
-/// WOR-1130: compatibility-only audit sink selection.
+/// Where the audit trail is durably recorded.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AuditConfig {
-    /// Accepted for config compatibility but not consumed by the OSS
-    /// runtime. Rows always use both the in-memory ring and tracing.
+    /// Which durable form the audit trail takes. The in-memory ring and
+    /// the `config_audit` / `security_audit` / `key_audit` tracing
+    /// targets are unconditional and are not what this selects.
     #[serde(default)]
     pub sink: AuditSinkKind,
+    /// Chain file for the `chain` sink. Required when `sink: chain`;
+    /// refused otherwise, because a path that names no file is a
+    /// deployment that believes it has a trail. Parent directories are
+    /// created at boot.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Signing identity for the `chain` sink. The only value this build
+    /// resolves is [`ATTESTATION_SIGN_WITH_WEB_BOT_AUTH`], and that block
+    /// must be present. Required when `sink: chain`; refused otherwise.
+    #[serde(default)]
+    pub sign_with: Option<String>,
 }
 
-/// WOR-1130: accepted audit sink names.
+/// Accepted audit sink names.
 #[derive(
     Debug,
     Clone,
@@ -369,13 +383,23 @@ pub struct AuditConfig {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum AuditSinkKind {
-    /// Compatibility value; rows remain queryable via `/api/audit/recent`
-    /// and are also mirrored to tracing.
+    /// No durable trail. Events reach the bounded in-memory ring behind
+    /// `/api/audit/events` and the tracing targets, and both are lost
+    /// when the process is.
     #[default]
     Memory,
-    /// Compatibility value; rows are still retained in memory as well
-    /// as emitted to the structured `security_audit` tracing target.
+    /// Retained for the error message. `compile_config` refuses this
+    /// value: emission to the tracing targets is unconditional and always
+    /// was, so selecting it never selected anything. Use `memory` for the
+    /// same behavior under an honest name, or `chain` for a trail that
+    /// survives a restart.
     Tracing,
+    /// Append every `security_audit` event to a SHA-256 hash-chained,
+    /// Ed25519-signed file at `path`, signed by the identity `sign_with`
+    /// names. Editing or removing a record breaks the chain, and
+    /// `sbproxy audit verify` re-derives it from genesis. `config_audit`
+    /// and `key_audit` are not chained yet.
+    Chain,
 }
 
 /// WOR-1186: session-ledger emission configuration.

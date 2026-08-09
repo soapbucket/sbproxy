@@ -150,6 +150,34 @@ pub trait LedgerPayload: Serialize + DeserializeOwned + Clone {
     fn provenance_conflict(&self) -> Option<crate::metrics::ProvenanceConflict<'_>> {
         None
     }
+
+    /// Whether an append of this payload belongs on the meter's own chain
+    /// instruments.
+    ///
+    /// `sbproxy_meter_chain_head` reports the head sequence of the chain
+    /// this proxy meters from, and `sbproxy_meter_append_duration_seconds`
+    /// reports that chain's backpressure. Both are process-wide and
+    /// single-valued, so a second chain built on this module does not add
+    /// a series to them, it overwrites one. A chain of a payload that is
+    /// not usage would leave an operator reading a head sequence that
+    /// belongs to a different file and an append latency that belongs to a
+    /// different write path.
+    ///
+    /// Defaults to `true` because the payloads that predate this method
+    /// are both usage chains, and their appends are exactly what those two
+    /// instruments already describe. Return `false` for a chain that
+    /// shares the machinery but not the meaning: the security audit trail
+    /// is hash-chained and signed by this same code and is not a meter, so
+    /// it opts out here and reports its own latency on the audit channel's
+    /// existing histogram instead.
+    ///
+    /// This is deliberately not a per-instance answer. One ledger writes
+    /// one payload type for its whole life, so the question is settled by
+    /// the type and asking it per append would imply a chain could change
+    /// its mind halfway down a file.
+    fn meter_observed() -> bool {
+        true
+    }
 }
 
 /// One link in the ledger chain. Serialized as a single JSON line.
@@ -380,21 +408,42 @@ impl<P: LedgerPayload> UsageLedger<P> {
         // across it would make every append wait on a metrics backend.
         drop(s);
 
-        crate::metrics::observe_chain_append(
-            head_seq,
-            started.elapsed().as_secs_f64(),
-            event.chain_contribution(),
-        );
+        // Gated rather than unconditional: see
+        // [`LedgerPayload::meter_observed`]. The two instruments behind
+        // this call are single-valued and process-wide, so a non-usage
+        // chain reporting into them overwrites the meter's numbers rather
+        // than adding its own.
+        if P::meter_observed() {
+            crate::metrics::observe_chain_append(
+                head_seq,
+                started.elapsed().as_secs_f64(),
+                event.chain_contribution(),
+            );
+        }
         Ok(Some(entry))
     }
 
     /// Best-effort append for the sink hot path: errors are logged and
     /// swallowed so a ledger problem can never fail the request it logs.
+    ///
+    /// The health flag and the gap counter are both meter-scoped, so both
+    /// are gated on [`LedgerPayload::meter_observed`] for the same reason
+    /// the append instruments are: a chain that is not a meter reporting
+    /// into them answers "is this proxy metering" with a fact about some
+    /// other file. The warning line is not gated, because a chain that
+    /// could not be written to is worth saying out loud whatever the chain
+    /// is for.
     pub fn append(&self, event: &P) {
         match self.append_checked(event) {
-            Ok(_) => LEDGER_HEALTH.store(1, Ordering::Relaxed),
+            Ok(_) => {
+                if P::meter_observed() {
+                    LEDGER_HEALTH.store(1, Ordering::Relaxed);
+                }
+            }
             Err(e) => {
-                LEDGER_HEALTH.store(2, Ordering::Relaxed);
+                if P::meter_observed() {
+                    LEDGER_HEALTH.store(2, Ordering::Relaxed);
+                }
                 // Degraded is not a guess here, it is what this method is.
                 // `append` swallows the error and lets the caller carry on,
                 // so by the time control reaches this line the request has
@@ -402,14 +451,16 @@ impl<P: LedgerPayload> UsageLedger<P> {
                 // that wants any other posture has to use `append_checked`
                 // and take the branch itself, and report its own gap with
                 // the posture it chose.
-                let tenant_id = event
-                    .chain_contribution()
-                    .map(|contribution| contribution.tenant_id)
-                    .unwrap_or_default();
-                crate::metrics::observe_chain_gap(
-                    tenant_id,
-                    crate::metrics::FailurePosture::Degraded,
-                );
+                if P::meter_observed() {
+                    let tenant_id = event
+                        .chain_contribution()
+                        .map(|contribution| contribution.tenant_id)
+                        .unwrap_or_default();
+                    crate::metrics::observe_chain_gap(
+                        tenant_id,
+                        crate::metrics::FailurePosture::Degraded,
+                    );
+                }
                 tracing::warn!(error = %e, path = %self.path.display(), "usage ledger: append failed");
             }
         }
@@ -951,6 +1002,64 @@ mod tests {
             UsageLedger::<ClaimingPayload>::open(&path, None).is_err(),
             "an incoherent entry keeps the ledger closed, exactly as a torn tail does"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A payload that shares the chain but is not a meter (WOR-2318).
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct UnmeteredPayload {
+        note: String,
+    }
+
+    impl LedgerPayload for UnmeteredPayload {
+        fn dedup_key(&self) -> Option<&str> {
+            None
+        }
+
+        fn meter_observed() -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn a_payload_can_opt_out_of_the_meter_instruments_and_still_chain() {
+        // The opt-out is a property of the payload type, not of the file,
+        // so the two halves are asserted separately: the answer itself,
+        // and the fact that answering `false` costs the chain nothing.
+        //
+        // What this cannot assert in this crate is that the gauges did not
+        // move. `crate::metrics::observer()` is a process-wide
+        // first-write-wins slot that no unit test here may claim, because
+        // the one test in `crate::metrics` that installs a recorder would
+        // then race this one for it. The instrument-level assertion lives
+        // where the observer is real.
+        assert!(
+            !UnmeteredPayload::meter_observed(),
+            "a payload that is not usage says so at the type level"
+        );
+        assert!(
+            TestPayload::meter_observed(),
+            "the default is unchanged for the usage payloads that predate it"
+        );
+
+        let path = temp_path("unmetered");
+        let _ = std::fs::remove_file(&path);
+        {
+            let ledger = UsageLedger::<UnmeteredPayload>::open(&path, None).unwrap();
+            for index in 0..3 {
+                ledger
+                    .append_checked(&UnmeteredPayload {
+                        note: format!("entry-{index}"),
+                    })
+                    .unwrap();
+            }
+        }
+        let res = verify_ledger::<UnmeteredPayload>(&path, None).unwrap();
+        assert!(
+            res.ok,
+            "opting out of the meter does not opt out of the chain: {res:?}"
+        );
+        assert_eq!(res.entries, 3);
         let _ = std::fs::remove_file(&path);
     }
 

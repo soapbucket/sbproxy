@@ -1,6 +1,6 @@
 # Config stability tiers
 
-*Last modified: 2026-08-08*
+*Last modified: 2026-08-09*
 
 This page defines the stability tiers and applies them to representative or
 high-impact configuration leaves. It also lists the current reviewed
@@ -117,12 +117,22 @@ surface that does the job. Boot and reload both refuse the document.
 | `transforms[].allowed_hosts` (`type: wasm`) | Never enforced, and unenforceable: WASM modules have no network surface at all here, so the allowlist described a boundary nothing checked. | Keep the reaching on the proxy side. Gate the origin with an `expression` policy, or route the callout through an origin the proxy controls. The key returns as an enforced one if a host callout ever lands. |
 | `transforms[].on_request` (`type: cel`) | Compiled at config load and never evaluated. Transforms run on the response body, so there is no request phase for it to run in. | An `expression` policy to gate the request, a rate-limit or WAF `key:` expression to key on it, or a forward rule to route on it. |
 
+#### Top-level values refused at config compile
+
+The same rule reaches a key the schema does describe when it is one
+accepted *value* of that key that does nothing. No reader-based check can
+see that case, because the key is read.
+
+| Key | Why it is refused | What to use instead |
+|---|---|---|
+| `audit.sink: tracing` | It never selected anything. Emission to the `config_audit`, `security_audit`, and `key_audit` targets has always been unconditional, so `tracing` and `memory` described the same proxy. | `memory` for the same behavior under an honest name, or `chain` with a `path` and a `sign_with` for a hash-chained, signed trail that survives a restart. |
+| `audit.path`, `audit.sign_with` under any sink but `chain` | Nothing would write to the file or sign anything. A path nothing writes to is the more dangerous of the two shapes, because it looks configured. | Set `sink: chain`, or remove the key. |
+
 ### Current config-only compatibility fields
 
 | Field or subtree | What happens today |
 |---|---|
 | `agent_classes.hosted_feed.url`, `.bootstrap_keys` | The resolver uses builtin or inline catalogs; it does not fetch or verify a hosted feed. |
-| `audit.sink` | Admin-action rows always use the in-memory ring and tracing mirror; this selector has no effect. |
 | `origins.*.action.resilience.circuit_breaker` | The AI router is built without per-provider breakers, so the breaker gate never fires. Setting `resilience` at all still widens cross-provider retries. |
 | `origins.*.action.resilience.outlier_detection` | The AI router is built without an outlier detector, so no provider is ejected on failure rate. Use `resilience.health_check`, which is live. |
 | `origins.*.action.targets[].zone` (load_balancer) | Target selection is not locality aware. The label is echoed in the admin targets view and nowhere else. |

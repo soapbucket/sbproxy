@@ -12,6 +12,36 @@ the next version cut.
 
 ### Added
 
+- **A tamper-evident security audit trail, behind `audit.sink: chain`.**
+  The security audit log was a tracing stream and an in-memory ring, which
+  means it recorded what the proxy said rather than what happened: whoever
+  could write the log file could edit a line, delete one out of the
+  middle, and leave nothing behind that said so. Setting `audit.sink:
+  chain` with a `path` and a `sign_with` now additionally appends every
+  `security_audit` event to a SHA-256 hash-chained, Ed25519-signed file.
+  Editing a record breaks its own digest and every link after it; deleting
+  one leaves a gap in a contiguous sequence; rewriting the file wholesale
+  produces a chain that no longer verifies against the published key.
+  `sbproxy audit verify <path> [--signing-seed-hex ...]` re-derives the
+  chain from genesis and exits 1 with the first broken record, reading the
+  file and nothing else, so an auditor can check a trail the proxy that
+  wrote it no longer has.
+
+  None of this is new cryptography. It is the hash chain that already
+  carried metering receipts and LLM spend, bound to a third payload; the
+  signing identity is the proxy's existing `proxy.web_bot_auth` keypair,
+  the same one `proxy.attestation.sign_with` names, so a deployment that
+  already publishes that key does not acquire a second key-distribution
+  problem by turning this on. The chained record is byte-for-byte the
+  record the `security_audit` tracing target already ships, so a SIEM's
+  copy and the chain's copy cannot disagree.
+
+  A chain that will not open fails the boot rather than degrading, which
+  is the opposite of what the metering chain does with an unopenable
+  ledger and deliberately so: billing can be reconciled after the fact and
+  an audit hole cannot. `config_audit`, `key_audit`, and the admin-action
+  ring are not chained yet.
+
 - **Trace spans on the ordinary proxied request, not only on the AI
   gateway.** A plain proxied HTTP request produced no span at all: it went
   through origin resolution, an auth provider, an enforcer chain, an
@@ -135,6 +165,18 @@ the next version cut.
   rules, MCP adapters, and `engine: js` custom log fields alike.
 
 ### Removed
+
+- **`audit.sink: tracing`.** It never selected anything. Emission to the
+  `config_audit`, `security_audit`, and `key_audit` targets has always been
+  unconditional, so `tracing` and `memory` described the same proxy, and
+  the key was documented as compatibility-only for exactly that reason.
+  Now that `audit.sink` does select something, a value that selects nothing
+  is the failure the rest of this entry is about. A config that still names
+  it fails config compile with a message pointing at `memory` for the same
+  behavior under an honest name, or `chain` for a trail that survives a
+  restart. `audit.path` or `audit.sign_with` under any sink other than
+  `chain` is refused on the same grounds: a path nothing writes to looks
+  configured and is not.
 
 - **The origin-level `rate_limit_headers:` block.** It parsed but was never
   consumed: `X-RateLimit-*` and `Retry-After` are emitted by the

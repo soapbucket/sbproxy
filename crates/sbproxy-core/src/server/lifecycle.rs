@@ -304,6 +304,75 @@ fn install_session_ledger_sink(cfg: &sbproxy_config::types::SessionLedgerConfig)
     }
 }
 
+/// WOR-2318: open the hash-chained, signed security audit trail and
+/// register it process-wide.
+///
+/// Fallible, and the caller propagates, which is the whole difference
+/// between this and every other sink installed around it. A session
+/// ledger that will not open falls back to logging and a request-event
+/// sink that will not open falls back to none, because in both cases a
+/// degraded record is better than a stopped proxy. An audit trail an
+/// operator explicitly asked for is not in that category: the events that
+/// would fall in the hole are the ones an investigator needs, and no
+/// later moment recovers them. `audit.sink: memory` is how an operator
+/// says they would rather have the proxy.
+///
+/// Startup-only and set-once, like the sinks it sits beside. A reload
+/// does not reopen the chain: the file is append-only and a second one
+/// opened mid-life would either continue a file the new configuration
+/// does not name or start a file that reads as a gap.
+///
+/// The signing identity is resolved rather than re-validated.
+/// `compile_config` already proved `sign_with` names
+/// `proxy.web_bot_auth`, that the block is present, and that its seed is
+/// 64 hex characters, so anything unresolvable here is a bug in that
+/// check rather than an operator error, and it says so.
+fn install_audit_chain(
+    audit: &sbproxy_config::types::AuditConfig,
+    web_bot_auth: Option<&sbproxy_config::types::WebBotAuthConfig>,
+) -> anyhow::Result<()> {
+    use sbproxy_config::types::AuditSinkKind;
+    use sbproxy_observe::audit_chain::{install_security_audit_chain, SecurityAuditChain};
+
+    if audit.sink != AuditSinkKind::Chain {
+        return Ok(());
+    }
+
+    let Some(path) = audit.path.as_deref() else {
+        anyhow::bail!(
+            "audit.sink is `chain` but audit.path is absent at boot; config compilation should \
+             have refused this document"
+        );
+    };
+    let Some(signer) = web_bot_auth else {
+        anyhow::bail!(
+            "audit.sink is `chain` but no signing identity resolved at boot; config compilation \
+             should have refused this document"
+        );
+    };
+
+    let chain = SecurityAuditChain::open(
+        std::path::Path::new(path),
+        &signer.ed25519_seed_hex,
+        &signer.key_id,
+    )?;
+    // Read before the move, and the kid rather than the seed: this is the
+    // one value an auditor needs in order to ask for the right public key.
+    let kid = chain.key_id().to_string();
+    match install_security_audit_chain(chain) {
+        Ok(()) => {
+            tracing::info!(
+                path = %path,
+                kid = %kid,
+                "security audit trail is hash-chained and signed; verify it with \
+                 `sbproxy audit verify`"
+            );
+            Ok(())
+        }
+        Err(error) => anyhow::bail!("audit.sink is `chain` but {error}"),
+    }
+}
+
 /// A constructed request-event sink, ready to hand to the setter.
 type RequestEventSinkHandle = std::sync::Arc<dyn sbproxy_observe::RequestEventSink>;
 
@@ -1564,6 +1633,16 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // candidate mesh-backed key plane consumes this handle instead of opening
     // duplicate listeners.
     crate::cluster::reconcile_process_cluster(&server_config)?;
+
+    // --- WOR-2318: open the tamper-evident security audit trail ---
+    //
+    // Before the pipeline, and with a `?`. Every other sink around this
+    // one degrades on failure; this one stops the boot, because a proxy
+    // that serves traffic with the audit trail its operator configured
+    // missing is the failure the trail exists to make impossible.
+    if let Some(cfg) = compiled.audit.as_ref() {
+        install_audit_chain(cfg, server_config.web_bot_auth.as_ref())?;
+    }
 
     // --- WOR-1186: register the session-ledger sink when enabled ---
     //

@@ -1,7 +1,9 @@
 # Audit log
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-09*
 
-SBproxy's audit surface is a set of narrow, structured channels rather than one audit framework. This page documents what actually ships: the admin-action audit rows served at `/api/audit/recent`, the `config_audit` / `security_audit` / `key_audit` tracing channels, the `AdminAuditEmitter` plugin seam, and the emission metric. There is no `sbproxy_audit` crate, no envelope middleware, and no append-only storage trait: admin-action rows live in an in-memory ring, and the tracing channels hand off to whatever sink you point at them. Hash-chained, signature-verifiable records are a different surface, covered in [ai-usage-ledger.md](ai-usage-ledger.md) and [metering.md](metering.md).
+SBproxy's audit surface is a set of narrow, structured channels rather than one audit framework. This page documents what actually ships: the admin-action audit rows served at `/api/audit/recent`, the `config_audit` / `security_audit` / `key_audit` tracing channels, the tamper-evident chain the `security_audit` channel can be written to, the `AdminAuditEmitter` plugin seam, and the emission metric. There is no `sbproxy_audit` crate and no envelope middleware.
+
+One thing on this page is durable and provable, and the rest is not. `audit.sink: chain` writes every `security_audit` event to a hash-chained, Ed25519-signed file that `sbproxy audit verify` re-derives from genesis; see [Tamper-evident security audit trail](#tamper-evident-security-audit-trail). Everything else here is either an in-memory ring that dies with the process or a tracing stream whose durability is whatever your collector gives it. Read the sections below with that split in mind, because a log stream is a record of what the proxy said rather than a record of what happened: whoever can write the file can rewrite it.
 
 ## Admin-action audit rows
 
@@ -27,20 +29,164 @@ GET /api/audit/recent?limit=50
 
 The response is a JSON array of rows, newest first. `limit` defaults to 50.
 
-### Compatibility-only sink selector
+### The `audit:` block
 
-The top-level `audit:` block remains parseable, but the runtime does not
-use its `sink` value:
+The top-level `audit:` block selects whether the audit trail has a durable
+form. It has two accepted values:
 
 ```yaml
 audit:
-  sink: memory        # accepted for compatibility; no runtime effect
+  sink: memory        # the default: no durable trail
 ```
 
-Admin-action rows always use both live paths: the most recent 256 rows remain
-queryable via `/api/audit/recent`, and every row is mirrored to the structured
-`security_audit` tracing target. Explicitly authoring `audit.sink` emits a
-config-only warning.
+`memory` is what a proxy with no `audit:` block does. The most recent 256
+admin-action rows stay queryable via `/api/audit/recent`, the unified ring
+behind `/api/audit/events` holds the most recent 1000 events across every
+channel, and each channel keeps emitting on its tracing target. All of it
+is lost when the process is.
+
+`chain` adds the durable, tamper-evident half; see the next section.
+
+`tracing` was removed. It never selected anything: emission to the
+`config_audit`, `security_audit`, and `key_audit` targets has always been
+unconditional, so `tracing` and `memory` described the same proxy. A
+config that still names it is refused at load with a message pointing at
+both replacements, rather than being accepted and quietly meaning
+`memory`. A `path` or a `sign_with` under any sink other than `chain` is
+refused for the same reason: a path nothing writes to is the more
+dangerous of the two mistakes, because it looks configured.
+
+## Tamper-evident security audit trail
+
+`audit.sink: chain` appends every `security_audit` event to a SHA-256
+hash-chained, Ed25519-signed file:
+
+```yaml
+proxy:
+  web_bot_auth:
+    key_id: sbproxy-audit-2026
+    ed25519_seed_hex: ${SBPROXY_AUDIT_SEED}
+
+audit:
+  sink: chain
+  path: /var/lib/sbproxy/security-audit.jsonl
+  sign_with: proxy.web_bot_auth
+```
+
+Three keys, and each one is doing something.
+
+`sink: chain` turns the chain on. Nothing else changes: the tracing
+targets and the in-memory rings keep working exactly as they did, and the
+chained record is byte-for-byte the record the `security_audit` target
+already ships, so your SIEM's copy of an event and the chain's copy cannot
+disagree.
+
+`path` is the file. It is opened once at boot, appended to under a mutex,
+and flushed per record, so a record that reached the file survives the
+process that wrote it. Put it on durable storage; parent directories are
+created at boot.
+
+`sign_with` is the signing identity, and the only value this build
+resolves is `proxy.web_bot_auth`. That is deliberate: it is the proxy's
+one Ed25519 identity, the same one `proxy.attestation.sign_with` names for
+metering receipts, so a deployment that already publishes that key does
+not acquire a second key-distribution problem by turning this on. Source
+the seed from the environment or a vault reference rather than committing
+it.
+
+### What the chain proves
+
+Each record is `SHA-256(prev_hash || seq || recorded_at || event)` and
+carries an Ed25519 signature over that raw digest. Three consequences an
+auditor can rely on:
+
+- **Editing a record is detectable.** The record's own digest stops
+  matching its bytes, and every record after it chains onto a head that no
+  longer exists.
+- **Deleting a record is detectable.** Sequence numbers are contiguous
+  from zero, so a removed line leaves a gap that verification reports.
+  This is the case a plain log file cannot cover at all.
+- **Rewriting the whole file is detectable.** Somebody with write access
+  can produce an internally consistent chain, but not one that verifies
+  against the published key.
+
+### Verifying it
+
+`sbproxy audit verify` re-derives the chain from genesis and reports the
+first record that does not check out. Exit 0 verifies, exit 1 does not, so
+it drops straight into cron or a CI lane:
+
+```bash
+sbproxy audit verify /var/lib/sbproxy/security-audit.jsonl \
+  --signing-seed-hex "$SBPROXY_AUDIT_SEED"
+```
+
+Without `--signing-seed-hex` only the hash chain is checked, which catches
+an edit made by somebody who could not re-link the file and misses one
+made by somebody who could. `--format json` emits a single object with
+`entries`, `ok`, `broken_seq`, `reason`, and `signature_checked` for
+tooling.
+
+The command reads the file and nothing else. No config, no admin API, no
+running proxy: an auditor with a copy of the trail and the public key can
+verify a file the proxy that wrote it no longer has. The digest layout is
+fixed and documented in the ledger module, so an auditor who would rather
+not run our binary at all can reproduce it from any SHA-256 and Ed25519
+implementation.
+
+### What it does not cover yet
+
+`config_audit` and `key_audit` are not chained. Both are worth chaining
+and neither is in this first pass. `key_audit` in particular ships a
+before/after diff of a credential record, and writing that into a file
+designed to be impossible to quietly amend needs its own answer to what
+the diff may contain before it goes anywhere permanent.
+
+The admin-action ring at `/api/audit/recent` is not chained either, and
+neither is the `sbproxy::admin::audit` tracing target that records admin
+logins and config writes.
+
+There is no rotation or segmentation: the chain is one file that grows,
+and truncating it is by construction indistinguishable from tampering with
+it. Size it accordingly, and archive by copying rather than by trimming.
+
+### What a record may contain
+
+The chained record is a `SecurityAuditEntry` and nothing more. Every field
+is an identifier, a label, or a status: hostname, client IP, request id,
+method, status code, tenant, the recognized provider label, the credential
+mode, and the public `api_key_id`. It never carries a credential, a token,
+a header value, or a resolved config value, which is a property the type
+is required to keep rather than one it happens to have. Durability is why
+it matters: a secret written into a hash chain cannot be quietly removed
+later, because quiet removal is the thing the chain exists to prevent.
+
+The one operator-authored field is `reason`, which carries a policy's deny
+message. It is written verbatim, in the chain and on the tracing target
+alike. If your deny messages interpolate request data, that data reaches
+both.
+
+### If the chain cannot be written
+
+Opening it is a boot condition. A path that cannot be created, a seed that
+is not 32 bytes of hex, or an existing file whose last line was torn by a
+crash all stop the proxy from starting, and the error names `audit.path`.
+
+That is the opposite of what the metering chain does with the same
+conditions, and the difference is deliberate. Metering defaults to
+`degraded` because a full ledger disk must not take an API down and
+billing can be reconciled afterwards. An audit trail cannot be
+reconciled afterwards: the events that would fall in the hole are the ones
+an investigator needs, and no later moment recovers them. An operator who
+would rather have the proxy sets `sink: memory`.
+
+An append that fails after boot cannot stop anything, because the request
+being audited is already being refused and failing it a second way would
+turn a full disk into an outage. The first such failure, and the first
+after any recovery, is logged at `error` on the `security_audit` target
+itself, which is the pipe you are already watching. Repeats are suppressed
+so an attack against a proxy with a full disk does not also produce one
+log line per refused request.
 
 ## Calling it
 
@@ -165,6 +311,7 @@ sbproxy_audit_emit_duration_seconds{channel, outcome}
 
 ## See also
 
+- [ai-usage-ledger.md](ai-usage-ledger.md) and [metering.md](metering.md) - the other two chains built on the same primitive, for LLM spend and for metering receipts.
 - [observability.md](observability.md) - the logging pipeline the tracing targets flow through.
 - [access-log.md](access-log.md) - routine request records; reads are not audited, they are access-logged.
 - [admin-api-reference.md](admin-api-reference.md) - the admin surface that serves `/api/audit/recent`.

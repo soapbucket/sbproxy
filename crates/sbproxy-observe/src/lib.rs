@@ -8,6 +8,7 @@ pub mod access_log;
 pub mod agent_labels;
 pub mod alerting;
 pub mod audit;
+pub mod audit_chain;
 pub mod audit_ring;
 /// P0 edge capture helpers: custom properties, session IDs,
 /// and user IDs.
