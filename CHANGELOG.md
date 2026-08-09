@@ -166,6 +166,42 @@ the next version cut.
 
 ### Removed
 
+- **Five config keys that parsed, warned, and governed nothing.**
+  `origins.*.connection_pool.max_connections`,
+  `origins.*.connection_pool.max_lifetime_secs`,
+  `origins.*.traffic_capture`, `origins.*.sessions.ttl_seconds`, and
+  `proxy.device_parser_file` were all accepted with a boot warning and
+  then ignored for the life of the process. Each now fails config compile
+  with a message naming the surface that does the job.
+
+  The warning was the wrong response for these. It fits a key whose
+  behavior is narrower than its name suggests, which is why
+  `cors.enable` still gets one. Four of these five name a resource limit
+  or a retention window, so a config that set one kept claiming a
+  property the proxy did not have, and nobody rereads a boot log from
+  three months ago.
+
+  None of them was waiting on plumbing. The two pool limits have no
+  primitive behind them: the upstream keepalive pool is sized once per
+  connector rather than per origin, so `max_connections` had nowhere to
+  go, and the pool has no age-based eviction at all, so
+  `max_lifetime_secs` never retired anything. `traffic_capture` was
+  accepted as a free-form value, so nothing read it and nothing
+  validated it either. `sessions.ttl_seconds` described the retention of
+  an index that does not exist; sessions age out of the admin
+  recent-request ring on entry count. `proxy.device_parser_file` named a
+  file no code path opens.
+
+  Migration, in order: a `concurrent_limit` policy for
+  `max_connections`, `timeouts.idle_ms` for `max_lifetime_secs`,
+  `mirror` for `traffic_capture`, `sessions.budget` for
+  `sessions.ttl_seconds`, and nothing for `device_parser_file`. Each key
+  still parses, so the failure is an explanatory diagnostic rather than
+  an unknown-key error.
+
+  `origins.*.connection_pool.idle_timeout_secs` is unaffected. It is the
+  legacy spelling of `timeouts.idle_ms` and is live.
+
 - **`audit.sink: tracing`.** It never selected anything. Emission to the
   `config_audit`, `security_audit`, and `key_audit` targets has always been
   unconditional, so `tracing` and `memory` described the same proxy, and

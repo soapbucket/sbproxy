@@ -209,15 +209,22 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "origins.*.connection_pool.idle_timeout_secs",
         "sbproxy_config::compiler::resolve_upstream_timeouts",
     ),
-    config_only(
+    // Refused at compile since WOR-2310. Neither has a Pingora primitive
+    // to be wired into, so they are not waiting on plumbing work.
+    // `PeerOptions`, the per-peer struct `proxy_http.rs` already tunes,
+    // has no pool-size and no maximum-lifetime field; the only pool sizing
+    // in the vendored fork is `ConnectorOptions::keepalive_pool_size`,
+    // which is set once per connector and cannot carry a per-origin value;
+    // and `pingora-pool` has no age-based eviction at all.
+    unsupported(
         "origins.*.connection_pool.max_connections",
-        "Pingora owns upstream connection pooling; these per-origin limits are not applied by \
-         the OSS runtime. Classified under WOR-1976.",
+        "Pingora sizes the upstream keepalive pool per connector, not per origin, so this never \
+         capped anything. The compile error points at a `concurrent_limit` policy. WOR-2310.",
     ),
-    config_only(
+    unsupported(
         "origins.*.connection_pool.max_lifetime_secs",
-        "Pingora owns upstream connection pooling; these per-origin limits are not applied by \
-         the OSS runtime. Classified under WOR-1976.",
+        "Pingora's connection pool has no age-based eviction, so no pooled connection was ever \
+         retired for being old. The compile error points at `timeouts.idle_ms`. WOR-2310.",
     ),
     config_only(
         "origins.*.cors.enable",
@@ -454,10 +461,12 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "origins.*.response_modifiers[].status.text",
         "sbproxy_core::server::action_dispatch::apply_plugin_action_response_modifiers",
     ),
-    config_only(
+    unsupported(
         "origins.*.sessions.ttl_seconds",
-        "Session capture does not expire its in-process request-ring entries from this value; it \
-         is a reserved retention hint under WOR-1976.",
+        "There is no sessions index to retain. The admin recent-request ring bounds itself by \
+         entry count and evicts the oldest entry when full, so a session aged out on request \
+         volume and never on this deadline. The compile error points at `sessions.budget`. \
+         WOR-2310.",
     ),
     stable(
         "origins.*.sessions.budget.max_per_window",
@@ -467,10 +476,10 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "origins.*.sessions.budget.window_seconds",
         "sbproxy_observe::capture::budget_admits",
     ),
-    config_only(
+    unsupported(
         "origins.*.traffic_capture",
-        "The OSS runtime has no traffic-capture consumer; use the live mirror block or an \
-         out-of-tree extension. Classified under WOR-1976.",
+        "No traffic-capture consumer exists, and the block was accepted as an untyped value, so \
+         nothing validated its contents either. The compile error points at `mirror`. WOR-2310.",
     ),
     stable(
         "origins.*.user.budget.max_per_window",
@@ -535,10 +544,12 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "proxy.credentials[].type",
         "sbproxy_config::compiler::lower_credentials_into_origin_virtual_keys",
     ),
-    config_only(
+    unsupported(
         "proxy.device_parser_file",
-        "The current pure-Rust device parser does not load an operator regex catalog. Reserved \
-         for the parser swap tracked under WOR-1976.",
+        "The device parser matches on compiled-in rules and has no code path that opens a \
+         catalog file, so a maintained catalog and a missing one behaved identically. The \
+         compile error points at `proxy.ai_providers_file` as the override that does work. \
+         WOR-2310.",
     ),
     config_only(
         "proxy.http3.enabled",

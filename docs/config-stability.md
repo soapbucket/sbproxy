@@ -117,6 +117,27 @@ surface that does the job. Boot and reload both refuse the document.
 | `transforms[].allowed_hosts` (`type: wasm`) | Never enforced, and unenforceable: WASM modules have no network surface at all here, so the allowlist described a boundary nothing checked. | Keep the reaching on the proxy side. Gate the origin with an `expression` policy, or route the callout through an origin the proxy controls. The key returns as an enforced one if a host callout ever lands. |
 | `transforms[].on_request` (`type: cel`) | Compiled at config load and never evaluated. Transforms run on the response body, so there is no request phase for it to run in. | An `expression` policy to gate the request, a rate-limit or WAF `key:` expression to key on it, or a forward rule to route on it. |
 
+#### Schema keys refused at config compile
+
+These parsed, warned once at boot, and then governed nothing. A warning
+is the proportionate response to a key whose behavior is narrower than
+its name suggests, which is why `cors.enable` still gets one. It is the
+wrong response to a key with no implementation at all: four of the five
+below name a resource limit or a retention window, and a config that
+sets one keeps claiming a property the proxy does not have.
+
+| Key | Why it is refused | What to use instead |
+|---|---|---|
+| `origins.*.connection_pool.max_connections` | Pingora sizes the upstream keepalive pool once per connector, not per origin, so there was no per-origin limit for the value to become and upstream connections were never capped at it. | A `concurrent_limit` policy, which caps in-flight requests per origin and rejects over the cap rather than queueing. |
+| `origins.*.connection_pool.max_lifetime_secs` | Pingora's connection pool has no age-based eviction, so no pooled connection was ever retired for being old. | `timeouts.idle_ms`, the deadline that does retire pooled connections once they go unused. |
+| `origins.*.sessions.ttl_seconds` | There is no sessions index to retain. Sessions appear in the admin recent-request ring, which is bounded by entry count and evicts the oldest entry when full, so a session aged out on request volume and never on this deadline. | `sessions.budget.max_per_window` with `sessions.budget.window_seconds`, both enforced. |
+| `origins.*.traffic_capture` | No capture consumer exists. The block was accepted as an untyped value, so nothing validated its contents either and a misspelled field inside it looked exactly like a working setting. | `mirror`, which forwards a fire-and-forget copy of each request to a second upstream without delaying or failing the real one. |
+| `proxy.device_parser_file` | The device parser matches on compiled-in rules and has no code path that opens a catalog file, so a maintained catalog and a missing one behaved identically. | Nothing for device detection. `proxy.ai_providers_file` is the neighboring override that does work, and it applies to the AI provider catalog. |
+
+`origins.*.connection_pool.idle_timeout_secs` is not refused. It is the
+legacy spelling of `timeouts.idle_ms` and feeds the resolved upstream
+idle deadline.
+
 #### Top-level values refused at config compile
 
 The same rule reaches a key the schema does describe when it is one
@@ -137,14 +158,10 @@ see that case, because the key is read.
 | `origins.*.action.resilience.outlier_detection` | The AI router is built without an outlier detector, so no provider is ejected on failure rate. Use `resilience.health_check`, which is live. |
 | `origins.*.action.targets[].zone` (load_balancer) | Target selection is not locality aware. The label is echoed in the admin targets view and nowhere else. |
 | `origins.*.agent_skills[].max_clock_skew_secs` | Reserved for signed artifact freshness headers that are not emitted yet. |
-| `origins.*.connection_pool` | Pingora's built-in upstream pool is used; these per-origin limits are not applied. |
 | `origins.*.cors.enable` | The presence of `cors:` enables CORS; the legacy boolean value is ignored. |
 | `origins.*.credentials[].attrs.budget.reset` | Reserved reset hint; no credential reset schedule is installed. The same leaf is config-only at proxy and tenant credential scopes. |
 | `origins.*.credentials[].attrs.team` | Parsed with a warning but not copied into the virtual-key principal. The same leaf is config-only at proxy and tenant credential scopes; use live `attrs.tags` or `attrs.metadata` attribution instead. |
 | `origins.*.forward_rules[].origin.hostname`, `.workspace_id`, `.version` | Inline forward-origin metadata is accepted but not copied into the compiled child origin. |
-| `origins.*.sessions.ttl_seconds` | Reserved retention hint; the in-process request ring does not expire entries from it. |
-| `origins.*.traffic_capture` | No capture consumer; use `mirror` for live fire-and-forget request mirroring. |
-| `proxy.device_parser_file` | The current pure-Rust device parser does not load this catalog override. |
 | `proxy.key_management.governance.key_introspection` | The caller-only introspection route is not installed. |
 | `proxy.key_management.store.redis_source_of_truth` | Redis is authoritative whenever `store.backend: redis`; this legacy boolean changes nothing. |
 | `proxy.observability.log.level`, `.format`, `.sampling` | Process logging uses CLI/environment selection and fixed sampling defaults. Sink-local `format` remains live. |
@@ -223,8 +240,8 @@ HTTP/3 is not served by this build. The block is retained for forward compatibil
 | `bot_detection` | - | object | - | **alpha** | Bot detection config. |
 | `threat_protection` | - | object | - | **alpha** | Dynamic threat blocklist config. |
 | `error_pages` | - | array | - | **beta** | Custom error page entries, each matching one status or a list of statuses. |
-| `traffic_capture` | - | object | - | **config-only** | No consumer; use `mirror` for request mirroring. |
-| `connection_pool` | - | object | - | **config-only** | Retained for compatibility; Pingora's built-in pool settings apply. |
+| `traffic_capture` | - | object | - | **refused** | No consumer; setting it fails config load. Use `mirror`. |
+| `connection_pool` | - | object | - | **stable** | Only `idle_timeout_secs` is read, as the legacy spelling of `timeouts.idle_ms`. `max_connections` and `max_lifetime_secs` fail config load. |
 | `message_signatures` | - | object | - | **alpha** | HTTP message signing config. |
 
 ### CORS Config (`cors:`)

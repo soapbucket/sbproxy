@@ -1594,18 +1594,19 @@ testing:
 ## 8. Connection tuning
 
 Pingora owns the runtime's upstream connection pool. The legacy
-per-origin `connection_pool` shape remains parseable for config compatibility,
-but none of its values are installed into Pingora today.
+per-origin `connection_pool` shape remains parseable, and one field in it
+is read.
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `max_connections` | `128` | Config-only compatibility value; does not cap live connections |
-| `idle_timeout_secs` | `90` | Config-only compatibility value; does not change live idle reaping |
-| `max_lifetime_secs` | `300` | Config-only compatibility value; does not change live connection lifetime |
+| `idle_timeout_secs` | `90` | Live. Legacy spelling of `timeouts.idle_ms`, in seconds; feeds the resolved upstream idle deadline when `idle_ms` is unset. Setting both fails config load |
+| `max_connections` | - | Refused. Setting it fails config load; the keepalive pool is sized once for the process, not per origin |
+| `max_lifetime_secs` | - | Refused. Setting it fails config load; the pool has no age-based eviction |
 
-Do not use this block to satisfy an upstream concurrency or lifetime
-requirement. Buffer sizes, pooling, and handshake timeouts currently follow
-Pingora's runtime defaults.
+Prefer `timeouts.idle_ms` in new configs. For the two refused fields,
+reach for a `concurrent_limit` policy to bound an origin's in-flight
+requests, and `timeouts.idle_ms` to retire pooled connections. Buffer
+sizes and handshake timeouts follow Pingora's runtime defaults.
 
 ### HTTP/3 (QUIC)
 

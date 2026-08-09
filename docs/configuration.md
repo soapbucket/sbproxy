@@ -338,7 +338,7 @@ proxy:
 | `correlation_id` | object | enabled, `X-Request-Id`, echo on | Correlation-ID propagation policy. See [Correlation ID](#correlation-id). |
 | `mtls` | object | unset | mTLS client-certificate verification on the HTTPS listener. See [mTLS client authentication](#mtls-client-authentication). |
 | `ai_providers_file` | string | unset | Override the embedded AI provider catalog at startup. |
-| `device_parser_file` | string | unset | Config-only. The current pure-Rust device parser does not load this override. |
+| `device_parser_file` | string | unset | Not supported. Setting it fails config load; the device parser matches on compiled-in rules and opens no catalog file. |
 | `synthetic_probe` | object | unset | Optional in-process transaction probe reported through readiness. |
 | `scripting` | object | defaults | Scripting runtime limits. The `lua.sandbox` and `javascript.sandbox` sub-blocks are both live and both reload without a restart. See [scripting.md](scripting.md). |
 | `http_client_timeouts` | object | (see below) | Tunable timeouts for the proxy's outbound HTTP helpers (forward-auth, callbacks, mirrors, SWR refreshes, bot-auth directory). See [HTTP client timeouts](#http-client-timeouts). |
@@ -956,12 +956,12 @@ origins:
 | `error_pages` | list | | Custom error pages matching one status code or an explicit list of status codes. |
 | `problem_details` | object | | RFC 9457 `application/problem+json` default renderer. Composes with `error_pages`. |
 | `proxy_status` | object | | RFC 9209 `Proxy-Status` response-header configuration. |
-| `traffic_capture` | object | | Config-only. Use `mirror` for live request mirroring. |
+| `traffic_capture` | object | | Not supported. Setting it fails config load. Use `mirror` for live request mirroring. |
 | `message_signatures` | object | | RFC 9421 HTTP message signatures. |
 | `olp` | object | | RSL Open License Protocol token issuer and public-key endpoints. |
 | `web_bot_auth_publish` | object | | Publish a Web Bot Auth key directory and Signature Agent Card on this origin. |
 | `idempotency` | object | | RFC 8594 idempotency middleware. See [Idempotency](#idempotency). |
-| `connection_pool` | object | | Config-only except `idle_timeout_secs`, the legacy spelling of `timeouts.idle_ms`. See [Connection pool](#connection-pool). |
+| `connection_pool` | object | | Only `idle_timeout_secs` is read, as the legacy spelling of `timeouts.idle_ms`. `max_connections` and `max_lifetime_secs` fail config load. See [Connection pool](#connection-pool). |
 | `timeouts` | object | | Upstream transport deadlines (connect, read, write, idle), in milliseconds. See [Upstream timeouts](#upstream-timeouts). |
 | `extensions` | object | | Opaque map for out-of-tree origin-level blocks. |
 | `expose_openapi` | bool | false | Publish this origin's generated OpenAPI document at its well-known paths. |
@@ -1022,7 +1022,6 @@ origins:
     sessions:
       capture: true
       auto_generate: anonymous
-      ttl_seconds: 86400
     user:
       capture: true
       max_length: 256
@@ -1037,7 +1036,7 @@ origins:
 | `properties.rollup_keys` | list | `[]` | Explicit property keys promoted into durable usage-rollup dimensions. At most five. |
 | `sessions.capture` | bool | `true` | Capture caller-supplied session and parent-session ULIDs. |
 | `sessions.auto_generate` | enum | `anonymous` | `never`, `anonymous`, or `always`. |
-| `sessions.ttl_seconds` | int | `86400` | Reserved compatibility hint. Nothing in the runtime expires the request ring from this value. |
+| `sessions.ttl_seconds` | int | - | Refused. Setting it fails config load: there is no sessions index to retain. Use `sessions.budget` to bound how many session IDs are minted. |
 | `sessions.budget` | object | unset | Optional per-workspace cap for automatically generated session IDs. Caller-supplied IDs are not gated. |
 | `user.capture` | bool | `true` | Capture the resolved user identifier. |
 | `user.max_length` | int | `256` | Maximum captured user-ID length. |
@@ -4103,13 +4102,28 @@ origins:
 
 ## Connection pool
 
-`origins.*.connection_pool` is retained for config compatibility. One field
-is live: `idle_timeout_secs` is the legacy spelling of `timeouts.idle_ms`
-(in seconds) and feeds the same resolved idle deadline when
-`timeouts.idle_ms` is unset. Setting both fails config compile; prefer
-`timeouts.idle_ms` in new configs. The other two fields (`max_connections`,
-`max_lifetime_secs`) are not applied by the runtime, and Pingora's built-in
-upstream connection-pool behavior remains in effect for them.
+`origins.*.connection_pool` is retained for config compatibility, and one
+field in it is live. `idle_timeout_secs` is the legacy spelling of
+`timeouts.idle_ms` (in seconds) and feeds the same resolved idle deadline
+when `timeouts.idle_ms` is unset. Setting both fails config compile; prefer
+`timeouts.idle_ms` in new configs.
+
+The other two fields fail config compile. Neither was ever applied, and
+neither has anything behind it to apply:
+
+- `max_connections` never capped upstream connections. The upstream
+  keepalive pool is sized once for the process rather than per origin, so
+  a per-origin number had nowhere to go. To bound how many requests an
+  origin has in flight, add a `concurrent_limit` policy, which is enforced
+  per request and rejects over the cap instead of queueing.
+- `max_lifetime_secs` never retired a connection. The pool has no
+  age-based eviction, so a long-lived upstream connection outlived this
+  deadline indefinitely. The deadline that does retire pooled connections
+  is the idle one, `timeouts.idle_ms`.
+
+Both were accepted with a boot warning in earlier releases. They are
+refused now because a limit that parses and does not limit reads as a
+limit that holds.
 
 ---
 
@@ -4458,9 +4472,19 @@ Buffering is bounded by the 64 KiB replay buffer, the same ceiling GraphQL reque
 
 ## Traffic capture
 
-The `traffic_capture` block is reserved for request mirroring and capture configuration. There is no consumer for it in the open-source binary. The field is accepted on the origin so configs that target a future release or an external capture hook validate without errors. Set the block only when an out-of-tree component reads it.
+The `traffic_capture` block is not supported, and a config that sets it
+fails to load.
 
-For shadow traffic that is wired into the request path, use [`mirror`](#request-mirror) instead.
+Nothing ever read it. It was also accepted as a free-form value rather
+than a typed block, so nothing validated its contents either: a
+misspelled field inside it looked exactly like a working setting. The
+block still parses, so the failure names the replacement instead of
+reading as an unknown key.
+
+For shadow traffic that is wired into the request path, use
+[`mirror`](#request-mirror), which forwards a fire-and-forget copy of
+each request to a second upstream without delaying or failing the real
+one.
 
 ---
 

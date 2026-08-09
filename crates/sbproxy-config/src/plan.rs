@@ -558,10 +558,15 @@ pub const BLAST_RADIUS_MATRIX: &[BlastRadiusRule] = &[
         radius: BlastRadius::Hitless,
         reason: "user-id capture is read per request",
     },
+    // Only `idle_timeout_secs` reaches a plan. Its two siblings are
+    // refused at config compile (WOR-2310), so a document carrying them
+    // never gets this far. `Reload` is still right for the survivor: it
+    // resolves into the origin's upstream deadlines, and the origin is
+    // recompiled on reload.
     BlastRadiusRule {
         pattern: "origins.*.connection_pool.**",
         radius: BlastRadius::Reload,
-        reason: "connection pool rebuilds on reload",
+        reason: "the legacy idle deadline re-resolves when the origin recompiles on reload",
     },
     // --- Catch-all for unrecognised origin fields ---
     BlastRadiusRule {

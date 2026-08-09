@@ -1131,6 +1131,13 @@ fn validate_compression_state_local_path(path: &str) -> Result<()> {
 /// legacy `features.*` blocks with the canonical `extensions` shape, if
 /// any origin or L2 cache backend fails to compile, or if the config
 /// sets `proxy.messenger_settings`, which this build refuses (WOR-2166).
+///
+/// Also refuses the keys that parse and govern nothing (WOR-2310):
+/// `proxy.device_parser_file`, `origins.*.traffic_capture`,
+/// `origins.*.sessions.ttl_seconds`, and `max_connections` /
+/// `max_lifetime_secs` under `origins.*.connection_pool`. Each error
+/// names a working surface to move to. `connection_pool.idle_timeout_secs`
+/// is not among them: it is live.
 pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
     // Interpolate environment variables before parsing YAML.
     let yaml = interpolate_env_vars(yaml);
@@ -1538,6 +1545,25 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
              the admin API, which reaches every replica when `proxy.l2_cache` puts the response \
              cache on a shared Redis tier. See `docs/configuration.md`.",
             settings.driver,
+        );
+    }
+
+    // WOR-2310: refuse the device-parser catalog override. The device
+    // parser in this build matches on compiled-in rules and has no code
+    // path that opens a catalog file, so this named a path the proxy never
+    // read: a missing file, an unreadable file, and a carefully maintained
+    // one all behaved identically. That is worse than an unsupported key,
+    // because an operator maintaining the catalog had every reason to
+    // believe the rules in it were live. The field still parses so the
+    // failure below explains itself instead of reading as an unknown key.
+    if let Some(path) = &config_file.proxy.device_parser_file {
+        anyhow::bail!(
+            "config compile: proxy.device_parser_file is set ('{path}'), but this build's device \
+             parser matches on compiled-in rules and never opens a catalog file. The path was \
+             not read at startup or on reload, so whatever it points at has no effect on how a \
+             user agent is classified. Remove it. The neighboring \
+             `proxy.ai_providers_file` is the override that does work, and it applies to the AI \
+             provider catalog rather than to device detection."
         );
     }
 
@@ -2394,6 +2420,74 @@ fn resolve_upstream_timeouts(
     })
 }
 
+/// Refuse the per-origin keys that parse and govern nothing (WOR-2310).
+///
+/// Each of these was accepted, warned about once at compile as
+/// `config_only`, and then ignored for the life of the process. A warning
+/// is the right call for a key whose behavior is merely narrower than its
+/// name suggests; it is the wrong call for a key with no implementation at
+/// all, because the config keeps claiming a property the proxy does not
+/// have. These are the second kind, so they are refused outright, the same
+/// call `load_balancer`'s `sticky:` and `audit.sink: tracing` took.
+///
+/// Every message names a surface that works, because an operator who set
+/// one of these wanted something real.
+///
+/// # Errors
+///
+/// Returns an error naming the key when any of them is authored. An
+/// omitted key is `None` and compiles.
+fn refuse_inert_origin_keys(hostname: &str, config: &RawOriginConfig) -> Result<()> {
+    if let Some(pool) = config.connection_pool.as_ref() {
+        if let Some(max) = pool.max_connections {
+            anyhow::bail!(
+                "origin {hostname}: connection_pool.max_connections is set ({max}), but this \
+                 build never applied it. Pingora sizes the upstream keepalive pool once per \
+                 connector, not per origin, so there is no per-origin limit for the value to \
+                 become and upstream connections were never capped at it. Remove it. To bound \
+                 how many requests this origin has in flight, add a `concurrent_limit` policy \
+                 with `max: {max}`, which is enforced per request and rejects over the cap \
+                 instead of queueing."
+            );
+        }
+        if let Some(secs) = pool.max_lifetime_secs {
+            anyhow::bail!(
+                "origin {hostname}: connection_pool.max_lifetime_secs is set ({secs}), but this \
+                 build never applied it. Pingora's connection pool has no age-based eviction, \
+                 so no pooled upstream connection was ever retired for being old and a \
+                 long-lived connection outlived this deadline indefinitely. Remove it. The \
+                 deadline that does retire pooled connections is the idle one, \
+                 `timeouts.idle_ms`, which closes a connection after it has gone unused for \
+                 that long."
+            );
+        }
+    }
+
+    if config.traffic_capture.is_some() {
+        anyhow::bail!(
+            "origin {hostname}: traffic_capture is set, but this build has no traffic-capture \
+             consumer. Nothing read the block, and because it was accepted as an untyped value \
+             nothing validated it either, so a misspelled field inside it looked exactly like a \
+             working setting. Remove it. To send a copy of each request somewhere for \
+             inspection, use `mirror`, which forwards a fire-and-forget duplicate to a second \
+             upstream and does not delay or fail the real request."
+        );
+    }
+
+    if let Some(ttl) = config.sessions.as_ref().and_then(|s| s.ttl_seconds) {
+        anyhow::bail!(
+            "origin {hostname}: sessions.ttl_seconds is set ({ttl}), but this build has no \
+             sessions index to retain. Sessions appear in the admin recent-request ring, which \
+             is bounded by entry count and evicts the oldest entry when it is full, so a \
+             session aged out on request volume and never on this deadline. Remove it. To bound \
+             how many sessions are minted, use `sessions.budget.max_per_window` with \
+             `sessions.budget.window_seconds`, both of which are enforced."
+        );
+    }
+
+    Ok(())
+}
+
 /// Validate an `origins:` map key at config compile.
 ///
 /// Exact hostnames pass through untouched. A key starting with `*.`
@@ -2443,6 +2537,10 @@ fn validate_origin_host_key(hostname: &str) -> Result<()> {
 /// auth, policy, or transform) names an unknown type or has invalid
 /// parameters, or if a referenced module cannot be built.
 pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<CompiledOrigin> {
+    // Before any work: reject the keys that would otherwise be accepted
+    // into a snapshot that does not honor them (WOR-2310).
+    refuse_inert_origin_keys(hostname, &config)?;
+
     let allowed_methods: SmallVec<[http::Method; 4]> = config
         .allowed_methods
         .iter()
@@ -3864,17 +3962,25 @@ origins:
         fn exit(&self, _span: &tracing::span::Id) {}
     }
 
+    /// The exemplar here used to be `proxy.device_parser_file`, which
+    /// WOR-2310 promoted from a warning to a compile error. `cors.enable`
+    /// replaces it because it is the other kind of config-only key: the
+    /// cors block still works, only the legacy `enable` value inside it is
+    /// ignored, so warning is the proportionate response and the key stays
+    /// accepted.
     #[test]
     fn compile_config_warns_when_an_operator_sets_a_config_only_key() {
         let yaml = r#"
 proxy:
   http_bind_port: 8080
-  device_parser_file: "/etc/sbproxy/devices.yaml"
 origins:
   "api.example.com":
     action:
       type: proxy
       url: https://test.sbproxy.dev
+    cors:
+      enable: true
+      allowed_origins: ["https://app.example.com"]
 "#;
         // Register the pin BEFORE the capture and keep it alive for the
         // whole test: with two dispatchers registered, `tracing` computes
@@ -3895,13 +4001,13 @@ origins:
             // rebuild reads the live dispatcher list, so the recomputed
             // value is honest regardless of which thread runs it.
             tracing::callsite::rebuild_interest_cache();
-            compile_config(yaml).expect("device_parser_file is config-only, not a compile error");
+            compile_config(yaml).expect("cors.enable is config-only, not a compile error");
         });
         drop(pin);
 
         assert_eq!(
             keys.lock().unwrap().as_slice(),
-            ["proxy.device_parser_file"],
+            ["origins.*.cors.enable"],
             "compile_config must warn once for the explicitly-set config-only key"
         );
     }
@@ -4488,9 +4594,14 @@ origins:
         );
     }
 
-    /// A `connection_pool` block that only sets other fields does not
-    /// count as authoring the legacy idle: `timeouts.idle_ms` wins and
-    /// the compile stays green.
+    /// A present but empty `connection_pool` block does not count as
+    /// authoring the legacy idle: `timeouts.idle_ms` wins and the compile
+    /// stays green.
+    ///
+    /// This used to reach the same state by setting `max_connections: 64`,
+    /// which is now refused, so the block is empty instead. What is being
+    /// pinned is the same either way: `idle_timeout_secs` at its serde
+    /// default must read as absent rather than as an authored 90.
     #[test]
     fn compile_origin_idle_ms_wins_over_defaulted_pool_idle() {
         let yaml = r#"
@@ -4499,8 +4610,7 @@ origins:
     action:
       type: proxy
       url: http://localhost:3000
-    connection_pool:
-      max_connections: 64
+    connection_pool: {}
     timeouts:
       idle_ms: 20000
 "#;
@@ -6110,6 +6220,155 @@ origins:
 "#;
         let compiled = compile_config(yaml).expect("compile");
         assert!(compiled.resolve_origin("api.example.com").is_some());
+    }
+
+    // --- WOR-2310: the inert config-only keys are refused, not warned ---
+
+    /// Wrap an origin body in a compilable document.
+    fn origin_doc(body: &str) -> String {
+        format!(
+            r#"
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+{body}
+"#
+        )
+    }
+
+    /// Each key used to compile with a warning. The warning was not
+    /// enough: the snapshot still claimed a property the proxy did not
+    /// have, and every one of these describes a resource limit or a
+    /// retention window an operator would reasonably assume was enforced.
+    ///
+    /// The assertion checks the authored value appears in the message
+    /// too. A refusal that names the key but not the value leaves an
+    /// operator with several origins guessing which one to edit.
+    #[test]
+    fn inert_per_origin_keys_are_refused_and_the_error_names_the_value() {
+        let cases = [
+            (
+                "    connection_pool:\n      max_connections: 64",
+                "connection_pool.max_connections",
+                "64",
+                "concurrent_limit",
+            ),
+            (
+                "    connection_pool:\n      max_lifetime_secs: 120",
+                "connection_pool.max_lifetime_secs",
+                "120",
+                "timeouts.idle_ms",
+            ),
+            (
+                "    sessions:\n      ttl_seconds: 3600",
+                "sessions.ttl_seconds",
+                "3600",
+                "sessions.budget.max_per_window",
+            ),
+        ];
+
+        for (body, key, value, replacement) in cases {
+            let yaml = origin_doc(body);
+            let err = compile_config(&yaml)
+                .err()
+                .unwrap_or_else(|| panic!("{key} must be refused"));
+            let msg = format!("{err:#}");
+            assert!(msg.contains(key), "error must name the key: {msg}");
+            assert!(
+                msg.contains(value),
+                "error must quote the authored value: {msg}"
+            );
+            assert!(
+                msg.contains(replacement),
+                "error must name the surface that works: {msg}"
+            );
+            assert!(
+                msg.contains("api.example.com"),
+                "error must name the origin: {msg}"
+            );
+        }
+    }
+
+    /// `traffic_capture` is untyped, so it has no value worth quoting.
+    /// The message has to carry the replacement instead.
+    #[test]
+    fn traffic_capture_is_refused_and_points_at_mirror() {
+        let yaml = origin_doc("    traffic_capture:\n      sample_rate: 0.1");
+        let msg = format!(
+            "{:#}",
+            compile_config(&yaml)
+                .err()
+                .expect("traffic_capture must be refused")
+        );
+        assert!(
+            msg.contains("traffic_capture"),
+            "error must name the key: {msg}"
+        );
+        assert!(
+            msg.contains("mirror"),
+            "error must name the working surface: {msg}"
+        );
+    }
+
+    /// The one live field on the block keeps working. Refusing the whole
+    /// of `connection_pool` would take the legacy idle spelling with it,
+    /// and that one does feed the resolved upstream deadline.
+    #[test]
+    fn connection_pool_idle_timeout_still_compiles_on_its_own() {
+        let yaml = origin_doc("    connection_pool:\n      idle_timeout_secs: 30");
+        let compiled = compile_config(&yaml).expect("the legacy idle spelling stays supported");
+        let origin = compiled
+            .resolve_origin("api.example.com")
+            .expect("origin compiles");
+        assert_eq!(
+            origin.timeouts.idle,
+            std::time::Duration::from_secs(30),
+            "the legacy key must still feed the resolved idle deadline"
+        );
+    }
+
+    /// A sessions block without the refused field is untouched: capture
+    /// and the budget gate are both live and must keep compiling.
+    #[test]
+    fn sessions_without_ttl_still_compiles() {
+        let yaml = origin_doc("    sessions:\n      capture: true");
+        compile_config(&yaml).expect("sessions capture stays supported");
+    }
+
+    /// The proxy-level twin of the origin keys above. It named a file the
+    /// proxy never opened, so a maintained catalog and a missing one
+    /// behaved identically.
+    #[test]
+    fn device_parser_file_is_refused_and_points_at_the_override_that_works() {
+        let yaml = r#"
+proxy:
+  device_parser_file: "/etc/sbproxy/devices.yaml"
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+"#;
+        let msg = format!(
+            "{:#}",
+            compile_config(yaml)
+                .err()
+                .expect("device_parser_file must be refused")
+        );
+        assert!(
+            msg.contains("proxy.device_parser_file"),
+            "error must name the key: {msg}"
+        );
+        assert!(
+            msg.contains("/etc/sbproxy/devices.yaml"),
+            "error must quote the path that was never read: {msg}"
+        );
+        assert!(
+            msg.contains("ai_providers_file"),
+            "error must name the override that does work: {msg}"
+        );
     }
 
     // --- WOR-2311: origin-level rate_limit_headers is removed ---

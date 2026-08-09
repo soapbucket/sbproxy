@@ -295,10 +295,16 @@ pub struct SessionsConfig {
     /// supply one.
     #[serde(default)]
     pub auto_generate: AutoGenerate,
-    /// Reserved sessions-index TTL hint. The OSS runtime does not expire the
-    /// in-process request ring or a downstream projection from this value.
-    #[serde(default = "default_session_ttl")]
-    pub ttl_seconds: u64,
+    /// Refused at config compile. It described the retention of a
+    /// sessions index that does not exist: the only thing holding
+    /// sessions is the in-process request ring, which is bounded by
+    /// entry count and never consulted this value, so a session
+    /// survived exactly as long as the ring did whatever was set here.
+    ///
+    /// Retained as a parseable field so the failure explains itself
+    /// rather than reading as an unknown key.
+    #[serde(default)]
+    pub ttl_seconds: Option<u64>,
     /// Cap on auto-generated session IDs per workspace per window.
     /// `None` disables the gate (default). When the cap is hit, the
     /// dimension is dropped silently and
@@ -314,14 +320,10 @@ impl Default for SessionsConfig {
         Self {
             capture: true,
             auto_generate: AutoGenerate::default(),
-            ttl_seconds: default_session_ttl(),
+            ttl_seconds: None,
             budget: None,
         }
     }
-}
-
-fn default_session_ttl() -> u64 {
-    86_400
 }
 
 /// Per-request counters reporting why session IDs were dropped.

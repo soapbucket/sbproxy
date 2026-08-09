@@ -705,7 +705,7 @@
           ]
         },
         "device_parser_file": {
-          "description": "Optional override for the embedded user-agent / device-parser regex catalog. Reserved for the (separate) UA-parser swap to a regex-driven implementation; the current pure-Rust device parser ignores this value but preserving the field shape now keeps existing sb.yml files forward-compatible.",
+          "description": "Refused at config compile. The device parser in this build matches on compiled-in rules and has no code path that loads a regex catalog from disk, so a path here named a file the proxy never opened. Compare [`Self::ai_providers_file`] just above, which is the same idea for the provider catalog and is read at startup.\n\nRetained as a parseable field so the failure explains itself rather than reading as an unknown key.",
           "default": null,
           "type": [
             "string",
@@ -7843,7 +7843,7 @@
           ]
         },
         "traffic_capture": {
-          "description": "Compatibility-only traffic-capture shape. The OSS runtime has no consumer; use [`MirrorConfig`] for live request mirroring.",
+          "description": "Refused at config compile. Nothing ever read this block, and because it is an untyped value nothing ever validated it either: a typo inside it was indistinguishable from a correct setting. Live request mirroring is [`MirrorConfig`] under `mirror`.\n\nRetained as a parseable field so the failure names the replacement rather than reading as an unknown key.",
           "default": null
         },
         "mirror": {
@@ -8650,9 +8650,12 @@
           ]
         },
         "ttl_seconds": {
-          "description": "Reserved sessions-index TTL hint. The OSS runtime does not expire the in-process request ring or a downstream projection from this value.",
-          "default": 86400,
-          "type": "integer",
+          "description": "Refused at config compile. It described the retention of a sessions index that does not exist: the only thing holding sessions is the in-process request ring, which is bounded by entry count and never consulted this value, so a session survived exactly as long as the ring did whatever was set here.\n\nRetained as a parseable field so the failure explains itself rather than reading as an unknown key.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
           "format": "uint64",
           "minimum": 0.0
         },
@@ -9723,13 +9726,16 @@
       ]
     },
     "ConnectionPoolConfig": {
-      "description": "Legacy per-origin connection-pool shape.\n\n`idle_timeout_secs` is live: it is the legacy spelling of the upstream idle deadline and feeds the origin's resolved [`UpstreamTimeouts`] when `timeouts.idle_ms` is not set. The other two values remain config-only compatibility values the OSS runtime does not install into Pingora.",
+      "description": "Legacy per-origin connection-pool shape.\n\nOne field is live. `idle_timeout_secs` is the legacy spelling of the upstream idle deadline and feeds the origin's resolved [`UpstreamTimeouts`] when `timeouts.idle_ms` is not set.\n\nThe other two parse and are then refused at config compile. They are retained as `Option` rather than deleted outright so an archived schema-v1 document reaches an explanatory diagnostic instead of an unknown-key error, the same call `proxy.messenger_settings` took.\n\nNeither has a Pingora primitive behind it in this build. `pingora_core::upstreams::peer::PeerOptions`, the per-peer struct `proxy_http.rs` tunes, carries no pool-size and no maximum-lifetime field. The only pool-size knob in the vendored fork is `ConnectorOptions::keepalive_pool_size`, which is set once per connector from the server config and so cannot express a per-origin limit, and `pingora-pool` has no age-based eviction at all. Wiring either one is a change to Pingora, not a change here.",
       "type": "object",
       "properties": {
         "max_connections": {
-          "description": "Maximum number of concurrent connections to the upstream.\n\nConfig-only compatibility value. Default: 128.",
-          "default": 128,
-          "type": "integer",
+          "description": "Refused at config compile. Pingora sizes the upstream keepalive pool per connector, not per origin, so this never bounded anything.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
           "format": "uint32",
           "minimum": 0.0
         },
@@ -9741,9 +9747,12 @@
           "minimum": 0.0
         },
         "max_lifetime_secs": {
-          "description": "Maximum total lifetime of a connection, in seconds.\n\nConfig-only compatibility value. Default: 300 s.",
-          "default": 300,
-          "type": "integer",
+          "description": "Refused at config compile. Pingora's connection pool has no age-based eviction, so no upstream connection was ever retired on this deadline.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
           "format": "uint32",
           "minimum": 0.0
         }

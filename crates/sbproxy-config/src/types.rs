@@ -884,11 +884,15 @@ pub struct ProxyServerConfig {
     /// binary.
     #[serde(default)]
     pub ai_providers_file: Option<String>,
-    /// Optional override for the embedded user-agent / device-parser
-    /// regex catalog. Reserved for the (separate) UA-parser swap to
-    /// a regex-driven implementation; the current pure-Rust device
-    /// parser ignores this value but preserving the field shape now
-    /// keeps existing sb.yml files forward-compatible.
+    /// Refused at config compile. The device parser in this build
+    /// matches on compiled-in rules and has no code path that loads a
+    /// regex catalog from disk, so a path here named a file the proxy
+    /// never opened. Compare [`Self::ai_providers_file`] just above,
+    /// which is the same idea for the provider catalog and is read at
+    /// startup.
+    ///
+    /// Retained as a parseable field so the failure explains itself
+    /// rather than reading as an unknown key.
     #[serde(default)]
     pub device_parser_file: Option<String>,
     /// Optional synthetic-transaction probe driving an in-process
@@ -6069,18 +6073,31 @@ fn default_idle_timeout() -> u32 {
 
 /// Legacy per-origin connection-pool shape.
 ///
-/// `idle_timeout_secs` is live: it is the legacy spelling of the upstream
-/// idle deadline and feeds the origin's resolved [`UpstreamTimeouts`] when
-/// `timeouts.idle_ms` is not set. The other two values remain config-only
-/// compatibility values the OSS runtime does not install into Pingora.
+/// One field is live. `idle_timeout_secs` is the legacy spelling of the
+/// upstream idle deadline and feeds the origin's resolved
+/// [`UpstreamTimeouts`] when `timeouts.idle_ms` is not set.
+///
+/// The other two parse and are then refused at config compile. They are
+/// retained as `Option` rather than deleted outright so an archived
+/// schema-v1 document reaches an explanatory diagnostic instead of an
+/// unknown-key error, the same call `proxy.messenger_settings` took.
+///
+/// Neither has a Pingora primitive behind it in this build.
+/// `pingora_core::upstreams::peer::PeerOptions`, the per-peer struct
+/// `proxy_http.rs` tunes, carries no pool-size and no maximum-lifetime
+/// field. The only pool-size knob in the vendored fork is
+/// `ConnectorOptions::keepalive_pool_size`, which is set once per
+/// connector from the server config and so cannot express a per-origin
+/// limit, and `pingora-pool` has no age-based eviction at all. Wiring
+/// either one is a change to Pingora, not a change here.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ConnectionPoolConfig {
-    /// Maximum number of concurrent connections to the upstream.
-    ///
-    /// Config-only compatibility value. Default: 128.
-    #[serde(default = "default_max_connections")]
-    pub max_connections: u32,
+    /// Refused at config compile. Pingora sizes the upstream keepalive
+    /// pool per connector, not per origin, so this never bounded
+    /// anything.
+    #[serde(default)]
+    pub max_connections: Option<u32>,
 
     /// Maximum idle time before a pooled upstream connection is closed, in
     /// seconds.
@@ -6090,31 +6107,31 @@ pub struct ConnectionPoolConfig {
     #[serde(default = "default_idle_timeout_secs")]
     pub idle_timeout_secs: u32,
 
-    /// Maximum total lifetime of a connection, in seconds.
-    ///
-    /// Config-only compatibility value. Default: 300 s.
-    #[serde(default = "default_max_lifetime_secs")]
-    pub max_lifetime_secs: u32,
-}
-
-fn default_max_connections() -> u32 {
-    128
+    /// Refused at config compile. Pingora's connection pool has no
+    /// age-based eviction, so no upstream connection was ever retired on
+    /// this deadline.
+    #[serde(default)]
+    pub max_lifetime_secs: Option<u32>,
 }
 
 fn default_idle_timeout_secs() -> u32 {
     90
 }
 
-fn default_max_lifetime_secs() -> u32 {
-    300
-}
-
 impl Default for ConnectionPoolConfig {
+    /// Mirrors serde, not `u32::default()`.
+    ///
+    /// `resolve_upstream_timeouts` compares an authored
+    /// `idle_timeout_secs` against this value to tell "the operator left
+    /// the key out" from "the operator wrote a number". A derived
+    /// `Default` would put `0` here and make every authored value look
+    /// like a conflict, so the 90 s serde default is repeated
+    /// deliberately.
     fn default() -> Self {
         Self {
-            max_connections: default_max_connections(),
+            max_connections: None,
             idle_timeout_secs: default_idle_timeout_secs(),
-            max_lifetime_secs: default_max_lifetime_secs(),
+            max_lifetime_secs: None,
         }
     }
 }
@@ -6780,8 +6797,13 @@ pub struct RawOriginConfig {
     /// wide branding (e.g. `acme-edge`).
     #[serde(default)]
     pub proxy_status: Option<ProxyStatusConfig>,
-    /// Compatibility-only traffic-capture shape. The OSS runtime has no
-    /// consumer; use [`MirrorConfig`] for live request mirroring.
+    /// Refused at config compile. Nothing ever read this block, and
+    /// because it is an untyped value nothing ever validated it either:
+    /// a typo inside it was indistinguishable from a correct setting.
+    /// Live request mirroring is [`MirrorConfig`] under `mirror`.
+    ///
+    /// Retained as a parseable field so the failure names the
+    /// replacement rather than reading as an unknown key.
     #[serde(default)]
     pub traffic_capture: Option<serde_json::Value>,
     /// Shadow traffic mirror, fire-and-forget copy of each request to
@@ -8953,43 +8975,45 @@ scripting:
 
     // --- ConnectionPoolConfig tests ---
 
+    /// `Default` has to agree with serde on the one live field.
+    /// `resolve_upstream_timeouts` reads
+    /// `ConnectionPoolConfig::default().idle_timeout_secs` to decide
+    /// whether an authored value conflicts with `timeouts.idle_ms`, so a
+    /// derived `Default` putting `0` here would turn every authored idle
+    /// value into a spurious conflict error.
     #[test]
-    fn connection_pool_defaults() {
-        let cfg = ConnectionPoolConfig::default();
-        assert_eq!(cfg.max_connections, 128);
-        assert_eq!(cfg.idle_timeout_secs, 90);
-        assert_eq!(cfg.max_lifetime_secs, 300);
+    fn connection_pool_default_idle_matches_the_serde_default() {
+        let from_impl = ConnectionPoolConfig::default();
+        let from_serde: ConnectionPoolConfig = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(from_impl.idle_timeout_secs, 90);
+        assert_eq!(from_serde.idle_timeout_secs, 90);
+        assert_eq!(from_impl.idle_timeout_secs, from_serde.idle_timeout_secs);
     }
 
+    /// The two refused fields are absent unless authored, which is what
+    /// lets the compiler tell "operator set this" from "operator left it
+    /// out" and refuse only the former.
     #[test]
-    fn connection_pool_deserialize_defaults() {
-        let yaml = r#"{}"#;
-        let cfg: ConnectionPoolConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(cfg.max_connections, 128);
-        assert_eq!(cfg.idle_timeout_secs, 90);
-        assert_eq!(cfg.max_lifetime_secs, 300);
+    fn connection_pool_refused_fields_are_none_when_unset() {
+        let cfg: ConnectionPoolConfig = serde_yaml::from_str("idle_timeout_secs: 30").unwrap();
+        assert_eq!(cfg.idle_timeout_secs, 30);
+        assert!(cfg.max_connections.is_none());
+        assert!(cfg.max_lifetime_secs.is_none());
     }
 
+    /// They still parse. Refusal is the compiler's job, and it needs the
+    /// authored value to exist so the diagnostic can be specific.
     #[test]
-    fn connection_pool_deserialize_explicit() {
+    fn connection_pool_refused_fields_still_parse_when_authored() {
         let yaml = r#"
 max_connections: 64
 idle_timeout_secs: 30
 max_lifetime_secs: 120
 "#;
         let cfg: ConnectionPoolConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(cfg.max_connections, 64);
+        assert_eq!(cfg.max_connections, Some(64));
         assert_eq!(cfg.idle_timeout_secs, 30);
-        assert_eq!(cfg.max_lifetime_secs, 120);
-    }
-
-    #[test]
-    fn connection_pool_partial_deserialize() {
-        let yaml = r#"max_connections: 256"#;
-        let cfg: ConnectionPoolConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(cfg.max_connections, 256);
-        assert_eq!(cfg.idle_timeout_secs, 90);
-        assert_eq!(cfg.max_lifetime_secs, 300);
+        assert_eq!(cfg.max_lifetime_secs, Some(120));
     }
 
     #[test]
@@ -9006,9 +9030,9 @@ connection_pool:
         let pool = origin
             .connection_pool
             .expect("connection_pool should be set");
-        assert_eq!(pool.max_connections, 32);
+        assert_eq!(pool.max_connections, Some(32));
         assert_eq!(pool.idle_timeout_secs, 45);
-        assert_eq!(pool.max_lifetime_secs, 300); // default
+        assert!(pool.max_lifetime_secs.is_none());
     }
 
     #[test]
