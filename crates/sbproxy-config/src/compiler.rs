@@ -726,6 +726,49 @@ fn yaml_uses_top_level_model_aliases(yaml: &str) -> bool {
         .is_some_and(|root| root.get("model_aliases").is_some())
 }
 
+/// The legacy `proxy.secrets` keys this document authors, in schema order.
+///
+/// Read off the raw YAML rather than off the typed block because presence
+/// is the thing being refused and two of the five carry serde defaults:
+/// after the typed parse an operator who wrote `backend: env` and one who
+/// wrote nothing at all are the same value, and only the first of the two
+/// has a belief about secret resolution to correct. Same reason
+/// `yaml_uses_top_level_model_aliases` reads the raw document.
+///
+/// `map` and `rotation` are not collected here. `map` is live (a non-empty
+/// map installs the process resolver, and its keys suppress the
+/// `missing-vault-key` finding in `sbproxy plan`), and `rotation` is
+/// reserved surface.
+fn yaml_legacy_secrets_keys(yaml: &str) -> Vec<&'static str> {
+    let Ok(root) = serde_yaml::from_str::<serde_yaml::Value>(yaml) else {
+        return Vec::new();
+    };
+    let Some(secrets) = root.get("proxy").and_then(|proxy| proxy.get("secrets")) else {
+        return Vec::new();
+    };
+    let mut authored: Vec<&'static str> = Vec::new();
+    for (field, path) in [
+        ("backend", "proxy.secrets.backend"),
+        ("fallback", "proxy.secrets.fallback"),
+    ] {
+        if secrets.get(field).is_some() {
+            authored.push(path);
+        }
+    }
+    if let Some(hashicorp) = secrets.get("hashicorp") {
+        for (field, path) in [
+            ("addr", "proxy.secrets.hashicorp.addr"),
+            ("mount", "proxy.secrets.hashicorp.mount"),
+            ("token", "proxy.secrets.hashicorp.token"),
+        ] {
+            if hashicorp.get(field).is_some() {
+                authored.push(path);
+            }
+        }
+    }
+    authored
+}
+
 fn yaml_uses_legacy_virtual_keys(yaml: &str) -> bool {
     for line in yaml.lines() {
         // Strip any inline comment that starts AFTER the YAML value;
@@ -1141,6 +1184,30 @@ fn validate_compression_state_local_path(path: &str) -> Result<()> {
 /// `max_lifetime_secs` under `origins.*.connection_pool`. Each error
 /// names a working surface to move to. `connection_pool.idle_timeout_secs`
 /// is not among them: it is live.
+///
+/// WOR-2325 continues that sweep. The legacy single-backend secrets
+/// surface is refused whenever it is authored: `proxy.secrets.backend`,
+/// `proxy.secrets.fallback`, and `addr` / `mount` / `token` under
+/// `proxy.secrets.hashicorp`. Resolution walks the named entries under
+/// `proxy.secrets.backends` and reads no other field on the block, so a
+/// Vault credential authored on the legacy shape bought no Vault access.
+/// `proxy.secrets.map` and `proxy.secrets.rotation` are deliberately not
+/// among them: the map is read, and rotation is reserved surface.
+///
+/// Three more are value-scoped, refused only for the value that
+/// misdescribed the build rather than for the key's presence:
+/// `proxy.key_management.governance.key_introspection: true` (no
+/// caller-facing introspection route is installed),
+/// `proxy.key_management.store.redis_source_of_truth: true` (the store
+/// backend already decides the system of record), and
+/// `origins.*.cors.enable: false` (CORS is gated on the presence of the
+/// `cors:` block, so `false` left it fully on). `enable: true` stays
+/// accepted because it agrees with what the block already does.
+///
+/// The per-origin refusals are applied while each origin compiles, and
+/// they also cover the inline forward-origin metadata
+/// (`origins.*.forward_rules[].origin.hostname` / `.workspace_id` /
+/// `.version`), none of which reaches the compiled child origin.
 pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
     // Interpolate environment variables before parsing YAML.
     let yaml = interpolate_env_vars(yaml);
@@ -1212,6 +1279,38 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
              Model aliases belong to the AI gateway action that serves them: move the block to \
              `origins.<hostname>.action.model_aliases` alongside that action's `providers:`. \
              See the `Model aliases` section of `docs/ai-gateway.md`."
+        );
+    }
+
+    // WOR-2325: refuse the legacy single-backend secrets surface. Every one
+    // of these parsed, validated, and selected nothing: secret resolution
+    // walks the named entries under `proxy.secrets.backends` and reads no
+    // other field on the block. The Vault three are why this is a refusal
+    // rather than one more boot warning, because an operator who set
+    // `proxy.secrets.hashicorp.token` had every reason to believe the proxy
+    // was authenticating to Vault with it and the proxy never opened a
+    // connection.
+    //
+    // Read off the raw YAML for two reasons. Presence is what is being
+    // refused and two of the five carry serde defaults, and `hashicorp.addr`
+    // is a required field, so a half-authored legacy block would otherwise
+    // die on `missing field addr` instead of on the migration.
+    //
+    // The message names the keys and never their values: one of the three
+    // is a credential.
+    let legacy_secrets_keys = yaml_legacy_secrets_keys(&yaml);
+    if !legacy_secrets_keys.is_empty() {
+        anyhow::bail!(
+            "config compile: legacy `proxy.secrets` key(s) that nothing reads: {}. Secret \
+             resolution walks the named entries under `proxy.secrets.backends` and consults no \
+             other field on the block, so an address, a mount, or a token authored on the legacy \
+             shape bought no access to anything: no connection was ever opened with it. Rewrite \
+             the block as a named backend, `proxy.secrets.backends: - type: hashicorp, name: \
+             primary, addr: https://vault.example/v1, mount: secret, auth: {{ type: token, \
+             token: ${{VAULT_TOKEN}} }}`, and reference it from each consumer as \
+             `vault://primary/<path>`. `proxy.secrets.map` is unaffected and stays supported. \
+             See the `Secrets` section of `docs/configuration.md`.",
+            legacy_secrets_keys.join(", ")
         );
     }
 
@@ -1314,7 +1413,7 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         anyhow::bail!(
             "config compile: proxy.http3.enabled=true is not supported because HTTP/3 is not \
              served by this build. Set `enabled: false` or remove the `http3` block. Native \
-             HTTP/3 support is tracked in WOR-1969."
+             HTTP/3 support is tracked in WOR-2310."
         );
     }
 
@@ -1323,6 +1422,36 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
             .inbound
             .validate()
             .map_err(|error| anyhow::anyhow!("config compile: {error}"))?;
+
+        // WOR-2325: two booleans on this block parse and govern nothing.
+        // Both are refused on `true` only, the value that misdescribes the
+        // build. `false` is the default and is what the build actually
+        // does, so an operator who wrote it has nothing to fix and no
+        // reason to be stopped at boot.
+        if key_management.governance.key_introspection {
+            anyhow::bail!(
+                "config compile: proxy.key_management.governance.key_introspection is true, but \
+                 this build installs no caller-facing introspection route. There is no \
+                 `GET /api/v1/key` handler for the holder of a minted key to call, so the flag \
+                 admitted nothing and a caller asking about its own key got the same 404 it \
+                 would have without the flag. Remove it, or set it to false. To read a key's \
+                 policy and usage today, use `GET /admin/keys/{{id}}` and \
+                 `GET /admin/keys/{{id}}/usage` on the admin API, which are \
+                 operator-authenticated rather than caller-authenticated."
+            );
+        }
+        if key_management.store.redis_source_of_truth {
+            anyhow::bail!(
+                "config compile: proxy.key_management.store.redis_source_of_truth is true, but \
+                 nothing reads it. The key plane picks its system of record from \
+                 `key_management.store.backend` and from nothing else, so selecting `backend: \
+                 redis` already makes Redis authoritative and this flag offered a choice that \
+                 does not exist: it could neither promote Redis under another backend nor demote \
+                 it under its own. Remove it, or set it to false. For a Redis-backed key store, \
+                 set `backend: redis` with a `store.url`; otherwise keep the default `embedded` \
+                 backend, which is the local redb file."
+            );
+        }
 
         let correlation = &config_file.proxy.correlation_id;
         if correlation.enabled
@@ -2560,6 +2689,12 @@ fn resolve_upstream_timeouts(
 /// Every message names a surface that works, because an operator who set
 /// one of these wanted something real.
 ///
+/// WOR-2325 added the inline forward-origin metadata
+/// (`forward_rules[].origin.hostname` / `.workspace_id` / `.version`) on
+/// the same grounds, and `cors.enable` on stronger ones: that boolean did
+/// not merely fail to govern, it governed backwards, so it is refused for
+/// the one value that lied rather than for its presence.
+///
 /// # Errors
 ///
 /// Returns an error naming the key when any of them is authored. An
@@ -2609,6 +2744,80 @@ fn refuse_inert_origin_keys(hostname: &str, config: &RawOriginConfig) -> Result<
              session aged out on request volume and never on this deadline. Remove it. To bound \
              how many sessions are minted, use `sessions.budget.max_per_window` with \
              `sessions.budget.window_seconds`, both of which are enforced."
+        );
+    }
+
+    // WOR-2325: the inline forward-origin metadata. The forward-origin
+    // runtime reads `origin.action` and `origin.request_modifiers`, and
+    // OpenAPI emission reads `origin.id`. These three are read by nobody:
+    // the parent origin's hostname is what routes the request, and the
+    // compiled child origin carries neither a version nor a workspace
+    // label for the other two to become. Each is refused on its own so the
+    // operator is told which line to delete and why that particular one
+    // never mattered.
+    for (index, rule) in config.forward_rules.iter().enumerate() {
+        // `origin.id` is the rule's own identifier and the one metadata
+        // field that is read, so it names the rule when it is present and
+        // the index stands in when it is not.
+        let rule_label = match rule.origin.id.as_deref() {
+            Some(id) => format!("forward_rules[{index}] (origin id `{id}`)"),
+            None => format!("forward_rules[{index}]"),
+        };
+        if let Some(value) = rule.origin.hostname.as_deref() {
+            anyhow::bail!(
+                "origin {hostname}: {rule_label} sets origin.hostname (`{value}`), but a forward \
+                 rule never routes on it. The request has already been matched to `{hostname}` \
+                 by the time the rule fires, so this tag selected no upstream and changed no \
+                 header. Delete the line. To send the matched request to a different host, put \
+                 that host in the rule's own `origin.action.url`; to label the rule in metrics \
+                 and in the emitted OpenAPI document, use `origin.id`, which is read."
+            );
+        }
+        if let Some(value) = rule.origin.workspace_id.as_deref() {
+            anyhow::bail!(
+                "origin {hostname}: {rule_label} sets origin.workspace_id (`{value}`), but \
+                 nothing reads it. The compiled child origin has no workspace field, so the \
+                 value never reached routing, logs, metrics, or cost attribution. Delete the \
+                 line. Multi-tenant attribution is `origins.{hostname}.tenant_id` naming a \
+                 declared `proxy.tenants[].id`, which is checked at compile and labels the \
+                 request everywhere downstream."
+            );
+        }
+        if let Some(value) = rule.origin.version.as_deref() {
+            anyhow::bail!(
+                "origin {hostname}: {rule_label} sets origin.version (`{value}`), but nothing \
+                 reads it. The compiled child origin carries no version label, so the value \
+                 never reached routing, logs, metrics, or the emitted OpenAPI document. Delete \
+                 the line. To version the surface a caller sees, match the version in the path \
+                 (`rules: - path: {{ prefix: /v2/ }}`); to version the rule for your own \
+                 records, fold it into `origin.id`, which is read."
+            );
+        }
+    }
+
+    // WOR-2325: `cors.enable: false` is the one value on this block that
+    // did not merely fail to govern, it governed backwards. Both runtime
+    // entry points gate on the PRESENCE of the `cors:` block and neither
+    // one looks at the boolean, so an operator who wrote `false` to turn
+    // CORS off ran with CORS fully on. `true` is left accepted because it
+    // agrees with what the block already does, which also keeps the
+    // archived schema-v1 fixtures compiling unmodified. The alias spelling
+    // `enabled` deserializes into this same field, so both spellings are
+    // covered by the one check.
+    if config
+        .cors
+        .as_ref()
+        .is_some_and(|cors| cors.enable == Some(false))
+    {
+        anyhow::bail!(
+            "origin {hostname}: cors.enable is false, but this build never read it and CORS has \
+             been fully active on this origin the whole time. Both entry points, the preflight \
+             responder and the response header pass, gate on the presence of the `cors:` block \
+             rather than on this boolean, so every matching request was answered with \
+             `Access-Control-Allow-Origin` despite the false. The only way to turn CORS off is \
+             to delete the whole `cors:` block. If you meant to leave CORS on, delete just the \
+             `enable` line (or set it to true, which is accepted because it describes what the \
+             block already does) and narrow `allowed_origins` instead."
         );
     }
 
@@ -3926,7 +4135,7 @@ origins:
         assert!(
             message.contains("proxy.http3.enabled")
                 && message.contains("not served")
-                && message.contains("WOR-1969"),
+                && message.contains("WOR-2310"),
             "error must name the unsupported setting, explain that it is not served, and point \
              to the implementation ticket: {message}"
         );
@@ -4089,25 +4298,33 @@ origins:
         fn exit(&self, _span: &tracing::span::Id) {}
     }
 
-    /// The exemplar here used to be `proxy.device_parser_file`, which
-    /// WOR-2310 promoted from a warning to a compile error. `cors.enable`
-    /// replaces it because it is the other kind of config-only key: the
-    /// cors block still works, only the legacy `enable` value inside it is
-    /// ignored, so warning is the proportionate response and the key stays
-    /// accepted.
+    /// This exemplar has now been promoted out from under the test twice:
+    /// first `proxy.device_parser_file`, then `cors.enable`, each of which
+    /// became a compile error once someone looked at what it did. That is
+    /// the sweep working, but it means the exemplar has to be a key that is
+    /// inert **and** harmless, not merely inert.
+    ///
+    /// `proxy.observability.log.sampling.debug` qualifies. The process
+    /// logger has no sampling call site at all, so the rate changes
+    /// nothing, but a rate that fails open emits more lines rather than
+    /// fewer. Nobody is misled about a security property, so a warning is
+    /// proportionate and the key stays accepted. Refusal is reserved for
+    /// keys that describe the build wrongly, which is why the previous two
+    /// exemplars left.
     #[test]
     fn compile_config_warns_when_an_operator_sets_a_config_only_key() {
         let yaml = r#"
 proxy:
   http_bind_port: 8080
+  observability:
+    log:
+      sampling:
+        debug: 0.5
 origins:
   "api.example.com":
     action:
       type: proxy
       url: https://test.sbproxy.dev
-    cors:
-      enable: true
-      allowed_origins: ["https://app.example.com"]
 "#;
         // Register the pin BEFORE the capture and keep it alive for the
         // whole test: with two dispatchers registered, `tracing` computes
@@ -4128,13 +4345,13 @@ origins:
             // rebuild reads the live dispatcher list, so the recomputed
             // value is honest regardless of which thread runs it.
             tracing::callsite::rebuild_interest_cache();
-            compile_config(yaml).expect("cors.enable is config-only, not a compile error");
+            compile_config(yaml).expect("log sampling is config-only, not a compile error");
         });
         drop(pin);
 
         assert_eq!(
             keys.lock().unwrap().as_slice(),
-            ["origins.*.cors.enable"],
+            ["proxy.observability.log.sampling.debug"],
             "compile_config must warn once for the explicitly-set config-only key"
         );
     }
@@ -6585,6 +6802,335 @@ origins:
             msg.contains("ai_providers_file"),
             "error must name the override that does work: {msg}"
         );
+    }
+
+    // --- WOR-2325: the rest of the keys that parse and govern nothing ---
+
+    /// The refusal text for a document that must not compile.
+    ///
+    /// `compile_config` returns a `CompiledConfig`, which is not `Debug`,
+    /// so `expect_err` does not compile against it. A `let ... else`
+    /// binding gets the error out without asking `Debug` of the success
+    /// type. The rendering is `{:#}` so the whole `anyhow` context chain
+    /// is searched, not just the outermost message.
+    fn refusal_message(yaml: &str, what: &str) -> String {
+        let Err(error) = compile_config(yaml) else {
+            panic!("{what} must not compile");
+        };
+        format!("{error:#}")
+    }
+
+    /// Wrap a `proxy:` body in a compilable document.
+    fn proxy_doc(body: &str) -> String {
+        format!(
+            r#"
+proxy:
+  http_bind_port: 8080
+{body}
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+"#
+        )
+    }
+
+    /// All five legacy secrets keys used to parse, validate, and select
+    /// nothing: `install_secret_resolver` walks `proxy.secrets.backends`
+    /// and reads no other field on the block. Each case here compiled
+    /// silently before this refusal existed.
+    ///
+    /// The Vault three are the reason this is an error rather than one
+    /// more boot warning. An operator who authored an address, a mount,
+    /// and a token believed the proxy held a Vault session, and it had
+    /// never opened a connection.
+    #[test]
+    fn legacy_secrets_keys_are_refused_with_the_named_backend_migration() {
+        // `hashicorp.addr` has no serde default, so every case on that
+        // block has to carry it or the typed parse fails first and the
+        // case proves nothing about the refusal.
+        let cases = [
+            ("    backend: hashicorp", "proxy.secrets.backend"),
+            ("    fallback: env", "proxy.secrets.fallback"),
+            (
+                "    hashicorp:\n      addr: https://vault.example/v1",
+                "proxy.secrets.hashicorp.addr",
+            ),
+            (
+                "    hashicorp:\n      addr: https://vault.example/v1\n      mount: secret/prod",
+                "proxy.secrets.hashicorp.mount",
+            ),
+            (
+                "    hashicorp:\n      addr: https://vault.example/v1\n      token: t0ken",
+                "proxy.secrets.hashicorp.token",
+            ),
+        ];
+
+        for (body, key) in cases {
+            let yaml = proxy_doc(&format!("  secrets:\n{body}"));
+            let msg = refusal_message(&yaml, key);
+            assert!(msg.contains(key), "error must name the key: {msg}");
+            assert!(
+                msg.contains("proxy.secrets.backends"),
+                "error must name the replacement surface: {msg}"
+            );
+            assert!(
+                msg.contains("vault://primary/"),
+                "error must show the reference shape the migration produces: {msg}"
+            );
+        }
+    }
+
+    /// The refusal must not echo the credential it is refusing. An error
+    /// string lands in logs, in CI output, and in bug reports, so naming
+    /// the key is the whole job and quoting the value would be a leak.
+    #[test]
+    fn the_legacy_vault_token_refusal_does_not_echo_the_token() {
+        let yaml = proxy_doc(
+            "  secrets:\n    hashicorp:\n      addr: https://vault.example/v1\n      \
+             token: hvs.SUPERSECRETVALUE",
+        );
+        let msg = refusal_message(&yaml, "proxy.secrets.hashicorp.token");
+        assert!(
+            !msg.contains("hvs.SUPERSECRETVALUE"),
+            "the refusal must name the key and never its value: {msg}"
+        );
+    }
+
+    /// `map` is live: a non-empty map installs the process secret
+    /// resolver, and its keys suppress the `missing-vault-key` finding
+    /// that exits `sbproxy plan` with 3. Refusing it alongside its legacy
+    /// neighbors would break both. `rotation` is reserved surface.
+    #[test]
+    fn the_live_and_reserved_secrets_keys_are_not_swept_up() {
+        let yaml = proxy_doc(
+            "  secrets:\n    map:\n      jwt_signing_key: KV_JWT_KEY\n    \
+             rotation:\n      grace_period_secs: 300\n      re_resolve_interval_secs: 60",
+        );
+        compile_config(&yaml).expect("proxy.secrets.map and .rotation stay supported");
+    }
+
+    /// A config on the current shape must not be caught by the scan that
+    /// finds the legacy one, or the migration the error asks for lands the
+    /// operator on a second error.
+    #[test]
+    fn the_named_backend_shape_the_refusal_asks_for_compiles() {
+        let yaml = proxy_doc(
+            "  secrets:\n    backends:\n      - type: local\n        name: primary\n        \
+             entries:\n          api_key: value",
+        );
+        compile_config(&yaml).expect("the migration target must compile");
+    }
+
+    /// The route this flag gates is not installed: there is no
+    /// `GET /api/v1/key` handler anywhere in the tree, and the field's
+    /// only readers are `#[cfg(test)]`. Setting it used to compile.
+    #[test]
+    fn key_introspection_is_refused_because_no_such_route_is_installed() {
+        let yaml = proxy_doc(
+            "  key_management:\n    enabled: true\n    governance:\n      \
+             key_introspection: true",
+        );
+        let msg = refusal_message(&yaml, "key_introspection: true");
+        assert!(
+            msg.contains("proxy.key_management.governance.key_introspection"),
+            "error must name the key: {msg}"
+        );
+        assert!(
+            msg.contains("/admin/keys/"),
+            "error must name the surface that does answer: {msg}"
+        );
+    }
+
+    /// The store backend alone decides the system of record, so this
+    /// boolean offered a choice that does not exist. Zero reads.
+    #[test]
+    fn redis_source_of_truth_is_refused_because_the_backend_already_decides() {
+        let yaml = proxy_doc(
+            "  key_management:\n    enabled: true\n    store:\n      backend: redis\n      \
+             url: redis://127.0.0.1:6379\n      redis_source_of_truth: true",
+        );
+        let msg = refusal_message(&yaml, "redis_source_of_truth: true");
+        assert!(
+            msg.contains("proxy.key_management.store.redis_source_of_truth"),
+            "error must name the key: {msg}"
+        );
+        assert!(
+            msg.contains("backend"),
+            "error must name the setting that actually decides: {msg}"
+        );
+    }
+
+    /// Both booleans default to false and false is what this build does,
+    /// so the operator who wrote it has nothing to fix. Refusing on
+    /// presence would stop a boot for a config that is already honest.
+    #[test]
+    fn the_key_management_booleans_set_to_false_still_compile() {
+        let yaml = proxy_doc(
+            "  key_management:\n    enabled: true\n    governance:\n      \
+             key_introspection: false\n    store:\n      redis_source_of_truth: false",
+        );
+        compile_config(&yaml).expect("false describes the build and stays accepted");
+    }
+
+    /// Wrap a single forward rule around the caller's `origin:` body.
+    fn forward_rule_doc(origin_body: &str) -> String {
+        format!(
+            r#"
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: http://127.0.0.1:18888
+    forward_rules:
+      - rules:
+          - path:
+              prefix: /api/
+        origin:
+{origin_body}
+          action:
+            type: proxy
+            url: http://127.0.0.1:18888/echo
+"#
+        )
+    }
+
+    /// The inline forward-origin runtime reads `origin.action` and
+    /// `origin.request_modifiers`; OpenAPI emission reads `origin.id`.
+    /// These three are read by nobody, and all three used to compile.
+    ///
+    /// Every message must name the rule as well as the origin: a config
+    /// with several forward rules leaves the operator guessing otherwise.
+    #[test]
+    fn informational_forward_origin_fields_are_refused_one_by_one() {
+        let cases = [
+            ("          hostname: api-b", "origin.hostname", "action.url"),
+            (
+                "          workspace_id: acme",
+                "origin.workspace_id",
+                "tenant_id",
+            ),
+            ("          version: v2", "origin.version", "origin.id"),
+        ];
+
+        for (line, key, replacement) in cases {
+            let yaml = forward_rule_doc(line);
+            let msg = refusal_message(&yaml, key);
+            assert!(msg.contains(key), "error must name the key: {msg}");
+            assert!(
+                msg.contains("forward_rules[0]"),
+                "error must name the rule that carries it: {msg}"
+            );
+            assert!(
+                msg.contains("api.example.com"),
+                "error must name the origin: {msg}"
+            );
+            assert!(
+                msg.contains(replacement),
+                "error must name a surface that is read: {msg}"
+            );
+        }
+    }
+
+    /// With `origin.id` set, the rule has a name of its own and the error
+    /// should use it rather than making the operator count list entries.
+    #[test]
+    fn a_forward_rule_refusal_names_the_rule_by_its_origin_id() {
+        let yaml = forward_rule_doc("          id: api-backend\n          hostname: api-backend");
+        let msg = refusal_message(&yaml, "origin.hostname");
+        assert!(
+            msg.contains("origin id `api-backend`"),
+            "error must identify the rule by the identifier that is read: {msg}"
+        );
+    }
+
+    /// `id`, `action`, and `request_modifiers` are the three fields the
+    /// forward-origin path actually reads. Refusing their neighbors must
+    /// not touch them.
+    #[test]
+    fn the_forward_origin_fields_that_are_read_still_compile() {
+        let yaml = forward_rule_doc(
+            r#"          id: api-backend
+          request_modifiers:
+            - headers:
+                set:
+                  X-Route: api"#,
+        );
+        compile_config(&yaml).expect("the read forward-origin fields stay supported");
+    }
+
+    /// The most serious of the sweep. Both runtime entry points gate on
+    /// the presence of the `cors:` block and neither reads this boolean,
+    /// so `enable: false` compiled cleanly and served CORS to everyone the
+    /// operator had just tried to shut out.
+    #[test]
+    fn cors_enable_false_is_refused_because_it_did_not_disable_cors() {
+        let yaml = origin_doc(
+            "    cors:\n      enable: false\n      \
+             allowed_origins: [\"https://app.example.com\"]",
+        );
+        let msg = refusal_message(&yaml, "cors.enable: false");
+        assert!(
+            msg.contains("cors.enable"),
+            "error must name the key: {msg}"
+        );
+        assert!(
+            msg.contains("api.example.com"),
+            "error must name the origin: {msg}"
+        );
+        assert!(
+            msg.contains("delete the whole `cors:` block"),
+            "error must say that removing the block is the only way to disable CORS: {msg}"
+        );
+    }
+
+    /// The alias spelling deserializes into the same field, so the
+    /// operator who wrote `enabled: false` was misled in exactly the same
+    /// way and gets exactly the same refusal.
+    #[test]
+    fn the_cors_enabled_alias_spelling_is_refused_the_same_way() {
+        let yaml = origin_doc(
+            "    cors:\n      enabled: false\n      \
+             allowed_origins: [\"https://app.example.com\"]",
+        );
+        let msg = refusal_message(&yaml, "cors.enabled: false");
+        assert!(
+            msg.contains("cors.enable"),
+            "the alias must reach the same refusal: {msg}"
+        );
+    }
+
+    /// The asymmetry is deliberate. `true` describes what the block
+    /// already does, so the operator who wrote it was not misled and has
+    /// nothing to fix, and the archived schema-v1 fixtures that carry it
+    /// must keep compiling unmodified.
+    #[test]
+    fn cors_enable_true_still_compiles_because_it_describes_the_build() {
+        let yaml = origin_doc(
+            "    cors:\n      enable: true\n      \
+             allowed_origins: [\"https://app.example.com\"]",
+        );
+        let compiled = compile_config(&yaml).expect("`enable: true` agrees with the runtime");
+        let origin = compiled
+            .resolve_origin("api.example.com")
+            .expect("origin compiles");
+        assert_eq!(
+            origin
+                .cors
+                .as_ref()
+                .expect("cors block survives compilation")
+                .allowed_origins,
+            vec!["https://app.example.com"]
+        );
+    }
+
+    /// A `cors:` block with no `enable` at all is the shape the refusal
+    /// asks for, so it has to compile.
+    #[test]
+    fn a_cors_block_without_the_legacy_flag_compiles() {
+        let yaml = origin_doc("    cors:\n      allowed_origins: [\"https://app.example.com\"]");
+        compile_config(&yaml).expect("the shape the refusal asks for must compile");
     }
 
     // --- WOR-2311: origin-level rate_limit_headers is removed ---

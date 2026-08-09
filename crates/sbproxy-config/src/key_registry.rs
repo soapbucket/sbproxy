@@ -58,9 +58,10 @@ const AI_RESILIENCE_CONSUMER: &str = "sbproxy_ai::handler::AiHandlerConfig::rout
 const JS_SANDBOX_CONSUMER: &str = "sbproxy_core::server::lifecycle::install_js_sandbox_limits";
 
 const LB_ZONE_NOTE: &str =
-    "Target selection is not locality aware. The `locality_filter` that would read this label \
-     has no production caller and no key turns it on, so the value only ever appears in the \
-     admin targets view. Tracked by WOR-2246.";
+    "Target selection is not locality aware. This label has exactly one reader in the \
+     workspace, the admin target-health view behind `GET /api/health/targets`, so zoning your \
+     targets renders a column and does not make the proxy prefer a same-zone target. Tracked \
+     by WOR-2328.";
 
 /// Keys whose reader is indirect, plus deliberately inert compatibility keys.
 ///
@@ -81,13 +82,15 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
     ),
     config_only(
         "agent_classes.hosted_feed.bootstrap_keys[]",
-        "The OSS resolver does not fetch hosted agent-class feeds; builtin and inline catalogs \
-         remain live. Retained for compatibility and tracked by WOR-1976.",
+        "No fetcher exists for a hosted agent-class feed, and no signature check is installed \
+         for one either, so these trust anchors verify nothing. Use `catalog: builtin` or \
+         `catalog: inline`, the two the resolver serves. WOR-2329.",
     ),
     config_only(
         "agent_classes.hosted_feed.url",
-        "The OSS resolver does not fetch hosted agent-class feeds; builtin and inline catalogs \
-         remain live. Retained for compatibility and tracked by WOR-1976.",
+        "The agent-class resolver serves `catalog: builtin` and `catalog: inline`. Selecting \
+         `hosted-feed` or `merged` logs a warning and falls back to the built-in defaults, and \
+         nothing in the tree ever requests this URL. WOR-2329.",
     ),
     // `audit.sink`, `audit.path`, and `audit.sign_with` deliberately have
     // no entry here. `audit.sink` was pinned `config_only` while the key
@@ -182,8 +185,10 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
     config_only("origins.*.action.targets[].zone", LB_ZONE_NOTE),
     config_only(
         "origins.*.agent_skills[].max_clock_skew_secs",
-        "Agent Skills responses do not yet carry the signed freshness headers this limit would \
-         verify. Reserved under WOR-1976.",
+        "Nothing signs an Agent Skills response, so there is no freshness header for this \
+         tolerance to check; skill artifacts are verified by SHA-256 digest only. The one \
+         signature freshness check in the tree is inbound RFC 9421 verification, which reads \
+         its own `clock_skew_seconds`. WOR-2315.",
     ),
     stable(
         "origins.*.agent_skills[].type",
@@ -236,10 +241,14 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "Pingora's connection pool has no age-based eviction, so no pooled connection was ever \
          retired for being old. The compile error points at `timeouts.idle_ms`. WOR-2310.",
     ),
-    config_only(
+    unsupported(
         "origins.*.cors.enable",
-        "The presence of the cors block enables CORS; the legacy enable/enabled value itself is \
-         ignored, including false. Classified under WOR-1976.",
+        "The presence of the cors block is what turns CORS on, and neither entry point reads \
+         this flag, so `enable: false` left CORS fully active while reading like a kill switch. \
+         WOR-2325 refuses `false` at compile for that reason and leaves `true` accepted, since \
+         `true` agrees with what the block already does. The `enabled` spelling is a serde \
+         alias of the same field, so one check covers both. Delete the cors block to turn CORS \
+         off.",
     ),
     stable(
         "origins.*.credentials[].policies[].type",
@@ -251,8 +260,10 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
     ),
     config_only(
         "origins.*.credentials[].attrs.budget.reset",
-        "Credential lowering carries token and cost caps but does not install or enforce this \
-         reset window. Reserved under WOR-1976.",
+        "Credential lowering copies `max_tokens` and `max_cost_usd` and nothing else, and no \
+         per-credential budget shape downstream carries a window, so the cap is cumulative and \
+         never resets. For a resetting cap today, use the AI action's `budget.limits[]`, which \
+         does take a `period`. WOR-2312.",
     ),
     stable(
         "origins.*.credentials[].attrs.tags[]",
@@ -262,10 +273,12 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "origins.*.credentials[].attrs.team",
         "sbproxy_config::compiler::lower_credentials_into_origin_virtual_keys",
     ),
-    config_only(
+    unsupported(
         "origins.*.forward_rules[].origin.hostname",
-        "The inline forward origin runtime consumes its action and modifiers but does not expose \
-         this informational hostname. Classified under WOR-1976.",
+        "The request has already been matched to the parent origin by the time a forward rule \
+         fires, so this tag selected no upstream and changed no header. Of the inline origin's \
+         metadata only `id` is read, by OpenAPI emission. Refused at compile since WOR-2325; \
+         put the target host in the rule's own `origin.action.url`.",
     ),
     stable(
         "origins.*.forward_rules[].origin.request_modifiers[].js_script",
@@ -275,15 +288,18 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "origins.*.forward_rules[].origin.request_modifiers[].lua_script",
         "sbproxy_core::pipeline::compile_single_forward_rule",
     ),
-    config_only(
+    unsupported(
         "origins.*.forward_rules[].origin.version",
-        "The inline forward origin runtime consumes its action and modifiers but does not expose \
-         this informational version. Classified under WOR-1976.",
+        "The compiled child origin carries no version label, so the value reached neither \
+         routing, logs, metrics, nor the emitted OpenAPI document. Refused at compile since \
+         WOR-2325; match the version in the rule's path, or fold it into `origin.id`, which is \
+         read.",
     ),
-    config_only(
+    unsupported(
         "origins.*.forward_rules[].origin.workspace_id",
-        "The inline forward origin runtime consumes its action and modifiers but does not apply \
-         this informational workspace identifier. Classified under WOR-1976.",
+        "The compiled child origin has no workspace field, so nothing scoped, attributed, or \
+         logged a request by this value. Refused at compile since WOR-2325; multi-tenant \
+         attribution is `origins.*.tenant_id` naming a declared `proxy.tenants[].id`.",
     ),
     stable(
         "origins.*.forward_rules[].parameters[].description",
@@ -533,8 +549,10 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
     ),
     config_only(
         "proxy.credentials[].attrs.budget.reset",
-        "Credential lowering carries token and cost caps but does not install or enforce this \
-         reset window. Reserved under WOR-1976.",
+        "Credential lowering copies `max_tokens` and `max_cost_usd` and nothing else, and no \
+         per-credential budget shape downstream carries a window, so the cap is cumulative and \
+         never resets. For a resetting cap today, use the AI action's `budget.limits[]`, which \
+         does take a `period`. WOR-2312.",
     ),
     stable(
         "proxy.credentials[].attrs.tags[]",
@@ -559,20 +577,27 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
          compile error points at `proxy.ai_providers_file` as the override that does work. \
          WOR-2310.",
     ),
+    // Repointed from WOR-1969, which was canceled on 2026-08-01 along with
+    // its only HTTP/3 child. The three keys below are not unreachable: the
+    // block compiles with `enabled: false`, and the two tuning leaves still
+    // move an `sbproxy plan` from Reload to Restart.
     config_only(
         "proxy.http3.enabled",
-        "This build does not serve HTTP/3; enabled=true fails config compilation. Native HTTP/3 \
-         support is tracked in WOR-1969.",
+        "This build does not serve HTTP/3. `enabled: true` is refused at config compile, so \
+         `false` is the only value that starts the proxy. WOR-2310.",
     ),
     config_only(
         "proxy.http3.idle_timeout_secs",
-        "This build does not serve HTTP/3, so the QUIC idle timeout is not installed. Native \
-         HTTP/3 support is tracked in WOR-1969.",
+        "Settable in a config that compiles, next to `enabled: false`, and it installs no QUIC \
+         idle timeout because no QUIC listener is ever started. Its one live effect is on \
+         `sbproxy plan`: `proxy.http3.**` carries a Restart blast radius, so editing this turns \
+         a reload into a restart. WOR-2310.",
     ),
     config_only(
         "proxy.http3.max_streams",
-        "This build does not serve HTTP/3, so the QUIC stream limit is not installed. Native \
-         HTTP/3 support is tracked in WOR-1969.",
+        "Settable in a config that compiles, next to `enabled: false`, and it caps no QUIC \
+         streams because no QUIC listener is ever started. Like `idle_timeout_secs`, its one \
+         live effect is to turn an `sbproxy plan` reload into a restart. WOR-2310.",
     ),
     stable(
         "proxy.http_client_timeouts.bot_auth_directory_client_secs",
@@ -614,10 +639,13 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "proxy.key_management.failure_posture",
         "sbproxy_core::key_plane::prepare_key_plane",
     ),
-    config_only(
+    unsupported(
         "proxy.key_management.governance.key_introspection",
-        "The caller-only key-introspection route is not installed by the OSS runtime. Retained \
-         for compatibility and classified under WOR-1976.",
+        "No build installs the caller-facing key-introspection route, so `true` added no \
+         endpoint and a caller asking about its own key got the same 404 either way. WOR-2325 \
+         refuses `true` at compile and leaves `false` accepted, since `false` is the default \
+         and is what the build does. Read a key's policy and usage through the admin API \
+         instead.",
     ),
     stable(
         "proxy.key_management.governance.missing_rate",
@@ -627,10 +655,13 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "proxy.key_management.governance.require_governed_key",
         "sbproxy_core::server::ai_dispatch::handle_ai_proxy",
     ),
-    config_only(
+    unsupported(
         "proxy.key_management.store.redis_source_of_truth",
-        "Selecting the Redis store already makes Redis authoritative; this legacy boolean does \
-         not alter runtime behavior. Classified under WOR-1976.",
+        "The key plane picks its system of record from `store.backend` and from nothing else, \
+         so this boolean offered a choice that does not exist: it could neither promote Redis \
+         under another backend nor demote it under its own. WOR-2325 refuses `true` at compile \
+         and leaves `false` accepted, since `false` is the default. Select the store with \
+         `proxy.key_management.store.backend`.",
     ),
     unsupported(
         "proxy.messenger_settings.driver",
@@ -690,19 +721,19 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "proxy.observability.log.sampling.debug",
         "The process logger has no sampling call site, so no rate is applied at any level and \
          this one drops nothing. Throttle request logs with access_log.sample_rate instead. \
-         Tracked by WOR-2325.",
+         Tracked by WOR-2318.",
     ),
     config_only(
         "proxy.observability.log.sampling.info",
         "The process logger has no sampling call site, so no rate is applied at any level and \
          this one drops nothing. Throttle request logs with access_log.sample_rate instead. \
-         Tracked by WOR-2325.",
+         Tracked by WOR-2318.",
     ),
     config_only(
         "proxy.observability.log.sampling.trace",
         "The process logger has no sampling call site, so no rate is applied at any level and \
          this one drops nothing. Throttle request logs with access_log.sample_rate instead. \
-         Tracked by WOR-2325.",
+         Tracked by WOR-2318.",
     ),
     stable(
         "proxy.observability.log.sinks[].output.type",
@@ -727,10 +758,12 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "proxy.scripting.javascript.sandbox.stack_kb",
         JS_SANDBOX_CONSUMER,
     ),
-    config_only(
+    unsupported(
         "proxy.secrets.backend",
-        "The legacy single-backend selector is not consulted; declare named entries under \
-         proxy.secrets.backends. Classified under WOR-1976.",
+        "The legacy single-backend selector was never consulted. The resolver is built only \
+         from the named entries under `proxy.secrets.backends`, so a provider named here \
+         selected nothing and every `secret://` reference resolved as if it were absent. \
+         Refused at compile since WOR-2325.",
     ),
     stable(
         "proxy.secrets.backends[].auth.access_key_id",
@@ -820,45 +853,64 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "proxy.secrets.backends[].type",
         "sbproxy::install_secret_resolver",
     ),
-    config_only(
+    unsupported(
         "proxy.secrets.fallback",
-        "The named-backend resolver fails unresolved provider URIs loudly and does not consult \
-         this legacy fallback selector. Classified under WOR-1976.",
+        "The named-backend resolver fails an unresolvable `secret://` reference loudly and \
+         never consulted this legacy selector, so no lookup ever fell through to it. Refused at \
+         compile since WOR-2325; declare every backend you want consulted under \
+         `proxy.secrets.backends`.",
     ),
-    config_only(
+    unsupported(
         "proxy.secrets.hashicorp.addr",
-        "The legacy HashiCorp block is not installed; configure a hashicorp entry under \
-         proxy.secrets.backends. Classified under WOR-1976.",
+        "The legacy top-level HashiCorp block is never installed: nothing builds a Vault client \
+         from it, so this address was contacted by nobody. Refused at compile since WOR-2325; \
+         declare a `hashicorp` entry under `proxy.secrets.backends` instead.",
     ),
-    config_only(
+    unsupported(
         "proxy.secrets.hashicorp.mount",
-        "The legacy HashiCorp block is not installed; configure a hashicorp entry under \
-         proxy.secrets.backends. Classified under WOR-1976.",
+        "The legacy top-level HashiCorp block is never installed: nothing builds a Vault client \
+         from it, so this mount path scoped no lookup. Refused at compile since WOR-2325; \
+         declare a `hashicorp` entry under `proxy.secrets.backends` instead.",
     ),
-    config_only(
+    unsupported(
         "proxy.secrets.hashicorp.token",
-        "The legacy HashiCorp block is not installed; configure a hashicorp entry under \
-         proxy.secrets.backends. Classified under WOR-1976.",
+        "The legacy top-level HashiCorp block is never installed: nothing builds a Vault client \
+         from it, so this token authenticated nothing and sat in the config for no purpose. \
+         Refused at compile since WOR-2325; declare a `hashicorp` entry under \
+         `proxy.secrets.backends` instead.",
     ),
-    config_only(
-        "proxy.secrets.map.*",
-        "The secret:<name> form was removed; use secret://<backend>/<name>. Retained for \
-         compatibility and tracked by WOR-1976.",
-    ),
+    // Not a resolution source, and still live. The `secret:<name>` colon
+    // form was removed (WOR-1785) and `install_secret_resolver` warns that
+    // the map's values resolve nothing, which is why this sat here as
+    // config-only. Two readers make that wrong. A non-empty map clears the
+    // `backends.is_empty() && map.is_empty()` early return, so the process
+    // resolver gets installed and four call sites that branch on
+    // `sbproxy_vault::process_resolver()` take their other arm. And
+    // `validate::validate` builds its known-secret set from the map's keys,
+    // so an undeclared `secret:<name>` becomes a `missing-vault-key` error
+    // that exits `sbproxy plan` with 3. Warning that a key which changes a
+    // plan's exit code does nothing is the wrong answer.
+    stable("proxy.secrets.map.*", "sbproxy::install_secret_resolver"),
     config_only(
         "proxy.secrets.rotation.grace_period_secs",
-        "The OSS process resolver does not schedule re-resolution or a dual-value grace window \
-         from this block. Classified under WOR-1976.",
+        "The rotation runtime exists and is unwired. `sbproxy_vault::RotationManager` \
+         implements exactly this grace window and re-resolve interval and is unit tested, but \
+         nothing constructs it from this block and nothing drives the interval, so secrets are \
+         resolved once at boot and never again. WOR-2327.",
     ),
     config_only(
         "proxy.secrets.rotation.re_resolve_interval_secs",
-        "The OSS process resolver does not schedule re-resolution or a dual-value grace window \
-         from this block. Classified under WOR-1976.",
+        "The rotation runtime exists and is unwired. `sbproxy_vault::RotationManager` \
+         implements exactly this grace window and re-resolve interval and is unit tested, but \
+         nothing constructs it from this block and nothing drives the interval, so secrets are \
+         resolved once at boot and never again. WOR-2327.",
     ),
     config_only(
         "proxy.tenants[].credentials[].attrs.budget.reset",
-        "Credential lowering carries token and cost caps but does not install or enforce this \
-         reset window. Reserved under WOR-1976.",
+        "Credential lowering copies `max_tokens` and `max_cost_usd` and nothing else, and no \
+         per-credential budget shape downstream carries a window, so the cap is cumulative and \
+         never resets. For a resetting cap today, use the AI action's `budget.limits[]`, which \
+         does take a `period`. WOR-2312.",
     ),
     stable(
         "proxy.tenants[].credentials[].attrs.tags[]",
@@ -952,9 +1004,10 @@ const MODULE_CONFIG_ROOTS: &[ModuleConfigRoot] = &[
         path: "origins.*.action",
         rust_type: "sbproxy_modules::action::loadbalancer::LoadBalancerConfig",
         enforcement: ModuleRootEnforcement::ReportOnly(
-            "target zones are dead here and are pinned above, and the load balancer refuses \
-             the removed sticky block at config compile; the rest of the load_balancer \
-             surface has not been triaged. WOR-2246.",
+            "target zones are display-only here and are pinned above, where WOR-2328 owns the \
+             build-or-retire decision, and the load balancer refuses the removed sticky block \
+             at config compile; the rest of the load_balancer surface has not been triaged, \
+             which is what WOR-2330 tracks.",
         ),
     },
     // Rooted at the subtree rather than at `AiHandlerConfig`, deliberately.
@@ -967,7 +1020,8 @@ const MODULE_CONFIG_ROOTS: &[ModuleConfigRoot] = &[
         rust_type: "sbproxy_ai::handler::AiResilienceConfig",
         enforcement: ModuleRootEnforcement::ReportOnly(
             "the circuit-breaker and outlier-detection blocks are wired and are pinned stable \
-             above; retry_policy and llm_aware have not been triaged. WOR-2233.",
+             above, which is what WOR-2233 shipped; retry_policy and llm_aware have not been \
+             triaged, which is what WOR-2330 tracks.",
         ),
     },
 ];
@@ -1107,12 +1161,16 @@ const MODULE_COVERAGE: &[ModuleCoverage] = &[
     deferred("transform", "wasm"),
 ];
 
+// `origins.*.cors.enabled` was listed here so the boot warning fired for
+// both spellings. It is gone because `cors.enable` is `Unsupported` now:
+// `enabled` is a serde alias of `enable`, so both spellings deserialize onto
+// the same field and hit the same compile refusal, and an alias whose
+// canonical entry can never be `ConfigOnly` again could never fire.
 const CONFIG_KEY_ALIASES: &[(&str, &str)] = &[
     (
         "agent_classes.hosted_feed.bootstrap_keys",
         "agent_classes.hosted_feed.bootstrap_keys[]",
     ),
-    ("origins.*.cors.enabled", "origins.*.cors.enable"),
     ("proxy.secrets.map", "proxy.secrets.map.*"),
 ];
 
@@ -1290,6 +1348,10 @@ origins:
         );
     }
 
+    /// The `map: {}` half is the negative case and is the point of keeping
+    /// it in the fixture: `proxy.secrets.map` is `stable` now, so authoring
+    /// it must produce no warning even though the empty-collection walk
+    /// still reaches it.
     #[test]
     fn empty_config_only_collections_still_warn_when_explicitly_authored() {
         let yaml: serde_yaml::Value = serde_yaml::from_str(
@@ -1309,17 +1371,58 @@ proxy:
             .map(|key| key.path)
             .collect();
 
-        assert_eq!(
-            paths,
-            [
-                "agent_classes.hosted_feed.bootstrap_keys[]",
-                "proxy.secrets.map.*",
-            ]
-        );
+        assert_eq!(paths, ["agent_classes.hosted_feed.bootstrap_keys[]"]);
     }
 
+    /// `proxy.secrets.map` gates whether the process secret resolver is
+    /// installed and which `secret:<name>` references `sbproxy plan`
+    /// accepts, so it is `stable` and must never warn. It was `config_only`
+    /// until WOR-2325, which told operators a live key was inert.
     #[test]
-    fn cors_enable_alias_emits_the_canonical_config_only_warning() {
+    fn secrets_map_is_stable_and_never_warns() {
+        let entry = CONFIG_KEY_OVERRIDES
+            .iter()
+            .find(|key| key.path == "proxy.secrets.map.*")
+            .expect("proxy.secrets.map.* is registered");
+        assert_eq!(entry.support, SupportLevel::Stable);
+        assert_eq!(entry.consumer, Some("sbproxy::install_secret_resolver"));
+
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+proxy:
+  secrets:
+    map:
+      upstream_key: env:UPSTREAM_KEY
+"#,
+        )
+        .expect("fixture parses");
+
+        let paths: Vec<&str> = configured_config_only_keys(&yaml)
+            .iter()
+            .map(|key| key.path)
+            .collect();
+        assert!(paths.is_empty(), "a stable key must not warn: {paths:?}");
+    }
+
+    /// Both spellings of the legacy CORS switch are refused at compile now,
+    /// so neither may reach the boot warning. `enabled` is a serde alias of
+    /// `enable`, which is why the registry no longer carries an alias row
+    /// for it: one classification covers both.
+    #[test]
+    fn cors_enable_is_unsupported_in_both_spellings() {
+        let entry = CONFIG_KEY_OVERRIDES
+            .iter()
+            .find(|key| key.path == "origins.*.cors.enable")
+            .expect("origins.*.cors.enable is registered");
+        assert_eq!(entry.support, SupportLevel::Unsupported);
+
+        assert!(
+            !CONFIG_KEY_ALIASES
+                .iter()
+                .any(|(alias, _)| *alias == "origins.*.cors.enabled"),
+            "an alias onto a non-ConfigOnly key can never fire and must not linger"
+        );
+
         for spelling in ["enable", "enabled"] {
             let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
                 r#"
@@ -1332,13 +1435,14 @@ origins:
             ))
             .expect("fixture parses");
 
-            let configured = configured_config_only_keys(&yaml);
-            let paths: Vec<&str> = configured.iter().map(|key| key.path).collect();
+            let paths: Vec<&str> = configured_config_only_keys(&yaml)
+                .iter()
+                .map(|key| key.path)
+                .collect();
 
-            assert_eq!(
-                paths,
-                ["origins.*.cors.enable"],
-                "raw YAML spelling {spelling} must produce the same warning"
+            assert!(
+                paths.is_empty(),
+                "spelling {spelling} is refused at compile and must not also warn: {paths:?}"
             );
         }
     }
@@ -1377,9 +1481,9 @@ origins:
         );
 
         // Findings under a `ReportOnly` root are printed, never asserted on.
-        // They are pre-existing debt: WOR-2233 and WOR-2246 decide whether
-        // each one gets wired or removed, and failing here would only mean
-        // this guard gets reverted before either lands.
+        // They are pre-existing debt, and each root's note says who owns it
+        // and what is still untriaged under it. Failing here instead would
+        // only mean this guard gets reverted before the wiring lands.
         if !report.reported.is_empty() {
             println!(
                 "module-surface keys with no production reader ({} of {} walked keys). These do \

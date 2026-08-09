@@ -14,9 +14,6 @@ origins:
               prefix: /api/
         origin:
           id: api-route
-          hostname: api-route
-          workspace_id: test
-          version: "1.0.0"
           action:
             type: proxy
             url: http://127.0.0.1:18888/echo
@@ -30,9 +27,6 @@ origins:
               exact: /status
         origin:
           id: status-static
-          hostname: status-static
-          workspace_id: test
-          version: "1.0.0"
           action:
             type: static
             status_code: 200
@@ -46,9 +40,6 @@ origins:
               prefix: /redirect/
         origin:
           id: redirect-rule
-          hostname: redirect-rule
-          workspace_id: test
-          version: "1.0.0"
           action:
             type: redirect
             url: http://127.0.0.1:18888/echo

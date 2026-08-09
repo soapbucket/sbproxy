@@ -42,7 +42,7 @@ curl -s -H 'Host: ai.local' \
 ## What this exercises
 
 - `forward_rules` evaluated in order, peeling specific paths off the default origin action
-- Inline child origins (`origin: { id, hostname, workspace_id, version, action }`) for static, proxy, and other actions
+- Inline child origins (`origin: { id, action }`) for static, proxy, and other actions
 - Default `action: ai_proxy` at the origin level catches anything that does not match a forward rule
 - Path matchers: `prefix: /healthz`, `exact: /v1/models`, `prefix: /docs/`
 

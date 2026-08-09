@@ -161,8 +161,11 @@ origins:
 
 const MISSING_SECRET_YAML: &str = r#"
 proxy:
+  observability:
+    log:
+      sampling:
+        debug: 0.5
   secrets:
-    backend: env
     map:
       jwt_signing_key: KV_JWT_KEY
 origins:
@@ -255,8 +258,15 @@ fn plan_missing_secret_exits_three_with_finding() {
         Some(3),
         "expected exit 3 for missing-vault-key; stderr:\n{stderr}\nstdout:\n{stdout}"
     );
+    // The exemplar used to be `proxy.secrets.backend` alongside
+    // `proxy.secrets.map.*`. Neither warns any more: `backend` is refused
+    // at compile, and `map` turned out to be read in two places and is
+    // pinned stable. The property under test is unchanged, that a run
+    // exiting 3 still prints its config-only warnings rather than
+    // swallowing them behind the error, so it needs a key that is still
+    // config-only.
     assert!(
-        stderr.contains("proxy.secrets.backend") && stderr.contains("proxy.secrets.map.*"),
+        stderr.contains("proxy.observability.log.sampling.debug"),
         "config-only compatibility warnings must remain visible on stderr:\n{stderr}"
     );
 

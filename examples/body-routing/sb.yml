@@ -54,9 +54,6 @@ origins:
               prefix: gpt-
         origin:
           id: gpt-pool
-          hostname: gpt-pool
-          workspace_id: examples
-          version: "1.0.0"
           action:
             type: static
             status: 200
@@ -72,9 +69,6 @@ origins:
               prefix: claude-
         origin:
           id: claude-pool
-          hostname: claude-pool
-          workspace_id: examples
-          version: "1.0.0"
           action:
             type: static
             status: 200

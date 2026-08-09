@@ -13,9 +13,6 @@ origins:
               prefix: /api/
         origin:
           id: api-backend
-          hostname: api-backend
-          workspace_id: test
-          version: "1.0.0"
           action:
             type: proxy
             url: http://127.0.0.1:18888/echo
@@ -29,9 +26,6 @@ origins:
               exact: /health
         origin:
           id: health-static
-          hostname: health-static
-          workspace_id: test
-          version: "1.0.0"
           action:
             type: static
             status_code: 200
@@ -45,9 +39,6 @@ origins:
               prefix: /docs/
         origin:
           id: docs-redirect
-          hostname: docs-redirect
-          workspace_id: test
-          version: "1.0.0"
           action:
             type: redirect
             url: http://127.0.0.1:18888

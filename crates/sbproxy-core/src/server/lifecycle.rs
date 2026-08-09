@@ -165,6 +165,11 @@ fn record_process_secrets_fingerprint(secrets: Option<&sbproxy_config::types::Se
 ///
 /// Mirrors `cluster::reconcile_process_cluster`, which rejects
 /// restart-only cluster changes the same way.
+///
+/// The message names only what a config can still carry. The legacy
+/// `backend`, `fallback`, and `hashicorp` keys are refused by
+/// `compile_config`, so a config holding one never reaches a reload and
+/// they cannot be what changed.
 fn reconcile_process_secrets(
     secrets: Option<&sbproxy_config::types::SecretsConfig>,
 ) -> anyhow::Result<()> {
@@ -174,8 +179,8 @@ fn reconcile_process_secrets(
         return Ok(());
     }
     anyhow::bail!(
-        "proxy.secrets backend, vault connection, named backends, rotation, or fallback changed; \
-         restart sbproxy to apply the new process-owned secret configuration"
+        "proxy.secrets named backends, rotation, or the inline map changed; restart sbproxy to \
+         apply the new process-owned secret configuration"
     )
 }
 

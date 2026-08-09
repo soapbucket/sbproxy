@@ -65,9 +65,6 @@ origins:
               prefix: /healthz
         origin:
           id: ai-health
-          hostname: ai-health
-          workspace_id: examples
-          version: "1.0.0"
           action:
             type: static
             status: 200
@@ -82,9 +79,6 @@ origins:
               exact: /v1/models
         origin:
           id: ai-models-catalog
-          hostname: ai-models-catalog
-          workspace_id: examples
-          version: "1.0.0"
           action:
             type: static
             status: 200
@@ -102,9 +96,6 @@ origins:
               prefix: /docs/
         origin:
           id: ai-docs
-          hostname: ai-docs
-          workspace_id: examples
-          version: "1.0.0"
           action:
             type: proxy
             url: https://example.com

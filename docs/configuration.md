@@ -3767,9 +3767,6 @@ origins:
               prefix: /api/v2/
         origin:
           id: v2-backend
-          hostname: v2-backend
-          workspace_id: example
-          version: "2.0.0"
           action:
             type: proxy
             url: https://v2-backend.internal:8080
@@ -3780,9 +3777,6 @@ origins:
               exact: /health
         origin:
           id: health
-          hostname: health
-          workspace_id: example
-          version: "1.0.0"
           action:
             type: static
             status: 200
@@ -3797,9 +3791,6 @@ origins:
               prefix: mobile
         origin:
           id: mobile-backend
-          hostname: mobile-backend
-          workspace_id: example
-          version: "1.0.0"
           action:
             type: proxy
             url: https://mobile-backend.internal:8080
@@ -3886,9 +3877,6 @@ origins:
               prefix: gpt-4o
         origin:
           id: gpt-4o-pool
-          hostname: gpt-4o-pool
-          workspace_id: example
-          version: "1.0.0"
           action:
             type: proxy
             url: https://gpt4o-pool.internal:8080
@@ -3927,9 +3915,6 @@ forward_rules:
           prefix: /admin/
     origin:
       id: admin
-      hostname: admin
-      workspace_id: example
-      version: "1.0.0"
       action:
         type: proxy
         url: https://admin-backend.internal:8080
@@ -3979,7 +3964,7 @@ origins:
 | `on_error` | bool | false | Trigger the fallback on transport-level upstream failures (DNS, connect, TLS, timeout). |
 | `on_status` | list[int] | `[]` | Trigger the fallback when the upstream responds with one of these status codes. Pair with `on_error` for full coverage. |
 | `add_debug_header` | bool | false | When true, the proxy sets `X-Fallback-Trigger` on the response so callers can tell the fallback path served the request. |
-| `origin` | object | required | Inline origin spec used to serve the request when a trigger fires. Must contain an `action` block; `id`, `hostname`, `workspace_id`, and `version` are accepted as optional metadata. |
+| `origin` | object | required | Inline origin spec used to serve the request when a trigger fires. Must contain an `action` block. `id` is optional and is used to name the rule in emitted OpenAPI operation ids. `hostname`, `workspace_id`, and `version` are refused at config compile: nothing read them. |
 
 ### Inline origin
 
@@ -5794,7 +5779,9 @@ origins:
       allow_credentials: true
 ```
 
-The presence of the `cors:` block is what enables CORS header injection. A legacy `enable` flag (alias `enabled`) still parses for backward compatibility, but the runtime never checks it: `enable: false` does not turn the block off.
+The presence of the `cors:` block is what enables CORS header injection. Remove the block to disable CORS.
+
+A legacy `enable` flag (alias `enabled`) still parses, and the runtime has never checked it. `enable: true` is accepted because it agrees with what the block already does. `enable: false` is refused at config compile, because it did not turn CORS off: a config that set it was serving CORS headers while reading as though it were not.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|

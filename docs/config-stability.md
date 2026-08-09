@@ -46,6 +46,16 @@ A `disabled` field is retained in the schema but cannot activate runtime behavio
 - Attempting to enable unavailable behavior fails config compilation instead of being ignored.
 - Currently applies to the `http3` block. Native HTTP/3 support is not implemented.
 
+`disabled` is a tier in this document, not a level in the build-time key
+registry. That registry has four levels (`stable`, `preview`,
+`config_only`, `unsupported`) and pins the three `proxy.http3` leaves
+`config_only`, which is the accurate level for them: the keys parse and
+nothing reads them. `unsupported` would be wrong, because that level
+means the compiler rejects a document for containing the key at all, and
+`http3:` with `enabled: false` compiles. `disabled` is those
+`config_only` keys plus the one refused value, so `config_only` for
+`proxy.http3.*` in registry-backed output is not a contradiction.
+
 ### `config-only`
 
 A `config-only` field remains parseable for compatibility but has no live
@@ -120,23 +130,56 @@ surface that does the job. Boot and reload both refuse the document.
 #### Schema keys refused at config compile
 
 These parsed, warned once at boot, and then governed nothing. A warning
-is the proportionate response to a key whose behavior is narrower than
-its name suggests, which is why `cors.enable` still gets one. It is the
-wrong response to a key with no implementation at all: four of the five
-below name a resource limit or a retention window, and a config that
-sets one keeps claiming a property the proxy does not have.
+is the proportionate response to a key that does less than its name
+promises while still doing something. `origins.*.action.targets[].zone`
+is one: it renders a column in the admin target-health view and never
+makes the proxy prefer a same-zone target, so refusing it would delete a
+working label over a routing promise nobody made.
+
+Refusal is for two other shapes. The first is a key with nothing behind
+it at all, where a config that sets it keeps claiming a property the
+proxy does not have: a connection cap nothing enforces, a retention
+window nothing retires on, a catalog file nothing opens. The second is a
+key that reads as the opposite of what it does. `cors.enable` was the
+second one. The runtime turns CORS on when the `cors:` block is present
+and never looks at the boolean inside it, so an operator who wrote
+`enable: false` to switch CORS off switched it on. A boot warning next
+to headers the proxy is already sending does not fix that.
+
+Three rows below name a value rather than a key, because only one of the
+accepted values misdescribed the build and the other agreed with it.
+Those three keys stay writable at the value the proxy actually does.
 
 | Key | Why it is refused | What to use instead |
 |---|---|---|
 | `origins.*.connection_pool.max_connections` | Pingora sizes the upstream keepalive pool once per connector, not per origin, so there was no per-origin limit for the value to become and upstream connections were never capped at it. | A `concurrent_limit` policy, which caps in-flight requests per origin and rejects over the cap rather than queueing. |
 | `origins.*.connection_pool.max_lifetime_secs` | Pingora's connection pool has no age-based eviction, so no pooled connection was ever retired for being old. | `timeouts.idle_ms`, the deadline that does retire pooled connections once they go unused. |
+| `origins.*.cors.enable: false` (alias `enabled`) | Both entry points, the preflight responder and the response header pass, gate on the presence of the `cors:` block and neither reads the boolean. An operator who wrote `false` to switch CORS off ran with CORS fully on. `true` stays accepted, because it agrees with what the block already does. | Delete the whole `cors:` block to turn CORS off for that origin. To keep CORS on, delete just the `enable` line and narrow `allowed_origins` instead. |
+| `origins.*.forward_rules[].origin.hostname` | The request has already been matched to the parent origin by the time a rule fires, so this tag selected no upstream and changed no header. The inline origin's `action`, `request_modifiers`, and `id` are the only three fields anything reads. | The rule's own `origin.action.url`, to send the matched request to a different host. To label the rule, use `origin.id`, which does reach metrics and the emitted OpenAPI document. |
+| `origins.*.forward_rules[].origin.version` | The compiled child origin carries no version label, so the value reached neither routing, logs, metrics, nor the emitted OpenAPI document. | Match the version in the path instead (`rules: - path: { prefix: /v2/ }`). To version the rule for your own records, fold it into `origin.id`. |
+| `origins.*.forward_rules[].origin.workspace_id` | The compiled child origin has no workspace field, so nothing scoped, attributed, or logged a request by it. | `origins.*.tenant_id`, naming an id declared under `proxy.tenants[]`. That one is checked at compile and labels the request everywhere downstream. |
 | `origins.*.sessions.ttl_seconds` | There is no sessions index to retain. Sessions appear in the admin recent-request ring, which is bounded by entry count and evicts the oldest entry when full, so a session aged out on request volume and never on this deadline. | `sessions.budget.max_per_window` with `sessions.budget.window_seconds`, both enforced. |
 | `origins.*.traffic_capture` | No capture consumer exists. The block was accepted as an untyped value, so nothing validated its contents either and a misspelled field inside it looked exactly like a working setting. | `mirror`, which forwards a fire-and-forget copy of each request to a second upstream without delaying or failing the real one. |
 | `proxy.device_parser_file` | The device parser matches on compiled-in rules and has no code path that opens a catalog file, so a maintained catalog and a missing one behaved identically. | Nothing for device detection. `proxy.ai_providers_file` is the neighboring override that does work, and it applies to the AI provider catalog. |
+| `proxy.key_management.governance.key_introspection: true` | No build installs a caller-facing introspection route, so the holder of a minted key had nothing to call and got the same 404 with the flag as without it. `false` is the default and is what the build does, so it stays accepted. | `GET /admin/keys/{id}` and `GET /admin/keys/{id}/usage` on the admin API, which read a key's policy and usage under an operator credential rather than the caller's own key. |
+| `proxy.key_management.store.redis_source_of_truth: true` | The key plane picks its system of record from `store.backend` and from nothing else, so the flag offered a choice that does not exist: it could neither promote Redis under another backend nor demote it under its own. `false` stays accepted. | `proxy.key_management.store.backend`. Set `redis` with a `store.url` for a Redis-backed key store, or keep the default `embedded`, which is the local redb file. |
+| `proxy.secrets.backend`, `proxy.secrets.fallback` | The resolver walks the named entries under `proxy.secrets.backends` and nothing else. The single-backend selector selected no backend, and the fallback selector was never reached, because an unresolved provider URI fails loudly instead of falling through to a second backend. | Declare each backend as a named entry under `proxy.secrets.backends` and reference it by name: `secret://<name>/<key>` for a local backend, `vault://<name>/<path>` for HashiCorp. The reference you write is what picks the backend. |
+| `proxy.secrets.hashicorp.addr`, `.mount`, `.token` | The legacy inline HashiCorp block was parsed and never turned into a backend, so an address, a mount, and a token sat in the config while the resolver had no Vault registered to reach. | A `type: hashicorp` entry under `proxy.secrets.backends`. It takes the same `addr` and `mount` and reads its credential from the entry's `auth:` block, and references to it are `vault://<name>/<path>`. |
 
 `origins.*.connection_pool.idle_timeout_secs` is not refused. It is the
 legacy spelling of `timeouts.idle_ms` and feeds the resolved upstream
 idle deadline.
+
+`proxy.secrets.map` is not refused either, and it is no longer
+config-only: the key registry pins it `stable`. Two things read it. A
+non-empty map installs the process secret resolver on its own, with no
+`backends` entry present. Its keys are also what `sbproxy plan` checks a
+legacy `secret:<name>` reference against, so a config that declares the
+block and leaves a referenced name out of it is a `missing-vault-key`
+error and exits 3. What the map no longer does is resolve anything at
+request time, because the `secret:<name>` reference form it served was
+removed, and boot warns about that when the map is set. Write
+`secret://<backend>/<name>` for live references.
 
 #### Top-level values refused at config compile
 
@@ -153,18 +196,17 @@ see that case, because the key is read.
 
 | Field or subtree | What happens today |
 |---|---|
-| `agent_classes.hosted_feed.url`, `.bootstrap_keys` | The resolver uses builtin or inline catalogs; it does not fetch or verify a hosted feed. |
-| `origins.*.action.resilience.circuit_breaker` | The AI router is built without per-provider breakers, so the breaker gate never fires. Setting `resilience` at all still widens cross-provider retries. |
-| `origins.*.action.resilience.outlier_detection` | The AI router is built without an outlier detector, so no provider is ejected on failure rate. Use `resilience.health_check`, which is live. |
-| `origins.*.action.targets[].zone` (load_balancer) | Target selection is not locality aware. The label is echoed in the admin targets view and nowhere else. |
+| `agent_classes.hosted_feed.url`, `.bootstrap_keys` | The resolver uses builtin or inline catalogs; it does not fetch or verify a hosted feed. No fetcher is installed, and no signature check is installed for one either, so the bootstrap keys verify nothing. |
+| `origins.*.action.targets[].zone` (load_balancer) | Target selection is not locality aware. The label has one reader, the admin target-health view behind `GET /api/health/targets`, so zoning your targets renders a column and does not make the proxy prefer a same-zone target. |
 | `origins.*.agent_skills[].max_clock_skew_secs` | Reserved for signed artifact freshness headers that are not emitted yet. |
-| `origins.*.cors.enable` | The presence of `cors:` enables CORS; the legacy boolean value is ignored. |
-| `origins.*.credentials[].attrs.budget.reset` | Reserved reset hint; no credential reset schedule is installed. The same leaf is config-only at proxy and tenant credential scopes. |
-| `origins.*.forward_rules[].origin.hostname`, `.workspace_id`, `.version` | Inline forward-origin metadata is accepted but not copied into the compiled child origin. |
-| `proxy.key_management.governance.key_introspection` | The caller-only introspection route is not installed. |
-| `proxy.key_management.store.redis_source_of_truth` | Redis is authoritative whenever `store.backend: redis`; this legacy boolean changes nothing. |
+| `origins.*.credentials[].attrs.budget.reset` | Credential lowering copies `max_tokens` and `max_cost_usd` and nothing else, so the cap is cumulative and never resets. For a resetting cap today, use the AI action's `budget.limits[]`, which does take a `period`. The same leaf is config-only at proxy and tenant credential scopes. |
 | `proxy.observability.log.sampling.info`, `.debug`, `.trace` | The process logger has no sampling call site, so no rate is applied at any level and every line is emitted. Throttle request logs with `access_log.sample_rate` instead. The sibling `log.level` and `log.format` are live; see [observability.md](observability.md) for where they sit against the CLI flags and `RUST_LOG`. |
-| `proxy.secrets.backend`, `.hashicorp`, `.map`, `.rotation`, `.fallback` | Legacy single-backend surface. Use named `proxy.secrets.backends` and provider URI references. |
+| `proxy.secrets.rotation.grace_period_secs`, `.re_resolve_interval_secs` | The rotation runtime exists and implements exactly this grace window and interval, but nothing constructs it from this block and nothing drives the interval. Secrets are resolved once at boot and never again, so neither deadline is ever reached. Wiring it is tracked as future work. |
+
+`origins.*.action.resilience.circuit_breaker` and
+`.outlier_detection` used to be listed here and are not config-only any
+more. The AI router installs both when the config asks for them, so they
+are live and are pinned `stable` in the key registry.
 
 ---
 
@@ -208,11 +250,17 @@ tier definitions above only where a field is listed explicitly.
 
 HTTP/3 is not served by this build. The block is retained for forward compatibility: omission or `enabled: false` compiles, while `enabled: true` fails config compilation and says so plainly.
 
+The build-time key registry pins all three leaves `config_only` rather than `unsupported`, because the block itself stays legal and only the one value is refused. See the [`disabled`](#disabled) tier for why the two labels disagree on purpose.
+
 | Field | Type | Default | Stability | Notes |
 |---|---|---|---|---|
 | `enabled` | boolean | false | **disabled** | Must remain false until HTTP/3 is served. |
-| `max_streams` | integer | 100 | **disabled** | Reserved max concurrent QUIC streams per connection. |
-| `idle_timeout_secs` | integer | 30 | **disabled** | Reserved QUIC idle timeout in seconds. |
+| `max_streams` | integer | 100 | **disabled** | Reserved max concurrent QUIC streams per connection. No QUIC listener starts, so nothing is capped. |
+| `idle_timeout_secs` | integer | 30 | **disabled** | Reserved QUIC idle timeout in seconds. No QUIC listener starts, so nothing times out. |
+
+The two tuning leaves have one live effect, and it is not on traffic:
+`proxy.http3.**` carries a Restart blast radius, so editing either of
+them turns an `sbproxy plan` reload into a restart.
 
 ### Origin Config (each entry under `origins:`)
 
@@ -224,13 +272,13 @@ HTTP/3 is not served by this build. The block is retained for forward compatibil
 | `transforms` | - | array | `[]` | **beta** | Body transform plugin list. |
 | `request_modifiers` | - | array | `[]` | **stable** | Request modification steps. |
 | `response_modifiers` | - | array | `[]` | **stable** | Response modification steps. |
-| `cors` | - | object | - | **stable** | CORS policy. |
+| `cors` | - | object | - | **stable** | CORS policy. Presence of the block is what enables CORS. The legacy `enable: false` inside it fails config load, because it never turned CORS off. |
 | `hsts` | - | object | - | **stable** | HSTS policy. |
 | `compression` | - | object | - | **stable** | Response compression. |
 | `session` | `session_config` | object | - | **beta** | Session cookie management. |
 | `force_ssl` | - | boolean | false | **stable** | Redirect HTTP to HTTPS. |
 | `allowed_methods` | - | array | `[]` (all) | **stable** | HTTP method allowlist. |
-| `forward_rules` | - | array | `[]` | **beta** | Conditional routing rules. |
+| `forward_rules` | - | array | `[]` | **beta** | Conditional routing rules. The inline origin's `hostname`, `version`, and `workspace_id` metadata fields fail config load. |
 | `fallback_origin` | - | object | - | **beta** | Secondary origin on primary failure. |
 | `response_cache` | - | object | - | **beta** | Response caching config. |
 | `variables` | - | object | `{}` | **beta** | Named template variables. |
@@ -253,7 +301,13 @@ HTTP/3 is not served by this build. The block is retained for forward compatibil
 | `expose_headers` | - | array | `[]` | **stable** |
 | `max_age` | - | integer | - | **stable** |
 | `allow_credentials` | - | boolean | false | **stable** |
-| `enable` | `enabled` | boolean | - | **config-only** |
+| `enable` | `enabled` | boolean | - | **refused** at `false` |
+
+CORS is on for an origin exactly when that origin has a `cors:` block.
+Nothing reads `enable`, so `false` never turned anything off and now
+fails config load; `true` still compiles, because it agrees with what the
+block does. Both spellings deserialize into the same field and are
+checked together. Delete the block to turn CORS off.
 
 ### HSTS Config (`hsts:`)
 

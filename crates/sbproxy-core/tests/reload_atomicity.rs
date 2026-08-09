@@ -140,13 +140,17 @@ origins:
 /// The same static config plus a `proxy.secrets:` block. The secret
 /// resolver is process-owned and set-once, so introducing this block on
 /// a reload has to be refused.
+///
+/// The block carries only a named backend. The legacy `backend:`
+/// selector this fixture used to set is now refused by `compile_config`,
+/// which would have failed the reload one stage earlier and stopped the
+/// test from reaching the fingerprint check it exists to cover.
 fn static_config_with_secrets(host: &str) -> String {
     format!(
         r#"
 proxy:
   http_bind_port: 0
   secrets:
-    backend: local
     backends:
       - type: local
         name: fixture

@@ -4381,9 +4381,6 @@ origins:
               prefix: /api/
         origin:
           id: api-route
-          hostname: api-route
-          workspace_id: test
-          version: "1.0.0"
           action:
             type: proxy
             url: http://127.0.0.1:18888/echo
