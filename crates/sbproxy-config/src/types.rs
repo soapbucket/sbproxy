@@ -5141,7 +5141,11 @@ pub struct AcmeConfig {
     /// rejected.
     #[serde(default = "default_storage_backend")]
     pub storage_backend: String,
-    /// Filesystem path for the certificate store.
+    /// Where the certificate store lives. The meaning depends on
+    /// `storage_backend`: a filesystem directory for `redb`, `sqlite`, and
+    /// `file`, a `host:port` for `redis`, and a bucket URL such as
+    /// `s3://bucket/prefix` for `s3`, `gcs`, and `azure`. Ignored by the
+    /// `memory` backend.
     #[serde(default = "default_storage_path")]
     pub storage_path: String,
     /// Number of days before expiry to attempt renewal.

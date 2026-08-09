@@ -1029,6 +1029,71 @@ pub fn validate_config_yaml(yaml: &str) -> Result<(), String> {
     }
 }
 
+/// Certificate-store backends that live and die with a single pod.
+///
+/// `redb` and `sqlite` are embedded files, `memory` is process state, and
+/// an omitted `storage_backend` parses as `redb`. `file` is deliberately
+/// not on this list: pointing it at an RWX volume is one of the documented
+/// ways to share one store across replicas.
+const POD_LOCAL_ACME_BACKENDS: [&str; 3] = ["memory", "redb", "sqlite"];
+
+/// Refuse a multi-replica `SBProxy` whose config drives ACME from a
+/// pod-local certificate store.
+///
+/// Two separate things break at `replicas: 2` on a local store, and
+/// neither is visible to `sbproxy_config::validate`, because the replica
+/// count is not in the `sb.yml` at all. The operator is the only component
+/// holding both halves, so the pairing is checked here.
+///
+/// The first is issuance. Every replica keeps its own store, so every
+/// replica opens its own order for the same hostname, and Let's Encrypt
+/// caps duplicate certificates for one hostname set at 5 per week. The
+/// second is validation. The CA fetches
+/// `/.well-known/acme-challenge/<token>` through the Service, which
+/// load-balances it across every ready pod. Answering that fetch from any
+/// pod is what the shared store buys: the replica driving the order
+/// publishes the token to it, and the rest read it back. On separate local
+/// stores the fetch usually lands on a pod that never saw the token, and
+/// the authorization fails.
+///
+/// Returns `Ok(())` for a single replica, for a config with no `acme`
+/// block or a disabled one, for any shared backend, and for a document
+/// that does not parse. That last case belongs to
+/// [`validate_config_yaml`], which reports it with the parser's own
+/// message; reporting it again here would overwrite a precise error with
+/// a vaguer one.
+pub fn check_acme_storage_for_replicas(sbproxy: &SBProxy, config_yaml: &str) -> Result<(), String> {
+    let replicas = sbproxy.spec.replicas;
+    if replicas <= 1 {
+        return Ok(());
+    }
+    let Ok(config) = serde_yaml::from_str::<sbproxy_config::ConfigFile>(config_yaml) else {
+        return Ok(());
+    };
+    let Some(acme) = config.proxy.acme.as_ref().filter(|a| a.enabled) else {
+        return Ok(());
+    };
+    // Serde fills in `redb` when the key is absent, so an empty value can
+    // only come from an explicit `storage_backend: ""`. Normalize it to the
+    // default rather than waving an unrecognized backend through the guard.
+    let backend = match acme.storage_backend.trim() {
+        "" => "redb",
+        other => other,
+    };
+    if !POD_LOCAL_ACME_BACKENDS.contains(&backend) {
+        return Ok(());
+    }
+    Err(format!(
+        "spec.replicas is {replicas} and proxy.acme.enabled is true with \
+         storage_backend \"{backend}\", which is local to one pod. Each replica \
+         would open its own order for the same hostname, and an HTTP-01 \
+         challenge load-balanced to a replica that did not open it cannot be \
+         answered. Use a shared store (file on an RWX volume, redis, s3, gcs, \
+         or azure), set spec.replicas to 1, or issue certificates with \
+         cert-manager and leave proxy.acme disabled. See docs/kubernetes.md."
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1596,5 +1661,82 @@ mod tests {
             previous_config_hash_statefulset(&sts).as_deref(),
             Some("abcdef")
         );
+    }
+
+    // --- ACME on a multi-replica fleet ---
+
+    /// An `sb.yml` that enables ACME on the named certificate-store backend.
+    fn acme_config_yaml(backend: &str) -> String {
+        format!(
+            "proxy:\n  acme:\n    enabled: true\n    email: ops@example.com\n    storage_backend: {backend}\norigins: {{}}\n"
+        )
+    }
+
+    #[test]
+    fn multi_replica_local_acme_store_is_refused() {
+        let sbp = fixture_sbproxy();
+        assert_eq!(sbp.spec.replicas, 2, "fixture is a two-replica fleet");
+
+        for backend in ["redb", "sqlite", "memory"] {
+            let err = check_acme_storage_for_replicas(&sbp, &acme_config_yaml(backend))
+                .expect_err("a pod-local cert store must be refused above one replica");
+            assert!(
+                err.contains("spec.replicas is 2"),
+                "unexpected error: {err}"
+            );
+            assert!(err.contains(backend), "unexpected error: {err}");
+            assert!(
+                err.contains("cert-manager"),
+                "the refusal must name the recommended way out: {err}"
+            );
+        }
+
+        // An omitted storage_backend parses as redb, so it is refused too.
+        let omitted =
+            "proxy:\n  acme:\n    enabled: true\n    email: ops@example.com\norigins: {}\n";
+        let err = check_acme_storage_for_replicas(&sbp, omitted)
+            .expect_err("an omitted storage_backend defaults to redb and must be refused");
+        assert!(err.contains("redb"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn multi_replica_shared_acme_store_reconciles() {
+        let sbp = fixture_sbproxy();
+        for backend in ["file", "redis", "s3", "gcs", "azure"] {
+            assert!(
+                check_acme_storage_for_replicas(&sbp, &acme_config_yaml(backend)).is_ok(),
+                "{backend} is reachable from every replica and must reconcile"
+            );
+        }
+    }
+
+    #[test]
+    fn single_replica_local_acme_store_reconciles() {
+        // One replica is the case dataplane ACME is built for: nothing to
+        // coordinate, so a local store is the right answer.
+        let mut sbp = fixture_sbproxy();
+        sbp.spec.replicas = 1;
+        assert!(check_acme_storage_for_replicas(&sbp, &acme_config_yaml("redb")).is_ok());
+
+        // Scaled to zero is not a fleet either.
+        sbp.spec.replicas = 0;
+        assert!(check_acme_storage_for_replicas(&sbp, &acme_config_yaml("redb")).is_ok());
+    }
+
+    #[test]
+    fn multi_replica_without_acme_is_untouched() {
+        // The guard must not refuse what already runs: a config with no
+        // acme block, or one that is present but disabled.
+        let sbp = fixture_sbproxy();
+        let cfg = fixture_sbproxyconfig();
+        assert!(check_acme_storage_for_replicas(&sbp, &cfg.spec.config).is_ok());
+
+        let disabled =
+            "proxy:\n  acme:\n    enabled: false\n    storage_backend: redb\norigins: {}\n";
+        assert!(check_acme_storage_for_replicas(&sbp, disabled).is_ok());
+
+        // A document that does not parse belongs to validate_config_yaml,
+        // which reports it with the parser's own message.
+        assert!(check_acme_storage_for_replicas(&sbp, "origins:\n  x: [unterminated").is_ok());
     }
 }

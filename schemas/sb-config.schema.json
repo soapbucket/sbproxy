@@ -859,7 +859,7 @@
           "type": "string"
         },
         "storage_path": {
-          "description": "Filesystem path for the certificate store.",
+          "description": "Where the certificate store lives. The meaning depends on `storage_backend`: a filesystem directory for `redb`, `sqlite`, and `file`, a `host:port` for `redis`, and a bucket URL such as `s3://bucket/prefix` for `s3`, `gcs`, and `azure`. Ignored by the `memory` backend.",
           "default": "/var/lib/sbproxy/certs",
           "type": "string"
         },

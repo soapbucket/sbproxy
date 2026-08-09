@@ -1,6 +1,6 @@
 # Self-hosting SBproxy
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-09*
 
 One binary to self-host your AI gateway, and the same binary runs the
 models. OpenRouter proved that teams want unified routing, fallbacks,
@@ -272,6 +272,24 @@ it; a public `/v1/chat/completions` with no auth is an open GPU. The
 field reference, other ACME directories, and the shared certificate
 stores a fleet needs are in
 [configuration.md](configuration.md#acme--auto-tls).
+
+One node with ports 80 and 443 open is exactly what this feature is
+built for, and it is the shape this page is about: nothing to
+coordinate, so a local certificate store is the right answer and a
+restart reuses the certificate. Two things it will not do. It drives
+`http-01` only, so no wildcard certificate, because Let's Encrypt
+issues those over DNS-01 alone. And more than one node behind a load
+balancer needs a shared certificate store before it will work at all,
+since the challenge fetch rarely lands on the node that opened the
+order.
+
+If you are running on Kubernetes, use
+[cert-manager](https://cert-manager.io/) and terminate TLS at the
+Ingress instead. It handles the challenge routing that a load-balanced
+dataplane cannot do cleanly, it covers DNS-01 and wildcards, and it is
+already installed on most clusters.
+[kubernetes.md](kubernetes.md#tls-certificates) has the worked example
+and the cases there where this block is still the better choice.
 
 ## OpenRouter parity map
 

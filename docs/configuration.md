@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-08-08*
+*Last modified: 2026-08-09*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -5062,7 +5062,11 @@ sbproxy serve -f sb.yml
 
 ## ACME / auto TLS
 
-SBproxy can automatically provision and renew TLS certificates using the ACME protocol (Let's Encrypt or any ACME-compatible CA).
+SBproxy can automatically provision and renew TLS certificates using the ACME protocol (Let's Encrypt or any ACME-compatible CA). One node or a fleet, the proxy answers the `http-01` challenge on its own listener, obtains the certificate, and renews it before expiry.
+
+Two limits worth knowing before you build on it. `http-01` is the only challenge type the proxy drives, so wildcard names are out: Let's Encrypt issues those only over DNS-01. And a fleet needs a shared certificate store, for issuance and for answering the challenge; [HTTP-01 behind a load balancer](#http-01-behind-a-load-balancer) below is that mechanism in full.
+
+On Kubernetes, prefer [cert-manager](https://cert-manager.io/) and terminate TLS at the Ingress rather than enabling this block. It solves challenge routing where the routing already happens, it does DNS-01 and therefore wildcards, and it is what the cluster is already running. [kubernetes.md](kubernetes.md#tls-certificates) has the worked example and the cases on Kubernetes where this block is still the right call.
 
 ### Production setup (Let's Encrypt)
 
@@ -5120,7 +5124,7 @@ The CA decides how long that token stays answerable. RFC 8555 §7.1.4 gives ever
 
 Two things follow from that. Every replica has to share one `storage_backend`: two proxies behind one load balancer on separate local stores cannot finish an HTTP-01 order no matter how the rest is configured. And `http_bind_port` has to stay reachable on port 80 for the whole fleet, not only for the node you expect to do the issuing.
 
-Kubernetes has its own version of this problem, including where the local store actually lives. See [kubernetes.md](kubernetes.md#acme-and-tls-certificates).
+Kubernetes has its own version of this problem, including where the local store actually lives and an operator that refuses to reconcile a multi-replica `SBProxy` onto a pod-local store. See [kubernetes.md](kubernetes.md#running-dataplane-acme-on-kubernetes-anyway).
 
 ### Local development (Pebble)
 

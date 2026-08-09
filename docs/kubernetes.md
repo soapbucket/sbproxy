@@ -1,6 +1,6 @@
 # Running sbproxy on Kubernetes
 
-*Last modified: 2026-08-08*
+*Last modified: 2026-08-09*
 
 The Kubernetes operator at `crates/sbproxy-k8s-operator/` reconciles two CustomResources into a running proxy: an `SBProxy` describes the deployment shape, and an `SBProxyConfig` carries the `sb.yml` document the proxy reads on startup. The operator owns a Deployment, Service, and ConfigMap per `SBProxy`. With `spec.clustering.enabled: true` the Deployment is replaced by a StatefulSet plus a headless Service and a shared-key Secret, and the replicas form a gossip mesh; see "Clustered proxies" below. Everything else on this page applies to both shapes.
 
@@ -248,20 +248,184 @@ In production, expose the Service via an Ingress, a LoadBalancer Service, or a G
 
 The dataplane shape behind an Ingress: trusted_proxies, service_discovery, host_override, and a threaded X-Request-Id ([config](../examples/k8s-gateway/)).
 
-## ACME and TLS certificates
+## TLS certificates
 
-The operator runs an `SBProxyConfig` with `proxy.acme.enabled: true` without complaint, and it templates nothing into that block. What it does decide is where the proxy's state lives, and the default there is wrong for ACME in both workload shapes.
+On Kubernetes, issue certificates with [cert-manager](https://cert-manager.io/) and terminate TLS at the Ingress. Leave the proxy's own ACME client off.
 
-### The default cert store does not survive a pod restart
+That is a recommendation about the platform, not a verdict on the feature. Dataplane ACME works, and [When dataplane ACME is the right answer](#when-dataplane-acme-is-the-right-answer) below says where it is the better choice. On Kubernetes it is the wrong tool for three reasons.
 
-`acme.storage_path` defaults to `/var/lib/sbproxy/certs` with `storage_backend: redb`. Neither shape gives that path durable storage:
+**Challenge routing.** HTTP-01 means the CA fetches `http://<hostname>/.well-known/acme-challenge/<token>` on port 80, and whatever fronts the Service picks a replica for that request. cert-manager operates at the Ingress, which is where the routing decision already gets made: for each order it creates a temporary solver pod, a Service, and an Ingress rule scoped to the challenge path, then deletes all three when the order completes. The proxy never sees the challenge. Solving it from the dataplane instead means every replica sharing one certificate store so whichever pod receives the fetch can answer it, plus an Ingress that does not redirect port 80 to HTTPS for that one path. Both are doable, and neither is something you should have to set up.
+
+**DNS-01, and therefore wildcards.** Our ACME client drives `http-01` and nothing else. Let's Encrypt does not issue wildcard certificates over HTTP-01; DNS-01 is the only challenge type it accepts for a name like `*.example.com`. So a wildcard is not something the proxy can obtain at any replica count or any storage backend. cert-manager ships DNS-01 solvers for Route53, Cloud DNS, Azure DNS, Cloudflare, and others, plus a webhook interface for providers with no built-in solver.
+
+**It is what the cluster already runs.** cert-manager is the standard certificate layer on Kubernetes. Its `Certificate` objects, renewal timers, and failure events are what the people operating the cluster already know how to read, and if the cluster has TLS anywhere else, its issuers are already wired to your CA. A second issuance path living inside the dataplane is one more thing to learn, monitor, and keep under the same rate limit. Competing with that is not a good use of the dataplane.
+
+### A worked example
+
+Three objects: an issuer, a certificate, and an Ingress that uses the Secret. Install cert-manager first (its own [installation docs](https://cert-manager.io/docs/installation/) cover that).
+
+A `ClusterIssuer` is cluster-scoped, so every namespace can reference it. Use a namespaced `Issuer` with the same `spec` if you would rather confine the ACME account to one namespace.
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: ops@example.com
+    # cert-manager creates this Secret itself and stores the ACME account
+    # key in it. Do not create it by hand.
+    privateKeySecretRef:
+      name: letsencrypt-prod-account-key
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: nginx
+```
+
+Then ask for a certificate. `secretName` is the Secret cert-manager writes the issued certificate into, and it rewrites that Secret in place on every renewal.
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: demo-tls
+  namespace: default
+spec:
+  secretName: demo-tls
+  dnsNames:
+    - demo.example.com
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+    group: cert-manager.io
+```
+
+The Secret is a standard `kubernetes.io/tls` Secret with `tls.crt` and `tls.key` entries, which is exactly what an Ingress `spec.tls` expects. That is how it reaches the proxy: the Ingress terminates TLS with it and forwards cleartext to the Service the operator created.
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: demo
+  namespace: default
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - demo.example.com
+      secretName: demo-tls
+  rules:
+    - host: demo.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: demo-svc
+                port:
+                  number: 8080
+```
+
+`demo-svc` on port 8080 is what the operator reconciles for an `SBProxy` named `demo` with the default `spec.port`. The matching `SBProxyConfig` has no `acme` block, no `https_bind_port`, and no `tls_cert_file`:
+
+```yaml
+apiVersion: sbproxy.dev/v1alpha1
+kind: SBProxyConfig
+metadata:
+  name: demo-config
+  namespace: default
+spec:
+  config: |
+    proxy:
+      http_bind_port: 8080
+    origins:
+      "demo.example.com":
+        action:
+          type: proxy
+          url: https://backend.internal:8080
+```
+
+Watch the order complete with `kubectl describe certificate demo-tls`; the `Ready` condition flips to `True` and the events name each step. While it is pending, `kubectl get challenges` shows the outstanding authorization and why it is stuck.
+
+The `Certificate` object above is optional. Annotate the Ingress with `cert-manager.io/cluster-issuer: letsencrypt-prod` and cert-manager's ingress-shim writes the equivalent Certificate for you from `spec.tls[].hosts` and `spec.tls[].secretName`. Two objects instead of three. Write the Certificate explicitly when you want fields the annotation cannot express, such as `duration`, `renewBefore`, or a specific `privateKey.algorithm`. Those two duration fields take Go duration strings and reject a `d` suffix, so a 90 day certificate renewed 15 days early is `duration: 2160h` and `renewBefore: 360h`.
+
+### Wildcards and DNS-01
+
+Swap the issuer's HTTP-01 solver for a DNS-01 one, then name the wildcard on the Certificate. Both blocks below are fragments of the objects above, not whole manifests.
+
+```yaml
+# Fragment: replaces spec.acme.solvers on the ClusterIssuer.
+    solvers:
+      - selector:
+          dnsZones:
+            - example.com
+        dns01:
+          route53:
+            region: us-east-1
+            hostedZoneID: Z2E3EXAMPLEZONE
+            accessKeyID: AKIAEXAMPLE
+            secretAccessKeySecretRef:
+              name: route53-credentials
+              key: secret-access-key
+```
+
+```yaml
+# Fragment: the spec of a Certificate, same apiVersion and kind as above.
+spec:
+  secretName: wildcard-tls
+  dnsNames:
+    - "*.example.com"
+    - example.com
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+    group: cert-manager.io
+```
+
+The `selector.dnsZones` field routes each zone to the solver that can answer for it, so one issuer can carry an HTTP-01 solver as a catch-all and DNS-01 solvers for the zones you control. Each provider has its own credential fields; on EKS you can drop `accessKeyID` and the Secret reference entirely and let the solver assume a role through IRSA. See cert-manager's [DNS-01 documentation](https://cert-manager.io/docs/configuration/acme/dns01/) for the provider list.
+
+### Terminating TLS at the proxy instead
+
+If you want the proxy itself to hold the certificate rather than the Ingress, the Secret has to be mounted into the proxy pod, and the operator cannot do that today. `SBProxy.spec` carries `image`, `configRef`, `replicas`, `port`, `resources`, `adminPort`, `adminAuthSecretRef`, and `clustering`. There is no volume, volumeMount, or pod-template field, so there is nowhere to attach the `secret` volume this needs.
+
+That shape means deploying the proxy from your own Deployment manifest instead of an `SBProxy`, mounting the cert-manager Secret, and pointing the config at the mounted files:
+
+```yaml
+proxy:
+  http_bind_port: 8080
+  https_bind_port: 8443
+  tls_cert_file: /etc/sbproxy/tls/tls.crt
+  tls_key_file: /etc/sbproxy/tls/tls.key
+```
+
+The proxy opens those files when the HTTPS listener starts and does not watch them afterwards. The kubelet does refresh a `secret` volume's contents after cert-manager rewrites the Secret, but the running process keeps serving the certificate it loaded at boot, so a renewal needs a pod restart to take effect. Most people should let the Ingress terminate and skip this.
+
+### When dataplane ACME is the right answer
+
+The recommendation above is scoped to Kubernetes with an Ingress. Outside that, `proxy.acme` is the better answer and the one to reach for:
+
+- **A single node.** One host, one binary, a real hostname, ports 80 and 443 open. There is no Ingress to route a challenge through and no cluster to install a certificate controller into. The proxy answers HTTP-01 on its own listener and keeps the certificate in a local `redb` file across restarts. This is the case the feature is built for. See [self-hosting.md](self-hosting.md#a-public-endpoint-with-lets-encrypt).
+- **No Kubernetes at all.** A VM, a bare-metal box, a container on a single Docker host, an appliance. cert-manager is a Kubernetes controller and has nothing to run on.
+- **Kubernetes with nothing in front of the proxy.** A `LoadBalancer` Service pointed straight at the pods, no Ingress, no Gateway. There is no ingress for cert-manager's HTTP-01 solver to attach to, so if you also cannot use DNS-01, dataplane ACME on a shared store is the path that works. The next section is the setup.
+
+The field reference, the full backend table, and the fleet behavior are in [configuration.md](configuration.md#acme--auto-tls).
+
+### Running dataplane ACME on Kubernetes anyway
+
+The operator templates nothing into an `acme` block and will roll out an `SBProxyConfig` that enables one. What it does decide is where pod state lives, and that default is wrong for certificates in both workload shapes.
+
+**Nothing at `/var/lib/sbproxy` survives the pod.** `acme.storage_path` defaults to `/var/lib/sbproxy/certs` with `storage_backend: redb`. Neither shape backs that path with durable storage:
 
 - The plain Deployment mounts only the config ConfigMap, at `/etc/sbproxy`. Nothing is mounted at `/var/lib/sbproxy`, so the cert store lands in the container's writable layer and goes away with the pod.
-- The clustered StatefulSet mounts an `emptyDir` at `/var/lib/sbproxy` for mesh state. `emptyDir` lives exactly as long as the pod, and the operator declares no `volumeClaimTemplates`, so the cert store goes away at the same moment.
+- The clustered StatefulSet mounts an `emptyDir` at `/var/lib/sbproxy` for mesh state. An `emptyDir` lives exactly as long as the pod, and the operator declares no `volumeClaimTemplates`, so the cert store goes away at the same moment.
 
-Every rollout, node drain, and crash loop therefore asks the CA for a fresh certificate. Let's Encrypt caps duplicate certificates for the same hostname set at 5 per week, so a handful of restarts is enough to get the domain rate-limited for days, at which point the proxy is serving its self-signed bootstrap cert to real traffic.
+Do not read the StatefulSet's mount as persistence. It is a writable scratch directory, deliberately so, because mesh node identity is pinned by an explicit `node_id` rather than by anything on disk. Certificates have no such fallback. Every rollout, node drain, and crash loop asks the CA for a fresh one, and Let's Encrypt caps duplicate certificates for the same hostname set at 5 per week. A handful of restarts is enough to rate-limit the domain for days, at which point the proxy is serving its self-signed bootstrap certificate to real traffic.
 
-### Point the cert store outside the pod
+The operator exposes no field for attaching a PersistentVolumeClaim, and one would not be the fix anyway. A PVC solves persistence for a single replica and does nothing for the next paragraph's problem, which is that any replica has to be able to answer a challenge any other replica started. A shared store solves both at once. Point `storage_backend` at something outside the pod:
 
 ```yaml
 apiVersion: sbproxy.dev/v1alpha1
@@ -287,13 +451,25 @@ spec:
 
 `s3`, `gcs`, and `azure` work the same way with a bucket URL in `storage_path` and credentials from the pod environment. `file` works too if you can mount one RWX volume across every replica. The full table is in [configuration.md](configuration.md#certificate-store-backends).
 
-A shared backend is also what makes `spec.replicas: 2` safe, and persistence is only half the reason. The CA validates HTTP-01 by fetching `/.well-known/acme-challenge/<token>`, and the Service load-balances that request across every ready pod. One pod wins the per-hostname issuance lock and drives the order; the others answer the CA by reading the token back out of the same store. Give the replicas separate local stores and the validation request lands on a pod that has never heard of the token, which is a 404 to the CA and a failed authorization.
+**The operator refuses a fleet on a pod-local store.** Persistence is only half of what the shared backend buys. The CA's HTTP-01 fetch is load-balanced across every ready pod, and the pod that receives it is rarely the pod that opened the order. A shared store closes that gap: the issuing replica publishes the token to it and any replica can serve the answer. On separate local stores the fetch lands on a pod that has never heard of the token.
 
-### Let the challenge reach the pods
+So when `spec.replicas` is above 1 and the referenced config enables ACME on `redb`, `sqlite`, `memory`, or an omitted `storage_backend` (which parses as `redb`), the operator refuses to reconcile. It records the reason in `status.lastError` and requeues without touching the workload, so `kubectl describe sbproxy demo` shows why nothing moved:
 
-The operator's Service exposes a single port, `spec.port` (default 8080), named `http`. The CA always fetches the challenge over plain HTTP on port 80, so whatever sits in front of the Service (an Ingress, a LoadBalancer, a Gateway) has to route port 80 for that hostname through to the proxy's port, at least for the `/.well-known/acme-challenge/` prefix. An Ingress that redirects all of port 80 to HTTPS will fail every order until you exempt that path.
+```yaml
+status:
+  lastError: >-
+    spec.replicas is 2 and proxy.acme.enabled is true with storage_backend
+    "redb", which is local to one pod. Each replica would open its own order
+    for the same hostname, and an HTTP-01 challenge load-balanced to a replica
+    that did not open it cannot be answered. Use a shared store (file on an
+    RWX volume, redis, s3, gcs, or azure), set spec.replicas to 1, or issue
+    certificates with cert-manager and leave proxy.acme disabled. See
+    docs/kubernetes.md.
+```
 
-Two gaps to know about while you set this up. The operator does not check that your cert store is shared before it scales `spec.replicas` past 1, and it exposes no field for attaching a PersistentVolumeClaim. Set `storage_backend` yourself before you scale.
+The check lives in the operator rather than in config validation because the replica count is on the `SBProxy` and the backend is in the `sb.yml`. Nothing else sees both. Set a shared `storage_backend`, scale to one replica, or move to cert-manager, and the next reconcile clears `lastError` and proceeds.
+
+**Let the challenge reach the pods.** The operator's Service exposes a single port, `spec.port` (default 8080), named `http`. The CA always fetches the challenge over plain HTTP on port 80, so whatever sits in front of the Service has to route port 80 for that hostname through to the proxy's port, at least for the `/.well-known/acme-challenge/` prefix. An Ingress that redirects all of port 80 to HTTPS fails every order until you exempt that path. If you have an Ingress capable of that, you have an Ingress cert-manager can solve against, which is the argument for using it.
 
 ## Leader election
 

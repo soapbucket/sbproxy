@@ -492,6 +492,30 @@ async fn reconcile_one_inner(
         return Ok(Action::requeue(Duration::from_secs(60)));
     }
 
+    // --- Refuse a fleet that drives ACME from a pod-local cert store ---
+    // Config validation cannot catch this pairing: the replica count is on
+    // the SBProxy, not in the sb.yml, so the operator is the only component
+    // that sees both. Record it on the CR and requeue without rolling out,
+    // the same way a malformed config is handled, so `kubectl describe`
+    // shows why nothing moved instead of leaving a fleet to burn through
+    // the CA's duplicate-certificate rate limit.
+    if let Err(msg) = reconcile::check_acme_storage_for_replicas(&sbproxy, &cfg.spec.config) {
+        tracing::warn!(
+            name = %name,
+            namespace = %ns,
+            error = %msg,
+            "multi-replica SBProxy drives ACME from a pod-local cert store; not rolling out"
+        );
+        patch_status(
+            &ctx.client,
+            &ns,
+            &name,
+            serde_json::json!({ "status": { "lastError": msg } }),
+        )
+        .await;
+        return Ok(Action::requeue(Duration::from_secs(60)));
+    }
+
     // --- Render the pod-facing sb.yml body ---
     // Non-clustered: the user document verbatim. Clustered: the user
     // document with the operator-owned `proxy.cluster` block injected.

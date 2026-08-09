@@ -1,6 +1,6 @@
 # SBproxy Runtime Manual
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-09*
 
 Vendor: Soap Bucket LLC - [www.soapbucket.com](https://www.soapbucket.com)
 
@@ -1529,7 +1529,7 @@ Field reference:
 | `directory_url` | Let's Encrypt production | ACME directory URL |
 | `challenge_types` | `["http-01"]` | Allowed challenge types in priority order. `http-01` is the only type the proxy drives today; `tls-alpn-01` parses but is not served |
 | `storage_backend` | `redb` | Backing store for issued certificates |
-| `storage_path` | `/var/lib/sbproxy/certs` | Filesystem path for the certificate store |
+| `storage_path` | `/var/lib/sbproxy/certs` | Where the store lives, interpreted per backend: a directory (`redb`, `sqlite`, `file`), a `host:port` (`redis`), or a bucket URL like `s3://bucket/prefix` (`s3`, `gcs`, `azure`) |
 | `renew_before_days` | `30` | Days before expiry to attempt renewal |
 
 The `http-01` challenge is answered on the plain HTTP listener, so
@@ -1538,6 +1538,13 @@ staging, point `directory_url` at
 `https://acme-staging-v02.api.letsencrypt.org/directory`. The Docker
 Compose stack ships a Pebble test CA for local development
 (`https://pebble:14000/dir`).
+
+`http-01` is the only challenge type the proxy drives, so this block
+cannot obtain a wildcard certificate; Let's Encrypt issues those over
+DNS-01 alone. On Kubernetes, issue certificates with
+[cert-manager](https://cert-manager.io/) and terminate TLS at the
+Ingress instead of enabling this block. See
+[kubernetes.md](kubernetes.md#tls-certificates).
 
 ### Mutual TLS (mTLS) for inbound connections
 
