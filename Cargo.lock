@@ -7052,6 +7052,7 @@ dependencies = [
  "sbproxy-httpkit",
  "sbproxy-meter",
  "sbproxy-model-host",
+ "sbproxy-observe",
  "sbproxy-platform",
  "sbproxy-plugin",
  "sbproxy-security",

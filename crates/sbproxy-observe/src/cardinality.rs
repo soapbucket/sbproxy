@@ -97,6 +97,28 @@ pub fn budget_for_label(label_name: &str) -> usize {
         // would silently apply to every one of them.
         "deployment" => 1000,
         "model" => 1000,
+        // Business-attribution labels. Unlike everything above them,
+        // these five arrive on a request header (`SB-Attr-Project`,
+        // `SB-Attr-Feature`, `SB-Attr-Team`, `SB-Attr-Agent`,
+        // `SB-Attr-Env`), so the distinct-value count is set by whoever
+        // is calling rather than by the operator's config. Nothing
+        // upstream of the label bounds it: the parser caps one value's
+        // LENGTH and rejects unknown keys, neither of which stops a
+        // caller varying one header per request. These entries are the
+        // bound.
+        //
+        // They split two ways. `project`, `feature`, and `team` name
+        // things the operator's org actually has, so the honest bound is
+        // "generous, but finite", and they get the workspace default
+        // spelled out rather than inherited so a later change to that
+        // default cannot move them by accident. `agent_type` and
+        // `environment` have small documented vocabularies (two buckets
+        // and three), so they are capped like the other closed enums
+        // here: near the real vocabulary, with headroom for drift, which
+        // is what makes the demotion arrive early enough to be a signal.
+        "project" | "feature" | "team" => 1000,
+        "environment" => 32,
+        "agent_type" => 8,
         "artifact_error_kind" => 20,
         "exclusion_reason" => 20,
         "stage" => 8,
@@ -459,6 +481,53 @@ mod tests {
         // this lookup keys on label name alone. It must fall through to
         // the workspace default, not the artifact-error-sized cap.
         assert_eq!(budget_for_label("kind"), 1000);
+    }
+
+    #[test]
+    fn header_settable_attribution_labels_have_a_budget_of_their_own() {
+        // These five are the only label values in the workspace a caller
+        // can choose outright, by varying an `SB-Attr-*` request header.
+        // Falling through to the default was survivable only while
+        // nothing on that path consulted the table at all; now that it
+        // does, an explicit entry is what says the number was chosen
+        // rather than inherited.
+        assert_eq!(budget_for_label("project"), 1000);
+        assert_eq!(budget_for_label("feature"), 1000);
+        assert_eq!(budget_for_label("team"), 1000);
+        // The two with documented vocabularies are capped near them.
+        assert_eq!(budget_for_label("environment"), 32);
+        assert_eq!(budget_for_label("agent_type"), 8);
+    }
+
+    #[test]
+    fn a_header_settable_attribution_label_demotes_past_its_budget() {
+        // The property the budget exists for, on the tightest of the
+        // five: fill `agent_type` to its cap and the next distinct value
+        // is the sentinel rather than a new time series.
+        let lim = CardinalityLimiter::new(CardinalityConfig {
+            max_per_label: 1_000_000,
+            hostname_cap: None,
+        });
+        let cap = budget_for_label("agent_type");
+        for index in 0..cap {
+            let value = format!("bucket-{index}");
+            assert_eq!(
+                lim.sanitize_budget("agent_type", &value),
+                value,
+                "value {index} is inside the budget and must pass through"
+            );
+        }
+        assert_eq!(lim.unique_count("agent_type"), cap);
+        assert_eq!(
+            lim.sanitize_budget("agent_type", "one-too-many"),
+            OTHER_LABEL,
+            "a caller past the cap must not be able to mint a new series"
+        );
+        // The rejected value is not admitted, so the next distinct value
+        // does not get a free slot either.
+        assert_eq!(lim.unique_count("agent_type"), cap);
+        // An already-accepted value keeps its own series.
+        assert_eq!(lim.sanitize_budget("agent_type", "bucket-0"), "bucket-0");
     }
 
     #[test]

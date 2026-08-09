@@ -2201,6 +2201,97 @@ fn principal_for_resolved_virtual_key(
     }
 }
 
+/// Fold the identity the request arrived with into the principal a matched
+/// credential stamps over it.
+///
+/// [`principal_for_resolved_virtual_key`] builds the credential's side of the
+/// identity and leaves every field it cannot source from the key at its
+/// default. Assigning that straight onto `ctx.principal` is what this function
+/// exists to stop: a JWT-authenticated request that matched a virtual key lost
+/// its `roles` and its `claims`, along with any attribution the key did not
+/// itself declare, and lost them a few lines after the selector had just
+/// finished reading them.
+///
+/// # The rule, and why it is this one
+///
+/// Every field is **key-wins when the key declares a value, inbound when it
+/// does not**. There is no union anywhere in here, and that is deliberate: a
+/// virtual key is a credential an operator issues to narrow what a caller can
+/// do, so on any field where the two disagree the narrower answer has to be
+/// the credential's. A union on `roles` would let key config widen a caller's
+/// authorization, which is the one direction a credential must never move.
+///
+/// What that resolves to per field today:
+///
+/// * `roles` decides authorization, and it is read after this point. The
+///   MCP tool ACL's `role:` selector is the reader, both for the tool
+///   catalogue a governed key injects and for the agent-alignment guardrail
+///   that re-checks model-emitted tool calls against the same policy. No key
+///   type in this workspace carries roles, so today the branch always takes
+///   the inbound set; the key-wins arm is there so that adding `roles:` to a
+///   key later narrows rather than widens.
+/// * `claims` has one reader past this point, the `principal.claims` map the
+///   Lua and JavaScript contexts publish, which the realtime lane reaches
+///   because it hands the request back to the proxy phases instead of
+///   terminating it here. Carrying it costs nothing: the map is moved out of
+///   the principal being replaced, not copied, so the allocation that was
+///   about to be dropped is reused.
+/// * `project`, `user`, `team`, and `tags` are attribution. Re-attribution is
+///   the point of a virtual key, so a key that names a project wins outright.
+///   A key that names nothing should not blank what the caller arrived with,
+///   which is what it did: spend that used to carry a project stopped carrying
+///   one the moment a key matched. `team` is the sharpest case, because no key
+///   type can set it at all, so the old code discarded it unconditionally.
+/// * `metadata` merges per entry rather than wholesale, since the two sides
+///   are independent free-form maps and there is no reading under which a key
+///   that sets `region` intends to also erase an inbound `cost_center`. The
+///   key's value wins on a shared name.
+///
+/// `key_id` is the deliberate exception and is **not** carried. It names the
+/// credential that authorized this request, and it is the join key the spend
+/// metrics, the access log, and the usage ledger roll up on. An ungoverned key
+/// has no id, and falling back to the inbound one there would bill the request
+/// to a credential that did not authorize it. Empty is the honest answer.
+/// `sub`, `source`, `virtual_key`, and `tenant_id` are replaced wholesale for
+/// the same reason in the other direction: after a key matches, the key is
+/// who the request is.
+///
+/// # Ordering
+///
+/// This runs strictly after `matches_principal` has read the inbound
+/// principal, and the resolution happens once per request, so no selector ever
+/// reads a field this function wrote. Keep it that way: moving credential
+/// resolution after this point would let a key's own attribution decide which
+/// key matches.
+fn carry_inbound_identity_into_stamped_principal(
+    inbound: sbproxy_plugin::Principal,
+    stamped: &mut sbproxy_plugin::Principal,
+) {
+    let sbproxy_plugin::Principal { attrs: inbound, .. } = inbound;
+    let attrs = &mut stamped.attrs;
+    if attrs.project.is_none() {
+        attrs.project = inbound.project;
+    }
+    if attrs.user.is_none() {
+        attrs.user = inbound.user;
+    }
+    if attrs.team.is_none() {
+        attrs.team = inbound.team;
+    }
+    if attrs.tags.is_empty() {
+        attrs.tags = inbound.tags;
+    }
+    for (name, value) in inbound.metadata {
+        attrs.metadata.entry(name).or_insert(value);
+    }
+    if attrs.roles.is_empty() {
+        attrs.roles = inbound.roles;
+    }
+    if attrs.claims.is_none() {
+        attrs.claims = inbound.claims;
+    }
+}
+
 /// Stamp a guardrail block onto the request context, and count it.
 ///
 /// These were two separate concerns until the counter turned out to have no
@@ -2274,7 +2365,22 @@ fn apply_resolved_virtual_key_context(
 
     // Stamp one unified principal before any dispatch path reads provider
     // policy, governed-key identity, attribution, or scheduling priority.
-    ctx.principal = principal_for_resolved_virtual_key(ctx.tenant_id.as_str(), key);
+    //
+    // The credential's side of that identity is stamped first, then the
+    // identity the request arrived with is folded in underneath it by
+    // `carry_inbound_identity_into_stamped_principal`, which documents the
+    // per-field rule. `mem::replace` hands the inbound principal over by
+    // value, so the roles, claims, and metadata that survive the fold are
+    // moved out of the principal being replaced rather than copied.
+    //
+    // Both the selector read above and this write happen exactly once per
+    // request, and the read is first. Nothing here is read back by a
+    // selector.
+    let inbound = std::mem::replace(
+        &mut ctx.principal,
+        principal_for_resolved_virtual_key(ctx.tenant_id.as_str(), key),
+    );
+    carry_inbound_identity_into_stamped_principal(inbound, &mut ctx.principal);
     ctx.attribution_tags =
         crate::server::ai_support::resolve_attribution_tags(session, &ctx.principal);
 
@@ -16538,6 +16644,87 @@ mod dynamic_key_resolution_tests {
         );
     }
 
+    // --- Folding the inbound identity into the credential principal ---
+    //
+    // One test per field the fold carries. Each builds the same shape: a
+    // key that declares nothing on the field under test, an inbound
+    // principal that does, and an assertion on both sides of the fold. The
+    // first assertion in each is what the credential alone produces, which
+    // is what `ctx.principal` used to become; the second is what the
+    // request keeps. Turn the fold into a no-op and the second assertion
+    // is the one that goes red.
+
+    /// A JWT-shaped inbound principal: roles and claims populated the way
+    /// `sbproxy_modules::auth`'s JWT path populates them, plus the
+    /// attribution a directory-issued identity carries.
+    fn inbound_jwt_principal() -> sbproxy_plugin::Principal {
+        let mut claims = serde_json::Map::new();
+        claims.insert(
+            "dept".to_string(),
+            serde_json::Value::String("platform".to_string()),
+        );
+        claims.insert(
+            "clearance".to_string(),
+            serde_json::Value::String("restricted".to_string()),
+        );
+        sbproxy_plugin::Principal {
+            tenant_id: sbproxy_plugin::TenantId::from("tenant-a"),
+            sub: "alice@example.com".to_string(),
+            source: sbproxy_plugin::PrincipalSource::Jwt,
+            virtual_key: None,
+            attrs: sbproxy_plugin::PrincipalAttrs {
+                project: Some("inbound-project".to_string()),
+                user: Some("alice".to_string()),
+                team: Some("platform".to_string()),
+                tags: vec!["inbound-tag".to_string()],
+                metadata: [("cost_center".to_string(), "cc-42".to_string())]
+                    .into_iter()
+                    .collect(),
+                roles: vec!["reader".to_string(), "tool-caller".to_string()],
+                claims: Some(claims),
+                key_id: Some("inbound-jwt-kid".to_string()),
+            },
+        }
+    }
+
+    /// A governed key that declares no attribution of its own. This is the
+    /// shape that made the discard visible: everything it does not name is
+    /// a field the request used to lose.
+    fn bare_governed_key() -> sbproxy_ai::identity::VirtualKeyConfig {
+        let rec = KeyRecord::new("bare-key", "hash", chrono::Utc::now());
+        let resolved = ResolvedRequestKey::from_record(&rec, "tenant-a").expect("valid policy");
+        resolved.virtual_key
+    }
+
+    fn stamp_and_fold(key: &sbproxy_ai::identity::VirtualKeyConfig) -> sbproxy_plugin::Principal {
+        let mut stamped = principal_for_resolved_virtual_key("tenant-a", key);
+        carry_inbound_identity_into_stamped_principal(inbound_jwt_principal(), &mut stamped);
+        stamped
+    }
+
+    #[test]
+    fn folded_principal_keeps_the_inbound_roles_the_tool_acl_reads() {
+        // `roles` is the authorization field. The MCP tool ACL's `role:`
+        // selector reads it after this point, for the catalogue a governed
+        // key injects and again in the agent-alignment guardrail that
+        // re-checks model-emitted tool calls. Under the ACL's default-deny
+        // an empty role set means no `role:`-scoped rule can ever match.
+        let key = bare_governed_key();
+
+        assert!(
+            principal_for_resolved_virtual_key("tenant-a", &key)
+                .attrs
+                .roles
+                .is_empty(),
+            "no key type in this workspace carries roles"
+        );
+        assert_eq!(
+            stamp_and_fold(&key).attrs.roles,
+            ["reader", "tool-caller"],
+            "the roles every downstream ACL matches on must survive the stamp"
+        );
+    }
+
     #[test]
     fn configured_credential_team_reaches_the_virtual_key_principal() {
         let key: sbproxy_ai::identity::VirtualKeyConfig =
@@ -16570,6 +16757,210 @@ mod dynamic_key_resolution_tests {
                 .get("cost_center")
                 .map(String::as_str),
             Some("R-12")
+        );
+    }
+
+    #[test]
+    fn folded_principal_keeps_the_inbound_claims_the_script_context_reads() {
+        // `claims` reaches the `principal.claims` map the Lua and
+        // JavaScript contexts publish. The realtime lane gets there,
+        // because it hands the request back to the proxy phases rather
+        // than terminating it in the AI handler.
+        let key = bare_governed_key();
+
+        assert!(
+            principal_for_resolved_virtual_key("tenant-a", &key)
+                .attrs
+                .claims
+                .is_none(),
+            "no key type in this workspace carries claims"
+        );
+        let claims = stamp_and_fold(&key)
+            .attrs
+            .claims
+            .expect("inbound claims survive");
+        assert_eq!(
+            claims.get("dept").and_then(serde_json::Value::as_str),
+            Some("platform")
+        );
+        assert_eq!(
+            claims.get("clearance").and_then(serde_json::Value::as_str),
+            Some("restricted")
+        );
+    }
+
+    #[test]
+    fn folded_principal_keeps_the_inbound_team_no_key_can_set() {
+        // `team` is the sharpest case of the four attribution fields: no
+        // key type can set it, so the stamp discarded it unconditionally.
+        // Two readers care. The MCP ACL matches a `team:` selector on it,
+        // and `resolve_attribution_tags` seeds the `team` metric label from
+        // it, so losing it also drops the credential-side default that
+        // bounds that label to the org's real teams.
+        let key = bare_governed_key();
+
+        assert_eq!(
+            principal_for_resolved_virtual_key("tenant-a", &key)
+                .attrs
+                .team,
+            None,
+            "the key has no team field to copy from"
+        );
+        assert_eq!(stamp_and_fold(&key).attrs.team.as_deref(), Some("platform"));
+    }
+
+    #[test]
+    fn folded_principal_keeps_an_inbound_project_the_key_does_not_name() {
+        let key = bare_governed_key();
+
+        assert_eq!(
+            principal_for_resolved_virtual_key("tenant-a", &key)
+                .attrs
+                .project,
+            None
+        );
+        assert_eq!(
+            stamp_and_fold(&key).attrs.project.as_deref(),
+            Some("inbound-project")
+        );
+    }
+
+    #[test]
+    fn folded_principal_keeps_an_inbound_user_the_key_does_not_name() {
+        let key = bare_governed_key();
+
+        assert_eq!(
+            principal_for_resolved_virtual_key("tenant-a", &key)
+                .attrs
+                .user,
+            None
+        );
+        assert_eq!(stamp_and_fold(&key).attrs.user.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn folded_principal_keeps_inbound_tags_when_the_key_declares_none() {
+        let key = bare_governed_key();
+
+        assert!(principal_for_resolved_virtual_key("tenant-a", &key)
+            .attrs
+            .tags
+            .is_empty());
+        assert_eq!(stamp_and_fold(&key).attrs.tags, ["inbound-tag"]);
+    }
+
+    #[test]
+    fn folded_principal_merges_metadata_entry_by_entry() {
+        // The two metadata maps are independent free-form namespaces, so
+        // this is the one field that composes rather than choosing a
+        // side. A key that sets `region` does not thereby intend to erase
+        // an inbound `cost_center`, and a key that sets a name the caller
+        // also set still wins on that name.
+        let mut rec = KeyRecord::new("meta-key", "hash", chrono::Utc::now());
+        rec.metadata.insert("region".into(), "us-central1".into());
+        rec.metadata.insert("cost_center".into(), "cc-key".into());
+        let key = ResolvedRequestKey::from_record(&rec, "tenant-a")
+            .expect("valid policy")
+            .virtual_key;
+
+        let stamped_only = principal_for_resolved_virtual_key("tenant-a", &key);
+        assert_eq!(
+            stamped_only.attrs.metadata.get("cost_center"),
+            Some(&"cc-key".to_string())
+        );
+        assert_eq!(stamped_only.attrs.metadata.len(), 2);
+
+        let folded = stamp_and_fold(&key);
+        assert_eq!(
+            folded.attrs.metadata.get("region"),
+            Some(&"us-central1".to_string()),
+            "the key's own entries are kept"
+        );
+        assert_eq!(
+            folded.attrs.metadata.get("cost_center"),
+            Some(&"cc-key".to_string()),
+            "the key wins on a name both sides set"
+        );
+        assert_eq!(
+            folded.attrs.metadata.len(),
+            2,
+            "the inbound cost_center is overridden, not added beside the key's"
+        );
+    }
+
+    #[test]
+    fn folded_principal_lets_the_credential_win_every_attribution_field() {
+        // The other direction. Re-attribution is what a virtual key is
+        // for, so on every field the key declares, the key's value is the
+        // answer and the inbound one is discarded. Nothing unions.
+        let mut rec = KeyRecord::new("attributed-key", "hash", chrono::Utc::now());
+        rec.project = Some("key-project".into());
+        rec.user = Some("service-account".into());
+        rec.tags = vec!["key-tag".into()];
+        let key = ResolvedRequestKey::from_record(&rec, "tenant-a")
+            .expect("valid policy")
+            .virtual_key;
+
+        let folded = stamp_and_fold(&key);
+
+        assert_eq!(folded.attrs.project.as_deref(), Some("key-project"));
+        assert_eq!(folded.attrs.user.as_deref(), Some("service-account"));
+        assert_eq!(
+            folded.attrs.tags,
+            ["key-tag"],
+            "tags choose a side rather than concatenating: two independent \
+             tag vocabularies in one list is not an attribution anyone can read"
+        );
+    }
+
+    #[test]
+    fn folded_principal_never_inherits_the_inbound_credential_id() {
+        // `key_id` is the one field the fold deliberately drops. It names
+        // the credential that authorized this request, and it is the join
+        // key the spend metrics, the access log, and the usage ledger roll
+        // up on. An ungoverned key has no id; inheriting the caller's
+        // would bill the request to a credential that did not authorize
+        // it.
+        let key = bare_governed_key();
+        let folded = stamp_and_fold(&key);
+
+        assert_eq!(folded.api_key_id(), "bare-key");
+        assert_ne!(folded.api_key_id(), "inbound-jwt-kid");
+
+        let mut ungoverned = key.clone();
+        ungoverned.key_id = None;
+        let mut stamped = principal_for_resolved_virtual_key("tenant-a", &ungoverned);
+        carry_inbound_identity_into_stamped_principal(inbound_jwt_principal(), &mut stamped);
+        assert_eq!(
+            stamped.api_key_id(),
+            "",
+            "an ungoverned key reports no credential rather than the caller's"
+        );
+    }
+
+    #[test]
+    fn folded_principal_still_replaces_the_dispatch_identity_wholesale() {
+        // The fold is additive on attribution and authorization only. Who
+        // the request IS after a key matches is the key, and the MCP ACL's
+        // `sub:` and `virtual_key:` selectors depend on that staying true.
+        let mut rec = KeyRecord::new("named-key", "hash", chrono::Utc::now());
+        rec.name = Some("production".into());
+        let key = ResolvedRequestKey::from_record(&rec, "tenant-a")
+            .expect("valid policy")
+            .virtual_key;
+
+        let folded = stamp_and_fold(&key);
+
+        assert_eq!(folded.sub, "production");
+        assert_ne!(folded.sub, "alice@example.com");
+        assert_eq!(
+            folded.source,
+            sbproxy_plugin::PrincipalSource::VirtualKey,
+            "the source names the credential that authorized the dispatch"
+        );
+        assert_eq!(
+            folded.virtual_key.as_ref().map(|key| key.name.as_str()),
+            Some("production")
         );
     }
 

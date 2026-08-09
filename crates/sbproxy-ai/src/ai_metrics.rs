@@ -1135,6 +1135,73 @@ fn label_or_empty(value: Option<&str>) -> &str {
     value.unwrap_or("")
 }
 
+/// The five attribution tags that reach a Prometheus label, bounded.
+///
+/// [`crate::attribution::AttributionTags`] is a closed schema and each
+/// value is length-capped at
+/// [`MAX_TAG_VALUE_LEN`](crate::attribution::MAX_TAG_VALUE_LEN), which
+/// is what the parser enforces and is not a cardinality bound: it caps
+/// how long one value is, not how many distinct ones there can be.
+/// Every one of these five is settable per request by an `SB-Attr-*`
+/// header, so a caller varying a single header mints a time series per
+/// value on each of the five families that carry them. Rejecting
+/// unknown tag KEYS does nothing about that, because the keys were
+/// never the unbounded part.
+///
+/// They therefore go through the same cardinality limiter as the rest
+/// of this proxy's label values, against the per-label budgets in
+/// [`sbproxy_observe::cardinality::budget_for_label`]. Past a label's
+/// budget the value becomes the `__other__` sentinel and
+/// `sbproxy_label_cardinality_overflow_total{metric, label}`
+/// increments, so an operator sees the collapse instead of inferring it
+/// from a panel that stopped splitting.
+///
+/// `trace_id`, `customer`, and `okr` are not here because they are not
+/// labels at all; they ride the span and the access log. `agent_id` is
+/// not here either, and that one is a real exclusion rather than an
+/// absence: it is the only attribution field no header can set, and
+/// what bounds it is the rule that the gateway writes it only from an
+/// identity it verified.
+struct AttributionLabels {
+    project: String,
+    feature: String,
+    team: String,
+    agent_type: String,
+    environment: String,
+}
+
+impl AttributionLabels {
+    /// Sanitize the label-bearing tags for a write to `metric`.
+    ///
+    /// Sanitizing once per record call rather than once per family is
+    /// deliberate. The limiter keys its accepted-value set on the label
+    /// name alone, not on the metric, so the answer is identical for
+    /// every family carrying the same label; asking a second time would
+    /// only double-count the overflow counter for one request. `metric`
+    /// therefore names the family whose write observed the demotion,
+    /// which is the family an operator reading the counter should go
+    /// look at first.
+    ///
+    /// The proxy-wide limiter is used rather than its tenant-scoped
+    /// sibling so that all five families agree. Two of the three
+    /// callers know the tenant and one does not, and a value accepted
+    /// under a tenant set on one family while being demoted under the
+    /// proxy-wide set on another would make the token counter and the
+    /// waste counter disagree about the same request.
+    fn sanitized(metric: &str, tags: &crate::attribution::AttributionTags) -> Self {
+        let bounded = |label: &str, value: Option<&str>| {
+            sbproxy_observe::metrics::sanitize_label_budget(metric, label, label_or_empty(value))
+        };
+        Self {
+            project: bounded("project", tags.project.as_deref()),
+            feature: bounded("feature", tags.feature.as_deref()),
+            team: bounded("team", tags.team.as_deref()),
+            agent_type: bounded("agent_type", tags.agent_type.as_deref()),
+            environment: bounded("environment", tags.environment.as_deref()),
+        }
+    }
+}
+
 /// Stable waste-class identifiers. The string slug lands on the
 /// `kind` label; using a closed enum keeps the label vocabulary
 /// auditable instead of letting a typo create a new time series.
@@ -1187,11 +1254,7 @@ pub fn record_waste(
     tokens: u64,
     cost_usd: f64,
 ) {
-    let project = label_or_empty(tags.project.as_deref());
-    let feature = label_or_empty(tags.feature.as_deref());
-    let team = label_or_empty(tags.team.as_deref());
-    let agent_type = label_or_empty(tags.agent_type.as_deref());
-    let environment = label_or_empty(tags.environment.as_deref());
+    let labels = AttributionLabels::sanitized("sbproxy_ai_wasted_tokens_total", tags);
     if tokens > 0 {
         AI_WASTED_TOKENS
             .with_label_values(&[
@@ -1199,11 +1262,11 @@ pub fn record_waste(
                 provider,
                 model,
                 surface,
-                project,
-                feature,
-                team,
-                agent_type,
-                environment,
+                labels.project.as_str(),
+                labels.feature.as_str(),
+                labels.team.as_str(),
+                labels.agent_type.as_str(),
+                labels.environment.as_str(),
             ])
             .inc_by(tokens as f64);
     }
@@ -1214,11 +1277,11 @@ pub fn record_waste(
                 provider,
                 model,
                 surface,
-                project,
-                feature,
-                team,
-                agent_type,
-                environment,
+                labels.project.as_str(),
+                labels.feature.as_str(),
+                labels.team.as_str(),
+                labels.agent_type.as_str(),
+                labels.environment.as_str(),
             ])
             .inc_by(cost_usd);
     }
@@ -1423,15 +1486,16 @@ pub fn record_ai_request_attributed(
     reasoning_tokens: u64,
     cost: f64,
 ) {
-    let project = label_or_empty(tags.project.as_deref());
-    let feature = label_or_empty(tags.feature.as_deref());
-    let team = label_or_empty(tags.team.as_deref());
-    let agent_type = label_or_empty(tags.agent_type.as_deref());
-    let environment = label_or_empty(tags.environment.as_deref());
+    let labels = AttributionLabels::sanitized("sbproxy_ai_tokens_attributed_total", tags);
     // WOR-2140. Empty when no verified agent identity resolved, which is
     // the same convention every other optional dimension here uses: the
     // spend is still counted, in a bucket that says it is not attributed
     // to an agent rather than one that names the wrong one.
+    //
+    // This one does not go through the limiter beside the five above it,
+    // and the reason is that it is not the same kind of value. No header
+    // sets it, so its distinct values are the operator's agent roster
+    // rather than whatever a caller sends.
     let agent_id = label_or_empty(tags.agent_id.as_deref());
 
     let record_token_kind = |direction: &'static str, n: u64| {
@@ -1445,11 +1509,11 @@ pub fn record_ai_request_attributed(
                 model,
                 surface,
                 direction,
-                project,
-                feature,
-                team,
-                agent_type,
-                environment,
+                labels.project.as_str(),
+                labels.feature.as_str(),
+                labels.team.as_str(),
+                labels.agent_type.as_str(),
+                labels.environment.as_str(),
                 tenant_id,
                 api_key_id,
                 agent_id,
@@ -1469,11 +1533,11 @@ pub fn record_ai_request_attributed(
                 provider,
                 model,
                 surface,
-                project,
-                feature,
-                team,
-                agent_type,
-                environment,
+                labels.project.as_str(),
+                labels.feature.as_str(),
+                labels.team.as_str(),
+                labels.agent_type.as_str(),
+                labels.environment.as_str(),
                 tenant_id,
                 api_key_id,
                 agent_id,
@@ -1530,16 +1594,17 @@ pub fn record_audio_seconds_attributed(
     if seconds <= 0.0 {
         return;
     }
+    let labels = AttributionLabels::sanitized("sbproxy_ai_audio_seconds_attributed_total", tags);
     AI_AUDIO_SECONDS_ATTRIBUTED
         .with_label_values(&[
             provider,
             model,
             surface,
-            label_or_empty(tags.project.as_deref()),
-            label_or_empty(tags.feature.as_deref()),
-            label_or_empty(tags.team.as_deref()),
-            label_or_empty(tags.agent_type.as_deref()),
-            label_or_empty(tags.environment.as_deref()),
+            labels.project.as_str(),
+            labels.feature.as_str(),
+            labels.team.as_str(),
+            labels.agent_type.as_str(),
+            labels.environment.as_str(),
             tenant_id,
             api_key_id,
         ])

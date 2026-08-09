@@ -55,6 +55,16 @@
 //! truncating: a silent truncation produces a corrupted ledger
 //! entry the operator cannot detect.
 //!
+//! Those two bound the shape of the schema and neither bounds its
+//! cardinality. A closed key set says nothing about how many distinct
+//! values one key can take, and a length cap on a value says nothing
+//! about how many different values of that length there are. Five of
+//! these tags reach a Prometheus label, so the third bound is
+//! [`MAX_DISTINCT_VALUES_PER_TAG`]: past it the label value becomes the
+//! `__other__` sentinel and the overflow counter fires. Read that
+//! constant's docs for where the cap is actually applied, because it is
+//! not applied here.
+//!
 //! ## Redaction
 //!
 //! Values flow through the workspace's `Redactor` before they
@@ -78,13 +88,29 @@ pub const ATTR_HEADER_PREFIX: &str = "sb-attr-";
 /// human-readable OKR slug fits inside 256).
 pub const MAX_TAG_VALUE_LEN: usize = 256;
 
-/// Maximum number of distinct values per tag the metrics layer
-/// accepts before the cardinality limiter coalesces further values
-/// into `_other`. The schema already restricts which tag KEYS are
-/// allowed; this cap protects the metrics surface from a per-tag
-/// cardinality explosion when an integration mints a fresh value
-/// every request (an unbounded `trace_id` is the obvious risk).
-pub const MAX_DISTINCT_VALUES_PER_TAG: usize = 1024;
+/// Maximum number of distinct values the metrics layer accepts for one
+/// of the open-vocabulary attribution tags before the cardinality
+/// limiter coalesces further values into the `__other__` sentinel.
+///
+/// The schema restricts which tag KEYS are allowed and
+/// [`MAX_TAG_VALUE_LEN`] restricts how long one value is. Neither of
+/// those bounds how MANY distinct values a caller can produce, and the
+/// caller is who produces them: `project`, `feature`, `team`,
+/// `agent_type`, and `environment` all reach a Prometheus label and all
+/// five are settable per request by an `SB-Attr-*` header. This is that
+/// bound, and until WOR-2326 it was only a number in a doc comment: no
+/// call site read it, and the labels reached Prometheus straight from
+/// the header.
+///
+/// Enforcement lives where the rest of the workspace's label bounds
+/// live, in `sbproxy_observe::cardinality::budget_for_label`, which
+/// keys on label name so one dimension gets one budget no matter which
+/// metric family carries it. This constant is the value that table
+/// gives the three open-vocabulary tags, `project`, `feature`, and
+/// `team`; `agent_type` and `environment` have small documented
+/// vocabularies and are capped much closer to them. A test pins the
+/// three against the table, so this cannot drift back into decoration.
+pub const MAX_DISTINCT_VALUES_PER_TAG: usize = 1000;
 
 /// Errors raised when an inbound request carries an attribution
 /// tag that fails validation. The gateway surfaces these to the
@@ -598,6 +624,30 @@ mod tests {
         assert!(tags.is_empty());
         tags.project = Some("growth".to_string());
         assert!(!tags.is_empty());
+    }
+
+    /// The distinct-value cap this module documents is the one the
+    /// metrics layer actually applies. It spent its whole life as a
+    /// number in a doc comment that no call site read, which is how the
+    /// five label-bearing tags reached Prometheus straight from a
+    /// caller's header; pin it to the table that enforces it so it
+    /// cannot go back to being decoration.
+    #[test]
+    fn documented_distinct_value_cap_matches_the_enforced_budget() {
+        use sbproxy_observe::cardinality::budget_for_label;
+
+        for tag in ["project", "feature", "team"] {
+            assert_eq!(
+                budget_for_label(tag),
+                MAX_DISTINCT_VALUES_PER_TAG,
+                "`{tag}` is open-vocabulary and must carry the documented cap"
+            );
+        }
+        // The two with documented vocabularies are capped near them
+        // rather than at the open-vocabulary ceiling, so a caller
+        // shredding either one runs out of budget early.
+        assert!(budget_for_label("environment") < MAX_DISTINCT_VALUES_PER_TAG);
+        assert!(budget_for_label("agent_type") < MAX_DISTINCT_VALUES_PER_TAG);
     }
 
     /// Non-UTF-8 header value rejected: every downstream surface

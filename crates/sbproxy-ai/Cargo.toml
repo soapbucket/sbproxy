@@ -17,6 +17,18 @@ sbproxy-platform.workspace = true
 # engine. sbproxy-extension does not depend on sbproxy-ai, so this is
 # acyclic.
 sbproxy-extension.workspace = true
+# The metrics cardinality limiter and the per-label budget table. Every
+# attribution tag that reaches a Prometheus label from this crate is
+# caller-settable through an `SB-Attr-*` header, so it needs the same
+# bound the rest of the workspace's label values get.
+#
+# This is acyclic, and it was already in the graph before it was named
+# here: `sbproxy-config` and `sbproxy-extension` above both depend on
+# `sbproxy-observe`, and `sbproxy-observe`'s own dependencies are
+# `sbproxy-capability`, `sbproxy-plugin`, `sbproxy-util`,
+# `sbproxy-security`, and `sbproxy-meter`, none of which depends on any
+# workspace crate at all.
+sbproxy-observe.workspace = true
 sbproxy-model-host.workspace = true
 # WOR-1637: the compat judge implements the extension's async Judge trait.
 async-trait.workspace = true
