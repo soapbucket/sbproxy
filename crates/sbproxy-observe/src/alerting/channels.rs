@@ -17,6 +17,19 @@ use std::time::Duration;
 
 use super::runtime::AlertRuntime;
 
+/// `kind` label for `sbproxy_telemetry_dropped_total` when a plain
+/// `webhook` channel loses an alert.
+///
+/// The `slack` and `pagerduty` channels have counted their failures under
+/// `alert_slack` and `alert_pagerduty` since they were added, because
+/// both go through `deliver_json`, which takes the kind as an argument.
+/// `webhook` has its own delivery function for the envelope and the HMAC
+/// signature, and the counter was never threaded through it, so the one
+/// channel type an operator is most likely to configure was also the only
+/// one whose failures were invisible to Prometheus. Its per-channel
+/// health still showed on `GET /api/alerts`; what was missing was a rate.
+const WEBHOOK_DROP_KIND: &str = "alert_webhook";
+
 // --- Data types ---
 
 /// Configuration for a single alert notification channel.
@@ -196,7 +209,13 @@ impl AlertDispatcher {
                     let result = match validate_delivery_target(&url, allow_private_test_urls).await
                     {
                         Ok(()) => deliver_alert(client, url, headers, secret, alert).await,
-                        Err(error) => Err(error),
+                        Err(error) => {
+                            crate::metrics::record_telemetry_dropped(
+                                WEBHOOK_DROP_KIND,
+                                "ssrf_rejected",
+                            );
+                            Err(error)
+                        }
                     };
                     record_delivery_result(runtime.as_ref(), channel_index, &result);
                 });
@@ -542,11 +561,13 @@ async fn deliver_alert(
             Ok(())
         }
         Ok(resp) => {
+            crate::metrics::record_telemetry_dropped(WEBHOOK_DROP_KIND, "http_error");
             let status = resp.status();
             tracing::warn!(url = %url, status = %status, "alerting: webhook non-success");
             Err(format!("HTTP {}", status.as_u16()))
         }
         Err(e) => {
+            crate::metrics::record_telemetry_dropped(WEBHOOK_DROP_KIND, "delivery_failed");
             tracing::warn!(url = %url, error = %e, "alerting: webhook delivery failed");
             Err(request_error_summary(&e))
         }
@@ -842,6 +863,65 @@ mod tests {
         assert_eq!(
             snapshot.channels[0].health.error.as_deref(),
             Some("HTTP 503")
+        );
+    }
+
+    /// Sum of `sbproxy_telemetry_dropped_total` over one kind/reason pair.
+    fn telemetry_dropped(kind: &str, reason: &str) -> f64 {
+        for family in prometheus::gather() {
+            if family.name() != "sbproxy_telemetry_dropped_total" {
+                continue;
+            }
+            for metric in family.get_metric() {
+                let pairs: Vec<(&str, &str)> = metric
+                    .get_label()
+                    .iter()
+                    .map(|pair| (pair.name(), pair.value()))
+                    .collect();
+                if pairs.contains(&("kind", kind)) && pairs.contains(&("reason", reason)) {
+                    return metric.get_counter().value();
+                }
+            }
+        }
+        0.0
+    }
+
+    /// A `webhook` channel that loses an alert has to leave a rate behind,
+    /// the same way `slack` and `pagerduty` already do.
+    ///
+    /// It was the only delivering channel type whose failures never
+    /// reached Prometheus, because `slack` and `pagerduty` share
+    /// `deliver_json`, which takes the drop kind as an argument, while
+    /// `webhook` has its own delivery function for the envelope and the
+    /// signature. `GET /api/alerts` did show the channel as failing;
+    /// what was missing was anything an alert rule could read.
+    #[tokio::test]
+    async fn a_failed_webhook_delivery_counts_a_dropped_alert() {
+        let (base_url, request_rx) = local_http_server(503).await;
+        let channels = vec![AlertChannelConfig {
+            channel_type: "webhook".to_string(),
+            url: Some(format!("{base_url}/failing")),
+            headers: vec![],
+            secret: None,
+            routing_key: None,
+        }];
+        let runtime = AlertRuntime::new(&EngineConfig::default(), &channels);
+        let dispatcher = AlertDispatcher::with_runtime_for_test(channels, runtime.clone());
+
+        let before = telemetry_dropped(WEBHOOK_DROP_KIND, "http_error");
+        dispatcher.fire_channel(0, make_alert("warning")).unwrap();
+        dispatcher.drain().await;
+        let _ = request_rx.await.unwrap();
+
+        assert!(
+            telemetry_dropped(WEBHOOK_DROP_KIND, "http_error") > before,
+            "a non-2xx from the receiver must count under kind={WEBHOOK_DROP_KIND}"
+        );
+        // The admin-API state surface keeps working alongside it; the two
+        // answer different questions and neither replaces the other.
+        assert_eq!(
+            runtime.snapshot().channels[0].health.status,
+            DeliveryStatus::Failing
         );
     }
 

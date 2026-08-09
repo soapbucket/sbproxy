@@ -6,6 +6,7 @@
 //! needs no `self`; `use super::*` brings every helper into scope.
 
 use super::*;
+use crate::key_plane::key_store_entrypoint;
 
 struct ConcurrentLimitDenialResponse {
     status: u16,
@@ -198,10 +199,20 @@ pub(super) enum InboundKeyPhase {
 /// per-key policy, budget, and attribution this request should have had
 /// were lost, and is logged as such so it can be alerted on. A plain
 /// `open` claims nothing.
+///
+/// `entrypoint` names which of the plane's inbound paths hit the outage,
+/// for `sbproxy_key_store_outage_total`. Both spellings of the decision
+/// (the WARN line and the counter) are emitted from here so they cannot
+/// drift apart, and the counter is what an operator alerts on: a store
+/// outage that only leaves a log line is a store outage nobody notices
+/// until someone goes looking, and this one changes whether requests are
+/// authenticated at all.
 fn inbound_key_store_outage(
     plane: &crate::key_plane::KeyPlane,
     error: &anyhow::Error,
+    entrypoint: &'static str,
 ) -> InboundKeyPhase {
+    crate::key_plane::note_key_store_outage(plane, entrypoint);
     let posture = plane.failure_posture();
     if !posture.admits() {
         return InboundKeyPhase::Deny {
@@ -283,8 +294,10 @@ pub(super) async fn resolve_inbound_key(
     };
 
     let now = chrono::Utc::now();
-    match plane.cache().resolve_key(key_id).await {
-        Err(e) => inbound_key_store_outage(plane, &e),
+    let resolved = plane.cache().resolve_key(key_id).await;
+    crate::key_plane::note_key_store_reachable(plane, &resolved);
+    match resolved {
+        Err(e) => inbound_key_store_outage(plane, &e, key_store_entrypoint::HEADER_SWEEP),
         Ok(None) => InboundKeyPhase::Deny {
             status: 401,
             message: "invalid key".to_string(),
@@ -364,8 +377,10 @@ async fn resolve_impersonation_ticket(
         });
     };
     let now = chrono::Utc::now();
-    Some(match plane.cache().resolve_key(&key_id).await {
-        Err(e) => inbound_key_store_outage(plane, &e),
+    let resolved = plane.cache().resolve_key(&key_id).await;
+    crate::key_plane::note_key_store_reachable(plane, &resolved);
+    Some(match resolved {
+        Err(e) => inbound_key_store_outage(plane, &e, key_store_entrypoint::IMPERSONATION_TICKET),
         Ok(None) => InboundKeyPhase::Deny {
             status: 401,
             message: "invalid key".to_string(),

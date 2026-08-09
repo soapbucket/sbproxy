@@ -6,6 +6,7 @@
 //! `use` aliases, so the moved code needs no rewiring.
 
 use super::*;
+use crate::key_plane::key_store_entrypoint;
 #[cfg(test)]
 use crate::key_policy::StoredPolicyErrorKind;
 use crate::key_policy::{key_record_to_effective_policy, StoredPolicyError};
@@ -1764,10 +1765,17 @@ pub(super) fn key_rate_limiter() -> &'static sbproxy_ai::identity::KeyRateLimite
 /// [`Open`](sbproxy_config::types::FailureMode::Open) take that same
 /// branch and differ only in whether the lost per-key policy, budget, and
 /// attribution are recorded as lost.
+///
+/// `entrypoint` names which of the plane's inbound paths hit the outage,
+/// for `sbproxy_key_store_outage_total`. The counter and the WARN line
+/// below are emitted from the same place so they cannot drift, and the
+/// counter is the half an operator can alert on.
 fn dynamic_key_store_outage(
     plane: &crate::key_plane::KeyPlane,
     error: &anyhow::Error,
+    entrypoint: &'static str,
 ) -> DynamicKeyOutcome {
+    crate::key_plane::note_key_store_outage(plane, entrypoint);
     let posture = plane.failure_posture();
     if !posture.admits() {
         return DynamicKeyOutcome::Deny(503, "key store unavailable".to_string());
@@ -1819,8 +1827,10 @@ async fn resolve_oidc_mapped_key(
     else {
         return DynamicKeyOutcome::NotApplicable;
     };
-    match plane.cache().resolve_key(key_id).await {
-        Err(e) => dynamic_key_store_outage(plane, &e),
+    let resolved = plane.cache().resolve_key(key_id).await;
+    crate::key_plane::note_key_store_reachable(plane, &resolved);
+    match resolved {
+        Err(e) => dynamic_key_store_outage(plane, &e, key_store_entrypoint::OIDC_CLAIM),
         // Same status for a missing record as the bearer path's unknown id.
         Ok(None) => DynamicKeyOutcome::Deny(401, "invalid key".to_string()),
         Ok(Some(rec)) => {
@@ -1856,8 +1866,10 @@ async fn resolve_dynamic_virtual_key(
     };
     let conforming_id = sbproxy_keystore::crypto::is_conforming_key_id(key_id);
     let now = chrono::Utc::now();
-    match plane.cache().resolve_key(key_id).await {
-        Err(e) => dynamic_key_store_outage(plane, &e),
+    let resolved = plane.cache().resolve_key(key_id).await;
+    crate::key_plane::note_key_store_reachable(plane, &resolved);
+    match resolved {
+        Err(e) => dynamic_key_store_outage(plane, &e, key_store_entrypoint::BEARER),
         // Unknown id and a wrong secret return the same status so neither is an
         // existence oracle. But only for an id that could plausibly have been
         // minted here: a caller presenting their own `sk-proj-...` provider key
@@ -2025,6 +2037,13 @@ async fn resolve_request_virtual_key(
             // the fall-through `docs/degradation.md` promises for `degraded`
             // and `open`. The request continues to the origin's own auth.
             if ctx.key_store_admitted_by_posture {
+                // Counted under its own entrypoint rather than folded into
+                // the one that set `key_store_admitted_by_posture`. This is
+                // a second gate reaching a second decision, and it is the
+                // one that leaves a recognized provider credential
+                // ungoverned, which is a different thing to explain in an
+                // incident than "the bearer path fell through".
+                crate::key_plane::note_key_store_outage(plane, key_store_entrypoint::NATIVE_KEY);
                 tracing::warn!(
                     provider = %provider,
                     "native provider key not governed: key store unavailable and \

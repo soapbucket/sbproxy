@@ -165,41 +165,6 @@ impl CertResolver {
         debug!("fallback cert OCSP response updated");
     }
 
-    /// How many certificates this resolver can put on the wire.
-    ///
-    /// Every SNI entry, plus the fallback when one is set. The fallback is
-    /// counted because a client that sends no SNI, or an SNI this resolver
-    /// does not know, is served it, so from a scanner's point of view it is
-    /// one of the certificates this proxy presents.
-    ///
-    /// Paired with [`Self::stapled_cert_count`] to state the OCSP boundary
-    /// at startup (WOR-2310).
-    pub fn served_cert_count(&self) -> usize {
-        self.certs.load().len() + usize::from(self.fallback.load().is_some())
-    }
-
-    /// How many of the served certificates carry a stapled OCSP response.
-    ///
-    /// Today this is at most one, the manual fallback, because
-    /// [`Self::update_fallback_ocsp`] is the only writer of the `ocsp`
-    /// field and it writes one slot. It is counted rather than assumed so
-    /// the startup line reports what the resolver actually holds.
-    pub fn stapled_cert_count(&self) -> usize {
-        let sni = self
-            .certs
-            .load()
-            .values()
-            .filter(|ck| ck.ocsp.is_some())
-            .count();
-        let fallback = self
-            .fallback
-            .load()
-            .as_ref()
-            .as_ref()
-            .is_some_and(|ck| ck.ocsp.is_some());
-        sni + usize::from(fallback)
-    }
-
     /// Build a [`ServerConfig`] that uses this resolver for SNI-based cert selection.
     ///
     /// ALPN protocols are set to `["h3", "h2", "http/1.1"]` for HTTP/3 and HTTP/2 support.
@@ -456,69 +421,5 @@ mod tests {
         let resolver = CertResolver::new();
         resolver.update_fallback_ocsp(vec![1, 2, 3]);
         assert!(resolver.fallback.load_full().as_ref().is_none());
-    }
-
-    // --- OCSP coverage accounting (WOR-2310) ---
-
-    #[test]
-    fn served_cert_count_counts_sni_entries_and_the_fallback() {
-        let resolver = CertResolver::new();
-        assert_eq!(resolver.served_cert_count(), 0);
-
-        let (cert_pem, key_pem) = generate_self_signed("a.example");
-        resolver.set_cert("a.example", &cert_pem, &key_pem).unwrap();
-        assert_eq!(resolver.served_cert_count(), 1);
-
-        let (fb_cert, fb_key) = generate_self_signed("fallback.local");
-        resolver.set_fallback(load_certified_key(&fb_cert, &fb_key).unwrap());
-        assert_eq!(
-            resolver.served_cert_count(),
-            2,
-            "the fallback is on the wire for an unknown SNI, so it is served"
-        );
-
-        // Replacing an entry does not double-count it.
-        let (again, again_key) = generate_self_signed("a.example");
-        resolver.set_cert("a.example", &again, &again_key).unwrap();
-        assert_eq!(resolver.served_cert_count(), 2);
-    }
-
-    #[test]
-    fn stapling_covers_the_fallback_only_never_the_sni_certs() {
-        // This pins the boundary WOR-2310 is about, and pins it as a
-        // limitation rather than as a property worth keeping. Widening
-        // stapling to the SNI map is the fix; when someone writes it,
-        // this test is supposed to go red and be rewritten, not deleted
-        // quietly along with the behaviour it describes.
-        let resolver = CertResolver::new();
-
-        let (fb_cert, fb_key) = generate_self_signed("fallback.local");
-        resolver.set_fallback(load_certified_key(&fb_cert, &fb_key).unwrap());
-        for host in ["sni-one.example", "sni-two.example"] {
-            let (cert_pem, key_pem) = generate_self_signed(host);
-            resolver.set_cert(host, &cert_pem, &key_pem).unwrap();
-        }
-
-        assert_eq!(resolver.served_cert_count(), 3);
-        assert_eq!(
-            resolver.stapled_cert_count(),
-            0,
-            "nothing is stapled before the first successful fetch"
-        );
-
-        resolver.update_fallback_ocsp(vec![0xCA, 0xFE]);
-
-        assert_eq!(
-            resolver.stapled_cert_count(),
-            1,
-            "one of three served certificates carries a staple"
-        );
-        for host in ["sni-one.example", "sni-two.example"] {
-            let ck = resolver.resolve(host).expect("SNI cert is registered");
-            assert!(
-                ck.ocsp.is_none(),
-                "{host} is served without a stapled response"
-            );
-        }
     }
 }

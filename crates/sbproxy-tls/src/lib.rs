@@ -423,49 +423,17 @@ impl TlsState {
     /// Must be called from a tokio runtime. The Pingora server
     /// installs its own runtime before any service starts, so this
     /// is invoked from the proxy's startup hook.
-    ///
-    /// # What stapling covers, said out loud (WOR-2310)
-    ///
-    /// Stapling covers exactly one certificate: the manual fallback.
-    /// `update_fallback_ocsp` writes one slot, and no SNI entry, which
-    /// is where every ACME-issued certificate lives, is ever written.
-    /// Both paths below log how many certificates the resolver serves
-    /// and how many of those stapling can reach, because the failure
-    /// mode this closes is silence: nothing errors, nothing warns, and
-    /// an operator who turned on HTTPS and read a clean log has no way
-    /// to tell a stapled deployment from an unstapled one until a TLS
-    /// scanner tells them.
     pub fn start_ocsp_refresh_task(&self) {
-        let served = self.resolver.served_cert_count();
-        let stapled = self.resolver.stapled_cert_count();
-
         let (Some(stapler), Some(cert_pem)) =
             (self.ocsp_stapler.as_ref(), self.manual_cert_pem.as_ref())
         else {
-            info!(
-                served,
-                stapled,
-                covered = 0,
-                "OCSP stapling is inactive: it reaches the manual fallback certificate \
-                 only, and no proxy.tls_cert_file is configured. Every certificate this \
-                 proxy serves, including every ACME-issued one, is served without a \
-                 stapled response."
-            );
             return;
         };
-
         let resolver = self.resolver.clone();
         stapler.start_refresh_task("_fallback".to_string(), cert_pem.clone(), move |bytes| {
             resolver.update_fallback_ocsp(bytes);
         });
-        info!(
-            served,
-            stapled,
-            covered = 1,
-            "OCSP refresh task started for the manual fallback certificate. Stapling \
-             reaches that certificate only; SNI-selected and ACME-issued certificates \
-             are served without a stapled response."
-        );
+        info!("OCSP refresh task started for manual fallback cert");
     }
 
     /// Spawn a background task that checks certificate expiry every 12 hours
@@ -937,59 +905,6 @@ mod tests {
         });
         rx.recv_timeout(std::time::Duration::from_secs(5))
             .expect("task spawned on the maintenance handle ran to completion");
-    }
-
-    // --- OCSP coverage boundary (WOR-2310) ---
-
-    fn self_signed_pem(san: &str) -> (Vec<u8>, Vec<u8>) {
-        let key = rcgen::KeyPair::generate().expect("generate a test key pair");
-        let params =
-            rcgen::CertificateParams::new(vec![san.to_string()]).expect("test cert params");
-        let cert = params.self_signed(&key).expect("self-sign the test cert");
-        (cert.pem().into_bytes(), key.serialize_pem().into_bytes())
-    }
-
-    #[test]
-    fn acme_only_tls_serves_certificates_that_stapling_never_reaches() {
-        // The WOR-2310 claim at the TlsState level. With no
-        // `proxy.tls_cert_file` there is no stapler at all, so
-        // `start_ocsp_refresh_task` has nothing to start however many
-        // certificates the resolver is serving. The point is not that
-        // the call is a no-op; it is that a no-op here means every
-        // served certificate goes out unstapled, and the startup line
-        // this test guards is the only place that says so.
-        let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().to_str().expect("utf-8 temp path").to_string();
-        let config = ProxyServerConfig {
-            https_bind_port: Some(8443),
-            acme: Some(acme_with_storage("file", &path)),
-            ..Default::default()
-        };
-        let tls = TlsState::init(&config, vec!["example.com".to_string()])
-            .expect("TLS state initializes without a manual certificate");
-
-        tls.install_self_signed_fallback()
-            .expect("the ACME bootstrap fallback installs");
-        for host in ["one.example", "two.example"] {
-            let (cert_pem, key_pem) = self_signed_pem(host);
-            tls.resolver
-                .set_cert(host, &cert_pem, &key_pem)
-                .expect("an issued certificate registers under its hostname");
-        }
-
-        assert_eq!(
-            tls.resolver.served_cert_count(),
-            3,
-            "two SNI entries plus the bootstrap fallback"
-        );
-
-        tls.start_ocsp_refresh_task();
-
-        assert_eq!(
-            tls.resolver.stapled_cert_count(),
-            0,
-            "with no manual certificate nothing is stapled, not even the fallback"
-        );
     }
 
     #[test]

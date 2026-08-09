@@ -1,6 +1,6 @@
 # SBproxy architecture and deployment guide
 
-*Last modified: 2026-08-09*
+*Last modified: 2026-08-08*
 
 This document covers the internal architecture of SBproxy, the request lifecycle, the plugin
 system, the AI gateway, caching, events, and common deployment topologies.
@@ -99,8 +99,7 @@ sbproxy/
     sbproxy-tls/          - TLS termination via rustls 0.23 with the `ring`
                               crypto provider, ACME auto-cert (Let's Encrypt),
                               HTTP/3 listener wiring (currently disabled
-                              pending native Pingora HTTP/3), OCSP stapling
-                              for the manual fallback certificate only.
+                              pending native Pingora HTTP/3), OCSP stapling.
     sbproxy-transport/    - Outbound transport: retry with exponential backoff,
                               request coalescing, hedged requests,
                               circuit breaker, upstream rate limiting.

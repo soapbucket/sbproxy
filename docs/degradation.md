@@ -1,6 +1,6 @@
 # Dependency degradation matrix
 
-*Last modified: 2026-08-06*
+*Last modified: 2026-08-09*
 
 What happens when each dependency that SBproxy talks to is unavailable, and how the proxy degrades while it heals.
 
@@ -89,14 +89,14 @@ Change the one line to `failure_posture: closed`, the default, and both requests
 | Redis (`proxy.l2_cache_settings`) | Connection, TLS, authentication, database selection, protocol, or command failure | A response-cache lookup failure bypasses the cache and does not arm write-back for that request. A shared rate-limit operation failure admits the request fail-open instead of switching to a local bucket. AI `summary_buffer` state never falls back to worker memory: that lever fails open, preserves the last committed message list, and lets later levers run. Other L2 consumers keep their feature-specific failure posture. | A later operation opens a fresh connection automatically; summary updates resume on a later request | `sbproxy_redis_kv_connections_total`, `sbproxy_redis_kv_operation_duration_seconds`, `sbproxy_redis_kv_operation_errors_total`, plus the compression state metrics |
 | Dedicated AI compression summarizer | Timeout, provider failure, invalid output, policy denial, or budget denial | `summary_buffer` skips safe admission denials or fails open on runtime errors. The primary AI request continues with the last committed messages, and a later `window_fit` lever still runs. | Next eligible request retries under the configured policy and timeout | `sbproxy_ai_compression_lever_total`, `sbproxy_ai_compression_requests_total`, `sbproxy_ai_compression_duration_seconds` |
 | Token-pruning classifier sidecar | Connection failure, timeout, unknown model, or invalid extractive output | `token_prune` fails open at its lever boundary. The primary request keeps the last committed messages, and later entries such as `window_fit` still run. | The route connects lazily again on the next eligible request | `sbproxy_ai_compression_lever_total{lever="token_prune"}`, `sbproxy_ai_compression_requests_total`, `sbproxy_ai_compression_duration_seconds` |
-| Virtual key store (`key_management.store`) | Connection / read failure | `key_management.failure_posture` decides it, and all five inbound-key paths (header sweep, playground ticket, bearer token, OIDC claim map, and native-provider-key admission) read the same value. The default `closed` denies with `503`. `degraded` and `open` both fall through to the origin's own configured auth, which is not a blanket admit; they differ in whether the lost per-key policy, budget, and attribution are recorded as lost. Native-provider-key admission carries one added carve-out: once the posture has already admitted a request with the store unreachable, a missing or non-admitting `native_key_policy` does not deny it again. Governed native mode is not stamped either, so the request falls through ungoverned instead of hitting a second, differently-worded 403 from the native-key gate a moment later. | Auto on the next successful store read; the cache never caches an error | None dedicated; logged at WARN with `failure_posture` and `guarantee_waived` fields |
+| Virtual key store (`key_management.store`) | Connection / read failure | `key_management.failure_posture` decides it, and all five inbound-key paths (header sweep, playground ticket, bearer token, OIDC claim map, and native-provider-key admission) read the same value. The default `closed` denies with `503`. `degraded` and `open` both fall through to the origin's own configured auth, which is not a blanket admit; they differ in whether the lost per-key policy, budget, and attribution are recorded as lost. Native-provider-key admission carries one added carve-out: once the posture has already admitted a request with the store unreachable, a missing or non-admitting `native_key_policy` does not deny it again. Governed native mode is not stamped either, so the request falls through ungoverned instead of hitting a second, differently-worded 403 from the native-key gate a moment later. | Auto on the next successful store read; the cache never caches an error | `sbproxy_key_store_outage_total{entrypoint,posture,outcome}` counts every one, and `sbproxy_key_store_unavailable{posture}` reads 1 for as long as the store stays unreachable. Also logged at WARN with `failure_posture` and `guarantee_waived` fields |
 | Governed-key budget backend (`key_management.governance.backend`, strict tier only) | Connection / command failure | Only affects keys governed under `consistency: strict`. The default `approximate` tier does not depend on this backend at all; its per-node counters keep disseminating over the cluster mesh. For a strict key, a reserve call that cannot reach the backend denies the request (`503`) by default (`failure_posture: closed`); `degraded` admits it without a reservation and audits the fact; `open` admits it and records nothing. A settle call on an already-admitted request is unaffected by the posture and stays best-effort. | Auto-reconnect; enforcement resumes on the next successful call | `sbproxy_governance_fail_open_total{key_id}` on `degraded`; also logged at WARN (admit/deny) or DEBUG (other reserve/settle errors) |
 | Fair-share quota accounting backend (`quota_pool.consistency: approximate \| strong`) | Connection / command failure | `quota_pool.failure_posture` decides it, on the AI dispatch path and the realtime WebSocket path alike. The default `closed` rejects with `503`. `degraded` admits the attempt with no reservation held and counts it; `open` admits and counts nothing. A real quota denial (`429`) and inconsistent pool state (`503`) never consult the posture. | Auto-reconnect; accounting resumes on the next successful call | `sbproxy_ai_quota_pool_fail_open_total{pool}` on `degraded` |
 | ACME CA (Let's Encrypt) | Renewal request fails | Existing cert keeps serving until expiry. With no usable cert, an HTTP-01 self-signed bootstrap is served and an `ERROR` is logged loudly. | Retry with exponential backoff (1m to 24h) | `sbproxy_acme_renewals_total{result}` |
-| Upstream DNS (`service_discovery`) | Resolver timeout / NXDOMAIN | The cached A/AAAA set keeps serving past TTL until the next refresh succeeds. New unseen hostnames fall back to Pingora's connect-time resolver. | Auto on next refresh | None dedicated; resolver failures are logged at WARN |
+| Upstream DNS (`service_discovery`) | Resolver timeout / NXDOMAIN | The cached A/AAAA set keeps serving past TTL until the next refresh succeeds. New unseen hostnames fall back to Pingora's connect-time resolver. | Auto on next refresh | None. A resolver failure is logged at WARN and counted nowhere, so there is nothing to alert on and no way to see the rate |
 | Vault / secrets backend (`proxy.secrets.backends`) | Fetch fails | Unresolved provider URI references fail startup; backend-local caches retain already resolved values where supported. | Backend reconnect/re-fetch behavior | `sbproxy_vault_resolution_total{backend,result}` |
-| Origin callback hooks (`origins.*.on_request` / `on_response`) | Send fails | Fire-and-forget for audit-mode callbacks; the triggering request or response is unaffected. Enrichment-mode (`enrich: true`) callbacks are awaited inline with their own `timeout`, but a failed or timed-out enrichment still lets the request flow (no `X-Inject-*` headers applied, nothing else changes). A failed delivery is logged at WARN. | None needed; the next matching request/response fires independently | None dedicated; failures are logged at WARN |
-| Alert-channel webhook delivery (`proxy.alerting.channels[].type: webhook`) | Send fails | Webhook delivery is fire-and-forget. A failed POST is logged at WARN and the firing alert still reaches any other configured channel. | None needed; the next alert evaluation tries again | None dedicated; failures are logged at WARN |
+| Origin callback hooks (`origins.*.on_request` / `on_response`) | Send fails | Fire-and-forget for audit-mode callbacks; the triggering request or response is unaffected. Enrichment-mode (`enrich: true`) callbacks are awaited inline with their own `timeout`, but a failed or timed-out enrichment still lets the request flow (no `X-Inject-*` headers applied, nothing else changes). A failed delivery is logged at WARN. | None needed; the next matching request/response fires independently | None. A failed delivery is logged at WARN and counted nowhere; these callbacks do not go through the shared outbound-request recorder either, so `sbproxy_outbound_request_duration_seconds` does not see them |
+| Alert-channel webhook delivery (`proxy.alerting.channels[].type: webhook`) | Send fails | Webhook delivery is fire-and-forget. A failed POST is logged at WARN and the firing alert still reaches any other configured channel. | None needed; the next alert evaluation tries again | `sbproxy_telemetry_dropped_total{kind="alert_webhook",reason}`, alongside the `alert_slack` and `alert_pagerduty` kinds. `GET /api/alerts` also reports per-channel delivery health (`untested`, `healthy`, or `failing`, the last attempt time, and a bounded error summary) |
 
 ## Detailed reference
 
@@ -366,9 +366,28 @@ Native-provider-key admission has one added carve-out. If the store is unreachab
 
 The policy cache in front of the store never caches an error and never decides admission. It propagates the failure so exactly one place applies the posture.
 
+**Metrics:** two families, and they answer different questions on purpose.
+
+| Metric | Labels |
+|---|---|
+| `sbproxy_key_store_outage_total` | `entrypoint`: `header_sweep`, `impersonation_ticket`, `bearer`, `oidc_claim`, or `native_key`. `posture`: `closed`, `degraded`, or `open`. `outcome`: `denied` or `admitted` |
+| `sbproxy_key_store_unavailable` | `posture`, as above |
+
+The counter says how often and at which gate. It counts one observation per gate rather than per request, so a caller that presents a bearer token and then reaches the native-provider-key carve-out appears under both entrypoints; those are two decisions and an incident review wants them apart. Every label value is a compile-time constant, so the family cannot grow with traffic, with the config, or with the number of keys. Nothing derived from a credential, a key id, or a resolved config value appears on either family.
+
+The gauge says whether it is happening now, which the counter structurally cannot: `increase(...[5m]) > 0` is a claim about the last five minutes. It reads 1 from the moment a resolution cannot reach the store until one reaches a verdict again, and the label rides along so a single query says both what is broken and what that costs:
+
+```
+sbproxy_key_store_unavailable{posture=~"degraded|open"} == 1
+```
+
+That is "the key store is down and requests are being admitted ungoverned right now". Swap the matcher for `posture="closed"` and it is "the key store is down and requests are being refused". Exactly one series is live: a reload that changes the posture removes the previous label value rather than stranding it, because a stale series at 1 reads exactly like a live one.
+
+The gauge falls back to 0 on the next resolution that reached a verdict, which is not the same as the next one that reached the store. A resolution served out of the TTL cache during an outage kept its per-key policy, budget, and attribution, so nothing was waived for it. The counter is what survives that flap.
+
 **Log level:** `WARN` per admitted request, carrying `failure_posture` and `guarantee_waived` fields.
 
-**Alert:** yes if you run anything other than `closed`. A sustained stream of `guarantee_waived=true` means governed keys stopped being governed.
+**Alert:** yes if you run anything other than `closed`, and the gauge above is the alert. A sustained stream of `guarantee_waived=true` means governed keys stopped being governed; `sum(rate(sbproxy_key_store_outage_total{outcome="admitted"}[5m])) > 0` is the same statement in a form that survives a restart.
 
 **Config:**
 ```yaml
@@ -435,9 +454,9 @@ service_discovery re-resolves every refresh_secs instead of pinning the pooled I
 
 **Fallback:** the cached A/AAAA set from the previous successful resolution keeps serving past TTL until the next refresh window. Connections that were already established to a still-reachable IP keep working. The first request to a never-resolved hostname returns 502 if DNS is fully unreachable. The DNS-SD idle-timeout cap (`min(refresh_secs/2, 10s)`) ensures stale connections cycle quickly when DNS does recover.
 
-**Log level:** `WARN` on resolver failure, `INFO` on recovery.
+**Log level:** `WARN` on resolver failure and on a resolution that returned no usable addresses. Recovery is silent: falling back to the last-good cached address logs at `DEBUG`, and a later successful refresh logs nothing at all.
 
-**Alert:** off by default. DNS failures are usually transient.
+**Alert:** not possible today. There is no metric here, so the only trace of a resolver outage is the WARN line, and the rate of those lines is not a series anything can graph or alert on. Treat the upstream's own error metrics as the proxy for it until this gets a counter.
 
 **Config:**
 ```yaml
@@ -476,7 +495,7 @@ See [`examples/service-discovery/sb.yml`](../examples/service-discovery/sb.yml).
 
 **Log level:** `WARN` per failed delivery (`debug!` on success).
 
-**Alert:** off by default.
+**Alert:** not possible today, and this is the remaining gap in this table. Callback delivery is counted nowhere, and it does not go through the shared outbound-request recorder either, so `sbproxy_outbound_request_duration_seconds` does not see it. An audit-mode callback that has been failing for a week looks identical to one that has never fired, which is the worse of the two states to be in silently.
 
 **Config:** see the `on_request` / `on_response` origin fields and the `Webhook envelope and signing` section in [configuration.md](configuration.md#webhook-envelope-and-signing).
 
@@ -488,9 +507,13 @@ See [`examples/service-discovery/sb.yml`](../examples/service-discovery/sb.yml).
 
 **Fallback:** webhook delivery is fire-and-forget. The firing alert still reaches any other configured channel. The failure is logged at WARN with the URL. There is no retry queue today; the next alert evaluation sends independently.
 
+**Metrics:** `sbproxy_telemetry_dropped_total{kind,reason}`, where `kind` is `alert_webhook`, `alert_slack`, or `alert_pagerduty` and `reason` is `http_error` (the receiver answered non-2xx), `delivery_failed` (the request never got an answer), or `ssrf_rejected` (the configured URL failed the SSRF check, so nothing was sent). Both label sets are closed, and neither carries the URL.
+
+`GET /api/alerts` reports the same thing as state rather than as a rate: every configured channel carries a status of `untested`, `healthy`, or `failing`, the time of the last attempt, and a bounded error summary that never contains the channel's credentials. That is the surface to check when the question is "is my pager wired up", because `untested` is a real answer there and is indistinguishable from `healthy` in any counter.
+
 **Log level:** `WARN` per failed delivery.
 
-**Alert:** off by default. A spike of failed deliveries usually means the receiver is down, which it knows about.
+**Alert:** off by default, and be careful what you point at it. A spike of failed deliveries usually means the receiver is down, which it knows about. The case worth alerting on is the alerting path itself going quiet, which is what the `/api/alerts` status answers and a delivery counter does not.
 
 **Config:** see the `Webhook envelope and signing` section in [configuration.md](configuration.md#webhook-envelope-and-signing).
 

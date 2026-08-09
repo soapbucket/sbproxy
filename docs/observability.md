@@ -249,6 +249,8 @@ Every family below is emitted by running code. That is worth stating because it 
 | `sbproxy_cert_expiry_seconds` | 256 | Labels: `host` (sanitised). Gauge; negative means already expired. |
 | `sbproxy_vault_resolution_total` | 200 | Labels: `backend` (sanitised), `result` (ok\|not_found\|backend_error\|denied). |
 | `sbproxy_vault_resolution_duration_seconds_bucket` | 2 400 | Same labels plus 12 histogram buckets 100us..5s. |
+| `sbproxy_key_store_outage_total` | 40 | Labels: `entrypoint` (header_sweep\|impersonation_ticket\|bearer\|oidc_claim\|native_key), `posture` (closed\|degraded\|open\|observe), `outcome` (denied\|admitted). Every value is a compile-time constant, so the family is bounded by 5 x 4 x 2 whatever the config says; `posture` reserves all four spellings even though `observe` is refused at config-compile time for this key, because the cap should hold against the enum rather than against today's validation. One observation per gate, not per request. |
+| `sbproxy_key_store_unavailable` | 4 | Labels: `posture`. Gauge; 1 while the last inbound-key resolution could not reach the virtual key store. Exactly one series is live at a time, because a posture change removes the previous label value; the cap is the enum bound, not the expected series count. |
 | `sbproxy_grpc_status_total` | 17 | Labels: `code` (canonical lowercase name; closed enum from tonic). |
 | `sbproxy_mcp_tool_dispatch_total` | 4 000 | Labels: `tool` (sanitised), `result` (ok\|tool_error\|tool_not_found\|policy_denied). |
 | `sbproxy_mcp_tool_dispatch_duration_seconds_bucket` | 12 000 | `tool` label plus 12 histogram buckets 100us..10s. |

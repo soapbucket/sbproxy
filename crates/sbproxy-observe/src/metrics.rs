@@ -1698,6 +1698,144 @@ pub fn record_governance_fail_open(key_id: &str) {
     counter.with_label_values(&[key_id_san.as_str()]).inc();
 }
 
+// --- virtual key store degradation ------------------------------------
+//
+// The widest blast radius of any dependency this proxy has. An
+// unreachable `key_management.store` does not degrade one feature; it
+// changes the authentication posture of the whole listener, because
+// `key_management.failure_posture` decides whether the request is
+// refused with a 503 or handed to the origin's own auth carrying no
+// per-key policy, budget, or attribution. Every other posture in
+// `docs/degradation.md` costs an enforcement guarantee. This one can
+// cost the identity the enforcement was keyed on.
+//
+// Until now the only trace of it was a WARN line, which is a signal
+// nobody is watching at three in the morning. Two families replace it,
+// and they answer different questions on purpose. The counter answers
+// "how often, and at which gate". The gauge answers "right now", which
+// is the question a counter structurally cannot: an operator paged at
+// 03:00 needs to know whether the store is failing *at this moment* and
+// what that currently costs, and `increase(...[5m]) > 0` is a claim
+// about the past five minutes, not about now.
+
+/// Move `sbproxy_key_store_unavailable{posture}`, keeping exactly one
+/// series alive for it.
+///
+/// `posture` changes only on a config reload, so the previous label value
+/// is removed before the new one is set. Without that a proxy reloaded
+/// from `closed` to `degraded` would keep exporting a `closed` series at
+/// whatever value it last held, and a stale series reads exactly like a
+/// live answer.
+///
+/// Registration failure is swallowed with `.ok()` rather than unwrapped,
+/// for the reason [`record_events_dropped`] gives: this runs from the
+/// request path, and a proxy that aborts because a gauge would not
+/// register is a worse outcome than one whose gauge is missing.
+///
+/// The mutex is taken on every inbound-key resolution, including the L1
+/// cache hits that are the hot auth path, and that is deliberate rather
+/// than unexamined. An uncontended lock plus a short string compare is
+/// the same order as the `with_label_values` hash lookup underneath it,
+/// and both are well inside what the surrounding path already pays for
+/// the keystore cache's own mutex and for `record_inbound_key_request`,
+/// which sanitises four labels through the cardinality budget on the same
+/// request. An atomic fast path was considered and dropped: it can skip
+/// the publish only by not noticing a posture change that leaves the
+/// value alone, which is exactly the reload that would strand the label
+/// this gauge exists to carry.
+fn set_key_store_unavailable(posture: &str, value: i64) {
+    use prometheus::{register_int_gauge_vec, IntGaugeVec};
+    use std::sync::{Mutex, OnceLock};
+    static G: OnceLock<Option<IntGaugeVec>> = OnceLock::new();
+    static CURRENT: Mutex<Option<String>> = Mutex::new(None);
+    let gauge = G.get_or_init(|| {
+        register_int_gauge_vec!(
+            "sbproxy_key_store_unavailable",
+            "1 while the last inbound-key resolution could not reach the virtual key store; the posture label is what that costs",
+            &["posture"],
+        )
+        .ok()
+    });
+    let Some(gauge) = gauge else {
+        return;
+    };
+    let mut current = CURRENT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if current.as_deref() != Some(posture) {
+        if let Some(previous) = current.as_deref() {
+            let _ = gauge.remove_label_values(&[previous]);
+        }
+        *current = Some(posture.to_string());
+    }
+    gauge.with_label_values(&[posture]).set(value);
+}
+
+/// Count one virtual-key-store outage decision on
+/// `sbproxy_key_store_outage_total{entrypoint,posture,outcome}` and raise
+/// `sbproxy_key_store_unavailable{posture}` to 1.
+///
+/// Every label value is a compile-time constant drawn from a closed set,
+/// so neither family can grow with traffic, with the config, or with the
+/// number of keys. Nothing derived from a credential, a key id, or a
+/// resolved config value is ever a label here: the id that failed to
+/// resolve belongs in the log line and the audit record, not in a series
+/// name.
+///
+/// | Label | Values |
+/// |---|---|
+/// | `entrypoint` | `header_sweep`, `impersonation_ticket`, `bearer`, `oidc_claim`, `native_key` |
+/// | `posture` | `closed`, `degraded`, `open`, `observe` |
+/// | `outcome` | `denied`, `admitted` |
+///
+/// `posture` carries all four spellings of `FailureMode` (the config
+/// enum, which this crate deliberately does not depend on) even though
+/// `observe` is refused at config-compile time for this key, because the
+/// bound the cardinality budget promises should hold against the enum
+/// rather than against today's validation rules.
+///
+/// One observation per gate, not per request. A caller that presents a
+/// bearer token and then reaches the native-provider-key carve-out is
+/// counted under both entrypoints, because those are two separate
+/// decisions and an operator debugging one does not want it hidden inside
+/// the other.
+pub fn record_key_store_outage(
+    entrypoint: &'static str,
+    posture: &'static str,
+    outcome: &'static str,
+) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_key_store_outage_total",
+            "Inbound-key resolutions that could not reach the virtual key store, by entrypoint, configured failure posture, and what the posture decided",
+            &["entrypoint", "posture", "outcome"],
+        )
+        .ok()
+    });
+    if let Some(counter) = counter {
+        counter
+            .with_label_values(&[entrypoint, posture, outcome])
+            .inc();
+    }
+    set_key_store_unavailable(posture, 1);
+}
+
+/// Drop `sbproxy_key_store_unavailable{posture}` back to 0 after an
+/// inbound-key resolution reached a verdict without needing the posture.
+///
+/// Deliberately says "reached a verdict" and not "reached the store". A
+/// resolution served from the TTL cache during an outage did keep its
+/// per-key policy, budget, and attribution, so nothing was waived for
+/// that request and the gauge is right to read 0 for it. What the gauge
+/// tracks is whether the posture is in force, which is the operator's
+/// actual question; the counter beside it is what survives the flap.
+pub fn record_key_store_reachable(posture: &'static str) {
+    set_key_store_unavailable(posture, 0);
+}
+
 /// Record drop counters returned by the capture helpers.
 /// `dimension` is `"property"`, `"session"`, or `"user"`; `reason`
 /// is one of the closed strings each helper exposes (e.g. `count`,
@@ -6408,6 +6546,104 @@ mod tests {
             rendered.contains("sink=webhook") && rendered.contains("reason=queue_full"),
             "sbproxy_events_dropped_total did not register or did not carry \
              the sink/reason labels: {rendered:?}"
+        );
+    }
+
+    /// Every label of a gathered family, as `name=value` pairs joined by
+    /// commas, one entry per series, with the series value appended.
+    fn gathered_series(family_name: &str) -> Vec<(String, f64)> {
+        let mut out = Vec::new();
+        for family in prometheus::gather() {
+            if family.name() != family_name {
+                continue;
+            }
+            for metric in family.get_metric() {
+                let labels: Vec<String> = metric
+                    .get_label()
+                    .iter()
+                    .map(|pair| format!("{}={}", pair.name(), pair.value()))
+                    .collect();
+                let value = match family.get_field_type() {
+                    prometheus::proto::MetricType::COUNTER => metric.get_counter().value(),
+                    prometheus::proto::MetricType::GAUGE => metric.get_gauge().value(),
+                    // Nothing calls this for a histogram or a summary, and
+                    // silently returning 0 for one would make a wrong
+                    // assertion pass rather than fail.
+                    other => {
+                        unreachable!("{family_name} is a {other:?}, not a counter or a gauge")
+                    }
+                };
+                out.push((labels.join(","), value));
+            }
+        }
+        out
+    }
+
+    /// Both halves of the key-store degradation pair, in one test on
+    /// purpose.
+    ///
+    /// They share one process-global gauge whose whole job is to hold a
+    /// single series, so splitting the claims into separate `#[test]`
+    /// functions would let a threaded runner interleave two posture
+    /// changes and fail on the interleaving rather than on the code.
+    /// Nextest's process-per-test would hide that; a plain
+    /// `cargo test -p sbproxy-observe --lib` would not.
+    ///
+    /// Three claims, in the order an outage produces them:
+    ///
+    /// 1. The counter registers (both families swallow a registration
+    ///    failure with `.ok()`, so nothing else proves the `Some` arm is
+    ///    taken) and carries all three labels.
+    /// 2. The gauge goes to 1 while the store is unreachable and back to 0
+    ///    once a resolution succeeds. This is the question a counter
+    ///    structurally cannot answer: "is it failing right now".
+    /// 3. A posture change removes the previous series. A stale
+    ///    `posture="closed"` stuck at 1 reads exactly like a live one, and
+    ///    it is the more alarming of the two on a panel.
+    #[test]
+    fn key_store_outage_is_counted_and_its_posture_gauge_tracks_the_current_state() {
+        record_key_store_outage("oidc_claim", "degraded", "admitted");
+
+        let counted = gathered_series("sbproxy_key_store_outage_total");
+        assert!(
+            counted
+                .iter()
+                .any(|(labels, value)| labels.contains("entrypoint=oidc_claim")
+                    && labels.contains("posture=degraded")
+                    && labels.contains("outcome=admitted")
+                    && *value >= 1.0),
+            "sbproxy_key_store_outage_total did not register or did not carry \
+             the entrypoint/posture/outcome labels: {counted:?}"
+        );
+
+        let during = gathered_series("sbproxy_key_store_unavailable");
+        assert_eq!(
+            during
+                .iter()
+                .find(|(labels, _)| labels.contains("posture=degraded"))
+                .map(|(_, value)| *value),
+            Some(1.0),
+            "the gauge did not go to 1 while the store was unreachable: {during:?}"
+        );
+
+        record_key_store_reachable("degraded");
+        let after = gathered_series("sbproxy_key_store_unavailable");
+        assert_eq!(
+            after
+                .iter()
+                .find(|(labels, _)| labels.contains("posture=degraded"))
+                .map(|(_, value)| *value),
+            Some(0.0),
+            "the gauge did not fall back to 0 once a resolution succeeded: {after:?}"
+        );
+
+        record_key_store_outage("header_sweep", "closed", "denied");
+        let reloaded = gathered_series("sbproxy_key_store_unavailable");
+        assert!(
+            !reloaded
+                .iter()
+                .any(|(labels, _)| labels.contains("posture=degraded")),
+            "the previous posture's series survived a posture change: {reloaded:?}"
         );
     }
 }

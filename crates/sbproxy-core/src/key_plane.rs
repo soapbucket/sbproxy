@@ -204,6 +204,63 @@ impl KeyPlane {
     }
 }
 
+/// The five inbound-key entrypoints that read
+/// [`KeyPlane::failure_posture`], as metric label values.
+///
+/// A closed set of compile-time constants, which is what keeps
+/// `sbproxy_key_store_outage_total` bounded. Nothing derived from a
+/// credential, a key id, a hostname, or a resolved config value belongs
+/// on that family; the id that failed to resolve goes in the log line and
+/// the audit record instead, where the storage cost is one row and the
+/// lookup is by id.
+pub(crate) mod key_store_entrypoint {
+    /// The pre-auth sweep over the configured inbound key headers.
+    pub(crate) const HEADER_SWEEP: &str = "header_sweep";
+    /// The admin playground's loopback impersonation ticket.
+    pub(crate) const IMPERSONATION_TICKET: &str = "impersonation_ticket";
+    /// The AI gateway's `Authorization: Bearer sbp_...` path.
+    pub(crate) const BEARER: &str = "bearer";
+    /// The OIDC claim that names a stored virtual-key record.
+    pub(crate) const OIDC_CLAIM: &str = "oidc_claim";
+    /// Native-provider-key admission, which does not read the store
+    /// itself and instead honours a decision an earlier entrypoint made.
+    pub(crate) const NATIVE_KEY: &str = "native_key";
+}
+
+/// Note that an inbound-key resolution reached a verdict without needing
+/// the failure posture, clearing `sbproxy_key_store_unavailable`.
+///
+/// Takes the whole `Result` and ignores the `Err` arm rather than being
+/// called from an `Ok` branch, because the `Err` branch already routes
+/// through one of the two outage helpers and counting it twice would put
+/// the gauge and the counter into different stories.
+///
+/// "Reached a verdict" is deliberately weaker than "reached the store". A
+/// resolution served out of the TTL cache during an outage kept its
+/// per-key policy, budget, and attribution, so nothing was waived for it
+/// and the gauge is right to read 0. The counter beside the gauge is what
+/// survives that flap.
+pub(crate) fn note_key_store_reachable<T>(plane: &KeyPlane, result: &anyhow::Result<T>) {
+    if result.is_ok() {
+        sbproxy_observe::metrics::record_key_store_reachable(plane.failure_posture().as_label());
+    }
+}
+
+/// Count one store-outage decision the failure posture made.
+///
+/// `outcome` is derived here rather than passed in so the counter cannot
+/// disagree with [`FailureMode::admits`], which is the function the
+/// request path actually branches on.
+pub(crate) fn note_key_store_outage(plane: &KeyPlane, entrypoint: &'static str) {
+    let posture = plane.failure_posture();
+    let outcome = if posture.admits() {
+        "admitted"
+    } else {
+        "denied"
+    };
+    sbproxy_observe::metrics::record_key_store_outage(entrypoint, posture.as_label(), outcome);
+}
+
 /// An upstream credential resolved into the exact header the proxy writes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedCredential {
@@ -1597,6 +1654,119 @@ mod tests {
         );
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// Every series of `family`, as `(sorted label pairs, value)`.
+    fn gathered(family_name: &str) -> Vec<(String, f64)> {
+        let mut out = Vec::new();
+        for family in prometheus::gather() {
+            if family.name() != family_name {
+                continue;
+            }
+            for metric in family.get_metric() {
+                let labels: Vec<String> = metric
+                    .get_label()
+                    .iter()
+                    .map(|pair| format!("{}={}", pair.name(), pair.value()))
+                    .collect();
+                let value = match family.get_field_type() {
+                    prometheus::proto::MetricType::COUNTER => metric.get_counter().value(),
+                    prometheus::proto::MetricType::GAUGE => metric.get_gauge().value(),
+                    other => panic!("{family_name} is a {other:?}"),
+                };
+                out.push((labels.join(","), value));
+            }
+        }
+        out
+    }
+
+    fn counter_value(labels: &[&str]) -> f64 {
+        gathered("sbproxy_key_store_outage_total")
+            .into_iter()
+            .find(|(rendered, _)| labels.iter().all(|label| rendered.contains(label)))
+            .map(|(_, value)| value)
+            .unwrap_or(0.0)
+    }
+
+    /// A key-store outage has to leave something an alert can read.
+    ///
+    /// It was the widest-blast-radius degradation in the matrix and the
+    /// only trace of it was a WARN line: `failure_posture` decides whether
+    /// an unreachable store refuses the request or hands it to the
+    /// origin's own auth carrying no per-key policy, budget, or
+    /// attribution, and an operator could only find out which by grepping
+    /// logs after the fact.
+    ///
+    /// Both postures run here because `outcome` is the label that
+    /// separates them, and a counter that recorded the outage without
+    /// distinguishing a refusal from an ungoverned admission would answer
+    /// the wrong half of the question.
+    ///
+    /// The gauge is asserted only on presence, not on value. Other tests
+    /// in this binary resolve keys through planes of their own without
+    /// holding the plane guard, and a successful resolution now clears the
+    /// gauge, so a value assertion here would be testing the scheduler.
+    /// The value transitions are pinned in isolation by
+    /// `key_store_outage_is_counted_and_its_posture_gauge_tracks_the_current_state`
+    /// in `sbproxy-observe`, where nothing else writes the family.
+    #[test]
+    fn a_key_store_outage_is_counted_with_the_verdict_its_posture_reached() {
+        let _guard = test_plane_guard();
+        let closed_path = temp_db();
+        let degraded_path = temp_db();
+
+        let closed = prepare_key_plane(Some(&base_cfg(&closed_path)))
+            .expect("prepare closed plane")
+            .expect("enabled plane");
+        assert_eq!(closed.failure_posture(), FailureMode::Closed);
+
+        let denial = ["entrypoint=bearer", "posture=closed", "outcome=denied"];
+        let before = counter_value(&denial);
+        note_key_store_outage(&closed, key_store_entrypoint::BEARER);
+        assert!(
+            counter_value(&denial) > before,
+            "a closed-posture outage must count as a denial"
+        );
+        assert!(
+            !gathered("sbproxy_key_store_unavailable").is_empty(),
+            "the outage site must publish the posture gauge, not just the counter"
+        );
+        drop(closed);
+
+        let mut degraded_cfg = base_cfg(&degraded_path);
+        degraded_cfg.failure_posture = Some(FailureMode::Degraded);
+        let degraded = prepare_key_plane(Some(&degraded_cfg))
+            .expect("prepare degraded plane")
+            .expect("enabled plane");
+
+        let admission = [
+            "entrypoint=native_key",
+            "posture=degraded",
+            "outcome=admitted",
+        ];
+        let before = counter_value(&admission);
+        note_key_store_outage(&degraded, key_store_entrypoint::NATIVE_KEY);
+        assert!(
+            counter_value(&admission) > before,
+            "a degraded-posture outage must count as an admission, on its own entrypoint"
+        );
+
+        // An Err carries no claim that the store came back. Without this
+        // the two helpers would fight over one series on every failure.
+        let before = counter_value(&admission);
+        note_key_store_reachable(
+            &degraded,
+            &Err::<(), anyhow::Error>(anyhow::anyhow!("store down")),
+        );
+        assert_eq!(
+            counter_value(&admission),
+            before,
+            "a failed resolution must not touch the outage counter"
+        );
+        drop(degraded);
+
+        std::fs::remove_file(&closed_path).ok();
+        std::fs::remove_file(&degraded_path).ok();
     }
 
     #[test]
