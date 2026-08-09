@@ -2654,7 +2654,6 @@ fn report_plugin_registrations() {
             PluginKind::Auth => "auth",
             PluginKind::Policy => "policy",
             PluginKind::Transform => "transform",
-            PluginKind::Enricher => "enricher",
         };
         sbproxy_observe::metrics::record_plugin_registered(kind, reg.name);
     }

@@ -239,15 +239,14 @@ Third-party plugins register via the `inventory` crate. The proxy discovers them
 
 ```rust
 inventory::submit! {
-    PluginRegistration {
-        kind: PluginKind::Policy,
+    PolicyPluginRegistration {
         name: "my_policy",
         factory: |config| { /* ... */ },
     }
 }
 ```
 
-Five extension points: `ActionHandler`, `AuthProvider`, `PolicyEnforcer`, `TransformHandler`, `RequestEnricher`.
+Four extension points, each with its own typed registration struct: `ActionHandler` (`ActionPluginRegistration`), `AuthProvider` (`AuthPluginRegistration`), `PolicyEnforcer` (`PolicyPluginRegistration`), and `TransformHandler` (`TransformPluginRegistration`). Register through the typed struct. The generic `PluginRegistration` channel, the one carrying a `PluginKind` and a `Box<dyn Any>` factory, feeds diagnostics and listings only; the config compiler never builds handlers from it.
 
 ## Performance
 

@@ -2346,8 +2346,8 @@ fn validate_origin_host_key(hostname: &str) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if any of the origin's configured modules (action,
-/// auth, policy, transform, or enricher) names an unknown type or has
-/// invalid parameters, or if a referenced module cannot be built.
+/// auth, policy, or transform) names an unknown type or has invalid
+/// parameters, or if a referenced module cannot be built.
 pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<CompiledOrigin> {
     let allowed_methods: SmallVec<[http::Method; 4]> = config
         .allowed_methods
