@@ -3306,12 +3306,25 @@ async fn check_forward_auth(
     let mut req = client.request(req_method, &fwd.url).timeout(timeout);
 
     for header_name in &fwd.headers_to_forward {
+        // Trace context is derived below, not copied. An operator who
+        // listed `traceparent` here would otherwise get two of them on
+        // the wire, because `RequestBuilder::header` appends, and the
+        // copied one would name the caller's span rather than this hop.
+        if header_name.eq_ignore_ascii_case("traceparent")
+            || header_name.eq_ignore_ascii_case("tracestate")
+        {
+            continue;
+        }
         if let Some(val) = request_headers.get(header_name.as_str()) {
             if let Ok(val_str) = val.to_str() {
                 req = req.header(header_name.as_str(), val_str);
             }
         }
     }
+    // The caller instruments this future with `sbproxy.intake.authenticate`
+    // (`request_phase.rs`), so the ambient span is the context to
+    // propagate and nothing needs plumbing here.
+    req = sbproxy_observe::telemetry::inject_reqwest_trace_context(req, None);
 
     let response = req.send().await.map_err(|e| {
         warn!(error = %e, url = %fwd.url, "forward auth request failed");

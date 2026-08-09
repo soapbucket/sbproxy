@@ -350,7 +350,7 @@ impl HttpLedger {
         request_id: &str,
         signature_header: &str,
     ) -> Result<RedeemResult, LedgerError> {
-        let response = self
+        let mut request = self
             .client
             .post(url)
             .header("content-type", "application/json")
@@ -358,8 +358,22 @@ impl HttpLedger {
             .header("x-sb-ledger-signature", signature_header)
             .header("x-sb-ledger-key-id", &self.config.key_id)
             .header("x-sb-request-id", request_id)
-            .body(body.to_vec())
-            .send();
+            .body(body.to_vec());
+        // The redeem call is a hop in the request's trace, so it carries
+        // the request's trace context. Taken from the ambient span rather
+        // than plumbed: `Ledger::redeem` is a sync trait with no
+        // `RequestContext` in its signature, and the AI-crawl enforcer
+        // that calls it runs inside `sbproxy.policy.enforce`. The
+        // `block_in_place` bridge above stays on the calling thread, so
+        // `Span::current()` is still that span down here.
+        //
+        // The blocking builder is a different type from the async one, so
+        // this reads the header pairs directly instead of going through
+        // `inject_reqwest_trace_context`. Same source, same formatter.
+        for (name, value) in sbproxy_observe::telemetry::outbound_trace_headers(None) {
+            request = request.header(name, value);
+        }
+        let response = request.send();
 
         let response = match response {
             Ok(r) => r,

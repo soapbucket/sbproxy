@@ -488,10 +488,19 @@ struct TokenEndpointResponse {
     body: bytes::Bytes,
 }
 
+/// `trace_ctx` is the request whose upstream call needs this credential.
+///
+/// It has to be handed in rather than read from `Span::current()`: the
+/// only production caller is `upstream_request_filter`, which runs after
+/// `sbproxy.intake.accept` has closed, so there is no ambient span here
+/// to read. The DPoP retry re-mints a proof and re-sends, and each
+/// attempt gets its own child span id, which is what a trace of a
+/// nonce-challenged exchange should look like.
 async fn send_token_request<F>(
     build: F,
     token_endpoint: &str,
     dpop: Option<&Arc<DpopRuntime>>,
+    trace_ctx: Option<&sbproxy_observe::TraceContext>,
 ) -> Result<TokenEndpointResponse>
 where
     F: Fn() -> reqwest::RequestBuilder,
@@ -500,7 +509,8 @@ where
         .map(|_| canonical_dpop_htu(token_endpoint))
         .transpose()?;
     for attempt in 0..=1 {
-        let mut request = build();
+        let mut request =
+            sbproxy_observe::telemetry::inject_reqwest_trace_context(build(), trace_ctx);
         if let (Some(runtime), Some(htu)) = (dpop, htu.as_deref()) {
             let proof = runtime
                 .mint_token_proof("POST", htu)
@@ -634,6 +644,16 @@ pub async fn resolve(
     resolve_with_egress(cfg, http, subject_token, secret_lookup, None).await
 }
 
+/// The trace context this credential's token exchange should join, for
+/// the two entry points that do not take one.
+///
+/// [`resolve`] and [`resolve_with_egress`] have no request in scope and
+/// no production caller; the request path enters at [`resolve_cached`].
+/// They pass this rather than a fabricated context, so a token exchange
+/// they drive leaves without `traceparent` instead of with an invented
+/// root trace.
+const NO_TRACE_CONTEXT: Option<&sbproxy_observe::TraceContext> = None;
+
 /// Like [`resolve`], with an optional fail-closed egress authorizer for
 /// token-endpoint HTTP (`EgressPurpose::TokenExchange`).
 ///
@@ -647,13 +667,23 @@ pub async fn resolve_with_egress(
     secret_lookup: &(dyn Fn(&str) -> Result<String> + Sync),
     egress: Option<&EgressAuthorizer>,
 ) -> Result<MintedCredential> {
-    resolve_with_egress_for_origin(cfg, http, subject_token, secret_lookup, egress, "").await
+    resolve_with_egress_for_origin(
+        cfg,
+        http,
+        subject_token,
+        secret_lookup,
+        egress,
+        "",
+        NO_TRACE_CONTEXT,
+    )
+    .await
 }
 
 /// [`resolve_with_egress`] with an explicit origin id for refusal
 /// attribution (WOR-2165). This deployment is multi-tenant, so an
 /// egress refusal that cannot say whose origin it belongs to is not
 /// actionable.
+#[allow(clippy::too_many_arguments)]
 pub async fn resolve_with_egress_for_origin(
     cfg: &OutboundCredentialConfig,
     http: &reqwest::Client,
@@ -661,6 +691,7 @@ pub async fn resolve_with_egress_for_origin(
     secret_lookup: &(dyn Fn(&str) -> Result<String> + Sync),
     egress: Option<&EgressAuthorizer>,
     origin_id: &str,
+    trace_ctx: Option<&sbproxy_observe::TraceContext>,
 ) -> Result<MintedCredential> {
     match cfg {
         OutboundCredentialConfig::TokenExchange(c) => {
@@ -694,6 +725,7 @@ pub async fn resolve_with_egress_for_origin(
                 },
                 &c.token_endpoint,
                 dpop.as_ref(),
+                trace_ctx,
             )
             .await
             .context("token exchange request failed")?;
@@ -727,6 +759,7 @@ pub async fn resolve_with_egress_for_origin(
                 },
                 &c.token_endpoint,
                 dpop.as_ref(),
+                trace_ctx,
             )
             .await
             .context("client-credentials request failed")?;
@@ -798,14 +831,26 @@ pub async fn resolve_cached(
     http: &reqwest::Client,
     subject_token: Option<&str>,
     secret_lookup: &(dyn Fn(&str) -> Result<String> + Sync),
+    trace_ctx: Option<&sbproxy_observe::TraceContext>,
 ) -> Result<MintedCredential> {
-    resolve_cached_isolated(origin_id, "", cfg, http, subject_token, secret_lookup, None).await
+    resolve_cached_isolated(
+        origin_id,
+        "",
+        cfg,
+        http,
+        subject_token,
+        secret_lookup,
+        None,
+        trace_ctx,
+    )
+    .await
 }
 
 /// Like [`resolve_cached`], with an explicit non-secret `isolation_key`
 /// (delegation subject id / principal `sub`) in the cache key so
 /// distinct users never share a minted token entry. Also accepts an
 /// optional egress authorizer for token-endpoint HTTP.
+#[allow(clippy::too_many_arguments)]
 pub async fn resolve_cached_isolated(
     origin_id: &str,
     isolation_key: &str,
@@ -814,6 +859,7 @@ pub async fn resolve_cached_isolated(
     subject_token: Option<&str>,
     secret_lookup: &(dyn Fn(&str) -> Result<String> + Sync),
     egress: Option<&EgressAuthorizer>,
+    trace_ctx: Option<&sbproxy_observe::TraceContext>,
 ) -> Result<MintedCredential> {
     if matches!(cfg, OutboundCredentialConfig::VaultSecret(_)) {
         return resolve_with_egress_for_origin(
@@ -823,6 +869,7 @@ pub async fn resolve_cached_isolated(
             secret_lookup,
             egress,
             origin_id,
+            trace_ctx,
         )
         .await;
     }
@@ -848,9 +895,16 @@ pub async fn resolve_cached_isolated(
         }
     }
 
-    let cred =
-        resolve_with_egress_for_origin(cfg, http, subject_token, secret_lookup, egress, origin_id)
-            .await?;
+    let cred = resolve_with_egress_for_origin(
+        cfg,
+        http,
+        subject_token,
+        secret_lookup,
+        egress,
+        origin_id,
+        trace_ctx,
+    )
+    .await?;
     // Cache only when the endpoint reported a lifetime; reuse it until
     // 30s before expiry to avoid serving a token that dies in flight.
     if let Some(secs) = cred.expires_in {
@@ -1351,6 +1405,7 @@ mod tests {
             Some(&shared_subject),
             &no_secret(),
             None,
+            None,
         )
         .await
         .expect("user a mint");
@@ -1361,6 +1416,7 @@ mod tests {
             &http,
             Some(&shared_subject),
             &no_secret(),
+            None,
             None,
         )
         .await
@@ -1377,6 +1433,7 @@ mod tests {
             &http,
             Some(&shared_subject),
             &no_secret(),
+            None,
             None,
         )
         .await

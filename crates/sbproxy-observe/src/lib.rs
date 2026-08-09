@@ -117,8 +117,8 @@ pub use synthetic::{
 };
 pub use telemetry::{
     extract_from_headers, init_otlp_metrics_pipeline, init_propagator, inject_into_headers,
-    inject_into_reqwest, parent_span_on_remote_trace_context, shutdown_otlp_metrics_pipeline,
-    shutdown_otlp_pipeline, span as pillar_span, tracing_helper, OtlpTransport, Pillar,
-    TelemetryConfig,
+    inject_into_reqwest, inject_reqwest_trace_context, outbound_trace_headers,
+    parent_span_on_remote_trace_context, shutdown_otlp_metrics_pipeline, shutdown_otlp_pipeline,
+    span as pillar_span, tracing_helper, OtlpTransport, Pillar, TelemetryConfig,
 };
 pub use trace_ctx::w3c::TraceContext;

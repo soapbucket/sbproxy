@@ -386,7 +386,16 @@ pub async fn fetch_and_validate(
     if !url.starts_with("https://") {
         return Err("not_https".to_string());
     }
-    let body = match tokio::time::timeout(FETCH_DEADLINE, client.get(url).send()).await {
+    // The directory fetch is an outbound HTTP call the proxy makes while
+    // authenticating somebody else's request, so it belongs in that
+    // request's trace. `AuthProvider` hands this function a bare
+    // `reqwest::Client` and no request context, but the caller
+    // (`check_auth_with_tls_outcome`) runs inside
+    // `sbproxy.intake.authenticate`, so the ambient span is the context
+    // to propagate and `None` is the right argument here rather than an
+    // absence of one.
+    let request = sbproxy_observe::telemetry::inject_reqwest_trace_context(client.get(url), None);
+    let body = match tokio::time::timeout(FETCH_DEADLINE, request.send()).await {
         Err(_) => return Err("fetch_deadline_exceeded".to_string()),
         Ok(Err(_)) => return Err("network".to_string()),
         Ok(Ok(resp)) => {

@@ -108,6 +108,16 @@ pub struct MirrorParams {
     pub headers: http::HeaderMap,
     /// Correlation ID; surfaced as `X-Sbproxy-Request-Id` on the mirror.
     pub request_id: String,
+    /// The request's W3C trace context, carried so the mirror can join
+    /// the trace it was teed from.
+    ///
+    /// Captured here rather than read at send time because the mirror
+    /// fires from a `tokio::spawn`, and a spawned task does not inherit
+    /// `tracing::Span::current()`. Without this the mirror would leave
+    /// with no `traceparent` at all, and inventing one at the send site
+    /// would put a second, unrelated root trace in the backend for every
+    /// mirrored request.
+    pub trace_ctx: Option<sbproxy_observe::TraceContext>,
     /// Whether to tee the inbound body into the mirror request.
     pub mirror_body: bool,
     /// Body size cap. Bodies larger than this skip body teeing (the

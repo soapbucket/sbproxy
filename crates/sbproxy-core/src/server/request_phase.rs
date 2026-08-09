@@ -4209,6 +4209,7 @@ pub(super) async fn request_filter(
                     .unwrap_or_else(|| session.req_header().uri.path().to_string()),
                 headers: session.req_header().headers.clone(),
                 request_id: ctx.request_id.to_string(),
+                trace_ctx: ctx.trace_ctx.clone(),
                 mirror_body: mirror.mirror_body,
                 max_body_bytes: mirror.max_body_bytes,
             });
@@ -4225,6 +4226,7 @@ pub(super) async fn request_filter(
         let request_id = ctx.request_id.to_string();
         let config_revision = pipeline.config_revision.clone();
         let callbacks = origin.on_request.clone();
+        let trace_ctx = ctx.trace_ctx.clone();
         let injected = fire_on_request_callbacks(
             &callbacks,
             &method,
@@ -4234,6 +4236,7 @@ pub(super) async fn request_filter(
             &request_id,
             &config_revision,
             &headers,
+            trace_ctx.as_ref(),
         )
         .await;
         if !injected.is_empty() {
@@ -5333,13 +5336,19 @@ async fn handle_oidc_callback(
             return Ok(());
         }
     };
-    let token_response = async_client
-        .post(&cfg.token_endpoint)
-        .basic_auth(&cfg.client_id, Some(&cfg.client_secret))
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(form)
-        .send()
-        .await;
+    // The callback runs inside `request_filter`, so `Span::current()` is
+    // `sbproxy.intake.accept` and the ambient context is the request's.
+    // Only the trace headers are added here; the client secret stays in
+    // the Basic credential where it already was.
+    let token_request = sbproxy_observe::telemetry::inject_reqwest_trace_context(
+        async_client
+            .post(&cfg.token_endpoint)
+            .basic_auth(&cfg.client_id, Some(&cfg.client_secret))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(form),
+        None,
+    );
+    let token_response = token_request.send().await;
     let body = match token_response {
         Ok(resp) if resp.status().is_success() => match resp.text().await {
             Ok(t) => t,
@@ -5454,11 +5463,13 @@ async fn handle_oidc_callback(
                 sbproxy_modules::auth::oidc::userinfo::build_userinfo_authorization_header(
                     &access_token,
                 );
-            let userinfo_result = async_client
-                .get(uinfo_url)
-                .header("authorization", auth_header)
-                .send()
-                .await;
+            let userinfo_request = sbproxy_observe::telemetry::inject_reqwest_trace_context(
+                async_client
+                    .get(uinfo_url)
+                    .header("authorization", auth_header),
+                None,
+            );
+            let userinfo_result = userinfo_request.send().await;
             match userinfo_result {
                 Ok(resp) if resp.status().is_success() => match resp.text().await {
                     Ok(uinfo_body) => {

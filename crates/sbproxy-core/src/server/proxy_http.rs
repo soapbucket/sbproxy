@@ -2098,12 +2098,17 @@ impl ProxyHttp for SbProxy {
                 })
                 .map(|s| s.to_string());
             let lookup = |r: &str| Ok::<String, anyhow::Error>(r.to_string());
+            // `upstream_request_filter` runs after the intake span has
+            // closed, so the token exchange has no ambient span to read
+            // and the request's context is handed over explicitly.
+            let cred_trace_ctx = ctx.trace_ctx.clone();
             match sbproxy_modules::auth::outbound_credential::resolve_cached(
                 &ctx.hostname,
                 cred_cfg,
                 forward_auth_client(),
                 inbound_bearer.as_deref(),
                 &lookup,
+                cred_trace_ctx.as_ref(),
             )
             .await
             {
@@ -3367,6 +3372,11 @@ impl ProxyHttp for SbProxy {
                 let path = session.req_header().uri.path().to_string();
                 let request_id = ctx.request_id.to_string();
                 let duration_ms = ctx.request_start.map(|s| s.elapsed().as_millis() as u64);
+                // Already advanced to the upstream hop's child by
+                // `upstream_request_filter`, which is the right parent:
+                // an on_response callback happens after that hop, not
+                // beside the inbound one.
+                let trace_ctx = ctx.trace_ctx.clone();
                 let injected = fire_on_response_callbacks(
                     &callbacks,
                     status,
@@ -3375,6 +3385,7 @@ impl ProxyHttp for SbProxy {
                     &request_id,
                     &config_revision,
                     duration_ms,
+                    trace_ctx.as_ref(),
                 )
                 .await;
                 for (key, value) in injected {
@@ -4663,6 +4674,7 @@ impl ProxyHttp for SbProxy {
                                 params.path_and_query,
                                 params.headers,
                                 params.request_id,
+                                params.trace_ctx,
                                 body_for_mirror,
                             )
                             .await;
@@ -4778,6 +4790,7 @@ impl ProxyHttp for SbProxy {
                             params.path_and_query,
                             params.headers,
                             params.request_id,
+                            params.trace_ctx,
                             None,
                         )
                         .await;

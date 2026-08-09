@@ -58,12 +58,18 @@ pub(super) fn fire_pending_mirror(ctx: &mut crate::context::RequestContext) {
             params.path_and_query,
             params.headers,
             params.request_id,
+            params.trace_ctx,
             body_for_mirror,
         )
         .await;
     });
 }
 
+/// `trace_ctx` is the mirrored request's own trace context, moved in
+/// from `MirrorParams` rather than read from the ambient span. Every
+/// call site spawns this, and a spawned task does not inherit
+/// `tracing::Span::current()`, so reading the ambient span here would
+/// find nothing on every single mirror.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn fire_request_mirror(
     mirror_url: String,
@@ -72,6 +78,7 @@ pub(super) async fn fire_request_mirror(
     path_and_query: String,
     headers: http::HeaderMap,
     request_id: String,
+    trace_ctx: Option<sbproxy_observe::TraceContext>,
     body: Option<bytes::Bytes>,
 ) {
     // Compose the full URL: mirror base + the original path + query.
@@ -118,6 +125,14 @@ pub(super) async fn fire_request_mirror(
                 | "te"
                 | "trailers"
                 | "upgrade"
+                // Trace context is re-derived below rather than copied.
+                // Forwarding the inbound value would name the caller's
+                // span as the mirror's parent and, because
+                // `RequestBuilder::header` appends, would leave two
+                // `traceparent` headers on the wire once the injection
+                // below adds the child.
+                | "traceparent"
+                | "tracestate"
         ) {
             continue;
         }
@@ -129,6 +144,7 @@ pub(super) async fn fire_request_mirror(
         .header("x-sbproxy-mirror", "1")
         .header("x-sbproxy-request-id", request_id.as_str())
         .header("x-sbproxy-instance", crate::identity::instance_id());
+    req = sbproxy_observe::telemetry::inject_reqwest_trace_context(req, trace_ctx.as_ref());
     if let Some(b) = body {
         req = req.body(b);
     }
@@ -250,6 +266,7 @@ pub(super) async fn fire_on_request_callbacks(
     request_id: &str,
     config_revision: &str,
     headers: &http::HeaderMap,
+    trace_ctx: Option<&sbproxy_observe::TraceContext>,
 ) -> Vec<(String, String)> {
     let mut inject: Vec<(String, String)> = Vec::new();
 
@@ -302,10 +319,15 @@ pub(super) async fn fire_on_request_callbacks(
                 &request_id_owned,
                 &config_revision_owned,
                 timeout_secs,
+                trace_ctx,
             )
             .await;
             inject.extend(injected);
         } else {
+            // Cloned into the task rather than borrowed: the spawn
+            // outlives this frame, and the ambient span it would
+            // otherwise fall back to does not cross the boundary.
+            let trace_ctx_owned = trace_ctx.cloned();
             WEBHOOK_TASKS.spawn(async move {
                 send_webhook(
                     &url,
@@ -316,6 +338,7 @@ pub(super) async fn fire_on_request_callbacks(
                     &request_id_owned,
                     &config_revision_owned,
                     timeout_secs,
+                    trace_ctx_owned.as_ref(),
                 )
                 .await;
             });
@@ -339,6 +362,7 @@ pub(super) async fn fire_on_response_callbacks(
     request_id: &str,
     config_revision: &str,
     duration_ms: Option<u64>,
+    trace_ctx: Option<&sbproxy_observe::TraceContext>,
 ) -> Vec<(String, String)> {
     let mut inject: Vec<(String, String)> = Vec::new();
 
@@ -384,10 +408,15 @@ pub(super) async fn fire_on_response_callbacks(
                 &request_id_owned,
                 &config_revision_owned,
                 timeout_secs,
+                trace_ctx,
             )
             .await;
             inject.extend(injected);
         } else {
+            // Same reason as the on_request branch: the task outlives
+            // this frame, so the context is moved in rather than read
+            // from a span the task will not have.
+            let trace_ctx_owned = trace_ctx.cloned();
             WEBHOOK_TASKS.spawn(async move {
                 send_webhook(
                     &url,
@@ -398,6 +427,7 @@ pub(super) async fn fire_on_response_callbacks(
                     &request_id_owned,
                     &config_revision_owned,
                     timeout_secs,
+                    trace_ctx_owned.as_ref(),
                 )
                 .await;
             });
@@ -408,8 +438,19 @@ pub(super) async fn fire_on_response_callbacks(
 }
 
 /// Build the outbound webhook request with the standard envelope,
-/// identifying headers, and optional HMAC signature. Returns `None`
-/// when payload serialization fails so callers can short-circuit.
+/// identifying headers, the W3C trace context, and optional HMAC
+/// signature. Returns `None` when payload serialization fails so callers
+/// can short-circuit.
+///
+/// This is the single place a webhook `reqwest::RequestBuilder` is
+/// constructed, which is why the trace context is injected here rather
+/// than at each of the three send sites.
+///
+/// `trace_ctx` is the firing request's context, threaded down from
+/// `RequestContext::trace_ctx`. Audit-mode webhooks are dispatched
+/// through `WEBHOOK_TASKS.spawn`, and a spawned task does not inherit
+/// `tracing::Span::current()`, so the ambient span is not a usable
+/// source here even though the enrichment-mode path is awaited inline.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_webhook_request(
     url: &str,
@@ -420,6 +461,7 @@ pub(super) fn build_webhook_request(
     request_id: &str,
     config_revision: &str,
     timeout_secs: u64,
+    trace_ctx: Option<&sbproxy_observe::TraceContext>,
 ) -> Option<reqwest::RequestBuilder> {
     let client = callback_client();
     let body = match serde_json::to_vec(payload) {
@@ -447,6 +489,7 @@ pub(super) fn build_webhook_request(
         .header("x-sbproxy-request-id", request_id)
         .header("x-sbproxy-config-revision", config_revision)
         .header("x-sbproxy-timestamp", timestamp.to_string());
+    req = sbproxy_observe::telemetry::inject_reqwest_trace_context(req, trace_ctx);
     if let Some(s) = secret {
         match sign_webhook(s, &body, timestamp) {
             Ok(sig) => {
@@ -472,6 +515,7 @@ pub(super) async fn send_webhook(
     request_id: &str,
     config_revision: &str,
     timeout_secs: u64,
+    trace_ctx: Option<&sbproxy_observe::TraceContext>,
 ) {
     let Some(req) = build_webhook_request(
         url,
@@ -482,6 +526,7 @@ pub(super) async fn send_webhook(
         request_id,
         config_revision,
         timeout_secs,
+        trace_ctx,
     ) else {
         return;
     };
@@ -512,6 +557,7 @@ pub(super) async fn send_webhook_collect_inject(
     request_id: &str,
     config_revision: &str,
     timeout_secs: u64,
+    trace_ctx: Option<&sbproxy_observe::TraceContext>,
 ) -> Vec<(String, String)> {
     let Some(req) = build_webhook_request(
         url,
@@ -522,6 +568,7 @@ pub(super) async fn send_webhook_collect_inject(
         request_id,
         config_revision,
         timeout_secs,
+        trace_ctx,
     ) else {
         return Vec::new();
     };

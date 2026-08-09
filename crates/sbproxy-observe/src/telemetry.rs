@@ -17,7 +17,13 @@
 //!    the current trace. [`inject_into_headers`] and
 //!    [`inject_into_reqwest`] turn those pairs into HTTP headers;
 //!    carriers that are not headers (a JSON body, a queue envelope)
-//!    consume the pairs directly.
+//!    consume the pairs directly. [`outbound_trace_headers`] is the
+//!    entry point for a helper HTTP call that holds a request-scoped
+//!    [`crate::trace_ctx::w3c::TraceContext`] rather than relying on the
+//!    ambient span. Two kinds of caller need that: the ones running
+//!    after the intake span has closed, and the ones running behind a
+//!    `tokio::spawn`, which does not inherit the span it was spawned
+//!    from.
 //! 4. **Span-naming helper** ([`span`]): every pillar emits spans
 //!    named `sbproxy.<pillar>.<verb>` so dashboards group cleanly.
 
@@ -1120,16 +1126,12 @@ pub fn propagation_pairs() -> Vec<(String, String)> {
 
 /// Inject the active OTel context into outbound HTTP headers.
 ///
-/// The intended propagation invariant is that every HTTP request
-/// leaving the proxy carries `traceparent`, and this is the one-line
-/// way for an outbound client to satisfy it. The invariant is not met
-/// yet. Before WOR-2139 wired [`inject_into_reqwest`] into the MCP
-/// gateway's OpenAPI-backed tool dispatch, neither function had a
-/// single production caller, and the outbound clients this doc used to
-/// name on the invariant's behalf (ledger, Stripe, facilitators,
-/// registry feeds, KYA token verifier, OAuth) still leave without one.
-/// Wiring them is open work, not a claim this doc gets to make for
-/// them.
+/// This is the ambient half of the propagation contract: it reads
+/// whatever trace the calling task is already inside. A caller that
+/// holds a request-scoped [`crate::trace_ctx::w3c::TraceContext`] should
+/// reach for [`outbound_trace_headers`] instead, which works on the
+/// paths this one cannot see: after the intake span has closed, inside a
+/// `tokio::spawn`, and with OTLP switched off entirely.
 ///
 /// Pairs come from [`propagation_pairs`], so the header path and every
 /// non-header carrier propagate the same context from the same code. A
@@ -1158,6 +1160,95 @@ pub fn inject_into_reqwest(req: reqwest::RequestBuilder) -> reqwest::RequestBuil
     let mut req = req;
     for (key, value) in propagation_pairs() {
         req = req.header(key, value);
+    }
+    req
+}
+
+/// The trace-context headers one outbound helper call should carry.
+///
+/// W3C Trace Context: <https://www.w3.org/TR/trace-context/>. The header
+/// is `traceparent`, plus `tracestate` when the trace carries vendor
+/// state, and the value is built by
+/// [`crate::trace_ctx::w3c::TraceContext::to_traceparent`], which is the
+/// only place in this workspace that formats one. The proxied upstream
+/// path in `sbproxy-core` writes the same two headers from the same
+/// formatter; the difference is only the carrier, because Pingora's
+/// request header is not a `reqwest` builder.
+///
+/// `trace_ctx` is the request-scoped context, normally
+/// `RequestContext::trace_ctx`. When it is `Some`, the returned
+/// `traceparent` names a fresh [`crate::trace_ctx::w3c::TraceContext::child`]
+/// of it: same `trace_id`, same sampled flag, a new span id, so the
+/// helper call reads as its own hop under the request's trace rather
+/// than claiming to be the request itself.
+///
+/// When it is `None` this falls back to [`propagation_pairs`], the
+/// ambient OTel context of the calling task. That is the right source
+/// for a caller that is inside an instrumented span but has no
+/// `RequestContext` reachable, and it is empty when no trace is active.
+///
+/// **An empty return means attach nothing.** It never invents a trace id.
+/// A fabricated root per outbound call would render in a trace backend as
+/// a real single-span trace, indistinguishable from a genuine one and
+/// linked to nothing, which is strictly worse than the header's absence:
+/// absence is legible as "this hop was not traced".
+///
+/// # Examples
+///
+/// ```
+/// use sbproxy_observe::telemetry::outbound_trace_headers;
+/// use sbproxy_observe::TraceContext;
+///
+/// let parent = TraceContext::parse("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+///     .expect("a well-formed traceparent");
+/// let headers = outbound_trace_headers(Some(&parent));
+///
+/// assert_eq!(headers.len(), 1);
+/// assert_eq!(headers[0].0, "traceparent");
+/// // Same trace, new span id: this is a child hop, not the request.
+/// assert!(headers[0].1.starts_with("00-4bf92f3577b34da6a3ce929d0e0e4736-"));
+/// assert!(headers[0].1.ends_with("-01"));
+/// assert!(!headers[0].1.contains("00f067aa0ba902b7"));
+/// ```
+pub fn outbound_trace_headers(
+    trace_ctx: Option<&crate::trace_ctx::w3c::TraceContext>,
+) -> Vec<(&'static str, String)> {
+    let Some(parent) = trace_ctx else {
+        // The ambient propagator emits `traceparent` and `tracestate`
+        // and nothing else, but it is swappable, so map by name rather
+        // than by position and drop anything this function has not
+        // promised to emit.
+        return propagation_pairs()
+            .into_iter()
+            .filter_map(|(key, value)| match key.as_str() {
+                "traceparent" => Some(("traceparent", value)),
+                "tracestate" => Some(("tracestate", value)),
+                _ => None,
+            })
+            .collect();
+    };
+    let child = parent.child();
+    let mut out = vec![("traceparent", child.to_traceparent())];
+    if let Some(state) = child.tracestate {
+        out.push(("tracestate", state));
+    }
+    out
+}
+
+/// Attach [`outbound_trace_headers`] to a `reqwest` request builder.
+///
+/// The one-line form for the outbound clients built on `reqwest`. Every
+/// helper HTTP call the proxy makes on a customer's behalf goes through
+/// this or through [`outbound_trace_headers`] directly, and
+/// `outbound_trace_drift` fails the build for one that does neither
+/// without a reviewed exemption.
+pub fn inject_reqwest_trace_context(
+    req: reqwest::RequestBuilder,
+    trace_ctx: Option<&crate::trace_ctx::w3c::TraceContext>,
+) -> reqwest::RequestBuilder {
+    let mut req = req;
+    for (name, value) in outbound_trace_headers(trace_ctx) {
+        req = req.header(name, value);
     }
     req
 }
@@ -2442,5 +2533,107 @@ mod tests {
             propagation_pairs().is_empty(),
             "with no active context there is nothing to propagate"
         );
+    }
+
+    // --- WOR-2318: the outbound helper-client injector ---
+
+    /// A well-formed inbound `traceparent`, from the W3C Trace Context
+    /// specification's own example.
+    const FIXTURE_TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+    fn fixture_context() -> crate::trace_ctx::w3c::TraceContext {
+        crate::trace_ctx::w3c::TraceContext::parse(FIXTURE_TRACEPARENT)
+            .expect("the fixture traceparent parses")
+    }
+
+    /// The header a helper call carries has to name the request's trace
+    /// and a new span, in that order. Same trace id means a backend can
+    /// hang the helper call under the request that caused it; a new span
+    /// id means it renders as its own hop rather than overwriting the
+    /// one the upstream request already claimed.
+    #[test]
+    fn outbound_trace_headers_build_a_child_of_the_request_context() {
+        let parent = fixture_context();
+        let headers = outbound_trace_headers(Some(&parent));
+
+        assert_eq!(
+            headers.len(),
+            1,
+            "no tracestate on the fixture: {headers:?}"
+        );
+        assert_eq!(headers[0].0, "traceparent");
+
+        let emitted = crate::trace_ctx::w3c::TraceContext::parse(&headers[0].1)
+            .expect("the emitted header must round-trip through the same parser");
+        assert_eq!(
+            emitted.trace_id, parent.trace_id,
+            "a helper call joins the request's trace, it does not start one"
+        );
+        assert_ne!(
+            emitted.parent_id, parent.parent_id,
+            "the helper call is its own hop and needs its own span id"
+        );
+        assert_eq!(
+            emitted.trace_flags, parent.trace_flags,
+            "the sampling decision is the caller's to make, not this function's"
+        );
+    }
+
+    /// `tracestate` is carried only because the workspace already
+    /// represents it: `TraceContext` has the field, the proxied upstream
+    /// path forwards it, and the downstream response echoes it. A trace
+    /// with no vendor state must not grow one here.
+    #[test]
+    fn outbound_trace_headers_carry_tracestate_only_when_the_trace_has_it() {
+        let mut parent = fixture_context();
+        parent.tracestate = Some("vendor=abc".to_string());
+
+        let headers = outbound_trace_headers(Some(&parent));
+        assert_eq!(headers.len(), 2, "{headers:?}");
+        assert_eq!(headers[1], ("tracestate", "vendor=abc".to_string()));
+
+        let bare = fixture_context();
+        assert!(
+            outbound_trace_headers(Some(&bare))
+                .iter()
+                .all(|(name, _)| *name != "tracestate"),
+            "a trace with no vendor state must not acquire one on the way out"
+        );
+    }
+
+    /// The property the whole design turns on. With no request context
+    /// and no ambient span there is nothing true to say, so this says
+    /// nothing. A fabricated root here would put one orphan single-span
+    /// trace in the backend per outbound call, and an operator cannot
+    /// tell those from real ones.
+    #[test]
+    fn outbound_trace_headers_are_empty_rather_than_fabricated() {
+        init_propagator();
+        assert!(
+            outbound_trace_headers(None).is_empty(),
+            "no context anywhere must mean no header, never an invented trace"
+        );
+    }
+
+    /// The `None` arm is not a dead branch: it is the path every caller
+    /// takes that sits inside an instrumented span but has no
+    /// `RequestContext` reachable (the forward-auth subrequest, the
+    /// bot-auth directory fetch, the ledger redeem).
+    #[test]
+    fn outbound_trace_headers_fall_back_to_the_ambient_span() {
+        let known = fixture_context();
+        with_active_span(Some(&known), || {
+            let headers = outbound_trace_headers(None);
+            let traceparent = headers
+                .iter()
+                .find(|(name, _)| *name == "traceparent")
+                .map(|(_, value)| value.clone())
+                .expect("an active span must produce a traceparent");
+            assert!(
+                traceparent.contains("4bf92f3577b34da6a3ce929d0e0e4736"),
+                "the ambient fallback must name the active trace, not a fresh \
+                 root: {traceparent}"
+            );
+        });
     }
 }
