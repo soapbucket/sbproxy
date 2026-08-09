@@ -315,8 +315,9 @@ written through to disk or shared over the mesh.
 Confirm that is what happened before you change anything:
 
 ```bash
-kubectl describe pod <pod> | grep -A5 'Last State'
-kubectl get pod <pod> -o jsonpath='{.status.containerStatuses[0].lastState.terminated.reason}'
+POD=sbproxy-0
+kubectl describe pod "$POD" | grep -A5 'Last State'
+kubectl get pod "$POD" -o jsonpath='{.status.containerStatuses[0].lastState.terminated.reason}'
 ```
 
 `OOMKilled` means the limit was too low or something was growing without a
