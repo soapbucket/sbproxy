@@ -1137,7 +1137,7 @@ these seven built-in rules:
 |---|---|
 | `budget_exhaustion` | Highest configured budget utilization. Warning at 80%, critical at 95%. |
 | `error_rate_spike` | AI-provider errors over attempts in the latest minute. Warning above 10%, critical above 20%; inactive below 10 attempts. |
-| `burn_rate` | Proxy request availability against a 99% target. The existing multi-window objectives use 14.4x, 6x, and 3x burn thresholds as their required windows mature. |
+| `burn_rate` | Proxy request availability against a 99% target, at 14.4x, 6x, and 3x. Inactive until the process-local ring holds 60 minutes, so it is blind for the first hour after a restart. |
 | `latency_slo` | Proxy-wide request p99 for the latest minute. Warning above 200 ms, critical above 400 ms. |
 | `rate_limit_approaching` | Rejected route and tenant rate-limit decisions as a fraction of all decisions in the latest minute. Warning above 80%, critical at 95%. |
 | `cert_expiry` | Soonest certificate in the active ACME store. Warning at 30 days remaining, critical at 7 days. |
@@ -1154,11 +1154,24 @@ configured and resolves incidents for breakers removed during reload.
 
 Burn-rate history is a bounded, process-local ring of 1,440 wall-clock
 one-minute buckets. Once request metrics are available, idle minutes occupy
-zero-request buckets so old failures age out after 24 hours. The ring is not
-persisted and starts empty after every process restart, so the longer burn
-windows need to mature again.
+zero-request buckets so old failures age out after 24 hours.
 
-Burn-rate windows for the page tier: 5m AND 1h at 14.4x, 30m AND 6h at 6x. Ticket tier: 2h AND 24h at 3x. Each paging alert carries a `runbook_id` label so on-call has a stable correlation key into deployment-specific runbooks.
+Nothing persists the ring. It starts empty after every restart, and the rule
+reports `inactive` until it holds 60 minutes again, because a window that has
+been filling for four minutes cannot answer a question about the last hour.
+The Alerts console prints the shortfall in the samples column, `4 / 60 min`
+beside the rule. An inactive burn-rate rule neither opens an incident nor
+resolves one already open, so restarting during an incident will not clear
+it. The 24-hour objective needs a full day of uptime before it can fire.
+
+The first hour after a deploy is therefore blind, and no setting closes it.
+Point anything you page on at an external Prometheus, which keeps the series
+across restarts. `deploy/alerts/alerting-rules.yml` ships the multi-window
+rules that read it: 5m AND 1h at 14.4x and 30m AND 6h at 6x for the page
+tier, 2h AND 24h at 3x for the ticket tier. Each paging alert carries a
+`runbook_id` label so on-call has a stable correlation key into
+deployment-specific runbooks. The in-process rule exists so a deployment with
+no scrape target still gets a signal.
 
 ## Health endpoints
 

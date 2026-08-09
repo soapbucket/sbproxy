@@ -9,7 +9,7 @@ use std::sync::{Arc, RwLock};
 use serde::Serialize;
 
 use super::channels::{Alert, AlertChannelConfig};
-use super::engine::{EngineConfig, RuleEvaluation, RuleEvaluationState};
+use super::engine::{EngineConfig, RuleEvaluation, RuleEvaluationState, BURN_RATE_MIN_SAMPLES};
 
 /// Maximum process-lifetime alert events retained for the admin console.
 pub const ALERT_HISTORY_CAPACITY: usize = 200;
@@ -202,7 +202,13 @@ impl AlertRuntime {
                     "Multi-window availability burn rate over a process-local 1,440-minute ring"
                         .to_string(),
                 thresholds: vec![3.0, 6.0, 14.4],
-                minimum_samples: None,
+                // The console renders the sample column as "n / floor" only
+                // for a rule that declares a floor, and prints "not gated" for
+                // one that does not. Leaving this None put the words "not
+                // gated" beside a reading taken from a ring that had been
+                // filling for four minutes, which is the one place an operator
+                // would have looked to find that out.
+                minimum_samples: Some(BURN_RATE_MIN_SAMPLES),
                 state: RuleEvaluationState::Inactive,
                 reading: None,
                 sample_count: None,
@@ -408,6 +414,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::alerting::burn_rate::MinuteSample;
     use crate::alerting::{Alert, AlertChannelConfig, AlertEngine, EngineConfig, MetricReadings};
 
     fn channel(channel_type: &str) -> AlertChannelConfig {
@@ -465,6 +472,38 @@ mod tests {
         assert_eq!(provider.minimum_samples, Some(10));
         assert_eq!(provider.sample_count, Some(4));
         assert!(provider.last_evaluated_at.is_some());
+    }
+
+    #[test]
+    fn burn_rate_rule_advertises_the_history_its_reading_needs() {
+        let config = EngineConfig::default();
+        let runtime = AlertRuntime::new(&config, &[]);
+        let mut engine = AlertEngine::new(config);
+        for _ in 0..4 {
+            engine.evaluate(&MetricReadings {
+                minute_sample: Some(MinuteSample {
+                    requests: 100,
+                    errors: 50,
+                    p99_ms: 20.0,
+                }),
+                ..MetricReadings::default()
+            });
+        }
+        runtime.record_evaluations(engine.latest_evaluations());
+
+        let snapshot = runtime.snapshot();
+        let burn = snapshot
+            .rules
+            .iter()
+            .find(|rule| rule.rule == "burn_rate")
+            .map(|rule| (rule.state, rule.sample_count, rule.minimum_samples));
+        // Without a declared floor the console prints "not gated" here, and a
+        // reading taken from four minutes of history is indistinguishable from
+        // one taken from a full day.
+        assert_eq!(
+            burn,
+            Some((RuleEvaluationState::Inactive, Some(4), Some(60)))
+        );
     }
 
     #[test]

@@ -593,10 +593,16 @@ mod tests {
             None,
         )
         .unwrap();
-        let fired = engine.evaluate(&MetricReadings {
-            minute_sample: Some(failure),
-            ..MetricReadings::default()
-        });
+        // The rule is inactive until the ring holds the shortest objective's
+        // full hour, so it takes sixty failing minutes to open the incident
+        // this test then ages back out. One failing minute opens nothing.
+        let mut fired = Vec::new();
+        for _ in 0..60 {
+            fired.extend(engine.evaluate(&MetricReadings {
+                minute_sample: Some(failure),
+                ..MetricReadings::default()
+            }));
+        }
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].rule, "burn_rate");
 

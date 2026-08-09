@@ -43,6 +43,15 @@ const SLO_FIRING_KEY: &str = "latency_slo:origin=proxy";
 const RATE_LIMIT_FIRING_KEY: &str = "rate_limit_approaching:origin=proxy";
 const BURN_RATE_FIRING_KEY: &str = "burn_rate:scope=substrate";
 const BURN_RATE_HISTORY_CAPACITY: usize = 24 * 60;
+/// Minute buckets the ring must hold before the burn-rate rule is active.
+///
+/// The shortest objective the evaluator publishes is the one-hour tier, so
+/// below an hour of history there is no window it can honestly answer for. The
+/// ring is process-local and starts empty, which makes every restart a partial
+/// window; without this floor the rule would report a confident burn rate
+/// computed from a single minute, and a fresh process would read healthy
+/// because it has not yet observed the failures it is supposed to be counting.
+pub(crate) const BURN_RATE_MIN_SAMPLES: u64 = 60;
 
 /// Earliest ACME certificate expiry supplied by the process runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,7 +124,10 @@ pub struct MetricReadings {
     /// configured.
     pub circuit_breakers: Option<Vec<CircuitBreakerReading>>,
     /// One complete minute of proxy request traffic. The engine retains a
-    /// process-local 24-hour ring and does not persist it across restart.
+    /// process-local 24-hour ring and does not persist it across restart, so
+    /// the rule stays inactive until the ring holds a full hour again. Anything
+    /// that must survive a restart belongs in an external Prometheus, which
+    /// keeps the series the process forgets.
     pub minute_sample: Option<MinuteSample>,
 }
 
@@ -193,7 +205,8 @@ pub struct AlertEngine {
     latest_evaluations: Vec<RuleEvaluation>,
     /// Minute-resolution history is deliberately process-local: restarting
     /// begins a fresh observation window. The hard cap prevents alerting from
-    /// growing with process uptime.
+    /// growing with process uptime, and [`BURN_RATE_MIN_SAMPLES`] keeps the
+    /// fresh window from being read as a healthy one.
     burn_rate_samples: VecDeque<MinuteSample>,
 }
 
@@ -285,32 +298,50 @@ impl AlertEngine {
                 }
                 self.burn_rate_samples.push_back(sample);
                 let samples: Vec<MinuteSample> = self.burn_rate_samples.iter().copied().collect();
-                let snapshot = replay_and_evaluate(&samples, self.config.burn_rate_slo_target);
-                let objectives: Vec<String> = snapshot
-                    .fired_names()
-                    .into_iter()
-                    .filter(|name| name.starts_with("SBPROXY-SUBSTRATE-AVAIL-"))
-                    .collect();
-                let alert = (!objectives.is_empty()).then(|| Alert {
-                    rule: "burn_rate".to_string(),
-                    severity: "critical".to_string(),
-                    message: format!(
-                        "Availability error budget is burning across {}",
-                        objectives.join(", ")
-                    ),
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                    labels: HashMap::from([
-                        ("scope".to_string(), "substrate".to_string()),
-                        ("objectives".to_string(), objectives.join(",")),
-                    ]),
-                    resolved: false,
-                });
-                let state = if alert.is_some() {
-                    RuleEvaluationState::Firing
-                } else {
-                    RuleEvaluationState::Ok
+                let sample_count = samples.len() as u64;
+                // A ring shorter than the shortest objective is a partial
+                // window, and a partial window is the state every process is in
+                // for an hour after it starts. Evaluating one would answer a
+                // question about the last hour using the last four minutes,
+                // which reads healthy for exactly as long as the evidence is
+                // missing. Below the floor the rule is inactive instead: it
+                // publishes the reading and how much history produced it, and
+                // takes neither the fire nor the resolve path, so a restart
+                // mid-incident cannot clear an open one either.
+                let ready = sample_count >= BURN_RATE_MIN_SAMPLES;
+                let alert = ready
+                    .then(|| {
+                        let snapshot =
+                            replay_and_evaluate(&samples, self.config.burn_rate_slo_target);
+                        let objectives: Vec<String> = snapshot
+                            .fired_names()
+                            .into_iter()
+                            .filter(|name| name.starts_with("SBPROXY-SUBSTRATE-AVAIL-"))
+                            .collect();
+                        (!objectives.is_empty()).then(|| Alert {
+                            rule: "burn_rate".to_string(),
+                            severity: "critical".to_string(),
+                            message: format!(
+                                "Availability error budget is burning across {}",
+                                objectives.join(", ")
+                            ),
+                            timestamp: chrono::Utc::now().to_rfc3339(),
+                            labels: HashMap::from([
+                                ("scope".to_string(), "substrate".to_string()),
+                                ("objectives".to_string(), objectives.join(",")),
+                            ]),
+                            resolved: false,
+                        })
+                    })
+                    .flatten();
+                let state = match (ready, alert.is_some()) {
+                    (false, _) => RuleEvaluationState::Inactive,
+                    (true, true) => RuleEvaluationState::Firing,
+                    (true, false) => RuleEvaluationState::Ok,
                 };
-                self.apply_active_rule(BURN_RATE_FIRING_KEY, alert, &mut to_fire);
+                if ready {
+                    self.apply_active_rule(BURN_RATE_FIRING_KEY, alert, &mut to_fire);
+                }
                 evaluations.push(RuleEvaluation {
                     rule: "burn_rate".to_string(),
                     state,
@@ -318,7 +349,7 @@ impl AlertEngine {
                         &samples,
                         self.config.burn_rate_slo_target,
                     )),
-                    sample_count: Some(samples.len() as u64),
+                    sample_count: Some(sample_count),
                     evaluated_at: evaluated_at.clone(),
                 });
             }
@@ -1274,6 +1305,50 @@ mod tests {
         assert_eq!(
             AlertEngine::new(EngineConfig::default()).burn_rate_sample_count(),
             0
+        );
+    }
+
+    #[test]
+    fn burn_rate_is_inactive_until_the_ring_holds_a_full_hour() {
+        let mut engine = AlertEngine::new(EngineConfig::default());
+        // 50% errors against a 1% budget is a 50x burn: over the floor it
+        // breaches every tier, so nothing but the floor keeps it quiet.
+        let burning = MinuteSample {
+            requests: 100,
+            errors: 50,
+            p99_ms: 20.0,
+        };
+        let burn_rate_state = |engine: &AlertEngine| {
+            engine
+                .latest_evaluations()
+                .iter()
+                .find(|evaluation| evaluation.rule == "burn_rate")
+                .map(|evaluation| (evaluation.state, evaluation.sample_count))
+        };
+
+        for minute in 1..BURN_RATE_MIN_SAMPLES {
+            let fired = engine.evaluate(&MetricReadings {
+                minute_sample: Some(burning),
+                ..MetricReadings::default()
+            });
+            assert!(fired.is_empty(), "minute {minute} must not fire");
+            assert_eq!(
+                burn_rate_state(&engine),
+                Some((RuleEvaluationState::Inactive, Some(minute))),
+                "a partial ring must report how little history it has"
+            );
+        }
+        assert_eq!(engine.firing_count(), 0);
+
+        let fired = engine.evaluate(&MetricReadings {
+            minute_sample: Some(burning),
+            ..MetricReadings::default()
+        });
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].rule, "burn_rate");
+        assert_eq!(
+            burn_rate_state(&engine),
+            Some((RuleEvaluationState::Firing, Some(BURN_RATE_MIN_SAMPLES)))
         );
     }
 
