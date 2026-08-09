@@ -199,7 +199,7 @@ pub trait ActionHandler: Send + Sync + 'static {
         ctx: &mut dyn std::any::Any,
     ) -> Pin<Box<dyn Future<Output = Result<ActionOutcome>> + Send + '_>>;
 }
-// Same shape for AuthProvider, PolicyEnforcer, TransformHandler, RequestEnricher.
+// Same shape for AuthProvider, PolicyEnforcer, and TransformHandler.
 ```
 
 For a linked plugin, the registration unit is a factory function that constructs a

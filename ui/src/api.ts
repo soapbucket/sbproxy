@@ -356,7 +356,6 @@ export type ExtensionHookKind =
   | "auth"
   | "policy"
   | "transform"
-  | "enricher"
   | "startup"
   | "identity"
   | "ml_classifier"

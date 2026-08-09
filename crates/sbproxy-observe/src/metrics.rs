@@ -3444,7 +3444,7 @@ pub fn record_compression_ratio(codec: &'static str, ratio: f64) {
 //   alert on config-invalid factories or panicking plugin init.
 //
 // `kind` is the closed enum
-// `policy | action | auth | transform | enricher`. `plugin` is
+// `policy | action | auth | transform`. `plugin` is
 // sanitised through the cardinality limiter so a hostile or
 // misconfigured deployment cannot blow up the label space by
 // registering thousands of distinct plugin names. `result` is a

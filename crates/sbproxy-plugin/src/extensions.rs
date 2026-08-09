@@ -296,8 +296,6 @@ pub enum ExtensionHookKind {
     Policy,
     /// Body transform hook.
     Transform,
-    /// Request enrichment hook.
-    Enricher,
     /// Process or pipeline startup hook.
     Startup,
     /// Identity resolution hook.

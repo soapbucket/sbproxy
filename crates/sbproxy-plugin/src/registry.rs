@@ -24,6 +24,12 @@ fn unique_registration<T: 'static>(
 }
 
 /// Which kind of plugin this registration covers.
+///
+/// Every variant here has a typed sibling channel further down this
+/// module that the config compiler actually builds handlers from. That
+/// is the bar for adding one: a kind with no typed channel is a
+/// registration an operator can write, see listed in diagnostics, and
+/// never have loaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PluginKind {
     /// Action handler (request routing / response generation).
@@ -34,8 +40,6 @@ pub enum PluginKind {
     Policy,
     /// Body transform handler.
     Transform,
-    /// Request enricher (GeoIP, UA parsing, etc.).
-    Enricher,
 }
 
 /// Plugin registration entry collected by inventory at link time.
@@ -90,10 +94,10 @@ pub fn list_plugins(kind: PluginKind) -> Vec<&'static str> {
 /// Strongly-typed Auth plugin registration.
 ///
 /// The base [`PluginRegistration`] uses `Box<dyn Any + Send>` for its
-/// factory return type, which works for action / policy / transform /
-/// enricher plugins (each consumed by a downcaster that knows the
-/// concrete type) but is awkward for auth: `compile_auth` cannot know
-/// every concrete auth type at build time.
+/// factory return type, which works for action / policy / transform
+/// plugins (each consumed by a downcaster that knows the concrete
+/// type) but is awkward for auth: `compile_auth` cannot know every
+/// concrete auth type at build time.
 ///
 /// This sibling channel returns `Box<dyn AuthProvider>` directly so
 /// the compile side can build `Auth::Plugin(...)` without any
@@ -452,10 +456,60 @@ mod tests {
     }
 
     #[test]
-    fn list_plugins_empty_for_unused_kind() {
-        let enrichers = list_plugins(PluginKind::Enricher);
-        // No enrichers registered in this test module.
-        assert!(enrichers.is_empty());
+    fn list_plugins_empty_for_kind_with_no_generic_registration() {
+        let transforms = list_plugins(PluginKind::Transform);
+        // This module submits its transform fixture through the typed
+        // channel only, so the generic feed has no transform rows.
+        assert!(transforms.is_empty());
+    }
+
+    /// Every [`PluginKind`] must have a typed sibling channel behind it.
+    ///
+    /// The generic [`PluginRegistration`] feed is diagnostics and
+    /// listing only; the config compiler builds handlers exclusively
+    /// from the typed registrations. A kind with no typed channel is
+    /// therefore a registration an operator can write, watch appear in
+    /// `/metrics` and in the extension inventory, and never have
+    /// loaded. `PluginKind::Enricher` was exactly that from the first
+    /// commit until it was removed: it named a `RequestEnricher` trait
+    /// nothing implemented, nothing dispatched, and no config key could
+    /// reach.
+    ///
+    /// The `match` below is the guard. It is exhaustive on purpose, so
+    /// a new variant added without a typed channel stops compiling here
+    /// rather than shipping as another undispatched promise.
+    #[test]
+    fn every_plugin_kind_has_a_typed_build_path() {
+        let every_kind = [
+            PluginKind::Action,
+            PluginKind::Auth,
+            PluginKind::Policy,
+            PluginKind::Transform,
+        ];
+
+        for kind in every_kind {
+            // Each arm queries that kind's typed channel for a name
+            // nothing registers. `None` is the answer only a channel
+            // that exists and is queryable can give.
+            let channel_answers = match kind {
+                PluginKind::Action => {
+                    build_action_plugin("__absent__", serde_json::Value::Null).is_none()
+                }
+                PluginKind::Auth => {
+                    build_auth_plugin("__absent__", serde_json::Value::Null).is_none()
+                }
+                PluginKind::Policy => {
+                    build_policy_plugin("__absent__", serde_json::Value::Null).is_none()
+                }
+                PluginKind::Transform => {
+                    build_transform_plugin("__absent__", serde_json::Value::Null).is_none()
+                }
+            };
+            assert!(
+                channel_answers,
+                "{kind:?} has no typed registration channel"
+            );
+        }
     }
 
     #[test]

@@ -9,7 +9,18 @@ name = "sbproxy-plugin"
 # returns, which drops its `Copy` impl and makes any exhaustive match on
 # the 0.2 variants non-exhaustive. See `ActionOutcome`'s rustdoc for the
 # migration.
-version = "0.3.0"
+#
+# 0.3 -> 0.4: removal of the `RequestEnricher` trait, the
+# `PluginKind::Enricher` variant, and the `ExtensionHookKind::Enricher`
+# variant. The trait shipped in the first commit and was never
+# implemented, never dispatched, and reachable from no config key; its
+# only output channel was a `&mut dyn Any` whose concrete type lives in
+# an internal crate, so no out-of-tree implementor could write anything
+# through it. Enrichment that runs early and annotates the request
+# context is `IdentityResolverHook` (plus `MlClassifierHook` and
+# `AnomalyDetectorHook`), which are dispatched and take a typed
+# `RequestContextView` rather than a type-erased context.
+version = "0.4.0"
 edition = "2021"
 license.workspace = true
 publish = false

@@ -1,5 +1,5 @@
 # sbproxy (Rust workspace)
-*Last modified: 2026-08-07*
+*Last modified: 2026-08-08*
 
 The active implementation of sbproxy. Cargo workspace with ~20
 crates under `crates/`, an e2e suite under `e2e/`, examples under
@@ -307,8 +307,15 @@ chain-construction path.
   no other crate in this workspace is part of the public surface
   today.
   - `sbproxy-plugin` - public plugin trait surface (`PolicyEnforcer`,
-    `ActionHandler`, `AuthProvider`, `TransformHandler`,
-    `RequestEnricher`, registry).
+    `ActionHandler`, `AuthProvider`, `TransformHandler`, registry).
+    Each of those four has a typed `inventory` registration channel the
+    config compiler builds handlers from; that pairing is the bar for
+    adding a fifth. `RequestEnricher` was declared here from the first
+    commit without one and was removed rather than wired, because its
+    only output channel was a `&mut dyn Any` no out-of-tree implementor
+    can downcast. Early request annotation is `IdentityResolverHook`,
+    `MlClassifierHook`, and `AnomalyDetectorHook`, which are dispatched
+    and take a typed `RequestContextView`.
   - `sbproxy-config` - config schema and `compile_config()` entry
     point.
   - `sbproxy-httpkit` - HTTP request/response helpers shared by

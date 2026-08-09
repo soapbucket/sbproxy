@@ -1,5 +1,5 @@
 # sbproxy (Rust workspace)
-*Last modified: 2026-07-31*
+*Last modified: 2026-08-08*
 
 The active implementation of sbproxy. Cargo workspace with ~20
 crates under `crates/`, an e2e suite under `e2e/`, examples under
@@ -225,18 +225,30 @@ sbproxy/
 
 ## Module system
 
-Caddy-style. Each module under `crates/sbproxy-modules/src/{action,
-auth,policy,transform}/` registers itself via `init()` into the
-`pkg/plugin` registry. The config compiler discovers modules by name
-at config-load time. Adding a new module:
+Built-in modules under `crates/sbproxy-modules/src/{action,
+auth,policy,transform}/` are enum variants dispatched by explicit
+match arms on the config `type` string in
+`crates/sbproxy-modules/src/compile.rs`. There is no `init()`-time
+registration, no `imports.rs`, and no `pkg/plugin` registry; those
+were Go-era mechanisms. Adding a new built-in module:
 
 1. Create the module file, define its config struct, implement the
    relevant trait (`PolicyEnforcer`, `ActionHandler`, `AuthProvider`,
-   `TransformHandler`, `RequestEnricher`).
-2. Register via `plugin::Register{Policy,Action,Auth,Transform,Enricher}`
-   in `init()`.
-3. Add a blank import to `crates/sbproxy-modules/src/imports.rs`.
-4. Run the four pre-commit checks.
+   `TransformHandler`).
+2. Add `pub mod my_module;` to the parent `mod.rs` and a variant to
+   that kind's enum (`Policy`, `Action`, `Auth`, `Transform`).
+3. Add a match arm for the `type` string in
+   `crates/sbproxy-modules/src/compile.rs`.
+4. Run the pre-commit checks.
+
+A `type` string with no match arm falls through to the typed
+inventory registrations in `sbproxy-plugin`
+(`inventory::submit!` with `{Action,Auth,Policy,Transform}PluginRegistration`),
+which is how linked third-party plugins load, and then to the
+config-loaded JS/WASM extension-bundle registry. The generic
+`PluginRegistration` channel (with `PluginKind` and a `Box<dyn Any>`
+factory) is diagnostics/listing only; the compiler never builds
+handlers from it.
 
 ## Compiled handler chain
 
@@ -253,8 +265,15 @@ chain-construction path.
   no other crate in this workspace is part of the public surface
   today.
   - `sbproxy-plugin` - public plugin trait surface (`PolicyEnforcer`,
-    `ActionHandler`, `AuthProvider`, `TransformHandler`,
-    `RequestEnricher`, registry).
+    `ActionHandler`, `AuthProvider`, `TransformHandler`, registry).
+    Each of those four has a typed `inventory` registration channel the
+    config compiler builds handlers from; that pairing is the bar for
+    adding a fifth. `RequestEnricher` was declared here from the first
+    commit without one and was removed rather than wired, because its
+    only output channel was a `&mut dyn Any` no out-of-tree implementor
+    can downcast. Early request annotation is `IdentityResolverHook`,
+    `MlClassifierHook`, and `AnomalyDetectorHook`, which are dispatched
+    and take a typed `RequestContextView`.
   - `sbproxy-config` - config schema and `compile_config()` entry
     point.
   - `sbproxy-httpkit` - HTTP request/response helpers shared by
