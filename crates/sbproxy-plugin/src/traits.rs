@@ -533,35 +533,6 @@ pub trait TransformHandler: Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = PluginResult<()>> + Send + 'a>>;
 }
 
-/// Request enricher - adds data to request context (GeoIP, UA parsing, etc.).
-pub trait RequestEnricher: Send + Sync + 'static {
-    /// Returns the enricher name (e.g. "geoip", "ua-parser").
-    fn name(&self) -> &str;
-
-    /// Enrich the request context with additional data.
-    ///
-    /// The enricher writes derived data into `ctx` (downcast to the
-    /// concrete request-context type) and resolves to `()` on success.
-    ///
-    /// ## Errors
-    ///
-    /// Returns a [`PluginError`](crate::PluginError) when enrichment
-    /// could not run: a lookup backend (GeoIP database, parser table)
-    /// was unavailable
-    /// ([`PluginError::Upstream`](crate::PluginError::Upstream)), the
-    /// enricher was misconfigured
-    /// ([`PluginError::Config`](crate::PluginError::Config)), or any
-    /// other failure folded into
-    /// [`PluginError::Internal`](crate::PluginError::Internal).
-    /// Enrichers are advisory, so the dispatcher may log and continue;
-    /// returning `Err` signals that the enriched fields are absent.
-    fn enrich(
-        &self,
-        req: &http::Request<bytes::Bytes>,
-        ctx: &mut dyn std::any::Any,
-    ) -> Pin<Box<dyn Future<Output = PluginResult<()>> + Send + '_>>;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

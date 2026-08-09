@@ -2433,9 +2433,12 @@ pub(super) async fn request_filter(
     //
     // We also stamp `ctx.canonical_url` here from the request URL +
     // hostname so the citation_block and json_envelope transforms
-    // have a stable Source: / url field. Operators can override by
-    // stamping their own value from a request enricher upstream of
-    // this point.
+    // have a stable Source: / url field. The stamp is skipped when the
+    // field is already set, but nothing upstream sets it today: no
+    // config key, module, or script reaches `canonical_url`, and the
+    // `RequestEnricher` trait this comment used to point at was
+    // declared without a dispatch point and removed. Giving operators
+    // an override means adding the seam first.
     {
         let origin_for_negotiate = &pipeline.config.origins[origin_idx];
         let accept = session

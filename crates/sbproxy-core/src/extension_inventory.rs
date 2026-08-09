@@ -699,7 +699,6 @@ const fn plugin_hook_kind(kind: PluginKind) -> ExtensionHookKind {
         PluginKind::Auth => ExtensionHookKind::Auth,
         PluginKind::Policy => ExtensionHookKind::Policy,
         PluginKind::Transform => ExtensionHookKind::Transform,
-        PluginKind::Enricher => ExtensionHookKind::Enricher,
     }
 }
 
@@ -716,7 +715,6 @@ const fn bundle_hook_kind(kind: ExtensionHookKind) -> Option<BundleHookKind> {
         ExtensionHookKind::AiClose => Some(BundleHookKind::AiClose),
         ExtensionHookKind::Payment => Some(BundleHookKind::Payment),
         ExtensionHookKind::Auth
-        | ExtensionHookKind::Enricher
         | ExtensionHookKind::Startup
         | ExtensionHookKind::Identity
         | ExtensionHookKind::MlClassifier
@@ -731,7 +729,6 @@ const fn hook_kind_label(kind: ExtensionHookKind) -> &'static str {
         ExtensionHookKind::Auth => "auth",
         ExtensionHookKind::Policy => "policy",
         ExtensionHookKind::Transform => "transform",
-        ExtensionHookKind::Enricher => "enricher",
         ExtensionHookKind::Startup => "startup",
         ExtensionHookKind::Identity => "identity",
         ExtensionHookKind::MlClassifier => "ml_classifier",
@@ -762,7 +759,6 @@ const fn hook_phase(kind: ExtensionHookKind) -> &'static str {
         ExtensionHookKind::ProxyWasmFilter => "http",
         ExtensionHookKind::Action
         | ExtensionHookKind::Policy
-        | ExtensionHookKind::Enricher
         | ExtensionHookKind::MlClassifier
         | ExtensionHookKind::AnomalyDetector => "request",
     }
