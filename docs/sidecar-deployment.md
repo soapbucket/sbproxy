@@ -1,6 +1,6 @@
 # Sidecar deployment
 
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-09*
 
 SBproxy is north-south first: most operators run it as a
 top-of-rack gateway in front of an LLM provider or an internal
@@ -290,6 +290,14 @@ ps -o rss= -p $(pgrep -f 'sbproxy serve') | awk '{printf "%.1f MB\n", $1/1024}'
 
 Measure this on your own build before trusting it. The figure moves with the
 feature set compiled in, and a debug binary is not what you ship.
+
+That 77.5 MB is also the only memory measurement published anywhere in this
+project, and it is an idle process with no cache, no classifier models, and no
+upstream connections open. Nothing has measured resident set under load, so the
+`resources` block in the pod spec above is extrapolated from this one reading
+rather than derived from a loaded one. [capacity-planning.md](capacity-planning.md)
+gives the arithmetic behind those numbers and the commands that replace them
+with a measurement from your own workload.
 
 ## Service-mesh integration
 

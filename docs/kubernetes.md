@@ -99,9 +99,22 @@ spec:
   configRef: demo-config
   replicas: 2
   port: 8080
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
 ```
 
 `configRef` must name an `SBProxyConfig` in the same namespace.
+
+### Always set `resources`
+
+`spec.resources` is optional and has no default. Leave it out and the operator reconciles a container with empty requests and empty limits, which Kubernetes classifies as BestEffort: the pod is first in line for eviction under node pressure, and nothing caps how far it can grow before the node does. Neither is a property you want on a data plane.
+
+The figures above are a starting point rather than a recommendation. The only resident-set measurement in this project is an idle process on a minimal config, so the headroom in that block is reasoned, not observed, and two features invalidate it outright (a filled response cache, and a local ONNX classifier that can reach 200 MiB by itself). [capacity-planning.md](capacity-planning.md) shows the arithmetic behind each number and the commands that replace them with a reading from your own traffic.
 
 ## Hot-reload (recommended)
 

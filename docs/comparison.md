@@ -1,6 +1,6 @@
 # How SBproxy compares
 
-*Last modified: 2026-08-08*
+*Last modified: 2026-08-09*
 
 SBproxy is an AI gateway that governs traffic in both directions. Most AI gateways only handle the calls your apps make out to models; SBproxy also governs the AI agents and crawlers coming in to your APIs and content, and because it is a real reverse proxy it handles the rest of your API traffic on the same runtime. This page is honest about where SBproxy fits and where you should pick something else.
 
@@ -74,7 +74,7 @@ self-hosted binary, with no vendor control plane.
 SBproxy fits when you need a production reverse proxy *and* an AI gateway in the same traffic layer. Pick it when:
 
 - **You run both kinds of traffic.** HTTP and LLM. Most teams glue Nginx or Traefik together with LiteLLM, Portkey, or a SaaS AI gateway. Two systems to configure, deploy, and monitor. SBproxy is one binary, one config, one place to put policies.
-- **You care about overhead.** Sub-millisecond p99 on the proxy path. Idle RSS in single-digit megabytes. LiteLLM wants 4 CPU and 8 GB plus Python, PostgreSQL, and Redis. Managed gateways add a public network hop.
+- **You care about overhead.** Sub-millisecond p99 on the proxy path. One binary, no interpreter and no database on the request path; the last measured idle resident set was 77.5 MB on a minimal sidecar config, and memory under load has not been measured (see [capacity-planning.md](capacity-planning.md)). LiteLLM wants 4 CPU and 8 GB plus Python, PostgreSQL, and Redis. Managed gateways add a public network hop.
 - **You want scripting that ships in the binary.** CEL for routing (compiled once, evaluates in microseconds), Lua for transforms, JavaScript via QuickJS, and sandboxed WebAssembly for plugins. No C modules to compile, no separate plugin daemon.
 - **You need MCP federation.** SBproxy proxies and federates Model Context Protocol traffic alongside HTTP and AI. No other general-purpose proxy ships this.
 - **You want to self-host without a database.** Single binary. No PostgreSQL.
@@ -100,7 +100,7 @@ SBproxy reaches 200+ models through 72 native providers behind one OpenAI-compat
 | LLM providers | 200+ models (72 native providers, bring your own keys) | 100+ native |
 | General HTTP proxy | Yes | No |
 | Implementation | Compiled native binary | Python |
-| Min resources | 1 CPU, 256 MB | 4 CPU, 8 GB |
+| Min resources | 1 CPU, 256 MB ([a starting point](capacity-planning.md), not a measured floor) | 4 CPU, 8 GB |
 | Database required | No | PostgreSQL |
 | HTTP/3 | Planned | No |
 | WebSocket proxy | Yes | No |

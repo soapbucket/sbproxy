@@ -67,6 +67,43 @@ rbac:
 watchNamespace: ""
 
 # Resource requests and limits for the operator pod itself.
+#
+# Read the scope first: this sizes the OPERATOR, not the proxy. The
+# operator watches CRs and writes Deployments; it never sees request
+# traffic. The data plane it creates is sized by `SBProxy.spec.resources`
+# on each custom resource, which this chart does not set and which has no
+# default. Omit that field and the proxy pod is reconciled with empty
+# requests and empty limits, so Kubernetes schedules it BestEffort: first
+# evicted under node pressure, and free to grow until the node runs out.
+# Set it on every SBProxy. `deploy/examples/sample-sbproxy.yaml` has a
+# starting point and `docs/capacity-planning.md` has the arithmetic.
+#
+# These operator numbers are a starting point, not a measurement. Nothing
+# in this repository has profiled the operator's resident set, so treat
+# every figure below as a reasoned guess to be replaced by a reading from
+# your own cluster:
+#
+#   requests.cpu 50m     - the reconcile loop is idle between watch
+#                          events, so the request only needs to cover
+#                          steady-state watch traffic plus leader-election
+#                          lease renewals.
+#   requests.memory 64Mi - a Rust binary holding a kube client, a watch
+#                          cache for two namespaced CRs, and no request
+#                          path. Small watch caches, so this scales with
+#                          how many SBProxy and SBProxyConfig objects
+#                          exist, not with proxied traffic. Raise it if
+#                          you manage hundreds of CRs from one operator.
+#   limits.cpu 500m      - reconciles are bursty: a config change can
+#                          re-render every owned Deployment at once. CPU
+#                          limits throttle rather than kill, so a low
+#                          limit shows up as slow rollouts.
+#   limits.memory 256Mi  - 4x the request, to contain a runaway watch
+#                          cache without letting one operator pod take a
+#                          node down. Exceeding a memory limit is an
+#                          OOMKill, not a throttle.
+#
+# Check it rather than inheriting it:
+#   kubectl top pod -n sbproxy-system -l app.kubernetes.io/name=sbproxy-k8s-operator
 resources:
   requests:
     cpu: 50m

@@ -1,5 +1,5 @@
 # Performance
-*Last modified: 2026-08-07*
+*Last modified: 2026-08-09*
 
 What SBproxy delivers on real hardware, with the methodology you'd need to reproduce it.
 
@@ -14,6 +14,10 @@ On an 8 vCPU GCE instance, single binary, zero tuning beyond the defaults:
 - **0.3 ms p50** at the median proxy path. Most p99s land under 1 ms.
 
 These are publishable medians from 60-second runs across three replicates. Run details below; raw artifacts and the full reproducibility recipe live in [`sbproxy-bench`](https://github.com/soapbucket/sbproxy-bench).
+
+**None of these numbers can be reproduced from this repository.** The scenario files, the Terraform that provisions the GCE instances, the load-generator configs, and the raw per-replicate `oha` output all live in that separate repo. Cloning this one and running something will not regenerate the table. What this tree does ship is a smaller local harness, described under [Reproduce locally](#reproduce-locally), which is the right tool for measuring your own config anyway.
+
+This page also says nothing about memory. For resident set, pod sizing, and OOM triage, see [capacity-planning.md](capacity-planning.md), which is honest about the fact that memory under load has never been measured here.
 
 ## Headline numbers
 
@@ -52,6 +56,7 @@ Be honest with yourself about coverage:
 - **Localhost numbers in older docs are lower.** Single-laptop runs hit ephemeral-port exhaustion around 150 concurrent connections and conflate proxy work with the load generator's CPU. Use the c3 numbers above as the trustworthy floor; expect higher on bigger hardware.
 - **Hardware matters.** c3-standard-8 is a Sapphire Rapids instance with dedicated cores. Burstable VMs (e2, t-series) or AMD Milan (n2d) will land lower; recent EPYC and bare metal will land higher.
 - **Configuration matters.** Logging at `debug`, full-body logging, or expensive Lua transforms can each cut throughput in half.
+- **There is no memory column, and that is a real gap.** Every scenario above reports rps and latency and nothing about resident set, so this table cannot tell you how big an instance to buy. The one memory figure published anywhere is an idle process on a developer laptop. [capacity-planning.md](capacity-planning.md) has the empty table and the commands that fill it.
 - **The AI rows predate the current AI-gateway feature set.** The matrix-v7 run measured the AI proxy path before the usage ledger, the CEL policy engine, the guardrail mesh, outcome-aware routing, and predictive budgets landed, and before the model host could serve weights on a local GPU. Each of those adds work per request, so treat the AI rows as a ceiling for a fully configured gateway and re-run the recipe with your config. For AI router strategy comparisons (round-robin vs peak-EWMA vs prefix-affinity and friends), see [ai-lb-benchmark.md](ai-lb-benchmark.md). Requests answered by the [model host](model-host.md) are bound by the engine's token generation rate, like the streaming row, not by the proxy.
 
 If you need numbers for your scenario, run the benchmark recipe yourself. Don't take the table above on faith.
@@ -132,23 +137,23 @@ The full set of scenarios, the harness code, the loadgen config, and the raw per
 
 You don't need GCE to get a useful read. The microbenchmarks and the local recipe below run on a laptop.
 
-### Microbenchmarks (criterion)
+### There is no microbenchmark suite
 
-In-process benchmarks of the config compiler, pipeline dispatch, host router, and other hot paths:
+Earlier versions of this page documented a criterion suite and a `target/criterion/` report directory. Neither exists. No crate in this workspace declares a `[[bench]]` target, there is no `benches/` directory, and `criterion` does not appear in `Cargo.lock`, so `cargo bench --workspace` compiles the workspace and benches nothing. If you came here looking for in-process numbers on the config compiler or pipeline dispatch, there are none to find; the two scripts below are the whole local story.
 
-```bash
-cargo bench --workspace                     # everything
-cargo bench -p sbproxy-core                 # just one crate
-cargo bench -- pipeline_dispatch            # one bench by name
-```
+### The scripted harness
 
-Results land in `target/criterion/`. Open `target/criterion/report/index.html` for charts and regression analysis. Save and diff baselines:
+Two scripts in `scripts/` drive load against a real proxy process and report both latency and resident set:
 
 ```bash
-cargo bench -- --save-baseline before
-# change something
-cargo bench -- --baseline before
+# Boots a release binary, samples idle and peak RSS, runs oha, writes JSON.
+scripts/perf-regression-run.sh /tmp/bench.json my-label
+
+# Three scenario shapes (static, full middleware, echo) at concurrency 64.
+SBPROXY_BIN=./target/release/sbproxy scripts/perf-compare.sh
 ```
+
+The first is what the `perf-regression` CI lane runs on a PR labelled `run-perf`; it compares the PR against a freshly built `main` baseline and fails the check when p99, idle RSS, or max RSS regresses more than 5%. Both scripts need [`oha`](https://github.com/hatoo/oha) on `PATH`, pinned to 1.4.5 in CI. [capacity-planning.md](capacity-planning.md) covers the tuning variables and how to read what comes back.
 
 ### End-to-end local run
 
@@ -207,5 +212,7 @@ For your own dashboards, the metrics that move first:
 - `sbproxy_active_connections`. Sustained climb means your upstream is slower than incoming.
 - `sbproxy_cache_results_total`. Compute the hit ratio as `hit / (hit + miss)` from the `result` label. It is the number that moves p99 the most when caching is configured.
 - `sbproxy_config_reload_total`. A spike means your reload tooling is flapping.
+
+Memory is not on that list because the proxy does not export its own resident set. Read it from the layer below (`container_memory_working_set_bytes` under Kubernetes, `ps -o rss=` on a plain host); [capacity-planning.md](capacity-planning.md) covers what to alert on.
 
 See [metrics-stability.md](metrics-stability.md) for the full catalog and stability tier of every metric.

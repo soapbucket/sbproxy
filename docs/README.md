@@ -123,6 +123,7 @@ Point a framework you already run at the gateway: chat completions through the O
 - [content-digest.md](content-digest.md) - `content_digest` policy: RFC 9530 request-body verification for integrity-critical inboxes.
 - [agent-budget.md](agent-budget.md) - `agent_budget` policy: semantic rate-limit primitive keyed on resolved agent identity.
 - [performance.md](performance.md) - tuning guide, benchmark methodology, profiling.
+- [capacity-planning.md](capacity-planning.md) - how big a pod: what memory is and is not measured, the commands that fill the gaps, a `resources:` starting point with its arithmetic shown, and OOM triage.
 - [degradation.md](degradation.md) - failure modes and graceful degradation behavior.
 - [upgrade.md](upgrade.md) - migration notes between releases.
 - [mesh-replication.md](mesh-replication.md) - the replicated cluster-state substrate: replication factor, read/write consistency, durable restart, handoff, anti-entropy, and the tombstone deletion protocol.

@@ -10,6 +10,40 @@ spec:
   configRef: demo-config
   replicas: 2
   port: 8080
+
+  # Do not delete this block. `spec.resources` is optional and has no
+  # default, so omitting it reconciles a container with empty requests
+  # and empty limits. Kubernetes schedules that BestEffort: first to be
+  # evicted under node pressure, and free to grow until the node runs
+  # out. An unsized proxy pod has no defaults, it has none.
+  #
+  # These figures are a starting point, not a recommendation. The only
+  # memory measurement in this project is 77.5 MB of resident set for an
+  # idle process on a minimal config; nothing has measured resident set
+  # under load, so the headroom below is reasoned rather than observed.
+  # `docs/capacity-planning.md` shows the arithmetic and the commands
+  # that replace it with a number from your own traffic.
+  #
+  #   requests.memory 128Mi - about 1.6x the one idle reading, covering
+  #                           connection buffers and an upstream pool
+  #                           that the idle measurement did not include.
+  #                           The scheduler reserves this, so it wants to
+  #                           sit near steady state, not near the peak.
+  #   limits.memory 256Mi   - 2x the request. Leaves roughly 178MB above
+  #                           the idle figure for everything load adds.
+  #                           No measurement says that is enough once a
+  #                           response cache fills, and a local ONNX
+  #                           classifier alone can reach 200 MiB, so
+  #                           raise this before enabling either.
+  #   requests.cpu 100m     - the proxy is event driven and does no
+  #                           polling at rest; this is about placement,
+  #                           not steady-state draw.
+  #   limits.cpu 500m       - published throughput was measured on 8
+  #                           dedicated vCPUs, so half a core serves a
+  #                           small fraction of that. Scale it with your
+  #                           target rps. A CPU limit throttles rather
+  #                           than kills, so setting it too low shows up
+  #                           as p99 latency, never as a restart.
   resources:
     requests:
       cpu: 100m

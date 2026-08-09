@@ -51,9 +51,20 @@ spec:
             - name: sbproxy
               containerPort: 15001
               protocol: TCP
-          # Sized for the sidecar's published targets (cold start
-          # under 500ms, RSS under 80MB at idle). Tune the upper
-          # bounds based on the workload's actual throughput.
+          # Sized against the sidecar's published targets (cold start
+          # under 500ms, RSS under 80MB at idle). The single supporting
+          # measurement is 77.5 MB of resident set for an idle process
+          # on the sample sidecar config; resident set under load has
+          # never been measured, so the limits below are extrapolated
+          # rather than observed. Treat them as a starting point and
+          # tune against your workload's actual throughput.
+          #
+          # 256Mi leaves roughly 178MB above that idle reading for
+          # everything traffic adds. That is untested, and it is wrong
+          # outright if the config enables a local ONNX classifier
+          # (200 MiB by itself) or a response cache large enough to
+          # matter. docs/capacity-planning.md has the arithmetic and
+          # the commands to measure your own.
           resources:
             requests:
               cpu: 100m
