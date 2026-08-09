@@ -13,11 +13,17 @@
 //!
 //! The harness wires the existing `sbproxy-observe::redact` middleware
 //! to a fake-sink trait so the same line is inspected per-sink without
-//! shelling to Loki / Tempo / Postgres. The fake-sink wiring lives
-//! behind R1.2; until then the per-sink assertions are `#[ignore]`d.
-//! The simpler `redactor_input_round_trip` test runs today against the
-//! existing `redact_secrets()` API as a regression floor so the value
-//! list at least stays grep-clean.
+//! shelling to Loki / Tempo / Postgres. That wiring shipped: the buffers
+//! live in `sbproxy_observe::fake_sinks` and the admin debug routes that
+//! read them are in `sbproxy-core`'s request phase, both behind
+//! `SBPROXY_TEST_FAKE_SINKS=1` so a production binary never exposes
+//! them. Every test in this file runs by default; none is `#[ignore]`d.
+//!
+//! `redaction_fixture_floor_no_secret_leaks_through_legacy_redactor` is
+//! the cheap floor underneath the two that spawn a proxy. It runs the
+//! fixture list through `redact_secrets()` directly so the value list
+//! stays grep-clean even if a harness change takes the per-sink pair
+//! offline.
 
 use sbproxy_e2e::{MockUpstream, ProxyHarness};
 use serde_json::json;
@@ -40,7 +46,13 @@ struct RedactionFixture {
 }
 
 #[derive(Clone, Copy)]
-#[allow(dead_code)] // Path / name fields are read by the per-sink fan-out test once R1.2 lands.
+// The fan-out test matches on the variant to choose how it plants the
+// secret, and only `RequestHeader` needs its payload to do that: the
+// body fixture plants both JSON keys at once and the env fixture drives
+// a plain request. `path` and `name` stay because they document where
+// each secret is supposed to land, and a fixture whose site is written
+// down is one a reader can check against the redactor.
+#[allow(dead_code)]
 enum SecretSite {
     /// HTTP request header (key, value pre-formatted).
     RequestHeader { name: &'static str },
@@ -140,19 +152,22 @@ fn fixtures() -> Vec<RedactionFixture> {
 const SINKS: &[&str] = &["access_log", "error_log", "audit_log", "trace_exporter"];
 
 /// Round-trip every fixture through `sbproxy_observe::redact_secrets()`
-/// and assert no original secret value survives. This is a regression
-/// FLOOR: the substantive coverage lands when the per-sink harness
-/// (R1.2) is wired. Today's redactor only scrubs free-form strings;
-/// the typed-marker output (`<redacted:authorization>`) is part of
-/// R1.2's structured-log redactor, not the legacy regex-based one.
+/// and assert no original secret value survives. This is the regression
+/// FLOOR under `redaction_per_sink_fan_out`, not a stand-in for it: it
+/// needs no proxy, so it still reports when a harness or port problem
+/// takes the two spawning tests out.
 ///
-/// We assert two things this test CAN check today:
+/// `redact_secrets` is the legacy free-form scrubber and does not emit
+/// typed markers. The typed `[REDACTED:FIELD_UPPER]` output comes from
+/// the structured-log redactor in `sbproxy_observe::logging`, which is
+/// what the fan-out test reads out of the sink buffers.
+///
+/// Two assertions:
 /// 1. The legacy redactor scrubs the value bytes for the patterns it
-///    knows about (Bearer, Basic, sk_live_, api_key=, etc).
-/// 2. Every fixture entry has a non-empty marker string. This catches
-///    "added a new variant, forgot the marker" before the typed
-///    redactor lands. Markers now use the schema-v2 shape
-///    `[REDACTED:FIELD_UPPER]`.
+///    knows about (Bearer, Basic, api_key=).
+/// 2. Every fixture entry carries a well-shaped marker. This catches
+///    "added a new variant, forgot the marker" at the cheap tier
+///    instead of inside a spawned-proxy failure message.
 #[test]
 fn redaction_fixture_floor_no_secret_leaks_through_legacy_redactor() {
     use sbproxy_observe::redact::redact_secrets;
@@ -162,10 +177,11 @@ fn redaction_fixture_floor_no_secret_leaks_through_legacy_redactor() {
         // The legacy regex redactor knows Bearer / Basic / api_key /
         // password patterns. For those, the original secret bytes MUST
         // be gone. Stripe SK uses `sk_live_` (underscore) which the
-        // legacy `sk-` regex does NOT match; the typed redactor in
-        // R1.2 picks that up. KyaToken, OAuthClientSecret, ledger
-        // HMAC, prompt-body, etc. are also typed-redactor-only. For
-        // those the floor test asserts marker shape only.
+        // legacy `sk-` regex does NOT match; the structured redactor in
+        // `sbproxy_observe::logging` is what catches that one, and
+        // KyaToken, OAuthClientSecret, the ledger HMAC key, and the
+        // prompt body likewise. Those are the fan-out test's to prove;
+        // here the floor asserts marker shape only.
         let legacy_known = matches!(
             fx.label,
             "AuthorizationHeader (Bearer)" | "AuthorizationHeader (Basic)" | "ApiKey"
@@ -249,10 +265,13 @@ origins:
                     .expect("planted-body POST");
             }
             SecretSite::EnvVar { name: _ } => {
-                // Env-var coverage drives a config-reload event so the
-                // boot path emits a `config_reload` log line. The R1.2
-                // harness exposes a tickle endpoint; we leave it to the
-                // implementation to wire.
+                // A plain request is enough. The capture helper stamps a
+                // placeholder for every env-typed redaction target into
+                // the synthetic event on every captured request, so the
+                // typed-key matcher fires whether or not the operator
+                // ever set the variable. Nothing needs planting here;
+                // what is under test is that the field is redacted by
+                // key rather than by recognizing the value.
                 let _ = harness
                     .get_with_headers("/", "redact.localhost", &[])
                     .expect("env-planted GET");

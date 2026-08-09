@@ -9,6 +9,7 @@ name: CI
 #                           generated-artifact freshness checks
 #   lint           (~4 min) fmt, clippy, rustdoc
 #   obs-budgets    (~5 min) e2e cardinality + redaction, observability paths only
+#                           (three test targets; see the job for why)
 #   payments      (~13 min) clippy + tests under the settlement feature union
 #   ui             (~40 s)  node typecheck + vitest
 #   supply-chain   (~60 s)  cargo-deny (crates) + npm audit (admin UI)
@@ -87,6 +88,13 @@ jobs:
             observability:
               - 'crates/sbproxy-observe/**'
               - 'crates/sbproxy-modules/src/policy/**'
+              # The obs-budgets lane's own test targets. Without these a
+              # PR could rewrite the assertions the lane is named for and
+              # never run the lane that would have checked them, which is
+              # how both files drifted into asserting less than they said.
+              - 'e2e/tests/cardinality.rs'
+              - 'e2e/tests/metrics_per_agent.rs'
+              - 'e2e/tests/redaction.rs'
               - '.github/workflows/ci.yml'
             ui:
               - 'ui/**'
@@ -345,9 +353,20 @@ jobs:
       # (a new label sneaks in, the limiter overflows into __other__,
       # a redactor regex misses a new shape). This canary runs only when
       # observability or policy code changed. `--test <name>` selects these
-      # two targets out of the 170 under e2e/tests.
+      # three targets out of the 170 under e2e/tests.
+      #
+      # metrics_per_agent is the cardinality half that needs a process.
+      # It lowers hostname_cap in config, drives 250 distinct hostnames
+      # through a spawned proxy, and asserts the __other__ sentinel and
+      # the overflow counter both land in a real /metrics scrape. It was
+      # written for exactly this property and sat outside the lane named
+      # for it, running only in the weekly e2e sweep, while cardinality.rs
+      # held an ignored stub of the same idea. Same package selection as
+      # the two targets already here, so it adds no rebuild.
       - name: observability budgets (cardinality + redaction)
-        run: cargo test --workspace --locked --test cardinality --test redaction
+        run: >-
+          cargo test --workspace --locked
+          --test cardinality --test metrics_per_agent --test redaction
 
   payments:
     name: payments (settlement features)
