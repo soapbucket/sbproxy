@@ -494,8 +494,8 @@ fn tenant(tenant_id: &str) -> String {
 
 // --- Divergence ---
 
-/// How long counted units and chained units are allowed to disagree before
-/// the disagreement is real.
+/// How long an imbalance has to survive before it counts as a
+/// disagreement.
 ///
 /// One minute, comfortably longer than the default 30 second OTLP export
 /// interval and the usual 15 second scrape. The window is not a tolerance
@@ -506,13 +506,47 @@ fn tenant(tenant_id: &str) -> String {
 /// receipt as a divergence.
 const DIVERGENCE_WINDOW: Duration = Duration::from_secs(60);
 
-/// Per-tenant totals for the two sides of the comparison.
+/// One tenant's standing between the counter and the chain.
+///
+/// A carried balance rather than a per-window pair of totals, and that is
+/// the difference between an alert that means something and one nobody
+/// reads (WOR-2324). Units are counted in `record_response` and chained a
+/// few hundred microseconds later when the append lands, so at any instant
+/// on a busy proxy some requests are between the two. A sweep that compared
+/// per-window totals and then cleared them would split those requests down
+/// the middle: counted in the window that ended, chained in the one that
+/// began, and reported as a divergence in both. By Little's law the number
+/// of requests sitting in that gap is arrival rate times append latency, so
+/// the false-positive rate rises with traffic, which is exactly backwards.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Balance {
+    /// Units counted minus units chained. Positive means the counter is
+    /// ahead, which is a receipt that was owed and never written. Negative
+    /// means the chain is ahead, which is something recording units outside
+    /// the counted path. Both are worth knowing and neither is enforcement.
+    imbalance: i128,
+    /// The value [`Balance::imbalance`] came nearest to zero at any point
+    /// since the last sweep, which is the part of it that was outstanding
+    /// for the whole window.
+    ///
+    /// This is what tells a lost receipt apart from an append in flight. A
+    /// request that straddles the sweep boundary drives the imbalance up and
+    /// straight back to zero, so the floor is zero and nothing is reported.
+    /// A receipt that was never written holds the imbalance above zero for
+    /// the entire window, so the floor is the amount that went missing.
+    /// Endpoint sampling cannot make that distinction: two unrelated
+    /// in-flight appends, one at each of two consecutive sweeps, read
+    /// identically to one receipt that was lost.
+    floor: i128,
+}
+
+/// Per-tenant reconciliation state.
 #[derive(Default)]
 struct Reconciliation {
-    /// Units reported through the counter path since the last sweep.
-    counted: HashMap<String, u64>,
-    /// Units reported as having reached the chain since the last sweep.
-    chained: HashMap<String, u64>,
+    /// Standing balance per tenant. An entry is dropped once the tenant is
+    /// square, so a long-lived process does not keep a row per tenant it
+    /// has ever seen.
+    balances: HashMap<String, Balance>,
     /// When the last comparison ran. `None` until the first observation, so
     /// a process that meters nothing never sweeps.
     last_sweep: Option<Instant>,
@@ -523,19 +557,47 @@ fn reconciliation() -> &'static Mutex<Reconciliation> {
     STATE.get_or_init(|| Mutex::new(Reconciliation::default()))
 }
 
-/// Add to the counter side of the comparison.
-fn note_counted(tenant_id: &str, count: u64) {
+/// The value nearer zero, and zero when the two sit on opposite sides of
+/// it.
+///
+/// A sign change means the balance passed through square, so nothing was
+/// continuously outstanding in either direction and the honest floor is
+/// zero rather than whichever end happened to be smaller.
+fn nearer_zero(a: i128, b: i128) -> i128 {
+    if (a > 0 && b < 0) || (a < 0 && b > 0) {
+        return 0;
+    }
+    if a.unsigned_abs() <= b.unsigned_abs() {
+        a
+    } else {
+        b
+    }
+}
+
+/// Move a tenant's balance and record how near square it got on the way.
+///
+/// Every mutation goes through here, because the floor is only meaningful
+/// if it sees each intermediate value: a balance that touched zero and left
+/// again has to be indistinguishable from one that never moved.
+fn adjust_balance(tenant_id: String, delta: i128) {
     let mut state = reconciliation().lock().expect("meter reconciliation mutex");
-    *state.counted.entry(tenant_id.to_string()).or_insert(0) += count;
+    let balance = state.balances.entry(tenant_id).or_default();
+    balance.imbalance += delta;
+    balance.floor = nearer_zero(balance.floor, balance.imbalance);
     state.last_sweep.get_or_insert_with(Instant::now);
+}
+
+/// Add to the counter side of the comparison.
+///
+/// `tenant_id` arrives already sanitized from [`record_meter_units`], which
+/// needed the bounded form for the label it had just written.
+fn note_counted(tenant_id: &str, count: u64) {
+    adjust_balance(tenant_id.to_string(), i128::from(count));
 }
 
 /// Add to the chain side of the comparison.
 fn note_chained(tenant_id: &str, count: u64) {
-    let tenant_id = tenant(tenant_id);
-    let mut state = reconciliation().lock().expect("meter reconciliation mutex");
-    *state.chained.entry(tenant_id).or_insert(0) += count;
-    state.last_sweep.get_or_insert_with(Instant::now);
+    adjust_balance(tenant(tenant_id), -i128::from(count));
 }
 
 /// Run the comparison if the window has elapsed.
@@ -557,41 +619,47 @@ fn maybe_sweep() {
     }
 }
 
-/// Compare both sides for every tenant seen since the last sweep, count a
-/// divergence for each tenant that disagrees, and re-baseline.
+/// Count a divergence for every tenant whose imbalance survived the whole
+/// window, settle that much of it, and start the next window from what is
+/// left.
 ///
 /// Returns how many tenants diverged.
 ///
-/// Re-baselining rather than carrying the imbalance forward is deliberate.
-/// A tenant that lost one receipt lost one receipt; leaving the difference
-/// in place would make that tenant diverge again on every window until
-/// somebody restarted the process, turning one lost receipt into an alert
-/// that never clears and therefore into an alert nobody reads.
+/// Settling the confirmed amount rather than carrying it forward is
+/// deliberate. A tenant that lost one receipt lost one receipt; leaving the
+/// difference in place would make that tenant diverge again on every window
+/// until somebody restarted the process, turning one lost receipt into an
+/// alert that never clears and therefore into an alert nobody reads. What
+/// is settled is the floor and not the whole balance, so a receipt that was
+/// merely in flight when the sweep ran stays on the books and squares
+/// itself a moment later.
 fn sweep() -> usize {
     let mut state = reconciliation().lock().expect("meter reconciliation mutex");
     state.last_sweep = Some(Instant::now());
 
-    let mut tenants: Vec<String> = state.counted.keys().cloned().collect();
-    tenants.extend(state.chained.keys().cloned());
-    tenants.sort_unstable();
-    tenants.dedup();
-
-    let diverged: Vec<String> = tenants
-        .into_iter()
-        .filter(|tenant_id| {
-            state.counted.get(tenant_id).copied().unwrap_or(0)
-                != state.chained.get(tenant_id).copied().unwrap_or(0)
-        })
-        .collect();
-
-    state.counted.clear();
-    state.chained.clear();
+    let mut diverged: Vec<String> = Vec::new();
+    state.balances.retain(|tenant_id, balance| {
+        let confirmed = balance.floor;
+        if confirmed != 0 {
+            diverged.push(tenant_id.clone());
+        }
+        balance.imbalance -= confirmed;
+        // The next window starts from where this one ended. Anything still
+        // outstanding has to hold that ground for a full window of its own
+        // before it is reported.
+        balance.floor = balance.imbalance;
+        balance.imbalance != 0
+    });
     // Released before recording. `record_meter_divergence` touches the
     // Prometheus registry and the OTel pipeline, and holding the
-    // reconciliation lock across either would serialise the metering path
+    // reconciliation lock across either would serialize the metering path
     // behind a metrics backend.
     drop(state);
 
+    // Sorted so a deployment with several diverging tenants reports them in
+    // the same order every window; `HashMap` iteration order is not stable
+    // even within one process.
+    diverged.sort_unstable();
     for tenant_id in &diverged {
         record_meter_divergence(tenant_id);
     }
@@ -737,6 +805,17 @@ mod tests {
             "an in-flight receipt must not be reported as a divergence"
         );
 
+        // Nor at the first sweep after it. The imbalance appeared partway
+        // through this window, so it has not yet held for a whole one, and
+        // an append that lands a moment from now would square it.
+        force_sweep();
+        assert_eq!(
+            divergence_count("acme"),
+            before,
+            "an imbalance younger than the window is not yet a disagreement"
+        );
+
+        // It held for the whole of the next window, so nothing is coming.
         force_sweep();
         assert_eq!(
             divergence_count("acme"),
@@ -752,6 +831,9 @@ mod tests {
         record_meter_units("globex", "api_call", UnitSource::Measured, 5);
         note_chained("globex", 5);
 
+        // Twice, because one sweep proves nothing here: a tenant is only
+        // ever reported at its second consecutive sweep.
+        force_sweep();
         force_sweep();
         assert_eq!(
             divergence_count("globex"),
@@ -761,18 +843,101 @@ mod tests {
     }
 
     #[test]
+    fn a_receipt_still_in_flight_across_a_sweep_is_not_a_divergence() {
+        // The regression this whole balance carries (WOR-2324). Units are
+        // counted in `record_response` and chained when the append lands a
+        // few hundred microseconds later, so on a busy proxy a sweep always
+        // catches some requests between the two. The old per-window totals
+        // reported every one of them, and the rate went up with traffic.
+        let before = divergence_count("straddle-tenant");
+
+        record_meter_units("straddle-tenant", "api_call", UnitSource::Measured, 4);
+        // The window ends here, with the append not yet landed.
+        force_sweep();
+        note_chained("straddle-tenant", 4);
+
+        // Two more, so neither the sweep that split the request nor the one
+        // after it can claim anything.
+        force_sweep();
+        force_sweep();
+        assert_eq!(
+            divergence_count("straddle-tenant"),
+            before,
+            "a receipt whose append landed on the far side of a sweep still reached the chain"
+        );
+    }
+
+    #[test]
+    fn a_tenant_that_straddles_every_single_window_still_never_diverges() {
+        // The case that rules out comparing the two endpoints of a window
+        // instead of tracking the floor between them. Under endpoint
+        // sampling, two unrelated in-flight appends at two consecutive
+        // sweeps look exactly like one receipt that went missing, so a
+        // steadily busy tenant would be reported forever.
+        let before = divergence_count("flapping-tenant");
+
+        for _ in 0..4 {
+            record_meter_units("flapping-tenant", "api_call", UnitSource::RouteWeight, 7);
+            force_sweep();
+            note_chained("flapping-tenant", 7);
+        }
+        force_sweep();
+
+        assert_eq!(
+            divergence_count("flapping-tenant"),
+            before,
+            "every receipt reached the chain; only the sweep boundary ever fell between the halves"
+        );
+    }
+
+    #[test]
     fn a_divergence_is_reported_once_rather_than_on_every_window_after() {
         let before = divergence_count("initech");
 
         record_meter_units("initech", "api_call", UnitSource::OriginHeader, 2);
         force_sweep();
+        force_sweep();
         let after_first = divergence_count("initech");
         assert_eq!(after_first, before + 1);
 
-        // The sweep re-baselined, so one lost receipt must not keep firing
-        // an alert nobody can clear.
+        // The sweep settled the confirmed amount, so one lost receipt must
+        // not keep firing an alert nobody can clear.
+        force_sweep();
         force_sweep();
         assert_eq!(divergence_count("initech"), after_first);
+    }
+
+    #[test]
+    fn a_chain_that_records_units_the_counter_never_saw_diverges_too() {
+        // The other direction, and the reason the balance is signed. A
+        // chained entry with no counted half means something is writing
+        // units outside the path the meter counts, which is as much worth
+        // knowing as a receipt that was dropped.
+        let before = divergence_count("umbrella");
+
+        note_chained("umbrella", 9);
+        force_sweep();
+        force_sweep();
+
+        assert_eq!(
+            divergence_count("umbrella"),
+            before + 1,
+            "units on the chain that the counter never saw are a disagreement"
+        );
+    }
+
+    #[test]
+    fn a_balance_that_crosses_zero_between_sweeps_is_square_rather_than_nearly_square() {
+        // `nearer_zero` returns the endpoint closest to zero, except when
+        // the two straddle it. Crossing means the balance passed through
+        // square, so no amount was outstanding in either direction and the
+        // floor has to be zero rather than the smaller of the two ends.
+        assert_eq!(nearer_zero(5, 3), 3);
+        assert_eq!(nearer_zero(-5, -3), -3);
+        assert_eq!(nearer_zero(3, -5), 0);
+        assert_eq!(nearer_zero(-3, 5), 0);
+        assert_eq!(nearer_zero(0, 7), 0);
+        assert_eq!(nearer_zero(7, 0), 0);
     }
 
     #[test]

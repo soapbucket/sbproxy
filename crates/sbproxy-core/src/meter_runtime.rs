@@ -206,16 +206,47 @@ impl LedgerPayload for ChainedReceipt {
         })
     }
 
-    // `chain_contribution` is deliberately left at its `None` default. Read
-    // that method's rustdoc before implementing it here: divergence
-    // compares units the meter counted against units that reached the
-    // chain, so a payload that answers one side of the comparison and not
-    // the other manufactures a disagreement rather than detecting one. The
-    // billed units are reported on the counted side through
-    // `sbproxy_meter::metrics::observe_settled_event`, and
-    // `sbproxy_meter_divergence_total` is the family that would start
-    // reading nonzero on a perfectly healthy proxy the moment somebody
-    // implemented this here without also wiring the other half.
+    /// What this receipt contributes to the meter's own reconciliation
+    /// (WOR-2324).
+    ///
+    /// The precondition the trait's `None` default protects is met here,
+    /// and it is the only payload in this workspace that meets it. Both
+    /// sides of `sbproxy_meter_divergence_total` count the same quantity
+    /// because they are computed once and used twice: [`record_response`]
+    /// calls `sbproxy_meter::OutcomeTable::billable_units` a single time,
+    /// hands that slice to `sbproxy_meter::metrics::observe_settled_event`
+    /// for the counted side, and maps the same slice through
+    /// `sbproxy_modules::policy::receipt_token::ReceiptUnit::from` into the
+    /// document this reads back. A payload that answered one side and not
+    /// the other would manufacture a disagreement instead of detecting one,
+    /// which is why the AI gateway's usage event and the security audit
+    /// entry both stay on the default: nothing counts their quantities
+    /// through the meter's unit path.
+    ///
+    /// Until this existed the chained side of the comparison was always
+    /// empty, so every tenant with billable units diverged in every window
+    /// and `SBPROXY-METER-DIVERGENCE` fired continuously on any metering
+    /// deployment with traffic.
+    ///
+    /// A gap marker carries no units and therefore contributes zero, which
+    /// is exactly right: the receipt it stands in for was counted and never
+    /// chained, and that imbalance is the one the counter exists to report.
+    ///
+    /// Summed rather than reported per unit, because the comparison is per
+    /// tenant. The counted side folds every unit of every receipt into one
+    /// per-tenant total, so a per-unit contribution would only have to be
+    /// re-summed at the other end. Saturating, because a total that wrapped
+    /// would report a healthy tenant.
+    fn chain_contribution(&self) -> Option<sbproxy_meter::metrics::ChainContribution<'_>> {
+        Some(sbproxy_meter::metrics::ChainContribution {
+            tenant_id: self.0.subject.tenant.as_str(),
+            units: self
+                .0
+                .units
+                .iter()
+                .fold(0u64, |total, unit| total.saturating_add(unit.count)),
+        })
+    }
 }
 
 // --- Bridging response_filter to logging ---
@@ -1600,6 +1631,87 @@ mod tests {
             .collect();
         assert_eq!(settled_units, receipt_units);
         assert!(!settled_units.is_empty(), "the fixture route is priced");
+    }
+
+    // --- Both sides of the divergence comparison (WOR-2324) ---
+
+    #[test]
+    fn a_chained_receipt_reports_the_units_the_counted_side_already_reported() {
+        // The two halves of `sbproxy_meter_divergence_total`. The counted
+        // half is `observe_settled_event`, which is handed
+        // `SettledRequest::billed`; the chained half is this method, read
+        // off the document that reached the disk. They have to name the
+        // same tenant and add up to the same number, or the counter reports
+        // a disagreement that only its own wiring created.
+        //
+        // Before this was implemented the method returned `None`, the
+        // chained side of every window was empty, and a healthy tenant
+        // diverged on every sweep.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ledger_path = dir.path().join("receipts.ndjson");
+        let ctx = context(runtime(&ledger_path, FailureMode::Degraded));
+
+        let settled = record_response(&ctx, METHOD, PATH, 200, false)
+            .expect("a receipt-writing origin settles something");
+        let counted: u64 = settled.billed.iter().map(|unit| unit.count).sum();
+        assert!(counted > 0, "the fixture route is priced");
+
+        // Bound before it is borrowed from: the contribution borrows the
+        // receipt's own strings, so indexing a temporary vector here would
+        // drop the entry out from under it.
+        let written = entries(&ledger_path);
+        let chained = written[0]
+            .event
+            .chain_contribution()
+            .expect("a receipt is the payload the divergence check is built on");
+
+        assert_eq!(
+            chained.tenant_id, "acme",
+            "the contribution is charged to the receipt's own subject"
+        );
+        assert_eq!(
+            chained.units, counted,
+            "the chained side has to add up to exactly what the counted side reported"
+        );
+    }
+
+    #[test]
+    fn a_gap_marker_contributes_nothing_so_the_receipt_it_stands_in_for_stays_unbalanced() {
+        // The half that keeps the fix from silencing the real signal. A
+        // request whose receipt could not be chained still counted its
+        // units, and the marker written in its place carries none, so the
+        // tenant ends the window counted-but-not-chained. That imbalance is
+        // the thing `sbproxy_meter_divergence_total` is for.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ledger_path = dir.path().join("receipts.ndjson");
+        let runtime = runtime(&ledger_path, FailureMode::Degraded);
+        let ctx = context(runtime.clone());
+
+        runtime
+            .chain
+            .as_deref()
+            .expect("the fixture opens a chain")
+            .fail_next_append();
+
+        let settled = record_response(&ctx, METHOD, PATH, 200, false)
+            .expect("a receipt-writing origin settles something");
+        let counted: u64 = settled.billed.iter().map(|unit| unit.count).sum();
+        assert!(counted > 0, "the fixture route is priced");
+
+        let written = entries(&ledger_path);
+        assert_eq!(written.len(), 1, "only the marker landed: {written:?}");
+        let contribution = written[0]
+            .event
+            .chain_contribution()
+            .expect("a marker is still a receipt");
+        assert_eq!(
+            contribution.units, 0,
+            "a marker carries no units, so nothing balances the receipt that was lost"
+        );
+        assert_ne!(
+            contribution.units, counted,
+            "a marker must never look like the receipt it replaced"
+        );
     }
 
     #[test]

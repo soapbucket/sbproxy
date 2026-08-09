@@ -1,6 +1,6 @@
 # Admin API reference
 
-*Last modified: 2026-08-08*
+*Last modified: 2026-08-09*
 
 The embedded admin server publishes the full control-plane HTTP surface for
 operator tooling: liveness probes, session login, key and credential
@@ -140,7 +140,7 @@ ready, `503` with `"status": "unready"` otherwise:
   "timestamp": "2026-07-09T10:15:32Z",
   "uptime_seconds": 86400,
   "checks": [
-    {"name": "ledger", "status": "healthy"},
+    {"name": "usage_ledger", "status": "healthy"},
     {"name": "bot_auth_directory", "status": "not_configured"}
   ]
 }

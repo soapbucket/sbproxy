@@ -1402,7 +1402,7 @@ process uptime, and the same component checks used by readiness:
   "timestamp": "2026-05-04T18:30:00Z",
   "uptime_seconds": 12345,
   "checks": [
-    {"name": "ledger", "status": "healthy"},
+    {"name": "usage_ledger", "status": "healthy"},
     {"name": "mesh_quorum", "status": "not_configured", "detail": "mesh not enabled"}
   ]
 }
@@ -1426,10 +1426,15 @@ dashboard can surface which component failed:
   "status": "ok",
   "components": [
     {"name": "agent_registry", "status": "healthy"},
-    {"name": "ledger", "status": "not_configured", "detail": "no ledger append yet"}
+    {"name": "usage_ledger", "status": "not_configured", "detail": "no ledger append yet"}
   ]
 }
 ```
+
+`usage_ledger` covers the verifiable usage chain this proxy appends to,
+and nothing else. The AI-crawl redeem ledger is a separate service with
+no readiness component, so a dead redeem endpoint leaves `/readyz`
+green; watch that one through its own metrics instead.
 
 When a component is `unhealthy`, the envelope's `status` flips to
 `"unready"` and the response is `503`:
@@ -1984,7 +1989,7 @@ readinessProbe:
     port: 9090
 ```
 
-`/readyz` folds in the registered component probes (ledger, mesh
+`/readyz` folds in the registered component probes (usage ledger, mesh
 quorum, synthetic pipeline), so it can take a pod out of rotation on a
 component failure instead of only on process death. See
 [section 6](#6-health-checks).

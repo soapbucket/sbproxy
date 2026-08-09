@@ -123,9 +123,11 @@ something about the tokens changed: check `ledger.key_id` and the HMAC secret
 against what the ledger expects, because a rotated key arrives as HTTP 401 and
 therefore as `hard_failure` on every single request.
 
-Do not check `/readyz` for this. Its `ledger` component reports the metering
-usage ledger's last append outcome, not crawl redeem health, and a completely
-dead payment ledger leaves it green.
+Do not check `/readyz` for this. Its `usage_ledger` component reports the
+metering usage ledger's last append outcome, not crawl redeem health, and a
+completely dead payment ledger leaves it green. The component was called
+`ledger` until the name was narrowed to what it covers; no component covers
+the redeem endpoint.
 
 **Resolved when.** `transient_failure` returns to zero and the breaker closes. A
 residual `hard_failure` rate is normal on a public crawl endpoint, because

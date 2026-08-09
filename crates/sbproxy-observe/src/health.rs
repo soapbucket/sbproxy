@@ -66,7 +66,8 @@ impl ComponentStatus {
 /// Per-component report attached to the `/readyz` body.
 #[derive(Debug, Clone, Serialize)]
 pub struct ComponentReport {
-    /// Pillar / component name (e.g. `"ledger"`, `"bot_auth_directory"`).
+    /// Pillar / component name (e.g. `"usage_ledger"`,
+    /// `"bot_auth_directory"`).
     pub name: String,
     /// Verdict for the component.
     pub status: ComponentStatus,
@@ -134,14 +135,16 @@ pub trait Probe: Send + Sync + 'static {
 /// Helper for probes that record "last successful contact at T" and
 /// translate that into a status based on a staleness threshold.
 ///
-/// Used by:
+/// Used by the bot-auth directory probe (`directory not stale beyond
+/// stale-while-fail grace`), whose backing service refreshes on a timer.
 ///
-/// - The ledger probe (`last redeem succeeded within N seconds`).
-/// - The bot-auth directory probe (`directory not stale beyond
-///   stale-while-fail grace`).
-///
-/// Both backing services already track success/failure internally; the
-/// probe just reads the cached value through this type.
+/// A timer is what makes recency readable. Apply this only to a dependency
+/// something contacts on a schedule, never to one contacted only when
+/// traffic asks for it: for those, "no success recently" is what a healthy
+/// idle deployment looks like, and [`RecencyProbe`] reports never-marked as
+/// `Unhealthy`. That is why the AI-crawl redeem ledger has no recency probe
+/// (WOR-2324), and why the `usage_ledger` component reads an append outcome
+/// instead of a clock.
 #[derive(Debug, Clone)]
 pub struct Recency {
     inner: Arc<RwLock<Option<Instant>>>,
@@ -330,7 +333,7 @@ impl HealthRegistry {
 
 /// Build a registry seeded with the standard probe set:
 ///
-/// - `ledger`: backed by the supplied `Recency`.
+/// - `usage_ledger`: backed by the supplied `Recency`.
 /// - `bot_auth_directory`: backed by the supplied `Recency`.
 /// - `agent_registry`: `NotConfigured` stub.
 /// - `mesh_quorum`: `NotConfigured` stub.
@@ -338,20 +341,48 @@ impl HealthRegistry {
 /// The `agent_registry` and `mesh_quorum` real probes are registered at
 /// startup (see `sbproxy-core`'s lifecycle) by calling
 /// `registry.register(...)`, which overrides the seeded stub by name.
-pub fn default_registry(ledger_recency: Recency, bot_auth_recency: Recency) -> HealthRegistry {
-    default_registry_optional(Some(ledger_recency), Some(bot_auth_recency))
+///
+/// # `usage_ledger` is the chain this proxy writes, not the one it calls
+///
+/// The component was called `ledger` and covered neither of the two things
+/// an operator read into that name (WOR-2324). What it reports is the
+/// verifiable usage chain this process appends to: the AI gateway's spend
+/// record and the meter's receipt chain, both of which write the same
+/// process-wide append outcome. The AI-crawl redeem ledger is a separate
+/// HTTP dependency with no probe at all, and a completely dead one leaves
+/// readiness green.
+///
+/// That gap is deliberate for now rather than merely unfixed. Redeem
+/// recency cannot close it: redeems only happen when a paying crawler hits
+/// a priced route, so "no successful redeem in the last N seconds" is what
+/// a healthy idle deployment looks like as well as a dead ledger, and a
+/// [`RecencyProbe`] reports never-marked as `Unhealthy`. Wiring one would
+/// pull idle-but-working pods out of rotation, which is a worse failure
+/// than the reporting gap it closes. The signal that would work is the
+/// redeem client's circuit breaker, which is traffic-independent in the
+/// right direction: never used reads closed, and open means the dependency
+/// has failed its threshold in a row.
+pub fn default_registry(
+    usage_ledger_recency: Recency,
+    bot_auth_recency: Recency,
+) -> HealthRegistry {
+    default_registry_optional(Some(usage_ledger_recency), Some(bot_auth_recency))
 }
 
 /// Build the standard registry, treating absent optional services as
 /// `NotConfigured` so `/readyz` remains 200 when a feature is not wired.
+///
+/// This is the form the proxy uses, with both arguments `None`: the real
+/// `usage_ledger` and `bot_auth_directory` probes are registered by name at
+/// startup and replace these seeds.
 pub fn default_registry_optional(
-    ledger_recency: Option<Recency>,
+    usage_ledger_recency: Option<Recency>,
     bot_auth_recency: Option<Recency>,
 ) -> HealthRegistry {
     let registry = HealthRegistry::new();
-    match ledger_recency {
-        Some(recency) => registry.register(Arc::new(RecencyProbe::new("ledger", recency))),
-        None => registry.register(Arc::new(NotConfiguredProbe::new("ledger"))),
+    match usage_ledger_recency {
+        Some(recency) => registry.register(Arc::new(RecencyProbe::new("usage_ledger", recency))),
+        None => registry.register(Arc::new(NotConfiguredProbe::new("usage_ledger"))),
     }
     match bot_auth_recency {
         Some(recency) => {
@@ -467,7 +498,7 @@ mod tests {
         let recency = Recency::new(Duration::from_secs(60));
         recency.mark_success();
         let registry = HealthRegistry::new();
-        registry.register(Arc::new(RecencyProbe::new("ledger", recency)));
+        registry.register(Arc::new(RecencyProbe::new("usage_ledger", recency)));
 
         let (status, ct, body) = handle_health(&registry, "1.2.3", "abc123");
 
@@ -479,7 +510,7 @@ mod tests {
         assert_eq!(v["build_hash"], "abc123");
         assert!(v["timestamp"].as_str().unwrap().contains('T'));
         assert!(v["uptime_seconds"].as_u64().is_some());
-        assert_eq!(v["checks"][0]["name"], "ledger");
+        assert_eq!(v["checks"][0]["name"], "usage_ledger");
         assert_eq!(v["checks"][0]["status"], "healthy");
     }
 
@@ -497,22 +528,22 @@ mod tests {
         let recency = Recency::new(Duration::from_secs(60));
         recency.mark_success();
         let registry = HealthRegistry::new();
-        registry.register(Arc::new(RecencyProbe::new("ledger", recency.clone())));
+        registry.register(Arc::new(RecencyProbe::new("usage_ledger", recency.clone())));
         let (status, _, body) = handle_readyz(&registry);
         assert_eq!(status, 200);
         assert!(body.contains("\"status\":\"ok\""));
-        assert!(body.contains("\"name\":\"ledger\""));
+        assert!(body.contains("\"name\":\"usage_ledger\""));
     }
 
     #[test]
     fn never_marked_recency_probe_fails_readyz() {
         let recency = Recency::new(Duration::from_secs(60));
         let registry = HealthRegistry::new();
-        registry.register(Arc::new(RecencyProbe::new("ledger", recency)));
+        registry.register(Arc::new(RecencyProbe::new("usage_ledger", recency)));
         let (status, _, body) = handle_readyz(&registry);
         assert_eq!(status, 503);
         assert!(body.contains("\"status\":\"unready\""));
-        assert!(body.contains("\"ledger\""));
+        assert!(body.contains("\"usage_ledger\""));
     }
 
     #[test]
@@ -521,7 +552,7 @@ mod tests {
         recency.mark_success();
         std::thread::sleep(Duration::from_millis(50));
         let registry = HealthRegistry::new();
-        registry.register(Arc::new(RecencyProbe::new("ledger", recency)));
+        registry.register(Arc::new(RecencyProbe::new("usage_ledger", recency)));
         let (status, _, _) = handle_readyz(&registry);
         assert_eq!(status, 503);
     }
@@ -543,9 +574,33 @@ mod tests {
             status, 200,
             "absent optional services should be ready: {body}"
         );
-        assert!(body.contains("\"name\":\"ledger\""));
+        assert!(body.contains("\"name\":\"usage_ledger\""));
         assert!(body.contains("\"name\":\"bot_auth_directory\""));
         assert!(body.contains("\"status\":\"not_configured\""));
+    }
+
+    #[test]
+    fn no_component_is_named_for_a_ledger_this_process_does_not_probe() {
+        // The component reports the usage chain this process appends to.
+        // It was called `ledger`, which an operator reasonably read as
+        // covering the AI-crawl redeem ledger as well, and it never did
+        // (WOR-2324). The bare name is not to come back under any probe:
+        // whatever covers the redeem client has to say so in its own name.
+        let registry = default_registry_optional(None, None);
+        let report = registry.evaluate();
+        let names: Vec<&str> = report
+            .components
+            .iter()
+            .map(|component| component.name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"usage_ledger"),
+            "the usage chain keeps a component: {names:?}"
+        );
+        assert!(
+            !names.contains(&"ledger"),
+            "a bare `ledger` component claims coverage of a dependency nothing probes: {names:?}"
+        );
     }
 
     #[test]
@@ -570,22 +625,22 @@ mod tests {
         let (status, _, body) = handle_readyz(&registry);
         assert_eq!(status, 200, "body: {}", body);
         // The seeded components show up.
-        assert!(body.contains("ledger"));
+        assert!(body.contains("\"name\":\"usage_ledger\""));
         assert!(body.contains("bot_auth_directory"));
         assert!(body.contains("agent_registry"));
         assert!(body.contains("mesh_quorum"));
     }
 
     #[test]
-    fn default_registry_is_unready_when_ledger_stale() {
+    fn default_registry_is_unready_when_usage_ledger_stale() {
         let l = Recency::new(Duration::from_secs(60));
-        // Don't mark - ledger never reached.
+        // Don't mark - the ledger was never reached.
         let b = Recency::new(Duration::from_secs(60));
         b.mark_success();
         let registry = default_registry(l, b);
         let (status, _, body) = handle_readyz(&registry);
         assert_eq!(status, 503);
-        assert!(body.contains("\"name\":\"ledger\""));
+        assert!(body.contains("\"name\":\"usage_ledger\""));
         assert!(body.contains("\"status\":\"unhealthy\""));
     }
 

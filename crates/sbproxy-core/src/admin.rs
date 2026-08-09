@@ -7260,7 +7260,7 @@ origins:
         );
         assert_eq!(ct, "application/json");
         assert!(body.contains("\"status\":\"ok\""));
-        assert!(body.contains("\"name\":\"ledger\""));
+        assert!(body.contains("\"name\":\"usage_ledger\""));
         assert!(body.contains("\"status\":\"not_configured\""));
     }
 
@@ -7310,8 +7310,8 @@ origins:
     }
 
     #[test]
-    fn readyz_returns_503_when_default_registry_has_unhealthy_ledger() {
-        // Seed the default Wave 1 registry but never mark the ledger
+    fn readyz_returns_503_when_default_registry_has_unhealthy_usage_ledger() {
+        // Seed the default Wave 1 registry but never mark the usage-ledger
         // recency as successful so it reports unhealthy.
         let l = sbproxy_observe::Recency::new(std::time::Duration::from_secs(60));
         let b = sbproxy_observe::Recency::new(std::time::Duration::from_secs(60));
@@ -7333,8 +7333,12 @@ origins:
         })
         .with_health_registry(registry);
         let (status, _, body) = handle_admin_request("GET", "/readyz", &state, None, None);
-        assert_eq!(status, 503, "ledger never marked => unready: {}", body);
-        assert!(body.contains("\"name\":\"ledger\""), "body: {}", body);
+        assert_eq!(
+            status, 503,
+            "usage ledger never marked => unready: {}",
+            body
+        );
+        assert!(body.contains("\"name\":\"usage_ledger\""), "body: {}", body);
         assert!(body.contains("\"status\":\"unhealthy\""), "body: {}", body);
     }
 
@@ -7363,7 +7367,7 @@ origins:
         let (status, _, body) = handle_admin_request("GET", "/readyz", &state, None, None);
         assert_eq!(status, 200, "fresh recencies + stubs => ready: {}", body);
         // The seeded components show up.
-        assert!(body.contains("ledger"));
+        assert!(body.contains("\"name\":\"usage_ledger\""));
         assert!(body.contains("bot_auth_directory"));
         assert!(body.contains("agent_registry"));
         assert!(body.contains("mesh_quorum"));

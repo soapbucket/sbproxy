@@ -2509,14 +2509,21 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
                 )));
         }
 
-        // ledger (WOR-1741): the verifiable usage ledger's last append
-        // outcome. Traffic-independent (an idle ledger reports
+        // usage_ledger (WOR-1741): the verifiable usage ledger's last
+        // append outcome. Traffic-independent (an idle ledger reports
         // NotConfigured rather than a false stale), so this tracks the
         // append result, not recency.
+        //
+        // Named `usage_ledger` and not `ledger` because that is the whole
+        // of what it covers (WOR-2324). The AI-crawl redeem ledger is a
+        // separate HTTP dependency and nothing here probes it, so a dead
+        // redeem endpoint leaves this component green; the bare name read
+        // as though it did not. See `sbproxy_observe::default_registry`
+        // for why redeem recency is not the signal that would close it.
         admin_state_inner
             .health_registry
             .register(std::sync::Arc::new(sbproxy_observe::SyntheticProbe::new(
-                "ledger",
+                "usage_ledger",
                 || match sbproxy_ai::usage_ledger::ledger_health() {
                     sbproxy_ai::usage_ledger::LedgerHealth::NeverAppended => (
                         sbproxy_observe::ComponentStatus::NotConfigured,

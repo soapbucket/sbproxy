@@ -89,16 +89,35 @@ impl HttpLedgerConfig {
 }
 
 /// HTTP ledger client.
+///
+/// # No readiness probe, and not by omission (WOR-2324)
+///
+/// This client carried a `with_recency` hook that stamped a readiness
+/// tracker on every successful redeem. Nothing ever called it, and the
+/// `/readyz` component that looked like its destination was reporting the
+/// proxy's own usage chain the whole time, under a name (`ledger`) that
+/// read as though it covered this.
+///
+/// The hook is gone rather than wired, because redeem recency cannot say
+/// what a reader would take it to say. Redeems happen only when a paying
+/// crawler hits a priced route, so "no successful redeem in the last N
+/// seconds" describes a healthy idle deployment exactly as well as a dead
+/// ledger, and `sbproxy_observe::RecencyProbe` reports a never-marked
+/// tracker as `Unhealthy`. Wiring it would drop working pods out of
+/// rotation for want of traffic, which is a worse failure than the
+/// reporting gap it closes.
+///
+/// [`HttpLedger::breaker`] is the signal that would work, and is still
+/// exposed for it: it is traffic-independent in the right direction, since
+/// a breaker nobody has exercised reads closed and an open one means the
+/// endpoint has failed its configured threshold in a row. What is missing
+/// is a way to hand this client's breaker to the health registry, because
+/// the client is built during config compile and lives inside a policy
+/// enforcer behind a pipeline generation.
 pub struct HttpLedger {
     config: HttpLedgerConfig,
     client: reqwest::blocking::Client,
     breaker: Arc<CircuitBreaker>,
-    /// Optional recency probe stamped on every successful redeem.
-    /// When wired into `sbproxy_observe::default_registry`, this
-    /// is what flips `/readyz` from 503 to 200 once the ledger
-    /// answers a real request. Left as `None` for tests and for
-    /// configs that do not expose `/readyz`.
-    recency: Option<sbproxy_observe::Recency>,
 }
 
 impl std::fmt::Debug for HttpLedger {
@@ -136,7 +155,6 @@ impl HttpLedger {
             config,
             client,
             breaker,
-            recency: None,
         })
     }
 
@@ -151,17 +169,6 @@ impl HttpLedger {
     /// multiple verbs in a future wave.
     pub fn with_breaker(mut self, breaker: Arc<CircuitBreaker>) -> Self {
         self.breaker = breaker;
-        self
-    }
-
-    /// Wire a `Recency` clone so every successful redeem stamps
-    /// the readiness probe. The same `Recency` should be passed
-    /// to `sbproxy_observe::default_registry(...)` at startup so
-    /// `/readyz` returns 200 once the ledger answers a real
-    /// request and 503 once it has been silent for longer than
-    /// the configured staleness window.
-    pub fn with_recency(mut self, recency: sbproxy_observe::Recency) -> Self {
-        self.recency = Some(recency);
         self
     }
 
@@ -311,9 +318,6 @@ impl HttpLedger {
                             from.as_str(),
                             to.as_str(),
                         );
-                    }
-                    if let Some(r) = &self.recency {
-                        r.mark_success();
                     }
                     return Ok(result);
                 }

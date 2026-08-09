@@ -1198,7 +1198,9 @@ curl http://localhost:9090/readyz
 
 There is no separate management port 9091.
 
-`/readyz` reports per-component status. The registered components are `ledger` (redeem recency), `bot_auth_directory` (directory freshness), `agent_registry`, `mesh_quorum`, and `telemetry_sink` (a poisoned sink dispatcher fails readiness so the load balancer drains a telemetry-blind instance). A component whose feature is not configured reports `not_configured` and passes readiness.
+`/readyz` reports per-component status. The registered components are `usage_ledger` (the last append outcome of the verifiable usage chain this proxy writes), `bot_auth_directory` (directory freshness), `agent_registry`, `mesh_quorum`, and `telemetry_sink` (a poisoned sink dispatcher fails readiness so the load balancer drains a telemetry-blind instance). A component whose feature is not configured reports `not_configured` and passes readiness.
+
+`usage_ledger` was called `ledger` and reported the same thing it does now. The name was the problem: it read as though it covered the AI-crawl redeem ledger, and no component does. A dead redeem endpoint leaves readiness green, so watch `sbproxy_ledger_redeem_duration_seconds` and the circuit-breaker transitions for that instead. Redeem recency would not fix it. Redeems happen only when a paying crawler hits a priced route, so "no successful redeem lately" is what a healthy idle deployment looks like as well as a dead ledger, and a recency component that has never been marked reports `unhealthy`: a pod that had simply seen no paid crawls would be pulled out of rotation.
 
 ## Reference Compose stack
 
