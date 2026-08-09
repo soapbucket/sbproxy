@@ -52,6 +52,40 @@ fn is_loopback_directory(directory_url: &str) -> bool {
             .unwrap_or(false)
 }
 
+// --- Anti-replay nonce handling (RFC 8555 §6.5) ---
+
+/// Problem-document `type` an ACME server returns when it does not accept
+/// the anti-replay nonce a JWS was signed over (RFC 8555 §6.5).
+const BAD_NONCE_PROBLEM_TYPE: &str = "urn:ietf:params:acme:error:badNonce";
+
+/// How many times one ACME request may be signed and sent before the client
+/// stops retrying `badNonce`.
+///
+/// RFC 8555 §6.5 says a client should retry a rejected nonce using
+/// the fresh one the error response carries, and says nothing about how
+/// often. Unbounded is the wrong reading of that silence: every attempt is
+/// a signed POST charged to the account, so a nonce loop against a real CA
+/// is a rate-limit incident rather than a recovery. Three attempts (the
+/// first plus two retries) rides out a server that rejects nonces
+/// probabilistically without the client ever becoming the source of load.
+/// The cap is a constant and not a config knob for that reason.
+const MAX_JWS_ATTEMPTS: u32 = 3;
+
+/// Read a usable `Replay-Nonce` value out of an ACME response.
+///
+/// RFC 8555 §6.5 has the server send a fresh nonce on the `badNonce`
+/// error itself, and that value is what the retry signs over. A server that
+/// omits the header, or sends a non-ASCII or empty one, has handed the
+/// client nothing to carry forward; `None` sends the caller back to the
+/// `newNonce` fetch rather than re-signing over a nonce already known spent.
+fn replay_nonce_of(resp: &reqwest::Response) -> Option<String> {
+    let value = resp.headers().get("replay-nonce")?.to_str().ok()?;
+    if value.is_empty() {
+        return None;
+    }
+    Some(value.to_owned())
+}
+
 // --- ACME JSON types ---
 
 /// ACME directory object returned by the directory URL.
@@ -390,10 +424,21 @@ impl AcmeClient {
 
     /// POST a JWS-signed request to an ACME endpoint and return the raw response.
     ///
-    /// Per RFC 8555 §6.5, the server may reject a request with
-    /// `urn:ietf:params:acme:error:badNonce` and the client MUST retry
-    /// with a fresh nonce. We retry once; persistent failure indicates
-    /// a real problem (clock skew, wrong key, etc.) and bubbles up.
+    /// Per RFC 8555 §6.5 the server rejects a request whose
+    /// anti-replay nonce it does not recognize with a
+    /// `urn:ietf:params:acme:error:badNonce` problem document, and the
+    /// client retries using the fresh nonce that same response carries in
+    /// its `Replay-Nonce` header. Each attempt re-signs: the nonce sits in
+    /// the JWS protected header, so replaying the rejected signature would
+    /// be refused for exactly the reason it is being retried. When the
+    /// error carries no usable header the retry falls back to the
+    /// `newNonce` fetch rather than signing over a nonce known to be spent.
+    ///
+    /// Only `badNonce` is retried. Every other problem type and every other
+    /// status returns to the caller on the first attempt. The retry is
+    /// capped at `MAX_JWS_ATTEMPTS`, because a server that keeps rejecting
+    /// nonces has a problem a longer loop turns into rate-limited load
+    /// rather than a fix.
     async fn post_jws(
         &self,
         key_pair: &EcdsaKeyPair,
@@ -401,50 +446,82 @@ impl AcmeClient {
         payload: &serde_json::Value,
         kid: Option<&str>,
     ) -> Result<reqwest::Response> {
-        let resp = self.post_jws_once(key_pair, url, payload, kid).await?;
+        // `None` means "fetch one from newNonce". A `Some` is the nonce a
+        // previous badNonce response handed back for this retry to sign.
+        let mut carried_nonce: Option<String> = None;
+        let mut attempt: u32 = 1;
 
-        if resp.status() != reqwest::StatusCode::BAD_REQUEST {
-            return Ok(resp);
+        loop {
+            let resp = self
+                .post_jws_once(key_pair, url, payload, kid, carried_nonce.take())
+                .await?;
+
+            if resp.status() != reqwest::StatusCode::BAD_REQUEST {
+                return Ok(resp);
+            }
+
+            // A 400 might be badNonce, and deciding needs the body. Reading
+            // the body consumes the response, so lift the header out first:
+            // it is the nonce the retry has to sign.
+            let fresh_nonce = replay_nonce_of(&resp);
+            let body_bytes = resp
+                .bytes()
+                .await
+                .context("read 400 response body for badNonce check")?;
+            let problem_type = serde_json::from_slice::<serde_json::Value>(&body_bytes)
+                .ok()
+                .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_owned));
+
+            if problem_type.as_deref() != Some(BAD_NONCE_PROBLEM_TYPE) {
+                // Not a nonce problem, so a second attempt fails the same
+                // way. The body bytes are already consumed, so wrap them in
+                // a synthetic anyhow error to keep the server's own message
+                // on the caller's error path.
+                return Err(anyhow!(
+                    "POST {url} returned 400: {}",
+                    String::from_utf8_lossy(&body_bytes)
+                ));
+            }
+
+            if attempt >= MAX_JWS_ATTEMPTS {
+                return Err(anyhow!(
+                    "POST {url} was rejected with a badNonce problem on all \
+                     {MAX_JWS_ATTEMPTS} attempts: {}",
+                    String::from_utf8_lossy(&body_bytes)
+                ));
+            }
+
+            debug!(
+                url,
+                attempt,
+                carried_replay_nonce = fresh_nonce.is_some(),
+                "ACME server rejected the JWS with badNonce; re-signing with a fresh nonce"
+            );
+            carried_nonce = fresh_nonce;
+            attempt += 1;
         }
-
-        // 400 might be badNonce; peek at the body to decide. We can only
-        // consume the body once, so if it is NOT badNonce we wrap the
-        // body bytes in a synthetic anyhow error so the original message
-        // still reaches the caller's error path.
-        let body_bytes = resp
-            .bytes()
-            .await
-            .context("read 400 response body for badNonce check")?;
-        let is_bad_nonce = serde_json::from_slice::<serde_json::Value>(&body_bytes)
-            .ok()
-            .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_owned))
-            == Some("urn:ietf:params:acme:error:badNonce".to_string());
-
-        if !is_bad_nonce {
-            return Err(anyhow!(
-                "POST {url} returned 400: {}",
-                String::from_utf8_lossy(&body_bytes)
-            ));
-        }
-
-        debug!(
-            url,
-            "ACME server rejected JWS with badNonce; retrying once with fresh nonce"
-        );
-        self.post_jws_once(key_pair, url, payload, kid).await
     }
 
-    /// One-shot JWS POST. Always grabs a fresh nonce, signs, sends,
-    /// returns whatever the server replied with. Wrapped by `post_jws`
-    /// for badNonce retry behavior.
+    /// One-shot JWS POST: sign, send, return whatever the server replied
+    /// with. Wrapped by `post_jws` for badNonce retry behavior.
+    ///
+    /// `nonce` is the anti-replay nonce to sign over. `Some` carries the one
+    /// a `badNonce` response handed back; `None` fetches a fresh one from
+    /// `newNonce`. Either way the protected header is rebuilt and the JWS
+    /// re-signed here, which is what makes a retry a new request rather than
+    /// a replay of the rejected one.
     async fn post_jws_once(
         &self,
         key_pair: &EcdsaKeyPair,
         url: &str,
         payload: &serde_json::Value,
         kid: Option<&str>,
+        nonce: Option<String>,
     ) -> Result<reqwest::Response> {
-        let nonce = self.new_nonce().await.context("get nonce for JWS post")?;
+        let nonce = match nonce {
+            Some(nonce) => nonce,
+            None => self.new_nonce().await.context("get nonce for JWS post")?,
+        };
         let body = Self::sign_jws(key_pair, url, &nonce, payload, kid).context("sign JWS")?;
 
         let resp = self
@@ -1559,5 +1636,385 @@ mod tests {
         // s part: 31 zeros followed by 0x02
         assert!(raw[32..63].iter().all(|&b| b == 0), "s leading zeros");
         assert_eq!(raw[63], 0x02, "s value");
+    }
+
+    // --- badNonce retry (RFC 8555 §6.5) ---
+
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// One scripted reply the ACME stub hands back for a POST.
+    struct StubReply {
+        /// Status line without the version, e.g. `"400 Bad Request"`.
+        status_line: &'static str,
+        /// Value for the `Replay-Nonce` response header, when the stub
+        /// should send one at all.
+        replay_nonce: Option<&'static str>,
+        /// Response body, normally an ACME problem document.
+        body: &'static str,
+    }
+
+    /// A request the ACME stub parsed off the wire.
+    struct StubRequest {
+        method: String,
+        body: String,
+    }
+
+    /// Everything the ACME stub saw, in arrival order.
+    #[derive(Default)]
+    struct StubLog {
+        /// Nonces handed out by `HEAD /nonce`.
+        nonces_issued: Vec<String>,
+        /// Raw JWS bodies received on `POST /target`.
+        posts: Vec<String>,
+    }
+
+    impl StubLog {
+        /// Decode the JWS protected header of the `index`-th POST.
+        fn protected_header(&self, index: usize) -> serde_json::Value {
+            let jws: serde_json::Value =
+                serde_json::from_str(&self.posts[index]).expect("the stub received JSON");
+            let protected = jws["protected"]
+                .as_str()
+                .expect("the JWS carries a protected header");
+            let decoded = URL_SAFE_NO_PAD
+                .decode(protected)
+                .expect("the protected header is base64url");
+            serde_json::from_slice(&decoded).expect("the protected header is JSON")
+        }
+
+        /// The nonce the `index`-th POST was signed over.
+        fn posted_nonce(&self, index: usize) -> String {
+            self.protected_header(index)["nonce"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        }
+
+        /// The signature on the `index`-th POST.
+        fn posted_signature(&self, index: usize) -> String {
+            let jws: serde_json::Value =
+                serde_json::from_str(&self.posts[index]).expect("the stub received JSON");
+            jws["signature"].as_str().unwrap_or_default().to_owned()
+        }
+    }
+
+    /// Read one HTTP/1.1 request, headers plus any `Content-Length` body,
+    /// off `sock`. `None` when the peer closed before sending a full one.
+    async fn read_stub_request(sock: &mut TcpStream) -> Option<StubRequest> {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 2048];
+        let head_len = loop {
+            let read = sock.read(&mut chunk).await.ok()?;
+            if read == 0 {
+                return None;
+            }
+            buf.extend_from_slice(&chunk[..read]);
+            if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break at + 4;
+            }
+        };
+        let head = String::from_utf8_lossy(&buf[..head_len]).into_owned();
+        let method = head.split_whitespace().next()?.to_owned();
+        let content_length = head
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        while buf.len() < head_len + content_length {
+            let read = sock.read(&mut chunk).await.ok()?;
+            if read == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..read]);
+        }
+        Some(StubRequest {
+            method,
+            body: String::from_utf8_lossy(&buf[head_len..]).into_owned(),
+        })
+    }
+
+    /// Spin a loopback stub speaking just enough ACME to drive `post_jws`.
+    ///
+    /// `HEAD /nonce` hands out `newnonce-1`, `newnonce-2`, ... so a test can
+    /// tell a nonce that came from the `newNonce` endpoint apart from one
+    /// carried out of an error response. `POST /target` answers from
+    /// `replies` in order and repeats the last entry once the script runs
+    /// out. Every response closes its connection, so the requests arrive
+    /// one per accept.
+    ///
+    /// Returns the bound address and the request log, or `None` when the
+    /// sandbox refuses a loopback bind.
+    async fn spawn_acme_stub(replies: Vec<StubReply>) -> Option<(String, Arc<Mutex<StubLog>>)> {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping ACME badNonce test: loopback bind denied: {err}");
+                return None;
+            }
+            Err(err) => panic!("failed to bind the ACME stub listener: {err}"),
+        };
+        let addr = listener
+            .local_addr()
+            .expect("the ACME stub listener has a local address")
+            .to_string();
+        let log = Arc::new(Mutex::new(StubLog::default()));
+        let server_log = Arc::clone(&log);
+
+        tokio::spawn(async move {
+            let mut posts_served = 0usize;
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let Some(request) = read_stub_request(&mut sock).await else {
+                    continue;
+                };
+                let response = if request.method == "HEAD" {
+                    let mut guard = server_log.lock();
+                    let nonce = format!("newnonce-{}", guard.nonces_issued.len() + 1);
+                    guard.nonces_issued.push(nonce.clone());
+                    drop(guard);
+                    format!(
+                        "HTTP/1.1 200 OK\r\nReplay-Nonce: {nonce}\r\n\
+                         Content-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                } else {
+                    server_log.lock().posts.push(request.body);
+                    let reply = replies
+                        .get(posts_served)
+                        .or_else(|| replies.last())
+                        .expect("the ACME stub was given at least one scripted reply");
+                    posts_served += 1;
+                    let nonce_header = match reply.replay_nonce {
+                        Some(nonce) => format!("Replay-Nonce: {nonce}\r\n"),
+                        None => String::new(),
+                    };
+                    format!(
+                        "HTTP/1.1 {}\r\n{}Content-Type: application/problem+json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        reply.status_line,
+                        nonce_header,
+                        reply.body.len(),
+                        reply.body
+                    )
+                };
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+
+        Some((addr, log))
+    }
+
+    /// An `AcmeClient` whose directory already points at the stub on `addr`,
+    /// so `post_jws` can run without a real ACME server.
+    fn stub_client(addr: &str) -> AcmeClient {
+        let mut client = AcmeClient::new(
+            &format!("http://{addr}/dir"),
+            "test@example.com",
+            vec!["http-01".into()],
+        );
+        client.directory = Some(Directory {
+            new_nonce: format!("http://{addr}/nonce"),
+            new_account: format!("http://{addr}/acct"),
+            new_order: format!("http://{addr}/target"),
+        });
+        client
+    }
+
+    /// A badNonce problem document, shaped the way Pebble and Boulder send it.
+    const BAD_NONCE_BODY: &str =
+        r#"{"type":"urn:ietf:params:acme:error:badNonce","detail":"bad nonce","status":400}"#;
+
+    /// A problem document that is not about the nonce, so must not retry.
+    const MALFORMED_BODY: &str =
+        r#"{"type":"urn:ietf:params:acme:error:malformed","detail":"malformed","status":400}"#;
+
+    #[tokio::test]
+    async fn a_bad_nonce_retry_signs_the_nonce_from_the_error_response() {
+        // RFC 8555 §6.5: the badNonce response carries the nonce the
+        // retry is meant to use, and the retry must be a freshly signed JWS
+        // because the nonce lives inside the signed protected header.
+        let Some((addr, log)) = spawn_acme_stub(vec![
+            StubReply {
+                status_line: "400 Bad Request",
+                replay_nonce: Some("nonce-from-the-error"),
+                body: BAD_NONCE_BODY,
+            },
+            StubReply {
+                status_line: "200 OK",
+                replay_nonce: Some("nonce-after-success"),
+                body: r#"{"status":"valid"}"#,
+            },
+        ])
+        .await
+        else {
+            return;
+        };
+
+        let key = AcmeClient::load_or_create_account_key(&make_store()).expect("account key");
+        let client = stub_client(&addr);
+        let url = format!("http://{addr}/target");
+
+        let resp = client
+            .post_jws(
+                &key,
+                &url,
+                &serde_json::json!({}),
+                Some("https://acme.example.com/acct/1"),
+            )
+            .await
+            .expect("a badNonce followed by a success is retried through to the success");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        let log = log.lock();
+        assert_eq!(log.posts.len(), 2, "the rejected request is sent twice");
+        assert_eq!(
+            log.posted_nonce(0),
+            "newnonce-1",
+            "the first attempt signs a nonce fetched from newNonce"
+        );
+        assert_eq!(
+            log.posted_nonce(1),
+            "nonce-from-the-error",
+            "the retry signs the Replay-Nonce the error response carried"
+        );
+        assert_eq!(
+            log.nonces_issued.len(),
+            1,
+            "newNonce is not re-fetched when the error already handed one back"
+        );
+        assert_ne!(
+            log.posted_signature(0),
+            log.posted_signature(1),
+            "the retry re-signs rather than replaying the rejected signature"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bad_nonce_without_a_replay_nonce_header_falls_back_to_new_nonce() {
+        // Nothing usable to carry forward, so the retry goes back to the
+        // newNonce endpoint instead of re-signing a nonce known to be spent.
+        let Some((addr, log)) = spawn_acme_stub(vec![
+            StubReply {
+                status_line: "400 Bad Request",
+                replay_nonce: None,
+                body: BAD_NONCE_BODY,
+            },
+            StubReply {
+                status_line: "200 OK",
+                replay_nonce: None,
+                body: r#"{"status":"valid"}"#,
+            },
+        ])
+        .await
+        else {
+            return;
+        };
+
+        let key = AcmeClient::load_or_create_account_key(&make_store()).expect("account key");
+        let client = stub_client(&addr);
+        let url = format!("http://{addr}/target");
+
+        let resp = client
+            .post_jws(&key, &url, &serde_json::json!({}), None)
+            .await
+            .expect("a header-less badNonce still retries, using a freshly fetched nonce");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        let log = log.lock();
+        assert_eq!(log.posts.len(), 2);
+        assert_eq!(
+            log.nonces_issued.len(),
+            2,
+            "both attempts fetch from newNonce when the error carries no nonce"
+        );
+        assert_eq!(log.posted_nonce(0), "newnonce-1");
+        assert_eq!(log.posted_nonce(1), "newnonce-2");
+    }
+
+    #[tokio::test]
+    async fn a_non_bad_nonce_problem_is_not_retried() {
+        // Only badNonce is retried. Any other problem document keeps its
+        // behavior: one attempt, and the server's own message on the error.
+        let Some((addr, log)) = spawn_acme_stub(vec![StubReply {
+            status_line: "400 Bad Request",
+            replay_nonce: Some("a-nonce-the-client-must-not-spend"),
+            body: MALFORMED_BODY,
+        }])
+        .await
+        else {
+            return;
+        };
+
+        let key = AcmeClient::load_or_create_account_key(&make_store()).expect("account key");
+        let client = stub_client(&addr);
+        let url = format!("http://{addr}/target");
+
+        let err = client
+            .post_jws(
+                &key,
+                &url,
+                &serde_json::json!({}),
+                Some("https://acme.example.com/acct/1"),
+            )
+            .await
+            .expect_err("a malformed problem document is an error, not a retry");
+
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("returned 400"),
+            "unexpected error: {rendered}"
+        );
+        assert!(
+            rendered.contains("malformed"),
+            "the server's own problem document must reach the caller: {rendered}"
+        );
+        assert_eq!(
+            log.lock().posts.len(),
+            1,
+            "a non-badNonce 400 is sent exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn bad_nonce_retries_stop_at_the_cap() {
+        // A CA that never accepts a nonce must cost a bounded number of
+        // signed POSTs. An unbounded loop here is a rate-limit incident.
+        let Some((addr, log)) = spawn_acme_stub(vec![StubReply {
+            status_line: "400 Bad Request",
+            replay_nonce: Some("still-not-good-enough"),
+            body: BAD_NONCE_BODY,
+        }])
+        .await
+        else {
+            return;
+        };
+
+        let key = AcmeClient::load_or_create_account_key(&make_store()).expect("account key");
+        let client = stub_client(&addr);
+        let url = format!("http://{addr}/target");
+
+        let err = client
+            .post_jws(
+                &key,
+                &url,
+                &serde_json::json!({}),
+                Some("https://acme.example.com/acct/1"),
+            )
+            .await
+            .expect_err("a server that never accepts a nonce must not loop forever");
+
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("badNonce"),
+            "the error must name the nonce problem: {rendered}"
+        );
+        assert_eq!(
+            log.lock().posts.len(),
+            MAX_JWS_ATTEMPTS as usize,
+            "the badNonce retry is bounded at MAX_JWS_ATTEMPTS"
+        );
     }
 }
