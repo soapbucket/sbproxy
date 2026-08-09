@@ -32,6 +32,13 @@ const START_MS: i64 = 1_700_000_000_000;
 /// A challenge expiry comfortably after the start instant.
 const EXPIRY_MS: i64 = 1_700_000_600_000;
 
+/// The reconciliation grace window these tests run with.
+///
+/// The production default, deliberately: the deadline these tests drive is
+/// the one a deployment gets, and a shortened fixture value would prove the
+/// arithmetic without proving the policy.
+const GRACE_MS: i64 = 900_000;
+
 /// One assembled world: a store, a service, a worker, and recording state.
 struct World {
     store: SharedSettlementStore,
@@ -90,6 +97,8 @@ impl World {
                 expiry_batch: 8,
                 usage_batch: 8,
                 lease_batch: 8,
+                reconciliation_grace_ms: GRACE_MS,
+                strand_batch: 8,
                 shutdown_deadline_ms: 2_000,
             },
         )
@@ -254,6 +263,110 @@ async fn the_worker_queries_reconciliation_and_only_a_proof_settles_it() {
         .is_some());
     assert_eq!(world.state.settle_calls(), 0);
     assert_eq!(world.state.provider_writes(), 0, "a query is never a write",);
+}
+
+// --- WOR-2317: the unattributable wait ends, the money question does not ---
+
+#[tokio::test]
+async fn an_unattributable_intent_is_stranded_once_past_its_deadline() {
+    let world = World::new();
+    // `None` for the payer scope is what `World::challenge` writes, and it is
+    // the ordinary shape of anonymous crawler traffic: no accountable key and
+    // no verified agent identity, so nothing to scope the guard to.
+    let intent_id = world.challenge("req-1", "request-key").await;
+    world.attempt(&intent_id, "spt_value", true).await;
+    let worker = world.worker();
+
+    world.state.set_query_plan(QueryPlan::StillPending);
+    world.clock.advance(60_000);
+    worker.run_once().await.expect("tick");
+    assert_eq!(
+        world.status(&intent_id).await,
+        IntentStatus::NeedsReconciliation,
+        "a dispatched write with no answer is what gates the route",
+    );
+
+    // Past the challenge expiry, but still inside the grace window. The
+    // deadline is measured from `expires_at_ms`, so this must change nothing:
+    // an intent that stopped gating here would be a deadline anchored on the
+    // wrong clock.
+    world.clock.advance(EXPIRY_MS - world.clock.now_ms() + 1);
+    let status = worker.run_once().await.expect("tick");
+    assert_eq!(
+        status.intents_stranded, 0,
+        "the grace window has not elapsed, so nothing is retired yet",
+    );
+    assert_eq!(
+        world.status(&intent_id).await,
+        IntentStatus::NeedsReconciliation,
+    );
+
+    // Past the grace window.
+    world.clock.advance(GRACE_MS);
+    let status = worker.run_once().await.expect("tick");
+    assert_eq!(status.intents_stranded, 1);
+    assert_eq!(world.status(&intent_id).await, IntentStatus::Stranded);
+    assert!(
+        !IntentStatus::Stranded.authorizes_origin(),
+        "retiring a payment must never be a way of admitting one",
+    );
+    assert!(
+        world
+            .store
+            .load_access_receipt(&intent_id)
+            .await
+            .expect("read")
+            .is_none(),
+        "nothing settled, so there is no receipt to authorize anything",
+    );
+    assert_eq!(world.state.settle_calls(), 0, "the worker must not settle");
+    assert_eq!(world.state.provider_writes(), 0);
+
+    // Exactly once per intent. The transition is what is counted, and a row
+    // already `Stranded` no longer matches the sweep, so a worker that runs
+    // every second for a week reports this one payment one time.
+    let status = worker.run_once().await.expect("tick");
+    assert_eq!(
+        status.intents_stranded, 1,
+        "the counter is cumulative over transitions, not over sweeps",
+    );
+    assert_eq!(world.status(&intent_id).await, IntentStatus::Stranded);
+}
+
+#[tokio::test]
+async fn a_stranded_intent_is_still_reconciled_and_can_still_settle() {
+    let world = World::new();
+    let intent_id = world.challenge("req-1", "request-key").await;
+    world.attempt(&intent_id, "spt_value", true).await;
+    let worker = world.worker();
+
+    world.state.set_query_plan(QueryPlan::StillPending);
+    world.clock.advance(EXPIRY_MS - START_MS + GRACE_MS + 1);
+    let status = worker.run_once().await.expect("tick");
+    assert_eq!(status.intents_stranded, 1);
+    assert_eq!(world.status(&intent_id).await, IntentStatus::Stranded);
+
+    // The serving question closed at the deadline. The money question did
+    // not: the attempt is still on the reconciliation queue, so the sweep
+    // keeps asking the provider, and an answer still commits a real receipt.
+    // That is the difference between retiring a payment and discarding one.
+    assert!(
+        status.reconciliations_attempted >= 1,
+        "a stranded intent's attempt must stay claimable by reconciliation",
+    );
+
+    world.state.set_query_plan(QueryPlan::Settled);
+    let status = worker.run_once().await.expect("tick");
+    assert_eq!(status.reconciliations_succeeded, 1);
+    assert_eq!(world.status(&intent_id).await, IntentStatus::Succeeded);
+    assert!(world
+        .store
+        .load_access_receipt(&intent_id)
+        .await
+        .expect("read")
+        .is_some());
+    assert_eq!(world.state.settle_calls(), 0, "the worker must not settle");
+    assert_eq!(world.state.provider_writes(), 0);
 }
 
 #[tokio::test]

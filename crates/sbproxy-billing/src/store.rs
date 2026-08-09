@@ -24,6 +24,18 @@
 //! Only a documented provider status query, or a documented idempotent
 //! response replay, can resolve a reconciliation record. Ambiguity never
 //! resolves itself and never increases an attempt generation.
+//!
+//! # The one deadline that exists, and what it does not do
+//!
+//! [`SettlementStore::strand_unattributable_intents`] is the only sweep that
+//! moves an intent out of [`IntentStatus::NeedsReconciliation`] without a
+//! provider having proved anything. It does not resolve the ambiguity and it
+//! does not touch the attempt: the attempt stays on the reconciliation queue,
+//! the intent keeps its `ambiguous` failure category, and the intent's new
+//! state, [`IntentStatus::Stranded`], authorizes nothing. All it releases is
+//! the route gate that [`SettlementStore::unresolved_intent_for_route`]
+//! enforces, and it releases it only for intents that were minted with no
+//! payer scope, which are the ones that withhold the route from everybody.
 
 use std::sync::Arc;
 
@@ -550,6 +562,13 @@ pub trait SettlementStore: Send + Sync {
     /// stopped blocking are the ones where two different identified payers
     /// are provably involved.
     ///
+    /// [`IntentStatus::Stranded`] is deliberately not matched here. That is
+    /// the state an unattributable intent reaches once
+    /// [`SettlementStore::strand_unattributable_intents`] has decided the
+    /// route gate has run out of purpose; the intent is still unresolved and
+    /// still on the reconciliation queue, but it no longer withholds
+    /// challenges.
+    ///
     /// # Errors
     ///
     /// Returns [`BillingError::Storage`] when the query fails.
@@ -560,6 +579,52 @@ pub trait SettlementStore: Send + Sync {
         route: &str,
         payer_hash: Option<&str>,
     ) -> Result<Option<String>, BillingError>;
+
+    /// Releases the route gate held by unattributable stranded payments.
+    ///
+    /// Moves every intent that is in [`IntentStatus::NeedsReconciliation`],
+    /// carries no payer scope, and whose challenge expired at least
+    /// `grace_ms` ago, to [`IntentStatus::Stranded`]. Returns how many rows
+    /// moved. Rows already `Stranded` do not match, so one intent is counted
+    /// exactly once however often the sweep runs.
+    ///
+    /// # Why the deadline is the challenge expiry rather than a constant
+    ///
+    /// The gate withholds fresh challenges over an unresolved intent because
+    /// that intent might represent a payment the deployment owes service for,
+    /// and billing again would be the second bill for it. That risk has an
+    /// end. The signed quote token the payment was made under carries `exp`
+    /// copied straight from the draft's `expires_at_ms`, and the verifier
+    /// refuses an expired token, so past that instant no holder of it reaches
+    /// the redemption path at all. Whatever the provider eventually says
+    /// about the funds, this intent can no longer buy anybody a response.
+    /// Continuing to withhold the route past that point protects nobody from
+    /// a second bill; it only guarantees the route earns nothing.
+    ///
+    /// `grace_ms` is the margin past expiry, and it exists for the store's
+    /// benefit rather than the payer's: it gives the reconciliation sweep a
+    /// long run at resolving the intent honestly, so the common case ends in
+    /// `Succeeded` or `Terminal` and an operator's queue only fills with
+    /// intents that genuinely could not be resolved.
+    ///
+    /// # Why only unattributable intents
+    ///
+    /// An intent with a payer scope withholds challenges from exactly one
+    /// payer and leaves the route earning from everyone else, which is a
+    /// bounded cost that does not need a deadline to make it survivable. It
+    /// also names a specific person the deployment may owe money to, and
+    /// billing that named person again is the concrete double charge, not a
+    /// hypothetical one. Those keep waiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BillingError::Storage`] when the sweep fails.
+    async fn strand_unattributable_intents(
+        &self,
+        now_ms: i64,
+        grace_ms: i64,
+        limit: u32,
+    ) -> Result<u64, BillingError>;
 
     /// Reserves a proof digest for one intent, or reports the replay.
     ///

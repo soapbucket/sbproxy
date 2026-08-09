@@ -40,10 +40,17 @@
 //! committed receipt.
 //!
 //! The three `NeedsReconciliation` rows outrank the challenge's expiry, and
-//! that ordering is load bearing. An intent in that state is never expired by
-//! any sweep, so an aged-out challenge over it means only that the provider
-//! has stayed unreachable. Answering `challenge_expired` there would hand a
-//! payer whose funds may already have moved a fresh bill for the same content.
+//! that ordering is load bearing. No sweep resolves an intent in that state,
+//! so an aged-out challenge over it means only that the provider has stayed
+//! unreachable. Answering `challenge_expired` there would hand a payer whose
+//! funds may already have moved a fresh bill for the same content.
+//!
+//! One sweep does move such an intent, and it changes none of the above.
+//! [`BillingService::strand_unattributable_intents`] retires an intent that
+//! carries no payer scope to `Stranded` once its challenge has aged out past
+//! a grace window, which stops it withholding challenges from every caller on
+//! its route. `Stranded` is still unresolved, still authorizes nothing, and
+//! still answers `Unavailable` here rather than `challenge_expired`.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -688,9 +695,19 @@ impl BillingService {
                 None => Ok(unavailable(self.retry_after_seconds)),
             };
         }
-        if intent.status == IntentStatus::NeedsReconciliation {
+        if intent.status.is_unresolved() {
             // A write is outstanding. Trying again here is how a double charge
             // happens, so the client waits for the worker instead.
+            //
+            // `is_unresolved` rather than an equality test, so
+            // `IntentStatus::Stranded` answers the same way (WOR-2317). That
+            // state releases the route gate, which is a decision about
+            // serving other callers; it asserts nothing new about these
+            // funds, so redeeming against this intent is still the double
+            // charge below. In production the gate never reaches here for a
+            // stranded intent, because the quote token's `exp` is the same
+            // instant the deadline is measured from and the verifier refuses
+            // it first.
             //
             // Ahead of the expiry check on purpose (WOR-2230). Nothing ever
             // expires an intent in this state: `expire_stale_challenges` only
@@ -1163,6 +1180,27 @@ impl BillingService {
     pub async fn expire_challenges(&self, limit: u32) -> Result<u64, BillingError> {
         self.store
             .expire_stale_challenges(self.clock.now_ms(), limit)
+            .await
+    }
+
+    /// Releases the route gate held by unattributable stranded payments.
+    ///
+    /// Delegates to
+    /// [`crate::store::SettlementStore::strand_unattributable_intents`],
+    /// which is where the reasoning lives. Nothing here can settle: the
+    /// method takes no adapter, writes no receipt, and the state it commits
+    /// does not authorize origin access.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the store returns.
+    pub async fn strand_unattributable_intents(
+        &self,
+        grace_ms: i64,
+        limit: u32,
+    ) -> Result<u64, BillingError> {
+        self.store
+            .strand_unattributable_intents(self.clock.now_ms(), grace_ms, limit)
             .await
     }
 

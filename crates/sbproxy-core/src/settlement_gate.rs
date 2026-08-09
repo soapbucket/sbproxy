@@ -38,9 +38,9 @@
 //!
 //! One thing stops that path before it prices anything: an intent for the
 //! same route already sitting in `NeedsReconciliation`. That payment may
-//! have moved a payer's money and nothing expires it, so a fresh invoice
-//! for the same content would be a second bill for it. The answer is a 503
-//! with `Retry-After`, counted as `operation="challenge"`,
+//! have moved a payer's money and no provider has said otherwise, so a
+//! fresh invoice for the same content would be a second bill for it. The
+//! answer is a 503 with `Retry-After`, counted as `operation="challenge"`,
 //! `outcome="unresolved_payment"` (WOR-2230).
 //!
 //! # Whose payment is stuck
@@ -70,6 +70,36 @@
 //! payer, and a request carrying no identity waits on every unresolved
 //! intent for the route. The narrowing only ever separates two payers the
 //! proxy can actually tell apart.
+//!
+//! # How long the unattributable case waits
+//!
+//! That leaves the expensive case intact, and for anonymous crawler traffic
+//! it is not the edge case: a caller with no accountable key and no verified
+//! agent identity is the ordinary shape of the traffic this gate prices, so
+//! the intents it mints ordinarily carry no payer scope and gate the whole
+//! route. On x402 there is no status endpoint to resolve one, so a single
+//! stuck payment could take a route's revenue to zero for the length of a
+//! facilitator outage, which is unbounded.
+//!
+//! WOR-2317 bounds it, and the bound comes off the intent rather than off a
+//! constant. The gate withholds challenges because the stranded intent might
+//! be a payment the deployment owes service for. It can only owe that
+//! service through the quote token it issued, whose `exp` is copied from the
+//! draft's `expires_at_ms` and which
+//! [`sbproxy_modules::policy::quote_token::QuoteTokenVerifier`] refuses once
+//! expired. Past that instant the stranded payer cannot reach the redemption
+//! path at all, however the funds land, so withholding the route no longer
+//! protects them from anything; it only guarantees nobody is billed.
+//!
+//! So a grace window past the challenge's expiry, and then the recovery
+//! worker retires the intent to `IntentStatus::Stranded`, which
+//! [`sbproxy_billing::store::SettlementStore::unresolved_intent_for_route`]
+//! does not match. The route starts issuing challenges again. The intent is
+//! not settled, not written off, still on the reconciliation queue, and
+//! counted on `sbproxy_payment_recovery_total{operation="strand_intent"}`
+//! for an operator to act on. Intents that do carry a payer scope are
+//! untouched: those withhold from one payer rather than from a route, and
+//! that payer is somebody the deployment can concretely owe.
 //!
 //! The retry path authenticates the presented quote token, addresses the
 //! durable intent through
@@ -325,6 +355,13 @@ const OUTCOME_NO_ACCEPTABLE_RAIL: &str = "no_acceptable_rail";
 /// Its own row rather than a share of `unavailable`, because this one says
 /// something an operator has to act on: a payment for this content is stuck,
 /// and until it resolves the route earns nothing. Alert on it.
+///
+/// It stops on its own now, which does not make it less worth alerting on.
+/// The reconciliation deadline (WOR-2317) caps how long this can fire for
+/// one stranded intent, but the cap is reached by giving up on the payment,
+/// not by resolving it: the same operator still has a payment to account
+/// for, and `sbproxy_payment_recovery_total{operation="strand_intent"}` is
+/// where that shows up.
 ///
 /// This value keeps meaning exactly what it meant before WOR-2238: the whole
 /// route is withheld. Every refusal counted here before the payer scope
@@ -1079,6 +1116,15 @@ async fn challenge_path(
     // provider, which is why it gets a loud counter and a warning rather than
     // a quiet 503.
     //
+    // For an unattributable intent that wait is now bounded (WOR-2317). The
+    // store stops matching one whose challenge expired more than the
+    // reconciliation grace window ago, because past the expiry the quote
+    // token it was minted with no longer verifies and the payment behind it
+    // can never buy a response. The read below needs no clause for that: the
+    // recovery worker has already moved the row to `Stranded`, which this
+    // query does not select. An intent that does carry a payer scope has no
+    // deadline and keeps waiting.
+    //
     // Known and out of scope, both predating this: the lookup is a read with
     // no lock, so two simultaneous tokenless requests from the same payer can
     // still both pass it (the window is narrowed, not closed); and `/article`
@@ -1733,6 +1779,7 @@ mod tests {
         AttemptOperation, PaymentRequirementDraft, RecoveryEnvelopeRecord, SafeFailure,
         SettlementRail, SettlementReceipt,
     };
+    use sbproxy_billing::worker::WorkerConfig;
     use sbproxy_modules::policy::quote_token::{
         InMemoryNonceStore, NonceStore, QuoteTokenSigner, QuoteTokenVerifier,
     };
@@ -1977,6 +2024,14 @@ mod tests {
         async fn purge_expired_recovery_envelopes(
             &self,
             _now_ms: i64,
+        ) -> Result<u64, BillingError> {
+            Err(BillingError::Storage("induced store failure"))
+        }
+        async fn strand_unattributable_intents(
+            &self,
+            _now_ms: i64,
+            _grace_ms: i64,
+            _limit: u32,
         ) -> Result<u64, BillingError> {
             Err(BillingError::Storage("induced store failure"))
         }
@@ -2823,6 +2878,162 @@ mod tests {
         assert_eq!(
             anonymous.status, 503,
             "no identity means no proof this is a different payer",
+        );
+    }
+
+    // --- WOR-2317: the unattributable hold runs out ---
+    //
+    // For anonymous crawler traffic the unattributable case is the ordinary
+    // one, not the edge case, and on x402 nothing resolves it: one stuck
+    // payment takes a route's revenue to zero for as long as the facilitator
+    // stays unreachable. The bound comes off the payment rather than off a
+    // constant. The quote token's `exp` is the draft's `expires_at_ms`, and
+    // the verifier refuses an expired token, so past that instant the
+    // stranded payer cannot redeem this intent whatever the funds did and
+    // withholding the route protects nobody.
+
+    /// The reconciliation grace window a deployment actually runs with.
+    ///
+    /// Read off the shipped default rather than restated, so a change to the
+    /// window moves these tests with it instead of leaving them asserting a
+    /// deadline nothing uses.
+    fn grace_ms() -> i64 {
+        WorkerConfig::default().reconciliation_grace_ms
+    }
+
+    /// Runs the recovery worker's deadline sweep against this gate's store.
+    ///
+    /// Called directly rather than through a spawned worker: the sweep is a
+    /// store transition, and driving it by hand is what lets the clock jump
+    /// instead of the test sleeping out a fifteen minute window.
+    async fn age_out(gate: &Gate) -> u64 {
+        gate.service
+            .strand_unattributable_intents(grace_ms(), 100)
+            .await
+            .expect("the deadline sweep runs")
+    }
+
+    #[tokio::test]
+    async fn an_unattributable_hold_still_gates_the_route_before_its_deadline() {
+        let gate = Gate::x402();
+        strand(&gate).await;
+
+        // Past the challenge TTL, inside the grace window. This is the window
+        // where the reconciliation sweep still has a real chance of resolving
+        // the payment honestly, and giving up here would trade a recoverable
+        // payment for a few minutes of revenue.
+        gate.clock.advance(CHALLENGE_TTL_MS + 1_000);
+        assert_eq!(age_out(&gate).await, 0, "the grace window has not elapsed");
+
+        let response = expect_respond(gate.decide_with(&crawler_headers()).await);
+        assert_eq!(
+            response.status, 503,
+            "an expired challenge is not yet a reason to bill for this content again",
+        );
+        header_value(&response, "Retry-After");
+        assert_eq!(gate.settle_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unattributable_hold_stops_gating_the_route_after_its_deadline() {
+        let gate = Gate::x402();
+        strand(&gate).await;
+
+        gate.clock.advance(CHALLENGE_TTL_MS + grace_ms() + 1);
+        assert_eq!(age_out(&gate).await, 1, "the hold has run out of purpose");
+
+        // The point of the ticket. The route earns again.
+        let response = expect_respond(gate.decide_with(&crawler_headers()).await);
+        assert_eq!(
+            response.status, 402,
+            "a route whose only stuck payment can no longer be redeemed by \
+             anybody must go back to billing, not stay at zero: {}",
+            response.response.body,
+        );
+        assert!(
+            !response.response.body.contains("settlement_unavailable"),
+            "this is a real challenge, not a wait: {}",
+            response.response.body,
+        );
+        assert_eq!(
+            gate.settle_calls(),
+            1,
+            "issuing the next challenge dispatches nothing",
+        );
+
+        // Exactly once per intent. The sweep matches `NeedsReconciliation`,
+        // and the retired row is no longer in it.
+        assert_eq!(age_out(&gate).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_retired_hold_never_authorizes_the_origin() {
+        let gate = Gate::x402();
+        let retry = strand(&gate).await;
+        let token = retry
+            .get("crawler-payment")
+            .and_then(|value| value.to_str().ok())
+            .expect("the stranded retry carries its quote token")
+            .to_string();
+
+        gate.clock.advance(CHALLENGE_TTL_MS + grace_ms() + 1);
+        assert_eq!(age_out(&gate).await, 1);
+
+        // Retiring a hold is a decision about serving other callers. It
+        // asserts nothing about these funds, so the payment it belonged to
+        // still buys nothing.
+        let decision = gate.decide_with(&retry).await;
+        assert!(
+            !matches!(&decision, GateDecision::Allow),
+            "a payment nobody ever proved must not reach the origin because \
+             the proxy stopped waiting for the proof",
+        );
+        let response = expect_respond(decision);
+        assert_eq!(response.status, 503);
+        assert!(
+            gate.receipt_for_token(&token).await.is_none(),
+            "no receipt exists, which is the only thing that opens the origin",
+        );
+        assert_eq!(gate.settle_calls(), 1, "nothing was dispatched again");
+    }
+
+    #[tokio::test]
+    async fn a_payer_scoped_hold_has_no_deadline() {
+        let gate = Gate::x402();
+        strand_as(&gate, "agent:gptbot").await;
+
+        // Far past any deadline an unattributable intent would have had.
+        gate.clock
+            .advance(CHALLENGE_TTL_MS + grace_ms().saturating_mul(10));
+        assert_eq!(
+            age_out(&gate).await,
+            0,
+            "an intent that names its payer withholds from one caller rather \
+             than from a route, and that caller is somebody this deployment \
+             can concretely owe",
+        );
+
+        // WOR-2238's three answers, unchanged.
+        let stuck = expect_respond(
+            gate.decide_as("/article", &crawler_headers(), "agent:gptbot")
+                .await,
+        );
+        assert_eq!(
+            stuck.status, 503,
+            "the payer whose money may already be gone is never billed again",
+        );
+        let other = expect_respond(
+            gate.decide_as("/article", &crawler_headers(), "agent:claudebot")
+                .await,
+        );
+        assert_eq!(
+            other.status, 402,
+            "and a different payer was billable the whole time",
+        );
+        let anonymous = expect_respond(gate.decide_with(&crawler_headers()).await);
+        assert_eq!(
+            anonymous.status, 503,
+            "an unidentified request still cannot be proved to be someone else",
         );
     }
 

@@ -136,6 +136,8 @@ impl World {
                 expiry_batch: 8,
                 usage_batch: 8,
                 lease_batch: 8,
+                reconciliation_grace_ms: 900_000,
+                strand_batch: 8,
                 shutdown_deadline_ms: 2_000,
             },
         )

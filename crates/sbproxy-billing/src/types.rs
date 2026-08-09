@@ -264,6 +264,27 @@ pub enum IntentStatus {
     Terminal,
     /// A dispatch happened with no authoritative recorded response.
     NeedsReconciliation,
+    /// A dispatch is still unresolved, and it has stopped gating the route.
+    ///
+    /// Reached only by the recovery sweep, and only for an intent that was
+    /// minted with no payer scope, once its challenge has aged out past the
+    /// reconciliation grace window (WOR-2317). Past that point the quote
+    /// token the payment was made under no longer verifies, so no holder of
+    /// it can be served by this intent whatever the provider eventually
+    /// says, and withholding fresh challenges from every caller on the route
+    /// buys nobody anything.
+    ///
+    /// It is deliberately not [`IntentStatus::Terminal`]. Terminal asserts
+    /// that no funds moved. This asserts the opposite of an assertion: funds
+    /// may well have moved, nothing ever proved it either way, and the money
+    /// question is still open. The attempt underneath stays in
+    /// [`crate::types::AttemptStatus::NeedsReconciliation`], so the sweep
+    /// keeps querying the provider and can still commit a real receipt, and
+    /// the row keeps the `ambiguous` failure category it was stranded with.
+    ///
+    /// It cannot be read as paid: [`IntentStatus::authorizes_origin`] has one
+    /// `true` arm and this is not it.
+    Stranded,
 }
 
 impl IntentStatus {
@@ -276,6 +297,7 @@ impl IntentStatus {
             Self::Succeeded => "succeeded",
             Self::Terminal => "terminal",
             Self::NeedsReconciliation => "needs_reconciliation",
+            Self::Stranded => "stranded",
         }
     }
 
@@ -294,6 +316,7 @@ impl IntentStatus {
             "succeeded" => Ok(Self::Succeeded),
             "terminal" => Ok(Self::Terminal),
             "needs_reconciliation" => Ok(Self::NeedsReconciliation),
+            "stranded" => Ok(Self::Stranded),
             _ => Err(BillingError::CorruptRecord),
         }
     }
@@ -301,12 +324,17 @@ impl IntentStatus {
     /// Reports whether this state may let a request reach the origin.
     ///
     /// Only [`IntentStatus::Succeeded`] returns `true`. Verified, processing,
-    /// waiting, ambiguous, and terminal all fail closed.
+    /// waiting, ambiguous, stranded, and terminal all fail closed.
     pub const fn authorizes_origin(self) -> bool {
         matches!(self, Self::Succeeded)
     }
 
     /// Reports whether the intent can still change state.
+    ///
+    /// [`IntentStatus::Stranded`] is not final. Its attempt is still on the
+    /// reconciliation queue, so a provider that later answers can still move
+    /// it to `Succeeded` or `Terminal`. What ended at the deadline was the
+    /// serving question, not the money question.
     pub const fn is_final(self) -> bool {
         matches!(self, Self::Succeeded | Self::Terminal)
     }
@@ -315,8 +343,22 @@ impl IntentStatus {
     ///
     /// [`IntentStatus::NeedsReconciliation`] deliberately returns `false`:
     /// that state permits a provider status query and nothing else.
+    /// [`IntentStatus::Stranded`] is the same state with the route gate
+    /// released, so it answers the same way: a write from here would be the
+    /// second charge the whole subsystem exists to prevent.
     pub const fn allows_provider_write(self) -> bool {
         matches!(self, Self::Pending | Self::Processing | Self::RetryWait)
+    }
+
+    /// Reports whether a dispatch under this intent is still unresolved.
+    ///
+    /// True for [`IntentStatus::NeedsReconciliation`] and
+    /// [`IntentStatus::Stranded`]: both mean a write may have moved funds and
+    /// nothing has proved what happened. They differ only in whether the
+    /// route is still being withheld on the intent's behalf, which is a
+    /// serving decision rather than a statement about the money.
+    pub const fn is_unresolved(self) -> bool {
+        matches!(self, Self::NeedsReconciliation | Self::Stranded)
     }
 }
 

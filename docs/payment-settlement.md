@@ -1,6 +1,6 @@
 # Payment settlement
 
-*Last modified: 2026-08-07*
+*Last modified: 2026-08-09*
 
 `proxy.payments` is how SBproxy charges for a request and proves it was
 paid. It is Apache-2.0, it is off unless you configure it, and it holds
@@ -67,8 +67,15 @@ answers the only question that matters the same way.
 | `Processing` | One bounded authoritative operation | No |
 | `RetryWait` | A retry proven not to have been dispatched | No |
 | `NeedsReconciliation` | Provider status query only | No |
+| `Stranded` | Provider status query only | No |
 | `Terminal` | None | No |
 | `Succeeded` | No repeat charge, receipt lookup only | Yes |
+
+`Stranded` is `NeedsReconciliation` with one thing given up on, and it is
+worth being precise about which. The payment is still unresolved and the
+provider is still being asked about it. What ended is the route's wait:
+the intent no longer withholds fresh challenges. See
+[The unattributable wait has a deadline](#the-unattributable-wait-has-a-deadline).
 
 The mapping from a failed authorization to a durable state is decided by
 the dispatch gate, not by the error text:
@@ -86,13 +93,16 @@ A `NeedsReconciliation` intent is never retried by the request path. A
 second attempt is how a payer gets charged twice, so the client waits for
 the recovery worker instead.
 
-That rule outranks the challenge's expiry, and it has to. Nothing expires
-an intent in this state: the challenge sweep only touches `Pending`, and
-it skips any intent whose provider write is still outstanding. So a
-`NeedsReconciliation` intent whose challenge has aged out means the
-provider has been unreachable for a while and nothing more. It keeps
-answering 503 with `Retry-After`, because the payer whose funds may
-already have moved is owed a resolution rather than a fresh bill.
+That rule outranks the challenge's expiry, and it has to. No sweep
+resolves an intent in this state: the challenge sweep only touches
+`Pending`, and it skips any intent whose provider write is still
+outstanding. So a `NeedsReconciliation` intent whose challenge has aged
+out means the provider has been unreachable for a while and nothing more.
+It keeps answering 503 with `Retry-After`, because the payer whose funds
+may already have moved is owed a resolution rather than a fresh bill.
+That answer does not change when the intent later reaches `Stranded`: the
+payer is still owed a resolution and is still not handed a fresh bill for
+the same content.
 
 The same reasoning applies one step earlier. While an intent for a route
 sits in `NeedsReconciliation`, that route issues no new challenge to the
@@ -151,6 +161,77 @@ clears it, one `worker.reconcile_interval_ms` later at the outside and
 honors it never sees the difference, and one that polls faster than the
 worker sweeps sees a short run of 503s first.
 
+## The unattributable wait has a deadline
+
+Those three situations are the expensive ones, and for anonymous crawler
+traffic the third is not an edge case. A caller with no authenticated key
+and no verified agent identity is the ordinary shape of the traffic this
+subsystem prices, so the intents it mints ordinarily carry no payer and
+withhold the whole route. Left alone that is unbounded: on a rail with no
+status query nothing resolves the stuck intent by itself, so one stuck
+payment can take a route's revenue to zero for the length of a provider
+outage.
+
+The bound comes off the payment rather than off a number somebody picked.
+A route is withheld because the stuck intent might be a payment you owe
+service for, and you can only owe that service through the quote token
+the 402 handed out. That token carries an expiry copied from the
+challenge, and an expired token is refused before anything else happens.
+Past the challenge's expiry the stranded payer cannot redeem that intent
+whatever the money turns out to have done, so continuing to withhold the
+route protects nobody from a second bill. It only guarantees that nobody
+is billed at all.
+
+So the deadline is the challenge's own expiry plus a **15 minute grace
+window**. The grace is there for the reconciliation sweep rather than for
+the payer: at the default one second cadence it is nine hundred more
+attempts to resolve the payment honestly, so an intent only reaches the
+deadline when it genuinely could not be resolved.
+
+At the deadline the recovery worker moves the intent to `Stranded` and
+the route starts issuing challenges again. Four things are deliberately
+true of that state:
+
+- It is not `Succeeded`. Nothing about the money was proved and no
+  receipt exists, so it cannot admit a request to the origin. Exactly one
+  state does that and this is not it.
+- It is not `Terminal` either. Terminal asserts that no funds moved.
+  This asserts nothing at all, which is the honest position, and the
+  intent keeps the `ambiguous` failure category it was stranded with.
+- It is not discarded. The provider attempt underneath stays on the
+  reconciliation queue, so the sweep keeps asking, and a provider that
+  answers later still commits a real receipt and still moves the intent
+  to `Succeeded` or `Terminal`.
+- It never comes back. A stranded intent does not return to
+  `NeedsReconciliation` and does not start withholding the route again.
+
+Intents that do carry a payer have no deadline and keep waiting. Those
+withhold challenges from one caller rather than from a route, which is a
+bounded cost, and that caller is somebody you can concretely owe money
+to: billing them again is the real double charge rather than a
+hypothetical one.
+
+**What to do when this fires.** Each aged-out intent is one payment you
+cannot account for. Take the intent ids out of the settlement database:
+
+```sql
+SELECT intent_id, origin_id, route, amount_micros, currency, expires_at_ms
+  FROM payment_intents
+ WHERE status = 'stranded'
+ ORDER BY expires_at_ms;
+```
+
+Then reconcile each one with the provider by hand, using the provider
+handle and idempotency key on its attempt row, and refund or credit
+anything that turns out to have settled. That payer was never served.
+
+The transition is counted as
+`sbproxy_payment_recovery_total{operation="strand_intent",
+outcome="stranded"}`, once per intent however long it stays stranded,
+and logged at warn with the count for the sweep. Alert on the rate. A
+non-zero rate means unaccounted money; a rate that climbs means the rail
+behind it stopped answering entirely.
+
 ## The request path, end to end
 
 With `proxy.payments` present, an `ai_crawl_control` 402 is settled
@@ -187,7 +268,9 @@ explained in the reference below.
 3. If an intent for this route is already in `NeedsReconciliation`, the
    gate stops here and answers 503 with `Retry-After`. That payment may
    have moved a payer's money, and a fresh invoice for the same content
-   would be a second bill for it.
+   would be a second bill for it. An intent that already reached
+   `Stranded` does not stop the gate: its deadline passed, so the route
+   is billable again.
 4. The matched price compiles into one normalized requirement, and a
    durable `Pending` intent is committed before the 402 leaves the
    proxy. A crash after this point leaves a record, never a dangling
@@ -951,16 +1034,28 @@ response has already been sent. A later retry from the client observes
 `Succeeded` and is allowed through, and the route it was blocking becomes
 challengeable again in the same moment.
 
+The reconciliation deadline is not an entry in that table, and reading it
+as one is the mistake worth avoiding. Moving an intent to `Stranded`
+proves nothing, commits nothing, and asks no provider anything. It
+releases a route gate and leaves the row on this queue, so every line
+above still applies to it afterwards.
+
 ## Metrics and logs
 
 Payment metrics carry four labels and no more: `rail`, `operation`,
 `outcome`, and `provider_class`. The recovery sweep's outcomes are
-`succeeded`, `terminal`, `retry_wait`, and `needs_reconciliation`. The
-request-path gate reports `operation="challenge"` with `prepared`,
-`no_acceptable_rail`, or `unresolved_payment`, and `operation="redeem"`
-with `succeeded`, `unavailable`, or one of the closed payment problem
-codes. Every one of those is a fixed word; none of them is derived from a
-provider response.
+`succeeded`, `terminal`, `retry_wait`, `needs_reconciliation`, and
+`stranded`. That last one appears only under
+`operation="strand_intent"`, and it is its own word rather than a share
+of `terminal` because the two mean opposite things: `terminal` says a
+provider proved no funds moved, and `stranded` says nobody proved
+anything. Folding them together would hide unaccounted money inside the
+series you read as clean failures. The request-path gate reports
+`operation="challenge"` with `prepared`, `no_acceptable_rail`,
+`unresolved_payment`, or `unresolved_payment_scoped`, and
+`operation="redeem"` with `succeeded`, `unavailable`, or one of the
+closed payment problem codes. Every one of those is a fixed word; none of
+them is derived from a provider response.
 
 No quote id, challenge id, tenant id, address, provider reference,
 PaymentIntent id, invoice, single-use token, credential, client secret,

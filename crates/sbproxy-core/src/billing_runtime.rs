@@ -1504,6 +1504,26 @@ fn record_worker_delta(observed: &ObservedStatus, current: WorkerStatus) {
             .challenges_expired
             .saturating_sub(previous.challenges_expired),
     );
+    // WOR-2317. Reuses `sbproxy_payment_recovery_total` rather than adding a
+    // family: this is a durable row the recovery worker moved, which is
+    // exactly what that counter is for, and it already carries the two labels
+    // the event needs. Both values are new and neither collides with an
+    // existing one, so a dashboard summing the family picks this up and every
+    // query written against a specific `operation` keeps selecting the rows
+    // it always did.
+    //
+    // `stranded` is its own outcome rather than a share of `terminal`. The
+    // whole point of the state is that it is not `terminal`: terminal means a
+    // provider proved no funds moved, and folding these rows into it would
+    // hide unaccounted money inside the series an operator reads as "clean
+    // failures". Alert on this one.
+    record_payment_recovery(
+        "strand_intent",
+        "stranded",
+        current
+            .intents_stranded
+            .saturating_sub(previous.intents_stranded),
+    );
     record_payment_recovery(
         "recover_lease",
         "retry_wait",
@@ -1665,6 +1685,77 @@ mod tests {
         );
     }
 
+    /// One `sbproxy_payment_recovery_total` series, or 0 when it is absent.
+    fn recovery_count(operation: &str, outcome: &str) -> f64 {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.name() == "sbproxy_payment_recovery_total")
+            .and_then(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .find(|metric| {
+                        let labelled = |name: &str, want: &str| {
+                            metric
+                                .get_label()
+                                .iter()
+                                .any(|label| label.name() == name && label.value() == want)
+                        };
+                        labelled("operation", operation) && labelled("outcome", outcome)
+                    })
+                    .map(|metric| metric.get_counter().value())
+            })
+            .unwrap_or(0.0)
+    }
+
+    #[test]
+    fn an_aged_out_hold_is_counted_once_on_the_recovery_family() {
+        // WOR-2317. Reuse rather than a new family: this is a durable row the
+        // recovery worker moved, which is what `sbproxy_payment_recovery_total`
+        // already means, and it needs no label the family does not have.
+        let before = recovery_count("strand_intent", "stranded");
+        let clean_failures_before = recovery_count("expire_challenge", "terminal");
+        let observed: ObservedStatus = Arc::new(Mutex::new(WorkerStatus::default()));
+
+        record_worker_delta(
+            &observed,
+            WorkerStatus {
+                intents_stranded: 1,
+                ..WorkerStatus::default()
+            },
+        );
+        assert!(
+            (recovery_count("strand_intent", "stranded") - before - 1.0).abs() < f64::EPSILON,
+            "one payment ageing out is one observation",
+        );
+
+        // The worker's counter is cumulative, so a later tick reporting the
+        // same total must add nothing. Without the diff an idle worker would
+        // re-report every retired payment once a second and an alert on this
+        // series would fire forever over one stuck intent.
+        record_worker_delta(
+            &observed,
+            WorkerStatus {
+                intents_stranded: 1,
+                ..WorkerStatus::default()
+            },
+        );
+        assert!(
+            (recovery_count("strand_intent", "stranded") - before - 1.0).abs() < f64::EPSILON,
+            "a repeated snapshot is not a second aged-out payment",
+        );
+
+        // Its own outcome, never folded into an existing one. `terminal`
+        // means a provider proved no funds moved, and hiding unaccounted
+        // money inside the series an operator reads as clean failures is
+        // exactly the reporting bug worth avoiding.
+        assert!(
+            (recovery_count("expire_challenge", "terminal") - clean_failures_before).abs()
+                < f64::EPSILON,
+            "an aged-out hold must not land in the clean-failure series",
+        );
+    }
+
     #[test]
     fn the_worker_cadence_comes_from_configuration_and_the_batches_do_not() {
         let mut config = sample_config();
@@ -1681,6 +1772,14 @@ mod tests {
         assert_eq!(lowered.usage_batch, defaults.usage_batch);
         assert_eq!(lowered.lease_batch, defaults.lease_batch);
         assert_eq!(lowered.lease_ttl_ms, defaults.lease_ttl_ms);
+        // The reconciliation deadline is not an operator knob either. Its
+        // right value follows from the reconciliation cadence and from the
+        // challenge TTL, both of which this crate owns.
+        assert_eq!(
+            lowered.reconciliation_grace_ms,
+            defaults.reconciliation_grace_ms
+        );
+        assert_eq!(lowered.strand_batch, defaults.strand_batch);
     }
 
     #[test]

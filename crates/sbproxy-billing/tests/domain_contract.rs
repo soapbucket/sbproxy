@@ -283,11 +283,33 @@ fn only_succeeded_authorizes_the_origin() {
         IntentStatus::RetryWait,
         IntentStatus::Terminal,
         IntentStatus::NeedsReconciliation,
+        IntentStatus::Stranded,
     ] {
         assert!(!status.authorizes_origin(), "{status} must not authorize");
     }
     assert!(IntentStatus::Succeeded.authorizes_origin());
     assert!(!IntentStatus::NeedsReconciliation.allows_provider_write());
+    // WOR-2317. `Stranded` releases a route gate and nothing else. It is not
+    // a settlement, so it authorizes nothing, and it is not a resolution, so
+    // it opens no new provider write: the outstanding dispatch it was
+    // retired with is still outstanding.
+    assert!(!IntentStatus::Stranded.allows_provider_write());
+    assert!(IntentStatus::Stranded.is_unresolved());
+    assert!(IntentStatus::NeedsReconciliation.is_unresolved());
+    assert!(
+        !IntentStatus::Terminal.is_unresolved(),
+        "terminal asserts no funds moved; stranded asserts nothing at all, \
+         and collapsing the two would hide unaccounted money",
+    );
+    assert!(
+        !IntentStatus::Stranded.is_final(),
+        "a provider that answers later must still be able to move this row",
+    );
+    assert_eq!(IntentStatus::Stranded.as_str(), "stranded");
+    assert_eq!(
+        IntentStatus::parse("stranded").expect("stranded parses"),
+        IntentStatus::Stranded,
+    );
     assert!(!AttemptOperation::MeterReport.can_settle());
     assert!(!AttemptOperation::PrepareChallenge.can_settle());
     assert!(AttemptOperation::Settle.can_settle());

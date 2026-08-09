@@ -847,6 +847,203 @@ async fn an_intent_with_no_payer_scope_withholds_from_everyone() {
     assert_eq!(guard(&reopened, Some("payer-a")).await, Some(legacy));
 }
 
+// --- WOR-2317: the unattributable hold has a deadline ---
+//
+// The guard above is right and, for an intent nobody can be attributed to,
+// unbounded: on a rail with no status endpoint nothing ever resolves it, so
+// one stuck payment takes a route's revenue to zero for as long as the
+// provider stays unreachable. The deadline is the challenge's own expiry plus
+// a grace window, because the quote token signs `exp` from that same column
+// and the verifier refuses an expired one: past it the stranded payer cannot
+// redeem this intent whatever the funds did, so the hold protects nobody.
+
+/// The grace window past a challenge's expiry these tests use.
+const GRACE_MS: i64 = 900_000;
+
+/// Runs the deadline sweep once and reports how many intents it retired.
+async fn strand_sweep(store: &SharedSettlementStore, clock: &Arc<TestClock>) -> u64 {
+    store
+        .strand_unattributable_intents(clock.now_ms(), GRACE_MS, 100)
+        .await
+        .expect("deadline sweep runs")
+}
+
+/// The durable state of one intent.
+async fn intent_status(store: &SharedSettlementStore, intent_id: &str) -> IntentStatus {
+    store
+        .load_intent(intent_id)
+        .await
+        .expect("read")
+        .expect("intent")
+        .status
+}
+
+#[tokio::test]
+async fn an_unattributable_intent_stops_withholding_once_past_its_deadline() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let path = directory.path().join("settlement.sqlite3");
+    let clock = TestClock::new(START_MS);
+    let store = handle(&path, &clock);
+
+    let stuck = stranded_intent(&store, "req-a", "key-a", None).await;
+    assert_eq!(
+        guard(&store, None).await,
+        Some(stuck.clone()),
+        "the whole route is withheld while the hold stands",
+    );
+
+    // The challenge has expired, and the grace window has not. Nothing moves:
+    // the deadline is anchored on the payment, so the reconciliation sweep
+    // gets its full run at resolving this honestly first.
+    clock.advance(EXPIRY_MS - clock.now_ms() + 1);
+    assert_eq!(strand_sweep(&store, &clock).await, 0);
+    assert_eq!(
+        intent_status(&store, &stuck).await,
+        IntentStatus::NeedsReconciliation,
+    );
+    assert_eq!(
+        guard(&store, None).await,
+        Some(stuck.clone()),
+        "inside the grace window the route is still withheld",
+    );
+
+    // Past it.
+    clock.advance(GRACE_MS);
+    assert_eq!(strand_sweep(&store, &clock).await, 1);
+    assert_eq!(intent_status(&store, &stuck).await, IntentStatus::Stranded);
+    assert_eq!(
+        guard(&store, None).await,
+        None,
+        "a retired hold stops gating the route, for every caller",
+    );
+    assert_eq!(
+        guard(&store, Some("payer-a")).await,
+        None,
+        "and for an identified one too",
+    );
+
+    // Exactly once per intent: the sweep matches `NeedsReconciliation`, and
+    // this row is not in it any more.
+    assert_eq!(
+        strand_sweep(&store, &clock).await,
+        0,
+        "one payment ages out one time, however often the worker sweeps",
+    );
+    assert_eq!(intent_status(&store, &stuck).await, IntentStatus::Stranded);
+}
+
+#[tokio::test]
+async fn a_payer_scoped_intent_has_no_deadline() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let path = directory.path().join("settlement.sqlite3");
+    let clock = TestClock::new(START_MS);
+    let store = handle(&path, &clock);
+
+    let stuck = stranded_intent(&store, "req-a", "key-a", Some("payer-a")).await;
+
+    // Far past any deadline an unattributable intent would have.
+    clock.advance(EXPIRY_MS - clock.now_ms() + GRACE_MS * 10);
+    assert_eq!(
+        strand_sweep(&store, &clock).await,
+        0,
+        "an intent that names its payer withholds from that payer alone, which \
+         is a bounded cost, and that payer is somebody this deployment can \
+         concretely owe money to",
+    );
+    assert_eq!(
+        intent_status(&store, &stuck).await,
+        IntentStatus::NeedsReconciliation,
+    );
+
+    // WOR-2238's answers, unchanged by the deadline existing.
+    assert_eq!(
+        guard(&store, Some("payer-a")).await,
+        Some(stuck.clone()),
+        "the payer whose money may already be gone keeps waiting",
+    );
+    assert_eq!(
+        guard(&store, Some("payer-b")).await,
+        None,
+        "a different payer is still billable",
+    );
+    assert_eq!(
+        guard(&store, None).await,
+        Some(stuck),
+        "and an unidentified request still cannot be proved to be someone else",
+    );
+}
+
+#[tokio::test]
+async fn a_retired_hold_is_not_a_settlement() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let path = directory.path().join("settlement.sqlite3");
+    let clock = TestClock::new(START_MS);
+    let store = handle(&path, &clock);
+
+    let stuck = stranded_intent(&store, "req-a", "key-a", None).await;
+    clock.advance(EXPIRY_MS - clock.now_ms() + GRACE_MS);
+    assert_eq!(strand_sweep(&store, &clock).await, 1);
+
+    let intent = store
+        .load_intent(&stuck)
+        .await
+        .expect("read")
+        .expect("intent");
+    assert_eq!(intent.status, IntentStatus::Stranded);
+    assert!(
+        !intent.authorizes_origin(),
+        "giving up on a payment must never be a way of admitting one",
+    );
+    assert!(
+        store
+            .load_access_receipt(&stuck)
+            .await
+            .expect("read")
+            .is_none(),
+        "the one read the request path authorizes on must stay empty",
+    );
+
+    // Not discarded either. The attempt is still on the reconciliation queue,
+    // so the sweep keeps asking the provider what happened.
+    let claimed = store
+        .claim_reconciliation(clock.now_ms(), 30_000, 10)
+        .await
+        .expect("claim");
+    assert_eq!(
+        claimed.len(),
+        1,
+        "a retired intent's dispatch is still outstanding and still queryable",
+    );
+    assert_eq!(claimed[0].attempt.intent_id, stuck);
+    assert_eq!(
+        claimed[0].attempt.status,
+        AttemptStatus::NeedsReconciliation,
+    );
+}
+
+#[tokio::test]
+async fn a_lease_sweep_does_not_resurrect_a_retired_hold() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let path = directory.path().join("settlement.sqlite3");
+    let clock = TestClock::new(START_MS);
+    let store = handle(&path, &clock);
+
+    let stuck = stranded_intent(&store, "req-a", "key-a", None).await;
+    clock.advance(EXPIRY_MS - clock.now_ms() + GRACE_MS);
+    assert_eq!(strand_sweep(&store, &clock).await, 1);
+
+    // Lease recovery propagates attempt state onto intents, and this intent's
+    // attempt is deliberately still `needs_reconciliation`. Without the
+    // exclusion for `Stranded` the next sweep would drag the intent back and
+    // the deadline would hold for exactly one worker interval.
+    store
+        .recover_stale_leases(clock.now_ms(), 100)
+        .await
+        .expect("recover leases");
+    assert_eq!(intent_status(&store, &stuck).await, IntentStatus::Stranded);
+    assert_eq!(guard(&store, None).await, None);
+}
+
 #[cfg(feature = "recovery-crypto")]
 mod recovery {
     use super::*;

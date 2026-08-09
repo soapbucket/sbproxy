@@ -33,6 +33,14 @@
 //! route-wide behavior those rows were written under. An upgrade therefore
 //! cannot turn an existing unresolved intent into a second bill.
 //!
+//! No migration 3 was needed for WOR-2317. The reconciliation deadline is
+//! derived from two columns that already exist, `expires_at_ms` and
+//! `payer_hash`, and the state it writes is a new value in the `status`
+//! column rather than a new column. A database written by this build and
+//! read by an older one fails closed on the unknown spelling
+//! (`IntentStatus::parse` returns `CorruptRecord`) rather than misreading a
+//! stranded intent as something that authorizes.
+//!
 //! # What is deliberately not stored
 //!
 //! No credential, no authorization header, no client secret, no macaroon, no
@@ -1367,6 +1375,73 @@ impl SettlementStore for SqliteSettlementStore {
         .await
     }
 
+    async fn strand_unattributable_intents(
+        &self,
+        now_ms: i64,
+        grace_ms: i64,
+        limit: u32,
+    ) -> Result<u64, BillingError> {
+        // Computed here rather than as `expires_at_ms + ?grace` in SQL, so
+        // the arithmetic saturates in Rust instead of wrapping in SQLite on a
+        // row with an absurd stored expiry.
+        let cutoff_ms = now_ms.saturating_sub(grace_ms.max(0));
+        self.call(move |connection| {
+            let transaction = begin_immediate(connection)?;
+            // Three conditions, and dropping any one of them is a double
+            // charge or a lost payment.
+            //
+            // `status = needs_reconciliation` keeps this away from every
+            // intent that is merely waiting: a `Pending` or `RetryWait` row
+            // has no outstanding write and is the challenge sweep's job.
+            //
+            // `payer_hash IS NULL` is the whole scope of WOR-2317. A row with
+            // a payer scope withholds the route from one identified payer and
+            // from nobody else, and that payer is someone the deployment may
+            // concretely owe. Only the rows that withhold from everybody, on
+            // the mere possibility that one of them is the stranded payer,
+            // age out.
+            //
+            // `expires_at_ms <= cutoff` is the deadline itself. The quote
+            // token signs `exp` from this same column, and the verifier
+            // refuses an expired token, so past it no holder can redeem this
+            // intent however the funds land.
+            //
+            // Oldest expiry first, so a backlog drains in the order it
+            // stranded rather than in whatever order the planner walks.
+            //
+            // Nothing else on the row is touched. `failure_category` keeps
+            // the `ambiguous` value `mark_needs_reconciliation` wrote, the
+            // attempt keeps its `needs_reconciliation` status and stays on
+            // the reconciliation queue, and no receipt is created. This
+            // sweep releases a gate; it does not decide anything about money.
+            let stranded = transaction
+                .execute(
+                    "UPDATE payment_intents
+                        SET status = ?1, updated_at_ms = ?2
+                      WHERE intent_id IN (
+                            SELECT intent_id FROM payment_intents
+                             WHERE status = ?3
+                               AND payer_hash IS NULL
+                               AND expires_at_ms <= ?4
+                             ORDER BY expires_at_ms
+                             LIMIT ?5)",
+                    params![
+                        IntentStatus::Stranded.as_str(),
+                        now_ms,
+                        IntentStatus::NeedsReconciliation.as_str(),
+                        cutoff_ms,
+                        limit,
+                    ],
+                )
+                .map_err(|_| BillingError::Storage("strand unattributable intents"))?;
+            transaction
+                .commit()
+                .map_err(|_| BillingError::Storage("commit stranded intents"))?;
+            Ok(stranded as u64)
+        })
+        .await
+    }
+
     async fn expire_stale_challenges(&self, now_ms: i64, limit: u32) -> Result<u64, BillingError> {
         self.call(move |connection| {
             let transaction = begin_immediate(connection)?;
@@ -1457,18 +1532,28 @@ impl SettlementStore for SqliteSettlementStore {
                 .map_err(|_| BillingError::Storage("recover dispatched leases"))?;
 
             // Intents follow their attempts, and never out of a final state.
+            //
+            // `Stranded` joins that exclusion list even though it is not
+            // final (WOR-2317). A stranded intent's attempt is still
+            // `needs_reconciliation` by design, so without this clause the
+            // very next lease sweep would drag the intent back to
+            // `NeedsReconciliation` and re-gate the route, and the deadline
+            // would hold for exactly one sweep interval. The intent can still
+            // leave `Stranded`, but only through `record_reconciliation`,
+            // where a provider actually proved something.
             transaction
                 .execute(
                     "UPDATE payment_intents
                         SET status = ?1, updated_at_ms = ?2
-                      WHERE status NOT IN (?3, ?4)
+                      WHERE status NOT IN (?3, ?4, ?5)
                         AND intent_id IN (
-                            SELECT intent_id FROM payment_attempts WHERE status = ?5)",
+                            SELECT intent_id FROM payment_attempts WHERE status = ?6)",
                     params![
                         IntentStatus::NeedsReconciliation.as_str(),
                         now_ms,
                         IntentStatus::Succeeded.as_str(),
                         IntentStatus::Terminal.as_str(),
+                        IntentStatus::Stranded.as_str(),
                         AttemptStatus::NeedsReconciliation.as_str(),
                     ],
                 )

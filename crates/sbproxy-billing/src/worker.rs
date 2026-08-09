@@ -22,12 +22,21 @@
 //! a committed receipt does, and reconciliation can commit one only when a
 //! provider proves the payment settled.
 //!
+//! It also cannot resolve an ambiguity by giving up on it. The one sweep
+//! that moves an intent without a provider answer,
+//! [`BillingService::strand_unattributable_intents`], retires an
+//! unattributable intent's hold on its route once the quote token that
+//! payment was made under can no longer be redeemed by anybody. It writes no
+//! receipt, it leaves the attempt on the reconciliation queue, and the state
+//! it commits authorizes nothing.
+//!
 //! # Scheduling
 //!
-//! Each tick drains four bounded queues in a fixed order: expiry, lease
-//! recovery, reconciliation, then usage. Every queue has its own batch size so
-//! a backlog in one cannot starve the others, and every claim takes a lease so
-//! two workers on one database do not duplicate provider calls.
+//! Each tick drains five bounded queues in a fixed order: expiry, lease
+//! recovery, the reconciliation deadline, reconciliation, then usage. Every
+//! queue has its own batch size so a backlog in one cannot starve the others,
+//! and every claim takes a lease so two workers on one database do not
+//! duplicate provider calls.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -55,6 +64,22 @@ pub struct WorkerConfig {
     pub usage_batch: u32,
     /// Most stale leases recovered per tick.
     pub lease_batch: u32,
+    /// How long an unattributable unresolved intent keeps withholding its
+    /// route after its challenge expired, in milliseconds.
+    ///
+    /// Measured from the intent's own `expires_at_ms`, not from now, so the
+    /// deadline is a property of the payment rather than of when the sweep
+    /// happens to run. See
+    /// [`crate::store::SettlementStore::strand_unattributable_intents`] for
+    /// why the challenge expiry is the right anchor.
+    ///
+    /// Not an operator knob today, for the reason the batch sizes are not:
+    /// the right value follows from the reconciliation cadence rather than
+    /// from the deployment, and every deployment gets the same cadence
+    /// defaults.
+    pub reconciliation_grace_ms: i64,
+    /// Most unattributable intents retired per tick.
+    pub strand_batch: u32,
     /// How long shutdown waits for the current tick to drain.
     pub shutdown_deadline_ms: u64,
 }
@@ -68,6 +93,15 @@ impl Default for WorkerConfig {
             expiry_batch: 256,
             usage_batch: 64,
             lease_batch: 128,
+            // Fifteen minutes past the challenge's own expiry. Three times
+            // the five-minute challenge TTL, and nine hundred sweeps at the
+            // default one-second cadence, which is a generous run at
+            // resolving the intent honestly before it is retired. Longer buys
+            // nothing: past `expires_at_ms` the payer cannot redeem this
+            // intent whatever the provider says, so every extra minute is a
+            // minute the route earns nothing and nobody is protected.
+            reconciliation_grace_ms: 900_000,
+            strand_batch: 256,
             shutdown_deadline_ms: 5_000,
         }
     }
@@ -86,6 +120,13 @@ impl WorkerConfig {
         if self.lease_ttl_ms <= 0 {
             return Err(BillingError::InvalidRequirement("lease_ttl_ms"));
         }
+        // Zero would retire an intent the instant its challenge expired,
+        // which is the one value that gives reconciliation no run at all.
+        // Negative would retire it before the challenge expired, which is the
+        // double charge this deadline is built not to be.
+        if self.reconciliation_grace_ms <= 0 {
+            return Err(BillingError::InvalidRequirement("reconciliation_grace_ms"));
+        }
         if self.shutdown_deadline_ms == 0 {
             return Err(BillingError::InvalidRequirement("shutdown_deadline_ms"));
         }
@@ -103,6 +144,14 @@ pub struct WorkerStatus {
     pub ticks: u64,
     /// Pending challenges moved to their terminal state after expiry.
     pub challenges_expired: u64,
+    /// Unattributable unresolved intents that stopped withholding their
+    /// route after the reconciliation deadline passed.
+    ///
+    /// Not a settlement counter and not a failure counter. Each one is a
+    /// payment whose fate is still unknown and which nothing is going to
+    /// resolve on its own, which is exactly the condition worth waking
+    /// somebody for.
+    pub intents_stranded: u64,
     /// Undispatched attempts whose stale lease returned them to `RetryWait`.
     pub leases_returned_to_retry_wait: u64,
     /// Dispatched attempts whose stale lease made them reconcilable.
@@ -128,6 +177,7 @@ pub struct WorkerStatus {
 struct WorkerCounters {
     ticks: AtomicU64,
     challenges_expired: AtomicU64,
+    intents_stranded: AtomicU64,
     leases_returned_to_retry_wait: AtomicU64,
     leases_moved_to_needs_reconciliation: AtomicU64,
     reconciliations_attempted: AtomicU64,
@@ -149,6 +199,7 @@ impl WorkerCounters {
         WorkerStatus {
             ticks: self.ticks.load(Ordering::Relaxed),
             challenges_expired: self.challenges_expired.load(Ordering::Relaxed),
+            intents_stranded: self.intents_stranded.load(Ordering::Relaxed),
             leases_returned_to_retry_wait: self
                 .leases_returned_to_retry_wait
                 .load(Ordering::Relaxed),
@@ -179,7 +230,8 @@ impl SettlementWorker {
     /// # Errors
     ///
     /// Returns [`BillingError::InvalidRequirement`] for a configuration with a
-    /// zero interval, lease lifetime, or shutdown deadline.
+    /// zero interval, lease lifetime, reconciliation grace window, or
+    /// shutdown deadline.
     pub fn new(service: Arc<BillingService>, config: WorkerConfig) -> Result<Self, BillingError> {
         config.validate()?;
         Ok(Self {
@@ -220,6 +272,38 @@ impl SettlementWorker {
             &self.counters.leases_moved_to_needs_reconciliation,
             recovered.moved_to_needs_reconciliation,
         );
+
+        // After lease recovery, because recovery is what puts an abandoned
+        // dispatch into `NeedsReconciliation` in the first place. An intent
+        // whose deadline passed while its holder was gone is therefore
+        // retired in the same tick it becomes reconcilable, rather than
+        // gating the route for one extra interval.
+        //
+        // Safe in the other direction too: recovery's propagation query
+        // excludes `Stranded`, so an intent retired on one tick is not
+        // dragged back to `NeedsReconciliation` on the next.
+        let stranded = self
+            .service
+            .strand_unattributable_intents(
+                self.config.reconciliation_grace_ms,
+                self.config.strand_batch,
+            )
+            .await?;
+        if stranded > 0 {
+            // Warn rather than info: every row here is money the deployment
+            // may owe and cannot account for, and the route it was holding
+            // has just started billing other callers again. No intent id, no
+            // route, and no payer: this is a count across the whole sweep,
+            // and the per-intent detail is already in the durable rows.
+            tracing::warn!(
+                stranded,
+                "unattributable payments outlived their reconciliation deadline; their routes \
+                 are challengeable again and the payments themselves are still unresolved. \
+                 Reconcile them with the provider by hand and refund or credit anything that \
+                 settled",
+            );
+        }
+        WorkerCounters::add(&self.counters.intents_stranded, stranded);
 
         self.drain_reconciliation().await?;
         self.drain_usage().await?;
