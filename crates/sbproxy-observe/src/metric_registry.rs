@@ -1531,7 +1531,15 @@ pub const METRICS: &[MetricCapability] = &[
              crates/sbproxy-observe/src/clock_skew.rs; what is missing is a \
              `ClockSkewMonitor::new(..)` + `tokio::spawn(monitor.clone().run())` call during \
              server startup, which belongs in the sbproxy binary crate (out of this lane's \
-             file allowlist), not in sbproxy-observe",
+             file allowlist), not in sbproxy-observe. Read the size of that call before \
+             reaching for it: it is three lines and a behavior change. ClockSkewConfig \
+             defaults to polling pool.ntp.org over UDP every 60s, and registering the Probe \
+             makes /readyz report 503 until the first exchange lands, so an unconditional \
+             spawn turns egress-restricted and air-gapped deployments (the ones \
+             docs/getting-started-sovereign-multicloud.md sells) into hosts that never \
+             become ready. Wiring this owes a config gate that defaults off, a \
+             config-stability entry, and the docs to go with it, which is why it is a \
+             ticket and not a metrics cleanup",
         ),
     },
     MetricCapability {
@@ -2750,24 +2758,25 @@ pub const METRICS: &[MetricCapability] = &[
         description: "Policy enforcement results.",
         dead_reason: None,
     },
+    // Wired from crates/sbproxy-modules/src/projections/. Note what it does
+    // not cover, because the description reads wider than the coverage: the
+    // pricing-derived renderers (robots, llms, licenses) format strings out of
+    // a compiled config and have no failure path at all, so they can never
+    // increment this. What can is the agent-skills manifest, where an entry
+    // whose artifact will not load or whose archive fails the safety check is
+    // dropped from a document that still serves, plus the serialize fallbacks
+    // in that manifest and in tdmrep, which substitute an empty document that
+    // reads as a deliberate "this origin advertises nothing".
     MetricCapability {
         name: "sbproxy_projection_render_failures_total",
         kind: MetricKind::Counter,
-        writer: Writer::Nothing,
-        support: SupportLevel::ConfigOnly,
+        writer: Writer::Recorder("record_projection_render_failure"),
+        support: SupportLevel::Stable,
         compat: CompatTier::Alpha,
         registry: Registry::Default,
         labels: &["projection"],
         description: "Well-known projection render failures, by projection.",
-        dead_reason: Some(
-            "nothing calls it, not even a test. WOR-1101 built the recorder \
-             (record_projection_render_failure, crates/sbproxy-observe/src/metrics.rs) so a \
-             failed robots.txt / llms.txt / similar well-known-projection render on config \
-             reload would be visible instead of silently serving stale or empty output. The \
-             projection renderers live in crates/sbproxy-modules/src/projections/ and \
-             crates/sbproxy-modules/src/transform/llms_txt.rs, out of this lane's file \
-             allowlist; wire the failure path there or delete under WOR-1898",
-        ),
+        dead_reason: None,
     },
     MetricCapability {
         name: "sbproxy_rate_limit_cluster_peer_denials_total",
@@ -2974,9 +2983,16 @@ pub const METRICS: &[MetricCapability] = &[
             "nothing calls it, not even a test. WOR-1104 built this so error paths that used \
              to be a silent `let _ = ...` would at least surface as a counter. Candidate call \
              sites already exist: crates/sbproxy-cache/src/store/file.rs:91,109 and \
-             store/redis.rs:56,101 each drop a cleanup error with `let _ = ...`. That crate is \
-             out of this lane's file allowlist; wire record_silent_degradation(op) at those \
-             sites or delete under WOR-1898",
+             store/redis.rs:56,101 each drop a cleanup error with `let _ = ...`. The blocker \
+             is not the file allowlist, it is the dependency graph: sbproxy-cache depends on \
+             sbproxy-plugin, sbproxy-platform, and sbproxy-security and on no observability \
+             crate at all, so wiring those four sites means adding a \
+             sbproxy-cache -> sbproxy-observe edge. That edge is sound in principle (the \
+             reverse does not exist, so there is no cycle) but it is a graph change, not a \
+             four-line patch, and it wants its own review. Add the edge and wire \
+             record_silent_degradation(op), or delete the family, under WOR-1898. Nothing \
+             recommends this metric today: the alerting advice that used to sit in \
+             docs/performance.md was removed once the family was found to be dead",
         ),
     },
     MetricCapability {

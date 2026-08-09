@@ -101,7 +101,14 @@ pub fn render(hostname: &str, ai_crawl: &Value, content_signal: Option<&str>) ->
     // Pretty-print with two-space indent for readability; the file is
     // typically fetched once per agent and parsed, so the bytes-on-the-wire
     // cost is negligible.
-    serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string())
+    serde_json::to_string_pretty(&entries).unwrap_or_else(|_| {
+        // An empty array is a valid TDMRep document that says this
+        // origin reserves nothing, which is the opposite of what the
+        // config asked for. Count the failure rather than let the
+        // fallback read as a deliberate waiver.
+        sbproxy_observe::metrics::record_projection_render_failure("tdmrep");
+        "[]".to_string()
+    })
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 # Content for agents
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-09*
 
 This guide is the operator-facing companion to the content-shaping pillar. If you have SBproxy running and you have already read [configuration.md](configuration.md) and [ai-crawl-control.md](ai-crawl-control.md), this is the next document. It covers how the proxy negotiates a content shape with an agent, how the body is transformed into that shape, what license posture the proxy advertises in four well-known documents, and how operators stamp the per-origin editorial signal that ties everything together.
 
@@ -531,7 +531,7 @@ Companion documents:
 
 - [ai-crawl-control.md](ai-crawl-control.md): the `ai_crawl_control` policy reference (tiers, free preview, paywall position). `citation_required` attaches to the tier shape; `content_signal` is an origin-level key.
 - [configuration.md](configuration.md): the full YAML reference (proxy settings, origins, transforms, policies). Look for the origin-level `content_signal` and `default_content_shape` keys and the content-shaping transform names.
-- [observability.md](observability.md): the metrics, logs, and traces surface. The served content shape lands as the `content_shape` label on `sbproxy_requests_total`; projection health is observable via `sbproxy_projection_render_failures_total{projection}`, which stays at zero in a healthy deployment.
+- [observability.md](observability.md): the metrics, logs, and traces surface. The served content shape lands as the `content_shape` label on `sbproxy_requests_total`. Projection health is `sbproxy_projection_render_failures_total{projection}`, which counts a well-known document the proxy could not render whole and stays at zero in a healthy deployment. It covers the failures that can actually happen: an agent-skills entry whose artifact will not load or whose archive fails the safety check is dropped from a manifest that still serves, so the document looks fine and is missing a skill. The pricing-derived projections (`robots.txt`, `llms.txt`, `/licenses.xml`) are formatted from compiled config and have no failure path, so they never contribute to it.
 - [rsl.md](rsl.md): the RSL 1.0 cookbook for license-term expression. Pair this guide with that one when writing `content_signal` config.
 
 External references:

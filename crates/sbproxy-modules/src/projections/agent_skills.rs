@@ -120,6 +120,15 @@ pub const DEFAULT_MAX_EXPANDED_BYTES: u64 = 10 * 1024 * 1024;
 /// each artifact body can wire its own freshness check.
 pub const DEFAULT_MAX_CLOCK_SKEW_SECS: u32 = 60;
 
+/// The `projection` label value this module reports failures under on
+/// `sbproxy_projection_render_failures_total`.
+///
+/// A constant rather than a literal at each call site because the label
+/// is a closed set: the cardinality limiter demotes an unbounded
+/// `projection` value to `__other__`, and three spellings of the same
+/// projection would read as three projections on the panel.
+const PROJECTION: &str = "agent_skills";
+
 /// One entry in the served manifest.
 ///
 /// Mirrors the v0.2.0 schema field-for-field. Serialised to JSON as
@@ -231,6 +240,10 @@ pub fn build_index(entries: &[AgentSkillEntry], workspace_root: &Path) -> AgentS
         // the body and the entry is skipped.
         let body_opt = resolve_artifact_bytes(entry, workspace_root);
         let Some(body) = body_opt else {
+            // A skipped entry is a partial render: the manifest still
+            // serves, one advertised skill silently disappears from it,
+            // and the only prior trace was a log line nobody alerts on.
+            sbproxy_observe::metrics::record_projection_render_failure(PROJECTION);
             tracing::warn!(
                 skill = %entry.name,
                 kind = %entry.kind,
@@ -254,6 +267,7 @@ pub fn build_index(entries: &[AgentSkillEntry], workspace_root: &Path) -> AgentS
             if let Err(e) =
                 validate_archive_bytes(&entry.url, &body, max_ratio, max_entries, max_bytes)
             {
+                sbproxy_observe::metrics::record_projection_render_failure(PROJECTION);
                 tracing::warn!(
                     skill = %entry.name,
                     error = %e,
@@ -415,7 +429,15 @@ pub fn render_manifest(
         "entries": entries,
     });
 
-    serde_json::to_string_pretty(&manifest).unwrap_or_else(|_| String::from("{\"entries\":[]}"))
+    serde_json::to_string_pretty(&manifest).unwrap_or_else(|_| {
+        // Serving an empty manifest in place of the real one is the
+        // worst of the three failure shapes here: the agent gets a
+        // well-formed document that says this origin advertises
+        // nothing. Count it rather than let it read as a legitimate
+        // empty index.
+        sbproxy_observe::metrics::record_projection_render_failure(PROJECTION);
+        String::from("{\"entries\":[]}")
+    })
 }
 
 /// Resolve one manifest URL to the address the proxy will answer.
@@ -928,6 +950,62 @@ mod tests {
                 .get(&CompactString::new("/skills/hello.md"))
                 .unwrap(),
             &sha256_hex(b"# Hello\n")
+        );
+    }
+
+    /// The summed value of every
+    /// `sbproxy_projection_render_failures_total` series carrying
+    /// `projection=<projection>`, or 0 when nothing has created the
+    /// family yet.
+    fn render_failures(projection: &str) -> f64 {
+        let mut total = 0.0;
+        for family in prometheus::gather() {
+            if family.name() != "sbproxy_projection_render_failures_total" {
+                continue;
+            }
+            for metric in family.get_metric() {
+                let tagged = metric
+                    .get_label()
+                    .iter()
+                    .any(|label| label.name() == "projection" && label.value() == projection);
+                if tagged {
+                    total += metric.get_counter().value();
+                }
+            }
+        }
+        total
+    }
+
+    #[test]
+    fn an_unresolvable_artifact_counts_a_projection_render_failure() {
+        // `build_index` drops an entry whose artifact will not load, so
+        // the manifest serves and one advertised skill quietly is not in
+        // it. The log line was the only evidence of that until this
+        // counter was wired, and
+        // `sbproxy_projection_render_failures_total` read a flat zero
+        // through every broken skill an operator could ship.
+        let mut entry = make_entry("gone", "skill-md", "/skills/gone.md", "unused");
+        entry.body = None;
+        entry.path = Some("no/such/skill.md".to_string());
+
+        let before = render_failures(PROJECTION);
+        let index = build_index(std::slice::from_ref(&entry), Path::new("."));
+        let after = render_failures(PROJECTION);
+
+        assert!(
+            index.entries.is_empty(),
+            "the unresolvable entry must not reach the manifest: {:?}",
+            index.entries
+        );
+        // A strict increase rather than an exact value. The Prometheus
+        // default registry is process-global, and under a threaded
+        // runner a sibling test in this binary can render a projection
+        // at the same time. "The counter moved" is the whole claim, and
+        // it is the one that cannot go flaky.
+        assert!(
+            after > before,
+            "sbproxy_projection_render_failures_total{{projection=\"{PROJECTION}\"}} \
+             did not move: {before} -> {after}"
         );
     }
 

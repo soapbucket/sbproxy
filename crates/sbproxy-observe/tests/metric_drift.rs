@@ -31,6 +31,7 @@ use sbproxy_observe::metric_registry::{
     run_scoped_label_gaps, tenant_label_gaps, METRICS, REFERENCE_EXEMPTIONS,
     RUN_SCOPED_LABEL_EXEMPTIONS, TENANT_LABEL_EXEMPTIONS, TENANT_SCOPED_METRICS,
 };
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
@@ -336,5 +337,91 @@ fn the_committed_catalogue_is_current() {
         "docs/metrics-stability.md is stale. Regenerate it:\n\n    \
          cargo run -q -p sbproxy-observe --bin generate-metrics-stability > \
          docs/metrics-stability.md\n"
+    );
+}
+
+/// The family a cardinality-budget row names, with any histogram suffix
+/// stripped, or `None` for a line that is not one of those rows.
+///
+/// Matched on the row's shape rather than on the name, because prose
+/// elsewhere in the doc puts metric names in backticks too and the SLO
+/// catalogue above the budget table is a table as well. A budget row is
+/// specifically a backticked `sbproxy_` or `mesh_` name followed by a
+/// numeric cap, and the caps are written with spaces as the thousands
+/// separator (`50 000`).
+fn cardinality_budget_row(line: &str) -> Option<String> {
+    let (name, rest) = line.strip_prefix("| `")?.split_once('`')?;
+    if !name.starts_with("sbproxy_") && !name.starts_with("mesh_") {
+        return None;
+    }
+    let cap = rest.strip_prefix(" | ")?.split('|').next()?.trim();
+    let digit_or_space = |value: char| value.is_ascii_digit() || value == ' ';
+    if cap.is_empty() || !cap.chars().all(digit_or_space) {
+        return None;
+    }
+    let family = ["_bucket", "_count", "_sum"]
+        .iter()
+        .find_map(|suffix| name.strip_suffix(suffix))
+        .unwrap_or(name);
+    Some(family.to_string())
+}
+
+#[test]
+fn the_cardinality_budget_table_lists_only_live_metrics() {
+    // `verify_references` above stops a dashboard or an alert rule from
+    // reading a metric nothing writes. This stops the doc that tells
+    // operators which metrics to build those from.
+    //
+    // A row in the cardinality budget reads as a promise the series
+    // exists, because that is what a budget is for: you only cap a
+    // dimension on something being emitted. Four rows in it were not.
+    // Three named families that are declared and never incremented
+    // (`sbproxy_script_reloads_total`, `sbproxy_transport_requests_total`,
+    // `sbproxy_transport_duration_seconds`), and the fourth,
+    // `sbproxy_dedup_cache_size`, was not declared anywhere in the
+    // workspace at all while its own row said it "drives the
+    // LRU-eviction alert". An operator following the table got a panel
+    // drawing a flat zero and an alert that could not fire.
+    let doc = std::fs::read_to_string(repo_root().join("docs/observability.md"))
+        .expect("read docs/observability.md");
+
+    let live: BTreeSet<&str> = METRICS
+        .iter()
+        .filter(|metric| metric.support != SupportLevel::ConfigOnly)
+        .map(|metric| metric.name)
+        .collect();
+
+    let mut rows = 0usize;
+    let mut offenders = Vec::new();
+    for line in doc.lines() {
+        let Some(family) = cardinality_budget_row(line) else {
+            continue;
+        };
+        rows += 1;
+        if !live.contains(family.as_str()) {
+            offenders.push(family);
+        }
+    }
+
+    // The floor guards the parser, not the table. A row-shape matcher
+    // that quietly stops matching turns this whole test into an
+    // assertion about the empty set, which is the failure mode the
+    // per-directory floors in the reference guard exist to catch too.
+    assert!(
+        rows > 40,
+        "matched only {rows} cardinality-budget rows in docs/observability.md; the row \
+         parser is not reading the table it thinks it is"
+    );
+
+    assert!(
+        offenders.is_empty(),
+        "docs/observability.md's cardinality budget names families that nothing \
+         increments, or that the registry has never heard of. Drop the row, or wire the \
+         metric and promote it out of config_only:\n\n{}\n",
+        offenders
+            .iter()
+            .map(|family| format!("  - {family}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }
