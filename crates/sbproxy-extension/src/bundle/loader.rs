@@ -8,10 +8,10 @@ use cap_std::ambient_authority;
 use cap_std::fs::{Dir, DirEntry, File};
 use jsonschema::{Draft, JSONSchema};
 use sbproxy_config::{
-    is_full_commit_sha, materialize_git_tree, redact_repo, BundleBodyMode, BundleHook,
-    BundleHookKind, BundleManifest, BundleManifestError, BundleRuntime, BundleSourceConfig,
-    ConfigSourceError, ExtensionBundlesConfig, FetchContext, GitTreeRequest, ResolvedRevision,
-    MAX_BUNDLE_MANIFEST_BYTES,
+    is_full_commit_sha, materialize_git_tree, redact_repo, BundleBodyMode, BundleDigestScope,
+    BundleHook, BundleHookKind, BundleManifest, BundleManifestError, BundleRuntime,
+    BundleSourceConfig, ConfigSourceError, ExtensionBundlesConfig, FetchContext, GitTreeRequest,
+    ResolvedRevision, MAX_BUNDLE_MANIFEST_BYTES,
 };
 use sbproxy_plugin::{
     ExtensionBodyMode, ExtensionBundleRecord, ExtensionDispatch, ExtensionExecution,
@@ -417,6 +417,34 @@ impl<'a> Candidate<'a> {
             ));
         }
 
+        // A `bundle_v1` bundle is verified whole before any byte is read for
+        // execution. The manifest inside it is what sets the hook kinds,
+        // sandbox limits, failure posture, and permissions the artifact would
+        // then run under, so verifying the artifact first would be verifying
+        // the code against rules nothing had checked.
+        if manifest.digest_scope == BundleDigestScope::BundleV1 {
+            let expected = manifest.sha256.as_deref().ok_or_else(|| {
+                BundleLoadError::new(
+                    "digest",
+                    format!(
+                        "bundle `{}` declares digest_scope bundle_v1 without sha256",
+                        manifest.name
+                    ),
+                )
+            })?;
+            let actual = bundle_root.bundle_v1_digest(&manifest.name, &manifest_bytes, expected)?;
+            if actual != expected {
+                return Err(BundleLoadError::new(
+                    "digest",
+                    format!(
+                        "bundle `{}` digest does not match sha256; \
+                         bundle.yaml or a shipped file changed",
+                        manifest.name
+                    ),
+                ));
+            }
+        }
+
         let artifact = Arc::<[u8]>::from(
             bundle_root
                 .read_capped(
@@ -428,16 +456,22 @@ impl<'a> Candidate<'a> {
                 .into_boxed_slice(),
         );
         let digest = hex::encode(Sha256::digest(&artifact));
-        if let Some(expected) = manifest.sha256.as_deref() {
-            if expected != digest {
-                return Err(BundleLoadError::new(
-                    "digest",
-                    format!(
-                        "bundle `{}` executable digest does not match sha256",
-                        manifest.name
-                    ),
-                ));
-            }
+        // Under the entry scope `sha256` promises the artifact bytes only, so
+        // that is the only thing it is checked against. It is never treated as
+        // though it had verified the manifest that shipped beside it.
+        if manifest.digest_scope == BundleDigestScope::Entry
+            && manifest
+                .sha256
+                .as_deref()
+                .is_some_and(|expected| expected != digest)
+        {
+            return Err(BundleLoadError::new(
+                "digest",
+                format!(
+                    "bundle `{}` executable digest does not match sha256",
+                    manifest.name
+                ),
+            ));
         }
 
         let manifest = Arc::new(manifest);
@@ -654,6 +688,20 @@ impl SourceRoot {
                 }
             }
         }
+    }
+
+    /// Digest this bundle directory whole under the `bundle_v1` scope.
+    ///
+    /// The walk uses the same capability handle every other read in this
+    /// candidate uses, so nothing can swap the directory out between the
+    /// digest and the load that trusts it.
+    fn bundle_v1_digest(
+        &self,
+        bundle_name: &str,
+        manifest_bytes: &[u8],
+        declared: &str,
+    ) -> Result<String, BundleLoadError> {
+        super::digest::bundle_v1_digest(&self.dir, bundle_name, manifest_bytes, declared)
     }
 
     fn read_capped(

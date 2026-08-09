@@ -2,9 +2,9 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use sbproxy_config::{
-    compile_config, reserved_builtin_hook_names, BundleBodyMode, BundleHookKind, BundleManifest,
-    BundleRuntime, BundleSourceConfig, EnforcementMode, FailureMode, BUNDLE_API_VERSION,
-    BUNDLE_KIND, MAX_BUNDLE_MANIFEST_BYTES,
+    compile_config, reserved_builtin_hook_names, BundleBodyMode, BundleDigestScope, BundleHookKind,
+    BundleManifest, BundleRuntime, BundleSourceConfig, EnforcementMode, FailureMode,
+    BUNDLE_API_VERSION, BUNDLE_KIND, MAX_BUNDLE_MANIFEST_BYTES,
 };
 
 const JAVASCRIPT_MANIFEST: &str = r#"
@@ -744,5 +744,40 @@ fn a_var_cannot_be_in_both_secret_vars_and_masked_vars() {
     assert!(
         error.contains("both secret_vars and masked_vars"),
         "{error}"
+    );
+}
+
+#[test]
+fn a_manifest_without_digest_scope_keeps_the_entry_only_scope() {
+    let manifest = parse_manifest(JAVASCRIPT_MANIFEST);
+
+    assert_eq!(manifest.digest_scope, BundleDigestScope::Entry);
+}
+
+#[test]
+fn digest_scope_bundle_v1_requires_a_digest_to_scope() {
+    let without = replace_once(
+        JAVASCRIPT_MANIFEST,
+        "entry: src/index.ts\n",
+        "entry: src/index.ts\ndigest_scope: bundle_v1\n",
+    );
+
+    let error = manifest_error(&without);
+
+    assert!(error.contains("digest_scope bundle_v1"), "{error}");
+    assert!(error.contains("sha256"), "{error}");
+
+    let with = replace_once(
+        JAVASCRIPT_MANIFEST,
+        "entry: src/index.ts\n",
+        &format!(
+            "entry: src/index.ts\ndigest_scope: bundle_v1\nsha256: {}\n",
+            "a".repeat(64)
+        ),
+    );
+
+    assert_eq!(
+        parse_manifest(&with).digest_scope,
+        BundleDigestScope::BundleV1
     );
 }

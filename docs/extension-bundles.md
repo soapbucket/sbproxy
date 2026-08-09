@@ -1,4 +1,5 @@
 # Extension Bundles
+*Last modified: 2026-08-08*
 
 Dynamic bundles add policies, transforms, actions, HTTP filters, and provider-neutral event hooks without linking a new proxy binary. A local installation is a directory of bundle directories:
 
@@ -38,7 +39,7 @@ extensions:
       refresh_interval_secs: 60
 ```
 
-`revision` must be a full 40- or 64-character commit SHA, or a reference whose tag or commit Git can verify when `verify_signature: true`. Every Git bundle must also declare its entry artifact's `sha256`. A relative `path` stays inside the verified checkout.
+`revision` must be a full 40- or 64-character commit SHA, or a reference whose tag or commit Git can verify when `verify_signature: true`. Every Git bundle must also declare a `sha256`; see [What the digest covers](#what-the-digest-covers) for how much of the bundle that digest is a digest of. A relative `path` stays inside the verified checkout.
 
 `credential` is a secret reference, not a token literal. It accepts the same `env:NAME`, `${NAME}`, `file:/path`, `secret://`, and provider-backed references as the rest of the config. SBproxy resolves it through the process secret resolver and gives Git command-scoped HTTP authorization. The resolved value is not added to the repository URL, Git arguments, checkout metadata, logs, errors, or extension inventory. SSH repositories continue to use the host's SSH credentials.
 
@@ -88,13 +89,14 @@ permissions: []
 - `name` is a stable lowercase bundle ID. Each hook `type` is the name used in `sb.yml`.
 - `runtime` is `javascript`, `wasm`, or `proxy_wasm`.
 - `entry` is a file inside the bundle directory. JavaScript accepts `.js` or `.ts`; both WASM runtimes accept `.wasm`.
+- `sha256` pins a digest and `digest_scope` says what that digest is a digest of. The example above omits `digest_scope`, so it means `entry`, the narrower of the two scopes. See [What the digest covers](#what-the-digest-covers).
 - `hooks` declares at least one typed hook. A JavaScript hook names its ES module export. WASM hooks omit `export`.
 - `config_schema` is an optional Draft 7 JSON Schema for one attachment. Defaults are applied before the hook starts, and invalid attachment config refuses the candidate.
 - `secret_vars` names `config_schema` properties that hold a secret. Each is resolved through the same [reference forms](secrets.md) any other secret-bearing field accepts (`${VAR}`, `env:NAME`, `file:`, or a provider URI) before the hook ever runs; an unresolvable reference refuses the candidate. A property not listed here is never inspected for a reference, so resolution is always something a bundle author declared, not something the config compiler guessed at.
 - `masked_vars` names `config_schema` properties to keep out of logs, errors, and diagnostics without resolving them, for a sensitive literal that is not a secret reference (a tenant ID, an internal hostname). Both lists require the named property to exist in `config_schema`, and a property cannot appear in both.
 - `failure_posture` defaults to `closed`. `open`, `degraded`, and `observe` are only valid where that hook contract defines them. An `action` hook is terminal and accepts only `closed`, because there is nothing to fall through to when it fails.
 - `sandbox` bounds wall time, memory, stack, buffered input, output, and WASM fuel. The values shown are the defaults.
-- `permissions` must remain empty in this release. Bundle code receives no filesystem or network capability.
+- `permissions` must remain empty in this release. Bundle code receives no filesystem or network capability. That empty list is what makes the guarantee true, so under `digest_scope: bundle_v1` it is inside the signed content along with the rest of the manifest.
 
 Hook types cannot replace a built-in or linked registration of the same kind. Duplicate claims fail candidate construction instead of choosing a winner by load order.
 
@@ -106,9 +108,49 @@ Where a hook's `failure_posture` applies, an attachment in `sb.yml` can override
 
 Writing nothing on the attachment is not the same as writing `open` there. A bundle that ships `failure_posture: closed` keeps it unless you say otherwise, which is what makes step two worth having: the bundle author's judgment about their own hook is the fallback, not the wrapper's default.
 
-## Exact SHA-256 validation
+## What the digest covers
 
-`sha256` covers the exact bytes of the single file named by `entry`. It does not cover `bundle.yaml`, the WAT or TypeScript source used to build another entry, or the directory as a whole. The value must be exactly 64 lowercase hexadecimal characters, with no `sha256:` prefix:
+`sha256` is 64 lowercase hexadecimal characters with no `sha256:` prefix. `digest_scope` says how much of the bundle those characters are a digest of, and there are two answers.
+
+`digest_scope: entry` is the default and covers the exact bytes of the single file named by `entry`. Nothing else: not `bundle.yaml`, not the WAT or TypeScript source used to build the entry, not any other file in the directory. Every manifest written before `digest_scope` existed means this, which is why it stays the default.
+
+Read that scope carefully before relying on it, because the manifest sits outside it. `bundle.yaml` is where a bundle's hook kinds, sandbox limits, failure posture, and `permissions` live, and an empty `permissions: []` is the line that guarantees guest code gets no filesystem or network capability. Pinning the code while leaving the file that grants its capabilities unpinned is the verification the wrong way round.
+
+`digest_scope: bundle_v1` covers `bundle.yaml` and every other file the bundle ships:
+
+```yaml
+sha256: 1f0a4c7e6b25d3908c11a4f52e7b0d63c9a8f4e21b5d7c6083ae95f2d41b7c60
+digest_scope: bundle_v1
+```
+
+### How a bundle_v1 digest is built
+
+The digest is a SHA-256 over a text index, one line per file:
+
+```text
+sbproxy-bundle-digest/v1
+<64 lowercase hex of the file's content>  <bundle-relative path>
+...
+```
+
+The rules that make the same directory produce the same value on any machine:
+
+- **Ordering.** Lines sort by bundle-relative path, comparing UTF-8 bytes ascending, which is what `LC_ALL=C sort` gives you. `bundle.yaml` takes its natural place in that order rather than a reserved slot.
+- **Separator.** Path components join with `/` on every platform.
+- **The path is hashed, not only the bytes.** Each line carries the file's path, so giving two files each other's names changes the index even though the set of content hashes did not move.
+- **Coverage.** Every regular file in the directory, recursively. Empty directories carry no content and do not appear.
+- **Self-exclusion.** A digest cannot be inside its own input, so `bundle.yaml` contributes the hash of its own bytes with the single top-level `sha256:` line deleted, terminating newline included. That is exactly `grep -v '^sha256:' bundle.yaml`, and nothing else in the file is rewritten, reordered, or normalized. The manifest has to be UTF-8, has to end with a newline, and has to write `sha256` as one unquoted top-level key with its value on the same line. Anything else refuses the bundle instead of guessing which bytes to drop.
+- **File modes are not covered.** Mode bits do not survive the transports a bundle travels through, and sbproxy reads guest files into a sandbox rather than executing them from disk, so the executable bit grants a bundle nothing the digest would be protecting.
+- **Symlinks are refused, never followed.** The bytes a symlink names live outside the hashed content, and one pointing out of the bundle directory reads a file you never shipped. Any symlink anywhere in the directory refuses the bundle.
+- **File names have to be portable.** A name that is not valid UTF-8, or that carries a control character, `/`, or `\`, refuses the bundle. A name holding a newline could otherwise forge an index line.
+
+Content is hashed byte for byte, so a checkout that rewrites line endings produces a different digest. Add `* -text` to a `.gitattributes` beside the bundle if anyone on your team runs `core.autocrlf`.
+
+One bundle may ship at most 512 files, nested at most 8 directories deep, at most 16 MiB per file and 64 MiB in total.
+
+### Computing a digest
+
+Under `digest_scope: entry`, one command over the final entry artifact:
 
 ```bash
 # macOS
@@ -118,7 +160,31 @@ shasum -a 256 bundles/hello-javascript/entry.js
 sha256sum bundles/hello-javascript/entry.js
 ```
 
-Copy the hex value into `bundle.yaml` only after the entry artifact is final. A mismatch refuses startup, validation, doctor candidate inspection, or reload before the candidate can become active. Local directory bundles may omit the field, but production bundles should pin it. Git-sourced bundles must pin it.
+Under `digest_scope: bundle_v1` no single command produces it, so the repository ships the recipe:
+
+```bash
+scripts/bundle-digest.sh bundles/hello-javascript
+```
+
+The script is a convenience for bundle authors and is not part of the trusted path. sbproxy recomputes the digest itself on every candidate load and compares against the manifest.
+
+Copy the value into `bundle.yaml` only once every file in the bundle is final, and recompute it after any later edit to any of them.
+
+### What a mismatch does
+
+A mismatch refuses startup, `sbproxy validate`, doctor candidate inspection, or reload before the candidate can become active. So does an unreadable file, a symlink under `bundle_v1`, a manifest that cannot be canonicalized, and a bundle over any of the limits above. None of these warn and continue. The previous generation keeps serving, and no hook from the refused candidate reaches the running registry.
+
+Local directory bundles may omit `sha256` entirely, which pins nothing at all. Production bundles should pin it, and Git-sourced bundles must.
+
+### Moving a bundle to bundle_v1
+
+Bundles already in production keep loading untouched, and the two scopes coexist across bundles in the same installation. To upgrade one:
+
+1. Run `scripts/bundle-digest.sh <bundle-directory>`.
+2. Replace that manifest's `sha256` value with what the script printed.
+3. Add `digest_scope: bundle_v1` beside it.
+
+A manifest that declares `digest_scope: bundle_v1` without a `sha256` fails validation rather than loading with nothing pinned.
 
 ## JavaScript and load-time TypeScript
 
@@ -221,7 +287,7 @@ For a `started` outcome, a blocking hook returns `continue` or `reject` before t
 
 ## Candidate load and reload
 
-Startup, `sbproxy validate`, `sbproxy doctor <config>`, the file watcher, `SIGHUP`, and `POST /admin/reload` all build a candidate before publication. Candidate construction checks the source path, manifest, exact digest, hook collisions, config schemas, JavaScript or TypeScript exports, and WASM module contract. The running registry and pipeline generation swap together only after every required check succeeds.
+Startup, `sbproxy validate`, `sbproxy doctor <config>`, the file watcher, `SIGHUP`, and `POST /admin/reload` all build a candidate before publication. Candidate construction checks the source path, manifest, declared digest at its declared scope, hook collisions, config schemas, JavaScript or TypeScript exports, and WASM module contract. The running registry and pipeline generation swap together only after every required check succeeds.
 
 If a bundle edit has a bad digest, syntax error, missing export, unsupported import, invalid WASM module, or conflicting hook name, reload rejects that candidate and the prior generation keeps serving. No hook from a rejected candidate leaks into the running registry.
 
