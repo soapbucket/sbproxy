@@ -1117,9 +1117,11 @@ plane, pipeline lifecycle hooks) log and degrade instead of blocking.
 11. **Admin server**: when `proxy.admin.enabled: true`, spawns the
     embedded admin listener (default `127.0.0.1:9090`) and registers
     the component health probes that `/readyz` and `/health` report.
-12. **Background tasks**: starts the ACME renewal and OCSP-stapling
-    refresh tasks when TLS is active, then hands control to Pingora's
-    run loop.
+12. **Background tasks**: starts the ACME renewal task when an enabled
+    `acme` block is present, and the OCSP-stapling refresh task when
+    `tls_cert_file` is set, then hands control to Pingora's run loop.
+    See [OCSP stapling](#ocsp-stapling) for which certificates the
+    second one covers.
 
 Startup progress is visible in the log; the listener bind is announced
 with a line like:
@@ -1545,6 +1547,47 @@ DNS-01 alone. On Kubernetes, issue certificates with
 [cert-manager](https://cert-manager.io/) and terminate TLS at the
 Ingress instead of enabling this block. See
 [kubernetes.md](kubernetes.md#tls-certificates).
+
+### OCSP stapling
+
+Stapling reaches one certificate, the manual fallback loaded from
+`tls_cert_file`. With that pair configured, SBproxy fetches an OCSP
+response for it at startup, refreshes every 12 hours, and attaches the
+result to the fallback certificate so later handshakes carry it.
+
+Certificates issued by the `acme` block are served without a stapled
+response, as is any certificate selected by SNI. A deployment that uses
+`acme` and no `tls_cert_file` staples nothing at all.
+
+There is no configuration key to turn stapling on or off. It follows
+from `tls_cert_file` being set, and the startup log says which case a
+given deployment is in:
+
+```text
+INFO OCSP stapling is inactive: it reaches the manual fallback certificate only, and no proxy.tls_cert_file is configured. Every certificate this proxy serves, including every ACME-issued one, is served without a stapled response. served=3 stapled=0 covered=0
+```
+
+`served` counts every certificate the resolver can present, the
+fallback included. `stapled` counts how many of those currently carry a
+response. `covered` is how many the refresh task can reach at all.
+
+Reaching the responder does not always produce something worth
+stapling. SBproxy sends a plain GET to the responder URL in the
+certificate's Authority Information Access extension rather than the
+RFC 6960 request that names the certificate, so a responder with
+nothing to answer about replies with `malformedRequest`, and some
+return an HTTP error page. SBproxy refuses to staple either. A response
+the client cannot tie to the certificate in front of it is worse than
+no response at all, because a client that checks the staple rejects a
+certificate that is otherwise valid. Refusals are counted under
+`sbproxy_ocsp_fetch_total{result="unknown_status"}`.
+
+Two metrics report the state:
+
+| Metric | Meaning |
+|--------|---------|
+| `sbproxy_ocsp_fetch_total{result}` | Fetch attempts by outcome: `ok`, `no_responder`, `parse_error`, `http_error`, `unknown_status` |
+| `sbproxy_ocsp_staple_age_seconds{host}` | Age of the cached response, labeled `_fallback`. Absent until a fetch succeeds, so a deployment that never stapled is distinguishable from one whose staple went stale |
 
 ### Mutual TLS (mTLS) for inbound connections
 

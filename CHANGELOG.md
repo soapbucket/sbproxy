@@ -261,6 +261,35 @@ the next version cut.
 
 ### Fixed
 
+- **A stapled OCSP response that no client could verify is no longer sent.**
+  The fetch never built an OCSP request. It issued a plain GET against the
+  responder URL in the certificate's Authority Information Access
+  extension, and a responder told nothing about a certificate cannot answer
+  for one, so it replied with `malformedRequest` or an HTTP error page.
+  `reqwest` reports a 4xx as a completed transfer, so those bytes were
+  cached and attached to the fallback certificate, and every handshake
+  carried them. A client that checks the staple rejects a perfectly valid
+  certificate on that basis, on every connection rather than
+  intermittently, which is a worse outcome than sending no staple. A fetch
+  now counts as successful only when what came back parses as a successful
+  basic OCSP response per RFC 6960; anything else is refused and counted as
+  `sbproxy_ocsp_fetch_total{result="unknown_status"}`, a label
+  `docs/observability.md` already documented and nothing emitted. Sending
+  a real OCSP request is still to do, so stapling is inactive in practice
+  until that lands, and the metrics now say so instead of reporting a
+  healthy staple.
+
+- **The startup log now says which certificates OCSP stapling reaches.**
+  Stapling covers the manual fallback certificate loaded from
+  `tls_cert_file` and nothing else: the refresh task does not start without
+  that file pair, and its update path writes the fallback slot rather than
+  the SNI map every ACME-issued certificate lives in. Neither condition
+  produced an error or a warning, so an operator who enabled HTTPS and read
+  a clean log had no way to distinguish a stapled deployment from an
+  unstapled one before a TLS scanner said so. Both paths through the boot
+  hook now log `served`, `stapled`, and `covered`, and name the boundary.
+  `docs/manual.md` section 7 documents it.
+
 - **A secret reference in `message_signatures.key` is now resolved instead
   of being used as the key itself.** Writing `key: vault://prod/signing-key`
   or `key: env:SIGNING_KEY` on an origin left the reference text standing in
