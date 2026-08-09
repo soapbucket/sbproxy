@@ -14,8 +14,60 @@
 //!
 //! Two redaction profiles ship today: `internal` (denylist only) and
 //! `external` (denylist + JA3/JA4 + URL → route).
+//!
+//! # Where the process log level and format come from
+//!
+//! This is the one place the whole chain is written down. Four sources
+//! can name a filter and three can name a format; the most specific
+//! wins, and none of them is consulted twice.
+//!
+//! | Rank | Filter (`level`) | Format |
+//! |---|---|---|
+//! | 1 | `--log-level`, or `SB_LOG_LEVEL` when the flag is absent | `--log-format`, or `SB_LOG_FORMAT` when the flag is absent |
+//! | 2 | `RUST_LOG` | none |
+//! | 3 | `proxy.observability.log.level` | `proxy.observability.log.format` |
+//! | 4 | `info` | `compact` |
+//!
+//! The binary resolves rank 1 through 4 before it builds a subscriber
+//! and hands the answer to
+//! [`LoggingConfig::init_with_resolved_filter_and_telemetry`], which is
+//! why that entry point does not look at `RUST_LOG` a second time.
+//! [`LoggingConfig::init`] and
+//! [`LoggingConfig::init_with_telemetry`] are the embedder-facing
+//! entry points: they have no CLI to read, so they let `RUST_LOG`
+//! override `self.level` and never see YAML.
+//!
+//! Two more inputs sit outside that table because they are not
+//! startup selectors:
+//!
+//! * `--request-log-level` / `SB_REQUEST_LOG_LEVEL` appends an
+//!   `access_log=<level>` directive to whatever rank 1 through 4
+//!   resolved. It narrows one target rather than replacing the filter.
+//! * `PUT /admin/log-level` calls [`set_log_filter`] against the live
+//!   reload handle. It outranks everything for as long as the process
+//!   runs, or until a config reload re-asserts YAML (see below).
+//!
+//! # What a config reload can and cannot change
+//!
+//! `level` hot-reloads. The root `EnvFilter` sits behind a
+//! [`tracing_subscriber::reload::Layer`], so [`set_log_filter_from_config`] can swap the
+//! directive on a running proxy, and the reload path calls it on every
+//! SIGHUP, admin reload, and file-watcher pass. Rank 1 and rank 2 stay
+//! ahead of it: a process started with `--log-level` or `RUST_LOG` has
+//! [`pin_log_filter_override`] set, and the config reload leaves the
+//! filter alone rather than demoting an explicit operator override to
+//! whatever the file says. An operator who changed the level through
+//! the admin API and then reloads config does lose that runtime value
+//! when YAML names a level, because a reload re-asserts the file.
+//!
+//! `format` does not hot-reload. The `fmt` layer is chosen once, when
+//! the subscriber is built, and the reload handle covers the filter
+//! layer only; there is no handle that could swap a
+//! `json` layer for a `pretty` one. Changing
+//! `proxy.observability.log.format` needs a process restart.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
@@ -30,10 +82,52 @@ static LOG_RELOAD: OnceLock<reload::Handle<EnvFilter, Registry>> = OnceLock::new
 /// The current filter directive string, kept alongside the handle since a
 /// `reload::Handle` does not expose its value.
 static CURRENT_FILTER: Mutex<String> = Mutex::new(String::new());
+/// Whether the filter this process started with came from an explicit
+/// operator override (`--log-level` / `SB_LOG_LEVEL` / `RUST_LOG`)
+/// rather than from YAML or the built-in default. Set once by the
+/// binary before the subscriber is installed; read by
+/// [`set_log_filter_from_config`] so a config reload cannot demote an
+/// override the operator typed.
+static FILTER_PINNED_BY_OVERRIDE: AtomicBool = AtomicBool::new(false);
 
 /// The active tracing filter directive (e.g. `info`, `sbproxy_ai=debug`).
 pub fn current_log_filter() -> String {
     CURRENT_FILTER.lock().map(|g| g.clone()).unwrap_or_default()
+}
+
+/// Record that `--log-level`, `SB_LOG_LEVEL`, or `RUST_LOG` supplied
+/// the startup filter, so `proxy.observability.log.level` stays behind
+/// it for the life of the process.
+///
+/// Called by the binary while it resolves the startup filter, before
+/// the subscriber exists. Without this call a config reload would
+/// overwrite the operator's `RUST_LOG` with whatever the file says,
+/// which is the one outcome the precedence order promises cannot
+/// happen. Idempotent; nothing ever clears it, because no later event
+/// makes a typed override stop being one.
+pub fn pin_log_filter_override() {
+    FILTER_PINNED_BY_OVERRIDE.store(true, Ordering::Relaxed);
+}
+
+/// Apply `proxy.observability.log.level` to the running process.
+///
+/// Returns `Ok(true)` when the directive was installed and `Ok(false)`
+/// when it was declined because an explicit CLI or environment
+/// override is pinned (see [`pin_log_filter_override`]). `Err` carries
+/// an invalid directive or a missing reload handle, exactly as
+/// [`set_log_filter`] does.
+///
+/// This is the reload half of the chain documented at the top of this
+/// module. Boot does not need it: the binary folds YAML into the
+/// filter it resolves before building the subscriber. A reload does,
+/// because by then the subscriber is already running with the previous
+/// generation's directive.
+pub fn set_log_filter_from_config(directive: &str) -> Result<bool, String> {
+    if FILTER_PINNED_BY_OVERRIDE.load(Ordering::Relaxed) {
+        return Ok(false);
+    }
+    set_log_filter(directive)?;
+    Ok(true)
 }
 
 /// Change the tracing filter of the running process at runtime. Returns
@@ -58,22 +152,35 @@ pub fn set_log_filter(directive: &str) -> Result<(), String> {
 // --- Logging subscriber config ---
 
 /// Configuration for the global tracing subscriber (log level and format).
+///
+/// The caller supplies already-resolved values. Which source won, and
+/// which of these fields a config reload can still change, is the
+/// precedence chain documented at the top of this module.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LoggingConfig {
-    /// Log level filter, one of `debug`, `info`, `warn`, `error`.
+    /// Log level filter, one of `debug`, `info`, `warn`, `error`, or
+    /// any `tracing-subscriber` per-target directive.
     #[serde(default = "default_level")]
     pub level: String, // "debug", "info", "warn", "error"
-    /// Output format, one of `json`, `pretty`, `compact`.
+    /// Output format, one of `json`, `pretty`, `compact`. Fixed for
+    /// the life of the process once the subscriber is built.
     #[serde(default = "default_format")]
     pub format: String, // "json", "pretty", "compact"
-    /// Per-level emission sampling. Default: 1.0 for `info`+, 0.1 for
-    /// debug, 0.01 for trace. Audit events are never sampled (see
-    /// `should_sample`).
+    /// Per-level emission sampling rates.
+    ///
+    /// Inert today. [`should_sample`] is the only reader and no
+    /// emitter calls it: [`emit`] renders, redacts, and hands every
+    /// record to `tracing` unconditionally. Building the subscriber
+    /// ignores this field entirely, so neither these rates nor the
+    /// defaults below drop a single line. The rate-limited log surface
+    /// operators actually have is `access_log.sampling:`, which is a
+    /// different block with a live consumer.
     #[serde(default)]
     pub sampling: SamplingConfig,
 }
 
-/// Per-level emission sampling rates.
+/// Per-level emission sampling rates. See [`LoggingConfig::sampling`]
+/// for why nothing reads these yet.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SamplingConfig {
     /// Fraction of `info` lines to emit (default 1.0).
@@ -116,7 +223,8 @@ fn default_format() -> String {
 }
 
 impl LoggingConfig {
-    /// Initialize the global tracing subscriber.
+    /// Initialize the global tracing subscriber. Embedder entry point:
+    /// with no CLI to read, `RUST_LOG` overrides `self.level` here.
     pub fn init(&self) {
         self.init_inner(None, true, false);
     }
@@ -129,8 +237,10 @@ impl LoggingConfig {
     }
 
     /// Initialize with an already-resolved filter string. The binary
-    /// uses this after applying CLI/env precedence itself so an ambient
-    /// `RUST_LOG` cannot override an explicit `--log-level`.
+    /// uses this after applying CLI, `RUST_LOG`, and YAML precedence
+    /// itself, so an ambient `RUST_LOG` cannot override an explicit
+    /// `--log-level` and a `proxy.observability.log.level` cannot
+    /// override either of them.
     pub fn init_with_resolved_filter_and_telemetry(
         &self,
         telemetry: Option<&crate::telemetry::TelemetryConfig>,
@@ -980,6 +1090,11 @@ fn match_denylist(key: &str, sink: Sink, extra_fields: &[String]) -> Option<&'st
 /// sampled. The sampling decision is deterministic for a given
 /// `request_id` so every line tied to one request shares the same
 /// keep/drop verdict.
+///
+/// No emitter calls this. [`emit`] does not consult it, so the
+/// process logger samples nothing and `proxy.observability.log.sampling`
+/// has no effect regardless of what it is set to. Wiring the emit path
+/// to this function is the work that would make those rates real.
 pub fn should_sample(
     sampling: &SamplingConfig,
     level: LogLevel,
@@ -1109,6 +1224,30 @@ mod tests {
         let config: LoggingConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.level, "warn");
         assert_eq!(config.format, "compact");
+    }
+
+    /// The reload half of the precedence chain: YAML reaches the live
+    /// filter, but never past an override the operator typed.
+    ///
+    /// Both halves live in one test on purpose. The pin is a
+    /// process-global with no way to clear it (nothing in production
+    /// ever un-types a `--log-level`), so a separate unpinned test
+    /// would pass or fail on test-ordering under a thread-per-test
+    /// runner. Asserting the before state first makes the order the
+    /// test's own.
+    #[test]
+    fn config_log_level_yields_to_a_pinned_cli_override() {
+        // Unpinned: the call is not declined. It still fails here,
+        // because no test in this crate installs a subscriber, so
+        // there is no reload handle to swap; what matters is that the
+        // refusal is not `Ok(false)`.
+        assert_ne!(set_log_filter_from_config("debug"), Ok(false));
+
+        pin_log_filter_override();
+
+        // Pinned: declined without touching the running filter.
+        assert_eq!(set_log_filter_from_config("debug"), Ok(false));
+        assert_eq!(set_log_filter_from_config("trace"), Ok(false));
     }
 
     // --- Schema v1 ---

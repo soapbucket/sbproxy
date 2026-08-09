@@ -662,30 +662,47 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "proxy.model_host.engines.*.shm_size_gib",
         "sbproxy_core::server::model_host::compile_runtime_candidate",
     ),
-    config_only(
+    // WOR-2325: `level` and `format` were pinned config-only because the
+    // binary resolved the startup filter from the CLI and `RUST_LOG` alone
+    // and never opened the file. They are now the rank below `RUST_LOG` in
+    // one documented chain, so they are `stable` and name the resolver that
+    // reads them. `level` picks up a config reload as well, through
+    // `sbproxy_core::server::lifecycle::install_config_log_level`; the
+    // registry names one consumer per key, and boot is the one that decides
+    // what the process starts with.
+    //
+    // The three `sampling.*` leaves below are a different finding and stay
+    // pinned. Their note used to say the process logger runs "fixed
+    // defaults", which reads as though a rate is applied. None is:
+    // `sbproxy_observe::logging::emit` has no sampling call site, so
+    // `should_sample` is dead on the emit path and every level ships at
+    // 100% whatever the YAML asks for. Installing the rates would not
+    // change that; the emitter has to learn to sample first.
+    stable(
         "proxy.observability.log.level",
-        "The active tracing filter is selected by CLI/environment precedence, not this YAML \
-         value. Classified under WOR-1976.",
+        "sbproxy::resolve_log_filter",
     ),
-    config_only(
+    stable(
         "proxy.observability.log.format",
-        "The active tracing format is selected by CLI/environment precedence, not this YAML \
-         value. Classified under WOR-1976.",
+        "sbproxy::resolve_log_format",
     ),
     config_only(
         "proxy.observability.log.sampling.debug",
-        "The process logger currently uses its fixed sampling defaults; these YAML rates are not \
-         installed. Classified under WOR-1976.",
+        "The process logger has no sampling call site, so no rate is applied at any level and \
+         this one drops nothing. Throttle request logs with access_log.sample_rate instead. \
+         Tracked by WOR-2325.",
     ),
     config_only(
         "proxy.observability.log.sampling.info",
-        "The process logger currently uses its fixed sampling defaults; these YAML rates are not \
-         installed. Classified under WOR-1976.",
+        "The process logger has no sampling call site, so no rate is applied at any level and \
+         this one drops nothing. Throttle request logs with access_log.sample_rate instead. \
+         Tracked by WOR-2325.",
     ),
     config_only(
         "proxy.observability.log.sampling.trace",
-        "The process logger currently uses its fixed sampling defaults; these YAML rates are not \
-         installed. Classified under WOR-1976.",
+        "The process logger has no sampling call site, so no rate is applied at any level and \
+         this one drops nothing. Throttle request logs with access_log.sample_rate instead. \
+         Tracked by WOR-2325.",
     ),
     stable(
         "proxy.observability.log.sinks[].output.type",

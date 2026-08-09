@@ -933,7 +933,8 @@ Filter passed to `tracing-subscriber`. Accepts a bare level
 string (`sbproxy=debug,h2=warn,pingora=info`).
 
 - **Default:** `info`.
-- **Priority:** `--log-level` > `SB_LOG_LEVEL` > `RUST_LOG` > `info`.
+- **Priority:** `--log-level` > `SB_LOG_LEVEL` > `RUST_LOG` >
+  `proxy.observability.log.level` > `info`.
 - **Environment:** `SB_LOG_LEVEL`
 
 ```bash
@@ -955,7 +956,8 @@ Invalid values fail the parse with a clap error listing the accepted
 names, so the proxy never starts with a silently ignored selector.
 
 - **Default:** `compact`.
-- **Priority:** `--log-format` > `SB_LOG_FORMAT` > `compact`.
+- **Priority:** `--log-format` > `SB_LOG_FORMAT` >
+  `proxy.observability.log.format` > `compact`.
 - **Environment:** `SB_LOG_FORMAT`
 
 ```bash
@@ -1196,17 +1198,23 @@ string (`sbproxy=debug,h2=warn`).
 sbproxy serve -f sb.yml --log-level warn --request-log-level debug
 ```
 
-The same knobs exist in YAML under `proxy.observability.log`, which
-also carries per-level sampling, redaction, sink fan-out, and custom
-access-log fields. CLI and env win over the YAML values.
+The same two knobs exist in YAML under `proxy.observability.log`,
+which also carries redaction, sink fan-out, and custom access-log
+fields. CLI flags and env vars win over the YAML values, so a
+deployment that already exports `RUST_LOG` keeps getting `RUST_LOG`.
 
 ```yaml
 proxy:
   observability:
     log:
-      level: info        # debug | info | warn | error
+      level: info        # trace | debug | info | warn | error
       format: compact    # compact | pretty | json
 ```
+
+A config reload picks up a changed `level` and cannot pick up a
+changed `format`, which needs a restart. The full order, including
+what a reload does to a level set through the admin API, is in
+[observability.md](observability.md).
 
 At runtime, the filter can be changed without a restart through the
 admin API: `PUT /admin/log-level` with `{"level": "debug"}` (see
@@ -2172,7 +2180,8 @@ restart.
 | `SB_APPLY_BASELINE` | (none) | (unset) | Optional baseline override for `sbproxy apply -p`. When set, apply compares the plan's recorded baseline revision against this YAML's revision; otherwise the empty config is the baseline. |
 
 In addition, the standard `RUST_LOG` env var is honored when neither
-`--log-level` nor `SB_LOG_LEVEL` is set.
+`--log-level` nor `SB_LOG_LEVEL` is set, and
+`proxy.observability.log.level` is honored when none of the three is.
 
 ### OpenTelemetry configuration
 

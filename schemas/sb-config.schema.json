@@ -953,11 +953,11 @@
       "additionalProperties": false
     },
     "ObservabilityConfig": {
-      "description": "Top-level observability block grouping live log extensions, telemetry, and durable usage rollups. The legacy process-logger fields under `log` remain parseable but are not installed into the tracing subscriber.",
+      "description": "Top-level observability block grouping the log surfaces, telemetry, and durable usage rollups. The process-logger `level` and `format` under `log` are installed, below the CLI flags and `RUST_LOG`; `sampling` is not.",
       "type": "object",
       "properties": {
         "log": {
-          "description": "Log sinks, redaction, and custom fields, plus compatibility-only parent level, format, and per-level sampling values.",
+          "description": "Log sinks, redaction, custom fields, and the process logger's level and format.",
           "default": null,
           "anyOf": [
             {
@@ -1000,7 +1000,7 @@
       "type": "object",
       "properties": {
         "level": {
-          "description": "Compatibility-only process log level. Use CLI/environment controls; this YAML value is not installed into the tracing subscriber.",
+          "description": "Process log level: a bare level (`trace`, `debug`, `info`, `warn`, `error`) or any `tracing-subscriber` per-target directive such as `sbproxy_ai=debug,h2=warn`.\n\nThird in precedence, behind `--log-level` (with its `SB_LOG_LEVEL` env form) and `RUST_LOG`, and ahead of the `info` default. A process started with either of those two keeps them for its whole life; this value is what a deployment that sets neither gets. Applied again on every config reload, so SIGHUP picks up an edit without a restart.",
           "default": null,
           "type": [
             "string",
@@ -1008,7 +1008,7 @@
           ]
         },
         "format": {
-          "description": "Compatibility-only process output format. Sink-local `format` remains live, while the process subscriber uses CLI/environment controls.",
+          "description": "Process output format: `compact`, `pretty`, or `json`. Behind `--log-format` (with its `SB_LOG_FORMAT` env form) and ahead of the `compact` default. Any other value is reported on stderr at startup and falls back rather than being silently accepted.\n\nRestart-only, unlike `level`: the output layer is built once and the runtime reload handle covers the filter alone. A reload logs the new value nowhere and keeps rendering in the old format. Sinks under `sinks:` carry their own independent `format`.",
           "default": null,
           "type": [
             "string",
@@ -1016,7 +1016,7 @@
           ]
         },
         "sampling": {
-          "description": "Compatibility-only per-level sampling rates. The process logger uses its built-in sampling defaults.",
+          "description": "Per-level sampling rates for the process logger. Parsed, validated, and inert: no emitter consults them, so the process logger drops no line at any rate. Per-request access-log sampling is a different key, `access_log.sample_rate:`, and that one is live.",
           "default": null,
           "anyOf": [
             {
@@ -1059,11 +1059,11 @@
       "additionalProperties": false
     },
     "ObservabilitySamplingConfig": {
-      "description": "Per-level sample rates for the structured-log emitter.",
+      "description": "Per-level sample rates for the structured-log emitter.\n\nEvery rate here is inert. The emitter has no sampling call site at all: it renders, redacts, and writes every record, so setting `debug: 0.0` drops nothing and setting `1.0` restores nothing. Documented rather than removed because the rates round-trip through existing configs; the surface that does throttle logs today is `access_log.sample_rate:`.",
       "type": "object",
       "properties": {
         "info": {
-          "description": "Fraction of `info` lines to emit (default 1.0).",
+          "description": "Fraction of `info` lines that would be emitted. Inert.",
           "default": null,
           "type": [
             "number",
@@ -1072,7 +1072,7 @@
           "format": "double"
         },
         "debug": {
-          "description": "Fraction of `debug` lines to emit (default 0.1).",
+          "description": "Fraction of `debug` lines that would be emitted. Inert.",
           "default": null,
           "type": [
             "number",
@@ -1081,7 +1081,7 @@
           "format": "double"
         },
         "trace": {
-          "description": "Fraction of `trace` lines to emit (default 0.01).",
+          "description": "Fraction of `trace` lines that would be emitted. Inert.",
           "default": null,
           "type": [
             "number",

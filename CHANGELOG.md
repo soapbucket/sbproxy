@@ -261,6 +261,32 @@ the next version cut.
 
 ### Fixed
 
+- **`proxy.observability.log.level` and `.format` now reach the process
+  logger.** Both parsed, both validated, and neither was ever installed: the
+  binary resolved the startup filter from `--log-level`, `SB_LOG_LEVEL`, and
+  `RUST_LOG` and never opened the config file for it, so an operator who
+  wrote `level: debug` in `sb.yml` got `info` with nothing anywhere saying
+  why. They are now the rank below `RUST_LOG` in one documented order: the
+  flag wins, then the environment variable, then YAML, then the built-in
+  `info` and `compact`. A deployment that exports `RUST_LOG` today resolves
+  to exactly what it resolved to before, and that override is pinned for the
+  life of the process so a later config reload cannot demote it.
+
+  `level` also picks up a config reload, through the same handle
+  `PUT /admin/log-level` uses, so SIGHUP applies an edited filter without a
+  restart. `format` does not and cannot: the output layer is built once at
+  startup and only the filter sits behind a reload handle. Changing it still
+  needs a restart, and an unrecognized value is now named on stderr and
+  falls back to `compact` rather than being silently accepted. The
+  precedence table, the reload split, and the admin-API interaction are in
+  `docs/observability.md`.
+
+  `proxy.observability.log.sampling` is not fixed and is now described
+  accurately. Its note used to say the process logger runs fixed sampling
+  defaults, which reads as though some rate applies. None does: the emitter
+  has no sampling call site at all, so every level ships at 100% whatever
+  the three rates are set to. Throttling request logs is
+  `access_log.sample_rate`, which is a different key with a live consumer.
 - **OCSP stapling asks the responder a real question, so it can work at all.**
   Refusing to staple a `malformedRequest` stopped the proxy sending bytes no
   client could verify, and it left stapling inactive rather than active and

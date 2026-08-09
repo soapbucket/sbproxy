@@ -5714,14 +5714,14 @@ pub struct AlertingConfig {
     pub channels: Vec<AlertChannelConfig>,
 }
 
-/// Top-level observability block grouping live log extensions, telemetry, and
-/// durable usage rollups. The legacy process-logger fields under `log` remain
-/// parseable but are not installed into the tracing subscriber.
+/// Top-level observability block grouping the log surfaces, telemetry, and
+/// durable usage rollups. The process-logger `level` and `format` under `log`
+/// are installed, below the CLI flags and `RUST_LOG`; `sampling` is not.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ObservabilityConfig {
-    /// Log sinks, redaction, and custom fields, plus compatibility-only parent
-    /// level, format, and per-level sampling values.
+    /// Log sinks, redaction, custom fields, and the process logger's level
+    /// and format.
     #[serde(default)]
     pub log: Option<ObservabilityLogConfig>,
     /// OTLP exporter configuration. When `enabled = true`, the
@@ -5788,16 +5788,32 @@ fn default_rollup_daily_days() -> u32 {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ObservabilityLogConfig {
-    /// Compatibility-only process log level. Use CLI/environment controls;
-    /// this YAML value is not installed into the tracing subscriber.
+    /// Process log level: a bare level (`trace`, `debug`, `info`, `warn`,
+    /// `error`) or any `tracing-subscriber` per-target directive such as
+    /// `sbproxy_ai=debug,h2=warn`.
+    ///
+    /// Third in precedence, behind `--log-level` (with its `SB_LOG_LEVEL`
+    /// env form) and `RUST_LOG`, and ahead of the `info` default. A process
+    /// started with either of those two keeps them for its whole life; this
+    /// value is what a deployment that sets neither gets. Applied again on
+    /// every config reload, so SIGHUP picks up an edit without a restart.
     #[serde(default)]
     pub level: Option<String>,
-    /// Compatibility-only process output format. Sink-local `format` remains
-    /// live, while the process subscriber uses CLI/environment controls.
+    /// Process output format: `compact`, `pretty`, or `json`. Behind
+    /// `--log-format` (with its `SB_LOG_FORMAT` env form) and ahead of the
+    /// `compact` default. Any other value is reported on stderr at startup
+    /// and falls back rather than being silently accepted.
+    ///
+    /// Restart-only, unlike `level`: the output layer is built once and the
+    /// runtime reload handle covers the filter alone. A reload logs the new
+    /// value nowhere and keeps rendering in the old format. Sinks under
+    /// `sinks:` carry their own independent `format`.
     #[serde(default)]
     pub format: Option<String>,
-    /// Compatibility-only per-level sampling rates. The process logger uses
-    /// its built-in sampling defaults.
+    /// Per-level sampling rates for the process logger. Parsed, validated,
+    /// and inert: no emitter consults them, so the process logger drops no
+    /// line at any rate. Per-request access-log sampling is a different
+    /// key, `access_log.sample_rate:`, and that one is live.
     #[serde(default)]
     pub sampling: Option<ObservabilitySamplingConfig>,
     /// Operator-extensible redaction block. `fields` extends the
@@ -6046,16 +6062,23 @@ pub enum ObservabilitySinkOutput {
 }
 
 /// Per-level sample rates for the structured-log emitter.
+///
+/// Every rate here is inert. The emitter has no sampling call site at
+/// all: it renders, redacts, and writes every record, so setting `debug:
+/// 0.0` drops nothing and setting `1.0` restores nothing. Documented
+/// rather than removed because the rates round-trip through existing
+/// configs; the surface that does throttle logs today is
+/// `access_log.sample_rate:`.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ObservabilitySamplingConfig {
-    /// Fraction of `info` lines to emit (default 1.0).
+    /// Fraction of `info` lines that would be emitted. Inert.
     #[serde(default)]
     pub info: Option<f64>,
-    /// Fraction of `debug` lines to emit (default 0.1).
+    /// Fraction of `debug` lines that would be emitted. Inert.
     #[serde(default)]
     pub debug: Option<f64>,
-    /// Fraction of `trace` lines to emit (default 0.01).
+    /// Fraction of `trace` lines that would be emitted. Inert.
     #[serde(default)]
     pub trace: Option<f64>,
 }

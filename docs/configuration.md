@@ -323,7 +323,7 @@ proxy:
 | `acme` | object | | ACME (auto-TLS) block. Overrides manual cert/key when set. See [ACME / auto TLS](#acme--auto-tls). |
 | `http3` | object | | Reserved HTTP/3 (QUIC) listener config. Enabling it is rejected; see [HTTP/3 fields](#http3-fields). |
 | `metrics` | object | | Metrics tuning, including label cardinality limits. |
-| `observability` | object | | Log sinks, redaction, custom fields, OTLP export, and usage rollups. Parent log level, format, and sampling fields are config-only; the process uses CLI/environment logging selection. |
+| `observability` | object | | Log sinks, redaction, custom fields, OTLP export, and usage rollups, plus the process logger's `log.level` and `log.format`. Those two sit below `--log-level`/`SB_LOG_LEVEL`, `RUST_LOG`, and `--log-format`/`SB_LOG_FORMAT`; see [observability.md](observability.md). `log.sampling` is config-only and drops nothing. |
 | `alerting` | object | | Alert notification channels. |
 | `admin` | object | | Embedded authenticated admin API and UI. |
 | `secrets` | object | | Secrets management backend. See [Secrets](#secrets). |

@@ -1115,6 +1115,13 @@ fn reload_compiled_config_locked(
         // `observability.log.redact.pii:` overrides (WOR-1043 PR2 / PR3).
         install_op_redact_state(compiled);
 
+        // The `level:` leaf of the same block, on the same schedule.
+        // Boot resolves it in the binary, ahead of the subscriber; this
+        // is the only path that can change it afterwards, and it yields
+        // to a `--log-level` / `RUST_LOG` override. The sibling
+        // `format:` cannot follow: the output layer is fixed once.
+        install_config_log_level(&compiled.server);
+
         // WOR-1067 PR2: refresh per-tenant cardinality caps on reload so
         // SIGHUP picks up changes to `tenants[].observability.cardinality.max_series`
         // without restarting the process. Tenants without an entry stay
@@ -2982,6 +2989,63 @@ fn install_js_sandbox_limits(server: &sbproxy_config::ProxyServerConfig) {
     sbproxy_extension::js::install_sandbox_config(server.scripting.javascript.sandbox.clone());
 }
 
+/// The `proxy.observability.log.level` directive this config asks for,
+/// or `None` when the block, the key, or its value is absent. A
+/// blank value is an absent value: it is what an operator who
+/// commented the line out but left the key leaves behind, and
+/// installing `""` as a filter would silence the process.
+fn config_log_level(server: &sbproxy_config::ProxyServerConfig) -> Option<&str> {
+    server
+        .observability
+        .as_ref()
+        .and_then(|observability| observability.log.as_ref())
+        .and_then(|log| log.level.as_deref())
+        .map(str::trim)
+        .filter(|level| !level.is_empty())
+}
+
+/// Re-assert `proxy.observability.log.level` on the running tracing
+/// filter after a config reload.
+///
+/// Boot does not come through here: the binary folds the YAML level
+/// into the filter it resolves before the subscriber is built, which
+/// is the only order that also lets `format` work. By reload time the
+/// subscriber is already running the previous generation's directive,
+/// so an operator who edited `level:` and sent SIGHUP needs the swap
+/// the reload handle exists for.
+///
+/// Three cases produce no change. A config with no `level:` leaves the
+/// filter alone rather than resetting it to the default, so an omitted
+/// key stays omitted. A process started with `--log-level`,
+/// `SB_LOG_LEVEL`, or `RUST_LOG` is pinned and keeps the operator's
+/// override; `set_log_filter_from_config` reports that as `Ok(false)`.
+/// An unparseable directive is warn-logged and the previous filter
+/// stays live.
+///
+/// `format` has no equivalent: the `fmt` layer is fixed for the life
+/// of the process and changing it needs a restart.
+fn install_config_log_level(server: &sbproxy_config::ProxyServerConfig) {
+    let Some(level) = config_log_level(server) else {
+        return;
+    };
+    match sbproxy_observe::set_log_filter_from_config(level) {
+        Ok(true) => {
+            tracing::info!(filter = %level, "reload: applied proxy.observability.log.level");
+        }
+        // An explicit CLI or environment override outranks the file
+        // for the life of the process. Silent: it is the documented
+        // outcome, and a reload loop would log it on every pass.
+        Ok(false) => {}
+        Err(e) => {
+            tracing::warn!(
+                filter = %level,
+                error = %e,
+                "reload: proxy.observability.log.level did not install; keeping the current filter"
+            );
+        }
+    }
+}
+
 /// Read `proxy.observability.log.redact:` (proxy scope) and walk
 /// `compiled.server.tenants` + `compiled.origins` for tenant- and
 /// origin-scope `observability.log.redact.pii:` overrides
@@ -4800,6 +4864,61 @@ origins:
         // Restore the prior config so sibling tests that build a
         // `JsEngine` are unaffected.
         sbproxy_extension::js::install_sandbox_config(saved);
+    }
+
+    // --- proxy.observability.log.level on reload ---
+
+    /// Build a server config carrying `proxy.observability.log.level`.
+    /// `None` leaves the whole `observability:` block absent, which is
+    /// what most deployments have.
+    fn server_with_log_level(level: Option<&str>) -> sbproxy_config::types::ProxyServerConfig {
+        use sbproxy_config::types::{ObservabilityConfig, ObservabilityLogConfig};
+
+        sbproxy_config::types::ProxyServerConfig {
+            http_bind_port: 8080,
+            observability: level.map(|level| ObservabilityConfig {
+                log: Some(ObservabilityLogConfig {
+                    level: Some(level.to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// The reload path reads the key an operator actually wrote.
+    #[test]
+    fn reload_reads_the_configured_log_level() {
+        assert_eq!(
+            config_log_level(&server_with_log_level(Some("debug"))),
+            Some("debug")
+        );
+        assert_eq!(
+            config_log_level(&server_with_log_level(Some("sbproxy_ai=trace,h2=warn"))),
+            Some("sbproxy_ai=trace,h2=warn")
+        );
+        assert_eq!(
+            config_log_level(&server_with_log_level(Some("  warn  "))),
+            Some("warn")
+        );
+    }
+
+    /// An absent or blank value must leave the running filter alone
+    /// rather than installing an empty directive, which would silence
+    /// the process on the next SIGHUP.
+    #[test]
+    fn reload_leaves_the_log_filter_alone_without_a_configured_level() {
+        assert_eq!(config_log_level(&server_with_log_level(None)), None);
+        assert_eq!(config_log_level(&server_with_log_level(Some(""))), None);
+        assert_eq!(config_log_level(&server_with_log_level(Some("   "))), None);
+
+        // No subscriber is installed in this test binary, so the
+        // install call has no reload handle to swap. It must still
+        // return quietly and record no filter change.
+        install_config_log_level(&server_with_log_level(None));
+        install_config_log_level(&server_with_log_level(Some("debug")));
+        assert_eq!(sbproxy_observe::current_log_filter(), "");
     }
 
     // --- resolve_or_default_admin_operator_pepper ---

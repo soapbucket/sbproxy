@@ -20,18 +20,17 @@ The correlation_id policy threads one identifier through logs, webhooks, and the
 ## Configuration
 
 The currently shipped schema lives under `proxy.observability:` and groups the
-live log sinks/redaction/custom-field surfaces with the `telemetry` (OTLP
-exporter) block. The parent `log.level`, `log.format`, and `log.sampling`
-values remain parseable for compatibility but are not installed into the
-process logger. Select the process filter and format with `--log-level`,
-`SB_LOG_LEVEL`/`RUST_LOG`, and `--log-format`/`SB_LOG_FORMAT`; process sampling
-uses the built-in defaults.
+log sinks, redaction, and custom-field surfaces with the `telemetry` (OTLP
+exporter) block, plus the process logger's own `level` and `format`.
 
 ```yaml
 proxy:
   observability:
     log:
-      # Live log configuration belongs under sinks/redact/custom_fields.
+      level: info        # trace | debug | info | warn | error, or a
+                         # per-target filter like sbproxy_ai=debug,h2=warn
+      format: compact    # compact | pretty | json
+      # Sinks, redaction, and custom fields configure the fan-out.
       # Each sink may select its own format.
       sinks: []
     telemetry:
@@ -52,6 +51,32 @@ proxy:
 ```
 
 `sample_rate` controls normal traffic with parent-based trace-id ratio sampling. Inbound sampled W3C parents are kept. Locally dropped spans are still recorded until completion so `always_sample_errors`, `keep_over_budget_usd`, and `keep_slower_than_secs` can export the traces operators usually need most.
+
+### Which log level and format the process actually uses
+
+Four sources can name a filter and three can name a format. The most specific one wins, and this table is the whole order:
+
+| Rank | Filter | Format |
+|---|---|---|
+| 1 | `--log-level`, or `SB_LOG_LEVEL` when the flag is absent | `--log-format`, or `SB_LOG_FORMAT` when the flag is absent |
+| 2 | `RUST_LOG` | none |
+| 3 | `proxy.observability.log.level` | `proxy.observability.log.format` |
+| 4 | `info` | `compact` |
+
+A deployment that exports `RUST_LOG` today keeps resolving to `RUST_LOG` whatever its `sb.yml` says. The YAML rank is what a deployment gets when it passes no flag and exports no variable, which used to mean it silently got `info` and `compact` instead.
+
+Two more inputs sit outside the table. `--request-log-level` and `SB_REQUEST_LOG_LEVEL` append an `access_log=<level>` directive to whichever rank won, so they narrow one target rather than replacing the filter. `PUT /admin/log-level` swaps the filter on a running proxy and outranks everything until the process exits or a config reload re-asserts the file.
+
+`level` and `format` differ on reload:
+
+| Key | On SIGHUP, admin reload, or a file-watcher pass |
+|---|---|
+| `proxy.observability.log.level` | Applied. A process started with `--log-level`, `SB_LOG_LEVEL`, or `RUST_LOG` keeps that override instead, for its whole life. A reload that installs the file's level also discards a level set earlier through `PUT /admin/log-level`. |
+| `proxy.observability.log.format` | Ignored. Restart to change it. The output layer is built once at startup and the runtime reload handle covers the filter alone. |
+
+An unparseable `level` leaves the running filter alone and logs a warning; an unrecognized `format` is named on stderr at startup and falls back to `compact`.
+
+`proxy.observability.log.sampling` is the one knob in this block that does nothing. The emitter has no sampling call site, so no rate is applied at any level and the process logs every line whatever `info`, `debug`, and `trace` are set to. To throttle request logs, use `access_log.sample_rate` in [access-log.md](access-log.md), which is a different key with a live consumer.
 
 ### Sinks
 

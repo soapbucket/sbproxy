@@ -1397,14 +1397,18 @@ fn main() {
         return;
     }
 
-    // Resolve the effective log filter before tracing init so --log-level
-    // and SB_LOG_LEVEL win over the default `info` and over RUST_LOG.
-    // The priority is documented in docs/manual.md §13:
+    // Resolve the effective log filter and format before tracing init so
+    // --log-level and SB_LOG_LEVEL win over RUST_LOG, over the YAML
+    // block, and over the built-in default. The priority is documented
+    // in docs/observability.md and on `sbproxy_observe::logging`:
     //   1. `--log-level <level>` CLI flag (or SB_LOG_LEVEL via clap env)
     //   2. `RUST_LOG` env var (rustc-style filter syntax)
-    //   3. `info`
-    let log_filter = resolve_log_filter(&cli.globals);
-    let log_format = cli.globals.log_format.unwrap_or_default();
+    //   3. `proxy.observability.log.level` from the config file
+    //   4. `info`
+    // Format follows the same order minus RUST_LOG, ending at `compact`.
+    let config_log = config_log_settings_for_cli(&cli);
+    let log_filter = resolve_log_filter(&cli.globals, &config_log);
+    let log_format = resolve_log_format(&cli.globals, &config_log);
     let runtime_telemetry = runtime_telemetry_config_for_cli(&cli);
     if let Some(config) = runtime_telemetry.as_ref() {
         if let Err(err) = config.validate_export_metrics() {
@@ -2012,22 +2016,136 @@ fn print_completions(shell: Shell) {
     clap_complete::generate(shell, &mut cmd, bin_name, &mut std::io::stdout());
 }
 
-/// Resolve the effective log filter. CLI `--log-level <level>` wins
-/// (clap also folds in `SB_LOG_LEVEL` via `env = "..."`); otherwise
-/// `RUST_LOG`, then `info`. CLI `--request-log-level <level>` /
-/// `SB_REQUEST_LOG_LEVEL` append an `access_log=<level>` target
-/// directive.
-fn resolve_log_filter(g: &GlobalArgs) -> String {
+/// The process-logger settings an `sb.yml` asked for.
+///
+/// Read off `proxy.observability.log:` before the subscriber exists.
+/// Both fields are `None` when the block is absent, which is the
+/// common case and means the CLI, env, and built-in defaults decide on
+/// their own.
+#[derive(Debug, Default, Clone)]
+struct ConfigLogSettings {
+    /// `proxy.observability.log.level`.
+    level: Option<String>,
+    /// `proxy.observability.log.format`.
+    format: Option<String>,
+}
+
+/// Resolve the effective log filter, most specific source first:
+///
+/// 1. CLI `--log-level <level>` (clap folds in `SB_LOG_LEVEL` via
+///    `env = "..."`, so the flag and the variable arrive in the same
+///    field with the flag already ahead).
+/// 2. `RUST_LOG`.
+/// 3. `proxy.observability.log.level` from the config file.
+/// 4. `info`.
+///
+/// CLI `--request-log-level <level>` / `SB_REQUEST_LOG_LEVEL` then
+/// append an `access_log=<level>` target directive to whichever of the
+/// four won.
+///
+/// Ranks 1 and 2 also pin the filter for the life of the process
+/// (`sbproxy_observe::pin_log_filter_override`), so a later config
+/// reload re-asserts YAML only when YAML is what is running. A
+/// deployment that exports `RUST_LOG` today keeps getting `RUST_LOG`
+/// whatever its `sb.yml` says.
+///
+/// The full chain, including the admin API and the reload asymmetry
+/// between `level` and `format`, is documented on
+/// `sbproxy_observe::logging`.
+fn resolve_log_filter(g: &GlobalArgs, config: &ConfigLogSettings) -> String {
     let base = match g.log_level.as_deref().filter(|s| !s.is_empty()) {
-        Some(v) => v.to_string(),
+        Some(v) => {
+            sbproxy_observe::pin_log_filter_override();
+            v.to_string()
+        }
         None => match env::var("RUST_LOG") {
-            Ok(v) if !v.is_empty() => v,
-            _ => "info".to_string(),
+            Ok(v) if !v.is_empty() => {
+                sbproxy_observe::pin_log_filter_override();
+                v
+            }
+            _ => match config.level.as_deref().filter(|s| !s.trim().is_empty()) {
+                Some(v) => v.trim().to_string(),
+                None => "info".to_string(),
+            },
         },
     };
     match g.request_log_level.as_deref().filter(|s| !s.is_empty()) {
         Some(request_level) => format!("{base},access_log={request_level}"),
         None => base,
+    }
+}
+
+/// Resolve the effective output format: CLI `--log-format` (clap folds
+/// in `SB_LOG_FORMAT`), then `proxy.observability.log.format`, then
+/// `compact`.
+///
+/// The flag is a `value_enum`, so clap already refused anything but
+/// the three names. YAML is a free-form string and reaches here
+/// unchecked, so an unknown value is named on stderr and falls back
+/// rather than being silently swallowed. Stderr, not `tracing`,
+/// because this runs to decide what the subscriber will be.
+///
+/// Unlike the filter, this cannot change without a restart: the `fmt`
+/// layer is fixed when the subscriber is built and the reload handle
+/// covers the filter layer only.
+fn resolve_log_format(g: &GlobalArgs, config: &ConfigLogSettings) -> LogFormat {
+    if let Some(flag) = g.log_format {
+        return flag;
+    }
+    match config.format.as_deref().map(str::trim) {
+        None | Some("") => LogFormat::default(),
+        Some("compact") => LogFormat::Compact,
+        Some("pretty") => LogFormat::Pretty,
+        Some("json") => LogFormat::Json,
+        Some(other) => {
+            // Bounded echo. The three accepted names are short, and
+            // `${VAR}` interpolation has already run by the time the
+            // value gets here, so an operator who put a variable in the
+            // wrong key should not have its whole expansion on stderr.
+            let shown: String = other.chars().take(32).collect();
+            eprintln!(
+                "warning: proxy.observability.log.format: `{shown}` is not one of compact, \
+                 pretty, json. Falling back to {}.",
+                LogFormat::default().as_str()
+            );
+            LogFormat::default()
+        }
+    }
+}
+
+/// Read `proxy.observability.log.level` and `.format` out of the run
+/// config before the subscriber is built.
+///
+/// Mirrors [`runtime_telemetry_config_for_cli`]: only the serve path
+/// consults the file, and any read or compile failure yields the empty
+/// set so the authoritative config error is still reported later,
+/// through a subscriber that exists. A subcommand such as `validate`
+/// keeps CLI-and-env-only logging, because the YAML block configures
+/// the served process rather than the tool inspecting the file.
+fn config_log_settings_for_cli(cli: &Cli) -> ConfigLogSettings {
+    if cli.check || !matches!(cli.cmd, None | Some(Cmd::Serve(_))) {
+        return ConfigLogSettings::default();
+    }
+    let Some(path) = pick_run_path(cli) else {
+        return ConfigLogSettings::default();
+    };
+    let Ok(yaml) = std::fs::read_to_string(&path) else {
+        return ConfigLogSettings::default();
+    };
+    let Ok(compiled) = sbproxy_config::compile_config(&yaml) else {
+        return ConfigLogSettings::default();
+    };
+    let Some(log) = compiled
+        .server
+        .observability
+        .as_ref()
+        .and_then(|observability| observability.log.as_ref())
+    else {
+        return ConfigLogSettings::default();
+    };
+    ConfigLogSettings {
+        level: log.level.clone(),
+        format: log.format.clone(),
     }
 }
 
@@ -11792,32 +11910,52 @@ hooks:
         }
     }
 
+    /// The YAML half of the precedence chain: what
+    /// `proxy.observability.log:` asked for.
+    fn config_log(level: Option<&str>, format: Option<&str>) -> ConfigLogSettings {
+        ConfigLogSettings {
+            level: level.map(str::to_string),
+            format: format.map(str::to_string),
+        }
+    }
+
+    /// No `proxy.observability.log:` block at all.
+    fn no_config_log() -> ConfigLogSettings {
+        ConfigLogSettings::default()
+    }
+
     // --- log-filter precedence ---
 
     #[test]
     fn log_filter_cli_wins_over_env() {
         let _env = EnvVarGuard::set(&[("RUST_LOG", Some("trace"))]);
-        let got = resolve_log_filter(&globals_with_log(Some("debug"), None));
+        let got = resolve_log_filter(&globals_with_log(Some("debug"), None), &no_config_log());
         assert_eq!(got, "debug");
     }
 
     #[test]
     fn log_filter_falls_through_to_rust_log() {
         let _env = EnvVarGuard::set(&[("RUST_LOG", Some("sbproxy=trace"))]);
-        let got = resolve_log_filter(&globals_with_log(None, None));
+        let got = resolve_log_filter(&globals_with_log(None, None), &no_config_log());
         assert_eq!(got, "sbproxy=trace");
     }
 
     #[test]
     fn log_filter_default_info() {
         let _env = EnvVarGuard::set(&[("RUST_LOG", None)]);
-        assert_eq!(resolve_log_filter(&globals_with_log(None, None)), "info");
+        assert_eq!(
+            resolve_log_filter(&globals_with_log(None, None), &no_config_log()),
+            "info"
+        );
     }
 
     #[test]
     fn request_log_level_cli_appends_access_log_target() {
         let _env = EnvVarGuard::set(&[("RUST_LOG", None)]);
-        let got = resolve_log_filter(&globals_with_log(Some("warn"), Some("debug")));
+        let got = resolve_log_filter(
+            &globals_with_log(Some("warn"), Some("debug")),
+            &no_config_log(),
+        );
         assert_eq!(got, "warn,access_log=debug");
     }
 
@@ -11828,8 +11966,118 @@ hooks:
         // clap would: with the env value already folded into the
         // `request_log_level` field.
         let _env = EnvVarGuard::set(&[("RUST_LOG", None)]);
-        let got = resolve_log_filter(&globals_with_log(None, Some("trace")));
+        let got = resolve_log_filter(&globals_with_log(None, Some("trace")), &no_config_log());
         assert_eq!(got, "info,access_log=trace");
+    }
+
+    // --- log-filter precedence: the YAML rank ---
+
+    /// The defect this fixes. An operator writes `level: debug` in
+    /// `sb.yml`, passes no flag, exports no `RUST_LOG`, and gets debug
+    /// output instead of silence.
+    #[test]
+    fn log_filter_yaml_level_applies_without_cli_or_rust_log() {
+        let _env = EnvVarGuard::set(&[("RUST_LOG", None)]);
+        let got = resolve_log_filter(
+            &globals_with_log(None, None),
+            &config_log(Some("debug"), None),
+        );
+        assert_eq!(got, "debug");
+    }
+
+    /// A per-target directive is a filter like any other, so the YAML
+    /// rank accepts the same syntax the flag does.
+    #[test]
+    fn log_filter_yaml_level_accepts_a_target_directive() {
+        let _env = EnvVarGuard::set(&[("RUST_LOG", None)]);
+        let got = resolve_log_filter(
+            &globals_with_log(None, None),
+            &config_log(Some("sbproxy_ai=debug,h2=warn"), None),
+        );
+        assert_eq!(got, "sbproxy_ai=debug,h2=warn");
+    }
+
+    #[test]
+    fn log_filter_cli_wins_over_yaml_level() {
+        let _env = EnvVarGuard::set(&[("RUST_LOG", None)]);
+        let got = resolve_log_filter(
+            &globals_with_log(Some("warn"), None),
+            &config_log(Some("debug"), None),
+        );
+        assert_eq!(got, "warn");
+    }
+
+    /// The compatibility promise: a deployment that exports `RUST_LOG`
+    /// keeps resolving to `RUST_LOG` after this change, whatever the
+    /// config file now says.
+    #[test]
+    fn log_filter_rust_log_wins_over_yaml_level() {
+        let _env = EnvVarGuard::set(&[("RUST_LOG", Some("warn"))]);
+        let got = resolve_log_filter(
+            &globals_with_log(None, None),
+            &config_log(Some("debug"), None),
+        );
+        assert_eq!(got, "warn");
+    }
+
+    /// An empty or whitespace-only value is an absent value, matching
+    /// how the CLI rank already treats an empty flag.
+    #[test]
+    fn log_filter_blank_yaml_level_falls_through_to_the_default() {
+        let _env = EnvVarGuard::set(&[("RUST_LOG", None)]);
+        let got = resolve_log_filter(&globals_with_log(None, None), &config_log(Some("  "), None));
+        assert_eq!(got, "info");
+    }
+
+    /// `--request-log-level` narrows one target on top of whichever
+    /// rank won, including the YAML one.
+    #[test]
+    fn request_log_level_appends_on_top_of_a_yaml_level() {
+        let _env = EnvVarGuard::set(&[("RUST_LOG", None)]);
+        let got = resolve_log_filter(
+            &globals_with_log(None, Some("trace")),
+            &config_log(Some("warn"), None),
+        );
+        assert_eq!(got, "warn,access_log=trace");
+    }
+
+    // --- log-format precedence ---
+
+    #[test]
+    fn log_format_yaml_applies_without_a_flag() {
+        let got = resolve_log_format(
+            &globals_with_log(None, None),
+            &config_log(None, Some("json")),
+        );
+        assert_eq!(got, LogFormat::Json);
+    }
+
+    #[test]
+    fn log_format_cli_wins_over_yaml() {
+        let globals = GlobalArgs {
+            log_format: Some(LogFormat::Pretty),
+            ..Default::default()
+        };
+        let got = resolve_log_format(&globals, &config_log(None, Some("json")));
+        assert_eq!(got, LogFormat::Pretty);
+    }
+
+    #[test]
+    fn log_format_defaults_to_compact_with_neither() {
+        let got = resolve_log_format(&globals_with_log(None, None), &no_config_log());
+        assert_eq!(got, LogFormat::Compact);
+    }
+
+    /// clap refuses an unknown `--log-format`, but YAML is a free-form
+    /// string. An unknown value must not resolve to something the
+    /// operator did not ask for without saying so.
+    #[test]
+    fn log_format_unknown_yaml_value_falls_back_to_compact() {
+        let got = resolve_log_format(
+            &globals_with_log(None, None),
+            &config_log(None, Some("logfmt")),
+        );
+        assert_eq!(got, LogFormat::Compact);
     }
 
     // --- clap env-var precedence (CLI > env) ---
