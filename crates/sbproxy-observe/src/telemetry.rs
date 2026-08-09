@@ -2060,10 +2060,27 @@ mod tests {
         // `auth_type` is a bounded provider label. A subject, a token, or
         // an authorization header value on this span would be a
         // credential sitting in whatever backend the traces go to.
-        let accept = intake_accept_span("GET");
-        let authenticate = intake_authenticate_span("forward_auth");
-        let enforce = policy_enforce_span("rate_limit");
-        let shape = transform_shape_span("html_to_markdown");
+        //
+        // Under a subscriber, and with the interest cache rebuilt, for the
+        // reason the traceparent test below spells out: with no subscriber
+        // installed the callsite's Interest caches as Never, the macro hands
+        // back `Span::none()`, and `metadata()` is `None` rather than the
+        // name this asserts. That made the test pass under `--workspace`,
+        // where some earlier test in the binary had already installed one,
+        // and fail under `cargo test -p sbproxy-observe`, which CLAUDE.md
+        // recommends as the fast inner loop. Installing one here makes the
+        // assertion mean the same thing under either selection.
+        let subscriber = tracing_subscriber::registry();
+        let (accept, authenticate, enforce, shape) =
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::callsite::rebuild_interest_cache();
+                (
+                    intake_accept_span("GET"),
+                    intake_authenticate_span("forward_auth"),
+                    policy_enforce_span("rate_limit"),
+                    transform_shape_span("html_to_markdown"),
+                )
+            });
 
         for span in [&accept, &authenticate, &enforce, &shape] {
             assert_eq!(

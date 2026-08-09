@@ -340,3 +340,29 @@
 # Both are exactly the shape this ratchet is meant to allow through with a
 # note rather than block: a table plus its checker, landing together, with
 # the check running in CI on every commit.
+
+# 2026-08-08 (WOR-2318): 289 -> 290. No new pub surface. `verify_references`
+# in sbproxy-capability's scan.rs has been pub, and tests-only, since the
+# guard was written; the scanner could not see it.
+#
+# `cfg_test_line_ranges` finds a `#[cfg(test)]` block by counting braces and
+# says so in its own docstring: braces inside string literals throw the count
+# off. scan.rs is full of them, because its tests carry Rust source fixtures
+# as raw strings and its extractors build PromQL selectors with `format!`.
+# On the parent commit the count never came back to zero, so the range that
+# opened at the first `#[cfg(test)]` ran to end of file and every pub item
+# below it was filed as test scaffolding. Adding the `label_values` extractor
+# happened to rebalance the braces, the range now closes where the test
+# module ends, and one item that was always a candidate became countable.
+#
+# It is not narrowable. Its consumer is
+# `crates/sbproxy-observe/tests/metric_drift.rs`, a separate crate's
+# integration test, which cannot see `pub(crate)`. It is the same shape as
+# `validate_metrics` and `validate_spans` above: a checker whose caller is
+# the guard that runs it.
+#
+# Worth knowing that the number can move again for this reason alone, in
+# either direction, on any edit to scan.rs that changes its brace balance.
+# The miscount is the conservative direction by design (an item looks more
+# used, not less), so the drift it causes is a ratchet that was too loose
+# getting tighter.

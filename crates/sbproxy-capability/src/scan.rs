@@ -102,15 +102,53 @@ const SANCTIONED_PREFIXES: &[&str] = &["sbproxy_", "mesh_"];
 ///   filters silently ignored, it would have shown an operator who had narrowed
 ///   to one vendor the latency of all of them.
 ///
-/// Two blind spots remain, both narrower than the directory-shaped one they
-/// replace, and neither is a place a broken SLO can hide:
+/// One control went the other way, gaining a matcher rather than losing a
+/// panel. `per-agent.json` shipped an `agent_id` textbox labeled "logs/traces
+/// only", above a description asserting that `agent_id` is not a Prometheus
+/// label. It is one: `record_request_with_labels` stamps it on
+/// `sbproxy_requests_total` next to `agent_class` and `agent_vendor`, and
+/// `RUN_SCOPED_LABEL_STEMS` in `sbproxy-observe` names it in its own doc as a
+/// live label the cardinality rule deliberately passes (the segment before its
+/// `_id` suffix is `agent`, not a run stem). So an operator typed an agent id
+/// into a control that filtered nothing and read the whole fleet under four
+/// panels titled for the agents they had selected. All four matchers now carry
+/// `agent_id=~"$agent_id"`, and the box defaults to `.*` so the unfiltered
+/// view is exactly where it was. No guard catches this one: a dashboard that
+/// declines to filter on a label that exists is not a query defect, which is
+/// why it is written down here.
 ///
-/// 1. Only `expr` is read, so a Grafana `templating` variable whose query is
-///    `label_values(<metric>, <label>)` is invisible here. That is how
-///    `deploy/dashboards/licensing-edits.json` still sources a dropdown from
-///    `sbproxy_audit_emit_total`, a metric that does not exist. Its panels are
-///    ClickHouse, not PromQL, so no alert or SLO depends on it.
-/// 2. A dashboard shipped outside these four directories is not scanned at all.
+/// Variable queries are read too, not just `expr`. A Grafana `templating`
+/// entry whose query is `label_values(<selector>, <label>)` is a live read of
+/// the same metric the panels use, and it fails the same three ways, so
+/// [`promql_only`] rewrites it into the selector it implies and the shared
+/// extractor checks it like any other query. Leaving it out was not a
+/// theoretical gap: `deploy/dashboards/licensing-edits.json` sourced its
+/// tenant dropdown from `label_values(sbproxy_audit_emit_total, tenant_id)`,
+/// and no crate has ever declared `sbproxy_audit_emit_total`. Every panel on
+/// that dashboard filters `tenant_id IN ($tenant_id)`, so the one variable
+/// nothing could populate was the one every panel depended on. It now reads
+/// `SELECT DISTINCT tenant_id FROM admin_audit_events`, the table those panels
+/// already query and the only place the tenant dimension exists: `tenant_id`
+/// is a column there and is not a label on any audit metric. With the
+/// Prometheus variable gone, nothing on that dashboard reads Prometheus, so
+/// its datasource picker went too.
+///
+/// A dropdown is worth the check for a reason the panel case does not cover.
+/// A dead `expr` draws an empty panel, which an operator sees. A dead
+/// `label_values` leaves an empty *selector*, and what happens next depends on
+/// the query it feeds rather than on the dropdown. Feeding SQL, as
+/// licensing-edits did, it produces `IN ()` and the panel fails loudly.
+/// Feeding a PromQL matcher it does the opposite: `=~"$var"` over an empty
+/// variable stops constraining anything, so the operator does not get no data,
+/// they get everyone's data under a title naming one of them. That is the
+/// `status_class` failure again, arriving through the variable rather than
+/// through the matcher, and `dashboards/grafana/sbproxy-ai-value.json` is
+/// where it would land: its tenant and api-key dropdowns both come from
+/// `label_values` and both feed `=~` matchers on per-tenant panels. They are
+/// correct today, and now a rename cannot quietly make them otherwise.
+///
+/// One blind spot remains, and it is not a place a broken SLO can hide: a
+/// dashboard shipped outside these four directories is not scanned at all.
 const QUERY_DIRS: &[&str] = &[
     "dashboards/grafana",
     "dashboards/prometheus",
@@ -1797,12 +1835,29 @@ pub fn query_references(root: &Path) -> Vec<MetricReference> {
 /// names, and a comment explaining why a metric was removed necessarily
 /// mentions it. All three look exactly like a query to a token scanner, and
 /// the guard would then indict the file for the very sentence explaining the
-/// fix. Only `expr` carries PromQL, so only `expr` is read.
+/// fix. So two things are read and nothing else: `expr`, and a Grafana
+/// templating variable's `label_values(...)` call.
+///
+/// `label_values` is matched on the call rather than on the key it sits under.
+/// The key is not reliable (`query` and `definition` both carry it, and
+/// `query` also carries a datasource name, a custom variable's comma-separated
+/// options, and on some datasources raw SQL), while the call is: it is a
+/// Grafana Prometheus-datasource function, it never appears in PromQL, and it
+/// never appears in prose here. Matching the key instead would mean deciding
+/// whether an arbitrary `query` string is PromQL, which is the guess that let
+/// prose into the old substring guard.
 fn promql_only(text: &str) -> String {
     let mut out = String::new();
     let mut lines = text.lines().peekable();
 
     while let Some(line) = lines.next() {
+        // Grafana templating: `"query": "label_values(<selector>, <label>)"`.
+        if let Some(selector) = label_values_as_selector(line) {
+            out.push_str(&selector);
+            out.push('\n');
+            continue;
+        }
+
         // Grafana JSON: `"expr": "sum(rate(...))"`.
         if let Some(at) = line.find("\"expr\"") {
             if let Some(value) = json_string_after(&line[at + 6..]) {
@@ -1836,6 +1891,81 @@ fn promql_only(text: &str) -> String {
     }
 
     out
+}
+
+/// Rewrite a Grafana `label_values(...)` call into the selector it implies.
+///
+/// `label_values(sbproxy_requests_total{agent_class=~"$agent_class"}, agent_vendor)`
+/// becomes `sbproxy_requests_total{agent_class=~"$agent_class",agent_vendor=""}`,
+/// which is a plain selector [`references_in`] already knows how to read: the
+/// family has to exist and be live, and every label named has to be one it
+/// carries. The dropdown's own label joins the selector because populating a
+/// dropdown from a label is a claim that the label is there.
+///
+/// Returns `None` when the line carries no such call, and also for the
+/// single-argument form `label_values(<label>)`, which names no family and so
+/// gives the guard nothing to check the label against.
+///
+/// Two details are worth naming. The argument list is split at the *last*
+/// comma outside every bracket, because a selector brings its own commas
+/// (`{a="x",b="y"}`) and the label is always last. And an unparseable label
+/// position, a template variable or an expression rather than a name, still
+/// yields the bare selector: the family is checkable even when the label is
+/// not, and returning nothing there would hide a dead metric behind an
+/// unreadable second argument.
+fn label_values_as_selector(line: &str) -> Option<String> {
+    const CALL: &str = "label_values(";
+    let at = line.find(CALL)?;
+    // Grafana stores the query inside a JSON string, so a selector's quotes
+    // arrive escaped. Everything downstream reads plain PromQL.
+    let rest = line[at + CALL.len()..].replace("\\\"", "\"");
+
+    let mut depth = 1usize;
+    let mut close = None;
+    for (index, byte) in rest.bytes().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(index);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let arguments = &rest[..close?];
+
+    let mut depth = 0usize;
+    let mut split = None;
+    for (index, byte) in arguments.bytes().enumerate() {
+        match byte {
+            b'{' | b'[' | b'(' => depth += 1,
+            b'}' | b']' | b')' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => split = Some(index),
+            _ => {}
+        }
+    }
+    let split = split?;
+    let selector = arguments[..split].trim();
+    let label = arguments[split + 1..].trim();
+    if selector.is_empty() {
+        return None;
+    }
+    if label.is_empty()
+        || !label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Some(selector.to_string());
+    }
+
+    Some(match selector.strip_suffix('}') {
+        Some(head) if head.ends_with('{') => format!("{head}{label}=\"\"}}"),
+        Some(head) => format!("{head},{label}=\"\"}}"),
+        None => format!("{selector}{{{label}=\"\"}}"),
+    })
 }
 
 /// Read the first JSON string value after a `"expr":` key, unescaping `\"`.
@@ -2537,5 +2667,66 @@ fn live() {
         assert!(errors
             .iter()
             .any(|e| e.message.contains("no crate declares")));
+    }
+
+    #[test]
+    fn a_dashboard_variable_query_is_read_as_a_selector() {
+        // The licensing-edits regression. Reading only `expr` could not see
+        // this line, so the dropdown every panel on that dashboard filtered
+        // through was populated from a metric no crate has ever declared.
+        let metrics = [metric(
+            "sbproxy_audit_emit_duration_seconds",
+            Writer::Recorder("record_audit_emit_duration"),
+            &["channel", "outcome"],
+        )];
+        let references = references_in(
+            &promql_only(r#"  "query": "label_values(sbproxy_audit_emit_total, tenant_id)","#),
+            "deploy/dashboards/licensing-edits.json",
+        );
+
+        assert_eq!(references.len(), 1);
+        assert_eq!(references[0].metric, "sbproxy_audit_emit_total");
+        assert!(references[0].labels.contains("tenant_id"));
+
+        let errors = verify_references(&metrics, &references, &[]);
+
+        assert!(errors
+            .iter()
+            .any(|e| e.message.contains("no crate declares")));
+    }
+
+    #[test]
+    fn a_variable_selector_keeps_its_filter_and_its_dropdown_label() {
+        // Grafana escapes the selector's quotes, and the label is the last
+        // argument rather than the second: both have to survive the rewrite.
+        let references = references_in(
+            &promql_only(
+                r#"  "query": "label_values(sbproxy_requests_total{agent_class=~\"$agent_class\"}, agent_vendor)","#,
+            ),
+            "deploy/dashboards/per-agent.json",
+        );
+
+        assert_eq!(references.len(), 1);
+        assert_eq!(references[0].metric, "sbproxy_requests_total");
+        assert!(references[0].labels.contains("agent_class"));
+        assert!(references[0].labels.contains("agent_vendor"));
+    }
+
+    #[test]
+    fn a_label_values_call_naming_no_metric_is_dropped() {
+        // `label_values(<label>)` asks for a label across every family, so
+        // there is nothing in it to hold against the registry.
+        assert_eq!(promql_only(r#"  "query": "label_values(pillar)","#), "");
+    }
+
+    #[test]
+    fn a_variable_that_is_not_promql_is_not_read_as_promql() {
+        // licensing-edits' replacement dropdown, and the reason the guard did
+        // not simply lose a reference when that metric name went away.
+        let sql = r#"  "definition": "SELECT DISTINCT tenant_id FROM admin_audit_events","#;
+        let prose = r#"  "description": "sbproxy_spans_emitted_total is declared nowhere.","#;
+
+        assert_eq!(promql_only(sql), "");
+        assert_eq!(promql_only(prose), "");
     }
 }

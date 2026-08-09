@@ -25,22 +25,6 @@
   "templating": {
     "list": [
       {
-        "name": "prometheus_datasource",
-        "label": "Prometheus",
-        "type": "datasource",
-        "query": "prometheus",
-        "current": {
-          "selected": false,
-          "text": "Prometheus",
-          "value": "Prometheus"
-        },
-        "hide": 0,
-        "refresh": 1,
-        "regex": "",
-        "skipUrlSync": false,
-        "options": []
-      },
-      {
         "name": "clickhouse_datasource",
         "label": "ClickHouse",
         "type": "datasource",
@@ -59,12 +43,18 @@
       {
         "name": "tenant_id",
         "label": "Tenant",
+        "description": "Tenants that have emitted a PolicyProjectionRefresh event. Read from admin_audit_events, the same table every panel here queries, because tenant_id is a column on that table and is not a label on any audit metric.",
         "type": "query",
         "datasource": {
-          "type": "prometheus",
-          "uid": "${prometheus_datasource}"
+          "type": "grafana-clickhouse-datasource",
+          "uid": "${clickhouse_datasource}"
         },
-        "query": "label_values(sbproxy_audit_emit_total, tenant_id)",
+        "query": {
+          "refId": "tenant_id",
+          "queryType": "table",
+          "rawSql": "SELECT DISTINCT tenant_id\n  FROM admin_audit_events\n WHERE action = 'PolicyProjectionRefresh'\n ORDER BY tenant_id"
+        },
+        "definition": "SELECT DISTINCT tenant_id FROM admin_audit_events WHERE action = 'PolicyProjectionRefresh' ORDER BY tenant_id",
         "includeAll": true,
         "multi": true,
         "refresh": 2,

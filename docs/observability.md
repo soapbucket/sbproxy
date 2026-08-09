@@ -1090,11 +1090,16 @@ Exemplars carry `trace_id` per scrape interval. Prometheus needs `--enable-featu
 
 JSON files live under `deploy/dashboards/`:
 
-- `overview.json` - request rate, error rate, latency p95/p99, ledger health.
-- `per-agent.json` - per-`agent_class` and per-`agent_vendor` request rate, redeem rate, revenue (Wave 2 fills the revenue panel).
-- `policy-triggers.json` - per-policy block rate, decision distribution.
-- `audit-log.json` - admin-action volume, outcome distribution, append-only verification status.
-- `traces-overview.json` - span chain length, slowest spans, sampling rate.
+- `overview.json` - request rate, 5xx rate, latency p95/p99, and ledger redeem success rate and latency.
+- `per-agent.json` - request rate and 5xx rate grouped by `agent_class`, plus top origins and top payment rails. Every panel filters on all three agent dimensions `sbproxy_requests_total` carries: `agent_class`, `agent_vendor`, and `agent_id`.
+- `policy-triggers.json` - trigger volume per hour, triggers by `policy_type`, and an origin-by-policy heatmap, all filtered by `action`.
+- `audit-log.json` - audit emit volume and write failures over 24h, emits by `channel` and `outcome`, and emit latency p95/p99. All four panels read `sbproxy_audit_emit_duration_seconds`.
+- `traces-overview.json` - Tempo search for recent error traces, with a pillar filter pinned to the `Pillar` enum. No Prometheus panels: nothing on the OTLP path counts spans or traces, so the emission-rate panels return when those counters do.
+- `boilerplate-stripping.json` - stripped-byte rate by origin, and stripped bytes per request.
+- `content-shapes.json` - request rate by negotiated `content_shape`, and a Markdown-versus-HTML breakdown by origin.
+- `licensing-edits.json` - PolicyProjectionRefresh audit events read from ClickHouse: recent events, weekly document-hash changes for `licenses.xml`, and the default-deny rollout count. The one dashboard here that reads no Prometheus metric, so its tenant dropdown comes from the audit table rather than from a metric label.
+
+Every panel and every `label_values` dropdown in this directory is held to the metric registry by `every_dashboard_and_alert_rule_reads_a_live_metric_with_labels_that_exist` in `crates/sbproxy-observe/tests/metric_drift.rs`. A panel that names a metric no crate declares, a metric nothing increments, or a label the family does not carry fails the build rather than shipping as an empty or silently unfiltered chart.
 
 The Helm chart ships them as a single ConfigMap that the kiwigrid Grafana sidecar discovers by label. The chart's values are:
 

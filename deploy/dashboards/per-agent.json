@@ -4,7 +4,7 @@
   },
   "id": null,
   "title": "SBproxy Per-Agent",
-  "description": "Per-agent traffic, error rate, and route breakdowns. Aggregates by agent_class and agent_vendor; agent_id is intentionally not a Prometheus label (it is a span attribute and log field).",
+  "description": "Per-agent traffic, error rate, and route breakdowns. Every panel filters on all three agent dimensions sbproxy_requests_total carries, agent_class, agent_vendor, and agent_id, and groups by agent_class. The agent id box defaults to .* so the unfiltered view is the whole class.",
   "tags": [
     "sbproxy",
     "wave1",
@@ -79,15 +79,15 @@
       },
       {
         "name": "agent_id",
-        "label": "Agent id (logs/traces only)",
+        "label": "Agent id",
         "type": "textbox",
-        "query": "",
+        "query": ".*",
         "current": {
           "selected": false,
-          "text": "",
-          "value": ""
+          "text": ".*",
+          "value": ".*"
         },
-        "description": "agent_id is a span attribute / log field. Type a value to use in a Tempo or Loki query. Not available as a Prometheus label.",
+        "description": "Regex matched against the agent_id label on sbproxy_requests_total. Defaults to .* so every panel shows the whole selected class; type an id to narrow all four to that one agent. Ids beyond the cardinality budget are recorded as __other__.",
         "options": []
       }
     ]
@@ -139,7 +139,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (agent_class) (rate(sbproxy_requests_total{agent_class=~\"$agent_class\",agent_vendor=~\"$agent_vendor\"}[$__rate_interval]))",
+          "expr": "sum by (agent_class) (rate(sbproxy_requests_total{agent_class=~\"$agent_class\",agent_vendor=~\"$agent_vendor\",agent_id=~\"$agent_id\"}[$__rate_interval]))",
           "legendFormat": "{{agent_class}}",
           "datasource": {
             "type": "prometheus",
@@ -194,7 +194,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (agent_class) (rate(sbproxy_requests_total{status=~\"5..\",agent_class=~\"$agent_class\",agent_vendor=~\"$agent_vendor\"}[$__rate_interval])) / sum by (agent_class) (rate(sbproxy_requests_total{agent_class=~\"$agent_class\",agent_vendor=~\"$agent_vendor\"}[$__rate_interval]))",
+          "expr": "sum by (agent_class) (rate(sbproxy_requests_total{status=~\"5..\",agent_class=~\"$agent_class\",agent_vendor=~\"$agent_vendor\",agent_id=~\"$agent_id\"}[$__rate_interval])) / sum by (agent_class) (rate(sbproxy_requests_total{agent_class=~\"$agent_class\",agent_vendor=~\"$agent_vendor\",agent_id=~\"$agent_id\"}[$__rate_interval]))",
           "legendFormat": "{{agent_class}}",
           "datasource": {
             "type": "prometheus",
@@ -238,7 +238,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "topk(20, sum by (hostname, agent_class) (rate(sbproxy_requests_total{agent_class=~\"$agent_class\",agent_vendor=~\"$agent_vendor\"}[$__rate_interval])))",
+          "expr": "topk(20, sum by (hostname, agent_class) (rate(sbproxy_requests_total{agent_class=~\"$agent_class\",agent_vendor=~\"$agent_vendor\",agent_id=~\"$agent_id\"}[$__rate_interval])))",
           "legendFormat": "{{hostname}} ({{agent_class}})",
           "format": "table",
           "instant": true,
@@ -284,7 +284,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "topk(20, sum by (payment_rail, agent_class) (rate(sbproxy_requests_total{agent_class=~\"$agent_class\",agent_vendor=~\"$agent_vendor\"}[$__rate_interval])))",
+          "expr": "topk(20, sum by (payment_rail, agent_class) (rate(sbproxy_requests_total{agent_class=~\"$agent_class\",agent_vendor=~\"$agent_vendor\",agent_id=~\"$agent_id\"}[$__rate_interval])))",
           "legendFormat": "{{payment_rail}} ({{agent_class}})",
           "format": "table",
           "instant": true,
