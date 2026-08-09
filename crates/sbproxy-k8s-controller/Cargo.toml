@@ -1,0 +1,78 @@
+[package]
+name = "sbproxy-k8s-controller"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+description = "Kubernetes Gateway API controller for sbproxy. Watches GatewayClass, Gateway, HTTPRoute, and GRPCRoute and renders an sb.yml the data plane reads."
+publish = false
+
+[lib]
+name = "sbproxy_k8s_controller"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sbproxy-k8s-controller"
+path = "src/main.rs"
+
+[dependencies]
+# Process-level rustls CryptoProvider install; the kube client's TLS
+# session to the API server needs one selected before first use. Same
+# reason sbproxy-k8s-operator carries it.
+rustls = { workspace = true }
+
+# Async runtime + stream combinators for the watcher event loop.
+tokio = { workspace = true }
+futures = { workspace = true }
+
+# Serialization. `serde_yaml` is the workspace alias for `yaml_serde`;
+# taking it from the workspace keeps one copy in the lockfile.
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+
+# Kubernetes client + controller-runtime + CRD derive. Pins match
+# sbproxy-k8s-operator and sbproxy-vault exactly: k8s-openapi refuses to
+# compile when two conflicting `v1_XX` features unify, so a third
+# opinion here is a build break rather than a warning.
+kube = { version = "0.95", default-features = false, features = [
+    "client",
+    "derive",
+    "runtime",
+    "rustls-tls",
+] }
+k8s-openapi = { version = "0.23", default-features = false, features = ["v1_30", "schemars"] }
+schemars = "0.8"
+
+# Prometheus metrics. Registered on the global default registry so the
+# single /metrics handler in the binary serves everything.
+prometheus = { workspace = true }
+
+# Async HTTP server for /healthz, /readyz, and /metrics.
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+
+# CLI flag parsing for the binary.
+clap = { version = "4", features = ["derive", "env"] }
+
+# Lease timestamps for leader election. `coordination.k8s.io/v1.Lease`
+# carries acquireTime / renewTime as MicroTime, which k8s-openapi
+# exposes as chrono::DateTime<Utc>. Also stamps condition
+# lastTransitionTime.
+chrono = { workspace = true }
+
+# Observability
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util", "macros"] }
+tempfile = "3"
+# The golden tests feed every generated document through the real
+# config compiler. This is the whole point of the test suite: a shape
+# the data plane would reject must fail here, in this crate, rather
+# than in a pod that will not start.
+sbproxy-config = { workspace = true }

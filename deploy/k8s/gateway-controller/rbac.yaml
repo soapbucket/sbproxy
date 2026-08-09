@@ -1,0 +1,95 @@
+# RBAC for the sbproxy Kubernetes Gateway API controller.
+#
+# Two grants, deliberately separate:
+#
+#   * A ClusterRole for the Gateway API resources. Read on the objects,
+#     write on their /status subresources only. The controller never
+#     mutates a spec, so `update` and `patch` appear on the /status
+#     resources and nowhere else.
+#   * A namespaced Role for the coordination Lease, so the controller can
+#     steward its own leader-election lock and nothing else.
+#
+# The /status rules are load bearing. Without them the controller still
+# routes traffic correctly and still logs what it decided, but
+# `kubectl describe gateway` shows no conditions at all and an operator
+# has no way to tell a working route from a silently dropped one. Missing
+# permission surfaces as a warn log per reconcile and on
+# `sbproxy_gateway_status_writes_total{result="error"}`.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sbproxy-gateway-controller
+  namespace: sbproxy-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sbproxy-gateway-controller
+rules:
+  # GatewayClass is cluster scoped. The controller reads every class and
+  # claims the ones naming sbproxy.dev/gateway-controller.
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gatewayclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gatewayclasses/status"]
+    verbs: ["get", "update", "patch"]
+
+  # The namespaced kinds the controller renders.
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gateways", "httproutes", "grpcroutes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources:
+      - "gateways/status"
+      - "httproutes/status"
+      - "grpcroutes/status"
+    verbs: ["get", "update", "patch"]
+
+  # Startup CRD check. The controller verifies all four kinds are
+  # registered and watchable before it starts a single watch, so a
+  # cluster with no Gateway API installed fails loudly instead of
+  # quietly writing an empty config forever.
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sbproxy-gateway-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sbproxy-gateway-controller
+subjects:
+  - kind: ServiceAccount
+    name: sbproxy-gateway-controller
+    namespace: sbproxy-system
+---
+# Leader election, scoped to the controller's own namespace. Only needed
+# when running more than one replica with --leader-election=true.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sbproxy-gateway-controller-leader-election
+  namespace: sbproxy-system
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sbproxy-gateway-controller-leader-election
+  namespace: sbproxy-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: sbproxy-gateway-controller-leader-election
+subjects:
+  - kind: ServiceAccount
+    name: sbproxy-gateway-controller
+    namespace: sbproxy-system

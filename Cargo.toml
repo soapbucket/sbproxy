@@ -26,6 +26,7 @@ members = [
     "crates/sbproxy-tls",
     "crates/sbproxy-openapi",
     "crates/sbproxy-k8s-operator",
+    "crates/sbproxy-k8s-controller",
     "crates/sbproxy-classifiers",
     "crates/sbproxy-classifier-proto",
     "crates/sbproxy-classifier-sidecar",
@@ -35,11 +36,11 @@ members = [
     "crates/sbproxy-capability",
     "e2e",
 ]
-# The k8s operator pulls kube + k8s-openapi, which adds ~30-60s to a cold
-# `cargo build --workspace`. Exclude it from default-members so plain
-# `cargo build` and `cargo test` (no --workspace flag) skip it for
-# day-to-day proxy work. CI's `cargo build --workspace --locked` still
-# picks it up.
+# The k8s operator and the Gateway API controller both pull kube +
+# k8s-openapi, which adds ~30-60s to a cold `cargo build --workspace`.
+# Exclude them from default-members so plain `cargo build` and
+# `cargo test` (no --workspace flag) skip them for day-to-day proxy
+# work. CI's `cargo build --workspace --locked` still picks them up.
 default-members = [
     "crates/sbproxy",
     "crates/sbproxy-core",

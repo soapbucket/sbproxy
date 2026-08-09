@@ -7435,6 +7435,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "sbproxy-k8s-controller"
+version = "1.10.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "futures",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "k8s-openapi",
+ "kube",
+ "prometheus 0.14.0",
+ "rustls",
+ "sbproxy-config",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "yaml_serde",
+]
+
+[[package]]
 name = "sbproxy-k8s-operator"
 version = "1.10.0"
 dependencies = [

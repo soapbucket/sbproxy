@@ -1,0 +1,150 @@
+# Namespace, Deployment, and headless Service for the sbproxy Gateway
+# API controller.
+#
+# The controller writes one file. Everything else in the cluster is read
+# only. Give it the smallest surface that can do that:
+#
+#   * `config` is the shared volume the data plane pod also mounts. In
+#     this manifest it is an emptyDir so the rendered document is
+#     observable inside the controller pod; in a real deployment make it
+#     the same volume the sbproxy pod reads its config from, and run the
+#     two as containers in one pod or share a PVC.
+#   * `tls` is where Gateway TLS Secrets are mounted, one subdirectory
+#     per Secret name. A listener with `certificateRefs: [{name: api-cert}]`
+#     renders `/etc/sbproxy/tls/api-cert/tls.crt` and `.../tls.key`, so
+#     the mount below has to exist for the data plane to serve HTTPS.
+#     The controller never reads the Secret itself.
+#
+# No release publishes this image. Build it from
+# `crates/sbproxy-k8s-controller/Dockerfile.ci`, push it somewhere your
+# nodes can pull from, and replace `image:` below.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sbproxy-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sbproxy-gateway-controller
+  namespace: sbproxy-system
+  labels:
+    app.kubernetes.io/name: sbproxy-gateway-controller
+spec:
+  # One replica writes one file. Scale past this only with
+  # --leader-election=true, or two controllers will fight over the
+  # rendered document.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sbproxy-gateway-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sbproxy-gateway-controller
+    spec:
+      serviceAccountName: sbproxy-gateway-controller
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: controller
+          image: replace-me.example.com/sbproxy-k8s-controller:dev
+          imagePullPolicy: IfNotPresent
+          args:
+            - --config-out=/etc/sbproxy/sb.yml
+            - --tls-mount-dir=/etc/sbproxy/tls
+            - --health-addr=0.0.0.0:8081
+            - --reconcile-interval-secs=300
+            - --verify-crds=true
+            # Serve one GatewayClass instead of every class naming this
+            # controller:
+            # - --gateway-class=sbproxy
+            #
+            # For more than one replica:
+            # - --leader-election=true
+            # - --lease-namespace=sbproxy-system
+            # - --lease-name=sbproxy-gateway-controller
+          env:
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: RUST_LOG
+              value: info
+          ports:
+            - name: health
+              containerPort: 8081
+              protocol: TCP
+          livenessProbe:
+            # Answering at all is the whole signal.
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            # 503 until the first reconcile has written a document, so a
+            # rollout does not retire the old replica early.
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/sbproxy
+            - name: tls
+              mountPath: /etc/sbproxy/tls
+              readOnly: true
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+      volumes:
+        - name: config
+          emptyDir: {}
+        # One projected entry per Gateway TLS Secret. The subdirectory
+        # name has to equal the Secret name, because that is what the
+        # rendered tls_cert_file path points at.
+        - name: tls
+          projected:
+            sources: []
+            # - secret:
+            #     name: api-cert
+            #     items:
+            #       - key: tls.crt
+            #         path: api-cert/tls.crt
+            #       - key: tls.key
+            #         path: api-cert/tls.key
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sbproxy-gateway-controller
+  namespace: sbproxy-system
+  labels:
+    app.kubernetes.io/name: sbproxy-gateway-controller
+spec:
+  selector:
+    app.kubernetes.io/name: sbproxy-gateway-controller
+  ports:
+    - name: health
+      port: 8081
+      targetPort: health
+  # Headless: probes and scrapes hit the pod directly, so no ClusterIP is
+  # needed.
+  clusterIP: None

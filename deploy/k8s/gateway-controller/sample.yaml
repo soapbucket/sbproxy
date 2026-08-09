@@ -1,0 +1,79 @@
+# A GatewayClass, a Gateway, and an HTTPRoute the controller renders
+# into a single origin. Apply it after the controller is running.
+#
+# The GatewayClass is the piece that matters and the piece people skip.
+# `controllerName` is what this controller claims; until a class naming
+# it exists, every Gateway in the cluster belongs to somebody else and
+# the rendered config stays empty. Check it took ownership with:
+#
+#   kubectl get gatewayclass sbproxy -o jsonpath='{.status.conditions}'
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: sbproxy
+spec:
+  controllerName: sbproxy.dev/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: sbproxy-sample
+  namespace: default
+spec:
+  gatewayClassName: sbproxy
+  listeners:
+    - name: http
+      port: 8080
+      protocol: HTTP
+      # `allowedRoutes` is accepted and ignored: this controller does not
+      # implement namespace or kind gating. Any route whose parentRefs
+      # name this Gateway attaches to it.
+      allowedRoutes:
+        namespaces:
+          from: All
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: sample-route
+  namespace: default
+spec:
+  # parentRefs is how attachment happens. A route with none is served by
+  # nothing, no matter what ports the Gateway listens on.
+  parentRefs:
+    - name: sbproxy-sample
+  hostnames:
+    - sample.sbproxy.test
+  rules:
+    # Two rules, to show the ordering. Exact beats prefix regardless of
+    # the order they appear in here.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api
+        - path:
+            type: PathPrefix
+            value: /api/v2
+          method: POST
+      filters:
+        - type: RequestHeaderModifier
+          requestHeaderModifier:
+            set:
+              - name: X-Gateway
+                value: sbproxy
+      backendRefs:
+        # Weighted backendRefs become a weighted_random load balancer.
+        - name: api-blue
+          port: 8080
+          weight: 90
+        - name: api-green
+          port: 8080
+          weight: 10
+    - matches:
+        - path:
+            type: Exact
+            value: /healthz
+      backendRefs:
+        - name: health-svc
+          port: 8080

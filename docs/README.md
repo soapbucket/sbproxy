@@ -1,6 +1,6 @@
 # SBproxy documentation
 
-*Last modified: 2026-08-08*
+*Last modified: 2026-08-09*
 
 SBproxy is an open source Enterprise AI Gateway for API, MCP and agent, and AI model traffic. Every feature in this repository ships under Apache-2.0.
 
@@ -128,6 +128,7 @@ Point a framework you already run at the gateway: chat completions through the O
 - [mesh-replication.md](mesh-replication.md) - the replicated cluster-state substrate: replication factor, read/write consistency, durable restart, handoff, anti-entropy, and the tombstone deletion protocol.
 - [quickstart-operator.md](quickstart-operator.md) - first 24 hours running the Kubernetes operator.
 - [kubernetes.md](kubernetes.md) - the Kubernetes operator and its CRDs.
+- [gateway-api.md](gateway-api.md) - the Gateway API controller: which `gateway.networking.k8s.io/v1` fields it translates, the status conditions it writes, and the explicit list of what it does not support. A subset of Gateway API v1, not conformance tested.
 - [sidecar-deployment.md](sidecar-deployment.md) - running sbproxy as a per-pod sidecar: traffic capture (iptables / eBPF), service-mesh integration (Istio, Linkerd), and the kustomize overlay under `deploy/k8s/sidecar/`.
 
 ## Reference

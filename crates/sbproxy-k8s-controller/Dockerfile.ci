@@ -1,0 +1,23 @@
+# Container image for the sbproxy Kubernetes Gateway API controller.
+#
+# No CI workflow builds this and no release publishes it, the same as the
+# operator image next door. Build it yourself, push it somewhere your
+# nodes can pull from, and point the Deployment at that tag:
+#
+#   cargo build --profile release-fast -p sbproxy-k8s-controller --locked
+#   docker build -t registry.example.com/sbproxy-k8s-controller:dev \
+#     -f crates/sbproxy-k8s-controller/Dockerfile.ci \
+#     .
+#
+# The build context is the repository root so the COPY can reach
+# `target/${CARGO_PROFILE}/sbproxy-k8s-controller` without a flat
+# directory copy. The controller is a one-shot binary that talks to the
+# in-cluster API server and writes one file, so the image needs nothing
+# else.
+#
+# syntax=docker/dockerfile:1.7
+ARG CARGO_PROFILE=release-fast
+FROM gcr.io/distroless/cc-debian12:nonroot
+ARG CARGO_PROFILE=release-fast
+COPY target/${CARGO_PROFILE}/sbproxy-k8s-controller /usr/local/bin/sbproxy-k8s-controller
+ENTRYPOINT ["/usr/local/bin/sbproxy-k8s-controller"]
