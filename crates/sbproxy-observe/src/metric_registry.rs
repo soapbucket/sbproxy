@@ -1699,6 +1699,59 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_gateway_reconcile_duration_seconds",
+        kind: MetricKind::Histogram,
+        writer: Writer::Recorder("record_reconcile"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["kind"],
+        description: "Gateway API reconcile latency in seconds, by the Kubernetes \
+             resource kind that triggered the pass. Answers whether a reconcile is \
+             outrunning the resync interval.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_gateway_reconcile_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_reconcile"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["kind", "result"],
+        description: "Gateway API reconcile attempts, by triggering resource kind and \
+             outcome. `kind` is one of GatewayClass, Gateway, HTTPRoute, GRPCRoute, or \
+             periodic, so cardinality is bounded by a closed set.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_gateway_status_writes_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_status_write"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["kind", "result"],
+        description: "Patches to the `/status` subresource, by resource kind and \
+             outcome. A rising error count here is usually RBAC missing the status \
+             subresource rather than anything wrong with the reconcile.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_gateway_watch_errors_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_watch_error"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["kind"],
+        description: "Watch stream errors, by Kubernetes resource kind. Distinct from a \
+             reconcile error: these come from the API server connection itself, so a \
+             rising count against a flat reconcile count means the controller has gone \
+             blind rather than broken.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_governance_fail_open_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_governance_fail_open"),
