@@ -2959,7 +2959,12 @@ policies:
 | `test_mode` | bool | false | If true, log matches but do not block. |
 | `failure_posture` | string | `closed` | What happens to a request the WAF could not fully evaluate: `closed` refuses with 403, `open` admits and claims nothing, `degraded` admits while recording that the WAF guarantee was not made. `observe` is rejected at config load. The shared vocabulary is defined in [degradation.md](degradation.md). |
 | `fail_open` | bool | false | Legacy spelling of the failure axis: `true` means `failure_posture: open`, `false` means `closed`. Still parses and is used only when `failure_posture` is absent. |
-| `custom_rules` | list | | Custom WAF rules (regex patterns or JS-defined matchers). |
+| `paranoia` | int | 1 | Rule strictness, 1 to 4, gating the built-in patterns, the managed bundle, and any feed rules at once. Only rules whose own paranoia level is at or below this value are evaluated. Level 1 runs 8 of the 16 baseline rules, level 2 runs 15, levels 3 and 4 run all 16. Wins over `owasp_crs.paranoia_level` when both are present. |
+| `custom_rules` | list | | Custom WAF rules (regex patterns or JS-defined matchers). A rule without a `paranoia` attribute defaults to 1 and therefore always runs. A feed rule with the same `id` shadows the inline rule. |
+| `feed` | object | | Signed remote rule-feed subscription. `enabled`, `transport` (`http` or `redis`), `url` or `redis_url` + `redis_stream`, `channel`, `signature_key_env` (required), `auth_token_env`, `poll_interval` (default 60s), `max_age` (default 86400s, `0` disables), `fallback_to_static` (default true), `cache_dir`, `cache_file`. Bundles are verified with HMAC-SHA256 over the raw body and cached on disk as last-good. See [waf-options.md](waf-options.md) for the bundle format and a publishing recipe. |
+| `persistent_block` | object | | Time-boxed blocking for repeat offenders. `enabled`, `strikes` (default 3), `window_secs` (default 60), `block_minutes` (default 10, clamped to 1 to 60), `track_by` (`ip`, `api_key`, or `cel`), `key` (the CEL expression when `track_by: cel`), `max_keys` (default 100000). Backed by the shared rate-limit store, so blocks apply fleet-wide when `proxy.l2_cache` is configured. |
+
+Inspection covers the request URI and the request headers. Request bodies are not scanned by this policy, normalization is a single percent-decode plus a plus-to-space swap, and there is no anomaly scoring or per-path rule exclusion. [waf-options.md](waf-options.md) sets out the boundary in full and covers the alternatives when you need more.
 
 ### ddos
 

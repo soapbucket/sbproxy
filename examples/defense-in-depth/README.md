@@ -2,7 +2,7 @@
 
 *Last modified: 2026-07-09*
 
-Layered authentication, authorisation, and inspection on a single origin. The chain answers a different question at each layer: `ip_filter` (is this source on the allow list?), WAF (does the request body or URI look benign?), `rate_limiting` (is this IP within its RPS budget?), `concurrent_limit` (is this IP within its in-flight cap?), JWT auth (is this user authenticated?), `request_validator` (does the body match the contract?), security headers and CORS injected on the response. The layers run in policy / auth / transform order. A failure in any layer short-circuits with the configured status; the upstream only sees requests that survived everything. mTLS is intentionally not enabled here (see [examples/mtls-client-auth/](../mtls-client-auth/) for the standalone demo); pair the two by setting `proxy.mtls` when the deployment requires certificate-based service identity in addition to JWT user auth.
+Layered authentication, authorisation, and inspection on a single origin. The chain answers a different question at each layer: `ip_filter` (is this source on the allow list?), WAF (do the URI and headers look benign? the WAF does not read request bodies), `rate_limiting` (is this IP within its RPS budget?), `concurrent_limit` (is this IP within its in-flight cap?), JWT auth (is this user authenticated?), `request_validator` (does the body match the contract?), security headers and CORS injected on the response. The layers run in policy / auth / transform order. A failure in any layer short-circuits with the configured status; the upstream only sees requests that survived everything. mTLS is intentionally not enabled here (see [examples/mtls-client-auth/](../mtls-client-auth/) for the standalone demo); pair the two by setting `proxy.mtls` when the deployment requires certificate-based service identity in addition to JWT user auth.
 
 ## Run
 
@@ -52,7 +52,7 @@ curl -i -X OPTIONS \
 ## What this exercises
 
 - `ip_filter` policy with whitelist CIDRs
-- `waf` policy with OWASP CRS and `fail_open: false`
+- `waf` policy with both `owasp_crs.enabled: true` (4 built-in patterns) and `owasp_crs.managed_bundle: true` (12 vendored CRS-derived rules), and `fail_open: false`
 - `rate_limiting` policy keyed by client IP
 - `concurrent_limit` policy keyed by client IP
 - `request_validator` policy enforcing a JSON Schema on the request body

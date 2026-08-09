@@ -5,7 +5,9 @@
 # answers a different question; together they look like:
 #
 #   1. ip_filter            - is this source even on the allow list?
-#   2. WAF                  - does the request body / URI look benign?
+#   2. WAF                  - do the URI and headers look benign?
+#                             (the WAF does not read request bodies;
+#                              request_validator below does)
 #   3. rate_limiting        - is this IP within its RPS budget?
 #   4. concurrent_limit     - is this IP within its in-flight cap?
 #   5. JWT auth             - is this user authenticated?
@@ -55,8 +57,12 @@ origins:
           - 10.0.0.0/8
 
       - type: waf
+        # Both flags: `enabled` is the 4 built-in patterns,
+        # `managed_bundle` is the 12-rule vendored CRS-derived bundle.
+        # Neither implies the other. See docs/waf-options.md.
         owasp_crs:
           enabled: true
+          managed_bundle: true
         action_on_match: block
         fail_open: false
 

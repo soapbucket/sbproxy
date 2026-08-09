@@ -1,10 +1,23 @@
 # yaml-language-server: $schema=../../schemas/sb-config.schema.json
-# WAF policy with built-in OWASP rules.
+# WAF policy with the full 16-rule baseline.
 #
-# Enables the OWASP Core Rule Set patterns and blocks any request that
-# matches a known SQL injection, XSS, or path-traversal signature. The
-# upstream is test.sbproxy.dev. Switch `action_on_match` to `log` (or set
-# `test_mode: true`) to record matches without blocking.
+# Two independent flags, and you want both. `owasp_crs.enabled: true`
+# turns on the 4 built-in patterns (SQL injection, XSS, path traversal,
+# and a stricter SQLi signature). `owasp_crs.managed_bundle: true`
+# compiles the 12-rule vendored CRS-derived bundle that ships in the
+# binary, with CRS-style rule ids and category numbering. Neither flag
+# implies the other: `enabled` on its own gives you 4 rules, not 16.
+#
+# `paranoia` gates all of them. The default of 1 runs 8 of the 16 rules;
+# 2 runs 15; 3 and 4 run all 16. Raise it after measuring false
+# positives with `test_mode: true`.
+#
+# The upstream is test.sbproxy.dev. Switch `action_on_match` to `log`
+# (or set `test_mode: true`) to record matches without blocking.
+#
+# docs/waf-options.md covers what this baseline does not catch (no
+# request bodies, one decoding pass, no anomaly scoring) and how to run
+# a full OWASP CRS WAF in front of it.
 #
 # Run:
 #   make run CONFIG=examples/waf/sb.yml
@@ -29,7 +42,8 @@ origins:
     policies:
       - type: waf
         owasp_crs:
-          enabled: true
+          enabled: true          # 4 built-in patterns
+          managed_bundle: true   # + the 12-rule vendored CRS bundle
         action_on_match: block
         test_mode: false
         failure_posture: closed

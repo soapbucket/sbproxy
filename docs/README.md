@@ -118,6 +118,7 @@ Point a framework you already run at the gateway: chat completions through the O
 - [openapi-emission.md](openapi-emission.md) - publishing an OpenAPI 3.0 document from the live config.
 - [policy.md](policy.md) - the policy engine, the `semantic_constraint` policy, and the `request_validator`, `concurrent_limit`, `rate_limit_budget`, `http_framing`, and `a2a` policy reference.
 - [object-authz.md](object-authz.md) - `object_authz` policy: BOLA + BFLA enforcement with tenant-isolation and enumeration detection.
+- [waf-options.md](waf-options.md) - what the 16-rule WAF baseline catches and what it does not, why there is no SecLang engine in the dataplane, and followable recipes for the three alternatives: a CRS-capable WAF in front (with the `trusted_proxies` setup that keeps client IP honest), the signed rule feed, and layering the policies already in the binary.
 - [headless-detection.md](headless-detection.md) - header-only headless / stealth-browser indicator heuristics surfaced under `request.agent.headless_*`.
 - [content-digest.md](content-digest.md) - `content_digest` policy: RFC 9530 request-body verification for integrity-critical inboxes.
 - [agent-budget.md](agent-budget.md) - `agent_budget` policy: semantic rate-limit primitive keyed on resolved agent identity.

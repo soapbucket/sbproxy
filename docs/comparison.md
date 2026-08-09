@@ -203,7 +203,7 @@ Caddy is a Go reverse proxy known for automatic HTTPS.
 | PROXY protocol | Yes (v1) | Yes (v1/v2) |
 | Service discovery | DNS SRV, Consul | SRV, A/AAAA |
 | Load balancing | 8 algorithms | 12+ algorithms |
-| WAF | Built-in (OWASP, SQLi, XSS) | Community module |
+| WAF | Built-in baseline (16 CRS-derived rules, no SecLang engine) | Community module |
 | DDoS protection | Built-in | No |
 | gRPC proxy | Yes | Yes |
 | MCP federation | Yes | No |

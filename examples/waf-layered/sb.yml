@@ -1,0 +1,121 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Layered request screening: ip_filter + ddos + waf + dlp.
+#
+# The WAF's 16-rule baseline is the narrowest layer in this file and the
+# easiest one to judge in isolation. This config shows the stack it is
+# meant to run inside. Policies are evaluated in declaration order and
+# the first denial short-circuits, so the order below is the funnel:
+#
+#   1. ip_filter  - is this source allowed to speak at all?  (403)
+#   2. ddos       - is it inside the per-IP request ceiling?  (429)
+#   3. waf        - does the URI or a header carry an attack signature? (403)
+#   4. dlp        - is a credential leaking outbound in the URI/headers?
+#
+# Layers 1 and 2 key off the resolved client IP, which is why
+# `proxy.trusted_proxies` is set below. Without it, the immediate TCP
+# peer is always the client: behind a load balancer or a CDN WAF every
+# request would carry the same address, the per-IP ceiling would become
+# one global ceiling, and the ip_filter lists would stop distinguishing
+# anyone. See docs/waf-options.md for the full argument.
+#
+# NOTE: 127.0.0.1/32 in trusted_proxies is a demo affordance so the curl
+# commands below can present a client address. In production this list
+# is the egress range of the proxy in front of you and nothing wider;
+# anything inside it can name its own source address.
+#
+# Run:
+#   make run CONFIG=examples/waf-layered/sb.yml
+#
+# Test:
+#   # 200 - benign request from an allowed source
+#   curl -i -H 'Host: layered.local' http://127.0.0.1:8080/get
+#
+#   # 403 - ip_filter, source outside the allowlist
+#   curl -i -H 'Host: layered.local' \
+#        -H 'X-Forwarded-For: 203.0.113.9' http://127.0.0.1:8080/get
+#
+#   # 403 - waf, SQL injection signature in the query string
+#   curl -i -H 'Host: layered.local' \
+#        "http://127.0.0.1:8080/get?id=1%27%20OR%20%271%27=%271"
+#
+#   # 403 - waf managed bundle, scanner fingerprint in the User-Agent
+#   curl -i -H 'Host: layered.local' -A 'sqlmap/1.7' \
+#        http://127.0.0.1:8080/get
+#
+#   # 403 - dlp, an AWS access key smuggled through the query string
+#   curl -i -H 'Host: layered.local' \
+#        'http://127.0.0.1:8080/get?key=AKIAIOSFODNN7EXAMPLE'
+
+proxy:
+  http_bind_port: 8080
+
+  # Whose X-Forwarded-For we believe. Everything else has its forwarding
+  # headers stripped on ingress so it cannot pick its own source address.
+  trusted_proxies:
+    - 127.0.0.1/32
+
+origins:
+  "layered.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+
+    policies:
+      # 1. Cheapest layer first: a CIDR comparison, no scanning.
+      - type: ip_filter
+        whitelist:
+          - 127.0.0.0/8
+          - 10.0.0.0/8
+        blacklist:
+          - 10.0.0.99/32
+
+      # 2. Per-IP request ceiling in front of the scanning layers. Set
+      #    high enough that the curl commands above do not trip it.
+      - type: ddos
+        requests_per_second: 100
+        block_duration_secs: 60
+        whitelist:
+          - 10.0.0.0/8
+
+      # 3. The signature baseline. Both flags are needed for all 16
+      #    rules: `enabled` turns on the 4 built-in patterns, and
+      #    `managed_bundle` compiles the 12-rule vendored CRS bundle.
+      #    Neither implies the other.
+      #
+      #    paranoia: 2 runs 15 of the 16 rules. The default of 1 runs 8.
+      #    Measure false positives with `test_mode: true` before raising
+      #    it; headers are scanned wholesale, Authorization and Cookie
+      #    included.
+      - type: waf
+        owasp_crs:
+          enabled: true
+          managed_bundle: true
+        paranoia: 2
+        action_on_match: block
+        test_mode: false
+        failure_posture: closed
+
+        # A client that keeps tripping rules stops getting evaluated.
+        # Three denials inside 60s escalate to a time-boxed block, keyed
+        # by the same resolved client IP the layers above use.
+        #
+        # block_minutes is 1 (the minimum) so a local demo recovers
+        # quickly after tripping it. Production wants the 10-minute
+        # default or longer; the supported range is 1 to 60.
+        persistent_block:
+          enabled: true
+          strikes: 3
+          window_secs: 60
+          block_minutes: 1
+          track_by: ip
+
+      # 4. The other direction: outbound credentials, not inbound
+      #    attacks. Scans the same URI + headers surface the WAF does.
+      - type: dlp
+        action: block
+        detectors:
+          - aws_access
+          - github_token
+          - slack_token
+          - openai_key
+          - anthropic_key
