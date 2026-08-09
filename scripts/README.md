@@ -22,6 +22,7 @@ script's header says otherwise.
 | `sync-doc-configs.py` | Sync strict documentation configs from compiler-validated examples, or report drift with `--check`. | local + `.github/workflows/docs-ci.yml` |
 | `check-model-host-capabilities.sh` | Fail when the generated model-host capability matrix drifts from the executable registry. | `.github/workflows/ci.yml` |
 | `examples-smoke.sh` | Local examples smoke runner. | local only: `make examples-smoke` |
+| `bundle-digest.sh` | Print an extension bundle's `digest_scope: bundle_v1` SHA-256, covering `bundle.yaml` and every file it ships. | local only: bundle authoring |
 
 Per-script usage and env knobs live in each script's leading comment
 header. Run `<script> --help` to dump the header.

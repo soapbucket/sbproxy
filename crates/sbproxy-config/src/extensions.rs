@@ -367,6 +367,43 @@ const fn default_max_fuel() -> u64 {
     100_000_000
 }
 
+/// What a manifest's `sha256` field is a digest of.
+///
+/// The scope is written in the manifest rather than inferred, because the two
+/// scopes make materially different promises and a loader that guessed would
+/// have to guess in favor of the weaker one. A manifest that says nothing
+/// keeps the original scope, so every bundle written before this field existed
+/// still loads and still says, in its own text, exactly how much of itself the
+/// digest covers.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Deserialize,
+    Serialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum BundleDigestScope {
+    /// `sha256` covers the exact bytes of the single file named by `entry`.
+    ///
+    /// Nothing else in the bundle is covered, including `bundle.yaml` itself.
+    /// This is the original scope and stays the default so existing bundles
+    /// keep loading.
+    #[default]
+    Entry,
+    /// `sha256` covers `bundle.yaml` and every other regular file in the
+    /// bundle directory, under version 1 of the canonical bundle index.
+    ///
+    /// A manifest that declares this scope must also declare `sha256`.
+    BundleV1,
+}
+
 /// Strict, versioned contents of one `bundle.yaml` file.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -388,10 +425,16 @@ pub struct BundleManifest {
     pub abi: Option<String>,
     /// Executable artifact path relative to the bundle directory.
     pub entry: String,
-    /// Optional SHA-256 digest of the executable artifact. Remote loaders
-    /// require this field before materializing a runnable bundle.
+    /// Optional SHA-256 digest. [`Self::digest_scope`] says what it covers.
+    /// Remote loaders require this field before materializing a runnable
+    /// bundle.
     #[serde(default)]
     pub sha256: Option<String>,
+    /// Scope covered by [`Self::sha256`]. Omitting it means
+    /// [`BundleDigestScope::Entry`], which is what every manifest written
+    /// before this field existed meant.
+    #[serde(default)]
+    pub digest_scope: BundleDigestScope,
     /// Hooks exported by this bundle.
     pub hooks: Vec<BundleHook>,
     /// Posture used when a hook errors, times out, or exceeds a limit.
@@ -440,8 +483,9 @@ impl BundleManifest {
     ///
     /// Returns an error for a wrong version or kind, invalid identifiers,
     /// duplicate or reserved hooks, incompatible runtime fields, unsafe JSON
-    /// Schemas, inactive permissions, unsafe failure posture, or a resource
-    /// limit outside its documented ceiling.
+    /// Schemas, inactive permissions, unsafe failure posture, a declared
+    /// digest scope with no digest, or a resource limit outside its documented
+    /// ceiling.
     pub fn validate(
         &self,
         reserved_names: &BTreeSet<(BundleHookKind, String)>,
@@ -481,6 +525,9 @@ impl BundleManifest {
             {
                 return invalid("sha256 must contain exactly 64 lowercase hexadecimal characters");
             }
+        }
+        if self.digest_scope == BundleDigestScope::BundleV1 && self.sha256.is_none() {
+            return invalid("digest_scope bundle_v1 requires sha256");
         }
         validate_limit("sandbox.budget_ms", self.sandbox.budget_ms, 1_000)?;
         validate_limit("sandbox.memory_mb", self.sandbox.memory_mb, 64)?;

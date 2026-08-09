@@ -3,8 +3,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use sbproxy_config::{
-    BundleHookKind, BundleSourceConfig, Cloner, ConfigSourceError, ExtensionBundlesConfig,
-    FetchContext, FetchRequest, ResolvedRevision,
+    BundleDigestScope, BundleHookKind, BundleSourceConfig, Cloner, ConfigSourceError,
+    ExtensionBundlesConfig, FetchContext, FetchRequest, ResolvedRevision,
 };
 use sbproxy_plugin::{
     ExtensionBodyMode, ExtensionDispatch, ExtensionHookKind, ExtensionRegistrationSource,
@@ -78,6 +78,93 @@ fn local_config(path: &Path) -> ExtensionBundlesConfig {
         bundles_dir: Some(path.display().to_string()),
         sources: Vec::new(),
     }
+}
+
+/// A `digest_scope: bundle_v1` manifest whose digest is still a placeholder.
+///
+/// The placeholder is safe to hash around: the canonical form deletes the
+/// whole `sha256:` line, so the manifest bytes that feed the digest are the
+/// same before and after the real value is written back.
+fn bundle_v1_manifest(name: &str, kind: &str, type_name: &str) -> String {
+    format!(
+        "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: {name}\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nsha256: __DIGEST__\ndigest_scope: bundle_v1\npermissions: []\nhooks:\n  - kind: {kind}\n    type: {type_name}\n    export: run\n"
+    )
+}
+
+/// Write a `bundle_v1` bundle and pin the digest the format produces for it.
+fn write_bundle_v1(
+    root: &Path,
+    directory: &str,
+    manifest: &str,
+    files: &[(&str, &[u8])],
+) -> String {
+    let bundle = root.join(directory);
+    std::fs::create_dir_all(&bundle).unwrap();
+    std::fs::write(bundle.join("bundle.yaml"), manifest).unwrap();
+    for (name, bytes) in files {
+        let path = bundle.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+    let digest = bundle_v1_digest_by_hand(&bundle);
+    std::fs::write(
+        bundle.join("bundle.yaml"),
+        manifest.replace("__DIGEST__", &digest),
+    )
+    .unwrap();
+    digest
+}
+
+/// Recompute the canonical index from the published rules, independently of
+/// the loader, so the two implementations have to agree.
+fn bundle_v1_digest_by_hand(bundle: &Path) -> String {
+    let mut lines = Vec::new();
+    index_lines_by_hand(bundle, "", &mut lines);
+    lines.sort();
+    let mut index = String::from("sbproxy-bundle-digest/v1\n");
+    for (path, content_digest) in &lines {
+        index.push_str(content_digest);
+        index.push_str("  ");
+        index.push_str(path);
+        index.push('\n');
+    }
+    hex::encode(Sha256::digest(index.as_bytes()))
+}
+
+fn index_lines_by_hand(dir: &Path, prefix: &str, lines: &mut Vec<(String, String)>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if entry.file_type().unwrap().is_dir() {
+            index_lines_by_hand(&entry.path(), &path, lines);
+            continue;
+        }
+        let bytes = std::fs::read(entry.path()).unwrap();
+        let bytes = if path == "bundle.yaml" {
+            std::str::from_utf8(&bytes)
+                .unwrap()
+                .split_inclusive('\n')
+                .filter(|line| !line.starts_with("sha256:"))
+                .collect::<String>()
+                .into_bytes()
+        } else {
+            bytes
+        };
+        lines.push((path, hex::encode(Sha256::digest(&bytes))));
+    }
+}
+
+fn load_error(root: &Path) -> BundleLoadError {
+    DynamicBundleRegistry::load(&local_config(root), root, &BTreeSet::new()).unwrap_err()
+}
+
+fn load_ok(root: &Path) {
+    DynamicBundleRegistry::load(&local_config(root), root, &BTreeSet::new()).unwrap();
 }
 
 #[test]
@@ -889,4 +976,235 @@ fn load_error_debug_and_display_are_bounded_and_hide_paths() {
         .contains(missing.to_string_lossy().as_ref()));
     assert!(!format!("{error:?}").contains(missing.to_string_lossy().as_ref()));
     let _: &BundleLoadError = &error;
+}
+
+#[test]
+fn entry_scope_bundles_written_before_digest_scope_existed_still_load() {
+    let temp = TempDir::new().unwrap();
+    let artifact = b"export function run() {}";
+    let digest = hex::encode(Sha256::digest(artifact));
+    write_bundle(
+        temp.path(),
+        "legacy",
+        &manifest("legacy", "policy", "legacy_policy", Some(&digest)),
+        artifact,
+    );
+    std::fs::write(temp.path().join("legacy/notes.txt"), b"shipped").unwrap();
+
+    let registry =
+        DynamicBundleRegistry::load(&local_config(temp.path()), temp.path(), &BTreeSet::new())
+            .unwrap();
+    let loaded = registry.policy("legacy_policy").unwrap();
+    assert_eq!(loaded.manifest().digest_scope, BundleDigestScope::Entry);
+    assert_eq!(loaded.sha256(), digest);
+
+    // The narrow scope is exactly why it is named in the manifest. Editing a
+    // file this digest never covered still loads, and the bundle says so.
+    std::fs::write(temp.path().join("legacy/notes.txt"), b"tampered").unwrap();
+    load_ok(temp.path());
+}
+
+#[test]
+fn bundle_v1_digest_covers_the_manifest_permissions_line() {
+    let temp = TempDir::new().unwrap();
+    let template = bundle_v1_manifest("perms", "policy", "perms_policy");
+    write_bundle_v1(
+        temp.path(),
+        "perms",
+        &template,
+        &[("entry.js", VALID_JAVASCRIPT)],
+    );
+    load_ok(temp.path());
+
+    let manifest_path = temp.path().join("perms/bundle.yaml");
+    let original = std::fs::read_to_string(&manifest_path).unwrap();
+
+    // `permissions: [ ]` parses to the same empty list as `permissions: []`,
+    // so no validation rule can tell the two files apart and only the digest
+    // is left to notice the manifest moved.
+    std::fs::write(
+        &manifest_path,
+        original.replace("permissions: []", "permissions: [ ]"),
+    )
+    .unwrap();
+    let spaced = load_error(temp.path());
+    assert!(
+        spaced.to_string().contains("digest does not match"),
+        "{spaced}"
+    );
+
+    // And the edit that the empty list is there to prevent. Two gates refuse
+    // it today, the inactive-permissions rule and this digest; when
+    // permissions become active the digest is the one that remains.
+    std::fs::write(
+        &manifest_path,
+        original.replace("permissions: []", "permissions: [\"fs:read\"]"),
+    )
+    .unwrap();
+    assert!(
+        DynamicBundleRegistry::load(&local_config(temp.path()), temp.path(), &BTreeSet::new())
+            .is_err(),
+        "a capability grant edited into a digested manifest must not load"
+    );
+}
+
+#[test]
+fn bundle_v1_digest_detects_a_tampered_non_entry_file() {
+    let temp = TempDir::new().unwrap();
+    let template = bundle_v1_manifest("data", "policy", "data_policy");
+    write_bundle_v1(
+        temp.path(),
+        "data",
+        &template,
+        &[
+            ("entry.js", VALID_JAVASCRIPT),
+            ("assets/rules.json", "{\"deny\":[]}".as_bytes()),
+        ],
+    );
+    load_ok(temp.path());
+
+    std::fs::write(
+        temp.path().join("data/assets/rules.json"),
+        b"{\"deny\":[\"*\"]}",
+    )
+    .unwrap();
+
+    let error = load_error(temp.path());
+    assert!(
+        error.to_string().contains("digest does not match"),
+        "{error}"
+    );
+}
+
+#[test]
+fn bundle_v1_digest_detects_swapped_and_renamed_files() {
+    let temp = TempDir::new().unwrap();
+    let template = bundle_v1_manifest("swap", "policy", "swap_policy");
+    write_bundle_v1(
+        temp.path(),
+        "swap",
+        &template,
+        &[
+            ("entry.js", VALID_JAVASCRIPT),
+            ("a.txt", "first".as_bytes()),
+            ("b.txt", "second".as_bytes()),
+        ],
+    );
+    load_ok(temp.path());
+
+    // The same set of file contents under swapped names. A digest over bytes
+    // alone would see an unchanged multiset and pass.
+    std::fs::write(temp.path().join("swap/a.txt"), b"second").unwrap();
+    std::fs::write(temp.path().join("swap/b.txt"), b"first").unwrap();
+    let swapped = load_error(temp.path());
+    assert!(
+        swapped.to_string().contains("digest does not match"),
+        "{swapped}"
+    );
+
+    // A plain rename moves the same bytes to a path the digest does not name.
+    std::fs::write(temp.path().join("swap/a.txt"), b"first").unwrap();
+    std::fs::remove_file(temp.path().join("swap/b.txt")).unwrap();
+    std::fs::write(temp.path().join("swap/c.txt"), b"second").unwrap();
+    let renamed = load_error(temp.path());
+    assert!(
+        renamed.to_string().contains("digest does not match"),
+        "{renamed}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn bundle_v1_refuses_symlinks_instead_of_following_them() {
+    let temp = TempDir::new().unwrap();
+    std::fs::write(temp.path().join("outside.txt"), b"outside").unwrap();
+    let template = bundle_v1_manifest("linked", "policy", "linked_policy");
+    write_bundle_v1(
+        temp.path(),
+        "linked",
+        &template,
+        &[("entry.js", VALID_JAVASCRIPT)],
+    );
+    load_ok(temp.path());
+
+    // A link out of the bundle directory reads bytes the operator never
+    // shipped, so it is refused rather than followed and hashed.
+    let escape = temp.path().join("linked/escape.txt");
+    std::os::unix::fs::symlink("../outside.txt", &escape).unwrap();
+    let escaping = load_error(temp.path());
+    assert!(escaping.to_string().contains("symlink"), "{escaping}");
+
+    // An internal link is refused on the same rule: its bytes are named by a
+    // target, and a target is not content the digest can cover.
+    std::fs::remove_file(&escape).unwrap();
+    std::os::unix::fs::symlink("entry.js", temp.path().join("linked/alias.js")).unwrap();
+    let internal = load_error(temp.path());
+    assert!(internal.to_string().contains("symlink"), "{internal}");
+}
+
+#[test]
+fn bundle_v1_refuses_a_manifest_whose_digest_line_cannot_be_excluded() {
+    let temp = TempDir::new().unwrap();
+    let template = bundle_v1_manifest("quoted", "policy", "quoted_policy");
+    write_bundle_v1(
+        temp.path(),
+        "quoted",
+        &template,
+        &[("entry.js", VALID_JAVASCRIPT)],
+    );
+    load_ok(temp.path());
+
+    let manifest_path = temp.path().join("quoted/bundle.yaml");
+    let original = std::fs::read_to_string(&manifest_path).unwrap();
+
+    // A quoted key parses to the same field but hides the line from the
+    // textual exclusion rule. Hashing it anyway would fold the digest into
+    // its own input, so the bundle is refused instead.
+    std::fs::write(
+        &manifest_path,
+        original.replacen("sha256: ", "\"sha256\": ", 1),
+    )
+    .unwrap();
+    let quoted = load_error(temp.path());
+    assert!(
+        quoted.to_string().contains("cannot be canonicalized"),
+        "{quoted}"
+    );
+
+    // A manifest with no terminating newline cannot round-trip through the
+    // published line-oriented recipe either.
+    std::fs::write(&manifest_path, original.trim_end()).unwrap();
+    let unterminated = load_error(temp.path());
+    assert!(
+        unterminated.to_string().contains("cannot be canonicalized"),
+        "{unterminated}"
+    );
+}
+
+#[test]
+fn bundle_v1_digest_is_stable_across_two_computations() {
+    let temp = TempDir::new().unwrap();
+    let template = bundle_v1_manifest("stable", "policy", "stable_policy");
+    let pinned = write_bundle_v1(
+        temp.path(),
+        "stable",
+        &template,
+        &[
+            ("entry.js", VALID_JAVASCRIPT),
+            ("nested/deep/file.txt", "deep".as_bytes()),
+        ],
+    );
+    let bundle = temp.path().join("stable");
+
+    assert_eq!(pinned.len(), 64);
+    assert_eq!(
+        bundle_v1_digest_by_hand(&bundle),
+        bundle_v1_digest_by_hand(&bundle)
+    );
+    assert_eq!(bundle_v1_digest_by_hand(&bundle), pinned);
+
+    // The loader's implementation has to land on the same value twice, which
+    // is the whole basis for pinning it in bundle.yaml.
+    load_ok(temp.path());
+    load_ok(temp.path());
 }

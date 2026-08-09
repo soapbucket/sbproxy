@@ -5,6 +5,7 @@
 //! process-wide static plugin registries.
 
 mod ai;
+mod digest;
 mod envelope;
 mod envelope_wasm;
 mod events;
