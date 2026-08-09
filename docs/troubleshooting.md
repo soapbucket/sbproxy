@@ -1,6 +1,6 @@
 # Troubleshooting
 
-*Last modified: 2026-07-29*
+*Last modified: 2026-08-08*
 
 When something breaks, this is the first place to look. Each section is one failure: the symptom, the likely cause, and the fix. For *why* these things happen, see [architecture.md](architecture.md); for what the proxy does on its own while a dependency is down, see [degradation.md](degradation.md); for the dashboard-to-action triage flow, see [operator-runbook.md](operator-runbook.md).
 
@@ -121,7 +121,7 @@ SBproxy adds well under 1 ms of overhead under normal load. If you see more, the
 1. Check `upstream_ttfb_ms` in the structured log. If it's high, the upstream is slow, not SBproxy.
 2. If `upstream_ttfb_ms` is low but total latency is high, suspect DNS. Resolved addresses are cached and refreshed in the background by a refreshing resolver, so a request that lands right after a hostname goes stale pays the resolver round trip.
 3. Turn on OpenTelemetry tracing (`telemetry` block) to get a per-span breakdown across the phase pipeline.
-4. If you have Lua configured, cap runaway scripts with `proxy.scripting.lua.sandbox.max_execution_ms`. JavaScript uses its built-in 100 ms budget; the parsed `proxy.scripting.javascript` tuning block is not installed yet.
+4. Cap runaway scripts at the engine that runs them: `proxy.scripting.lua.sandbox.max_execution_ms` for Lua, `proxy.scripting.javascript.sandbox.budget_ms` for JavaScript. Both default to 100 ms and both take effect on reload.
 5. The `sbproxy_phase_duration_seconds{phase}` histogram (and the matching `auth_ms` / `upstream_ttfb_ms` / `response_filter_ms` access-log fields) splits end-to-end latency into auth, upstream wait, and response transforms, so you can see which phase grew without tracing.
 
 ## No access-log lines appear

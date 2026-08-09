@@ -20,9 +20,13 @@
 //!   engine's epoch once per millisecond; a module that runs past
 //!   its deadline is aborted with `Trap`.
 //! - **Filesystem.** No preopens. The module sees an empty FS.
-//! - **Network.** Not exposed. `allowed_hosts` is reserved for a
-//!   future WASI-sockets integration; today the field is parsed but
-//!   the module cannot open sockets.
+//! - **Network.** Not exposed, and there is no key that pretends
+//!   otherwise. A module gets no sockets: no WASI networking, no host
+//!   callout function. The `allowed_hosts` field this config used to
+//!   carry was parsed and never enforced, so the `wasm` transform now
+//!   refuses it at config compile rather than accept an allowlist over
+//!   a boundary that does not exist (WOR-2319). It comes back as an
+//!   enforced key the day a host callout lands.
 //!
 //! ## Authoring guide
 //!
@@ -120,11 +124,6 @@ pub struct WasmConfig {
     /// Optional lowercase SHA-256 assertion for the selected module bytes.
     #[serde(default)]
     pub sha256: Option<String>,
-    /// Hostnames the module would be permitted to contact via WASI
-    /// networking. Reserved for future use; currently unused because
-    /// WASI sockets are not wired in.
-    #[serde(default)]
-    pub allowed_hosts: Vec<String>,
     /// Upper bound on linear memory, in 64 KiB pages. Defaults to 256
     /// (16 MiB) when unset; the module aborts with a memory-exhausted
     /// trap on any allocation past this bound.
@@ -425,7 +424,6 @@ impl WasmRuntime {
                 module_path: None,
                 module_bytes: None,
                 sha256: None,
-                allowed_hosts: Vec::new(),
                 max_memory_pages: None,
                 timeout_ms: None,
                 max_fuel: None,
@@ -971,7 +969,6 @@ mod tests {
             module_path: None,
             module_bytes: Some(bytes.to_vec()),
             sha256: None,
-            allowed_hosts: vec![],
             max_memory_pages: None,
             timeout_ms: None,
             max_fuel: None,
@@ -1008,7 +1005,6 @@ mod tests {
     fn config_deserializes() {
         let json = r#"{
             "module_path": "/opt/wasm/transform.wasm",
-            "allowed_hosts": ["api.example.com"],
             "max_memory_pages": 256,
             "timeout_ms": 5000
         }"#;
@@ -1017,9 +1013,32 @@ mod tests {
             config.module_path.as_deref(),
             Some("/opt/wasm/transform.wasm")
         );
-        assert_eq!(config.allowed_hosts, vec!["api.example.com"]);
         assert_eq!(config.max_memory_pages, Some(256));
         assert_eq!(config.timeout_ms, Some(5000));
+    }
+
+    /// WOR-2319: the field is gone from the shape. The transform layer
+    /// is what refuses an authored key (see
+    /// `sbproxy_modules::transform::WasmTransform::from_config`); this
+    /// only pins that nothing here silently rehydrates it.
+    #[test]
+    fn config_no_longer_carries_a_host_allowlist() {
+        let json = r#"{
+            "module_path": "/opt/wasm/transform.wasm",
+            "allowed_hosts": ["api.example.com"]
+        }"#;
+        let config: WasmConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            config.module_path.as_deref(),
+            Some("/opt/wasm/transform.wasm")
+        );
+        // Nothing on the runtime config describes a network boundary,
+        // because the runtime does not have one.
+        let rendered = format!("{config:?}");
+        assert!(
+            !rendered.contains("allowed_hosts"),
+            "the runtime config must not carry a host allowlist: {rendered}"
+        );
     }
 
     #[test]
@@ -1028,7 +1047,6 @@ mod tests {
             module_path: None,
             module_bytes: None,
             sha256: None,
-            allowed_hosts: vec![],
             max_memory_pages: None,
             timeout_ms: None,
             max_fuel: None,
@@ -1156,7 +1174,6 @@ mod tests {
             module_path: Some(path.display().to_string()),
             module_bytes: None,
             sha256: Some(digest),
-            allowed_hosts: vec![],
             max_memory_pages: None,
             timeout_ms: None,
             max_fuel: None,
@@ -1179,7 +1196,6 @@ mod tests {
             module_path: Some(path.display().to_string()),
             module_bytes: None,
             sha256: Some(expected.clone()),
-            allowed_hosts: vec![],
             max_memory_pages: None,
             timeout_ms: None,
             max_fuel: None,

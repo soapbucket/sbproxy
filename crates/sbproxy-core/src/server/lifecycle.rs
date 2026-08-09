@@ -902,6 +902,10 @@ fn reload_compiled_config_locked(
             sbproxy_extension::lua::SandboxConfig::from(&compiled.server.scripting.lua.sandbox),
         );
 
+        // WOR-2319: the JavaScript half of the same block, refreshed on
+        // the same schedule.
+        install_js_sandbox_limits(&compiled.server);
+
         // Refresh the operator-extensible log redactor on reload so
         // SIGHUP picks up changes to `proxy.observability.log.redact:`
         // (proxy scope) as well as the tenant-scope and origin-scope
@@ -1519,6 +1523,13 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     sbproxy_extension::lua::install_sandbox_config(sbproxy_extension::lua::SandboxConfig::from(
         &server_config.scripting.lua.sandbox,
     ));
+
+    // WOR-2319: same for `proxy.scripting.javascript.sandbox:`. Every
+    // `JsEngine::new()` after this point (response modifiers, JSON and
+    // body transforms, WAF custom rules, MCP adapters, custom log
+    // fields) picks up these values; before this runs, the documented
+    // defaults are in effect.
+    install_js_sandbox_limits(&server_config);
 
     // Initialise the AI provider catalog from the embedded YAML, with
     // an optional override path from `proxy.ai_providers_file`: use
@@ -2722,6 +2733,23 @@ fn install_tenant_cardinality_state(server: &sbproxy_config::ProxyServerConfig) 
             limiter.set_tenant_cap(tenant.id.clone(), max_series);
         }
     }
+}
+
+/// Install `proxy.scripting.javascript.sandbox:` into the extension
+/// crate's process-wide JavaScript handle (WOR-2319).
+///
+/// The Lua half of `proxy.scripting:` has been installed the same way
+/// since WOR-594; the JavaScript half parsed and did nothing, so every
+/// QuickJS engine ran the built-in 100 ms / 16 MB / 1 MB defaults no
+/// matter what the operator wrote. This is the missing call.
+///
+/// Called once at boot (from `run`) and on every config reload (from
+/// `reload_from_config_path`), so SIGHUP, admin reload, and the file
+/// watcher all pick up new limits without restarting the process.
+/// Engines are built lazily per invocation, so the next script picks up
+/// the new values; engines already constructed keep their snapshot.
+fn install_js_sandbox_limits(server: &sbproxy_config::ProxyServerConfig) {
+    sbproxy_extension::js::install_sandbox_config(server.scripting.javascript.sandbox.clone());
 }
 
 /// Read `proxy.observability.log.redact:` (proxy scope) and walk
@@ -4503,6 +4531,44 @@ origins:
         sbproxy_observe::logging::install_op_redact_config(
             sbproxy_observe::logging::OpRedactState::empty(),
         );
+    }
+
+    /// WOR-2319: `proxy.scripting.javascript.sandbox:` has to reach the
+    /// live QuickJS engines. Before the boot path called
+    /// `install_js_sandbox_limits`, this block parsed and nothing read
+    /// it, so `active_sandbox_config()` never moved off 100 / 16 / 1024
+    /// however the operator authored it.
+    #[test]
+    fn install_js_sandbox_limits_reaches_the_process_wide_handle() {
+        use sbproxy_config::types::{JsSandboxConfig, ProxyServerConfig};
+
+        let saved = (*sbproxy_extension::js::active_sandbox_config()).clone();
+
+        // Assign through the field path rather than spelling the two
+        // wrapper structs between the server config and the sandbox
+        // leaf: production reaches them the same way, and naming them
+        // only here would make them look test-only to the pub-item
+        // scan.
+        let mut server = ProxyServerConfig {
+            http_bind_port: 8080,
+            ..Default::default()
+        };
+        server.scripting.javascript.sandbox = JsSandboxConfig {
+            budget_ms: 321,
+            memory_mb: 48,
+            stack_kb: 4096,
+        };
+
+        install_js_sandbox_limits(&server);
+
+        let active = sbproxy_extension::js::active_sandbox_config();
+        assert_eq!(active.budget_ms, 321);
+        assert_eq!(active.memory_mb, 48);
+        assert_eq!(active.stack_kb, 4096);
+
+        // Restore the prior config so sibling tests that build a
+        // `JsEngine` are unaffected.
+        sbproxy_extension::js::install_sandbox_config(saved);
     }
 
     // --- resolve_or_default_admin_operator_pepper ---

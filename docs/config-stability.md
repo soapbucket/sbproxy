@@ -103,6 +103,19 @@ module field does this today: `origins.*.action.sticky`, the one field that
 did, was removed in favor of the `ring_hash` load-balancer algorithm and is
 now refused at config compile with an error naming the replacement.
 
+#### Module keys refused at config compile
+
+A module key that names behavior the runtime does not have is refused rather
+than warned about, because a key nobody can make work is not a compatibility
+surface. The error names the key, says what it did not do, and points at the
+surface that does the job. Boot and reload both refuse the document.
+
+| Key | Why it is refused | What to use instead |
+|---|---|---|
+| `origins.*.action.sticky` (`load_balancer`) | No affinity cookie was ever issued. | `algorithm: ring_hash` keyed on `cookie`, `header`, `ip`, or `uri`. |
+| `transforms[].allowed_hosts` (`type: wasm`) | Never enforced, and unenforceable: WASM modules have no network surface at all here, so the allowlist described a boundary nothing checked. | Keep the reaching on the proxy side. Gate the origin with an `expression` policy, or route the callout through an origin the proxy controls. The key returns as an enforced one if a host callout ever lands. |
+| `transforms[].on_request` (`type: cel`) | Compiled at config load and never evaluated. Transforms run on the response body, so there is no request phase for it to run in. | An `expression` policy to gate the request, a rate-limit or WAF `key:` expression to key on it, or a forward rule to route on it. |
+
 ### Current config-only compatibility fields
 
 | Field or subtree | What happens today |
@@ -124,7 +137,6 @@ now refused at config compile with an error naming the replacement.
 | `proxy.key_management.governance.key_introspection` | The caller-only introspection route is not installed. |
 | `proxy.key_management.store.redis_source_of_truth` | Redis is authoritative whenever `store.backend: redis`; this legacy boolean changes nothing. |
 | `proxy.observability.log.level`, `.format`, `.sampling` | Process logging uses CLI/environment selection and fixed sampling defaults. Sink-local `format` remains live. |
-| `proxy.scripting.javascript.sandbox.budget_ms`, `.memory_mb`, `.stack_kb` | QuickJS engines use built-in sandbox defaults; these YAML leaves are not installed. |
 | `proxy.secrets.backend`, `.hashicorp`, `.map`, `.rotation`, `.fallback` | Legacy single-backend surface. Use named `proxy.secrets.backends` and provider URI references. |
 
 ---

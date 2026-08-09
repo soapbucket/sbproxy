@@ -51,15 +51,31 @@
 //! deny-list lives at [`HEADER_DENY_LIST`] and is checked case-
 //! insensitively.
 //!
+//! ## There is no request side (WOR-2319)
+//!
+//! This transform is response-only, and so is every other transform in
+//! this crate: the dispatch signature is
+//! `Transform::apply(&self, body, content_type)` and the pipeline calls
+//! it off the response body buffer. There is no request-phase transform
+//! stage for an expression to run in.
+//!
+//! An `on_request:` key used to be accepted here. It was compiled at
+//! config load and then never evaluated, which read as "request-phase
+//! CEL exists and mine is not firing" rather than "this surface does not
+//! exist". [`CelScriptTransform::from_config`] refuses it now and points
+//! at the request-phase CEL surfaces that are real: `expression`
+//! policies, rate-limit and WAF `key:` expressions, and CEL forward-rule
+//! gating.
+//!
 //! ## Failure posture (WOR-2179)
 //!
-//! Every expression on this transform (`on_response`, each rule's
-//! `value_expr`, and the reserved `on_request`) is compiled exactly
-//! once, in [`CelScriptTransform::from_config`], at config-compile
-//! time. Malformed CEL rejects the candidate config with an error
-//! naming the transform, the field or header the expression belongs to,
-//! and the bad source; boot and reload both refuse it. Response-time
-//! evaluation only evaluates.
+//! Every expression on this transform (`on_response` and each rule's
+//! `value_expr`) is compiled exactly once, in
+//! [`CelScriptTransform::from_config`], at config-compile time.
+//! Malformed CEL rejects the candidate config with an error naming the
+//! transform, the field or header the expression belongs to, and the bad
+//! source; boot and reload both refuse it. Response-time evaluation only
+//! evaluates.
 //!
 //! Runtime evaluation errors keep the posture this transform has always
 //! had, now that they are the only failures left here: a header rule
@@ -164,12 +180,6 @@ pub enum CelHeaderMutation {
 /// precompiled programs.
 #[derive(Debug)]
 pub struct CelScriptTransform {
-    /// Optional CEL expression that runs at request time. Reserved for
-    /// a future iteration; today the body-buffer apply path uses
-    /// `on_response` exclusively. Still parsed at config load so a
-    /// malformed expression cannot sit in a config waiting for the
-    /// request-phase wiring to land.
-    pub on_request: Option<String>,
     /// CEL expression that runs at response-body time. Optional when
     /// `headers` is supplied.
     pub on_response: Option<String>,
@@ -200,11 +210,29 @@ impl CelScriptTransform {
     /// Every expression is compiled here, once. Malformed CEL is a
     /// config error naming the field or header it belongs to, so it
     /// never reaches the response path (WOR-2179).
+    ///
+    /// An authored `on_request:` is refused; see the inline note below.
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
+        // WOR-2319: `on_request:` was compiled here and then thrown
+        // away, because there is nowhere to run it. Transforms in this
+        // crate are response-side by construction: `Transform::apply`
+        // takes `(body, content_type)` and the pipeline drives it off
+        // the response body buffer. Accepting the key made an operator
+        // think request-phase transform CEL exists and theirs is
+        // misfiring, when the phase itself does not exist. The inner
+        // `Config` below has no `deny_unknown_fields`, so dropping the
+        // field alone would have made the key silently ignored instead
+        // of merely inert; refuse it and name the surfaces that do run
+        // at request time.
+        anyhow::ensure!(
+            value.get("on_request").is_none(),
+            "cel transform `on_request:` was removed: it compiled and was never evaluated. \
+             Transforms run on the response body, so there is no request phase here for it to \
+             run in. For CEL at request time use an `expression` policy to gate the request, a \
+             rate-limit or WAF `key:` expression to key on it, or a forward rule to route on it."
+        );
         #[derive(Deserialize)]
         struct Config {
-            #[serde(default)]
-            on_request: Option<String>,
             #[serde(default, alias = "expression")]
             on_response: Option<String>,
             #[serde(default)]
@@ -259,16 +287,8 @@ impl CelScriptTransform {
             Some(src) => Some(CompiledCel::compile("transform `cel`: on_response", src)?),
             None => None,
         };
-        // `on_request` is accepted but not evaluated yet. Parse it so a
-        // malformed expression is caught now rather than the day the
-        // request-phase wiring lands, then drop the program: keeping it
-        // would be a field nothing reads.
-        if let Some(src) = cfg.on_request.as_deref() {
-            CompiledCel::compile("transform `cel`: on_request", src)?;
-        }
 
         Ok(Self {
-            on_request: cfg.on_request,
             on_response: cfg.on_response,
             headers: cfg.headers,
             compiled_on_response,
@@ -934,18 +954,74 @@ mod tests {
         );
     }
 
+    // --- on_request: is removed and refused (WOR-2319) ---
+    //
+    // It compiled at config load and was never evaluated, because
+    // transforms are response-side and there is no request phase here
+    // to evaluate it in. The inner `Config` has no
+    // `deny_unknown_fields`, so a plain field deletion would have
+    // demoted "parsed and inert" to "ignored and silent".
+
     #[test]
-    fn from_config_rejects_malformed_on_request() {
-        // `on_request` is not evaluated yet, so a bad expression there
-        // is inert until the request-phase wiring lands. Catch it now
-        // rather than then.
+    fn on_request_is_refused_at_config_compile_with_the_real_alternatives() {
+        let v = serde_json::json!({
+            "type": "cel",
+            "on_request": r#""perfectly valid CEL""#,
+            "on_response": r#""ok""#,
+        });
+        let err = CelScriptTransform::from_config(v)
+            .expect_err("an authored on_request must fail config compilation, not sit inert");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("on_request"),
+            "the error must name the removed key: '{message}'"
+        );
+        assert!(
+            message.contains("never evaluated"),
+            "the error must say the key did nothing: '{message}'"
+        );
+        assert!(
+            message.contains("response body"),
+            "the error must say why transforms cannot host it: '{message}'"
+        );
+        assert!(
+            message.contains("expression") && message.contains("forward rule"),
+            "the error must point at the request-phase CEL surfaces that exist: '{message}'"
+        );
+    }
+
+    #[test]
+    fn a_malformed_on_request_is_refused_for_being_on_request_not_for_parsing() {
+        // The refusal has to precede compilation: an operator whose
+        // expression is also broken should be told the key is gone, not
+        // handed a CEL syntax error that implies fixing the syntax
+        // would make it work.
         let v = serde_json::json!({
             "type": "cel",
             "on_request": "not valid !!!",
             "on_response": r#""ok""#,
         });
-        let err = CelScriptTransform::from_config(v).expect_err("malformed CEL must not compile");
-        assert!(err.to_string().contains("on_request"), "{err}");
+        let err = CelScriptTransform::from_config(v).expect_err("still refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("was removed"),
+            "the removal must win over the parse error: '{message}'"
+        );
+        assert!(
+            !message.contains("not valid !!!"),
+            "no point quoting an expression that has nowhere to run: '{message}'"
+        );
+    }
+
+    #[test]
+    fn omitting_on_request_compiles_cleanly() {
+        let t = CelScriptTransform::from_config(serde_json::json!({
+            "type": "cel",
+            "on_response": r#""ok""#,
+        }))
+        .expect("a response-only cel transform is still the normal case");
+        assert_eq!(t.on_response.as_deref(), Some(r#""ok""#));
     }
 
     #[test]

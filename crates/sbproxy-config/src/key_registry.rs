@@ -52,6 +52,11 @@ const OUTBOUND_CREDENTIAL_CONSUMER: &str =
 
 const AI_RESILIENCE_CONSUMER: &str = "sbproxy_ai::handler::AiHandlerConfig::router";
 
+/// Boot- and reload-path installer for `proxy.scripting.javascript.sandbox:`.
+/// It hands the block to the extension crate's process-wide handle, which
+/// every `JsEngine::new()` then reads (WOR-2319).
+const JS_SANDBOX_CONSUMER: &str = "sbproxy_core::server::lifecycle::install_js_sandbox_limits";
+
 const LB_ZONE_NOTE: &str =
     "Target selection is not locality aware. The `locality_filter` that would read this label \
      has no production caller and no key turns it on, so the value only ever appears in the \
@@ -108,6 +113,27 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
     // the only available one: the key is `routing`, the key is read, and it
     // was one accepted *value* of it that did nothing, a shape no
     // reader-based check can see. Target zones are the remaining pin.
+    //
+    // Two more keys took the refusal route for the same reason (WOR-2319).
+    // Both live under `origins.*.transforms[]`, which `ConfigFile` types as
+    // `serde_json::Value` and no root walks, so the schema cannot see them
+    // and no entry here could pin them even if pinning were the answer:
+    //
+    //   * `type: wasm`, key `allowed_hosts`. Parsed and never enforced.
+    //     Modules get no sockets at all today, so there is nothing to
+    //     enforce it against, and an allowlist that describes a boundary
+    //     nothing checks is worse than no key. `WasmTransform::from_config`
+    //     refuses it and says why.
+    //   * `type: cel`, key `on_request`. Compiled at config load and never
+    //     evaluated. Transforms in this repo are response-side: the dispatch
+    //     signature is `(body, content_type)` and it runs off the response
+    //     body buffer, so there is no request phase for the expression to
+    //     run in. `CelScriptTransform::from_config` refuses it and points at
+    //     the request-phase surfaces that do exist.
+    //
+    // Deleting either field on its own would have been silent: neither
+    // config struct sets `deny_unknown_fields`, so an operator's key would
+    // have gone from inert-and-documented to inert-and-ignored.
     stable(
         "origins.*.action.resilience.circuit_breaker.failure_threshold",
         AI_RESILIENCE_CONSUMER,
@@ -644,20 +670,24 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "proxy.observability.log.sinks[].output.type",
         "sbproxy_core::server::lifecycle::compile_one_sink",
     ),
-    config_only(
+    // WOR-2319: these three were pinned config-only because the boot path
+    // never installed them and every QuickJS engine ran the built-in
+    // defaults. They reach the engine now, through the same process-wide
+    // handle the Lua half has used since WOR-594, so they are `stable` and
+    // name the installer. The read itself happens in `sbproxy-extension`,
+    // one indirection past the handle, which is what the entry stands in
+    // for.
+    stable(
         "proxy.scripting.javascript.sandbox.budget_ms",
-        "QuickJS engines currently use their built-in sandbox defaults; this YAML block is not \
-         installed into JsEngine::new. Classified under WOR-1976.",
+        JS_SANDBOX_CONSUMER,
     ),
-    config_only(
+    stable(
         "proxy.scripting.javascript.sandbox.memory_mb",
-        "QuickJS engines currently use their built-in sandbox defaults; this YAML block is not \
-         installed into JsEngine::new. Classified under WOR-1976.",
+        JS_SANDBOX_CONSUMER,
     ),
-    config_only(
+    stable(
         "proxy.scripting.javascript.sandbox.stack_kb",
-        "QuickJS engines currently use their built-in sandbox defaults; this YAML block is not \
-         installed into JsEngine::new. Classified under WOR-1976.",
+        JS_SANDBOX_CONSUMER,
     ),
     config_only(
         "proxy.secrets.backend",

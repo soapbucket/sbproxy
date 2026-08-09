@@ -1,6 +1,6 @@
 # WASM transform development guide
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-08*
 
 This guide covers writing WebAssembly modules for sbproxy's `wasm`
 transform. Two minimal example modules live in `examples/wasm/`,
@@ -158,12 +158,19 @@ Field reference:
 | `module_bytes` | required (or `module_path`) | Inline bytes. Most useful when configs are fetched from a control plane that already has the module bytes. |
 | `timeout_ms` | 1000 | Hard wall-clock cap. Enforced via wasmtime's epoch interruption, ticked once per millisecond. A module that doesn't yield within this many ticks is aborted with `Trap`. |
 | `max_memory_pages` | 256 | Linear-memory cap in 64 KiB pages. 256 pages = 16 MiB. Raise for transforms that buffer large bodies. Allocations past this cap trap. |
-| `allowed_hosts` | `[]` | Reserved. WASI sockets are not wired in today; this field is parsed for forward compatibility but currently does nothing. |
 
 Module compilation happens once at config load. A bogus path or a
 malformed `.wasm` fails the load (the proxy will not start with a
 broken transform), which surfaces problems at deploy time rather
 than at first request.
+
+There is no `allowed_hosts:` field. An older build accepted one and
+never enforced it. That is a bad shape for a key that reads as a
+security boundary, so the transform refuses it at config compile now
+and says why. Nothing is lost: a module has no way to open a socket in
+the first place, so the allowlist was never gating anything. If a host
+callout lands later, the key returns as an enforced one and fails
+closed from the start.
 
 ## Sandbox boundaries
 
@@ -177,7 +184,9 @@ What the host enforces:
   the module is interrupted at the next instruction boundary after
   the deadline.
 - **Filesystem.** No preopens. The module sees an empty FS.
-- **Network.** Not exposed.
+- **Network.** Not exposed, and no config key claims otherwise. There
+  are no WASI sockets and no host callout function, so there is nothing
+  for a host allowlist to allow.
 - **Environment.** No environment variables forwarded; `std::env`
   reads return empty.
 - **Random.** WASI's `random_get` is allowed and produces

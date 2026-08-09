@@ -104,6 +104,17 @@ the next version cut.
   `invalidate_on_mutation: false` for deployments that accept TTL-based
   expiry.
 
+- **`proxy.scripting.javascript.sandbox` now tunes the live QuickJS
+  engines.** The block parsed and nothing read it, so every JavaScript
+  surface ran the built-in 100 ms budget, 16 MiB heap cap, and 1 MiB stack
+  cap however the operator authored it. It installs into a process-wide
+  handle at boot now, the same mechanism the Lua half has used since the
+  block was introduced, and refreshes on SIGHUP, admin reload, and the
+  filesystem watcher. Every JavaScript engine is built per invocation, so a
+  reload reaches the next script with no restart. The limits apply to
+  response modifiers, `javascript` and `js_json` transforms, WAF custom
+  rules, MCP adapters, and `engine: js` custom log fields alike.
+
 ### Removed
 
 - **The origin-level `rate_limit_headers:` block.** It parsed but was never
@@ -112,6 +123,25 @@ the next version cut.
   origin-level key was accepted. A config that still carries the block now
   fails config compile with a pointer at the policy-level configuration
   instead of silently doing nothing.
+
+- **`allowed_hosts:` on the `wasm` transform.** It parsed and was never
+  enforced, and it could not have been: a module gets no sockets here at
+  all, neither WASI networking nor a host callout function, so the
+  allowlist named a boundary nothing checked. That is the worst shape a
+  security key can have, because an operator who writes one believes the
+  boundary exists. An authored key now fails config compile with an error
+  saying so and pointing at the proxy-side alternatives. If host callouts
+  ever land, the key returns as an enforced one that fails closed from its
+  first day rather than an inert one already in circulation.
+
+- **`on_request:` on the `cel` transform.** It was compiled at config load
+  and then never evaluated, because there is nowhere for it to run:
+  transforms in SBproxy are response-side, driven off the response body
+  buffer. Accepting it read as a broken request-phase feature rather than
+  an absent one. An authored key now fails config compile and names the CEL
+  surfaces that do run at request time: an `expression` policy to gate the
+  request, a rate-limit or WAF `key:` expression to key on it, or a forward
+  rule to route on it.
 
 ### Fixed
 

@@ -3765,9 +3765,9 @@ pub struct SeedCredentialConfig {
 /// Per-engine scripting sandbox limits, exposed under the
 /// `proxy.scripting:` block of sb.yml.
 ///
-/// The Lua sub-block is installed into the live engine. The JavaScript
-/// sub-block remains parseable for compatibility but `JsEngine::new` uses its
-/// built-in defaults; CEL and WebAssembly manage their own budgets separately.
+/// Both the Lua and the JavaScript sub-block are installed into their live
+/// engines at boot and refreshed on reload. CEL and WebAssembly manage their
+/// own budgets separately.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ScriptingConfig {
@@ -3776,16 +3776,18 @@ pub struct ScriptingConfig {
     /// `None`.
     #[serde(default)]
     pub lua: LuaScriptingConfig,
-    /// Reserved JavaScript sandbox shape. It is not installed into the
-    /// QuickJS-backed `JsEngine` by the OSS boot path.
+    /// JavaScript sandbox limits. Always populated, even when the
+    /// operator omitted the block, so callers never have to
+    /// special-case `None`.
     #[serde(default)]
     pub javascript: JsScriptingConfig,
 }
 
 /// JavaScript engine config block (`proxy.scripting.javascript:`).
 ///
-/// Retained so existing configs keep parsing. Programmatic callers may pass
-/// this sandbox to `JsEngine::with_sandbox`, but the YAML boot path does not.
+/// The boot and reload paths install this sandbox into the process-wide handle
+/// every `JsEngine::new` reads, so an operator override reaches the live
+/// QuickJS engines.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct JsScriptingConfig {

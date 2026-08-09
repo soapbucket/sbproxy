@@ -340,7 +340,7 @@ proxy:
 | `ai_providers_file` | string | unset | Override the embedded AI provider catalog at startup. |
 | `device_parser_file` | string | unset | Config-only. The current pure-Rust device parser does not load this override. |
 | `synthetic_probe` | object | unset | Optional in-process transaction probe reported through readiness. |
-| `scripting` | object | defaults | Scripting runtime limits, including the live Lua sandbox controls. |
+| `scripting` | object | defaults | Scripting runtime limits. The `lua.sandbox` and `javascript.sandbox` sub-blocks are both live and both reload without a restart. See [scripting.md](scripting.md). |
 | `http_client_timeouts` | object | (see below) | Tunable timeouts for the proxy's outbound HTTP helpers (forward-auth, callbacks, mirrors, SWR refreshes, bot-auth directory). See [HTTP client timeouts](#http-client-timeouts). |
 | `web_bot_auth` | object | unset | Process-wide Ed25519 identity for outbound Web Bot Auth signing and public-key discovery. |
 | `tenants` | list | `[]` | Declared tenants referenced by `origins.*.tenant_id`. |

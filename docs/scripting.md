@@ -424,7 +424,9 @@ origins:
 
 The expression sees `response.body`, `response.status`, `response.headers`, and the `request.*` namespace. A string result is written back verbatim; ints, floats, and bools render as strings; maps and lists are JSON-serialized; null leaves the body unchanged. `Set-Cookie` is on a deny-list: a CEL header rule cannot set it.
 
-Every expression on the transform is compiled when the config compiles: `on_response`, each rule's `value_expr`, and the reserved `on_request` field. A syntax error in any of them refuses the config, naming the origin and the field or header it belongs to. Responses then only evaluate.
+Every expression on the transform is compiled when the config compiles: `on_response` and each rule's `value_expr`. A syntax error in either refuses the config, naming the origin and the field or header it belongs to. Responses then only evaluate.
+
+The transform is response-only, and so is every other transform. There is no `on_request:` here. The key was accepted for a while, compiled at config load and never evaluated, which read as a broken request-phase feature rather than an absent one; it is refused at config compile now. For CEL at request time, reach for the surfaces that actually run there: an `expression` policy to gate the request, a rate-limit or WAF `key:` expression to key on it, or a forward rule to route on it.
 
 At response time the postures are unchanged and deliberately forgiving, because the response is already on its way out: a header rule whose expression fails is skipped and the rest of the chain still runs, and a failing `on_response` leaves the body byte-for-byte unchanged. Both are logged.
 
@@ -712,15 +714,33 @@ transforms:
 
 The `ctx` argument carries the same context table as the Lua surfaces in section 4.2: `ctx.request.aipref.*` (each flag defaulting to `true` when the request has no valid `aipref` header), `ctx.request.tls.*` (JA3/JA4/JA4H fingerprints, empty strings on plain HTTP), and `ctx.principal.*` (the unified caller identity, mirroring the CEL `principal.*` namespace from section 3.1).
 
-QuickJS always runs with a sandbox: a 100 ms CPU budget, 16 MiB heap cap, and
-1 MiB native-stack cap. A script that exceeds the CPU budget is aborted by a
-watchdog with an uncatchable exception; the modifier or transform is skipped
-and the error is logged.
+### 5.1 Sandbox limits
 
-The `proxy.scripting.javascript.sandbox` YAML subtree remains parseable for
-compatibility but is not installed into `JsEngine::new` today, so changing
-those YAML values does not tune the live engine. Rust integrations that
-construct `JsEngine::with_sandbox` directly can supply different limits.
+QuickJS always runs with a sandbox. The defaults keep an adversarial script
+from stalling a worker; raise them if your scripts legitimately need more
+headroom, or tighten them on sensitive deployments.
+
+```yaml
+proxy:
+  scripting:
+    javascript:
+      sandbox:
+        budget_ms: 100    # wall-clock CPU budget per invocation
+        memory_mb: 16     # heap cap for the QuickJS runtime
+        stack_kb: 1024    # native stack cap
+```
+
+| Field | Default | Notes |
+|---|---|---|
+| `budget_ms` | `100` | Wall-clock CPU budget per invocation. A script that overruns it is aborted by a watchdog with an uncatchable exception; the modifier or transform is skipped and the error is logged. This is the guard against `while (true) {}`. |
+| `memory_mb` | `16` | Heap cap for the QuickJS runtime. An allocation past the cap fails the script rather than letting it grow the proxy's resident set. |
+| `stack_kb` | `1024` | Native stack cap. Guards against deeply recursive scripts. |
+
+Limits apply to every JavaScript surface uniformly: response modifiers, body
+and JSON transforms, WAF custom rules, MCP adapters, and `engine: js` custom
+log fields. Changes take effect on the next config reload (SIGHUP, admin
+reload, or filesystem watch) without restarting the process, the same as the
+Lua block in [§4.6](#46-sandbox-limits).
 
 ---
 
@@ -755,9 +775,12 @@ Sandbox tunables:
 | `module_bytes` | optional | Inline bytes of a precompiled module. One of `module_path` or `module_bytes` must be set. |
 | `timeout_ms` | 1000 | Hard wall-clock cap per invocation. Enforced via wasmtime's epoch interruption. |
 | `max_memory_pages` | 256 | Linear-memory cap in 64 KiB pages. 256 = 16 MiB. |
-| `allowed_hosts` | `[]` | Reserved for a future WASI-sockets integration. Currently parsed but not enforced; modules cannot open sockets today. |
 
-There is no filesystem access, no network access, no environment variables, and no clock skew the host can observe. The full authoring guide is in [wasm-development.md](wasm-development.md), with hello-world Rust and TinyGo modules in `examples/wasm/`.
+There is no filesystem access, no network access, no environment variables, and no clock skew the host can observe.
+
+There is also no `allowed_hosts:`. The key used to be accepted here and was never enforced, which is the wrong shape for something that reads as a security boundary: modules get no sockets at all, so an allowlist had nothing to sit in front of. It is refused at config compile now, with an error saying so. If a host callout ever lands, the key comes back as an enforced one. Until then, keep the reaching on the proxy side: gate the origin with an `expression` policy, or route the callout through an origin the proxy controls.
+
+The full authoring guide is in [wasm-development.md](wasm-development.md), with hello-world Rust and TinyGo modules in `examples/wasm/`.
 
 ---
 
@@ -861,7 +884,7 @@ The AI proxy action does not embed the general scripting engines. It has two ded
 ### JavaScript
 
 - Fresh sandboxed engine per invocation; `eval` removed.
-- CPU budget (default 100 ms) enforced via a watchdog interrupt; heap cap (default 16 MB) and native stack cap (default 1 MB) enforced by the runtime.
+- CPU budget (default 100 ms) enforced via a watchdog interrupt; heap cap (default 16 MB) and native stack cap (default 1 MB) enforced by the runtime. All three are tunable under `proxy.scripting.javascript.sandbox` and reload without a restart.
 - No filesystem, no network, no module loader.
 
 ### WASM
@@ -869,6 +892,7 @@ The AI proxy action does not embed the general scripting engines. It has two ded
 - Wasmtime sandbox running WASI preview-1. No network, no filesystem, no environment variables, no host clock beyond the epoch-interruption deadline.
 - Per-request `Store` so module state never leaks between requests; the compiled `Module` is shared across calls so per-invocation cost is one instantiate plus one `_start`.
 - `timeout_ms` is enforced via epoch interruption; `max_memory_pages` caps linear memory.
+- There is no host allowlist because there is nothing to allow: modules get no sockets. An authored `allowed_hosts:` is refused at config compile rather than accepted as a boundary nothing checks.
 
 ---
 
@@ -920,8 +944,8 @@ With debug logging on, script failures are logged with the engine, the error mes
 | `engine: cel` custom log field | A CEL parse error rejects the config at compile time; an evaluation error is logged at debug and the field is omitted from the line |
 | Lua / JS modifiers | Error logged per request; the modifier's headers are not applied; the request proceeds |
 | `lua_json` / `js_json` / `javascript` transforms | Error logged per request; the body is left unchanged |
-| `cel` transform | Missing both `on_response` and `headers`, or a CEL parse error in any expression, fails config compile; a runtime evaluation error leaves the body unchanged and skips only the failing header rule |
-| WASM transform | Missing `module_path` / `module_bytes` or a module that fails to compile fails config compile; runtime errors skip the transform |
+| `cel` transform | Missing both `on_response` and `headers`, a CEL parse error in any expression, or an authored `on_request:` (removed; transforms have no request phase) fails config compile; a runtime evaluation error leaves the body unchanged and skips only the failing header rule |
+| WASM transform | Missing `module_path` / `module_bytes`, a module that fails to compile, or an authored `allowed_hosts:` (removed; modules have no network surface) fails config compile; runtime errors skip the transform |
 | JavaScript / TypeScript bundle hook | Invalid source, imports, a missing export, an invalid return envelope, timeout, or resource-limit error follows the bundle's `failure_posture`; candidate-load failures reject the whole candidate |
 | Envelope WASM bundle hook | Invalid ABI, compile failure, malformed output, timeout, or resource-limit error follows `failure_posture`; candidate-load failures reject the whole candidate |
 | Proxy-Wasm filter | An unsupported import, invalid ABI, trap, resource-limit error, or unresolved `Pause` becomes a bounded filter failure and follows the resolved `failure_posture` |

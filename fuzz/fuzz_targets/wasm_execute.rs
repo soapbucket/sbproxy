@@ -43,7 +43,6 @@ fn drive(input: &[u8]) {
         module_path: None,
         module_bytes: Some(input.to_vec()),
         sha256: None,
-        allowed_hosts: Vec::new(),
         max_memory_pages: Some(16),
         timeout_ms: Some(25),
         max_fuel: Some(5_000_000),

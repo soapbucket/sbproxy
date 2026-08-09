@@ -810,7 +810,29 @@ impl WasmTransform {
     /// `module_bytes` (inline bytes) must be set; failing to set
     /// either is an error so misconfigured pipelines fail loudly at
     /// startup instead of silently accepting traffic with a no-op.
+    ///
+    /// An authored `allowed_hosts:` is refused. See the inline note
+    /// below for why refusing beats keeping the key.
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
+        // WOR-2319: `allowed_hosts:` parsed for years and was never
+        // enforced. It could not have been: a module gets no sockets
+        // at all here (no WASI networking, no host callout function),
+        // so there is no call for an allowlist to sit in front of.
+        // A key that names a security boundary nothing checks is worse
+        // than no key, because an operator who writes it believes the
+        // boundary exists. `WasmConfig` does not set
+        // `deny_unknown_fields`, so deleting the field alone would have
+        // turned "parsed and inert" into "ignored and silent"; refusing
+        // keeps the removal loud, the way the load balancer refuses
+        // `sticky:`.
+        anyhow::ensure!(
+            value.get("allowed_hosts").is_none(),
+            "wasm transform `allowed_hosts:` was removed: it was never enforced. WASM modules \
+             have no network surface at all here (no WASI sockets, no host callout), so the \
+             allowlist described a boundary nothing checked. Remove the key. To restrict what a \
+             module can reach, keep the reaching on the proxy side: gate the origin with an \
+             `expression` policy, or route the callout through an origin the proxy controls."
+        );
         let cfg: sbproxy_extension::wasm::WasmConfig = serde_json::from_value(value)?;
         if cfg.module_path.is_none() && cfg.module_bytes.is_none() {
             anyhow::bail!("wasm transform requires either module_path or module_bytes");
@@ -1659,5 +1681,68 @@ mod tests {
             }
             other => panic!("expected Plugin error variant, got {:?}", other),
         }
+    }
+
+    // --- wasm `allowed_hosts:` is removed and refused (WOR-2319) ---
+    //
+    // The key parsed and was never enforced. `WasmConfig` does not set
+    // `deny_unknown_fields`, so a plain field deletion would have made
+    // an authored key silently vanish. These pin the refusal.
+
+    #[test]
+    fn wasm_allowed_hosts_is_refused_at_config_compile() {
+        let error = WasmTransform::from_config(serde_json::json!({
+            "type": "wasm",
+            "module_path": "/opt/sbproxy/wasm/echo.wasm",
+            "allowed_hosts": ["api.example.com"]
+        }))
+        .expect_err("an authored allowed_hosts must fail config compilation, not sit inert");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("allowed_hosts"),
+            "the error must name the removed key: '{message}'"
+        );
+        assert!(
+            message.contains("never enforced"),
+            "the error must say the key did nothing: '{message}'"
+        );
+        assert!(
+            message.contains("no network surface"),
+            "the error must say why it could not have been enforced: '{message}'"
+        );
+    }
+
+    #[test]
+    fn wasm_allowed_hosts_is_refused_before_the_module_is_loaded() {
+        // The refusal must not depend on a readable `.wasm`: an
+        // operator who authored both a bad path and the dead key should
+        // still be told about the key, and config compile should never
+        // touch the filesystem to reject it.
+        let error = WasmTransform::from_config(serde_json::json!({
+            "type": "wasm",
+            "module_path": "/nonexistent/definitely-not-here.wasm",
+            "allowed_hosts": []
+        }))
+        .expect_err("an empty allowed_hosts list is still an authored key");
+
+        assert!(
+            error.to_string().contains("allowed_hosts"),
+            "an empty list must be refused too: '{error}'"
+        );
+    }
+
+    #[test]
+    fn wasm_transform_without_allowed_hosts_still_reports_the_real_problem() {
+        // The refusal must not swallow the pre-existing validation.
+        let error = WasmTransform::from_config(serde_json::json!({
+            "type": "wasm"
+        }))
+        .expect_err("neither module_path nor module_bytes is still an error");
+
+        assert!(
+            error.to_string().contains("module_path"),
+            "unrelated configs must keep their own error: '{error}'"
+        );
     }
 }

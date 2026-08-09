@@ -8,10 +8,11 @@
 //! ## Sandbox
 //!
 //! Every script runs under three independently enforced limits, all
-//! supplied when the engine is constructed. The
-//! `proxy.scripting.javascript.sandbox` YAML shape remains parseable
-//! for compatibility, but the OSS boot path does not pass it to
-//! [`JsEngine`]:
+//! supplied when the engine is constructed. Operators set them under
+//! `proxy.scripting.javascript.sandbox:` in `sb.yml`; the boot path
+//! calls [`install_sandbox_config`] with those values and every
+//! [`JsEngine::new`] after that picks them up, the same way the Lua
+//! engine reads `proxy.scripting.lua.sandbox:`:
 //!
 //! * **CPU time budget** (`budget_ms`, default 100 ms): the shared watchdog
 //!   scheduler flips an atomic flag after the budget elapses. The
@@ -33,11 +34,42 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use parking_lot::RwLock;
 use rquickjs::function::Rest;
 use rquickjs::{Array, Context, Function, Object, Runtime, String as JsString, Value};
 use thiserror::Error;
 
 pub use sbproxy_config::types::JsSandboxConfig;
+
+// --- Process-wide sandbox handle ---
+
+/// Process-wide active JavaScript sandbox configuration. The proxy boot
+/// path calls [`install_sandbox_config`] once with the values from
+/// `proxy.scripting.javascript.sandbox:` in `sb.yml`; thereafter, every
+/// [`JsEngine::new`] picks up the active limits without each
+/// request-time callsite having to thread the config through. The
+/// initial value matches the documented YAML defaults so the engine is
+/// safe even before the boot path runs.
+///
+/// This mirrors the Lua engine's handle
+/// (`sbproxy_extension::lua::install_sandbox_config`) deliberately: two
+/// engines with the same operator-facing shape should not have two
+/// different wiring mechanisms.
+static GLOBAL_SANDBOX_CONFIG: LazyLock<RwLock<Arc<JsSandboxConfig>>> =
+    LazyLock::new(|| RwLock::new(Arc::new(JsSandboxConfig::default())));
+
+/// Replace the process-wide sandbox configuration. Subsequent
+/// `JsEngine::new()` calls will adopt the new limits. Existing engines
+/// keep the config they were constructed with.
+pub fn install_sandbox_config(config: JsSandboxConfig) {
+    *GLOBAL_SANDBOX_CONFIG.write() = Arc::new(config);
+}
+
+/// Read the process-wide sandbox configuration. Returns a cloned
+/// [`Arc`] so callers can hold onto it without keeping the lock.
+pub fn active_sandbox_config() -> Arc<JsSandboxConfig> {
+    GLOBAL_SANDBOX_CONFIG.read().clone()
+}
 
 const MAX_PENDING_WATCHDOGS: usize = 4_096;
 
@@ -340,23 +372,32 @@ fn js_result_label<T>(out: &std::result::Result<T, JsExecutionError>) -> &'stati
 }
 
 impl JsEngine {
-    /// Create a new sandboxed JS engine with default sandbox limits.
+    /// Create a new sandboxed JS engine using the process-wide active
+    /// sandbox configuration ([`active_sandbox_config`]).
     ///
-    /// Equivalent to `JsEngine::with_sandbox(JsSandboxConfig::default())`.
-    /// Sets a 100 ms CPU budget, a 16 MB memory limit, and a 1 MB
-    /// stack size limit. Removes `eval` to prevent dynamic code
-    /// injection, and registers `json_encode` / `json_decode` as
-    /// global helpers.
+    /// The boot path installs operator settings from
+    /// `proxy.scripting.javascript.sandbox:` via
+    /// [`install_sandbox_config`]; before that runs, the documented
+    /// defaults ([`JsSandboxConfig::default`]) are in effect: a 100 ms
+    /// CPU budget, a 16 MB memory limit, and a 1 MB stack size limit.
+    /// Existing engines keep the snapshot they were constructed with.
+    ///
+    /// Removes `eval` to prevent dynamic code injection, and registers
+    /// `json_encode` / `json_decode` as global helpers.
     pub fn new() -> Result<Self> {
-        Self::with_sandbox(JsSandboxConfig::default())
+        Self::with_sandbox((*active_sandbox_config()).clone())
     }
 
     /// Create a new sandboxed JS engine with a custom memory limit.
     ///
     /// Convenience wrapper that keeps the CPU budget and stack size
-    /// at their defaults and overrides only the heap memory cap.
-    /// `limit_bytes` is in bytes (it gets translated to MB inside the
-    /// underlying [`JsSandboxConfig`]).
+    /// at the built-in defaults and overrides only the heap memory
+    /// cap. `limit_bytes` is in bytes (it gets translated to MB inside
+    /// the underlying [`JsSandboxConfig`]). Deliberately does not
+    /// consult the process-wide handle: callers reach for this to pin
+    /// one exact limit, and inheriting the other two from whatever the
+    /// operator installed would make the result depend on config the
+    /// caller never asked about.
     pub fn with_memory_limit(limit_bytes: usize) -> Result<Self> {
         // `set_memory_limit` is byte-precise, so for users who pass a
         // value that is not a clean MB multiple we round up to the
@@ -371,12 +412,13 @@ impl JsEngine {
 
     /// Create a new sandboxed JS engine with caller-provided sandbox limits.
     ///
-    /// Programmatic callers can deserialize the compatibility YAML
-    /// shape and pass it here explicitly, but the OSS boot path does
-    /// not wire `proxy.scripting.javascript.sandbox` into the engine.
-    /// The supplied [`JsSandboxConfig`] is applied to the QuickJS
-    /// runtime up front and retained for the lifetime of the engine so
-    /// the CPU-budget watchdog can read it on every script invocation.
+    /// Used by the runtime to thread the values from
+    /// `proxy.scripting.javascript.sandbox:` in `sb.yml` through to the
+    /// engine, and by programmatic callers that want limits of their
+    /// own rather than the installed ones. The supplied
+    /// [`JsSandboxConfig`] is applied to the QuickJS runtime up front
+    /// and retained for the lifetime of the engine so the CPU-budget
+    /// watchdog can read it on every script invocation.
     pub fn with_sandbox(sandbox: JsSandboxConfig) -> Result<Self> {
         let runtime = Runtime::new()?;
         runtime.set_memory_limit(sandbox.memory_mb.saturating_mul(1024 * 1024));
@@ -819,12 +861,89 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
+    /// Serializes tests that mutate or assert the process-global sandbox
+    /// config (`install_sandbox_config` / `active_sandbox_config`, read by
+    /// `JsEngine::new()`). Without it, a temporary install races the
+    /// default-config assertion in parallel runs. Mirrors the same lock in
+    /// the Lua engine's test module.
+    static SANDBOX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     // --- Engine Construction ---
 
     #[test]
     fn test_new_engine() {
         let _engine = JsEngine::new().unwrap();
         // Should construct without panic
+    }
+
+    #[test]
+    fn js_engine_default_config_matches_documented_defaults() {
+        // Hold the lock so a parallel install test cannot have the
+        // global config temporarily set to non-default values.
+        let _g = SANDBOX_LOCK.lock().unwrap();
+        let engine = JsEngine::new().unwrap();
+        let cfg = engine.sandbox_config();
+        assert_eq!(cfg.budget_ms, 100);
+        assert_eq!(cfg.memory_mb, 16);
+        assert_eq!(cfg.stack_kb, 1024);
+    }
+
+    /// The operator block has to reach the live engine. Before the
+    /// process-wide handle existed, `JsEngine::new()` hardcoded
+    /// `JsSandboxConfig::default()` and this asserted 100 / 16 / 1024
+    /// no matter what the operator wrote.
+    #[test]
+    fn js_engine_new_adopts_the_installed_sandbox_config() {
+        // The global handle is process-wide. Hold the shared lock and
+        // save/restore around the assertions. The installed values are
+        // all more generous than the defaults, so a parallel test that
+        // does not take the lock still runs.
+        let _g = SANDBOX_LOCK.lock().unwrap();
+        let saved = (*active_sandbox_config()).clone();
+
+        install_sandbox_config(JsSandboxConfig {
+            budget_ms: 250,
+            memory_mb: 32,
+            stack_kb: 2048,
+        });
+
+        let engine = JsEngine::new().unwrap();
+        let cfg = engine.sandbox_config();
+        assert_eq!(cfg.budget_ms, 250);
+        assert_eq!(cfg.memory_mb, 32);
+        assert_eq!(cfg.stack_kb, 2048);
+
+        // The installed budget is the one the watchdog actually arms:
+        // a spinning script reports it back on the structured error.
+        let err = engine
+            .execute("while (true) {}", HashMap::new())
+            .expect_err("infinite loop must error out");
+        match err {
+            JsExecutionError::Interrupt { budget_ms } => assert_eq!(budget_ms, 250),
+            other => panic!("expected Interrupt, got {other:?}"),
+        }
+
+        // Restore the prior config so other tests are unaffected.
+        install_sandbox_config(saved);
+    }
+
+    #[test]
+    fn install_sandbox_config_round_trips_via_global_handle() {
+        let _g = SANDBOX_LOCK.lock().unwrap();
+        let saved = (*active_sandbox_config()).clone();
+
+        install_sandbox_config(JsSandboxConfig {
+            budget_ms: 777,
+            memory_mb: 32,
+            stack_kb: 2048,
+        });
+
+        let observed = (*active_sandbox_config()).clone();
+        assert_eq!(observed.budget_ms, 777);
+        assert_eq!(observed.memory_mb, 32);
+        assert_eq!(observed.stack_kb, 2048);
+
+        install_sandbox_config(saved);
     }
 
     #[test]
