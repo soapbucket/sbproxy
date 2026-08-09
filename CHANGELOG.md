@@ -261,6 +261,35 @@ the next version cut.
 
 ### Fixed
 
+- **OCSP stapling asks the responder a real question, so it can work at all.**
+  Refusing to staple a `malformedRequest` stopped the proxy sending bytes no
+  client could verify, and it left stapling inactive rather than active and
+  wrong: the fetch still built no OCSP request, so there was nothing a
+  responder could usefully answer. It now sends the request RFC 6960 defines,
+  a POST of `application/ocsp-request` carrying a `CertID` that names the
+  certificate by its serial number and by hashes of its issuer's name and
+  public key. The issuer is read out of `tls_cert_file`, matched by
+  comparing the leaf's issuer name against each certificate's subject name
+  rather than by position, so a chain written in an unusual order still
+  produces the right question and a file holding only the leaf is refused
+  with a message that says to configure the full chain.
+
+  Two checks came with it, both of which a fetch can pass without and both
+  of which decide whether the answer means anything. The HTTP status is
+  checked before the body is read, because `reqwest` reports a 4xx as a
+  completed transfer and an error page otherwise arrives as bytes like any
+  other. And the `CertID` on the response is matched against the one that
+  was sent, so a responder, or anything on the plaintext hop to it, cannot
+  answer `good` about a different certificate and have that stapled to
+  every handshake. Both refusals count as
+  `sbproxy_ocsp_fetch_total{result="unknown_status"}`.
+
+  The responder's own signature is still not verified. A client that reads
+  the staple verifies it against the issuer itself, so a forged response
+  cannot make a revoked certificate look good; what it can do is cost
+  connections to clients that check. Stapling still covers the manual
+  fallback certificate only.
+
 - **A stapled OCSP response that no client could verify is no longer sent.**
   The fetch never built an OCSP request. It issued a plain GET against the
   responder URL in the certificate's Authority Information Access

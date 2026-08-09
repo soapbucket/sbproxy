@@ -1571,16 +1571,33 @@ INFO OCSP stapling is inactive: it reaches the manual fallback certificate only,
 fallback included. `stapled` counts how many of those currently carry a
 response. `covered` is how many the refresh task can reach at all.
 
-Reaching the responder does not always produce something worth
-stapling. SBproxy sends a plain GET to the responder URL in the
-certificate's Authority Information Access extension rather than the
-RFC 6960 request that names the certificate, so a responder with
-nothing to answer about replies with `malformedRequest`, and some
-return an HTTP error page. SBproxy refuses to staple either. A response
-the client cannot tie to the certificate in front of it is worse than
-no response at all, because a client that checks the staple rejects a
-certificate that is otherwise valid. Refusals are counted under
-`sbproxy_ocsp_fetch_total{result="unknown_status"}`.
+The request is the RFC 6960 one that names the certificate: a POST of
+`application/ocsp-request` to the responder URL in the certificate's
+Authority Information Access extension, carrying a `CertID` built from
+the leaf's serial number together with hashes of its issuer's name and
+public key. That issuer comes out of `tls_cert_file` itself, so the
+file has to hold the full chain, leaf first. A file holding only the
+leaf is refused with a message saying so, because without the issuer
+there is no public key to hash and so no way to say which certificate
+the question is about.
+
+Reaching the responder is still not the same as getting something
+worth stapling, so three things are checked before anything is
+attached. The HTTP status has to be 200. The body has to parse as a
+successful basic OCSP response. And the response has to be about the
+certificate that was asked about, which is what stops a responder, or
+anything on the plaintext hop to it, from answering `good` for some
+other certificate. Anything refused is counted under
+`sbproxy_ocsp_fetch_total{result="unknown_status"}` and never reaches
+a handshake. A response a client cannot tie to the certificate in
+front of it is worse than no response at all, because a client that
+checks the staple rejects a certificate that is otherwise valid.
+
+What SBproxy does not check is the responder's own signature. A client
+that reads the staple verifies that itself against the issuer, so a
+forged response cannot make a revoked certificate look good. What it
+can do is cost connections to the clients that check, which is why the
+three checks above matter even without it.
 
 Two metrics report the state:
 
