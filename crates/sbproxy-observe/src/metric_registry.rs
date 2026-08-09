@@ -953,6 +953,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_ai_multipart_inspection_skipped_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_multipart_inspection_skipped"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["check", "surface"],
+        description: "Request-body inspection skipped because the AI request body was multipart, by inspection kind and classified surface.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_ai_native_bypass_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_native_bypass"),

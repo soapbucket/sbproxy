@@ -106,6 +106,7 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_ai_quota_pool_overshare_total` | Counter | `stable` | `beta` | `pool` | Soft quota-pool admissions beyond a member entitlement. |
 | `sbproxy_ai_routing_fallbacks_total` | Counter | `stable` | `beta` | `strategy`, `reason` | AI routing selections that used an explicit fallback path. |
 | `sbproxy_ai_model_directory_exclusions_total` | Counter | `stable` | `alpha` | `exclusion_reason` | Directory nodes excluded from model routing, by exclusion reason. |
+| `sbproxy_ai_multipart_inspection_skipped_total` | Counter | `stable` | `beta` | `check`, `surface` | Request-body inspection skipped because the AI request body was multipart, by inspection kind and classified surface. |
 | `sbproxy_ai_native_bypass_total` | Counter | `stable` | `beta` | `inbound_format`, `provider_format` | AI requests that bypassed the hub format round-trip when client format matched provider format. |
 | `sbproxy_ai_output_throughput_tokens_per_second` | Histogram | `stable` | `beta` | `provider`, `model` | AI streaming output throughput (completion tokens / generation duration). |
 | `sbproxy_ai_price_source_total` | Counter | `stable` | `alpha` | `source` | Cost estimates by the price-table layer that produced the price. |

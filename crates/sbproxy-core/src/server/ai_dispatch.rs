@@ -3875,6 +3875,49 @@ pub(super) async fn handle_ai_proxy(
             .await?;
             return Ok(());
         }
+        // WOR-2309: every exit from this branch returns, so the JSON parse
+        // below and everything hanging off it never runs: the built-in
+        // input guardrail pipeline, origin-level PII redaction, body-aware
+        // prompt-injection scanning, and the AI policy plane. That bypass
+        // used to be entirely silent. The only evidence a configured
+        // guardrail had not run was the absence of a block, which reads
+        // exactly like a clean request.
+        //
+        // Recorded per configured check rather than as one counter so an
+        // operator can tell which coverage they lost, and keyed on the
+        // config fields rather than on `config.guardrail_pipeline()` so
+        // this stays a field read: compiling the pipeline here would pull
+        // a lazy classifier load onto a path that has never paid for one.
+        //
+        // Deliberately a metric and not a log. This fires once per
+        // multipart request, so a `warn!` would re-fire per request on
+        // ordinary audio-transcription traffic.
+        //
+        // The gate above keys on `Content-Type`, not on the classified
+        // surface, so `surface_label` is the label that matters: multipart
+        // on `audio_transcription` is the expected shape, while multipart
+        // on `chat_completions` is a caller relabeling a JSON surface to
+        // take this path.
+        if config
+            .guardrails
+            .as_ref()
+            .is_some_and(|guardrails| !guardrails.input.is_empty())
+        {
+            sbproxy_ai::ai_metrics::record_multipart_inspection_skipped(
+                "input_guardrails",
+                surface_label,
+            );
+        }
+        if config
+            .pii
+            .as_ref()
+            .is_some_and(|pii| pii.enabled && pii.redact_request)
+        {
+            sbproxy_ai::ai_metrics::record_multipart_inspection_skipped(
+                "pii_redaction",
+                surface_label,
+            );
+        }
         let maximum = config
             .max_body_size
             .filter(|maximum| *maximum > 0)
@@ -14089,6 +14132,135 @@ mod external_guardrail_context_tests {
         assert!(response.starts_with("HTTP/1.1 400"), "{response}");
         assert!(response.contains("guardrail_violation"), "{response}");
         assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+    }
+
+    /// One `sbproxy_ai_multipart_inspection_skipped_total` series, or 0
+    /// when nothing has created it yet.
+    ///
+    /// `prometheus::gather()` reads a process-global registry and the
+    /// sibling tests in this module run concurrently, so callers assert a
+    /// strict increase rather than an exact value.
+    fn multipart_inspection_skipped_count(check: &str, surface: &str) -> f64 {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.name() == "sbproxy_ai_multipart_inspection_skipped_total")
+            .map(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .filter(|metric| {
+                        let labelled = |name: &str, want: &str| {
+                            metric
+                                .get_label()
+                                .iter()
+                                .any(|label| label.name() == name && label.value() == want)
+                        };
+                        labelled("check", check) && labelled("surface", surface)
+                    })
+                    .map(|metric| metric.get_counter().value())
+                    .sum()
+            })
+            .unwrap_or_default()
+    }
+
+    fn builtin_guardrail_and_pii_config(upstream_url: &str) -> sbproxy_ai::AiHandlerConfig {
+        sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key",
+                "model_map": {"requested-model": "selected-model"}
+            }],
+            "guardrails": {"input": [{
+                "type": "regex",
+                "patterns": ["forbidden"],
+                "action": "block"
+            }]},
+            "pii": {"enabled": true, "redact_request": true}
+        }))
+        .expect("builtin guardrail proxy config")
+    }
+
+    /// WOR-2309: the multipart short-circuit forwards the body without
+    /// running the built-in input guardrail pipeline or origin-level PII
+    /// redaction. That is the shipped behavior and this test does not
+    /// change it; what it pins is that the gap is now *countable*. Before
+    /// the counter existed, a configured guardrail that never ran was
+    /// indistinguishable from one that ran and allowed.
+    #[tokio::test]
+    async fn multipart_records_the_builtin_inspection_it_skipped() {
+        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"text":"transcribed"}"#).await;
+        let config = builtin_guardrail_and_pii_config(&upstream_url);
+        let guardrails_before =
+            multipart_inspection_skipped_count("input_guardrails", "audio_transcription");
+        let pii_before = multipart_inspection_skipped_count("pii_redaction", "audio_transcription");
+        let (content_type, body) = multipart_audio_request();
+        let (mut session, client) =
+            downstream_bytes_session("/v1/audio/transcriptions", content_type, body).await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("multipart request is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response utf8");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert!(
+            multipart_inspection_skipped_count("input_guardrails", "audio_transcription")
+                > guardrails_before,
+            "a configured built-in input guardrail was bypassed without being counted"
+        );
+        assert!(
+            multipart_inspection_skipped_count("pii_redaction", "audio_transcription") > pii_before,
+            "configured request PII redaction was bypassed without being counted"
+        );
+    }
+
+    /// WOR-2309: the short-circuit keys on the inbound `Content-Type`, not
+    /// on the classified surface, so a caller can relabel a JSON surface as
+    /// multipart and take the same bypass. The `surface` label is what makes
+    /// that visible, and `chat_completions` is the value that separates a
+    /// bypass attempt from routine audio traffic.
+    #[tokio::test]
+    async fn multipart_content_type_on_a_json_surface_is_counted_under_that_surface() {
+        let (upstream_url, _upstream_hits) = upstream_fixture(r#"{"id":"chat-fixture"}"#).await;
+        let config = builtin_guardrail_and_pii_config(&upstream_url);
+        let before = multipart_inspection_skipped_count("input_guardrails", "chat_completions");
+        let (content_type, body) = multipart_audio_request();
+        let (mut session, client) =
+            downstream_bytes_session("/v1/chat/completions", content_type, body).await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("multipart-on-chat request is handled");
+        drop(session);
+
+        let _ = live_downstream_body(client).await;
+        assert!(
+            multipart_inspection_skipped_count("input_guardrails", "chat_completions") > before,
+            "a multipart Content-Type on a JSON surface bypassed the built-in guardrails \
+             without being counted under that surface"
+        );
     }
 
     #[tokio::test]

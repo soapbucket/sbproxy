@@ -1,6 +1,6 @@
 # SBproxy threat model
 
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-08*
 
 This is the threat-model companion to [`operator-runbook.md`](operator-runbook.md).
 It records the operator-facing assumptions that should be revisited at the end
@@ -136,7 +136,7 @@ To explore SBproxy's security model in action, see the following examples:
 |---------|------------|---------------|---------|
 | [`csrf`](../examples/csrf/) | Cross-Site Request Forgery protection. | Configure CSRF token validation policies. | Blocks unauthorized state-changing requests from browsers. |
 | [`defense-in-depth`](../examples/defense-in-depth/) | Layered security. | Combine WAF, rate limits, and authentication. | Comprehensive, multi-tiered protection for sensitive endpoints. |
-| [`dlp-catalog`](../examples/dlp-catalog/) | Data Loss Prevention. | Use `dlp` policies for PII detection. | Automatically detects and masks sensitive data before egress. |
+| [`dlp-catalog`](../examples/dlp-catalog/) | Data Loss Prevention. | Use `dlp` policies for PII detection. | Detects sensitive shapes in the request URI and headers, then tags or blocks. It does not read request bodies; use the `pii:` block on an `ai_proxy` origin for those. |
 | [`hsts`](../examples/hsts/) | Strict Transport Security. | Set `hsts: true` in your server block. | Forces client browsers to use secure TLS connections. |
 | [`page-shield`](../examples/page-shield/) | Monitor third-party scripts. | Inject Content Security Policy (CSP) rules. | Mitigates risks like Magecart attacks on frontend assets. |
 | [`security-headers`](../examples/security-headers/) | Standard secure headers. | Apply the `security_headers` configuration preset. | Hardens browser interactions out-of-the-box. |

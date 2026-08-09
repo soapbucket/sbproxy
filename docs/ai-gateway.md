@@ -609,7 +609,9 @@ Input guardrails apply to whichever body field the surface carries user text in:
 | `reranking` | `body["query"]` |
 | `moderations` | `body["input"]` |
 
-A single built-in guardrail block on the AI handler config covers every supported surface; the proxy picks the right field automatically based on the classified surface. Multipart-bodied surfaces (image edits, image variations, audio transcription) bypass the built-in input check today because their bodies are forwarded byte-transparently; built-in output scanning for those surfaces is reserved for a follow-up. External adapters apply their documented [unavailable-content policy](guardrails.md#streaming-and-multipart-content) to multipart bodies.
+A single built-in guardrail block on the AI handler config covers every supported surface; the proxy picks the right field automatically based on the classified surface. A request whose inbound `Content-Type` starts with `multipart/` bypasses the built-in input check, because its body is forwarded byte-transparently and never parsed as JSON. Built-in output scanning for those requests is reserved for a follow-up. External adapters apply their documented [unavailable-content policy](guardrails.md#streaming-and-multipart-content) to multipart bodies.
+
+That gate keys on the `Content-Type` and not on the classified surface, which is worth reading twice. Image edits, image variations, and audio transcription are the surfaces that legitimately send multipart, but nothing stops a caller putting a multipart `Content-Type` on `/v1/chat/completions` and taking the same path. Each bypassed check increments `sbproxy_ai_multipart_inspection_skipped_total`, labeled by `check` (`input_guardrails` or `pii_redaction`) and by `surface`, so a skipped guardrail shows up on a dashboard instead of looking exactly like a clean request. Traffic on `audio_transcription` is the expected shape. A nonzero rate on a JSON surface is somebody routing around your guardrails, and it is worth an alert.
 
 ### Gateway-side retrieval (RAG)
 
@@ -1530,16 +1532,29 @@ these methods is not implemented yet.
 Image edits, image variations, audio transcription, and audio translation send
 multipart request bodies. The proxy detects multipart from the inbound
 `Content-Type`; when it starts with `multipart/`, the body is forwarded with
-that Content-Type preserved. A governed key's model policy is checked against
-the bounded `model` part, and `route_to_model` or a budget downgrade rewrites
-only that part. A required model with no interpretable model part fails closed.
-Because the gateway cannot safely apply JSON PII redaction to arbitrary
-multipart bytes, a credential with `require_pii_redaction` is rejected before
-idempotency, cache, or provider dispatch.
+that Content-Type preserved. The detection is on the Content-Type alone, so any
+surface can end up on this path, not only the four above. A governed key's model
+policy is checked against the bounded `model` part, and `route_to_model` or a
+budget downgrade rewrites only that part. A required model with no interpretable
+model part fails closed. Because the gateway cannot safely apply JSON PII
+redaction to arbitrary multipart bytes, a credential with
+`require_pii_redaction` is rejected before idempotency, cache, or provider
+dispatch.
 
-Provider format translation does not run for multipart. Multipart responses do
-not currently settle stored-key token-per-minute or lifetime token and cost
-counters; that work is not implemented yet.
+Everything downstream of the JSON parse is skipped for these requests: the
+built-in input guardrails, origin-level `pii:` request redaction, body-aware
+`prompt_injection_v2` scanning, and the AI policy plane. Only the
+credential-level `require_pii_redaction` gate above rejects; the rest are
+permitted and counted under
+`sbproxy_ai_multipart_inspection_skipped_total`. Scan that counter before you
+assume a configured guardrail covers your upload traffic.
+
+Provider *request* translation does not run for multipart, so the inbound bytes
+reach the provider unchanged. The response is still translated and rewrapped
+for the inbound format like any other, which is a no-op only when the provider
+already speaks the OpenAI shape. Multipart responses do not currently settle
+stored-key token-per-minute or lifetime token and cost counters; that work is
+not implemented yet.
 
 ### Per-surface configuration
 

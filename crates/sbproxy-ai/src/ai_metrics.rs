@@ -1608,6 +1608,56 @@ pub fn record_stream_guardrail_decode_fallback() {
     STREAM_GUARDRAIL_DECODE_FALLBACK.inc();
 }
 
+/// Request-body inspection the AI gateway skipped because the inbound
+/// body was multipart, by inspection kind and classified surface
+/// (WOR-2309).
+///
+/// The multipart short-circuit forwards the body byte-transparently, so
+/// every check that needs a parsed JSON body is bypassed. That bypass
+/// was previously silent: the only evidence a configured guardrail did
+/// not run was the absence of a block, which is indistinguishable from
+/// a clean request. This is the built-in analogue of
+/// `sbproxy_ai_stream_guardrail_skipped_total`, and it exists for the
+/// same reason: a coverage gap has to be visible on a dashboard.
+///
+/// The `surface` label carries the security signal. Multipart on
+/// `audio_transcription` or `image_edits` is the expected shape, but the
+/// short-circuit keys on the inbound `Content-Type` rather than on the
+/// surface, so a caller can relabel any surface as multipart and take
+/// the same path. A nonzero rate on `chat_completions` is a bypass
+/// attempt, not routine traffic.
+///
+/// Cardinality is bounded: `check` is a closed set fixed at the call
+/// site and `surface` is the closed `AiSurface::label()` vocabulary.
+///
+/// Registered without `.unwrap()` (unlike its neighbors) because the
+/// production unwrap/expect ratchet in `scripts/check-unwrap-ratchet.sh`
+/// is at its baseline and a metric family is not worth a panic path.
+static MULTIPART_INSPECTION_SKIPPED: LazyLock<Option<CounterVec>> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_multipart_inspection_skipped_total",
+            "Request-body inspection skipped because the AI request body was multipart (WOR-2309)"
+        ),
+        &["check", "surface"]
+    )
+    .ok()
+});
+
+/// Record a request-body inspection skipped by the multipart short-circuit.
+///
+/// `check` names the bypassed inspection (`input_guardrails`,
+/// `pii_redaction`); `surface` is [`AiSurface::label`] for the
+/// classified request.
+///
+/// [`AiSurface::label`]: crate::handler::AiSurface::label
+pub fn record_multipart_inspection_skipped(check: &str, surface: &str) {
+    let Some(counter) = &*MULTIPART_INSPECTION_SKIPPED else {
+        return;
+    };
+    counter.with_label_values(&[check, surface]).inc();
+}
+
 // --- RAG retrieval metrics (WOR-2098) ---
 
 /// AI requests that consulted a RAG retrieval runtime, by embedding
@@ -1810,6 +1860,39 @@ mod tests {
         assert!(families
             .iter()
             .any(|f| f.name() == "sbproxy_ai_stream_guardrail_decode_fallback_total"));
+    }
+
+    /// WOR-2309: the multipart coverage-gap family registers and carries
+    /// both label names. Pinned because the `surface` label is what makes
+    /// a content-type bypass distinguishable from routine audio traffic;
+    /// dropping it would leave the family readable but useless.
+    #[test]
+    fn multipart_inspection_skipped_counter_registers_with_check_and_surface_labels() {
+        record_multipart_inspection_skipped("input_guardrails", "chat_completions");
+        record_multipart_inspection_skipped("pii_redaction", "audio_transcription");
+        let families = prometheus::gather();
+        let skipped = families
+            .iter()
+            .find(|f| f.name() == "sbproxy_ai_multipart_inspection_skipped_total")
+            .expect("multipart inspection skipped counter registered");
+        let bypass = skipped
+            .get_metric()
+            .iter()
+            .find(|m| {
+                m.get_label()
+                    .iter()
+                    .any(|l| l.name() == "check" && l.value() == "input_guardrails")
+                    && m.get_label()
+                        .iter()
+                        .any(|l| l.name() == "surface" && l.value() == "chat_completions")
+            })
+            .expect("input_guardrails row on chat_completions");
+        assert_eq!(bypass.get_counter().value(), 1.0);
+        assert!(skipped.get_metric().iter().any(|m| {
+            m.get_label()
+                .iter()
+                .any(|l| l.name() == "check" && l.value() == "pii_redaction")
+        }));
     }
 
     /// WOR-2098: the three RAG families register and carry the expected
