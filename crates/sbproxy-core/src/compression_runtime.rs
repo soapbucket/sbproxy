@@ -1109,7 +1109,7 @@ impl CompressionRuntime {
                         ai_client: self.ai_client.clone(),
                         provider,
                         configured_model: config.summarizer.model.clone(),
-                        max_input_tokens: sbproxy_ai::context_overflow::model_context_window(
+                        max_input_tokens: sbproxy_ai::context_window::model_context_window(
                             &config.summarizer.model,
                         )
                         .unwrap_or(16_384)

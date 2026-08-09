@@ -143,6 +143,25 @@ the next version cut.
   request, a rate-limit or WAF `key:` expression to key on it, or a forward
   rule to route on it.
 
+- **The AI gateway's context-overflow decision layer, and the
+  `context_overflow:` block the docs said it read.** The block was never a
+  field on the AI handler, and the code behind it, a pair of functions
+  returning an action of error, fall back to a larger model, or truncate,
+  was never called from anywhere. The AI gateway guide described the key as
+  parsed and ignored, which is an invitation to write it and wait. None of
+  the three actions was worth wiring as written. Truncating an oversized
+  prompt is the `window_fit` compression lever, which ships; the deleted
+  code only named truncation as a recommendation and never trimmed a
+  message. Erroring took an estimated token count as its input, so a prompt
+  the provider would have accepted could be refused before it was ever sent.
+  Rerouting to a model with a larger window needs a config surface nobody
+  designed, since no key names the model to reroute to. An authored
+  `context_overflow:` now fails config compile with an error naming the
+  compression settings that do fit a prompt to the window. The window
+  registry the module also held is untouched and still live: compression
+  reads it to size a model's budget, and it now sits in `context_window`, a
+  file named for the one thing left in it.
+
 ### Fixed
 
 - **A secret reference in `message_signatures.key` is now resolved instead

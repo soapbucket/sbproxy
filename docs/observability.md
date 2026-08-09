@@ -1,5 +1,5 @@
 # Observability
-*Last modified: 2026-08-08*
+*Last modified: 2026-08-09*
 
 SBproxy ships metrics, logs, and traces from one process. This guide covers the Wave 1 substrate: the SLO catalog, the metric label budget, the log schema and redaction policy, the trace propagation contract, the health endpoints, the dashboards, and the reference Compose stack you can boot in one command.
 
@@ -221,6 +221,8 @@ PromQL recording rules pre-compute each SLI at 1m, 5m, 1h, 6h, and 24h windows. 
 
 ### Cardinality budget
 
+Every family below is emitted by running code. That is worth stating because it has not always been true here. A budget row reads as a promise that the series exists, since a cap is something you only put on a dimension of something being emitted, and four rows in this table were not that. Three named families that are declared and scraped while nothing increments them, and one, `sbproxy_dedup_cache_size`, that was not declared anywhere in the proxy at all while its own row said it drove an alert. An operator building from those rows got a panel drawing a flat zero and an alert that could not fire. Families that are declared but not yet written are listed as `config_only` in [metrics-stability.md](metrics-stability.md); check there before building a panel. A drift guard in `crates/sbproxy-observe/tests/metric_drift.rs` now fails the build if one of them reappears here, or in a dashboard or alert rule.
+
 | Metric family | Cardinality cap | Notes |
 |---|---|---|
 | `sbproxy_requests_total` | 50 000 | Labels: `hostname`, `method`, `status`, `agent_id`, `agent_class`, `agent_vendor`, `payment_rail`, `content_shape`. `agent_id` is the sanitized registry id, never a raw UA-derived value. |
@@ -232,7 +234,6 @@ PromQL recording rules pre-compute each SLI at 1m, 5m, 1h, 6h, and 24h windows. 
 | `sbproxy_script_compile_total` | 12 | Labels: `engine` (cel\|lua\|js\|wasm), `result` (ok\|parse_error\|sandbox_reject). |
 | `sbproxy_script_invocations_total` | 20 | Same `engine`, plus `result` (ok\|runtime_error\|timeout\|memory_cap\|instruction_cap). |
 | `sbproxy_script_duration_seconds_bucket` | 52 | `engine` label only; histogram buckets 0.1ms..10s. |
-| `sbproxy_script_reloads_total` | 12 | Same labels as compile; counts hot-reload events separately so reload churn surfaces independently. |
 | `sbproxy_rate_limit_decisions_total` | 4 000 | Labels: `policy` (sanitised route pattern), `result` (allow\|throttle_route\|throttle_tenant\|disabled). |
 | `sbproxy_idempotency_cache_results_total` | 16 | Labels: `backend` (default), `result` (hit\|miss\|conflict\|not_applicable). |
 | `sbproxy_idempotency_cache_duration_seconds_bucket` | 11 | `backend` label only; histogram buckets 50us..1s. |
@@ -248,8 +249,6 @@ PromQL recording rules pre-compute each SLI at 1m, 5m, 1h, 6h, and 24h windows. 
 | `sbproxy_cert_expiry_seconds` | 256 | Labels: `host` (sanitised). Gauge; negative means already expired. |
 | `sbproxy_vault_resolution_total` | 200 | Labels: `backend` (sanitised), `result` (ok\|not_found\|backend_error\|denied). |
 | `sbproxy_vault_resolution_duration_seconds_bucket` | 2 400 | Same labels plus 12 histogram buckets 100us..5s. |
-| `sbproxy_transport_requests_total` | 28 | Labels: `protocol` (h1\|h2\|h3\|grpc\|grpc_web\|graphql\|websocket), `result` (ok\|client_error\|upstream_error\|timeout). |
-| `sbproxy_transport_duration_seconds_bucket` | 364 | Same labels plus 13 histogram buckets 100us..10s. |
 | `sbproxy_grpc_status_total` | 17 | Labels: `code` (canonical lowercase name; closed enum from tonic). |
 | `sbproxy_mcp_tool_dispatch_total` | 4 000 | Labels: `tool` (sanitised), `result` (ok\|tool_error\|tool_not_found\|policy_denied). |
 | `sbproxy_mcp_tool_dispatch_duration_seconds_bucket` | 12 000 | `tool` label plus 12 histogram buckets 100us..10s. |
@@ -278,7 +277,6 @@ PromQL recording rules pre-compute each SLI at 1m, 5m, 1h, 6h, and 24h windows. 
 | `sbproxy_synthetic_probe_failures_total` | 32 | Labels: `reason` (timeout\|status_5xx\|tls_handshake\|connect\|dns\|other). Background-probe failure counter; signals an upstream gone bad before customer traffic notices. |
 | `sbproxy_capture_dropped_total` | 6 000 | Labels: `workspace` (sanitised), `dimension` (token\|cost\|attribution\|other), `reason` (queue_full\|backend_error\|policy_block\|budget_exhausted). Per-workspace tokenomics capture-drop counter (rolls up the budget-dropped sub-counter below). |
 | `sbproxy_capture_budget_dropped_total` | 2 000 | Labels: `workspace` (sanitised), `dimension` (token\|cost\|attribution\|other). Subset of `sbproxy_capture_dropped_total` for the budget-exhausted reason; carried separately so a budget-tuning loop can isolate this signal. |
-| `sbproxy_dedup_cache_size` | 1 | Gauge; current entry count in the in-memory dedup cache. Drives the LRU-eviction alert. |
 | `sbproxy_mirror_state_drift_total` | 1 | Counter; per-request increments when the request-mirror's primary and shadow responses diverge enough that a downstream replay would notice. Always sample to a debug log so the trigger is investigatable. |
 | `sbproxy_policy_audit_events_total` | 1 200 | Labels: `verdict` (allow\|deny\|warn), `surface` (http\|mcp\|a2a\|admin), `policy_id` (sanitised). Per-event audit-channel counter; the policy-decision path emits one per evaluated policy. |
 | `sbproxy_policy_audit_events_dropped_total` | 40 | Labels: `tenant` (sanitised). Counts the policy-audit events dropped because the per-tenant queue was full. A non-zero rate here means the operator should raise `policy.audit.queue_size` or shed load. |

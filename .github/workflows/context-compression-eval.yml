@@ -7,7 +7,7 @@ on:
     paths:
       - 'sbproxy-bench/harness/context_compression_eval/**'
       - 'crates/sbproxy-ai/src/compression/**'
-      - 'crates/sbproxy-ai/src/context_overflow.rs'
+      - 'crates/sbproxy-ai/src/context_window.rs'
       - 'crates/sbproxy-ai/src/token_estimate.rs'
       - 'crates/sbproxy-core/src/compression_runtime.rs'
       - 'crates/sbproxy-core/src/server/ai_dispatch.rs'
@@ -24,7 +24,7 @@ on:
     paths:
       - 'sbproxy-bench/harness/context_compression_eval/**'
       - 'crates/sbproxy-ai/src/compression/**'
-      - 'crates/sbproxy-ai/src/context_overflow.rs'
+      - 'crates/sbproxy-ai/src/context_window.rs'
       - 'crates/sbproxy-ai/src/token_estimate.rs'
       - 'crates/sbproxy-core/src/compression_runtime.rs'
       - 'crates/sbproxy-core/src/server/ai_dispatch.rs'

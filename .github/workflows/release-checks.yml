@@ -182,13 +182,19 @@ jobs:
         env:
           PEBBLE_VA_ALWAYS_VALID: "1"
           PEBBLE_VA_NOSLEEP: "1"
-          # Pebble rejects 5% of nonces by default to exercise client
-          # retry, which our ACME client does not implement yet, so the
-          # lane fails probabilistically on most runs (an issuance is
-          # ~20 JWS posts). Pin to deterministic until the client
-          # retries badNonce per RFC 8555 s6.5; then restore the
-          # default so the retry path stays exercised.
-          PEBBLE_WA_NONCE_REJECT: "0"
+          # Pebble rejects a percentage of otherwise-valid nonces to
+          # exercise the client retry RFC 8555 s6.5 asks for, and the
+          # default is 5%. Held at the default on purpose: an issuance
+          # is ~20 JWS posts, so this is the only lane that drives the
+          # badNonce path against a real server at all.
+          #
+          # The knob is PEBBLE_WFE_NONCEREJECT. This block used to set
+          # PEBBLE_WA_NONCE_REJECT, which is not a name Pebble reads, so
+          # the lane it claimed to make deterministic was running at the
+          # 5% default the whole time. That is what flaked the v1.9.0
+          # tag inside test_full_cert_issuance. Use the spelling in
+          # test/pebble/docker-compose.yml when changing this.
+          PEBBLE_WFE_NONCEREJECT: "5"
     steps:
       - uses: actions/checkout@v5
 
