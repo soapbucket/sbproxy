@@ -213,6 +213,47 @@ features, so dead-code failures CI never reports, and fewer packages, so
 `<binary-crate>/<feature>` when a lane needs a wider union, and let the
 package selection stay where the rest of CI has it.
 
+### Payments e2e is scheduled, not per-PR
+
+`e2e/tests/settlement_gate.rs` and `e2e/tests/usage_bridge.rs` are the
+only tests that drive a payment through a real proxy process.
+`challenge_settle_allow_and_replay_refusal` is the one that asserts the
+origin served exactly once for a settled payment and then refused the
+replay. Both files spawn a binary no other lane builds: a release
+`sbproxy` carrying
+`payment-x402,payment-mpp,payment-stripe,payment-lightning-cln`, found
+under `target/payments/` or named by `SBPROXY_E2E_PAYMENTS_BIN`.
+
+That binary, plus a spawned child on real ports, is why these two files
+are not in the required PR lane.
+`.github/workflows/payments-e2e.yml` runs them nightly at 03:40 UTC
+instead, with `workflow_dispatch` for a manual run. A red run opens or
+comments on a "Payments e2e is failing" issue and names the tests that
+failed. Two other scheduled lanes happen to run the same files,
+`release-checks.yml`'s test-isolation job nightly and `e2e.yml` weekly,
+but neither is named for them and neither says which payment test broke.
+
+What that costs: a PR can merge green having never built the binary
+these tests spawn, and the exactly-once property is confirmed the next
+morning rather than before the merge. The `payments` lane in `ci.yml`
+still runs on every PR, so the settlement code compiles and its unit
+tests run there. What waits for the night is the proof that an assembled
+proxy serves a paid request once.
+
+So run the pair locally before merging anything that reaches settlement:
+
+```bash
+CARGO_TARGET_DIR=target/payments cargo build --release -p sbproxy --locked \
+  --features payment-x402,payment-mpp,payment-stripe,payment-lightning-cln
+cargo test -p sbproxy-e2e --locked --no-fail-fast \
+  --test settlement_gate --test usage_bridge -- --test-threads=1
+```
+
+`--test-threads=1` is load bearing: settlement_gate is red under
+parallelism (WOR-2295). Build that binary once and `SBPROXY_CHECK_E2E=1
+bash scripts/check.sh` picks both files up on every later gate. Without
+it the gate lists them under `SKIPPED PHASES`.
+
 ## Workspace layout
 
 ```
