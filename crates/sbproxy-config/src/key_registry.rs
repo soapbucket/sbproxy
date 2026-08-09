@@ -282,11 +282,11 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
     ),
     stable(
         "origins.*.forward_rules[].origin.request_modifiers[].js_script",
-        "sbproxy_core::pipeline::compile_single_forward_rule",
+        "sbproxy_core::server::js_request_modifier",
     ),
     stable(
         "origins.*.forward_rules[].origin.request_modifiers[].lua_script",
-        "sbproxy_core::pipeline::compile_single_forward_rule",
+        "sbproxy_core::server::lua_request_modifier",
     ),
     unsupported(
         "origins.*.forward_rules[].origin.version",
@@ -476,11 +476,11 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
     ),
     stable(
         "origins.*.request_modifiers[].js_script",
-        "sbproxy_config::compiler::compile_origin",
+        "sbproxy_core::server::js_request_modifier",
     ),
     stable(
         "origins.*.request_modifiers[].lua_script",
-        "sbproxy_config::compiler::compile_origin",
+        "sbproxy_core::server::lua_request_modifier",
     ),
     stable(
         "origins.*.response_modifiers[].status.text",

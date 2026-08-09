@@ -426,6 +426,42 @@ fn lua_request_modifier_reads_tls_and_principal() {
     assert!(out.contains(&("x-team".to_string(), "ml".to_string())));
 }
 
+/// The JavaScript twin of the test above, asserting the two engines see
+/// the same request table.
+///
+/// Before this landed there was no `js_request_modifier` at all:
+/// `request_modifiers[].js_script` parsed, compiled, was pinned `stable`
+/// in the key registry, and never ran. Because it was `stable` rather
+/// than `config_only`, the boot warning that covers inert keys did not
+/// fire either, so the config was accepted in total silence. The three
+/// existing `js_script` call sites all read `ResponseModifier`.
+#[test]
+fn js_request_modifier_reads_the_same_table_lua_does() {
+    let ctx = ctx_with_principal_and_tls();
+    let mut req_header = pingora_http::RequestHeader::build("GET", b"/v1/things", None).unwrap();
+    req_header.insert_header("x-probe", "1").unwrap();
+    let script = r#"
+        function modify_request(req, ctx) {
+          return { set_headers: {
+            "x-tls-ja4": req.tls.ja4,
+            "x-team": ctx.principal.attrs.team,
+            "x-method": req.method,
+            "x-path": req.path,
+          } };
+        }
+    "#;
+
+    let out = js_request_modifier(script, &req_header, &ctx).expect("js request modifier runs");
+
+    assert!(out.contains(&(
+        "x-tls-ja4".to_string(),
+        "t13d1516h2_8daaf6152771".to_string()
+    )));
+    assert!(out.contains(&("x-team".to_string(), "ml".to_string())));
+    assert!(out.contains(&("x-method".to_string(), "GET".to_string())));
+    assert!(out.contains(&("x-path".to_string(), "/v1/things".to_string())));
+}
+
 // --- resolve_override parsing ---
 
 #[test]

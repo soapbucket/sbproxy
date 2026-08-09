@@ -4232,6 +4232,62 @@ fn js_response_modifier(
     Ok(response_modifier_headers(&result, response_headers))
 }
 
+/// Execute a JavaScript request modifier script.
+///
+/// The script defines `modify_request(req, ctx)` and returns
+/// `{set_headers: {...}}`. The request table matches the one
+/// [`lua_request_modifier`] builds, so a script ported between the two
+/// engines reads the same fields, including the `req.tls.*` namespace.
+///
+/// There is no Go-format fallback here. That branch exists on the Lua
+/// side to keep `match_request(req, ctx)` scripts from the archived Go
+/// implementation working, and no JavaScript modifier ever ran in that
+/// implementation, so there is nothing to stay compatible with.
+fn js_request_modifier(
+    script: &str,
+    req_header: &RequestHeader,
+    ctx: &RequestContext,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let engine = sbproxy_extension::js::JsEngine::new()?;
+
+    let mut headers_map = std::collections::HashMap::new();
+    for (name, value) in req_header.headers.iter() {
+        if let Ok(v) = value.to_str() {
+            headers_map.insert(name.as_str().to_string(), v.to_string());
+        }
+    }
+
+    let mut req_table = serde_json::json!({
+        "method": req_header.method.as_str(),
+        "path": req_header.uri.path(),
+        "headers": headers_map,
+        "host": ctx.hostname.as_str(),
+    });
+    {
+        let fp = ctx.tls_fingerprint.as_ref();
+        sbproxy_extension::lua::bindings::enrich_request_table_with_tls_fingerprint(
+            &mut req_table,
+            fp.and_then(|f| f.ja3.as_deref()),
+            fp.and_then(|f| f.ja4.as_deref()),
+            fp.and_then(|f| f.ja4h.as_deref()),
+            fp.is_some_and(|f| f.trustworthy),
+        );
+    }
+    let ctx_table = script_modifier_context(ctx);
+
+    let result = engine.call_function(script, "modify_request", vec![req_table, ctx_table])?;
+
+    let mut headers_to_set = Vec::new();
+    if let Some(set_headers) = result.get("set_headers").and_then(|h| h.as_object()) {
+        for (key, value) in set_headers {
+            if let Some(v) = value.as_str() {
+                headers_to_set.push((key.clone(), v.to_string()));
+            }
+        }
+    }
+    Ok(headers_to_set)
+}
+
 // --- Session cookie builder ---
 
 /// Build a Set-Cookie header value for a session cookie.

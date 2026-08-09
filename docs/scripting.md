@@ -1,6 +1,6 @@
 # SBproxy scripting reference: CEL, Lua, JavaScript, and WASM
 
-*Last modified: 2026-08-08*
+*Last modified: 2026-08-09*
 
 SBproxy includes four scripting engines for custom logic: CEL (Common Expression Language), Lua, JavaScript, and WASM. All run in sandboxed environments with access to request context.
 
@@ -40,6 +40,7 @@ CEL expressions that come from `sb.yml` are parsed once, while the config compil
 | `policies[] type: waf`, field `persistent_block.key` | CEL | Returns the persistent-block tracking key when `track_by: cel` |
 | `observability.log.custom_fields[]` with `engine: cel` | CEL | Returns the value of one operator-defined access-log field |
 | `request_modifiers[].lua_script` | Lua | Defines `modify_request(req, ctx)`; returned `set_headers` are applied to the upstream request |
+| `request_modifiers[].js_script` | JavaScript | Defines `modify_request(req, ctx)`; returned `set_headers` are applied to the upstream request |
 | `response_modifiers[].lua_script` | Lua | Defines `modify_response(resp, ctx)`; returned `set_headers` are applied to the response |
 | `response_modifiers[].js_script` | JavaScript | Defines `modify_response(resp, ctx)`; returned `set_headers` are applied to the response |
 | `transforms[] type: lua_json`, field `script` | Lua | Defines `modify_json(data, ctx)`; return value replaces the JSON response body |

@@ -1417,6 +1417,7 @@ impl ProxyHttp for SbProxy {
         let mut req_to_remove: Vec<String> = Vec::new();
         let mut req_to_append: Vec<(String, String)> = Vec::new();
         let mut lua_scripts: Vec<String> = Vec::new();
+        let mut js_scripts: Vec<String> = Vec::new();
         let mut advanced_modifiers: Vec<sbproxy_config::RequestModifierConfig> = Vec::new();
         let mut upstream_url_path: Option<String> = None;
         let mut upstream_host_header: Option<String> = None;
@@ -1673,6 +1674,9 @@ impl ProxyHttp for SbProxy {
                         if let Some(script) = &modifier.lua_script {
                             lua_scripts.push(script.clone());
                         }
+                        if let Some(script) = &modifier.js_script {
+                            js_scripts.push(script.clone());
+                        }
                     }
                     // Clone modifiers for advanced processing (URL rewrite, query, method, body).
                     advanced_modifiers = origin.request_modifiers.to_vec();
@@ -1694,6 +1698,17 @@ impl ProxyHttp for SbProxy {
                                     for (key, value) in &hm.add {
                                         req_to_append.push((key.clone(), value.clone()));
                                     }
+                                }
+                                // This loop read `headers` and nothing else, so a
+                                // script on a forward rule was collected by the
+                                // compiler and never run, for both engines. They
+                                // join the same vectors the origin-level scripts
+                                // use and execute at the one call site below.
+                                if let Some(script) = &modifier.lua_script {
+                                    lua_scripts.push(script.clone());
+                                }
+                                if let Some(script) = &modifier.js_script {
+                                    js_scripts.push(script.clone());
                                 }
                             }
                         }
@@ -2197,6 +2212,22 @@ impl ProxyHttp for SbProxy {
                 }
                 Err(e) => {
                     warn!(error = %e, "Lua request modifier script error");
+                }
+            }
+        }
+
+        // Apply JavaScript request modifiers, after Lua so that a config
+        // setting both on one modifier resolves the same way the response
+        // side already does: the JavaScript result wins on a shared header.
+        for script in &js_scripts {
+            match js_request_modifier(script, session.req_header(), ctx) {
+                Ok(headers_to_set) => {
+                    for (key, value) in headers_to_set {
+                        let _ = upstream_request.insert_header(key, &value);
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "JavaScript request modifier script error");
                 }
             }
         }
