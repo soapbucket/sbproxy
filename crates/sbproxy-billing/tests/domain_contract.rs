@@ -301,10 +301,6 @@ fn only_succeeded_authorizes_the_origin() {
         "terminal asserts no funds moved; stranded asserts nothing at all, \
          and collapsing the two would hide unaccounted money",
     );
-    assert!(
-        !IntentStatus::Stranded.is_final(),
-        "a provider that answers later must still be able to move this row",
-    );
     assert_eq!(IntentStatus::Stranded.as_str(), "stranded");
     assert_eq!(
         IntentStatus::parse("stranded").expect("stranded parses"),

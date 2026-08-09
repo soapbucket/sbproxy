@@ -329,16 +329,6 @@ impl IntentStatus {
         matches!(self, Self::Succeeded)
     }
 
-    /// Reports whether the intent can still change state.
-    ///
-    /// [`IntentStatus::Stranded`] is not final. Its attempt is still on the
-    /// reconciliation queue, so a provider that later answers can still move
-    /// it to `Succeeded` or `Terminal`. What ended at the deadline was the
-    /// serving question, not the money question.
-    pub const fn is_final(self) -> bool {
-        matches!(self, Self::Succeeded | Self::Terminal)
-    }
-
     /// Reports whether a new provider write may be started from this state.
     ///
     /// [`IntentStatus::NeedsReconciliation`] deliberately returns `false`:
