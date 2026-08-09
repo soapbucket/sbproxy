@@ -1,6 +1,6 @@
 # 402 challenge contract
 
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-09*
 
 The exact bytes SBproxy puts on the wire when a request has to be paid
 for, and the exact bytes it accepts back. This page is the wire reference.
@@ -459,10 +459,14 @@ A multi-tenant deployment publishes one document covering every origin's
 issuer, which is a different reason for the same shape.
 
 On the retry the token is authenticated and its claims validated without
-consuming the nonce. The durable transaction that reserves the intent and
-the credential digest is what spends it, which is why the same client
-`Idempotency-Key` with the same credential can resume a retry or read a
-committed receipt, while a different credential cannot reuse the quote.
+consuming the nonce, which is why the same client `Idempotency-Key` with
+the same credential can resume a retry or read a committed receipt, while
+a different credential cannot reuse the quote. The nonce is spent later
+and separately, in its own durable write, once a committed receipt has
+authorized a response. Spending it any earlier would burn the quote while
+parsing a signature and leave an interrupted payment unresumable. See
+[payment-settlement.md](payment-settlement.md#replay-protection-and-where-it-stops)
+for what that spend covers and where it stops.
 
 ## Related
 

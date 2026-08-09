@@ -24,9 +24,10 @@
 //! The proxy hot path is sync. Signing
 //! is sync (pure ed25519 + base64); the persistence of `(nonce, quote_id)`
 //! into the `quote_tokens` table is async fire-and-forget and lives behind a
-//! pluggable [`NonceStore`] impl. The OSS build ships with the in-memory
-//! [`InMemoryNonceStore`] which the e2e tests and the single-host deployment
-//! topology use.
+//! pluggable [`NonceStore`] impl. This crate ships the in-memory
+//! [`InMemoryNonceStore`], which the crawl-pricing path and the e2e tests
+//! use. Payment settlement wires a durable ledger instead, because a nonce
+//! that a restart forgets is a paid response that can be served twice.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -708,11 +709,14 @@ impl<'a> NonceContext<'a> {
 /// Pluggable single-use nonce ledger.
 ///
 /// Implementations:
-/// - [`InMemoryNonceStore`]: OSS default. Ships with the proxy and is
-///   sufficient for single-host topologies and the e2e tests.
-/// - A Postgres-backed implementation (out of scope for this OSS crate)
-///   writes to the `quote_tokens` table for replay protection. The trait
-///   is the wire shape both implementations agree on.
+/// - [`InMemoryNonceStore`]: process-local. Sufficient for the crawl-pricing
+///   ledger path and for tests, and explicitly not sufficient for payment
+///   settlement, where a restart would empty it and let an already-settled
+///   quote serve a second time.
+/// - The settlement runtime's durable ledger, which writes the burn into the
+///   same SQLite file the rest of payment state lives in. It is assembled by
+///   `sbproxy-core` because that is the crate that owns the settlement store;
+///   this crate only owns the shape both implementations agree on.
 pub trait NonceStore: Send + Sync + std::fmt::Debug + 'static {
     /// Atomically check whether `nonce` has been consumed and, if not,
     /// mark it consumed.
@@ -725,6 +729,36 @@ pub trait NonceStore: Send + Sync + std::fmt::Debug + 'static {
     ///   has not landed yet; the verifier rejects with `bad_request` and
     ///   the agent re-quotes.
     fn check_and_consume(&self, nonce: &str) -> Result<NonceCheck, NonceError>;
+
+    /// Atomically consume `nonce`, and say how long the record of that
+    /// consumption has to outlive the request.
+    ///
+    /// `expires_at_unix_secs` is the `exp` claim of the token the nonce was
+    /// minted under. A nonce whose token has expired can never be validly
+    /// presented again, so that instant is the earliest a durable backend may
+    /// forget the burn without weakening replay protection at all. It is a
+    /// bound the token already carries rather than a lifetime this trait
+    /// invents, which matters: a backend cannot be configured into keeping
+    /// burns for less time than the tokens they refuse.
+    ///
+    /// The default forwards to [`NonceStore::check_and_consume`] and drops
+    /// the bound, which is right for any backend that keeps nothing on disk:
+    /// it has nothing to prune, and its whole ledger is already bounded by
+    /// the process lifetime.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NonceError`] when the backend could not answer. A caller
+    /// must treat that as a refusal. It is deliberately not a
+    /// [`NonceCheck`] variant, so no `Ok` value can stand for "the burn may
+    /// or may not have landed".
+    fn check_and_consume_with_expiry(
+        &self,
+        nonce: &str,
+        _expires_at_unix_secs: u64,
+    ) -> Result<NonceCheck, NonceError> {
+        self.check_and_consume(nonce)
+    }
 
     /// Pre-registration hook with full issuance context. The issuer calls
     /// this when emitting a 402 challenge so the verifier can later
@@ -755,10 +789,17 @@ pub trait NonceStore: Send + Sync + std::fmt::Debug + 'static {
     }
 }
 
-/// In-memory single-use nonce ledger. Suitable for tests and single-host OSS
-/// deployments. Multi-host enterprise deployments must use the Postgres-
-/// backed store per the ADR, otherwise an attacker can bounce the same
-/// token between proxies before the in-memory state propagates.
+/// In-memory single-use nonce ledger.
+///
+/// Suitable for tests and for the crawl-pricing ledger path, where a lost
+/// nonce costs a re-quote. It is not suitable for payment settlement and the
+/// settlement runtime does not wire it: this set empties on restart, so a
+/// client re-presenting an already-settled quote token would be served again,
+/// once per restart, having paid once. Settlement uses the durable ledger in
+/// the settlement database instead.
+///
+/// It is also single-process. Two proxies sharing traffic each keep their own
+/// set, so a token can be bounced between them before either has seen it.
 #[derive(Debug, Default)]
 pub struct InMemoryNonceStore {
     /// Set of nonces that have been issued (via `register`) and not yet

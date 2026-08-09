@@ -757,6 +757,11 @@ async fn retry_path(
             "presented token is not a settlement quote",
         ));
     }
+    // Read before the partial move below. This is the retention bound the
+    // durable nonce ledger stores beside the burn: after it, this token can
+    // never be validly presented again, so that is the earliest the burn can
+    // be forgotten without weakening anything.
+    let token_expires_at_unix_secs = claims.exp;
     let Some(requirement_id) = claims.requirement_id else {
         return Ok(RetryOutcome::FreshChallenge(
             "settlement quote carries no requirement id",
@@ -842,7 +847,15 @@ async fn retry_path(
             if let Err(error) = deps.seam.nonce_store.register(&requirement_id) {
                 return Err(infra_msg("nonce_register", &error.to_string()));
             }
-            match deps.seam.nonce_store.check_and_consume(&requirement_id) {
+            // The burn carries the token's own expiry, so a durable ledger
+            // knows exactly how long this row has to outlive the request:
+            // until the token it refuses can no longer be presented. Nothing
+            // here invents a lifetime.
+            match deps
+                .seam
+                .nonce_store
+                .check_and_consume_with_expiry(&requirement_id, token_expires_at_unix_secs)
+            {
                 Ok(NonceCheck::Fresh) => {
                     // The one place a payment both settled durably and
                     // bought origin access, which is the only event an
