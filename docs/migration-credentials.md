@@ -1,6 +1,6 @@
 # Migration: credentials block
 
-*Last modified: 2026-07-09*
+*Last modified: 2026-08-09*
 
 The legacy `virtual_keys:` YAML array under `origins[].action.providers` is no longer supported. The canonical replacement is the unified `credentials:` block, configurable at proxy, tenant, or origin scope.
 
@@ -126,7 +126,7 @@ Resolution at request time walks origin → tenant → proxy. A credential at or
 |---|---|---|
 | `project` | string | Project the credential's spend rolls up to. |
 | `user` | string | User the credential is owned by. |
-| `team` | string | Compatibility-only team grouping. Accepted with a warning but not copied into the principal; use `tags` or `metadata` instead. |
+| `team` | string | Team the credential's spend rolls up to. Copied onto the principal, so it reaches the access log's `team` column and the `team` metric label. An inbound `SB-Attr-Team` header overrides it for that request. |
 | `cost_center` | string | Cost center. Lifted onto `Principal.attrs.metadata` under the `cost_center` key. |
 | `tags` | list | Operator-supplied tags. Each tag becomes a separate attribution row. |
 | `metadata` | map | Free-form metadata copied verbatim onto `Principal.attrs.metadata`. |

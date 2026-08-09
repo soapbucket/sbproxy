@@ -6593,10 +6593,11 @@ pub struct CredentialAttrs {
     /// inbound request authenticates as).
     #[serde(default)]
     pub user: Option<String>,
-    /// Compatibility-only team grouping. The field remains parseable, but
-    /// credential lowering does not currently copy it onto the matched
-    /// principal. Use `tags` or `metadata` for live attribution until
-    /// WOR-1976 wires this value.
+    /// Team the credential's spend rolls up to. Copied onto
+    /// `Principal.attrs.team`, which feeds the access log's `team`
+    /// column, the attribution tag set behind the `team` metric label,
+    /// and the usage rollup dimension. This is the write end of the
+    /// same dimension `principals[].team` selects on.
     #[serde(default)]
     pub team: Option<String>,
     /// Cost center. Lifted onto `Principal.attrs.metadata` under

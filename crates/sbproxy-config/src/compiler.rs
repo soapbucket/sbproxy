@@ -574,6 +574,9 @@ fn lower_credentials_into_origin_virtual_keys(file: &mut crate::types::ConfigFil
                 if let Some(u) = &cred.attrs.user {
                     vk["user"] = json!(u);
                 }
+                if let Some(t) = &cred.attrs.team {
+                    vk["team"] = json!(t);
+                }
                 if let Some(provider) = &cred.provider {
                     vk["allowed_providers"] = json!([provider]);
                 }
@@ -5180,6 +5183,95 @@ origins:
         // tenant block does not apply. virtual_keys may be absent
         // or empty; both encode "no credentials".
         assert!(shared_vks.map(|v| v.is_empty()).unwrap_or(true));
+    }
+
+    /// `attrs.team` lowers onto the virtual key from all three
+    /// credential scopes, the same way `project` and `user` do. The
+    /// three scopes merge through one closure, so a regression in any
+    /// of them is a regression in all three; asserting each separately
+    /// is what makes that visible rather than assumed.
+    #[test]
+    fn credential_team_lowers_from_every_credential_scope() {
+        let yaml = r#"
+proxy:
+  credentials:
+    - name: shared
+      type: ai_provider
+      provider: openai
+      attrs: { team: platform }
+  tenants:
+    - id: acme-corp
+      credentials:
+        - name: tenant-scoped
+          type: ai_provider
+          provider: openai
+          attrs: { team: acme-ml }
+origins:
+  api.acme.local:
+    tenant_id: acme-corp
+    action:
+      type: ai_proxy
+      require_governed_key: true
+      providers:
+        - name: openai
+          api_key: dummy
+    credentials:
+      - name: origin-scoped
+        type: ai_provider
+        provider: openai
+        attrs: { team: research }
+"#;
+        let compiled = compile_config(yaml).expect("should compile");
+        let origin = compiled
+            .resolve_origin("api.acme.local")
+            .expect("origin exists");
+        let vks = origin
+            .action_config
+            .get("virtual_keys")
+            .and_then(|v| v.as_array())
+            .expect("virtual_keys array materialised");
+
+        let teams: std::collections::BTreeMap<&str, &str> = vks
+            .iter()
+            .filter_map(|vk| Some((vk["name"].as_str()?, vk["team"].as_str()?)))
+            .collect();
+
+        assert_eq!(teams.get("shared").copied(), Some("platform"));
+        assert_eq!(teams.get("tenant-scoped").copied(), Some("acme-ml"));
+        assert_eq!(teams.get("origin-scoped").copied(), Some("research"));
+    }
+
+    /// A credential that authors no team lowers no `team` key at all,
+    /// matching how `project` and `user` are omitted rather than
+    /// emitted as null.
+    #[test]
+    fn credential_without_a_team_lowers_no_team_key() {
+        let yaml = r#"
+proxy:
+  credentials:
+    - name: plain
+      type: ai_provider
+      provider: openai
+      attrs: { project: shared }
+origins:
+  ai.local:
+    action:
+      type: ai_proxy
+      require_governed_key: true
+      providers:
+        - name: openai
+          api_key: dummy
+"#;
+        let compiled = compile_config(yaml).expect("should compile");
+        let origin = compiled.resolve_origin("ai.local").expect("origin exists");
+        let vks = origin
+            .action_config
+            .get("virtual_keys")
+            .and_then(|v| v.as_array())
+            .expect("virtual_keys array materialised");
+
+        assert_eq!(vks.len(), 1);
+        assert!(vks[0].get("team").is_none());
     }
 
     /// WOR-1053 PR1: declaring a tenant named `__default__` clashes

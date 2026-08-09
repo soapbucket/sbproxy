@@ -242,6 +242,14 @@ fn effective_policy_to_virtual_key(
         tags: policy.tags.clone(),
         project: policy.project.clone(),
         user: policy.user.clone(),
+        // `EffectiveKeyPolicy` carries no team of its own. Its only `team`
+        // is the one on `PrincipalSelector`, which is the read end of the
+        // dimension rather than the write end, so there is nothing here to
+        // copy. Stored governed keys therefore attribute by project, user,
+        // tags, and metadata exactly as they did before; the config
+        // `credentials[].attrs.team` path lowers through
+        // `ResolvedRequestKey::from_configured` and does not come past here.
+        team: None,
         metadata: policy
             .metadata
             .iter()
@@ -2164,7 +2172,7 @@ fn principal_for_resolved_virtual_key(
     let attrs = sbproxy_plugin::PrincipalAttrs {
         project: key.project.clone(),
         user: key.user.clone(),
-        team: None,
+        team: key.team.clone(),
         tags: key.tags.clone(),
         metadata: key
             .metadata
@@ -16528,6 +16536,56 @@ mod dynamic_key_resolution_tests {
             principal.attrs.metadata.get("region").map(String::as_str),
             Some("us-central1")
         );
+    }
+
+    #[test]
+    fn configured_credential_team_reaches_the_virtual_key_principal() {
+        let key: sbproxy_ai::identity::VirtualKeyConfig =
+            serde_json::from_value(serde_json::json!({
+                "key": "sk-team",
+                "key_id": "cfg:9:tenant-ops:11:api.example:research",
+                "name": "research",
+                "project": "atlas",
+                "user": "alice",
+                "team": "research",
+                "tags": ["internal"],
+                "metadata": {"cost_center": "R-12"}
+            }))
+            .expect("configured key with a team parses");
+
+        let principal = principal_for_resolved_virtual_key("tenant-ops", &key);
+
+        assert_eq!(
+            principal.attrs.team.as_deref(),
+            Some("research"),
+            "the credential's team must reach the principal alongside its five siblings"
+        );
+        assert_eq!(principal.attrs.project.as_deref(), Some("atlas"));
+        assert_eq!(principal.attrs.user.as_deref(), Some("alice"));
+        assert_eq!(principal.attrs.tags, ["internal"]);
+        assert_eq!(
+            principal
+                .attrs
+                .metadata
+                .get("cost_center")
+                .map(String::as_str),
+            Some("R-12")
+        );
+    }
+
+    #[test]
+    fn configured_credential_without_a_team_leaves_the_principal_team_unset() {
+        let key: sbproxy_ai::identity::VirtualKeyConfig =
+            serde_json::from_value(serde_json::json!({
+                "key": "sk-no-team",
+                "key_id": "cfg:9:tenant-ops:11:api.example:plain",
+                "name": "plain"
+            }))
+            .expect("configured key without a team parses");
+
+        let principal = principal_for_resolved_virtual_key("tenant-ops", &key);
+
+        assert!(principal.attrs.team.is_none());
     }
 
     #[tokio::test]

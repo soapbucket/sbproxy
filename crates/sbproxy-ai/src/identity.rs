@@ -139,6 +139,18 @@ pub struct VirtualKeyConfig {
     /// [`Self::project`] for per-user breakdowns.
     #[serde(default)]
     pub user: Option<String>,
+    /// Team this key's spend rolls up to. Same path as
+    /// [`Self::project`]: stamped onto `Principal.attrs.team`, which
+    /// feeds the access log's `team` column, the attribution tag set
+    /// behind the `team` metric label, and the usage rollup dimension.
+    ///
+    /// This is the write end of the same dimension
+    /// [`PrincipalSelectorConfig::team`] reads. The selector runs
+    /// against the inbound principal before this key is applied, so a
+    /// key can select on the team a request arrived with and still
+    /// re-attribute the spend to its own.
+    #[serde(default)]
+    pub team: Option<String>,
     /// WOR-894: arbitrary string-keyed metadata. Surfaced on the access
     /// log as a JSON object so reports can group by a custom dimension.
     /// Kept off metric labels to avoid cardinality blow-up.
@@ -487,6 +499,7 @@ mod tests {
             tags: vec![],
             project: None,
             user: None,
+            team: None,
             metadata: HashMap::new(),
             route_to_model: None,
             compression_profile: None,

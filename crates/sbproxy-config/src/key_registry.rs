@@ -258,10 +258,9 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "origins.*.credentials[].attrs.tags[]",
         "sbproxy_config::compiler::lower_credentials_into_origin_virtual_keys",
     ),
-    config_only(
+    stable(
         "origins.*.credentials[].attrs.team",
-        "Credential lowering does not copy this attribution value into the virtual-key principal; \
-         project, user, tags, metadata, and cost_center remain live. Reserved under WOR-1976.",
+        "sbproxy_config::compiler::lower_credentials_into_origin_virtual_keys",
     ),
     config_only(
         "origins.*.forward_rules[].origin.hostname",
@@ -541,10 +540,9 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "proxy.credentials[].attrs.tags[]",
         "sbproxy_config::compiler::lower_credentials_into_origin_virtual_keys",
     ),
-    config_only(
+    stable(
         "proxy.credentials[].attrs.team",
-        "Credential lowering does not copy this attribution value into the virtual-key principal; \
-         project, user, tags, metadata, and cost_center remain live. Reserved under WOR-1976.",
+        "sbproxy_config::compiler::lower_credentials_into_origin_virtual_keys",
     ),
     stable(
         "proxy.credentials[].policies[].type",
@@ -849,10 +847,9 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "proxy.tenants[].credentials[].attrs.tags[]",
         "sbproxy_config::compiler::lower_credentials_into_origin_virtual_keys",
     ),
-    config_only(
+    stable(
         "proxy.tenants[].credentials[].attrs.team",
-        "Credential lowering does not copy this attribution value into the virtual-key principal; \
-         project, user, tags, metadata, and cost_center remain live. Reserved under WOR-1976.",
+        "sbproxy_config::compiler::lower_credentials_into_origin_virtual_keys",
     ),
     stable(
         "proxy.tenants[].credentials[].policies[].type",
@@ -1220,8 +1217,35 @@ origins:
         assert!(!paths.contains(&"proxy.http3"));
     }
 
+    /// `attrs.team` is lowered onto the virtual key at all three
+    /// credential scopes, so authoring it is no longer inert and must
+    /// not warn. The registry has to agree with the compiler here or an
+    /// operator is told a live key does nothing.
     #[test]
-    fn credential_team_warns_at_every_supported_scope() {
+    fn credential_team_is_stable_at_every_supported_scope() {
+        const TEAM_KEYS: [&str; 3] = [
+            "origins.*.credentials[].attrs.team",
+            "proxy.credentials[].attrs.team",
+            "proxy.tenants[].credentials[].attrs.team",
+        ];
+
+        for path in TEAM_KEYS {
+            let entry = CONFIG_KEY_OVERRIDES
+                .iter()
+                .find(|key| key.path == path)
+                .unwrap_or_else(|| panic!("{path} is registered"));
+            assert_eq!(
+                entry.support,
+                SupportLevel::Stable,
+                "{path} lowers into the virtual key and must not be classified inert"
+            );
+            assert_eq!(
+                entry.consumer,
+                Some("sbproxy_config::compiler::lower_credentials_into_origin_virtual_keys"),
+                "{path} must name the lowering site that reads it"
+            );
+        }
+
         let yaml: serde_yaml::Value = serde_yaml::from_str(
             r#"
 proxy:
@@ -1243,13 +1267,9 @@ origins:
             .map(|key| key.path)
             .collect();
 
-        assert_eq!(
-            paths,
-            [
-                "origins.*.credentials[].attrs.team",
-                "proxy.credentials[].attrs.team",
-                "proxy.tenants[].credentials[].attrs.team",
-            ]
+        assert!(
+            paths.is_empty(),
+            "authoring a credential team must emit no config-only warning: {paths:?}"
         );
     }
 
