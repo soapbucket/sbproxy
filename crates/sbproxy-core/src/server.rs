@@ -3765,7 +3765,22 @@ async fn check_policies(
         let started = std::time::Instant::now();
         let surface = compiled.surface;
         let ctx_any: &mut dyn std::any::Any = ctx;
-        let decision = match compiled.enforcer.enforce(&req_snapshot, ctx_any).await {
+        // WOR-2318: one span per enforcer. The chain already reports a
+        // per-policy verdict event and a per-policy metric, and neither
+        // answers "which of the eleven policies on this origin is the one
+        // adding 40ms". A span per evaluation does, and it nests under the
+        // intake span for free because `request_filter` runs this whole
+        // filter inside it.
+        //
+        // `.instrument` rather than an entered guard: `enforce` is awaited
+        // and the dispatch future has to stay `Send`, which an `Entered`
+        // held across the await would break.
+        let enforce_span = sbproxy_observe::telemetry::policy_enforce_span(policy_id);
+        let enforced = tracing::Instrument::instrument(
+            compiled.enforcer.enforce(&req_snapshot, ctx_any),
+            enforce_span,
+        );
+        let decision = match enforced.await {
             Ok(d) => d,
             Err(err) => {
                 tracing::warn!(

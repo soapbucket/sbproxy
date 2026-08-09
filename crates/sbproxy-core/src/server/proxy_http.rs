@@ -1025,7 +1025,27 @@ impl ProxyHttp for SbProxy {
     where
         Self::CTX: Send + Sync,
     {
-        request_phase::request_filter(session, ctx).await
+        // WOR-2318: the root span of a proxied request. Wrapping the whole
+        // filter rather than opening the span inside it is what makes it a
+        // parent: `Instrument` re-enters the span around every poll, so the
+        // auth span, every policy span, and the AI request span all nest
+        // under it without a single one of them being handed a parent
+        // explicitly.
+        //
+        // `method.as_str()` is borrowed straight from the request header,
+        // so the field costs no allocation, and `tracing` does not even
+        // evaluate it unless the callsite is enabled.
+        //
+        // The span cannot be parented on the caller's trace here: the
+        // inbound `traceparent` has not been parsed yet at this point, and
+        // parsing it twice to get an earlier answer would allocate per
+        // request for a value the filter is about to compute anyway.
+        // `request_phase::request_filter` calls
+        // `parent_span_on_remote_trace_context` against `Span::current()`
+        // the moment it has the context, which is this span.
+        let span =
+            sbproxy_observe::telemetry::intake_accept_span(session.req_header().method.as_str());
+        tracing::Instrument::instrument(request_phase::request_filter(session, ctx), span).await
     }
 
     /// Resolve the upstream peer for proxy actions.
@@ -5264,12 +5284,38 @@ impl ProxyHttp for SbProxy {
                         if needs_synth_projection {
                             synthesise_markdown_projection_if_missing(ctx, &buf, ratio);
                         }
-                        if let Err(e) = apply_transform_with_ctx(
+                        // WOR-2318: one span per transform. `transform_type`
+                        // is borrowed from the compiled transform and the
+                        // body never reaches an attribute, so the span costs
+                        // no allocation on a path that already owns the
+                        // whole response in memory.
+                        //
+                        // Parented explicitly rather than contextually. This
+                        // is a different Pingora callback from
+                        // `request_filter`, so the intake span is not current
+                        // here and there is nothing to inherit. Where the
+                        // caller sent a `traceparent` the transform joins
+                        // that trace, which is the case that matters; where
+                        // it did not, the proxy's own root was synthesized
+                        // and parenting on it would point at a span nothing
+                        // ever exported, so this stays a root of its own.
+                        let shape_span = sbproxy_observe::telemetry::transform_shape_span(
+                            compiled_transform.transform.transform_type(),
+                        );
+                        sbproxy_observe::telemetry::parent_span_on_remote_trace_context(
+                            &shape_span,
+                            ctx.trace_ctx.as_ref(),
+                            ctx.trace_parent_is_remote,
+                        );
+                        let shape_guard = shape_span.entered();
+                        let transform_outcome = apply_transform_with_ctx(
                             compiled_transform,
                             &mut buf,
                             content_type,
                             ctx,
-                        ) {
+                        );
+                        drop(shape_guard);
+                        if let Err(e) = transform_outcome {
                             // WOR-168: a `TransformError::InvariantViolated`
                             // or `TransformError::Plugin` is a code-level
                             // bug or a misbehaving plugin; both must

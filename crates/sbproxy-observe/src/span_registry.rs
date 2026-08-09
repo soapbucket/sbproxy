@@ -11,11 +11,13 @@
 //! landed, and none of them was visible to review:
 //!
 //! - The doc published eight fully-qualified `sbproxy.<pillar>.<verb>` span
-//!   names as the span-naming convention. Nothing in the proxy emits any of
-//!   the eight. An operator who filtered a trace query on
+//!   names as the span-naming convention. Nothing in the proxy emitted any
+//!   of the eight. An operator who filtered a trace query on
 //!   `sbproxy.policy.enforce` got an empty result and no way to tell that
-//!   from a quiet system.
-//! - The one pillar span production really opens,
+//!   from a quiet system. Three of the eight are live now on the ordinary
+//!   proxied request path, along with a fourth name the published eight
+//!   did not have, `sbproxy.intake.authenticate`. The rest are reserved.
+//! - The one pillar span production really opened,
 //!   `sbproxy.rail.reconcile`, was not on the published list. It is also a
 //!   background worker rather than a request-path span, which is worth
 //!   knowing before anyone reads a latency panel built from it.
@@ -47,11 +49,25 @@
 //! # Scope
 //!
 //! This table describes the vocabulary. It does not emit anything, and
-//! adding an entry does not make a span appear: the eight pillar names
-//! below are recorded as not emitted precisely because putting them on the
-//! request path is a separate change with its own design questions
-//! (which pillar owns which phase, what the root span is on a proxied
-//! request, and what happens to the attribute budget).
+//! adding an entry does not make a span appear. The entries still recorded
+//! as not emitted are the payment, ledger, and audit names, and they stay
+//! that way until something opens them.
+//!
+//! Four phases of a proxied request are covered: inbound acceptance,
+//! which is the parent of the rest, then authentication, policy
+//! evaluation, and response-body shaping. Three of those had a pillar name
+//! reserved and waiting. Authentication did not, and took a new verb under
+//! the pillar that already owns inbound admission rather than a pillar of
+//! its own.
+//!
+//! The phases that are still uncovered are worth stating, because a reader
+//! will go looking for them: the upstream connect and send, and the
+//! response header filter. Neither has a pillar in this vocabulary at all.
+//! The eight are a domain taxonomy rather than an HTTP-phase one, so
+//! covering those two means adding a pillar, which moves the enum,
+//! `deploy/dashboards/traces-overview.json`, and the published convention
+//! together. That is a vocabulary change rather than a wiring change, so
+//! it is not folded in here.
 
 use sbproxy_capability::{CompatTier, SpanCapability, SpanEmitter, SupportLevel};
 
@@ -72,29 +88,43 @@ pub const SPANS: &[SpanCapability] = &[
         name: "sbproxy.intake.accept",
         pillar: Some("intake"),
         verb: Some("accept"),
-        emitter: SpanEmitter::Nothing,
-        support: SupportLevel::ConfigOnly,
+        emitter: SpanEmitter::Constructor("intake_accept_span"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        description: "The inbound phase of one request, and the parent of every other \
+                      span the proxy opens while handling it: origin resolution, \
+                      authentication, the policy chain, the response-cache probe, and \
+                      non-proxy action dispatch. It closes before the upstream is \
+                      dialed, so its duration is admission cost rather than origin \
+                      latency. Carries `http.request.method`.",
+        dead_reason: None,
+    },
+    SpanCapability {
+        name: "sbproxy.intake.authenticate",
+        pillar: Some("intake"),
+        verb: Some("authenticate"),
+        emitter: SpanEmitter::Constructor("intake_authenticate_span"),
+        support: SupportLevel::Stable,
         compat: CompatTier::Alpha,
-        description: "Would cover inbound request acceptance and framing validation, \
-                      as the root span of a proxied request.",
-        dead_reason: Some(
-            "published as the span-naming convention and emitted by nothing; the \
-             request path opens no pillar span (WOR-2318)",
-        ),
+        description: "One authentication check against the origin's configured \
+                      provider, which is what makes a slow forward-auth subrequest \
+                      visible instead of folded into the inbound phase. Carries the \
+                      provider type and nothing about the caller: no subject, no \
+                      token, no header.",
+        dead_reason: None,
     },
     SpanCapability {
         name: "sbproxy.policy.enforce",
         pillar: Some("policy"),
         verb: Some("enforce"),
-        emitter: SpanEmitter::Nothing,
-        support: SupportLevel::ConfigOnly,
-        compat: CompatTier::Alpha,
-        description: "Would cover one policy evaluation: rate limit, WAF, AI crawl, \
-                      and the rest of the enforcer chain.",
-        dead_reason: Some(
-            "published as the span-naming convention and emitted by nothing; policy \
-             enforcement is observable through metrics and events only (WOR-2318)",
-        ),
+        emitter: SpanEmitter::Constructor("policy_enforce_span"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        description: "One policy evaluation: rate limit, WAF, AI crawl, and the rest \
+                      of the enforcer chain. Opened per enforcer rather than per \
+                      chain, so the trace says which policy spent the time, and the \
+                      spans render in configured order under the inbound phase.",
+        dead_reason: None,
     },
     SpanCapability {
         name: "sbproxy.action.challenge",
@@ -167,15 +197,14 @@ pub const SPANS: &[SpanCapability] = &[
         name: "sbproxy.transform.shape",
         pillar: Some("transform"),
         verb: Some("shape"),
-        emitter: SpanEmitter::Nothing,
-        support: SupportLevel::ConfigOnly,
-        compat: CompatTier::Alpha,
-        description: "Would cover a content transform such as PDF extraction, OCR, \
-                      or summarization.",
-        dead_reason: Some(
-            "published as the span-naming convention and emitted by nothing; \
-             transforms are observable through metrics only (WOR-2318)",
-        ),
+        emitter: SpanEmitter::Constructor("transform_shape_span"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        description: "One response-body transform, opened per transform in the \
+                      origin's chain over the buffered body. This is the proxy's own \
+                      CPU rather than the upstream's latency, which is the point of \
+                      separating it. The body never reaches an attribute.",
+        dead_reason: None,
     },
     SpanCapability {
         name: "sbproxy.audit.emit",
@@ -329,9 +358,11 @@ pub fn render_markdown() -> String {
          emitter against the source tree and requiring a call site outside \
          tests. `not yet` means the name is reserved and published here and \
          nothing opens it, so a trace query filtered on that name returns \
-         nothing. Most of the pillar vocabulary is still in that state: the \
-         request path does not open pillar spans today, and the one pillar span \
-         that is live runs on a background worker.\n\n",
+         nothing. Four pillar spans cover an ordinary proxied request: the \
+         inbound phase, one per authentication check, one per policy \
+         evaluation, and one per response-body transform. The reserved names \
+         that remain are the payment, ledger, and audit ones, plus the \
+         settlement rail's second verb.\n\n",
     );
 
     out.push_str(
@@ -430,6 +461,37 @@ mod tests {
             !rendered.contains("WOR-"),
             "the published vocabulary must not cite internal ticket numbers"
         );
+    }
+
+    #[test]
+    fn the_request_path_constructors_name_registered_spans() {
+        // The request path opens its spans by a `&'static str` constant
+        // instead of formatting `sbproxy.<pillar>.<verb>` per request, so
+        // the name is written down twice: once where the span is opened
+        // and once here. This is the join. Without it a rename lands on
+        // one side, the published table keeps describing a name nothing
+        // emits, and the drift guard stays green because its own
+        // emitter check only asks whether the constructor has a caller.
+        //
+        // In-crate rather than in `tests/span_drift.rs` because the
+        // constants are `pub(crate)`: an out-of-crate reader would be the
+        // only reason they were `pub`, and a `pub` item whose only
+        // consumer is a test is what the pub-item ratchet refuses.
+        for name in [
+            crate::telemetry::SPAN_INTAKE_ACCEPT,
+            crate::telemetry::SPAN_INTAKE_AUTHENTICATE,
+            crate::telemetry::SPAN_POLICY_ENFORCE,
+            crate::telemetry::SPAN_TRANSFORM_SHAPE,
+        ] {
+            let span = SPANS
+                .iter()
+                .find(|span| span.name == name)
+                .unwrap_or_else(|| panic!("the request path opens {name}, which is unregistered"));
+            assert!(
+                span.emitter.is_live(),
+                "{name} is opened on the request path but recorded as emitted by nothing"
+            );
+        }
     }
 
     #[test]

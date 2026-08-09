@@ -1234,6 +1234,27 @@ pub(super) async fn request_filter(
             Some(remote_trace_ctx.unwrap_or_else(sbproxy_observe::TraceContext::new_random));
     }
 
+    // WOR-2318: hand the intake span its parent.
+    //
+    // `SbProxy::request_filter` runs this whole function inside
+    // `sbproxy.intake.accept`, so `Span::current()` here is that span. It
+    // could not be given a parent where it was created: nothing had read
+    // the inbound `traceparent` yet, and parsing it a second time up there
+    // would have meant allocating a `TraceContext` per request to learn
+    // what the block above was about to work out anyway.
+    //
+    // Same explicit, request-scoped call the AI dispatch path makes, and
+    // for the same reason: no ambient or thread-local OTel state is
+    // touched, so nothing leaks onto an unrelated later request that
+    // happens to reuse this worker thread. It no-ops unless the context
+    // came off the wire, because parenting on a root the proxy invented
+    // would point at a span nothing exports.
+    sbproxy_observe::telemetry::parent_span_on_remote_trace_context(
+        &tracing::Span::current(),
+        ctx.trace_ctx.as_ref(),
+        ctx.trace_parent_is_remote,
+    );
+
     // --- ACME HTTP-01 challenge interception ---
     // Owned `path` (as opposed to a &str borrowed from
     // `req_header()`) so we can re-borrow `session` mutably for
@@ -2797,12 +2818,24 @@ pub(super) async fn request_filter(
     // configured provider is skipped. That makes the two front doors
     // alternatives rather than a chain.
     if let (None, Some(auth)) = (&ctx.resolved_inbound_key, &pipeline.auths[origin_idx]) {
+        // WOR-2318: `sbproxy.intake.authenticate` wraps both branches
+        // below. Imported here rather than at module scope because this is
+        // the only phase in this file that opens a span of its own.
+        use tracing::Instrument as _;
+
         let auth_type = auth.auth_type().to_string();
         let origin_label = ctx.hostname.to_string();
         // Handle forward auth (requires async HTTP subrequest).
         if let Auth::ForwardAuth(fwd) = auth {
             let req_headers = &session.req_header().headers;
-            match check_forward_auth(fwd, req_headers).await {
+            // Forward auth is an outbound HTTP call on the inbound path,
+            // which is exactly the latency a trace should separate from the
+            // rest of admission. `auth_type` is already built above for the
+            // metric, so the span borrows it rather than making a second
+            // copy.
+            let auth_span = sbproxy_observe::telemetry::intake_authenticate_span(&auth_type);
+            let authenticated = check_forward_auth(fwd, req_headers).instrument(auth_span);
+            match authenticated.await {
                 Ok(trust_headers) => {
                     // Pull the resolved user out of the trust
                     // headers (typically `X-Forwarded-User` or
@@ -2877,7 +2910,13 @@ pub(super) async fn request_filter(
             // extra `session` borrow is held across the await.
             let tls_cert_thumbprint: Option<String> =
                 client_cert_x5t_s256(session.digest().and_then(|d| d.ssl_digest.as_deref()));
-            let (auth_result, principal_opt, trust_outcome) = check_auth_with_tls_outcome(
+            // WOR-2318: the same span as the forward-auth branch above, on
+            // the branch that runs every other provider. A JWKS fetch or a
+            // remote introspection call lands here and is worth its own bar
+            // in a trace; a local HMAC check costs nothing and shows as
+            // nothing.
+            let auth_span = sbproxy_observe::telemetry::intake_authenticate_span(&auth_type);
+            let authenticated = check_auth_with_tls_outcome(
                 auth,
                 req_headers,
                 query,
@@ -2887,7 +2926,8 @@ pub(super) async fn request_filter(
                 tls_cert_thumbprint.as_deref(),
                 resolved_agent_id.as_deref(),
             )
-            .await;
+            .instrument(auth_span);
+            let (auth_result, principal_opt, trust_outcome) = authenticated.await;
             #[cfg(feature = "agent-class")]
             let bot_auth_keyid = principal_opt
                 .as_ref()

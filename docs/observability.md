@@ -733,20 +733,21 @@ names as though the proxy emitted them, and it emitted none of them.
 
 Span names follow one of two conventions. SBproxy's own pillars are `sbproxy.<pillar>.<verb>`, with eight pillars: `intake`, `policy`, `action`, `transform`, `ledger`, `rail`, `audit`, and `notify`. The AI gateway spans instead follow the OpenTelemetry GenAI and OpenInference vocabularies, so LLM-native trace backends render them without remapping.
 
-The `Emitted` column is the one to read first. `yes` means production code opens the span and a drift guard proves it, by resolving the emitter against the source tree and requiring a call site outside tests. `not yet` means the name is reserved and published here and nothing opens it, so a trace query filtered on that name returns nothing. Most of the pillar vocabulary is still in that state: the request path does not open pillar spans today, and the one pillar span that is live runs on a background worker.
+The `Emitted` column is the one to read first. `yes` means production code opens the span and a drift guard proves it, by resolving the emitter against the source tree and requiring a call site outside tests. `not yet` means the name is reserved and published here and nothing opens it, so a trace query filtered on that name returns nothing. Four pillar spans cover an ordinary proxied request: the inbound phase, one per authentication check, one per policy evaluation, and one per response-body transform. The reserved names that remain are the payment, ledger, and audit ones, plus the settlement rail's second verb.
 
 `Name` is the compatibility promise about the span name itself, on the same three tiers the metric catalog uses. `stable` will not be renamed without a deprecation period, `beta` may be renamed in a minor release with a changelog entry, and `alpha` may be renamed or removed in any release. A name nothing emits cannot be better than `alpha`.
 
 | Span | Pillar | Emitted | Name | What it covers |
 | --- | --- | --- | --- | --- |
-| `sbproxy.intake.accept` | `intake` | not yet | `alpha` | Would cover inbound request acceptance and framing validation, as the root span of a proxied request. |
-| `sbproxy.policy.enforce` | `policy` | not yet | `alpha` | Would cover one policy evaluation: rate limit, WAF, AI crawl, and the rest of the enforcer chain. |
+| `sbproxy.intake.accept` | `intake` | yes | `beta` | The inbound phase of one request, and the parent of every other span the proxy opens while handling it: origin resolution, authentication, the policy chain, the response-cache probe, and non-proxy action dispatch. It closes before the upstream is dialed, so its duration is admission cost rather than origin latency. Carries `http.request.method`. |
+| `sbproxy.intake.authenticate` | `intake` | yes | `alpha` | One authentication check against the origin's configured provider, which is what makes a slow forward-auth subrequest visible instead of folded into the inbound phase. Carries the provider type and nothing about the caller: no subject, no token, no header. |
+| `sbproxy.policy.enforce` | `policy` | yes | `beta` | One policy evaluation: rate limit, WAF, AI crawl, and the rest of the enforcer chain. Opened per enforcer rather than per chain, so the trace says which policy spent the time, and the spans render in configured order under the inbound phase. |
 | `sbproxy.action.challenge` | `action` | not yet | `alpha` | Would cover issuing a 402 payment challenge. |
 | `sbproxy.action.redeem` | `action` | not yet | `alpha` | Would cover verifying a presented token or receipt. |
 | `sbproxy.ledger.redeem` | `ledger` | not yet | `alpha` | Would cover the outbound HTTP call to the ledger. |
 | `sbproxy.rail.settle` | `rail` | not yet | `alpha` | Would cover an outbound payment-rail settlement. The rail pillar is live, but only for reconciliation. |
 | `sbproxy.rail.reconcile` | `rail` | yes | `beta` | One settlement reconciliation attempt. Opened by the background sweep and by an operator-triggered sweep, never on the request path, so it has no parent span and its latency is not a user's latency. |
-| `sbproxy.transform.shape` | `transform` | not yet | `alpha` | Would cover a content transform such as PDF extraction, OCR, or summarization. |
+| `sbproxy.transform.shape` | `transform` | yes | `beta` | One response-body transform, opened per transform in the origin's chain over the buffered body. This is the proxy's own CPU rather than the upstream's latency, which is the point of separating it. The body never reaches an attribute. |
 | `sbproxy.audit.emit` | `audit` | not yet | `alpha` | Would cover appending one audit-log entry. |
 | `ai.request` | not pillar-shaped | yes | `stable` | One AI gateway request, from dispatch entry to the last byte of the completion. Carries the gen_ai and OpenInference attribute sets, the token split, the derived cost, and the run identity. |
 | `mcp.execute_tool` | not pillar-shaped | yes | `stable` | One MCP tool dispatch: the tool name, the server it went to, the outcome, and the per-tool cost when the price map resolves it. |
@@ -759,8 +760,30 @@ The `Emitted` column is the one to read first. `yes` means production code opens
 
 <!-- END GENERATED SPAN VOCABULARY -->
 
-The attribute set below is the naming contract for pillar spans as they land, not
-a description of traffic you can go and query today. Span attributes include the
+The inbound span wraps the whole request filter, so the authentication span and
+one span per enforcer are its children, in the order they ran, and on an AI origin
+the AI request span nests under it as well. Transform spans are the exception:
+they open in a later phase, after the inbound span has closed, so they join the
+caller's trace through the inbound `traceparent` when there is one and start a
+root of their own when there is not.
+
+Their attribute sets are deliberately small. `http.request.method` on the inbound
+span, `sbproxy.auth_type` on the authentication span, `policy` on each policy
+span, `transform` on each transform span. Every one of those is already a metric
+label or a bounded type name. Nothing caller-supplied rides along, and the request
+target in particular is not on the inbound span, because a query string routinely
+carries a credential and the access log already records the path against the same
+request id.
+
+Two phases still have no span, and the reason is the vocabulary rather than the
+wiring: the upstream connect and send, and the response header filter. Both are
+HTTP phases that the eight pillars do not name, so covering them means adding a
+pillar, which moves the published convention and the traces dashboard along with
+it.
+
+The attribute set below is the naming contract for the pillar spans that have not
+landed yet, not a description of traffic you can go and query today. Span
+attributes include the
 OTel semantic conventions (`http.request.method`, `http.response.status_code`, `server.address`) plus the SBproxy-specific set (`sbproxy.request_id`, `sbproxy.tenant_id`, `sbproxy.route`, `sbproxy.agent_id`, `sbproxy.agent_class`, `sbproxy.rail`, `sbproxy.shape`, `sbproxy.ledger.idempotency_key`).
 
 Per-request attributes such as `request_id` are span attributes only, never Prometheus labels; the Hard rule under the cardinality budget above is the long form. `agent_id` is the exception that proves the shape of that rule: it rides the span in full fidelity and it is also a Prometheus label, because the label carries only the sanitized, budgeted form.

@@ -1351,6 +1351,154 @@ pub mod tracing_helper {
 /// without going through the `tracing_helper` sub-module.
 pub use tracing_helper::span;
 
+// --- WOR-2318: pillar spans on the ordinary proxied request path ---
+//
+// Until this landed the only spans a request could produce came from the
+// AI gateway. A plain proxied HTTP request produced none at all: the eight
+// `sbproxy.<pillar>.<verb>` names were published as the naming convention
+// and emitted by nothing, and the one pillar span that was live ran on the
+// settlement background sweep. An operator tracing a slow proxied request
+// had metrics and an access-log line and no span.
+//
+// [`tracing_helper::span`] is the friendly shape for that vocabulary and
+// the wrong one for a per-request phase. It formats
+// `sbproxy.<pillar>.<verb>` into a fresh `String` on every call, before the
+// span macro can decide whether any subscriber wants the span, so a proxy
+// with tracing switched off still pays one allocation per phase per
+// request. The constructors below name the span with a `&'static str` the
+// compiler already holds and take every field borrowed or already
+// computed, so the request path allocates nothing and, when the callsite
+// is disabled, evaluates nothing: `tracing`'s `span!` only builds the
+// value set after the callsite reports interest.
+//
+// They are `info_span!` rather than `debug_span!` on purpose. The root
+// `EnvFilter` in [`crate::logging`] sits in front of the OpenTelemetry
+// layer and not only the fmt layer, so a `debug_span!` at the default
+// `info` level is never constructed and therefore never exported. That
+// span would still satisfy the drift guard, which proves a call site
+// exists rather than that anything reaches a collector, which is the
+// quiet failure this whole registry was written to make impossible.
+//
+// Nothing here adds a sampling decision of its own. These spans reach the
+// same `tracing-opentelemetry` layer every other span does and are
+// therefore subject to the same head sampler the SDK is built with
+// (ParentBased over TraceIdRatio, from `telemetry.sample_rate`).
+
+// The four names below are `pub(crate)` rather than `pub` deliberately.
+// Nothing outside this crate needs to name a span it does not open, and a
+// `pub` const whose only out-of-crate reader is a test is exactly what the
+// pub-item ratchet is there to refuse. `span_registry`'s own tests bind
+// them to the published registry entries from inside the crate.
+
+/// Span name for the inbound phase of one request.
+///
+/// Pairs with [`intake_accept_span`].
+pub(crate) const SPAN_INTAKE_ACCEPT: &str = "sbproxy.intake.accept";
+
+/// Span name for one authentication check against the origin's provider.
+///
+/// Pairs with [`intake_authenticate_span`].
+pub(crate) const SPAN_INTAKE_AUTHENTICATE: &str = "sbproxy.intake.authenticate";
+
+/// Span name for one policy evaluation in an origin's enforcer chain.
+///
+/// Pairs with [`policy_enforce_span`].
+pub(crate) const SPAN_POLICY_ENFORCE: &str = "sbproxy.policy.enforce";
+
+/// Span name for one response-body transform.
+///
+/// Pairs with [`transform_shape_span`].
+pub(crate) const SPAN_TRANSFORM_SHAPE: &str = "sbproxy.transform.shape";
+
+/// Build the span covering the inbound phase of one request.
+///
+/// Opened around the whole request filter, so origin resolution,
+/// authentication, the policy chain, the response-cache probe, and
+/// non-proxy action dispatch all run inside it and any span they open
+/// nests under it. It closes when the filter returns, which is before the
+/// upstream is dialed, so its duration is the proxy's own admission cost
+/// and not the origin's latency.
+///
+/// `method` is the HTTP method, under the OpenTelemetry
+/// `http.request.method` convention. It is the only field, and that is
+/// deliberate. The request target is caller-controlled and routinely
+/// carries credentials in a query string; the resolved hostname, tenant,
+/// and route are not known yet at the point the span opens; and the
+/// access log already carries all four against the same request id.
+pub fn intake_accept_span(method: &str) -> tracing::Span {
+    tracing::info_span!(
+        "sbproxy.span",
+        otel.name = SPAN_INTAKE_ACCEPT,
+        pillar = Pillar::Intake.as_str(),
+        verb = "accept",
+        "http.request.method" = method,
+    )
+}
+
+/// Build the span covering one authentication check.
+///
+/// One span per request that reaches the origin's configured auth
+/// provider, which is what makes a slow forward-auth subrequest visible as
+/// its own bar under the intake span instead of disappearing into it.
+///
+/// `auth_type` is the provider's type name (`basic`, `jwt`, `forward_auth`,
+/// ...), the same bounded label `record_auth` already partitions on.
+/// Nothing about the outcome rides the span: no subject, no resolved user,
+/// no token, no header. A credential on a span is a credential in the
+/// trace backend, and the allow/deny split is already on the auth metric
+/// and in the audit record.
+pub fn intake_authenticate_span(auth_type: &str) -> tracing::Span {
+    tracing::info_span!(
+        "sbproxy.span",
+        otel.name = SPAN_INTAKE_AUTHENTICATE,
+        pillar = Pillar::Intake.as_str(),
+        verb = "authenticate",
+        "sbproxy.auth_type" = auth_type,
+    )
+}
+
+/// Build the span covering one policy evaluation.
+///
+/// One span per enforcer, not one per chain, so a trace answers which
+/// policy spent the time rather than only that the chain did. The
+/// enforcers run in order inside the intake span, so they render as
+/// siblings in the order they were configured.
+///
+/// `policy_type` is the enforcer's own stable label (`rate_limit`, `waf`,
+/// `ip_filter`, ...), borrowed from the compiled enforcer and already a
+/// metric label, so the field costs nothing to produce and tells a trace
+/// reader nothing the metrics do not.
+pub fn policy_enforce_span(policy_type: &str) -> tracing::Span {
+    tracing::info_span!(
+        "sbproxy.span",
+        otel.name = SPAN_POLICY_ENFORCE,
+        pillar = Pillar::Policy.as_str(),
+        verb = "enforce",
+        policy = policy_type,
+    )
+}
+
+/// Build the span covering one response-body transform.
+///
+/// Opened per transform in the origin's chain, on the buffered body at
+/// end of stream. Transform work is the one part of the response path that
+/// is the proxy's own CPU rather than the upstream's latency, so a chain
+/// that is quietly costing 30ms of HTML-to-Markdown conversion is worth
+/// separating from a slow origin.
+///
+/// `transform_type` is the configured transform's type name (`json`,
+/// `html_to_markdown`, `wasm`, ...), borrowed from the compiled transform.
+/// The body never touches a span attribute.
+pub fn transform_shape_span(transform_type: &str) -> tracing::Span {
+    tracing::info_span!(
+        "sbproxy.span",
+        otel.name = SPAN_TRANSFORM_SHAPE,
+        pillar = Pillar::Transform.as_str(),
+        verb = "shape",
+        transform = transform_type,
+    )
+}
+
 // --- WOR-2100: payment settlement correlation ---
 
 /// Domain separator for the access log's settlement correlation digest.
@@ -1879,6 +2027,69 @@ mod tests {
             tracing_helper::span_name(Pillar::Action, "challenge"),
             "sbproxy.action.challenge"
         );
+    }
+
+    #[test]
+    fn request_path_span_names_are_spelled_from_their_pillar_and_verb() {
+        // The request-path constructors hard-code their names so the hot
+        // path does not format one per request, which trades a `format!`
+        // for a literal that can drift from the pillar and verb it is
+        // meant to spell. This is the check that pays for that trade: the
+        // literal has to be exactly what the canonical builder would
+        // produce from the same two parts.
+        for (name, pillar, verb) in [
+            (SPAN_INTAKE_ACCEPT, Pillar::Intake, "accept"),
+            (SPAN_INTAKE_AUTHENTICATE, Pillar::Intake, "authenticate"),
+            (SPAN_POLICY_ENFORCE, Pillar::Policy, "enforce"),
+            (SPAN_TRANSFORM_SHAPE, Pillar::Transform, "shape"),
+        ] {
+            assert_eq!(
+                name,
+                tracing_helper::span_name(pillar, verb),
+                "{name} does not spell sbproxy.{}.{verb}",
+                pillar.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn request_path_spans_carry_their_name_and_no_credential_shaped_field() {
+        // Constructing each one proves the field sets typecheck and that
+        // no constructor panics, and pins the one property no reviewer
+        // should have to re-derive: what the auth span is allowed to hold.
+        // `auth_type` is a bounded provider label. A subject, a token, or
+        // an authorization header value on this span would be a
+        // credential sitting in whatever backend the traces go to.
+        let accept = intake_accept_span("GET");
+        let authenticate = intake_authenticate_span("forward_auth");
+        let enforce = policy_enforce_span("rate_limit");
+        let shape = transform_shape_span("html_to_markdown");
+
+        for span in [&accept, &authenticate, &enforce, &shape] {
+            assert_eq!(
+                span.metadata().map(|meta| meta.name()),
+                Some("sbproxy.span"),
+                "every pillar span is created under the shared metadata name"
+            );
+        }
+
+        let auth_fields: Vec<&str> = authenticate
+            .metadata()
+            .expect("the auth span has metadata")
+            .fields()
+            .iter()
+            .map(|field| field.name())
+            .collect();
+        assert!(
+            auth_fields.contains(&"sbproxy.auth_type"),
+            "the auth span must say which provider ran: {auth_fields:?}"
+        );
+        for forbidden in ["sub", "subject", "user", "authorization", "token", "secret"] {
+            assert!(
+                !auth_fields.contains(&forbidden),
+                "'{forbidden}' must never be an attribute of the auth span: {auth_fields:?}"
+            );
+        }
     }
 
     // --- Propagation ---

@@ -12,6 +12,25 @@ the next version cut.
 
 ### Added
 
+- **Trace spans on the ordinary proxied request, not only on the AI
+  gateway.** A plain proxied HTTP request produced no span at all: it went
+  through origin resolution, an auth provider, an enforcer chain, an
+  upstream call, and a transform chain, and the only ways to see where the
+  time went were a metric with no per-request identity and an access-log
+  line with no phase breakdown. Meanwhile three of the
+  `sbproxy.<pillar>.<verb>` names had been published as the span-naming
+  convention for long enough that operators had built trace queries on
+  them, and nothing emitted any of them. Four spans now cover the request:
+  `sbproxy.intake.accept` over the whole inbound phase and parent of the
+  rest, `sbproxy.intake.authenticate` per authentication check,
+  `sbproxy.policy.enforce` per enforcer, and `sbproxy.transform.shape` per
+  response-body transform. Their attributes are the HTTP method, the auth
+  provider type, the policy type, and the transform type, all of which are
+  already bounded metric labels; nothing caller-supplied and no part of the
+  request target rides along. The upstream connect and send, and the
+  response header filter, still have no span, because the pillar
+  vocabulary names neither phase.
+
 - **A top-level `request_events:` block, so the request events the proxy
   already builds can leave the process.** Every terminating request was
   populating a full event envelope (tenant, session, credential id,

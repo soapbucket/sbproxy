@@ -12,10 +12,14 @@
 //!   `sbproxy.action.challenge`, `sbproxy.action.redeem`,
 //!   `sbproxy.ledger.redeem`, `sbproxy.rail.settle`,
 //!   `sbproxy.transform.shape`, `sbproxy.audit.emit`) as the span-naming
-//!   convention. Zero of the eight are emitted by any production code, and
-//!   a trace query filtered on one of them is indistinguishable from a
-//!   quiet system.
-//! - The one pillar span production really opens is
+//!   convention. Zero of the eight were emitted by any production code,
+//!   and a trace query filtered on one of them was indistinguishable from
+//!   a quiet system. Three of those eight are live now, alongside a fourth
+//!   name the vocabulary did not have, and
+//!   `the_proxied_request_path_opens_pillar_spans` is what keeps them
+//!   that way: an ordinary proxied HTTP request used to produce no span at
+//!   all while an AI request produced four kinds.
+//! - The one pillar span production really opened was
 //!   `sbproxy.rail.reconcile`, a background worker, and it was not on the
 //!   published list.
 //! - Three AI span constructors (`provider_selection_span`,
@@ -63,6 +67,31 @@ fn report(what: &str, errors: &[RegistryError]) {
 /// pillar slugs to the enum.
 fn pillar_slugs() -> Vec<&'static str> {
     Pillar::ALL.iter().map(|pillar| pillar.as_str()).collect()
+}
+
+/// Every pillar span an ordinary proxied request opens, and the
+/// constructor the request path calls to open it.
+///
+/// Spelled with literals rather than with the `telemetry::SPAN_*`
+/// constants on purpose. This table is the assertion, and an assertion
+/// written in terms of the thing it is checking cannot fail: point it at
+/// the constants and a rename moves both sides together and the guard
+/// stays green. `span_registry`'s own
+/// `the_request_path_constructors_name_registered_spans` binds the
+/// constants to the registry from inside the crate, which is the direction
+/// that wants them.
+const REQUEST_PATH_PILLAR_SPANS: &[(&str, &str)] = &[
+    ("sbproxy.intake.accept", "intake_accept_span"),
+    ("sbproxy.intake.authenticate", "intake_authenticate_span"),
+    ("sbproxy.policy.enforce", "policy_enforce_span"),
+    ("sbproxy.transform.shape", "transform_shape_span"),
+];
+
+fn registered(name: &str) -> &'static SpanCapability {
+    SPANS
+        .iter()
+        .find(|span| span.name == name)
+        .unwrap_or_else(|| panic!("{name} is not in the span registry"))
 }
 
 #[test]
@@ -120,6 +149,65 @@ fn the_scanner_sees_the_spans_it_thinks_it_does() {
 }
 
 #[test]
+fn the_proxied_request_path_opens_pillar_spans() {
+    // The gap this closes, stated as a test so it cannot reopen quietly.
+    //
+    // Before this landed, every span the proxy could emit came off the AI
+    // gateway. A plain proxied HTTP request went through origin
+    // resolution, an auth provider, an enforcer chain, an upstream call,
+    // and a transform chain, and produced no span for any of it, so the
+    // only two ways to see where a slow request spent its time were a
+    // metric with no per-request identity and an access-log line with no
+    // phase breakdown. Meanwhile the pillar names for three of those
+    // phases had been published as the naming convention for long enough
+    // that operators had built queries on them.
+    //
+    // This fails against a registry that records any of the four as
+    // emitted by nothing, which is what the registry said before.
+    for &(name, constructor) in REQUEST_PATH_PILLAR_SPANS {
+        let span = registered(name);
+
+        assert_eq!(
+            span.emitter,
+            SpanEmitter::Constructor(constructor),
+            "{name} has to name the constructor the request path calls. A pillar span \
+             cannot be classified as an inline literal: the request path builds the \
+             name from a pillar and a verb, so it never appears in a span macro."
+        );
+        assert_eq!(
+            span.support,
+            SupportLevel::Stable,
+            "{name} is opened on the request path, so it is not config_only"
+        );
+        assert!(
+            span.dead_reason.is_none(),
+            "{name} is live and must not still carry a dead_reason"
+        );
+        assert!(
+            span.pillar.is_some() && span.verb.is_some(),
+            "{name} is pillar-shaped and has to declare both halves"
+        );
+    }
+
+    // The four entries above are a claim about the source tree. This is
+    // the scan that has to agree with it: each constructor must exist and
+    // must be called from something that is not a test. Running it over
+    // the four on their own rather than over SPANS is deliberate, so a
+    // failure names the request path rather than the whole vocabulary.
+    let entries: Vec<SpanCapability> = REQUEST_PATH_PILLAR_SPANS
+        .iter()
+        .map(|&(name, _)| *registered(name))
+        .collect();
+
+    report(
+        "A request-path pillar span names a constructor that no production code calls. \
+         The span is registered as live and emits nothing, which is the exact state \
+         this registry exists to make impossible.",
+        &scan::verify_span_emitters(&entries, &repo_root()),
+    );
+}
+
+#[test]
 fn no_span_name_is_declared_twice() {
     let mut seen: Vec<&str> = SPANS.iter().map(|span| span.name).collect();
     seen.sort_unstable();
@@ -163,7 +251,10 @@ fn the_pillar_enum_and_the_traces_dashboard_agree() {
 fn a_dead_span_names_the_ticket_that_resolves_it() {
     // Same rule the metric registry's allow-lists carry, for the same
     // reason: an admission with no tracking decays back into "nobody
-    // noticed". Eleven of the seventeen entries here are admissions.
+    // noticed". Eight of the eighteen entries here are admissions, down
+    // from eleven of seventeen when the request path opened no span at
+    // all; what remains is the payment, ledger, and audit vocabulary plus
+    // the three unwired AI constructors.
     for span in SPANS {
         if span.emitter.is_live() {
             continue;
