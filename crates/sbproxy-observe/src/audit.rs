@@ -110,6 +110,32 @@ impl ConfigAuditEntry {
                 self.origins_modified.len(),
             )),
         ));
+        // WOR-2318: the `events:` egress sees this channel as
+        // `config_reloaded`.
+        //
+        // The variant name is narrower than the channel: a mesh
+        // broadcast and an API-driven origin update land here too, and
+        // `source` distinguishes them inside `data`. Minting three new
+        // variants for one closed enum that consumers already match on
+        // exhaustively would be the more expensive answer to a
+        // distinction the payload already carries.
+        //
+        // Every field of this entry is a config fact: which origins
+        // moved, which revision to which revision, and the operator name
+        // an authenticated admin surface supplied. No config *value* is
+        // in here, which matters because a webhook sink ships these
+        // bytes off the box and config values are where the credentials
+        // live.
+        crate::event_sink::publish_proxy_event(crate::events::EventType::ConfigReloaded, || {
+            crate::events::ProxyEvent::new(
+                crate::events::EventType::ConfigReloaded,
+                String::new(),
+                self.tenant_id.clone().unwrap_or_default(),
+                serde_json::to_value(self).unwrap_or_else(
+                    |_| serde_json::json!({ "error": "config audit entry did not serialize" }),
+                ),
+            )
+        });
         crate::metrics::record_audit_emit_duration(
             "config",
             outcome,
@@ -357,11 +383,67 @@ impl SecurityAuditEntry {
         // ring and the tracing line because those two are what the running
         // system is watched through and neither should wait on a disk.
         crate::audit_chain::append_security_audit(self);
+        // WOR-2318: and the egress half. Last, and outside anything that
+        // can block: this is a bitmask test and a `try_send` when an
+        // `events:` sink is configured, one relaxed load when it is not.
+        self.publish_to_event_egress();
         crate::metrics::record_audit_emit_duration(
             "security",
             outcome,
             started.elapsed().as_secs_f64(),
         );
+    }
+
+    /// Which [`crate::events::EventType`] this entry is, for the
+    /// `events:` egress.
+    ///
+    /// `event_type` here is an open string; the egress filter is a closed
+    /// enum of eleven. The split follows what a SIEM rule would route on:
+    /// the four values [`Self::auth_failure`] documents are the
+    /// credential ones, and everything else that reaches this channel
+    /// (framing violations plus every policy label
+    /// [`Self::policy_violation`] lists) is the proxy refusing a request
+    /// on a rule.
+    ///
+    /// The prefix test rather than an exact match is deliberate:
+    /// `auth_denied_with_headers` and `auth_digest_challenge` are auth
+    /// outcomes and a new `auth_*` value should not silently become a
+    /// policy denial in somebody's dashboard.
+    fn egress_event_type(&self) -> crate::events::EventType {
+        let is_auth =
+            self.event_type.starts_with("auth_") || self.event_type.starts_with("forward_auth_");
+        if is_auth {
+            crate::events::EventType::AuthDenied
+        } else {
+            crate::events::EventType::PolicyDenied
+        }
+    }
+
+    /// Hand this entry to the `events:` egress, if one is configured and
+    /// selects its type.
+    ///
+    /// The whole entry becomes the event's `data`, unchanged. That is
+    /// safe for exactly the reason the hash chain is safe to write it:
+    /// this type is documented and reviewed as secret-free, `api_key_id`
+    /// is the public id, `key_provider` is a label, and no field carries
+    /// a token, a header value, or a resolved config value. A webhook
+    /// sink puts these bytes on a third-party endpoint, so a field added
+    /// to the struct without answering that question leaks to two places
+    /// now rather than one.
+    fn publish_to_event_egress(&self) {
+        crate::event_sink::publish_proxy_event(self.egress_event_type(), || {
+            crate::events::ProxyEvent::new(
+                self.egress_event_type(),
+                self.hostname.clone().unwrap_or_default(),
+                self.tenant_id.clone().unwrap_or_default(),
+                serde_json::to_value(self).unwrap_or_else(|_| {
+                    // Infallible for this struct's field types. If it
+                    // ever is not, an event that says so beats an event
+                    // that never arrives.
+                    serde_json::json!({ "error": "security audit entry did not serialize" })
+                }),
+            )
+        });
     }
 }
 
@@ -776,5 +858,104 @@ mod tests {
         let json_anon = serde_json::to_string(&entry_anon).unwrap();
         let v_anon: serde_json::Value = serde_json::from_str(&json_anon).unwrap();
         assert!(v_anon.get("tenant_id").is_none());
+    }
+
+    // --- WOR-2318: the `events:` egress bridge ---
+
+    #[test]
+    fn auth_failures_map_to_auth_denied_and_everything_else_to_policy_denied() {
+        use crate::events::EventType;
+
+        // The four values `auth_failure` documents, plus the shape a
+        // future `auth_*` value would take.
+        for auth in [
+            "auth_denied",
+            "auth_denied_with_headers",
+            "auth_digest_challenge",
+            "forward_auth_denied",
+            "auth_something_new",
+        ] {
+            let entry = SecurityAuditEntry::auth_failure(auth, "jwt", 401, None, None, None, None);
+            assert_eq!(
+                entry.egress_event_type(),
+                EventType::AuthDenied,
+                "{auth} must not land in a policy dashboard"
+            );
+        }
+
+        // Framing plus the policy labels `policy_violation` documents.
+        for policy in [
+            "framing_violation",
+            "rate_limit",
+            "ip_filter",
+            "waf",
+            "prompt_injection",
+            "credential_exposure",
+        ] {
+            let entry = SecurityAuditEntry::policy_violation(
+                policy, "blocked", 403, None, None, None, None,
+            );
+            assert_eq!(
+                entry.egress_event_type(),
+                EventType::PolicyDenied,
+                "{policy}"
+            );
+        }
+    }
+
+    /// The egress payload is the entry verbatim, so this is the field
+    /// audit made executable: every key that reaches a third-party
+    /// webhook is named here, and adding one to the struct without
+    /// adding it here fails.
+    #[test]
+    fn the_egress_payload_carries_only_the_documented_secret_free_fields() {
+        let entry = SecurityAuditEntry::policy_violation(
+            "rate_limit",
+            "exceeded",
+            429,
+            Some("api.acme.example".to_string()),
+            Some("203.0.113.7".parse().expect("test ip")),
+            Some("req-1".to_string()),
+            Some("POST".to_string()),
+        )
+        .with_tenant_id("acme")
+        .with_key_context(Some("openai"), "native")
+        .with_api_key_id(Some("sk_deadbeef"));
+
+        let payload = serde_json::to_value(&entry).expect("entry serializes");
+        let object = payload.as_object().expect("entry is a JSON object");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+
+        assert_eq!(
+            keys,
+            vec![
+                "api_key_id",
+                "client_ip",
+                "event_type",
+                "hostname",
+                "key_mode",
+                "key_provider",
+                "method",
+                "reason",
+                "request_id",
+                "status_code",
+                "tenant_id",
+                "timestamp",
+            ],
+            "a field was added to SecurityAuditEntry. It now ships to any \
+             configured events: webhook, so confirm it cannot carry a \
+             credential before adding it to this list."
+        );
+        assert_eq!(object["api_key_id"], "sk_deadbeef");
+    }
+
+    #[test]
+    fn publishing_to_a_missing_egress_is_a_no_op() {
+        // The default deployment: no `events:` block, so the publish is
+        // one relaxed load and the payload is never built.
+        SecurityAuditEntry::framing_violation("duplicate_cl", None, None, None, None)
+            .publish_to_event_egress();
+        ConfigAuditEntry::new("file_watcher", vec![], vec![], vec![]).emit();
     }
 }

@@ -209,6 +209,7 @@ rate_limits: { ... }
 audit: { ... }
 session_ledger: { ... }
 request_events: { ... }
+events: { ... }
 flags: [ ... ]
 update: { ... }
 
@@ -246,6 +247,7 @@ origins:
 | `audit` | object | unset | Compatibility audit configuration. `audit.sink` is config-only; audit rows remain in memory and tracing. |
 | `session_ledger` | object | unset | MCP tool-call session-ledger emission. |
 | `request_events` | object | unset | Where completed request events go: `none` (default), `logging`, or `file`. See [Request-event egress](observability.md#request-event-egress). |
+| `events` | object | unset | Where typed lifecycle events go: `none` (default), `file`, or `webhook`. Delivery is off the request path through a bounded queue. See [events.md](events.md). |
 | `flags` | list | `[]` | Process-wide feature flags exposed to CEL. |
 | `update` | object | stable channel, automatic checks off | Binary and managed-engine update policy. |
 

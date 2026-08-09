@@ -1710,6 +1710,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_events_dropped_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_events_dropped"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["sink", "reason"],
+        description: "Proxy events the events: egress did not deliver, by sink (file or webhook) and closed reason.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_gateway_reconcile_duration_seconds",
         kind: MetricKind::Histogram,
         writer: Writer::Recorder("record_reconcile"),

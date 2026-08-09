@@ -79,6 +79,11 @@ pub struct ConfigFile {
     /// no-op and every event is discarded.
     #[serde(default)]
     pub request_events: Option<RequestEventsConfig>,
+    /// Where typed proxy events go. Absent, or present with the default
+    /// `sink: none`, means the eleven event types stay in-process and
+    /// nothing leaves the proxy.
+    #[serde(default)]
+    pub events: Option<EventsConfig>,
     /// Process-wide feature flags available to CEL through
     /// `flag_enabled(name, key)`. An absent or empty list installs an
     /// empty runtime store, including on hot reload.
@@ -475,6 +480,98 @@ pub enum RequestEventSinkKind {
     Logging,
     /// Append each event as one NDJSON line to `path`.
     File,
+}
+
+/// Egress for the typed proxy events.
+///
+/// Distinct from [`RequestEventsConfig`], and the difference is the
+/// stream rather than the transport. `request_events:` carries the
+/// capture envelope: one fully populated record per terminating request,
+/// for analytics and billing reconciliation. `events:` carries the
+/// lifecycle events an operator wants to react to (a policy denial, an
+/// auth failure, a config reload) and can filter down to just those, so
+/// a SIEM subscription does not cost one delivery per request served.
+///
+/// Delivery never runs on the request path. The publish site puts the
+/// event on a bounded queue and returns; a background worker owns the
+/// file handle or the HTTP client. When the queue is full the event is
+/// dropped and counted on `sbproxy_events_dropped_total`, because the
+/// alternative is a slow SIEM adding latency to every denied request.
+///
+/// Shutdown does not flush; see `docs/events.md`.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EventsConfig {
+    /// Which backend receives each selected event.
+    #[serde(default)]
+    pub sink: EventSinkKind,
+    /// NDJSON output path for the `file` sink. Required when
+    /// `sink: file`; refused otherwise, because a path nothing writes to
+    /// describes a deployment that believes it has an event log.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Destination URL for the `webhook` sink. Required when
+    /// `sink: webhook`; refused otherwise. Validated against the SSRF
+    /// guard at boot and again before every batch.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Shared secret the `webhook` sink signs each batch with
+    /// (HMAC-SHA256, sent as `X-Sbproxy-Signature: v1=<hex>` over
+    /// `<timestamp>.<body>`, the same construction the alert webhook
+    /// uses).
+    ///
+    /// Accepts a secret reference (`${VAR}`, `file:`, `secret://`,
+    /// `vault://`, and the other backend URI schemes) and is the only
+    /// way to give the sink a credential: there is no plaintext
+    /// alternative field. Optional, but an unsigned POST is a payload
+    /// any host that can reach the endpoint can forge.
+    #[serde(default)]
+    pub signing_secret: Option<String>,
+    /// Which of the eleven event types to deliver. Empty or absent means
+    /// all of them.
+    ///
+    /// Names are the snake_case wire names (`policy_denied`,
+    /// `auth_denied`, `config_reloaded`, ...). An unrecognized name is
+    /// refused with the accepted list rather than skipped, so a typo
+    /// cannot present as a sink that is working and quiet.
+    #[serde(default)]
+    pub types: Vec<String>,
+    /// Bound on the hand-off queue between the publish site and the
+    /// delivery worker. Defaults to 4096. Refused when `sink: none`, and
+    /// refused at zero, which would drop every event while looking
+    /// configured.
+    #[serde(default)]
+    pub queue_capacity: Option<usize>,
+}
+
+/// Accepted `events.sink` values.
+///
+/// Kafka, NATS, and EventBridge are not here. Each needs a client
+/// library, a partitioning decision, and a delivery-guarantee story that
+/// a bounded queue and a best-effort POST do not have. They are
+/// follow-ups, and until they land their names are refused by the
+/// deserializer rather than accepted into a sink that would not deliver.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum EventSinkKind {
+    /// Publish nothing. The default, and the only behavior the proxy had
+    /// before the block existed.
+    #[default]
+    None,
+    /// Append each event as one NDJSON line to `path`.
+    File,
+    /// POST batches of events to `url`.
+    Webhook,
 }
 
 /// Where to load a `sb.yml` config text from.

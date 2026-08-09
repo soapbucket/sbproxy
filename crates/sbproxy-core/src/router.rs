@@ -206,6 +206,7 @@ mod tests {
             audit: None,
             session_ledger: None,
             request_events: None,
+            events: None,
             flags: Vec::new(),
         }
     }

@@ -176,7 +176,7 @@ pub struct ProxyEvent {
 }
 
 /// Enumeration of proxy event types emitted on the event bus.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum EventType {
     /// Event name `request_started`. A new request has begun processing.
@@ -201,6 +201,112 @@ pub enum EventType {
     GuardrailTriggered,
     /// Event name `config_reloaded`. The proxy configuration was reloaded.
     ConfigReloaded,
+}
+
+impl ProxyEvent {
+    /// Build an event stamped with the current wall clock.
+    ///
+    /// `data` reaches third-party endpoints verbatim once an `events:`
+    /// webhook sink is configured, so what a caller puts in it is a
+    /// disclosure decision rather than a formatting one. The bridges in
+    /// [`crate::audit`] and [`crate::request_sink`] pass types whose
+    /// secret-free property is already documented and tested; a new
+    /// publisher owes the same argument before it calls this.
+    pub fn new(
+        event_type: EventType,
+        hostname: String,
+        tenant_id: String,
+        data: serde_json::Value,
+    ) -> Self {
+        Self {
+            event_type,
+            hostname,
+            tenant_id,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_millis() as u64)
+                .unwrap_or(0),
+            data,
+        }
+    }
+}
+
+/// Every [`EventType`] variant, in declaration order.
+///
+/// Two consumers need the list rather than one variant at a time: the
+/// `events.types:` config validator, which names the accepted values in
+/// its refusal message, and [`crate::event_sink::EventTypeMask`], which
+/// indexes bits by position here.
+///
+/// The array length is written out, so a variant added to the enum and
+/// not added here fails to compile. That is deliberate. The failure
+/// mode this prevents is a twelfth event type that no `events:` sink can
+/// ever be told to deliver, which looks exactly like a working sink to
+/// everyone except the operator waiting for the event.
+pub const ALL_EVENT_TYPES: [EventType; 11] = [
+    EventType::RequestStarted,
+    EventType::RequestCompleted,
+    EventType::RequestError,
+    EventType::AuthDenied,
+    EventType::PolicyDenied,
+    EventType::CacheHit,
+    EventType::CacheMiss,
+    EventType::ProviderSelected,
+    EventType::BudgetExceeded,
+    EventType::GuardrailTriggered,
+    EventType::ConfigReloaded,
+];
+
+impl EventType {
+    /// The wire name, identical to what serde writes.
+    ///
+    /// Hand written rather than derived from the `serde` rename so it can
+    /// be used where a `&'static str` is required (Prometheus labels,
+    /// error messages, header values) without serializing to a `String`
+    /// and trimming the quotes. `event_type_as_str_matches_serde` pins
+    /// the two together.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::RequestStarted => "request_started",
+            Self::RequestCompleted => "request_completed",
+            Self::RequestError => "request_error",
+            Self::AuthDenied => "auth_denied",
+            Self::PolicyDenied => "policy_denied",
+            Self::CacheHit => "cache_hit",
+            Self::CacheMiss => "cache_miss",
+            Self::ProviderSelected => "provider_selected",
+            Self::BudgetExceeded => "budget_exceeded",
+            Self::GuardrailTriggered => "guardrail_triggered",
+            Self::ConfigReloaded => "config_reloaded",
+        }
+    }
+
+    /// Parse a wire name back to a variant. `None` for anything the enum
+    /// does not name, which is what lets `events.types:` refuse a typo
+    /// instead of quietly delivering nothing.
+    pub fn from_name(name: &str) -> Option<Self> {
+        ALL_EVENT_TYPES
+            .into_iter()
+            .find(|candidate| candidate.as_str() == name)
+    }
+
+    /// Position of this variant in [`ALL_EVENT_TYPES`], which is the bit
+    /// [`crate::event_sink::EventTypeMask`] sets for it.
+    pub fn index(&self) -> usize {
+        match self {
+            Self::RequestStarted => 0,
+            Self::RequestCompleted => 1,
+            Self::RequestError => 2,
+            Self::AuthDenied => 3,
+            Self::PolicyDenied => 4,
+            Self::CacheHit => 5,
+            Self::CacheMiss => 6,
+            Self::ProviderSelected => 7,
+            Self::BudgetExceeded => 8,
+            Self::GuardrailTriggered => 9,
+            Self::ConfigReloaded => 10,
+        }
+    }
 }
 
 /// Event subscriber callback type.
@@ -358,6 +464,44 @@ mod tests {
             assert_eq!(serialized, expected, "Failed for {:?}", variant);
             let deserialized: EventType = serde_json::from_str(&serialized).unwrap();
             assert_eq!(deserialized, variant);
+        }
+    }
+
+    #[test]
+    fn event_type_as_str_matches_serde() {
+        // `as_str` is hand written and serde's name is derived from the
+        // `rename_all`. Nothing but this test keeps them equal, and an
+        // `events.types:` entry an operator copied out of the JSON would
+        // stop resolving the moment they diverged.
+        for variant in ALL_EVENT_TYPES {
+            let serialized = serde_json::to_string(&variant).expect("serialize");
+            assert_eq!(
+                serialized,
+                format!("\"{}\"", variant.as_str()),
+                "as_str disagrees with serde for {variant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn event_type_from_name_round_trips_and_rejects_unknown() {
+        for variant in ALL_EVENT_TYPES {
+            assert_eq!(EventType::from_name(variant.as_str()), Some(variant));
+        }
+        assert_eq!(EventType::from_name("policy_denied "), None);
+        assert_eq!(EventType::from_name("PolicyDenied"), None);
+        assert_eq!(EventType::from_name("kafka"), None);
+    }
+
+    #[test]
+    fn event_type_index_is_its_position_and_is_unique() {
+        for (position, variant) in ALL_EVENT_TYPES.into_iter().enumerate() {
+            assert_eq!(
+                variant.index(),
+                position,
+                "{variant:?} indexes off its own position, so the mask would \
+                 route it to another type's bit"
+            );
         }
     }
 

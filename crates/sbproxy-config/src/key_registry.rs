@@ -96,6 +96,16 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
     // `sbproxy_core::server::lifecycle::install_audit_chain` read all three
     // off a typed `&AuditConfig`, which is the shape the reader guard
     // resolves on its own (WOR-2318).
+    //
+    // The six `events.*` keys are absent for the same reason and are worth
+    // naming, because "no entry" is indistinguishable from "nobody looked".
+    // `compiler::validate_events` and
+    // `sbproxy_core::server::lifecycle::build_event_egress` read `sink`,
+    // `path`, `url`, `signing_secret`, `types`, and `queue_capacity` off a
+    // typed `&EventsConfig`. None of them is inert: an option that belongs
+    // to a sink other than the selected one is refused at compile rather
+    // than pinned here, which is the same call `audit.path` under
+    // `sink: memory` took.
     // The eight entries below are the first from the module and AI-gateway
     // surface, which the generated schema cannot describe and which
     // `MODULE_CONFIG_ROOTS` now walks instead.

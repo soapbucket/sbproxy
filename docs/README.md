@@ -114,7 +114,7 @@ Point a framework you already run at the gateway: chat completions through the O
 - [multi-tenant.md](multi-tenant.md) - when to use the multi-tenant shape, the three scopes, isolation guarantees, the synthetic `__default__` tenant.
 - [operator-runbook.md](operator-runbook.md) - dashboard triage and rollback actions.
 - [threat-model.md](threat-model.md) - trust boundaries and per-wave review checklist.
-- [events.md](events.md) - the event bus, callback hooks, and emitted event types.
+- [events.md](events.md) - the eleven typed events, the `events:` file and webhook sinks, and the in-process bus.
 - [openapi-emission.md](openapi-emission.md) - publishing an OpenAPI 3.0 document from the live config.
 - [policy.md](policy.md) - the policy engine, the `semantic_constraint` policy, and the `request_validator`, `concurrent_limit`, `rate_limit_budget`, `http_framing`, and `a2a` policy reference.
 - [object-authz.md](object-authz.md) - `object_authz` policy: BOLA + BFLA enforcement with tenant-isolation and enumeration detection.

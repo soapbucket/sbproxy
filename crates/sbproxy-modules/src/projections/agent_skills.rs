@@ -1808,6 +1808,7 @@ spec:
             audit: None,
             session_ledger: None,
             request_events: None,
+            events: None,
             flags: Vec::new(),
         };
         let map = render_indices(&cfg, Path::new("."));

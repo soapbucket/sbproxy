@@ -555,13 +555,19 @@ with optional HMAC signing via a per-entry `secret`, a timeout, and an error pol
 is the shipped push mechanism for request lifecycle events; the envelope and signing are
 specified in [configuration.md](configuration.md#webhook-envelope-and-signing).
 
-### Embedder bus (library only)
+### Typed event egress
 
-`sbproxy-observe::events` also defines an `EventBus` with a closed `EventType` enum
-(`request_started`, `budget_exceeded`, `config_reloaded`, ...) and synchronous
-per-event-type handler fan-out. The shipped binary does not publish to it; it is a seam
-for code-level embedders building on the workspace crates. See [events.md](events.md) for
-the event shapes and subscription API.
+`sbproxy-observe` defines a closed `EventType` enum (`request_started`, `policy_denied`,
+`config_reloaded`, ...) with two independent consumers.
+
+The `events:` block is the shipped one. It sends selected types to an NDJSON file or an
+HTTP endpoint through a bounded queue drained by a background worker, so a slow collector
+cannot add latency to a request, and a full queue drops the event and counts it on
+`sbproxy_events_dropped_total`.
+
+`EventBus` is the other, a library-only seam for code-level embedders. It fans out to
+handler closures synchronously on the publisher's thread and is not what the `events:`
+sinks use. See [events.md](events.md) for both.
 
 ---
 

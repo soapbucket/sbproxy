@@ -259,10 +259,45 @@ pub fn set_request_event_sink(sink: Arc<dyn RequestEventSink>) -> Result<(), &'s
         .map_err(|_| "request event sink already registered")
 }
 
-/// Hand a completed `RequestEvent` to the registered sink. When no
-/// sink is registered (the OSS default), this is a no-op and pays a
-/// single relaxed atomic load.
+/// Hand a completed `RequestEvent` to the registered sink, and to the
+/// `events:` egress when one selects its lifecycle type.
+///
+/// With neither configured (the OSS default) this is two relaxed atomic
+/// loads and nothing else.
+///
+/// The two consumers are deliberately independent. `request_events:` is
+/// the analytics stream and takes every terminating request;
+/// [`crate::event_sink`] is the reaction stream and is usually filtered
+/// down to a few types. Feeding one from the other would force an
+/// operator who wants `policy_denied` in a SIEM to also stand up a
+/// per-request envelope sink.
+///
+/// The egress call comes first so the closure can borrow `event` before
+/// it is moved into the sink. It builds nothing unless an egress is
+/// installed and selects this event's type, so a `policy_denied`
+/// subscription does not pay to serialize every request the proxy
+/// serves.
 pub fn dispatch_request_event(event: RequestEvent) {
+    crate::event_sink::publish_proxy_event(event.event_type, || {
+        // The whole envelope becomes the event's `data`. Auditing that
+        // for a third-party endpoint: `api_key_id` is the public id or
+        // the derived `sk_<hex>` fingerprint and never the secret,
+        // `prompt_fingerprint` is salted and non-reversible,
+        // `key_provider` and `key_mode` are labels, and no field carries
+        // prompt text or a header value. `properties` is the one field
+        // whose contents are operator-shaped rather than fixed; it is
+        // allowlist-checked, length-capped, and redaction-applied on the
+        // capture path before it reaches here, and it is already written
+        // to the request-event file and log sinks under the same rules.
+        crate::events::ProxyEvent::new(
+            event.event_type,
+            event.hostname.clone(),
+            event.tenant_id.clone().unwrap_or_default(),
+            serde_json::to_value(&event).unwrap_or_else(
+                |_| serde_json::json!({ "error": "request event did not serialize" }),
+            ),
+        )
+    });
     if let Some(sink) = SINK.get() {
         sink.publish(event);
     }
@@ -334,6 +369,84 @@ mod tests {
         // set by another test in this module (OnceLock is set-once).
         // This test just confirms the function does not panic.
         dispatch_request_event(sample_event());
+    }
+
+    /// The envelope reaches a third-party endpoint verbatim once an
+    /// `events:` webhook sink is configured, so the field list is a
+    /// disclosure decision. Adding a field to `RequestEvent` fails here
+    /// until somebody confirms it cannot carry a credential.
+    #[test]
+    fn the_egress_payload_carries_only_secret_free_envelope_fields() {
+        let mut event = sample_event();
+        event.api_key_id = Some("sk_deadbeef".to_string());
+        event.key_provider = Some("openai".to_string());
+        event.key_mode = Some("native".to_string());
+        event.prompt_fingerprint = Some("pf_0011".to_string());
+        event.user_id = Some("u-1".to_string());
+        event.user_id_source = Some(crate::request_event::UserIdSource::Header);
+        event.session_id = Some(ulid::Ulid::new());
+        event.parent_session_id = Some(ulid::Ulid::new());
+        event.parent_request_id = Some(ulid::Ulid::new());
+        event.tenant_id = Some("acme".to_string());
+        event.latency_ms = Some(12);
+        event.provider = Some("openai".to_string());
+        event.model = Some("gpt-4o".to_string());
+        event.prompt_tokens_est = Some(10);
+        event.tokens_in = Some(10);
+        event.tokens_out = Some(2);
+        event.tokens_cached = Some(1);
+        event.cost_usd_micros = Some(3);
+        event.status_code = Some(200);
+        event.error_class = Some("upstream_5xx".to_string());
+        event.guardrail_category = Some("pii".to_string());
+        event.guardrail_action = Some("block".to_string());
+        event.request_geo = Some("US".to_string());
+        event
+            .properties
+            .insert("environment".to_string(), "prod".to_string());
+
+        let payload = serde_json::to_value(&event).expect("event serializes");
+        let object = payload.as_object().expect("event is a JSON object");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+
+        assert_eq!(
+            keys,
+            vec![
+                "api_key_id",
+                "cost_usd_micros",
+                "error_class",
+                "event_type",
+                "guardrail_action",
+                "guardrail_category",
+                "hostname",
+                "key_mode",
+                "key_provider",
+                "latency_ms",
+                "model",
+                "parent_request_id",
+                "parent_session_id",
+                "prompt_fingerprint",
+                "prompt_tokens_est",
+                "properties",
+                "provider",
+                "request_geo",
+                "request_id",
+                "session_id",
+                "status_code",
+                "tenant_id",
+                "timestamp_ms",
+                "tokens_cached",
+                "tokens_in",
+                "tokens_out",
+                "user_id",
+                "user_id_source",
+                "workspace_id",
+            ],
+            "a field was added to RequestEvent. It now ships to any \
+             configured events: webhook, so confirm it cannot carry a \
+             credential before adding it to this list."
+        );
     }
 
     /// One `sbproxy_telemetry_dropped_total{kind="request_event"}`

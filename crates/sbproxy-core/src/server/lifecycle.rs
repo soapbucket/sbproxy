@@ -450,6 +450,140 @@ fn install_request_event_sink(cfg: &sbproxy_config::types::RequestEventsConfig) 
     }
 }
 
+/// WOR-2318: turn an `events:` block into a started
+/// [`sbproxy_observe::EventEgress`], or `None` when it asks for nothing.
+///
+/// Split from [`install_event_egress`] so the mapping is testable
+/// without touching the process-global slot, which is set-once and
+/// therefore assertable at most once per test binary.
+///
+/// Fallible where the sibling sinks are not. A request-event `path` that
+/// will not open falls back to the logging sink, because the operator
+/// asked for records and a degraded record beats none. There is no
+/// analogous fallback here: `sink: webhook` names an endpoint, and
+/// quietly writing those events to a local log instead would satisfy
+/// nothing the operator configured while looking like success in the
+/// boot line. The caller decides whether that is fatal.
+fn build_event_egress(
+    cfg: &sbproxy_config::types::EventsConfig,
+) -> anyhow::Result<Option<(sbproxy_observe::EventEgress, &'static str)>> {
+    use sbproxy_config::types::EventSinkKind;
+    use sbproxy_observe::{
+        EventEgress, EventSinkTarget, EventType, EventTypeMask, DEFAULT_EVENT_QUEUE_CAPACITY,
+    };
+
+    let target = match cfg.sink {
+        // The default, and the historical behavior: nothing is
+        // registered, so every publish site stays one relaxed load.
+        EventSinkKind::None => return Ok(None),
+        EventSinkKind::File => {
+            let Some(path) = cfg.path.as_deref() else {
+                anyhow::bail!(
+                    "events.sink is `file` but events.path is absent at boot; config \
+                     compilation should have refused this document"
+                );
+            };
+            EventSinkTarget::File {
+                path: std::path::PathBuf::from(path),
+            }
+        }
+        EventSinkKind::Webhook => {
+            let Some(url) = cfg.url.as_deref() else {
+                anyhow::bail!(
+                    "events.sink is `webhook` but events.url is absent at boot; config \
+                     compilation should have refused this document"
+                );
+            };
+            EventSinkTarget::Webhook {
+                url: url.to_string(),
+                signing_secret: resolve_events_signing_secret(cfg.signing_secret.as_deref())?,
+            }
+        }
+    };
+
+    // An empty `types:` means every type; the config validator already
+    // refused the explicit-but-empty selection that would mean none.
+    let mask = if cfg.types.is_empty() {
+        EventTypeMask::all()
+    } else {
+        let mut selected = Vec::with_capacity(cfg.types.len());
+        for name in &cfg.types {
+            let Some(event_type) = EventType::from_name(name) else {
+                anyhow::bail!(
+                    "events.types names `{name}`, which is not an event type; config \
+                     compilation should have refused this document"
+                );
+            };
+            selected.push(event_type);
+        }
+        EventTypeMask::from_types(&selected)
+    };
+    if mask.is_empty() {
+        anyhow::bail!("events.types resolved to no event types, so nothing would be delivered");
+    }
+
+    let capacity = cfg.queue_capacity.unwrap_or(DEFAULT_EVENT_QUEUE_CAPACITY);
+    if capacity == 0 {
+        anyhow::bail!(
+            "events.queue_capacity is 0 at boot; config compilation should have refused this \
+             document"
+        );
+    }
+
+    let label = target.label();
+    Ok(Some((EventEgress::start(target, mask, capacity)?, label)))
+}
+
+/// Resolve `events.signing_secret` through the process secret resolver.
+///
+/// The only way the webhook sink gets a credential. A reference that
+/// will not resolve fails the boot rather than being posted verbatim,
+/// which is the WOR-1767 fail-loud convention the telemetry headers and
+/// the alert channels already follow: a raw `vault://` string arriving
+/// at a third-party endpoint is a config leak, and a silently-unsigned
+/// batch is a signature check the receiver stops performing.
+fn resolve_events_signing_secret(reference: Option<&str>) -> anyhow::Result<Option<String>> {
+    let Some(reference) = reference else {
+        return Ok(None);
+    };
+    let resolver = sbproxy_vault::process_resolver();
+    let resolved = match resolver.as_deref() {
+        Some(resolver) => resolver.resolve(reference),
+        // No backends declared: `${VAR}` and `file:` still resolve, and a
+        // provider URI fails loud pointing at proxy.secrets.backends.
+        None => sbproxy_vault::SecretResolver::new().resolve(reference),
+    };
+    match resolved {
+        Ok(value) => Ok(Some(value)),
+        // The reference itself is not echoed. It can name a path or a
+        // vault key an operator would rather not have in a boot log, and
+        // the resolver's own error already says what it could not find.
+        Err(error) => Err(anyhow::anyhow!("events.signing_secret: {error:#}")),
+    }
+}
+
+/// WOR-2318: start the configured event egress and register it
+/// process-wide.
+///
+/// Startup-only and set-once, like the sinks beside it. A reload does not
+/// restart it: swapping a live egress would either strand a queue nothing
+/// will drain or open a second file that reads as a gap in the first.
+fn install_event_egress(cfg: &sbproxy_config::types::EventsConfig) -> anyhow::Result<()> {
+    let Some((egress, sink)) = build_event_egress(cfg)? else {
+        return Ok(());
+    };
+    match sbproxy_observe::install_event_egress(egress) {
+        Ok(()) => {
+            tracing::info!(sink, "proxy event egress enabled");
+            Ok(())
+        }
+        Err(error) => {
+            tracing::warn!("{error}; keeping the existing one");
+            Ok(())
+        }
+    }
+}
+
 /// WOR-1164: (re)install the detection-singleton globals from
 /// `compiled`. Runs at startup AND from the hot-reload path so a SIGHUP
 /// that changed `agent_classes:`, the resolver flags, or
@@ -1662,6 +1796,17 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // block existed.
     if let Some(cfg) = compiled.request_events.as_ref() {
         install_request_event_sink(cfg);
+    }
+
+    // --- WOR-2318: start the typed-proxy-event egress when configured ---
+    //
+    // Fatal on failure, unlike the two sinks above. `events:` names an
+    // endpoint or a file an operator is relying on to see denials; a
+    // proxy that starts anyway is one whose SIEM is empty for a reason
+    // nobody will look for until an incident. `sink: none` (the default)
+    // starts nothing and cannot fail.
+    if let Some(cfg) = compiled.events.as_ref() {
+        install_event_egress(cfg)?;
     }
 
     // WOR-1164: install the detection singletons (agent-class resolver,
@@ -4547,6 +4692,7 @@ origins:
             audit: None,
             session_ledger: None,
             request_events: None,
+            events: None,
             flags: Vec::new(),
         };
 
@@ -5051,5 +5197,149 @@ mod request_event_sink_tests {
         let (_, kind) = build_request_event_sink(&cfg).expect("a fallback sink is still built");
         assert_eq!(kind, "logging");
         assert!(!path.exists());
+    }
+}
+
+/// WOR-2318: the `events:` block, from YAML through to the egress the
+/// boot path would start.
+///
+/// Same reasoning as the module above: these drive
+/// [`build_event_egress`] rather than [`install_event_egress`], because
+/// the registered egress is a process-global `OnceLock` and only one
+/// test per binary could ever observe an install.
+#[cfg(test)]
+mod event_egress_tests {
+    use super::*;
+
+    use sbproxy_config::types::{EventSinkKind, EventsConfig};
+
+    fn file_config(path: &std::path::Path) -> EventsConfig {
+        EventsConfig {
+            sink: EventSinkKind::File,
+            path: Some(path.display().to_string()),
+            url: None,
+            signing_secret: None,
+            types: Vec::new(),
+            queue_capacity: None,
+        }
+    }
+
+    #[test]
+    fn the_config_block_round_trips_from_yaml_to_the_compiled_snapshot() {
+        let yaml = "proxy: {}\nevents:\n  sink: webhook\n  url: https://siem.example.com/in\n  \
+                    types:\n    - policy_denied\n";
+        let compiled = sbproxy_config::compile_config(yaml).expect("config compiles");
+
+        let cfg = compiled
+            .events
+            .as_ref()
+            .expect("the block survives compilation");
+        assert_eq!(cfg.sink, EventSinkKind::Webhook);
+        assert_eq!(cfg.url.as_deref(), Some("https://siem.example.com/in"));
+        assert_eq!(cfg.types, vec!["policy_denied"]);
+    }
+
+    #[test]
+    fn an_absent_block_compiles_to_no_events_config() {
+        let compiled = sbproxy_config::compile_config("proxy: {}\n").expect("config compiles");
+        assert!(compiled.events.is_none());
+    }
+
+    #[test]
+    fn the_default_sink_kind_starts_nothing() {
+        // The pre-existing behavior: every publish site stays one
+        // relaxed load, so the builder must decline to start a worker
+        // rather than starting one that discards.
+        let built = build_event_egress(&EventsConfig::default()).expect("none is not an error");
+        assert!(built.is_none());
+    }
+
+    #[test]
+    fn a_file_egress_writes_the_published_event_to_its_configured_path() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("events.ndjson");
+
+        let (egress, sink) = build_event_egress(&file_config(&path))
+            .expect("file egress builds")
+            .expect("file egress is started");
+        assert_eq!(sink, "file");
+
+        egress.publish(sbproxy_observe::ProxyEvent::new(
+            sbproxy_observe::EventType::PolicyDenied,
+            "api.example.com".to_string(),
+            "acme".to_string(),
+            serde_json::json!({"reason": "rate_limit"}),
+        ));
+        // Dropping drains, flushes, and joins the worker, so the read
+        // below cannot race it.
+        drop(egress);
+
+        let written = std::fs::read_to_string(&path).expect("read back the ndjson");
+        assert!(
+            written.contains("policy_denied") && written.contains("api.example.com"),
+            "the event never reached the file: {written:?}"
+        );
+    }
+
+    #[test]
+    fn a_type_filter_is_carried_onto_the_started_egress() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut cfg = file_config(&dir.path().join("events.ndjson"));
+        cfg.types = vec!["policy_denied".to_string()];
+
+        let (egress, _) = build_event_egress(&cfg)
+            .expect("file egress builds")
+            .expect("file egress is started");
+        assert!(egress.wants(sbproxy_observe::EventType::PolicyDenied));
+        assert!(!egress.wants(sbproxy_observe::EventType::CacheHit));
+    }
+
+    #[test]
+    fn an_empty_type_list_means_every_type() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (egress, _) = build_event_egress(&file_config(&dir.path().join("events.ndjson")))
+            .expect("file egress builds")
+            .expect("file egress is started");
+        for event_type in sbproxy_observe::ALL_EVENT_TYPES {
+            assert!(egress.wants(event_type), "{event_type:?} was filtered out");
+        }
+    }
+
+    #[test]
+    fn a_file_egress_whose_path_cannot_be_opened_fails_the_boot() {
+        // The deliberate difference from `request_events:`, which falls
+        // back to logging here. An operator who named a file for their
+        // events did not ask for them to go somewhere else.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("events.ndjson");
+        std::fs::create_dir_all(&path).expect("occupy the path with a directory");
+
+        let error = build_event_egress(&file_config(&path))
+            .expect_err("a path that cannot be opened must not boot");
+        assert!(
+            error.to_string().contains("events.path"),
+            "the failure names the key: {error}"
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_signing_secret_fails_the_boot() {
+        // WOR-1767 fail-loud: a reference that will not resolve must not
+        // be posted verbatim to a third-party endpoint, and an unsigned
+        // batch is a signature check the receiver stops performing.
+        let cfg = EventsConfig {
+            sink: EventSinkKind::Webhook,
+            url: Some("https://siem.example.com/in".to_string()),
+            path: None,
+            signing_secret: Some("vault://nowhere/nothing".to_string()),
+            types: Vec::new(),
+            queue_capacity: None,
+        };
+
+        let error = build_event_egress(&cfg).expect_err("an unresolvable secret must not boot");
+        assert!(
+            error.to_string().contains("events.signing_secret"),
+            "the failure names the key: {error}"
+        );
     }
 }

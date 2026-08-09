@@ -171,6 +171,7 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_config_source_revision_info` | Gauge | `stable` | `beta` | `sha` | Commit the config source resolved to; always 1, the commit is the label. |
 | `sbproxy_egress_refused_total` | Counter | `stable` | `beta` | `purpose`, `reason`, `tenant`, `origin` | Outbound dials refused by purpose-scoped egress authorization, by purpose, closed reason, tenant, and origin. |
 | `sbproxy_errors_total` | Counter | `stable` | `beta` | `hostname`, `error_type` | Total errors. |
+| `sbproxy_events_dropped_total` | Counter | `stable` | `beta` | `sink`, `reason` | Proxy events the events: egress did not deliver, by sink (file or webhook) and closed reason. |
 | `sbproxy_gateway_reconcile_duration_seconds` | Histogram | `stable` | `beta` | `kind` | Gateway API reconcile latency in seconds, by the Kubernetes resource kind that triggered the pass. Answers whether a reconcile is outrunning the resync interval. |
 | `sbproxy_gateway_reconcile_total` | Counter | `stable` | `beta` | `kind`, `result` | Gateway API reconcile attempts, by triggering resource kind and outcome. `kind` is one of GatewayClass, Gateway, HTTPRoute, GRPCRoute, or periodic, so cardinality is bounded by a closed set. |
 | `sbproxy_gateway_status_writes_total` | Counter | `stable` | `beta` | `kind`, `result` | Patches to the `/status` subresource, by resource kind and outcome. A rising error count here is usually RBAC missing the status subresource rather than anything wrong with the reconcile. |

@@ -1991,6 +1991,54 @@ pub fn record_telemetry_dropped(kind: &'static str, reason: &'static str) {
     counter.with_label_values(&[kind, reason]).inc();
 }
 
+/// Count a [`crate::events::ProxyEvent`] the `events:` egress did not
+/// deliver, by sink and closed reason.
+///
+/// Separate from `sbproxy_telemetry_dropped_total` on purpose, and the
+/// reason is the label set rather than the subject. That family is keyed
+/// `{kind, reason}`, where `kind` is a compile-time constant naming a
+/// subsystem. The question an operator has about an event sink is
+/// per-sink ("is my SIEM webhook keeping up"), and answering it there
+/// would mean folding the sink into `kind` and teaching every existing
+/// `kind` consumer that some of its values are now sinks.
+///
+/// `sink` is the backend kind (`file` or `webhook`), not the operator's
+/// name for it: one `events:` block selects one sink, so the label is
+/// closed at two values and cannot grow with the config.
+///
+/// The closed reasons are `queue_full` (the bounded hand-off queue was
+/// at capacity when a request tried to publish), `worker_stopped` (the
+/// delivery thread is gone), `serialize_error`, `write_error`,
+/// `http_error` (the endpoint answered non-2xx), `delivery_failed` (the
+/// request never got an answer), and `ssrf_rejected`.
+///
+/// A drop that is not counted is indistinguishable from a proxy that saw
+/// no traffic, which is the failure this exists to make impossible.
+/// Registration itself is the one failure this cannot report, so it is
+/// swallowed with `.ok()` rather than unwrapped: the recorder runs from a
+/// request-path publish, and a proxy that aborts because a counter would
+/// not register is a worse outcome than one whose drop counter is
+/// missing. The only ways `register_int_counter_vec!` fails are a
+/// duplicate name and a malformed one, both of which
+/// `events_dropped_counter_registers_and_increments` catches before a
+/// release.
+pub fn record_events_dropped(sink: &'static str, reason: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_events_dropped_total",
+            "Proxy events the events: egress did not deliver, by sink and reason",
+            &["sink", "reason"],
+        )
+        .ok()
+    });
+    if let Some(counter) = counter {
+        counter.with_label_values(&[sink, reason]).inc();
+    }
+}
+
 /// Count a config (hot) reload outcome on
 /// `sbproxy_config_reload_total{result}`. `result` is a closed string
 /// (`success` / `failure`). Operators alert on a non-zero `failure`
@@ -6321,5 +6369,45 @@ mod tests {
     #[test]
     fn record_ai_cost_usd_micros_skips_zero_cost() {
         record_ai_cost_usd_micros("openai", "gpt-4o", "acme", 0);
+    }
+
+    /// `record_events_dropped` swallows a registration failure so a
+    /// request-path publish cannot abort the process. That makes the
+    /// registration itself the untested branch unless something proves
+    /// it takes the `Some` arm, which is what this does: a counter that
+    /// silently failed to register would leave the family absent from
+    /// the render.
+    #[test]
+    fn events_dropped_counter_registers_and_increments() {
+        record_events_dropped("webhook", "queue_full");
+
+        let mut rendered = String::new();
+        for family in prometheus::gather() {
+            if family.name() == "sbproxy_events_dropped_total" {
+                for metric in family.get_metric() {
+                    let labels: Vec<String> = metric
+                        .get_label()
+                        .iter()
+                        .map(|pair| format!("{}={}", pair.name(), pair.value()))
+                        .collect();
+                    rendered.push_str(&format!(
+                        "{} {}\n",
+                        labels.join(","),
+                        metric.get_counter().value()
+                    ));
+                }
+            }
+        }
+
+        // Each label separately, not one joined string. `prometheus` returns
+        // a metric's labels sorted by name, so the pair renders as
+        // `reason=...,sink=...` regardless of the order they were declared
+        // in, and asserting on the declared order tests the crate's sort
+        // rather than our registration.
+        assert!(
+            rendered.contains("sink=webhook") && rendered.contains("reason=queue_full"),
+            "sbproxy_events_dropped_total did not register or did not carry \
+             the sink/reason labels: {rendered:?}"
+        );
     }
 }

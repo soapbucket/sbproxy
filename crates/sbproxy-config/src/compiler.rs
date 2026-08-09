@@ -20,12 +20,12 @@ use crate::types::{
     AttestationBillableConfig, AttestationConfig, AttestationLedgerConfig,
     AttestationMeasuredConfig, AttestationOriginHeaderConfig, AttestationQueueConfig,
     AttestationRole, AttestationRouteWeightConfig, AuditConfig, AuditSinkKind, ConfigFile,
-    ConnectionPoolConfig, EnforcementMode, FailureMode, L2CacheConfig, L2CacheParams,
-    OriginAttestationConfig, RawOriginConfig, UpstreamTimeouts, UpstreamTimeoutsConfig,
-    WebBotAuthConfig, ATTESTATION_SIGN_WITH_WEB_BOT_AUTH, DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS,
-    DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS, DEFAULT_UPSTREAM_READ_TIMEOUT_MS,
-    DEFAULT_UPSTREAM_TOTAL_CONNECT_TIMEOUT_MS, DEFAULT_UPSTREAM_WRITE_TIMEOUT_MS,
-    MAX_ATTESTATION_QUEUE_ENTRIES,
+    ConnectionPoolConfig, EnforcementMode, EventSinkKind, EventsConfig, FailureMode, L2CacheConfig,
+    L2CacheParams, OriginAttestationConfig, RawOriginConfig, UpstreamTimeouts,
+    UpstreamTimeoutsConfig, WebBotAuthConfig, ATTESTATION_SIGN_WITH_WEB_BOT_AUTH,
+    DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS, DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS,
+    DEFAULT_UPSTREAM_READ_TIMEOUT_MS, DEFAULT_UPSTREAM_TOTAL_CONNECT_TIMEOUT_MS,
+    DEFAULT_UPSTREAM_WRITE_TIMEOUT_MS, MAX_ATTESTATION_QUEUE_ENTRIES,
 };
 
 const MAX_REDIS_TLS_FILE_BYTES: u64 = 1_048_576;
@@ -1630,6 +1630,13 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         validate_audit(audit, config_file.proxy.web_bot_auth.as_ref())?;
     }
 
+    // WOR-2318: the `events:` egress. Same reasoning as `audit:`: an
+    // `sbproxy validate` run has to reject a sink that could never
+    // deliver without opening a file or a socket to find out.
+    if let Some(events) = &config_file.events {
+        validate_events(events)?;
+    }
+
     // WOR-2127: consumption attestation. Validated here rather than in
     // the pipeline because `sbproxy validate` has to reject a broken
     // block without touching the filesystem, and because a proxy that
@@ -1735,6 +1742,8 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         session_ledger: config_file.session_ledger,
         // WOR-2318: request-event egress config.
         request_events: config_file.request_events,
+        // WOR-2318: typed-proxy-event egress config.
+        events: config_file.events,
         // WOR-1971: hand the complete top-level flag set to the binary.
         flags: config_file.flags,
     })
@@ -1930,6 +1939,121 @@ fn validate_audit(audit: &AuditConfig, web_bot_auth: Option<&WebBotAuthConfig>) 
             "audit.sign_with `{other}` is not a signing identity this build can resolve; the \
              only accepted value is `{ATTESTATION_SIGN_WITH_WEB_BOT_AUTH}`"
         ),
+    }
+
+    Ok(())
+}
+
+/// Validate the top-level `events:` block (WOR-2318).
+///
+/// Every rule here refuses a config that would compile, boot, serve
+/// traffic, and deliver nothing, which is the failure an event sink is
+/// uniquely bad at surfacing: the operator's evidence that it works is
+/// events arriving, and the evidence that it is misconfigured is
+/// identical to the evidence that nothing happened.
+///
+/// Options that belong to a sink other than the selected one are refused
+/// rather than ignored, following `audit.path` under `sink: memory`. An
+/// ignored `url:` under `sink: file` is the more dangerous half of that
+/// pair, because it reads as configured.
+///
+/// `types:` is checked against the closed enum rather than passed
+/// through. A misspelled `policy_denial` would otherwise select no
+/// events and present as a healthy sink on a quiet proxy.
+///
+/// Kafka, NATS, and EventBridge never reach this function: they are not
+/// [`EventSinkKind`] variants, so serde refuses the name and names the
+/// three that are accepted. That is deliberate rather than an oversight
+/// to be papered over with a friendlier message here, because a variant
+/// that exists only to be rejected is a config surface that lies about
+/// what the build can do.
+fn validate_events(events: &EventsConfig) -> Result<()> {
+    let sink = events.sink;
+
+    if sink != EventSinkKind::File && events.path.is_some() {
+        anyhow::bail!(
+            "events.path is set but events.sink is not `file`, so nothing would ever be written \
+             to it. Set `sink: file` or remove the path."
+        );
+    }
+    if sink != EventSinkKind::Webhook {
+        if events.url.is_some() {
+            anyhow::bail!(
+                "events.url is set but events.sink is not `webhook`, so nothing would ever be \
+                 posted to it. Set `sink: webhook` or remove the url."
+            );
+        }
+        if events.signing_secret.is_some() {
+            anyhow::bail!(
+                "events.signing_secret is set but events.sink is not `webhook`, so nothing would \
+                 ever be signed with it. Set `sink: webhook` or remove the secret."
+            );
+        }
+    }
+
+    if sink == EventSinkKind::None {
+        if !events.types.is_empty() {
+            anyhow::bail!(
+                "events.types selects event types but events.sink is `none`, so none of them \
+                 would be delivered. Choose `file` or `webhook`, or remove the block."
+            );
+        }
+        if events.queue_capacity.is_some() {
+            anyhow::bail!(
+                "events.queue_capacity is set but events.sink is `none`, so there is no queue. \
+                 Choose `file` or `webhook`, or remove the capacity."
+            );
+        }
+        return Ok(());
+    }
+
+    match sink {
+        EventSinkKind::File => match events.path.as_deref().map(str::trim) {
+            None | Some("") => anyhow::bail!(
+                "events.sink is `file` but events.path is missing, so there is no file to append \
+                 to. Point it at a path on writable storage, for example \
+                 `/var/log/sbproxy/events.ndjson`."
+            ),
+            Some(_) => {}
+        },
+        EventSinkKind::Webhook => match events.url.as_deref().map(str::trim) {
+            None | Some("") => anyhow::bail!(
+                "events.sink is `webhook` but events.url is missing, so there is nowhere to post. \
+                 Point it at your collector, for example `https://siem.example.com/sbproxy`."
+            ),
+            Some(url) if !(url.starts_with("http://") || url.starts_with("https://")) => {
+                anyhow::bail!(
+                    "events.url `{url}` is not an http(s) URL. The webhook sink posts over HTTP \
+                     and the SSRF guard refuses every other scheme."
+                )
+            }
+            Some(_) => {}
+        },
+        EventSinkKind::None => {}
+    }
+
+    if events.queue_capacity == Some(0) {
+        anyhow::bail!(
+            "events.queue_capacity is 0, so every event would be dropped the moment it was \
+             published while the sink looked configured. Leave it unset for the default of \
+             {default}, or give it a real depth.",
+            default = sbproxy_observe::event_sink::DEFAULT_QUEUE_CAPACITY,
+        );
+    }
+
+    for name in &events.types {
+        if sbproxy_observe::EventType::from_name(name).is_none() {
+            let accepted = sbproxy_observe::ALL_EVENT_TYPES
+                .iter()
+                .map(|event_type| event_type.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "events.types names `{name}`, which is not an event this proxy emits. A name \
+                 that matches nothing selects nothing, and a sink that delivers nothing looks \
+                 exactly like a quiet proxy. Accepted values: {accepted}."
+            );
+        }
     }
 
     Ok(())
@@ -7073,6 +7197,202 @@ origins:
         assert!(
             error.to_string().contains("audit.path"),
             "the refusal names the key that would be ignored: {error}"
+        );
+    }
+
+    // --- WOR-2318: the `events:` egress ---
+
+    /// A config whose `events:` body is the caller's.
+    fn events_yaml(body: &str) -> String {
+        format!("proxy: {{}}\nevents:\n{body}\n")
+    }
+
+    /// The full refusal text for an `events:` block that must not
+    /// compile.
+    ///
+    /// Two details are load bearing. `compile_config` returns a
+    /// `CompiledConfig`, which is not `Debug`, so `expect_err` will not
+    /// compile against it; `.err().expect(..)` is the form that does.
+    /// And the rendering is `{:?}` rather than `to_string()`, because a
+    /// serde failure arrives wrapped in
+    /// `.context("failed to parse config YAML")` and `Display` on an
+    /// `anyhow::Error` prints only the outermost message, hiding the
+    /// part that names the offending key.
+    fn events_refusal(body: &str) -> String {
+        let error = compile_config(&events_yaml(body))
+            .err()
+            .expect("this events: block must not compile");
+        format!("{error:?}")
+    }
+
+    #[test]
+    fn events_sink_none_compiles_and_asks_for_nothing_else() {
+        let compiled = compile_config(&events_yaml("  sink: none")).expect("compile");
+        let events = compiled.events.expect("events block survives compilation");
+        assert_eq!(events.sink, EventSinkKind::None);
+        assert!(events.path.is_none());
+        assert!(events.url.is_none());
+        assert!(events.types.is_empty());
+    }
+
+    #[test]
+    fn events_file_sink_compiles_with_a_path() {
+        let compiled = compile_config(&events_yaml(
+            "  sink: file\n  path: /var/log/sbproxy/events.ndjson",
+        ))
+        .expect("compile");
+        let events = compiled.events.expect("events block survives compilation");
+        assert_eq!(events.sink, EventSinkKind::File);
+        assert_eq!(
+            events.path.as_deref(),
+            Some("/var/log/sbproxy/events.ndjson")
+        );
+    }
+
+    #[test]
+    fn events_webhook_sink_compiles_with_a_url_and_a_type_filter() {
+        let compiled = compile_config(&events_yaml(
+            "  sink: webhook\n  url: https://siem.example.com/sbproxy\n  \
+             signing_secret: ${SIEM_HMAC}\n  types:\n    - policy_denied\n    \
+             - auth_denied",
+        ))
+        .expect("compile");
+        let events = compiled.events.expect("events block survives compilation");
+        assert_eq!(events.sink, EventSinkKind::Webhook);
+        assert_eq!(events.types, vec!["policy_denied", "auth_denied"]);
+    }
+
+    #[test]
+    fn events_file_sink_without_a_path_is_refused() {
+        let message = events_refusal("  sink: file");
+        assert!(
+            message.contains("events.path"),
+            "the refusal names the missing key: {message}"
+        );
+    }
+
+    #[test]
+    fn events_webhook_sink_without_a_url_is_refused() {
+        let message = events_refusal("  sink: webhook");
+        assert!(
+            message.contains("events.url"),
+            "the refusal names the missing key: {message}"
+        );
+    }
+
+    #[test]
+    fn a_url_under_the_file_sink_is_refused_rather_than_ignored() {
+        // The dangerous shape, same as `audit.path` under `sink: memory`:
+        // it reads as configured and posts nothing.
+        let message = events_refusal(
+            "  sink: file\n  path: /var/log/sbproxy/events.ndjson\n  \
+             url: https://siem.example.com/sbproxy",
+        );
+        assert!(
+            message.contains("events.url"),
+            "the refusal names the key that would be ignored: {message}"
+        );
+    }
+
+    #[test]
+    fn a_path_under_the_webhook_sink_is_refused_rather_than_ignored() {
+        let message = events_refusal(
+            "  sink: webhook\n  url: https://siem.example.com/sbproxy\n  \
+             path: /var/log/sbproxy/events.ndjson",
+        );
+        assert!(
+            message.contains("events.path"),
+            "the refusal names the key that would be ignored: {message}"
+        );
+    }
+
+    #[test]
+    fn a_signing_secret_with_no_webhook_is_refused_rather_than_ignored() {
+        let message = events_refusal(
+            "  sink: file\n  path: /var/log/sbproxy/events.ndjson\n  \
+             signing_secret: ${SIEM_HMAC}",
+        );
+        assert!(
+            message.contains("events.signing_secret"),
+            "the refusal names the key that would be ignored: {message}"
+        );
+    }
+
+    #[test]
+    fn types_and_queue_capacity_under_sink_none_are_refused() {
+        let types = events_refusal("  sink: none\n  types:\n    - policy_denied");
+        assert!(
+            types.contains("events.types"),
+            "the refusal names the inert key: {types}"
+        );
+        let capacity = events_refusal("  sink: none\n  queue_capacity: 512");
+        assert!(
+            capacity.contains("events.queue_capacity"),
+            "the refusal names the inert key: {capacity}"
+        );
+    }
+
+    #[test]
+    fn a_zero_queue_capacity_is_refused() {
+        let message = events_refusal(
+            "  sink: file\n  path: /var/log/sbproxy/events.ndjson\n  queue_capacity: 0",
+        );
+        assert!(
+            message.contains("events.queue_capacity"),
+            "the refusal names the key: {message}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_event_type_is_refused_with_the_accepted_list() {
+        // The failure this prevents: a misspelling selects no events,
+        // and a sink that delivers nothing is indistinguishable from a
+        // quiet proxy.
+        let message = events_refusal(
+            "  sink: file\n  path: /var/log/sbproxy/events.ndjson\n  types:\n    - policy_denial",
+        );
+        assert!(
+            message.contains("policy_denial"),
+            "the refusal quotes the offending name: {message}"
+        );
+        assert!(
+            message.contains("policy_denied") && message.contains("guardrail_triggered"),
+            "and lists what is accepted: {message}"
+        );
+    }
+
+    #[test]
+    fn a_non_http_webhook_url_is_refused() {
+        let message = events_refusal("  sink: webhook\n  url: file:///tmp/events");
+        assert!(
+            message.contains("http"),
+            "the refusal says which schemes are allowed: {message}"
+        );
+    }
+
+    #[test]
+    fn kafka_nats_and_eventbridge_are_refused_by_name() {
+        // Not `EventSinkKind` variants, so serde refuses them and names
+        // the three that exist. A variant declared only to be rejected
+        // would be a config surface that lies about what the build does.
+        for absent in ["kafka", "nats", "eventbridge"] {
+            let message = events_refusal(&format!("  sink: {absent}"));
+            assert!(
+                message.contains("webhook") && message.contains("file"),
+                "refusing `{absent}` must name the sinks that do exist: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_events_key_is_refused() {
+        // `deny_unknown_fields`, so a `batch_size:` or a `retries:` an
+        // operator hoped for fails rather than being dropped.
+        let message =
+            events_refusal("  sink: file\n  path: /var/log/sbproxy/events.ndjson\n  retries: 3");
+        assert!(
+            message.contains("retries"),
+            "the refusal names the unknown key: {message}"
         );
     }
 

@@ -370,6 +370,16 @@ const EXEMPT: &[Exemption] = &[
                  the index is rendered from config, not per request. WOR-2318.",
     },
     Exemption {
+        file: "crates/sbproxy-observe/src/event_sink.rs",
+        reason: "The span is lost at a spawn boundary, and a batch has no single \
+                 trace to join. The webhook worker owns its own runtime and drains a \
+                 queue, so nothing is current when it sends, and one POST carries \
+                 events from many unrelated requests. A traceparent there would name \
+                 whichever request happened to be first in the batch, which is worse \
+                 than none: it renders as a real edge. Per-event context would have to \
+                 ride in the payload rather than the header. WOR-2318.",
+    },
+    Exemption {
         file: "crates/sbproxy-observe/src/alerting/channels.rs",
         reason: "The span is lost at a spawn boundary. Alert webhooks are dispatched \
                  through an uninstrumented task set, and an alert is usually raised by a \

@@ -269,6 +269,11 @@ pub struct CompiledConfig {
     /// the dispatch on the request path a no-op. The binary registers
     /// the process-wide sink from this at startup.
     pub request_events: Option<crate::types::RequestEventsConfig>,
+    /// Typed-proxy-event egress config. `None` (or `sink: none`) leaves
+    /// every publish site a single relaxed load. The binary starts the
+    /// bounded queue and its delivery worker from this at startup; a
+    /// reload does not restart it.
+    pub events: Option<crate::types::EventsConfig>,
     /// Process-wide flags compiled from the top-level `flags:` block.
     /// The binary atomically replaces the live CEL store from this
     /// complete snapshot at boot and after every successful reload.

@@ -16,6 +16,11 @@ pub mod capture;
 pub mod cardinality;
 /// Clock-skew monitor: SNTP poller + `/readyz` probe.
 pub mod clock_skew;
+/// Egress for the typed proxy events: the `events:` block's bounded
+/// queue, background worker, and file / webhook sinks. Delivery never
+/// runs on the publisher's thread, which is the difference between this
+/// and [`events::EventBus`].
+pub mod event_sink;
 /// Typed proxy events and the in-process subscriber bus.
 pub mod events;
 /// OpenMetrics exemplar side-store used to wire trace IDs
@@ -84,7 +89,13 @@ pub use clock_skew::{
     sntp_query, ClockSkewConfig, ClockSkewMonitor, ProbeError as ClockSkewProbeError,
     DEFAULT_NTP_SOURCE, DEFAULT_POLL_INTERVAL_SECS, SNTP_TIMEOUT, TOLERANCE_SECS,
 };
-pub use events::{EventBus, EventType, PolicySurface, PolicyVerdictEvent, ProxyEvent, VerdictTag};
+pub use event_sink::{
+    install_event_egress, publish_proxy_event, EventEgress, EventSinkTarget, EventTypeMask,
+    DEFAULT_QUEUE_CAPACITY as DEFAULT_EVENT_QUEUE_CAPACITY,
+};
+pub use events::{
+    EventBus, EventType, PolicySurface, PolicyVerdictEvent, ProxyEvent, VerdictTag, ALL_EVENT_TYPES,
+};
 pub use health::{
     default_registry, default_registry_optional, handle_health, handle_healthz, handle_livez,
     handle_readyz, mark_process_start, ComponentReport, ComponentStatus, HealthMetadata,
