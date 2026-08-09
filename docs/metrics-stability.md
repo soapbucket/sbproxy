@@ -1,5 +1,5 @@
 # Metrics stability
-*Last modified: 2026-08-02*
+*Last modified: 2026-08-09*
 
 *Generated from the executable metric registry. Do not hand-edit; run `cargo run -q -p sbproxy-observe --bin generate-metrics-stability > docs/metrics-stability.md`.*
 
@@ -22,6 +22,23 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 `beta` names are functional and may still be renamed or relabeled in a minor release, with a changelog entry.
 
 `alpha` names may be renamed, relabeled, or removed in any release.
+
+## Deprecation schedule
+
+The tiers above say what may change. This says when, so a cost report built on a `stable` name can be planned around rather than hoped for.
+
+A `stable` metric name, or a label on one, is retired in four steps, and every step is visible from outside this repository:
+
+1. The replacement family ships in a minor release and writes alongside the original. Both carry the same values for the whole window.
+2. That same release marks the original deprecated here and in its changelog entry, naming the replacement and the earliest release that may remove it.
+3. The window stays open for at least two further minor releases and at least 90 days, whichever ends later.
+4. Removal lands in a major release. Never a minor, never a patch.
+
+Gaining a label is not a deprecation and opens no window: new labels go on the end of the set, every existing query keeps matching, and the release notes it. Removing or reordering one renames every series in the family, so it takes all four steps above.
+
+`beta` and `alpha` names get no window at all. A `beta` name changes with a changelog entry in the release that changes it; an `alpha` name changes without one.
+
+The set of `stable` names, and the label prefix each one carried at promotion, is frozen in a build guard, so a rename, a removal, or a label reorder fails the build rather than waiting on review to notice.
 
 ## Catalog
 
@@ -91,7 +108,7 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_ai_compression_value_cost_saved_micros_total` | Counter | `stable` | `beta` | `tenant_id`, `origin`, `model`, `lever`, `token_count_precision` | Gross known-price target-model input cost avoided by successful AI context compression, in micro-USD. |
 | `sbproxy_ai_compression_value_tokens_saved_total` | Counter | `stable` | `beta` | `tenant_id`, `origin`, `model`, `lever`, `token_count_precision` | Estimated target-model input tokens avoided by successful AI context compression. |
 | `sbproxy_ai_context_poisoning_findings_total` | Counter | `stable` | `beta` | `rule_id`, `action` | Context-poisoning guardrail findings. |
-| `sbproxy_ai_cost_dollars_attributed_total` | Counter | `stable` | `beta` | `origin`, `provider`, `model`, `surface`, `project`, `feature`, `team`, `agent_type`, `environment`, `tenant_id`, `api_key_id`, `agent_id` | AI cost in USD, partitioned by attribution tag. |
+| `sbproxy_ai_cost_dollars_attributed_total` | Counter | `stable` | `stable` | `origin`, `provider`, `model`, `surface`, `project`, `feature`, `team`, `agent_type`, `environment`, `tenant_id`, `api_key_id`, `agent_id` | AI cost in USD, partitioned by attribution tag. |
 | `sbproxy_ai_cost_saved_micros_total` | Counter | `stable` | `beta` | `tenant`, `origin`, `model` | Micro-USD avoided by a semantic-cache hit. |
 | `sbproxy_ai_cost_usd_micros_total` | Counter | `stable` | `beta` | `provider`, `model`, `tenant_id` | Derived AI request cost in micro-USD. |
 | `sbproxy_ai_failovers_total` | Counter | `stable` | `beta` | `from_provider`, `to_provider`, `reason` | Provider failover events. |
@@ -135,7 +152,7 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_ai_surface_request_duration_seconds` | Histogram | `stable` | `stable` | `surface`, `method` | AI request latency partitioned by classified surface. |
 | `sbproxy_ai_surface_requests_total` | Counter | `stable` | `stable` | `surface`, `method` | AI gateway requests partitioned by classified surface. |
 | `sbproxy_ai_token_estimate_error_ratio` | Histogram | `stable` | `beta` | `model` | Relative error of pre-request token estimate vs upstream usage.prompt_tokens. |
-| `sbproxy_ai_tokens_attributed_total` | Counter | `stable` | `beta` | `origin`, `provider`, `model`, `surface`, `direction`, `project`, `feature`, `team`, `agent_type`, `environment`, `tenant_id`, `api_key_id`, `agent_id` | AI tokens consumed, partitioned by attribution tag. |
+| `sbproxy_ai_tokens_attributed_total` | Counter | `stable` | `stable` | `origin`, `provider`, `model`, `surface`, `direction`, `project`, `feature`, `team`, `agent_type`, `environment`, `tenant_id`, `api_key_id`, `agent_id` | AI tokens consumed, partitioned by attribution tag. |
 | `sbproxy_ai_tokens_saved_total` | Counter | `stable` | `beta` | `tenant`, `origin`, `model`, `kind` | Tokens avoided by a semantic-cache hit. |
 | `sbproxy_ai_ttft_seconds` | Histogram | `stable` | `stable` | `provider`, `model` | AI streaming time to first token. |
 | `sbproxy_ai_usage_parse_miss_total` | Counter | `stable` | `beta` | `provider`, `surface` | 2xx AI responses on a token surface that carried no parseable usage block (budget debited from an estimate). |

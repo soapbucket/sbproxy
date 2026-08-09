@@ -788,7 +788,13 @@ pub const METRICS: &[MetricCapability] = &[
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_ai_request_attributed"),
         support: SupportLevel::Stable,
-        compat: CompatTier::Beta,
+        // Promoted out of beta. Nobody builds a chargeback report on a
+        // series that can be renamed in the next minor, and this is the
+        // series a chargeback report is built on: two alert rules and two
+        // recording rules already sum it by `tenant_id` and by
+        // `api_key_id`. The frozen shape is pinned by
+        // STABLE_NAME_CONTRACT in the drift guard.
+        compat: CompatTier::Stable,
         registry: Registry::Default,
         // `agent_id` is appended last: this list is positional, so the
         // only safe place for a new label is the end. It is the
@@ -1292,7 +1298,11 @@ pub const METRICS: &[MetricCapability] = &[
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_ai_request_attributed"),
         support: SupportLevel::Stable,
-        compat: CompatTier::Beta,
+        // Promoted with the cost counter it shares a writer with. The two
+        // are divided against each other to get a per-attribution unit
+        // cost, so promoting one and leaving the other renameable would
+        // pin half of an expression. See STABLE_NAME_CONTRACT.
+        compat: CompatTier::Stable,
         registry: Registry::Default,
         // See `sbproxy_ai_cost_dollars_attributed_total`: `agent_id`
         // is appended last because the list is positional, and it
@@ -1340,6 +1350,16 @@ pub const METRICS: &[MetricCapability] = &[
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_waste"),
         support: SupportLevel::Stable,
+        // Deliberately left beta when the two attributed-spend counters
+        // were promoted. Three things say the shape is not settled. No
+        // dashboard, alert, or recording rule reads either wasted family,
+        // so nothing has ever exercised it. `docs/observability.md`
+        // publishes a `kind` vocabulary
+        // (canceled/retried/cached/guardrail_blocked/other) that shares
+        // not one value with what `WasteKind` actually emits. And these
+        // are the only attributed families carrying neither `tenant_id`
+        // nor `api_key_id`, which is why they are absent from
+        // TENANT_SCOPED_METRICS below. Fix those, then promote.
         compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &["kind", "provider", "model", "surface", "project", "feature", "team", "agent_type", "environment"],
@@ -1351,6 +1371,7 @@ pub const METRICS: &[MetricCapability] = &[
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_waste"),
         support: SupportLevel::Stable,
+        // Left beta for the reasons on its cost sibling above.
         compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &["kind", "provider", "model", "surface", "project", "feature", "team", "agent_type", "environment"],
@@ -3738,7 +3759,7 @@ pub fn run_scoped_label_gaps(
 pub fn render_markdown() -> String {
     let mut out = String::from(
         "# Metrics stability\n\
-         *Last modified: 2026-08-02*\n\n\
+         *Last modified: 2026-08-09*\n\n\
          *Generated from the executable metric registry. Do not hand-edit; run \
          `cargo run -q -p sbproxy-observe --bin generate-metrics-stability > \
          docs/metrics-stability.md`.*\n\n\
@@ -3767,7 +3788,37 @@ pub fn render_markdown() -> String {
          losing one follows the same deprecation path.\n\n\
          `beta` names are functional and may still be renamed or relabeled in a \
          minor release, with a changelog entry.\n\n\
-         `alpha` names may be renamed, relabeled, or removed in any release.\n\n\
+         `alpha` names may be renamed, relabeled, or removed in any release.\n\n",
+    );
+
+    // The tiers above are a vocabulary; this is the timetable. A tier with
+    // no stated window is not a promise, it is an adjective, and an
+    // operator cannot plan a chargeback report around an adjective.
+    out.push_str(
+        "## Deprecation schedule\n\n\
+         The tiers above say what may change. This says when, so a cost report \
+         built on a `stable` name can be planned around rather than hoped for.\n\n\
+         A `stable` metric name, or a label on one, is retired in four steps, \
+         and every step is visible from outside this repository:\n\n\
+         1. The replacement family ships in a minor release and writes \
+         alongside the original. Both carry the same values for the whole \
+         window.\n\
+         2. That same release marks the original deprecated here and in its \
+         changelog entry, naming the replacement and the earliest release that \
+         may remove it.\n\
+         3. The window stays open for at least two further minor releases and \
+         at least 90 days, whichever ends later.\n\
+         4. Removal lands in a major release. Never a minor, never a patch.\n\n\
+         Gaining a label is not a deprecation and opens no window: new labels \
+         go on the end of the set, every existing query keeps matching, and the \
+         release notes it. Removing or reordering one renames every series in \
+         the family, so it takes all four steps above.\n\n\
+         `beta` and `alpha` names get no window at all. A `beta` name changes \
+         with a changelog entry in the release that changes it; an `alpha` name \
+         changes without one.\n\n\
+         The set of `stable` names, and the label prefix each one carried at \
+         promotion, is frozen in a build guard, so a rename, a removal, or a \
+         label reorder fails the build rather than waiting on review to notice.\n\n\
          ## Catalog\n\n",
     );
 

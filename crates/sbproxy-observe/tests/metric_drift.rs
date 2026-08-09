@@ -425,3 +425,359 @@ fn the_cardinality_budget_table_lists_only_live_metrics() {
             .join("\n")
     );
 }
+
+// --- The stable name promise, made enforceable ---
+//
+// `CompatTier::Stable` published a promise that nothing checked. The only
+// rule the registry carried about it lived in `validate_metrics`: a stable
+// name needs a live writer. Everything the tier actually claims, that the
+// name survives, that the family survives, that a query written against it
+// keeps matching, was enforced by nobody. A rename was one word in a struct
+// literal and a regenerated table, and the table would have looked correct
+// afterwards, because the table is generated from the thing that changed.
+//
+// So promotion out of beta bought a word in a column. That is the wrong
+// direction for a tier whose whole content is "you may build on this": the
+// families most worth promoting are the spend counters a finance report
+// sums, and those are exactly the ones where a silent rename is most
+// expensive.
+//
+// The contract below is the missing half. It is a snapshot, taken at
+// promotion, of every stable family and the label prefix it froze at, and
+// it is deliberately a second copy rather than something derived from
+// METRICS. A guard derived from the registry cannot catch a change to the
+// registry; it would agree with whatever the registry said this morning.
+// Two copies disagree, and the disagreement is the signal.
+
+/// Every family carrying a `stable` name promise, and the label prefix it
+/// carried when that promise was made.
+///
+/// Append-only in two directions. A new promotion adds a row. A stable
+/// family that gains a label leaves its row alone, because the row records
+/// what was promised and a later label is not part of it. Editing a row in
+/// place is the one thing that is never right: it is how you make the guard
+/// agree with the break it exists to catch.
+const STABLE_NAME_CONTRACT: &[(&str, &[&str])] = &[
+    ("sbproxy_active_connections", &[]),
+    ("sbproxy_agent_detect_inference_seconds", &[]),
+    ("sbproxy_agent_detect_score", &[]),
+    ("sbproxy_agent_detect_total", &["agent_id", "provenance"]),
+    ("sbproxy_ai_budget_utilization_ratio", &["scope"]),
+    (
+        "sbproxy_ai_cache_results_total",
+        &["provider", "cache_type", "result"],
+    ),
+    (
+        "sbproxy_ai_cost_dollars_attributed_total",
+        &[
+            "origin",
+            "provider",
+            "model",
+            "surface",
+            "project",
+            "feature",
+            "team",
+            "agent_type",
+            "environment",
+            "tenant_id",
+            "api_key_id",
+            "agent_id",
+        ],
+    ),
+    ("sbproxy_ai_guardrail_blocks_total", &["category"]),
+    (
+        "sbproxy_ai_provider_errors_total",
+        &["provider", "error_kind"],
+    ),
+    (
+        "sbproxy_ai_realtime_session_duration_seconds",
+        &["provider", "close_reason"],
+    ),
+    ("sbproxy_ai_realtime_sessions_active", &[]),
+    (
+        "sbproxy_ai_surface_request_duration_seconds",
+        &["surface", "method"],
+    ),
+    ("sbproxy_ai_surface_requests_total", &["surface", "method"]),
+    (
+        "sbproxy_ai_tokens_attributed_total",
+        &[
+            "origin",
+            "provider",
+            "model",
+            "surface",
+            "direction",
+            "project",
+            "feature",
+            "team",
+            "agent_type",
+            "environment",
+            "tenant_id",
+            "api_key_id",
+            "agent_id",
+        ],
+    ),
+    ("sbproxy_ai_ttft_seconds", &["provider", "model"]),
+    (
+        "sbproxy_auth_results_total",
+        &["origin", "auth_type", "result"],
+    ),
+    ("sbproxy_bytes_total", &["origin", "direction"]),
+    ("sbproxy_cache_reserve_evictions_total", &["origin"]),
+    ("sbproxy_cache_reserve_hits_total", &["origin"]),
+    ("sbproxy_cache_reserve_misses_total", &["origin"]),
+    ("sbproxy_cache_reserve_writes_total", &["origin"]),
+    ("sbproxy_phase_duration_seconds", &["phase", "origin"]),
+    (
+        "sbproxy_policy_triggers_total",
+        &["origin", "policy_type", "action", "agent_id", "agent_class"],
+    ),
+    ("sbproxy_request_duration_seconds", &["hostname"]),
+    (
+        "sbproxy_requests_total",
+        &[
+            "hostname",
+            "method",
+            "status",
+            "agent_id",
+            "agent_class",
+            "agent_vendor",
+            "payment_rail",
+            "content_shape",
+        ],
+    ),
+];
+
+/// Diff the published stable promises against what the registry says today.
+///
+/// Four ways to break a promise, all reported in one run so a single fix
+/// pass sees everything:
+///
+/// - the family is gone from `METRICS`, which is a removal without the
+///   deprecation window the catalog publishes;
+/// - the family is still there but no longer `stable`, which is a promise
+///   withdrawn by editing one word;
+/// - a frozen label was dropped or reordered, which renames every series in
+///   the family as surely as renaming the family would, because a label
+///   list is positional and a query selects on names that have moved;
+/// - a family is `stable` in the registry with no contract row, so the
+///   promotion pinned nothing and the next rename is free again.
+fn stable_contract_gaps(
+    metrics: &[MetricCapability],
+    contract: &[(&str, &[&str])],
+) -> Vec<RegistryError> {
+    let mut errors = Vec::new();
+
+    for (name, frozen) in contract {
+        let Some(metric) = metrics.iter().find(|m| m.name == *name) else {
+            errors.push(RegistryError {
+                subject: (*name).to_string(),
+                message: "carries a published stable name promise and is no longer declared in \
+                          METRICS. Removing a stable family is a deprecation, not a deletion: \
+                          ship the replacement alongside it, mark this one deprecated, and drop \
+                          it in a major release. See the deprecation schedule in \
+                          docs/metrics-stability.md."
+                    .to_string(),
+            });
+            continue;
+        };
+
+        if metric.compat != CompatTier::Stable {
+            errors.push(RegistryError {
+                subject: (*name).to_string(),
+                message: format!(
+                    "is in STABLE_NAME_CONTRACT and the registry now calls it `{}`. A published \
+                     promise is not withdrawn by editing one word; run the deprecation schedule \
+                     in docs/metrics-stability.md instead.",
+                    metric.compat.as_str()
+                ),
+            });
+        }
+
+        let kept = frozen.len() <= metric.labels.len()
+            && frozen
+                .iter()
+                .zip(metric.labels.iter())
+                .all(|(promised, current)| promised == current);
+        if !kept {
+            errors.push(RegistryError {
+                subject: (*name).to_string(),
+                message: format!(
+                    "changed the frozen part of its label set. Promised {frozen:?}, now declares \
+                     {:?}. A stable family may gain labels, on the end, and nothing else: the \
+                     list is positional, so dropping or reordering one breaks every dashboard \
+                     and alert that selects on it. Append instead, and leave the contract row \
+                     alone.",
+                    metric.labels
+                ),
+            });
+        }
+    }
+
+    for metric in metrics {
+        if metric.compat != CompatTier::Stable {
+            continue;
+        }
+        if contract.iter().any(|(name, _)| *name == metric.name) {
+            continue;
+        }
+        errors.push(RegistryError {
+            subject: metric.name.to_string(),
+            message: "is declared `stable` with no STABLE_NAME_CONTRACT row, so the promotion \
+                      pinned nothing and the name is as renameable as it was on beta. Add the \
+                      name and its label set to the contract in the same change that promotes it."
+                .to_string(),
+        });
+    }
+
+    errors
+}
+
+/// A `stable`/`stable` fixture, for the guard's own failure proofs.
+fn promised_metric(name: &'static str, labels: &'static [&'static str]) -> MetricCapability {
+    MetricCapability {
+        name,
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_thing"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Stable,
+        registry: Registry::Default,
+        labels,
+        description: "A fixture.",
+        dead_reason: None,
+    }
+}
+
+#[test]
+fn every_stable_name_promise_is_still_kept() {
+    report(
+        "A published stable metric promise was broken. The catalog in \
+         docs/metrics-stability.md tells operators these names and label sets survive a minor \
+         release, and something in this change says otherwise.",
+        &stable_contract_gaps(METRICS, STABLE_NAME_CONTRACT),
+    );
+}
+
+#[test]
+fn attributed_ai_spend_carries_a_stable_name() {
+    // The reason the contract above exists. Chargeback and showback
+    // reporting is built on these two counters, and a report is not
+    // rebuilt every minor release, so a renameable name is not a name a
+    // finance team can use. Named explicitly rather than left to the
+    // contract sweep so a demotion fails on a test whose name says what
+    // was lost.
+    for name in [
+        "sbproxy_ai_cost_dollars_attributed_total",
+        "sbproxy_ai_tokens_attributed_total",
+    ] {
+        let metric = METRICS
+            .iter()
+            .find(|metric| metric.name == name)
+            .unwrap_or_else(|| panic!("{name} is not declared in METRICS"));
+
+        assert_eq!(
+            metric.compat,
+            CompatTier::Stable,
+            "{name} must keep a stable name promise; attributed spend is what operators build \
+             cost reporting on"
+        );
+        assert_eq!(
+            metric.support,
+            SupportLevel::Stable,
+            "{name} cannot promise a stable name without a live writer"
+        );
+    }
+}
+
+#[test]
+fn the_stable_contract_guard_catches_a_removed_family() {
+    // A guard with no proof it can fail is not a guard: the sweep above
+    // passes today, so an empty contract, a broken comparison, and a real
+    // absence of violations are indistinguishable from its result alone.
+    let deleted: &[MetricCapability] = &[];
+    let contract: &[(&str, &[&str])] = &[("sbproxy_gone_total", &["origin"])];
+
+    let errors = stable_contract_gaps(deleted, contract);
+
+    assert_eq!(errors.len(), 1, "the guard did not fire: {errors:?}");
+    assert!(
+        errors[0].message.contains("no longer declared in METRICS"),
+        "{:?}",
+        errors[0]
+    );
+}
+
+#[test]
+fn the_stable_contract_guard_catches_a_demotion() {
+    let mut demoted = promised_metric("sbproxy_thing_total", &["origin"]);
+    demoted.compat = CompatTier::Beta;
+    let contract: &[(&str, &[&str])] = &[("sbproxy_thing_total", &["origin"])];
+
+    let errors = stable_contract_gaps(&[demoted], contract);
+
+    assert_eq!(errors.len(), 1, "the guard did not fire: {errors:?}");
+    assert!(errors[0].message.contains("`beta`"), "{:?}", errors[0]);
+}
+
+#[test]
+fn the_stable_contract_guard_catches_a_dropped_or_reordered_label() {
+    let contract: &[(&str, &[&str])] = &[("sbproxy_thing_total", &["origin", "method", "status"])];
+
+    // Dropped: the family keeps its name and every query that selects on
+    // `method` silently matches nothing.
+    let dropped = promised_metric("sbproxy_thing_total", &["origin", "status"]);
+    let errors = stable_contract_gaps(&[dropped], contract);
+    assert_eq!(
+        errors.len(),
+        1,
+        "a dropped label went unnoticed: {errors:?}"
+    );
+    assert!(
+        errors[0].message.contains("frozen part of its label set"),
+        "{:?}",
+        errors[0]
+    );
+
+    // Reordered: the set is identical, so a naive set comparison passes.
+    // The Prometheus handle indexes by position, so the values land under
+    // the wrong names.
+    let reordered = promised_metric("sbproxy_thing_total", &["origin", "status", "method"]);
+    let errors = stable_contract_gaps(&[reordered], contract);
+    assert_eq!(errors.len(), 1, "a reorder went unnoticed: {errors:?}");
+    assert!(
+        errors[0].message.contains("frozen part of its label set"),
+        "{:?}",
+        errors[0]
+    );
+}
+
+#[test]
+fn the_stable_contract_guard_allows_an_appended_label() {
+    // The published schedule says stable families may gain labels in a
+    // minor release, so the guard has to permit exactly that and nothing
+    // wider. `agent_id` reached both attributed counters this way.
+    let grown = promised_metric("sbproxy_thing_total", &["origin", "method", "agent_id"]);
+    let contract: &[(&str, &[&str])] = &[("sbproxy_thing_total", &["origin", "method"])];
+
+    let errors = stable_contract_gaps(&[grown], contract);
+
+    assert_eq!(errors, vec![], "appending a label must stay legal");
+}
+
+#[test]
+fn the_stable_contract_guard_catches_an_unpinned_promotion() {
+    // Promotion has to cost something, or the tier is decorative again:
+    // the change that writes `CompatTier::Stable` is the change that has to
+    // write down the shape it just froze.
+    let promoted = promised_metric("sbproxy_thing_total", &["origin"]);
+    let unpinned: &[(&str, &[&str])] = &[];
+
+    let errors = stable_contract_gaps(&[promoted], unpinned);
+
+    assert_eq!(errors.len(), 1, "the guard did not fire: {errors:?}");
+    assert!(
+        errors[0].message.contains("no STABLE_NAME_CONTRACT row"),
+        "{:?}",
+        errors[0]
+    );
+}
