@@ -217,7 +217,7 @@ The Wave 1 substrate adds five labels: `agent_id`, `agent_class`, `agent_vendor`
 | SLO-BOT-AUTH-DIR | Bot Auth | directory freshness (TTL not exceeded) | 99.9% | 7d | Ticket |
 | SLO-CARD-BUDGET | Substrate | per-metric series count under cap | 100% | continuous | Log-only (CI gate) |
 
-PromQL recording rules pre-compute each SLI at 1m, 5m, 1h, 6h, and 24h windows. Burn-rate alerts use the multi-window pattern from the SRE workbook (5m AND 1h at 14.4x for page tier, 30m AND 6h at 6x, 2h AND 24h at 3x for ticket). The full rule set lives in `deploy/alerts/`.
+PromQL recording rules pre-compute each SLI at 1m, 5m, 1h, 6h, and 24h windows. Burn-rate alerts use the multi-window pattern from the SRE workbook (5m AND 1h at 14.4x for page tier, 30m AND 6h at 6x, 1h AND 24h at 3x for ticket). The full rule set lives in `deploy/alerts/`. These are the rules to page on. The proxy also evaluates one availability burn rate in process, covered under [Alerts](#alerts), and it is a fallback for deployments with no scrape target rather than a second copy of the set above.
 
 ### Cardinality budget
 
@@ -1137,7 +1137,7 @@ these seven built-in rules:
 |---|---|
 | `budget_exhaustion` | Highest configured budget utilization. Warning at 80%, critical at 95%. |
 | `error_rate_spike` | AI-provider errors over attempts in the latest minute. Warning above 10%, critical above 20%; inactive below 10 attempts. |
-| `burn_rate` | Proxy request availability against a 99% target, at 14.4x, 6x, and 3x. Inactive until the process-local ring holds 60 minutes, so it is blind for the first hour after a restart. |
+| `burn_rate` | Proxy request availability over the last 60 minutes against a 99% target, firing at 14.4x. Inactive until the process-local ring holds those 60 minutes, so it is blind for the first hour after a restart. |
 | `latency_slo` | Proxy-wide request p99 for the latest minute. Warning above 200 ms, critical above 400 ms. |
 | `rate_limit_approaching` | Rejected route and tenant rate-limit decisions as a fraction of all decisions in the latest minute. Warning above 80%, critical at 95%. |
 | `cert_expiry` | Soonest certificate in the active ACME store. Warning at 30 days remaining, critical at 7 days. |
@@ -1156,20 +1156,34 @@ Burn-rate history is a bounded, process-local ring of 1,440 wall-clock
 one-minute buckets. Once request metrics are available, idle minutes occupy
 zero-request buckets so old failures age out after 24 hours.
 
+The rule reads the last 60 of those buckets and nothing older. A burn that
+ended an hour ago will not hold the incident open, and an hour that is
+burning now is not averaged away by the clean day sitting behind it in the
+ring. Clearing therefore takes a full window: the failing minutes have to
+leave the hour, not merely stop arriving.
+
 Nothing persists the ring. It starts empty after every restart, and the rule
 reports `inactive` until it holds 60 minutes again, because a window that has
 been filling for four minutes cannot answer a question about the last hour.
 The Alerts console prints the shortfall in the samples column, `4 / 60 min`
 beside the rule. An inactive burn-rate rule neither opens an incident nor
 resolves one already open, so restarting during an incident will not clear
-it. The 24-hour objective needs a full day of uptime before it can fire.
+it.
 
 The first hour after a deploy is therefore blind, and no setting closes it.
 Point anything you page on at an external Prometheus, which keeps the series
 across restarts. `deploy/alerts/alerting-rules.yml` ships the multi-window
 rules that read it: 5m AND 1h at 14.4x and 30m AND 6h at 6x for the page
-tier, 2h AND 24h at 3x for the ticket tier. The in-process rule exists so a
-deployment with no scrape target still gets a signal.
+tier, 1h AND 24h at 3x for the ticket tier.
+
+The in-process rule answers the first of those three and only the first, and
+it answers it with the long window alone rather than the short-and-long pair,
+so it opens later on a burn that has just started and closes later after one
+ends. The 6x and 3x tiers are not evaluated in process at all. Both of them
+need history that outlives the process, and a 24-hour window read from a ring
+that empties on restart reports healthy for a full day every time the proxy
+comes back. The in-process rule exists so a deployment with no scrape target
+is not silent during a fast outage, not to stand in for the rules above.
 
 Each paging alert carries a `runbook_id` label so on-call has a stable
 correlation key. [`operator-runbook.md`](operator-runbook.md#alert-index)

@@ -1090,9 +1090,12 @@ mod tests {
             errors: 0,
             p99_ms: 20.0,
         };
+        // 30% failure for half the window averages 15x across the hour the
+        // objective reads, over its 14.4x threshold. Clearing takes a whole
+        // window, so the recovery loop runs 60 clean minutes rather than 30.
         let burning = MinuteSample {
             requests: 100,
-            errors: 10,
+            errors: 30,
             p99_ms: 20.0,
         };
         let mut burn = AlertEngine::new(EngineConfig::default());
@@ -1114,7 +1117,7 @@ mod tests {
                 .or(fired);
         }
         let mut resolved = None;
-        for _ in 0..30 {
+        for _ in 0..60 {
             resolved = burn
                 .evaluate(&MetricReadings {
                     minute_sample: Some(clean),

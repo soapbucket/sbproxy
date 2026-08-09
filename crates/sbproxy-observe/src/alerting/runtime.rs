@@ -199,9 +199,14 @@ impl AlertRuntime {
             AlertRuleSnapshot {
                 rule: "burn_rate".to_string(),
                 description:
-                    "Multi-window availability burn rate over a process-local 1,440-minute ring"
+                    "Availability burn rate over the last 60 minutes of a process-local ring"
                         .to_string(),
-                thresholds: vec![3.0, 6.0, 14.4],
+                // One threshold, because there is one objective. The console
+                // used to advertise 3x, 6x, and 14.4x for three tiers that
+                // computed two distinct windows between them and opened one
+                // shared incident. The 6x and 3x tiers are Prometheus rules
+                // now; see deploy/alerts/alerting-rules.yml.
+                thresholds: vec![14.4],
                 // The console renders the sample column as "n / floor" only
                 // for a rule that declares a floor, and prints "not gated" for
                 // one that does not. Leaving this None put the words "not

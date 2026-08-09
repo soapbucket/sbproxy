@@ -287,6 +287,42 @@ the next version cut.
   hook now log `served`, `stapled`, and `covered`, and name the boundary.
   `docs/manual.md` section 7 documents it.
 
+- **The in-process burn-rate rule now reads the hour it is named for, and
+  reads only that hour.** The evaluator published three availability
+  objectives, `-1H`, `-6H`, and `-24H`, and not one of them computed the
+  window its name claimed. `-1H` had no window at all: it summed every
+  sample in the ring, so it widened with process uptime until, against a
+  full 1,440-minute ring, it returned the identical number as `-24H`. `-6H`
+  was gated on 60 samples and read a 30-minute tail, so its name, its gate,
+  and its window were three different durations. Only `-24H` was honest.
+
+  In practice that meant a proxy that had been up for a day would page on an
+  outage that ended hours ago while the hour actually in front of it was
+  clean, and would stay quiet through a 20x burn in the last hour because
+  the clean day behind it averaged the number down to under 1x.
+
+  All three collapsed into one alert with one severity and one deduplication
+  key, so they were never three paging decisions. There is one objective
+  now: `SBPROXY-SUBSTRATE-AVAIL-INBOUND-1H`, the last 60 minutes at 14.4x,
+  which is the window the rule's existing 60-sample floor fills exactly. The
+  6x-over-6h and 3x-over-24h tiers are Prometheus rules in
+  `deploy/alerts/alerting-rules.yml` and are not evaluated in process at
+  all; both need history that outlives the process, and a 24-hour window
+  read from a ring that empties on restart reports healthy for a full day
+  every time the proxy comes back.
+
+  What changes for an operator: a slow burn under 14.4x over the last hour
+  no longer opens an in-process incident, and if you were paging off this
+  rule rather than off Prometheus, that coverage has to come from
+  `alerting-rules.yml`. A fast burn confined to the last hour now opens one
+  that did not open before. Recovery takes a full window, because the
+  failing minutes have to leave the hour rather than merely stop arriving.
+  The alert's labels are now `scope`, `objective`, and `window` in place of
+  `scope` and a joined `objectives` list, which changes the PagerDuty
+  deduplication key: an incident open across the upgrade will not be closed
+  by the new build's resolve event. The new key is at least stable, which
+  the old one was not, since its value moved with the set of tiers firing.
+
 - **A secret reference in `message_signatures.key` is now resolved instead
   of being used as the key itself.** Writing `key: vault://prod/signing-key`
   or `key: env:SIGNING_KEY` on an origin left the reference text standing in

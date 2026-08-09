@@ -1,180 +1,178 @@
-//! SLO burn-rate regression (Wave 1 / Q1.13).
+//! SLO burn-rate regression for the in-process evaluator.
 //!
-//! Per  (A1.6), every SLO has a
-//! multi-window multi-burn-rate alert pair. This test replays a fixture
-//! traffic profile and asserts the right alerts fire (and only the
-//! right ones fire) when the error rate or latency cross thresholds.
+//! These fixtures replay minute-resolution traffic through
+//! `sbproxy_observe::alerting::burn_rate` and assert which objectives fire.
+//! They spawn no proxy: the evaluator is a pure function of a sample slice,
+//! and the samples the live engine feeds it come from a ring this test can
+//! build directly.
 //!
-//! Window pairs and thresholds from the ADR (page tier):
+//! # What the in-process evaluator is for
 //!
-//! | Window pair  | Burn rate | Time to budget burn |
-//! |--------------|-----------|---------------------|
-//! | 5m AND 1h    | 14.4×     | 2% of monthly in 1h |
-//! | 30m AND 6h   | 6×        | 5% of monthly in 6h |
-//! | 2h AND 24h   | 3×        | 10% of monthly in 24h |
+//! It publishes exactly one availability objective,
+//! `SBPROXY-SUBSTRATE-AVAIL-INBOUND-1H`: the last 60 minutes against the
+//! configured target, firing at 14.4x. That is the fast-burn page tier and
+//! nothing else.
 //!
-//! Fixture profile: configure SLO at 99% (1% error budget), drive
-//! 100 successes and 5 errors over a simulated 1h window. Burn rate
-//! at 1h is `0.05 / 0.01 = 5×`, which crosses the 30m/6h pair (6×
-//! threshold trips on a tighter window) but NOT the 5m/1h 14.4× pair.
+//! The other two tiers an operator pages on live in
+//! `deploy/alerts/alerting-rules.yml` and are evaluated by Prometheus
+//! against retained series:
 //!
-//! Then add another 100 errors over a simulated additional hour.
-//! Cumulative error rate crosses 14.4× and the page-tier alert fires.
+//! | Objective | Windows | Burn rate | Tier |
+//! |---|---|---|---|
+//! | `SBPROXY-SUBSTRATE-AVAIL-1H` | 5m AND 1h | 14.4x | page |
+//! | `SBPROXY-SUBSTRATE-AVAIL-6H` | 30m AND 6h | 6x | page |
+//! | `SBPROXY-SUBSTRATE-AVAIL-24H` | 1h AND 24h | 3x | ticket |
 //!
-//! The test uses `golden_signals.rs` as the in-memory SLI source. The
-//! burn-rate evaluator (`sbproxy_observe::alerting::burn_rate`) is
-//! NEW in R1.1 / A1.6 implementation; until it lands the assertions
-//! that depend on it are `#[ignore]`d. The fixture-shape test runs
-//! today as a contract floor.
+//! Both 6h and 24h need history that outlives the process. The in-process
+//! ring is 1,440 minutes, holds nothing across a restart, and reads healthy
+//! for as long as it is refilling, so it is the wrong place to answer them
+//! from. What it can answer, and the reason it exists, is a fast burn in a
+//! deployment that has no scrape target pointed at it.
+//!
+//! This file previously asserted the opposite of all of that, because it
+//! was written against a version of the evaluator whose 1H tier summed
+//! every sample it was given and whose 6H tier read a 30-minute tail.
 
 use sbproxy_observe::alerting::burn_rate::{replay_and_evaluate, slo_target, MinuteSample};
 
-/// One synthetic minute of traffic. Every fixture is built out of
-/// these so the test is self-contained and replay is deterministic.
-/// Fixture profile A: 105 requests over 60 minutes with 5 errors all
-/// concentrated in the last 15 minutes. Hits the 30m/6h burn pair but
-/// stays under the 5m/1h 14.4× threshold because the per-5m error
-/// rate never spikes high enough.
-fn profile_5_errors_over_one_hour() -> Vec<MinuteSample> {
-    let mut out = Vec::with_capacity(60);
-    // Minutes 0..=44: 2 requests/minute, 0 errors.
-    for _ in 0..45 {
-        out.push(MinuteSample {
-            requests: 2,
-            errors: 0,
+/// The one objective the in-process evaluator publishes.
+const ONE_HOUR: &str = "SBPROXY-SUBSTRATE-AVAIL-INBOUND-1H";
+/// Objectives this evaluator used to publish and no longer does. Prometheus
+/// owns both; nothing in process may emit either name again.
+const RETIRED: [&str; 2] = [
+    "SBPROXY-SUBSTRATE-AVAIL-INBOUND-6H",
+    "SBPROXY-SUBSTRATE-AVAIL-INBOUND-24H",
+];
+/// The 99% availability target every fixture here runs against, so one
+/// percent of requests is the whole error budget and a burn rate is just
+/// the error percentage.
+const TARGET: f64 = 0.99;
+
+/// `count` identical minutes of traffic. `p99_ms` sits far below the 50 ms
+/// latency threshold so availability fixtures cannot trip the latency
+/// objective by accident.
+fn minutes(count: usize, requests: u64, errors: u64) -> Vec<MinuteSample> {
+    vec![
+        MinuteSample {
+            requests,
+            errors,
             p99_ms: 18.0,
-        });
-    }
-    // Minutes 45..=59: 1 request/minute with one error every 3 minutes.
-    for i in 45..60 {
-        out.push(MinuteSample {
-            requests: 1,
-            errors: if i % 3 == 0 { 1 } else { 0 },
-            p99_ms: 22.0,
-        });
-    }
-    debug_assert_eq!(
-        out.iter().map(|m| m.requests).sum::<u64>(),
-        105,
-        "profile A request total"
-    );
-    debug_assert_eq!(
-        out.iter().map(|m| m.errors).sum::<u64>(),
-        5,
-        "profile A error total"
-    );
+        };
+        count
+    ]
+}
+
+/// A full ring: `head` minutes of one shape followed by `tail` of another.
+fn profile(head: Vec<MinuteSample>, tail: Vec<MinuteSample>) -> Vec<MinuteSample> {
+    let mut out = head;
+    out.extend(tail);
     out
 }
 
-/// Fixture profile B: profile A with 100 additional errors stacked
-/// across the second hour. Cumulative error rate crosses the 14.4×
-/// threshold; the page-tier alert MUST fire.
-fn profile_full_burn() -> Vec<MinuteSample> {
-    let mut out = profile_5_errors_over_one_hour();
-    for _ in 60..120 {
-        out.push(MinuteSample {
-            requests: 2,
-            errors: 2, // every request errors out
-            p99_ms: 110.0,
-        });
+#[test]
+fn an_hour_of_burn_above_the_page_threshold_fires_the_one_hour_objective() {
+    // Twenty-three hours of clean traffic, then the last hour fails 20% of
+    // requests. That is 20x the budget over the window the objective names.
+    let prof = profile(minutes(23 * 60, 100, 0), minutes(60, 100, 20));
+    let alerts = replay_and_evaluate(&prof, slo_target(TARGET));
+
+    assert!(
+        alerts.fired(ONE_HOUR),
+        "a 20x hour must page; alerts={:?}",
+        alerts.fired_names()
+    );
+}
+
+#[test]
+fn a_burn_that_ended_an_hour_ago_no_longer_fires() {
+    // The mirror image: a day-long outage that recovered an hour ago. The
+    // ring still holds every failing minute and the objective must not,
+    // because the hour it reads is clean.
+    let prof = profile(minutes(23 * 60, 100, 50), minutes(60, 100, 0));
+    let alerts = replay_and_evaluate(&prof, slo_target(TARGET));
+
+    assert_eq!(
+        alerts.fired_names(),
+        Vec::<String>::new(),
+        "a recovered hour must be quiet even with a ring full of failures"
+    );
+}
+
+#[test]
+fn a_thirty_minute_burn_under_the_hourly_threshold_no_longer_fires() {
+    // 15% failure for half an hour inside an otherwise clean hour. Over the
+    // hour that averages 7.5x, under the page threshold. The retired 6H
+    // tier fired here, off a 30-minute tail it called six hours; the
+    // Prometheus 6x rule is the one that owns this shape now.
+    let prof = profile(minutes(30, 100, 0), minutes(30, 100, 15));
+    let alerts = replay_and_evaluate(&prof, slo_target(TARGET));
+
+    assert_eq!(
+        alerts.fired_names(),
+        Vec::<String>::new(),
+        "7.5x over the hour is under the 14.4x page threshold"
+    );
+}
+
+#[test]
+fn a_full_day_of_slow_burn_is_left_to_the_prometheus_ticket_tier() {
+    // 3.1x sustained for 24 hours: real budget loss, and a ticket rather
+    // than a page. deploy/alerts/alerting-rules.yml carries it as
+    // SBPROXY-SUBSTRATE-AVAIL-24H against series that survive a restart.
+    let prof = minutes(24 * 60, 1_000, 31);
+    let alerts = replay_and_evaluate(&prof, slo_target(TARGET));
+
+    assert_eq!(
+        alerts.fired_names(),
+        Vec::<String>::new(),
+        "the slow-burn ticket tier is a Prometheus rule, not an in-process one"
+    );
+}
+
+#[test]
+fn less_than_an_hour_of_history_fires_nothing() {
+    // Fifty-nine minutes in which every single request failed. The
+    // objective is an hour, this is not an hour, and a partial window is
+    // the state every process is in for an hour after it starts.
+    let prof = minutes(59, 1, 1);
+    let alerts = replay_and_evaluate(&prof, slo_target(TARGET));
+
+    assert_eq!(
+        alerts.fired_names(),
+        Vec::<String>::new(),
+        "a partial window must not answer for a full one"
+    );
+}
+
+#[test]
+fn the_retired_six_and_twenty_four_hour_objectives_are_never_published() {
+    // Every shape that used to reach one of the retired tiers, replayed
+    // together. Whatever else fires, neither name may appear.
+    let shapes = [
+        profile(minutes(30, 100, 0), minutes(30, 100, 50)),
+        profile(minutes(23 * 60, 100, 50), minutes(60, 100, 0)),
+        minutes(24 * 60, 1_000, 31),
+        minutes(24 * 60, 100, 50),
+    ];
+
+    for prof in shapes {
+        let alerts = replay_and_evaluate(&prof, slo_target(TARGET));
+        for retired in RETIRED {
+            assert!(
+                !alerts.fired(retired),
+                "{retired} is a Prometheus rule now; alerts={:?}",
+                alerts.fired_names()
+            );
+        }
     }
-    debug_assert_eq!(out.len(), 120);
-    out
 }
 
-/// Compute the simple ratio used by the SLO computation. The real
-/// burn-rate engine in R1.1 keeps a sliding window per metric family
-/// and emits per-(window, burn-rate) alerts; this helper is a sanity
-/// check the fixture matches the expected shape.
-fn error_rate(samples: &[MinuteSample]) -> f64 {
-    let total: u64 = samples.iter().map(|s| s.requests).sum();
-    let err: u64 = samples.iter().map(|s| s.errors).sum();
-    if total == 0 {
-        0.0
-    } else {
-        err as f64 / total as f64
-    }
-}
-
-#[test]
-fn fixture_profile_a_under_threshold_for_short_window() {
-    let prof = profile_5_errors_over_one_hour();
-    let er = error_rate(&prof);
-    // 5/105 = ~4.76% which is 4.76× the 1% budget; under 14.4×, over 3×.
-    assert!(er > 0.04 && er < 0.06, "profile A error rate: {er}");
-}
-
-#[test]
-fn fixture_profile_b_above_threshold_for_short_window() {
-    let prof = profile_full_burn();
-    let er = error_rate(&prof);
-    // 105 errors out of 225 = ~46.6% which is 46× the 1% budget.
-    assert!(er > 0.4, "profile B error rate: {er}");
-}
-
-/// Replay profile A through the SLO engine and assert the right alerts
-/// fire. Per the ADR:
-/// - SBPROXY-SUBSTRATE-AVAIL-INBOUND-1H (5m/1h, 14.4×): MUST NOT fire.
-/// - SBPROXY-SUBSTRATE-AVAIL-INBOUND-6H (30m/6h, 6×): MUST fire.
-/// - SBPROXY-SUBSTRATE-AVAIL-INBOUND-24H (2h/24h, 3×): would fire on
-///   sustained burn but the 24h window is not yet full; expected not
-///   to fire on a 1h replay.
-#[test]
-fn slo_burn_rate_partial_burn_fires_six_hour_alert_only() {
-    let prof = profile_5_errors_over_one_hour();
-    let alerts = replay_and_evaluate(&prof, slo_target(0.99));
-
-    assert!(
-        !alerts.fired("SBPROXY-SUBSTRATE-AVAIL-INBOUND-1H"),
-        "5m/1h 14.4× alert must not fire on partial burn; alerts={:?}",
-        alerts.fired_names()
-    );
-    assert!(
-        alerts.fired("SBPROXY-SUBSTRATE-AVAIL-INBOUND-6H"),
-        "30m/6h 6× alert MUST fire on partial burn; alerts={:?}",
-        alerts.fired_names()
-    );
-    assert!(
-        !alerts.fired("SBPROXY-SUBSTRATE-AVAIL-INBOUND-24H"),
-        "2h/24h 3× alert must not fire when 24h window is unfilled"
-    );
-}
-
-/// Replay profile B (full burn) and assert the page-tier alert fires.
-#[test]
-fn slo_burn_rate_full_burn_fires_one_hour_page_alert() {
-    let prof = profile_full_burn();
-    let alerts = replay_and_evaluate(&prof, slo_target(0.99));
-
-    assert!(
-        alerts.fired("SBPROXY-SUBSTRATE-AVAIL-INBOUND-1H"),
-        "5m/1h 14.4× alert MUST fire on full burn; alerts={:?}",
-        alerts.fired_names()
-    );
-    // The 6h alert from the partial-burn case MUST also fire (an
-    // upgrade from ticket to page is fine; a regression from page back
-    // to ticket would be a serious bug).
-    assert!(
-        alerts.fired("SBPROXY-SUBSTRATE-AVAIL-INBOUND-6H"),
-        "30m/6h 6× alert MUST also fire on full burn"
-    );
-}
-
-/// Latency-side coverage: drive a profile where p99 latency crosses
-/// the SLO-LATENCY-P99 threshold (50 ms per ADR) for a sustained 5
-/// minutes. SBPROXY-SUBSTRATE-LATENCY-P99 page tier MUST fire.
 #[test]
 fn slo_latency_p99_breach_fires_page_alert() {
-    let mut prof = vec![
-        MinuteSample {
-            requests: 100,
-            errors: 0,
-            p99_ms: 22.0,
-        };
-        55
-    ];
-    // 200 ms is 4x the 50 ms threshold so the burn rate is high enough
-    // to trip the 5m / 1h pair quickly.
+    // Latency is unchanged and was never part of the window defect: five
+    // consecutive minutes above 50 ms fires the page tier, matching the
+    // `for: 5m` on the Prometheus rule of the same name.
+    let mut prof = minutes(55, 100, 0);
     prof.extend(std::iter::repeat_n(
         MinuteSample {
             requests: 100,
@@ -184,10 +182,14 @@ fn slo_latency_p99_breach_fires_page_alert() {
         5,
     ));
 
-    let alerts = replay_and_evaluate(&prof, slo_target(0.99));
+    let alerts = replay_and_evaluate(&prof, slo_target(TARGET));
     assert!(
         alerts.fired("SBPROXY-SUBSTRATE-LATENCY-P99"),
         "p99 latency breach MUST fire page-tier alert; alerts={:?}",
         alerts.fired_names()
+    );
+    assert!(
+        !alerts.fired(ONE_HOUR),
+        "a latency breach with no errors must not open an availability incident"
     );
 }
