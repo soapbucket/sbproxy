@@ -1689,9 +1689,11 @@ The complete configuration, session and structured-content safety rules,
 state-backend guarantees, failure table, metrics, logs, and PromQL are
 in [AI context compression](ai-context-compression.md).
 
-### Context overflow (design stage)
+### Context overflow
 
-The overflow decision layer is design-stage: `crates/sbproxy-ai/src/context_overflow.rs` ships a registry of context windows for the OpenAI, Anthropic, Gemini, Mistral, and Llama families plus typed overflow actions (`Error`, `FallbackToLarger`, `Truncate`), but no dispatch code drives those actions and a `context_overflow:` block in the config is ignored. The one part of the module that does run is its window registry, which context compression consults to size a model's budget. The shipped way to handle overflow is `resilience.llm_aware.context_compress` above.
+There is no `context_overflow:` key. An earlier version of this page described one as parsed and ignored, which was an invitation to write it and wait for it to start working. A config that carries it now fails to compile, with an error naming what to use instead.
+
+Fitting an oversized prompt to the model's window is what the compression pipeline above does. Add a `window_fit` lever under `compression.levers`, or set `resilience.llm_aware.context_compress: true` for the one-lever shorthand. Nothing reroutes an oversized prompt to a model with a larger window on its own. If that is the behavior you want, order the larger model first in the provider list, or point a model alias at it.
 
 ## Stored prompts and offline optimization
 

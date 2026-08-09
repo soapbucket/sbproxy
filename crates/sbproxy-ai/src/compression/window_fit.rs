@@ -51,7 +51,7 @@ fn fit_messages_to_model(
     model: &str,
     completion_reserve_tokens: u64,
 ) -> Option<Vec<Value>> {
-    let window = crate::context_overflow::model_context_window(model)?;
+    let window = crate::context_window::model_context_window(model)?;
     let budget = window.saturating_sub(completion_reserve_tokens).max(1);
     let total = messages.iter().map(estimate_message_tokens).sum::<u64>();
     if total <= budget {
@@ -66,7 +66,7 @@ fn fit_messages_to_input_budget(
     completion_reserve_tokens: u64,
     input_budget_tokens: u64,
 ) -> ExplicitBudgetFit {
-    let model_capacity = crate::context_overflow::model_context_window(model)
+    let model_capacity = crate::context_window::model_context_window(model)
         .map(|window| window.saturating_sub(completion_reserve_tokens).max(1));
     let budget = model_capacity.map_or(input_budget_tokens, |capacity| {
         input_budget_tokens.min(capacity)
@@ -235,7 +235,7 @@ impl CompressionLever for WindowFitLever {
                 },
             };
         }
-        if crate::context_overflow::model_context_window(request.model()).is_none() {
+        if crate::context_window::model_context_window(request.model()).is_none() {
             return CompressionDecision::Skipped {
                 reason: SkipReason::UnknownModelWindow,
             };

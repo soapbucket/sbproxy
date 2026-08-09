@@ -12,7 +12,7 @@ pub mod budget;
 pub mod client;
 pub mod compression;
 pub mod concurrency;
-pub mod context_overflow;
+pub mod context_window;
 pub mod cost_quality;
 pub mod degradation;
 pub mod effective_key_policy;
@@ -66,9 +66,7 @@ pub use budget::{
 };
 pub use client::AiClient;
 pub use concurrency::ConcurrencyLimiter;
-pub use context_overflow::{
-    check_overflow, check_overflow_with_truncate, model_context_window, OverflowAction,
-};
+pub use context_window::model_context_window;
 pub use degradation::{should_degrade, DegradationConfig};
 pub use handler::*;
 pub use identity::VirtualKeyConfig;

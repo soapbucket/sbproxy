@@ -939,7 +939,35 @@ where
 
 impl AiHandlerConfig {
     /// Build from a generic JSON value.
+    ///
+    /// An authored `context_overflow:` block is refused. See the inline
+    /// note below for why refusing beats ignoring it.
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
+        // WOR-2309: `context_overflow:` was never a field on this struct,
+        // but ai-gateway.md named the block by that spelling and told
+        // operators it was "ignored", which is an invitation to write it
+        // and wait for the feature to arrive. The module behind that
+        // promise held a `check_overflow` pair returning `Error`,
+        // `FallbackToLarger`, or `Truncate`, and no dispatch code ever
+        // called it; the doc paragraph and the decision layer are both
+        // gone now. This struct does not set `deny_unknown_fields`, so
+        // without an explicit refusal the key would go from
+        // documented-and-inert to silently swallowed, which is the worse
+        // of the two. Refusing also keeps the spelling free to come back
+        // as a live key if the fallback-to-a-larger-model decision is
+        // ever designed, rather than arriving to find it already sitting
+        // in deployed configs meaning nothing.
+        anyhow::ensure!(
+            value.get("context_overflow").is_none(),
+            "ai `context_overflow:` was removed: no dispatch code ever read it, so it never \
+             errored, fell back to a larger model, or truncated anything. Fitting an \
+             oversized prompt to the model's window is what the compression pipeline does: \
+             add a `window_fit` lever under `compression.levers`, or set \
+             `resilience.llm_aware.context_compress: true` for the one-lever shorthand. \
+             There is no configuration today that reroutes an oversized prompt to a \
+             larger-window model; list the larger model first, or alias to it, if that is \
+             the behavior you want."
+        );
         let mut config: Self = serde_json::from_value(value)?;
         if let Some(rag) = config.rag.as_ref() {
             rag.validate()
@@ -1665,6 +1693,32 @@ mod tests {
             message.contains("least_token_usage"),
             "the error has to name the strategy that preserves today's behaviour: {message}"
         );
+    }
+
+    #[test]
+    fn context_overflow_block_is_refused_instead_of_being_silently_swallowed() {
+        let error = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "k"}],
+            "context_overflow": {"action": "fallback_to_larger", "fallback_model": "gpt-4o"},
+        }))
+        .expect_err("a key no code reads must fail the config, not sit in it");
+        let message = error.to_string();
+        assert!(
+            message.contains("context_overflow"),
+            "the error has to name the key an operator wrote: {message}"
+        );
+        assert!(
+            message.contains("window_fit") && message.contains("context_compress"),
+            "the error has to name the surfaces that do fit a prompt to the window: {message}"
+        );
+    }
+
+    #[test]
+    fn an_ai_config_without_a_context_overflow_block_still_compiles() {
+        AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "k"}],
+        }))
+        .expect("the refusal must be scoped to an authored context_overflow block");
     }
 
     #[test]
