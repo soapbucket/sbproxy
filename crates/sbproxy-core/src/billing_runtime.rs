@@ -1,10 +1,23 @@
 //! Runtime assembly and lifecycle for authoritative payment settlement.
 //!
 //! This module is the seam between a `proxy.payments` document and the
-//! machinery in `sbproxy-billing`. It owns four things and deliberately no
+//! machinery in `sbproxy-billing`. It owns five things and deliberately no
 //! others: opening the durable store, registering the rail adapters this
-//! build compiled, constructing the authoritative service, and running the
-//! recovery worker's lifecycle from start to drain.
+//! build compiled, constructing the authoritative service, attaching the
+//! request path's single-serve nonce ledger to that same store, and running
+//! the recovery worker's lifecycle from start to drain.
+//!
+//! # The nonce ledger is not a choice
+//!
+//! Single serve is durable, and no caller picks the backend. A caller fills
+//! in a [`SettlementGateSeamPlan`], which has no ledger field, and
+//! [`PaymentsRuntimeCandidate::build`] turns it into a
+//! [`SettlementGateSeam`] carrying a ledger over the store it has just
+//! opened. WOR-2317 shipped the other shape: an in-memory set went into the
+//! production seam, and because a burn lived only in that process, a restart
+//! let an already-settled quote token serve one more response per restart.
+//! Nothing downstream could see the difference, which is why the fix is
+//! structural rather than a swapped constructor.
 //!
 //! # Construction is two phase
 //!
@@ -65,7 +78,7 @@ use sbproxy_billing::error::BillingError;
 use sbproxy_billing::registry::RailRegistry;
 use sbproxy_billing::service::{BillingService, RequirementSigner};
 use sbproxy_billing::sqlite::{SqliteSettlementStore, SCHEMA_VERSION};
-use sbproxy_billing::store::{BillingClock, ReconciliationOutcome};
+use sbproxy_billing::store::{BillingClock, ReconciliationOutcome, SharedSettlementStore};
 use sbproxy_billing::types::{AttemptOperation, SettlementRail};
 use sbproxy_billing::worker::{
     SettlementWorker, SettlementWorkerHandle, WorkerConfig, WorkerStatus,
@@ -278,12 +291,18 @@ pub async fn build_payments_runtime_with_observer(
         QUOTE_DEFAULT_TTL,
     );
     let verifying = quote_signer.verifying_key();
-    let nonce_store = Arc::new(sbproxy_modules::policy::quote_token::InMemoryNonceStore::new())
-        as Arc<dyn sbproxy_modules::policy::quote_token::NonceStore>;
+    // The verifier's ledger is the refusing one, not the durable one. Its
+    // constructor requires a store because its legacy `verify` consumes, and
+    // the settlement path deliberately never calls that: it authenticates
+    // with `verify_authenticity` and lets the durable intent and proof
+    // transaction own single use, because burning a quote while parsing a
+    // signature leaves an interrupted payment unresumable. Handing it a
+    // ledger that refuses makes that a property of the value rather than of
+    // today's call graph.
     let verifier = sbproxy_modules::policy::quote_token::QuoteTokenVerifier::single_key(
         QUOTE_KEY_ID,
         verifying,
-        Arc::clone(&nonce_store),
+        Arc::new(crate::payment_nonce::RefusingNonceStore::new()),
     );
     let requirement_signer = Arc::new(crate::payment_signer::QuoteRequirementSigner::new(
         quote_signer,
@@ -309,9 +328,11 @@ pub async fn build_payments_runtime_with_observer(
         None => None,
     };
 
-    let gate = SettlementGateSeam {
+    // No nonce ledger here. `PaymentsRuntimeCandidate::build` attaches one
+    // backed by the settlement store it opens, which is the only way the
+    // burn and the settlement can be guaranteed to land in the same file.
+    let gate = SettlementGateSeamPlan {
         quote_signer: Arc::clone(&requirement_signer),
-        nonce_store,
         #[cfg(feature = "payment-mpp")]
         challenge_binder,
         failure_mode: config.failure_mode,
@@ -463,9 +484,65 @@ pub fn compiled_payment_features() -> Vec<&'static str> {
     features
 }
 
+/// Everything the gate needs that does not depend on the durable store.
+///
+/// This exists so the nonce ledger cannot be chosen by whoever assembles the
+/// runtime. The seam is built in two steps: the caller resolves secrets and
+/// fills in this plan, and [`PaymentsRuntimeCandidate::build`] completes it
+/// into a [`SettlementGateSeam`] by attaching the ledger backed by the
+/// settlement store it has just opened.
+///
+/// The ordering is the point. The store cannot be opened before secrets are
+/// resolved, and the ledger cannot exist before the store, so a single-step
+/// seam would have had to carry a placeholder ledger past the store open. A
+/// placeholder is exactly how WOR-2317 shipped: an in-memory set went into
+/// the production seam, and nothing downstream could tell it apart from a
+/// durable one. There is now no field to place it in.
+#[derive(Clone)]
+pub struct SettlementGateSeamPlan {
+    /// Parses and authenticates presented quote tokens. Held concretely so
+    /// the gate can read claims; the service only ever sees the
+    /// [`RequirementSigner`] trait.
+    pub quote_signer: Arc<crate::payment_signer::QuoteRequirementSigner>,
+    /// Issues and verifies `WWW-Authenticate: Payment` challenges. `None`
+    /// when `proxy.payments.protocols.payment_auth` is absent, in which
+    /// case the gate never advertises the `mpp` rail.
+    #[cfg(feature = "payment-mpp")]
+    pub challenge_binder: Option<Arc<sbproxy_billing::payment_auth::ChallengeBinder>>,
+    /// What the gate does when settlement infrastructure cannot answer.
+    /// Payment refusals are never subject to it.
+    pub failure_mode: sbproxy_config::types::FailureMode,
+}
+
+impl SettlementGateSeamPlan {
+    /// Completes the plan with the ledger the opened store backs.
+    fn into_seam(
+        self,
+        nonce_store: Arc<dyn sbproxy_modules::policy::quote_token::NonceStore>,
+    ) -> SettlementGateSeam {
+        SettlementGateSeam {
+            quote_signer: self.quote_signer,
+            nonce_store,
+            #[cfg(feature = "payment-mpp")]
+            challenge_binder: self.challenge_binder,
+            failure_mode: self.failure_mode,
+        }
+    }
+}
+
+impl std::fmt::Debug for SettlementGateSeamPlan {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = formatter.debug_struct("SettlementGateSeamPlan");
+        debug.field("failure_mode", &self.failure_mode);
+        #[cfg(feature = "payment-mpp")]
+        debug.field("challenge_binder", &self.challenge_binder.is_some());
+        debug.finish()
+    }
+}
+
 /// Request-path material the settlement origin gate reads beside the service.
 ///
-/// Built in [`build_payments_runtime`] from the same configuration
+/// Built in [`PaymentsRuntimeCandidate::build`] from the same configuration
 /// generation as the service, so the signer that parses a presented quote
 /// token, the nonce ledger that makes one settled challenge serve exactly
 /// once, the Payment HTTP Authentication binder, and the operator's
@@ -481,6 +558,12 @@ pub struct SettlementGateSeam {
     /// a settled intent redeemable so an interrupted payment can resume;
     /// this is the request-path consumption on top, burned only after a
     /// committed receipt authorized a response.
+    ///
+    /// On the production path this is
+    /// [`crate::payment_nonce::DurableNonceStore`], writing into the same
+    /// SQLite file as the settlement it authorizes, and there is no
+    /// configuration surface that can select anything else. Tests construct
+    /// this struct directly and may put a process-local ledger here.
     pub nonce_store: Arc<dyn sbproxy_modules::policy::quote_token::NonceStore>,
     /// Issues and verifies `WWW-Authenticate: Payment` challenges. `None`
     /// when `proxy.payments.protocols.payment_auth` is absent, in which
@@ -519,11 +602,15 @@ pub struct PaymentsRuntimeInputs {
     pub signer: SharedRequirementSigner,
     /// Request-path gate material, when this runtime will serve requests.
     ///
+    /// A plan rather than a finished seam: the nonce ledger is attached by
+    /// [`PaymentsRuntimeCandidate::build`] from the store it opens, so no
+    /// caller can supply one.
+    ///
     /// `None` is a valid assembly and simply leaves the request path on the
     /// legacy ledger behaviour: the admin and worker surfaces never need
     /// it, and tests that exercise topology or lifecycle rules build
     /// candidates without a real signer.
-    pub gate: Option<SettlementGateSeam>,
+    pub gate: Option<SettlementGateSeamPlan>,
     /// Generation-scoped payment extension observer, when the compiled
     /// pipeline carries payment hooks.
     pub payment_observer: Option<Arc<dyn sbproxy_billing::PaymentLifecycleObserver>>,
@@ -572,10 +659,10 @@ impl PaymentsRuntimeCandidate {
     /// Build a candidate runtime from a validated configuration.
     ///
     /// Performs, in order: configuration validation, the compiled-feature
-    /// check, state directory creation, store open and migration, adapter
-    /// registration, the configured-rail coverage check, and service
-    /// construction. Every one of those is an effect, which is why none of
-    /// it runs on the validation path.
+    /// check, state directory creation, store open and migration, nonce
+    /// ledger attachment, adapter registration, the configured-rail coverage
+    /// check, and service construction. Every one of those is an effect,
+    /// which is why none of it runs on the validation path.
     ///
     /// # Errors
     ///
@@ -613,7 +700,15 @@ impl PaymentsRuntimeCandidate {
         if let Some(clock) = &inputs.clock {
             store = store.with_clock(Arc::clone(clock));
         }
-        let store = store.shared();
+        // One handle, held twice. The service reaches the store through the
+        // trait object and the nonce ledger reaches the same open connection
+        // directly, so a nonce burn and the settlement it records cannot end
+        // up in two files, and both read the same injected clock.
+        let opened = Arc::new(store);
+        let nonce_store: Arc<dyn sbproxy_modules::policy::quote_token::NonceStore> = Arc::new(
+            crate::payment_nonce::DurableNonceStore::new(Arc::clone(&opened)),
+        );
+        let store: SharedSettlementStore = opened;
 
         let registry = compiled_registry(config, inputs)?;
         // Every rail the operator configured has to have an adapter here,
@@ -667,7 +762,7 @@ impl PaymentsRuntimeCandidate {
             service: Arc::new(builder.build()),
             worker_config: worker_config(config),
             rails,
-            gate: inputs.gate.clone(),
+            gate: inputs.gate.clone().map(|plan| plan.into_seam(nonce_store)),
             // WOR-2169. Built here, from the same document generation as
             // the service and the reporter registry, so the meter event a
             // request queues and the reporter that drains it can never come

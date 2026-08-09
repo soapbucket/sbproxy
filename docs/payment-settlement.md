@@ -1,6 +1,6 @@
 # Payment settlement
 
-*Last modified: 2026-08-07*
+*Last modified: 2026-08-09*
 
 `proxy.payments` is how SBproxy charges for a request and proves it was
 paid. It is Apache-2.0, it is off unless you configure it, and it holds
@@ -226,6 +226,59 @@ explained in the reference below.
    nonce on the request path is what makes one settled payment serve
    the content exactly once. A second presentation of a settled
    credential is refused as `proof_replayed`.
+
+### Replay protection, and where it stops
+
+Two different things are being prevented, and it is worth keeping them
+apart, because they used to have different durability.
+
+**Paying twice.** A credential's digest is reserved against exactly one
+intent before any provider call, in the same row-level transaction that
+owns the intent. A digest already reserved for another intent is refused
+as `proof_replayed`, and a repeat of a request that already succeeded
+returns the stored receipt instead of settling again.
+
+**Being served twice for one payment.** A settled intent stays
+redeemable on purpose, so a payment interrupted between the provider's
+confirmation and the response can resume. What stops that from becoming
+a free second response is the quote nonce, spent once, after the receipt
+is committed and before the origin is called.
+
+Both records live in the SQLite file at `proxy.payments.state_path`, and
+both survive a restart. The nonce is spent with a single insert against
+a unique constraint rather than a read followed by a write, so two
+simultaneous presentations of one settled quote produce exactly one
+served response and one `proof_replayed` refusal, whichever order they
+arrive in.
+
+Spent nonces are pruned at the moment their quote token expires, which
+is the bound the token already carries. A nonce for an expired token can
+never be validly presented again, so forgetting it costs nothing, and
+the pruning happens inside the next spend rather than on a timer. The
+table therefore holds live nonces plus whatever expired since the last
+paid request.
+
+The boundaries:
+
+- **One node.** This is one local file. A node that also configures
+  `proxy.cluster` refuses to start, for the reasons in
+  [What this release does not do](#what-this-release-does-not-do).
+  Across a mesh with no shared backend, each node would keep its own
+  nonce ledger and the same payment could serve once per node.
+- **Restoring a backup rewinds it.** The nonce ledger is in the same
+  file as the intents and receipts, so restoring an older copy can bring
+  back a nonce that was already spent. That is the same exposure as
+  restoring over a settled intent, and it resolves the same way:
+  reconciliation, on the rails that can answer.
+- **`failure_mode` still applies to the spend.** If the database cannot
+  be reached at that moment the spend fails, and it fails as an error
+  rather than as a successful spend: there is no outcome on that path
+  that reads as "served". Under the default `closed` posture the request
+  is refused with a 503. Under `open`, `degraded`, or `observe` it is
+  admitted, the same as any other infrastructure failure, and admitting
+  there means a paid response could be served more than once. If that
+  matters more to you than availability, leave `failure_mode` at
+  `closed`.
 
 ### When settlement itself breaks
 
@@ -903,8 +956,18 @@ access, and it loses the record of writes that were outstanding.
 - Restoring an older copy can resurrect an intent the provider already
   settled. Reconciliation resolves that by asking the provider, on the
   rails that can answer.
+- It also rewinds the spent-nonce ledger, so a quote token that was
+  already served once can be served once more against the restored file.
+  Both records are in this one database on purpose, so a restore moves
+  them together rather than leaving the two halves disagreeing.
 - Do not point two proxies at one database over a network filesystem.
   Leases assume local durable writes.
+- Upgrades migrate the file in place on the first open, and are one-way.
+  A build that does not understand the schema it finds refuses to start
+  rather than opening it, which is what stops an older binary from
+  running against a newer ledger and quietly ignoring the parts of it it
+  has no code for. Keep a copy of the file before an upgrade if you want
+  the option of going back.
 
 ## Timeouts, breakers, retries, and crashes
 

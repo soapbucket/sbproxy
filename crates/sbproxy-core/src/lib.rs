@@ -163,6 +163,10 @@ pub mod model_plane;
 /// Fail-open delivery for terminal payment extension events.
 #[cfg(feature = "payments")]
 pub mod payment_extensions;
+/// WOR-2317: the durable single-serve ledger settlement burns quote nonces
+/// against, in the same database as the settlement it authorizes.
+#[cfg(feature = "payments")]
+pub mod payment_nonce;
 /// Signs payment requirements into the existing quote JWS.
 #[cfg(feature = "payments")]
 pub mod payment_signer;

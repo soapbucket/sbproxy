@@ -33,6 +33,22 @@
 //! route-wide behavior those rows were written under. An upgrade therefore
 //! cannot turn an existing unresolved intent into a second bill.
 //!
+//! # Migration 3
+//!
+//! One table, `served_quote_nonces`, added under `user_version = 3` for
+//! WOR-2317. It is the durable half of single serve. Double *charge*
+//! protection was already durable, because `consumed_payment_proofs` and
+//! `payment_intents.reserved_proof_digest` are rows; double *serve*
+//! protection was not, because the request-path nonce ledger was an
+//! in-process set that emptied on restart. A client re-presenting an
+//! already-settled quote token could therefore be served a second time,
+//! once per restart, without paying twice.
+//!
+//! The table is written through [`SqliteSettlementStore::burn_quote_nonce`],
+//! which is the one place a nonce is spent and the one place expired nonces
+//! are forgotten. Both happen in a single `BEGIN IMMEDIATE` transaction, so
+//! a burn is one commit rather than two.
+//!
 //! # What is deliberately not stored
 //!
 //! No credential, no authorization header, no client secret, no macaroon, no
@@ -81,7 +97,7 @@ use crate::types::{
 };
 
 /// The schema version this build understands.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Every table and index migration 1 creates.
 const MIGRATION_1: &str = r#"
@@ -271,6 +287,38 @@ const MIGRATION_2: &str = r#"
 ALTER TABLE payment_intents ADD COLUMN payer_hash TEXT;
 "#;
 
+/// WOR-2317: the durable ledger of quote nonces that have already served.
+///
+/// `nonce` is the primary key, which in a `WITHOUT ROWID`-less table is a
+/// unique index, and that index is the whole concurrency argument. A burn is
+/// an insert that either creates the row or conflicts; there is no read
+/// followed by a write for two requests to interleave inside. Two
+/// simultaneous presentations of one settled quote therefore produce exactly
+/// one insert and one conflict, whichever order SQLite serializes them in.
+///
+/// `expires_at_ms` is nullable, and null means "no retention bound was
+/// supplied, keep this row forever". That is the fail-closed default: a bound
+/// nobody stated can never cause a row to be forgotten early, and forgetting
+/// a burn early is the only way pruning could let a payment serve twice.
+///
+/// `burned_at_ms` is when the row was written. Nothing reads it back today;
+/// it exists so an operator inspecting the database after an incident can see
+/// when a nonce was spent, which the expiry alone cannot tell them.
+///
+/// Like [`MIGRATION_1`] and unlike [`MIGRATION_2`] this is
+/// `CREATE ... IF NOT EXISTS` throughout, so it is idempotent and re-runs
+/// harmlessly on every open.
+const MIGRATION_3: &str = r#"
+CREATE TABLE IF NOT EXISTS served_quote_nonces (
+    nonce           TEXT    NOT NULL PRIMARY KEY,
+    expires_at_ms   INTEGER,
+    burned_at_ms    INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS served_quote_nonces_expiry
+    ON served_quote_nonces (expires_at_ms);
+"#;
+
 /// Every column `payment_intents` rows are read through, in order.
 const INTENT_COLUMNS: &str = "intent_id, tenant_id, origin_id, route, quote_id, \
      request_idempotency_key, protocol, settlement_rail, status, draft_jcs, draft_digest, \
@@ -298,6 +346,21 @@ impl Default for SqliteStoreConfig {
             busy_timeout_ms: 5_000,
         }
     }
+}
+
+/// What one call to [`SqliteSettlementStore::burn_quote_nonce`] proved.
+///
+/// Two variants, not three. The durable ledger has no "never registered"
+/// state to report, because the burn is the insert: a nonce is either being
+/// spent for the first time right now or it was spent before. There is
+/// nothing for a pre-registration step to make known ahead of time, and so
+/// no window in which one could be missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuoteNonceBurn {
+    /// This call spent the nonce. The caller may serve exactly one response.
+    Fresh,
+    /// An earlier call already spent it. The caller must refuse as a replay.
+    AlreadyServed,
 }
 
 /// The durable settlement store, backed by one SQLite database.
@@ -367,6 +430,91 @@ impl SqliteSettlementStore {
         self.config.lease_ttl_ms
     }
 
+    /// Spends one quote nonce, durably, exactly once.
+    ///
+    /// This is the request path's single-serve ledger, and it lives in this
+    /// database rather than beside it on purpose. The nonce burn and the
+    /// settlement it authorizes are two facts about one payment, and putting
+    /// them in one file means they cannot disagree about which file they are
+    /// in: restoring a backup, moving `state_path`, or losing a volume moves
+    /// both or neither.
+    ///
+    /// # Atomicity
+    ///
+    /// One statement, no read-then-write. The insert either creates the row
+    /// or hits the primary key, and the affected-row count is what decides
+    /// which of the two happened. Concurrent presentations of one nonce are
+    /// serialized by SQLite's write lock, so exactly one of them sees a row
+    /// count of 1 and every other one sees 0.
+    ///
+    /// # Retention
+    ///
+    /// `expires_at_ms` is the instant after which this nonce can never be
+    /// validly presented again, which for a quote nonce is its token's `exp`.
+    /// Rows at or past that instant are deleted at the start of the same
+    /// transaction, so the table holds live nonces plus whatever expired
+    /// since the previous burn and nothing else. Pruning inside the burn is
+    /// what keeps the bound true without a scheduler: rows can only
+    /// accumulate when burns are happening, and a burn is what prunes.
+    ///
+    /// Passing `None` keeps the row forever. Use it only where no bound is
+    /// known, because an early deletion is the one pruning mistake that can
+    /// let a settled payment serve twice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BillingError::StoreUnavailable`] when the connection cannot
+    /// be taken and [`BillingError::Storage`] when the transaction fails.
+    /// Both mean the burn did not happen and the caller must refuse: there is
+    /// no error here that a caller could read as a successful burn, because
+    /// success is only ever [`QuoteNonceBurn::Fresh`] on the `Ok` side.
+    pub fn burn_quote_nonce(
+        &self,
+        nonce: &str,
+        expires_at_ms: Option<i64>,
+    ) -> Result<QuoteNonceBurn, BillingError> {
+        let now_ms = self.clock.now_ms();
+        let mut guard = self
+            .connection
+            .lock()
+            .map_err(|_| BillingError::StoreUnavailable)?;
+        let transaction = begin_immediate(&mut guard)?;
+
+        // Prune first, so the insert is the last thing before the commit and
+        // the row count it returns is unambiguous. Ordering cannot lose a
+        // burn that still matters: the predicate is exactly "this token has
+        // expired", and an expired token is refused before the gate ever
+        // reaches a burn.
+        transaction
+            .execute(
+                "DELETE FROM served_quote_nonces
+                  WHERE expires_at_ms IS NOT NULL AND expires_at_ms <= ?1",
+                params![now_ms],
+            )
+            .map_err(|_| BillingError::Storage("prune served quote nonces"))?;
+
+        let inserted = transaction
+            .execute(
+                "INSERT INTO served_quote_nonces (nonce, expires_at_ms, burned_at_ms)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT (nonce) DO NOTHING",
+                params![nonce, expires_at_ms, now_ms],
+            )
+            .map_err(|_| BillingError::Storage("burn served quote nonce"))?;
+
+        transaction
+            .commit()
+            .map_err(|_| BillingError::Storage("commit served quote nonce burn"))?;
+
+        // One affected row means this call created it. Zero means the
+        // primary key already held it, which is the replay.
+        Ok(if inserted == 1 {
+            QuoteNonceBurn::Fresh
+        } else {
+            QuoteNonceBurn::AlreadyServed
+        })
+    }
+
     /// Applies pragmas and migration 1 to an open connection.
     fn from_connection(
         connection: Connection,
@@ -402,6 +550,13 @@ impl SqliteSettlementStore {
                 .execute_batch(MIGRATION_2)
                 .map_err(|_| BillingError::Storage("apply migration 2"))?;
         }
+        // Migration 3 is `CREATE ... IF NOT EXISTS` like migration 1, so it
+        // is unconditional for the same reason: no stamped version has to be
+        // trusted for it to be correct, and a database whose `user_version`
+        // is somehow behind its tables still ends up with the table.
+        connection
+            .execute_batch(MIGRATION_3)
+            .map_err(|_| BillingError::Storage("apply migration 3"))?;
         connection
             .pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(|_| BillingError::Storage("stamp schema version"))?;
