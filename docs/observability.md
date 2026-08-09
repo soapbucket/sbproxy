@@ -1168,10 +1168,17 @@ The first hour after a deploy is therefore blind, and no setting closes it.
 Point anything you page on at an external Prometheus, which keeps the series
 across restarts. `deploy/alerts/alerting-rules.yml` ships the multi-window
 rules that read it: 5m AND 1h at 14.4x and 30m AND 6h at 6x for the page
-tier, 2h AND 24h at 3x for the ticket tier. Each paging alert carries a
-`runbook_id` label so on-call has a stable correlation key into
-deployment-specific runbooks. The in-process rule exists so a deployment with
-no scrape target still gets a signal.
+tier, 2h AND 24h at 3x for the ticket tier. The in-process rule exists so a
+deployment with no scrape target still gets a signal.
+
+Each paging alert carries a `runbook_id` label so on-call has a stable
+correlation key. [`operator-runbook.md`](operator-runbook.md#alert-index)
+indexes every id the shipped rules can emit and answers each one in its own
+section; the anchor is the id lowercased, which is also the fragment on the
+alert's `runbook_url`. A build guard fails when a rule emits an id the index
+does not carry, so the key cannot go stale. Point it at a deployment-specific
+runbook instead by rewriting `runbook_url` and keeping the label as the join
+key.
 
 ## Health endpoints
 

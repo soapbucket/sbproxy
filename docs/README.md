@@ -112,7 +112,7 @@ Point a framework you already run at the gateway: chat completions through the O
 - [migration-litellm.md](migration-litellm.md) - moving a LiteLLM proxy to SBproxy with `config import-litellm` and the field-by-field mapping.
 - [secrets.md](secrets.md) - the secret-reference vocabulary (env vars, files, provider URIs) resolved everywhere in config, plus backend setup for HashiCorp Vault, AWS Secrets Manager, GCP Secret Manager, Azure Key Vault, and Kubernetes Secrets.
 - [multi-tenant.md](multi-tenant.md) - when to use the multi-tenant shape, the three scopes, isolation guarantees, the synthetic `__default__` tenant.
-- [operator-runbook.md](operator-runbook.md) - dashboard triage and rollback actions.
+- [operator-runbook.md](operator-runbook.md) - the `runbook_id` index every paging alert resolves through, a response section per id, plus dashboard triage and rollback actions.
 - [threat-model.md](threat-model.md) - trust boundaries and per-wave review checklist.
 - [events.md](events.md) - the eleven typed events, the `events:` file and webhook sinks, and the in-process bus.
 - [openapi-emission.md](openapi-emission.md) - publishing an OpenAPI 3.0 document from the live config.
