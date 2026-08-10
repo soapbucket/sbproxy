@@ -6664,9 +6664,9 @@ mod tests {
             Some("resource-nonce")
         );
 
-        response.status = http::StatusCode::BAD_REQUEST;
+        response.set_status(http::StatusCode::BAD_REQUEST).unwrap();
         assert!(dpop_resource_nonce_challenge(&response).is_none());
-        response.status = http::StatusCode::UNAUTHORIZED;
+        response.set_status(http::StatusCode::UNAUTHORIZED).unwrap();
         response
             .append_header("dpop-nonce", "second-resource-nonce")
             .unwrap();
