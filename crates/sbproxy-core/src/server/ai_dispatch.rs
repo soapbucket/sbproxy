@@ -4031,16 +4031,47 @@ pub(super) async fn handle_ai_proxy(
         // on `audio_transcription` is the expected shape, while multipart
         // on `chat_completions` is a caller relabeling a JSON surface to
         // take this path.
-        if config
-            .guardrails
-            .as_ref()
-            .is_some_and(|guardrails| !guardrails.input.is_empty())
+        //
+        // WOR-2312: the `prompt` form field is the exception. Image edits,
+        // image variations, and transcription all accept one, so a caller
+        // could move text out of a JSON body into that part and skip
+        // prompt-injection scanning entirely. It is extracted here and
+        // scanned below, once the model is known, so the skip metric now
+        // reports only what genuinely cannot be inspected.
+        //
+        // Extraction failure is a 400 rather than a silent skip. A body
+        // this parser cannot walk is also a body whose `model` part cannot
+        // be trusted, and the rewrite below depends on that same walk.
+        let multipart_prompt_text =
+            crate::model_plane::multipart_prompt(body_bytes.as_ref(), &request_content_type)
+                .map_err(|error| {
+                    Error::because(
+                        ErrorType::HTTPStatus(400),
+                        "invalid multipart prompt field",
+                        error,
+                    )
+                })?;
+        let inspectable_prompt = multipart_prompt_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty());
+
+        if inspectable_prompt.is_none()
+            && config
+                .guardrails
+                .as_ref()
+                .is_some_and(|guardrails| !guardrails.input.is_empty())
         {
             sbproxy_ai::ai_metrics::record_multipart_inspection_skipped(
                 "input_guardrails",
                 surface_label,
             );
         }
+        // PII redaction is still skipped even when a prompt is present.
+        // Redaction rewrites the body it inspects, and rewriting one part
+        // in place would have to re-length the multipart framing around
+        // it. Scanning is safe because it only reads. The required-PII
+        // case above already refuses rather than forwarding unredacted.
         if config
             .pii
             .as_ref()
@@ -4165,11 +4196,78 @@ pub(super) async fn handle_ai_proxy(
             .as_ref()
             .map(|guardrails| guardrails.external.as_slice())
             .unwrap_or_default();
-        if let Some((name, reason)) =
+        if let Some(prompt_text) = inspectable_prompt {
+            // The `prompt` part is real caller-supplied text, so it goes
+            // through the same evaluator the JSON path uses rather than a
+            // second, weaker one. `extract_prompt_text` already recognizes
+            // a bare `prompt` field, so a synthetic body carrying just
+            // that field reaches every input guardrail unchanged,
+            // including the external providers with content instead of
+            // without it.
+            //
+            // Compiling the pipeline lazily loads classifier artifacts,
+            // which is why the skip-metric block above deliberately reads
+            // config fields instead. Doing it here keeps that cost on
+            // requests that actually carry text: a plain audio
+            // transcription still never pays for a classifier load.
+            let multipart_pipeline = match config.guardrail_pipeline() {
+                Ok(pipeline) => pipeline,
+                Err(error) => {
+                    // Fails closed, matching the JSON path. An enforcing
+                    // backend that will not load must not become an open
+                    // door on the surface that was already the weaker one.
+                    tracing::error!(
+                        error = %error,
+                        "AI proxy: guardrail pipeline compilation failed for multipart request; rejecting"
+                    );
+                    send_error(session, 503, "guardrail pipeline unavailable").await?;
+                    return Ok(());
+                }
+            };
+            let mut synthetic_body = serde_json::json!({ "prompt": prompt_text });
+            match evaluate_ai_input_guardrails(
+                config,
+                multipart_pipeline.as_ref(),
+                &surface,
+                requested_model.as_deref().unwrap_or_default(),
+                &mut synthetic_body,
+                &ctx.principal,
+                InputGuardrailStage::Original,
+            )
+            .await
+            {
+                InputGuardrailDecision::Allow { labels, .. } => {
+                    ctx.ai_guardrail_labels = labels;
+                }
+                InputGuardrailDecision::Block {
+                    name,
+                    reason,
+                    status,
+                } => {
+                    sbproxy_ai::tracing_spans::record_error(
+                        &ai_span,
+                        sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                        &reason,
+                    );
+                    mark_guardrail_block(ctx, name.clone());
+                    send_guardrail_block_response(
+                        session,
+                        ctx,
+                        &ai_span,
+                        status,
+                        sbproxy_ai::guardrails::GuardrailBlock { name, reason },
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+        } else if let Some((name, reason)) =
             sbproxy_ai::external_guardrail::run_input_external_guardrails_without_content(
                 multipart_external,
             )
         {
+            // No inspectable text, so external providers still get their
+            // content-free call and can refuse the surface outright.
             send_guardrail_block_response(
                 session,
                 ctx,
@@ -12795,6 +12893,25 @@ mod external_guardrail_context_tests {
         )
     }
 
+    /// An image-edit multipart body carrying a caller-supplied `prompt`.
+    ///
+    /// This is the shape the bypass used: the same surfaces that take a
+    /// binary part also take free-form text next to it, so a caller could
+    /// move their prompt here and skip the scanning a JSON body gets.
+    fn multipart_image_edit_request(prompt: &str) -> (&'static str, Vec<u8>) {
+        const BOUNDARY: &str = "sbproxy-guardrail-boundary";
+        let body = format!(
+            "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nrequested-model\r\n\
+             --{BOUNDARY}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n{prompt}\r\n\
+             --{BOUNDARY}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"fixture.png\"\r\n\
+             Content-Type: image/png\r\n\r\nfixture-image\r\n--{BOUNDARY}--\r\n"
+        );
+        (
+            "multipart/form-data; boundary=sbproxy-guardrail-boundary",
+            body.into_bytes(),
+        )
+    }
+
     fn cascade_proxy_config(
         upstream_url: &str,
         guardrail_url: String,
@@ -14316,12 +14433,19 @@ mod external_guardrail_context_tests {
         .expect("builtin guardrail proxy config")
     }
 
-    /// WOR-2309: the multipart short-circuit forwards the body without
-    /// running the built-in input guardrail pipeline or origin-level PII
-    /// redaction. That is the shipped behavior and this test does not
-    /// change it; what it pins is that the gap is now *countable*. Before
-    /// the counter existed, a configured guardrail that never ran was
-    /// indistinguishable from one that ran and allowed.
+    /// WOR-2309, narrowed by WOR-2312: what stays uninspected, and is
+    /// counted.
+    ///
+    /// This fixture is a plain audio transcription with `model` and `file`
+    /// parts and **no** `prompt`, which is why both counters still move.
+    /// Audio bytes are not text and no configured guardrail can read them,
+    /// so the skip is real here rather than a gap.
+    ///
+    /// A multipart request that *does* carry a `prompt` is now scanned;
+    /// see `multipart_prompt_is_scanned_by_the_input_guardrails` below.
+    /// PII redaction skips either way, because redaction rewrites the body
+    /// it inspects and rewriting one part in place would have to re-length
+    /// the multipart framing around it.
     #[tokio::test]
     async fn multipart_records_the_builtin_inspection_it_skipped() {
         let (upstream_url, upstream_hits) = upstream_fixture(r#"{"text":"transcribed"}"#).await;
@@ -14358,6 +14482,97 @@ mod external_guardrail_context_tests {
         assert!(
             multipart_inspection_skipped_count("pii_redaction", "audio_transcription") > pii_before,
             "configured request PII redaction was bypassed without being counted"
+        );
+    }
+
+    /// WOR-2312: the bypass this closes.
+    ///
+    /// Before this, a caller who wanted to skip prompt-injection scanning
+    /// could stop sending a JSON body and send the same text as a
+    /// multipart `prompt` part instead. The short-circuit returned before
+    /// the JSON parse, so the configured input guardrails never saw it,
+    /// and the only trace was a skip counter that looks identical to
+    /// ordinary audio traffic.
+    ///
+    /// The fixture config blocks on the regex `forbidden`. The prompt
+    /// carries it, so a scanned request must be refused and the upstream
+    /// must never be reached. Before the fix this returned 200 and the
+    /// provider was called.
+    #[tokio::test]
+    async fn multipart_prompt_is_scanned_by_the_input_guardrails() {
+        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"data":[]}"#).await;
+        let config = builtin_guardrail_and_pii_config(&upstream_url);
+        let skipped_before = multipart_inspection_skipped_count("input_guardrails", "image_edits");
+        let (content_type, body) = multipart_image_edit_request("please do the forbidden thing");
+        let (mut session, client) =
+            downstream_bytes_session("/v1/images/edits", content_type, body).await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("multipart request is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response utf8");
+        assert!(
+            !response.starts_with("HTTP/1.1 200"),
+            "a blocking guardrail matched the multipart prompt, so this must not be a 200: {response}"
+        );
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            0,
+            "a blocked request must never reach the provider"
+        );
+        assert_eq!(
+            multipart_inspection_skipped_count("input_guardrails", "image_edits"),
+            skipped_before,
+            "the guardrails ran, so nothing was skipped and the counter must not move"
+        );
+    }
+
+    /// The other half: scanning must not refuse ordinary traffic.
+    ///
+    /// Same surface and same config, with a prompt that matches nothing.
+    /// It reaches the provider, and the skip counter still does not move,
+    /// because the text was inspected and allowed rather than bypassed.
+    #[tokio::test]
+    async fn multipart_prompt_that_matches_nothing_is_forwarded() {
+        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"data":[]}"#).await;
+        let config = builtin_guardrail_and_pii_config(&upstream_url);
+        let skipped_before = multipart_inspection_skipped_count("input_guardrails", "image_edits");
+        let (content_type, body) = multipart_image_edit_request("make the sky a little bluer");
+        let (mut session, client) =
+            downstream_bytes_session("/v1/images/edits", content_type, body).await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("multipart request is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response utf8");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            multipart_inspection_skipped_count("input_guardrails", "image_edits"),
+            skipped_before,
+            "an inspected prompt is not a skipped one"
         );
     }
 
