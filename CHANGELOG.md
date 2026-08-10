@@ -10,6 +10,8 @@ repository.
 Work that has merged to `main` since the latest tag and is queued for
 the next version cut.
 
+## [1.11.0] - 2026-08-10
+
 ### Added
 
 - **A tamper-evident security audit trail, behind `audit.sink: chain`.**
@@ -97,6 +99,217 @@ the next version cut.
   a bare placeholder, so an operator can tell two values apart without
   the value ever being logged.
 
+- **`env:NAME` now resolves through the same secret resolver as every
+  other secret-bearing field.** Three call sites (JWKS auth, a vault
+  backend, and one CEL helper) hand-rolled their own `env:NAME` parsing
+  outside `SecretResolver::resolve()`, so a field that accepted
+  `${VAR}`, `file:`, and seven provider URIs still refused the bare
+  `env:NAME` spelling everywhere else. It now resolves identically
+  wherever any other secret reference does, with the same
+  missing-variable error.
+
+- **`localsecret://` replaces the overloaded `secret://` scheme name.**
+  `secret://` reads as "any secret" but has only ever named one
+  specific backend, the local-secret provider, which is exactly the
+  kind of mismatch that led one deployment to misread
+  `secret://env/NAME` as an env-variable alias. `secret://` keeps
+  working, with a once-per-process deprecation warning identical to the
+  existing `vault://<alias>` mechanism. The scheme-validation table in
+  `sbproxy-config` also gains an entry for it; previously it wasn't
+  recognized there at all and silently skipped validation against
+  `proxy.secrets.backends`.
+
+- **Forward rules can match on a field inside the JSON request body.**
+  A rule now accepts an RFC 6901 JSON Pointer matcher, ANDed with the
+  existing path, header, and query matchers. The motivating case is AI
+  traffic, where the model name lives in the body on OpenAI, Anthropic,
+  and Bedrock shapes: routing different models to different origins
+  used to mean cramming everything into one `ai_proxy` action sharing
+  one auth config, one policy chain, and one transform set. The cost is
+  opt-in: an origin with no body matcher never buffers a body for this
+  purpose, and a body that's too large or not JSON just falls through
+  to header-only matching instead of failing the request.
+
+- **`origins.*.timeouts` makes the five upstream deadlines configurable
+  per origin.** Connect (5s), total-connect (10s), read/write (30s),
+  and idle (90s) were hardcoded with no config path at all. They're now
+  set via `connect_ms`, `total_connect_ms`, `read_ms`, `write_ms`, and
+  `idle_ms`, resolved at config compile; a zero value is refused. The
+  legacy, previously inert `connection_pool.idle_timeout_secs` now
+  feeds the same resolved idle timeout and is promoted from
+  config-only to stable, and authoring both spellings on one origin is
+  a compile error. A forward rule's inline origin inherits its
+  parent's timeouts.
+
+- **The configured A2A agent card is now served at its well-known
+  path.** `agent_card` has been storable on the `a2a` action, but
+  nothing served it: a request to `/.well-known/agent-card.json` just
+  proxied through like any other path. It's now served pre-auth
+  (matching sbproxy's other discovery surfaces), GET-only, at the
+  ratified A2A 1.0 path plus two legacy aliases. The card is validated
+  as a typed `AgentCard` at config compile, so a malformed card is a
+  boot error rather than a runtime surprise, and its URLs are rewritten
+  to advertise the proxy host through the same mechanism the
+  `a2a_agent_card_rewrite` transform uses.
+
+- **Forward rules can match on HTTP method.** A rule that should route
+  `POST /webhook` differently from `GET /webhook` had no way to say so.
+  A `method:` field, single value or list, is normalized to uppercase
+  and validated against `http::Method`, and it's evaluated first in the
+  rule's match chain since it's the cheapest, non-capturing test to run
+  before path, header, and body predicates.
+
+- **Origin hostnames can start with `*.` for wildcard routing.**
+  Hostnames could previously only match exactly, so a per-subdomain
+  product (`*.tenant.example.com`) needed one origin block per literal
+  hostname actually in use. A wildcard origin key now matches on the
+  longest matching suffix after an exact match fails, Envoy-style,
+  across both the request-path router and the admin snapshot lookup.
+  Configs with no wildcards keep the existing bloom-filter fast-reject
+  path unchanged, so this costs nothing for anyone not using it. Docs
+  that already (incorrectly) claimed one-level wildcard support now
+  match the code.
+
+- **`sbproxy ai ledger report` reads the AI value ledger offline.** The
+  local-versus-cloud spend and savings ledger was only queryable
+  through the admin HTTP endpoint, and the docs had long promised a CLI
+  subcommand that was never built (and has since been retracted from
+  the docs it was promised in). The new subcommand reads the redb
+  ledger file directly, the same pattern `ai ledger verify` already
+  uses, and prints the identical report as text or JSON, with the JSON
+  matching the admin endpoint's schema byte for byte. Useful for
+  scripting, air-gapped nodes, or CI cost reporting where hitting the
+  admin API isn't an option.
+
+- **`algorithm: ring_hash` adds consistent hashing to the load
+  balancer.** The existing hash-based algorithms used a plain modulus
+  over the target list, so any pool resize, a scale-up, a scale-down,
+  an unhealthy target dropping out, reshuffled most keys' target
+  assignment and defeated session or cache affinity at exactly the
+  moment it mattered. `ring_hash` implements ketama-style consistent
+  hashing (160 virtual nodes per target by weight, FNV-1a plus a
+  splitmix64 finisher), so only the keys owned by a target that joins
+  or leaves the pool actually move. Health is applied at lookup time by
+  walking the ring, so an unhealthy target doesn't require rebuilding
+  it. The `sticky:` block, which parsed and produced a boot warning but
+  never issued an affinity cookie, is now a hard config-compile refusal
+  that points at `ring_hash` instead, and a dead `ConsistentHash`
+  scaffold built on a non-deterministic per-process hasher, which would
+  have disagreed across replicas had it ever been wired up, is deleted.
+
+- **An `examples/admin-mcp` reference config lets an agent client
+  manage a running proxy over MCP.** No MCP server exposed SBproxy's
+  own admin API before this, so Claude Code, Cursor, or any other MCP
+  client couldn't manage a proxy the way it could manage other
+  infrastructure. It reuses the existing OpenAPI-to-MCP-tools converter
+  against a curated, hand-written admin API spec (the live
+  `/api/openapi.json` only describes the data plane, so no generated
+  admin spec exists to point at). `openapi` federated MCP servers also
+  gain a static `headers:` map for service credentials like HTTP Basic,
+  since outbound MCP auth previously only supported per-caller
+  run-as-user Bearer tokens and failed closed for anonymous callers; a
+  minted per-call header always wins over the static one, so
+  run-as-user auth can't be shadowed by it. `headers:` on a
+  non-openapi server, or combined with `run_as_user_auth`, is a config
+  error. The shipped example's tool surface is read-only by default,
+  held there by three independent gates (the curated spec, RBAC, and
+  `tool_allowlist`), so exposing any mutating admin action takes
+  deliberately editing at least two of them.
+
+- **The MCP gateway federates `prompts/list` and `prompts/get`.** Both
+  previously returned JSON-RPC `-32601`, method not found, for every
+  caller, so an agent client built around MCP prompts rather than tools
+  got nothing through the gateway even when the upstream server it
+  wanted supported them. They now federate the same way `tools/list`
+  and `tools/call` already do: aggregated across upstream servers under
+  the existing name-prefixing scheme, and routed back to the owning
+  server by namespaced name. The `prompts` capability is only
+  advertised in `initialize` when at least one upstream actually
+  declares it, and access follows the server's existing
+  `rbac_policies` entry rather than a new config key. Five other
+  unimplemented MCP methods are unchanged and still return `-32601`.
+
+- **`model_aliases` now actually does something.** The config key
+  parsed and was silently ignored, since `ConfigFile` has no
+  `deny_unknown_fields` to catch it, and the documented workaround,
+  per-provider `model_map`, doesn't cover the same case: `map_model`
+  only runs after a provider is already chosen, so it can rename a
+  model on the way out but has no say in which provider gets picked,
+  which is non-deterministic under round-robin routing. Aliases now
+  resolve before provider selection on all three AI dispatch paths,
+  with an optional provider pin that narrows candidates rather than
+  falling through to a provider that can't serve the aliased model.
+  Config load rejects an alias that shadows a served model, a
+  `model_map` key, or the default model, plus duplicate aliases,
+  self-reference, alias chains, and a pin at a provider that can't
+  serve the target. A second bug closed in the same change: on the
+  non-POST dispatch path, credential-level model gates were checked
+  against the pre-alias name, so an alias could previously be used to
+  reach a model a credential's block list was supposed to forbid.
+  That's now closed and pinned by a regression test.
+
+- **`digest_scope: bundle_v1` covers a whole extension bundle, not just
+  its entry file.** An extension bundle's `sha256` previously covered
+  only the JS or WASM entry artifact; `bundle.yaml`, which declares
+  hook kinds, sandbox limits, `failure_posture`, and `permissions`, sat
+  outside the digest and could be widened (`permissions: []` and
+  beyond) without breaking verification. Under `bundle_v1`, the digest
+  is computed over a sorted, path-plus-content-hash index of every
+  regular file in the bundle directory, including `bundle.yaml` itself
+  with its own `sha256:` line stripped first. Symlinks, non-UTF-8 or
+  control-character filenames, and oversized bundles are refused
+  outright. `digest_scope: entry`, the old whole-entry-file behavior,
+  stays the default, so existing bundles load unchanged.
+  `scripts/bundle-digest.sh` computes a `bundle_v1` digest for bundle
+  authors.
+
+- **The Kubernetes Gateway API controller ships in OSS for the first
+  time.** It watches `Gateway`, `HTTPRoute`, and `GRPCRoute` resources
+  and renders an `sb.yml` from them, in a new `sbproxy-k8s-controller`
+  crate (`deploy/k8s/gateway-controller/`, `docs/gateway-api.md`). It
+  also fixes a real bug carried over from the closed-source tree it's
+  ported from: the generator emitted forward rules using a `path`
+  field the config schema doesn't accept, so any `HTTPRoute` with a
+  non-root `PathPrefix` produced a document sbproxy couldn't parse, and
+  the data plane kept serving stale config while the controller logged
+  success. Enterprise-only pieces, a non-Gateway-API custom CRD and a
+  `bincode` dependency banned under RUSTSEC-2025-0141, were dropped
+  rather than ported. Generated output is now deterministic, sorted,
+  where it previously churned on hash-iteration order.
+
+- **Seven more outbound helper call sites inject W3C trace context.**
+  Only one of 49 production files making outbound HTTP calls injected
+  `traceparent`, and the docs' own list of exceptions was wrong in both
+  directions and missed the request mirror, webhooks, JWKS, and forward
+  auth entirely. Ledger redeem, the Web Bot Auth directory fetch,
+  webhooks, OAuth and OIDC token exchange, and forward auth now inject
+  it too, with the trace context threaded explicitly through the
+  `tokio::spawn` boundaries that would otherwise drop the ambient span.
+  Two duplicate-header bugs came out of the same pass: the request
+  mirror and forward auth were both copying the inbound `traceparent`
+  verbatim, which would have put two headers on the wire the moment
+  injection was added on top. Coverage across all outbound call sites
+  is now enforced by a build-time guard.
+
+- **RFC 9421 message-signature verification adds ECDSA-P256 and can now
+  actually check a covered body.** Inbound signature verification only
+  recognized `hmac-sha256` and `ed25519`; `ecdsa-p256-sha256` (RFC 9421
+  section 3.3.5) is now supported too, through `ring`, so a caller or
+  partner signing with ECDSA-P256 is no longer refused outright.
+  Separately, and more seriously: a signature claiming to cover
+  `content-digest` could never actually be checked against the body,
+  because the verifier was always invoked with an empty body regardless
+  of what the signature claimed to cover. It's now an explicit, typed
+  decision through a new `BodyBinding` enum: `Enforce` checks a covered
+  `content-digest` against the real bytes and fails the signature on a
+  mismatch, `Defer` is for the one call site that verifies headers
+  during auth and completes the body check later in the body filter,
+  and a caller that claims body coverage with no body available is
+  refused rather than marked verified. Before this fix, a forged or
+  tampered body could pass signature verification whenever the
+  signature covered the digest, because the digest itself was never
+  checked.
+
 ### Changed
 
 - **A payment stuck in reconciliation now withholds fresh 402 challenges
@@ -163,6 +376,38 @@ the next version cut.
   reload reaches the next script with no restart. The limits apply to
   response modifiers, `javascript` and `js_json` transforms, WAF custom
   rules, MCP adapters, and `engine: js` custom log fields alike.
+
+- **`key_management.crypto.pepper`/`master_key` and
+  `cluster.security.shared_key` can now resolve through any configured
+  secrets backend.** These fields previously accepted `env:NAME`,
+  `file:PATH`, or an inline literal, but refused a provider-URI
+  reference like `vault://` or `awssm://` even when a secrets backend
+  was already configured for everything else. They now delegate to the
+  installed process resolver when one exists, so the crypto pepper,
+  master key, and cluster shared key can come from any backend the rest
+  of the config uses, not just env or file. MCP run-as-user credential
+  lookups gain the same resolver support, keeping the existing
+  bare-variable-name shorthand. `validate_shared_key_reference` also
+  stops silently under-validating: it previously only recognized
+  `vault://` by name and let the other six provider schemes fall
+  through to a length check as if they were inline entropy. The runtime
+  path already caught a bad value here, so this closes a validate-time
+  message gap rather than a live bypass.
+
+- **cert-manager is now the recommended path for TLS on Kubernetes, and
+  the operator refuses the configurations that can't work.** Reconcile
+  previously rolled out a multi-replica deployment with
+  `proxy.acme.enabled: true` on a pod-local cert store without
+  complaint, which doesn't work: every replica opens its own ACME order
+  for the same hostname, risking Let's Encrypt's five-per-week
+  duplicate-certificate limit, and a load-balanced HTTP-01 challenge
+  fetch often lands on a replica that never opened the order. Reconcile
+  now refuses that combination outright when `spec.replicas > 1` and
+  ACME is enabled on a pod-local backend (`file`-backed and remote
+  backends are unaffected), recording the error on `status.lastError`
+  and requeuing rather than rolling out. The docs now lead with
+  cert-manager plus Ingress-terminated TLS as the recommended
+  Kubernetes path, with worked examples.
 
 ### Removed
 
@@ -391,6 +636,290 @@ the next version cut.
   origin then rejects every request with a 401. Inline keys behave exactly as
   before, and the `${VAR}` form was never affected, because config
   interpolation replaced it before this code ran.
+
+- **A plain "not paid yet" read from a Lightning invoice no longer
+  poisons the settlement intent.** The CLN/LND invoice-status check ran
+  inside the same write gate as a real provider write, and since only
+  `ProviderRejected` is on the authoritative-negative allowlist, an
+  unpaid-but-not-rejected read resolved to `Ambiguous` and stamped the
+  intent `NeedsReconciliation`, unreachable by the request path until a
+  background worker swept it later. The status read now runs in the
+  read-only query gate; only paid, expired, or unparseable outcomes
+  touch the write gate. A client retrying against a still-unpaid
+  invoice now gets a normal `RetryWait` and settles on the next request
+  once it's actually paid, instead of waiting on the reconciliation
+  worker.
+
+- **An `ai_proxy` origin's `credentials:` block now does something even
+  without `action.require_governed_key: true` set alongside it.**
+  Before this fix, `credentials:` on its own enforced nothing:
+  `/v1/chat/completions` accepted any Bearer token, or none, and
+  dispatched to the real upstream regardless. Eight of the nine shipped
+  examples, including the flagship `ai-virtual-keys` example, shipped
+  this exact vulnerable shape. Config compile now fails loud when
+  `credentials:` is present without `require_governed_key: true`,
+  naming the origin and pointing at
+  `docs/migration-credentials.md`, rather than silently turning the
+  flag on and flipping an already-compiling, already-vulnerable config
+  into one that starts rejecting traffic with no compile-time signal
+  that anything changed. All eight examples and six e2e fixtures
+  carrying the vulnerable shape were fixed in the same change.
+
+- **The `a2a_agent_card_rewrite` transform now actually runs.** It was
+  fully implemented, but `apply()` was a deliberate no-op with no call
+  site, so a configured rewrite silently passed agent-card response
+  bodies through unchanged. A client reading an unrewritten card
+  learned the real upstream URL and could call it directly on later
+  requests, going around the proxy entirely. It's now wired into
+  `apply_transform_with_ctx`, covering both upstream-proxied and
+  static-action agent cards, with a new `RequestContext::request_path`
+  field feeding it: a configured `proxy_host` wins, and the inbound
+  `Host` header is the fallback.
+
+- **`require_mtls_bound: true` no longer rejects every request in
+  production.** The RFC 8705 verifier itself was correct, but the
+  production auth path hardcoded `None` for the client certificate's
+  thumbprint; only test code ever passed a real one. Any origin
+  actually enabling `require_mtls_bound` was rejecting all of its
+  traffic. `request_filter` now derives the real `x5t#S256` thumbprint
+  from the session's TLS digest and passes it through. A plaintext
+  connection or a handshake with no client certificate still correctly
+  yields `None`, so a bound token still fails closed there, and origins
+  that don't use `require_mtls_bound` are unaffected.
+
+- **`GET /admin/config` and `GET /admin/config/effective` no longer
+  return inlined secrets in plaintext.** Both endpoints returned the
+  raw or merged config verbatim, so a read-only admin credential could
+  read back any secret written inline into the config. Both now pass
+  through the same `redact_secrets` the log pipeline already uses. One
+  side effect worth knowing about: a config with an inlined secret can
+  no longer be round-tripped through a GET, edit, PUT cycle, since PUT
+  now rejects the redacted placeholder with a 400. Moving those values
+  to an `env:` or secrets-backend reference restores the round trip,
+  which was already the documented way to hold a secret in config.
+
+- **Four fixes from a security inventory of the auth path.** The JWKS
+  unknown-`kid` refresh built a blocking `reqwest` client inside an
+  async call chain, which could stall a Tokio worker for up to ten
+  seconds against a slow identity provider; it's now async end to end,
+  with the blocking variant kept only for the one caller that genuinely
+  needs `spawn_blocking`. Seven hand-rolled constant-time comparators,
+  not the two originally scoped, now delegate to
+  `subtle::ConstantTimeEq`, closing a timing side-channel; two vault
+  comparators are deliberately left as they were, since they need
+  length-padding that `subtle`'s slice implementation short-circuits. A
+  malformed CIDR in `parse_cidrs` now fails config compile instead of
+  warning and dropping the entry, so a typo can no longer silently
+  narrow a deny list. Two misleading code comments were also corrected.
+
+- **A federated MCP server with no `rbac:` label of its own no longer
+  defaults to allowing every tool on it.** A server declared under
+  `federated_servers` with `rbac_policies` configured elsewhere in the
+  config, but no `rbac:` label pointing at one of them, was treated as
+  allow-all at all four dispatch sites, which quietly undoes
+  default-deny for exactly the upstream an operator forgot to label.
+  Config compile now rejects that combination outright, naming the
+  offending server. An operator who genuinely wants allow-all for a
+  server sets `rbac:` pointing at a policy with `default_allow: true`,
+  an explicit choice instead of a silent default. Servers with no
+  `rbac_policies` configured anywhere are unaffected. The dead
+  `rest_to_mcp.rs` stub, a REST-execution path with zero call sites, is
+  deleted in the same change.
+
+- **`agent_budget`'s `tokens_per_hour` limit is now actually
+  enforced.** The policy's request-rate half worked; the token half
+  didn't, because `consume_tokens` had zero call sites.
+  `tokens_per_hour` was checked for pre-flight headroom, so a 429 could
+  still fire against a budget that had never once been decremented, but
+  nothing ever charged usage after a response completed. Completion now
+  charges the per-agent token sink at two points, the logging phase for
+  buffered responses and end-of-stream aggregation for streamed ones,
+  draining exactly once so neither seam double-counts. The streaming
+  path previously never stamped `ctx.ai_tokens_*` at all, despite a
+  comment claiming it did, so fixing only the logging phase would have
+  silently missed every streamed AI response. Non-AI traffic and
+  upstream errors consume nothing.
+
+- **The Helm chart, the operator's own version, and the workspace
+  version now agree.** `Chart.appVersion` claimed `2.0.0`, the operator
+  crate was still versioned `0.1.0` and had never been bumped, and the
+  workspace was at `1.10.0`; none of the three numbers matched anything
+  real. The operator crate now inherits `version.workspace = true`, and
+  the chart's deployment template defaults `image.tag` to
+  `.Chart.AppVersion`, so the chart carries one true version instead of
+  three that drift independently. Separately, the chart's operator
+  image tag pointed at an image no CI workflow actually builds, so a
+  stock `helm install` landed the operator pod in `ImagePullBackOff`;
+  this is now called out explicitly in the docs and `values.yaml`, with
+  a documented local-build workaround. Three docs and the sample
+  manifest had also disagreed with each other on the proxy image tag;
+  all now match what the release workflow actually publishes.
+
+- **ACME HTTP-01 challenge validation now works behind a load
+  balancer.** The per-hostname issuance lease was already shared across
+  replicas, but the challenge token itself lived only in a
+  process-local map on whichever replica won the lease. The CA's
+  validation callback is load-balanced like any other request, so it
+  frequently landed on a different replica with no record of the token
+  and answered 404, meaning HTTP-01 validation couldn't complete at all
+  in a multi-replica deployment. This failed silently: issuance errors
+  are logged and swallowed, the proxy falls back to a self-signed
+  certificate so the handshake still completes and the pod stays
+  Ready, and nothing paged anyone for the roughly twelve-hour retry
+  window in between. The token now lives in the same shared `KVStore`
+  backing the cert store, keyed `acme:challenge:<token>`, so any
+  replica can answer the CA. Its TTL is now derived from the CA's
+  actual authorization-expiry field per RFC 8555 section 7.1.4, instead
+  of a hardcoded, invented 600 seconds. In the same change,
+  `storage_backend: sqlite` stopped silently downgrading to in-memory
+  storage; an unrecognized backend value is now a hard error instead.
+
+- **The served-quote nonce ledger for x402 payments is now durable.**
+  Double-charge protection was already durable, backed by SQLite, but
+  double-serve protection, stopping an already-settled quote token from
+  being redeemed twice, used an in-memory set on the production path. A
+  client re-presenting a settled quote token got served the paid
+  content again, once per proxy restart. The ledger is now
+  SQLite-backed over the settlement store's own connection, and a spend
+  is a single atomic `BEGIN IMMEDIATE` plus
+  `INSERT ... ON CONFLICT DO NOTHING`, so there's no read-then-write
+  race across processes. Nonces prune themselves on the quote token's
+  own expiry claim, and there's no longer a production code path that
+  can construct the old in-memory version.
+
+- **A stranded payment intent with no identifiable payer now stops
+  withholding challenges after a bounded window.** When a payment
+  intent lands in `NeedsReconciliation` and its payer can't be
+  identified, the normal case for anonymous or crawler traffic, the
+  route withheld fresh 402 challenges entirely and indefinitely; x402
+  has no status-query endpoint, so a facilitator outage could zero a
+  route's revenue for as long as the outage lasted. A separate fix
+  already scoped withholding to a single payer when one could be
+  identified; this covers the case where it can't. A new `Stranded`
+  state now lifts the gate at the quote token's own challenge expiry
+  plus a fixed fifteen-minute reconciliation grace window, past which
+  point the stranded payer couldn't redeem the token anyway. The route
+  resumes issuing challenges while the underlying provider attempt
+  stays queued, so a late answer can still commit a real receipt.
+  Operators get a documented query to pull stranded intent IDs for
+  manual reconciliation, and a
+  `sbproxy_payment_recovery_total{operation="strand_intent"}` metric to
+  alert on.
+
+- **A credential's `attrs.team` now reaches the request principal.**
+  `project`, `user`, `tags`, `metadata`, and `cost_center` all flowed
+  from a virtual key's attrs into the principal; `team` didn't, because
+  `VirtualKeyConfig` had no field for it and
+  `principal_for_resolved_virtual_key` hardcoded `team: None`. Any
+  deployment attributing spend or metrics by team, across five metric
+  families, the access log, spend rollups, the usage sink, CEL/Lua/JS
+  contexts, and MCP RBAC, got every request bucketed under an empty
+  team. `team` now follows the same origin, proxy, and tenant
+  config-scope lowering path the other attribution fields already use.
+
+- **The metering divergence sweep no longer alerts on every tenant with
+  billable traffic.** `chain_contribution` only had a trait default
+  returning `None`, so `note_chained` never ran, the chained-receipts
+  map stayed permanently empty, and the sweep flagged a divergence for
+  every tenant, every window, unconditionally. Once wired, a second
+  problem surfaced: comparing raw per-window totals flagged any request
+  whose count and its chain entry landed on opposite sides of a window
+  boundary, and the false-positive rate rose with traffic. State is now
+  a signed per-tenant balance carried across sweeps, along with its
+  nearest-to-zero floor since the last sweep; a request straddling a
+  window boundary nets to zero and stays quiet, while a genuinely lost
+  receipt holds the balance up and reports once, at the cost of
+  surfacing sixty to a hundred twenty seconds later than before. The
+  `ledger` health component is also renamed `usage_ledger`, and
+  `with_recency` is removed, since it would have marked a healthy but
+  idle deployment, one with no paying traffic, Unhealthy and pulled it
+  out of rotation.
+
+- **A matched virtual key no longer erases the inbound principal's
+  roles and claims.** `apply_resolved_virtual_key_context`
+  wholesale-replaced `ctx.principal` on a match, so a JWT-authenticated
+  request lost its `roles` and `claims` the moment a virtual key also
+  matched. Under default-deny, that meant role-scoped MCP ACL rules and
+  claim-based CEL policies could silently stop matching. The merge is
+  now per field: attribution fields let the credential win, identity
+  fields like `sub`, `source`, and `virtual_key` still replace
+  outright, but `roles` and `claims` now carry forward from the inbound
+  principal. Separately, five header-settable attribution tags reached
+  Prometheus straight from caller headers with no cardinality limit; a
+  documented constant, `MAX_DISTINCT_VALUES_PER_TAG`, existed but no
+  call site read it, so an untrusted caller could mint unbounded label
+  values across five metric families. Both are now routed through the
+  existing cardinality limiter.
+
+- **Every `config_only` key now has a real disposition instead of a
+  boot warning pointing at a closed ticket.** The most visible fix
+  among 32: `cors.enable: false` was silently ignored, since the
+  runtime enabled CORS on the block's presence, never on the boolean's
+  value, so an operator writing `false` to disable CORS actually left
+  it enabled. Config compile now refuses that combination, naming the
+  fix. Eleven other config-only keys are now refused outright instead
+  of silently accepted: five legacy `proxy.secrets` keys superseded by
+  `backends`, three dead `forward_rules[].origin` metadata fields, and
+  `key_introspection` and `redis_source_of_truth` on the one value that
+  never worked. Two keys, `proxy.secrets.map` and
+  `proxy.http3.idle_timeout_secs`/`.max_streams`, turn out to have been
+  live all along and are reclassified from config-only to stable.
+
+- **`request_modifiers[].js_script` now runs.** It parsed, compiled,
+  and was pinned `stable` in the key registry, so it never triggered a
+  boot warning, but no code path ever executed it: only its Lua twin,
+  `lua_request_modifier`, actually ran at the request phase, despite
+  docs and the glossary describing both as supported symmetrically. A
+  second, independently found instance of the same class of bug: a
+  forward rule's modifier loop only read `headers`, so a `lua_script`
+  or `js_script` attached to a forward rule was compiled and silently
+  never run, for either engine. Both are now wired to execute; on the
+  origin path, JS runs after Lua, and both now run on forward rules
+  too.
+
+- **ACME issuance now retries a `badNonce` rejection with the nonce the
+  server actually offered.** On a `badNonce` response, the retry
+  previously discarded the fresh nonce the server returned in
+  `Replay-Nonce`, because the body was read before the headers, making
+  the header unreachable, and instead re-fetched a nonce with a second
+  `HEAD newNonce` call that could itself be rejected with no further
+  retry. A failed second attempt then surfaced only as a bare "returned
+  400," with the real cause lost. `post_jws` is now a bounded loop,
+  three attempts, that reads `Replay-Nonce` off the 400 before
+  consuming the body and signs the retry with it, falling back to
+  `newNonce` only when the header is absent. Non-badNonce errors are
+  unaffected. This makes certificate issuance resilient to a
+  nonce-rejection race against a real CA, per RFC 8555 section 6.5,
+  instead of failing outright.
+
+- **A `sbproxy_ai_multipart_inspection_skipped_total` counter makes the
+  multipart guardrail gap visible.** The AI gateway's dispatch gate
+  branches on the inbound `Content-Type`, and every exit of the
+  multipart branch returns early, so input guardrails, `pii:` request
+  redaction, and `prompt_injection_v2` never run against a multipart
+  request. A caller can still send `multipart/form-data` to
+  `/v1/chat/completions` and route around every configured guardrail
+  with no metric or log to show it happened, until now: a nonzero rate
+  on a surface where multipart isn't legitimate, like
+  `chat_completions`, is now a dashboard signal. Enforcement itself is
+  unchanged here, only the visibility; the docs are also corrected,
+  since they previously understated how narrow the bypass was and
+  overstated what the `dlp` policy covers (it reads URIs and headers,
+  not body content).
+
+- **A multipart AI request's `prompt` field now goes through input
+  guardrails.** A multipart request, an image edit or a transcription,
+  short-circuited before the JSON parse, so the guardrail pipeline,
+  including prompt-injection scanning, never ran on its `prompt` text
+  field at all. That was a documented way to bypass scanning entirely:
+  send the same text as a multipart part instead of JSON. The `prompt`
+  part is now extracted and run through the same
+  `evaluate_ai_input_guardrails` evaluator the JSON path uses, covering
+  both built-in and external guardrails. Image and audio bytes still
+  aren't scanned, since no classifier reads them, and PII redaction
+  still deliberately skips multipart, since rewriting it would break
+  the multipart framing, but a credential that requires redaction now
+  gets a 403 instead of an unredacted forward.
 
 ## [1.10.0] - 2026-08-04
 
