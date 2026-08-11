@@ -2928,6 +2928,8 @@ version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
+ "allocator-api2",
+ "equivalent",
  "foldhash 0.1.5",
 ]
 
@@ -2948,6 +2950,8 @@ version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4f467dd6dccf739c208452f8014c75c18bb8301b050ad1cfb27153803edb0f51"
 dependencies = [
+ "allocator-api2",
+ "equivalent",
  "foldhash 0.2.0",
  "serde",
  "serde_core",
@@ -4326,11 +4330,11 @@ dependencies = [
 
 [[package]]
 name = "lru"
-version = "0.16.4"
+version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
+checksum = "5d2f2f9b4ba7e6b24d95e7e899329d35be83bcded72c8540cdd5368932d1d90a"
 dependencies = [
- "hashbrown 0.16.1",
+ "hashbrown 0.17.0",
 ]
 
 [[package]]
@@ -5425,7 +5429,7 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 [[package]]
 name = "pingora-cache"
 version = "0.8.0"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#58a2bd3281cf7081d8479c7ac2dae348b7434b9d"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#4153f0d22ef5ccc591a3ae5e75637effe83f9be8"
 dependencies = [
  "ahash",
  "arrayvec",
@@ -5460,7 +5464,7 @@ dependencies = [
 [[package]]
 name = "pingora-core"
 version = "0.8.0"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#58a2bd3281cf7081d8479c7ac2dae348b7434b9d"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#4153f0d22ef5ccc591a3ae5e75637effe83f9be8"
 dependencies = [
  "ahash",
  "async-trait",
@@ -5513,12 +5517,12 @@ dependencies = [
 [[package]]
 name = "pingora-error"
 version = "0.8.0"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#58a2bd3281cf7081d8479c7ac2dae348b7434b9d"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#4153f0d22ef5ccc591a3ae5e75637effe83f9be8"
 
 [[package]]
 name = "pingora-header-serde"
 version = "0.8.0"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#58a2bd3281cf7081d8479c7ac2dae348b7434b9d"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#4153f0d22ef5ccc591a3ae5e75637effe83f9be8"
 dependencies = [
  "bytes",
  "http 1.4.0",
@@ -5533,7 +5537,7 @@ dependencies = [
 [[package]]
 name = "pingora-http"
 version = "0.8.0"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#58a2bd3281cf7081d8479c7ac2dae348b7434b9d"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#4153f0d22ef5ccc591a3ae5e75637effe83f9be8"
 dependencies = [
  "bytes",
  "http 1.4.0",
@@ -5543,13 +5547,13 @@ dependencies = [
 [[package]]
 name = "pingora-lru"
 version = "0.8.0"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#58a2bd3281cf7081d8479c7ac2dae348b7434b9d"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#4153f0d22ef5ccc591a3ae5e75637effe83f9be8"
 dependencies = [
  "ahash",
  "arrayvec",
  "async-channel",
  "flurry",
- "hashbrown 0.14.5",
+ "hashbrown 0.15.5",
  "log",
  "parking_lot",
  "rand 0.8.6",
@@ -5559,7 +5563,7 @@ dependencies = [
 [[package]]
 name = "pingora-pool"
 version = "0.8.0"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#58a2bd3281cf7081d8479c7ac2dae348b7434b9d"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#4153f0d22ef5ccc591a3ae5e75637effe83f9be8"
 dependencies = [
  "crossbeam-queue",
  "dashmap 5.5.3",
@@ -5574,7 +5578,7 @@ dependencies = [
 [[package]]
 name = "pingora-proxy"
 version = "0.8.0"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#58a2bd3281cf7081d8479c7ac2dae348b7434b9d"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#4153f0d22ef5ccc591a3ae5e75637effe83f9be8"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5596,7 +5600,7 @@ dependencies = [
 [[package]]
 name = "pingora-runtime"
 version = "0.8.0"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#58a2bd3281cf7081d8479c7ac2dae348b7434b9d"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#4153f0d22ef5ccc591a3ae5e75637effe83f9be8"
 dependencies = [
  "log",
  "once_cell",
@@ -5609,7 +5613,7 @@ dependencies = [
 [[package]]
 name = "pingora-rustls"
 version = "0.8.0"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#58a2bd3281cf7081d8479c7ac2dae348b7434b9d"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#4153f0d22ef5ccc591a3ae5e75637effe83f9be8"
 dependencies = [
  "log",
  "no_debug",
@@ -5625,7 +5629,7 @@ dependencies = [
 [[package]]
 name = "pingora-timeout"
 version = "0.8.0"
-source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#58a2bd3281cf7081d8479c7ac2dae348b7434b9d"
+source = "git+https://github.com/soapbucket/pingora?branch=sbproxy-0.8.0#4153f0d22ef5ccc591a3ae5e75637effe83f9be8"
 dependencies = [
  "once_cell",
  "parking_lot",
