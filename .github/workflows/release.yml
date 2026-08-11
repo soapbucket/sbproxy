@@ -698,6 +698,19 @@ jobs:
             echo "no CHANGELOG section found for ${version}" >&2
             exit 1
           fi
+          # A tag-time-only failure's documented recovery is to move the
+          # tag (git tag -d + recreate + push) and let this workflow run
+          # again. gh release create refuses to reuse a tag name a draft
+          # release already claims and silently creates an orphaned
+          # "untagged-*" draft instead, leaving the stale first-attempt
+          # release (and its assets) live under the real tag. Caught at
+          # v1.11.0: the tag moved 4 times and the published release kept
+          # attempt 1's binaries through 3 more rebuilds. Delete any
+          # existing release for this tag first (never the tag itself,
+          # which is what triggered this run) so a retag always produces
+          # exactly one release, matching the assets this run just built.
+          gh release delete "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" --yes 2>/dev/null || true
           gh release create "${GITHUB_REF_NAME}" \
             --repo "${GITHUB_REPOSITORY}" \
             --title "${GITHUB_REF_NAME}" \
