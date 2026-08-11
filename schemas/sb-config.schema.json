@@ -3091,7 +3091,7 @@
           }
         },
         "rotation": {
-          "description": "Reserved rotation shape; no OSS scheduler consumes it.",
+          "description": "How resolved upstream credentials are re-read and how a failed re-read behaves. Consumed by the key plane (WOR-2327).",
           "default": null,
           "anyOf": [
             {
@@ -3146,18 +3146,18 @@
       "additionalProperties": false
     },
     "RotationConfig": {
-      "description": "Reserved secret-rotation configuration.\n\nNo OSS scheduler consumes this compatibility block.",
+      "description": "Secret-rotation behavior for credentials the proxy resolves from a backend and presents upstream.\n\nRead at boot into `sbproxy_vault::RotationPolicy` and applied by the key plane. Process-owned like the rest of `proxy.secrets`: a reload that changes it is refused with a restart message.",
       "type": "object",
       "properties": {
         "grace_period_secs": {
-          "description": "Seconds the previous secret value remains valid after rotation. Defaults to 300 (5 minutes).",
+          "description": "How long a resolved credential may still be served after re-resolution has **failed**, measured from the end of the re-resolve window. Defaults to 300 (5 minutes).\n\nThis is availability, not credential overlap: the proxy presents upstream credentials rather than validating them, so it has no old-value acceptance window to honor. What this prevents is a briefly unreachable backend turning every request carrying a bound credential into a 503. A deleted or revoked credential is never served out of this window.",
           "default": 300,
           "type": "integer",
           "format": "uint64",
           "minimum": 0.0
         },
         "re_resolve_interval_secs": {
-          "description": "How often (seconds) to re-fetch secrets from the vault backend. Defaults to 60.",
+          "description": "How long a resolved credential is served before the backend is consulted again. Defaults to 60, which is the value the key plane hardcoded before this block was consumed.",
           "default": 60,
           "type": "integer",
           "format": "uint64",
