@@ -147,7 +147,7 @@ rand.workspace = true
 # RoutingStrategy plugin registry. Already a workspace dep used by
 # sbproxy-plugin and sbproxy-core; no new third-party dep.
 inventory.workspace = true
-lru = "0.16"
+lru = "0.18"
 
 # Needed for spawn_blocking when calling sync KVStore methods (Redis rate limiting).
 # Also: rt + time for active health-check probe loops on load_balancer targets.

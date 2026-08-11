@@ -60,7 +60,7 @@ parking_lot.workspace = true
 # Bounded LRU for the mTLS client-cert metadata cache. Workspace
 # dependents (sbproxy-ai, sbproxy-modules) all standardise on 0.16,
 # so keep the same line here for cargo's resolver.
-lru = "0.16"
+lru = "0.18"
 
 # Process-wide metrics registry. Used to publish the
 # `sbproxy_mtls_cert_cache_evictions_total` counter that tracks
