@@ -15,6 +15,7 @@ use sbproxy_modules::DynamicHookMetadata;
 use sbproxy_observe::events::PolicySurface;
 use sbproxy_plugin::PolicyEnforcer;
 
+use super::shared_admission::SharedAdmission;
 #[cfg(feature = "agent-class")]
 use super::AgentClassEnforcer;
 use super::{
@@ -42,6 +43,16 @@ pub struct CompiledEnforcer {
     pub enforcer: Box<dyn PolicyEnforcer>,
     /// Dynamic bundle execution metadata, absent for built-ins and linked plugins.
     pub dynamic_hook: Option<DynamicHookMetadata>,
+    /// Handle for admitting against state shared with other replicas.
+    ///
+    /// `Some` only for a policy that was configured with an L2 store or a
+    /// mesh tier; `None` for every local-only policy, which is the common
+    /// case and keeps its synchronous path untouched. `check_policies`
+    /// awaits this before dispatching the enforcer, because the enforcer
+    /// itself cannot hold the request context across an await. The
+    /// internal `builtin_enforcers::shared_admission` module explains
+    /// why.
+    pub(crate) shared_admission: Option<Arc<dyn SharedAdmission>>,
 }
 
 /// Compile every [`Policy`] in `policies` into a
@@ -73,7 +84,20 @@ pub fn compile_builtin_enforcers(
 /// each variant in isolation without standing up a Vec.
 fn compile_one(policy: Policy, metric_policy: &str) -> anyhow::Result<CompiledEnforcer> {
     let compiled = match policy {
-        Policy::RateLimit(p) => builtin(RateLimitEnforcer::new(Arc::new(p), metric_policy)?),
+        Policy::RateLimit(p) => {
+            // The only variant that carries a shared-admission handle
+            // today. It is resolved here, once at config-compile time,
+            // rather than probed per request: whether a store is attached
+            // cannot change without a reload, which recompiles the chain.
+            let enforcer = RateLimitEnforcer::new(Arc::new(p), metric_policy)?;
+            let shared_admission = enforcer.shared_admission();
+            CompiledEnforcer {
+                surface: PolicySurface::BuiltIn,
+                enforcer: Box::new(enforcer),
+                dynamic_hook: None,
+                shared_admission,
+            }
+        }
         Policy::RateLimitBudget(p) => builtin(RateLimitBudgetEnforcer(Arc::new(p))),
         Policy::IpFilter(p) => builtin(IpFilterEnforcer(Arc::new(p))),
         Policy::SecHeaders(p) => builtin(SecHeadersEnforcer(Arc::new(p))),
@@ -106,17 +130,60 @@ fn compile_one(policy: Policy, metric_policy: &str) -> anyhow::Result<CompiledEn
                 surface: PolicySurface::Plugin,
                 enforcer,
                 dynamic_hook,
+                // The seam is internal, so a plugin cannot opt into it.
+                shared_admission: None,
             }
         }
     };
     Ok(compiled)
 }
 
+/// Resolve `compiled`'s cluster-shared admission decision, if it has one,
+/// and leave it on the context for the enforcer to consume.
+///
+/// This is the WOR-2332 seam. `server.rs::check_policies` calls it
+/// immediately before dispatching each enforcer, and it is a named
+/// function rather than five inline lines so a test can drive the exact
+/// code the request path runs. Every previous rate-limit test called the
+/// policy's own methods, which is how a shared tier with no caller went
+/// on looking covered.
+///
+/// The two calls are split so the context borrow ends before the await.
+/// [`SharedAdmission::shared_admission_key`] borrows `ctx` and returns an
+/// owned key; [`SharedAdmission::shared_admit`] takes that key and never
+/// touches `ctx`. Only then is writing the decision back legal. Doing it
+/// in one call would capture `ctx` across the await and the future would
+/// not be `Send`.
+///
+/// A no-op for every local-only policy, which is the common case: those
+/// carry no handle and keep their synchronous path exactly.
+pub(crate) async fn resolve_shared_admission(
+    compiled: &CompiledEnforcer,
+    req: &http::Request<bytes::Bytes>,
+    ctx: &mut crate::context::RequestContext,
+) {
+    let Some(shared) = compiled.shared_admission.as_ref() else {
+        return;
+    };
+    let Some(key) = shared.shared_admission_key(req, ctx) else {
+        return;
+    };
+    let info = shared.shared_admit(key).await;
+    ctx.shared_rate_limit_decision = Some(info);
+}
+
+/// Wrap a built-in enforcer that admits entirely in process.
+///
+/// Every variant except `RateLimit` goes through here. `RateLimit` builds
+/// its `CompiledEnforcer` by hand because it is the one policy that can
+/// be configured with a cluster-shared tier and so may carry a
+/// [`shared_admission`](CompiledEnforcer::shared_admission) handle.
 fn builtin<E: PolicyEnforcer>(enforcer: E) -> CompiledEnforcer {
     CompiledEnforcer {
         surface: PolicySurface::BuiltIn,
         enforcer: Box::new(enforcer),
         dynamic_hook: None,
+        shared_admission: None,
     }
 }
 
@@ -393,5 +460,189 @@ mod tests {
                 expected_label
             );
         }
+    }
+
+    // --- WOR-2332: the shared-admission seam ---
+    //
+    // These drive `resolve_shared_admission`, the function
+    // `check_policies` calls, rather than the policy's own methods. That
+    // distinction is the whole point of the ticket: the L2 tier had a
+    // passing mesh-convergence test and no production caller, because
+    // every test reached past the wiring to the thing being wired.
+
+    /// A `KVStore` that implements only the counter operation the
+    /// fixed-window path uses, and records how many times it was asked.
+    ///
+    /// Counting the calls is what lets a test assert the store was
+    /// *consulted*. Asserting only on the admit/deny outcome would pass
+    /// against the old code, because a local token bucket produces the
+    /// same shape of answer from entirely local state.
+    #[derive(Default)]
+    struct CountingStore {
+        counters: parking_lot::Mutex<std::collections::HashMap<Vec<u8>, i64>>,
+        hits: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingStore {
+        fn hits(&self) -> usize {
+            self.hits.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl sbproxy_platform::KVStore for CountingStore {
+        fn get(&self, _key: &[u8]) -> anyhow::Result<Option<bytes::Bytes>> {
+            Ok(None)
+        }
+        fn put(&self, _key: &[u8], _value: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn delete(&self, _key: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn scan_prefix(&self, _prefix: &[u8]) -> anyhow::Result<Vec<(bytes::Bytes, bytes::Bytes)>> {
+            Ok(Vec::new())
+        }
+        fn incr_with_ttl(&self, key: &[u8], _ttl_secs: u64) -> anyhow::Result<i64> {
+            self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut guard = self.counters.lock();
+            let slot = guard.entry(key.to_vec()).or_insert(0);
+            *slot += 1;
+            Ok(*slot)
+        }
+    }
+
+    /// Compile a one-policy chain the way the pipeline does, optionally
+    /// attaching a shared store first.
+    fn chain_with_store(
+        store: Option<Arc<dyn sbproxy_platform::KVStore>>,
+    ) -> Vec<CompiledEnforcer> {
+        let mut policy = sbproxy_modules::RateLimitPolicy::from_config(serde_json::json!({
+            // A per-minute rate, so `window_secs` is 60 and the fixed
+            // window is long enough to be worth sharing.
+            "requests_per_minute": 2.0,
+            "burst": 100
+        }))
+        .expect("rate-limit config");
+        if let Some(store) = store {
+            policy = policy.with_store(Some(store), "seam-test-origin");
+        }
+        compile_builtin_enforcers(vec![Policy::RateLimit(policy)], "seam-test-route")
+            .expect("chain compiles")
+    }
+
+    fn seam_request() -> http::Request<bytes::Bytes> {
+        http::Request::builder()
+            .uri("/")
+            .body(bytes::Bytes::new())
+            .expect("request builds")
+    }
+
+    fn seam_ctx() -> crate::context::RequestContext {
+        let mut ctx = crate::context::RequestContext::new();
+        ctx.hostname = "seam.example".into();
+        ctx
+    }
+
+    /// Run one request through the seam exactly as `check_policies` does:
+    /// resolve the shared decision first, then dispatch the enforcer.
+    async fn drive_one(compiled: &CompiledEnforcer) -> sbproxy_plugin::PolicyDecision {
+        let req = seam_request();
+        let mut ctx = seam_ctx();
+        resolve_shared_admission(compiled, &req, &mut ctx).await;
+        let ctx_any: &mut dyn std::any::Any = &mut ctx;
+        compiled
+            .enforcer
+            .enforce(&req, ctx_any)
+            .await
+            .expect("enforce succeeds")
+    }
+
+    #[test]
+    fn a_configured_store_produces_a_shared_admission_handle() {
+        // The regression this ticket is about. A store was attached at
+        // config-compile time and nothing downstream carried a way to
+        // reach it, so the request path could not consult it even in
+        // principle.
+        let store: Arc<dyn sbproxy_platform::KVStore> = Arc::new(CountingStore::default());
+        let with = chain_with_store(Some(store));
+        assert!(
+            with[0].shared_admission.is_some(),
+            "a policy with an L2 store must carry a shared-admission handle"
+        );
+
+        let without = chain_with_store(None);
+        assert!(
+            without[0].shared_admission.is_none(),
+            "a local-only policy must not pay for the seam"
+        );
+    }
+
+    #[tokio::test]
+    async fn driving_a_request_through_the_chain_consults_the_store() {
+        // Asserts the wiring, not the tier. `rate_limit_mesh_convergence`
+        // already proves the tier works when called; nothing proved
+        // anything called it.
+        let store = Arc::new(CountingStore::default());
+        let chain = chain_with_store(Some(store.clone()));
+
+        assert_eq!(store.hits(), 0, "compiling a chain must not touch Redis");
+        let decision = drive_one(&chain[0]).await;
+        assert!(
+            matches!(decision, sbproxy_plugin::PolicyDecision::Allow),
+            "first request is under the cap"
+        );
+        assert_eq!(
+            store.hits(),
+            1,
+            "one request through the chain must be exactly one shared-counter increment"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_local_only_chain_never_reaches_a_store() {
+        // The other half of the contract: adding the seam must not make
+        // the ordinary deployment pay for it.
+        let chain = chain_with_store(None);
+        let decision = drive_one(&chain[0]).await;
+        assert!(matches!(decision, sbproxy_plugin::PolicyDecision::Allow));
+        assert!(
+            chain[0].shared_admission.is_none(),
+            "no handle means no await and no store call"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_chains_sharing_one_store_enforce_a_single_combined_cap() {
+        // The property an operator actually buys when they configure
+        // Redis: two replicas, one budget. Under the pre-WOR-2332 code
+        // each chain held its own token bucket and both would admit the
+        // full rate, so this is the assertion that fails without the fix.
+        let store: Arc<dyn sbproxy_platform::KVStore> = Arc::new(CountingStore::default());
+        let replica_a = chain_with_store(Some(Arc::clone(&store)));
+        let replica_b = chain_with_store(Some(Arc::clone(&store)));
+
+        // Cap is 2 per minute across both replicas.
+        assert!(
+            matches!(
+                drive_one(&replica_a[0]).await,
+                sbproxy_plugin::PolicyDecision::Allow
+            ),
+            "first request, count 1 of 2"
+        );
+        assert!(
+            matches!(
+                drive_one(&replica_b[0]).await,
+                sbproxy_plugin::PolicyDecision::Allow
+            ),
+            "second request lands on the other replica, count 2 of 2"
+        );
+        assert!(
+            matches!(
+                drive_one(&replica_b[0]).await,
+                sbproxy_plugin::PolicyDecision::Deny { status: 429, .. }
+            ),
+            "third request exceeds the shared cap, even though this replica \
+             has only served two and its local bucket has burst 100 left"
+        );
     }
 }

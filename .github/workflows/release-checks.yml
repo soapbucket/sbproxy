@@ -71,7 +71,14 @@ jobs:
   doc-captures:
     name: documented output still reproduces
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # Was 25; this job's payments-featured build was still on the default
+    # [profile.release] (fat LTO, codegen-units=1), the same slow profile
+    # test-isolation's identical build step already works around with
+    # CARGO_PROFILE_RELEASE_LTO: thin below. Without it, a cold-cache build
+    # alone can eat most of a 25-minute budget before the capture replay
+    # even starts, and the v1.11.0 tag run's job was cancelled by this
+    # timeout mid-compile.
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v5
 
@@ -84,8 +91,13 @@ jobs:
 
       # The settlement captures talk to a stub Core Lightning node, so the
       # binary has to carry the rail's feature. No payment feature is in
-      # any default set.
+      # any default set. CARGO_PROFILE_RELEASE_LTO=thin matches
+      # test-isolation's identical build step below; this job was still on
+      # the workspace's default fat-LTO profile, which is why it kept
+      # running long enough to threaten the job timeout.
       - name: build a payments-featured binary
+        env:
+          CARGO_PROFILE_RELEASE_LTO: thin
         run: cargo build --release -p sbproxy --features payment-lightning-cln,payment-stripe --locked
 
       # Replays every CAPTURE marker in document order against a fixture

@@ -636,6 +636,22 @@ pub struct RequestContext {
     // --- Rate limit info ---
     /// Rate limit info from the policy check, used to add response headers.
     pub rate_limit_info: Option<RateLimitInfo>,
+    /// Admission decision already taken against a cluster-shared tier.
+    ///
+    /// A rate-limit policy with an L2 (Redis) store or a mesh tier cannot
+    /// decide inside `enforce`, because consulting that tier is an await
+    /// and `PolicyEnforcer::enforce` may not hold this context across
+    /// one. `check_policies` therefore resolves the decision just before
+    /// dispatching that enforcer and leaves it here; the enforcer takes
+    /// it and skips its local token bucket.
+    ///
+    /// Deliberately separate from [`Self::rate_limit_info`], which is the
+    /// *outcome* read later by the 429 response handler. This slot is the
+    /// hand-off, it is always `take`n rather than read, and it is empty
+    /// again by the time the enforcer returns. A chain carrying two
+    /// rate-limit policies fills and drains it once per policy, so the
+    /// second never inherits the first's decision.
+    pub shared_rate_limit_decision: Option<RateLimitInfo>,
 
     // --- Transform body buffering ---
     /// Buffer for accumulating upstream response body chunks when transforms are configured.
@@ -1660,6 +1676,7 @@ impl RequestContext {
             response_filter_finished_at: None,
             response_status: None,
             rate_limit_info: None,
+            shared_rate_limit_decision: None,
             response_body_buf: None,
             buffering_body: false,
             upstream_content_type: None,

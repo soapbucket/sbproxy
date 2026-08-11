@@ -1,10 +1,28 @@
 //! Wrapper enforcer for the `Policy::RateLimit` variant.
 //!
-//! Calls
+//! Stashes the resulting `RateLimitInfo` on the request context so the
+//! dispatcher's 429 response handler can emit the `X-RateLimit-*`
+//! headers.
+//!
+//! ## Which admission path runs (WOR-2332)
+//!
+//! A local-only policy calls the synchronous
 //! [`sbproxy_modules::policy::RateLimitPolicy::allow_with_info_for`]
-//! and stashes the resulting `RateLimitInfo` on the request context
-//! so the dispatcher's 429 response handler can emit the
-//! `X-RateLimit-*` headers.
+//! here, in `enforce`, exactly as it always has.
+//!
+//! A policy with an L2 (Redis) store or a mesh cluster tier attached
+//! cannot: consulting that tier is an await, and this trait method may
+//! not hold the request context across one. So admission for those
+//! policies happens one level up, at the `check_policies` call site,
+//! through the internal `SharedAdmission` seam (see the
+//! `builtin_enforcers::shared_admission` module), and `enforce` consumes
+//! the decision from
+//! [`crate::context::RequestContext::shared_rate_limit_decision`].
+//!
+//! Until that seam existed the wrapper always took the synchronous path,
+//! so an operator who configured Redis-backed distributed rate limiting
+//! got purely local enforcement and ten replicas admitted ten times the
+//! configured rate.
 //!
 //! When `policy.key` is a non-empty CEL expression the wrapper
 //! evaluates it against the per-request CEL context (method, path,
@@ -34,9 +52,10 @@ use std::sync::Arc;
 use bytes::Bytes;
 use compact_str::CompactString;
 use sbproxy_extension::cel::CompiledCel;
-use sbproxy_modules::policy::RateLimitPolicy;
+use sbproxy_modules::policy::{RateLimitInfo, RateLimitPolicy};
 use sbproxy_plugin::{PolicyDecision, PolicyEnforcer};
 
+use super::shared_admission::SharedAdmission;
 use crate::context::RequestContext;
 
 /// Bucket-key prefix used when the compiled `key:` expression fails to
@@ -89,7 +108,11 @@ pub struct RateLimitEnforcer {
     /// The policy's `key:` expression, compiled once at config load.
     /// `None` when the policy configures no key (the default client-IP
     /// behaviour).
-    compiled_key: Option<CompiledCel>,
+    ///
+    /// Behind an `Arc` so the shared-admission handle can derive the same
+    /// bucket key from the same compiled expression without recompiling
+    /// it or holding a borrow of the enforcer.
+    compiled_key: Option<Arc<CompiledCel>>,
 }
 
 impl RateLimitEnforcer {
@@ -102,9 +125,10 @@ impl RateLimitEnforcer {
     /// in the default bucket.
     pub fn new(policy: Arc<RateLimitPolicy>, metric_policy: &str) -> anyhow::Result<Self> {
         let compiled_key = match policy.key.as_deref() {
-            Some(expr) if !expr.is_empty() => {
-                Some(CompiledCel::compile("policy `rate_limiting` key", expr)?)
-            }
+            Some(expr) if !expr.is_empty() => Some(Arc::new(CompiledCel::compile(
+                "policy `rate_limiting` key",
+                expr,
+            )?)),
             _ => None,
         };
         Ok(Self {
@@ -112,6 +136,77 @@ impl RateLimitEnforcer {
             metric_policy: CompactString::new(metric_policy),
             compiled_key,
         })
+    }
+
+    /// A handle that admits this policy against its cluster-shared tier,
+    /// for policies that have one.
+    ///
+    /// `None` for a local-only policy, which is the common case: the
+    /// request path then never enters the seam and keeps exactly the
+    /// synchronous behaviour it had before WOR-2332.
+    pub(crate) fn shared_admission(&self) -> Option<Arc<dyn SharedAdmission>> {
+        if !self.policy.has_shared_tier() {
+            return None;
+        }
+        Some(Arc::new(RateLimitSharedAdmission {
+            policy: Arc::clone(&self.policy),
+            compiled_key: self.compiled_key.clone(),
+        }))
+    }
+}
+
+/// The shared-tier half of [`RateLimitEnforcer`], split out so the bucket
+/// key can be derived under a context borrow that ends before the await.
+///
+/// Shares the policy and the compiled key expression with the enforcer by
+/// `Arc`, so there is one policy, one set of counters, and one compiled
+/// CEL program no matter which half runs.
+struct RateLimitSharedAdmission {
+    policy: Arc<RateLimitPolicy>,
+    compiled_key: Option<Arc<CompiledCel>>,
+}
+
+impl SharedAdmission for RateLimitSharedAdmission {
+    fn shared_admission_key(
+        &self,
+        req: &http::Request<Bytes>,
+        ctx: &RequestContext,
+    ) -> Option<String> {
+        Some(bucket_key(self.compiled_key.as_deref(), req, ctx))
+    }
+
+    fn shared_admit<'a>(
+        &'a self,
+        key: String,
+    ) -> Pin<Box<dyn Future<Output = RateLimitInfo> + Send + 'a>> {
+        Box::pin(async move { self.policy.allow_with_info_async(&key).await })
+    }
+}
+
+/// Resolve the rate-limit bucket key for one request.
+///
+/// Shared by the synchronous enforcer and the shared-admission handle so
+/// the two cannot bucket the same request differently. Splitting it out
+/// is what makes the seam work at all: this is the only part of admission
+/// that needs the request context, and it needs it only synchronously.
+fn bucket_key(
+    compiled_key: Option<&CompiledCel>,
+    req: &http::Request<Bytes>,
+    ctx: &RequestContext,
+) -> String {
+    let default_client_id = ctx
+        .client_ip
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| ctx.hostname.to_string());
+    match compiled_key {
+        Some(expr) => match rate_limit_key_from_cel(req, ctx, expr) {
+            CelKeyOutcome::Resolved(key) => key,
+            CelKeyOutcome::NoKey => default_client_id,
+            CelKeyOutcome::EvalError => {
+                format!("{CEL_KEY_ERROR_BUCKET_PREFIX}{default_client_id}")
+            }
+        },
+        None => default_client_id,
     }
 }
 
@@ -138,27 +233,29 @@ impl PolicyEnforcer for RateLimitEnforcer {
                 });
             }
         };
-        let default_client_id = ctx
-            .client_ip
-            .map(|ip| ip.to_string())
-            .unwrap_or_else(|| ctx.hostname.to_string());
-        let client_id = match self.compiled_key.as_ref() {
-            Some(expr) => match rate_limit_key_from_cel(req, ctx, expr) {
-                CelKeyOutcome::Resolved(key) => key,
-                CelKeyOutcome::NoKey => default_client_id,
-                CelKeyOutcome::EvalError => {
-                    format!("{CEL_KEY_ERROR_BUCKET_PREFIX}{default_client_id}")
-                }
-            },
-            None => default_client_id,
+        // Take, do not peek: a chain may carry more than one rate-limit
+        // policy, and the second must not inherit the first's decision.
+        // `check_policies` fills this slot immediately before dispatching
+        // the enforcer it belongs to.
+        let info = match ctx.shared_rate_limit_decision.take() {
+            // WOR-2332: the shared tier already decided, at the
+            // `check_policies` call site, where the await is legal. The
+            // bucket key was derived there from this same request and
+            // context, so nothing is recomputed here.
+            Some(precomputed) => precomputed,
+            // Local-only policy: the synchronous token bucket, unchanged.
+            // No shared tier is attached, so there is nothing to consult
+            // and no reason to pay for an await.
+            //
+            // This branch is not a fallback for a failed shared call.
+            // `allow_with_info_async` has its own fail-open posture and
+            // returns an admitting `RateLimitInfo` when Redis is
+            // unreachable, so a store outage never lands here.
+            None => {
+                let client_id = bucket_key(self.compiled_key.as_deref(), req, ctx);
+                policy.allow_with_info_for(&client_id)
+            }
         };
-        // Synchronous variant of the rate-limit check. The async
-        // path the original server.rs arm called only differs in
-        // that it yields between buckets; the per-decision
-        // semantics are identical. Synchronous keeps the ctx
-        // mutation off the `.await` boundary so the trait's
-        // `Send + '_` future bound holds.
-        let info = policy.allow_with_info_for(&client_id);
         // The label is the configured route pattern captured once during
         // pipeline compilation, never a request-derived hostname. The metric
         // helper additionally applies the shared cardinality cap.

@@ -609,6 +609,21 @@ export interface CreatedKey {
   key: AdminKey;
 }
 
+/**
+ * Result of a key lifecycle action.
+ *
+ * `rotate` mints a new secret and is the only action that returns one, so
+ * `token` is optional. WOR-2345: this was typed `unknown` and the caller
+ * discarded the body, which meant rotating a key from the console threw
+ * the new secret away. Typing it is what makes forgetting it a compile
+ * error rather than a silent lockout once the grace window lapses.
+ */
+export interface KeyActionResult {
+  token?: string;
+  grace_expires_at?: string;
+  key?: AdminKey;
+}
+
 /** Minimal, strictly-typed key listing for selectors (e.g. the playground's
  *  virtual-key picker). `api.keys()` above stays loosely typed for the
  *  full Keys view; this mirrors the same `GET /admin/keys` response. */
@@ -2035,6 +2050,63 @@ export interface PromptEntry {
   [k: string]: unknown;
 }
 
+/**
+ * Flatten `GET /admin/prompts` into the row shape the Prompts page renders.
+ *
+ * The endpoint returns a doubly-nested map:
+ *
+ * ```json
+ * { "hosts": { "<host>": { "prompts": { "<name>": {
+ *     "default_version": "...", "effective_version": "...",
+ *     "versions": ["1", "2"] } } } } }
+ * ```
+ *
+ * WOR-2343: the page used the generic `asList` helper, which looks for a
+ * known key (`prompts`, `overlays`, `items`, `data`) or the first
+ * array-valued property. `hosts` is in neither category, and its value is
+ * an object, so the helper returned `[]` and the page rendered empty
+ * forever, with no error anywhere. The feature underneath works end to
+ * end; only this projection was missing.
+ *
+ * `default_version` is the operator's pin and `effective_version` is what
+ * `PromptStore::render` would actually choose, which is the pinned
+ * version when one is set and the highest numeric label otherwise. Both
+ * are carried so the page can show the pin without implying an unpinned
+ * prompt has no active version.
+ */
+export function flattenPromptOverlay(data: unknown): PromptEntry[] {
+  const hosts = (data as { hosts?: unknown } | null)?.hosts;
+  if (!hosts || typeof hosts !== "object") return [];
+  const rows: PromptEntry[] = [];
+  for (const [host, hostEntry] of Object.entries(hosts as Record<string, unknown>)) {
+    const prompts = (hostEntry as { prompts?: unknown } | null)?.prompts;
+    if (!prompts || typeof prompts !== "object") continue;
+    for (const [name, entry] of Object.entries(prompts as Record<string, unknown>)) {
+      const e = (entry ?? {}) as {
+        default_version?: string | null;
+        effective_version?: string | null;
+        versions?: unknown;
+      };
+      rows.push({
+        host,
+        name,
+        pinned: e.default_version ?? undefined,
+        active: e.effective_version ?? undefined,
+        versions: Array.isArray(e.versions) ? (e.versions as string[]) : [],
+      });
+    }
+  }
+  // Stable ordering so a poll does not reshuffle the page under the
+  // operator; `Object.entries` order is insertion order from the server's
+  // map, which is not guaranteed to be meaningful.
+  rows.sort(
+    (a, b) =>
+      (a.host ?? "").localeCompare(b.host ?? "") ||
+      (a.name ?? "").localeCompare(b.name ?? ""),
+  );
+  return rows;
+}
+
 // WOR-2094: one normalized audit event from the bounded runtime sample.
 export interface AuditEvent {
   timestamp: string;
@@ -2139,11 +2211,21 @@ export interface CacheStatus {
   prefix_purge_supported?: boolean;
 }
 export interface SemanticDecision {
+  /**
+   * One of `hit`, `no_entry`, `expired`, `below_threshold`,
+   * `incompatible`, or `backend_error`. Mirrors `CacheDecision.reason` in
+   * crates/sbproxy-ai/src/semantic_cache.rs.
+   */
   reason: string;
   score?: number | null;
   threshold: number;
-  scope: string;
+  /** Unix seconds when the lookup happened. */
   at_unix: number;
+  // WOR-2344: `scope` was declared here as a required string long after
+  // the 2026-08-01 distributed-cache rewrite stopped emitting it, so
+  // every read was `undefined` while TypeScript insisted it was a string.
+  // The cross-tenant guarantee it described is intact; only the
+  // admin-visible field went away.
 }
 export interface SemanticCacheDebug {
   caches: { origin: string; recent: SemanticDecision[] }[];
@@ -2501,7 +2583,10 @@ export const api = {
       ),
     ),
   keyAction: (id: string, action: "revoke" | "block" | "unblock" | "rotate") =>
-    sendJson<unknown>("POST", `/admin/keys/${encodeURIComponent(id)}/${action}`),
+    sendJson<KeyActionResult>(
+      "POST",
+      `/admin/keys/${encodeURIComponent(id)}/${action}`,
+    ),
   deleteKey: (id: string) =>
     sendJson<unknown>("DELETE", `/admin/keys/${encodeURIComponent(id)}`),
 

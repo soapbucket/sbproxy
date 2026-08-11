@@ -63,6 +63,20 @@ const LB_ZONE_NOTE: &str =
      targets renders a column and does not make the proxy prefer a same-zone target. Tracked \
      by WOR-2328.";
 
+/// Where the load balancer parses and validates its own config block.
+const LB_CONFIG_CONSUMER: &str =
+    "sbproxy_modules::action::loadbalancer::LoadBalancerAction::from_config_for_origin";
+
+/// Per-request target selection, which is where priority ordering applies.
+const LB_SELECT_CONSUMER: &str =
+    "sbproxy_modules::action::loadbalancer::LoadBalancerAction::select_target_for_request";
+
+/// The forwarding-header controls are read a crate away, on a local
+/// `forwarding` binding rather than as a field access on
+/// `ForwardingHeaderControls`, so the reader scan cannot attribute them.
+/// All seven are read in the same function, each gating one header.
+const FORWARDING_CONSUMER: &str = "sbproxy_core::server::proxy_http::apply_forwarding_headers";
+
 /// Keys whose reader is indirect, plus deliberately inert compatibility keys.
 ///
 /// Every override names one exact schema leaf. Parent entries never suppress
@@ -149,6 +163,48 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
     // Deleting either field on its own would have been silent: neither
     // config struct sets `deny_unknown_fields`, so an operator's key would
     // have gone from inert-and-documented to inert-and-ignored.
+    // WOR-2330: the eleven entries below are what flipping
+    // `origins.*.action` to `Enforced` surfaced. Every one has a real
+    // production reader; the scan cannot attribute them because the read
+    // happens on a local binding, inside a validation, or a crate away
+    // from the type that declares the field. They are `stable` with a
+    // named consumer rather than `config_only`, because each key does
+    // change behaviour.
+    stable("origins.*.action.lb_method", LB_CONFIG_CONSUMER),
+    stable("origins.*.action.strategy_config", LB_CONFIG_CONSUMER),
+    stable("origins.*.action.targets[].priority", LB_SELECT_CONSUMER),
+    stable(
+        "origins.*.action.targets[].health_check.path",
+        "sbproxy_modules::action::loadbalancer::LoadBalancerAction::spawn_health_probes_on",
+    ),
+    stable(
+        "origins.*.action.targets[].disable_forwarded_for_header",
+        FORWARDING_CONSUMER,
+    ),
+    stable(
+        "origins.*.action.targets[].disable_forwarded_header",
+        FORWARDING_CONSUMER,
+    ),
+    stable(
+        "origins.*.action.targets[].disable_forwarded_host_header",
+        FORWARDING_CONSUMER,
+    ),
+    stable(
+        "origins.*.action.targets[].disable_forwarded_port_header",
+        FORWARDING_CONSUMER,
+    ),
+    stable(
+        "origins.*.action.targets[].disable_forwarded_proto_header",
+        FORWARDING_CONSUMER,
+    ),
+    stable(
+        "origins.*.action.targets[].disable_real_ip_header",
+        FORWARDING_CONSUMER,
+    ),
+    stable(
+        "origins.*.action.targets[].disable_via_header",
+        FORWARDING_CONSUMER,
+    ),
     stable(
         "origins.*.action.resilience.circuit_breaker.failure_threshold",
         AI_RESILIENCE_CONSUMER,
@@ -891,19 +947,13 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
     // that exits `sbproxy plan` with 3. Warning that a key which changes a
     // plan's exit code does nothing is the wrong answer.
     stable("proxy.secrets.map.*", "sbproxy::install_secret_resolver"),
-    config_only(
+    stable(
         "proxy.secrets.rotation.grace_period_secs",
-        "The rotation runtime exists and is unwired. `sbproxy_vault::RotationManager` \
-         implements exactly this grace window and re-resolve interval and is unit tested, but \
-         nothing constructs it from this block and nothing drives the interval, so secrets are \
-         resolved once at boot and never again. WOR-2327.",
+        "sbproxy_core::key_plane::KeyPlane::resolve_credential_secret",
     ),
-    config_only(
+    stable(
         "proxy.secrets.rotation.re_resolve_interval_secs",
-        "The rotation runtime exists and is unwired. `sbproxy_vault::RotationManager` \
-         implements exactly this grace window and re-resolve interval and is unit tested, but \
-         nothing constructs it from this block and nothing drives the interval, so secrets are \
-         resolved once at boot and never again. WOR-2327.",
+        "sbproxy_core::key_plane::KeyPlane::resolve_credential_secret",
     ),
     config_only(
         "proxy.tenants[].credentials[].attrs.budget.reset",
@@ -990,39 +1040,53 @@ const fn rooted(kind: &'static str, name: &'static str) -> ModuleCoverage {
 
 /// Configuration subtrees the generated schema cannot reach.
 ///
-/// Both entries are `ReportOnly` for now. Their findings print, they do not
-/// fail the build, and the ones already traced by hand are pinned in
-/// `CONFIG_KEY_OVERRIDES` so an operator who sets them is warned at boot.
-/// Turning a root `Enforced` is a separate, deliberate step: it means
-/// somebody has read every finding under it and either wired the key or
-/// pinned it. Doing that on the same change that widened the scan would
-/// fail the build on five pre-existing dead keys, and a check that does
-/// that gets reverted rather than fixed.
+/// Both entries are `Enforced` as of WOR-2330: somebody has read every key
+/// under each and either confirmed a reader or pinned it above. A dead key
+/// added under either root now fails the build rather than printing a line
+/// nobody reads.
+///
+/// `ReportOnly` remains the honest state for a subtree nobody has walked
+/// yet, and it is how both of these started. It is meant to be temporary,
+/// because a `ReportOnly` root prevents no regressions and quietly
+/// accumulates whatever is added under it. Widening the scan and flipping
+/// the flag are still two separate changes: doing both at once fails the
+/// build on pre-existing dead keys, and a check that does that gets
+/// reverted rather than fixed.
+///
+/// What the WOR-2330 walk found, recorded so the next person does not
+/// re-derive it:
+///
+/// * `origins.*.action`: every key had a live reader except `targets[].zone`,
+///   which stays pinned above under WOR-2328. Two looked dead and are not.
+///   `targets[].host_override` reads in `sbproxy_core`'s upstream-host
+///   selection rather than in the load balancer, so a search scoped to
+///   `loadbalancer.rs` misses it. `lb_method` is read only by the
+///   `lb_method: plugin requires strategy` validation and selects nothing,
+///   which is exactly what it is documented to be.
+/// * `origins.*.action.resilience`: `retry_policy` and `llm_aware` were the
+///   untriaged pair and both are live, in the failover loop's per-error
+///   retry classification and in the handler's LLM-aware action lookup.
+///
+/// Growing coverage a subtree at a time is the intended pattern. The AI
+/// action is several hundred keys, so `resilience` is rooted at the
+/// subtree rather than at `AiHandlerConfig`; more narrow roots are the
+/// right shape for the rest, not one wide one.
 #[cfg(test)]
 const MODULE_CONFIG_ROOTS: &[ModuleConfigRoot] = &[
     ModuleConfigRoot {
         path: "origins.*.action",
         rust_type: "sbproxy_modules::action::loadbalancer::LoadBalancerConfig",
-        enforcement: ModuleRootEnforcement::ReportOnly(
-            "target zones are display-only here and are pinned above, where WOR-2328 owns the \
-             build-or-retire decision, and the load balancer refuses the removed sticky block \
-             at config compile; the rest of the load_balancer surface has not been triaged, \
-             which is what WOR-2330 tracks.",
-        ),
+        enforcement: ModuleRootEnforcement::Enforced,
     },
     // Rooted at the subtree rather than at `AiHandlerConfig`, deliberately.
     // The whole AI action is several hundred keys and nobody has triaged
-    // them; `resilience` is where the confirmed-dead ones are. A root is a
+    // them; `resilience` is where the confirmed-dead ones were. A root is a
     // path and a type, so coverage can grow a subtree at a time instead of
     // waiting for one very large review.
     ModuleConfigRoot {
         path: "origins.*.action.resilience",
         rust_type: "sbproxy_ai::handler::AiResilienceConfig",
-        enforcement: ModuleRootEnforcement::ReportOnly(
-            "the circuit-breaker and outlier-detection blocks are wired and are pinned stable \
-             above, which is what WOR-2233 shipped; retry_policy and llm_aware have not been \
-             triaged, which is what WOR-2330 tracks.",
-        ),
+        enforcement: ModuleRootEnforcement::Enforced,
     },
 ];
 

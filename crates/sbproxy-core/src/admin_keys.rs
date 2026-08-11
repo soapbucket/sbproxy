@@ -1651,6 +1651,18 @@ struct KeyView {
     updated_at: DateTime<Utc>,
     source: sbproxy_keystore::record::RecordSource,
     /// True while a rotation grace window is open (the prior secret still works).
+    ///
+    /// WOR-2346: this used to be `prev_secret_hash.is_some()`, and nothing
+    /// ever clears `prev_secret_hash`, so every key that had ever been
+    /// rotated reported `true` forever. The flag disagreed with its own
+    /// documentation and with the code that decides the question.
+    ///
+    /// The authority is `KeyRecord::verify_secret`, which accepts the
+    /// prior hash only while `prev_hash_expires_at > now`. This is
+    /// computed the same way, so the badge an operator reads and the
+    /// check the request path performs cannot disagree. It self-clears
+    /// when the window lapses, which is why no "confirm rotation" action
+    /// is needed to make it honest.
     rotation_pending: bool,
 }
 
@@ -1688,7 +1700,8 @@ impl From<&KeyRecord> for KeyView {
             created_at: r.created_at,
             updated_at: r.updated_at,
             source: r.source,
-            rotation_pending: r.prev_secret_hash.is_some(),
+            rotation_pending: r.prev_secret_hash.is_some()
+                && r.prev_hash_expires_at.is_some_and(|exp| exp > Utc::now()),
         }
     }
 }
@@ -2401,6 +2414,10 @@ mod tests {
             .starts_with(&format!("sk-{key_id}-")));
         assert_eq!(v["key"]["rotation_pending"], true);
         assert_eq!(v["key"]["policy_revision"], 5);
+        assert!(
+            v["key"]["rotation_pending"].as_bool().unwrap(),
+            "a 120s grace window opened moments ago is genuinely still open"
+        );
 
         // Revocation is terminal. Neither unblock nor rotation may change it.
         let resp = dispatch(
@@ -3373,5 +3390,53 @@ mod tests {
             governance.snapshot_requests().is_empty(),
             "malformed monetary policies must not reach governance storage"
         );
+    }
+
+    /// WOR-2346: `rotation_pending` has to mean what it says.
+    ///
+    /// Driven through the `KeyView` conversion rather than the dispatcher
+    /// because the interesting case is a grace window that has already
+    /// lapsed, and the dispatcher cannot travel in time.
+    #[test]
+    fn rotation_pending_tracks_the_grace_window_not_merely_the_prior_hash() {
+        use sbproxy_keystore::record::KeyRecord;
+
+        let now = Utc::now();
+        let mut record = KeyRecord::new("k-rotation", "hash-current", now);
+        assert!(
+            !KeyView::from(&record).rotation_pending,
+            "a key that was never rotated has no window open"
+        );
+
+        // Rotation just happened: window open, prior secret still valid.
+        record.prev_secret_hash = Some("hash-previous".to_string());
+        record.prev_hash_expires_at = Some(now + chrono::Duration::seconds(120));
+        assert!(
+            KeyView::from(&record).rotation_pending,
+            "an unexpired window is genuinely pending"
+        );
+
+        // The window has lapsed. `verify_secret` stopped accepting the
+        // prior hash at this instant, so the badge has to agree. Nothing
+        // clears `prev_secret_hash`, which is exactly why reading it
+        // alone reported `true` forever.
+        record.prev_hash_expires_at = Some(now - chrono::Duration::seconds(1));
+        assert!(
+            record.prev_secret_hash.is_some(),
+            "the prior hash is still on the record, which is the trap"
+        );
+        assert!(
+            !record.verify_secret("anything", b"pepper", now),
+            "the authority has already closed the window"
+        );
+        assert!(
+            !KeyView::from(&record).rotation_pending,
+            "an expired window must not keep reporting pending"
+        );
+
+        // A prior hash with no expiry at all cannot be verified against
+        // either, so it must not read as pending.
+        record.prev_hash_expires_at = None;
+        assert!(!KeyView::from(&record).rotation_pending);
     }
 }

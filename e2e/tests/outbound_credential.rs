@@ -139,6 +139,7 @@ origins:
       token_endpoint: "{token}"
       audience: "https://api.example.com"
       allowed_audiences: ["https://api.example.com"]
+      subject_token_issuers: ["https://issuer"]
 "#,
         app = app.base_url(),
         token = token_endpoint.base_url(),

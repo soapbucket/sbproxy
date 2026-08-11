@@ -2,21 +2,19 @@
 import { computed, onMounted, ref, watch } from "vue";
 import {
   api,
-  ApiError,
   type AuditEvent,
   type AuditRow,
-  type WorkspaceStatus,
 } from "../api";
 import { useAsync } from "../composables/useAsync";
 import { toast } from "../composables/useToasts";
-import { formatTime, shortId, toDate } from "../lib/format";
+import { formatTime, shortId } from "../lib/format";
 import PageHeader from "../components/PageHeader.vue";
 import StatusBadge from "../components/StatusBadge.vue";
 import ErrorState from "../components/ErrorState.vue";
 import EmptyState from "../components/EmptyState.vue";
+import WorkspaceBudgets from "../components/WorkspaceBudgets.vue";
 
 const req = useAsync(() => api.auditRecent(100));
-const budgetReq = useAsync(() => api.budgetSnapshot());
 
 // WOR-2094: the unified security + change audit sample.
 const channelFilter = ref<"" | "security" | "key" | "config" | "admin" | "policy">("");
@@ -35,7 +33,6 @@ watch([channelFilter, keyFilter], () => eventsReq.run());
 
 function refresh() {
   req.run();
-  budgetReq.run();
   eventsReq.run();
 }
 onMounted(refresh);
@@ -57,45 +54,6 @@ function channelTone(channel: string): "ok" | "warn" | "err" | "info" | "neutral
 
 const rows = computed<AuditRow[]>(() => (Array.isArray(req.data.value) ? req.data.value : []));
 
-// Budget snapshot (WOR-1764). 404 means no rate_limits block; treat as empty.
-const budgets = computed<WorkspaceStatus[]>(() =>
-  Array.isArray(budgetReq.data.value) ? budgetReq.data.value : [],
-);
-const budgetConfigured = computed(
-  () => !(budgetReq.error.value instanceof ApiError && budgetReq.error.value.status === 404),
-);
-
-const busy = ref("");
-async function resume(ws: string) {
-  if (busy.value) return;
-  busy.value = ws;
-  try {
-    await api.resumeWorkspace(ws);
-    toast.success(`Resumed "${ws}"`);
-    budgetReq.run();
-    req.run();
-  } catch (e) {
-    toast.error(e, "Resume workspace");
-  } finally {
-    busy.value = "";
-  }
-}
-
-function tierTone(tier?: string): "ok" | "warn" | "err" | "neutral" {
-  switch (tier) {
-    case "auto_suspend":
-      return "err";
-    case "throttle":
-      return "warn";
-    case "soft":
-      return "warn";
-    case "normal":
-      return "ok";
-    default:
-      return "neutral";
-  }
-}
-
 function actionTone(action?: string): "ok" | "warn" | "err" | "neutral" {
   const a = (action ?? "").toLowerCase();
   if (a.includes("suspend") || a.includes("block")) return "err";
@@ -116,38 +74,13 @@ function actionTone(action?: string): "ok" | "warn" | "err" | "neutral" {
   </PageHeader>
 
 
-  <!-- Workspace budgets + manual resume (WOR-1764) -->
-  <section class="section" v-if="budgetConfigured">
-    <h2>Workspace budgets</h2>
-    <EmptyState
-      v-if="!budgets.length"
-      message="No workspaces have tripped the rate-limit budget yet."
-    />
-    <div v-else class="table-wrap">
-      <table class="sb-table">
-        <thead>
-          <tr><th>Workspace</th><th>Tier</th><th>Cooldown</th><th></th></tr>
-        </thead>
-        <tbody>
-          <tr v-for="b in budgets" :key="b.workspace">
-            <td class="sb-mono">{{ b.workspace }}</td>
-            <td><StatusBadge :label="b.tier ?? 'unknown'" :tone="tierTone(b.tier)" /></td>
-            <td>{{ b.cooldown_secs != null ? `${b.cooldown_secs}s` : "-" }}</td>
-            <td>
-              <button
-                v-if="b.suspended && b.workspace"
-                class="sb-btn sb-btn--sm"
-                :disabled="busy === b.workspace"
-                @click="resume(b.workspace)"
-              >
-                {{ busy === b.workspace ? "Resuming..." : "Resume" }}
-              </button>
-            </td>
-          </tr>
-        </tbody>
-      </table>
-    </div>
-  </section>
+  <!--
+    WOR-2353: the budgets table and its Resume control moved into a shared
+    component so Overview carries them too. They stay here because the
+    budget audit trail below is the record of these actions, but Overview
+    is where an operator looks when something needs attention.
+  -->
+  <WorkspaceBudgets @resumed="req.run()" />
 
   <!-- WOR-2094: security + change audit timeline -->
   <section class="section">
@@ -191,7 +124,7 @@ function actionTone(action?: string): "ok" | "warn" | "err" | "neutral" {
         </thead>
         <tbody>
           <tr v-for="(e, i) in events" :key="i">
-            <td class="sb-mono">{{ formatTime(toDate(e.timestamp)) }}</td>
+            <td class="sb-mono">{{ formatTime(e.timestamp) }}</td>
             <td><StatusBadge :label="e.channel" :tone="channelTone(e.channel)" /></td>
             <td class="sb-mono">{{ e.kind }}</td>
             <td class="sb-mono">{{ e.actor ?? "-" }}</td>
@@ -220,7 +153,7 @@ function actionTone(action?: string): "ok" | "warn" | "err" | "neutral" {
         </thead>
         <tbody>
           <tr v-for="(r, i) in rows" :key="i">
-            <td class="sb-mono">{{ r.timestamp ? formatTime(toDate(r.timestamp)) : "-" }}</td>
+            <td class="sb-mono">{{ r.timestamp ? formatTime(r.timestamp) : "-" }}</td>
             <td><StatusBadge :label="r.action ?? 'unknown'" :tone="actionTone(r.action)" /></td>
             <td class="sb-mono">
               {{ r.target_kind ? `${r.target_kind}:` : "" }}{{ r.target_id ?? "-" }}

@@ -8,6 +8,7 @@ import StatCard from "../components/StatCard.vue";
 import StatusBadge from "../components/StatusBadge.vue";
 import ErrorState from "../components/ErrorState.vue";
 import EmptyState from "../components/EmptyState.vue";
+import WorkspaceBudgets from "../components/WorkspaceBudgets.vue";
 
 // This page's subtitle promises live health, so it polls. 10s on health
 // (the thing an operator is actually watching) and 30s on the heavier
@@ -215,6 +216,14 @@ function optionalNumber(v: unknown): number | undefined {
       />
     </div>
   </section>
+
+  <!--
+    WOR-2353: a suspended workspace is exactly the kind of thing an
+    operator opens this page to find, and the only control that resumes
+    one used to live unlinked under /audit. Shown only when something is
+    suspended, so a healthy fleet does not grow a permanently empty card.
+  -->
+  <WorkspaceBudgets only-when-noteworthy />
 </template>
 
 <style scoped>

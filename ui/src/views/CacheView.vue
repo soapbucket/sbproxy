@@ -4,7 +4,7 @@ import { api, type CacheStatus } from "../api";
 import { useAsync } from "../composables/useAsync";
 import { toast } from "../composables/useToasts";
 import { parsePrometheus, findFamily, sumSamples } from "../lib/metrics";
-import { formatNumber } from "../lib/format";
+import { formatNumber, formatTime } from "../lib/format";
 import PageHeader from "../components/PageHeader.vue";
 import StatCard from "../components/StatCard.vue";
 import ErrorState from "../components/ErrorState.vue";
@@ -230,16 +230,26 @@ const evictAllPolicies = () =>
 
     <div class="sb-card panel" v-if="semanticCaches.length">
       <h3>Semantic cache decisions</h3>
+      <!--
+        WOR-2344: reasons kept in step with `CacheDecision` in
+        crates/sbproxy-ai/src/semantic_cache.rs. `cross_scope` was real
+        until the 2026-08-01 distributed-cache rewrite stopped reporting
+        it; the cross-tenant guarantee itself is intact and pinned by that
+        commit's `cross_scope_entries_never_enter_exact_selection`, only
+        the admin-visible distinction went away. `incompatible` and
+        `backend_error` arrived in the same change and were never listed.
+      -->
       <p class="sb-faint">
         Recent embedding-cache lookups and why each hit or missed
-        (no_entry / expired / below_threshold / cross_scope).
+        (hit / no_entry / expired / below_threshold / incompatible /
+        backend_error).
       </p>
       <div v-for="c in semanticCaches" :key="c.origin" class="semantic">
         <div class="semantic__origin sb-mono">{{ c.origin }}</div>
         <div class="table-wrap">
           <table class="sb-table">
             <thead>
-              <tr><th>Reason</th><th>Score</th><th>Threshold</th><th>Scope</th></tr>
+              <tr><th>Reason</th><th>Score</th><th>Threshold</th><th>When</th></tr>
             </thead>
             <tbody>
               <tr v-for="(d, i) in c.recent" :key="i">
@@ -250,7 +260,9 @@ const evictAllPolicies = () =>
                 </td>
                 <td>{{ d.score != null ? d.score.toFixed(3) : "-" }}</td>
                 <td>{{ d.threshold.toFixed(2) }}</td>
-                <td class="sb-mono sb-muted">{{ d.scope || "-" }}</td>
+                <td class="sb-mono sb-muted">
+                  {{ d.at_unix ? formatTime(d.at_unix) : "-" }}
+                </td>
               </tr>
             </tbody>
           </table>

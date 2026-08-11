@@ -1814,88 +1814,13 @@ impl ProxyHttp for SbProxy {
         // the real client + the public-facing scheme/port. Each header is
         // governed by an opt-out flag on the action so callers can suppress
         // any of them per route.
-        let client_ip_str = ctx.client_ip.map(|ip| ip.to_string());
-        let is_tls = session
-            .digest()
-            .and_then(|d| d.ssl_digest.as_ref())
-            .is_some();
-        let proto = if is_tls { "https" } else { "http" };
-        let listener_port: Option<u16> = session
-            .server_addr()
-            .and_then(|a| a.as_inet())
-            .map(|a| a.port());
-
-        if !forwarding.disable_forwarded_for_header {
-            if let Some(ip) = &client_ip_str {
-                // RFC: append to existing X-Forwarded-For so chained
-                // proxies preserve the full client trail.
-                let new_xff = match upstream_request
-                    .headers
-                    .get("x-forwarded-for")
-                    .and_then(|v| v.to_str().ok())
-                {
-                    Some(existing) if !existing.is_empty() => format!("{existing}, {ip}"),
-                    _ => ip.clone(),
-                };
-                let _ = upstream_request.insert_header("x-forwarded-for".to_string(), &new_xff);
-            }
-        }
-
-        if !forwarding.disable_real_ip_header {
-            if let Some(ip) = &client_ip_str {
-                let _ = upstream_request.insert_header("x-real-ip".to_string(), ip.as_str());
-            }
-        }
-
-        if !forwarding.disable_forwarded_proto_header {
-            let _ = upstream_request.insert_header("x-forwarded-proto".to_string(), proto);
-        }
-
-        if !forwarding.disable_forwarded_port_header {
-            if let Some(port) = listener_port {
-                let _ = upstream_request
-                    .insert_header("x-forwarded-port".to_string(), port.to_string().as_str());
-            }
-        }
-
-        if !forwarding.disable_forwarded_header {
-            // RFC 7239 Forwarded: for=<client>; proto=<scheme>; host=<orig>; by=<proxy>
-            // Append to existing Forwarded so chained proxies preserve the trail.
-            let mut parts: Vec<String> = Vec::with_capacity(4);
-            if let Some(ip) = &client_ip_str {
-                parts.push(format!("for={}", forwarded_node(ip)));
-            }
-            parts.push(format!("proto={proto}"));
-            if let Some(orig) = &client_host {
-                parts.push(format!("host=\"{orig}\""));
-            }
-            if let Some(addr) = session.server_addr().and_then(|a| a.as_inet()) {
-                parts.push(format!("by={}", forwarded_node(&addr.ip().to_string())));
-            }
-            let new_value = parts.join("; ");
-            let merged = match upstream_request
-                .headers
-                .get("forwarded")
-                .and_then(|v| v.to_str().ok())
-            {
-                Some(existing) if !existing.is_empty() => format!("{existing}, {new_value}"),
-                _ => new_value,
-            };
-            let _ = upstream_request.insert_header("forwarded".to_string(), &merged);
-        }
-
-        if !forwarding.disable_via_header {
-            let token = "1.1 sbproxy";
-            let merged = match upstream_request
-                .headers
-                .get("via")
-                .and_then(|v| v.to_str().ok())
-            {
-                Some(existing) if !existing.is_empty() => format!("{existing}, {token}"),
-                _ => token.to_string(),
-            };
-            let _ = upstream_request.insert_header("via".to_string(), &merged);
-        }
+        apply_forwarding_headers(
+            &forwarding,
+            session,
+            upstream_request,
+            ctx.client_ip,
+            client_host.as_deref(),
+        );
 
         // Propagate the correlation ID to the upstream under the
         // configured header name. The same value is echoed on the
@@ -6487,6 +6412,112 @@ impl ProxyHttp for SbProxy {
     }
 }
 
+/// Write the standard forwarding headers, honoring each per-target
+/// opt-out.
+///
+/// Split out of `upstream_request_filter` for WOR-2330. The seven
+/// `disable_*_header` flags are read here and nowhere else, and the
+/// config-reader guard cannot attribute a read that happens inside a
+/// trait method: it skips trait impls deliberately, because a trait
+/// method's name belongs to the trait rather than to the type. A free
+/// function gives those seven keys a consumer the guard can name, which
+/// is what lets `origins.*.action` be an `Enforced` root at all.
+///
+/// The same reasoning is already recorded on `LoadBalancerConfig`, which
+/// lives at module scope rather than inside its constructor so the guard
+/// can walk it. Keeping readers nameable is a standing requirement in
+/// this workspace, not a one-off.
+fn apply_forwarding_headers(
+    forwarding: &sbproxy_modules::action::ForwardingHeaderControls,
+    session: &Session,
+    upstream_request: &mut pingora_http::RequestHeader,
+    client_ip: Option<std::net::IpAddr>,
+    client_host: Option<&str>,
+) {
+    let client_ip_str = client_ip.map(|ip| ip.to_string());
+    let is_tls = session
+        .digest()
+        .and_then(|d| d.ssl_digest.as_ref())
+        .is_some();
+    let proto = if is_tls { "https" } else { "http" };
+    let listener_port: Option<u16> = session
+        .server_addr()
+        .and_then(|a| a.as_inet())
+        .map(|a| a.port());
+
+    if !forwarding.disable_forwarded_for_header {
+        if let Some(ip) = &client_ip_str {
+            // RFC: append to existing X-Forwarded-For so chained
+            // proxies preserve the full client trail.
+            let new_xff = match upstream_request
+                .headers
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok())
+            {
+                Some(existing) if !existing.is_empty() => format!("{existing}, {ip}"),
+                _ => ip.clone(),
+            };
+            let _ = upstream_request.insert_header("x-forwarded-for".to_string(), &new_xff);
+        }
+    }
+
+    if !forwarding.disable_real_ip_header {
+        if let Some(ip) = &client_ip_str {
+            let _ = upstream_request.insert_header("x-real-ip".to_string(), ip.as_str());
+        }
+    }
+
+    if !forwarding.disable_forwarded_proto_header {
+        let _ = upstream_request.insert_header("x-forwarded-proto".to_string(), proto);
+    }
+
+    if !forwarding.disable_forwarded_port_header {
+        if let Some(port) = listener_port {
+            let _ = upstream_request
+                .insert_header("x-forwarded-port".to_string(), port.to_string().as_str());
+        }
+    }
+
+    if !forwarding.disable_forwarded_header {
+        // RFC 7239 Forwarded: for=<client>; proto=<scheme>; host=<orig>; by=<proxy>
+        // Append to existing Forwarded so chained proxies preserve the trail.
+        let mut parts: Vec<String> = Vec::with_capacity(4);
+        if let Some(ip) = &client_ip_str {
+            parts.push(format!("for={}", forwarded_node(ip)));
+        }
+        parts.push(format!("proto={proto}"));
+        if let Some(orig) = client_host {
+            parts.push(format!("host=\"{orig}\""));
+        }
+        if let Some(addr) = session.server_addr().and_then(|a| a.as_inet()) {
+            parts.push(format!("by={}", forwarded_node(&addr.ip().to_string())));
+        }
+        let new_value = parts.join("; ");
+        let merged = match upstream_request
+            .headers
+            .get("forwarded")
+            .and_then(|v| v.to_str().ok())
+        {
+            Some(existing) if !existing.is_empty() => format!("{existing}, {new_value}"),
+            _ => new_value,
+        };
+        let _ = upstream_request.insert_header("forwarded".to_string(), &merged);
+    }
+
+    if !forwarding.disable_via_header {
+        let token = "1.1 sbproxy";
+        let merged = match upstream_request
+            .headers
+            .get("via")
+            .and_then(|v| v.to_str().ok())
+        {
+            Some(existing) if !existing.is_empty() => format!("{existing}, {token}"),
+            _ => token.to_string(),
+        };
+        let _ = upstream_request.insert_header("via".to_string(), &merged);
+    }
+}
+
 /// WOR-819: helper that turns the buffered gRPC response frame plus
 /// the captured `grpc-status` / `grpc-message` into the JSON body the
 /// transcoded REST response should carry. Re-fetches the transcoder
@@ -6664,9 +6695,9 @@ mod tests {
             Some("resource-nonce")
         );
 
-        response.status = http::StatusCode::BAD_REQUEST;
+        response.set_status(http::StatusCode::BAD_REQUEST).unwrap();
         assert!(dpop_resource_nonce_challenge(&response).is_none());
-        response.status = http::StatusCode::UNAUTHORIZED;
+        response.set_status(http::StatusCode::UNAUTHORIZED).unwrap();
         response
             .append_header("dpop-nonce", "second-resource-nonce")
             .unwrap();

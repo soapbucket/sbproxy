@@ -152,13 +152,18 @@ function statusOf(c: Credential): string {
           <td>{{ c.created_at ? formatTime(c.created_at) : "n/a" }}</td>
           <td>{{ c.expires_at ? formatTime(c.expires_at) : "never" }}</td>
           <td class="actions">
-            <button
-              class="sb-btn sb-btn--sm"
-              :disabled="rowBusy === credId(c) + 'rotate'"
-              @click="doAction(c, 'rotate')"
-            >
-              Rotate
-            </button>
+            <!--
+              WOR-2347: no Rotate button here. `credential_subroute` in
+              admin_keys.rs implements revoke, block, and unblock only, so
+              every click returned "unknown credential action".
+
+              It is absent rather than implemented because rotation is not
+              sbproxy's to perform. A key is minted here, so the proxy can
+              issue a replacement; a credential holds a secret the operator
+              obtained from an upstream provider. Rotate it at the provider
+              and PATCH the new value (or point the credential at a
+              `vault://` reference and let the resolver pick it up).
+            -->
             <button
               v-if="c.status !== 'blocked'"
               class="sb-btn sb-btn--sm"

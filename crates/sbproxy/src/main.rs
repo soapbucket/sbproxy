@@ -1708,6 +1708,19 @@ fn install_secret_resolver(path: &std::path::Path) {
             std::process::exit(1);
         }
     };
+    // WOR-2327: install the rotation policy before the backends check
+    // below. It governs how a *resolved* credential is cached and how a
+    // failed re-resolution behaves, which the key plane applies to
+    // credentials it holds regardless of how many backends this config
+    // declares. Both keys parsed into nothing before this call existed.
+    if let Some(rotation) = &secrets.rotation {
+        sbproxy_vault::install_process_rotation(std::sync::Arc::new(
+            sbproxy_vault::RotationPolicy::new(
+                rotation.re_resolve_interval_secs,
+                rotation.grace_period_secs,
+            ),
+        ));
+    }
     if secrets.backends.is_empty() && secrets.map.is_empty() {
         return;
     }

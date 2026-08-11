@@ -88,13 +88,52 @@ function historyTone(
   return entry.alert.severity === "critical" ? "err" : "warn";
 }
 
-function formatRate(value: number | undefined): string {
+/**
+ * What a rule's thresholds and reading are actually measured in.
+ *
+ * WOR-2349: every value used to be multiplied by 100 and suffixed with
+ * `%`, with no check on rule kind anywhere in this file. The engine emits
+ * `cert_expiry` as a day count and `latency_slo` in milliseconds, so an
+ * operator reading either column saw a nonsensical percentage: a 7-day
+ * certificate warning rendered as "700%".
+ *
+ * Ratio is the default because most rules genuinely are ratios, and a new
+ * rule is far more likely to be one than not. `burn_rate` is deliberately
+ * left as a percentage: a burn-rate multiplier expressed that way is a
+ * real SRE convention, not a bug.
+ */
+type AlertUnit = "ratio" | "days" | "milliseconds";
+
+const RULE_UNITS: Record<string, AlertUnit> = {
+  cert_expiry: "days",
+  latency_slo: "milliseconds",
+};
+
+function unitFor(rule: AlertRule): AlertUnit {
+  return RULE_UNITS[rule.rule] ?? "ratio";
+}
+
+function formatReading(value: number | undefined, unit: AlertUnit): string {
   if (value === undefined || !Number.isFinite(value)) return "n/a";
-  return `${formatNumber(value * 100)}%`;
+  switch (unit) {
+    case "days":
+      return `${formatNumber(value)} ${value === 1 ? "day" : "days"}`;
+    case "milliseconds":
+      return `${formatNumber(value)} ms`;
+    case "ratio":
+      return `${formatNumber(value * 100)}%`;
+  }
+}
+
+function formatRate(rule: AlertRule, value: number | undefined): string {
+  return formatReading(value, unitFor(rule));
 }
 
 function formatThresholds(rule: AlertRule): string {
-  return rule.thresholds.map((threshold) => formatRate(threshold)).join(" / ");
+  const unit = unitFor(rule);
+  return rule.thresholds
+    .map((threshold) => formatReading(threshold, unit))
+    .join(" / ");
 }
 
 function channelDescriptor(channel: AlertChannel): string {
@@ -179,7 +218,7 @@ const newestHistory = computed(() => [...(snapshot.value?.history ?? [])].revers
                   <span class="rule-description">{{ rule.description }}</span>
                 </td>
                 <td class="sb-mono">{{ formatThresholds(rule) }}</td>
-                <td class="sb-mono">{{ formatRate(rule.reading) }}</td>
+                <td class="sb-mono">{{ formatRate(rule, rule.reading) }}</td>
                 <td>
                   <span v-if="rule.minimum_samples">
                     {{ formatNumber(rule.sample_count ?? 0) }} /

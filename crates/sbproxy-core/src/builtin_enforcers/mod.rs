@@ -43,6 +43,7 @@ pub mod request_limit;
 pub mod request_validator;
 pub mod response_phase;
 pub mod semantic_constraint;
+pub(crate) mod shared_admission;
 pub mod waf;
 
 pub use a2a::A2AEnforcer;
@@ -64,6 +65,7 @@ pub use openapi_validation::OpenApiValidationEnforcer;
 pub use prompt_injection_v2::PromptInjectionV2Enforcer;
 pub use rate_limit::RateLimitEnforcer;
 pub use rate_limit_budget::RateLimitBudgetEnforcer;
+pub(crate) use registry::resolve_shared_admission;
 pub use registry::{compile_builtin_enforcers, CompiledEnforcer};
 pub use request_limit::RequestLimitEnforcer;
 pub use request_validator::RequestValidatorEnforcer;

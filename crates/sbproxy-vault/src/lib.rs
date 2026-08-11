@@ -43,7 +43,9 @@ pub use metadata::{SecretMeta, SecretMetadataTracker};
 #[cfg(any(test, feature = "test-support"))]
 pub use resolver::reset_process_resolver_for_test;
 pub use resolver::{install_process_resolver, process_resolver, SecretResolver};
-pub use rotation::RotationManager;
+pub use rotation::{
+    install_process_rotation, process_rotation, reset_process_rotation_for_test, RotationPolicy,
+};
 pub use scope::{auto_scope, parse_scope, validate_access, SecretScope};
 pub use secret_string::SecretString;
 pub use vault_ref::{

@@ -150,16 +150,19 @@ as `sbproxy_payment_settlement_total{operation="challenge",
 outcome="unresolved_payment"}` and logged at warn with the intent id, the
 origin, and the route, and with nothing at all about who is paying.
 
-An ordinary client reaches that state by being early. A crawler that
-retries before its invoice is paid is answered 503, and that same 503
-leaves its intent in `NeedsReconciliation`, because the rail verified the
-payment and did not settle it. Paying afterwards does not clear it:
-nothing on the request path is allowed to try again. The next sweep
-clears it, one `worker.reconcile_interval_ms` later at the outside and
-1000 ms by default, and the retry after that reaches the origin. The
-`Retry-After` on the 503 asks for exactly that wait, so a client that
-honors it never sees the difference, and one that polls faster than the
-worker sweeps sees a short run of 503s first.
+An ordinary client being early is nothing like that state. A crawler
+that retries before its invoice is paid is answered 503, but a rail's
+own status check is a clean, repeatable read rather than a stamp on the
+intent: it leaves the intent in `RetryWait`, checked fresh on every
+request rather than remembered from an earlier unpaid answer. Paying
+and retrying is all it takes; the very next request settles, with no
+worker sweep in between. The `Retry-After` on the 503 is a suggested
+pace for that retry, not a wait for anything running in the background.
+What the recovery sweep actually resolves is narrower: a provider
+response that could not be read as a clean negative, a malformed
+success, or a deadline that elapsed after the provider was actually
+asked to act, all of which land in `NeedsReconciliation`, along with the
+unattributable-payer wait described above.
 
 ## The unattributable wait has a deadline
 

@@ -3995,8 +3995,9 @@ origins:
 ### Secret references
 
 Declare named backends under `proxy.secrets.backends` and place a provider URI
-directly in a secret-bearing field. The legacy `backend`, `hashicorp`, `map`,
-`rotation`, and `fallback` fields remain parseable but are config-only. See
+directly in a secret-bearing field. The legacy `backend`, `hashicorp`, `map`, and
+`fallback` fields remain parseable but are config-only. `rotation` is live: see
+[Secret rotation](#secret-rotation). See also
 [Secrets](#secrets) and [the secrets guide](secrets.md).
 
 ### Template scopes
@@ -4949,11 +4950,45 @@ origins:
           api_key: vault://primary/apps/openai?key=api_key
 ```
 
-The legacy `proxy.secrets.backend`, `hashicorp`, `map`, `rotation`, and
-`fallback` keys are config-only compatibility fields. They do not select a
-backend, schedule re-resolution, provide a dual-value grace window, or change
-failure behavior. Use [the named-backend guide](secrets.md) for every supported
-backend and URI shape.
+The legacy `proxy.secrets.backend`, `hashicorp`, `map`, and `fallback` keys are
+config-only compatibility fields. They do not select a backend or change failure
+behavior. Use [the named-backend guide](secrets.md) for every supported backend
+and URI shape.
+
+### Secret rotation
+
+`proxy.secrets.rotation` governs a credential that sbproxy resolves from a
+backend and then presents to an upstream.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `re_resolve_interval_secs` | int | `60` | How long a resolved credential is served before the backend is consulted again. Lower picks up a rotated secret sooner and calls the backend more often. |
+| `grace_period_secs` | int | `0` | How long past that window a credential may still be served, and only when re-resolution has actually failed. `0` disables it. |
+
+```yaml
+proxy:
+  secrets:
+    rotation:
+      re_resolve_interval_secs: 60
+      grace_period_secs: 300
+```
+
+`grace_period_secs` buys availability, not credential overlap. sbproxy presents
+upstream credentials rather than validating them, so it has no old-value
+acceptance window to honor; that belongs to the secret provider, and every
+supported backend already does it (AWS Secrets Manager keeps `AWSPREVIOUS`
+valid, Vault keeps the old lease alive until revocation). What the grace window
+prevents is a briefly unreachable backend turning every request that carries a
+bound credential into a `503` when a good value was resolved seconds earlier.
+
+Two things it deliberately does not cover. A credential that was **deleted or
+revoked** is not served out of the grace window, because that would turn a
+revocation into a window where the credential still works. And an admin
+mutation drops the cached value immediately, so an operator-driven rotation
+takes effect on the next request regardless of the interval.
+
+Both keys are process-owned. A reload that changes them is refused with a
+restart message, for the same reason the rest of `proxy.secrets` is.
 
 The `extensions` map at both the proxy and the origin level holds opaque blocks consumed by out-of-tree crates. The proxy does not parse them.
 

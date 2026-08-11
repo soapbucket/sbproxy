@@ -4236,13 +4236,38 @@ async fn write_admin_response_headed<S: tokio::io::AsyncWrite + Unpin>(
         "HTTP/1.1 {status} {reason}\r\n\
          Content-Type: {content_type}\r\n\
          Content-Length: {len}\r\n\
-         Connection: close\r\n\
-         WWW-Authenticate: Basic realm=\"sbproxy admin\"\r\n",
+         Connection: close\r\n",
         status = status,
         reason = reason_phrase(status),
         content_type = content_type,
         len = body.len(),
     );
+    // WOR-2334: only a 401 carries the challenge.
+    //
+    // This header used to go on every admin response, 200s included.
+    // RFC 7235 section 4.1 defines `WWW-Authenticate` as the challenge
+    // accompanying a 401, and browsers treat it that way: seeing it on an
+    // ordinary successful response is an invitation to cache the
+    // credentials for the whole origin and silently re-attach them to
+    // every later request, invisibly to page JS.
+    //
+    // That is what made the admin console appear to survive restarts. A
+    // browser that had ever picked up admin Basic credentials, which it
+    // could do from any successful page load, would re-authenticate via
+    // Basic on the next request; `resolve_principal` falls back to Basic
+    // against the static config credentials, which no restart affects,
+    // and `basic_session_upgrade_headers` then minted a fresh, validly
+    // signed session cookie underneath the user with no visible re-login.
+    // It is also the most likely explanation for "logging in as a
+    // different role signs me in as admin instead": a background request
+    // racing a fresh login, carrying cached admin Basic credentials.
+    //
+    // The SPA has its own login and CSRF flow (WOR-1714) and never needed
+    // this header. Scripted and CLI clients still get a correct challenge
+    // where the RFC says it belongs.
+    if status == 401 {
+        header.push_str("WWW-Authenticate: Basic realm=\"sbproxy admin\"\r\n");
+    }
     for (k, v) in extra_headers {
         header.push_str(k);
         header.push_str(": ");
