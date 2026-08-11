@@ -3539,9 +3539,30 @@ origins:
 |-------|------|---------|-------------|
 | `enabled` | bool | false | Enable response caching |
 | `ttl_secs` | duration | 300 | Cache entry TTL. Accepts integers (`60`) or humanized strings (`60s`, `5m`, `2h30m`). Alias: `ttl`. |
-| `cacheable_methods` | list | `[GET]` | HTTP methods eligible for caching. Alias: `methods`. |
+| `cacheable_methods` | list | `[GET]` | HTTP methods eligible for caching. Only `GET` and `HEAD` are accepted; anything else is refused at config load. Alias: `methods`. |
 | `cacheable_status` | list | `[200]` | Status codes eligible for caching. Alias: `status_codes`. |
 | `max_size` | int | 10000 | Upper bound on the in-memory cache size in entries. Ignored when an L2 Redis backend is attached. |
+
+#### Why only GET and HEAD
+
+The cache key is built from the workspace, hostname, method, path, canonical
+query, and a fingerprint of the `Vary` headers. It does not include the request
+body.
+
+For `GET` and `HEAD` that is complete: the request is fully described by its
+target and its headers. For a method whose body carries the request it is not.
+Every `POST` to one path would share a single cache entry, so the first response
+stored would be returned to every later request at that path no matter what it
+asked for. On an AI origin that means one caller's completion served to another
+caller's prompt, as a cache hit, with nothing to indicate anything went wrong.
+
+So `cacheable_methods` refuses anything other than `GET` and `HEAD` at config
+load rather than accepting it and behaving incorrectly.
+
+To cache AI completions, use [the semantic cache](ai-gateway.md), which keys on
+prompt content with a similarity threshold and per-scope isolation. That is a
+different mechanism for a different job, and it is the one that makes caching a
+`POST` safe.
 
 ### Choosing the backing store
 

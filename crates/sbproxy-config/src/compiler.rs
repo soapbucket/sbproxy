@@ -2996,6 +2996,52 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
         None => None,
     };
 
+    // WOR-2342: refuse a cacheable method that carries a request body.
+    //
+    // `compute_cache_key` builds
+    // `<workspace>:<hostname>:<method>:<path>:<query>:<vary>` and takes no
+    // body parameter at all. For GET and HEAD that is complete, because
+    // the request is fully described by its target and headers. For a
+    // method whose body carries the request, it is not: every POST to one
+    // URL collapses to a single key.
+    //
+    // So `methods: [GET, POST]` on an AI origin serves the first cached
+    // completion to every later prompt at that path. Not a stale answer,
+    // someone else's answer, returned as a cache hit with no indication
+    // anything is wrong. The default is GET-only, which is the only
+    // reason this has not caused damage.
+    //
+    // Refused rather than fixed by hashing the body, for two reasons. The
+    // lookup happens in `request_filter`, before the body is buffered, so
+    // keying on it would mean buffering every request body on the hot
+    // path before knowing whether the route caches at all. And AI traffic
+    // already has a purpose-built answer: the semantic cache keys on
+    // prompt content by design, with a similarity threshold and per-scope
+    // isolation this cache has no notion of.
+    //
+    // nginx takes the same position from the other direction:
+    // `proxy_cache_methods` accepts POST, but the operator must add
+    // `$request_body` to `proxy_cache_key` themselves. Accepting the
+    // method without the key is the combination that is never right.
+    if let Some(cache) = &response_cache {
+        const BODY_SAFE_METHODS: &[&str] = &["GET", "HEAD"];
+        for method in &cache.cacheable_methods {
+            if !BODY_SAFE_METHODS
+                .iter()
+                .any(|safe| safe.eq_ignore_ascii_case(method))
+            {
+                anyhow::bail!(
+                    "origin '{hostname}': response_cache cannot cache `{method}`. The cache key \
+                     is built from method, path, query, and Vary headers only, so every \
+                     `{method}` to one path shares a single entry and the first response is \
+                     served to every later request regardless of its body. Only GET and HEAD \
+                     are safe here. To cache AI completions, use the semantic cache \
+                     (`origins.<host>.action.semantic_cache`), which keys on prompt content."
+                );
+            }
+        }
+    }
+
     // --- Wave 4 day-4: auto-prepend the content-shaping chain ---
     //
     // When the origin authors an `ai_crawl_control` policy or one of
@@ -8982,5 +9028,81 @@ origins:
             .await
             .expect("compile from local kind");
         assert!(cfg.host_map.contains_key("app.example.com"));
+    }
+    // --- WOR-2342: response_cache method allowlist ---
+
+    fn response_cache_yaml(methods: &str) -> String {
+        format!(
+            r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    response_cache:
+      enabled: true
+      ttl_secs: 60
+      cacheable_methods: [{methods}]
+"#
+        )
+    }
+
+    #[test]
+    fn caching_a_body_bearing_method_is_refused() {
+        // The cache key is method, path, query, and Vary headers. It
+        // carries no body, so every POST to one path collapses to a
+        // single entry and the first response is served to every later
+        // prompt. Refused at compile rather than documented, because the
+        // failure is silent and returns someone else's answer.
+        for method in ["POST", "PUT", "PATCH", "DELETE", "post"] {
+            let err = compile_config(&response_cache_yaml(method))
+                .err()
+                .unwrap_or_else(|| panic!("{method} must be refused"));
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("response_cache cannot cache"),
+                "error must name the refusal: {msg}"
+            );
+            assert!(
+                msg.contains("regardless of its body"),
+                "error must say why, not just that: {msg}"
+            );
+            assert!(
+                msg.contains("semantic_cache"),
+                "error must point at the surface that does key on content: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn get_and_head_still_compile() {
+        // The other half. Both are fully described by their target and
+        // headers, so the existing key is complete for them, and every
+        // shipped example and conformance case uses one of the two.
+        for methods in ["GET", "HEAD", "GET, HEAD"] {
+            compile_config(&response_cache_yaml(methods))
+                .unwrap_or_else(|e| panic!("{methods} must compile: {e:#}"));
+        }
+    }
+
+    #[test]
+    fn an_unset_method_list_still_compiles() {
+        // Defaults to GET-only in the request path; an operator who never
+        // wrote the key must not be asked about it.
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    response_cache:
+      enabled: true
+      ttl_secs: 60
+"#;
+        compile_config(yaml).expect("a cache block without methods must compile");
     }
 }

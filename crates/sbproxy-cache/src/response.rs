@@ -192,18 +192,18 @@ pub fn vary_fingerprint(headers: &[(String, String)]) -> String {
     hex::encode(&digest[..8])
 }
 
-/// Check if a request method is cacheable given the allowed methods list.
-///
-/// If `allowed_methods` is empty, only GET and HEAD are cacheable.
-pub fn is_cacheable_method(method: &str, allowed_methods: &[String]) -> bool {
-    if allowed_methods.is_empty() {
-        method == "GET" || method == "HEAD"
-    } else {
-        allowed_methods
-            .iter()
-            .any(|m| m.eq_ignore_ascii_case(method))
-    }
-}
+// WOR-2342: `is_cacheable_method` stood here and had zero production call
+// sites. The request path decides this inline in
+// `server::request_phase`, against `cache_cfg.cacheable_methods`.
+//
+// Deleted rather than wired, because the two had already drifted: this
+// one admitted HEAD on an empty list and the live gate admits GET only.
+// A helper that disagrees with the code actually making the decision is
+// worse than no helper, since the next reader has to work out which of
+// the two is authoritative.
+//
+// The method allowlist is now validated at config compile
+// (`compiler.rs`), which refuses anything other than GET and HEAD.
 
 /// HTTP methods that should trigger cache invalidation when
 /// `invalidate_on_mutation` is enabled.
@@ -586,27 +586,6 @@ mod tests {
     #[test]
     fn test_vary_fingerprint_empty() {
         assert_eq!(vary_fingerprint(&[]), "");
-    }
-
-    // --- is_cacheable_method tests ---
-
-    #[test]
-    fn test_default_cacheable_methods() {
-        let empty: Vec<String> = vec![];
-        assert!(is_cacheable_method("GET", &empty));
-        assert!(is_cacheable_method("HEAD", &empty));
-        assert!(!is_cacheable_method("POST", &empty));
-        assert!(!is_cacheable_method("PUT", &empty));
-        assert!(!is_cacheable_method("DELETE", &empty));
-    }
-
-    #[test]
-    fn test_custom_cacheable_methods() {
-        let methods = vec!["GET".to_string(), "POST".to_string()];
-        assert!(is_cacheable_method("GET", &methods));
-        assert!(is_cacheable_method("POST", &methods));
-        assert!(is_cacheable_method("post", &methods));
-        assert!(!is_cacheable_method("PUT", &methods));
     }
 
     // --- cached conditional requests ---
