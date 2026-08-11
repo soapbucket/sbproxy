@@ -3697,10 +3697,17 @@ fn effective_policy_type(ctx: &RequestContext, fallback: &'static str) -> &'stat
 /// fallback only surfaces when no slot was set, which is the case
 /// for `Policy::Plugin` enforcers and dispatcher-synthesised denies.
 ///
-/// Async because rate-limit enforcers attached to an L2 (Redis)
-/// store call `allow_with_info_async`, which `spawn_blocking`s the
-/// Redis INCR. Local-only token-bucket rate limiters short-circuit
-/// synchronously without hitting the runtime.
+/// Async for two reasons. Every enforcer's `enforce` returns a future,
+/// and, since WOR-2332, a rate-limit policy attached to an L2 (Redis)
+/// store or a mesh tier is admitted *here* rather than inside its
+/// enforcer, through
+/// [`crate::builtin_enforcers::shared_admission::SharedAdmission`]. That
+/// admission is the await this function exists to host: `enforce` cannot
+/// perform it, because its future must be `Send` and the `&mut dyn Any`
+/// it receives to reach the request context is not.
+///
+/// Local-only token-bucket rate limiters carry no such handle and still
+/// decide synchronously inside `enforce`, without hitting the runtime.
 ///
 /// `verdict_ctx` carries the request / tenant / workspace
 /// identifiers reused for every
@@ -3777,6 +3784,9 @@ async fn check_policies(
         let policy_id = compiled.enforcer.policy_type();
         let started = std::time::Instant::now();
         let surface = compiled.surface;
+        // WOR-2332: admission against a cluster-shared tier happens here,
+        // not inside `enforce`. See `resolve_shared_admission`.
+        crate::builtin_enforcers::resolve_shared_admission(compiled, &req_snapshot, ctx).await;
         let ctx_any: &mut dyn std::any::Any = ctx;
         // WOR-2318: one span per enforcer. The chain already reports a
         // per-policy verdict event and a per-policy metric, and neither

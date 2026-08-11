@@ -2826,6 +2826,15 @@ fn compile_origin_policy_chain(
                     // counter-key prefix, so attach order cannot split
                     // counters across keyspaces (pinned by a test in
                     // sbproxy-modules).
+                    //
+                    // WOR-2332: attaching a store here is necessary but
+                    // was not sufficient. Until the `check_policies`
+                    // shared-admission seam existed, nothing on the
+                    // request path called `allow_with_info_async`, so
+                    // this tier was compiled in and never consulted.
+                    // `compile_builtin_enforcers` now derives a
+                    // shared-admission handle from whatever this loop
+                    // attached, which is what connects the two.
                     *rl = taken
                         .with_store(l2_store.clone(), origin_id)
                         .with_async_store(l2_async_store.clone(), origin_id);

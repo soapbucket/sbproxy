@@ -527,6 +527,28 @@ impl RateLimitPolicy {
         self.window_secs > 1
     }
 
+    /// Whether admission for this policy has to consult state that lives
+    /// outside this process.
+    ///
+    /// True when an L2 counter store is attached, or when a mesh cluster
+    /// tier is attached and the window is long enough to reconcile. False
+    /// for the ordinary local-only policy, which is the common case.
+    ///
+    /// This is what tells the request path whether it must reach
+    /// [`Self::allow_with_info_async`] instead of the synchronous
+    /// [`Self::allow_with_info_for`]. Until WOR-2332 nothing asked, so a
+    /// configured Redis tier was attached at config-compile time and then
+    /// never consulted: ten replicas each enforced the full configured
+    /// rate locally while a healthy Redis sat beside them. The condition
+    /// deliberately mirrors `allow_with_info_async`'s own dispatch, so the
+    /// two cannot drift into disagreeing about whether a shared tier is
+    /// live.
+    pub fn has_shared_tier(&self) -> bool {
+        self.async_store.is_some()
+            || self.store.is_some()
+            || (self.cluster.is_some() && self.converges_on_mesh())
+    }
+
     /// Test-only accessor for the counter-key prefix, so tests can build the
     /// same bucket string the cluster path derives.
     #[cfg(test)]
