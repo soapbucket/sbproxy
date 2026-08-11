@@ -52,9 +52,22 @@ export function formatUsd(n: number | undefined | null): string {
   })}`;
 }
 
-/** Parse a timestamp (ISO string, epoch seconds, or epoch millis). */
+/**
+ * Parse a timestamp (ISO string, epoch seconds, or epoch millis).
+ *
+ * Idempotent: passing an already-parsed `Date` gives it back. WOR-2348 —
+ * without that branch a `Date` fell through to `return null`, because its
+ * `typeof` is `"object"`. Every caller that wrapped defensively, or that
+ * passed the output of one `toDate` into a helper that calls `toDate`
+ * again, silently got `null` and rendered "n/a". A function named
+ * `toDate` returning null for a Date is the trap; this closes it at the
+ * source rather than only at the call sites that tripped over it.
+ */
 export function toDate(value: unknown): Date | null {
   if (value === undefined || value === null) return null;
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value;
+  }
   if (typeof value === "number") {
     // Heuristic: values below ~10^12 are seconds.
     return new Date(value < 1e12 ? value * 1000 : value);

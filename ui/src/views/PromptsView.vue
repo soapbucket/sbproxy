@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from "vue";
-import { api, asList, ApiError, type PromptEntry } from "../api";
+import { api, flattenPromptOverlay, ApiError, type PromptEntry } from "../api";
 import { useAsync } from "../composables/useAsync";
 import { toast } from "../composables/useToasts";
 import PageHeader from "../components/PageHeader.vue";
@@ -13,7 +13,7 @@ const req = useAsync(() => api.prompts());
 onMounted(req.run);
 
 const prompts = computed<PromptEntry[]>(() =>
-  asList<PromptEntry>(req.data.value, "prompts", "overlays", "items", "data"),
+  flattenPromptOverlay(req.data.value),
 );
 
 function versionsOf(p: PromptEntry): string[] {

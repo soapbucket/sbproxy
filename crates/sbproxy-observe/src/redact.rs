@@ -56,8 +56,83 @@ static RE_API_KEY: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Generic `password = "..."` / `password: ...` patterns.
+///
+/// Split into the label-plus-separator run and the value so the value can
+/// be inspected before anything is replaced: see [`is_secret_reference`].
+/// Sibling patterns get away with a single group because their value
+/// character classes happen to exclude the reference syntax; this one
+/// matches `\S`, so it has to check.
 static RE_PASSWORD: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"(?i)password["'\s:=]+\S{8,}"#).expect("valid regex"));
+    LazyLock::new(|| Regex::new(r#"(?i)(password["'\s:=]+)(\S{8,})"#).expect("valid regex"));
+
+/// Whether `value` names a secret rather than being one.
+///
+/// A reference is a pointer the resolver dereferences at boot: an env
+/// var, a file path, or a provider URI. Redacting one destroys
+/// information without protecting anything, because the reference is
+/// already safe to print. That is exactly why an operator is told to use
+/// them.
+///
+/// WOR-2333: `RE_PASSWORD` matched `\S{8,}`, so it swallowed
+/// `${SB_ADMIN_PASSWORD}` whole and the replacement text took the `:`
+/// with it. `GET /admin/config` redacts server-side, so the Config page
+/// handed the operator YAML whose `admin:` block read
+/// `password=[REDACTED]`, and Validate+Save wrote that back. The config
+/// was lost with only a generic `failed to parse config YAML` to explain
+/// it, and the drift indicator still read "in sync" because it compares
+/// hashes of the redacted content.
+///
+/// `RE_API_KEY` was unaffected only by luck: its value class is
+/// `[a-zA-Z0-9_\-]`, which cannot match `$`, `{`, or `}`.
+///
+/// The check is deliberately whole-value. `${VAR}suffix` is not a
+/// reference, the resolver passes it through literally (and warns), so it
+/// stays redactable.
+fn is_secret_reference(value: &str) -> bool {
+    // Trailing YAML/JSON punctuation the `\S` run may have absorbed, so
+    // `password: "${VAR}",` is recognised as the reference it is.
+    let value = value.trim_end_matches([',', '"', '\'', ';']);
+    if value.starts_with("${") && value.ends_with('}') {
+        return true;
+    }
+    // The resolver's non-URI forms, and every provider-URI scheme it
+    // parses. Kept in sync with `sbproxy_vault::SecretResolver::resolve`.
+    const PREFIXES: &[&str] = &[
+        "env:",
+        "file:",
+        "vault://",
+        "awssm://",
+        "gcpsm://",
+        "azurekv://",
+        "k8ssecret://",
+        "secretfile://",
+        "secret://",
+    ];
+    PREFIXES.iter().any(|prefix| {
+        value.len() > prefix.len() && value[..prefix.len()].eq_ignore_ascii_case(prefix)
+    })
+}
+
+/// Apply the password redaction, leaving secret references intact.
+fn redact_passwords(input: &str) -> String {
+    RE_PASSWORD
+        .replace_all(input, |caps: &regex::Captures<'_>| {
+            let value = &caps[2];
+            if is_secret_reference(value) {
+                // Whole match back verbatim, separator included.
+                caps[0].to_string()
+            } else {
+                // Unchanged output for an actual inline secret. The
+                // separator is deliberately still consumed: a config
+                // carrying an inline secret is not meant to survive a
+                // GET-edit-PUT round trip, and the resulting parse
+                // failure is the loud signal WOR-2316 chose over
+                // silently writing `[REDACTED]` back as the password.
+                "password=[REDACTED]".to_string()
+            }
+        })
+        .into_owned()
+}
 
 // --- Public API ---
 
@@ -78,8 +153,7 @@ pub fn redact_secrets(input: &str) -> String {
     let s = RE_BEARER.replace_all(&s, "Bearer [REDACTED]");
     let s = RE_BASIC.replace_all(&s, "Basic [REDACTED]");
     let s = RE_API_KEY.replace_all(&s, "api_key=[REDACTED]");
-    let s = RE_PASSWORD.replace_all(&s, "password=[REDACTED]");
-    s.into_owned()
+    redact_passwords(&s)
 }
 
 /// Check if a string contains any known secret patterns.
@@ -96,7 +170,12 @@ pub fn contains_secret(input: &str) -> bool {
         || RE_BEARER.is_match(input)
         || RE_BASIC.is_match(input)
         || RE_API_KEY.is_match(input)
-        || RE_PASSWORD.is_match(input)
+        // A reference is not a secret, so it must not count as one here
+        // either. Reusing the capture keeps this in step with
+        // `redact_passwords` rather than letting the two drift.
+        || RE_PASSWORD
+            .captures_iter(input)
+            .any(|caps| !is_secret_reference(&caps[2]))
 }
 
 // --- Tests ---
@@ -323,5 +402,107 @@ mod tests {
     #[test]
     fn test_contains_secret_false() {
         assert!(!contains_secret("GET /health HTTP/1.1 200 OK"));
+    }
+
+    // --- WOR-2333: a reference is not a secret ---
+
+    #[test]
+    fn an_interpolated_admin_password_survives_redaction() {
+        // The bug that motivated all of this. `GET /admin/config` redacts
+        // server-side, so the Config page handed the operator YAML whose
+        // `admin:` block read `password=[REDACTED]`, colon and all, and
+        // Validate+Save wrote that straight back. The config was lost
+        // behind a generic `failed to parse config YAML`.
+        let input = "admin:\n  password: ${SB_ADMIN_PASSWORD}\n  port: 9901\n";
+        let output = redact_secrets(input);
+        assert_eq!(
+            output, input,
+            "an interpolation reference names a secret, it is not one"
+        );
+    }
+
+    #[test]
+    fn the_redacted_config_still_parses_as_yaml() {
+        // The property the operator actually depends on: whatever comes
+        // back from a redacted round trip is still a config. Asserting on
+        // the substring alone would not have caught the eaten colon.
+        let input = "admin:\n  password: ${SB_ADMIN_PASSWORD}\n  port: 9901\n";
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(&redact_secrets(input)).expect("redacted config still parses");
+        assert_eq!(
+            parsed["admin"]["password"].as_str(),
+            Some("${SB_ADMIN_PASSWORD}")
+        );
+        assert_eq!(parsed["admin"]["port"].as_u64(), Some(9901));
+    }
+
+    #[test]
+    fn every_resolver_reference_form_survives() {
+        // `${VAR}` was the reported one, but `\S{8,}` swallowed all of
+        // these equally. Each is a pointer the resolver dereferences at
+        // boot and each is safe to print.
+        for reference in [
+            "${SB_ADMIN_PASSWORD}",
+            "env:SB_ADMIN_PASSWORD",
+            "file:/run/secrets/admin-password",
+            "vault://primary/admin?key=password",
+            "awssm://prod/admin-password",
+            "gcpsm://prod/admin-password",
+            "azurekv://prod/admin-password",
+            "k8ssecret://ns/admin-password",
+            "secretfile://local/admin-password",
+            "secret://local/admin-password",
+        ] {
+            let input = format!("password: {reference}");
+            assert_eq!(
+                redact_secrets(&input),
+                input,
+                "{reference} is a reference and must be preserved"
+            );
+            assert!(
+                !contains_secret(&input),
+                "{reference} must not be reported as a secret"
+            );
+        }
+    }
+
+    #[test]
+    fn an_inline_password_is_still_redacted() {
+        // The other half of the contract. Loosening the pattern must not
+        // stop it catching a real secret.
+        let input = "password: hunter2-actual-secret";
+        let output = redact_secrets(input);
+        assert!(!output.contains("hunter2-actual-secret"));
+        assert!(output.contains("password=[REDACTED]"));
+        assert!(contains_secret(input));
+    }
+
+    #[test]
+    fn a_password_containing_a_dollar_sign_is_still_redacted() {
+        // The reason this is a value check rather than a narrower
+        // character class. Excluding `$` from the pattern would have
+        // fixed the reported bug and silently stopped redacting any
+        // password containing one.
+        let input = "password: p$ssw0rd-with-braces{}";
+        let output = redact_secrets(input);
+        assert!(!output.contains("p$ssw0rd-with-braces"));
+        assert!(output.contains("password=[REDACTED]"));
+    }
+
+    #[test]
+    fn a_partial_interpolation_is_not_treated_as_a_reference() {
+        // `${VAR}suffix` is not a reference: the resolver passes it
+        // through literally and warns. Whole-value only, so this stays
+        // redactable.
+        let input = "password: ${SB_ADMIN_PASSWORD}-suffix";
+        assert!(redact_secrets(input).contains("password=[REDACTED]"));
+    }
+
+    #[test]
+    fn a_quoted_reference_survives_its_punctuation() {
+        // JSON and quoted YAML put the closing quote and comma inside the
+        // `\S` run, so the trailing-punctuation trim is load bearing.
+        let input = r#"{"password": "${SB_ADMIN_PASSWORD}", "port": 9901}"#;
+        assert_eq!(redact_secrets(input), input);
     }
 }

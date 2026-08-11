@@ -176,6 +176,16 @@ const curlExample = computed(
     `curl https://your-proxy/v1/messages \\\n  -H 'x-api-key: ${createdToken.value ?? ""}' \\\n  -H 'content-type: application/json' \\\n  -d '{"model":"...","messages":[]}'`,
 );
 const createdMeta = ref<AdminKey | null>(null);
+/// Set only when the reveal modal is showing a rotated secret rather than
+/// a newly created one, so the modal can say which it is and how long the
+/// previous secret keeps working.
+const rotationGraceExpiresAt = ref<string | null>(null);
+const revealIsRotation = computed(() => rotationGraceExpiresAt.value !== null);
+
+function dismissReveal() {
+  createdToken.value = null;
+  rotationGraceExpiresAt.value = null;
+}
 
 function resetCreate() {
   Object.assign(createForm, {
@@ -651,7 +661,18 @@ async function doAction(
   if (action === "revoke" && !confirm(`Revoke key ${id}? This cannot be undone.`)) return;
   rowBusy.value = id + action;
   try {
-    await api.keyAction(id, action);
+    const result = await api.keyAction(id, action);
+    // WOR-2345: a rotate mints a new secret and returns it exactly once.
+    // This response body used to be discarded, so the only copy of the
+    // new secret went in the bin: the old one keeps working until the
+    // grace window lapses, and then the key is simply unusable. The
+    // reveal modal is the same one key creation uses, because it is the
+    // same promise, that this is the last time the value is shown.
+    if (result?.token) {
+      createdToken.value = result.token;
+      createdMeta.value = result.key ?? k;
+      rotationGraceExpiresAt.value = result.grace_expires_at ?? null;
+    }
     toast.success(ACTION_DONE[action], shortId(id));
     keysReq.run();
   } catch (e) {
@@ -1189,8 +1210,12 @@ function statusOf(k: AdminKey): string {
     </template>
   </ModalDialog>
 
-  <!-- Copy-once token modal -->
-  <ModalDialog v-if="createdToken" title="Key created" @close="createdToken = null">
+  <!-- Copy-once token modal, shared by key creation and key rotation -->
+  <ModalDialog
+    v-if="createdToken"
+    :title="revealIsRotation ? 'Key rotated' : 'Key created'"
+    @close="dismissReveal"
+  >
     <p class="warn-line">
       This is the only time the token is shown. Copy it now and store it somewhere safe.
       It cannot be retrieved again.
@@ -1198,6 +1223,11 @@ function statusOf(k: AdminKey): string {
     <CopyText :value="createdToken" mono />
     <p class="sb-faint" style="margin-top: 12px" v-if="createdMeta">
       Key id: <span class="sb-mono">{{ keyId(createdMeta) }}</span>
+    </p>
+    <p class="warn-line" style="margin-top: 12px" v-if="rotationGraceExpiresAt">
+      The previous secret keeps working until
+      <span class="sb-mono">{{ formatTime(rotationGraceExpiresAt) }}</span>. Roll every
+      caller over before then; after that only the token above is accepted.
     </p>
 
     <h4 class="use-head">How to present it</h4>
@@ -1215,7 +1245,7 @@ function statusOf(k: AdminKey): string {
       <code>x-sb-api</code> and leave <code>authorization</code> as it is.
     </p>
     <template #footer>
-      <button class="sb-btn sb-btn--primary" @click="createdToken = null">Done</button>
+      <button class="sb-btn sb-btn--primary" @click="dismissReveal">Done</button>
     </template>
   </ModalDialog>
 
