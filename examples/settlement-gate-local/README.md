@@ -34,7 +34,7 @@ python3 examples/settlement-gate-local/fixture.py &
 target/payments/release/sbproxy serve -f examples/settlement-gate-local/sb.yml
 ```
 
-There is no `docker-compose.yml`, and the reason is the build rather than the stack: `Dockerfile.cloudbuild` compiles the default feature set, so the image the other examples share would start this config and fail on the rail. That also means `scripts/examples-smoke.sh` skips this directory; `smoke.json` records the contract it would assert, and [`e2e/tests/settlement_gate.rs`](../../e2e/tests/settlement_gate.rs) drives the same stub node and the same counting origin from Rust. It pays before its first retry, so it proves the challenge, the settle, and the replay refusal, and it does not cover the reconciliation the script below walks through.
+There is no `docker-compose.yml`, and the reason is the build rather than the stack: `Dockerfile.cloudbuild` compiles the default feature set, so the image the other examples share would start this config and fail on the rail. That also means `scripts/examples-smoke.sh` skips this directory; `smoke.json` records the contract it would assert, and [`e2e/tests/settlement_gate.rs`](../../e2e/tests/settlement_gate.rs) drives the same stub node and the same counting origin from Rust. It pays before its first retry, so it proves the challenge, the settle, and the replay refusal, and it does not cover the early, unpaid retry the script below walks through.
 
 ## The whole sequence, with the origin's own counter
 
@@ -54,9 +54,9 @@ bash examples/settlement-gate-local/bin/settle-once.sh
 5 reader, never challenged    status=200 origin_hits=2
 ```
 
-Step 3 retries in a loop instead of asking once, and the reason is worth reading before you write a crawler against this. Step 2 retried before the invoice was paid, which is ordinary client behavior and is also what leaves the intent in `needs_reconciliation`: the rail verified the payment and did not settle it. From there the request path never tries again, because a second attempt is how a payer gets charged twice, so paying the invoice does not on its own get the crawler in. The recovery worker clears it on its next sweep, `worker.reconcile_interval_ms` apart and 1000 ms in this config, and the retry after that reaches the origin. That is what the 503's `Retry-After: 2` is asking a client to do.
+Step 3 retries in a loop instead of asking once, and the reason is worth reading before you write a crawler against this. Step 2 retried before the invoice was paid, which is ordinary client behavior: the rail checks the invoice's status fresh on every request rather than remembering the earlier "not paid yet" answer, so an unpaid read is a clean, repeatable `retry_wait`, never a write that could double-charge the payer. Paying the invoice and retrying is all it takes; the very next request against the intent settles it, with no recovery worker involved. `Retry-After: 2` is a suggested pace for that retry, not a wait for anything running in the background.
 
-The loop is bounded at 100 attempts 0.2s apart, which is twenty times the sweep interval. Running out is a failure and says so, printing the intent's durable status, because a walkthrough that prints a 503 where a 200 belongs teaches the wrong thing quietly. Every status the script prints is asserted for the same reason. `SETTLE_ATTEMPTS` and `SETTLE_INTERVAL` move the bound if you raise `reconcile_interval_ms`.
+The loop is bounded at 100 attempts 0.2s apart as a defensive margin, not because settlement is expected to take that long; a run that reaches the origin on the first retry after payment, which is the normal case, only ever executes once. Running out is a failure and says so, printing the intent's durable status, because a walkthrough that prints a 503 where a 200 belongs teaches the wrong thing quietly. Every status the script prints is asserted for the same reason. `SETTLE_ATTEMPTS` and `SETTLE_INTERVAL` move the bound for a slower stack.
 
 ## Step by step
 
@@ -93,7 +93,7 @@ Connection: keep-alive
 {"amount_micros":100,"challenge":{"bolt11":"lnbcrt100u1stubinvoicestubinvoicestubinvoice","label":"sbproxy-invoice-sbpi_ppFV2kS5oWRd-WqoDUGQ-3ROCgyXYjARyFOiq2pcQ6Y","payment_hash":"1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f"},"currency":"BTC","error":"payment_required","expires_at_ms":1785794915015,"header":"crawler-payment","rail":"lightning","requirement_id":"req_01kz4tenq72a9y36yjhs0j6ccz","target":"blog.local/article"}
 ```
 
-Retrying before the invoice is paid is the case the gate exists for. The quote token authenticates and names a live intent, so this is not a refusal; it is verified-but-not-settled, which is a 503 with `Retry-After` and never origin access. It is also what strands the intent in `needs_reconciliation` until the worker sweeps, so run this and the crawler's next successful request is one sweep away rather than immediate:
+Retrying before the invoice is paid is the case the gate exists for. The quote token authenticates and names a live intent, so this is not a refusal; it is verified-but-not-settled, which is a 503 with `Retry-After` and never origin access. The intent is left `retry_wait`, not stranded, so run this and the crawler's very next request, once it has actually paid, is the one that reaches the origin:
 
 ```bash
 TOKEN=$(curl -sS -D - -o /dev/null -H 'Host: blog.local' -H 'User-Agent: GPTBot/1.0' http://127.0.0.1:8080/article | tr -d '\r' | awk '/^crawler-payment:/ {print $2}'); curl -is -H 'Host: blog.local' -H 'User-Agent: GPTBot/1.0' -H "crawler-payment: $TOKEN" http://127.0.0.1:8080/article
@@ -145,7 +145,7 @@ sqlite3 /tmp/sbproxy-settlement/payments.sqlite3 \
 ```text
 succeeded|lightning_cln|100|BTC
 pending|lightning_cln|100|BTC
-needs_reconciliation|lightning_cln|100|BTC
+retry_wait|lightning_cln|100|BTC
 ```
 
 ```bash
@@ -168,7 +168,7 @@ curl -s -u admin:demo-change-me http://127.0.0.1:9090/admin/payments/status
 <!-- CAPTURE: curl -s -u admin:demo-change-me http://127.0.0.1:9090/admin/payments/status -->
 
 ```text
-{"configured":true,"rails":["lightning_cln"],"schema_version":2,"worker":{"challenges_expired":0,"clean_shutdown":false,"leases_moved_to_needs_reconciliation":0,"leases_returned_to_retry_wait":0,"reconciliations_succeeded":1,"reconciliations_unresolved":0,"ticks":2}}
+{"configured":true,"rails":["lightning_cln"],"schema_version":3,"worker":{"challenges_expired":<N>,"clean_shutdown":false,"leases_moved_to_needs_reconciliation":<N>,"leases_returned_to_retry_wait":<N>,"reconciliations_succeeded":<N>,"reconciliations_unresolved":<N>,"ticks":<N>}}
 ```
 
 The metrics carry four labels and no more: `rail`, `operation`, `outcome`, and `provider_class`.
@@ -186,7 +186,7 @@ sbproxy_payment_settlement_total{operation="challenge",outcome="no_acceptable_ra
 sbproxy_payment_settlement_total{operation="challenge",outcome="prepared",rail="lightning_cln"} 3
 sbproxy_payment_settlement_total{operation="redeem",outcome="proof_replayed",rail="lightning_cln"} 1
 sbproxy_payment_settlement_total{operation="redeem",outcome="succeeded",rail="lightning_cln"} 1
-sbproxy_payment_settlement_total{operation="redeem",outcome="unavailable",rail="lightning_cln"} 6
+sbproxy_payment_settlement_total{operation="redeem",outcome="unavailable",rail="lightning_cln"} 2
 ```
 
 ## Validate without holding anything

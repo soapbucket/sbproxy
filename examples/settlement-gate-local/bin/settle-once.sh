@@ -7,14 +7,14 @@
 # whatever it likes about a payment, but only the origin knows how many
 # times it actually served the content.
 #
-# Step 3 polls instead of asking once, and the reason is a real property
-# of the gate rather than a timing fudge. The early retry in step 2
-# leaves the intent in `needs_reconciliation`: the rail verified the
-# payment and did not settle it. The request path never retries from
-# there, by design, because a second attempt is how a payer gets charged
-# twice, so only the recovery worker moves that intent on. The retry
-# that reaches the origin is whichever one lands after a sweep, which is
-# exactly what the 503's own `Retry-After` asks a client to do.
+# Step 3 polls instead of asking once, as a defensive margin rather than
+# because settlement is expected to take a while. The early retry in
+# step 2 leaves the intent in `retry_wait`: the rail checks the invoice's
+# status fresh on every request, so an unpaid read is a clean, repeatable
+# answer, never a write that could double-charge the payer. Once the
+# invoice is actually paid, the very next request against the intent
+# settles it, no recovery worker involved, which is what the 503's own
+# `Retry-After` is asking a client to do.
 #
 # Every step is asserted. A run that cannot reach the expected outcome
 # fails and says what it wanted, rather than printing a 503 as if it
@@ -35,10 +35,10 @@ READER_UA="${READER_UA:-Mozilla/5.0}"
 # failure; nothing on the happy path touches it.
 STATE_DB="${STATE_DB:-/tmp/sbproxy-settlement/payments.sqlite3}"
 
-# The bound on step 3, as attempts times seconds. The default is 20s
-# against the 1000 ms `worker.reconcile_interval_ms` this example
-# configures, so running out means the worker is not sweeping rather
-# than that it was slow.
+# The bound on step 3, as attempts times seconds. This is a defensive
+# margin, not a wait for a background sweep: the normal case settles on
+# the first attempt after payment, so running out means something is
+# actually wrong with the rail rather than that it needed more time.
 SETTLE_ATTEMPTS="${SETTLE_ATTEMPTS:-100}"
 SETTLE_INTERVAL="${SETTLE_INTERVAL:-0.2}"
 
@@ -72,9 +72,9 @@ await_settlement() {
   {
     printf 'settle-once: the paid quote never left 503 after %s attempts.\n' \
       "$SETTLE_ATTEMPTS"
-    printf 'The intent is stranded in needs_reconciliation, and only the recovery\n'
-    printf 'worker clears that. Check that the worker is sweeping and that the rail\n'
-    printf 'can still reach the node.\n'
+    printf 'The normal case settles on the first attempt after payment, so this\n'
+    printf 'means the rail cannot see the payment. Check that the __pay call\n'
+    printf 'landed and that the rail can still reach the node.\n'
     if command -v sqlite3 >/dev/null 2>&1 && [ -r "$STATE_DB" ]; then
       printf 'intent status: %s\n' \
         "$(sqlite3 "$STATE_DB" 'select status from payment_intents order by created_at_ms')"
@@ -108,15 +108,15 @@ printf '1 challenge, unpaid crawler   status=%s origin_hits=%s\n' \
   "$challenge_status" "$(hits)"
 
 # 2. Retrying before the invoice is paid is verified-but-not-settled,
-#    which is a 503 with Retry-After, never origin access. It also
-#    strands the intent, so from here only the worker can move it on.
+#    which is a 503 with Retry-After, never origin access. The intent is
+#    left retryable, not stranded, so the very next request against it
+#    re-checks the rail rather than remembering this answer.
 early_status="$(crawl -H "crawler-payment: $token")"
 printf '2 retry before payment        status=%s origin_hits=%s\n' \
   "$early_status" "$(hits)"
 
 # 3. The payer settles out of band, exactly as a Lightning wallet would,
-#    and the crawler retries until the worker has reconciled the intent
-#    step 2 stranded.
+#    and the crawler retries until that payment is visible to the rail.
 curl -sS -o /dev/null -X POST "$ORIGIN/__pay"
 if ! settled_status="$(await_settlement)"; then
   exit 1

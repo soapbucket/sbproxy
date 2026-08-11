@@ -179,6 +179,20 @@ NORMALIZERS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"lnbcrt[0-9a-z]{20,}"), "lnbcrt<INVOICE>"),
     (re.compile(r"127\.0\.0\.1:\d{4,5}"), "127.0.0.1:<PORT>"),
     (re.compile(r"^content-length: \d+$", re.MULTILINE), "content-length: <LEN>"),
+    # The recovery worker's admin status counters advance on its own
+    # wall-clock tick interval, independent of what a walkthrough's steps
+    # require of it, so their exact value at the moment a doc's capture
+    # ran is a function of real elapsed time rather than of anything the
+    # walkthrough asserts. `schema_version` is not in this group: it is a
+    # fixed integer for a given build, not a runtime counter.
+    (
+        re.compile(
+            r'"(ticks|challenges_expired|reconciliations_succeeded|'
+            r'reconciliations_unresolved|leases_moved_to_needs_reconciliation|'
+            r'leases_returned_to_retry_wait)":\d+'
+        ),
+        r'"\1":<N>',
+    ),
 ]
 
 
