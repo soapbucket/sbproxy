@@ -179,7 +179,7 @@ dashmap = "6"
 # Bounded LRU maps (sbproxy-ai response caches, sbproxy-rag stale-context
 # cache). Same 0.16 line sbproxy-ai already pins so the lockfile keeps one
 # copy.
-lru = "0.16"
+lru = "0.18"
 parking_lot = "0.12"
 smallvec = { version = "1", features = ["union"] }
 compact_str = "0.8"
